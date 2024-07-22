@@ -1,0 +1,37 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "runWosKern",
+            "command": "${workspaceFolder}/modules/kern/scripts/run_kern.sh",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}/modules/kern",
+            },
+            "args": [],
+            "isBackground": true,
+            "problemMatcher": [
+                "$tsc",
+                {
+                    "pattern": [
+                        {
+                            "regexp": ".",
+                            "file": 1,
+                            "location": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": ".",
+                        "endsPattern": "."
+                    }
+                }
+            ],
+            "presentation": {
+                "reveal": "always"
+            },
+            "group": "build"
+        }
+    ]
+}
