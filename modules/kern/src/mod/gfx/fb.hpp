@@ -13,25 +13,25 @@ namespace gfx {
             OFFSET_CHAR
         };
 
-        namespace TermColors {
-            static const uint32_t BLACK = 0x00000000;
-            static const uint32_t RED = 0x00AA0000;
-            static const uint32_t ORANGE = 0x00FFAA00;
-            static const uint32_t YELLOW = 0x00AAAA00;
-            static const uint32_t GREEN = 0x0000AA00;
-            static const uint32_t BLUE = 0x000000AA;
-            static const uint32_t MAGENTA = 0x00AA00AA;
-            static const uint32_t CYAN = 0x0000AAAA;
-            static const uint32_t WHITE = 0x00AAAAAA;
-            static const uint32_t BRIGHT_BLACK = 0x00555555;
-            static const uint32_t BRIGHT_RED = 0x00FF5555;
-            static const uint32_t BRIGHT_ORANGE = 0x00FFAF19;
-            static const uint32_t BRIGHT_GREEN = 0x0055FF55;
-            static const uint32_t BRIGHT_YELLOW = 0x00FFFF55;
-            static const uint32_t BRIGHT_BLUE = 0x005555FF;
-            static const uint32_t BRIGHT_MAGENTA = 0x00FF55FF;
-            static const uint32_t BRIGHT_CYAN = 0x0055FFFF;
-            static const uint32_t BRIGHT_WHITE = 0x00FFFFFF;
+        enum TermColors: uint32_t {
+            BLACK = 0x00000000,
+            RED = 0x00AA0000,
+            ORANGE = 0x00FFAA00,
+            YELLOW = 0x00AAAA00,
+            GREEN = 0x0000AA00,
+            BLUE = 0x000000AA,
+            MAGENTA = 0x00AA00AA,
+            CYAN = 0x0000AAAA,
+            WHITE = 0x00AAAAAA,
+            BRIGHT_BLACK = 0x00555555,
+            BRIGHT_RED = 0x00FF5555,
+            BRIGHT_ORANGE = 0x00FFAF19,
+            BRIGHT_GREEN = 0x0055FF55,
+            BRIGHT_YELLOW = 0x00FFFF55,
+            BRIGHT_BLUE = 0x005555FF,
+            BRIGHT_MAGENTA = 0x00FF55FF,
+            BRIGHT_CYAN = 0x0055FFFF,
+            BRIGHT_WHITE = 0x00FFFFFF
         };
 
         enum class FillMode {
