@@ -1,3 +1,3 @@
-int constexpr abs(int x) {
+int abs(int x) {
     return x & 0x7FFFFFFF;
 } 

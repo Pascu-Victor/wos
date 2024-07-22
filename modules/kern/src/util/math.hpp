@@ -1,3 +1,2 @@
 #pragma once
-
-static constexpr int abs(int x);
+int abs(int x);
