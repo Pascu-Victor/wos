@@ -281,7 +281,7 @@ namespace ker::mod::desc::idt {
         ISR_ENTRY(255);
     }
 
-    static inline bool isInit = false;
+    bool isInit = false;
     void idtInit(void) {
         if(isInit){
             return;

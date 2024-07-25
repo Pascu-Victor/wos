@@ -10,9 +10,9 @@ static volatile limine_smp_request smp_request = {
 
 namespace ker::mod::smt
 {
-    static inline bool isInit = false;
 
     limine_smp_response *smp_info;
+    bool isInit = false;
     void init(void) {
         if (isInit) {
             return;

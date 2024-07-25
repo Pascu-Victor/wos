@@ -20,25 +20,25 @@ namespace ker::mod::acpi {
         return sum == 0;
     }
 
-    ACPIResult parseAcpiTables(char* ident) {
+    ACPIResult parseAcpiTables(const char* ident) {
         rsdp::Rsdp rsdp = rsdp::get();
         
-        Rsdt *rsdt = (Rsdt*)mm::addr::getPhysAddr(rsdp.xsdt_addr);
+        Rsdt *rsdt = (Rsdt*)mm::addr::getVirtPointer(rsdp.xsdt_addr);
         Xsdt *xsdt = nullptr;
         Sdt header;
 
         if(rsdp::useXsdt()) {
-            xsdt = (Xsdt*)mm::addr::getPhysAddr(rsdp.xsdt_addr);
+            xsdt = (Xsdt*)mm::addr::getVirtPointer(rsdp.xsdt_addr);
             header = xsdt->header;
         } else {
-            rsdt = (Rsdt*)mm::addr::getPhysAddr((uint64_t)rsdp.rsdt_addr);
+            rsdt = (Rsdt*)mm::addr::getVirtPointer((uint64_t)rsdp.rsdt_addr);
             header = rsdt->header;
         }
 
         size_t entries = (header.length - sizeof(Sdt)) / (rsdp::useXsdt() ? sizeof(uint64_t) : sizeof(uint32_t));
 
         for(size_t i = 0; i < entries; i++) {
-            Sdt *sdt =(Sdt*) mm::addr::getPhysAddr((rsdp::useXsdt() ? xsdt->next[i] : (uint64_t)rsdt->next[i]));
+            Sdt *sdt =(Sdt*) mm::addr::getVirtPointer((rsdp::useXsdt() ? xsdt->next[i] : (uint64_t)rsdt->next[i]));
             if(memcmp(sdt->signature, ident, 4) == 0 && validateChecksum(sdt)) {
                 ACPIResult result;
                 result.success = true;

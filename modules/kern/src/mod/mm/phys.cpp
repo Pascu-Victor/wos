@@ -39,7 +39,7 @@ namespace ker::mod::mm::phys
             }
 
             paging::PageZone* zone = initPageZone(
-                (uint64_t)addr::getPhysAddr(memmap.entries[i]->base),
+                (uint64_t)addr::getVirtPointer(memmap.entries[i]->base),
                 memmap.entries[i]->length - 1,
                 zoneNum++
             );
@@ -56,7 +56,12 @@ namespace ker::mod::mm::phys
         zones_tail->next = nullptr;
 
         for(paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-            uint64_t bitmapSize = PAGE_ALIGN_UP(((uint64_t)addr::getPhysAddr(zone->start) + zone->len) / paging::PAGE_SIZE);
+            io::serial::write("Zone: ");
+            io::serial::write(zone->name);
+            io::serial::write(" size: ");
+            io::serial::write(zone->len);
+            io::serial::write("\n");
+            uint64_t bitmapSize = PAGE_ALIGN_UP(((uint64_t)addr::getVirtPointer(zone->start) + zone->len) / paging::PAGE_SIZE);
             zone->buddy = buddy_embed((uint8_t*)zone->start, zone->len);
 
             zone->start += bitmapSize;

@@ -10,8 +10,8 @@ namespace ker::mod::mm::addr {
     void setHHDMOffset(uint64_t offset);
     void setMMAPSize(uint64_t size);
 
-    paddr_t* getPhysAddr(vaddr_t vaddr);
-    vaddr_t* getVirtAddr(paddr_t paddr);
+    paddr_t* getVirtPointer(paddr_t paddr);
+    vaddr_t* getPhysPointer(vaddr_t vaddr);
 
     void init(limine_hhdm_response* hhdmResponse);
 }

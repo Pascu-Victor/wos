@@ -12,11 +12,11 @@ namespace ker::mod::mm::addr {
         mmapSize = size;
     }
 
-    paddr_t* getPhysAddr(vaddr_t vaddr) {
+    paddr_t* getVirtPointer(paddr_t vaddr) {
         return reinterpret_cast<paddr_t*>(vaddr + hhdmOffset);
     }
 
-    vaddr_t* getVirtAddr(paddr_t paddr) {
+    vaddr_t* getPhysPointer(vaddr_t paddr) {
         return reinterpret_cast<vaddr_t*>(paddr - hhdmOffset);
     }
 

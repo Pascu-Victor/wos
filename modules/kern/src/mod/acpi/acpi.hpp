@@ -15,5 +15,5 @@ namespace ker::mod::acpi {
 
     void init();
 
-    ACPIResult parseAcpiTables(char* ident);
+    ACPIResult parseAcpiTables(const char* ident);
 }

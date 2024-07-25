@@ -12,4 +12,5 @@ namespace ker::mod::dbg {
     void init(void);
     void log(const char *str);
     void error(const char *str);
+    void enableTime(void);
 }

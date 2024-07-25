@@ -46,7 +46,7 @@ namespace ker::mod::apic {
             hcf();
         }
 
-        LAPIC_BASE = (uint64_t)mm::addr::getPhysAddr(apicInfo.lapicAddr);
+        LAPIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
         enable();
     }
 }

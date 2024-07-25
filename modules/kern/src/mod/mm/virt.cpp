@@ -18,7 +18,7 @@ namespace ker::mod::mm::virt {
     }
 
     void switchToKernelPagemap() {
-        wrcr3((uint64_t)addr::getVirtAddr((paddr_t)kernelPagemap));
+        wrcr3((uint64_t)addr::getPhysPointer((paddr_t)kernelPagemap));
     }
 
     PageTable* createPagemap() {
@@ -37,7 +37,7 @@ namespace ker::mod::mm::virt {
             hcf();
         }
 
-        wrcr3((uint64_t)addr::getVirtAddr((paddr_t)t.pagemap));
+        wrcr3((uint64_t)addr::getPhysPointer((paddr_t)t.pagemap));
     }
 
     void pagefaultHandler(uint64_t controlRegister, int errCode) {
@@ -49,7 +49,7 @@ namespace ker::mod::mm::virt {
         }
 
         mapPage(
-            (PageTable*)rdcr3(),
+            getKernelPageTable(),
             controlRegister,
             controlRegister,
             pagefault.flags
@@ -69,13 +69,13 @@ namespace ker::mod::mm::virt {
 
         PageTable* table = pageTable;
         for(int i = 4; i > 1; i--) {
-            table = (PageTable*)addr::getPhysAddr(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
+            table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
             if(!table) {
                 return 0;
             }
         }
 
-        return (paddr_t)addr::getPhysAddr((table->entries[index_of(vaddr, 1)].frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1)));
+        return (paddr_t)addr::getVirtPointer((table->entries[index_of(vaddr, 1)].frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1)));
     }
 
     void initPagemap() {
@@ -95,7 +95,7 @@ namespace ker::mod::mm::virt {
             for(size_t j = 0; j < entry->length / paging::PAGE_SIZE; j++) {
                 mapPage(
                     kernelPagemap,
-                    (vaddr_t)addr::getPhysAddr(entry->base + j * paging::PAGE_SIZE),
+                    (vaddr_t)addr::getVirtPointer(entry->base + j * paging::PAGE_SIZE),
                     entry->base + j * paging::PAGE_SIZE,
                     entry->type == LIMINE_MEMMAP_RESERVED ||
                             entry->type == LIMINE_MEMMAP_BAD_MEMORY || 
@@ -130,17 +130,17 @@ namespace ker::mod::mm::virt {
                 pageTable->entries[level] = entry;
             }
 
-            return (PageTable*)addr::getPhysAddr(entry.frame << paging::PAGE_SHIFT);
+            return (PageTable*)addr::getVirtPointer(entry.frame << paging::PAGE_SHIFT);
         }
 
-        uint64_t addr = (uint64_t)addr::getVirtAddr((uint64_t)phys::pageAlloc<PageTable>());
+        uint64_t addr = (uint64_t)addr::getPhysPointer((uint64_t)phys::pageAlloc<PageTable>());
         if(addr == 0) {
             //PANIC!
             hcf();
         }
         
         pageTable->entries[level] = paging::createPageTableEntry(addr, flags);
-        return (PageTable*)addr::getPhysAddr(addr);
+        return (PageTable*)addr::getVirtPointer(addr);
     }
 
     void mapPage(PageTable *pageTable, vaddr_t vaddr, paddr_t paddr, int flags) {
@@ -175,7 +175,7 @@ namespace ker::mod::mm::virt {
         table->entries[index_of(vaddr, 1)] = paging::purgePageTableEntry();
 
         invlpg(vaddr);
-        phys::pageFree<>(addr::getVirtAddr(addr));
+        phys::pageFree<>((void*)addr);
     }
 
     void mapRange(PageTable *pageTable, Range range, int flags, uint64_t offset) {

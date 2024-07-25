@@ -24,6 +24,10 @@ namespace ker::mod::mm::virt {
         limine_kernel_address_response* kernelAddressResponse
     );
 
+    static inline PageTable* getKernelPageTable() {
+        return (PageTable*)rdcr3();
+    }
+
     void mapPage(PageTable *pageTable, vaddr_t vaddr, paddr_t paddr, int flags);
     void mapRange(PageTable *pageTable, Range range, int flags, uint64_t offset = 0);
     void unmapPage(PageTable *pageTable, vaddr_t vaddr);

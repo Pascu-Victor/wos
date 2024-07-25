@@ -1,9 +1,9 @@
 #include "serial.hpp"
 
-inline static  bool isInit = false;
 
 namespace ker::mod::io {
     namespace serial {
+        bool isInit = false;
         void init(void) {
             if (isInit) {
                 return;
