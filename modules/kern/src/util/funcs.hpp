@@ -6,3 +6,7 @@ static inline void hcf(void) noexcept {
         asm ("hlt");
     }
 }
+
+void inline static wos_nop(...) {}
+
+#define WOS_NOP wos_nop

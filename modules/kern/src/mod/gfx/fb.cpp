@@ -8,7 +8,7 @@ static volatile limine_framebuffer_request framebufferRequest = {
     .response = nullptr,
 };
 
-namespace gfx {
+namespace ker::mod::gfx {
     namespace fb {
         FbFont __currentFont;
         limine_framebuffer *__framebuffer;

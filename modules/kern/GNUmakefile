@@ -26,11 +26,11 @@ override DEFAULT_KCXX := clang++
 $(eval $(call DEFAULT_VAR,KCXX,$(DEFAULT_KCXX)))
 
 # Same thing for "ld" (the linker).
-override DEFAULT_KLD := ld
+override DEFAULT_KLD := ld.lld
 $(eval $(call DEFAULT_VAR,KLD,$(DEFAULT_KLD)))
 
 # User controllable C flags.
-override DEFAULT_KCFLAGS := -g -Og -pipe
+override DEFAULT_KCFLAGS := -g -O2 -pipe
 $(eval $(call DEFAULT_VAR,KCFLAGS,$(DEFAULT_KCFLAGS)))
 
 # User controllable C preprocessor flags. We set none by default.
@@ -46,7 +46,7 @@ override DEFAULT_KLDFLAGS :=
 $(eval $(call DEFAULT_VAR,KLDFLAGS,$(DEFAULT_KLDFLAGS)))
 
 # User controllable C++ flags.
-override DEFAULT_KCXXFLAGS := -g -Og
+override DEFAULT_KCXXFLAGS := -g -O2 -pipe
 $(eval $(call DEFAULT_VAR,KCXXFLAGS,$(DEFAULT_KCXXFLAGS)))
 
 # Internal C flags that should not be changed by the user.
@@ -71,6 +71,7 @@ override KCFLAGS += \
 # Internal C preprocessor flags that should not be changed by the user.
 override KCPPFLAGS := \
     -I src \
+    -I ../extern \
     $(KCPPFLAGS) \
     -MMD \
     -MP
@@ -83,6 +84,7 @@ override KCXXFLAGS += \
     -ffreestanding \
     -fno-stack-protector \
     -fno-stack-check \
+    -fomit-frame-pointer \
     -fno-lto \
     -fPIE \
     -m64 \
@@ -96,6 +98,7 @@ override KCXXFLAGS += \
 # Internal C++ preprocessor flags that should not be changed by the user.
 override KCXXPPFLAGS := \
     -I src \
+    -I ../extern \
     $(KCPPFLAGS) \
     -MMD \
     -MP
@@ -112,7 +115,9 @@ override KLDFLAGS += \
 # Internal nasm flags that should not be changed by the user.
 override KNASMFLAGS += \
     -Wall \
-    -f elf64
+    -f elf64 \
+    -w-reloc-abs-qword \
+    -w-reloc-rel-dword \
 
 # Use "find" to glob all *.c, *.S, and *.asm files in the tree and obtain the
 # object and header dependency file names.

@@ -1,5 +1,9 @@
+# build artifacts
 **/bin
 **/obj
+# libc
 **/musl
-
+#kernel images
 image.hdd
+#log files
+**/*.log

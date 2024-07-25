@@ -95,7 +95,9 @@
 			"mem.h": "c",
 			"stddef.h": "c",
 			"strstream": "cpp",
-			"slist": "cpp"
+			"slist": "cpp",
+			"*.inc": "cpp",
+			"*.ipp": "cpp"
 		}
 	}
 }

@@ -6,7 +6,7 @@
 #include <util/mem.hpp>
 #include <mod/gfx/fb_font.hpp>
 
-namespace gfx {
+namespace ker::mod::gfx {
     namespace fb {
         enum class OffsetMode {
             OFFSET_PIXEL,

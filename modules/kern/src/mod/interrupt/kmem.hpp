@@ -1,11 +1,10 @@
 #pragma once
-#include <stdint.h>
-#include <stddef.h>
 #include <limine.h>
 
-typedef __SIZE_TYPE__ size_t;
-
-namespace ker {
+#include <defines/defines.hpp>
+#include <mod/dbg/dbg.hpp>
+#include <mod/interrupt/gdt.hpp>
+namespace ker::mod::mem {
     const static uint64_t NUM_MMAP_ENTRIES = 256;
 
     const static constexpr uint64_t PAGE_SIZE = 4096;
@@ -28,7 +27,7 @@ namespace ker {
 
     static volatile page_table_entry* __page_table = nullptr;
 
-    void kmem_init(void);
+    void init(void);
 
     uint64_t mmap_read(uint64_t addr, uint64_t offset);
 

@@ -19,6 +19,66 @@ namespace std {
         return dest;
     }
 
+    void reverse(char s[]) {
+        int c, i, j;
+
+        for (i = 0, j = strlen(s) - 1; i < j; i++, j--) {
+            c = s[i];
+            s[i] = s[j];
+            s[j] = c;
+        }
+    }
+
+    void itoa(int n, char s[], int base) {
+        int i = 0;
+        bool isNegative = false;
+
+        if (n == 0) {
+            s[i++] = '0';
+            s[i] = '\0';
+            return;
+        }
+
+        if (n < 0 && base == 10) {
+            isNegative = true;
+            n = -n;
+        }
+
+        while (n != 0) {
+            int rem = n % base;
+            s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+            n = n / base;
+        }
+
+        if (isNegative) {
+            s[i++] = '-';
+        }
+
+        s[i] = '\0';
+
+        reverse(s);
+    }
+
+    void u64toa(uint64_t n, char s[], int base) {
+        int i = 0;
+
+        if (n == 0) {
+            s[i++] = '0';
+            s[i] = '\0';
+            return;
+        }
+
+        while (n != 0) {
+            int rem = n % base;
+            s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+            n = n / base;
+        }
+
+        s[i] = '\0';
+
+        reverse(s);
+    }
+
     // char* strdup(const char* str) {
     //     size_t len = strlen(str);
     //     char* new_str = new char[len + 1];

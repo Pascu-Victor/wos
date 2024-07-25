@@ -5,7 +5,8 @@
             "includePath": [
                 "${default}",
                 "/usr/include/efi",
-                "${workspaceFolder}/modules/kern/src"
+                "${workspaceFolder}/modules/kern/src",
+                "${workspaceFolder}/modules/extern"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",
