@@ -162,3 +162,27 @@ namespace ker::mod::mm::dyn::kmalloc
     }
 
 }
+
+void* operator new(std::size_t sz) {
+    return ker::mod::mm::dyn::kmalloc::kmalloc(sz);
+}
+
+void* operator new[](std::size_t sz) {
+    return ker::mod::mm::dyn::kmalloc::kmalloc(sz);
+}
+
+// void operator delete(void* ptr) noexcept {
+//     ker::mod::mm::dyn::kmalloc::kfree(ptr);
+// }
+
+void operator delete(void* ptr, std::size_t size) noexcept {
+    ker::mod::mm::dyn::kmalloc::kfree(ptr, size);
+}
+
+// void operator delete[](void* ptr) noexcept {
+//     ker::mod::mm::dyn::kmalloc::kfree(ptr);
+// }
+
+void operator delete[](void* ptr, std::size_t size) noexcept {
+    ker::mod::mm::dyn::kmalloc::kfree(ptr, size);
+}
