@@ -1,0 +1,17 @@
+#pragma once
+
+#include <limine.h>
+#include <std/hcf.hpp>
+#include <util/string.hpp>
+#include <util/mem.hpp>
+
+#include <mod/io/serial/serial.hpp>
+#include <platform/ktime/ktime.hpp>
+#include <mod/gfx/fb.hpp>
+
+namespace ker::mod::dbg {
+    void init(void);
+    void log(const char *str);
+    void error(const char *str);
+    void enableTime(void);
+}

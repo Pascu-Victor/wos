@@ -224,24 +224,24 @@ namespace ker::mod::gfx {
 
         }
 
-        int viewportWidth(void) {
+        uint64_t viewportWidth(void) {
             return __framebuffer->width;
         }
 
-        int viewportHeight(void) {
+        uint64_t viewportHeight(void) {
             return __framebuffer->height;
         }
 
-        int viewportWidthChars(void) {
+        uint64_t viewportWidthChars(void) {
             return __framebuffer->width / __currentFont.width;
         }
 
-        int viewportHeightChars(void) {
+        uint64_t viewportHeightChars(void) {
             return __framebuffer->height / __currentFont.height;
         }
 
         void scroll() {
-            uint32_t *fb = (uint32_t*)__framebuffer->address;
+            uint64_t *fb = (uint64_t*)__framebuffer->address;
             for (size_t i = 0; i < __framebuffer->width * (__framebuffer->height - __currentFont.height); i++) {
                 fb[i] = fb[i + __framebuffer->width * __currentFont.height];
             }

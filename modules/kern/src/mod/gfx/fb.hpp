@@ -92,16 +92,16 @@ namespace ker::mod::gfx {
         );
 
         //viewport width in current font characters
-        int viewportWidthChars(void);
+        uint64_t viewportWidthChars(void);
 
         //viewport height in current font characters
-        int viewportHeightChars(void);
+        uint64_t viewportHeightChars(void);
 
         //viewport width in pixels
-        int viewportWidth(void);
+        uint64_t viewportWidth(void);
 
         //viewport height in pixels
-        int viewportHeight(void);
+        uint64_t viewportHeight(void);
 
         //scrolls the viewport up by one line
         void scroll(void);
