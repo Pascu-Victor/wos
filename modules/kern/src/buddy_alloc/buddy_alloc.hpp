@@ -22,7 +22,7 @@
 // #include <string.h>
 // #include <sys/types.h>
 #include <defines/defines.hpp>
-#include <util/mem.hpp>
+#include <std/mem.hpp>
 
 #ifndef BUDDY_PRINTF
 // #include <stdio.h>

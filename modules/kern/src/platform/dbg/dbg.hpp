@@ -2,8 +2,8 @@
 
 #include <limine.h>
 #include <std/hcf.hpp>
-#include <util/string.hpp>
-#include <util/mem.hpp>
+#include <std/string.hpp>
+#include <std/mem.hpp>
 
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>

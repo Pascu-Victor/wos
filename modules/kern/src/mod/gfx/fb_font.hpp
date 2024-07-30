@@ -2,8 +2,8 @@
 #include <stdint.h>
 #include <cstddef>
 
-#include <util/mem.hpp>
-#include <util/string.hpp>
+#include <std/mem.hpp>
+#include <std/string.hpp>
 namespace ker::mod::gfx::fb {
     class FbFont {
     public:

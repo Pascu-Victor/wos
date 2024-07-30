@@ -1,6 +1,6 @@
 #pragma once
 
-#include <util/mem.hpp>
+#include <std/mem.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/hpet/hpet.hpp>
 #include <platform/interrupt/gates.hpp>

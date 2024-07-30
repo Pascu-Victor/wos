@@ -2,8 +2,8 @@
 #include <limine.h>
 
 #include <std/hcf.hpp>
-#include <util/math.hpp>
-#include <util/mem.hpp>
+#include <std/math.hpp>
+#include <std/mem.hpp>
 #include <mod/gfx/fb_font.hpp>
 
 namespace ker::mod::gfx {

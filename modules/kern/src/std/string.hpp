@@ -1,6 +1,6 @@
 #pragma once
-#include <util/mem.hpp>
-#include <util/math.hpp>
+#include <std/mem.hpp>
+#include <std/math.hpp>
 
 namespace std {
     size_t strlen(const char* str);

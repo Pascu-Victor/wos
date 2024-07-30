@@ -3,14 +3,14 @@
 #include <limine.h>
 
 #include <std/hcf.hpp>
-#include <util/mem.hpp>
+#include <std/mem.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/interrupt/interrupt.hpp>
-#include <util/drawing.hpp>
+#include <std/drawing.hpp>
 
 __attribute__((used, section(".requests")))
 static volatile LIMINE_BASE_REVISION(2);

@@ -2,8 +2,8 @@
 
 #include <limine.h>
 #include <std/hcf.hpp>
-#include <util/string.hpp>
-#include <util/mem.hpp>
+#include <std/string.hpp>
+#include <std/mem.hpp>
 #include <mod/io/port/port.hpp>
 
 namespace ker::mod::io {

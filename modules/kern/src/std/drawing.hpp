@@ -1,7 +1,7 @@
 #pragma once
 
 #include <defines/defines.hpp>
-#include <util/math.hpp>
+#include <std/math.hpp>
 
 namespace std::gfx {
 
