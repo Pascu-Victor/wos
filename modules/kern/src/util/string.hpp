@@ -9,9 +9,9 @@ namespace std {
 
     void reverse(char s[]);
 
-    void itoa(int n, char s[], int base=10);
+    int itoa(int n, char s[], int base=10);
 
-    void u64toa(uint64_t n, char s[], int base=10);
+    int u64toa(uint64_t n, char s[], int base=10);
 
     //TODO: char* strdup(const char* str);
 }

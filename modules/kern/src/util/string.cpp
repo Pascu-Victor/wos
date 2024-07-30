@@ -29,14 +29,14 @@ namespace std {
         }
     }
 
-    void itoa(int n, char s[], int base) {
+    int itoa(int n, char s[], int base) {
         int i = 0;
         bool isNegative = false;
 
         if (n == 0) {
             s[i++] = '0';
             s[i] = '\0';
-            return;
+            return 1;
         }
 
         if (n < 0 && base == 10) {
@@ -57,15 +57,16 @@ namespace std {
         s[i] = '\0';
 
         reverse(s);
+        return i;
     }
 
-    void u64toa(uint64_t n, char s[], int base) {
+    int u64toa(uint64_t n, char s[], int base) {
         int i = 0;
 
         if (n == 0) {
             s[i++] = '0';
             s[i] = '\0';
-            return;
+            return 1;
         }
 
         while (n != 0) {
@@ -77,6 +78,8 @@ namespace std {
         s[i] = '\0';
 
         reverse(s);
+
+        return i;
     }
 
     // char* strdup(const char* str) {
