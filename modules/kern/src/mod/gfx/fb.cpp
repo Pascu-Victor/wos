@@ -224,6 +224,32 @@ namespace ker::mod::gfx {
 
         }
 
+        int viewportWidth(void) {
+            return __framebuffer->width;
+        }
+
+        int viewportHeight(void) {
+            return __framebuffer->height;
+        }
+
+        int viewportWidthChars(void) {
+            return __framebuffer->width / __currentFont.width;
+        }
+
+        int viewportHeightChars(void) {
+            return __framebuffer->height / __currentFont.height;
+        }
+
+        void scroll() {
+            uint32_t *fb = (uint32_t*)__framebuffer->address;
+            for (size_t i = 0; i < __framebuffer->width * (__framebuffer->height - __currentFont.height); i++) {
+                fb[i] = fb[i + __framebuffer->width * __currentFont.height];
+            }
+            for (size_t i = __framebuffer->width * (__framebuffer->height - __currentFont.height); i < __framebuffer->width * __framebuffer->height; i++) {
+                fb[i] = TERM_BG_COLOR;
+            }
+        }
+
         // int set_font(const FbFont* font) {
         //     if(font->getWidth() > 64) {
         //         return -1;

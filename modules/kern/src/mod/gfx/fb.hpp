@@ -91,6 +91,21 @@ namespace ker::mod::gfx {
             FillMode fill = FillMode::NO_FILL
         );
 
+        //viewport width in current font characters
+        int viewportWidthChars(void);
+
+        //viewport height in current font characters
+        int viewportHeightChars(void);
+
+        //viewport width in pixels
+        int viewportWidth(void);
+
+        //viewport height in pixels
+        int viewportHeight(void);
+
+        //scrolls the viewport up by one line
+        void scroll(void);
+
         //TODO: int  setFont(const FbFont* font);
     }
 }
