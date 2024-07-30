@@ -7,6 +7,8 @@ namespace ker::mod::dbg {
     bool isKmallocAvailable = false;
     using namespace ker::mod;
 
+    uint64_t linesLogged = 0;
+
     void init(void) {
         if(isInit) {
             return;
@@ -33,11 +35,10 @@ namespace ker::mod::dbg {
         log("Kernel memory allocator is now available");
     }
 
-    void log(const char *str) {
+    inline void serialLog(const char* str) {
         if(isTimeAvailable) [[likely]] {
-            
-            char timeSec[21] = {0};
-            char timeMs[8] = {0};
+            char timeSec[10] = {0};
+            char timeMs[5] = {0};
             int logTime = time::getMs();
             int logTimeMsPart = logTime % 1000;
             int logTimeSecPart = logTime / 1000;
@@ -51,6 +52,45 @@ namespace ker::mod::dbg {
         }
         io::serial::write(str);
         io::serial::write('\n');
+    }
+
+    inline void fbLog(const char* str) {
+        int line = linesLogged;
+        if (linesLogged >= gfx::fb::viewportHeightChars())
+        {
+            gfx::fb::scroll();
+            line = gfx::fb::viewportHeightChars() - 1;
+        }
+        
+
+        gfx::fb::drawChar(0, line, '[');
+        int stampLen = 1;
+        if(isTimeAvailable) [[likely]] {
+            char timeSec[10] = {0}; // good enough for 30 years of uptime
+            char timeMs[5] = {0};
+            int logTime = time::getMs();
+            int logTimeMsPart = logTime % 1000;
+            int logTimeSecPart = logTime / 1000;
+            int msLen = std::u64toa(logTimeMsPart, timeMs, 10);
+            int secLen = std::u64toa(logTimeSecPart, timeSec, 10);
+            gfx::fb::drawString(stampLen, line, timeSec);
+            stampLen += secLen;
+            gfx::fb::drawChar(stampLen, line, '.');
+            stampLen++;
+            gfx::fb::drawString(stampLen, line, timeMs);
+            stampLen += msLen;
+        }
+        gfx::fb::drawChar(stampLen, line, ']');
+        stampLen++;
+        gfx::fb::drawChar(stampLen, line, ':');
+        stampLen++;
+        gfx::fb::drawString(stampLen, line, str);
+    }
+
+    void log(const char *str) {
+        serialLog(str);
+        fbLog(str);
+        linesLogged++;
     }
 
     void error(const char *str) {

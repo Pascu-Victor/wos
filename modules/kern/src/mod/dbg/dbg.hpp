@@ -7,6 +7,7 @@
 
 #include <mod/io/serial/serial.hpp>
 #include <mod/ktime/ktime.hpp>
+#include <mod/gfx/fb.hpp>
 
 namespace ker::mod::dbg {
     void init(void);
