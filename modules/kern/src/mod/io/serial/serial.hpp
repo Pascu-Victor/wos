@@ -1,7 +1,7 @@
 #pragma once
 
 #include <limine.h>
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 #include <util/string.hpp>
 #include <util/mem.hpp>
 #include <mod/io/port/port.hpp>

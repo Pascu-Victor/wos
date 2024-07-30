@@ -2,7 +2,7 @@
 
 #include <limine.h>
 #include <defines/defines.hpp>
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 
 namespace ker::mod::mm::addr {
     typedef uint64_t vaddr_t, paddr_t;

@@ -38,4 +38,4 @@ namespace ker::mod::mm {
             kernelAddressRequest.response
         );
     }
-}   // namespace ker::mod::mm
+}

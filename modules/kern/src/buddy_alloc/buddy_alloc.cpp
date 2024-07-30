@@ -1,4 +1,5 @@
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
+#include <std/nop.hpp>
 #define BUDDY_PRINTF WOS_NOP
 #define BUDDY_ALLOC_ALIGN 8
 #define CHAR_BIT 8

@@ -10,8 +10,6 @@ namespace ker::mod::mm::phys
         base = PAGE_ALIGN_UP(base + sizeof(paging::PageZone));
         len -= paging::PAGE_SIZE;
 
-        //TODO: logging
-
         zone->start = base;
         zone->len = len;
         zone->name = "Physical Memory";
@@ -56,11 +54,6 @@ namespace ker::mod::mm::phys
         zones_tail->next = nullptr;
 
         for(paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-            io::serial::write("Zone: ");
-            io::serial::write(zone->name);
-            io::serial::write(" size: ");
-            io::serial::write(zone->len);
-            io::serial::write("\n");
             uint64_t bitmapSize = PAGE_ALIGN_UP(((uint64_t)addr::getVirtPointer(zone->start) + zone->len) / paging::PAGE_SIZE);
             zone->buddy = buddy_embed((uint8_t*)zone->start, zone->len);
 

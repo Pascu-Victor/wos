@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <limine.h>
 
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 #include <util/mem.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
@@ -80,9 +80,6 @@ void _start(void) {
 
         ker::mod::time::sleep(33);
     }
-    
-
-    // asm volatile("int $0x20");
 
     // Kernel should halt and catch fire if it reaches this point.
     hcf();

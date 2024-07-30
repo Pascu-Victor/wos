@@ -4,6 +4,7 @@
 namespace ker::mod::dbg {
     bool isInit = false;
     bool isTimeAvailable = false;
+    bool isKmallocAvailable = false;
     using namespace ker::mod;
 
     void init(void) {
@@ -21,6 +22,15 @@ namespace ker::mod::dbg {
         }
         isTimeAvailable = true;
         log("Kernel time is now available");
+    }
+
+    void enableKmalloc(void) {
+        if(isKmallocAvailable) {
+            //Panic! should only be called once when kmalloc is initialized
+            hcf();
+        }
+        isKmallocAvailable = true;
+        log("Kernel memory allocator is now available");
     }
 
     void log(const char *str) {
@@ -47,4 +57,5 @@ namespace ker::mod::dbg {
         log(str);
         //TODO: pretty print error
     }
+    
 }

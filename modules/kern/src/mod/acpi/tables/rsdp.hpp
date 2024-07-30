@@ -3,7 +3,7 @@
 #include <defines/defines.hpp>
 #include <mod/io/port/port.hpp>
 #include <mod/io/serial/serial.hpp>
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 
 namespace ker::mod::acpi::rsdp {
     struct Rsdp

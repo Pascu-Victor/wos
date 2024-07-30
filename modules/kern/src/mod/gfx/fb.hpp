@@ -1,7 +1,7 @@
 #pragma once
 #include <limine.h>
 
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 #include <util/math.hpp>
 #include <util/mem.hpp>
 #include <mod/gfx/fb_font.hpp>

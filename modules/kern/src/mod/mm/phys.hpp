@@ -7,7 +7,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <mod/mm/addr.hpp>
 #include <mod/sys/spinlock.hpp>
-#include <util/funcs.hpp>
+#include <std/hcf.hpp>
 
 namespace ker::mod::mm::phys {
     void init(limine_memmap_response *memmapResponse);
