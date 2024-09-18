@@ -66,7 +66,10 @@ override KCFLAGS += \
     -mno-mmx \
     -mno-sse \
     -mno-sse2 \
-    -mno-red-zone
+    -mno-red-zone \
+    -Wformat \
+    -Wformat-security \
+    -Werror=format-security
 
 # Internal C preprocessor flags that should not be changed by the user.
 override KCPPFLAGS := \
@@ -93,7 +96,10 @@ override KCXXFLAGS += \
     -mno-mmx \
     -mno-sse \
     -mno-sse2 \
-    -mno-red-zone
+    -mno-red-zone \
+    -Wformat \
+    -Wformat-security \
+    -Werror=format-security
 
 # Internal C++ preprocessor flags that should not be changed by the user.
 override KCXXPPFLAGS := \

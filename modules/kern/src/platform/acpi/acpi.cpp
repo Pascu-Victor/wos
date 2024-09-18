@@ -36,7 +36,9 @@ namespace ker::mod::acpi {
         }
 
         size_t entries = (header.length - sizeof(Sdt)) / (rsdp::useXsdt() ? sizeof(uint64_t) : sizeof(uint32_t));
-
+        if(xsdt == nullptr) {
+            hcf(); // no xsdt entries???
+        }
         for(size_t i = 0; i < entries; i++) {
             Sdt *sdt =(Sdt*) mm::addr::getVirtPointer((rsdp::useXsdt() ? xsdt->next[i] : (uint64_t)rsdt->next[i]));
             if(memcmp(sdt->signature, ident, 4) == 0 && validateChecksum(sdt)) {

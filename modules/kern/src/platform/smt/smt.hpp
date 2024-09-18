@@ -1,12 +1,16 @@
 #pragma once
 #include <limine.h>
 
-namespace ker::mod::smt
-{
-    void init(void);
+#include <defines/defines.hpp>
+#include <platform/asm/cpu.hpp>
 
-    uint64_t getCoreCount(void);
+namespace ker::mod::smt {
+constexpr static uint64_t SMT_MAX_CPUS = 256;
 
-    limine_smp_info* getCpu(uint64_t number);
-    
-}
+uint64_t getCoreCount(void);
+const limine_smp_info& getCpu(uint64_t number);
+
+void init(void);
+
+limine_smp_info* currentCpu();
+}  // namespace ker::mod::smt

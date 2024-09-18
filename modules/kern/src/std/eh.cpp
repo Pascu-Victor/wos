@@ -12,26 +12,20 @@ extern "C" void* __cxa_begin_catch(void* exceptionObject) {
     return exceptionObject;
 }
 
-
-extern "C" _Unwind_Reason_Code __gxx_personality_v0(
-    int version,
-    _Unwind_Action actions,
-    uint64_t exceptionClass,
-    struct _Unwind_Exception* exceptionObject,
-    struct _Unwind_Context* context
-) {
+extern "C" _Unwind_Reason_Code __gxx_personality_v0(int version, _Unwind_Action actions, uint64_t exceptionClass,
+                                                    struct _Unwind_Exception* exceptionObject, struct _Unwind_Context* context) {
     (void)version;
     (void)exceptionClass;
     (void)exceptionObject;
     (void)context;
-    
+
     if (actions & _UA_SEARCH_PHASE) {
-        //TODO: Check if this frame can handle the exception
+        // TODO: Check if this frame can handle the exception
         return _URC_CONTINUE_UNWIND;
     }
 
     if (actions & _UA_CLEANUP_PHASE) {
-        //TODO: Perform any necessary cleanup
+        // TODO: Perform any necessary cleanup
         return _URC_CONTINUE_UNWIND;
     }
 

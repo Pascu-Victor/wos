@@ -97,7 +97,9 @@
 			"strstream": "cpp",
 			"slist": "cpp",
 			"*.inc": "cpp",
-			"*.ipp": "cpp"
-		}
+			"*.ipp": "cpp",
+			"scoped_allocator": "cpp"
+		},
+        "editor.formatOnSave": true,
 	}
 }

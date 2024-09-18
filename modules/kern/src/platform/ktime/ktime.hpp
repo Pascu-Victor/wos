@@ -1,41 +1,29 @@
 #pragma once
 
-#include <std/mem.hpp>
+#include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/hpet/hpet.hpp>
-#include <platform/interrupt/gates.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <mod/io/serial/serial.hpp>
+#include <platform/interrupt/gates.hpp>
+#include <std/mem.hpp>
 
 namespace ker::mod::time {
 
-    #define IA32_APIC_BASE_MSR 0x1B
-    #define IA32_APIC_BASE_MSR_BSP 0x100 // Processor is a BSP
-    #define IA32_APIC_BASE_MSR_ENABLE 0x800
+#define IA32_APIC_BASE_MSR 0x1B
+#define IA32_APIC_BASE_MSR_BSP 0x100  // Processor is a BSP
+#define IA32_APIC_BASE_MSR_ENABLE 0x800
 
-    void init(void);
+void init(void);
 
-    inline uint64_t getTicks(void) {
-        return hpet::getTicks();
-    }
+inline uint64_t getTicks(void) { return hpet::getTicks(); }
 
-    inline uint64_t getUs(void) {
-        return hpet::getUs();
-    }
+inline uint64_t getUs(void) { return hpet::getUs(); }
 
-    inline uint64_t getMs(void) {
-        return getUs() / 1000;
-    }
+inline uint64_t getMs(void) { return getUs() / 1000; }
 
-    inline void sleepTicks(uint64_t ticks) {
-        hpet::sleepTicks(ticks);
-    }
+inline void sleepTicks(uint64_t ticks) { hpet::sleepTicks(ticks); }
 
-    inline void sleepUs(uint64_t us) {
-        hpet::sleepUs(us);
-    }
-    
-    inline void sleep(uint64_t ms) {
-        hpet::sleepUs(ms * 1000);
-    }
-}
+inline void sleepUs(uint64_t us) { hpet::sleepUs(us); }
+
+inline void sleep(uint64_t ms) { hpet::sleepUs(ms * 1000); }
+}  // namespace ker::mod::time

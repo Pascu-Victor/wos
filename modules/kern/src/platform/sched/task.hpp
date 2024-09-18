@@ -1,29 +1,44 @@
 #pragma once
 
 #include <defines/defines.hpp>
-#include <platform/mm/paging.hpp>
 #include <platform/asm/cpu.hpp>
+#include <platform/interrupt/gdt.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/sys/context_switch.hpp>
+#include <std/rbtree.hpp>
 
-namespace ker::mod::sched::task
-{
+namespace ker::mod::sched {
+namespace task {
 
-    enum TaskType {
-        DAEMON,
-        PROCESS,
-    };
+enum TaskType {
+    DAEMON,
+    PROCESS,
+};
 
-    struct Task {
-        const char* name;
-        mm::paging::PageTable* pagemap;
-        uint64_t entry;
-        TaskType type;
-        uint64_t stack;
-        sys::context_switch::TaskRegisters regs;
+struct TaskRegisters {
+    cpu::GPRegs regs;
+    uint64_t ip;
+    uint64_t rsp;
+} __attribute__((packed));
 
-        Task(const char* name, mm::paging::PageTable* pagemap, uint64_t entry, TaskType type, uint64_t stack, sys::context_switch::TaskRegisters regs);
+struct Thread {
+    desc::gdt::GdtEntry tls[3];
+    uint64_t fsindex;
+    uint64_t gsindex;
 
-        Task(const char* name, uint64_t entry);
+    uint64_t fsbase;
+    uint64_t gsbase;
 
-    } __attribute__((packed));
-}
+    uint64_t stack;
+    uint64_t stackSize;
+} __attribute__((packed));
+struct Task {
+    const char* name;
+    mm::paging::PageTable* pagemap;
+    TaskType type;
+    uint64_t cpu;
+    TaskRegisters regs;
+    Thread* thread;
+} __attribute__((packed));
+}  // namespace task
+}  // namespace ker::mod::sched

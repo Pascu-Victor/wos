@@ -44,6 +44,10 @@ SECTIONS
     .data : {
         *(.data .data.*)
 
+        __per_cpu_start = .;
+        *(.percpu .percpu.*)
+        __per_cpu_end = .;
+
         /* Place the sections that contain the Limine requests as part of the .data */
         /* output section. */
         KEEP(*(.requests_start_marker))

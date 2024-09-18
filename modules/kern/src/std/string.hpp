@@ -1,17 +1,19 @@
 #pragma once
-#include <std/mem.hpp>
 #include <std/math.hpp>
+#include <std/mem.hpp>
 
 namespace std {
-    size_t strlen(const char* str);
+size_t strlen(const char *str);
 
-    char *strcpy(char *dest, const char *src);
+char *strcpy(char *dest, const char *src);
 
-    void reverse(char s[]);
+char *strncpy(char *dest, const char *src, size_t n);
 
-    int itoa(int n, char s[], int base=10);
+void reverse(char s[]);
 
-    int u64toa(uint64_t n, char s[], int base=10);
+int itoa(int n, char s[], int base = 10);
 
-    //TODO: char* strdup(const char* str);
-}
+int u64toa(uint64_t n, char s[], int base = 10);
+
+// TODO: char* strdup(const char* str);
+}  // namespace std

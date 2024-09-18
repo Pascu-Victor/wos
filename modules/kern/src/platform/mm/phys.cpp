@@ -51,6 +51,10 @@ namespace ker::mod::mm::phys
             zones_tail = zone;
         }
 
+        if(zones_tail == nullptr) {
+            hcf(); // no usable memory???
+        }
+
         zones_tail->next = nullptr;
 
         for(paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
