@@ -92,6 +92,28 @@ int u64toa(uint64_t n, char s[], int base) {
     return i;
 }
 
+int u64toh(uint64_t n, char s[]) {
+    int i = 0;
+
+    if (n == 0) {
+        s[i++] = '0';
+        s[i] = '\0';
+        return 1;
+    }
+
+    while (n != 0) {
+        int rem = n % 16;
+        s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        n = n / 16;
+    }
+
+    s[i] = '\0';
+
+    reverse(s);
+
+    return i;
+}
+
 // char* strdup(const char* str) {
 //     size_t len = strlen(str);
 //     char* new_str = new char[len + 1];
