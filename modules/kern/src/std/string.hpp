@@ -15,5 +15,7 @@ int itoa(int n, char s[], int base = 10);
 
 int u64toa(uint64_t n, char s[], int base = 10);
 
+int u64toh(uint64_t n, char s[]);
+
 // TODO: char* strdup(const char* str);
 }  // namespace std
