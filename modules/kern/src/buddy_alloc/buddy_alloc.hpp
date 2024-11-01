@@ -1,3 +1,4 @@
+#pragma once
 /*
  * Copyright 2021 Stanislav Paskalev <spaskalev@protonmail.com>
  *
@@ -12,21 +13,12 @@
  * Latest version is available at https://github.com/spaskalev/buddy_alloc
  */
 
-#pragma once
+#ifndef BUDDY_ALLOC_H
+#define BUDDY_ALLOC_H
 
 #ifndef BUDDY_HEADER
-// #include <limits.h>
-// #include <stdbool.h>
-// #include <stddef.h>
-// #include <stdint.h>
-// #include <string.h>
-// #include <sys/types.h>
 #include <defines/defines.hpp>
 #include <std/mem.hpp>
-
-#ifndef BUDDY_PRINTF
-// #include <stdio.h>
-#endif
 #endif
 
 #ifdef __cplusplus
@@ -110,14 +102,21 @@ void *buddy_calloc(struct buddy *buddy, size_t members_count, size_t member_size
 void *buddy_realloc(struct buddy *buddy, void *ptr, size_t requested_size, bool ignore_data);
 
 /* Realloc-like behavior that checks for overflow. See reallocarray*/
-void *buddy_reallocarray(struct buddy *buddy, void *ptr,
-    size_t members_count, size_t member_size, bool ignore_data);
+void *buddy_reallocarray(struct buddy *buddy, void *ptr, size_t members_count, size_t member_size, bool ignore_data);
 
 /* Use the specified buddy to free memory. See free. */
 void buddy_free(struct buddy *buddy, void *ptr);
 
+enum buddy_safe_free_status {
+    BUDDY_SAFE_FREE_SUCCESS,
+    BUDDY_SAFE_FREE_BUDDY_IS_NULL,
+    BUDDY_SAFE_FREE_INVALID_ADDRESS,
+    BUDDY_SAFE_FREE_SIZE_MISMATCH,
+    BUDDY_SAFE_FREE_ALREADY_FREE,
+};
+
 /* A (safer) free with a size. Will not free unless the size fits the target span. */
-void buddy_safe_free(struct buddy *buddy, void *ptr, size_t requested_size);
+enum buddy_safe_free_status buddy_safe_free(struct buddy *buddy, void *ptr, size_t requested_size);
 
 /*
  * Reservation functions
@@ -153,8 +152,28 @@ void *buddy_walk(struct buddy *buddy, void *(fp)(void *ctx, void *addr, size_t s
  */
 unsigned char buddy_fragmentation(struct buddy *buddy);
 
+#ifdef BUDDY_EXPERIMENTAL_CHANGE_TRACKING
+/*
+ * Enable change tracking for this allocator instance.
+ *
+ * This will store a header at the start of the arena that contains the function pointer (tracker) and
+ * a void* (context). The tracker will be called with the context, the start of changed memory and its length.
+ *
+ * This function MUST be called before any allocations are performed!
+ *
+ * Change tracking is in effect only for allocation functions, resizing functions are excluded from it.
+ *
+ * This is an experimental feature designed to facilitate integration with https://github.com/spaskalev/libpvl
+ *
+ * The API is not (yet) part of the allocator contract and its semantic versioning!
+ */
+void buddy_enable_change_tracking(struct buddy *buddy, void *context, void (*tracker)(void *, unsigned char *, size_t));
+#endif
+
 #ifdef __cplusplus
 #ifndef BUDDY_CPP_MANGLED
 }
 #endif
 #endif
+
+#endif /* BUDDY_ALLOC_H */
