@@ -9,7 +9,7 @@ void init(void) {
     }
     outb(0x3F8 + 1, 0x00);  // Disable all interrupts
     outb(0x3F8 + 3, 0x80);  // Enable DLAB (set baud rate divisor)
-    outb(0x3F8 + 0, 0x03);  // Set divisor to 3 (lo byte) 38400 baud
+    outb(0x3F8 + 0, 0x02);  // Set divisor to 2 (lo byte) 38400 baud
     outb(0x3F8 + 1, 0x00);  //                  (hi byte)
     outb(0x3F8 + 3, 0x03);  // 8 bits, no parity, one stop bit
     outb(0x3F8 + 2, 0xC7);  // Enable FIFO, clear them, with 14-byte threshold
@@ -35,5 +35,13 @@ void write(uint64_t num) {
     std::u64toa(num, str);
     write(str);
 }
+
+void writeHex(uint64_t num) {
+    char str[17];
+    str[16] = '\0';
+    std::u64toh(num, str);
+    write(str);
+}
+
 }  // namespace serial
 }  // namespace ker::mod::io
