@@ -1,4 +1,10 @@
 # Create an empty zeroed-out 64MiB image file.
+set -e
+
+if [ -e image.hdd ]; then
+    rm image.hdd
+fi
+
 dd if=/dev/zero bs=1M count=0 seek=64 of=image.hdd
 
 # Create a GPT partition table.
@@ -15,5 +21,5 @@ mmd -i image.hdd@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
 
 # Copy over the relevant files.
 mcopy -i image.hdd@@1M bin/wos ::/boot
-mcopy -i image.hdd@@1M limine.cfg /usr/share/limine/limine-bios.sys ::/boot/limine
+mcopy -i image.hdd@@1M limine.conf /usr/share/limine/limine-bios.sys ::/boot/limine
 mcopy -i image.hdd@@1M /usr/share/limine/BOOTX64.EFI ::/EFI/BOOT
