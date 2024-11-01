@@ -36,4 +36,6 @@ void init(void) {
     LAPIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
     enable();
 }
+
+void oneShotTimer(uint64_t ticks) { write(LAPIC_TIMER_INIT_COUNT, ticks); }
 }  // namespace ker::mod::apic

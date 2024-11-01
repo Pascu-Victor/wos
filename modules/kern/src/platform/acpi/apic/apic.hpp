@@ -30,5 +30,7 @@ uint32_t calibrateTimer(uint64_t us);
 void setTimeout(uint64_t numTicks);
 int cpuid(void);
 
+void oneShotTimer(uint64_t ticks);
+
 void init(void);
 }  // namespace ker::mod::apic
