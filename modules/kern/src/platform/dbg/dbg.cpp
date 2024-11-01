@@ -4,6 +4,7 @@ namespace ker::mod::dbg {
 bool isInit = false;
 bool isTimeAvailable = false;
 bool isKmallocAvailable = false;
+sys::Spinlock logLock;
 using namespace ker::mod;
 
 uint64_t linesLogged = 0;
@@ -13,6 +14,7 @@ void init(void) {
         return;
     }
     io::serial::init();
+    logLock = sys::Spinlock();
     isInit = true;
 }
 
@@ -85,14 +87,18 @@ inline void fbLog(const char* str) {
 }
 
 void log(const char* str) {
+    logLock.lock();
     serialLog(str);
     fbLog(str);
     linesLogged++;
+    logLock.unlock();
 }
 
 void error(const char* str) {
+    logLock.lock();
     log(str);
     // TODO: pretty print error
+    logLock.unlock();
 }
 
 }  // namespace ker::mod::dbg
