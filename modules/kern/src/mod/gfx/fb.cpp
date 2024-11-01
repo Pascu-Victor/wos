@@ -194,12 +194,9 @@ uint64_t viewportHeightChars(void) { return __framebuffer->height / __currentFon
 
 void scroll() {
     uint64_t *fb = (uint64_t *)__framebuffer->address;
+    // copy all lines up one line
     for (size_t i = 0; i < __framebuffer->width * (__framebuffer->height - __currentFont.height); i++) {
-        fb[i] = fb[i + __framebuffer->width * __currentFont.height];
-    }
-    for (size_t i = __framebuffer->width * (__framebuffer->height - __currentFont.height); i < __framebuffer->width * __framebuffer->height;
-         i++) {
-        fb[i] = TERM_BG_COLOR;
+        fb[i] = fb[i + __framebuffer->width * __currentFont.height / 2];
     }
 }
 
