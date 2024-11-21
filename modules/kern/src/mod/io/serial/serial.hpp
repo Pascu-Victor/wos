@@ -14,5 +14,6 @@ void write(const char *str);
 void write(const char c);
 void write(uint64_t num);
 void writeHex(uint64_t num);
+void writeBin(uint64_t num);
 }  // namespace serial
 }  // namespace ker::mod::io

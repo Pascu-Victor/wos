@@ -3,11 +3,21 @@
 namespace ker::mod::time {
 bool isInit = false;
 
+std::list<void (*)(gates::interruptFrame *)> tasks;
+
 static uint64_t ktimePITTick = 0;
 
-void handle_pit(gates::interruptFrame *frame) {
-    (void)frame;
+void handle_pit(sched::task::TaskRegisters tr, gates::interruptFrame *frame) {
+    (void)tr;
     ktimePITTick++;
+    for (auto &task : tasks) {
+        task(frame);
+    }
+    apic::eoi();
+    auto c = apic::calibrateTimer(2000);
+    apic::oneShotTimer(c);
+    dbg::log("PIT tick!");
+    asm volatile("iretq");
 }
 
 void init(void) {
@@ -15,12 +25,16 @@ void init(void) {
         return;
     }
 
-    gates::setInterruptHandler(0x0, handle_pit);
-
     // HPET
     hpet::init();
 
     dbg::enableTime();
     isInit = true;
+}
+
+void pushTask(uint64_t ticks, void (*task)(gates::interruptFrame *), void *arg) {
+    (void)ticks;
+    (void)arg;
+    tasks.push_back(task);
 }
 }  // namespace ker::mod::time

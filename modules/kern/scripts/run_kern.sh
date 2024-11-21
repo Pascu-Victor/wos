@@ -1,7 +1,28 @@
+#!/bin/bash
 set -e
-sh scripts/check_headers.sh && echo "All headers are good"
-make -j16
-sh scripts/make_image.sh
+# run  scripts/check_headers.sh
+sh scripts/check_headers.sh
+if [ "$?" != "0" ]; then
+    echo "Error: check_headers.sh failed"
+    exit 1
+else
+    echo "all headers are good"
+fi
+make -j32
+
+# run scripts/make_image.sh
+result=$(sh scripts/make_image.sh)
+if [ "$?" != "0" ]; then
+    echo "Error: make_image.sh failed"
+    exit 1
+else
+    echo "image created successfully"
+fi
+
+# remove old log files
+rm -f serial.log
+rm -f qemu.*log
+
 echo "STARTING BOOT:"
-qemu-system-x86_64 -m 256M -drive file=image.hdd,format=raw -bios /usr/share/OVMF/x64/OVMF.fd -chardev stdio,id=char0,mux=on,logfile=serial.log,signal=off \
--serial chardev:char0 -mon chardev=char0 -s -S -d in_asm,op,guest_errors -D qemu.log -no-reboot
+qemu-system-x86_64 -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd -chardev stdio,id=char0,mux=on,logfile=serial.log,signal=off \
+-serial chardev:char0 -mon chardev=char0 -s -S -d cpu_reset,int,tid,in_asm -D qemu.%d.log -no-reboot -M q35 -cpu qemu64,+la57 -smp 4

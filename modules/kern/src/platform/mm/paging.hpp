@@ -9,7 +9,6 @@
 namespace ker::mod::mm::paging {
 const static uint64_t PAGE_SHIFT = 12;
 const static uint64_t PAGE_SIZE = 0x1000;
-
 struct PageZone {
     PageZone* next;
     buddy* buddy;
@@ -28,16 +27,15 @@ struct PageTableEntry {
     uint8_t cacheDisabled : 1;
     uint8_t accessed : 1;
     uint8_t dirty : 1;
-    uint8_t huge_page : 1;
+    uint8_t pagesize : 1;
     uint8_t global : 1;
-    uint8_t no_execute : 1;
     uint8_t available : 3;
-    uint64_t frame : 51;
+    uint64_t frame : 52;
 } __attribute__((packed));
 
 struct PageTable {
     PageTableEntry entries[512];
-} __attribute__((aligned(4096), packed));
+} __attribute__((packed));
 
 struct PageFault {
     uint8_t present;
@@ -63,10 +61,10 @@ const static uint64_t USER_READONLY = PAGE_PRESENT | PAGE_USER;
 }  // namespace pageTypes
 
 namespace errorFlags {
-const static uint64_t WRITE = 0x1;
-const static uint64_t USER = 0x2;
-const static uint64_t FETCH = 0x4;
-const static uint64_t PROTECTION_KEY = 0x8;
+const static uint64_t WRITE = 0x01;
+const static uint64_t USER = 0x02;
+const static uint64_t FETCH = 0x04;
+const static uint64_t PROTECTION_KEY = 0x08;
 const static uint64_t SHADOW_STACK = 0x10;
 }  // namespace errorFlags
 
@@ -75,4 +73,5 @@ PageTableEntry purgePageTableEntry(void);
 PageFault createPageFault(uint64_t flags, bool isCritical = false);
 
 inline uint64_t align(uint64_t size, uint64_t align) { return (size + align - 1) & ~(align - 1); }
+
 }  // namespace ker::mod::mm::paging

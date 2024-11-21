@@ -33,6 +33,12 @@
 #define CPUID_FEAT_EDX_PBE (1 << 31)
 
 #define IA32_KERNEL_GS_BASE 0xC0000102
+#define IA32_EFER 0xC0000080
+#define IA32_STAR 0xC0000081
+#define IA32_LSTAR 0xC0000082
+#define IA32_FMASK 0xC0000084
+#define IA32_CSTAR 0xC0000083
+
 #define GS_BASE 0xC0000101
 
 static inline void cpuid(uint32_t eax, uint32_t *eax_out, uint32_t *edx_out) {

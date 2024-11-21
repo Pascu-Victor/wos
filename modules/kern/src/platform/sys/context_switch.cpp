@@ -1,15 +1,27 @@
 #include "context_switch.hpp"
 
-namespace ker::mod::sys::context_switch {
-extern "C" void _wOS_asm_switchTo(sched::task::TaskRegisters regs);
+#include <platform/sched/scheduler.hpp>
 
-static inline void save_fsgs(sched::task::Task* task) {
-    savesegment(fs, task->thread->fsindex);
-    savesegment(gs, task->thread->gsindex);
+namespace ker::mod::sys::context_switch {
+
+void switchTo(cpu::GPRegs* gpr, gates::interruptFrame* frame, sched::task::Task* nextTask) {
+    frame->rip = nextTask->regs.ip;
+    frame->rsp = nextTask->regs.rsp;
+    *gpr = nextTask->regs.regs;
+
+    mm::virt::switchPagemap(nextTask);
 }
 
-extern "C" sched::task::Task* _wOS_switchTo(sched::task::Task* prev_task, sched::task::Task* next_task) {
-    sched::task::TaskRegisters* prev_regs = &prev_task->regs;
-    sched::task::TaskRegisters* next_regs = &next_task->regs;
+static long timerQuantum;
+
+extern "C" void _wOS_schedTimer(cpu::GPRegs* gpr, gates::interruptFrame* frame) {
+    sched::processTasks(gpr, frame);
+    apic::eoi();
+    apic::oneShotTimer(timerQuantum);
+}
+
+void startSchedTimer() {
+    timerQuantum = apic::calibrateTimer(20);
+    apic::oneShotTimer(timerQuantum);
 }
 }  // namespace ker::mod::sys::context_switch

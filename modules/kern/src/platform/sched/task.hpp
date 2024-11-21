@@ -4,7 +4,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/paging.hpp>
-#include <platform/sys/context_switch.hpp>
+// #include <platform/sys/context_switch.hpp>
 #include <std/rbtree.hpp>
 
 namespace ker::mod::sched {
@@ -33,11 +33,15 @@ struct Thread {
     uint64_t stackSize;
 } __attribute__((packed));
 struct Task {
-    const char* name;
+    Task(const char* name, uint64_t elf_start, TaskType type);
+
     mm::paging::PageTable* pagemap;
+    TaskRegisters regs;
+    uint64_t entry;
+
+    const char* name;
     TaskType type;
     uint64_t cpu;
-    TaskRegisters regs;
     Thread* thread;
 } __attribute__((packed));
 }  // namespace task

@@ -4,6 +4,7 @@
 
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <platform/mm/addr.hpp>
 
 namespace ker::mod::desc::gdt {
 // GDT Setup
@@ -12,16 +13,21 @@ constexpr static uint64_t GDT_ENTRY_KERNEL_CODE = 1;
 constexpr static uint64_t GDT_ENTRY_KERNEL_DATA = 2;
 constexpr static uint64_t GDT_ENTRY_USER_CODE = 3;
 constexpr static uint64_t GDT_ENTRY_USER_DATA = 4;
-// needs 2 entries \/
-constexpr static uint64_t GDT_ENTRY_TSS = 5;
-constexpr static uint64_t GDT_ENTRY_TLS_MIN = 6;
-constexpr static uint64_t GDT_ENTRY_TLS_MAX = 8;
-constexpr static uint64_t GDT_ENTRY_CPUNODE = 9;
+constexpr static uint64_t GDT_ENTRY_TLS_MIN = 5;
+constexpr static uint64_t GDT_ENTRY_TLS_MAX = 6;
+constexpr static uint64_t GDT_ENTRY_CPUNODE = 7;
+// 2 entries for TSS technically count in the gdt count but are stored in a separate struct
+constexpr static uint64_t GDT_TSS_OFFSET = 2;
+constexpr static uint64_t GDT_ENTRY_TSS = 8;
 
-constexpr static uint64_t GDT_ENTRY_COUNT = 10;
+constexpr static uint64_t GDT_ENTRY_COUNT = 10 - GDT_TSS_OFFSET;
 
 constexpr static uint64_t GDT_KERN_CS = 0x08;
 constexpr static uint64_t GDT_KERN_DS = 0x10;
+
+constexpr static uint64_t GDT_USER_CS = 0x18;
+constexpr static uint64_t GDT_USER_DS = 0x20;
+
 struct TssDescriptor {
     uint16_t size;
     uint16_t base_low;
@@ -64,5 +70,5 @@ struct Gdt {
     GdtPtr ptr;
 } __attribute__((packed));
 
-void initDescriptors(uint64_t stackPointer);
+void initDescriptors(uint64_t *stackPointer);
 }  // namespace ker::mod::desc::gdt

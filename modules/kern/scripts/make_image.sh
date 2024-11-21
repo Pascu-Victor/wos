@@ -5,21 +5,20 @@ if [ -e image.hdd ]; then
     rm image.hdd
 fi
 
-dd if=/dev/zero bs=1M count=0 seek=64 of=image.hdd
-
-# Create a GPT partition table.
-sgdisk image.hdd -n 1:2048 -t 1:ef00
-
-# Install the Limine BIOS stages onto the image.
-limine bios-install image.hdd
-
-# Format the image as fat32.
-mformat -i image.hdd@@1M
-
-# Make relevant subdirectories.
-mmd -i image.hdd@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
-
-# Copy over the relevant files.
-mcopy -i image.hdd@@1M bin/wos ::/boot
-mcopy -i image.hdd@@1M limine.conf /usr/share/limine/limine-bios.sys ::/boot/limine
-mcopy -i image.hdd@@1M /usr/share/limine/BOOTX64.EFI ::/EFI/BOOT
+qemu-img create -f qcow2 disk.qcow2 64M
+guestfish --rw -a disk.qcow2 <<_EOF_
+run
+part-init /dev/sda gpt
+part-add /dev/sda p 2048 126976
+mkfs fat /dev/sda1
+mount /dev/sda1 /
+mkdir /EFI
+mkdir /EFI/BOOT
+mkdir /boot
+mkdir /boot/limine
+copy-in /home/womywomwoo/git/wos/modules/kern/bin/wos /boot
+copy-in /home/womywomwoo/git/wos/modules/kern/limine.conf /boot/limine
+copy-in /usr/share/limine/BOOTX64.EFI /EFI/BOOT
+copy-in /home/womywomwoo/git/wos/modules/init/bin/init /boot
+umount /
+_EOF_

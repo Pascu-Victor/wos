@@ -4,6 +4,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/interrupt/idt.hpp>
+#include <platform/sched/task.hpp>
 
 namespace ker::mod::gates {
 struct interruptFrame {
@@ -36,10 +37,10 @@ enum : uint64_t {
     IRQ15 = 47
 };
 
-typedef void (*interruptHandler_t)(interruptFrame *frame);
+typedef void (*interruptHandler_t)(cpu::GPRegs gpr, interruptFrame frame);
 
 extern "C" {
-void iterrupt_handler(interruptFrame *frame);
+void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame);
 }
 
 #define isIrq(vector) (vector >= IRQ0 && vector <= IRQ15)

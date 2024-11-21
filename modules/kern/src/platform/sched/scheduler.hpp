@@ -1,6 +1,8 @@
 #pragma once
 
 #include <platform/asm/cpu.hpp>
+#include <platform/interrupt/gates.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
@@ -12,17 +14,21 @@ namespace ker::mod::sched {
 struct RunQueue {
     std::list<task::Task*> activeTasks;
     std::list<task::Task*> expiredTasks;
-    sys::Spinlock lock;
+    task::Task* currentTask;
+    [[nodiscard]]
+    RunQueue()
+        : activeTasks(), expiredTasks(), currentTask(nullptr) {}
 };
 
 struct SchedEntry {
     uint32_t weight;
     uint32_t inverseWeight;
+};
 
-}
-
-    void init();
+void init();
 bool postTask(task::Task* task);
-task::Task getCurrentTask();
-void processTasks();
+task::Task* getCurrentTask();
+void startScheduler();
+void percpuInit();
+void processTasks(ker::mod::cpu::GPRegs* gpr, ker::mod::gates::interruptFrame* frame);
 }  // namespace ker::mod::sched

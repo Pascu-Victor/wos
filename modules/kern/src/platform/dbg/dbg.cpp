@@ -52,8 +52,9 @@ inline void serialLog(const char* str) {
         io::serial::write("]:");
     }
     io::serial::write(str);
-    io::serial::write('\n');
 }
+
+inline void serialNewline() { io::serial::write('\n'); }
 
 inline void fbLog(const char* str) {
     uint64_t line = linesLogged;
@@ -86,12 +87,43 @@ inline void fbLog(const char* str) {
     gfx::fb::drawString(stampLen, line, str);
 }
 
-void log(const char* str) {
-    logLock.lock();
+void logNewLineNoSync(void) {
+    serialNewline();
+    linesLogged++;
+}
+
+void logNoSync(const char* str) {
     serialLog(str);
     fbLog(str);
-    linesLogged++;
+}
+
+void logString(const char* str) {
+    logLock.lock();
+    logNoSync(str);
+    logNewLineNoSync();
     logLock.unlock();
+}
+
+void logVa(const char* format, va_list& args) {
+    // 4k should be enough for everyone
+    char buf[4096];
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    // if we have args
+    if (args) {
+        std::vsnprintf(buf, 4096ul, format, argsCopy);
+    } else {
+        std::strncpy(buf, format, 4096);
+    }
+    va_end(argsCopy);
+    logString(buf);
+}
+
+void __logVar(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    logVa(format, args);
+    va_end(args);
 }
 
 void error(const char* str) {

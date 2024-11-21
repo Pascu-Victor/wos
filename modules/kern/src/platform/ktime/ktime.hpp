@@ -5,6 +5,7 @@
 #include <platform/acpi/hpet/hpet.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <std/list.hpp>
 #include <std/mem.hpp>
 
 namespace ker::mod::time {
@@ -26,4 +27,6 @@ inline void sleepTicks(uint64_t ticks) { hpet::sleepTicks(ticks); }
 inline void sleepUs(uint64_t us) { hpet::sleepUs(us); }
 
 inline void sleep(uint64_t ms) { hpet::sleepUs(ms * 1000); }
+
+void pushTask(uint64_t ticks, void (*task)(gates::interruptFrame *), void *arg);
 }  // namespace ker::mod::time

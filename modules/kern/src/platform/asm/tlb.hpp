@@ -2,9 +2,8 @@
 
 #include <defines/defines.hpp>
 
-static inline void invlpg(uint64_t addr) { asm volatile("invlpg (%0)" ::"r"(addr) : "memory"); }
-
-static inline void wrcr3(uint64_t val) { asm volatile("mov %0, %%cr3" ::"r"(val) : "memory"); }
+void invlpg(uint64_t addr);
+void wrcr3(uint64_t val);
 
 static inline uint64_t rdcr3(void) {
     uint64_t val;

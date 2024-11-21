@@ -2,7 +2,7 @@
 
 namespace ker::mod::cpu {
 void initPerCpu(uint64_t current_stack) {
-    PerCpu* per_cpu = mm::dyn::kmalloc::kmalloc<PerCpu>();
+    PerCpu* per_cpu = mm::dyn::kmalloc::malloc<PerCpu>();
 
     per_cpu->syscallStack = current_stack;
     per_cpu->kernelStack = 0;

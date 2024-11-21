@@ -43,5 +43,13 @@ void writeHex(uint64_t num) {
     write(str);
 }
 
+void writeBin(uint64_t num) {
+    char str[65];
+    str[64] = '\0';
+    for (uint64_t i = 64; i > 0; i--) {
+        str[64 - i] = (num & (1ULL << (i - 1))) ? '1' : '0';
+    }
+    write(str);
+}
 }  // namespace serial
 }  // namespace ker::mod::io

@@ -28,8 +28,8 @@
                     "ignoreFailures": true
                 }
             ],
+            "serverLaunchTimeout": 1000000,
             "preLaunchTask": "runWosKern"
         }
-
     ]
 }

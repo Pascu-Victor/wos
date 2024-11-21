@@ -2,41 +2,7 @@ bits 64
 
 extern iterrupt_handler
 
-%macro pushl 0
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-%endmacro
-
-%macro popl 0
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-%endmacro
+%include "platform/asm/helpers.asm"
 
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace
@@ -77,7 +43,7 @@ load_idt:
 %macro isr 1
 global isr%1
 isr%1:
-    push 0  ; No-error code
+    push -1  ; No-error code
     push %1 ; INT number
     jmp __idt_isr_handler
 %endmacro

@@ -4,6 +4,13 @@
 # libc
 **/musl
 #kernel images
-image.hdd
+disk.qcow2
 #log files
 **/*.log
+**/extern/clang/*
+
+#tool binaries
+resolve_addresses
+
+#clang dir
+**/extern/clang/*

@@ -1,7 +1,5 @@
 #pragma once
-#include <stdint.h>
-
-#include <cstddef>
+#include <defines/defines.hpp>
 #include <std/mem.hpp>
 #include <std/string.hpp>
 namespace ker::mod::gfx::fb {

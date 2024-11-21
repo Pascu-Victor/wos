@@ -98,8 +98,45 @@
 			"slist": "cpp",
 			"*.inc": "cpp",
 			"*.ipp": "cpp",
-			"scoped_allocator": "cpp"
+			"scoped_allocator": "cpp",
+			"*.conf": "conf",
+			"cassert": "cpp",
+			"print": "cpp",
+			"__bit_reference": "cpp",
+			"__hash_table": "cpp",
+			"__node_handle": "cpp",
+			"__split_buffer": "cpp",
+			"__threading_support": "cpp",
+			"__verbose_abort": "cpp",
+			"ios": "cpp",
+			"locale": "cpp",
+			"ranges": "cpp",
+			"__tree": "cpp",
+			"queue": "cpp",
+			"stack": "cpp",
+			"c++config.h": "c",
+			"version": "cpp",
+			"__config": "c",
+			"__stddef_ptrdiff_t.h": "c",
+			"filesystem": "cpp",
+			"execution": "cpp",
+			"regex": "cpp",
+			"export": "cpp"
 		},
         "editor.formatOnSave": true,
+        "files.exclude": {
+			"**/cache/": true,
+			"**/*.rpyc": true,
+			"**/*.rpa": true,
+			"**/*.rpymc": true
+		},
+        "[conf]": {
+            "editor.formatOnSave": false
+        },
+
+        "C_Cpp.codeAnalysis.exclude": {
+            "**/extern/": true,
+        }
+
 	}
 }

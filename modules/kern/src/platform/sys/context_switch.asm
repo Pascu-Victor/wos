@@ -1,31 +1,52 @@
 bits 64
 
-global _wOS_asm_switchTo
+%include "platform/asm/helpers.asm"
 
-; extern "C" void _wOS_asm_switchTo(TaskRegisters regs);
+global _wOS_asm_enterUsermode
+_wOS_asm_enterUsermode:
 
-_wOS_asm_switchTo:
-    ; Save callee-saved registers
-    push rbp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
+    ;clear registers
 
-    ; switch stack
-    movq rsp, rdi
-    movq rsi, rsp
+    xor rax, rax
+    xor rbx, rbx
+    xor rcx, rcx
+    xor rdx, rdx
+    ; stack remains
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    xor r11, r11
+    xor r12, r12
+    xor r13, r13
+    xor r14, r14
+    xor r15, r15
 
-    ; TODO: add stack protection
-    ; TODO: speculative execution protection
+    swapgs
 
-    ; Restore callee-saved registers
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
+    ; init usermode stack on rsi
+    mov rbp, rsi
+    mov rsp, rbp
 
-    jmp switchTo
+    ; set segment selectors
+
+    mov ax, 0x1B ; RPL 11 -> RING 3 AND THIRD GDT SELECTOR
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; sysret params
+    mov rcx, rdi   ; set RIP
+    mov r11, 0x202 ; RFLAGS IF=1 and RESERVED=1
+    o64 sysret
+
+extern _wOS_schedTimer
+global task_switch_handler
+task_switch_handler:
+    cld
+    pushl
+    mov rdi, rsp
+    call _wOS_schedTimer
+    popl
+    add rsp, 16
+    iretq
