@@ -1,5 +1,7 @@
 #include "mm.hpp"
 
+#include <platform/dbg/dbg.hpp>
+
 __attribute__((used, section(".requests"))) static volatile limine_memmap_request memmapRequest = {
     .id = LIMINE_MEMMAP_REQUEST,
     .revision = 0,
@@ -27,8 +29,11 @@ __attribute__((used, section(".requests"))) static volatile limine_hhdm_request 
 namespace ker::mod::mm {
 void init(void) {
     addr::init(hhdmRequest.response);
+    dbg::log("Memory manager initialized\n");
     phys::init(memmapRequest.response);
+    dbg::log("Physical memory manager initialized\n");
     virt::init(memmapRequest.response, kernelFileRequest.response, kernelAddressRequest.response);
+    dbg::log("Virtual memory manager initialized\n");
     virt::initPagemap();
 }
 }  // namespace ker::mod::mm

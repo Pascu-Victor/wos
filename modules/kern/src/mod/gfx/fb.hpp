@@ -71,6 +71,8 @@ uint64_t viewportHeight(void);
 // scrolls the viewport up by one line
 void scroll(void);
 
+void mapFramebuffer(void);
+
 // TODO: int  setFont(const FbFont* font);
 }  // namespace fb
 }  // namespace ker::mod::gfx

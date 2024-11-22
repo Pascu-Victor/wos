@@ -33,5 +33,9 @@ PageTable* createPagemap(void);
 void copyKernelMappings(sched::task::Task t);
 void switchPagemap(sched::task::Task* t);
 void pagefaultHandler(uint64_t controlRegister, int errCode);
+void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, int flags);
+void mapRangeToKernelPageTable(Range range, int flags, uint64_t offset);
+// assume hhdm as offset
+void mapRangeToKernelPageTable(Range range, int flags);
 paddr_t translate(PageTable* pageTable, vaddr_t vaddr);
 }  // namespace ker::mod::mm::virt

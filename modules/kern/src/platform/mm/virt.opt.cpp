@@ -92,8 +92,14 @@ void initPagemap() {
             case LIMINE_MEMMAP_BAD_MEMORY:
                 std::strncpy(typeBuf, "BAD_MEMORY", 32);
                 break;
+            case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE:
+                std::strncpy(typeBuf, "BOOTLOADER_RECLAIMABLE", 32);
+                break;
             case LIMINE_MEMMAP_KERNEL_AND_MODULES:
                 std::strncpy(typeBuf, "KERNEL_AND_MODULES", 32);
+                break;
+            case LIMINE_MEMMAP_FRAMEBUFFER:
+                std::strncpy(typeBuf, "FRAMEBUFFER", 32);
                 break;
             default:
                 std::strncpy(typeBuf, "UNKNOWN", 32);
@@ -214,6 +220,15 @@ void mapRange(PageTable* pageTable, Range range, int flags, uint64_t offset) {
         mapPage(pageTable, start + offset, start, flags);
         start += paging::PAGE_SIZE;
     }
+}
+
+void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, int flags) { mapPage(kernelPagemap, vaddr, paddr, flags); }
+
+void mapRangeToKernelPageTable(Range range, int flags, uint64_t offset) { mapRange(kernelPagemap, range, flags, offset); }
+
+void mapRangeToKernelPageTable(Range range, int flags) {
+    // no offset assume hhdm
+    mapRange(kernelPagemap, range, flags, addr::getHHDMOffset());
 }
 
 }  // namespace ker::mod::mm::virt

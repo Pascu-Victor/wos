@@ -30,7 +30,9 @@ struct PageTableEntry {
     uint8_t pagesize : 1;
     uint8_t global : 1;
     uint8_t available : 3;
-    uint64_t frame : 52;
+    uint64_t frame : 40;
+    uint64_t reserved : 11;
+    uint8_t nx : 1;
 } __attribute__((packed));
 
 struct PageTable {

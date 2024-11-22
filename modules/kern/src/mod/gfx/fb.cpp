@@ -1,5 +1,6 @@
 #include "fb.hpp"
 
+#include <platform/mm/virt.hpp>
 __attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebufferRequest = {
     .id = LIMINE_FRAMEBUFFER_REQUEST,
     .revision = 0,
@@ -207,5 +208,12 @@ void scroll() {
 //     __currentFont = *font;
 //     return 0;
 // }
+
+void mapFramebuffer(void) {
+    ker::mod::mm::virt::mapRangeToKernelPageTable(
+        {(uint64_t)__framebuffer->address, (uint64_t)((uint64_t)__framebuffer->address + __framebuffer->width * __framebuffer->height * 4)},
+        ker::mod::mm::paging::pageTypes::KERNEL);
+}
+
 }  // namespace fb
 }  // namespace ker::mod::gfx

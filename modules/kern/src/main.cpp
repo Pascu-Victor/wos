@@ -51,6 +51,11 @@ extern "C" void _start(void) {
     // Init memory manager.
     ker::mod::mm::init();
 
+    gfx::fb::mapFramebuffer();
+
+    dbg::log("Framebuffer mapped");
+    dbg::log("Pages mapped");
+
     // Init gds.
     ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
 

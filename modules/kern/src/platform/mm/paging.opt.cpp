@@ -6,9 +6,9 @@ static inline bool isFlagSet(uint64_t flags, uint64_t flag) { return (flags & fl
 PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
     PageTableEntry entry;
     entry.frame = frame >> PAGE_SHIFT;
-    entry.present = flags & PAGE_PRESENT;
-    entry.writable = flags & PAGE_WRITE;
-    entry.user = flags & PAGE_USER;
+    entry.present = (flags & PAGE_PRESENT) > 0;
+    entry.writable = (flags & PAGE_WRITE) > 0;
+    entry.user = (flags & PAGE_USER) > 0;
     entry.writeThrough = 0;
     entry.cacheDisabled = 0;
     entry.accessed = 0;

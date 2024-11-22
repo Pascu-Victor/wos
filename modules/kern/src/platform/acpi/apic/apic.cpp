@@ -1,5 +1,8 @@
 #include "apic.hpp"
 
+#include <platform/mm/paging.hpp>
+#include <platform/mm/virt.hpp>
+
 namespace ker::mod::apic {
 void write(uint32_t offset, uint32_t value) { *(volatile uint32_t*)(LAPIC_BASE + offset) = value; }
 
@@ -34,6 +37,7 @@ void init(void) {
     }
 
     LAPIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
+    mm::virt::mapToKernelPageTable((uint64_t)LAPIC_BASE, (uint64_t)apicInfo.lapicAddr, mm::paging::pageTypes::KERNEL);
     enable();
 }
 
