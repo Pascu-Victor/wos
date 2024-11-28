@@ -14,7 +14,6 @@ struct CpuidContext {
     int function;
 };
 
-void initPerCpu(uint64_t current_stack);
 void cpuid(struct CpuidContext *cpuid_context);
 uint64_t currentCpu(void);
 
@@ -27,9 +26,9 @@ struct GPRegs {
     uint64_t r10;
     uint64_t r9;
     uint64_t r8;
-    uint64_t rsi;
-    uint64_t rdi;
     uint64_t rbp;
+    uint64_t rdi;
+    uint64_t rsi;
     uint64_t rdx;
     uint64_t rcx;
     uint64_t rbx;
@@ -63,6 +62,13 @@ static __always_inline uint64_t rdgsbase(void) {
 static __always_inline void wrfsbase(uint64_t fsbase) { asm volatile("wrfsbase %0" ::"r"(fsbase) : "memory"); }
 
 static __always_inline void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %0" ::"r"(gsbase) : "memory"); }
+
+static __always_inline void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
+
+static __always_inline void rdcr4(uint64_t *val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
+
+void enablePAE(void);
+void enablePSE(void);
 
 #define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

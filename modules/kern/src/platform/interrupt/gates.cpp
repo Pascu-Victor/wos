@@ -1,11 +1,21 @@
 #include "gates.hpp"
 
+#include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 
 namespace ker::mod::gates {
 smt::PerCpuVar<interruptHandler_t> interruptHandlers[256](nullptr);
 
 void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
+    if (frame.intNum == 14) {
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
+
+        mm::virt::pagefaultHandler(cr2, frame.errCode);
+        return;
+    }
+
     uint64_t cr0;
     uint64_t cr2;
     uint64_t cr3;

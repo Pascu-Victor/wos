@@ -5,20 +5,26 @@
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/paging.hpp>
 // #include <platform/sys/context_switch.hpp>
+#include <platform/interrupt/gates.hpp>
 #include <std/rbtree.hpp>
 
-namespace ker::mod::sched {
-namespace task {
+namespace ker::mod::sched::task {
 
 enum TaskType {
     DAEMON,
     PROCESS,
 };
 
-struct TaskRegisters {
+struct Context {
+    uint64_t syscallKernelStack;
+    uint64_t syscallUserStack;
+
     cpu::GPRegs regs;
-    uint64_t ip;
-    uint64_t rsp;
+
+    uint64_t intNo;
+    uint64_t errorCode;
+
+    gates::interruptFrame frame;
 } __attribute__((packed));
 
 struct Thread {
@@ -33,16 +39,18 @@ struct Thread {
     uint64_t stackSize;
 } __attribute__((packed));
 struct Task {
-    Task(const char* name, uint64_t elf_start, TaskType type);
+    Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
     mm::paging::PageTable* pagemap;
-    TaskRegisters regs;
+    Context context;
     uint64_t entry;
 
     const char* name;
     TaskType type;
     uint64_t cpu;
     Thread* thread;
+
+    void loadContext(cpu::GPRegs* gpr);
+    void saveContext(cpu::GPRegs* gpr);
 } __attribute__((packed));
-}  // namespace task
-}  // namespace ker::mod::sched
+}  // namespace ker::mod::sched::task

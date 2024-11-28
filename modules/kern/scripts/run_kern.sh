@@ -23,6 +23,8 @@ fi
 rm -f serial.log
 rm -f qemu.*log
 
+# Define the character device to output to a file
+CHARDEV="-chardev file,id=char0,path=serial.log -serial chardev:char0 -monitor stdio"
+
 echo "STARTING BOOT:"
-qemu-system-x86_64 -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd -chardev stdio,id=char0,mux=on,logfile=serial.log,signal=off \
--serial chardev:char0 -mon chardev=char0 -s -S -d cpu_reset,int,tid,in_asm -D qemu.%d.log -no-reboot -M q35 -cpu qemu64,+la57 -smp 4
+qemu-system-x86_64 -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV -s -S -d cpu_reset,int,tid,in_asm -D qemu.%d.log -no-reboot -M q35 -cpu qemu64,+la57 -smp 4

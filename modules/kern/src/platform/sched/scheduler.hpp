@@ -30,5 +30,5 @@ bool postTask(task::Task* task);
 task::Task* getCurrentTask();
 void startScheduler();
 void percpuInit();
-void processTasks(ker::mod::cpu::GPRegs* gpr, ker::mod::gates::interruptFrame* frame);
+void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);
 }  // namespace ker::mod::sched

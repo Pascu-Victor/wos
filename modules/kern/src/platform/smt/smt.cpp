@@ -7,17 +7,16 @@ __attribute__((used, section(".requests"))) const static volatile limine_smp_req
     .flags = 1,
 };
 namespace ker::mod::smt {
-CpuInfo _wOS_CPUDATA[SMT_MAX_CPUS];
-uint64_t revision;
+PerCpuCrossAccess<CpuInfo>* cpuData;
 uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t cpu_count;
 
 uint64_t getCoreCount(void) { return cpu_count; }
 
-const CpuInfo& getCpu(uint64_t number) { return _wOS_CPUDATA[number]; }
+const CpuInfo getCpu(uint64_t number) { return cpuData->thatCpu(number).copy(); }
 
-const CpuInfo& thisCpuInfo() { return _wOS_CPUDATA[cpu::currentCpu()]; }
+const CpuInfo thisCpuInfo() { return cpuData->thisCpu().copy(); }
 
 // Future NUMA support here
 uint64_t getCpuNode(uint64_t cpuNo) { return cpuNo; }
@@ -41,34 +40,34 @@ void cpuParamInit(uint64_t* stack) {
     sched::startScheduler();
 }
 
-void runHandoverTasks(boot::HandoverModules& modStruct) {
+void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
     sched::percpuInit();
     for (uint64_t i = 0; i < modStruct.count; i++) {
-        auto newTask =
-            new sched::task::Task(modStruct.modules[i].name, (uint64_t)modStruct.modules[i].entry, sched::task::TaskType::PROCESS);
+        auto newTask = new sched::task::Task(modStruct.modules[i].name, (uint64_t)modStruct.modules[i].entry, kernelRsp,
+                                             sched::task::TaskType::PROCESS);
         sched::postTask(newTask);
     }
     sched::startScheduler();
 }
 
-// init per cpu data
-__attribute__((noreturn)) void init(boot::HandoverModules& modules) {
-    revision = smp_request.revision;
+void init() {
     assert(smp_request.response != nullptr);
     flags = smp_request.response->flags;
     bsp_lapic_id = smp_request.response->bsp_lapic_id;
     cpu_count = smp_request.response->cpu_count;
+}
 
-    if (smp_request.response->cpu_count > SMT_MAX_CPUS) {
-        [[unlikely]] dbg::log("SMT: CPU count exceeds maximum supported CPUs");
-        hcf();
-    }
+// init per cpu data
+__attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp) {
+    assert(smp_request.response != nullptr);
 
-    for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
-        _wOS_CPUDATA[i].processor_id = smp_request.response->cpus[i]->processor_id;
-        _wOS_CPUDATA[i].lapic_id = smp_request.response->cpus[i]->lapic_id;
-        _wOS_CPUDATA[i].goto_address = &smp_request.response->cpus[i]->goto_address;
-        _wOS_CPUDATA[i].stack_pointer_ref = (uint64_t**)&(smp_request.response->cpus[i]->extra_argument);
+    cpuData = new PerCpuCrossAccess<CpuInfo>();
+
+    for (uint64_t i = 0; i < getCoreCount(); i++) {
+        cpuData->thatCpu(i)->processor_id = smp_request.response->cpus[i]->processor_id;
+        cpuData->thatCpu(i)->lapic_id = smp_request.response->cpus[i]->lapic_id;
+        cpuData->thatCpu(i)->goto_address = &smp_request.response->cpus[i]->goto_address;
+        cpuData->thatCpu(i)->stack_pointer_ref = (uint64_t**)&(smp_request.response->cpus[i]->extra_argument);
     }
 
     for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
@@ -76,11 +75,11 @@ __attribute__((noreturn)) void init(boot::HandoverModules& modules) {
             continue;
         }
         auto stack = mm::Stack();
-        _wOS_CPUDATA[i].stack_pointer_ref = &stack.sp;
+        cpuData->thatCpu(i)->stack_pointer_ref = &stack.sp;
         startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack, stack.sp);
     }
 
-    runHandoverTasks(modules);
+    runHandoverTasks(modules, kernelRsp);
     hcf();
 }
 

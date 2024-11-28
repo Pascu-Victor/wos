@@ -30,7 +30,7 @@ void unmapPage(PageTable* pageTable, vaddr_t vaddr);
 void switchToKernelPagemap(void);
 void initPagemap(void);
 PageTable* createPagemap(void);
-void copyKernelMappings(sched::task::Task t);
+void copyKernelMappings(sched::task::Task* t);
 void switchPagemap(sched::task::Task* t);
 void pagefaultHandler(uint64_t controlRegister, int errCode);
 void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, int flags);

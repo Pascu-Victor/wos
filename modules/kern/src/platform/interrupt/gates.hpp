@@ -3,8 +3,8 @@
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/interrupt/idt.hpp>
-#include <platform/sched/task.hpp>
 
 namespace ker::mod::gates {
 struct interruptFrame {

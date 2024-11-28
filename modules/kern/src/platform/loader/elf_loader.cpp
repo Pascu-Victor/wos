@@ -65,12 +65,12 @@ void loadSectionHeaders(ElfFile elf, ker::mod::mm::virt::PageTable *pagemap) {
 
     for (size_t sectionIndex = 0; sectionIndex < elf.elfHead.e_shnum; sectionIndex++) {
         Elf64_Shdr *sectionHeader = (Elf64_Shdr *)((uint64_t)elf.seHead + sectionIndex * elf.elfHead.e_shentsize);  // Get section header
-        mod::dbg::log("Section name: %s\n", sectionNames + sectionHeader->sh_name);
+        mod::dbg::log("Section name: %s", sectionNames + sectionHeader->sh_name);
         if (!std::strncmp(&sectionNames[sectionHeader->sh_name], ".rodata", 7)) {
             auto rodataVaddr = sectionHeader->sh_addr;
             auto rodataPaddr = mod::mm::virt::translate(pagemap, rodataVaddr);
-            mod::dbg::log("Rodata vaddr: %x\n", rodataVaddr);
-            mod::dbg::log("Rodata paddr: %x\n", rodataPaddr);
+            mod::dbg::log("Rodata vaddr: %x", rodataVaddr);
+            mod::dbg::log("Rodata paddr: %x", rodataPaddr);
             memcpy((void *)rodataPaddr, elf.base + sectionHeader->sh_offset, sectionHeader->sh_size);
         }
     }

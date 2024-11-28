@@ -5,6 +5,7 @@
 #include <platform/acpi/hpet/hpet.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/sched/task.hpp>
 #include <std/list.hpp>
 #include <std/mem.hpp>
 

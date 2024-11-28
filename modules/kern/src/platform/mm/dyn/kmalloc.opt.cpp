@@ -1,10 +1,6 @@
 #include "kmalloc.hpp"
 
 namespace ker::mod::mm::dyn::kmalloc {
-// static const uint64_t KEMEM_LIST_SIZE = 6;
-// min size is 8 bytes
-// max size is 4096 bytes
-// static slab::SlabCache* kmemList[KEMEM_LIST_SIZE];
 static tlsf_t tlsf = nullptr;
 static ker::mod::sys::Spinlock *kmallocLock;
 
@@ -12,7 +8,7 @@ void init() {
     // for (uint64_t i = 0; i < KEMEM_LIST_SIZE; i++) {
     //     kmemList[i] = createCache(cacheSize, "kmalloc", 0);
     // }
-    tlsf = tlsf_create_with_pool(phys::pageAlloc(1024 * 1024 * 256), 1024 * 1024 * 256);
+    tlsf = tlsf_create_with_pool(phys::pageAlloc(1024 * 1024 * 128), 1024 * 1024 * 128);
     kmallocLock = (ker::mod::sys::Spinlock *)tlsf_malloc(tlsf, sizeof(ker::mod::sys::Spinlock));
 }
 
@@ -47,16 +43,9 @@ void free(void *ptr) {
 
 }  // namespace ker::mod::mm::dyn::kmalloc
 
-void *operator new(size_t sz) {
-    void *ptr = ker::mod::mm::dyn::kmalloc::malloc(sz + sizeof(uint64_t));
-    *((uint64_t *)ptr) = sz;
-    return (void *)((uint64_t)ptr + sizeof(uint64_t));
-}
+void *operator new(size_t sz) { return (void *)ker::mod::mm::dyn::kmalloc::malloc(sz); }
 
-void *operator new[](size_t sz) {
-    void *ptr = ker::mod::mm::dyn::kmalloc::malloc(sz);
-    return (void *)((uint64_t)ptr);
-}
+void *operator new[](size_t sz) { return (void *)ker::mod::mm::dyn::kmalloc::malloc(sz); }
 
 // void operator delete(void* ptr) noexcept {
 //     ker::mod::mm::dyn::kmalloc::kfree(ptr);

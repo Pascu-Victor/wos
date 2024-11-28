@@ -7,5 +7,6 @@ struct Spinlock {
     volatile bool locked;
     void lock();
     void unlock();
+    Spinlock() : locked(false) {}
 };
 }  // namespace ker::mod::sys

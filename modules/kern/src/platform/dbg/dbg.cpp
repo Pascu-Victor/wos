@@ -64,6 +64,7 @@ inline void fbLog(const char* str) {
     }
 
     gfx::fb::drawChar(0, line, '[');
+    // todo maybe print cpu id
     int stampLen = 1;
     if (isTimeAvailable) [[likely]] {
         char timeSec[10] = {0};  // good enough for 30 years of uptime

@@ -4,21 +4,33 @@
 #include <platform/mm/virt.hpp>
 
 namespace ker::mod::sched::task {
-Task::Task(const char* name, uint64_t elf_start, TaskType type) {
+Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
     this->name = name;
     // this->entry = entry;
     // this->regs.ip = entry;
     this->pagemap = mm::virt::createPagemap();
-    this->regs.rsp =
+    this->context.frame.rsp =
         (uint64_t)mm::addr::getPhysPointer((mm::addr::vaddr_t)mm::phys::pageAlloc(mm::paging::PAGE_SIZE)) + mm::paging::PAGE_SIZE;
-    this->regs.regs = cpu::GPRegs();
+    this->context.regs = cpu::GPRegs();
     this->type = type;
     this->cpu = cpu::currentCpu();
-    mm::virt::mapPage(this->pagemap, (uint64_t)this->regs.rsp - mm::paging::PAGE_SIZE, (uint64_t)this->regs.rsp - mm::paging::PAGE_SIZE,
-                      mm::paging::pageTypes::USER);
+    this->context.syscallKernelStack = kernelRsp;
+    this->context.syscallUserStack = (uint64_t)(new uint8_t[USER_STACK_SIZE]) + USER_STACK_SIZE;
 
-    uint64_t elfEntry = loader::elf::loadElf((loader::elf::ElfFile*)elf_start, this->pagemap);
+    mm::virt::copyKernelMappings(this);
+    mm::virt::mapPage(this->pagemap, (uint64_t)this->context.frame.rsp - mm::paging::PAGE_SIZE,
+                      (uint64_t)this->context.frame.rsp - mm::paging::PAGE_SIZE, mm::paging::pageTypes::USER);
+
+    uint64_t elfEntry = loader::elf::loadElf((loader::elf::ElfFile*)elfStart, this->pagemap);
     this->entry = elfEntry;
-    this->regs.ip = elfEntry;
+    this->context.frame.rip = elfEntry;
+}
+
+void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
+
+void Task::saveContext(cpu::GPRegs* gpr) {
+    cpuSetMSR(IA32_GS_BASE, (uint64_t)this->context.syscallUserStack);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)this->context.syscallKernelStack);
+    *gpr = context.regs;
 }
 }  // namespace ker::mod::sched::task

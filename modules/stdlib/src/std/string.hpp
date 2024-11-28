@@ -56,6 +56,13 @@ char *vsnprintf(char *str, T size, const char *format, va_list args) {
                     str[j++] = c;
                     break;
                 }
+                case 'b': {
+                    int n = va_arg(args, int);
+                    int len = itoa(n, buf, 2);
+                    strncpy(str + j, buf, size - j);
+                    j += len;
+                    break;
+                }
                 default:
                     str[j++] = format[i];
                     break;

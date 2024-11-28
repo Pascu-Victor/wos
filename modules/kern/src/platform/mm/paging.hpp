@@ -30,9 +30,7 @@ struct PageTableEntry {
     uint8_t pagesize : 1;
     uint8_t global : 1;
     uint8_t available : 3;
-    uint64_t frame : 40;
-    uint64_t reserved : 11;
-    uint8_t nx : 1;
+    uint64_t frame : 52;
 } __attribute__((packed));
 
 struct PageTable {
@@ -63,11 +61,11 @@ const static uint64_t USER_READONLY = PAGE_PRESENT | PAGE_USER;
 }  // namespace pageTypes
 
 namespace errorFlags {
-const static uint64_t WRITE = 0x01;
-const static uint64_t USER = 0x02;
-const static uint64_t FETCH = 0x04;
-const static uint64_t PROTECTION_KEY = 0x08;
-const static uint64_t SHADOW_STACK = 0x10;
+const static uint64_t WRITE = 1;
+const static uint64_t USER = 2;
+const static uint64_t FETCH = 4;
+const static uint64_t PROTECTION_KEY = 5;
+const static uint64_t SHADOW_STACK = 6;
 }  // namespace errorFlags
 
 PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags);

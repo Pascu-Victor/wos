@@ -19,9 +19,9 @@ void switchToKernelPagemap() { wrcr3((uint64_t)addr::getPhysPointer((paddr_t)ker
 
 PageTable* createPagemap() { return (PageTable*)phys::pageAlloc(); }
 
-void copyKernelMappings(sched::task::Task t) {
+void copyKernelMappings(sched::task::Task* t) {
     for (size_t i = 256; i < 512; i++) {
-        t.pagemap->entries[i] = kernelPagemap->entries[i];
+        t->pagemap->entries[i] = kernelPagemap->entries[i];
     }
 }
 
@@ -37,14 +37,14 @@ void switchPagemap(sched::task::Task* t) {
 
 void pagefaultHandler(uint64_t controlRegister, int errCode) {
     PageFault pagefault = paging::createPageFault(errCode, true);
-    dbg::log("Page fault at address %p with error code %x\n", controlRegister, errCode);
 
-    if (pagefault.present) {
-        // PANIC!
-        hcf();
-    }
+    // if (pagefault.present) {
+    //     // PANIC!
+    //     hcf();
+    // }
 
-    mapPage(getKernelPageTable(), controlRegister, controlRegister, pagefault.flags);
+    mapPage((mm::paging::PageTable*)mm::addr::getVirtPointer((uint64_t)getKernelPageTable()), controlRegister, controlRegister,
+            pagefault.flags);
 }
 
 static inline uint64_t index_of(const uint64_t vaddr, const int offset) { return vaddr >> (12 + 9 * (offset - 1)) & 0x1FF; }
@@ -68,6 +68,8 @@ paddr_t translate(PageTable* pageTable, vaddr_t vaddr) {
 }
 
 void initPagemap() {
+    cpu::enablePAE();
+    cpu::enablePSE();
     kernelPagemap = (PageTable*)phys::pageAlloc();
     if (kernelPagemap == nullptr) {
         // PANIC!

@@ -1,7 +1,7 @@
 #include "paging.hpp"
 
 namespace ker::mod::mm::paging {
-static inline bool isFlagSet(uint64_t flags, uint64_t flag) { return (flags & flag) == flag; }
+static inline bool isFlagSet(uint64_t flags, uint64_t flag) { return flags >> flag & 1; }
 
 PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
     PageTableEntry entry;
@@ -30,7 +30,8 @@ PageFault createPageFault(uint64_t flags, bool isCritical) {
     fault.protectionKey = isFlagSet(flags, errorFlags::PROTECTION_KEY);
     fault.shadowStack = isFlagSet(flags, errorFlags::SHADOW_STACK);
     fault.criticalHandling = isCritical && (fault.fetch || fault.protectionKey || fault.shadowStack);
-    fault.flags = fault.user | fault.writable | 0x1;
+    fault.flags = fault.present | fault.writable << 1 | fault.user << 2 | fault.reserved << 3 | fault.fetch << 4 |
+                  fault.protectionKey << 5 | fault.shadowStack << 6;
     return fault;
 }
 }  // namespace ker::mod::mm::paging

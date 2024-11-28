@@ -15,7 +15,6 @@
 #include <std/type_traits.hpp>
 
 namespace ker::mod::smt {
-constexpr static uint64_t SMT_MAX_CPUS = 256;
 
 typedef void (*CpuGotoAddr)(struct limine_smp_info*);
 
@@ -27,11 +26,13 @@ struct CpuInfo {
 };
 
 uint64_t getCoreCount(void);
-const CpuInfo& getCpu(uint64_t number);
+const CpuInfo getCpu(uint64_t number);
 
-__attribute__((noreturn)) void init(boot::HandoverModules& modules);
+__attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp);
 
-const CpuInfo& thisCpuInfo();
+void init();
+
+const CpuInfo thisCpuInfo();
 
 template <typename T>
 class PerCpuVar {
@@ -39,44 +40,36 @@ class PerCpuVar {
                   "T must have a default constructor or be a primitive type");
 
    private:
-    T _data[SMT_MAX_CPUS];
+    T* _data;
 
    public:
-    PerCpuVar(T defaultValue = T()) {
-        for (uint64_t i = 0; i < SMT_MAX_CPUS; i++) {
-            _data[i] = defaultValue;
-        }
-    }
+    PerCpuVar(T defaultValue = T()) { _data = new T[getCoreCount()](defaultValue); }
 
-    T& get() { return _data[thisCpuInfo().processor_id]; }
+    T& get() { return _data[cpu::currentCpu()]; }
 
-    T* operator->() { return &_data[thisCpuInfo().processor_id]; }
+    T* operator->() { return &_data[cpu::currentCpu()]; }
 
-    void set(const T& data) { _data[thisCpuInfo().processor_id] = data; }
+    void set(const T& data) { _data[cpu::currentCpu()] = data; }
 
     T& operator=(const T& data) {
-        _data[thisCpuInfo().processor_id] = data;
-        return _data[thisCpuInfo().processor_id];
+        _data[cpu::currentCpu()] = data;
+        return _data[cpu::currentCpu()];
     }
 };
 
 template <typename T>
 class PerCpuCrossAccess {
    private:
-    std::Borrowable<T> _data[SMT_MAX_CPUS];
+    std::Borrowable<T>* _data;
 
    public:
-    PerCpuCrossAccess(T defaultValue = T()) {
-        for (uint64_t i = 0; i < SMT_MAX_CPUS; i++) {
-            _data[i] = defaultValue;
-        }
-    }
+    PerCpuCrossAccess(T defaultValue = T()) { _data = new std::Borrowable<T>[getCoreCount()](defaultValue); }
 
-    std::Borrowable<T>::BorrowedRef thisCpu() { return _data[thisCpuInfo().processor_id].borrow(); }
+    std::Borrowable<T>::BorrowedRef thisCpu() { return _data[cpu::currentCpu()].borrow(); }
 
     std::Borrowable<T>::BorrowedRef thatCpu(uint64_t cpu) { return _data[cpu].borrow(); }
 
-    void setThisCpu(const T& data) { _data[thisCpuInfo().processor_id] = data; }
+    void setThisCpu(const T& data) { _data[cpu::currentCpu()] = data; }
 
     void setThatCpu(const T& data, uint64_t cpu) { _data[cpu] = data; }
 };
@@ -104,7 +97,7 @@ constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
     mm::Stack<4096>* initStacks;
     initStacks = new mm::Stack<4096>[getCoreCount()];
     for (uint64_t i = 0; i < getCoreCount(); i++) {
-        if (i == thisCpuInfo().processor_id) {
+        if (i == cpu::currentCpu()) {
             continue;
         }
         startCpuTask(i, reinterpret_cast<CpuGotoAddr>(func), initStacks[i], data...);

@@ -7,8 +7,8 @@ std::list<void (*)(gates::interruptFrame *)> tasks;
 
 static uint64_t ktimePITTick = 0;
 
-void handle_pit(sched::task::TaskRegisters tr, gates::interruptFrame *frame) {
-    (void)tr;
+void handle_pit(sched::task::Context ctx, gates::interruptFrame *frame) {
+    (void)ctx;
     ktimePITTick++;
     for (auto &task : tasks) {
         task(frame);

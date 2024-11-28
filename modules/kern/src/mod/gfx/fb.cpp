@@ -210,9 +210,29 @@ void scroll() {
 // }
 
 void mapFramebuffer(void) {
-    ker::mod::mm::virt::mapRangeToKernelPageTable(
-        {(uint64_t)__framebuffer->address, (uint64_t)((uint64_t)__framebuffer->address + __framebuffer->width * __framebuffer->height * 4)},
-        ker::mod::mm::paging::pageTypes::KERNEL);
+    auto fbPhys = (uint64_t)mm::addr::getPhysPointer((mm::addr::paddr_t)(__framebuffer->address));
+
+    ker::mod::io::serial::write("Mapping framebuffer\n");
+    ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("Width: ");
+    ker::mod::io::serial::writeHex(__framebuffer->width);
+    ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("Height: ");
+    ker::mod::io::serial::writeHex(__framebuffer->height);
+    ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("Start physical address: ");
+    ker::mod::io::serial::writeHex(fbPhys);
+    uint64_t framebufferSize = __framebuffer->width * __framebuffer->height * 8;
+    ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("Theoretical end physical address: ");
+    ker::mod::io::serial::writeHex((uint64_t)fbPhys + framebufferSize);
+    ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("Framebuffer size: ");
+    ker::mod::io::serial::writeHex(framebufferSize);
+    ker::mod::io::serial::write("\n");
+
+    ker::mod::mm::virt::mapRangeToKernelPageTable({(uint64_t)fbPhys, (uint64_t)((uint64_t)fbPhys + framebufferSize)},
+                                                  ker::mod::mm::paging::pageTypes::KERNEL);
 }
 
 }  // namespace fb

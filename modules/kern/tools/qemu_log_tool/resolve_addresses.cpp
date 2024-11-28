@@ -20,11 +20,20 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 // Declare thread-local storage for the bfd object
 thread_local bfd* abfd = nullptr;
 
 namespace fs = std::filesystem;
+
+#include <cxxabi.h>
+
+std::string demangle(const std::string& mangledName) {
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(mangledName.c_str(), nullptr, nullptr, &status);
+    std::string result = (status == 0) ? demangled : mangledName;
+    free(demangled);
+    return result;
+}
 
 std::string getFunctionNameFromAddress(const std::string& address, const std::string& executable) {
     // Save the current stderr file descriptor
@@ -69,7 +78,8 @@ std::string getFunctionNameFromAddress(const std::string& address, const std::st
         // Restore stderr
         dup2(stderr_fd, STDERR_FILENO);
         close(stderr_fd);
-        return address + "(" + std::string(filename) + ":" + std::to_string(line) + ")";
+        return address + "[" + (functionname ? demangle(functionname) : "unknown") + "](" + fs::relative(filename).string() + ":" +
+               std::to_string(line) + ")";
     }
 
     bfd_close(abfd);
@@ -91,7 +101,7 @@ void processLogFile(const std::string& logFile, const std::string& executable) {
     }
     inFile.close();
 
-    std::regex addressRegex("0xffffffff8[0-9a-fA-F]{7}");
+    std::regex addressRegex("(0xffff[0-9a-fA-F]{12})");
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string& line = lines[i];
         std::string resultString;

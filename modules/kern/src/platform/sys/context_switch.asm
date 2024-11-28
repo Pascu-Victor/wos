@@ -4,7 +4,7 @@ bits 64
 
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:
-
+    cli
     ;clear registers
 
     xor rax, rax
@@ -21,9 +21,13 @@ _wOS_asm_enterUsermode:
     xor r14, r14
     xor r15, r15
 
+    mov [gs:0x0], rsp ; save kernel stack pointer to local cpu data
     swapgs
-
     ; init usermode stack on rsi
+    ;;TODO`
+    ;;/home/womywomwoo/Downloads/brutal-main/sources/kernel/x86_64/syscall.c SEE THIS
+    ;; syscall_set_gs specifically
+    ;; need to setup tls
     mov rbp, rsi
     mov rsp, rbp
 
@@ -32,12 +36,15 @@ _wOS_asm_enterUsermode:
     mov ax, 0x1B ; RPL 11 -> RING 3 AND THIRD GDT SELECTOR
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
+    ; mov fs, ax
+    ; mov gs, ax
+
+    ;; ^^^^^ wipes gs_base and fs_base registers need to reload
 
     ; sysret params
     mov rcx, rdi   ; set RIP
     mov r11, 0x202 ; RFLAGS IF=1 and RESERVED=1
+    sti
     o64 sysret
 
 extern _wOS_schedTimer
@@ -45,7 +52,7 @@ global task_switch_handler
 task_switch_handler:
     cld
     pushl
-    mov rdi, rsp
+    ; mov rdi, rsp
     call _wOS_schedTimer
     popl
     add rsp, 16

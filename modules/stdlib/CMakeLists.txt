@@ -103,6 +103,9 @@ foreach(file ${CXXFILES})
 	set(OBJ_FILES ${OBJ_FILES} ${file})
 endforeach()
 
+enable_language(ASM_NASM)
+set_source_files_properties(${NASMFILES} PROPERTIES LANGUAGE ASM_NASM)
+
 add_library(std STATIC ${OBJ_FILES})
 target_compile_options(std PRIVATE ${C_FLAGS} ${CXX_FLAGS})
 

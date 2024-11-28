@@ -11,6 +11,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/syscall.hpp>
 #include <std/drawing.hpp>
 #include <std/hcf.hpp>
 #include <std/mem.hpp>
@@ -32,9 +33,7 @@ __attribute__((used, section(".requests_end_marker"))) static volatile LIMINE_RE
 
 using namespace ker::mod;
 
-#define STACK_SIZE 0x100  // 8KB
-
-__attribute__((aligned(16))) static uint64_t stack[STACK_SIZE];
+__attribute__((aligned(16))) static uint64_t stack[KERNEL_STACK_SIZE];
 
 // Kernel entry point.
 extern "C" void _start(void) {
@@ -64,7 +63,7 @@ extern "C" void _start(void) {
 
     // Init interrupts.
     ker::mod::interrupt::init();
-
+    ker::mod::sys::init();
     ker::mod::sched::init();
 
     boot::HandoverModules modules;
@@ -88,8 +87,10 @@ extern "C" void _start(void) {
         modules.modules[i].cmdline = kernelModuleRequest.response->modules[i]->path;
     }
 
+    uint8_t* kernelRsp = (uint8_t*)mm::dyn::kmalloc::malloc(KERNEL_STACK_SIZE);  // 16KB
+    kernelRsp += KERNEL_STACK_SIZE;                                              // Stack grows down so we start at the top.
     // Init smt
-    ker::mod::smt::init(modules);
+    ker::mod::smt::startSMT(modules, (uint64_t)kernelRsp);
 
     // Kernel should halt and catch fire if it reaches this point.
     hcf();

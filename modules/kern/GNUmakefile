@@ -169,7 +169,7 @@ obj/%.c.o: src/%.c GNUmakefile
 # Compilation rules for *.opt.cpp files.
 obj/%.opt.cpp.o: src/%.opt.cpp GNUmakefile
 	mkdir -p "$$(dirname $@)"
-	$(KCXX) $(KCXXFLAGS) $(KCXXPPFLAGS) -c $< -o $@
+	$(KCXX) $(KCXXFLAGS) $(KCXXPPFLAGS) -O2 -c $< -o $@
 
 # Compilation rules for *.cpp files.
 obj/%.cpp.o: src/%.cpp GNUmakefile

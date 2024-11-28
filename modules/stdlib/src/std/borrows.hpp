@@ -28,11 +28,24 @@ class Borrowable {
 
         T* operator->() { return &_parent->_data; }
 
+        const T& get() const { return _parent->_data; }
+
+        const T copy() const { return _parent->_data; }
+
+        const T operator*() const { return _parent->_data; }
+
+        const T* operator->() const { return &_parent->_data; }
+
         BorrowedRef(const BorrowedRef&) = delete;
         BorrowedRef& operator=(const BorrowedRef&) = delete;
     };
 
-    Borrowable(std::unique_ptr<T> defaultValue = nullptr) : _data(defaultValue.get() != nullptr ? *defaultValue : *(new T())) {}
+    // Borrowable(std::unique_ptr<T> defaultValue = nullptr)
+    //     : _data(defaultValue.get() != nullptr ? *defaultValue : *(new T())), _borrowLock() {}
+
+    Borrowable(T defaultValue) : _data(*(new T())), _borrowLock() { _data = defaultValue; }
+
+    Borrowable() : _data(*(new T())), _borrowLock() {}
 
     ~Borrowable() { delete &_data; }
 
