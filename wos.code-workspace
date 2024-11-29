@@ -121,7 +121,8 @@
 			"filesystem": "cpp",
 			"execution": "cpp",
 			"regex": "cpp",
-			"export": "cpp"
+			"export": "cpp",
+			"expected": "cpp"
 		},
         "editor.formatOnSave": true,
         "files.exclude": {
