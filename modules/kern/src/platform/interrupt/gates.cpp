@@ -10,7 +10,7 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     if (frame.intNum == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
-        dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
+        // dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
 
         mm::virt::pagefaultHandler(cr2, frame.errCode);
         return;
@@ -57,7 +57,6 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     ker::mod::io::serial::write(" (0x");
     ker::mod::io::serial::writeHex(cr0);
     ker::mod::io::serial::write(")\n");
-    ker::mod::io::serial::write("\n");
     ker::mod::io::serial::write("CR2: ");
     ker::mod::io::serial::writeBin(cr2);
     ker::mod::io::serial::write(" (0x");
@@ -143,12 +142,15 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     hcf();
 }
 
+extern "C" void task_switch_handler(interruptFrame frame);
 extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     if (frame.errCode != UINT64_MAX) {
         exception_handler(gpr, frame);
         return;
     }
-    if (interruptHandlers[frame.intNum].get() != nullptr) {
+    if (frame.intNum == 0x20) {
+        task_switch_handler(frame);
+    } else if (interruptHandlers[frame.intNum].get() != nullptr) {
         interruptHandlers[frame.intNum].get()(gpr, frame);
     } else {
         if (!isIrq(frame.intNum)) {

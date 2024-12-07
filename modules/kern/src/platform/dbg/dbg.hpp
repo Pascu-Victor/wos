@@ -22,7 +22,8 @@ void log(const char *format, Args... args) {
         __logVar(format, args...);
     }
 }
-
+void logFbOnly(const char *str);
+void logFbAdvance(void);
 void error(const char *str);
 void enableTime(void);
 

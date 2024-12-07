@@ -27,10 +27,10 @@ void park() {
     }
 }
 
-void cpuParamInit(uint64_t* stack) {
-    (void)stack;
-    // ker::mod::desc::gdt::initDescriptors((uint64_t)stack + sizeof((uint64_t)stack));
-    apic::init();
+void cpuParamInit(uint32_t* cpuNo) {
+    // ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
+    // apic::init();
+    apic::setCpuId(*cpuNo);
     desc::idt::idtInit();
 
     // auto firstTask = new sched::task::Task("park", (uint64_t)&park, sched::task::TaskType::DAEMON);
@@ -76,7 +76,7 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
         }
         auto stack = mm::Stack();
         cpuData->thatCpu(i)->stack_pointer_ref = &stack.sp;
-        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack, stack.sp);
+        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack, &smp_request.response->cpus[i]->processor_id);
     }
 
     runHandoverTasks(modules, kernelRsp);

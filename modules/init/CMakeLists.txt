@@ -10,7 +10,7 @@ set(TARGET init)
 file(GLOB_RECURSE CFILES RELATIVE ${CMAKE_SOURCE_DIR} "*.cpp")
 list(FILTER CFILES EXCLUDE REGEX "CMakeFiles/.*")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffreestanding -O2 -std=c++23 -mno-sse -mno-sse2 -Wall")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffreestanding -g -O0 -std=c++23 -mno-sse -mno-sse2 -Wall")
 
 add_executable(${TARGET} ${CFILES})
 

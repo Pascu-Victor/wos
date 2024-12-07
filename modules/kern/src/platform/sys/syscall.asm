@@ -1,18 +1,17 @@
 bits 64
 section .text
-%include "platform/asm/helpers.asm"
+%include "../asm/helpers.asm"
 extern syscallHandler
 global _wOS_asm_syscallHandler
 
 _wOS_asm_syscallHandler:
-    cli
     swapgs
     ; ffff800000000000
     mov [gs:0x08], rsp ; save usermode stack
     mov rsp, [gs:0x0] ; switch to kernel stack
 
-
-
+    pushl
+    cld
 
     ; save usermode segment ds and es
     mov [gs:0x18], ds
@@ -21,18 +20,14 @@ _wOS_asm_syscallHandler:
     mov ds, ax
     mov es, ax
 
-
     ; push qword 0x1b       ; usermode data segment
     ; push qword [gs:0x08]  ; usermode stack
     ; push r11              ; usermode rflags
     ; push qword 0x23       ; usermode code segment
     ; push rcx              ; usermode rip
 
-    cld
-    pushl
-
-    mov rdi, rsp
-    mov rbp, 0
+    ; mov rdi, rsp
+    ; mov rbp, 0
 
     call syscallHandler
 

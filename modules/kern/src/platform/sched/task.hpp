@@ -41,6 +41,8 @@ struct Thread {
 struct Task {
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
+    Task(const Task& task);
+
     mm::paging::PageTable* pagemap;
     Context context;
     uint64_t entry;

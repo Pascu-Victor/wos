@@ -26,6 +26,16 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->context.frame.rip = elfEntry;
 }
 
+Task::Task(const Task& task) {
+    this->name = task.name;
+    this->entry = task.entry;
+    this->context = task.context;
+    this->pagemap = task.pagemap;
+    this->type = task.type;
+    this->cpu = task.cpu;
+    this->thread = task.thread;
+}
+
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 
 void Task::saveContext(cpu::GPRegs* gpr) {

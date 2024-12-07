@@ -27,7 +27,11 @@ void copyKernelMappings(sched::task::Task* t) {
 
 void switchPagemap(sched::task::Task* t) {
     if (!t->pagemap) {
-        // PANIC!
+        if (t->name) {
+            dbg::log("Task %s has no pagemap\n", t->name);
+        } else {
+            dbg::log("Task has no pagemap\n Halting.");
+        }
         hcf();
     }
 

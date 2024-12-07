@@ -30,7 +30,7 @@ override DEFAULT_KLD := ld.lld
 $(eval $(call DEFAULT_VAR,KLD,$(DEFAULT_KLD)))
 
 # User controllable C flags.
-override DEFAULT_KCFLAGS := -g -O2 -pip
+override DEFAULT_KCFLAGS := -g -O0 -pip
 $(eval $(call DEFAULT_VAR,KCFLAGS,$(DEFAULT_KCFLAGS)))
 
 # User controllable C preprocessor flags. We set none by default.
@@ -46,7 +46,7 @@ override DEFAULT_KLDFLAGS :=
 $(eval $(call DEFAULT_VAR,KLDFLAGS,$(DEFAULT_KLDFLAGS)))
 
 # User controllable C++ flags.
-override DEFAULT_KCXXFLAGS := -g -O2 -pipe
+override DEFAULT_KCXXFLAGS := -g -O0 -pipe
 $(eval $(call DEFAULT_VAR,KCXXFLAGS,$(DEFAULT_KCXXFLAGS)))
 
 # Internal C flags that should not be changed by the user.
@@ -124,8 +124,8 @@ override KLDFLAGS += \
 	-z text \
 	-z max-page-size=0x1000 \
 	-T linker.ld \
-    -v \
-    -L../stdlib/bin -lstdkern
+	-v \
+	-L../stdlib/bin -lstdkern
 
 # Internal nasm flags that should not be changed by the user.
 override KNASMFLAGS += \
@@ -184,7 +184,11 @@ obj/%.S.o: src/%.S GNUmakefile
 # Compilation rules for *.asm (nasm) files.
 obj/%.asm.o: src/%.asm GNUmakefile
 	mkdir -p "$$(dirname $@)"
-	nasm $(KNASMFLAGS) $< -o $@
+	CWD=$(shell pwd)/$@ && \
+	cd "$$(dirname $<)" && \
+	nasm $(KNASMFLAGS) "$$(basename $<)" -o "$$CWD"
+	cd -
+
 
 # Remove object files and the final executable.
 .PHONY: clean

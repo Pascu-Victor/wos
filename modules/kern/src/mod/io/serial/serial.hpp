@@ -11,6 +11,7 @@ namespace ker::mod::io {
 namespace serial {
 void init(void);
 void write(const char *str);
+void write(const char *str, uint64_t len);
 void write(const char c);
 void write(uint64_t num);
 void writeHex(uint64_t num);

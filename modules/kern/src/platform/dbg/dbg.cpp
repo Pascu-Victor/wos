@@ -127,6 +127,18 @@ void __logVar(const char* format, ...) {
     va_end(args);
 }
 
+void logFbOnly(const char* str) {
+    logLock.lock();
+    fbLog(str);
+    logLock.unlock();
+}
+
+void logFbAdvance(void) {
+    logLock.lock();
+    linesLogged++;
+    logLock.unlock();
+}
+
 void error(const char* str) {
     logLock.lock();
     log(str);

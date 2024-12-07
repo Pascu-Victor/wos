@@ -4,20 +4,24 @@ namespace ker::mod::desc::idt {
 __attribute__((aligned(0x10))) static IdtEntry idt[IDT_ENTRIES];  // at most 256 interrupts
 static IdtPtr idtPtr;
 
-void idtSetEntry(IdtEntry* entry, void* isr, uint8_t flags) {
-    entry->isr_low = (uint64_t)isr & 0xFFFF;
+void idtSetEntry(IdtEntry* entry, void* isr, uint8_t gateType) {
+    entry->offset0 = (uint64_t)isr & 0xFFFF;
     entry->kernel_cs = gdt::GDT_KERN_CS;
     entry->ist = 0;
-    entry->attributes = flags;
-    entry->isr_mid = ((uint64_t)isr >> 16) & 0xFFFF;
-    entry->isr_high = ((uint64_t)isr >> 32) & 0xFFFFFFFF;
-    entry->reserved = 0;
+    entry->reserved0 = 0;
+    entry->gateType = gateType;
+    entry->zero0 = 0;
+    entry->dpl = 0;  // kernel level
+    entry->present = 1;
+    entry->offset1 = ((uint64_t)isr >> 16) & 0xFFFF;
+    entry->offset2 = ((uint64_t)isr >> 32) & 0xFFFFFFFF;
+    entry->reserved1 = 0;
 }
 
 static inline IdtEntry* calcIdtEntry(uint8_t intNumber) { return &idt[intNumber]; }
 
-#define ISR_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr##n, IDT_PRESENT | IDT_INTERRUPT_GATE)
-#define ISR_EXCEPT_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_PRESENT | IDT_TRAP_GATE)
+#define ISR_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE)
+#define ISR_EXCEPT_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE)
 
 void mapIsrEntries() {
     ISR_ENTRY(0);
@@ -289,7 +293,6 @@ void idtInit(void) {
     idtPtr.base = (uint64_t)&idt;
 
     __asm__ volatile("lidt %0" : : "m"(idtPtr));  // load the new IDT
-    asm volatile("sti");
     isInit = true;
 }
 

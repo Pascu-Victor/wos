@@ -1,11 +1,13 @@
 #pragma once
 
+#include <abi/callnums.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/asm/msr.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/sched/task.hpp>
 #include <std/hcf.hpp>
+#include <syscalls_impl/syscalls.hpp>
 
 namespace ker::mod::sys {
 

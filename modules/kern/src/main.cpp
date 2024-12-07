@@ -33,8 +33,6 @@ __attribute__((used, section(".requests_end_marker"))) static volatile LIMINE_RE
 
 using namespace ker::mod;
 
-__attribute__((aligned(16))) static uint64_t stack[KERNEL_STACK_SIZE];
-
 // Kernel entry point.
 extern "C" void _start(void) {
     if (LIMINE_BASE_REVISION_SUPPORTED == 0) {
@@ -55,8 +53,11 @@ extern "C" void _start(void) {
     dbg::log("Framebuffer mapped");
     dbg::log("Pages mapped");
 
+    uint8_t* stack = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+
     // Init gds.
-    ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
+    ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
+    asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
 
     // Init kmalloc
     ker::mod::mm::dyn::kmalloc::init();

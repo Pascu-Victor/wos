@@ -11,22 +11,21 @@ namespace ker::mod::desc::gdt {
 constexpr static uint64_t GDT_ENTRY_NULL = 0;
 constexpr static uint64_t GDT_ENTRY_KERNEL_CODE = 1;
 constexpr static uint64_t GDT_ENTRY_KERNEL_DATA = 2;
-constexpr static uint64_t GDT_ENTRY_USER_CODE = 3;
-constexpr static uint64_t GDT_ENTRY_USER_DATA = 4;
-constexpr static uint64_t GDT_ENTRY_TLS_MIN = 5;
-constexpr static uint64_t GDT_ENTRY_TLS_MAX = 6;
-constexpr static uint64_t GDT_ENTRY_CPUNODE = 7;
+constexpr static uint64_t GDT_ENTRY_USER_DATA = 3;
+constexpr static uint64_t GDT_ENTRY_USER_CODE = 4;
 // 2 entries for TSS technically count in the gdt count but are stored in a separate struct
 constexpr static uint64_t GDT_TSS_OFFSET = 2;
-constexpr static uint64_t GDT_ENTRY_TSS = 8;
+constexpr static uint64_t GDT_ENTRY_TSS = 5;
 
-constexpr static uint64_t GDT_ENTRY_COUNT = 10 - GDT_TSS_OFFSET;
+constexpr static uint64_t GDT_ENTRY_COUNT = 7 - GDT_TSS_OFFSET;
 
 constexpr static uint64_t GDT_KERN_CS = 0x08;
 constexpr static uint64_t GDT_KERN_DS = 0x10;
 
 constexpr static uint64_t GDT_USER_CS = 0x18;
 constexpr static uint64_t GDT_USER_DS = 0x20;
+
+constexpr static uint64_t GDT_RING3 = 0x3;
 
 struct TssDescriptor {
     uint16_t size;
@@ -44,7 +43,7 @@ struct Tss_t {
     uint64_t rsp[3];
     uint64_t reserved1;
     uint64_t ist[7];
-    uint64_t reserved2;
+    uint64_t interruptSSPTable;
     uint16_t reserved3;
     uint16_t iomap_base;
 } __attribute__((packed));
@@ -54,10 +53,28 @@ struct GdtEntry {
     uint16_t limit_low;
     uint16_t base_low;
     uint8_t base_middle;
-    uint8_t access;
-    uint8_t granularity;
+    uint8_t segmentType : 4;
+    uint8_t descriptorType : 1;
+    uint8_t dpl : 2;
+    uint8_t present : 1;
+    uint8_t limit_high : 4;
+    uint8_t avl : 1;
+    uint8_t longMode : 1;
+    uint8_t defaultSize : 1;
+    uint8_t granularity : 1;
     uint8_t base_high;
 } __attribute__((packed));
+
+struct GdtFlags {
+    uint8_t segmentType : 4;     // type of segment
+    uint8_t descriptorType : 1;  // 0 for system, 1 for code/data
+    uint8_t dpl : 2;             // descriptor privilege level
+    uint8_t present : 1;         // 1 for valid entries
+    uint8_t avl : 1;             // available for use by system software
+    uint8_t longMode : 1;        // 64-bit code segment
+    uint8_t defaultSize : 1;     // 0 for 64-bit code segment
+    uint8_t granularity : 1;     // 0 for 1 byte granularity, 1 for 4KB granularity
+};
 
 struct GdtPtr {
     uint16_t limit;

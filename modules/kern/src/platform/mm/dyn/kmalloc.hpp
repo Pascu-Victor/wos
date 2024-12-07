@@ -1,9 +1,10 @@
 #pragma once
 
 // #include "slab.hpp"
+#include <minimalist_malloc/mini_malloc.hpp>
+
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
-#include "tlsf/tlsf.hpp"
 
 namespace ker::mod::mm::dyn::kmalloc {
 static const uint64_t KMALLOC_NOGROW = 1;

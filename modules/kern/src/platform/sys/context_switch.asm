@@ -1,10 +1,9 @@
 bits 64
 
-%include "platform/asm/helpers.asm"
+%include "../asm/helpers.asm"
 
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:
-    cli
     ;clear registers
 
     xor rax, rax
@@ -44,16 +43,24 @@ _wOS_asm_enterUsermode:
     ; sysret params
     mov rcx, rdi   ; set RIP
     mov r11, 0x202 ; RFLAGS IF=1 and RESERVED=1
-    sti
     o64 sysret
 
 extern _wOS_schedTimer
 global task_switch_handler
 task_switch_handler:
+    ; mov ax, 0x10
+    ; mov ds, ax
+    ; mov es, ax
+    ; mov fs, ax
+    ; mov gs, ax
     cld
-    pushl
-    ; mov rdi, rsp
+    ; pushl
+    mov rdi, rsp
     call _wOS_schedTimer
-    popl
-    add rsp, 16
-    iretq
+    ; popl
+    ; mov ax, [rsp+8]
+    ; mov ds, ax
+    ; mov es, ax
+    ; mov fs, ax
+    ; mov gs, ax
+    ret

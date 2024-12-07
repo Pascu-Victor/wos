@@ -41,6 +41,8 @@
 #define IA32_FMASK 0xC0000084
 #define IA32_CSTAR 0xC0000083
 
+#define IA32_APIC_BASE 0x1B
+
 #define GS_BASE 0xC0000101
 
 static inline void cpuid(uint32_t eax, uint32_t *eax_out, uint32_t *edx_out) {

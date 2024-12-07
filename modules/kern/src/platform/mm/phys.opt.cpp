@@ -87,7 +87,7 @@ void* pageAlloc(uint64_t size) {
         return nullptr;
     }
 
-    // memset(block, 0, size);
+    memset(block, 0, size);
 
     memlock.unlock();
     return block;

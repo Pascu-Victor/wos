@@ -16,7 +16,7 @@ struct interruptFrame {
     uint64_t flags;
     uint64_t rsp;
     uint64_t ss;
-};
+} __attribute__((packed));
 
 enum : uint64_t {
     IRQ0 = 32,

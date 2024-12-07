@@ -8,7 +8,6 @@ static smt::PerCpuVar<RunQueue> *runQueues;
 
 bool postTask(task::Task *task) {
     runQueues->get().activeTasks.push_back(task);
-    dbg::log("addr of rq task: %x", runQueues->get().activeTasks.front());
     return true;
 }
 
@@ -30,9 +29,10 @@ void processTasks(ker::mod::cpu::GPRegs &gpr, ker::mod::gates::interruptFrame &f
 }
 
 void percpuInit() {
-    dbg::log("Initializing scheduler, CPU:%x", cpu::currentCpu());
-    // runQueues->thisCpu()->activeTasks = std::list<task::Task *>();
-    // runQueues->thisCpu()->expiredTasks = std::list<task::Task *>();
+    auto cpu = cpu::currentCpu();
+    dbg::log("Initializing scheduler, CPU:%x", cpu);
+    runQueues->get().activeTasks = std::list<task::Task *>();
+    runQueues->get().expiredTasks = std::list<task::Task *>();
 }
 
 void startScheduler() {

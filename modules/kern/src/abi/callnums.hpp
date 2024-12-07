@@ -1,5 +1,5 @@
 #pragma once
-
+#include <std/cstdint.hpp>
 namespace ker::abi {
-enum class callnums { sys_log, futex };
+enum class callnums : uint64_t { sysLog, futex };
 }  // namespace ker::abi

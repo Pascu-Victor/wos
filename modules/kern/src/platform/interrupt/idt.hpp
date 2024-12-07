@@ -8,19 +8,22 @@ namespace ker::mod::desc::idt {
 // IDT Setup
 const static uint64_t IDT_ENTRIES = 256;
 
-const static uint64_t IDT_PRESENT = 0b10000000;
-const static uint64_t IDT_INTERRUPT_GATE = 0b1110;
-const static uint64_t IDT_TRAP_GATE = 0b1111;
+const static uint64_t IDT_INTERRUPT_GATE = 0xE;
+const static uint64_t IDT_TRAP_GATE = 0xF;
 
 // interrupt descriptor table long mode
 struct IdtEntry {
-    uint16_t isr_low;    // The lower 16 bits of the ISR's address
-    uint16_t kernel_cs;  // The GDT segment selector that the CPU will load into CS before calling the ISR
-    uint8_t ist;         // The IST in the TSS that the CPU will load into RSP; set to zero for now
-    uint8_t attributes;  // Type and attributes; see the IDT page
-    uint16_t isr_mid;    // The higher 16 bits of the lower 32 bits of the ISR's address
-    uint32_t isr_high;   // The higher 32 bits of the ISR's address
-    uint32_t reserved;   // Set to zero
+    uint16_t offset0;       // The lower 16 bits of the ISR's address
+    uint16_t kernel_cs;     // The GDT segment selector that the CPU will load into CS before calling the ISR
+    uint8_t ist : 3;        // The IST in the TSS that the CPU will load into RSP; set to zero for now
+    uint8_t reserved0 : 5;  // Set to zero
+    uint8_t gateType : 4;   // Type and attributes; see the IDT page
+    uint8_t zero0 : 1;      // Set to zero
+    uint8_t dpl : 2;        // Descriptor privilege level; 0 for now
+    uint8_t present : 1;    // Must be 1 for valid entries
+    uint16_t offset1;       // The middle 16 bits of the ISR's address
+    uint32_t offset2;       // The upper 32 bits of the ISR's address
+    uint32_t reserved1;     // Set to zero
 } __attribute__((packed));
 
 struct IdtPtr {

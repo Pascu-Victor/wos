@@ -2,7 +2,7 @@ bits 64
 
 extern iterrupt_handler
 
-%include "platform/asm/helpers.asm"
+%include "../asm/helpers.asm"
 
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace
@@ -77,15 +77,19 @@ isr_except 14
 %assign i i + 1
 %endrep
 
-global isr32
-extern task_switch_handler
-isr32:
-    push 0
-    push 32
-    jmp task_switch_handler
+; global isr32
+; extern task_switch_handler
+; isr32:
+;     push qword 0
+;     push qword 32
+;     cmp [rsp + 24], dword 8 ; Check if we're in userspace
+;     je .isr32_entry
+;     ; swapgs
+;     .isr32_entry:
+;     jmp task_switch_handler
 
-%assign i 33
-%rep 15
+%assign i 32
+%rep 16
     isr i
 %assign i i + 1
 %endrep

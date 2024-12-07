@@ -1,9 +1,14 @@
 #pragma once
 #include <defines/defines.hpp>
 
-namespace ker::abi::inter::sys_log {
+namespace ker::abi::inter::sysLog {
 enum class sys_log_ops : uint64_t {
     log,
-    log_line,
+    logLine,
 };
-}  // namespace ker::abi::inter::sys_log
+
+enum class sys_log_device : uint64_t {
+    serial,
+    vga,
+};
+}  // namespace ker::abi::inter::sysLog

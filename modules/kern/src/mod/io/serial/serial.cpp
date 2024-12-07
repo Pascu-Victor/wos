@@ -24,6 +24,13 @@ void write(const char *str) {
     }
 }
 
+void write(const char *str, uint64_t len) {
+    for (size_t i = 0; i < len; i++) {
+        while ((inb(0x3F8 + 5) & 0x20) == 0);
+        outb(0x3F8, str[i]);
+    }
+}
+
 void write(const char c) {
     while ((inb(0x3F8 + 5) & 0x20) == 0);
     outb(0x3F8, c);

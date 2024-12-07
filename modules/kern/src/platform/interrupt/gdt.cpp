@@ -23,15 +23,88 @@ void initTss(uint64_t *stackPointer) {
     tss.ist[0] = 0;  // Disable IST
 }
 
+GdtEntry constexpr makeGdtEntry(uint32_t limit, uint32_t base, GdtFlags flags) {
+    GdtEntry entry;
+    entry.limit_low = limit & 0xFFFF;
+    entry.base_low = base & 0xFFFF;
+    entry.base_middle = (base >> 16) & 0xFF;
+    entry.segmentType = flags.segmentType;
+    entry.descriptorType = flags.descriptorType;
+    entry.dpl = flags.dpl;
+    entry.present = flags.present;
+    entry.limit_high = (limit >> 16) & 0xF;
+    entry.avl = flags.avl;
+    entry.longMode = flags.longMode;
+    entry.defaultSize = flags.defaultSize;
+    entry.granularity = flags.granularity;
+    entry.base_high = (base >> 24) & 0xFF;
+    return entry;
+}
+
 void initGdt(uint64_t *stackPointer) {
-    gdt.memorySegments[GDT_ENTRY_NULL] = {0, 0, 0, 0, 0, 0};               // null
-    gdt.memorySegments[GDT_ENTRY_KERNEL_CODE] = {0, 0, 0, 0x9A, 0xA2, 0};  // kernelCode
-    gdt.memorySegments[GDT_ENTRY_KERNEL_DATA] = {0, 0, 0, 0x92, 0xA0, 0};  // kernelData
-    gdt.memorySegments[GDT_ENTRY_USER_CODE] = {0, 0, 0, 0xF2, 0, 0};       // userCode
-    gdt.memorySegments[GDT_ENTRY_USER_DATA] = {0, 0, 0, 0xFA, 0x20, 0};    // userData
-    gdt.memorySegments[GDT_ENTRY_TLS_MIN] = {0, 0, 0, 0x92, 0, 0};         // tlsMin
-    gdt.memorySegments[GDT_ENTRY_TLS_MAX] = {0, 0, 0, 0x92, 0, 0};         // tlsMax
-    gdt.memorySegments[GDT_ENTRY_CPUNODE] = {0, 0, 0, 0x92, 0, 0};         // cpuNode
+    /*
+    null        -  0x00
+    kernel Code -  (present, ring 0, type: code, non-conforming, readable)
+    kernel Data -  (present, ring 0, type: data, expand-down)
+    user Code   -  (present, ring 3, type: code, non-conforming, readable)
+    user Data   -  (present, ring 3, type: data, expand-down)
+    */
+    gdt.memorySegments[GDT_ENTRY_NULL] = makeGdtEntry(0, 0,
+                                                      {
+                                                          .segmentType = 0,
+                                                          .descriptorType = 0,
+                                                          .dpl = 0,
+                                                          .present = 0,
+                                                          .avl = 0,
+                                                          .longMode = 0,
+                                                          .defaultSize = 0,
+                                                          .granularity = 0,
+                                                      });  // null
+    gdt.memorySegments[GDT_ENTRY_KERNEL_CODE] = makeGdtEntry(0, 0,
+                                                             {
+                                                                 .segmentType = 0xA,
+                                                                 .descriptorType = 1,
+                                                                 .dpl = 0,
+                                                                 .present = 1,
+                                                                 .avl = 0,
+                                                                 .longMode = 1,
+                                                                 .defaultSize = 0,
+                                                                 .granularity = 1,
+                                                             });  // kernel Code
+    gdt.memorySegments[GDT_ENTRY_KERNEL_DATA] = makeGdtEntry(0, 0,
+                                                             {
+                                                                 .segmentType = 0x2,
+                                                                 .descriptorType = 1,
+                                                                 .dpl = 0,
+                                                                 .present = 1,
+                                                                 .avl = 0,
+                                                                 .longMode = 1,
+                                                                 .defaultSize = 0,
+                                                                 .granularity = 1,
+                                                             });  // kernel Data
+    gdt.memorySegments[GDT_ENTRY_USER_CODE] = makeGdtEntry(0, 0,
+                                                           {
+                                                               .segmentType = 0xA,
+                                                               .descriptorType = 1,
+                                                               .dpl = 3,
+                                                               .present = 1,
+                                                               .avl = 0,
+                                                               .longMode = 1,
+                                                               .defaultSize = 0,
+                                                               .granularity = 1,
+                                                           });  // user Code
+    gdt.memorySegments[GDT_ENTRY_USER_DATA] = makeGdtEntry(0, 0,
+                                                           {
+                                                               .segmentType = 0x2,
+                                                               .descriptorType = 1,
+                                                               .dpl = 3,
+                                                               .present = 1,
+                                                               .avl = 0,
+                                                               .longMode = 1,
+                                                               .defaultSize = 0,
+                                                               .granularity = 1,
+                                                           });  // user Data
+
     gdt.ptr = {sizeof(Gdt) - 1, (uint64_t)&gdt};
 
     initTss(stackPointer);
