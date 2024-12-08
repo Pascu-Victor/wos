@@ -29,7 +29,7 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     ker::mod::io::serial::write("PANIC!\n");
     // print frame info
     ker::mod::io::serial::write("CPU: ");
-    ker::mod::io::serial::write((uint64_t)smt::thisCpuInfo().processor_id);
+    ker::mod::io::serial::write((uint64_t)apic::getApicId());
     ker::mod::io::serial::write("\n");
     ker::mod::io::serial::write("Interrupt number: ");
     ker::mod::io::serial::write(frame.intNum);

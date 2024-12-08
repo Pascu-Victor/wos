@@ -7,7 +7,7 @@ __attribute__((used, section(".requests"))) const static volatile limine_smp_req
     .flags = 1,
 };
 namespace ker::mod::smt {
-PerCpuCrossAccess<CpuInfo>* cpuData;
+static PerCpuCrossAccess<CpuInfo>* cpuData;
 uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t cpu_count;
@@ -27,12 +27,16 @@ void park() {
     }
 }
 
-void cpuParamInit(uint32_t* cpuNo) {
+void cpuParamInit() {
     // ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
     // apic::init();
-    apic::setCpuId(*cpuNo);
-    desc::idt::idtInit();
+    apic::initApicMP();
+    uint64_t cpuNo = apic::getApicId();
 
+    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)cpuData->thatCpu(cpuNo)->stack_pointer_ref - KERNEL_STACK_SIZE);
+
+    cpu::setCurrentCpuid(cpuNo);
+    desc::idt::idtInit();
     // auto firstTask = new sched::task::Task("park", (uint64_t)&park, sched::task::TaskType::DAEMON);
     sched::percpuInit();
     // sched::postTask(firstTask);
@@ -60,6 +64,8 @@ void init() {
 // init per cpu data
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp) {
     assert(smp_request.response != nullptr);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, kernelRsp - KERNEL_STACK_SIZE);
+    cpu::setCurrentCpuid(0);
 
     cpuData = new PerCpuCrossAccess<CpuInfo>();
 
@@ -67,18 +73,13 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
         cpuData->thatCpu(i)->processor_id = smp_request.response->cpus[i]->processor_id;
         cpuData->thatCpu(i)->lapic_id = smp_request.response->cpus[i]->lapic_id;
         cpuData->thatCpu(i)->goto_address = &smp_request.response->cpus[i]->goto_address;
-        cpuData->thatCpu(i)->stack_pointer_ref = (uint64_t**)&(smp_request.response->cpus[i]->extra_argument);
+        cpuData->thatCpu(i)->stack_pointer_ref = (uint64_t*)(smp_request.response->cpus[i]->extra_argument);
     }
-
-    for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
-        if (i == cpu::currentCpu()) {
-            continue;
-        }
+    for (uint64_t i = 1; i < smp_request.response->cpu_count; i++) {
         auto stack = mm::Stack();
-        cpuData->thatCpu(i)->stack_pointer_ref = &stack.sp;
-        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack, &smp_request.response->cpus[i]->processor_id);
+        cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
+        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack);
     }
-
     runHandoverTasks(modules, kernelRsp);
     hcf();
 }

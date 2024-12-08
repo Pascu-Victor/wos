@@ -282,18 +282,13 @@ void mapIsrEntries() {
     ISR_ENTRY(255);
 }
 
-bool isInit = false;
 void idtInit(void) {
-    if (isInit) {
-        return;
-    }
     mapIsrEntries();
 
     idtPtr.limit = (uint16_t)sizeof(idt) - 1;
     idtPtr.base = (uint64_t)&idt;
 
     __asm__ volatile("lidt %0" : : "m"(idtPtr));  // load the new IDT
-    isInit = true;
 }
 
 }  // namespace ker::mod::desc::idt

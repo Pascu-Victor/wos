@@ -53,11 +53,12 @@ extern "C" void _start(void) {
     dbg::log("Framebuffer mapped");
     dbg::log("Pages mapped");
 
-    uint8_t* stack = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    uint8_t* stack;  // = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
 
     // Init gds.
+    asm volatile("mov %%rsp, %0" : "=r"(stack));
     ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
-    asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
+    // asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
 
     // Init kmalloc
     ker::mod::mm::dyn::kmalloc::init();
@@ -86,12 +87,13 @@ extern "C" void _start(void) {
         modules.modules[i].entry = kernelModuleRequest.response->modules[i]->address;
         modules.modules[i].size = kernelModuleRequest.response->modules[i]->size;
         modules.modules[i].cmdline = kernelModuleRequest.response->modules[i]->path;
+        modules.modules[i].name = kernelModuleRequest.response->modules[i]->path;
     }
 
-    uint8_t* kernelRsp = (uint8_t*)mm::dyn::kmalloc::malloc(KERNEL_STACK_SIZE);  // 16KB
-    kernelRsp += KERNEL_STACK_SIZE;                                              // Stack grows down so we start at the top.
+    // uint8_t* kernelRsp = (uint8_t*)mm::dyn::kmalloc::malloc(KERNEL_STACK_SIZE);  // 16KB
+    // kernelRsp += KERNEL_STACK_SIZE;                                              // Stack grows down so we start at the top.
     // Init smt
-    ker::mod::smt::startSMT(modules, (uint64_t)kernelRsp);
+    ker::mod::smt::startSMT(modules, (uint64_t)stack);
 
     // Kernel should halt and catch fire if it reaches this point.
     hcf();

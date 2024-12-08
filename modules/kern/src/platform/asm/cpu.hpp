@@ -16,6 +16,7 @@ struct CpuidContext {
 
 void cpuid(struct CpuidContext *cpuid_context);
 uint64_t currentCpu(void);
+void setCurrentCpuid(uint64_t id);
 
 struct GPRegs {
     uint64_t r15;
@@ -38,10 +39,8 @@ struct GPRegs {
 struct PerCpu {
     uint64_t syscallStack;
     uint64_t kernelStack;
+    uint64_t cpuId;
 } __attribute__((packed));
-
-#define CURRENT_CPU \
-    { (PerCpu *)cpuGetMSR(GS_BASE); }
 
 static __always_inline uint64_t rdfsbase(void) {
     uint64_t fsbase;

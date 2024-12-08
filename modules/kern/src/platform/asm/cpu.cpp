@@ -7,7 +7,17 @@ void cpuid(struct CpuidContext* cpuid_context) {
                  : "a"(cpuid_context->function));
 }
 
-uint64_t currentCpu(void) { return apic::cpuid(); }
+uint64_t currentCpu(void) {
+    PerCpu* cpuPtr;
+    cpuGetMSR(IA32_KERNEL_GS_BASE, (uint64_t*)&cpuPtr);
+    return cpuPtr->cpuId;
+}
+
+void setCurrentCpuid(uint64_t id) {
+    PerCpu* cpuPtr;
+    cpuGetMSR(IA32_KERNEL_GS_BASE, (uint64_t*)&cpuPtr);
+    cpuPtr->cpuId = id;
+}
 
 void enablePAE(void) {
     uint64_t cr4;

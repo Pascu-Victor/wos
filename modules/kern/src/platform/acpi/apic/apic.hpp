@@ -9,34 +9,6 @@
 #include <platform/mm/addr.hpp>
 
 namespace ker::mod::apic {
-static uint64_t LAPIC_BASE = 0x0;
-static const uint64_t LAPIC_ID = 0x20;
-static const uint64_t LAPIC_EOI = 0xb0;
-static const uint64_t LAPIC_SPURIOUS = 0xf0;
-static const uint64_t LAPIC_LVT_TIMER = 0x320;
-static const uint64_t LAPIC_TIMER_MASK = 0x10000;
-static const uint64_t LAPIC_TIMER_PERIODIC = 0x20000;
-static const uint64_t LAPIC_TIMER_INIT_COUNT = 0x380;
-static const uint64_t LAPIC_TIMER_CURRENT_COUNT = 0x390;
-static const uint64_t LAPIC_TIMER_DIV = 0x3e0;
-
-void write(uint32_t offset, uint32_t value);
-uint32_t read(uint32_t offset);
-
-void enable(void);
-void eoi(void);
-
-uint32_t calibrateTimer(uint64_t us);
-void setTimeout(uint64_t numTicks);
-int cpuid(void);
-void setCpuId(uint32_t id);
-
-void oneShotTimer(uint64_t ticks);
-
-void init(void);
-}  // namespace ker::mod::apic
-
-namespace ker::mod::apic2 {
 static uint64_t APIC_BASE = 0x0;
 
 enum class APICRegisters {
@@ -106,23 +78,26 @@ enum class APICQueries : uint32_t {
     ICR0_DELIVERY_STATUS = (1 << 12),
 };
 
-static void writeReg(uint32_t reg, uint32_t value);
+void writeReg(uint32_t reg, uint32_t value);
 
-static uint32_t readReg(uint32_t reg);
+uint32_t readReg(uint32_t reg);
 
-static void eoi();
+void eoi();
 
-static void sendIpi(uint32_t lapicId, uint32_t vector, ICR0MessageType messageType);
+void sendIpi(uint32_t lapicId, uint32_t vector, ICR0MessageType messageType);
 
-static void resetApicCounter();
+void resetApicCounter();
 
-static uint64_t getTicks();
+uint64_t getTicks();
 
-static void calibrateTimer(uint64_t us);
+uint32_t calibrateTimer(uint64_t us);
 
 void oneShotTimer(uint64_t ticks);
 
-void initForCpu(uint64_t cpuNo);
+void init();
+void initApicMP();
 
-void startInterrupts();
-}  // namespace ker::mod::apic2
+uint32_t getApicId();
+
+// void startInterrupts();
+}  // namespace ker::mod::apic

@@ -39,8 +39,8 @@ void startScheduler() {
     dbg::log("Starting scheduler, CPU:%x", cpu::currentCpu());
     // time::sleep(1000);
     auto firstTask = runQueues->get().activeTasks.front();
-    cpuSetMSR(IA32_GS_BASE, (uint64_t)firstTask->context.syscallUserStack);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)firstTask->context.syscallKernelStack);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
+    cpuSetMSR(IA32_GS_BASE, (uint64_t)firstTask->context.syscallUserStack - USER_STACK_SIZE);
     mm::virt::switchPagemap(firstTask);
     sys::context_switch::startSchedTimer();
     _wOS_asm_enterUsermode(firstTask->entry, firstTask->context.frame.rsp);

@@ -20,7 +20,10 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     mm::virt::copyKernelMappings(this);
     mm::virt::mapPage(this->pagemap, (uint64_t)this->context.frame.rsp - mm::paging::PAGE_SIZE,
                       (uint64_t)this->context.frame.rsp - mm::paging::PAGE_SIZE, mm::paging::pageTypes::USER);
-
+    if (elfStart == 0) {
+        dbg::log("No elf start\n halting");
+        hcf();
+    }
     uint64_t elfEntry = loader::elf::loadElf((loader::elf::ElfFile*)elfStart, this->pagemap);
     this->entry = elfEntry;
     this->context.frame.rip = elfEntry;
@@ -39,8 +42,8 @@ Task::Task(const Task& task) {
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 
 void Task::saveContext(cpu::GPRegs* gpr) {
-    cpuSetMSR(IA32_GS_BASE, (uint64_t)this->context.syscallUserStack);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)this->context.syscallKernelStack);
+    cpuSetMSR(IA32_GS_BASE, (uint64_t)this->context.syscallUserStack - USER_STACK_SIZE);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)this->context.syscallKernelStack - KERNEL_STACK_SIZE);
     *gpr = context.regs;
 }
 }  // namespace ker::mod::sched::task

@@ -22,7 +22,7 @@ struct CpuInfo {
     uint32_t processor_id;
     uint32_t lapic_id;
     CpuGotoAddr* goto_address = nullptr;
-    uint64_t** stack_pointer_ref = nullptr;
+    uint64_t* stack_pointer_ref = nullptr;
 };
 
 uint64_t getCoreCount(void);
@@ -65,7 +65,7 @@ class PerCpuCrossAccess {
    public:
     PerCpuCrossAccess(T defaultValue = T()) { _data = new std::Borrowable<T>[getCoreCount()](defaultValue); }
 
-    std::Borrowable<T>::BorrowedRef thisCpu() { return _data[cpu::currentCpu()].borrow(); }
+    std::Borrowable<T>::BorrowedRef thisCpu() { return _data[apic::getApicId()].borrow(); }
 
     std::Borrowable<T>::BorrowedRef thatCpu(uint64_t cpu) { return _data[cpu].borrow(); }
 
@@ -74,21 +74,17 @@ class PerCpuCrossAccess {
     void setThatCpu(const T& data, uint64_t cpu) { _data[cpu] = data; }
 };
 
-template <size_t StackSize = 4096, typename... FuncArgs>
-void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<StackSize> stack, FuncArgs... data) {
+inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack) {
     uint64_t getCpuNode(uint64_t cpuNo);
 
     auto cpu = getCpuNode(cpuNo);
     auto cpuData = getCpu(cpu);
 
     // push function arguments to the stack of the target CPU
-    static_assert(sizeof...(data) < stack.size, "Stack size is too small for the data provided");
     *stack.sp = reinterpret_cast<uint64_t>(task);
     stack.sp++;
-    std::multimemcpy(stack.sp, data...);
-    stack.sp += sizeof...(data);
 
-    __atomic_store_n(cpuData.stack_pointer_ref, stack.sp, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&cpuData.stack_pointer_ref, stack.sp, __ATOMIC_SEQ_CST);
     __atomic_store_n(cpuData.goto_address, reinterpret_cast<CpuGotoAddr>(task), __ATOMIC_SEQ_CST);
 }
 

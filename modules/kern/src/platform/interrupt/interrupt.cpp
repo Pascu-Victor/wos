@@ -8,6 +8,7 @@ void init(void) {
     ker::mod::acpi::init();
     // Init APIC.
     ker::mod::apic::init();
+    ker::mod::apic::initApicMP();
     // Init ktime
     ker::mod::time::init();
     // Init interrupt descriptor table.
