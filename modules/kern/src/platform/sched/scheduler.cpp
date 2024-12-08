@@ -16,16 +16,13 @@ task::Task *getCurrentTask() {
     return task;
 }
 void processTasks(ker::mod::cpu::GPRegs &gpr, ker::mod::gates::interruptFrame &frame) {
-    // save current task
     apic::eoi();
     auto currentTask = getCurrentTask();
-    {
-        currentTask->context.regs = gpr;
-        currentTask->context.frame = frame;
-        runQueues->get().activeTasks.push_back(currentTask);
-        task::Task *nextTask = runQueues->get().activeTasks.pop_front();
-        sys::context_switch::switchTo(gpr, frame, nextTask);
-    }
+    currentTask->context.regs = gpr;
+    currentTask->context.frame = frame;
+    runQueues->get().activeTasks.push_back(currentTask);
+    task::Task *nextTask = runQueues->get().activeTasks.pop_front();
+    sys::context_switch::switchTo(gpr, frame, nextTask);
 }
 
 void percpuInit() {
@@ -37,7 +34,6 @@ void percpuInit() {
 
 void startScheduler() {
     dbg::log("Starting scheduler, CPU:%x", cpu::currentCpu());
-    // time::sleep(1000);
     auto firstTask = runQueues->get().activeTasks.front();
     cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
     cpuSetMSR(IA32_GS_BASE, (uint64_t)firstTask->context.syscallUserStack - USER_STACK_SIZE);

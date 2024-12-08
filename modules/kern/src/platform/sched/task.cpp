@@ -6,6 +6,9 @@
 namespace ker::mod::sched::task {
 Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
     this->name = name;
+    if (type == TaskType::IDLE) {
+        return;
+    }
     // this->entry = entry;
     // this->regs.ip = entry;
     this->pagemap = mm::virt::createPagemap();

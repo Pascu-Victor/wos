@@ -13,6 +13,7 @@ namespace ker::mod::sched::task {
 enum TaskType {
     DAEMON,
     PROCESS,
+    IDLE,
 };
 
 struct Context {

@@ -12,8 +12,8 @@
 
 namespace ker::mod::sched {
 struct RunQueue {
-    std::list<task::Task*> activeTasks;
-    std::list<task::Task*> expiredTasks;
+    std::list<task::Task*> activeTasks;   // TODO: replace with fast priority queue
+    std::list<task::Task*> expiredTasks;  // TODO: replace with fast priority queue
     task::Task* currentTask;
     [[nodiscard]]
     RunQueue()

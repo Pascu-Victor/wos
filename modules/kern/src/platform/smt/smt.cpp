@@ -21,12 +21,6 @@ const CpuInfo thisCpuInfo() { return cpuData->thisCpu().copy(); }
 // Future NUMA support here
 uint64_t getCpuNode(uint64_t cpuNo) { return cpuNo; }
 
-void park() {
-    while (true) {
-        asm volatile("hlt");
-    }
-}
-
 void cpuParamInit() {
     // ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
     // apic::init();
@@ -37,10 +31,9 @@ void cpuParamInit() {
 
     cpu::setCurrentCpuid(cpuNo);
     desc::idt::idtInit();
-    // auto firstTask = new sched::task::Task("park", (uint64_t)&park, sched::task::TaskType::DAEMON);
     sched::percpuInit();
-    // sched::postTask(firstTask);
-    park();
+    auto idleTask = new sched::task::Task("idle", 0, 0, sched::task::TaskType::IDLE);
+    sched::postTask(idleTask);
     sched::startScheduler();
 }
 
