@@ -85,7 +85,7 @@ inline void fbLog(const char* str) {
     stampLen++;
     gfx::fb::drawChar(stampLen, line, ':');
     stampLen++;
-    gfx::fb::drawString(stampLen, line, str);
+    linesLogged += gfx::fb::drawString(stampLen, line, str);
 }
 
 void logNewLineNoSync(void) {

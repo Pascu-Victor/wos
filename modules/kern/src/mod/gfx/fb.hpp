@@ -48,8 +48,9 @@ void drawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color = s
 void drawChar(uint16_t x, uint16_t y, char c, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
               uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
 
-void drawString(uint16_t x, uint16_t y, const char *str, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
-                uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
+// returns number of extra lines drawn (due to newlines)
+uint64_t drawString(uint16_t x, uint16_t y, const char *str, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
+                    uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
 
 void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color = static_cast<uint32_t>(TermColors::WHITE));
 
