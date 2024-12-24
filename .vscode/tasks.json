@@ -3,10 +3,10 @@
     "tasks": [
         {
             "label": "runWosKern",
-            "command": "${workspaceFolder}/modules/kern/scripts/run_kern.sh",
+            "command": "${workspaceFolder}/scripts/run_kern.sh",
             "type": "shell",
             "options": {
-                "cwd": "${workspaceFolder}/modules/kern"
+                "cwd": "${workspaceFolder}"
             },
             "args": [],
             "isBackground": true,
@@ -39,7 +39,7 @@
         {
             "type": "cppbuild",
             "label": "C/C++: g++ build active file",
-            "command": "/usr/bin/g++",
+            "command": "${workspaceFolder}/tools/llvm-build/bin/clang++",
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",

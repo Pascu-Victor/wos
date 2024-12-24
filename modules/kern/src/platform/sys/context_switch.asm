@@ -1,6 +1,6 @@
 bits 64
 
-%include "../asm/helpers.asm"
+%include "platform/asm/helpers.asm"
 
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:

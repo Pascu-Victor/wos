@@ -100,4 +100,6 @@ constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
     }
 }
 
+uint64_t cpuCount();
+
 }  // namespace ker::mod::smt

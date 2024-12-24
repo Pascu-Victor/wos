@@ -1,5 +1,6 @@
 #check that all .hpp files in PWD begin with a #pragma once
 set -e
+cd $1
 for i in $(find . -name "*.hpp"); do
     if [ "$(head -n 1 $i)" != "#pragma once" ]; then
         echo "Error: $i does not begin with #pragma once"
@@ -8,4 +9,5 @@ for i in $(find . -name "*.hpp"); do
         exit 1
     fi
 done
+cd -
 exit 0

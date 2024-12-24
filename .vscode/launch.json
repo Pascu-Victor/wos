@@ -8,7 +8,7 @@
             "name": "(gdb) Launch",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/modules/kern/bin/wos",
+            "program": "${workspaceFolder}/build/modules/kern/wos",
             "args": [],
             "stopAtEntry": true,
             "cwd": "${workspaceFolder}",

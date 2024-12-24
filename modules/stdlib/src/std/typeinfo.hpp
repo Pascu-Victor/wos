@@ -1,3 +1,4 @@
+#pragma once
 // RTTI support for -*- C++ -*-
 // Copyright (C) 1994-2024 Free Software Foundation, Inc.
 //

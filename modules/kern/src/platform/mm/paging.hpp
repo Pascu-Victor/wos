@@ -11,7 +11,7 @@ const static uint64_t PAGE_SHIFT = 12;
 const static uint64_t PAGE_SIZE = 0x1000;
 struct PageZone {
     PageZone* next;
-    buddy* buddy;
+    buddy* buddyInstance;
     uint64_t start;
     uint64_t len;
     size_t pageCount;

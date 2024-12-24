@@ -1,6 +1,6 @@
 bits 64
 section .text
-%include "../asm/helpers.asm"
+%include "platform/asm/helpers.asm"
 extern syscallHandler
 global _wOS_asm_syscallHandler
 

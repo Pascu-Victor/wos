@@ -11,7 +11,7 @@
                 "${workspaceFolder}/modules"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/clang",
+            "compilerPath": "${workspaceFolder}/tools/llvm-build/bin/clang",
             "intelliSenseMode": "linux-clang-x64"
         }
     ],

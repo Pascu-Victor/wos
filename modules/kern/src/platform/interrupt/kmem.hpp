@@ -25,8 +25,6 @@ struct page_table_entry {
     uint64_t no_execute : 1;
 } __attribute__((packed));
 
-static volatile page_table_entry* __page_table = nullptr;
-
 void init(void);
 
 uint64_t mmap_read(uint64_t addr, uint64_t offset);

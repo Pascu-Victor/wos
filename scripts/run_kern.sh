@@ -1,14 +1,22 @@
 #!/bin/bash
 set -e
-# run  scripts/check_headers.sh
-sh scripts/check_headers.sh
-if [ "$?" != "0" ]; then
-    echo "Error: check_headers.sh failed"
-    exit 1
-else
-    echo "all headers are good"
-fi
-make -j32
+
+function check_headers() {
+    sh scripts/check_headers.sh $1
+    if [ "$?" != "0" ]; then
+        echo "Error: check_headers.sh failed for modules/kern"
+        exit 1
+    else
+        echo "all headers are good"
+    fi
+}
+# run check_headers
+check_headers "modules/kern"
+check_headers "modules/init"
+check_headers "modules/stdlib"
+
+cmake -B build -GNinja .
+cmake --build build
 
 # run scripts/make_image.sh
 result=$(sh scripts/make_image.sh)

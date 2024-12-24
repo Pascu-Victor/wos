@@ -6,6 +6,7 @@
 	],
 	"settings": {
 		"files.associations": {
+			"*.pl": "prolog",
 			"stdbool.h": "c",
 			"coroutine": "c",
 			"cctype": "c",
@@ -122,7 +123,14 @@
 			"execution": "cpp",
 			"regex": "cpp",
 			"export": "cpp",
-			"expected": "cpp"
+			"expected": "cpp",
+			"__config_site": "cpp",
+			"__stddef_size_t.h": "c",
+			"__stddef_rsize_t.h": "c",
+			"__stddef_wchar_t.h": "c",
+			"__stddef_offsetof.h": "c",
+			"__stddef_max_align_t.h": "c",
+			"__locale": "cpp"
 		},
         "editor.formatOnSave": true,
         "files.exclude": {

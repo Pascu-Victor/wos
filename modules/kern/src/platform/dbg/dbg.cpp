@@ -108,15 +108,7 @@ void logString(const char* str) {
 void logVa(const char* format, va_list& args) {
     // 4k should be enough for everyone
     char buf[4096];
-    va_list argsCopy;
-    va_copy(argsCopy, args);
-    // if we have args
-    if (args) {
-        std::vsnprintf(buf, 4096ul, format, argsCopy);
-    } else {
-        std::strncpy(buf, format, 4096);
-    }
-    va_end(argsCopy);
+    std::vsnprintf(buf, 4096ul, format, args);
     logString(buf);
 }
 

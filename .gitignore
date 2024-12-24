@@ -1,6 +1,7 @@
 # build artifacts
 **/bin
 **/obj
+**/CMakeFiles
 # libc
 **/musl
 #kernel images
@@ -14,3 +15,7 @@ resolve_addresses
 
 #clang dir
 **/extern/clang/*
+
+#build directory
+llvm-build
+build

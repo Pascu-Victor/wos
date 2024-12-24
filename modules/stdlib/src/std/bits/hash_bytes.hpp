@@ -1,3 +1,4 @@
+#pragma once
 // Declarations for hash functions. -*- C++ -*-
 
 // Copyright (C) 2010-2024 Free Software Foundation, Inc.

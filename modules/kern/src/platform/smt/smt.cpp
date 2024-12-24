@@ -22,8 +22,6 @@ const CpuInfo thisCpuInfo() { return cpuData->thisCpu().copy(); }
 uint64_t getCpuNode(uint64_t cpuNo) { return cpuNo; }
 
 void cpuParamInit() {
-    // ker::mod::desc::gdt::initDescriptors(stack + sizeof(stack));
-    // apic::init();
     apic::initApicMP();
     uint64_t cpuNo = apic::getApicId();
 
@@ -43,6 +41,12 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         auto newTask = new sched::task::Task(modStruct.modules[i].name, (uint64_t)modStruct.modules[i].entry, kernelRsp,
                                              sched::task::TaskType::PROCESS);
         sched::postTask(newTask);
+    }
+    dbg::log("Posted task for main thread");
+    for (uint64_t i = 1; i < smt::cpu_count; i++) {
+        auto newCpuTask = new sched::task::Task(modStruct.modules[0].name, (uint64_t)modStruct.modules[0].entry, kernelRsp,
+                                                sched::task::TaskType::PROCESS);
+        sched::postTaskForCpu(i, newCpuTask);
     }
     sched::startScheduler();
 }
@@ -76,5 +80,7 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     runHandoverTasks(modules, kernelRsp);
     hcf();
 }
+
+uint64_t cpuCount() { return cpu_count; }
 
 }  // namespace ker::mod::smt

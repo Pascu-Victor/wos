@@ -1,7 +1,8 @@
 #include "mem.hpp"
 
-namespace std {
+__attribute__((used)) void *__dso_handle;
 
+namespace std {
 struct AtExitEntry {
     void (*func)(void *);
     void *arg;

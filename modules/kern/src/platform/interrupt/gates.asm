@@ -2,7 +2,7 @@ bits 64
 
 extern iterrupt_handler
 
-%include "../asm/helpers.asm"
+%include "platform/asm/helpers.asm"
 
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace

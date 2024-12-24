@@ -16,7 +16,7 @@ paging::PageZone* initPageZone(uint64_t base, uint64_t len, int zoneNum) {
     zone->name = "Physical Memory";
     zone->pageCount = len / paging::PAGE_SIZE;
     zone->zoneNum = zoneNum;
-    zone->buddy = buddy_embed((uint8_t*)base, len);
+    zone->buddyInstance = buddy_embed((uint8_t*)base, len);
 
     return zone;
 }
@@ -68,7 +68,7 @@ void* findFreeBlock(uint64_t size) {
         if (zone->len < size) {
             continue;
         }
-        void* const block = buddy_malloc(zone->buddy, size);
+        void* const block = buddy_malloc(zone->buddyInstance, size);
         if (!block) {
             [[unlikely]] continue;
         }
@@ -100,7 +100,7 @@ void pageFree(void* page) {
             continue;
         }
 
-        buddy_free(zone->buddy, page);
+        buddy_free(zone->buddyInstance, page);
         break;
     }
     memlock.unlock();
