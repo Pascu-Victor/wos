@@ -128,7 +128,7 @@ int main() {
     int fd = open("/dev/null", O_WRONLY);
     dup2(fd, STDERR_FILENO);
 
-    std::string executable = "./bin/wos";
+    std::string executable = "./build/modules/kern/wos";
     std::string logPattern = "qemu.[^(modified)]*.log";
 
     for (const auto& entry : fs::directory_iterator(".")) {
