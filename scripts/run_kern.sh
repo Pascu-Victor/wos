@@ -4,10 +4,10 @@ set -e
 function check_headers() {
     sh scripts/check_headers.sh $1
     if [ "$?" != "0" ]; then
-        echo "Error: check_headers.sh failed for modules/kern"
+        echo "Error: check_headers.sh failed for $1"
         exit 1
     else
-        echo "all headers are good"
+        echo "$1 headers are good"
     fi
 }
 # run check_headers

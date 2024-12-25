@@ -9,5 +9,5 @@ for i in $(find . -name "*.hpp"); do
         exit 1
     fi
 done
-cd -
+cd - > /dev/null
 exit 0
