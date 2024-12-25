@@ -15,6 +15,6 @@ extern "C" void _wOS_asm_syscallHandler(void);
 
 void init(void);
 
-extern "C" void syscallHandler(cpu::GPRegs regs);
+extern "C" uint64_t syscallHandler(cpu::GPRegs regs);
 
 }  // namespace ker::mod::sys

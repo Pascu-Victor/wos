@@ -43,11 +43,11 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         sched::postTask(newTask);
     }
     dbg::log("Posted task for main thread");
-    for (uint64_t i = 1; i < smt::cpu_count; i++) {
-        auto newCpuTask = new sched::task::Task(modStruct.modules[0].name, (uint64_t)modStruct.modules[0].entry, kernelRsp,
-                                                sched::task::TaskType::PROCESS);
-        sched::postTaskForCpu(i, newCpuTask);
-    }
+    // for (uint64_t i = 1; i < smt::cpu_count; i++) {
+    //     auto newCpuTask = new sched::task::Task(modStruct.modules[0].name, (uint64_t)modStruct.modules[0].entry, kernelRsp,
+    //                                             sched::task::TaskType::PROCESS);
+    //     sched::postTaskForCpu(i, newCpuTask);
+    // }
     sched::startScheduler();
 }
 

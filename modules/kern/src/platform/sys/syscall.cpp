@@ -2,7 +2,7 @@
 
 namespace ker::mod::sys {
 
-extern "C" void syscallHandler(cpu::GPRegs regs) {
+extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
     auto callnum = static_cast<abi::callnums>(regs.rax);
     uint64_t a1 = regs.rdi;
     uint64_t a2 = regs.rsi;
@@ -13,10 +13,10 @@ extern "C" void syscallHandler(cpu::GPRegs regs) {
 
     switch (callnum) {
         case abi::callnums::sysLog:
-            ker::syscall::log::sysLog(static_cast<abi::inter::sysLog::sys_log_ops>(a1), (const char*)a2, a3,
-                                      static_cast<abi::inter::sysLog::sys_log_device>(a4));
-            break;
-
+            return ker::syscall::log::sysLog(static_cast<abi::inter::sysLog::sys_log_ops>(a1), (const char*)a2, a3,
+                                             static_cast<abi::inter::sysLog::sys_log_device>(a4));
+        case abi::callnums::threadInfo:
+            return ker::syscall::multiproc::threadInfo(static_cast<abi::inter::multiproc::threadInfoOps>(a1));
         default:
             io::serial::write("Syscall undefined\n");
             io::serial::write("Callnum: ");

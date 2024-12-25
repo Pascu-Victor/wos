@@ -2,7 +2,7 @@
 #include <abi/syslog.hpp>
 #include <std/string.hpp>
 
-void* operator new[](unsigned long v) { return (void*)12; }
+void* operator new[](unsigned long v) { return (void*)v; }
 void operator delete[](void*) noexcept {}
 
 extern "C" int _start(void) {
