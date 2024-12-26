@@ -63,6 +63,17 @@ char *vsnprintf(char *str, T size, const char *format, va_list args) {
                     j += len;
                     break;
                 }
+                case 'h': {
+                    // padded hex byte
+                    uint64_t n = va_arg(args, uint64_t);
+                    int len = u64toh(n, buf);
+                    if (len == 1) {
+                        str[j++] = '0';
+                    }
+                    strncpy(str + j, buf, size - j);
+                    j += len;
+                    break;
+                }
                 default:
                     str[j++] = format[i];
                     break;
