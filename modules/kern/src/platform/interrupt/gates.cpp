@@ -43,6 +43,9 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     ker::mod::io::serial::write("CS: ");
     ker::mod::io::serial::write(frame.cs);
     ker::mod::io::serial::write("\n");
+    ker::mod::io::serial::write("CALCULATED PRIVILEGE LEVEL: ");
+    ker::mod::io::serial::write(frame.cs & 0x3);
+    ker::mod::io::serial::write("\n");
     ker::mod::io::serial::write("RFLAGS: ");
     ker::mod::io::serial::writeHex(frame.flags);
     ker::mod::io::serial::write("\n");
@@ -138,7 +141,7 @@ void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
     }
 
     ker::mod::io::serial::write("Halting\n");
-    ker::mod::apic::eoi();
+    // ker::mod::apic::eoi();
     hcf();
 }
 
@@ -154,14 +157,14 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
         interruptHandlers[frame.intNum].get()(gpr, frame);
     } else {
         if (!isIrq(frame.intNum)) {
-            ker::mod::apic::eoi();
+            // ker::mod::apic::eoi();
             ker::mod::io::serial::write("No handler for interrupt");
             ker::mod::io::serial::write(frame.intNum);
             ker::mod::io::serial::write("\n");
             hcf();
         }
     }
-    ker::mod::apic::eoi();
+    // ker::mod::apic::eoi();
 }
 
 void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
