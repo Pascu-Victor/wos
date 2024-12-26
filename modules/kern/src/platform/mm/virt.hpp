@@ -24,6 +24,8 @@ void init(limine_memmap_response* memmapResponse, limine_kernel_file_response* k
 static inline PageTable* getKernelPageTable() { return (PageTable*)rdcr3(); }
 
 void mapPage(PageTable* pageTable, vaddr_t vaddr, paddr_t paddr, int flags);
+bool isPageMapped(PageTable* pageTable, vaddr_t vaddr);
+void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags);
 void mapRange(PageTable* pageTable, Range range, int flags, uint64_t offset = 0);
 void unmapPage(PageTable* pageTable, vaddr_t vaddr);
 

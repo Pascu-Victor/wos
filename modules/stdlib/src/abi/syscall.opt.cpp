@@ -10,7 +10,9 @@ uint64_t syscall(callnums callnum, uint64_t a1, uint64_t a2, uint64_t a3, uint64
     // a4 -> RCX
     // a5 -> R8
     // a6 -> R9
-    return _wOS_asm_syscall((uint64_t)callnum, a1, a2, a3, a4, a5, a6);
+    uint64_t retVal;
+    asm volatile("syscall" : "=a"(retVal) : "a"(callnum), "D"(a1), "S"(a2), "d"(a3), "c"(a4), "r"(a5), "r"(a6) : "memory");
+    return retVal;
 }
 
 }  // namespace ker::abi

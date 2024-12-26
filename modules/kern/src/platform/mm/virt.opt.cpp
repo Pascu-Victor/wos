@@ -197,6 +197,40 @@ void mapPage(PageTable* pml4, vaddr_t vaddr, paddr_t paddr, int flags) {
     invlpg(vaddr);
 }
 
+bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
+    if (!pageTable) {
+        // PANIC!
+        hcf();
+    }
+
+    PageTable* table = pageTable;
+    for (int i = 4; i > 1; i--) {
+        table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
+        if (!addr::getPhysPointer((vaddr_t)table)) {
+            return false;
+        }
+    }
+
+    return table->entries[index_of(vaddr, 1)].present;
+}
+
+void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
+    if (!pageTable) {
+        // PANIC!
+        hcf();
+    }
+
+    PageTable* table = pageTable;
+    for (int i = 4; i > 1; i--) {
+        table = advancePageTable(table, index_of(vaddr, i), 0);
+    }
+
+    PageTableEntry entry = table->entries[index_of(vaddr, 1)];
+    entry.writable = entry.writable | (flags & paging::PAGE_WRITE);
+    entry.user = entry.user | (flags & paging::PAGE_USER);
+    table->entries[index_of(vaddr, 1)] = entry;
+}
+
 void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
     if (!pageTable) {
         // PANIC!

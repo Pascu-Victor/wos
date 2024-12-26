@@ -25,34 +25,57 @@ static ElfFile parseElf(uint8_t *base) {
 }
 
 void loadSegment(uint8_t *elfBase, ker::mod::mm::virt::PageTable *pagemap, Elf64_Phdr *programHeader, uint64_t pageNo) {
-    auto pagePaddr = (mod::mm::addr::vaddr_t)mod::mm::phys::pageAlloc();
+    // Allocate a page (or reuse existing when mapped)
+    uint64_t pagePaddr = (mod::mm::addr::vaddr_t)mod::mm::phys::pageAlloc();
     if (!pagePaddr) {
         ker::mod::io::serial::write("Failed to allocate page\n");
         return;
     }
 
-    auto pageVaddr = programHeader->p_vaddr + pageNo * mod::mm::virt::PAGE_SIZE;
-    // auto pageAdd = pagepa
-    mod::mm::virt::mapPage(pagemap, pageVaddr, (mod::mm::addr::paddr_t)mod::mm::addr::getPhysPointer(pagePaddr),
-                           mod::mm::paging::pageTypes::USER);
+    uint64_t pageVaddr = programHeader->p_vaddr + pageNo * mod::mm::virt::PAGE_SIZE;
 
-    auto pageOffset = pageNo * mod::mm::virt::PAGE_SIZE;
-    auto copySize = mod::mm::virt::PAGE_SIZE;
-
-    if (pageOffset >= programHeader->p_filesz) {
-        memset((void *)pagePaddr, 0, mod::mm::virt::PAGE_SIZE);
+    // Prevent mapping kernel space
+    if (pageVaddr > mod::mm::addr::getHHDMOffset()) {
+        ker::mod::io::serial::write("Program tried to map kernel page 0x%x", pageVaddr);
         return;
     }
 
+    // Check if already mapped, unify flags if so
+    bool alreadyMapped = mod::mm::virt::isPageMapped(pagemap, pageVaddr);
+    uint64_t physAddress;
+
+    if (alreadyMapped) {
+        mod::mm::virt::unifyPageFlags(pagemap, pageVaddr, mod::mm::paging::pageTypes::USER);
+        physAddress = mod::mm::virt::translate(pagemap, pageVaddr);
+    } else {
+        physAddress = (uint64_t)mod::mm::addr::getPhysPointer(pagePaddr);
+        mod::mm::virt::mapPage(pagemap, pageVaddr, (mod::mm::addr::paddr_t)physAddress, mod::mm::paging::pageTypes::USER);
+    }
+
+    // Calculate how much data to copy
+    uint64_t pageOffset = pageNo * mod::mm::virt::PAGE_SIZE;
+    uint64_t copySize = mod::mm::virt::PAGE_SIZE;
+
+    // If outside file range, just zero new pages
+    if (pageOffset >= programHeader->p_filesz) {
+        if (!alreadyMapped) {
+            memset((void *)physAddress, 0, mod::mm::virt::PAGE_SIZE);
+        }
+        return;
+    }
+
+    // Trim copy if near end of segment
     if (pageOffset + mod::mm::virt::PAGE_SIZE > programHeader->p_filesz) {
         copySize = programHeader->p_filesz - pageOffset;
     }
 
-    memcpy((void *)pagePaddr, elfBase + programHeader->p_offset + pageOffset, copySize);
-
-    if (copySize < mod::mm::virt::PAGE_SIZE) {
-        memset((void *)(pagePaddr + copySize), 0, mod::mm::virt::PAGE_SIZE - copySize);
+    // Zero newly allocated page before copying so we preserve data in mapped pages
+    if (!alreadyMapped) {
+        memset((void *)physAddress, 0, mod::mm::virt::PAGE_SIZE);
     }
+
+    // Copy segment content
+    memcpy((void *)physAddress, elfBase + programHeader->p_offset + pageOffset, copySize);
 }
 
 void loadSectionHeaders(ElfFile elf, ker::mod::mm::virt::PageTable *pagemap) {
@@ -75,7 +98,6 @@ void loadSectionHeaders(ElfFile elf, ker::mod::mm::virt::PageTable *pagemap) {
         }
     }
 }
-
 Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap) {
     ElfFile elfFile = parseElf((uint8_t *)elf);
 
@@ -86,7 +108,6 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap) {
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {  // iterate over program headers
         if (elfFile.pgHead->p_type != PT_LOAD) continue;
         size_t num_pages = PAGE_ALIGN_UP(elfFile.pgHead->p_memsz) / mod::mm::virt::PAGE_SIZE;
-
         for (uint64_t j = 0; j < num_pages; j++) {
             loadSegment(elfFile.base, pagemap, elfFile.pgHead, j);
         }
