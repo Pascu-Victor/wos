@@ -3,7 +3,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 namespace ker::mod::apic {
-void writeReg(uint32_t reg, uint32_t value) { cpuSetMSR(reg, value); }
+void writeReg(uint32_t reg, uint64_t value) { cpuSetMSR(reg, value); }
 
 uint32_t readReg(uint32_t reg) {
     uint64_t res;
@@ -12,17 +12,13 @@ uint32_t readReg(uint32_t reg) {
 }
 
 // end of apic interrupt
-void eoi() { writeReg((uint32_t)APICRegisters::EOI, 0); }
+void eoi() { cpuSetMSR((uint32_t)X2APICMSRs::EOI, 0); }
 
-void sendIpi(uint32_t lapicId, uint32_t vector, ICR0MessageType messageType) {
-    while (readReg((uint32_t)APICRegisters::ICR0) & (uint32_t)APICQueries::ICR0_DELIVERY_STATUS) {
-        asm volatile("pause");
-    }
-    // set the destination
-    writeReg((uint32_t)APICRegisters::ICR1, lapicId << 24);
-    // signal the interrupt
-    writeReg((uint32_t)APICRegisters::ICR0, (uint32_t)messageType | vector);
+void sendIpi(IPIConfig messageType, uint32_t destination) {
+    writeReg((uint32_t)X2APICMSRs::ICR, (((uint64_t)destination) << 32) | messageType.packedValue);
 }
+
+void selfIpi(uint8_t vector) { cpuSetMSR((uint32_t)X2APICMSRs::SELF_IPI, vector, 0); }
 
 void resetApicCounter() { writeReg((uint32_t)APICRegisters::TMR_INIT_CNT, 0xFFFFFFFF); }
 
