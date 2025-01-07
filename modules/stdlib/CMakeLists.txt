@@ -6,7 +6,7 @@ set(CMAKE_C_FLAGS
 	-std=c11 \
 	-fPIC \
 	-nostdinc \
-	-g \
+	-O3 \
 	-Wall \
 	-Wextra \
 	-Werror \
@@ -18,7 +18,7 @@ set(CMAKE_CXX_FLAGS
 	-std=c++23 \
 	-fPIC \
 	-nostdinc \
-	-g \
+	-O3 \
 	-Wall \
 	-Wextra \
 	-Werror \
@@ -26,12 +26,12 @@ set(CMAKE_CXX_FLAGS
 	-Wformat-security"
 )
 
-set(KERNEL_C_FLAGS
+    set(KERNEL_C_FLAGS
 	"-nostdlib \
 	-std=c11 \
 	-fno-pic \
 	-nostdinc \
-	-g \
+	-O3 \
 	-Wall \
 	-Wextra \
 	-Werror \
@@ -58,7 +58,7 @@ set(KERNEL_CXX_FLAGS
 	-std=c++23 \
 	-fno-pic \
 	-nostdinc \
-	-g \
+	-O3 \
 	-Wall \
 	-Wextra \
 	-Werror \

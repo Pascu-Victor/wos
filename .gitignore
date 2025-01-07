@@ -2,8 +2,6 @@
 **/bin
 **/obj
 **/CMakeFiles
-# libc
-**/musl
 #kernel images
 disk.qcow2
 #log files
@@ -18,4 +16,5 @@ resolve_addresses
 
 #build directory
 llvm-build
+libcxx-build
 build

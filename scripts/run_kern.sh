@@ -35,4 +35,4 @@ rm -f qemu.*log
 CHARDEV="-chardev file,id=char0,path=serial.log -serial chardev:char0 -monitor stdio"
 
 echo "STARTING BOOT:"
-qemu-system-x86_64 -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV -s -S -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -M q35 -cpu max -smp 4
+qemu-system-x86_64 --enable-kvm -cpu host -s -S -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 4

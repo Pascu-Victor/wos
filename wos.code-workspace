@@ -130,7 +130,17 @@
 			"__stddef_wchar_t.h": "c",
 			"__stddef_offsetof.h": "c",
 			"__stddef_max_align_t.h": "c",
-			"__locale": "cpp"
+			"__locale": "cpp",
+			"*.def": "c",
+			"__availability": "c",
+			"features.h": "c",
+			"glue.h": "c",
+			"stdint.h": "c",
+			"syncstream": "cpp",
+			"inttypes.h": "c",
+			"stdlib.h": "c",
+			"ucontext_i.h": "c",
+			"signal.h": "c"
 		},
         "editor.formatOnSave": true,
         "files.exclude": {
