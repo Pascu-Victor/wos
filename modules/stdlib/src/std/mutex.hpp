@@ -1,5 +1,6 @@
 #pragma once
-#include <abi/interfaces/futex.int.hpp>
+#include <abi/callnums/futex.h>
+
 #include <abi/syscall.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <std/atomic.hpp>
@@ -48,8 +49,8 @@ class mutex {
             // If the lock is already held, wait for it to be released
             while (true) {
                 if (expected == 2 || m_futex.compare_exchange_strong(expected, 2, std::memory_order_acquire)) {
-                    ker::abi::syscall(ker::abi::callnums::futex, (uint64_t)&m_futex,
-                                      (uint64_t)ker::abi::inter::futex::futex_ops::futex_wait, 2, 0, 0, 0);
+                    ker::abi::syscall(ker::abi::callnums::futex, (uint64_t)&m_futex, (uint64_t)ker::abi::futex::futex_ops::futex_wait, 2, 0,
+                                      0, 0);
                     expected = 0;
                 }
                 if (m_futex.compare_exchange_strong(expected, 2, std::memory_order_acquire)) {
@@ -62,8 +63,7 @@ class mutex {
     void unlock() {
         if (m_futex.fetch_sub(1, std::memory_order_release) != 1) {
             m_futex.store(0, std::memory_order_release);
-            ker::abi::syscall(ker::abi::callnums::futex, (uint64_t)&m_futex, (uint64_t)ker::abi::inter::futex::futex_ops::futex_wake, 1, 0,
-                              0, 0);
+            ker::abi::syscall(ker::abi::callnums::futex, (uint64_t)&m_futex, (uint64_t)ker::abi::futex::futex_ops::futex_wake, 1, 0, 0, 0);
         }
     }
 

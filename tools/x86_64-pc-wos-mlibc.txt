@@ -1,0 +1,13 @@
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+windres = 'llvm-windres'
+strip = 'llvm-strip'
+exe_wrapper = 'elfhack'
+
+[host_machine]
+system = 'wos'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

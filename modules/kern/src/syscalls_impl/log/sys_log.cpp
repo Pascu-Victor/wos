@@ -1,12 +1,12 @@
-#include "sysLog.hpp"
+#include "sys_log.hpp"
 
 namespace ker::syscall::log {
-uint64_t sysLog(ker::abi::inter::sysLog::sys_log_ops op, const char* str, uint64_t len, abi::inter::sysLog::sys_log_device device) {
+uint64_t sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, abi::sys_log::sys_log_device device) {
     switch (op) {
-        case abi::inter::sysLog::sys_log_ops::log:
-            if (device == abi::inter::sysLog::sys_log_device::serial) {
+        case abi::sys_log::sys_log_ops::log:
+            if (device == abi::sys_log::sys_log_device::serial) {
                 mod::io::serial::write(str, len);
-            } else if (device == abi::inter::sysLog::sys_log_device::vga) {
+            } else if (device == abi::sys_log::sys_log_device::vga) {
                 mod::dbg::logFbOnly(str);
             } else {
                 mod::io::serial::write("Invalid sysLog device: ");
@@ -16,11 +16,11 @@ uint64_t sysLog(ker::abi::inter::sysLog::sys_log_ops op, const char* str, uint64
             }
 
             break;
-        case ker::abi::inter::sysLog::sys_log_ops::logLine:
-            if (device == abi::inter::sysLog::sys_log_device::serial) {
+        case ker::abi::sys_log::sys_log_ops::logLine:
+            if (device == abi::sys_log::sys_log_device::serial) {
                 mod::io::serial::write(str, len);
                 mod::io::serial::write("\n");
-            } else if (device == abi::inter::sysLog::sys_log_device::vga) {
+            } else if (device == abi::sys_log::sys_log_device::vga) {
                 mod::dbg::logFbOnly(str);
                 mod::dbg::logFbAdvance();
             } else {

@@ -12,11 +12,11 @@ extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
     uint64_t a6 = regs.r10;
 
     switch (callnum) {
-        case abi::callnums::sysLog:
-            return ker::syscall::log::sysLog(static_cast<abi::inter::sysLog::sys_log_ops>(a1), (const char*)a2, a3,
-                                             static_cast<abi::inter::sysLog::sys_log_device>(a4));
+        case abi::callnums::sys_log:
+            return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
+                                             static_cast<abi::sys_log::sys_log_device>(a4));
         case abi::callnums::threadInfo:
-            return ker::syscall::multiproc::threadInfo(static_cast<abi::inter::multiproc::threadInfoOps>(a1));
+            return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
         default:
             io::serial::write("Syscall undefined\n");
             io::serial::write("Callnum: ");

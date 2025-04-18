@@ -140,7 +140,15 @@
 			"inttypes.h": "c",
 			"stdlib.h": "c",
 			"ucontext_i.h": "c",
-			"signal.h": "c"
+			"signal.h": "c",
+			"int_lib.h": "c",
+			"string.h": "c",
+			"assert.h": "c",
+			"mman.h": "c",
+			"stdio.h": "c",
+			"intrin.h": "c",
+			"cpuid.h": "c",
+			"types": "cpp"
 		},
         "editor.formatOnSave": true,
         "files.exclude": {

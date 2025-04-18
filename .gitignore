@@ -18,3 +18,6 @@ resolve_addresses
 llvm-build
 libcxx-build
 build
+
+#toolchain build directory
+toolchain
