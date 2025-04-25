@@ -12,9 +12,8 @@ mkdir -p $B/src
 cd $B/src
 
 # Clone required repositories if they don't exist
-[ ! -d mlibc ] && git clone --depth=1 --branch=master https://github.com/managarm/mlibc.git
-[ ! -d llvm-project ] && git clone --depth=1 --branch=main https://github.com/llvm/llvm-project.git
-[ ! -d libcxxrt ] && git clone --depth=1 https://github.com/libcxxrt/libcxxrt.git
+[ ! -d mlibc ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/mlibc.git
+[ ! -d llvm-project ] && git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
 
 # 2. Build stage1 clang/lld for the host
 mkdir -p $B/stage1-build
@@ -105,15 +104,62 @@ ninja && ninja install
 
 mkdir -p $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH
 mv $B/stage1-prefix/lib/clang/21/target/lib/* $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH
-rm -rf mv $B/stage1-prefix/lib/clang/21/target
+rm -rf $B/stage1-prefix/lib/clang/21/target
 
 ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.builtins.a
 ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.crtbegin.a
 ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.crtend.a
 
+ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
+ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
+ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
+
+# 6.1 fail building libcxx for it's headers
+
+mkdir -p $B/libcxx-build
+cd $B/libcxx-build
+cmake -G Ninja \
+ -DCMAKE_BUILD_TYPE=Release \
+ -DCMAKE_INSTALL_PREFIX=$B/target1 \
+ -DCMAKE_C_COMPILER=$CC \
+ -DCMAKE_CXX_COMPILER=$CXX \
+ -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_C_COMPILER_WORKS=ON \
+ -DCMAKE_CXX_COMPILER_WORKS=ON \
+ -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+ -DCMAKE_SYSROOT=$B/target1 \
+ -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
+ -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -nostdinc++" \
+ -DCMAKE_CROSSCOMPILING=True \
+ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
+ -DLIBCXX_CXX_ABI=libcxxabi \
+ -DLIBCXX_USE_COMPILER_RT=On \
+ -DLIBCXX_HAS_PTHREAD_API=Off \
+ -DLIBCXX_HAS_PTHREAD_LIB=Off \
+ -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+ -DLIBCXX_INCLUDE_TESTS=OFF \
+ -DLIBCXXABI_ENABLE_STATIC=OFF \
+ -DLIBCXXABI_ENABLE_SHARED=ON \
+ -DLIBCXX_INSTALL_HEADERS=ON \
+ -DLIBCXXABI_USE_COMPILER_RT=ON \
+ -DLIBCXXABI_INCLUDE_TESTS=OFF \
+ -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_API=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
+ -DLIBCXXABI_USE_COMPILER_RT=ON \
+ -DHAVE_LIBPTHREAD=OFF \
+ -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+ -DLIBCXX_ENABLE_FILESYSTEM=OFF \
+ $B/src/llvm-project/runtimes
+
+ninja && ninja install
+
+#copy $B/libcxx-build/include to $B/target1/include
+cp -r $B/libcxx-build/include/* $B/target1/include/
+
 # 6. Build mlibc
-mkdir -p $B/mlibc-build
-cd $B/mlibc-build
 
 # Prepare cross-file if it doesn't exist
 if [ ! -f $B/../tools/x86_64-pc-wos-mlibc.txt ]; then
@@ -139,31 +185,26 @@ endian = 'little'
 EOF
 fi
 
-export CFLAGS="--sysroot=$B/target1"
+export CFLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1"
 export CXXFLAGS="$CFLAGS"
 export LDFLAGS="--sysroot=$B/target1"
+
+mkdir -p $B/mlibc-build
+cd $B/mlibc-build
 
 meson setup --prefix=$B/target1 \
   --sysconfdir=etc \
   --default-library=static \
   --buildtype=release \
-  -Dc_args="$CFLAGS" \
-  -Dcpp_args="$CXXFLAGS" \
-  -Dc_link_args="$LDFLAGS" \
-  -Dcpp_link_args="$LDFLAGS" \
   --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
   -Dheaders_only=false \
   $B/src/mlibc
 
 ninja && ninja install
 
-# Copy mlibc headers to the target directory
-mkdir -p $B/target1/include
-cp -r $B/src/mlibc/include/* $B/target1/include
-
-# 7. Build libcxx, libcxxabi, and libunwind
-mkdir -p $B/libcxx-build
-cd $B/libcxx-build
+# 7. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
+mkdir -p $B/libcxx-build-full
+cd $B/libcxx-build-full
 cmake -G Ninja \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$B/target1 \
@@ -175,19 +216,29 @@ cmake -G Ninja \
  -DCMAKE_C_COMPILER_WORKS=ON \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
- -DCMAKE_SYSTEM_NAME=Linux \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
  -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -nostdinc++" \
  -DCMAKE_CROSSCOMPILING=True \
- -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
+ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
  -DLIBCXX_CXX_ABI=libcxxabi \
  -DLIBCXX_USE_COMPILER_RT=On \
- -DLIBCXX_HAS_PTHREAD_API=On \
- -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
- -DLIBCXXABI_ENABLE_STATIC=ON \
+ -DLIBCXX_HAS_PTHREAD_API=Off \
+ -DLIBCXX_HAS_PTHREAD_LIB=Off \
+ -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+ -DLIBCXX_INCLUDE_TESTS=OFF \
+ -DLIBCXXABI_ENABLE_STATIC=OFF \
+ -DLIBCXXABI_ENABLE_SHARED=ON \
+ -DLIBCXX_INSTALL_HEADERS=ON \
  -DLIBCXXABI_USE_COMPILER_RT=ON \
- -DLIBUNWIND_USE_COMPILER_RT=ON \
+ -DLIBCXXABI_INCLUDE_TESTS=OFF \
+ -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_API=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
+ -DLIBCXXABI_USE_COMPILER_RT=ON \
+ -DHAVE_LIBPTHREAD=OFF \
+ -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+ -DLIBCXX_ENABLE_FILESYSTEM=OFF \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
@@ -201,7 +252,6 @@ cmake -G Ninja \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_CXX_FLAGS="-stdlib=libc++ -I$B/target1/include/c++/v1" \
- -DCMAKE_SYSTEM_NAME=Linux \
  -DCMAKE_C_COMPILER_WORKS=ON \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \

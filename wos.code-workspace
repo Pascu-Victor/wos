@@ -148,22 +148,21 @@
 			"stdio.h": "c",
 			"intrin.h": "c",
 			"cpuid.h": "c",
-			"types": "cpp"
+			"types": "cpp",
+			"__string": "cpp"
 		},
-        "editor.formatOnSave": true,
-        "files.exclude": {
+		"editor.formatOnSave": true,
+		"files.exclude": {
 			"**/cache/": true,
 			"**/*.rpyc": true,
 			"**/*.rpa": true,
 			"**/*.rpymc": true
 		},
-        "[conf]": {
-            "editor.formatOnSave": false
-        },
-
-        "C_Cpp.codeAnalysis.exclude": {
-            "**/extern/": true,
-        }
-
+		"[conf]": {
+			"editor.formatOnSave": false
+		},
+		"C_Cpp.codeAnalysis.exclude": {
+			"**/extern/": true,
+		}
 	}
 }
