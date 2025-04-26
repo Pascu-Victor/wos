@@ -63,6 +63,8 @@ meson setup --prefix=$B/target1 \
     -Ddefault_library=static \
     --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
     -Dbindir=bin \
+    -Dwos_option=enabled \
+    -Dglibc_option=enabled \
     $B/src/mlibc
 ninja install
 
@@ -84,11 +86,10 @@ cmake -G Ninja \
  -DCMAKE_INSTALL_PREFIX=$B/stage1-prefix/lib/clang/21/target \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_CXX_COMPILER=$CXX \
- -DCMAKE_SYSTEM_NAME=Linux \
  -DCMAKE_SYSROOT=$B/target1 \
- -DCMAKE_C_FLAGS="--sysroot=$B/target1 -nostdlib" \
- -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -nostdlib" \
- -DCMAKE_ASM_FLAGS="--sysroot=$B/target1 -nostdlib" \
+ -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
+ -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -fdiagnostics-color=always -v" \
+ -DCMAKE_ASM_FLAGS="--sysroot=$B/target1" \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
@@ -96,9 +97,12 @@ cmake -G Ninja \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
  -DCOMPILER_RT_BUILD_BUILTINS=ON \
- -DCOMPILER_RT_BAREMETAL_BUILD=ON \
+ -DCOMPILER_RT_BUILD_MEMPROF=OFF \
  -DCOMPILER_RT_OS_DIR="" \
- $B/src/llvm-project/compiler-rt/lib/builtins
+ -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+ -DWOS=ON \
+ $B/src/llvm-project/compiler-rt
+#  -DCOMPILER_RT_BAREMETAL_BUILD=ON \
 
 ninja && ninja install
 
@@ -114,7 +118,7 @@ ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64
 ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
 ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
 
-# 6.1 fail building libcxx for it's headers
+# 6.1 fail building libcxx for it's headers see {{cxx-headers}} maybe
 
 mkdir -p $B/libcxx-build
 cd $B/libcxx-build
@@ -131,7 +135,7 @@ cmake -G Ninja \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
- -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -nostdinc++" \
+ -DCMAKE_CXX_FLAGS="--sysroot=$B/target1" \
  -DCMAKE_CROSSCOMPILING=True \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
  -DLIBCXX_CXX_ABI=libcxxabi \
@@ -152,6 +156,7 @@ cmake -G Ninja \
  -DHAVE_LIBPTHREAD=OFF \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  -DLIBCXX_ENABLE_FILESYSTEM=OFF \
+ -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
@@ -185,9 +190,9 @@ endian = 'little'
 EOF
 fi
 
-export CFLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1"
+export CFLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack"
 export CXXFLAGS="$CFLAGS"
-export LDFLAGS="--sysroot=$B/target1"
+export LDFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
 
 mkdir -p $B/mlibc-build
 cd $B/mlibc-build
@@ -198,6 +203,8 @@ meson setup --prefix=$B/target1 \
   --buildtype=release \
   --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
   -Dheaders_only=false \
+  -Dwos_option=enabled \
+  -Dglibc_option=enabled \
   $B/src/mlibc
 
 ninja && ninja install
@@ -213,14 +220,17 @@ cmake -G Ninja \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_C_FLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack" \
+ -DCMAKE_CXX_FLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack" \
+ -DCMAKE_LINK_FLAGS="--sysroot=$B/target1 -fsanitize=safe-stack" \
  -DCMAKE_C_COMPILER_WORKS=ON \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
- -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -nostdinc++" \
+ -DCMAKE_CXX_FLAGS="--sysroot=$B/target1" \
  -DCMAKE_CROSSCOMPILING=True \
- -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
+ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
  -DLIBCXX_CXX_ABI=libcxxabi \
  -DLIBCXX_USE_COMPILER_RT=On \
  -DLIBCXX_HAS_PTHREAD_API=Off \
@@ -236,7 +246,6 @@ cmake -G Ninja \
  -DLIBCXXABI_HAS_PTHREAD_API=OFF \
  -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
  -DLIBCXXABI_USE_COMPILER_RT=ON \
- -DHAVE_LIBPTHREAD=OFF \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  -DLIBCXX_ENABLE_FILESYSTEM=OFF \
  $B/src/llvm-project/runtimes

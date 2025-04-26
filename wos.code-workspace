@@ -149,7 +149,9 @@
 			"intrin.h": "c",
 			"cpuid.h": "c",
 			"types": "cpp",
-			"__string": "cpp"
+			"__string": "cpp",
+			"sim_vector": "cpp",
+			"csetjmp": "cpp"
 		},
 		"editor.formatOnSave": true,
 		"files.exclude": {
