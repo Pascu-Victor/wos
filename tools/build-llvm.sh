@@ -20,7 +20,7 @@ mkdir -p $B/stage1-build
 cd $B/stage1-build
 cmake -G Ninja \
  -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_INSTALL_PREFIX=$B/stage1-prefix \
+ -DCMAKE_INSTALL_PREFIX=$B/target1 \
  -DLLVM_TARGETS_TO_BUILD=X86 \
  -DLLVM_ENABLE_PROJECTS='clang;lld' \
  -DLLVM_ENABLE_LIBXML2=Off \
@@ -34,18 +34,18 @@ cmake -G Ninja \
  $B/src/llvm-project/llvm && ninja install
 
 # Create symlinks for easier use
-mkdir -p $B/stage1-prefix/bin
-cd $B/stage1-prefix/bin
+mkdir -p $B/target1/bin
+cd $B/target1/bin
 ln -sf clang cc
 ln -sf clang++ c++
 ln -sf llvm-ar ar
 
 # 3. Set up environment
-export CC="$B/stage1-prefix/bin/clang"
-export CXX="$B/stage1-prefix/bin/clang++"
-export LD="$B/stage1-prefix/bin/ld.lld"
-export PATH=$B/stage1-prefix/bin:$OLD_PATH
-export LD_LIBRARY_PATH="$B/stage1-prefix/lib"
+export CC="$B/target1/bin/clang"
+export CXX="$B/target1/bin/clang++"
+export LD="$B/target1/bin/ld.lld"
+export PATH=$B/target1/bin:$OLD_PATH
+export LD_LIBRARY_PATH="$B/target1/lib"
 
 # 4. Create target directories and empty CRT files
 mkdir -p $B/target1/lib $B/target1/include/abi-bits
@@ -68,9 +68,6 @@ meson setup --prefix=$B/target1 \
     $B/src/mlibc
 ninja install
 
-# Copy ABI bits
-cp -r $B/src/mlibc/abis/mlibc/* $B/target1/include/abi-bits/
-
 # Create empty CRT files
 touch empty.c
 $CC -O3 -c empty.c       -o $B/target1/lib/crtbegin.o
@@ -83,13 +80,14 @@ mkdir -p $B/compiler-rt-build
 cd $B/compiler-rt-build
 cmake -G Ninja \
  -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_INSTALL_PREFIX=$B/stage1-prefix/lib/clang/21/target \
+ -DCMAKE_INSTALL_PREFIX=$B/target1/lib/clang/21/target \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_SYSROOT=$B/target1 \
- -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
- -DCMAKE_CXX_FLAGS="--sysroot=$B/target1 -fdiagnostics-color=always -v" \
- -DCMAKE_ASM_FLAGS="--sysroot=$B/target1" \
+ -DCMAKE_SYSTEM_NAME=WOS \
+ -DCMAKE_C_FLAGS="-fdiagnostics-color=always" \
+ -DCMAKE_CXX_FLAGS="-fdiagnostics-color=always" \
+ -DCMAKE_ASM_FLAGS="-fdiagnostics-color=always" \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
@@ -98,25 +96,31 @@ cmake -G Ninja \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
  -DCOMPILER_RT_BUILD_BUILTINS=ON \
  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+ -DCOMPILER_RT_BUILD_ORC=OFF \
+ -DCOMPILER_RT_HAS_SAFESTACK=ON \
  -DCOMPILER_RT_OS_DIR="" \
- -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+ -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
+ -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
+ -DCOMPILER_RT_BUILD_XRAY=OFF \
+ -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
+ -DCOMPILER_RT_STANDALONE_BUILD=ON \
  -DWOS=ON \
  $B/src/llvm-project/compiler-rt
 #  -DCOMPILER_RT_BAREMETAL_BUILD=ON \
 
 ninja && ninja install
 
-mkdir -p $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH
-mv $B/stage1-prefix/lib/clang/21/target/lib/* $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH
-rm -rf $B/stage1-prefix/lib/clang/21/target
+mkdir -p $B/target1/lib/clang/21/lib/$TARGET_ARCH
+mv $B/target1/lib/clang/21/target/lib/* $B/target1/lib/clang/21/lib/$TARGET_ARCH
+rm -rf $B/target1/lib/clang/21/target
 
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.builtins.a
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.crtbegin.a
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/stage1-prefix/lib/clang/21/lib/libclang_rt.crtend.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
 
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
-ln -s $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/stage1-prefix/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
+ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
 
 # 6.1 fail building libcxx for it's headers see {{cxx-headers}} maybe
 
@@ -147,7 +151,6 @@ cmake -G Ninja \
  -DLIBCXXABI_ENABLE_STATIC=OFF \
  -DLIBCXXABI_ENABLE_SHARED=ON \
  -DLIBCXX_INSTALL_HEADERS=ON \
- -DLIBCXXABI_USE_COMPILER_RT=ON \
  -DLIBCXXABI_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
  -DLIBCXXABI_HAS_PTHREAD_API=OFF \
@@ -213,41 +216,49 @@ ninja && ninja install
 mkdir -p $B/libcxx-build-full
 cd $B/libcxx-build-full
 cmake -G Ninja \
- -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_INSTALL_PREFIX=$B/target1 \
- -DCMAKE_C_COMPILER=$CC \
- -DCMAKE_CXX_COMPILER=$CXX \
- -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_C_FLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack" \
- -DCMAKE_CXX_FLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack" \
- -DCMAKE_LINK_FLAGS="--sysroot=$B/target1 -fsanitize=safe-stack" \
- -DCMAKE_C_COMPILER_WORKS=ON \
- -DCMAKE_CXX_COMPILER_WORKS=ON \
- -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
- -DCMAKE_SYSROOT=$B/target1 \
- -DCMAKE_C_FLAGS="--sysroot=$B/target1" \
- -DCMAKE_CXX_FLAGS="--sysroot=$B/target1" \
- -DCMAKE_CROSSCOMPILING=True \
- -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
- -DLIBCXX_CXX_ABI=libcxxabi \
- -DLIBCXX_USE_COMPILER_RT=On \
- -DLIBCXX_HAS_PTHREAD_API=Off \
- -DLIBCXX_HAS_PTHREAD_LIB=Off \
- -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
- -DLIBCXX_INCLUDE_TESTS=OFF \
- -DLIBCXXABI_ENABLE_STATIC=OFF \
- -DLIBCXXABI_ENABLE_SHARED=ON \
- -DLIBCXX_INSTALL_HEADERS=ON \
- -DLIBCXXABI_USE_COMPILER_RT=ON \
- -DLIBCXXABI_INCLUDE_TESTS=OFF \
+ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind;compiler-rt' \
  -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
- -DLIBCXXABI_HAS_PTHREAD_API=OFF \
+ -DLIBCXXABI_USE_COMPILER_RT=On \
+ -DLIBCXXABI_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
- -DLIBCXXABI_USE_COMPILER_RT=ON \
+ -DLIBCXXABI_HAS_PTHREAD_API=OFF \
+ -DLIBCXXABI_ENABLE_STATIC=ON \
+ -DLIBCXX_USE_COMPILER_RT=On \
+ -DLIBCXX_INSTALL_HEADERS=ON \
+ -DLIBCXX_INCLUDE_TESTS=OFF \
+ -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+ -DLIBCXX_HAS_PTHREAD_LIB=Off \
+ -DLIBCXX_HAS_PTHREAD_API=Off \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  -DLIBCXX_ENABLE_FILESYSTEM=OFF \
+ -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
+ -DLIBCXX_CXX_ABI=libcxxabi \
+ -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+ -DCMAKE_SYSTEM_NAME=WOS \
+ -DCMAKE_SYSROOT=$B/target1 \
+ -DCMAKE_INSTALL_PREFIX=$B/target1 \
+ -DCMAKE_CXX_FLAGS="-I$B/target1/include -lclang_rt.safestack-x86_64 --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always -L$B/target1/lib/clang/21/target/lib/" \
+ -DCMAKE_CXX_COMPILER=$CXX \
+ -DCMAKE_CXX_COMPILER_WORKS=ON \
+ -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_CROSSCOMPILING=True \
+ -DCMAKE_C_FLAGS="-I$B/target1/include -lclang_rt.safestack-x86_64 --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always -L$B/target1/lib/clang/21/target/lib/" \
+ -DCMAKE_C_COMPILER=$CC \
+ -DCMAKE_C_COMPILER_WORKS=ON \
+ -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
+ -DCMAKE_BUILD_TYPE=Release \
+ -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
+ -DCOMPILER_RT_BUILD_BUILTINS=ON \
+ -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+ -DCOMPILER_RT_BUILD_ORC=OFF \
+ -DCOMPILER_RT_HAS_SAFESTACK=ON \
+ -DCOMPILER_RT_OS_DIR="" \
+ -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
+ -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
+ -DCOMPILER_RT_BUILD_XRAY=OFF \
+ -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
+ -DCOMPILER_RT_STANDALONE_BUILD=ON \
+ -DWOS=ON \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install

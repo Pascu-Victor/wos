@@ -1,4 +1,6 @@
 #pragma once
+#include <unistd.h>
+
 #include <std/cstdint.hpp>
 
 namespace ker::abi {
