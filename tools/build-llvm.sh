@@ -53,6 +53,22 @@ ln -sf . $B/target1/usr
 ln -sf lib $B/target1/lib64
 
 # headers-only mlibc -- compiler-rt needs these
+# Create a basic cross-file for headers-only build
+mkdir -p $B/../tools
+cat > $B/../tools/x86_64-pc-wos-mlibc.txt << 'EOF'
+[binaries]
+c = ['clang', '--target=x86_64-pc-wos']
+cpp = ['clang++', '--target=x86_64-pc-wos']
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+
+[host_machine]
+system = 'wos'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+EOF
+
 # Build mlibc headers
 mkdir -p $B/mlibc-headers
 cd $B/mlibc-headers
@@ -102,8 +118,12 @@ cmake -G Ninja \
  -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
  -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
  -DCOMPILER_RT_BUILD_XRAY=OFF \
- -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
+ -DCOMPILER_RT_BUILD_SANITIZERS=ON \
+ -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack;interception" \
  -DCOMPILER_RT_STANDALONE_BUILD=ON \
+ -DCOMPILER_RT_INTERCEPT_LIBDISPATCH=OFF \
+ -DCOMPILER_RT_HAS_PTHREAD_LIB=OFF \
+ -DCAN_TARGET_AMD64=ON \
  -DWOS=ON \
  $B/src/llvm-project/compiler-rt
 #  -DCOMPILER_RT_BAREMETAL_BUILD=ON \
@@ -114,13 +134,13 @@ mkdir -p $B/target1/lib/clang/21/lib/$TARGET_ARCH
 mv $B/target1/lib/clang/21/target/lib/* $B/target1/lib/clang/21/lib/$TARGET_ARCH
 rm -rf $B/target1/lib/clang/21/target
 
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
 
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
-ln -s $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
 
 # 6.1 fail building libcxx for it's headers see {{cxx-headers}} maybe
 
@@ -169,21 +189,14 @@ cp -r $B/libcxx-build/include/* $B/target1/include/
 
 # 6. Build mlibc
 
-# Prepare cross-file if it doesn't exist
-if [ ! -f $B/../tools/x86_64-pc-wos-mlibc.txt ]; then
-  mkdir -p $B/../tools
-  cat > $B/../tools/x86_64-pc-wos-mlibc.txt << 'EOF'
+# Prepare cross-file (always regenerate to ensure correct paths)
+mkdir -p $B/../tools
+cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos']
-cpp = ['clang++', '--target=x86_64-pc-wos']
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
-
-[built-in options]
-c_args = ['--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-resource-dir=/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21']
-c_link_args = ['--sysroot=/home/womywomwoo/git/wos/toolchain/target1']
-cpp_args = ['--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-resource-dir=/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21']
-cpp_link_args = ['--sysroot=/home/womywomwoo/git/wos/toolchain/target1']
 
 [host_machine]
 system = 'wos'
@@ -191,11 +204,9 @@ cpu_family = 'x86_64'
 cpu = 'x86_64'
 endian = 'little'
 EOF
-fi
 
-export CFLAGS="-I$B/target1/include/c++/v1 --sysroot=$B/target1 -fsanitize=safe-stack"
-export CXXFLAGS="$CFLAGS"
-export LDFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
+# Clear conflicting flags for mlibc build
+unset CFLAGS CXXFLAGS LDFLAGS
 
 mkdir -p $B/mlibc-build
 cd $B/mlibc-build
@@ -213,16 +224,24 @@ meson setup --prefix=$B/target1 \
 ninja && ninja install
 
 # 7. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
+# Re-export flags for libcxx build
+export CFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
+export CXXFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
+export LDFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
+
 mkdir -p $B/libcxx-build-full
 cd $B/libcxx-build-full
 cmake -G Ninja \
- -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind;compiler-rt' \
- -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
+ -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
  -DLIBCXXABI_USE_COMPILER_RT=On \
  -DLIBCXXABI_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
  -DLIBCXXABI_HAS_PTHREAD_API=OFF \
  -DLIBCXXABI_ENABLE_STATIC=ON \
+ -DLIBCXXABI_ENABLE_SHARED=ON \
+ -DLIBUNWIND_ENABLE_SHARED=ON \
+ -DLIBUNWIND_ENABLE_STATIC=ON \
  -DLIBCXX_USE_COMPILER_RT=On \
  -DLIBCXX_INSTALL_HEADERS=ON \
  -DLIBCXX_INCLUDE_TESTS=OFF \
@@ -233,61 +252,26 @@ cmake -G Ninja \
  -DLIBCXX_ENABLE_FILESYSTEM=OFF \
  -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
  -DLIBCXX_CXX_ABI=libcxxabi \
+ -DLIBCXX_HAS_ATOMIC_LIB=OFF \
+ -DLIBCXXABI_HAS_ATOMIC_LIB=OFF \
  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
  -DCMAKE_SYSTEM_NAME=WOS \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_INSTALL_PREFIX=$B/target1 \
- -DCMAKE_CXX_FLAGS="-I$B/target1/include -lclang_rt.safestack-x86_64 --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always -L$B/target1/lib/clang/21/target/lib/" \
+ -DCMAKE_CXX_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always" \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CROSSCOMPILING=True \
- -DCMAKE_C_FLAGS="-I$B/target1/include -lclang_rt.safestack-x86_64 --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always -L$B/target1/lib/clang/21/target/lib/" \
+ -DCMAKE_C_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always" \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_C_COMPILER_WORKS=ON \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
- -DCOMPILER_RT_BUILD_BUILTINS=ON \
- -DCOMPILER_RT_BUILD_MEMPROF=OFF \
- -DCOMPILER_RT_BUILD_ORC=OFF \
- -DCOMPILER_RT_HAS_SAFESTACK=ON \
- -DCOMPILER_RT_OS_DIR="" \
- -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
- -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
- -DCOMPILER_RT_BUILD_XRAY=OFF \
- -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
- -DCOMPILER_RT_STANDALONE_BUILD=ON \
+ -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH -lclang_rt.safestack-x86_64" \
+ -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH -lclang_rt.safestack-x86_64" \
  -DWOS=ON \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
-
-# 8. Build full clang toolchain targeting WOS
-mkdir -p $B/stage2-build
-cd $B/stage2-build
-cmake -G Ninja \
- -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_INSTALL_PREFIX=$B/target1 \
- -DCMAKE_C_COMPILER=$CC \
- -DCMAKE_CXX_COMPILER=$CXX \
- -DCMAKE_CXX_FLAGS="-stdlib=libc++ -I$B/target1/include/c++/v1" \
- -DCMAKE_C_COMPILER_WORKS=ON \
- -DCMAKE_CXX_COMPILER_WORKS=ON \
- -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
- -DLLVM_ENABLE_PROJECTS='clang;lld' \
- -DLLVM_TARGETS_TO_BUILD=X86 \
- -DLLVM_DEFAULT_TARGET_TRIPLE=$TARGET_ARCH \
- -DLLVM_ENABLE_LLD=On \
- -DLLVM_ENABLE_LIBXML2=Off \
- -DCLANG_DEFAULT_LINKER=lld \
- -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
- -DCLANG_DEFAULT_RTLIB=compiler-rt \
- -DLLVM_INCLUDE_TESTS=OFF \
- -DLLVM_INCLUDE_EXAMPLES=OFF \
- -DLLVM_INCLUDE_BENCHMARKS=OFF \
- $B/src/llvm-project/llvm
-
-ninja && ninja install
-
-echo "WOS toolchain build complete!"

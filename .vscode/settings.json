@@ -1,0 +1,32 @@
+{
+    "files.associations": {
+        "*.pl": "prolog",
+        "*.inc": "cpp",
+        "limits.h": "c",
+        "stdlib.h": "c",
+        "string.h": "c",
+        "cstdlib": "cpp",
+        "__bit_reference": "cpp",
+        "__hash_table": "cpp",
+        "__split_buffer": "cpp",
+        "__tree": "cpp",
+        "array": "cpp",
+        "deque": "cpp",
+        "iterator": "cpp",
+        "hash_map": "cpp",
+        "hash_set": "cpp",
+        "forward_list": "cpp",
+        "list": "cpp",
+        "map": "cpp",
+        "set": "cpp",
+        "span": "cpp",
+        "string": "cpp",
+        "string_view": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "chrono": "cpp",
+        "format": "cpp",
+        "ranges": "cpp"
+    }
+}
