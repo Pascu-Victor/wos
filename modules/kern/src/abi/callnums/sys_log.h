@@ -1,5 +1,5 @@
 #pragma once
-#include <std/cstdint.hpp>
+#include <cstdint>
 
 namespace ker::abi::sys_log {
 enum class sys_log_ops : uint64_t {

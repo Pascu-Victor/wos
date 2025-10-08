@@ -7,7 +7,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/sys/spinlock.hpp>
-#include <std/hcf.hpp>
+#include <util/hcf.hpp>
 
 namespace ker::mod::mm::phys {
 void init(limine_memmap_response* memmapResponse);

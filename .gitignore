@@ -9,7 +9,7 @@ disk.qcow2
 **/extern/clang/*
 
 #tool binaries
-resolve_addresses
+**/tools/bin/*
 
 #clang dir
 **/extern/clang/*

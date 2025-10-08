@@ -68,6 +68,8 @@ static __always_inline void rdcr4(uint64_t *val) { asm volatile("mov %%cr4, %0" 
 
 void enablePAE(void);
 void enablePSE(void);
+void enableSSE(void);
+void enableFSGSBASE(void);
 
 #define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

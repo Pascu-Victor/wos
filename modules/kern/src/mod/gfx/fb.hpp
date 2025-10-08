@@ -1,10 +1,10 @@
 #pragma once
 #include <limine.h>
+#include <math.h>
 
 #include <mod/gfx/fb_font.hpp>
-#include <std/hcf.hpp>
-#include <std/math.hpp>
-#include <std/mem.hpp>
+#include <util/hcf.hpp>
+#include <util/mem.hpp>
 
 namespace ker::mod::gfx {
 namespace fb {

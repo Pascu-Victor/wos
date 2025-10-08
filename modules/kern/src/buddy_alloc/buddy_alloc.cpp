@@ -1,10 +1,12 @@
-#include <std/hcf.hpp>
-#include <std/nop.hpp>
+#include <util/hcf.hpp>
+#include <util/nop.hpp>
 #define BUDDY_PRINTF WOS_NOP
 #define BUDDY_ALLOC_ALIGN 8
 #define CHAR_BIT 8
 
 #define NULL nullptr
+
+#include <bits/ssize_t.h>
 
 #include "buddy_alloc.hpp"
 #define BUDDY_ALLOC_IMPLEMENTATION
@@ -83,8 +85,7 @@ struct buddy_tree_pos {
 };
 
 #ifdef __cplusplus
-#define INVALID_POS \
-    buddy_tree_pos { 0, 0 }
+#define INVALID_POS buddy_tree_pos{0, 0}
 #else
 #define INVALID_POS ((struct buddy_tree_pos){0, 0})
 #endif

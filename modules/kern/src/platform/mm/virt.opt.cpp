@@ -1,5 +1,6 @@
 #include "virt.hpp"
 
+#include <cstring>
 #include <platform/dbg/dbg.hpp>
 namespace ker::mod::mm::virt {
 static paging::PageTable* kernelPagemap;
@@ -27,6 +28,7 @@ void copyKernelMappings(sched::task::Task* t) {
 
 void switchPagemap(sched::task::Task* t) {
     if (!t->pagemap) {
+        [[unlikely]]
         if (t->name) {
             dbg::log("Task %s has no pagemap\n", t->name);
         } else {
@@ -55,28 +57,29 @@ static inline uint64_t index_of(const uint64_t vaddr, const int offset) { return
 
 paddr_t translate(PageTable* pageTable, vaddr_t vaddr) {
     if (!pageTable) {
-        // PANIC!
+        dbg::log("translate: no page table\n");
         hcf();
     }
 
     PageTable* table = pageTable;
     for (int i = 4; i > 1; i--) {
-        table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
-        if (!table) {
+        uint64_t phys = table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT;
+        table = (PageTable*)(phys + 0xffff800000000000ULL);  // Use HHDM for page table walk
+        if ((uint64_t)table == 0xffff800000000000ULL) {
             return 0;
         }
     }
 
-    return (paddr_t)addr::getVirtPointer((table->entries[index_of(vaddr, 1)].frame << paging::PAGE_SHIFT) +
-                                         (vaddr & (paging::PAGE_SIZE - 1)));
+    uint64_t phys = (table->entries[index_of(vaddr, 1)].frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
+    return phys;  // Return physical address only
 }
-
 void initPagemap() {
     cpu::enablePAE();
     cpu::enablePSE();
     kernelPagemap = (PageTable*)phys::pageAlloc();
     if (kernelPagemap == nullptr) {
         // PANIC!
+        dbg::log("init: failed to allocate kernel pagemap\n function: initPagemap\n");
         hcf();
     }
     dbg::log("Kernel pagemap allocated at %x\n", kernelPagemap);
@@ -160,14 +163,19 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
         return (PageTable*)addr::getVirtPointer(entry.frame << paging::PAGE_SHIFT);
     }
 
-    paddr_t addr = (paddr_t)addr::getPhysPointer((vaddr_t)phys::pageAlloc());
-    if (addr == 0) {
+    void* pageVirt = phys::pageAlloc();
+    if (pageVirt == nullptr) {
         // PANIC!
+        dbg::log("init: failed to allocate kernel page table\n function: advancePageTable\n");
         hcf();
     }
 
-    pageTable->entries[level] = paging::createPageTableEntry(addr, flags);
-    return (PageTable*)addr::getVirtPointer(addr);
+    paddr_t pagePhys = (paddr_t)addr::getPhysPointer((vaddr_t)pageVirt);
+
+    memset(pageVirt, 0, paging::PAGE_SIZE);
+
+    pageTable->entries[level] = paging::createPageTableEntry(pagePhys, flags);
+    return (PageTable*)pageVirt;
 }
 /*
  * Map a page in the page table
@@ -177,9 +185,10 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
  * @param paddr - the physical address to map the page to
  * @param flags - the flags to set for the page
  */
-void mapPage(PageTable* pml4, vaddr_t vaddr, paddr_t paddr, int flags) {
+void mapPage(PageTable* pml4, const vaddr_t vaddr, const paddr_t paddr, const int flags) {
     if (!pml4 || !flags) {
         // PANIC!
+        dbg::log("init: failed to map page\n function: mapPage\n args: <vaddr: %p, paddr: %p, flags: %d>", vaddr, paddr, flags);
         hcf();
     }
 
@@ -200,6 +209,7 @@ void mapPage(PageTable* pml4, vaddr_t vaddr, paddr_t paddr, int flags) {
 bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
     if (!pageTable) {
         // PANIC!
+        dbg::log("init: failed to get page table\n function: isPageMapped\n");
         hcf();
     }
 
@@ -217,6 +227,7 @@ bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
 void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
     if (!pageTable) {
         // PANIC!
+        dbg::log("init: failed to get page table\n function: unifyPageFlags\n");
         hcf();
     }
 
@@ -228,12 +239,17 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
     PageTableEntry entry = table->entries[index_of(vaddr, 1)];
     entry.writable = entry.writable | (flags & paging::PAGE_WRITE);
     entry.user = entry.user | (flags & paging::PAGE_USER);
+    // Set NX if requested; we never clear NX here to avoid creating executable holes inadvertently.
+    if (flags & paging::PAGE_NX) {
+        entry.noExecute = 1;
+    }
     table->entries[index_of(vaddr, 1)] = entry;
 }
 
 void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
     if (!pageTable) {
         // PANIC!
+        dbg::log("init: failed to get page table\n function: unmapPage\n");
         hcf();
     }
 
@@ -253,6 +269,7 @@ void mapRange(PageTable* pageTable, Range range, int flags, uint64_t offset) {
     auto [start, end] = range;
     if (start % paging::PAGE_SIZE || end % paging::PAGE_SIZE || start >= end) {
         // PANIC!
+        dbg::log("init: failed to map range\n");
         hcf();
     }
 

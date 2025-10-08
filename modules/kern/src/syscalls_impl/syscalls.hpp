@@ -2,4 +2,7 @@
 
 #include <syscalls_impl/log/log.hpp>
 #include <syscalls_impl/multiproc/multiproc.hpp>
+#include <syscalls_impl/net/sys_net.hpp>
 #include <syscalls_impl/process/process.hpp>
+#include <syscalls_impl/time/time.hpp>
+#include <syscalls_impl/vfs/sys_vfs.hpp>

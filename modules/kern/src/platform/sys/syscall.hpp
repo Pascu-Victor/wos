@@ -1,12 +1,15 @@
 #pragma once
 
 #include <abi/callnums.hpp>
+#include <cstdint>
 #include <mod/io/serial/serial.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/asm/msr.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/sched/task.hpp>
-#include <std/hcf.hpp>
+
+// Avoid pulling in the project's heavy in-tree std headers here; only declare hcf()
+extern "C" __attribute__((noreturn)) void hcf() noexcept;
 #include <syscalls_impl/syscalls.hpp>
 
 namespace ker::mod::sys {

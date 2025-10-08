@@ -1,5 +1,9 @@
 #include "syscall.hpp"
 
+#include <syscalls_impl/net/sys_net.hpp>
+#include <syscalls_impl/time/time.hpp>
+#include <syscalls_impl/vfs/sys_vfs.hpp>
+
 namespace ker::mod::sys {
 
 extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
@@ -15,8 +19,14 @@ extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
         case abi::callnums::sys_log:
             return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
                                              static_cast<abi::sys_log::sys_log_device>(a4));
-        case abi::callnums::threadInfo:
+        case abi::callnums::threading:
             return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
+        case abi::callnums::time:
+            return ker::syscall::time::sys_time_get(a1, (void*)a2, (void*)a3);
+        case abi::callnums::vfs:
+            return ker::syscall::vfs::sys_vfs(a1, a2, a3, a4);
+        case abi::callnums::net:
+            return ker::syscall::net::sys_net(a1, a2, a3, a4, a5);
         default:
             io::serial::write("Syscall undefined\n");
             io::serial::write("Callnum: ");

@@ -6,12 +6,12 @@
                 "${default}",
                 "${workspaceFolder}/modules/kern/src",
                 "${workspaceFolder}/modules/extern",
-                "${workspaceFolder}/modules/stdlib/src",
+                
                 "${workspaceFolder}/modules/defines",
                 "${workspaceFolder}/modules"
             ],
             "defines": [],
-            "compilerPath": "${workspaceFolder}/tools/llvm-build/bin/clang",
+            "compilerPath": "${workspaceFolder}/toolchain/target1/bin/clang",
             "intelliSenseMode": "linux-clang-x64",
             "configurationProvider": "ms-vscode.cmake-tools"
         }

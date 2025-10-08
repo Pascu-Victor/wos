@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#include <std/cstdint.hpp>
+#include <cstdint>
 
 /* Misc */
 

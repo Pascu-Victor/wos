@@ -15,6 +15,7 @@ PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
     entry.dirty = 0;
     entry.global = 0;
     entry.available = 0;
+    entry.noExecute = (flags & PAGE_NX) ? 1 : 0;
     return entry;
 }
 

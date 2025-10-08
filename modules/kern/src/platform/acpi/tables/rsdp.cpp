@@ -22,7 +22,7 @@ bool useXsdt(void) { return hasXsdt; }
 
 void init(uint64_t rsdpAddr) {
     validateChecksum(&rsdp);
-    rsdp = *(Rsdp *)rsdpAddr;
+    rsdp = *(Rsdp *)mm::addr::getVirtPointer(rsdpAddr);
     rsdp.oem_id[5] = 0;
     // TODO: log stuff
 

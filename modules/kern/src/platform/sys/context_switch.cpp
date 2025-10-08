@@ -20,7 +20,7 @@ extern "C" void _wOS_schedTimer(cpu::GPRegs gpr, gates::interruptFrame frame) {
 }
 
 void startSchedTimer() {
-    timerQuantum = apic::calibrateTimer(200);
+    timerQuantum = apic::calibrateTimer(400);
     apic::oneShotTimer(timerQuantum);
 }
 }  // namespace ker::mod::sys::context_switch

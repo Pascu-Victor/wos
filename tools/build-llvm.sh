@@ -57,11 +57,10 @@ ln -sf lib $B/target1/lib64
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << 'EOF'
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos']
-cpp = ['clang++', '--target=x86_64-pc-wos']
+c = ['clang', '--target=x86_64-pc-wos',  '-fno-PIC', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos',  '-fno-PIC', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
-
 [host_machine]
 system = 'wos'
 cpu_family = 'x86_64'
@@ -81,15 +80,22 @@ meson setup --prefix=$B/target1 \
     -Dbindir=bin \
     -Dwos_option=enabled \
     -Dglibc_option=enabled \
+    -Db_staticpic=false \
     $B/src/mlibc
 ninja install
 
-# Create empty CRT files
+# Create minimal CRT files for compiler-rt build (these will be replaced by mlibc later)
 touch empty.c
 $CC -O3 -c empty.c       -o $B/target1/lib/crtbegin.o
 $CC -O3 -c empty.c -fPIC -o $B/target1/lib/crtbeginS.o
 $CC -O3 -c empty.c       -o $B/target1/lib/crtend.o
 $CC -O3 -c empty.c -fPIC -o $B/target1/lib/crtendS.o
+
+# Create temporary CRT startup files for compiler-rt (will be replaced by mlibc)
+$CC -O3 -c empty.c       -o $B/target1/lib/Scrt1.o
+$CC -O3 -c empty.c       -o $B/target1/lib/crt1.o
+$CC -O3 -c empty.c       -o $B/target1/lib/crti.o
+$CC -O3 -c empty.c       -o $B/target1/lib/crtn.o
 
 # 5. Build compiler-rt builtins
 mkdir -p $B/compiler-rt-build
@@ -119,7 +125,7 @@ cmake -G Ninja \
  -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
  -DCOMPILER_RT_BUILD_XRAY=OFF \
  -DCOMPILER_RT_BUILD_SANITIZERS=ON \
- -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack;interception" \
+ -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
  -DCOMPILER_RT_STANDALONE_BUILD=ON \
  -DCOMPILER_RT_INTERCEPT_LIBDISPATCH=OFF \
  -DCOMPILER_RT_HAS_PTHREAD_LIB=OFF \
@@ -132,6 +138,8 @@ ninja && ninja install
 
 mkdir -p $B/target1/lib/clang/21/lib/$TARGET_ARCH
 mv $B/target1/lib/clang/21/target/lib/* $B/target1/lib/clang/21/lib/$TARGET_ARCH
+mv $B/target1/lib/clang/21/target/include $B/target1/lib/clang/21/include
+
 rm -rf $B/target1/lib/clang/21/target
 
 ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
@@ -193,8 +201,8 @@ cp -r $B/libcxx-build/include/* $B/target1/include/
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include']
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 
@@ -213,12 +221,12 @@ cd $B/mlibc-build
 
 meson setup --prefix=$B/target1 \
   --sysconfdir=etc \
-  --default-library=static \
   --buildtype=release \
   --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
   -Dheaders_only=false \
   -Dwos_option=enabled \
   -Dglibc_option=enabled \
+  -Ddefault_library=static \
   $B/src/mlibc
 
 ninja && ninja install

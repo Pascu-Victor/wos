@@ -6,7 +6,7 @@
 namespace ker::mod::gates {
 smt::PerCpuVar<interruptHandler_t> interruptHandlers[256](nullptr);
 
-void exception_handler(cpu::GPRegs gpr, interruptFrame &frame) {
+void exception_handler(cpu::GPRegs &gpr, interruptFrame &frame) {
     if (frame.intNum == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));

@@ -35,6 +35,8 @@ void idtSetEntry(IdtEntry* entry, void* isr, uint8_t flags);
 
 void idtInit(void);
 
+void loadIdt(void);
+
 extern "C" {
 #define isr(n) void isr##n(void)
 #define isr_except(n) void isr_except##n(void)

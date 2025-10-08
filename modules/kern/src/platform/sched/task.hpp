@@ -6,7 +6,8 @@
 #include <platform/mm/paging.hpp>
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
-#include <std/rbtree.hpp>
+#include <platform/sched/threading.hpp>
+// Avoid pulling in in-tree std headers into kernel translation units from here.
 
 namespace ker::mod::sched::task {
 
@@ -28,17 +29,6 @@ struct Context {
     gates::interruptFrame frame;
 } __attribute__((packed));
 
-struct Thread {
-    desc::gdt::GdtEntry tls[3];
-    uint64_t fsindex;
-    uint64_t gsindex;
-
-    uint64_t fsbase;
-    uint64_t gsbase;
-
-    uint64_t stack;
-    uint64_t stackSize;
-} __attribute__((packed));
 struct Task {
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
@@ -51,9 +41,17 @@ struct Task {
     const char* name;
     TaskType type;
     uint64_t cpu;
-    Thread* thread;
+    threading::Thread* thread;
+    uint64_t pid;
+
+    // File descriptor table for the task (per-process model planned).
+    // Small fixed-size table for now; will be moved/made dynamic when process struct is available.
+    static constexpr unsigned FD_TABLE_SIZE = 256;
+    void* fds[FD_TABLE_SIZE];  // opaque pointers to kernel file descriptor objects (ker::vfs::File)
 
     void loadContext(cpu::GPRegs* gpr);
     void saveContext(cpu::GPRegs* gpr);
 } __attribute__((packed));
+
+uint64_t getNextPid();
 }  // namespace ker::mod::sched::task

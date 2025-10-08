@@ -1,6 +1,7 @@
 #pragma once
 
-#include <std/mem.hpp>
+#include <cstdint>
+#include <util/mem.hpp>
 
 void outb(uint16_t port, uint8_t val);
 uint8_t inb(uint16_t port);

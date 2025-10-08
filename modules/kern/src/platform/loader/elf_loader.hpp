@@ -6,9 +6,15 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
-#include <std/string.hpp>
 
 namespace ker::loader::elf {
+
+// TLS module information
+struct TlsModule {
+    uint64_t tlsBase;    // Base address of TLS area (not used for template)
+    uint64_t tlsSize;    // Size of TLS area (from PT_TLS segment)
+    uint64_t tcbOffset;  // Offset to TCB within TLS
+};
 
 typedef uint64_t Elf64Entry;
 
@@ -16,10 +22,19 @@ struct ElfFile {
     Elf64_Ehdr elfHead;         // ELF header
     Elf64_Phdr *pgHead;         // Program headers
     Elf64_Shdr *seHead;         // Section headers
-    elf64_shdr *sctHeadStrTab;  // Section header string table
+    Elf64_Shdr *sctHeadStrTab;  // Section header string table
     uint8_t *base;              // Base address of the ELF file
+    uint64_t loadBase;          // Load base address for PIE executables
+    TlsModule tlsInfo;          // TLS information for this ELF
 };
 
-Elf64Entry loadElf(ElfFile *elf, mod::mm::virt::PageTable *pagemap);
+Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName,
+                   bool registerSpecialSymbols = true);
+
+// Extract TLS information from ELF without fully loading it
+TlsModule extractTlsInfo(void *elfData);
+
+// Remove the global getter - TLS info should be passed per-process
+// TlsModule getTlsModule();
 
 }  // namespace ker::loader::elf

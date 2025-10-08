@@ -8,7 +8,7 @@
 #include <platform/smt/smt.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
-#include <std/list.hpp>
+#include <util/list.hpp>
 
 namespace ker::mod::sched {
 struct RunQueue {

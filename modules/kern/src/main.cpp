@@ -1,5 +1,6 @@
 #include <limine.h>
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
@@ -12,12 +13,12 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
-#include <std/drawing.hpp>
-#include <std/hcf.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
+#include <vfs/vfs.hpp>
 
-__attribute__((used, section(".requests"))) static volatile LIMINE_BASE_REVISION(2);
+// Minimal forward-declarations to avoid including the project's in-tree std headers
+extern "C" __attribute__((noreturn)) void hcf() noexcept;
+
+__attribute__((used, section(".requests"))) static volatile LIMINE_BASE_REVISION(3);
 
 __attribute__((used, section(".requests_start_marker"))) static volatile LIMINE_REQUESTS_START_MARKER;
 
@@ -53,8 +54,10 @@ extern "C" void _start(void) {
     dbg::log("Framebuffer mapped");
     dbg::log("Pages mapped");
 
-    uint8_t* stack;  // = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    // Enable FSGSBASE instructions
+    cpu::enableFSGSBASE();
 
+    uint8_t* stack;  // = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
     // Init gds.
     asm volatile("mov %%rsp, %0" : "=r"(stack));
     ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
@@ -66,6 +69,8 @@ extern "C" void _start(void) {
     // Init interrupts.
     ker::mod::interrupt::init();
     ker::mod::sys::init();
+    // Init VFS
+    ker::vfs::init();
     ker::mod::sched::init();
 
     boot::HandoverModules modules;
@@ -90,8 +95,10 @@ extern "C" void _start(void) {
         modules.modules[i].name = kernelModuleRequest.response->modules[i]->path;
     }
 
-    // uint8_t* kernelRsp = (uint8_t*)mm::dyn::kmalloc::malloc(KERNEL_STACK_SIZE);  // 16KB
-    // kernelRsp += KERNEL_STACK_SIZE;                                              // Stack grows down so we start at the top.
+    // Enable SSE instructions
+    // Here so we can fail hard for sse instructions in the kernel easily for as long as possible
+    cpu::enableSSE();
+
     // Init smt
     ker::mod::smt::startSMT(modules, (uint64_t)stack);
 

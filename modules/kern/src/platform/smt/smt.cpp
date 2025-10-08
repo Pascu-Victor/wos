@@ -1,5 +1,7 @@
 #include "smt.hpp"
 
+#include <cassert>
+
 __attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
     .id = LIMINE_SMP_REQUEST,
     .revision = 0,
@@ -14,9 +16,9 @@ uint64_t cpu_count;
 
 uint64_t getCoreCount(void) { return cpu_count; }
 
-const CpuInfo getCpu(uint64_t number) { return cpuData->thatCpu(number).copy(); }
+const CpuInfo getCpu(uint64_t number) { return *cpuData->thatCpu(number); }
 
-const CpuInfo thisCpuInfo() { return cpuData->thisCpu().copy(); }
+const CpuInfo thisCpuInfo() { return *cpuData->thisCpu(); }
 
 // Future NUMA support here
 uint64_t getCpuNode(uint64_t cpuNo) { return cpuNo; }
@@ -33,6 +35,14 @@ void cpuParamInit() {
     auto idleTask = new sched::task::Task("idle", 0, 0, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
     sched::startScheduler();
+}
+
+void nonPrimaryCpuInit() {
+    desc::idt::loadIdt();
+    for (;;) {
+        asm volatile("hlt");
+    }
+    cpuParamInit();
 }
 
 void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
@@ -75,12 +85,24 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     for (uint64_t i = 1; i < smp_request.response->cpu_count; i++) {
         auto stack = mm::Stack();
         cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
-        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(cpuParamInit), stack);
+        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(nonPrimaryCpuInit), stack);
     }
     runHandoverTasks(modules, kernelRsp);
     hcf();
 }
 
 uint64_t cpuCount() { return cpu_count; }
+
+// update fsbase in current thread and switch the fs_base register
+uint64_t setTcb(void* tcb) {
+    mod::dbg::log("setTcb called with tcb = 0x%x", (uint64_t)tcb);
+    asm volatile("cli");
+    cpuData->thisCpu()->currentTask->thread->fsbase = (uint64_t)tcb;
+    *(uint64_t*)tcb = (uint64_t)tcb;
+    cpu::wrfsbase((uint64_t)tcb);
+    asm volatile("sti");
+    mod::dbg::log("setTcb: fsbase set to 0x%x", (uint64_t)tcb);
+    return 0;
+}
 
 }  // namespace ker::mod::smt

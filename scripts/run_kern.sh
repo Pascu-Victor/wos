@@ -13,7 +13,6 @@ function check_headers() {
 # run check_headers
 check_headers "modules/kern"
 check_headers "modules/init"
-check_headers "modules/stdlib"
 
 cmake -B build -GNinja .
 cmake --build build
@@ -35,4 +34,4 @@ rm -f qemu.*log
 CHARDEV="-chardev file,id=char0,path=serial.log -serial chardev:char0 -monitor stdio"
 
 echo "STARTING BOOT:"
-qemu-system-x86_64 --enable-kvm -cpu host -s -S -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 4
+qemu-system-x86_64 -cpu max -s -S -m 1G -drive file=disk.qcow2 -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 1

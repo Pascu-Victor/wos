@@ -1,6 +1,6 @@
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include/c++/v1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include']
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include', '-fno-PIC', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include/c++/v1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/21/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include', '-fno-PIC', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 

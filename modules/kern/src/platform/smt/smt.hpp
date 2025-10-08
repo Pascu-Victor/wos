@@ -8,11 +8,8 @@
 #include <platform/interrupt/interrupt.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/sched/scheduler.hpp>
-#include <std/borrows.hpp>
-#include <std/cstdassert.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
-#include <std/type_traits.hpp>
+#include <platform/sched/task.hpp>
+#include <type_traits>
 
 namespace ker::mod::smt {
 
@@ -23,6 +20,7 @@ struct CpuInfo {
     uint32_t lapic_id;
     CpuGotoAddr* goto_address = nullptr;
     uint64_t* stack_pointer_ref = nullptr;
+    sched::task::Task* currentTask = nullptr;
 };
 
 uint64_t getCoreCount(void);
@@ -43,7 +41,10 @@ class PerCpuVar {
     T* _data;
 
    public:
-    PerCpuVar(T defaultValue = T()) { _data = new T[getCoreCount()](defaultValue); }
+    PerCpuVar(T defaultValue = T()) {
+        _data = new T[getCoreCount()];
+        for (uint64_t i = 0; i < getCoreCount(); ++i) _data[i] = defaultValue;
+    }
 
     T& get() { return _data[cpu::currentCpu()]; }
 
@@ -60,14 +61,17 @@ class PerCpuVar {
 template <typename T>
 class PerCpuCrossAccess {
    private:
-    std::Borrowable<T>* _data;
+    T* _data;
 
    public:
-    PerCpuCrossAccess(T defaultValue = T()) { _data = new std::Borrowable<T>[getCoreCount()](defaultValue); }
+    PerCpuCrossAccess(T defaultValue = T()) {
+        _data = new T[getCoreCount()];
+        for (uint64_t i = 0; i < getCoreCount(); ++i) _data[i] = defaultValue;
+    }
 
-    std::Borrowable<T>::BorrowedRef thisCpu() { return _data[apic::getApicId()].borrow(); }
+    T* thisCpu() { return &_data[cpu::currentCpu()]; }
 
-    std::Borrowable<T>::BorrowedRef thatCpu(uint64_t cpu) { return _data[cpu].borrow(); }
+    T* thatCpu(uint64_t cpu) { return &_data[cpu]; }
 
     void setThisCpu(const T& data) { _data[cpu::currentCpu()] = data; }
 
@@ -101,5 +105,7 @@ constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
 }
 
 uint64_t cpuCount();
+
+uint64_t setTcb(void* tcb);
 
 }  // namespace ker::mod::smt

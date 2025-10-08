@@ -39,14 +39,37 @@ void write(const char c) {
 void write(uint64_t num) {
     char str[21];
     str[20] = '\0';
-    std::u64toa(num, str);
+    // simple u64 -> decimal string converter
+    int pos = 20;
+    if (num == 0) {
+        str[--pos] = '0';
+    } else {
+        while (num > 0 && pos > 0) {
+            str[--pos] = '0' + (num % 10);
+            num /= 10;
+        }
+    }
+    // shift to start
+    int len = 20 - pos;
+    for (int i = 0; i < len; ++i) str[i] = str[pos + i];
+    str[len] = '\0';
     write(str);
 }
 
 void writeHex(uint64_t num) {
     char str[17];
     str[16] = '\0';
-    std::u64toh(num, str);
+    const char *hex = "0123456789abcdef";
+    for (int i = 0; i < 16; ++i) {
+        str[15 - i] = hex[num & 0xF];
+        num >>= 4;
+    }
+    // trim leading zeros
+    int start = 0;
+    while (start < 15 && str[start] == '0') ++start;
+    int len = 16 - start;
+    for (int i = 0; i < len; ++i) str[i] = str[start + i];
+    str[len] = '\0';
     write(str);
 }
 

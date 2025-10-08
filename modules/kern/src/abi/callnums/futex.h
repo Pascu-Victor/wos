@@ -1,5 +1,5 @@
 #pragma once
-#include <std/cstdint.hpp>
+#include <cstdint>
 
 namespace ker::abi::futex {
 enum class futex_ops : uint64_t {

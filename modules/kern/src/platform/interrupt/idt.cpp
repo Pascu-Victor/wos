@@ -288,6 +288,10 @@ void idtInit(void) {
     idtPtr.limit = (uint16_t)sizeof(idt) - 1;
     idtPtr.base = (uint64_t)&idt;
 
+    loadIdt();
+}
+
+void loadIdt(void) {
     __asm__ volatile("lidt %0" : : "m"(idtPtr));  // load the new IDT
 }
 

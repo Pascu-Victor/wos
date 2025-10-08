@@ -33,4 +33,15 @@ void enablePSE(void) {
     wrcr4(cr4);
 }
 
+void enableFSGSBASE(void) {
+    uint64_t cr4;
+    rdcr4(&cr4);
+    cr4 |= 1 << 16;  // FSGSBASE
+    wrcr4(cr4);
+}
+
+extern "C" void _wOS_enableSSE_asm(void);
+
+void enableSSE(void) { _wOS_enableSSE_asm(); }
+
 }  // namespace ker::mod::cpu

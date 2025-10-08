@@ -1,5 +1,7 @@
 #include "fb.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <platform/mm/virt.hpp>
 __attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebufferRequest = {
     .id = LIMINE_FRAMEBUFFER_REQUEST,
@@ -20,8 +22,8 @@ void init(void) {
 
     __framebuffer = framebufferRequest.response->framebuffers[0];
 
-    __framebuffer->width = min(__framebuffer->width, 3840);
-    __framebuffer->height = min(__framebuffer->height, 2160);
+    __framebuffer->width = std::min<uint64_t>(__framebuffer->width, (uint64_t)3840);
+    __framebuffer->height = std::min<uint64_t>(__framebuffer->height, (uint64_t)2160);
 
     // manual constructor calling since we can't use new for now
     std::strcpy(__currentFont.name, "default");
@@ -132,11 +134,11 @@ void drawLineNoSwap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t
     } else if (dx > 0) {
         dx2 = 1;
     }
-    int longest = abs(dx);
-    int shortest = abs(dy);
+    int longest = std::abs(dx);
+    int shortest = std::abs(dy);
     if (!(longest > shortest)) {
-        longest = abs(dy);
-        shortest = abs(dx);
+        longest = std::abs(dy);
+        shortest = std::abs(dx);
         if (dy < 0) {
             dy2 = -1;
         } else if (dy > 0) {

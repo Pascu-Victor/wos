@@ -5,10 +5,8 @@
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <std/function.hpp>
-#include <std/hcf.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
+#include <util/hcf.hpp>
+#include <util/mem.hpp>
 
 namespace ker::mod::dbg {
 void init(void);

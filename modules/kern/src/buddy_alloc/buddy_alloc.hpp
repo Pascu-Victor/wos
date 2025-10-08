@@ -18,7 +18,7 @@
 
 #ifndef BUDDY_HEADER
 #include <defines/defines.hpp>
-#include <std/mem.hpp>
+#include <util/mem.hpp>
 #endif
 
 #ifdef __cplusplus

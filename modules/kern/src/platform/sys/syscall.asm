@@ -28,8 +28,9 @@ _wOS_asm_syscallHandler:
     ; push qword 0x23       ; usermode code segment
     ; push rcx              ; usermode rip
 
-    ; mov rdi, rsp
-    ; mov rbp, 0
+    ; Pass pointer to saved registers (GPRegs) as first argument
+    mov rdi, rsp
+    xor rbp, rbp
 
     call syscallHandler
     ; save return value

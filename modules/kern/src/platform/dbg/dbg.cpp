@@ -1,5 +1,8 @@
 #include "dbg.hpp"
 
+#include <cstdarg>
+#include <util/string.hpp>
+
 namespace ker::mod::dbg {
 bool isInit = false;
 bool isTimeAvailable = false;
@@ -43,8 +46,29 @@ inline void serialLog(const char* str) {
         int logTime = time::getMs();
         int logTimeMsPart = logTime % 1000;
         int logTimeSecPart = logTime / 1000;
-        std::u64toa(logTimeMsPart, timeMs, 10);
-        std::u64toa(logTimeSecPart, timeSec, 10);
+        // simple u64 to ascii helper (avoid depending on userspace std here)
+        auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
+            if (n == 0) {
+                s[0] = '0';
+                s[1] = '\0';
+                return 1;
+            }
+            char buf[32];
+            int i = 0;
+            while (n > 0) {
+                int digit = n % base;
+                buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                n /= base;
+            }
+            int j = 0;
+            while (i > 0) {
+                s[j++] = buf[--i];
+            }
+            s[j] = '\0';
+            return j;
+        };
+        u64toa_local(logTimeMsPart, timeMs, 10);
+        u64toa_local(logTimeSecPart, timeSec, 10);
         io::serial::write('[');
         io::serial::write(timeSec);
         io::serial::write('.');
@@ -72,8 +96,28 @@ inline void fbLog(const char* str) {
         int logTime = time::getMs();
         int logTimeMsPart = logTime % 1000;
         int logTimeSecPart = logTime / 1000;
-        int msLen = std::u64toa(logTimeMsPart, timeMs, 10);
-        int secLen = std::u64toa(logTimeSecPart, timeSec, 10);
+        auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
+            if (n == 0) {
+                s[0] = '0';
+                s[1] = '\0';
+                return 1;
+            }
+            char buf[32];
+            int i = 0;
+            while (n > 0) {
+                int digit = n % base;
+                buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                n /= base;
+            }
+            int j = 0;
+            while (i > 0) {
+                s[j++] = buf[--i];
+            }
+            s[j] = '\0';
+            return j;
+        };
+        int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
+        int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
         gfx::fb::drawString(stampLen, line, timeSec);
         stampLen += secLen;
         gfx::fb::drawChar(stampLen, line, '.');

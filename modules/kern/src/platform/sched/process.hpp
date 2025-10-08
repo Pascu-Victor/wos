@@ -1,7 +1,6 @@
 #pragma once
 
 #include <platform/sched/task.hpp>
-#include <std/map.hpp>
 #include <std/string.hpp>
 #include <std/vector.hpp>
 

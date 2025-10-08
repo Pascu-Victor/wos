@@ -8,6 +8,8 @@ static Slab<0x080, PAGE_SIZE> slab_0x80;
 static Slab<0x100, PAGE_SIZE> slab_0x100;
 static Slab<0x200, PAGE_SIZE> slab_0x200;
 static Slab<0x300, PAGE_SIZE> slab_0x300;
+static Slab<0x400, PAGE_SIZE> slab_0x400;
+static Slab<0x800, PAGE_SIZE> slab_0x800;
 
 void free_from_slab(SlabHeader<1, 1>& generic_slab, void* address);
 
@@ -19,8 +21,11 @@ void mini_malloc_init() {
     slab_0x100.init();
     slab_0x200.init();
     slab_0x300.init();
+    slab_0x400.init();
+    slab_0x800.init();
 }
 
+// TODO: Implement static asserts for size > max size for mini_malloc
 void* mini_malloc(size_t size) {
     if (!size) {
         return nullptr;
@@ -39,6 +44,10 @@ void* mini_malloc(size_t size) {
         return slab_0x200.alloc();
     } else if (size <= 0x500) {
         return slab_0x300.alloc();
+    } else if (size <= 0x800) {
+        return slab_0x400.alloc();
+    } else if (size <= 0x1000) {
+        return slab_0x800.alloc();
     } else {
         return nullptr;
     }
@@ -87,6 +96,16 @@ void free_from_slab(SlabHeader<1, 1>& generic_slab, void* address) {
         }
         case 0x300: {
             auto* slab = reinterpret_cast<Slab<0x300, PAGE_SIZE>*>(&generic_slab);
+            slab->free(address);
+            break;
+        }
+        case 0x400: {
+            auto* slab = reinterpret_cast<Slab<0x400, PAGE_SIZE>*>(&generic_slab);
+            slab->free(address);
+            break;
+        }
+        case 0x800: {
+            auto* slab = reinterpret_cast<Slab<0x800, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }

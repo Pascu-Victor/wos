@@ -2,10 +2,10 @@
 
 #include <limine.h>
 
+#include <cstddef>
 #include <mod/io/port/port.hpp>
-#include <std/hcf.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
+
+extern "C" __attribute__((noreturn)) void hcf() noexcept;
 
 namespace ker::mod::io {
 namespace serial {

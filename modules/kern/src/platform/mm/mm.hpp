@@ -7,8 +7,9 @@
 
 namespace ker::mod::mm {
 void init(void);
-#define KERNEL_STACK_SIZE 0x8000  // 64KB
-#define USER_STACK_SIZE 0x8000    // 64KB
+#define KERNEL_STACK_SIZE 0x8000  // 32KB
+#define USER_STACK_SIZE 0x800000  // 8MiB
+#define TLS_STATIC_SIZE 0x16000   // 64KB
 
 template <size_t StackSize = 4096>
 struct Stack {
