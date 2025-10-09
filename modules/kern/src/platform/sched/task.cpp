@@ -63,8 +63,8 @@ Task::Task(const char *name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     }
 
     // Initialize other special non-TLS symbols if present
-    const char *specials[] = {"__ehdr_start",          "__fini_array_start",  "__fini_array_end",
-                              "__preinit_array_start", "__preinit_array_end", "__dso_handle"};
+    const char *specials[] = {"__ehdr_start",     "__init_array_start",    "__init_array_end",    "__fini_array_start",
+                              "__fini_array_end", "__preinit_array_start", "__preinit_array_end", "__dso_handle"};
     ker::loader::debug::ProcessDebugInfo *pinfo = ker::loader::debug::getProcessDebugInfo(this->pid);
     if (pinfo) {
         for (auto &name : specials) {

@@ -40,22 +40,27 @@ auto logLine(const char* str, uint64_t len, abi::sys_log::sys_log_device device)
 namespace {
 const char* const initmsg = "init: open failed";
 constexpr size_t buffer_size = 64;
+const char* const text = "hello-vfs";
 }  // namespace
+
 auto main() -> int {
     // Create/open /test
-    const char* path = "/test";
+    const char* const path = "/test";
     int fd = ker::abi::vfs::open(path, 0, 0);
     if (fd < 0) {
         ker::logging::logLine(initmsg, 0, ker::abi::sys_log::sys_log_device::serial);
     } else {
-        const char* text = "hello-vfs";
         ker::abi::vfs::write(fd, text, strlen(text));
         ker::logging::logLine("init: wrote to /test", 0, ker::abi::sys_log::sys_log_device::serial);
+        ker::abi::vfs::close(fd);
+        ker::logging::logLine("init: closed fd for /test", 0, ker::abi::sys_log::sys_log_device::serial);
+        fd = ker::abi::vfs::open(path, 0, 0);
+        ker::logging::logLine("init: re-opened /test", 0, ker::abi::sys_log::sys_log_device::serial);
         std::array<char, buffer_size> buf = {0};
         ker::abi::vfs::read(fd, buf.data(), sizeof(buf) - 1);
         ker::logging::logLine("init: read buffer", 0, ker::abi::sys_log::sys_log_device::serial);
         ker::logging::log("init: buffer was: '", 0, ker::abi::sys_log::sys_log_device::serial);
-        ker::logging::log(buf.data(), buf.size(), ker::abi::sys_log::sys_log_device::serial);
+        ker::logging::log(buf.data(), strlen(buf.data()), ker::abi::sys_log::sys_log_device::serial);
         ker::logging::logLine("'", 0, ker::abi::sys_log::sys_log_device::serial);
         ker::abi::vfs::close(fd);
     }

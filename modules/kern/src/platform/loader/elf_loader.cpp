@@ -1,44 +1,56 @@
 #include "elf_loader.hpp"
 
+#include <extern/elf.h>
+
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 #include "debug_info.hpp"
+#include "mod/io/serial/serial.hpp"
+#include "platform/dbg/dbg.hpp"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/mm/phys.hpp"
+#include "platform/mm/virt.hpp"
+#include "util/hcf.hpp"
 
 // TLS relocation support
 namespace {
 
 // Define relocation types that we need to handle
-#define R_X86_64_NONE 0
-#define R_X86_64_64 1
-#define R_X86_64_PC32 2
-#define R_X86_64_GOT32 3
-#define R_X86_64_PLT32 4
-#define R_X86_64_COPY 5
-#define R_X86_64_GLOB_DAT 6
-#define R_X86_64_JUMP_SLOT 7
-#define R_X86_64_RELATIVE 8
-#define R_X86_64_GOTPCREL 9
-#define R_X86_64_32 10
-#define R_X86_64_32S 11
-#define R_X86_64_16 12
-#define R_X86_64_PC16 13
-#define R_X86_64_8 14
-#define R_X86_64_PC8 15
-#define R_X86_64_DTPMOD64 16
-#define R_X86_64_DTPOFF64 17
-#define R_X86_64_TPOFF64 18
-#define R_X86_64_TLSGD 19
-#define R_X86_64_TLSLD 20
+constexpr uint64_t R_X86_64_NONE = 0;
+constexpr uint64_t R_X86_64_64 = 1;
+constexpr uint64_t R_X86_64_PC32 = 2;
+constexpr uint64_t R_X86_64_GOT32 = 3;
+constexpr uint64_t R_X86_64_PLT32 = 4;
+constexpr uint64_t R_X86_64_COPY = 5;
+constexpr uint64_t R_X86_64_GLOB_DAT = 6;
+constexpr uint64_t R_X86_64_JUMP_SLOT = 7;
+constexpr uint64_t R_X86_64_RELATIVE = 8;
+constexpr uint64_t R_X86_64_GOTPCREL = 9;
+constexpr uint64_t R_X86_64_32 = 10;
+constexpr uint64_t R_X86_64_32S = 11;
+constexpr uint64_t R_X86_64_16 = 12;
+constexpr uint64_t R_X86_64_PC16 = 13;
+constexpr uint64_t R_X86_64_8 = 14;
+constexpr uint64_t R_X86_64_PC8 = 15;
+constexpr uint64_t R_X86_64_DTPMOD64 = 16;
+constexpr uint64_t R_X86_64_DTPOFF64 = 17;
+constexpr uint64_t R_X86_64_TPOFF64 = 18;
+constexpr uint64_t R_X86_64_TLSGD = 19;
+constexpr uint64_t R_X86_64_TLSLD = 20;
 }  // namespace
 
 #ifndef SHF_TLS
-#define SHF_TLS 0x400
+constexpr uint64_t SHF_TLS = 0x400;
 #endif
 
-namespace ker::loader::elf {}  // namespace ker::loader::elf
-
 namespace ker::loader::elf {
-static bool headerIsValid(const Elf64_Ehdr &ehdr) {
+namespace {
+
+auto headerIsValid(const Elf64_Ehdr &ehdr) -> bool {
     return ehdr.e_ident[EI_CLASS] == ELFCLASS64                  // 64-bit
            && ehdr.e_ident[EI_OSABI] == ELFOSABI_NONE            // System V
            && (ehdr.e_type == ET_EXEC || ehdr.e_type == ET_DYN)  // Executable or PIE
@@ -48,15 +60,15 @@ static bool headerIsValid(const Elf64_Ehdr &ehdr) {
            && (ehdr).e_ident[EI_MAG3] == ELFMAG3;                // Magic 3
 }
 
-static ElfFile parseElf(uint8_t *base) {
-    ElfFile elf;
+auto parseElf(uint8_t *base) -> ElfFile {
+    ElfFile elf{};
     elf.base = base;
     elf.elfHead = *(Elf64_Ehdr *)base;
     elf.pgHead = (Elf64_Phdr *)(base + elf.elfHead.e_phoff);
     elf.seHead = (Elf64_Shdr *)(base + elf.elfHead.e_shoff);
-    elf.sctHeadStrTab = (Elf64_Shdr *)(elf.elfHead.e_shoff +          // Section header offset
-                                       elf.elfHead.e_shstrndx         // Section header string table index
-                                           * elf.elfHead.e_shentsize  // Size of each section header
+    elf.sctHeadStrTab = (Elf64_Shdr *)(elf.elfHead.e_shoff +                                // Section header offset
+                                       (static_cast<Elf64_Off>(elf.elfHead.e_shstrndx       // Section header string table index
+                                                               * elf.elfHead.e_shentsize))  // Size of each section header
     );
 
     // Determine load base for PIE executables
@@ -83,7 +95,7 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
     // No per-process resolver stub: we eagerly resolve and enforce RELRO.
     // Find relocation sections (REL and RELA)
     for (size_t i = 0; i < elf.elfHead.e_shnum; i++) {
-        Elf64_Shdr *sectionHeader = (Elf64_Shdr *)((uint64_t)elf.seHead + i * elf.elfHead.e_shentsize);
+        Elf64_Shdr *sectionHeader = (Elf64_Shdr *)((uint64_t)elf.seHead + (i * elf.elfHead.e_shentsize));
 
         // Handle the newer SHT_RELR compressed relocation section by name
         const char *secName = nullptr;
@@ -91,11 +103,11 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
             secName = shstr + sectionHeader->sh_name;
         }
 
-        if (secName && (!std::strncmp(secName, ".relr", 5) || !std::strncmp(secName, ".relr.dyn", 9))) {
-            mod::dbg::log("Processing SHT_RELR (.relr) relocations in section %d (%s)", i, secName ? secName : "");
+        if ((secName != nullptr) && ((std::strncmp(secName, ".relr", 5) == 0) || (std::strncmp(secName, ".relr.dyn", 9) == 0))) {
+            mod::dbg::log("Processing SHT_RELR (.relr) relocations in section %d (%s)", i, (secName != nullptr) ? secName : "");
 
             uint64_t numEntries = sectionHeader->sh_size / sizeof(uint64_t);
-            uint64_t *entries = (uint64_t *)(elf.base + sectionHeader->sh_offset);
+            auto *entries = (uint64_t *)(elf.base + sectionHeader->sh_offset);
 
             uint64_t base = 0;
             for (uint64_t ei = 0; ei < numEntries; ei++) {
@@ -106,7 +118,7 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                     uint64_t P = base + elf.loadBase;
                     uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                     if (paddr != 0) {
-                        uint64_t *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                        auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                         // RELR encodes RELATIVE relocations: add loadBase to the current value
                         *physPtr = *physPtr + elf.loadBase;
                     }
@@ -114,13 +126,12 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                     // bitmask compressed entries: bits set indicate further relocations relative to 'base'
                     uint64_t bitmap = ent & ~1ULL;
                     for (int bit = 0; bit < 63; ++bit) {
-                        if (bitmap & (1ULL << bit)) {
+                        if ((bitmap & (1ULL << bit)) != 0U) {
                             uint64_t offset = (uint64_t)(bit + 1) * sizeof(uint64_t);
                             uint64_t P = base + offset + elf.loadBase;
                             uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                             if (paddr != 0) {
-                                uint64_t *physPtr =
-                                    (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                                auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                                 *physPtr = *physPtr + elf.loadBase;
                             }
                         }
@@ -134,7 +145,7 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
             mod::dbg::log("Processing SHT_REL relocations in section %d", i);
 
             uint64_t numRelocations = sectionHeader->sh_size / sizeof(Elf64_Rel);
-            Elf64_Rel *relocations = (Elf64_Rel *)(elf.base + sectionHeader->sh_offset);
+            auto *relocations = (Elf64_Rel *)(elf.base + sectionHeader->sh_offset);
 
             for (uint64_t j = 0; j < numRelocations; j++) {
                 Elf64_Rel *rel = &relocations[j];
@@ -146,7 +157,7 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                 uint64_t addend = 0;
                 uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                 if (paddr != 0) {
-                    uint64_t *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                    auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                     addend = *physPtr;
                 }
 
@@ -156,24 +167,27 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                 if (symIndex != 0) {
                     // The relocation section's sh_link tells which symbol table to use
                     if (sectionHeader->sh_link < elf.elfHead.e_shnum) {
-                        Elf64_Shdr *symTabSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sectionHeader->sh_link * elf.elfHead.e_shentsize);
-                        Elf64_Sym *syms = (Elf64_Sym *)(elf.base + symTabSec->sh_offset);
+                        auto *symTabSec = (Elf64_Shdr *)((uint64_t)elf.seHead +
+                                                         (static_cast<uint64_t>(sectionHeader->sh_link * elf.elfHead.e_shentsize)));
+                        auto *syms = (Elf64_Sym *)(elf.base + symTabSec->sh_offset);
                         uint64_t n = symTabSec->sh_size / symTabSec->sh_entsize;
                         // Get string table for symbol names if available
                         const char *symStrs = nullptr;
                         if (symTabSec->sh_link < elf.elfHead.e_shnum) {
-                            Elf64_Shdr *strtabSec = (Elf64_Shdr *)((uint64_t)elf.seHead + symTabSec->sh_link * elf.elfHead.e_shentsize);
+                            auto *strtabSec = (Elf64_Shdr *)((uint64_t)elf.seHead +
+                                                             (static_cast<uint64_t>(symTabSec->sh_link * elf.elfHead.e_shentsize)));
                             symStrs = (const char *)(elf.base + strtabSec->sh_offset);
                         }
 
                         if (symIndex < n) {
                             Elf64_Sym *sym = &syms[symIndex];
-                            symName = symStrs ? (symStrs + sym->st_name) : "";
+                            symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
                             S = sym->st_value;
                             // If the symbol is defined in a section, add loadBase (unless TLS)
                             if (sym->st_shndx < elf.elfHead.e_shnum) {
-                                Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
-                                if (!(symSec->sh_flags & SHF_TLS)) {
+                                auto *symSec =
+                                    (Elf64_Shdr *)((uint64_t)elf.seHead + (static_cast<uint64_t>(sym->st_shndx * elf.elfHead.e_shentsize)));
+                                if ((symSec->sh_flags & SHF_TLS) == 0U) {
                                     S += elf.loadBase;
                                 }
                             }
@@ -181,16 +195,16 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                     } else {
                         // Fallback: search symbol tables if sh_link is invalid
                         for (size_t sidx = 0; sidx < elf.elfHead.e_shnum; sidx++) {
-                            Elf64_Shdr *sec = (Elf64_Shdr *)((uint64_t)elf.seHead + sidx * elf.elfHead.e_shentsize);
+                            auto *sec = (Elf64_Shdr *)((uint64_t)elf.seHead + (sidx * elf.elfHead.e_shentsize));
                             if (sec->sh_type == SHT_SYMTAB || sec->sh_type == SHT_DYNSYM) {
-                                Elf64_Sym *syms = (Elf64_Sym *)(elf.base + sec->sh_offset);
+                                auto *syms = (Elf64_Sym *)(elf.base + sec->sh_offset);
                                 uint64_t n = sec->sh_size / sec->sh_entsize;
                                 if (symIndex < n) {
                                     Elf64_Sym *sym = &syms[symIndex];
                                     S = sym->st_value;
                                     if (sym->st_shndx < elf.elfHead.e_shnum) {
-                                        Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
-                                        if (!(symSec->sh_flags & SHF_TLS)) {
+                                        auto *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
+                                        if ((symSec->sh_flags & SHF_TLS) == 0U) {
                                             S += elf.loadBase;
                                         }
                                     }
@@ -293,37 +307,40 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                 const char *symName = "";
                 if (symIndex != 0) {
                     if (sectionHeader->sh_link < elf.elfHead.e_shnum) {
-                        Elf64_Shdr *symTabSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sectionHeader->sh_link * elf.elfHead.e_shentsize);
-                        Elf64_Sym *syms = (Elf64_Sym *)(elf.base + symTabSec->sh_offset);
+                        auto *symTabSec = (Elf64_Shdr *)((uint64_t)elf.seHead +
+                                                         (static_cast<uint64_t>(sectionHeader->sh_link * elf.elfHead.e_shentsize)));
+                        auto *syms = (Elf64_Sym *)(elf.base + symTabSec->sh_offset);
                         uint64_t n = symTabSec->sh_size / symTabSec->sh_entsize;
                         const char *symStrs = nullptr;
                         if (symTabSec->sh_link < elf.elfHead.e_shnum) {
-                            Elf64_Shdr *strtabSec = (Elf64_Shdr *)((uint64_t)elf.seHead + symTabSec->sh_link * elf.elfHead.e_shentsize);
+                            auto *strtabSec = (Elf64_Shdr *)((uint64_t)elf.seHead +
+                                                             (static_cast<uint64_t>(symTabSec->sh_link * elf.elfHead.e_shentsize)));
                             symStrs = (const char *)(elf.base + strtabSec->sh_offset);
                         }
 
                         if (symIndex < n) {
                             Elf64_Sym *sym = &syms[symIndex];
-                            symName = symStrs ? (symStrs + sym->st_name) : "";
+                            symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
                             S = sym->st_value;
                             if (sym->st_shndx < elf.elfHead.e_shnum) {
-                                Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
-                                if (!(symSec->sh_flags & SHF_TLS)) {
+                                auto *symSec =
+                                    (Elf64_Shdr *)((uint64_t)elf.seHead + (static_cast<uint64_t>(sym->st_shndx * elf.elfHead.e_shentsize)));
+                                if ((symSec->sh_flags & SHF_TLS) == 0U) {
                                     S += elf.loadBase;
                                 }
                             }
                         }
                     } else {
                         for (size_t sidx = 0; sidx < elf.elfHead.e_shnum; sidx++) {
-                            Elf64_Shdr *sec = (Elf64_Shdr *)((uint64_t)elf.seHead + sidx * elf.elfHead.e_shentsize);
+                            auto *sec = (Elf64_Shdr *)((uint64_t)elf.seHead + (sidx * elf.elfHead.e_shentsize));
                             if (sec->sh_type == SHT_SYMTAB || sec->sh_type == SHT_DYNSYM) {
-                                Elf64_Sym *syms = (Elf64_Sym *)(elf.base + sec->sh_offset);
+                                auto *syms = (Elf64_Sym *)(elf.base + sec->sh_offset);
                                 uint64_t n = sec->sh_size / sec->sh_entsize;
                                 if (symIndex < n) {
                                     Elf64_Sym *sym = &syms[symIndex];
                                     S = sym->st_value;
                                     if (sym->st_shndx < elf.elfHead.e_shnum) {
-                                        Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
+                                        auto *symSec = (Elf64_Shdr *)((uint64_t)elf.seHead + sym->st_shndx * elf.elfHead.e_shentsize);
                                         if (!(symSec->sh_flags & SHF_TLS)) {
                                             S += elf.loadBase;
                                         }
@@ -341,16 +358,16 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
 
                 switch (type) {
                     case R_X86_64_TPOFF64: {
-                        int64_t tlsOffset = (int64_t)addend;  // use addend if present
+                        int64_t tlsOffset = addend;  // use addend if present
                         if (paddr != 0) {
-                            uint64_t *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                            auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                             *physPtr = (uint64_t)tlsOffset;
                         }
                         break;
                     }
                     case R_X86_64_RELATIVE: {
                         if (paddr != 0) {
-                            uint64_t *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                            auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                             *physPtr = elf.loadBase + (uint64_t)addend;
                         }
                         break;
@@ -360,16 +377,16 @@ void processRelocations(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                         if (paddr == 0) {
                             uint64_t targetPage = P & ~(mod::mm::virt::PAGE_SIZE - 1);
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
-                            uint64_t newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
+                            auto newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
                             if (newPaddr != 0) {
-                                uint64_t physPtr = (uint64_t)mod::mm::addr::getPhysPointer(newPaddr);
+                                auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(newPaddr);
                                 mod::mm::virt::mapPage(pagemap, targetPage, physPtr, mod::mm::paging::pageTypes::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
 
                         if (paddr != 0) {
-                            uint64_t *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                            auto *physPtr = (uint64_t *)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
                             if (S == 0) {
                                 mod::dbg::log("ERROR: Unresolved symbol for relocation at P=0x%x (type=%d). Writing 0 to catch fault.", P,
                                               type);
@@ -452,7 +469,7 @@ void loadSegment(uint8_t *elfBase, ker::mod::mm::virt::PageTable *pagemap, Elf64
     const uint64_t segStartVA = programHeader->p_vaddr + baseOffset;
     const uint64_t firstPageOffset = segStartVA & (mod::mm::virt::PAGE_SIZE - 1);
     const uint64_t alignedStartVA = segStartVA & ~(mod::mm::virt::PAGE_SIZE - 1);
-    const uint64_t pageVA = alignedStartVA + pageNo * mod::mm::virt::PAGE_SIZE;
+    const uint64_t pageVA = alignedStartVA + (pageNo * mod::mm::virt::PAGE_SIZE);
 
     // Additional validation for PIE executables
     if (baseOffset != 0 && pageVA < 0x1000) {
@@ -463,7 +480,7 @@ void loadSegment(uint8_t *elfBase, ker::mod::mm::virt::PageTable *pagemap, Elf64
     // Map the page at a page-aligned virtual address
     bool alreadyMapped = mod::mm::virt::isPageMapped(pagemap, pageVA);
     // HHDM-mapped pointer to the backing physical page so we can write contents
-    uint64_t pageHhdmPtr;
+    uint64_t pageHhdmPtr = 0;
     if (alreadyMapped) {
         mod::mm::virt::unifyPageFlags(pagemap, pageVA, mod::mm::paging::pageTypes::USER);
         uint64_t paddr = mod::mm::virt::translate(pagemap, pageVA);
@@ -508,23 +525,23 @@ void loadSegment(uint8_t *elfBase, ker::mod::mm::virt::PageTable *pagemap, Elf64
 
 void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagemap, const uint64_t &pid) {
     (void)pid;
-    Elf64_Shdr *scnHeadTable = (Elf64_Shdr *)((uint64_t)elf.base                 // Base address of the ELF file
-                                              + elf.elfHead.e_shoff              // Section header offset
-                                              + elf.elfHead.e_shstrndx           // Section header string table index
-                                                    * elf.elfHead.e_shentsize);  // Size of each section header
+    auto *scnHeadTable = (Elf64_Shdr *)((uint64_t)elf.base               // Base address of the ELF file
+                                        + elf.elfHead.e_shoff            // Section header offset
+                                        + (elf.elfHead.e_shstrndx        // Section header string table index
+                                           * elf.elfHead.e_shentsize));  // Size of each section header
 
     const char *sectionNames = (const char *)(elf.base + scnHeadTable->sh_offset);
 
     // Allocate memory for section headers to preserve them for debugging
-    uint64_t sectionHeadersSize = elf.elfHead.e_shnum * elf.elfHead.e_shentsize;
+    auto sectionHeadersSize = static_cast<uint64_t>(elf.elfHead.e_shnum * elf.elfHead.e_shentsize);
     uint64_t sectionHeadersPages = PAGE_ALIGN_UP(sectionHeadersSize) / mod::mm::virt::PAGE_SIZE;
-    uint64_t sectionHeadersVaddr = 0x700000000000ULL;  // High memory area for debug info
+    constexpr uint64_t sectionHeadersVaddr = 0x700000000000ULL;  // High memory area for debug info
 
     uint64_t sectionHeadersPhysPtr = 0;  // Make this accessible throughout function
     for (uint64_t i = 0; i < sectionHeadersPages; i++) {
-        uint64_t paddr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
-            uint64_t physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
+            auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
             uint64_t physAddr = physPtr;  // physPtr is already the physical address
             mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr,
                                    mod::mm::paging::pageTypes::USER);
@@ -552,9 +569,9 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
 
     uint64_t stringTablePhysPtr = 0;
     for (uint64_t i = 0; i < stringTablePages; i++) {
-        uint64_t paddr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
-            uint64_t physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
+            auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
             uint64_t physAddr = physPtr;  // physPtr is already the physical address
             mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr, mod::mm::paging::pageTypes::USER);
 
@@ -575,7 +592,7 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
     debug::setStringTable(pid, (const char *)stringTableVaddr, stringTableVaddr, stringTableSize);
 
     for (size_t sectionIndex = 0; sectionIndex < elf.elfHead.e_shnum; sectionIndex++) {
-        Elf64_Shdr *sectionHeader = (Elf64_Shdr *)((uint64_t)elf.seHead + sectionIndex * elf.elfHead.e_shentsize);
+        auto *sectionHeader = (Elf64_Shdr *)((uint64_t)elf.seHead + (sectionIndex * elf.elfHead.e_shentsize));
         const char *sectionName = &sectionNames[sectionHeader->sh_name];
         mod::dbg::log("Section name: %s", sectionName);
         (void)sectionName;
@@ -599,9 +616,9 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                 uint64_t sourceOffset = 0;
                 bool allocationSuccess = true;
                 for (uint64_t i = 0; i < debugPages && remainingSize > 0; i++) {
-                    uint64_t debugPaddr = (uint64_t)mod::mm::phys::pageAlloc();
+                    auto debugPaddr = (uint64_t)mod::mm::phys::pageAlloc();
                     if (debugPaddr != 0) {
-                        uint64_t physPtr = (uint64_t)mod::mm::addr::getPhysPointer(debugPaddr);
+                        auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(debugPaddr);
                         mod::mm::virt::mapPage(pagemap, debugVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                                mod::mm::paging::pageTypes::USER);
                         memset((void *)physPtr, 0, mod::mm::virt::PAGE_SIZE);
@@ -617,8 +634,7 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
 
                 if (allocationSuccess) {
                     if (sectionHeadersPhysPtr != 0) {
-                        Elf64_Shdr *mappedSectionHeader =
-                            (Elf64_Shdr *)((uint64_t)sectionHeadersPhysPtr + sectionIndex * elf.elfHead.e_shentsize);
+                        auto *mappedSectionHeader = (Elf64_Shdr *)(sectionHeadersPhysPtr + (sectionIndex * elf.elfHead.e_shentsize));
                         mappedSectionHeader->sh_addr = debugVaddr;
                     }
                     debug::addDebugSection(pid, sectionName, debugVaddr, debugVaddr, sectionHeader->sh_size, sectionHeader->sh_offset,
@@ -630,8 +646,8 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
             }
         }
         // Additionally, record GOT sections in debug info registry for diagnostics (no remapping or copying here)
-        if ((!std::strncmp(sectionName, ".got", 4) || !std::strncmp(sectionName, ".got.plt", 8)) && sectionHeader->sh_addr != 0 &&
-            sectionHeader->sh_size > 0) {
+        if (((std::strncmp(sectionName, ".got", 4) == 0) || (std::strncmp(sectionName, ".got.plt", 8) == 0)) &&
+            sectionHeader->sh_addr != 0 && sectionHeader->sh_size > 0) {
             uint64_t sectionVaddr = sectionHeader->sh_addr + elf.loadBase;
             uint64_t firstPaddr = mod::mm::virt::translate(pagemap, sectionVaddr);
             debug::addDebugSection(pid, sectionName, sectionVaddr, firstPaddr, sectionHeader->sh_size, sectionHeader->sh_offset,
@@ -641,8 +657,10 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
         }
     }
 }
-Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName,
-                   bool registerSpecialSymbols) {
+}  // namespace
+
+auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName, bool registerSpecialSymbols)
+    -> Elf64Entry {
     ElfFile elfFile = parseElf((uint8_t *)elf);
 
     if (!headerIsValid(elfFile.elfHead)) {
@@ -654,25 +672,25 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
 
     // Allocate memory for ELF header and preserve it
     // TODO: make this dynamic or make llvm aware of this memory no-go zone
-    uint64_t elfHeaderVaddr = 0x700000010000ULL;  // High memory area for ELF header
-    uint64_t elfHeaderPaddr = (uint64_t)mod::mm::phys::pageAlloc();
+    constexpr uint64_t elfHeaderVaddr = 0x700000010000ULL;  // High memory area for ELF header
+    auto elfHeaderPaddr = (uint64_t)mod::mm::phys::pageAlloc();
     if (elfHeaderPaddr != 0) {
-        uint64_t elfHeaderPhysPtr = (uint64_t)mod::mm::addr::getPhysPointer(elfHeaderPaddr);
+        auto elfHeaderPhysPtr = (uint64_t)mod::mm::addr::getPhysPointer(elfHeaderPaddr);
         mod::mm::virt::mapPage(pagemap, elfHeaderVaddr, elfHeaderPhysPtr, mod::mm::paging::pageTypes::USER);
         memcpy((void *)elfHeaderPhysPtr, &elfFile.elfHead, sizeof(Elf64_Ehdr));
         debug::setElfHeaders(pid, elfFile.elfHead, elfHeaderVaddr);
     }
 
     // Allocate memory for program headers and preserve them
-    uint64_t programHeadersSize = elfFile.elfHead.e_phnum * elfFile.elfHead.e_phentsize;
+    auto programHeadersSize = static_cast<uint64_t>(elfFile.elfHead.e_phnum * elfFile.elfHead.e_phentsize);
     uint64_t programHeadersPages = PAGE_ALIGN_UP(programHeadersSize) / mod::mm::virt::PAGE_SIZE;
-    uint64_t programHeadersVaddr = 0x700000020000ULL;  // After ELF header
+    constexpr uint64_t programHeadersVaddr = 0x700000020000ULL;  // After ELF header
 
     uint64_t programHeadersPhysPtr = 0;
     for (uint64_t i = 0; i < programHeadersPages; i++) {
-        uint64_t paddr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
-            uint64_t physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
+            auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
             uint64_t physAddr = physPtr;  // physPtr is already the physical address
             mod::mm::virt::mapPage(pagemap, programHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr,
                                    mod::mm::paging::pageTypes::USER);
@@ -693,7 +711,7 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
     }
     debug::setProgramHeaders(pid, (Elf64_Phdr *)programHeadersVaddr, programHeadersVaddr, elfFile.elfHead.e_phnum);
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        Elf64_Phdr *currentHeader = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + i * elfFile.elfHead.e_phentsize);
+        auto *currentHeader = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
 
         switch (currentHeader->p_type) {
             case PT_GNU_STACK:
@@ -734,6 +752,24 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
                 // Exception handling frame segment
                 processEhFrameSegment(currentHeader, pagemap, pid);
                 break;
+
+            case PT_INTERP:
+                mod::dbg::log("WARN: PT_INTERP skipped FIXME!");
+                break;
+
+            case PT_DYNAMIC:
+                mod::dbg::log("WARN: PT_DYNAMIC skipped FIXME!");
+                break;
+
+            case PT_NOTE:
+                mod::dbg::log("WARN: PT_NOTE skipped FIXME!");
+                break;
+
+            default:
+                mod::dbg::log("Segment processing failed");
+                mod::dbg::log("Tried to load segment type %d", currentHeader->p_type);
+                hcf();
+                break;
         }
     }
 
@@ -747,13 +783,17 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
     // With NX available:
     //  - PF_W set   -> USER (read/write), NX if PF_X not set
     //  - PF_W clear -> USER_READONLY (read-only), NX if PF_X not set
-    for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + i * elfFile.elfHead.e_phentsize);
+    // NOTE: Process segments in reverse order so that executable segments (typically first)
+    // can override non-executable segments if pages overlap after alignment.
+    for (int i = elfFile.elfHead.e_phnum - 1; i >= 0; i--) {
+        auto *ph = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
         if (ph->p_type == PT_LOAD) {
             const bool writable = (ph->p_flags & PF_W) != 0;
             const bool executable = (ph->p_flags & PF_X) != 0;
             uint64_t baseFlags = writable ? mod::mm::paging::pageTypes::USER : mod::mm::paging::pageTypes::USER_READONLY;
-            if (!executable) baseFlags |= mod::mm::paging::PAGE_NX;
+            if (!executable) {
+                baseFlags |= mod::mm::paging::PAGE_NX;
+            }
             uint64_t start = (ph->p_vaddr + elfFile.loadBase) & ~(mod::mm::virt::PAGE_SIZE - 1);
             uint64_t end = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
             for (uint64_t va = start; va < end; va += mod::mm::virt::PAGE_SIZE) {
@@ -766,7 +806,7 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
 
     // Enforce RELRO after relocations: PT_GNU_RELRO pages become read-only
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + i * elfFile.elfHead.e_phentsize);
+        auto *ph = (Elf64_Phdr *)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
         if (ph->p_type == PT_GNU_RELRO) {
             uint64_t start = ph->p_vaddr + elfFile.loadBase;
             uint64_t end = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
@@ -779,13 +819,7 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
         }
     }
 
-    // // If requested, scan symbol tables (.symtab and .dynsym) and register special symbols so debugger can resolve them
-    // // Important symbols: __safestack_unsafe_stack_ptr, __ehdr_start, __fini_array_start, __fini_array_end, __preinit_array_start,
-    // // __preinit_array_end, __dso_handle
     if (registerSpecialSymbols) {
-        Elf64_Shdr *shdr = elfFile.seHead;
-        const char *shstr = (const char *)(elfFile.base + shdr[elfFile.elfHead.e_shstrndx].sh_offset);
-
         // Helper to register a symbol by name
         auto registerSymbolIfFound = [&](const char *symName, uint64_t symVaddr, uint64_t symSize, uint8_t bind, uint8_t type, bool isTls,
                                          uint16_t shndx, uint64_t rawVal) {
@@ -795,7 +829,8 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
                 vaddr = symVaddr;
             } else if (shndx < elfFile.elfHead.e_shnum) {
                 // If symbol is defined in a section, compute vaddr from section address + sym value
-                Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elfFile.seHead + shndx * elfFile.elfHead.e_shentsize);
+                Elf64_Shdr *symSec =
+                    (Elf64_Shdr *)((uint64_t)elfFile.seHead + (static_cast<uint64_t>(shndx * elfFile.elfHead.e_shentsize)));
                 if (symSec->sh_addr != 0) {
                     vaddr = symSec->sh_addr + symVaddr;
                 } else {
@@ -823,27 +858,29 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
 
         // Iterate section headers to find symbol tables
         for (size_t sidx = 0; sidx < elfFile.elfHead.e_shnum; sidx++) {
-            Elf64_Shdr *section = (Elf64_Shdr *)((uint64_t)elfFile.seHead + sidx * elfFile.elfHead.e_shentsize);
+            auto *section = (Elf64_Shdr *)((uint64_t)elfFile.seHead + (sidx * elfFile.elfHead.e_shentsize));
 
             if (section->sh_type == SHT_SYMTAB || section->sh_type == SHT_DYNSYM) {
                 // Get string table for this symbol table
-                Elf64_Shdr *strtab =
-                    (Elf64_Shdr *)(elfFile.base + elfFile.elfHead.e_shoff + section->sh_link * elfFile.elfHead.e_shentsize);
+                auto *strtab = (Elf64_Shdr *)(elfFile.base + elfFile.elfHead.e_shoff +
+                                              (static_cast<size_t>(section->sh_link * elfFile.elfHead.e_shentsize)));
                 const char *strs = (const char *)(elfFile.base + strtab->sh_offset);
                 uint64_t numSymbols = section->sh_size / section->sh_entsize;
-                Elf64_Sym *syms = (Elf64_Sym *)(elfFile.base + section->sh_offset);
+                auto *syms = (Elf64_Sym *)(elfFile.base + section->sh_offset);
 
                 for (uint64_t si = 0; si < numSymbols; si++) {
                     Elf64_Sym *sym = &syms[si];
                     const char *sname = strs + sym->st_name;
-                    if (!sname || !sname[0]) continue;
+                    if ((sname == nullptr) || (sname[0] == 0)) {
+                        continue;
+                    }
 
                     // Check for special names
-                    if (registerSpecialSymbols &&
-                        (!std::strncmp(sname, "__safestack_unsafe_stack_ptr", 27) || !std::strncmp(sname, "__ehdr_start", 11) ||
-                         !std::strncmp(sname, "__fini_array_start", 18) || !std::strncmp(sname, "__fini_array_end", 16) ||
-                         !std::strncmp(sname, "__preinit_array_start", 21) || !std::strncmp(sname, "__preinit_array_end", 19) ||
-                         !std::strncmp(sname, "__dso_handle", 12))) {
+                    if (((std::strncmp(sname, "__safestack_unsafe_stack_ptr", 27) == 0) || (std::strncmp(sname, "__ehdr_start", 11) == 0) ||
+                         (std::strncmp(sname, "__init_array_start", 18) == 0) || (std::strncmp(sname, "__init_array_end", 16) == 0) ||
+                         (std::strncmp(sname, "__fini_array_start", 18) == 0) || (std::strncmp(sname, "__fini_array_end", 16) == 0) ||
+                         (std::strncmp(sname, "__preinit_array_start", 21) == 0) || (std::strncmp(sname, "__preinit_array_end", 19) == 0) ||
+                         (std::strncmp(sname, "__dso_handle", 12) == 0))) {
                         uint64_t symVaddr = sym->st_value;
                         uint64_t symSize = sym->st_size;
                         uint8_t bind = ELF64_ST_BIND(sym->st_info);
@@ -852,8 +889,9 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
 
                         bool isTls = false;
                         if (shndx < elfFile.elfHead.e_shnum) {
-                            Elf64_Shdr *symSec = (Elf64_Shdr *)((uint64_t)elfFile.seHead + shndx * elfFile.elfHead.e_shentsize);
-                            if (symSec->sh_flags & SHF_TLS) {
+                            auto *symSec =
+                                (Elf64_Shdr *)((uint64_t)elfFile.seHead + (static_cast<uint64_t>(shndx * elfFile.elfHead.e_shentsize)));
+                            if ((symSec->sh_flags & SHF_TLS) != 0U) {
                                 isTls = true;
                             }
                         }
@@ -865,9 +903,6 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
         }
     }
 
-    // Process relocations AFTER loading all segments (already done once above)
-    // processRelocations(elfFile, pagemap);
-
     // Print debug info for verification
     debug::printDebugInfo(pid);
 
@@ -876,8 +911,8 @@ Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_
 }
 
 // Extract TLS information from ELF without fully loading it
-TlsModule extractTlsInfo(void *elfData) {
-    TlsModule tlsInfo = {0, 0, 0};  // Default empty TLS info
+auto extractTlsInfo(void *elfData) -> TlsModule {
+    TlsModule tlsInfo = {.tlsBase = 0, .tlsSize = 0, .tcbOffset = 0};  // Default empty TLS info
 
     mod::dbg::log("extractTlsInfo: Starting TLS extraction from ELF data at 0x%x", (uint64_t)elfData);
 
@@ -888,7 +923,7 @@ TlsModule extractTlsInfo(void *elfData) {
 
     // Look for PT_TLS segment
     for (uint32_t i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        elfFile.pgHead = (Elf64_Phdr *)(elfFile.base + elfFile.elfHead.e_phoff + i * elfFile.elfHead.e_phentsize);
+        elfFile.pgHead = (Elf64_Phdr *)(elfFile.base + elfFile.elfHead.e_phoff + (static_cast<size_t>(i * elfFile.elfHead.e_phentsize)));
 
         if (elfFile.pgHead->p_type == PT_TLS) {
             tlsInfo.tlsSize = elfFile.pgHead->p_memsz;

@@ -1,6 +1,7 @@
 #pragma once
 #include <extern/elf.h>
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/mm.hpp>
@@ -16,7 +17,7 @@ struct TlsModule {
     uint64_t tcbOffset;  // Offset to TCB within TLS
 };
 
-typedef uint64_t Elf64Entry;
+using Elf64Entry = uint64_t;
 
 struct ElfFile {
     Elf64_Ehdr elfHead;         // ELF header
@@ -28,11 +29,11 @@ struct ElfFile {
     TlsModule tlsInfo;          // TLS information for this ELF
 };
 
-Elf64Entry loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName,
-                   bool registerSpecialSymbols = true);
+auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName,
+             bool registerSpecialSymbols = true) -> Elf64Entry;
 
 // Extract TLS information from ELF without fully loading it
-TlsModule extractTlsInfo(void *elfData);
+auto extractTlsInfo(void *elfData) -> TlsModule;
 
 // Remove the global getter - TLS info should be passed per-process
 // TlsModule getTlsModule();

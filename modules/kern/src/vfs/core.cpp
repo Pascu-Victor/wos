@@ -31,11 +31,11 @@ int vfs_close(int fd) {
     if (!t) return -1;
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (!f) return -1;
-    // free file object
+    // Release the FD from the task's file descriptor table
     vfs_release_fd(t, fd);
-    if (f->private_data) {
-        // For tmpfs root node we don't free backing node here.
-    }
+    // Free the File descriptor object (just the handle/wrapper)
+    // but keep the underlying tmpfs node (f->private_data) intact
+    // so the file can be reopened later
     ker::mod::mm::dyn::kmalloc::free((void*)f);
     return 0;
 }

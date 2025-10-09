@@ -239,9 +239,10 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
     PageTableEntry entry = table->entries[index_of(vaddr, 1)];
     entry.writable = entry.writable | (flags & paging::PAGE_WRITE);
     entry.user = entry.user | (flags & paging::PAGE_USER);
-    // Set NX if requested; we never clear NX here to avoid creating executable holes inadvertently.
-    if (flags & paging::PAGE_NX) {
+    if ((flags & paging::PAGE_NX) != 0U) {
         entry.noExecute = 1;
+    } else {
+        entry.noExecute = 0;
     }
     table->entries[index_of(vaddr, 1)] = entry;
 }
