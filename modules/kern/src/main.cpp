@@ -34,11 +34,40 @@ __attribute__((used, section(".requests_end_marker"))) static volatile LIMINE_RE
 
 using namespace ker::mod;
 
+// Linker-provided symbols for init/fini arrays
+extern "C" {
+extern void (*__preinit_array_start[])();
+extern void (*__preinit_array_end[])();
+extern void (*__init_array_start[])();
+extern void (*__init_array_end[])();
+extern void (*__fini_array_start[])();
+extern void (*__fini_array_end[])();
+}
+
+static void callGlobalConstructors() {
+    for (auto *ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
+        (*ctor)();
+    }
+
+    for (auto *ctor = static_cast<void (**)()>(__init_array_start); ctor < static_cast<void (**)()>(__init_array_end); ++ctor) {
+        (*ctor)();
+    }
+}
+
+static void callGlobalDestructors() {
+    for (auto *dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
+        --dtor;
+        (*dtor)();
+    }
+}
+
 // Kernel entry point.
 extern "C" void _start(void) {
     if (LIMINE_BASE_REVISION_SUPPORTED == 0) {
         hcf();
     }
+
+    // callGlobalConstructors();
 
     // Init the framebuffer.
     gfx::fb::init();
@@ -57,10 +86,10 @@ extern "C" void _start(void) {
     // Enable FSGSBASE instructions
     cpu::enableFSGSBASE();
 
-    uint8_t* stack;  // = (uint8_t*)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    uint8_t *stack;
     // Init gds.
     asm volatile("mov %%rsp, %0" : "=r"(stack));
-    ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
+    ker::mod::desc::gdt::initDescriptors((uint64_t *)stack + KERNEL_STACK_SIZE);
     // asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
 
     // Init kmalloc

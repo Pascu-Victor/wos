@@ -56,10 +56,29 @@ SECTIONS
         *(.dynamic)
     } :data :dynamic
 
+    /* Constructors and destructors arrays */
+    .preinit_array : {
+        __preinit_array_start = .;
+        KEEP(*(.preinit_array))
+        __preinit_array_end = .;
+    } :data
+
+    .init_array : {
+        __init_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
+        KEEP(*(.init_array .ctors))
+        __init_array_end = .;
+    } :data
+
+    .fini_array : {
+        __fini_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
+        KEEP(*(.fini_array .dtors))
+        __fini_array_end = .;
+    } :data
+
     /* NOTE: .bss needs to be the last thing mapped to :data, otherwise lots of */
     /* unnecessary zeros will be written to the binary. */
-    /* If you need, for example, .init_array and .fini_array, those should be placed */
-    /* above this. */
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
