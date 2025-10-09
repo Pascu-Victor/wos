@@ -6,72 +6,52 @@
     "configurations": [
         {
             "name": "Debug WOS Kernel",
-            "type": "lldb",
+            "type": "lldb-dap",
             "request": "attach",
-            "stopOnEntry": false,
-            "targetCreateCommands": [
-                "target create ${workspaceFolder}/build/modules/kern/wos.debug"
+            "attachCommands": [
+                "gdb-remote localhost:1234"
             ],
-            "processCreateCommands": [
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+            ],
+            "initCommands": [
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
                 "settings set plugin.process.gdb-remote.packet-timeout 10",
-                "gdb-remote localhost:1234"
+            ],
+            "terminateCommands": [
+                "process kill"
             ],
             "preLaunchTask": "Build and Start QEMU"
         },
         {
             "name": "Debug WOS Userspace (Init Process)",
-            "type": "lldb",
+            "type": "lldb-dap",
             "request": "attach",
-            "stopOnEntry": false,
-            "targetCreateCommands": [
-                "target create ${workspaceFolder}/build/modules/kern/wos.debug",
-                "target modules add ${workspaceFolder}/build/modules/init/init.debug"
+            "attachCommands": [
+                "gdb-remote localhost:1234"
             ],
-            "processCreateCommands": [
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.so",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.so",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libstdc++.so",
+            ],
+            "initCommands": [
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.process.thread.step-avoid-nodebug false",
+                "settings set target.process.thread.step-avoid-regexp ''",
                 "settings set plugin.process.gdb-remote.packet-timeout 10",
-                "gdb-remote localhost:1234"
+                "settings set target.skip-prologue false",
+            ],
+            "terminateCommands": [
+                "process kill"
             ],
             "preLaunchTask": "Build and Start QEMU"
         },
-        {
-            "name": "Debug WOS Userspace (Base Address)",
-            "type": "lldb",
-            "request": "attach",
-            "stopOnEntry": false,
-            "targetCreateCommands": [
-                "target create ${workspaceFolder}/build/modules/kern/wos.debug",
-                "target modules add ${workspaceFolder}/build/modules/init/init.debug"
-            ],
-            "processCreateCommands": [
-                "settings set target.x86-disassembly-flavor intel",
-                "settings set target.load-script-from-symbol-file false",
-                "settings set plugin.process.gdb-remote.packet-timeout 10",
-                "gdb-remote localhost:1234",
-                "breakpoint set --name ker::mod::smt::runHandoverTasks",
-                "breakpoint set --name ker::loader::elf::loadElf",
-                "breakpoint set --address 0x400000",
-                "breakpoint set --name _start"
-            ],
-            "preLaunchTask": "Build and Start QEMU"
-        },
-        {
-            "name": "Debug WOS Manual Connect",
-            "type": "lldb",
-            "request": "attach",
-            "stopOnEntry": false,
-            "targetCreateCommands": [
-                "target create ${workspaceFolder}/build/modules/kern/wos.debug --slide 0xffffffff80000000"
-            ],
-            "processCreateCommands": [
-                "settings set target.x86-disassembly-flavor intel",
-                "settings set target.load-script-from-symbol-file false",
-                "settings set plugin.process.gdb-remote.packet-timeout 10",
-                "gdb-remote localhost:1234"
-            ]
-        }
     ]
 }

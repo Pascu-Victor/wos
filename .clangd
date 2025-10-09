@@ -35,6 +35,13 @@ Diagnostics:
         Remove:
             - readability-identifier-length
             - cppcoreguidelines-pro-type-reinterpret-cast
+            - cppcoreguidelines-owning-memory
+            - cppcoreguidelines-pro-bounds-pointer-arithmetic
+            - cppcoreguidelines-avoid-non-const-global-variables
+            - cppcoreguidelines-pro-type-cstyle-cast
+            - bugprone-easily-swappable-parameters
+            - bugprone-reserved-identifier
+
     Includes:
         IgnoreHeader: ".*toolchain/target1/.*"
     UnusedIncludes: Strict
