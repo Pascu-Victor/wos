@@ -10,8 +10,6 @@
 #include "callnums/sys_log.h"
 #include "sys/callnums.h"
 
-// Temporary veneers until a proper vDSO/ld.so exists:
-// Implement ker::logging functions using the syscall ABI so symbols resolve locally.
 namespace ker::logging {
 
 auto log(const char* str, uint64_t len, abi::sys_log::sys_log_device device) -> uint64_t {

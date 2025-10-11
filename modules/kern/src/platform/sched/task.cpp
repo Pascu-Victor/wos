@@ -62,30 +62,30 @@ Task::Task(const char *name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         }
     }
 
-    // Initialize other special non-TLS symbols if present
-    const char *specials[] = {"__ehdr_start",     "__init_array_start",    "__init_array_end",    "__fini_array_start",
-                              "__fini_array_end", "__preinit_array_start", "__preinit_array_end", "__dso_handle"};
-    ker::loader::debug::ProcessDebugInfo *pinfo = ker::loader::debug::getProcessDebugInfo(this->pid);
-    if (pinfo) {
-        for (auto &name : specials) {
-            ker::loader::debug::DebugSymbol *sym = ker::loader::debug::getProcessSymbol(this->pid, name);
-            if (!sym) continue;
-            if (sym->isTlsOffset) continue;  // TLS handled above
+    // // Initialize other special non-TLS symbols if present
+    // const char *specials[] = {"__ehdr_start",     "__init_array_start",    "__init_array_end",    "__fini_array_start",
+    //                           "__fini_array_end", "__preinit_array_start", "__preinit_array_end", "__dso_handle"};
+    // ker::loader::debug::ProcessDebugInfo *pinfo = ker::loader::debug::getProcessDebugInfo(this->pid);
+    // if (pinfo) {
+    //     for (auto &name : specials) {
+    //         ker::loader::debug::DebugSymbol *sym = ker::loader::debug::getProcessSymbol(this->pid, name);
+    //         if (!sym) continue;
+    //         if (sym->isTlsOffset) continue;  // TLS handled above
 
-            uint64_t storeValue = pinfo->baseAddress;
-            if (!std::strncmp(name, "__ehdr_start", 11)) {
-                storeValue = pinfo->elfHeaderAddr;
-            }
+    //         uint64_t storeValue = pinfo->baseAddress;
+    //         if (!std::strncmp(name, "__ehdr_start", 11)) {
+    //             storeValue = pinfo->elfHeaderAddr;
+    //         }
 
-            uint64_t destVaddr = sym->vaddr;
-            uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
-            if (destPaddr != 0) {
-                uint64_t *destPtr = (uint64_t *)mm::addr::getPhysPointer(destPaddr);
-                *destPtr = storeValue;
-                dbg::log("Wrote special symbol %s for PID %x at vaddr=%x value=%x", name, this->pid, destVaddr, storeValue);
-            }
-        }
-    }
+    //         uint64_t destVaddr = sym->vaddr;
+    //         uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
+    //         if (destPaddr != 0) {
+    //             uint64_t *destPtr = (uint64_t *)mm::addr::getPhysPointer(destPaddr);
+    //             *destPtr = storeValue;
+    //             dbg::log("Wrote special symbol %s for PID %x at vaddr=%x value=%x", name, this->pid, destVaddr, storeValue);
+    //         }
+    //     }
+    // }
 }
 
 Task::Task(const Task &task) {

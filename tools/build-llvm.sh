@@ -227,6 +227,9 @@ meson setup --prefix=$B/target1 \
   -Dwos_option=enabled \
   -Dglibc_option=enabled \
   -Ddefault_library=static \
+  -Duse_freestnd_hdrs=enabled \
+  -Dposix_option=enabled \
+  -Dbsd_option=enabled \
   $B/src/mlibc
 
 ninja && ninja install

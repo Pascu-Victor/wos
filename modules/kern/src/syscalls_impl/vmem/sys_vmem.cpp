@@ -1,0 +1,262 @@
+#include "sys_vmem.hpp"
+
+#include <abi/callnums/vmem.h>
+#include <assert.h>
+
+#include <cstdint>
+#include <cstring>
+#include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/paging.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
+#include <platform/sched/scheduler.hpp>
+
+namespace ker::syscall::vmem {
+
+// Linux x86_64 user space address range
+// User space: 0x0000000000000000 - 0x00007FFFFFFFFFFF (128TB)
+// Kernel space: 0xFFFF800000000000 - 0xFFFFFFFFFFFFFFFF
+constexpr uint64_t USER_SPACE_START = 0x0000000000400000ULL;  // Start after first 4MB (for NULL protection and low mem)
+constexpr uint64_t USER_SPACE_END = 0x00007FFFFFFFFFFFULL;    // Linux canonical address limit
+constexpr uint64_t MMAP_START = 0x0000700000000000ULL;        // Typical mmap base on Linux
+
+namespace {
+// Get the current task
+inline ker::mod::sched::task::Task* getCurrentTask() { return ker::mod::sched::getCurrentTask(); }
+
+// Find a free virtual address range of the given size
+// Uses a simple linear search through allocated regions
+uint64_t findFreeRange(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint) {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return 0;
+    }
+
+    // Align size to page boundary
+    size = PAGE_ALIGN_UP(size);
+
+    // If hint is provided and valid, try to use it
+    if (hint >= USER_SPACE_START && hint + size <= USER_SPACE_END) {
+        // Check if the hint range is free
+        bool isFree = true;
+        for (uint64_t addr = hint; addr < hint + size; addr += ker::mod::mm::paging::PAGE_SIZE) {
+            if (ker::mod::mm::virt::isPageMapped(task->pagemap, addr)) {
+                isFree = false;
+                break;
+            }
+        }
+        if (isFree) {
+            return hint;
+        }
+    }
+
+    // Simple linear search for free space starting from MMAP_START
+    // TODO: Replace with a proper VMA allocator
+    uint64_t searchStart = MMAP_START;
+    uint64_t currentAddr = searchStart;
+
+    while (currentAddr + size <= USER_SPACE_END) {
+        bool rangeIsFree = true;
+
+        // Check if the entire range is unmapped
+        for (uint64_t addr = currentAddr; addr < currentAddr + size; addr += ker::mod::mm::paging::PAGE_SIZE) {
+            if (ker::mod::mm::virt::isPageMapped(task->pagemap, addr)) {
+                rangeIsFree = false;
+                // Skip past this mapped page and align to next page
+                currentAddr = PAGE_ALIGN_UP(addr + 1);
+                break;
+            }
+        }
+
+        if (rangeIsFree) {
+            return currentAddr;
+        }
+
+        // Move to next potential range
+        currentAddr += ker::mod::mm::paging::PAGE_SIZE;
+    }
+
+    return 0;  // No free range found
+}
+
+// Convert protection flags to page table flags
+uint64_t protToPageFlags(uint64_t prot) {
+    uint64_t flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER;
+
+    if ((prot & ker::abi::vmem::PROT_WRITE) != 0) {
+        flags |= ker::mod::mm::paging::PAGE_WRITE;
+    }
+
+    // If not executable, set NX bit
+    if ((prot & ker::abi::vmem::PROT_EXEC) == 0) {
+        flags |= ker::mod::mm::paging::PAGE_NX;
+    }
+
+    return flags;
+}
+
+// Allocate anonymous memory
+uint64_t anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) {
+    // Get current task
+    auto* task = getCurrentTask();
+    if (task == nullptr) {
+        ker::mod::dbg::error("vmem: no current task");
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    if (task->pagemap == nullptr) {
+        ker::mod::dbg::error("vmem: task has no pagemap");
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    // Validate size
+    if (size == 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    // Check for size overflow
+    if (size > USER_SPACE_END - USER_SPACE_START) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EOVERFLOW);
+    }
+
+    // Align size to page boundary
+    size = PAGE_ALIGN_UP(size);
+
+    // Find a free virtual address range
+    uint64_t vaddr = 0;
+
+    if (((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0) {
+        // MAP_FIXED: use exact address
+        if (hint < USER_SPACE_START || hint + size > USER_SPACE_END) {
+            return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+        }
+        if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
+            return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+        }
+        vaddr = hint;
+    } else {
+        // Find a suitable range
+        vaddr = findFreeRange(task, size, hint);
+        if (vaddr == 0) {
+            ker::mod::dbg::log("vmem: no free range found for size %x", size);
+            return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+    }
+
+    // Convert protection flags to page flags
+    uint64_t pageFlags = protToPageFlags(prot);
+
+    // Allocate and map pages
+    uint64_t numPages = size / ker::mod::mm::paging::PAGE_SIZE;
+    for (uint64_t i = 0; i < numPages; i++) {
+        uint64_t currentVaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+
+        // Allocate a physical page
+        void* physPage = ker::mod::mm::phys::pageAlloc();
+        if (physPage == nullptr) {
+            // Out of physical memory - unmap what we've allocated so far
+            for (uint64_t j = 0; j < i; j++) {
+                uint64_t unmapVaddr = vaddr + (j * ker::mod::mm::paging::PAGE_SIZE);
+                ker::mod::mm::virt::unmapPage(task->pagemap, unmapVaddr);
+            }
+            ker::mod::dbg::log("vmem: out of physical memory at page %llu/%llu", i, numPages);
+            return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+
+        // Get physical address
+        uint64_t paddr = (uint64_t)ker::mod::mm::addr::getPhysPointer((uint64_t)physPage);
+
+        // Zero out the page for security
+        memset(physPage, 0, ker::mod::mm::paging::PAGE_SIZE);
+
+        // Map the page
+        ker::mod::mm::virt::mapPage(task->pagemap, currentVaddr, paddr, static_cast<int>(pageFlags));
+    }
+
+    return vaddr;
+}
+
+// Free anonymous memory
+uint64_t anonFree(uint64_t addr, uint64_t size) {
+    // Get current task
+    auto* task = getCurrentTask();
+    if (task == nullptr) {
+        ker::mod::dbg::error("vmem: no current task for free");
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    if (task->pagemap == nullptr) {
+        ker::mod::dbg::error("vmem: task has no pagemap for free");
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    // Validate address
+    if (addr == 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    if (addr < USER_SPACE_START || addr >= USER_SPACE_END) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    // Validate size
+    if (size == 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    // Check alignment
+    if (addr % ker::mod::mm::paging::PAGE_SIZE != 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    // Align size to page boundary
+    size = PAGE_ALIGN_UP(size);
+
+    // Check bounds
+    if (addr + size > USER_SPACE_END || addr + size < addr) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    // Unmap pages
+    uint64_t numPages = size / ker::mod::mm::paging::PAGE_SIZE;
+    for (uint64_t i = 0; i < numPages; i++) {
+        uint64_t currentVaddr = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
+
+        // Check if page is mapped
+        if (ker::mod::mm::virt::isPageMapped(task->pagemap, currentVaddr)) {
+            // Unmap the page (this also frees the physical page)
+            ker::mod::mm::virt::unmapPage(task->pagemap, currentVaddr);
+        }
+    }
+
+    ker::mod::dbg::log("vmem: freed %llu bytes at 0x%llx", size, addr);
+
+    return 0;  // Success
+}
+
+}  // anonymous namespace
+
+// Main syscall handler
+uint64_t sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    switch (static_cast<ker::abi::vmem::ops>(op)) {
+        case ker::abi::vmem::ops::anon_allocate: {
+            // a1: hint address
+            // a2: size
+            // a3: protection flags
+            // a4: mapping flags
+            return anonAllocate(a1, a2, a3, a4);
+        }
+
+        case ker::abi::vmem::ops::anon_free: {
+            // a1: address
+            // a2: size
+            return anonFree(a1, a2);
+        }
+
+        default:
+            ker::mod::dbg::log("vmem: invalid operation %llu", op);
+            return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+}
+
+}  // namespace ker::syscall::vmem

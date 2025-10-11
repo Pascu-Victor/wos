@@ -9,11 +9,12 @@ __attribute__((used, section(".requests"))) static volatile limine_framebuffer_r
     .response = nullptr,
 };
 
-namespace ker::mod::gfx {
-namespace fb {
+namespace ker::mod::gfx::fb {
+namespace {
 FbFont __currentFont;
 limine_framebuffer *__framebuffer;
 uint32_t backBuffer[3840 * 2160];
+}  // namespace
 
 void init(void) {
     if (framebufferRequest.response == nullptr || framebufferRequest.response->framebuffer_count < 1) {
@@ -260,5 +261,4 @@ void mapFramebuffer(void) {
     ker::mod::io::serial::write("\n");
 }
 
-}  // namespace fb
-}  // namespace ker::mod::gfx
+}  // namespace ker::mod::gfx::fb

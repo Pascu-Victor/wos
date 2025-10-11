@@ -6,3 +6,4 @@
 #include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>

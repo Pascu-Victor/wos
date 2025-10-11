@@ -1,12 +1,25 @@
 #include "phys.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <mod/io/serial/serial.hpp>
 
-namespace ker::mod::mm::phys {
-static sys::Spinlock memlock;
+#include "buddy_alloc/buddy_alloc.hpp"
+#include "limine.h"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/sys/spinlock.hpp"
 
-paging::PageZone* initPageZone(uint64_t base, uint64_t len, int zoneNum) {
-    paging::PageZone* zone = (paging::PageZone*)base;
+namespace ker::mod::mm::phys {
+
+namespace {
+sys::Spinlock memlock;
+__attribute__((section(".data"))) paging::PageZone* zones = nullptr;
+}  // namespace
+
+auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone* {
+    auto* zone = (paging::PageZone*)base;
 
     base = PAGE_ALIGN_UP(base + sizeof(paging::PageZone));
     len -= paging::PAGE_SIZE;
@@ -20,8 +33,6 @@ paging::PageZone* initPageZone(uint64_t base, uint64_t len, int zoneNum) {
 
     return zone;
 }
-
-static paging::PageZone* zones = nullptr;
 
 void init(limine_memmap_response* memmapResponse) {
     if (memmapResponse == nullptr) {
@@ -53,23 +64,15 @@ void init(limine_memmap_response* memmapResponse) {
     }
 
     zones_tail->next = nullptr;
-    uint64_t totalSize = 0;
-    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-        totalSize += zone->len;
-    }
-
-    mod::io::serial::write("Memory pool size: ");
-    mod::io::serial::write(totalSize);
-    mod::io::serial::write("B\n");
 }
 
-void* findFreeBlock(uint64_t size) {
+static auto findFreeBlock(uint64_t size) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if (zone->len < size) {
             continue;
         }
         void* const block = buddy_malloc(zone->buddyInstance, size);
-        if (!block) {
+        if (block == nullptr) {
             [[unlikely]] continue;
         }
         return block;
@@ -78,7 +81,7 @@ void* findFreeBlock(uint64_t size) {
     return nullptr;
 }
 
-void* pageAlloc(uint64_t size) {
+auto pageAlloc(uint64_t size) -> void* {
     memlock.lock();
     void* block = findFreeBlock(size);
 
@@ -100,7 +103,11 @@ void pageFree(void* page) {
             continue;
         }
 
-        buddy_free(zone->buddyInstance, page);
+        // Get the buddy instance dynamically since it's in RELATIVE_MODE
+        buddy* buddyPtr = buddy_get_embed_at((uint8_t*)zone->start, zone->len);
+        if (buddyPtr != nullptr) {
+            buddy_free(buddyPtr, page);
+        }
         break;
     }
     memlock.unlock();

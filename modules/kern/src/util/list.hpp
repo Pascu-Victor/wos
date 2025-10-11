@@ -15,7 +15,7 @@ class list {
     list() {
         head = nullptr;
         tail = nullptr;
-        size = 0;
+        m_size = 0;
     }
 
     void push_back(T data) {
@@ -34,7 +34,7 @@ class list {
             head = node;
         }
 
-        size++;
+        m_size++;
     }
 
     void push_front(T data) {
@@ -53,7 +53,7 @@ class list {
             tail = node;
         }
 
-        size++;
+        m_size++;
     }
 
     T pop_back() {
@@ -75,7 +75,7 @@ class list {
             head = nullptr;
         }
 
-        size--;
+        m_size--;
 
         return data;
     }
@@ -99,7 +99,7 @@ class list {
             tail = nullptr;
         }
 
-        size--;
+        m_size--;
 
         return data;
     }
@@ -129,16 +129,18 @@ class list {
                 }
 
                 delete current;
-                size--;
+                m_size--;
                 return;
             }
             current = current->next;
         }
     }
 
+    [[nodiscard]] auto size() const -> uint64_t { return m_size; }
+
    private:
     Node* head;
     Node* tail;
-    uint64_t size;
+    uint64_t m_size;
 };
 }  // namespace std

@@ -29,6 +29,7 @@ void init();
 bool postTask(task::Task* task);
 bool postTaskForCpu(uint64_t cpuNo, task::Task* task);
 task::Task* getCurrentTask();
+void removeCurrentTask();  // Remove current task from runqueue (for exit)
 void startScheduler();
 void percpuInit();
 void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);

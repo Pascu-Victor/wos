@@ -67,7 +67,7 @@ extern "C" void _start(void) {
         hcf();
     }
 
-    // callGlobalConstructors();
+    callGlobalConstructors();
 
     // Init the framebuffer.
     gfx::fb::init();

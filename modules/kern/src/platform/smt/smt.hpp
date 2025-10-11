@@ -41,9 +41,10 @@ class PerCpuVar {
     T* _data;
 
    public:
-    PerCpuVar(T defaultValue = T()) {
-        _data = new T[getCoreCount()];
-        for (uint64_t i = 0; i < getCoreCount(); ++i) _data[i] = defaultValue;
+    PerCpuVar(T defaultValue = T()) : _data(new T[getCoreCount()]) {
+        for (uint64_t i = 0; i < getCoreCount(); ++i) {
+            _data[i] = defaultValue;
+        }
     }
 
     T& get() { return _data[cpu::currentCpu()]; }

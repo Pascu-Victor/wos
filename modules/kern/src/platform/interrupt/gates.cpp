@@ -4,7 +4,9 @@
 #include <platform/smt/smt.hpp>
 
 namespace ker::mod::gates {
-smt::PerCpuVar<interruptHandler_t> interruptHandlers[256](nullptr);
+namespace {
+interruptHandler_t interruptHandlers[256](nullptr);
+}
 
 void exception_handler(cpu::GPRegs &gpr, interruptFrame &frame) {
     if (frame.intNum == 14) {
@@ -153,8 +155,8 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     }
     if (frame.intNum == 0x20) {
         task_switch_handler(frame);
-    } else if (interruptHandlers[frame.intNum].get() != nullptr) {
-        interruptHandlers[frame.intNum].get()(gpr, frame);
+    } else if (interruptHandlers[frame.intNum] != nullptr) {
+        interruptHandlers[frame.intNum](gpr, frame);
     } else {
         if (!isIrq(frame.intNum)) {
             // ker::mod::apic::eoi();
@@ -168,7 +170,7 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
 }
 
 void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
-    if (interruptHandlers[intNum].get() != nullptr) {
+    if (interruptHandlers[intNum] != nullptr) {
         ker::mod::io::serial::write("Handler already set\n");
         return;
     }
@@ -177,5 +179,5 @@ void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
 
 void removeInterruptHandler(uint8_t intNum) { interruptHandlers[intNum] = nullptr; }
 
-bool isInterruptHandlerSet(uint8_t intNum) { return interruptHandlers[intNum].get() != nullptr; }
+bool isInterruptHandlerSet(uint8_t intNum) { return interruptHandlers[intNum] != nullptr; }
 }  // namespace ker::mod::gates

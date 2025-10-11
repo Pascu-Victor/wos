@@ -542,16 +542,15 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
             auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
-            uint64_t physAddr = physPtr;  // physPtr is already the physical address
-            mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr,
+            mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                    mod::mm::paging::pageTypes::USER);
 
             // Zero the page
-            memset((void *)physPtr, 0, mod::mm::virt::PAGE_SIZE);
+            memset((void *)paddr, 0, mod::mm::virt::PAGE_SIZE);
 
             // Remember first page for copying
             if (i == 0) {
-                sectionHeadersPhysPtr = physPtr;
+                sectionHeadersPhysPtr = paddr;
             }
         }
     }
@@ -565,22 +564,21 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
     // Allocate memory for string table
     uint64_t stringTableSize = scnHeadTable->sh_size;
     uint64_t stringTablePages = PAGE_ALIGN_UP(stringTableSize) / mod::mm::virt::PAGE_SIZE;
-    uint64_t stringTableVaddr = 0x700000001000ULL;  // After section headers
+    uint64_t stringTableVaddr = 0x700000201000ULL;  // After section headers
 
     uint64_t stringTablePhysPtr = 0;
     for (uint64_t i = 0; i < stringTablePages; i++) {
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
             auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
-            uint64_t physAddr = physPtr;  // physPtr is already the physical address
-            mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr, mod::mm::paging::pageTypes::USER);
+            mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr, mod::mm::paging::pageTypes::USER);
 
             // Zero the page
-            memset((void *)physPtr, 0, mod::mm::virt::PAGE_SIZE);
+            memset((void *)paddr, 0, mod::mm::virt::PAGE_SIZE);
 
             // Remember first page for copying
             if (i == 0) {
-                stringTablePhysPtr = physPtr;
+                stringTablePhysPtr = paddr;
             }
         }
     }
@@ -621,9 +619,9 @@ void loadSectionHeaders(const ElfFile &elf, ker::mod::mm::virt::PageTable *pagem
                         auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(debugPaddr);
                         mod::mm::virt::mapPage(pagemap, debugVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                                mod::mm::paging::pageTypes::USER);
-                        memset((void *)physPtr, 0, mod::mm::virt::PAGE_SIZE);
+                        memset((void *)debugPaddr, 0, mod::mm::virt::PAGE_SIZE);
                         uint64_t copySize = (remainingSize > mod::mm::virt::PAGE_SIZE) ? mod::mm::virt::PAGE_SIZE : remainingSize;
-                        memcpy((void *)physPtr, elf.base + sectionHeader->sh_offset + sourceOffset, copySize);
+                        memcpy((void *)debugPaddr, elf.base + sectionHeader->sh_offset + sourceOffset, copySize);
                         remainingSize -= copySize;
                         sourceOffset += copySize;
                     } else {
@@ -672,12 +670,12 @@ auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid,
 
     // Allocate memory for ELF header and preserve it
     // TODO: make this dynamic or make llvm aware of this memory no-go zone
-    constexpr uint64_t elfHeaderVaddr = 0x700000010000ULL;  // High memory area for ELF header
+    constexpr uint64_t elfHeaderVaddr = 0x400000ULL;  // High memory area for ELF header
     auto elfHeaderPaddr = (uint64_t)mod::mm::phys::pageAlloc();
     if (elfHeaderPaddr != 0) {
-        auto elfHeaderPhysPtr = (uint64_t)mod::mm::addr::getPhysPointer(elfHeaderPaddr);
-        mod::mm::virt::mapPage(pagemap, elfHeaderVaddr, elfHeaderPhysPtr, mod::mm::paging::pageTypes::USER);
-        memcpy((void *)elfHeaderPhysPtr, &elfFile.elfHead, sizeof(Elf64_Ehdr));
+        mod::mm::virt::mapPage(pagemap, elfHeaderVaddr, (uint64_t)mod::mm::addr::getPhysPointer(elfHeaderPaddr),
+                               mod::mm::paging::pageTypes::USER);
+        memcpy((void *)elfHeaderPaddr, &elfFile.elfHead, sizeof(Elf64_Ehdr));
         debug::setElfHeaders(pid, elfFile.elfHead, elfHeaderVaddr);
     }
 
@@ -691,16 +689,15 @@ auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid,
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != 0) {
             auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
-            uint64_t physAddr = physPtr;  // physPtr is already the physical address
-            mod::mm::virt::mapPage(pagemap, programHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physAddr,
+            mod::mm::virt::mapPage(pagemap, programHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                    mod::mm::paging::pageTypes::USER);
 
             // Zero the page
-            memset((void *)physPtr, 0, mod::mm::virt::PAGE_SIZE);
+            memset((void *)paddr, 0, mod::mm::virt::PAGE_SIZE);
 
             // Remember first page for copying
             if (i == 0) {
-                programHeadersPhysPtr = physPtr;
+                programHeadersPhysPtr = paddr;
             }
         }
     }
@@ -876,7 +873,8 @@ auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid,
                     }
 
                     // Check for special names
-                    if (((std::strncmp(sname, "__safestack_unsafe_stack_ptr", 27) == 0) || (std::strncmp(sname, "__ehdr_start", 11) == 0) ||
+                    if (false &&
+                        ((std::strncmp(sname, "__safestack_unsafe_stack_ptr", 27) == 0) || (std::strncmp(sname, "__ehdr_start", 11) == 0) ||
                          (std::strncmp(sname, "__init_array_start", 18) == 0) || (std::strncmp(sname, "__init_array_end", 16) == 0) ||
                          (std::strncmp(sname, "__fini_array_start", 18) == 0) || (std::strncmp(sname, "__fini_array_end", 16) == 0) ||
                          (std::strncmp(sname, "__preinit_array_start", 21) == 0) || (std::strncmp(sname, "__preinit_array_end", 19) == 0) ||

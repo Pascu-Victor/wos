@@ -8,9 +8,6 @@
             "name": "Debug WOS Kernel",
             "type": "lldb-dap",
             "request": "attach",
-            "attachCommands": [
-                "gdb-remote localhost:1234"
-            ],
             "preRunCommands": [
                 "target create ${workspaceFolder}/build/modules/kern/wos",
             ],
@@ -18,10 +15,12 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set plugin.process.gdb-remote.packet-timeout 10",
             ],
             "terminateCommands": [
                 "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 1234"
             ],
             "preLaunchTask": "Build and Start QEMU"
         },
@@ -30,22 +29,19 @@
             "type": "lldb-dap",
             "request": "attach",
             "attachCommands": [
-                "gdb-remote localhost:1234"
+                "gdb-remote 1234"
             ],
             "preRunCommands": [
                 "target create ${workspaceFolder}/build/modules/kern/wos",
                 "target modules add ${workspaceFolder}/build/modules/init/init",
-                "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.so",
-                "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.so",
-                "target modules add ${workspaceFolder}/toolchain/target1/lib/libstdc++.so",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.a",
             ],
             "initCommands": [
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.process.thread.step-avoid-nodebug false",
                 "settings set target.process.thread.step-avoid-regexp ''",
-                "settings set plugin.process.gdb-remote.packet-timeout 10",
                 "settings set target.skip-prologue false",
             ],
             "terminateCommands": [

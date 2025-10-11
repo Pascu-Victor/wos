@@ -4,20 +4,21 @@
 #include <util/string.hpp>
 
 namespace ker::mod::dbg {
+namespace {
+sys::Spinlock logLock{};
 bool isInit = false;
 bool isTimeAvailable = false;
 bool isKmallocAvailable = false;
-sys::Spinlock logLock;
+uint64_t linesLogged = 0;
+}  // namespace
+
 using namespace ker::mod;
 
-uint64_t linesLogged = 0;
-
-void init(void) {
+void init() {
     if (isInit) {
         return;
     }
     io::serial::init();
-    logLock = sys::Spinlock();
     isInit = true;
 }
 
