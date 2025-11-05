@@ -1,6 +1,8 @@
 #ifndef QEMU_LOG_VIEWER_H
 #define QEMU_LOG_VIEWER_H
 
+#include <qtmetamacros.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -32,7 +34,7 @@ typedef size_t csh;  // Forward declare capstone handle
 #include <QtWidgets/QSplitter>
 #include <QtWidgets/QStyledItemDelegate>
 #include <QtWidgets/QTableWidget>
-#include <QtWidgets/QTextEdit>
+#include <QtWidgets/QTextBrowser>
 #include <QtWidgets/QToolBar>
 #include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QVBoxLayout>
@@ -47,6 +49,8 @@ class LogProcessor;
 class CapstoneDisassembler;
 class SyntaxHighlighter;
 class SyntaxHighlightDelegate;
+class VirtualTableView;
+class VirtualTableModel;
 
 enum class EntryType { INSTRUCTION, INTERRUPT, REGISTER, BLOCK, SEPARATOR, OTHER };
 
@@ -129,6 +133,7 @@ class QemuLogViewer : public QMainWindow {
     void onInterruptPanelActivated(QTreeWidgetItem* item, int column);
     void onInterruptNext();
     void onInterruptPrevious();
+    void onInterruptToggleFold(QTreeWidgetItem* item, int column);
 
    private:
     // UI Components
@@ -149,10 +154,12 @@ class QemuLogViewer : public QMainWindow {
 
     // Main content
     QSplitter* mainSplitter;
-    QTableWidget* logTable;
+    QTableWidget* legacyLogTable;          // Keep for compatibility during transition
+    VirtualTableView* logTable;            // New virtual table
+    VirtualTableModel* virtualTableModel;  // Model for virtual table
     QTextEdit* hexView;
     QTextEdit* disassemblyView;
-    QTextEdit* detailsPane;
+    QTextBrowser* detailsPane;
 
     // Search functionality
     std::vector<int> searchMatches;
@@ -180,8 +187,9 @@ class QemuLogViewer : public QMainWindow {
     QTreeWidget* interruptsPanel;                            // Left-side panel listing interrupts
     std::unordered_map<size_t, int> entryIndexToVisibleRow;  // map from logEntries index to visible row
     // Interrupt navigation state
-    std::string currentSelectedInterrupt;  // raw interrupt number string
-    int currentInterruptIndex;             // index within visible occurrences
+    std::string currentSelectedInterrupt;                    // raw interrupt number string
+    int currentInterruptIndex;                               // index within visible occurrences
+    std::unordered_set<size_t> foldedInterruptEntryIndices;  // Set of entry indices for folded individual interrupt occurrences
 
     // Performance optimization members
     std::vector<QString> stringBuffers;                      // Pre-allocated string buffers
@@ -202,8 +210,7 @@ class QemuLogViewer : public QMainWindow {
     void setupTable();
     void connectSignals();
     void loadLogFiles();
-    void populateTable();
-    void populateTableOptimized();   // Optimized version
+    void populateTable();            // Optimized version
     void populateInterruptFilter();  // Populate interrupt dropdown
     void performSearch();
     void performSearchOptimized();  // Optimized version
@@ -220,12 +227,14 @@ class QemuLogViewer : public QMainWindow {
     QString formatFunction(const std::string& func);
     QString formatHexBytes(const std::string& bytes);
     QString formatAssembly(const std::string& assembly);
-    QString extractFileInfo(const std::string& func);  // Extract file:line:column from function
-    QColor getEntryTypeColor(EntryType type);          // Get color for entry type
+    QString extractFileInfo(const std::string& func);                              // Extract file:line:column from function
+    QString getSourceCodeForAddress(uint64_t address, const QString& binaryPath);  // Get source code via addr2line
+    QColor getEntryTypeColor(EntryType type);                                      // Get color for entry type
 
     // Event handling
     bool eventFilter(QObject* obj, QEvent* event) override;
-    void cancelSearch();  // Cancel search and return to original position
+    void cancelSearch();                             // Cancel search and return to original position
+    void onDetailsPaneLinkClicked(const QUrl& url);  // Handle clicks on VS Code links in details pane
 
     // Performance optimization methods
     void initializePerformanceOptimizations();
@@ -237,6 +246,7 @@ class QemuLogViewer : public QMainWindow {
     void preAllocateTableItems(int rowCount);
     void batchUpdateTable(const std::vector<const LogEntry*>& entries);
     void buildInterruptPanel();
+    int findNextIretLine(int startLineNumber) const;  // Find the next iret instruction after a given line
 };
 
 #endif  // QEMU_LOG_VIEWER_H

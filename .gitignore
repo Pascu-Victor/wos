@@ -2,8 +2,8 @@
 **/bin
 **/obj
 **/CMakeFiles
-#kernel images
-disk.qcow2
+#qcow images
+*.qcow2
 #log files
 **/*.log
 **/extern/clang/*

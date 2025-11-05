@@ -12,13 +12,10 @@ PHDRS
 
 SECTIONS
 {
+    /* ELF header*/
+    PROVIDE_HIDDEN(__ehdr_start = 0x1000);
+
     . = 0x400000;
-
-    /* ELF header starts at the image base */
-    PROVIDE_HIDDEN(__ehdr_start = ABSOLUTE(.));
-
-    /* Reserve space for ELF header and program headers */
-    . += SIZEOF_HEADERS;
 
     /* Code sections */
     .text : ALIGN(4K) {

@@ -29,11 +29,12 @@
             "type": "lldb-dap",
             "request": "attach",
             "attachCommands": [
-                "gdb-remote 1234"
+                "!gdb-remote 1234"
             ],
             "preRunCommands": [
                 "target create ${workspaceFolder}/build/modules/kern/wos",
                 "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
                 "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.a",
                 "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.a",
             ],
@@ -44,10 +45,7 @@
                 "settings set target.process.thread.step-avoid-regexp ''",
                 "settings set target.skip-prologue false",
             ],
-            "terminateCommands": [
-                "process kill"
-            ],
-            "preLaunchTask": "Build and Start QEMU"
+            "preLaunchTask": "Build and Start QEMU",
         },
     ]
 }

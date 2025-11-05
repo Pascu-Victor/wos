@@ -21,7 +21,8 @@ void idtSetEntry(IdtEntry* entry, void* isr, uint8_t gateType) {
 static inline IdtEntry* calcIdtEntry(uint8_t intNumber) { return &idt[intNumber]; }
 
 #define ISR_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE)
-#define ISR_EXCEPT_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE)
+#define ISR_TRAP_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE)
+#define ISR_EXCEPT_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_INTERRUPT_GATE)
 
 void mapIsrEntries() {
     ISR_ENTRY(0);

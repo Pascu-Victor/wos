@@ -15,9 +15,9 @@ void setTssEntry(uint64_t base, uint8_t flags, uint8_t access) {
 }
 
 static Tss_t tss;
-void initTss(uint64_t *stackPointer) {
+void initTss(uint64_t* stackPointer) {
     setTssEntry((uintptr_t)&tss, 0x20, 0x89);
-    memset((void *)&tss, 0, sizeof(Tss_t));
+    memset((void*)&tss, 0, sizeof(Tss_t));
 
     tss.rsp[0] = (uint64_t)stackPointer;
     tss.ist[0] = 0;  // Disable IST
@@ -41,7 +41,7 @@ GdtEntry constexpr makeGdtEntry(uint32_t limit, uint32_t base, GdtFlags flags) {
     return entry;
 }
 
-void initGdt(uint64_t *stackPointer) {
+void initGdt(uint64_t* stackPointer) {
     /*
     null        -  0x00
     kernel Code -  (present, ring 0, type: code, non-conforming, readable)
@@ -73,7 +73,7 @@ void initGdt(uint64_t *stackPointer) {
                                                              });  // kernel Code
     gdt.memorySegments[GDT_ENTRY_KERNEL_DATA] = makeGdtEntry(0, 0,
                                                              {
-                                                                 .segmentType = 0x2,
+                                                                 .segmentType = 0x3,
                                                                  .descriptorType = 1,
                                                                  .dpl = 0,
                                                                  .present = 1,
@@ -95,7 +95,7 @@ void initGdt(uint64_t *stackPointer) {
                                                            });  // user Code
     gdt.memorySegments[GDT_ENTRY_USER_DATA] = makeGdtEntry(0, 0,
                                                            {
-                                                               .segmentType = 0x2,
+                                                               .segmentType = 0x3,  // Data: writable, expand-up
                                                                .descriptorType = 1,
                                                                .dpl = 3,
                                                                .present = 1,
@@ -110,14 +110,14 @@ void initGdt(uint64_t *stackPointer) {
     initTss(stackPointer);
 
     gdt.ptr.base = (uint64_t)&gdt.memorySegments;
-    gdt.ptr.limit = sizeof(Gdt) * GDT_ENTRY_COUNT - 1;
+    gdt.ptr.limit = sizeof(gdt.memorySegments) + sizeof(gdt.tss) - 1;
 }
 
 extern "C" void loadGdt(uint64_t gdtr);
 
 static inline void loadTss(uint16_t tss_selector) { asm volatile("ltr %%ax" ::"a"(tss_selector) : "memory"); }
 
-void initDescriptors(uint64_t *stackPointer) {
+void initDescriptors(uint64_t* stackPointer) {
     initGdt(stackPointer);
     loadGdt((uint64_t)&gdt.ptr);
     loadTss(GDT_ENTRY_TSS * 8);

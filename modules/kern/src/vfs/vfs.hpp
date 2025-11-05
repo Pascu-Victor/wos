@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 #include "bits/off_t.h"
 #include "bits/ssize_t.h"
@@ -23,7 +24,7 @@ struct VNode {
 };
 
 // Open a path and return a file descriptor-like opaque pointer
-auto vfs_open(const char* path, int flags, int mode) -> int;
+auto vfs_open(std::string_view path, int flags, int mode) -> int;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, std::size_t count) -> ssize_t;
 auto vfs_write(int fd, const void* buf, std::size_t count) -> ssize_t;
@@ -36,5 +37,8 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 
 // Initialize VFS (register tmpfs, devfs, etc.)
 void init();
+
+// Mark FAT32 as mounted (called after successful FAT32 mount)
+void set_fat32_mounted(bool mounted);
 
 }  // namespace ker::vfs

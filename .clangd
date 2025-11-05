@@ -1,28 +1,3 @@
-If:
-    PathMatch: ".*"
-    PathExclude: ".*(build|toolchain).*"
-CompileFlags:
-    CompilationDatabase: .
-    Add:
-        - --target=x86_64-pc-wos
-        - -DWOS=1
-        - -D__x86_64__=1
-        - -resource-dir=toolchain/target1/lib/clang/21
-        - --sysroot=toolchain/target1
-        - -I../toolchain/target1/include/c++/v1
-        - -I../toolchain/target1/include
-        - -I../modules/defines
-        - -I../modules/extern
-    Remove:
-        - -w-reloc-rel-dword
-        - -w-reloc-abs-qword
-        - -f
-        - -fsanitize=safe-stack
-        - -felf64
-        - -fPIE
-        - -pie
-        - -resource-dir=/usr/lib/clang/20
-
 Diagnostics:
     ClangTidy:
         Add:
@@ -46,6 +21,17 @@ Diagnostics:
         IgnoreHeader: ".*toolchain/target1/.*"
     UnusedIncludes: Strict
     MissingIncludes: Strict
+
+CompileFlags:
+    Remove:
+        - -w-reloc-rel-dword
+        - -w-reloc-abs-qword
+        - -f
+        - -fsanitize=safe-stack
+        - -felf64
+        - -fPIE
+        - -pie
+        - -resource-dir=/usr/lib/clang/20
 
 Index:
     Background: Build

@@ -56,7 +56,7 @@ class list {
         m_size++;
     }
 
-    T pop_back() {
+    auto pop_back() -> T {
         if (!tail) {
             return T();
         }
@@ -80,7 +80,7 @@ class list {
         return data;
     }
 
-    T pop_front() {
+    auto pop_front() -> T {
         if (!head) {
             return T();
         }
@@ -136,7 +136,7 @@ class list {
         }
     }
 
-    [[nodiscard]] auto size() const -> uint64_t { return m_size; }
+    auto size() -> uint64_t { return this->m_size; }
 
    private:
     Node* head;

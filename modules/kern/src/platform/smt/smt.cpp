@@ -1,6 +1,16 @@
 #include "smt.hpp"
 
+#include <array>
 #include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <string_view>
+
+#include "platform/boot/handover.hpp"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/mm/virt.hpp"
+#include "platform/sched/scheduler.hpp"
 
 __attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
     .id = LIMINE_SMP_REQUEST,
@@ -48,16 +58,115 @@ void nonPrimaryCpuInit() {
 void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
     sched::percpuInit();
     for (uint64_t i = 0; i < modStruct.count; i++) {
-        auto newTask = new sched::task::Task(modStruct.modules[i].name, (uint64_t)modStruct.modules[i].entry, kernelRsp,
-                                             sched::task::TaskType::PROCESS);
+        const auto& module = modStruct.modules[i];
+        auto* newTask = new sched::task::Task(module.name, (uint64_t)module.entry, kernelRsp, sched::task::TaskType::PROCESS);
+
+        // Setup minimal argc/argv/envp on user stack
+        uint64_t userStackVirt = newTask->thread->stack;
+        uint64_t currentVirtOffset = 0;
+
+        // Helper to push data onto stack
+        auto pushToStack = [&](const void* data, size_t size) -> uint64_t {
+            if (currentVirtOffset + size > USER_STACK_SIZE) {
+                return 0;
+            }
+            currentVirtOffset += size;
+            uint64_t virtAddr = userStackVirt - currentVirtOffset;
+
+            uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
+            uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
+
+            uint64_t pagePhys = mm::virt::translate(newTask->pagemap, pageVirt);
+            if (pagePhys == 0) {
+                dbg::log("ERROR: Failed to translate page virt=0x%x for stack data", pageVirt);
+                return 0;
+            }
+
+            auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+            std::memcpy(destPtr, data, size);
+            dbg::log("Pushed %d bytes: virt=0x%x, phys=0x%x, data[0]=0x%x", size, virtAddr, pagePhys, *(uint32_t*)data);
+
+            return virtAddr;
+        };
+
+        // Helper to push string onto stack
+        auto pushString = [&](const char* str) -> uint64_t {
+            size_t len = std::strlen(str) + 1;
+            if (currentVirtOffset + len > USER_STACK_SIZE) {
+                return 0;
+            }
+            currentVirtOffset += len;
+            uint64_t virtAddr = userStackVirt - currentVirtOffset;
+
+            uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
+            uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
+
+            uint64_t pagePhys = mm::virt::translate(newTask->pagemap, pageVirt);
+            if (pagePhys == 0) {
+                dbg::log("ERROR: Failed to translate page virt=0x%x for string '%s'", pageVirt, str);
+                return 0;
+            }
+
+            auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+            std::memcpy(destPtr, str, len);
+            dbg::log("Pushed string '%s' at virt=0x%x (len=%d)", str, virtAddr, len);
+
+            return virtAddr;
+        };
+
+        // Push program name as argv[0]
+        uint64_t argv0 = pushString(module.name);
+
+        // Align stack to 16 bytes
+        // no return address to push, so just align
+        constexpr uint64_t alignment = 16;
+        uint64_t currentAddr = userStackVirt - currentVirtOffset;
+        uint64_t aligned = currentAddr & ~(alignment - 1);
+        currentVirtOffset += (currentAddr - aligned);
+
+        constexpr uint64_t AT_NULL = 0;
+        constexpr uint64_t AT_PAGESZ = 6;
+        constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_PHDR = 3;
+        constexpr uint64_t AT_EHDR = 33;  // AT_EHDR (glibc extension but widely supported)
+
+        std::array<uint64_t, 10> auxvEntries = {AT_PAGESZ, (uint64_t)mm::paging::PAGE_SIZE,
+                                                AT_ENTRY,  newTask->entry,
+                                                AT_PHDR,   newTask->programHeaderAddr,
+                                                AT_EHDR,   newTask->elfHeaderAddr,
+                                                AT_NULL,   0};
+
+        // Push auxv in reverse order
+        for (int j = auxvEntries.size() - 1; j >= 0; j--) {
+            uint64_t val = auxvEntries[static_cast<size_t>(j)];
+            pushToStack(&val, sizeof(uint64_t));
+        }
+
+        // Push envp array first (will end up lowest in memory)
+        uint64_t nullPtr = 0;
+        uint64_t envpPtr = pushToStack(&nullPtr, sizeof(uint64_t));
+
+        // Push argv array
+        uint64_t argvData[2] = {argv0, 0};  // NOLINT
+        uint64_t argvPtr = pushToStack(static_cast<const void*>(argvData), 2 * sizeof(uint64_t));
+
+        // Push argc last
+        uint64_t argc = 1;
+        pushToStack(&argc, sizeof(uint64_t));
+
+        // Set user stack pointer to point to argc
+        newTask->context.frame.rsp = userStackVirt - currentVirtOffset;
+        // System V x86-64 ABI: RDI=argc, RSI=argv, RDX=envp
+        newTask->context.regs.rdi = argc;
+        newTask->context.regs.rsi = argvPtr;
+        newTask->context.regs.rdx = envpPtr;
+
+        dbg::log("Task %s: argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", module.name, argc, argvPtr, envpPtr, newTask->context.frame.rsp);
+        dbg::log("  userStackVirt=0x%x, currentVirtOffset=0x%x, argv0=0x%x", userStackVirt, currentVirtOffset, argv0);
+
         sched::postTask(newTask);
     }
     dbg::log("Posted task for main thread");
-    // for (uint64_t i = 1; i < smt::cpu_count; i++) {
-    //     auto newCpuTask = new sched::task::Task(modStruct.modules[0].name, (uint64_t)modStruct.modules[0].entry, kernelRsp,
-    //                                             sched::task::TaskType::PROCESS);
-    //     sched::postTaskForCpu(i, newCpuTask);
-    // }
     sched::startScheduler();
 }
 

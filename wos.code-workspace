@@ -182,8 +182,6 @@
         "[conf]": {
             "editor.formatOnSave": false
         },
-        "C_Cpp.codeAnalysis.exclude": {
-            "**/extern/": true,
-        },
+        "cmake.generator": "Ninja"
     }
 }

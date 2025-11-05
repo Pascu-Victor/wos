@@ -1,6 +1,24 @@
 #include "qemu_log_viewer.h"
 
+#include <qcombobox.h>
+#include <qcontainerfwd.h>
+#include <qlineedit.h>
+#include <qmainwindow.h>
+#include <qnamespace.h>
+#include <qoverload.h>
+#include <qpushbutton.h>
+#include <qscrollbar.h>
+#include <qtablewidget.h>
+#include <qtreewidget.h>
+#include <qwidget.h>
+
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 #include "config.h"
+#include "virtual_table.h"
 
 // Work around BFD config.h requirement
 #define PACKAGE "qemu_log_viewer"
@@ -15,6 +33,7 @@ extern "C" {
 #include <QtCore/QRegularExpression>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QTimer>
+#include <QtGui/QDesktopServices>
 #include <QtGui/QPainter>
 #include <QtGui/QSyntaxHighlighter>
 #include <QtGui/QTextCharFormat>
@@ -26,6 +45,7 @@ extern "C" {
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QStyle>
 #include <QtWidgets/QStyledItemDelegate>
+#include <QtWidgets/QTextBrowser>
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -857,7 +877,7 @@ class SyntaxHighlightDelegate : public QStyledItemDelegate {
 };
 
 QemuLogViewer::QemuLogViewer(QWidget* parent)
-    : QMainWindow(parent), currentSearchIndex(-1), nextStringBuffer(0), preSearchPosition(-1), searchActive(false) {
+    : QMainWindow(parent), currentSearchIndex(-1), preSearchPosition(-1), searchActive(false), nextStringBuffer(0) {
     disassembler = std::make_unique<CapstoneDisassembler>();
 
     // Initialize search debounce timer
@@ -896,9 +916,9 @@ QemuLogViewer::~QemuLogViewer() {
     // No manual cleanup needed
 }
 
-bool QemuLogViewer::eventFilter(QObject* obj, QEvent* event) {
+auto QemuLogViewer::eventFilter(QObject* obj, QEvent* event) -> bool {
     if (obj == searchEdit && event->type() == QEvent::KeyPress) {
-        QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (keyEvent->key() == Qt::Key_Escape) {
             cancelSearch();
             return true;  // Event handled
@@ -976,14 +996,14 @@ QString QemuLogViewer::getDarkThemeCSS() {
             background-color: #2b2b2b;
             color: #ffffff;
         }
-        
+
         QToolBar {
             background-color: #3c3c3c;
             border: none;
             spacing: 3px;
             color: #ffffff;
         }
-        
+
         QComboBox {
             background-color: #404040;
             color: #ffffff;
@@ -992,25 +1012,25 @@ QString QemuLogViewer::getDarkThemeCSS() {
             border-radius: 3px;
             min-height: 20px;
         }
-        
+
         QComboBox::drop-down {
             border: none;
             width: 20px;
         }
-        
+
         QComboBox::down-arrow {
             width: 12px;
             height: 12px;
             border: none;
         }
-        
+
         QComboBox QAbstractItemView {
             background-color: #404040;
             color: #ffffff;
             border: 1px solid #555555;
             selection-background-color: #1e3a5f;
         }
-        
+
         QLineEdit {
             background-color: #404040;
             color: #ffffff;
@@ -1018,11 +1038,11 @@ QString QemuLogViewer::getDarkThemeCSS() {
             padding: 5px;
             border-radius: 3px;
         }
-        
+
         QLineEdit:focus {
             border: 1px solid #1e3a5f;
         }
-        
+
         QPushButton {
             background-color: #404040;
             color: #ffffff;
@@ -1031,26 +1051,26 @@ QString QemuLogViewer::getDarkThemeCSS() {
             border-radius: 3px;
             min-height: 20px;
         }
-        
+
         QPushButton:hover {
             background-color: #4a4a4a;
         }
-        
+
         QPushButton:pressed {
             background-color: #353535;
         }
-        
+
         QPushButton:disabled {
             background-color: #2b2b2b;
             color: #666666;
             border: 1px solid #444444;
         }
-        
+
         QCheckBox {
             color: #ffffff;
             spacing: 5px;
         }
-        
+
         QCheckBox::indicator {
             width: 16px;
             height: 16px;
@@ -1058,12 +1078,12 @@ QString QemuLogViewer::getDarkThemeCSS() {
             border: 1px solid #555555;
             border-radius: 3px;
         }
-        
+
         QCheckBox::indicator:checked {
             background-color: #1e3a5f;
             border: 1px solid #1e3a5f;
         }
-        
+
         QTableWidget {
             background-color: #1a1a1a;
             alternate-background-color: #252525;
@@ -1073,17 +1093,17 @@ QString QemuLogViewer::getDarkThemeCSS() {
             selection-color: #ffffff;
             border: 1px solid #666666;
         }
-        
+
         QTableWidget::item {
             padding: 6px;
             border-bottom: 1px solid #404040;
         }
-        
+
         QTableWidget::item:selected {
             background-color: #1e3a5f;
             color: #ffffff;
         }
-        
+
         QHeaderView::section {
             background-color: #3c3c3c;
             color: #ffffff;
@@ -1091,11 +1111,11 @@ QString QemuLogViewer::getDarkThemeCSS() {
             border: 1px solid #555555;
             font-weight: bold;
         }
-        
+
         QHeaderView::section:hover {
             background-color: #4a4a4a;
         }
-        
+
         QTextEdit {
             background-color: #1a1a1a;
             color: #e8e8e8;
@@ -1104,23 +1124,23 @@ QString QemuLogViewer::getDarkThemeCSS() {
             selection-color: #ffffff;
             font-family: "Consolas", "Monaco", "Courier New", monospace;
         }
-        
+
         QSplitter::handle {
             background-color: #555555;
         }
-        
+
         QSplitter::handle:horizontal {
             width: 3px;
         }
-        
+
         QSplitter::handle:vertical {
             height: 3px;
         }
-        
+
         QSplitter::handle:hover {
             background-color: #666666;
         }
-        
+
         QProgressBar {
             background-color: #404040;
             border: 1px solid #555555;
@@ -1130,60 +1150,60 @@ QString QemuLogViewer::getDarkThemeCSS() {
             min-height: 20px;
             font-weight: bold;
         }
-        
+
         QProgressBar::chunk {
             background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                 stop:0 #1e3a5f, stop:0.5 #2a4a7a, stop:1 #1e3a5f);
             border-radius: 3px;
             margin: 1px;
         }
-        
+
         QLabel {
             color: #ffffff;
         }
-        
+
         QScrollBar:vertical {
             background-color: #3c3c3c;
             width: 12px;
             border: none;
             border-radius: 6px;
         }
-        
+
         QScrollBar::handle:vertical {
             background-color: #555555;
             border-radius: 6px;
             min-height: 20px;
             margin: 2px;
         }
-        
+
         QScrollBar::handle:vertical:hover {
             background-color: #666666;
         }
-        
+
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             border: none;
             background: none;
             height: 0;
         }
-        
+
         QScrollBar:horizontal {
             background-color: #3c3c3c;
             height: 12px;
             border: none;
             border-radius: 6px;
         }
-        
+
         QScrollBar::handle:horizontal {
             background-color: #555555;
             border-radius: 6px;
             min-width: 20px;
             margin: 2px;
         }
-        
+
         QScrollBar::handle:horizontal:hover {
             background-color: #666666;
         }
-        
+
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             border: none;
             background: none;
@@ -1198,14 +1218,14 @@ QString QemuLogViewer::getLightThemeCSS() {
             background-color: #ffffff;
             color: #333333;
         }
-        
+
         QToolBar {
             background-color: #e8e8e8;
             border: none;
             spacing: 3px;
             color: #333333;
         }
-        
+
         QTableWidget {
             background-color: #ffffff;
             alternate-background-color: #f5f5f5;
@@ -1215,7 +1235,7 @@ QString QemuLogViewer::getLightThemeCSS() {
             selection-color: #ffffff;
             border: 1px solid #cccccc;
         }
-        
+
         QTextEdit {
             background-color: #ffffff;
             color: #000000;
@@ -1233,14 +1253,14 @@ QString QemuLogViewer::getHighContrastThemeCSS() {
             background-color: #000000;
             color: #ffffff;
         }
-        
+
         QToolBar {
             background-color: #1a1a1a;
             border: none;
             spacing: 3px;
             color: #ffffff;
         }
-        
+
         QTableWidget {
             background-color: #000000;
             alternate-background-color: #111111;
@@ -1250,7 +1270,7 @@ QString QemuLogViewer::getHighContrastThemeCSS() {
             selection-color: #000000;
             border: 1px solid #ffffff;
         }
-        
+
         QTextEdit {
             background-color: #000000;
             color: #ffffff;
@@ -1390,7 +1410,7 @@ void QemuLogViewer::setupMainContent() {
     rightSplitter->addWidget(disassemblyView);
 
     // Details pane for interrupt information
-    detailsPane = new QTextEdit();
+    detailsPane = new QTextBrowser();
     detailsPane->setReadOnly(true);
     detailsPane->setFont(QFont("Consolas", 12));  // Increased from 10 to 12
     detailsPane->setPlaceholderText("Interrupt details will be displayed here...");
@@ -1405,40 +1425,77 @@ void QemuLogViewer::setupMainContent() {
 }
 
 void QemuLogViewer::setupTable() {
-    logTable = new QTableWidget();
-    logTable->setColumnCount(6);
+    // Create virtual table view
+    logTable = new VirtualTableView(nullptr);
 
+    // Create virtual model
     QStringList headers = {"Line", "Type", "Address", "Function", "Hex Bytes", "Assembly"};
-    logTable->setHorizontalHeaderLabels(headers);
+    virtualTableModel = new VirtualTableModel(0, headers, logTable);  // 0 rows initially
 
-    // Set column widths
-    auto header = logTable->horizontalHeader();
-    header->resizeSection(0, 60);         // Line
-    header->resizeSection(1, 80);         // Type
-    header->resizeSection(2, 120);        // Address
-    header->resizeSection(3, 200);        // Function (wider since no file column)
-    header->resizeSection(4, 140);        // Hex Bytes (wider)
-    header->setStretchLastSection(true);  // Assembly
+    virtualTableModel->setDataProvider([this](int row, std::vector<QString>& cells, QColor& bgColor) {
+        if (row < 0 || row >= static_cast<int>(visibleEntryPointers.size())) {
+            cells.clear();
+            bgColor = Qt::transparent;
+            return;
+        }
 
-    // Table properties for performance
-    logTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    logTable->setAlternatingRowColors(true);
-    logTable->setFont(QFont("Consolas", 11));  // Increased from 9 to 11
-    logTable->setSortingEnabled(false);
-    logTable->setWordWrap(false);
+        const LogEntry* entry = visibleEntryPointers[row];
+        if (!entry) {
+            cells.clear();
+            bgColor = Qt::transparent;
+            return;
+        }
 
-    // Performance optimizations
-    logTable->setShowGrid(false);                                        // Disable grid for faster rendering
-    logTable->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);  // Smoother scrolling
-    logTable->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
-    logTable->verticalHeader()->setDefaultSectionSize(24);  // Fixed row height for performance
-    logTable->verticalHeader()->hide();                     // Hide row numbers for performance
+        // Format cell data
+        cells.clear();
+        cells.reserve(6);
 
-    // Optimize update behavior
-    logTable->setUpdatesEnabled(true);
-    logTable->viewport()->setAttribute(Qt::WA_StaticContents);  // Optimize for static content
+        cells.push_back(QString::number(entry->lineNumber));
 
-    // Enable tooltips
+        QString typeStr;
+        switch (entry->type) {
+            case EntryType::INSTRUCTION:
+                typeStr = "INSTRUCTION";
+                break;
+            case EntryType::INTERRUPT:
+                typeStr = "INTERRUPT";
+                break;
+            case EntryType::REGISTER:
+                typeStr = "REGISTER";
+                break;
+            case EntryType::BLOCK:
+                typeStr = "BLOCK";
+                break;
+            case EntryType::SEPARATOR:
+                typeStr = "SEPARATOR";
+                break;
+            case EntryType::OTHER:
+                typeStr = "OTHER";
+                break;
+        }
+        cells.push_back(typeStr);
+        cells.push_back(formatAddress(entry->address));
+        cells.push_back(formatFunction(entry->function));
+        cells.push_back(formatHexBytes(entry->hexBytes));
+        cells.push_back(formatAssembly(entry->assembly));
+
+        // Set background color based on type
+        bgColor = getEntryTypeColor(entry->type);
+    });
+
+    logTable->setVirtualModel(virtualTableModel);
+
+    // Configure appearance
+    logTable->horizontalHeader()->resizeSection(0, 60);         // Line
+    logTable->horizontalHeader()->resizeSection(1, 80);         // Type
+    logTable->horizontalHeader()->resizeSection(2, 120);        // Address
+    logTable->horizontalHeader()->resizeSection(3, 200);        // Function
+    logTable->horizontalHeader()->resizeSection(4, 140);        // Hex Bytes
+    logTable->horizontalHeader()->setStretchLastSection(true);  // Assembly
+
+    logTable->setFont(QFont("Consolas", 11));
+    logTable->verticalHeader()->setDefaultSectionSize(24);
+    logTable->verticalHeader()->hide();
     logTable->setMouseTracking(true);
 }
 
@@ -1473,13 +1530,28 @@ void QemuLogViewer::connectSignals() {
         }
     });
 
-    connect(logTable, &QTableWidget::itemSelectionChanged, this, &QemuLogViewer::onTableSelectionChanged);
+    // Virtual table selection handling
+    connect(logTable->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+            [this](const QItemSelection& selected, const QItemSelection&) {
+                if (!selected.isEmpty()) {
+                    int row = selected.first().top();
+                    updateDetailsPane(row);
+                }
+            });
 
-    // Add table click handler for expand/collapse
-    connect(logTable, &QTableWidget::cellClicked, this, &QemuLogViewer::onTableCellClicked);
+    // Virtual table click handler
+    connect(logTable, &VirtualTableView::clicked, this, [this](const QModelIndex& index) {
+        if (index.isValid()) {
+            updateDetailsPane(index.row());
+        }
+    });
 
     // Sync scroll bars
     connect(logTable->verticalScrollBar(), &QScrollBar::valueChanged, this, &QemuLogViewer::syncScrollBars);
+
+    // Handle VSCode link clicks
+    connect(detailsPane, &QTextBrowser::anchorClicked, this, &QemuLogViewer::onDetailsPaneLinkClicked);
+
     // Interrupt filter changed
     connect(interruptFilterCombo, &QComboBox::currentTextChanged, this, &QemuLogViewer::onInterruptFilterChanged);
     connect(interruptNextBtn, &QPushButton::clicked, this, &QemuLogViewer::onInterruptNext);
@@ -1487,6 +1559,15 @@ void QemuLogViewer::connectSignals() {
     connect(onlyInterruptsCheckbox, &QCheckBox::toggled, this,
             &QemuLogViewer::onHideStructuralToggled);  // reuse hideStructural logic for simplicity
     connect(interruptsPanel, &QTreeWidget::itemActivated, this, &QemuLogViewer::onInterruptPanelActivated);
+
+    // Right-click to fold/unfold interrupts
+    connect(interruptsPanel, &QTreeWidget::customContextMenuRequested, [this](const QPoint& pos) {
+        QTreeWidgetItem* item = interruptsPanel->itemAt(pos);
+        if (item) {
+            onInterruptToggleFold(item, 0);
+        }
+    });
+    interruptsPanel->setContextMenuPolicy(Qt::CustomContextMenu);
 }
 
 void QemuLogViewer::loadLogFiles() {
@@ -1507,7 +1588,9 @@ void QemuLogViewer::loadLogFiles() {
     std::sort(files.begin(), files.end(), [](const QString& a, const QString& b) {
         bool aModified = a.contains(".modified.");
         bool bModified = b.contains(".modified.");
-        if (aModified != bModified) return aModified > bModified;
+        if (aModified != bModified) {
+            return aModified > bModified;
+        }
         return a < b;
     });
 
@@ -1529,7 +1612,9 @@ void QemuLogViewer::loadLogFiles() {
 }
 
 void QemuLogViewer::onFileSelected(const QString& filename) {
-    if (filename.isEmpty()) return;
+    if (filename.isEmpty()) {
+        return;
+    }
 
     // Disable UI elements during processing
     fileSelector->setEnabled(false);
@@ -1543,8 +1628,12 @@ void QemuLogViewer::onFileSelected(const QString& filename) {
     progressBar->setFormat("Opening file... %p%");
 
     // Clear current data
-    logTable->setRowCount(0);
+    // For virtual table: reset model row count to 0
+    if (virtualTableModel) {
+        virtualTableModel->resetModel();
+    }
     logEntries.clear();
+    visibleEntryPointers.clear();
     searchMatches.clear();
     currentSearchIndex = -1;
 
@@ -1616,7 +1705,7 @@ void QemuLogViewer::onProcessingComplete() {
     QApplication::processEvents();
 
     // Use optimized table population
-    populateTableOptimized();
+    populateTable();
 
     // Build searchable rows after table is populated
     progressBar->setFormat("Building search index... %p%");
@@ -1722,7 +1811,7 @@ void QemuLogViewer::populateInterruptFilter() {
 // Slot fired when the interrupt filter selection changes
 void QemuLogViewer::onInterruptFilterChanged(const QString& text) {
     if (text.isEmpty() || text == "All") {
-        populateTableOptimized();
+        populateTable();
         currentSelectedInterrupt.clear();
         currentInterruptIndex = -1;
         interruptPrevBtn->setEnabled(false);
@@ -1738,7 +1827,7 @@ void QemuLogViewer::onInterruptFilterChanged(const QString& text) {
     currentSelectedInterrupt = raw.toStdString();
 
     // Ensure table is populated according to current hideStructural/onlyInterrupts state
-    populateTableOptimized();
+    populateTable();
 
     // Build list of visible rows containing this interrupt
     std::vector<int> rows;
@@ -1813,109 +1902,6 @@ void QemuLogViewer::onInterruptPrevious() {
     statusLabel->setText(QString("Jumped to interrupt (occurrence %1 of %2)").arg(currentInterruptIndex + 1).arg(rows.size()));
 }
 
-void QemuLogViewer::populateTable() {
-    // Simplified: only show parent entries, no expansion
-    bool hideStructural = hideStructuralCheckbox->isChecked();
-
-    std::vector<const LogEntry*> visibleEntries;
-
-    for (size_t logIndex = 0; logIndex < logEntries.size(); ++logIndex) {
-        const auto& entry = logEntries[logIndex];
-
-        // Only process parent entries
-        if (!entry.isChild) {
-            // Skip structural entries if hiding is enabled
-            if (hideStructural && (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK)) {
-                continue;
-            }
-
-            visibleEntries.push_back(&entry);
-        }
-    }
-
-    logTable->setRowCount(static_cast<int>(visibleEntries.size()));
-
-    for (size_t i = 0; i < visibleEntries.size(); ++i) {
-        const auto* entry = visibleEntries[i];
-        QColor rowColor = getEntryTypeColor(entry->type);
-
-        auto lineItem = new QTableWidgetItem(QString::number(entry->lineNumber));
-        lineItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        lineItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 0, lineItem);
-
-        QString typeStr;
-        switch (entry->type) {
-            case EntryType::INSTRUCTION:
-                typeStr = "INSTR";
-                break;
-            case EntryType::INTERRUPT:
-                typeStr = "INT";
-                break;
-            case EntryType::REGISTER:
-                typeStr = "REG";
-                break;
-            case EntryType::BLOCK:
-                typeStr = "BLOCK";
-                break;
-            case EntryType::SEPARATOR:
-                typeStr = "SEP";
-                break;
-            case EntryType::OTHER:
-                typeStr = "OTHER";
-                break;
-        }
-        auto typeItem = new QTableWidgetItem(typeStr);
-        typeItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 1, typeItem);
-
-        auto addressItem = new QTableWidgetItem(formatAddress(entry->address));
-        addressItem->setToolTip(QString::fromStdString(entry->function));
-        addressItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 2, addressItem);
-
-        auto functionItem = new QTableWidgetItem(formatFunction(entry->function));
-        functionItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 3, functionItem);
-
-        auto hexItem = new QTableWidgetItem(formatHexBytes(entry->hexBytes));
-        hexItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 4, hexItem);
-
-        // Assembly text with type-specific formatting
-        QString assemblyText;
-        if (entry->type == EntryType::REGISTER) {
-            // For REG entries, show CPU state summary from original line
-            if (!entry->originalLine.empty()) {
-                QString originalLine = QString::fromStdString(entry->originalLine);
-                // Extract key CPU state info (first 100 chars or until specific patterns)
-                if (originalLine.length() > 100) {
-                    assemblyText = originalLine.left(100) + "...";
-                } else {
-                    assemblyText = originalLine;
-                }
-            } else {
-                assemblyText = formatAssembly(entry->assembly);
-            }
-        } else {
-            assemblyText = formatAssembly(entry->assembly);
-            if (entry->type == EntryType::INTERRUPT && !entry->childEntries.empty()) {
-                assemblyText = assemblyText + QString(" [%1 details]").arg(entry->childEntries.size());
-            }
-        }
-
-        auto assemblyItem = new QTableWidgetItem(assemblyText);
-        assemblyItem->setBackground(rowColor);
-        logTable->setItem(static_cast<int>(i), 5, assemblyItem);
-
-        // Store the visible entry index for selection handling
-        logTable->item(static_cast<int>(i), 5)->setData(Qt::UserRole, QVariant::fromValue(static_cast<qulonglong>(i)));
-    }
-
-    // Store visible entries for selection handling
-    visibleEntryPointers = visibleEntries;
-}
-
 void QemuLogViewer::onSearchTextChanged() {
     // Cancel any pending search
     searchDebounceTimer->stop();
@@ -1953,21 +1939,10 @@ void QemuLogViewer::performSearch() {
         searchRegex = QRegularExpression(pattern, QRegularExpression::CaseInsensitiveOption);
     }
 
-    // Search through all entries
-    for (int row = 0; row < logTable->rowCount(); ++row) {
-        bool found = false;
-
-        // Search all columns
-        for (int col = 0; col < logTable->columnCount(); ++col) {
-            auto item = logTable->item(row, col);
-            if (item && searchRegex.match(item->text()).hasMatch()) {
-                found = true;
-                break;
-            }
-        }
-
-        if (found) {
-            searchMatches.push_back(row);
+    // Search through searchable rows (already built from visible entries)
+    for (int row = 0; row < static_cast<int>(searchableRows.size()); ++row) {
+        if (searchRegex.match(searchableRows[row].combinedText).hasMatch()) {
+            searchMatches.push_back(searchableRows[row].originalRowIndex);
         }
     }
 
@@ -2013,7 +1988,7 @@ void QemuLogViewer::onRegexToggled(bool enabled) {
 
 void QemuLogViewer::onHideStructuralToggled(bool enabled) {
     Q_UNUSED(enabled)
-    populateTableOptimized();
+    populateTable();
 
     // Re-run search if there was one
     if (!searchEdit->text().isEmpty()) {
@@ -2027,30 +2002,11 @@ void QemuLogViewer::onNavigationTextChanged() {
 }
 
 void QemuLogViewer::highlightSearchMatches() {
-    // Clear all highlighting first
-    for (int row = 0; row < logTable->rowCount(); ++row) {
-        for (int col = 0; col < logTable->columnCount(); ++col) {
-            QTableWidgetItem* item = logTable->item(row, col);
-            if (item) {
-                item->setBackground(QBrush());
-            }
-        }
-    }
-
-    // Only highlight the current match (if any)
-    if (!searchMatches.empty() && currentSearchIndex >= 0 && static_cast<size_t>(currentSearchIndex) < searchMatches.size()) {
-        int currentRow = searchMatches[currentSearchIndex];
-        if (currentRow < logTable->rowCount()) {
-            const QBrush orangeBrush(QColor(255, 165, 0, 150));  // Orange for current match
-
-            // Only highlight columns that actually match the search
-            for (int col = 0; col < logTable->columnCount(); ++col) {
-                QTableWidgetItem* item = logTable->item(currentRow, col);
-                if (item && searchRegex.match(item->text()).hasMatch()) {
-                    item->setBackground(orangeBrush);
-                }
-            }
-        }
+    // With virtual tables, highlighting is handled through the model/delegate
+    // The visual highlighting happens dynamically as rows are rendered
+    // Re-invalidate visible rows to trigger refresh with highlight updates
+    if (logTable && virtualTableModel) {
+        virtualTableModel->invalidateRows(0, logTable->model()->rowCount() - 1);
     }
 }
 
@@ -2122,28 +2078,23 @@ void QemuLogViewer::jumpToLine(int lineNumber) {
 }
 
 void QemuLogViewer::scrollToRow(int row) {
-    if (row >= 0 && row < logTable->rowCount()) {
-        logTable->selectRow(row);
-        logTable->scrollToItem(logTable->item(row, 0), QAbstractItemView::PositionAtCenter);
+    if (row >= 0 && row < static_cast<int>(visibleEntryPointers.size())) {
+        if (logTable) {
+            logTable->scrollToLogicalRow(row, QAbstractItemView::PositionAtCenter);
+            logTable->selectRow(row);
+        }
     }
 }
 
 void QemuLogViewer::scrollToRowForSearch(int row) {
-    if (row >= 0 && row < logTable->rowCount()) {
-        // For search navigation, we want to ensure single row selection regardless of modifier keys
-        // Temporarily disable extended selection behavior
-        QAbstractItemView::SelectionMode oldMode = logTable->selectionMode();
-
-        // Set to single selection mode to prevent Shift-key extending selection
-        logTable->setSelectionMode(QAbstractItemView::SingleSelection);
-
-        // Clear existing selection and select target row
-        logTable->clearSelection();
-        logTable->selectRow(row);
-        logTable->scrollToItem(logTable->item(row, 0), QAbstractItemView::PositionAtCenter);
-
-        // Restore original selection mode
-        logTable->setSelectionMode(oldMode);
+    if (row >= 0 && row < static_cast<int>(visibleEntryPointers.size())) {
+        if (logTable) {
+            // For virtual table, use scrollToLogicalRow which handles loading
+            logTable->scrollToLogicalRow(row, QAbstractItemView::PositionAtCenter);
+            // Select the row
+            logTable->selectRow(row);
+            updateDetailsPane(row);
+        }
     }
 }
 
@@ -2262,7 +2213,15 @@ void QemuLogViewer::updateDetailsPane(int row) {
     }
 
     if (!entry->function.empty()) {
-        detailsText += QString("Function: %1\n").arg(QString::fromStdString(entry->function));
+        // Display function name without offset
+        QString funcName = formatFunction(entry->function);
+        detailsText += QString("Function: %1\n").arg(funcName);
+
+        // Try to extract source code location from the function string
+        QString fileInfo = extractFileInfo(entry->function);
+        if (!fileInfo.isEmpty()) {
+            detailsText += QString("Source: %1\n").arg(fileInfo);
+        }
     }
 
     if (!entry->assembly.empty()) {
@@ -2275,12 +2234,20 @@ void QemuLogViewer::updateDetailsPane(int row) {
         detailsText += QString("CPU State: %1\n").arg(QString::fromStdString(entry->originalLine));
     }
 
-    QString fileInfo = extractFileInfo(entry->function);
-    if (!fileInfo.isEmpty()) {
-        detailsText += QString("File: %1\n").arg(fileInfo);
-    }
-
     detailsText += QString("\n");
+
+    // Try to get source code for INSTRUCTION entries
+    if (entry->type == EntryType::INSTRUCTION && entry->addressValue != 0) {
+        const Config& config = ConfigService::instance().getConfig();
+        QString symbolFilePath = config.findSymbolFileForAddress(entry->addressValue);
+        if (!symbolFilePath.isEmpty()) {
+            QString sourceHtml = getSourceCodeForAddress(entry->addressValue, symbolFilePath);
+            if (!sourceHtml.isEmpty()) {
+                detailsText += "=== Source Code ===\n";
+                // We'll append this as HTML later
+            }
+        }
+    }
 
     // For interrupt entries, show all child details
     if (entry->type == EntryType::INTERRUPT && !entry->childEntries.empty()) {
@@ -2314,12 +2281,38 @@ void QemuLogViewer::updateDetailsPane(int row) {
         }
     }
 
-    detailsPane->setPlainText(detailsText);
+    // Build HTML if we have source code to display
+    QString htmlContent;
+    if (entry->type == EntryType::INSTRUCTION && entry->addressValue != 0) {
+        const Config& config = ConfigService::instance().getConfig();
+        QString symbolFilePath = config.findSymbolFileForAddress(entry->addressValue);
+        if (!symbolFilePath.isEmpty()) {
+            QString sourceHtml = getSourceCodeForAddress(entry->addressValue, symbolFilePath);
+            if (!sourceHtml.isEmpty()) {
+                htmlContent = QString("<pre>%1</pre>\n").arg(detailsText.toHtmlEscaped());
+                htmlContent += "<hr>\n";
+                htmlContent += sourceHtml;
+            }
+        }
+    }
+
+    if (!htmlContent.isEmpty()) {
+        detailsPane->setHtml(htmlContent);
+    } else {
+        detailsPane->setPlainText(detailsText);
+    }
 }
 
 void QemuLogViewer::syncScrollBars(int value) {
     Q_UNUSED(value)
     // Additional sync logic can be added here if needed
+}
+
+void QemuLogViewer::onDetailsPaneLinkClicked(const QUrl& url) {
+    // Handle VS Code links - open external URL
+    if (url.scheme() == "vscode") {
+        QDesktopServices::openUrl(url);
+    }
 }
 
 void QemuLogViewer::onHexViewSelectionChanged() {
@@ -2336,46 +2329,24 @@ QString QemuLogViewer::formatAddress(const std::string& addr) {
 QString QemuLogViewer::formatFunction(const std::string& func) {
     if (func.empty()) return QString();
 
-    // Use a static regex for better performance (compiled once)
-    static const QRegularExpression funcRegex(R"(\[([^\]]+)\])");
-    static const QRegularExpression asmPathRegex(R"(^(.*/)?([^/]+\.asm)(\+0x[0-9a-fA-F]+)?$)");
-    static const QRegularExpression directAsmRegex(R"(^(.*/)?([^/]+\.asm)(\+0x[0-9a-fA-F]+)?$)");
-
     QString qfunc = QString::fromStdString(func);
 
-    // Extract just the function name if it's in format "addr[func](file:line:column)"
-    auto match = funcRegex.match(qfunc);
-    if (match.hasMatch()) {
-        const QString& functionName = match.captured(1);
+    // Remove offset like "+0xc6f" from the end
+    static const QRegularExpression offsetRegex(R"(\+0x[0-9a-fA-F]+$)");
+    QString cleanFunc = qfunc;
+    cleanFunc.remove(offsetRegex);
 
-        // For assembly files with paths like "/path/to/file.asm+0x123", clean it up
-        auto asmMatch = asmPathRegex.match(functionName);
-        if (asmMatch.hasMatch()) {
-            QString& result = getStringBuffer();
-            result = asmMatch.captured(2);                 // Just the filename
-            const QString& offset = asmMatch.captured(3);  // The +0x123 part if present
-            if (!offset.isEmpty()) {
-                result += offset;
-            }
-            return result;
-        }
-
-        return functionName;
+    // If it contains a path (especially .asm files), trim to just the filename
+    static const QRegularExpression pathRegex(R"(^(.*/)?([^/]+\.(asm|cpp|c|h|hpp))(.*)$)");
+    auto pathMatch = pathRegex.match(cleanFunc);
+    if (pathMatch.hasMatch()) {
+        // Keep just filename + extension + any remaining info
+        QString filename = pathMatch.captured(2);
+        QString remaining = pathMatch.captured(4);
+        cleanFunc = filename + remaining;
     }
 
-    // Handle direct assembly path references without brackets
-    auto directMatch = directAsmRegex.match(qfunc);
-    if (directMatch.hasMatch()) {
-        QString& result = getStringBuffer();
-        result = directMatch.captured(2);
-        const QString& offset = directMatch.captured(3);
-        if (!offset.isEmpty()) {
-            result += offset;
-        }
-        return result;
-    }
-
-    return qfunc;
+    return cleanFunc;
 }
 
 QString QemuLogViewer::formatHexBytes(const std::string& bytes) {
@@ -2399,20 +2370,29 @@ QString QemuLogViewer::extractFileInfo(const std::string& func) {
     if (func.empty()) return "";
     QString qfunc = QString::fromStdString(func);
 
-    // Extract file:line:column info from format "addr[func](file:line:column)"
-    QRegularExpression fileRegex(R"(\(([^)]+)\))");
+    // First check if this is an .asm file path in the function string
+    // Format could be: "/path/to/file.asm" or just "file.asm"
+    static const QRegularExpression asmFileRegex(R"((^|/|\\)([^/\\]+\.asm)(?:/|\\|$))");
+    auto asmMatch = asmFileRegex.match(qfunc);
+    if (asmMatch.hasMatch()) {
+        // Extract just the .asm filename
+        return asmMatch.captured(2);
+    }
+
+    // Try to extract file:line:column info from format "addr[func](file:line:column)"
+    static const QRegularExpression fileRegex(R"(\(([^)]+)\))");
     auto match = fileRegex.match(qfunc);
     if (match.hasMatch()) {
         QString fileInfo = match.captured(1);
 
         // Check if this looks like file:line:column (not function parameters)
-        QRegularExpression fileLineRegex(R"(^[^:]+\.(asm|cpp|c|h|hpp):\d+(?::\d+)?$)");
+        static const QRegularExpression fileLineRegex(R"(^[^:]+\.(asm|cpp|c|h|hpp):\d+(?::\d+)?$)");
         if (fileLineRegex.match(fileInfo).hasMatch()) {
-            // Remove the full path and keep only filename+line+column
-            QRegularExpression pathRegex(R"([^/\\]+\.(asm|cpp|c|h|hpp):\d+(?::\d+)?)");
+            // Extract just filename:line (trim the path)
+            static const QRegularExpression pathRegex(R"(([^/\\]+\.(asm|cpp|c|h|hpp):\d+(?::\d+)?))");
             auto pathMatch = pathRegex.match(fileInfo);
             if (pathMatch.hasMatch()) {
-                return pathMatch.captured(0);
+                return pathMatch.captured(1);
             }
             return fileInfo;
         }
@@ -2455,24 +2435,31 @@ void QemuLogViewer::buildLookupMaps() {
 void QemuLogViewer::buildSearchableRows() {
     // Build shadow search structure for fast text searching
     searchableRows.clear();
-    searchableRows.reserve(logTable->rowCount());
+    searchableRows.reserve(visibleEntryPointers.size());
 
-    for (int row = 0; row < logTable->rowCount(); ++row) {
+    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
         SearchableRow searchableRow;
-        searchableRow.originalRowIndex = row;
+        searchableRow.originalRowIndex = static_cast<int>(row);
 
         // Concatenate all column text with separators for comprehensive searching
         QString& combinedText = searchableRow.combinedText;
-        combinedText.reserve(512);  // Reserve space for typical row content
+        combinedText.reserve(512);
 
-        for (int col = 0; col < logTable->columnCount(); ++col) {
-            QTableWidgetItem* item = logTable->item(row, col);
-            if (item) {
-                if (!combinedText.isEmpty()) {
-                    combinedText += '\t';  // Use tab as separator
-                }
-                combinedText += item->text();
-            }
+        if (visibleEntryPointers[row]) {
+            const LogEntry* entry = visibleEntryPointers[row];
+
+            // Combine all fields for searching
+            combinedText = QString::number(entry->lineNumber);
+            combinedText += '\t';
+            combinedText += QString::fromStdString(entry->address);
+            combinedText += '\t';
+            combinedText += QString::fromStdString(entry->function);
+            combinedText += '\t';
+            combinedText += QString::fromStdString(entry->hexBytes);
+            combinedText += '\t';
+            combinedText += QString::fromStdString(entry->assembly);
+            combinedText += '\t';
+            combinedText += QString::fromStdString(entry->originalLine);
         }
 
         searchableRows.push_back(std::move(searchableRow));
@@ -2504,159 +2491,97 @@ QString& QemuLogViewer::getStringBuffer() {
 }
 
 void QemuLogViewer::preAllocateTableItems(int rowCount) {
-    // Disable updates during batch operations
-    logTable->setUpdatesEnabled(false);
-
-    // Pre-allocate all rows at once
-    logTable->setRowCount(rowCount);
+    Q_UNUSED(rowCount)
+    // Virtual table doesn't need pre-allocation
+    // Rows are created on-demand as needed
 }
 
 void QemuLogViewer::batchUpdateTable(const std::vector<const LogEntry*>& entries) {
-    // Pre-compute all formatted strings to minimize allocations
-    std::vector<QString> lineNumbers, typeStrings, addresses, functions, hexBytes, assemblies;
-    std::vector<QColor> rowColors;
-
-    const int numEntries = static_cast<int>(entries.size());
-
-    // Reserve space for all vectors
-    lineNumbers.reserve(numEntries);
-    typeStrings.reserve(numEntries);
-    addresses.reserve(numEntries);
-    functions.reserve(numEntries);
-    hexBytes.reserve(numEntries);
-    assemblies.reserve(numEntries);
-    rowColors.reserve(numEntries);
-
-    // Pre-compute all strings in a single pass
-    for (const auto* entry : entries) {
-        lineNumbers.emplace_back(QString::number(entry->lineNumber));
-        rowColors.emplace_back(getEntryTypeColor(entry->type));
-
-        // Pre-compute type string
-        switch (entry->type) {
-            case EntryType::INSTRUCTION:
-                typeStrings.emplace_back("INSTR");
-                break;
-            case EntryType::INTERRUPT:
-                typeStrings.emplace_back("INT");
-                break;
-            case EntryType::REGISTER:
-                typeStrings.emplace_back("REG");
-                break;
-            case EntryType::BLOCK:
-                typeStrings.emplace_back("BLOCK");
-                break;
-            case EntryType::SEPARATOR:
-                typeStrings.emplace_back("SEP");
-                break;
-            case EntryType::OTHER:
-                typeStrings.emplace_back("OTHER");
-                break;
-        }
-
-        addresses.emplace_back(formatAddress(entry->address));
-        functions.emplace_back(formatFunction(entry->function));
-        hexBytes.emplace_back(formatHexBytes(entry->hexBytes));
-
-        // Assembly with type-specific details
-        QString assemblyText;
-        if (entry->type == EntryType::REGISTER) {
-            // For REG entries, show CPU state summary from original line
-            if (!entry->originalLine.empty()) {
-                QString originalLine = QString::fromStdString(entry->originalLine);
-                // Extract key CPU state info (first 100 chars or until specific patterns)
-                if (originalLine.length() > 100) {
-                    assemblyText = originalLine.left(100) + "...";
-                } else {
-                    assemblyText = originalLine;
-                }
-            } else {
-                assemblyText = formatAssembly(entry->assembly);
-            }
-        } else {
-            assemblyText = formatAssembly(entry->assembly);
-            if (entry->type == EntryType::INTERRUPT && !entry->childEntries.empty()) {
-                assemblyText += QString(" [%1 details]").arg(entry->childEntries.size());
-            }
-        }
-        assemblies.emplace_back(std::move(assemblyText));
-    }
-
-    // Batch set all items
-    for (int i = 0; i < numEntries; ++i) {
-        const QColor& rowColor = rowColors[i];
-
-        // Line number
-        QTableWidgetItem* lineItem = getPooledItem();
-        lineItem->setText(lineNumbers[i]);
-        lineItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        lineItem->setBackground(rowColor);
-        logTable->setItem(i, 0, lineItem);
-
-        // Type
-        QTableWidgetItem* typeItem = getPooledItem();
-        typeItem->setText(typeStrings[i]);
-        typeItem->setBackground(rowColor);
-        logTable->setItem(i, 1, typeItem);
-
-        // Address
-        QTableWidgetItem* addressItem = getPooledItem();
-        addressItem->setText(addresses[i]);
-        addressItem->setToolTip(QString::fromStdString(entries[i]->function));
-        addressItem->setBackground(rowColor);
-        logTable->setItem(i, 2, addressItem);
-
-        // Function
-        QTableWidgetItem* functionItem = getPooledItem();
-        functionItem->setText(functions[i]);
-        functionItem->setBackground(rowColor);
-        logTable->setItem(i, 3, functionItem);
-
-        // Hex bytes
-        QTableWidgetItem* hexItem = getPooledItem();
-        hexItem->setText(hexBytes[i]);
-        hexItem->setBackground(rowColor);
-        logTable->setItem(i, 4, hexItem);
-
-        // Assembly
-        QTableWidgetItem* assemblyItem = getPooledItem();
-        assemblyItem->setText(assemblies[i]);
-        assemblyItem->setBackground(rowColor);
-        assemblyItem->setData(Qt::UserRole, QVariant::fromValue(static_cast<qulonglong>(i)));
-        logTable->setItem(i, 5, assemblyItem);
-    }
-
-    // Re-enable updates
-    logTable->setUpdatesEnabled(true);
+    Q_UNUSED(entries)
+    // Virtual table doesn't need batch updates
+    // Rows are created on-demand via the data provider
 }
 
-void QemuLogViewer::populateTableOptimized() {
-    // Filter visible entries first
-    bool hideStructural = hideStructuralCheckbox->isChecked();
-
-    std::vector<const LogEntry*> visibleEntries;
-    visibleEntries.reserve(logEntries.size());  // Reserve maximum possible size
-
-    for (const auto& entry : logEntries) {
-        // Only process parent entries
-        if (!entry.isChild) {
-            // Skip structural entries if hiding is enabled
-            if (hideStructural && (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK)) {
-                continue;
+int QemuLogViewer::findNextIretLine(int startLineNumber) const {
+    // Find the next iret instruction after the given line number
+    for (size_t i = 0; i < logEntries.size(); ++i) {
+        const auto& entry = logEntries[i];
+        if (entry.lineNumber > startLineNumber && entry.type == EntryType::INSTRUCTION) {
+            // Check if the assembly contains 'iret' (case-insensitive)
+            std::string assemblyLower = entry.assembly;
+            std::transform(assemblyLower.begin(), assemblyLower.end(), assemblyLower.begin(), ::tolower);
+            if (assemblyLower.find("iret") != std::string::npos) {
+                return entry.lineNumber;
             }
-
-            visibleEntries.push_back(&entry);
         }
     }
+    return INT_MAX;  // No iret found
+}
 
-    // Pre-allocate table for all visible entries
-    preAllocateTableItems(static_cast<int>(visibleEntries.size()));
+void QemuLogViewer::populateTable() {
+    // Filter visible entries first
+    bool hideStructural = hideStructuralCheckbox->isChecked();
+    bool onlyInterrupts = onlyInterruptsCheckbox->isChecked();
 
-    // Batch update the table
-    batchUpdateTable(visibleEntries);
+    std::vector<const LogEntry*> visibleEntries;
+    visibleEntries.reserve(logEntries.size());
+
+    for (size_t i = 0; i < logEntries.size(); ++i) {
+        const auto& entry = logEntries[i];
+        // Only process parent entries
+        if (entry.isChild) continue;
+
+        // Apply filters
+        if (hideStructural && (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK)) {
+            continue;
+        }
+
+        if (onlyInterrupts && entry.type != EntryType::INTERRUPT) {
+            continue;
+        }
+
+        // Apply interrupt filter if selected
+        if (!currentSelectedInterrupt.empty() && entry.type == EntryType::INTERRUPT) {
+            if (entry.interruptNumber != currentSelectedInterrupt) {
+                continue;
+            }
+        }
+
+        // Check if this interrupt is folded
+        if (entry.type == EntryType::INTERRUPT && foldedInterruptEntryIndices.count(i)) {
+            // Add the interrupt itself
+            visibleEntries.push_back(&entry);
+
+            // Find the next iret and skip everything until then
+            int iretLine = findNextIretLine(entry.lineNumber);
+
+            // Skip all entries between this interrupt and the iret
+            for (size_t j = i + 1; j < logEntries.size(); ++j) {
+                const auto& nextEntry = logEntries[j];
+                if (nextEntry.lineNumber >= iretLine) {
+                    // We've reached or passed the iret, continue normal processing
+                    i = j - 1;  // Will be incremented by loop
+                    break;
+                }
+            }
+            continue;
+        }
+
+        visibleEntries.push_back(&entry);
+    }
 
     // Store visible entries for selection handling
     visibleEntryPointers = std::move(visibleEntries);
+
+    // Update virtual model row count and signal refresh
+    if (virtualTableModel) {
+        // Need to update the model's row count before resetting
+        virtualTableModel->setRowCount(static_cast<int>(visibleEntryPointers.size()));
+        virtualTableModel->resetModel();
+        if (!visibleEntryPointers.empty()) {
+            virtualTableModel->invalidateRows(0, static_cast<int>(visibleEntryPointers.size()) - 1);
+        }
+    }
 
     // Build fast map from logEntries index to visible row for O(1) jumps from panel
     entryIndexToVisibleRow.clear();
@@ -2726,19 +2651,30 @@ void QemuLogViewer::buildInterruptPanel() {
         }
 
         QTreeWidgetItem* top = new QTreeWidgetItem(interruptsPanel);
-        top->setText(0, title);
-        top->setText(1, QString::number(indices.size()));
 
         // Add children for each occurrence with entry index stored
         for (size_t idx : indices) {
             const auto& e = logEntries[idx];
+            QString childText = QString("Line %1").arg(e.lineNumber);
+
+            // Add fold indicator if this occurrence is folded
+            if (foldedInterruptEntryIndices.count(idx)) {
+                childText = QString("[▼ FOLDED] ") + childText;
+            } else {
+                childText = QString("[▲] ") + childText;
+            }
+
             QTreeWidgetItem* child = new QTreeWidgetItem();
-            child->setText(0, QString("Line %1").arg(e.lineNumber));
+            child->setText(0, childText);
             child->setText(1, QString::fromStdString(e.address));
-            // store entry index as user data
+            // store entry index as user data (this uniquely identifies this specific interrupt occurrence)
             child->setData(0, Qt::UserRole, QVariant::fromValue(static_cast<qulonglong>(idx)));
             top->addChild(child);
         }
+
+        top->setText(0, title);
+        top->setText(1, QString::number(indices.size()));
+
         interruptsPanel->addTopLevelItem(top);
     }
 
@@ -2771,7 +2707,7 @@ void QemuLogViewer::onInterruptPanelActivated(QTreeWidgetItem* item, int /*colum
     }
 
     // If mapping not found (entry not visible), repopulate table and try again
-    populateTableOptimized();
+    populateTable();
     it = entryIndexToVisibleRow.find(entryIndex);
     if (it != entryIndexToVisibleRow.end()) {
         int row = it->second;
@@ -2782,6 +2718,69 @@ void QemuLogViewer::onInterruptPanelActivated(QTreeWidgetItem* item, int /*colum
     } else {
         statusLabel->setText("Selected interrupt occurrence not visible (may be hidden by filters)");
     }
+}
+
+void QemuLogViewer::onInterruptToggleFold(QTreeWidgetItem* item, int /*column*/) {
+    if (!item) {
+        return;
+    }
+
+    // Handle child items (individual interrupt occurrences)
+    if (item->parent()) {
+        QVariant v = item->data(0, Qt::UserRole);
+        if (!v.isValid()) {
+            return;
+        }
+
+        size_t entryIndex = static_cast<size_t>(v.toULongLong());
+        if (entryIndex >= logEntries.size()) {
+            return;
+        }
+
+        // Toggle the folded state for this specific occurrence
+        if (foldedInterruptEntryIndices.count(entryIndex)) {
+            foldedInterruptEntryIndices.erase(entryIndex);
+            statusLabel->setText(QString("Interrupt at line %1 unfolded").arg(logEntries[entryIndex].lineNumber));
+        } else {
+            foldedInterruptEntryIndices.insert(entryIndex);
+            statusLabel->setText(QString("Interrupt at line %1 folded").arg(logEntries[entryIndex].lineNumber));
+        }
+
+        // Rebuild interrupt panel to update visual indicators and repopulate table
+        buildInterruptPanel();
+        populateTable();
+        return;
+    }
+
+    // Handle top-level items (fold all occurrences of this interrupt type)
+    // First, collect all child entry indices
+    for (int i = 0; i < item->childCount(); ++i) {
+        QTreeWidgetItem* child = item->child(i);
+        if (!child) {
+            continue;
+        }
+
+        QVariant v = child->data(0, Qt::UserRole);
+        if (!v.isValid()) {
+            continue;
+        }
+
+        size_t entryIndex = static_cast<size_t>(v.toULongLong());
+        if (entryIndex >= logEntries.size()) {
+            continue;
+        }
+
+        // Toggle the folded state for each occurrence
+        if (foldedInterruptEntryIndices.count(entryIndex)) {
+            foldedInterruptEntryIndices.erase(entryIndex);
+        } else {
+            foldedInterruptEntryIndices.insert(entryIndex);
+        }
+    }
+
+    // Rebuild interrupt panel to update visual indicators and repopulate table
+    buildInterruptPanel();
+    populateTable();
 }
 
 void QemuLogViewer::performSearchOptimized() {
@@ -2864,6 +2863,89 @@ void QemuLogViewer::performSearchOptimized() {
         statusLabel->setText("No matches found");
         highlightSearchMatches();
     }
+}
+
+QString QemuLogViewer::getSourceCodeForAddress(uint64_t address, const QString& binaryPath) {
+    // Use addr2line to get source file and line number
+    QProcess addr2line;
+    addr2line.start("addr2line", {"-e", binaryPath, QString("0x%1").arg(address, 0, 16)});
+
+    if (!addr2line.waitForFinished(5000)) {
+        return "";
+    }
+
+    QString output = addr2line.readAllStandardOutput().trimmed();
+    if (output.isEmpty() || output.contains("??")) {
+        return "";
+    }
+
+    // Parse output: "filename:linenumber" or "filename:linenumber:column"
+    QStringList parts = output.split(":");
+    if (parts.size() < 2) {
+        return "";
+    }
+
+    QString filename = parts[0];
+    bool lineOk = false;
+    int lineNumber = parts[1].toInt(&lineOk);
+
+    if (!lineOk || lineNumber <= 0) {
+        return "";
+    }
+
+    // Try to read the source file
+    QFile sourceFile(filename);
+    if (!sourceFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        // Return just the filename:line if we can't read the file
+        return QString("%1:%2").arg(QFileInfo(filename).fileName()).arg(lineNumber);
+    }
+
+    QTextStream in(&sourceFile);
+    QStringList lines;
+    int currentLine = 0;
+
+    while (!in.atEnd() && currentLine < lineNumber + 2) {
+        lines.append(in.readLine());
+        currentLine++;
+    }
+
+    sourceFile.close();
+
+    // Build HTML with syntax highlighting and clickable lines
+    QString html;
+    html += QString("<b>%1:%2</b><br>").arg(QFileInfo(filename).fileName()).arg(lineNumber);
+    html += "<pre style='font-family: Consolas, monospace; font-size: 10px; margin: 5px 0;'>";
+
+    int startLine = std::max(0, lineNumber - 3);
+    int endLine = std::min(static_cast<int>(lines.size()), lineNumber + 2);
+
+    for (int i = startLine; i < endLine; ++i) {
+        int displayLine = i + 1;
+        QString line = lines[i];
+
+        // Highlight the target line
+        if (displayLine == lineNumber) {
+            html += QString("<span style='background-color: #333300; color: #ffff99;'><b>%1 > </b>%2</span>\n")
+                        .arg(displayLine, 4)
+                        .arg(line.toHtmlEscaped());
+        } else {
+            html += QString("<span style='color: #666666;'>%1   %2</span>\n").arg(displayLine, 4).arg(line.toHtmlEscaped());
+        }
+    }
+
+    html += "</pre>";
+
+    // Add clickable link to open in VS Code with proper format
+    // VS Code URI scheme: vscode://file/ABSOLUTE_PATH:LINE:COLUMN
+    QFileInfo fileInfo(filename);
+    QString absolutePath = fileInfo.absoluteFilePath();
+    // URL encode the path
+    absolutePath.replace(" ", "%20");
+    html += QString("<br><a href='vscode://file/%1:%2:1' style='color: #4da6ff; text-decoration: underline;'>Open in VS Code</a>")
+                .arg(absolutePath)
+                .arg(lineNumber);
+
+    return html;
 }
 
 QColor QemuLogViewer::getEntryTypeColor(EntryType type) {

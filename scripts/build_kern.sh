@@ -17,15 +17,20 @@ check_headers "modules/init"
 cmake -B build -GNinja .
 cmake --build build
 
+# run scripts/create_fat32_test_disk.sh
+result=$(sh scripts/create_fat32_test_disk.sh)
+if [ "$?" != "0" ]; then
+    echo "Error: create_fat32_test_disk.sh failed"
+    exit 1
+else
+    echo "fat32 image created successfully"
+fi
+
 # run scripts/make_image.sh
 result=$(sh scripts/make_image.sh)
 if [ "$?" != "0" ]; then
     echo "Error: make_image.sh failed"
     exit 1
 else
-    echo "image created successfully"
+    echo "kernel image created successfully"
 fi
-
-# remove old log files
-rm -f serial.log
-rm -f qemu.*log

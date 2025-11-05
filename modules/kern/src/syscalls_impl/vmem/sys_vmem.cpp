@@ -170,7 +170,7 @@ uint64_t anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flag
         memset(physPage, 0, ker::mod::mm::paging::PAGE_SIZE);
 
         // Map the page
-        ker::mod::mm::virt::mapPage(task->pagemap, currentVaddr, paddr, static_cast<int>(pageFlags));
+        ker::mod::mm::virt::mapPage(task->pagemap, currentVaddr, paddr, pageFlags);
     }
 
     return vaddr;
@@ -229,7 +229,7 @@ uint64_t anonFree(uint64_t addr, uint64_t size) {
         }
     }
 
-    ker::mod::dbg::log("vmem: freed %llu bytes at 0x%llx", size, addr);
+    ker::mod::dbg::log("vmem: freed %x bytes at %p", size, addr);
 
     return 0;  // Success
 }

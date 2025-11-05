@@ -1,7 +1,13 @@
 #include "sys_log.hpp"
 
+#include <cstdint>
+
+#include "abi/callnums/sys_log.h"
+#include "mod/io/serial/serial.hpp"
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::syscall::log {
-uint64_t sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, abi::sys_log::sys_log_device device) {
+auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, abi::sys_log::sys_log_device device) -> uint64_t {
     switch (op) {
         case abi::sys_log::sys_log_ops::log:
             if (device == abi::sys_log::sys_log_device::serial) {

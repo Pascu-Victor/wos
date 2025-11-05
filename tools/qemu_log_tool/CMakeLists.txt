@@ -34,12 +34,20 @@ find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
 # Find other required libraries
 find_package(PkgConfig REQUIRED)
 
-# Find BFD library
-find_library(BFD_LIBRARY bfd)
-find_path(BFD_INCLUDE_DIR bfd.h)
+# Find BFD library using pkg-config first
+pkg_check_modules(BFD libbfd)
 
-if(NOT BFD_LIBRARY OR NOT BFD_INCLUDE_DIR)
-    message(FATAL_ERROR "BFD library not found. Please install binutils-dev or binutils-devel")
+# Fallback to manual find if pkg-config fails
+if(NOT BFD_FOUND)
+    find_library(BFD_LIBRARY bfd)
+    find_path(BFD_INCLUDE_DIR bfd.h)
+
+    if(NOT BFD_LIBRARY OR NOT BFD_INCLUDE_DIR)
+        message(FATAL_ERROR "BFD library not found. Please install binutils-dev or binutils-devel")
+    endif()
+else()
+    set(BFD_LIBRARY ${BFD_LIBRARIES})
+    set(BFD_INCLUDE_DIR ${BFD_INCLUDE_DIRS})
 endif()
 
 # Find Capstone library
@@ -52,12 +60,18 @@ add_executable(qemu_log_viewer
     log_processor.cpp
     config.h
     config.cpp
+    virtual_table.h
+    virtual_table.cpp
+    virtual_table_integration.h
+    virtual_table_integration.cpp
 )
 
 
 # Add worker executable
 add_executable(log_worker
     log_worker.cpp
+    config.cpp
+    config.h
 )
 
 # Link libraries for main executable
@@ -70,7 +84,7 @@ target_link_libraries(qemu_log_viewer
     dl
 )
 
-# Link libraries for worker executable  
+# Link libraries for worker executable
 target_link_libraries(log_worker
     Qt6::Core
     ${BFD_LIBRARY}

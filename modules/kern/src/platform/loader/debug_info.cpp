@@ -30,7 +30,9 @@ void addDebugSection(uint64_t pid, const char* name, uint64_t vaddr, uint64_t pa
             section.type = type;
 
             process.sections.push_back(section);
+#ifdef ELF_DEBUG
             ker::mod::dbg::log("Added debug section: %s, vaddr=%x, paddr=%x, size=%x", name, vaddr, paddr, size);
+#endif
             return;
         }
     }
@@ -52,8 +54,10 @@ void addDebugSymbol(uint64_t pid, const char* name, uint64_t vaddr, uint64_t pad
             sym.rawValue = rawValue;
 
             process.symbols.push_back(sym);
+#ifdef ELF_DEBUG
             ker::mod::dbg::log("Added debug symbol: %s, vaddr=%x, paddr=%x, size=%x, bind=%d, type=%d", name, vaddr, paddr, size, bind,
                                type);
+#endif
             return;
         }
     }

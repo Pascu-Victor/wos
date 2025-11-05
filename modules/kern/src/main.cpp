@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <defines/defines.hpp>
+#include <dev/ahci.hpp>
+#include <dev/block_device.hpp>
+#include <dev/pci.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/boot/handover.hpp>
@@ -13,6 +16,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
 // Minimal forward-declarations to avoid including the project's in-tree std headers
@@ -45,17 +49,17 @@ extern void (*__fini_array_end[])();
 }
 
 static void callGlobalConstructors() {
-    for (auto *ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
+    for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
         (*ctor)();
     }
 
-    for (auto *ctor = static_cast<void (**)()>(__init_array_start); ctor < static_cast<void (**)()>(__init_array_end); ++ctor) {
+    for (auto* ctor = static_cast<void (**)()>(__init_array_start); ctor < static_cast<void (**)()>(__init_array_end); ++ctor) {
         (*ctor)();
     }
 }
 
 static void callGlobalDestructors() {
-    for (auto *dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
+    for (auto* dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
         --dtor;
         (*dtor)();
     }
@@ -86,10 +90,10 @@ extern "C" void _start(void) {
     // Enable FSGSBASE instructions
     cpu::enableFSGSBASE();
 
-    uint8_t *stack;
+    uint8_t* stack;
     // Init gds.
     asm volatile("mov %%rsp, %0" : "=r"(stack));
-    ker::mod::desc::gdt::initDescriptors((uint64_t *)stack + KERNEL_STACK_SIZE);
+    ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
     // asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
 
     // Init kmalloc
@@ -98,6 +102,13 @@ extern "C" void _start(void) {
     // Init interrupts.
     ker::mod::interrupt::init();
     ker::mod::sys::init();
+
+    // Init AHCI controller
+    ker::dev::ahci::ahci_controller_init();
+
+    // Init block devices and mount filesystems
+    ker::dev::block_device_init();
+
     // Init VFS
     ker::vfs::init();
     ker::mod::sched::init();

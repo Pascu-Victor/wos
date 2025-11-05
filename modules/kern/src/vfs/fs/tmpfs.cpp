@@ -7,6 +7,8 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/file.hpp>
 
+#include "vfs/file_operations.hpp"
+
 namespace {
 // Local strcmp helper to avoid linking against libc strcmp in kernel
 auto _kstrcmp(const char* a, const char* b) -> int {
@@ -178,5 +180,51 @@ auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
     auto* n = static_cast<TmpNode*>(f->private_data);
     return n->size;
 }
+
+// FileOperations callback implementations
+auto tmpfs_fops_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t { return tmpfs_read(f, buf, count, offset); }
+
+auto tmpfs_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+    return tmpfs_write(f, buf, count, offset);
+}
+
+auto tmpfs_fops_close(ker::vfs::File* f) -> int {
+    // tmpfs doesn't need special cleanup
+    return 0;
+}
+
+auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
+    if (f == nullptr) return -1;
+
+    size_t file_size = tmpfs_get_size(f);
+    off_t newpos = f->pos;
+
+    switch (whence) {
+        case 0:  // SEEK_SET
+            newpos = offset;
+            break;
+        case 1:  // SEEK_CUR
+            newpos = f->pos + offset;
+            break;
+        case 2:  // SEEK_END
+            newpos = (off_t)file_size + offset;
+            break;
+        default:
+            return -1;
+    }
+
+    if (newpos < 0) return -1;
+    f->pos = newpos;
+    return f->pos;
+}
+
+// Static storage for tmpfs FileOperations
+static ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,  // vfs_open - will be set by register_tmpfs
+                                                       .vfs_close = tmpfs_fops_close,
+                                                       .vfs_read = tmpfs_fops_read,
+                                                       .vfs_write = tmpfs_fops_write,
+                                                       .vfs_lseek = tmpfs_fops_lseek};
+
+auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }
 
 }  // namespace ker::vfs::tmpfs

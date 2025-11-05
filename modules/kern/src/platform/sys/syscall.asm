@@ -12,7 +12,7 @@ _wOS_asm_syscallHandler:
 
     ;syscall return value
     sub rsp, 8
-    pushl
+    pushq
     cld
 
     ; save usermode segment ds and es
@@ -29,7 +29,8 @@ _wOS_asm_syscallHandler:
     ; push rcx              ; usermode rip
 
     ; Pass pointer to saved registers (GPRegs) as first argument
-    mov rdi, rsp
+    ; Skip the 8-byte return value slot
+    lea rdi, [rsp+8]
     xor rbp, rbp
 
     call syscallHandler
@@ -40,7 +41,7 @@ _wOS_asm_syscallHandler:
     mov ds, [gs:0x18]
     mov es, [gs:0x20]
 
-    popl
+    popq
     pop rax
     mov rsp, [gs:0x08] ; restore usermode stack
     swapgs

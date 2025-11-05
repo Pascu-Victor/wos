@@ -30,6 +30,9 @@ struct Context {
 } __attribute__((packed));
 
 struct Task {
+    Task(Task&&) = delete;
+    auto operator=(const Task&) -> Task& = delete;
+    auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
     Task(const Task& task);
@@ -43,6 +46,18 @@ struct Task {
     uint64_t cpu;
     threading::Thread* thread;
     uint64_t pid;
+    uint64_t parentPid;  // Parent process ID (0 for orphaned/init processes)
+
+    // has the task run at least once
+    bool hasRun;
+
+    // ELF buffer for cleanup
+    uint8_t* elfBuffer;
+    size_t elfBufferSize;
+
+    // ELF metadata for auxv setup
+    uint64_t programHeaderAddr;  // Virtual address of program headers (AT_PHDR)
+    uint64_t elfHeaderAddr;      // Virtual address of ELF header (AT_EHDR)
 
     // File descriptor table for the task (per-process model planned).
     // Small fixed-size table for now; will be moved/made dynamic when process struct is available.

@@ -1,34 +1,15 @@
 #pragma once
-#include <stdarg.h>
-
+#include <cstdarg>
 #include <util/mem.hpp>
 
 namespace _std {
-// size_t strlen(const char *str);
 
-// char *strcpy(char *dest, const char *src);
+auto itoa(int n, char s[], int base = 10) -> int;
 
-// char *strncpy(char *dest, const char *src, size_t n);
+auto u64toh(uint64_t n, char s[]) -> int;
 
-// void reverse(char s[]);
-
-int itoa(int n, char s[], int base = 10);
-
-// int u64toa(uint64_t n, char s[], int base = 10);
-
-int u64toh(uint64_t n, char s[]);
-
-// char *snprintf(char *str, size_t size, const char *format, ...);
-
-// char *strcat(char *dest, const char *src);
-
-// size_t strlcat(char *dest, const char *src, size_t size);
-
-// int strncmp(const char *s1, const char *s2, size_t n);
-
-// char *vsnprintf(char *str, size_t size, const char *format, va_list args);
 template <typename T>
-char *vsnprintf(char *str, T size, const char *format, va_list args) {
+auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
     static_assert(std::is_same_v<T, size_t>, "size must be of type size_t");
     size_t i = 0;
     size_t j = 0;
@@ -38,6 +19,28 @@ char *vsnprintf(char *str, T size, const char *format, va_list args) {
         if (format[i] == '%') {
             i++;
             switch (format[i]) {
+                case '.':
+                    i++;
+                    if (format[i] == '*') {
+                        i++;
+                        if (format[i] == 's') {
+                            // %.*s - precision-limited string
+                            int precision = va_arg(args, int);
+                            const char* s = va_arg(args, const char*);
+                            int len = strlen(s);
+                            int copy_len = (precision < len) ? precision : len;
+                            if (j + copy_len < size) {
+                                strncpy(str + j, s, copy_len);
+                                j += copy_len;
+                            }
+                            break;
+                        }
+                    }
+                    // Unsupported format, treat literally
+                    str[j++] = '%';
+                    str[j++] = '.';
+                    str[j++] = format[i];
+                    break;
                 case 'd': {
                     int n = va_arg(args, int);
                     int len = itoa(n, buf);
@@ -53,7 +56,7 @@ char *vsnprintf(char *str, T size, const char *format, va_list args) {
                     break;
                 }
                 case 's': {
-                    const char *s = va_arg(args, const char *);
+                    const char* s = va_arg(args, const char*);
                     strncpy(str + j, s, size - j);
                     j += strlen(s);
                     break;
@@ -66,6 +69,15 @@ char *vsnprintf(char *str, T size, const char *format, va_list args) {
                 case 'b': {
                     int n = va_arg(args, int);
                     int len = itoa(n, buf, 2);
+                    strncpy(str + j, buf, size - j);
+                    j += len;
+                    break;
+                }
+                case 'p': {
+                    uint64_t n = va_arg(args, uint64_t);
+                    str[j++] = '0';
+                    str[j++] = 'x';
+                    int len = u64toh(n, buf);
                     strncpy(str + j, buf, size - j);
                     j += len;
                     break;

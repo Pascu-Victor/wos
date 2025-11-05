@@ -2,6 +2,14 @@
 // This avoids libbfd thread safety issues
 
 // Work around BFD config.h requirement
+#include <qlogging.h>
+#include <qtypes.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #define PACKAGE "qemu_log_worker"
 #define PACKAGE_VERSION "1.0"
 extern "C" {
@@ -19,33 +27,31 @@ extern "C" {
 #include <QtCore/QJsonObject>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QTextStream>
-#include <fstream>
 #include <iostream>
 #include <sstream>
 
 enum class EntryType { INSTRUCTION, INTERRUPT, REGISTER, BLOCK, SEPARATOR, OTHER };
 
 struct LogEntry {
-    int lineNumber;
-    EntryType type;
+    int lineNumber{};
+    EntryType type{};
     std::string address;
     std::string function;
     std::string hexBytes;
     std::string assembly;
     std::string originalLine;
-    uint64_t addressValue;
-    
+    uint64_t addressValue{};
+
     // For grouped entries (like interrupts)
-    bool isExpanded;
+    bool isExpanded{};
     std::vector<LogEntry> childEntries;
-    bool isChild;
-    
+    bool isChild{};
+
     // Interrupt-specific fields
     std::string interruptNumber;
     std::string cpuStateInfo;
-    
-    LogEntry() : lineNumber(0), type(EntryType::OTHER), addressValue(0), 
-                 isExpanded(false), isChild(false) {}
+
+    LogEntry() = default;
 };
 
 // CapstoneDisassembler implementation (same as main)
@@ -53,12 +59,12 @@ class CapstoneDisassembler {
    public:
     CapstoneDisassembler();
     ~CapstoneDisassembler();
-    std::string convertToIntel(const std::string& atntAssembly);
+    [[nodiscard]] auto convertToIntel(const std::string& atntAssembly) const -> std::string;
 
    private:
     csh handle;
-    std::string extractHexBytes(const std::string& line);
-    std::vector<uint8_t> hexStringToBytes(const std::string& hex);
+    static auto extractHexBytes(const std::string& line) -> std::string;
+    static auto hexStringToBytes(const std::string& hex) -> std::vector<uint8_t>;
 };
 
 CapstoneDisassembler::CapstoneDisassembler() : handle(0) {
@@ -75,14 +81,20 @@ CapstoneDisassembler::~CapstoneDisassembler() {
     }
 }
 
-std::string CapstoneDisassembler::convertToIntel(const std::string& atntAssembly) {
-    if (!handle) return atntAssembly;
+auto CapstoneDisassembler::convertToIntel(const std::string& atntAssembly) const -> std::string {
+    if (!handle) {
+        return atntAssembly;
+    }
 
     auto hexBytes = extractHexBytes(atntAssembly);
-    if (hexBytes.empty()) return atntAssembly;
+    if (hexBytes.empty()) {
+        return atntAssembly;
+    }
 
     std::vector<uint8_t> bytes = hexStringToBytes(hexBytes);
-    if (bytes.empty()) return atntAssembly;
+    if (bytes.empty()) {
+        return atntAssembly;
+    }
 
     cs_insn* insn;
     size_t count = cs_disasm(handle, bytes.data(), bytes.size(), 0x1000, 0, &insn);
@@ -96,7 +108,7 @@ std::string CapstoneDisassembler::convertToIntel(const std::string& atntAssembly
     return atntAssembly;
 }
 
-std::string CapstoneDisassembler::extractHexBytes(const std::string& line) {
+auto CapstoneDisassembler::extractHexBytes(const std::string& line) -> std::string {
     QRegularExpression hexRegex(R"(:\s*([0-9a-fA-F\s]{2,})\s+)");
     QString qline = QString::fromStdString(line);
     auto match = hexRegex.match(qline);
@@ -110,14 +122,14 @@ std::string CapstoneDisassembler::extractHexBytes(const std::string& line) {
     return "";
 }
 
-std::vector<uint8_t> CapstoneDisassembler::hexStringToBytes(const std::string& hex) {
+auto CapstoneDisassembler::hexStringToBytes(const std::string& hex) -> std::vector<uint8_t> {
     std::vector<uint8_t> bytes;
 
     for (size_t i = 0; i < hex.length(); i += 2) {
         if (i + 1 < hex.length()) {
             std::string byteStr = hex.substr(i, 2);
             try {
-                uint8_t byte = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
+                auto byte = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
                 bytes.push_back(byte);
             } catch (...) {
                 break;
@@ -129,18 +141,17 @@ std::vector<uint8_t> CapstoneDisassembler::hexStringToBytes(const std::string& h
 }
 
 class LogWorker {
-public:
+   public:
     LogWorker();
     void processChunk(const QString& inputFile, const QString& outputFile);
-    
-private:
-    LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, 
-                        bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, 
-                        bfd* initBfd, asymbol** initSymbols, long initSymCount);
-    
-    std::string getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount,
-                                          bfd* initBfd, asymbol** initSymbols, long initSymCount);
-    
+
+   private:
+    static LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, bfd* kernelBfd,
+                                asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd, asymbol** initSymbols, long initSymCount);
+
+    static std::string getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount,
+                                                  bfd* initBfd, asymbol** initSymbols, long initSymCount);
+
     QJsonObject logEntryToJson(const LogEntry& entry);
 };
 
@@ -155,7 +166,8 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
 
     QTextStream in(&file);
     std::vector<LogEntry> entries;
-    
+    entries.reserve(10000);  // Pre-allocate for typical log sizes
+
     CapstoneDisassembler disassembler;
 
     // Initialize BFD
@@ -186,50 +198,42 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
         }
     }
 
+    // Pre-compile regexes for CPU state detection (instead of compiling per-line)
+    static const QRegularExpression cpuStateRegex(
+        R"(RAX=|RBX=|RCX=|RDX=|RSI=|RDI=|RBP=|RSP=|R\d+=|RIP=|RFL=|[CEDFGS]S =|LDT=|TR =|[GI]DT=|CR[0234]=|DR[0-7]=|CC[CDs]=|CCO=|EFER=)");
+
     int lineNumber = 1;
     QString line;
-    int currentInterruptGroupIndex = -1;  // Use index instead of pointer
+    ptrdiff_t currentInterruptGroupIndex = -1;  // Use index instead of pointer
 
     while (!in.atEnd()) {
         line = in.readLine();
 
-        LogEntry entry = processLine(line, lineNumber, disassembler, kernelBfd, kernelSymbols, kernelSymCount, 
-                                   initBfd, initSymbols, initSymCount);
+        LogEntry entry =
+            processLine(line, lineNumber, disassembler, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols, initSymCount);
 
         // Handle interrupt grouping and extract key information
         if (entry.type == EntryType::INTERRUPT) {
-            entries.push_back(entry);
+            entries.push_back(std::move(entry));
             currentInterruptGroupIndex = entries.size() - 1;  // Store index of the interrupt entry
-        } else if (currentInterruptGroupIndex != -1 && 
-                  (entry.type == EntryType::REGISTER || 
-                   (entry.type == EntryType::OTHER && !entry.originalLine.empty() && 
-                    (line.contains("RAX=") || line.contains("RBX=") || line.contains("RCX=") || line.contains("RDX=") ||
-                     line.contains("RSI=") || line.contains("RDI=") || line.contains("RBP=") || line.contains("RSP=") ||
-                     line.contains("R8 =") || line.contains("R9 =") || line.contains("R10=") || line.contains("R11=") ||
-                     line.contains("R12=") || line.contains("R13=") || line.contains("R14=") || line.contains("R15=") ||
-                     line.contains("RIP=") || line.contains("RFL=") || 
-                     line.contains("ES =") || line.contains("CS =") || line.contains("SS =") || 
-                     line.contains("DS =") || line.contains("FS =") || line.contains("GS =") ||
-                     line.contains("LDT=") || line.contains("TR =") || line.contains("GDT=") || line.contains("IDT=") ||
-                     line.contains("CR0=") || line.contains("CR2=") || line.contains("CR3=") || line.contains("CR4=") ||
-                     line.contains("DR0=") || line.contains("DR1=") || line.contains("DR2=") || line.contains("DR3=") ||
-                     line.contains("DR6=") || line.contains("DR7=") || 
-                     line.contains("CCS=") || line.contains("CCD=") || line.contains("CCO=") || 
-                     line.contains("EFER="))))) {
+        } else if (currentInterruptGroupIndex != -1 &&
+                   (entry.type == EntryType::REGISTER ||
+                    (entry.type == EntryType::OTHER && !entry.originalLine.empty() && cpuStateRegex.match(line).hasMatch()))) {
             entry.isChild = true;
-            entries[currentInterruptGroupIndex].childEntries.push_back(entry);
-            
+            entries[currentInterruptGroupIndex].childEntries.push_back(std::move(entry));
+
             // Extract key information for interrupt summary
             LogEntry& interruptEntry = entries[currentInterruptGroupIndex];
-            
-            if (entry.type == EntryType::REGISTER) {
+
+            if (entries[currentInterruptGroupIndex].childEntries.back().type == EntryType::REGISTER) {
+                const auto& childEntry = entries[currentInterruptGroupIndex].childEntries.back();
                 if (interruptEntry.cpuStateInfo.empty()) {
-                    interruptEntry.cpuStateInfo = entry.assembly;
+                    interruptEntry.cpuStateInfo = childEntry.assembly;
                 }
-                
+
                 // Extract RIP from the register dump line
-                QString lineStr = QString::fromStdString(entry.originalLine);
-                QRegularExpression ripRegex(R"(pc=([0-9a-fA-F]+))");
+                static const QRegularExpression ripRegex(R"(pc=([0-9a-fA-F]+))");
+                QString lineStr = QString::fromStdString(childEntry.originalLine);
                 auto ripMatch = ripRegex.match(lineStr);
                 if (ripMatch.hasMatch()) {
                     interruptEntry.address = "0x" + ripMatch.captured(1).toStdString();
@@ -238,7 +242,7 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
                 }
             } else if (line.contains("RIP=")) {
                 // Extract RIP from CPU state lines
-                QRegularExpression ripRegex(R"(RIP=([0-9a-fA-F]+))");
+                static const QRegularExpression ripRegex(R"(RIP=([0-9a-fA-F]+))");
                 auto ripMatch = ripRegex.match(line);
                 if (ripMatch.hasMatch() && interruptEntry.address.empty()) {
                     interruptEntry.address = "0x" + ripMatch.captured(1).toStdString();
@@ -256,13 +260,13 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
                     if (!interruptEntry.address.empty()) {
                         summary += " at " + interruptEntry.address;
                     }
-                    interruptEntry.assembly = summary;
+                    interruptEntry.assembly = std::move(summary);
                 }
             }
-            
+
             currentInterruptGroupIndex = -1;
             if (entry.type != EntryType::OTHER || !entry.originalLine.empty()) {
-                entries.push_back(entry);
+                entries.push_back(std::move(entry));
             }
         }
 
@@ -270,10 +274,18 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     }
 
     // Cleanup BFD resources
-    if (kernelSymbols) free(kernelSymbols);
-    if (initSymbols) free(initSymbols);
-    if (kernelBfd) bfd_close(kernelBfd);
-    if (initBfd) bfd_close(initBfd);
+    if (kernelSymbols) {
+        free(kernelSymbols);
+    }
+    if (initSymbols) {
+        free(initSymbols);
+    }
+    if (kernelBfd) {
+        bfd_close(kernelBfd);
+    }
+    if (initBfd) {
+        bfd_close(initBfd);
+    }
 
     // Write results to JSON file
     QJsonArray jsonArray;
@@ -282,16 +294,17 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     }
 
     QJsonDocument doc(jsonArray);
-    
+
     QFile outputFileObj(outputFile);
     if (outputFileObj.open(QIODevice::WriteOnly)) {
         outputFileObj.write(doc.toJson());
+        outputFileObj.close();
     }
 }
 
-LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, 
-                               bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, 
-                               bfd* initBfd, asymbol** initSymbols, long initSymCount) {
+auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, bfd* kernelBfd,
+                            asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd, asymbol** initSymbols, long initSymCount)
+    -> LogEntry {
     LogEntry entry;
     entry.lineNumber = lineNumber;
     entry.originalLine = line.toStdString();
@@ -299,10 +312,14 @@ LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDis
 
     QString trimmedLine = line.trimmed();
 
-    // Check if it's an instruction line: 0x[address]:  [hex bytes]  [assembly]
-    QRegularExpression instrRegex(R"(^0x([0-9a-fA-F]+):\s+([0-9a-fA-F]{2}(?:\s[0-9a-fA-F]{2})*)\s{2,}(.+)$)");
-    auto instrMatch = instrRegex.match(trimmedLine);
+    // Pre-compile static regexes for better performance
+    static const QRegularExpression instrRegex(R"(^0x([0-9a-fA-F]+):\s+([0-9a-fA-F]{2}(?:\s[0-9a-fA-F]{2})*)\s{2,}(.+)$)");
+    static const QRegularExpression intRegex(R"(^Servicing hardware INT=0x([0-9a-fA-F]+))");
+    static const QRegularExpression excRegex(R"(^check_exception\s+old:\s*0x([0-9a-fA-F]+)\s+new\s+0x([0-9a-fA-F]+))");
+    static const QRegularExpression regRegex(R"(^\s*(\d+):\s+v=([0-9a-fA-F]+)\s+e=([0-9a-fA-F]+))");
 
+    // Check if it's an instruction line: 0x[address]:  [hex bytes]  [assembly]
+    auto instrMatch = instrRegex.match(trimmedLine);
     if (instrMatch.hasMatch()) {
         entry.type = EntryType::INSTRUCTION;
         entry.address = ("0x" + instrMatch.captured(1)).toStdString();
@@ -310,25 +327,22 @@ LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDis
         bool ok;
         entry.addressValue = instrMatch.captured(1).toULongLong(&ok, 16);
         if (ok) {
-            entry.function = getFunctionNameFromAddress(entry.addressValue, kernelBfd, kernelSymbols, kernelSymCount, 
-                                                       initBfd, initSymbols, initSymCount);
+            entry.function = getFunctionNameFromAddress(entry.addressValue, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols,
+                                                        initSymCount);
 
             QString hexStr = instrMatch.captured(2).simplified();
             hexStr.remove(' ');
             entry.hexBytes = hexStr.toStdString();
 
             QString asmStr = instrMatch.captured(3).trimmed();
-            std::string intelAsm = disassembler.convertToIntel(asmStr.toStdString());
-            entry.assembly = intelAsm;
+            entry.assembly = disassembler.convertToIntel(asmStr.toStdString());
         }
 
         return entry;
     }
 
     // Check for hardware interrupt
-    QRegularExpression intRegex(R"(^Servicing hardware INT=0x([0-9a-fA-F]+))");
     auto intMatch = intRegex.match(trimmedLine);
-
     if (intMatch.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
         entry.interruptNumber = intMatch.captured(1).toStdString();
@@ -337,9 +351,7 @@ LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDis
     }
 
     // Check for exception entries: "check_exception old: 0xffffffff new 0xe"
-    QRegularExpression excRegex(R"(^check_exception\s+old:\s*0x([0-9a-fA-F]+)\s+new\s+0x([0-9a-fA-F]+))");
     auto excMatch = excRegex.match(trimmedLine);
-
     if (excMatch.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
         entry.interruptNumber = excMatch.captured(2).toStdString();
@@ -348,13 +360,10 @@ LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDis
     }
 
     // Check for register dump lines
-    QRegularExpression regRegex(R"(^\s*(\d+):\s+v=([0-9a-fA-F]+)\s+e=([0-9a-fA-F]+))");
     auto regMatch = regRegex.match(trimmedLine);
-
     if (regMatch.hasMatch()) {
         entry.type = EntryType::REGISTER;
-        entry.assembly = "CPU state dump (v=" + regMatch.captured(2).toStdString() + 
-                        " e=" + regMatch.captured(3).toStdString() + ")";
+        entry.assembly = "CPU state dump (v=" + regMatch.captured(2).toStdString() + " e=" + regMatch.captured(3).toStdString() + ")";
         return entry;
     }
 
@@ -375,8 +384,8 @@ LogEntry LogWorker::processLine(const QString& line, int lineNumber, CapstoneDis
     return entry;
 }
 
-std::string LogWorker::getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount,
-                                                  bfd* initBfd, asymbol** initSymbols, long initSymCount) {
+auto LogWorker::getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
+                                           asymbol** initSymbols, long initSymCount) -> std::string {
     // Same implementation as in main processor
     bfd* targetBfd = nullptr;
     asymbol** targetSymbols = nullptr;
@@ -413,9 +422,13 @@ std::string LogWorker::getFunctionNameFromAddress(uint64_t address, bfd* kernelB
 
     for (long i = 0; i < targetSymCount; i++) {
         asymbol* sym = targetSymbols[i];
-        if (!sym || !sym->name) continue;
+        if (!sym || !sym->name) {
+            continue;
+        }
 
-        if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) continue;
+        if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) {
+            continue;
+        }
 
         bfd_vma symAddr = bfd_asymbol_value(sym);
         if (symAddr <= address) {
@@ -451,7 +464,7 @@ std::string LogWorker::getFunctionNameFromAddress(uint64_t address, bfd* kernelB
     return "";
 }
 
-QJsonObject LogWorker::logEntryToJson(const LogEntry& entry) {
+auto LogWorker::logEntryToJson(const LogEntry& entry) -> QJsonObject {
     QJsonObject obj;
     obj["lineNumber"] = entry.lineNumber;
     obj["type"] = static_cast<int>(entry.type);
@@ -465,14 +478,14 @@ QJsonObject LogWorker::logEntryToJson(const LogEntry& entry) {
     obj["isChild"] = entry.isChild;
     obj["interruptNumber"] = QString::fromStdString(entry.interruptNumber);
     obj["cpuStateInfo"] = QString::fromStdString(entry.cpuStateInfo);
-    
+
     // Handle child entries
     QJsonArray childArray;
     for (const auto& child : entry.childEntries) {
         childArray.append(logEntryToJson(child));
     }
     obj["childEntries"] = childArray;
-    
+
     return obj;
 }
 

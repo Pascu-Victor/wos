@@ -1,28 +1,33 @@
 #include "gates.hpp"
 
+#include <cstdint>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+
+#include "mod/io/serial/serial.hpp"
 
 namespace ker::mod::gates {
 namespace {
 interruptHandler_t interruptHandlers[256](nullptr);
 }
 
-void exception_handler(cpu::GPRegs &gpr, interruptFrame &frame) {
-    if (frame.intNum == 14) {
-        uint64_t cr2;
-        asm volatile("mov %%cr2, %0" : "=r"(cr2));
-        // dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
+void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
+    // FIXME: disabled direct map page fault handling for now
+    // TODO: implement proper page fault handling
+    //  if (frame.intNum == 14) {
+    //      uint64_t cr2;
+    //      asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    //      // dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
 
-        mm::virt::pagefaultHandler(cr2, frame.errCode);
-        return;
-    }
+    //     mm::virt::pagefaultHandler(cr2, frame.errCode);
+    //     return;
+    // }
 
-    uint64_t cr0;
-    uint64_t cr2;
-    uint64_t cr3;
-    uint64_t cr4;
-    uint64_t cr8;
+    uint64_t cr0{};
+    uint64_t cr2{};
+    uint64_t cr3{};
+    uint64_t cr4{};
+    uint64_t cr8{};
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     asm volatile("mov %%cr2, %0" : "=r"(cr2));
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -133,8 +138,9 @@ void exception_handler(cpu::GPRegs &gpr, interruptFrame &frame) {
 
     // stack trace
     ker::mod::io::serial::write("\nStack trace:\n");
-    uint64_t *rsp = (uint64_t *)frame.rsp;
-    for (uint64_t i = 0; i < 30; i++) {
+    auto* rsp = (uint64_t*)frame.rsp;
+    constexpr uint64_t MAX_STACK_TRACE = 32;
+    for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
         ker::mod::io::serial::write(i);
         ker::mod::io::serial::write(":");
         ker::mod::io::serial::write(" 0x");
@@ -143,30 +149,26 @@ void exception_handler(cpu::GPRegs &gpr, interruptFrame &frame) {
     }
 
     ker::mod::io::serial::write("Halting\n");
-    // ker::mod::apic::eoi();
     hcf();
 }
 
-extern "C" void task_switch_handler(interruptFrame frame);
 extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     if (frame.errCode != UINT64_MAX) {
         exception_handler(gpr, frame);
         return;
     }
-    if (frame.intNum == 0x20) {
-        task_switch_handler(frame);
-    } else if (interruptHandlers[frame.intNum] != nullptr) {
+    if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
     } else {
         if (!isIrq(frame.intNum)) {
-            // ker::mod::apic::eoi();
+            ker::mod::apic::eoi();
             ker::mod::io::serial::write("No handler for interrupt");
             ker::mod::io::serial::write(frame.intNum);
             ker::mod::io::serial::write("\n");
             hcf();
         }
     }
-    // ker::mod::apic::eoi();
+    ker::mod::apic::eoi();
 }
 
 void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {

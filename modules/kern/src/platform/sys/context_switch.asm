@@ -2,6 +2,13 @@ bits 64
 
 %include "platform/asm/helpers.asm"
 
+%macro isr_swapgs 1
+    cmp [rsp + 24], dword 8 ; Check if we're in userspace
+    je .%1
+    swapgs
+    .%1:
+%endmacro
+
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:
     ;clear registers
@@ -50,19 +57,14 @@ _wOS_asm_enterUsermode:
 extern _wOS_schedTimer
 global task_switch_handler
 task_switch_handler:
-    ; mov ax, 0x10
-    ; mov ds, ax
-    ; mov es, ax
-    ; mov fs, ax
-    ; mov gs, ax
-    cld
-    ; pushl
     mov rdi, rsp
     call _wOS_schedTimer
-    ; popl
-    ; mov ax, [rsp+8]
-    ; mov ds, ax
-    ; mov es, ax
-    ; mov fs, ax
-    ; mov gs, ax
-    ret
+
+    popq
+    cmp qword [rsp + 32], qword 0x1b
+    jne .no_swapgs_exit
+    swapgs
+    .no_swapgs_exit:
+    add rsp, 16  ; Skip intNum and errCode
+    sti
+    iretq

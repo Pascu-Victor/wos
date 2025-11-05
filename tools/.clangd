@@ -1,0 +1,12 @@
+CompileFlags:
+  Add:
+    - "--target=x86_64-linux-gnu"
+  CompilationDatabase: ../build/tools
+Diagnostics:
+  ClangTidy:
+    Remove:
+      - cppcoreguidelines-*
+      - misc-non-private-member-variables-in-classes
+      - readability-implicit-bool-conversion
+      - readability-magic-numbers
+      - readability-redundant-access-specifiers

@@ -21,13 +21,13 @@ void *calloc(size_t nmemb, size_t size);
 // void cacheDestroy(slab::SlabCache* cache);
 
 template <typename T>
-inline static T *malloc(void) {
+inline static auto malloc() -> T * {
     return (T *)malloc(sizeof(T));
 }
 
 template <typename T>
 inline static void free(T *ptr) {
-    free(ptr, sizeof(T));
+    free(ptr);
 }
 }  // namespace ker::mod::mm::dyn::kmalloc
 

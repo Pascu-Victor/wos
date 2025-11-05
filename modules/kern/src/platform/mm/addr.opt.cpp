@@ -10,9 +10,9 @@ uint64_t getHHDMOffset() { return hhdmOffset; }
 
 void setMMAPSize(uint64_t size) { mmapSize = size; }
 
-paddr_t* getVirtPointer(paddr_t vaddr) { return reinterpret_cast<paddr_t*>(vaddr + hhdmOffset); }
+auto getVirtPointer(vaddr_t vaddr) -> vaddr_t* { return reinterpret_cast<vaddr_t*>(vaddr + hhdmOffset); }
 
-vaddr_t* getPhysPointer(vaddr_t paddr) { return reinterpret_cast<vaddr_t*>(paddr - hhdmOffset); }
+auto getPhysPointer(paddr_t paddr) -> paddr_t* { return reinterpret_cast<paddr_t*>(paddr - hhdmOffset); }
 
 void init(limine_hhdm_response* hhdmResponse) {
     if (hhdmResponse == nullptr) {

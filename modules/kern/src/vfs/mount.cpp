@@ -1,0 +1,139 @@
+#include "mount.hpp"
+
+#include <cstring>
+#include <dev/gpt.hpp>
+#include <mod/io/serial/serial.hpp>
+#include <platform/mm/dyn/kmalloc.hpp>
+#include <vfs/fs/fat32.hpp>
+
+#include "vfs/fs/tmpfs.hpp"
+
+namespace ker::vfs {
+
+// Mount point registry
+namespace {
+constexpr size_t MAX_MOUNTS = 8;
+MountPoint* mounts[MAX_MOUNTS] = {};
+size_t mount_count = 0;
+}  // namespace
+
+auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
+    if (path == nullptr || fstype == nullptr) {
+        mod::io::serial::write("mount_filesystem: invalid arguments\n");
+        return -1;
+    }
+
+    if (mount_count >= MAX_MOUNTS) {
+        mod::io::serial::write("mount_filesystem: mount table full\n");
+        return -1;
+    }
+
+    auto* mount = new MountPoint;
+    mount->path = path;
+    mount->fstype = fstype;
+    mount->device = device;
+    mount->private_data = nullptr;
+    mount->fops = nullptr;
+
+    // Initialize the appropriate filesystem
+    if (fstype[0] == 'f' && fstype[1] == 'a' && fstype[2] == 't' && fstype[3] == '3' && fstype[4] == '2' && fstype[5] == '\0') {
+        // FAT32 filesystem
+        if (device == nullptr) {
+            mod::io::serial::write("mount_filesystem: FAT32 requires a block device\n");
+            delete mount;
+            return -1;
+        }
+
+        // Check if device has GPT partition table and find FAT32 partition
+        uint64_t partition_start_lba = 0;
+        partition_start_lba = ker::dev::gpt::gpt_find_fat32_partition(device);
+
+        if (partition_start_lba == 0) {
+            mod::io::serial::write("mount_filesystem: No FAT32 partition found (assuming raw FAT32 at LBA 0)\n");
+            partition_start_lba = 0;
+        }
+
+        // Initialize FAT32 with the device and partition offset
+        if (ker::vfs::fat32::fat32_init_device(device, partition_start_lba) != 0) {
+            mod::io::serial::write("mount_filesystem: FAT32 initialization failed\n");
+            delete mount;
+            return -1;
+        }
+
+        mount->fops = ker::vfs::fat32::get_fat32_fops();
+    } else if (fstype[0] == 't' && fstype[1] == 'm' && fstype[2] == 'p' && fstype[3] == 'f' && fstype[4] == 's' && fstype[5] == '\0') {
+        // tmpfs filesystem
+        mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
+    } else {
+        mod::io::serial::write("mount_filesystem: unknown filesystem type\n");
+        delete mount;
+        return -1;
+    }
+
+    mounts[mount_count] = mount;
+    mount_count++;
+
+    mod::io::serial::write("mount_filesystem: mounted ");
+    mod::io::serial::write(fstype);
+    mod::io::serial::write(" at ");
+    mod::io::serial::write(path);
+    mod::io::serial::write("\n");
+
+    return 0;
+}
+
+auto unmount_filesystem(const char* path) -> int {
+    if (path == nullptr) return -1;
+
+    for (size_t i = 0; i < mount_count; ++i) {
+        if (mounts[i] != nullptr && mounts[i]->path != nullptr) {
+            // Simple string comparison
+            size_t j = 0;
+            while (path[j] != '\0' && mounts[i]->path[j] != '\0') {
+                if (path[j] != mounts[i]->path[j]) break;
+                j++;
+            }
+            if (path[j] == '\0' && mounts[i]->path[j] == '\0') {
+                delete mounts[i];
+                mounts[i] = nullptr;
+                mod::io::serial::write("unmount_filesystem: unmounted ");
+                mod::io::serial::write(path);
+                mod::io::serial::write("\n");
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+auto find_mount_point(const char* path) -> MountPoint* {
+    if (path == nullptr) return nullptr;
+
+    // Find the longest matching mount point
+    MountPoint* best_match = nullptr;
+    size_t best_length = 0;
+
+    for (size_t i = 0; i < mount_count; ++i) {
+        if (mounts[i] == nullptr || mounts[i]->path == nullptr) continue;
+
+        // Check if path starts with this mount point
+        size_t j = 0;
+        while (mounts[i]->path[j] != '\0' && path[j] != '\0') {
+            if (mounts[i]->path[j] != path[j]) break;
+            j++;
+        }
+
+        // Path matches this mount point if we've consumed the entire mount path
+        // and either reached the end of the path or hit a path separator
+        if (mounts[i]->path[j] == '\0' && (path[j] == '\0' || path[j] == '/')) {
+            if (j > best_length) {
+                best_match = mounts[i];
+                best_length = j;
+            }
+        }
+    }
+
+    return best_match;
+}
+
+}  // namespace ker::vfs

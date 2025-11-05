@@ -1,7 +1,10 @@
 #include "virt.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+
+#include "platform/mm/paging.hpp"
 namespace ker::mod::mm::virt {
 static paging::PageTable* kernelPagemap;
 
@@ -27,7 +30,7 @@ void copyKernelMappings(sched::task::Task* t) {
 }
 
 void switchPagemap(sched::task::Task* t) {
-    if (!t->pagemap) {
+    if (t->pagemap == nullptr) {
         [[unlikely]]
         if (t->name) {
             dbg::log("Task %s has no pagemap\n", t->name);
@@ -37,8 +40,12 @@ void switchPagemap(sched::task::Task* t) {
         hcf();
     }
 
-    wrcr3((uint64_t)addr::getPhysPointer((paddr_t)t->pagemap));
-    // wrcr3((uint64_t)addr::getPhysPointer((paddr_t)t->pagemap));
+    auto phys_pagemap = (uint64_t)addr::getPhysPointer((vaddr_t)t->pagemap);
+#ifdef VERBOSE_PAGEMAP_SWITCH
+    dbg::log("switchPagemap: task=%s pid=%d virt=0x%x phys=0x%x", (t->name != nullptr) ? t->name : "unknown", t->pid,
+             (unsigned int)(uintptr_t)t->pagemap, (unsigned int)phys_pagemap);
+#endif
+    wrcr3(phys_pagemap);
 }
 
 void pagefaultHandler(uint64_t controlRegister, int errCode) {
@@ -160,6 +167,20 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
             pageTable->entries[level] = entry;
         }
 
+        bool desired_nx = (flags & paging::PAGE_NX) != 0;
+        if (entry.noExecute != desired_nx) {
+            entry.noExecute = desired_nx ? 1 : 0;
+            auto* raw_entry = (uint64_t*)&entry;
+            if (!desired_nx) {
+                *raw_entry &= ~(1ULL << 63);  // Clear NX bit
+            } else {
+                *raw_entry |= (1ULL << 63);  // Set NX bit
+            }
+            pageTable->entries[level] = entry;
+            // Force full TLB flush
+            wrcr3(rdcr3());
+        }
+
         return (PageTable*)addr::getVirtPointer(entry.frame << paging::PAGE_SHIFT);
     }
 
@@ -185,10 +206,10 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
  * @param paddr - the physical address to map the page to
  * @param flags - the flags to set for the page
  */
-void mapPage(PageTable* pml4, const vaddr_t vaddr, const paddr_t paddr, const int flags) {
-    if (!pml4 || !flags) {
+void mapPage(PageTable* pml4, const vaddr_t vaddr, const paddr_t paddr, const uint64_t flags) {
+    if (!pml4 || flags == 0) {
         // PANIC!
-        dbg::log("init: failed to map page\n function: mapPage\n args: <vaddr: %p, paddr: %p, flags: %d>", vaddr, paddr, flags);
+        dbg::log("init: failed to map page\n function: mapPage\n args: <vaddr: %p, paddr: %p, flags: %x>", vaddr, paddr, flags);
         hcf();
     }
 
@@ -225,7 +246,7 @@ bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
 }
 
 void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
-    if (!pageTable) {
+    if (pageTable == nullptr) {
         // PANIC!
         dbg::log("init: failed to get page table\n function: unifyPageFlags\n");
         hcf();
@@ -233,18 +254,38 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
 
     PageTable* table = pageTable;
     for (int i = 4; i > 1; i--) {
-        table = advancePageTable(table, index_of(vaddr, i), 0);
+        table = advancePageTable(table, index_of(vaddr, i), flags);
     }
 
-    PageTableEntry entry = table->entries[index_of(vaddr, 1)];
-    entry.writable = entry.writable | (flags & paging::PAGE_WRITE);
-    entry.user = entry.user | (flags & paging::PAGE_USER);
-    if ((flags & paging::PAGE_NX) != 0U) {
-        entry.noExecute = 1;
-    } else {
-        entry.noExecute = 0;
+    // Get the current page table entry by computing the index first
+    uint64_t idx = index_of(vaddr, 1);
+    PageTableEntry& entry = table->entries[idx];
+
+    if (entry.present == 0) {
+        // Page doesn't exist, nothing to modify
+        return;
     }
-    table->entries[index_of(vaddr, 1)] = entry;
+
+    // Update page table entry flags
+    entry.present = (flags & paging::PAGE_PRESENT) != 0U ? 1 : 0;
+    entry.writable = (flags & paging::PAGE_WRITE) != 0U ? 1 : 0;
+    entry.user = (flags & paging::PAGE_USER) != 0U ? 1 : 0;
+    entry.noExecute = (flags & paging::PAGE_NX) != 0U ? 1 : 0;
+
+    auto* raw_entry = (uint64_t*)&entry;
+    constexpr uint64_t NX_BIT_POSITION = 63ULL;
+    if ((flags & paging::PAGE_NX) != 0U) {
+        *raw_entry |= (1ULL << NX_BIT_POSITION);  // Set NX bit
+    } else {
+        *raw_entry &= ~(1ULL << NX_BIT_POSITION);  // Clear NX bit
+    }
+
+#ifdef ELF_DEBUG
+    if (vaddr >= 0x501000 && vaddr < 0x580000) {
+        mod::dbg::log("unifyPageFlags: vaddr=0x%x, flags=0x%llx, entry_after=0x%llx, nx=%d present=%d", vaddr, flags, *raw_entry,
+                      static_cast<int>((*raw_entry >> NX_BIT_POSITION) & 1U), static_cast<int>(entry.present));
+    }
+#endif
 }
 
 void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
@@ -266,7 +307,7 @@ void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
     phys::pageFree<>((void*)addr);
 }
 
-void mapRange(PageTable* pageTable, Range range, int flags, uint64_t offset) {
+void mapRange(PageTable* pageTable, Range range, uint64_t flags, uint64_t offset) {
     auto [start, end] = range;
     if (start % paging::PAGE_SIZE || end % paging::PAGE_SIZE || start >= end) {
         // PANIC!
@@ -280,11 +321,11 @@ void mapRange(PageTable* pageTable, Range range, int flags, uint64_t offset) {
     }
 }
 
-void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, int flags) { mapPage(kernelPagemap, vaddr, paddr, flags); }
+void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, uint64_t flags) { mapPage(kernelPagemap, vaddr, paddr, flags); }
 
-void mapRangeToKernelPageTable(Range range, int flags, uint64_t offset) { mapRange(kernelPagemap, range, flags, offset); }
+void mapRangeToKernelPageTable(Range range, uint64_t flags, uint64_t offset) { mapRange(kernelPagemap, range, flags, offset); }
 
-void mapRangeToKernelPageTable(Range range, int flags) {
+void mapRangeToKernelPageTable(Range range, uint64_t flags) {
     // no offset assume hhdm
     mapRange(kernelPagemap, range, flags, addr::getHHDMOffset());
 }

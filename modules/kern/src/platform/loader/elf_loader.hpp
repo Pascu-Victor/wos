@@ -19,21 +19,27 @@ struct TlsModule {
 
 using Elf64Entry = uint64_t;
 
+struct ElfLoadResult {
+    uint64_t entryPoint;         // Program entry point
+    uint64_t programHeaderAddr;  // Virtual address of program headers (for AT_PHDR)
+    uint64_t elfHeaderAddr;      // Virtual address of ELF header (for AT_EHDR)
+};
+
 struct ElfFile {
     Elf64_Ehdr elfHead;         // ELF header
-    Elf64_Phdr *pgHead;         // Program headers
-    Elf64_Shdr *seHead;         // Section headers
-    Elf64_Shdr *sctHeadStrTab;  // Section header string table
-    uint8_t *base;              // Base address of the ELF file
+    Elf64_Phdr* pgHead;         // Program headers
+    Elf64_Shdr* seHead;         // Section headers
+    Elf64_Shdr* sctHeadStrTab;  // Section header string table
+    uint8_t* base;              // Base address of the ELF file
     uint64_t loadBase;          // Load base address for PIE executables
     TlsModule tlsInfo;          // TLS information for this ELF
 };
 
-auto loadElf(ElfFile *elf, ker::mod::mm::virt::PageTable *pagemap, uint64_t pid, const char *processName,
-             bool registerSpecialSymbols = true) -> Elf64Entry;
+auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName,
+             bool registerSpecialSymbols = true) -> ElfLoadResult;
 
 // Extract TLS information from ELF without fully loading it
-auto extractTlsInfo(void *elfData) -> TlsModule;
+auto extractTlsInfo(void* elfData) -> TlsModule;
 
 // Remove the global getter - TLS info should be passed per-process
 // TlsModule getTlsModule();
