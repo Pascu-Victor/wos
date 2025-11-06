@@ -236,9 +236,9 @@ ninja && ninja install
 
 # 7. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
 # Re-export flags for libcxx build
-export CFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
-export CXXFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
-export LDFLAGS="--sysroot=$B/target1 -fsanitize=safe-stack"
+export CFLAGS="--sysroot=$B/target1"
+export CXXFLAGS="--sysroot=$B/target1"
+export LDFLAGS="--sysroot=$B/target1"
 
 mkdir -p $B/libcxx-build-full
 cd $B/libcxx-build-full
@@ -286,14 +286,3 @@ cmake -G Ninja \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
-
-#for safestack, we rebuild now that we have full libcxx
-
-cd $B/compiler-rt-build
-
-ninja && ninja install
-
-mv $B/target1/lib/clang/21/target/lib/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/
-
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.safestack.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack.a
