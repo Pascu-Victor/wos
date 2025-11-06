@@ -19,8 +19,5 @@ llvm-build
 libcxx-build
 build
 
-#toolchain build directory
-toolchain
-
 #ccache
 .cache
