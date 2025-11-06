@@ -143,12 +143,12 @@ mv $B/target1/lib/clang/21/target/include $B/target1/lib/clang/21/include
 rm -rf $B/target1/lib/clang/21/target
 
 ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
 
 ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/clang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
 
 # 6.1 fail building libcxx for it's headers see {{cxx-headers}} maybe
 
@@ -280,9 +280,12 @@ cmake -G Ninja \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH -lclang_rt.safestack-x86_64" \
- -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH -lclang_rt.safestack-x86_64" \
+ -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
+ -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
  -DWOS=ON \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
+
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.safestack.a
+ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack.a
