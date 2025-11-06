@@ -213,8 +213,11 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-# Clear conflicting flags for mlibc build
+# Reset flags because the compiler gods want to i guess :D
 unset CFLAGS CXXFLAGS LDFLAGS
+export CFLAGS="--sysroot=$B/target1"
+export CXXFLAGS="--sysroot=$B/target1"
+export LDFLAGS="--sysroot=$B/target1"
 
 mkdir -p $B/mlibc-build
 cd $B/mlibc-build
@@ -235,10 +238,6 @@ meson setup --prefix=$B/target1 \
 ninja && ninja install
 
 # 7. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
-# Re-export flags for libcxx build
-export CFLAGS="--sysroot=$B/target1"
-export CXXFLAGS="--sysroot=$B/target1"
-export LDFLAGS="--sysroot=$B/target1"
 
 mkdir -p $B/libcxx-build-full
 cd $B/libcxx-build-full
