@@ -287,5 +287,13 @@ cmake -G Ninja \
 
 ninja && ninja install
 
+#for safestack, we rebuild now that we have full libcxx
+
+cd $B/compiler-rt-build
+
+ninja && ninja install
+
+mv $B/target1/lib/clang/21/target/lib/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/
+
 ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.safestack.a
 ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.safestack.a

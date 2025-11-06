@@ -58,9 +58,9 @@ else
 fi
 
 # Compiler flags for WOS development
-export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -fsanitize=safe-stack"
-export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -fsanitize=safe-stack"
-export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -fsanitize=safe-stack"
+export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
+export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
+export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
 
 # Additional useful variables
 export WOS_SYSROOT="$WOS_TOOLCHAIN_ROOT/target1"
