@@ -39,16 +39,13 @@
                 "reveal": "always"
             },
             "group": {
-                "kind": "build",
+                "kind": "build"
             }
         },
         {
             "label": "Build and Start QEMU",
             "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build WOS",
-                "Start QEMU Debug"
-            ],
+            "dependsOn": ["Build WOS", "Start QEMU Debug"],
             "problemMatcher": [],
             "group": "build"
         },
@@ -73,10 +70,7 @@
             },
             "presentation": {
                 "reveal": "always"
-            },
-            "problemMatcher": [
-                "$gcc"
-            ]
+            }
         },
         {
             "label": "Start QEMU Debug",
