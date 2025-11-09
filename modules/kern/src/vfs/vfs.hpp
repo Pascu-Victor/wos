@@ -29,6 +29,7 @@ auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, std::size_t count) -> ssize_t;
 auto vfs_write(int fd, const void* buf, std::size_t count) -> ssize_t;
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
+auto vfs_isatty(int fd) -> bool;
 
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;

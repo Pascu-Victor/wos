@@ -189,12 +189,14 @@ auto tmpfs_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
 }
 
 auto tmpfs_fops_close(ker::vfs::File* f) -> int {
-    // tmpfs doesn't need special cleanup
+    (void)f;
     return 0;
 }
 
 auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
-    if (f == nullptr) return -1;
+    if (f == nullptr) {
+        return -1;
+    }
 
     size_t file_size = tmpfs_get_size(f);
     off_t newpos = f->pos;
@@ -213,17 +215,27 @@ auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             return -1;
     }
 
-    if (newpos < 0) return -1;
+    if (newpos < 0) {
+        return -1;
+    }
     f->pos = newpos;
     return f->pos;
 }
 
+auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool {
+    (void)f;
+    return false;
+}
+
 // Static storage for tmpfs FileOperations
-static ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,  // vfs_open - will be set by register_tmpfs
-                                                       .vfs_close = tmpfs_fops_close,
-                                                       .vfs_read = tmpfs_fops_read,
-                                                       .vfs_write = tmpfs_fops_write,
-                                                       .vfs_lseek = tmpfs_fops_lseek};
+namespace {
+ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,  // vfs_open - will be set by register_tmpfs
+                                                .vfs_close = tmpfs_fops_close,
+                                                .vfs_read = tmpfs_fops_read,
+                                                .vfs_write = tmpfs_fops_write,
+                                                .vfs_lseek = tmpfs_fops_lseek,
+                                                .vfs_isatty = tmpfs_fops_isatty};
+}
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }
 

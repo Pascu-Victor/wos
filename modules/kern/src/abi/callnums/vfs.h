@@ -8,6 +8,7 @@ enum class ops : uint64_t {
     write,
     close,
     lseek,
+    isatty,
 };
 
 }  // namespace ker::abi::vfs

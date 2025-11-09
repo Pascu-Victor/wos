@@ -9,11 +9,10 @@
 #include "file.hpp"
 #include "fs/fat32.hpp"
 #include "fs/tmpfs.hpp"
+#include "platform/mm/dyn/kmalloc.hpp"
 #include "vfs.hpp"
 
 namespace ker::vfs {
-
-void init();
 
 // Function to mark FAT32 as mounted (called from main after successful mount)
 namespace {
@@ -49,8 +48,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     std::memcpy(pathBuffer, path.data(), path.size());
     pathBuffer[path.size()] = '\0';
 
-    auto current = ker::mod::sched::getCurrentTask();
-    if (!current) {
+    auto* current = ker::mod::sched::getCurrentTask();
+    if (current == nullptr) {
         mod::io::serial::write("vfs_open: no current task\n");
         return -1;
     }
@@ -61,34 +60,40 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     if (fat32_mounted && is_fat32_path(pathBuffer)) {
         // FAT32 path
         f = ker::vfs::fat32::fat32_open_path(pathBuffer, flags, mode);
-        if (f) {
+        if (f != nullptr) {
             f->fops = ker::vfs::fat32::get_fat32_fops();
         }
     } else {
         // Default to tmpfs
         f = ker::vfs::tmpfs::tmpfs_open_path(pathBuffer, flags, mode);
-        if (f) {
+        if (f != nullptr) {
             f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
         }
     }
 
-    if (!f) {
+    if (f == nullptr) {
         mod::io::serial::write("vfs_open: failed to open file\n");
         return -1;
     }
 
     int fd = vfs_alloc_fd(current, f);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        return -1;
+    }
     return fd;
 }
 
-int vfs_close(int fd) {
+auto vfs_close(int fd) -> int {
     // Release FD from current task
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
-    if (!t) return -1;
+    if (t == nullptr) {
+        return -1;
+    }
     ker::vfs::File* f = vfs_get_file(t, fd);
-    if (!f) return -1;
-    if (f->fops && f->fops->vfs_close) {
+    if (f == nullptr) {
+        return -1;
+    }
+    if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         f->fops->vfs_close(f);
     }
     // Release the FD from the task's file descriptor table
@@ -100,39 +105,63 @@ int vfs_close(int fd) {
     return 0;
 }
 
-ssize_t vfs_read(int fd, void* buf, size_t count) {
+auto vfs_read(int fd, void* buf, size_t count) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
-    if (!t) return -1;
+    if (t == nullptr) {
+        return -1;
+    }
     ker::vfs::File* f = vfs_get_file(t, fd);
-    if (!f) return -1;
-    if (!f->fops || !f->fops->vfs_read) return -1;
+    if (f == nullptr) {
+        return -1;
+    }
+    if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
+        return -1;
+    }
     ssize_t r = f->fops->vfs_read(f, buf, count, (size_t)f->pos);
-    if (r > 0) f->pos += r;
+    if (r > 0) {
+        f->pos += r;
+    }
     return r;
 }
 
-ssize_t vfs_write(int fd, const void* buf, size_t count) {
+auto vfs_write(int fd, const void* buf, size_t count) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
-    if (!t) return -1;
+    if (t == nullptr) {
+        return -1;
+    }
     ker::vfs::File* f = vfs_get_file(t, fd);
-    if (!f) return -1;
-    if (!f->fops || !f->fops->vfs_write) return -1;
+    if (f == nullptr) {
+        return -1;
+    }
+    if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
+        return -1;
+    }
     ssize_t r = f->fops->vfs_write(f, buf, count, (size_t)f->pos);
-    if (r > 0) f->pos += r;
+    if (r > 0) {
+        f->pos += r;
+    }
     return r;
 }
 
-off_t vfs_lseek(int fd, off_t offset, int whence) {
+auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
-    if (!t) return -1;
+    if (t == nullptr) {
+        return -1;
+    }
     ker::vfs::File* f = vfs_get_file(t, fd);
-    if (!f) return -1;
-    if (!f->fops || !f->fops->vfs_lseek) return -1;
+    if (f == nullptr) {
+        return -1;
+    }
+    if ((f->fops == nullptr) || (f->fops->vfs_lseek == nullptr)) {
+        return -1;
+    }
     return f->fops->vfs_lseek(f, offset, whence);
 }
 
-int vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) {
-    if (!task || !file) return -1;
+auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
+    if ((task == nullptr) || (file == nullptr)) {
+        return -1;
+    }
     for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
         if (task->fds[i] == nullptr) {
             task->fds[i] = file;
@@ -143,17 +172,40 @@ int vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) {
     return -1;  // EMFILE (too many open files)
 }
 
-struct File* vfs_get_file(ker::mod::sched::task::Task* task, int fd) {
-    if (!task) return nullptr;
-    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) return nullptr;
+auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
+    if (task == nullptr) {
+        return nullptr;
+    }
+    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return nullptr;
+    }
     return reinterpret_cast<struct File*>(task->fds[fd]);
 }
 
-int vfs_release_fd(ker::mod::sched::task::Task* task, int fd) {
-    if (!task) return -1;
-    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) return -1;
+auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
+    if (task == nullptr) {
+        return -1;
+    }
+    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return -1;
+    }
     task->fds[fd] = nullptr;
     return 0;
+}
+
+auto vfs_isatty(int fd) -> bool {
+    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    if (t == nullptr) {
+        return false;
+    }
+    ker::vfs::File* f = vfs_get_file(t, fd);
+    if (f == nullptr) {
+        return false;
+    }
+    if ((f->fops == nullptr) || (f->fops->vfs_isatty == nullptr)) {
+        return false;
+    }
+    return f->fops->vfs_isatty(f);
 }
 
 void init() {

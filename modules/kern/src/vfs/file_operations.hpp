@@ -14,6 +14,7 @@ using vfs_close_fn = int (*)(struct File*);
 using vfs_read_fn = ssize_t (*)(struct File*, void*, size_t, size_t);         // f, buf, count, offset
 using vfs_write_fn = ssize_t (*)(struct File*, const void*, size_t, size_t);  // f, buf, count, offset
 using vfs_lseek_fn = off_t (*)(struct File*, off_t, int);                     // f, offset, whence
+using vfs_isatty_fn = bool (*)(struct File*);                                 // f
 
 struct FileOperations {
     vfs_open_fn vfs_open;
@@ -21,6 +22,7 @@ struct FileOperations {
     vfs_read_fn vfs_read;
     vfs_write_fn vfs_write;
     vfs_lseek_fn vfs_lseek;
+    vfs_isatty_fn vfs_isatty;
 };
 
 }  // namespace ker::vfs

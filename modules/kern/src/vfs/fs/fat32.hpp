@@ -92,6 +92,7 @@ auto fat32_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t;
 auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize_t;
 auto fat32_lseek(File* f, off_t offset, int whence) -> off_t;
 auto fat32_close(File* f) -> int;
+constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
 
 // Get FAT32 FileOperations structure
 auto get_fat32_fops() -> FileOperations*;

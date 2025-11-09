@@ -703,14 +703,20 @@ auto fat32_close(ker::vfs::File* f) -> int {
     return 0;
 }
 
+constexpr auto fat32_isatty(ker::vfs::File* f) -> bool {
+    (void)f;
+    return false;
+}
+
 // Static storage for FAT32 FileOperations
 namespace {
 ker::vfs::FileOperations fat32_fops_instance = {
-    .vfs_open = nullptr,       // vfs_open
-    .vfs_close = fat32_close,  // vfs_close
-    .vfs_read = fat32_read,    // vfs_read
-    .vfs_write = fat32_write,  // vfs_write
-    .vfs_lseek = fat32_lseek   // vfs_lseek
+    .vfs_open = nullptr,        // vfs_open
+    .vfs_close = fat32_close,   // vfs_close
+    .vfs_read = fat32_read,     // vfs_read
+    .vfs_write = fat32_write,   // vfs_write
+    .vfs_lseek = fat32_lseek,   // vfs_lseek
+    .vfs_isatty = fat32_isatty  // vfs_isatty
 };
 }
 
