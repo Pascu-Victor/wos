@@ -94,13 +94,13 @@ auto vfs_close(int fd) -> int {
     if (f == nullptr) {
         return -1;
     }
-    
+
     // Decrement reference count
     f->refcount--;
-    
+
     // Release the FD from the task's file descriptor table
     vfs_release_fd(t, fd);
-    
+
     // Only call close and free if no more references
     if (f->refcount <= 0) {
         if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
@@ -111,7 +111,7 @@ auto vfs_close(int fd) -> int {
         // so the file can be reopened later
         ker::mod::mm::dyn::kmalloc::free((void*)f);
     }
-    
+
     return 0;
 }
 
