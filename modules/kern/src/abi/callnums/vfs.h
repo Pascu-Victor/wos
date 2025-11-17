@@ -9,6 +9,7 @@ enum class ops : uint64_t {
     close,
     lseek,
     isatty,
+    read_dir_entries,
 };
 
 }  // namespace ker::abi::vfs

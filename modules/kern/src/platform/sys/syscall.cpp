@@ -7,12 +7,19 @@
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 
 #include "abi/callnums.hpp"
+#include "abi/callnums/multiproc.h"
 #include "abi/callnums/process.h"
+#include "abi/callnums/sys_log.h"
+#include "mod/io/serial/serial.hpp"
+#include "platform/asm/msr.hpp"
+#include "platform/interrupt/gdt.hpp"
+#include "syscalls_impl/log/sys_log.hpp"
+#include "syscalls_impl/multiproc/threadInfo.hpp"
 #include "syscalls_impl/process/process.hpp"
 
 namespace ker::mod::sys {
 
-extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
+extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
     auto callnum = static_cast<abi::callnums>(regs.rax);
     uint64_t a1 = regs.rdi;
     uint64_t a2 = regs.rsi;
@@ -35,6 +42,8 @@ extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
             return ker::syscall::net::sys_net(a1, a2, a3, a4, a5);
         case abi::callnums::vmem:
             return ker::syscall::vmem::sys_vmem(a1, a2, a3, a4, a5);
+        case abi::callnums::vmem_map:
+            return ker::syscall::vmem::sys_vmem_map(a1, a2, a3, a4, a5, a6);
         case abi::callnums::process:
             return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(a1), a2, a3, a4, a5);
 

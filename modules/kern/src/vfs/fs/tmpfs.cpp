@@ -37,11 +37,16 @@ namespace ker::vfs::tmpfs {
 
 constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
 
+enum class TmpNodeType : uint8_t { FILE, DIRECTORY };
+
 struct TmpNode {
     char* data;
     size_t size;
     size_t capacity;
     const char* name;
+    TmpNodeType type;
+    TmpNode** children;  // For directories
+    size_t children_count;
 };
 namespace {
 
@@ -51,12 +56,15 @@ TmpNode* rootNode = nullptr;
 TmpNode** children = nullptr;
 size_t children_count = 0;
 
-auto create_node_for_name(const char* name) -> TmpNode* {
+auto create_node_for_name(const char* name, TmpNodeType type = TmpNodeType::FILE) -> TmpNode* {
     auto* n = new TmpNode;
     n->data = nullptr;
     n->size = 0;
     n->capacity = 0;
     n->name = name;
+    n->type = type;
+    n->children = nullptr;
+    n->children_count = 0;
     // append to children list
     size_t newcount = children_count + 1;
     auto** newarr = new TmpNode*;
@@ -96,15 +104,21 @@ void register_tmpfs() {
         rootNode->size = 0;
         rootNode->capacity = 0;
         rootNode->name = "/";
+        rootNode->type = TmpNodeType::DIRECTORY;
+        rootNode->children = nullptr;
+        rootNode->children_count = 0;
     }
 }
 
 // Create a File object representing root
 auto create_root_file() -> ker::vfs::File* {
-    auto* f = new File;
+    File* f = new File;
     f->private_data = rootNode;
     f->fd = -1;
     f->pos = 0;
+    f->is_directory = true;
+    f->fs_type = FSType::TMPFS;
+    f->refcount = 1;
     return f;
 }
 
@@ -125,13 +139,16 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
     }
     TmpNode* n = find_child_by_name(name);
     if (n == nullptr) {
-        // create node by name
-        n = create_node_for_name(name);
+        // create node by name - default to FILE type
+        n = create_node_for_name(name, TmpNodeType::FILE);
     }
     File* f = new File;
     f->private_data = n;
     f->fd = -1;
     f->pos = 0;
+    f->is_directory = (n->type == TmpNodeType::DIRECTORY);
+    f->fs_type = FSType::TMPFS;
+    f->refcount = 1;
     return f;
 }
 
@@ -227,6 +244,48 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool {
     return false;
 }
 
+auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
+    if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
+        return -1;
+    }
+
+    auto* n = static_cast<TmpNode*>(f->private_data);
+
+    // Check if this is a directory
+    if (n->type != TmpNodeType::DIRECTORY) {
+        return -1;
+    }
+
+    // Check if index is valid
+    if (index >= n->children_count) {
+        return -1;  // No more entries
+    }
+
+    // Get the child at this index
+    TmpNode* child = n->children[index];
+    if (child == nullptr) {
+        return -1;
+    }
+
+    // Fill in the dirent structure
+    entry->d_ino = reinterpret_cast<uint64_t>(child);  // Use pointer as inode
+    entry->d_off = index + 1;
+    entry->d_reclen = sizeof(DirEntry);
+    entry->d_type = (child->type == TmpNodeType::DIRECTORY) ? DT_DIR : DT_REG;
+
+    // Copy filename
+    size_t name_len = 0;
+    if (child->name != nullptr) {
+        while (child->name[name_len] != '\0' && name_len < DIRENT_NAME_MAX - 1) {
+            entry->d_name[name_len] = child->name[name_len];
+            name_len++;
+        }
+    }
+    entry->d_name[name_len] = '\0';
+
+    return 0;
+}
+
 // Static storage for tmpfs FileOperations
 namespace {
 ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,  // vfs_open - will be set by register_tmpfs
@@ -234,7 +293,8 @@ ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,  // vfs_ope
                                                 .vfs_read = tmpfs_fops_read,
                                                 .vfs_write = tmpfs_fops_write,
                                                 .vfs_lseek = tmpfs_fops_lseek,
-                                                .vfs_isatty = tmpfs_fops_isatty};
+                                                .vfs_isatty = tmpfs_fops_isatty,
+                                                .vfs_readdir = tmpfs_fops_readdir};
 }
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }

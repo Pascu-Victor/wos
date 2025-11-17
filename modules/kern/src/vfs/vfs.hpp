@@ -30,6 +30,7 @@ auto vfs_read(int fd, void* buf, std::size_t count) -> ssize_t;
 auto vfs_write(int fd, const void* buf, std::size_t count) -> ssize_t;
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
 auto vfs_isatty(int fd) -> bool;
+auto vfs_read_dir_entries(int fd, void* buffer, std::size_t max_size) -> ssize_t;
 
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
@@ -38,8 +39,5 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 
 // Initialize VFS (register tmpfs, devfs, etc.)
 void init();
-
-// Mark FAT32 as mounted (called after successful FAT32 mount)
-void set_fat32_mounted(bool mounted);
 
 }  // namespace ker::vfs

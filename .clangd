@@ -23,6 +23,8 @@ Diagnostics:
     MissingIncludes: Strict
 
 CompileFlags:
+    Add:
+        - -std=c++23
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword

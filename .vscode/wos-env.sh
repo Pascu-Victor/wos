@@ -58,8 +58,8 @@ else
 fi
 
 # Compiler flags for WOS development
-export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
-export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
+export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -std=c23"
+export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -std=c++23"
 export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
 
 # Additional useful variables

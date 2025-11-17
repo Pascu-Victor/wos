@@ -36,6 +36,7 @@ struct FAT32Node {
     uint32_t file_size;
     uint8_t attributes;
     char* name;
+    bool is_directory;
 };
 
 // Read a sector from disk (handles both buffer and block device)
@@ -342,6 +343,27 @@ auto fat32_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
     mod::io::serial::write(filename);
     mod::io::serial::write("'\n");
 
+    // If filename is empty, we're opening the root directory
+    if (filename[0] == '\0') {
+        mod::io::serial::write("fat32_open_path: opening root directory\n");
+
+        auto* node = new FAT32Node;
+        node->start_cluster = boot_sector->root_cluster;
+        node->file_size = 0;  // Directories don't have a meaningful size
+        node->is_directory = true;
+
+        auto* file = new File;
+        file->fd = -1;
+        file->private_data = node;
+        file->fops = nullptr;  // Will be set by caller
+        file->pos = 0;
+        file->is_directory = true;
+        file->fs_type = FSType::FAT32;
+
+        mod::io::serial::write("fat32_open_path: root directory opened\n");
+        return file;
+    }
+
     // Search root directory for the file
     size_t cluster_size = bytes_per_sector * sectors_per_cluster;
     auto* cluster_buf = new uint8_t[cluster_size];
@@ -413,12 +435,19 @@ search_done:
     node->file_size = found_entry.file_size;
     node->attributes = found_entry.attributes;
     node->name = nullptr;
+    node->is_directory = (found_entry.attributes & FAT32_ATTR_DIRECTORY) != 0;
 
     auto* f = new File;
     f->private_data = node;
     f->fd = -1;
     f->pos = 0;
     f->fops = nullptr;  // Will be set by vfs_open
+    f->is_directory = node->is_directory;
+    f->fs_type = FSType::FAT32;
+
+    mod::io::serial::write("fat32_open_path: opened ");
+    mod::io::serial::write(node->is_directory ? "directory" : "file");
+    mod::io::serial::write("\n");
 
     return f;
 }
@@ -708,15 +737,125 @@ constexpr auto fat32_isatty(ker::vfs::File* f) -> bool {
     return false;
 }
 
+// Read directory entry at given index
+auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
+    if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
+        return -1;
+    }
+
+    auto* node = static_cast<FAT32Node*>(f->private_data);
+
+    // Check if this is a directory
+    if (!node->is_directory) {
+        mod::io::serial::write("fat32_readdir: not a directory\n");
+        return -1;
+    }
+
+    // Read directory entries from the directory's cluster chain
+    size_t cluster_size = bytes_per_sector * sectors_per_cluster;
+    auto* cluster_buf = new uint8_t[cluster_size];
+    if (cluster_buf == nullptr) {
+        return -1;
+    }
+
+    uint32_t current_cluster = node->start_cluster;
+    size_t entries_seen = 0;
+    bool found = false;
+
+    while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
+        // Read the cluster
+        if (read_cluster(current_cluster, cluster_buf) != 0) {
+            delete[] cluster_buf;
+            return -1;
+        }
+
+        // Parse directory entries
+        size_t num_entries = cluster_size / sizeof(FAT32DirectoryEntry);
+        auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
+
+        for (size_t i = 0; i < num_entries; ++i) {
+            auto* dir_entry = &entries[i];
+
+            // End of directory
+            if (dir_entry->name[0] == 0x00) {
+                delete[] cluster_buf;
+                return -1;  // No more entries
+            }
+
+            // Skip deleted entries
+            if (dir_entry->name[0] == (char)0xE5) {
+                continue;
+            }
+
+            // Skip long filename entries and volume IDs
+            if ((dir_entry->attributes & FAT32_ATTR_LONG_NAME) == FAT32_ATTR_LONG_NAME ||
+                (dir_entry->attributes & FAT32_ATTR_VOLUME_ID) != 0) {
+                continue;
+            }
+
+            // Skip . and .. entries
+            if (dir_entry->name[0] == '.' && (dir_entry->name[1] == ' ' || dir_entry->name[1] == '.')) {
+                continue;
+            }
+
+            // Check if this is the entry we're looking for
+            if (entries_seen == index) {
+                // Fill in the dirent structure
+                entry->d_ino = ((uint32_t)dir_entry->cluster_high << 16) | dir_entry->cluster_low;
+                entry->d_off = index + 1;
+                entry->d_reclen = sizeof(DirEntry);
+                entry->d_type = (dir_entry->attributes & FAT32_ATTR_DIRECTORY) != 0 ? DT_DIR : DT_REG;
+
+                // Convert FAT32 name to null-terminated string
+                size_t name_idx = 0;
+                // Copy filename part (8 chars)
+                for (int j = 0; j < 8 && dir_entry->name[j] != ' '; ++j) {
+                    entry->d_name[name_idx++] = dir_entry->name[j];
+                }
+                // Add dot if extension exists
+                bool has_ext = false;
+                for (int j = 8; j < 11; ++j) {
+                    if (dir_entry->name[j] != ' ') {
+                        has_ext = true;
+                        break;
+                    }
+                }
+                if (has_ext) {
+                    entry->d_name[name_idx++] = '.';
+                    for (int j = 8; j < 11 && dir_entry->name[j] != ' '; ++j) {
+                        entry->d_name[name_idx++] = dir_entry->name[j];
+                    }
+                }
+                entry->d_name[name_idx] = '\0';
+
+                found = true;
+                break;
+            }
+            entries_seen++;
+        }
+
+        if (found) {
+            break;
+        }
+
+        // Get next cluster
+        current_cluster = get_next_cluster(current_cluster);
+    }
+
+    delete[] cluster_buf;
+    return found ? 0 : -1;
+}
+
 // Static storage for FAT32 FileOperations
 namespace {
 ker::vfs::FileOperations fat32_fops_instance = {
-    .vfs_open = nullptr,        // vfs_open
-    .vfs_close = fat32_close,   // vfs_close
-    .vfs_read = fat32_read,     // vfs_read
-    .vfs_write = fat32_write,   // vfs_write
-    .vfs_lseek = fat32_lseek,   // vfs_lseek
-    .vfs_isatty = fat32_isatty  // vfs_isatty
+    .vfs_open = nullptr,          // vfs_open
+    .vfs_close = fat32_close,     // vfs_close
+    .vfs_read = fat32_read,       // vfs_read
+    .vfs_write = fat32_write,     // vfs_write
+    .vfs_lseek = fat32_lseek,     // vfs_lseek
+    .vfs_isatty = fat32_isatty,   // vfs_isatty
+    .vfs_readdir = fat32_readdir  // vfs_readdir
 };
 }
 

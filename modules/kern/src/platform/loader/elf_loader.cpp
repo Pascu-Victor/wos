@@ -173,9 +173,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 
                 // Resolve symbol value S
                 uint64_t S = 0;
-#ifdef ELF_DEBUG
                 const char* symName = "";
-#endif
                 if (symIndex != 0) {
                     // The relocation section's sh_link tells which symbol table to use
                     if (sectionHeader->sh_link < elf.elfHead.e_shnum) {
@@ -184,19 +182,15 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                         auto* syms = (Elf64_Sym*)(elf.base + symTabSec->sh_offset);
                         uint64_t n = symTabSec->sh_size / symTabSec->sh_entsize;
                         // Get string table for symbol names if available
-#ifdef ELF_DEBUG
                         const char* symStrs = nullptr;
                         if (symTabSec->sh_link < elf.elfHead.e_shnum) {
                             auto* strtabSec =
                                 (Elf64_Shdr*)((uint64_t)elf.seHead + (static_cast<uint64_t>(symTabSec->sh_link * elf.elfHead.e_shentsize)));
                             symStrs = (const char*)(elf.base + strtabSec->sh_offset);
                         }
-#endif
                         if (symIndex < n) {
                             Elf64_Sym* sym = &syms[symIndex];
-#ifdef ELF_DEBUG
                             symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
-#endif
                             S = sym->st_value;
                             // If the symbol is defined in a section, add loadBase (unless TLS)
                             if (sym->st_shndx < elf.elfHead.e_shnum) {
@@ -216,6 +210,13 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                                 uint64_t n = sec->sh_size / sec->sh_entsize;
                                 if (symIndex < n) {
                                     Elf64_Sym* sym = &syms[symIndex];
+                                    // Try to get symbol name from string table
+                                    if (sec->sh_link < elf.elfHead.e_shnum) {
+                                        auto* strtabSec = (Elf64_Shdr*)((uint64_t)elf.seHead +
+                                                                        (static_cast<uint64_t>(sec->sh_link * elf.elfHead.e_shentsize)));
+                                        const char* symStrs = (const char*)(elf.base + strtabSec->sh_offset);
+                                        symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
+                                    }
                                     S = sym->st_value;
                                     if (sym->st_shndx < elf.elfHead.e_shnum) {
                                         auto* symSec = (Elf64_Shdr*)((uint64_t)elf.seHead +
@@ -242,8 +243,6 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                         int64_t tlsOffset = DEFAULT_SAFESTACK_TLS_OFFSET;
                         if (paddr != 0) {
                             auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
-                            mod::dbg::log("WARN: CHECK ME!! R_X86_64_TPOFF64: paddr: %x, physPtr: %x tlsOffset: %x", paddr, physPtr,
-                                          tlsOffset);
                             *physPtr = (uint64_t)tlsOffset;
                         }
                         break;
@@ -276,8 +275,9 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                         if (paddr != 0) {
                             auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
                             if (S == 0) {
-                                mod::dbg::log("ERROR: Unresolved symbol for relocation at P=0x%x (type=%d). Writing 0 to catch fault.", P,
-                                              type);
+                                mod::dbg::log(
+                                    "ERROR: Unresolved symbol '%s' (idx=%d) for relocation at P=0x%x (type=%d). Writing 0 to catch fault.",
+                                    symName, symIndex, P, type);
                             }
                             uint64_t writeVal = S + addend;
                             *physPtr = writeVal;
@@ -341,7 +341,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #endif
 
             uint64_t numRelocations = sectionHeader->sh_size / sizeof(Elf64_Rela);
-            Elf64_Rela* relocations = (Elf64_Rela*)(elf.base + sectionHeader->sh_offset);
+            auto* relocations = (Elf64_Rela*)(elf.base + sectionHeader->sh_offset);
 
             for (uint64_t j = 0; j < numRelocations; j++) {
                 Elf64_Rela* rel = &relocations[j];
@@ -352,29 +352,23 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 
                 // Resolve symbol value S
                 uint64_t S = 0;
-#ifdef ELF_DEBUG
                 const char* symName = "";
-#endif
                 if (symIndex != 0) {
                     if (sectionHeader->sh_link < elf.elfHead.e_shnum) {
                         auto* symTabSec =
                             (Elf64_Shdr*)((uint64_t)elf.seHead + (static_cast<uint64_t>(sectionHeader->sh_link * elf.elfHead.e_shentsize)));
                         auto* syms = (Elf64_Sym*)(elf.base + symTabSec->sh_offset);
                         uint64_t n = symTabSec->sh_size / symTabSec->sh_entsize;
-#ifdef ELF_DEBUG
                         const char* symStrs = nullptr;
                         if (symTabSec->sh_link < elf.elfHead.e_shnum) {
                             auto* strtabSec =
                                 (Elf64_Shdr*)((uint64_t)elf.seHead + (static_cast<uint64_t>(symTabSec->sh_link * elf.elfHead.e_shentsize)));
                             symStrs = (const char*)(elf.base + strtabSec->sh_offset);
                         }
-#endif
 
                         if (symIndex < n) {
                             Elf64_Sym* sym = &syms[symIndex];
-#ifdef ELF_DEBUG
                             symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
-#endif
                             S = sym->st_value;
                             if (sym->st_shndx < elf.elfHead.e_shnum) {
                                 auto* symSec =
@@ -392,6 +386,13 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                                 uint64_t n = sec->sh_size / sec->sh_entsize;
                                 if (symIndex < n) {
                                     Elf64_Sym* sym = &syms[symIndex];
+                                    // Try to get symbol name from string table
+                                    if (sec->sh_link < elf.elfHead.e_shnum) {
+                                        auto* strtabSec = (Elf64_Shdr*)((uint64_t)elf.seHead +
+                                                                        (static_cast<uint64_t>(sec->sh_link * elf.elfHead.e_shentsize)));
+                                        const char* symStrs = (const char*)(elf.base + strtabSec->sh_offset);
+                                        symName = (symStrs != nullptr) ? (symStrs + sym->st_name) : "";
+                                    }
                                     S = sym->st_value;
                                     if (sym->st_shndx < elf.elfHead.e_shnum) {
                                         auto* symSec = (Elf64_Shdr*)((uint64_t)elf.seHead +
@@ -447,8 +448,9 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                         if (paddr != 0) {
                             auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
                             if (S == 0) {
-                                mod::dbg::log("ERROR: Unresolved symbol for relocation at P=0x%x (type=%d). Writing 0 to catch fault.", P,
-                                              type);
+                                mod::dbg::log(
+                                    "ERROR: Unresolved symbol '%s' (idx=%d) for relocation at P=0x%x (type=%d). Writing 0 to catch fault.",
+                                    symName, symIndex, P, type);
                             }
                             uint64_t writeVal = S + (uint64_t)addend;
                             *physPtr = writeVal;
@@ -788,7 +790,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     // Copy filtered program headers right after ELF header
     {
         uint64_t destOffset = programHeadersOffsetInHeader;
-        for (size_t headerIdx = 0; headerIdx < filteredHeaders.size(); headerIdx++) {
+        for (auto& filteredHeader : filteredHeaders) {
             uint64_t headerSize = elfFile.elfHead.e_phentsize;
             for (uint64_t i = 0; i < headerSize; i++) {
                 uint64_t pageIdx = destOffset / mod::mm::virt::PAGE_SIZE;
@@ -800,7 +802,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                 }
 
                 uint8_t* destPtr = (uint8_t*)headerPhysAddrs[pageIdx] + offsetInPage;
-                uint8_t* srcPtr = (uint8_t*)&filteredHeaders[headerIdx] + i;
+                uint8_t* srcPtr = (uint8_t*)&filteredHeader + i;
                 *destPtr = *srcPtr;
                 destOffset++;
             }

@@ -1,89 +1,65 @@
 #include <abi/callnums/sys_log.h>
+#include <dirent.h>
 #include <sys/logging.h>
+#include <sys/mman.h>
 #include <sys/process.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 
+#include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-
-namespace ker::logging {
-
-auto log(const char* str, uint64_t len, abi::sys_log::sys_log_device device) -> uint64_t {
-    if (str == nullptr) {
-        return 1;
-    }
-    if (len == 0) {
-        len = std::strlen(str);
-    }
-    return syscall(ker::abi::callnums::sys_log, static_cast<uint64_t>(ker::abi::sys_log::sys_log_ops::log),
-                   static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)), len, static_cast<uint64_t>(device));
-}
-
-auto logLine(const char* str, uint64_t len, abi::sys_log::sys_log_device device) -> uint64_t {
-    if (str == nullptr) {
-        return 1;
-    }
-    if (len == 0) {
-        len = std::strlen(str);
-    }
-    return syscall(ker::abi::callnums::sys_log, static_cast<uint64_t>(ker::abi::sys_log::sys_log_ops::logLine),
-                   static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)), len, static_cast<uint64_t>(device));
-}
-
-}  // namespace ker::logging
+#include <print>
 
 // Alternative main function for testing with argc/argv
-extern "C" auto main(int argc, char** argv, char** envp) -> int {
+auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
-
-    ker::logging::logLine("testprog: main() called", 0, ker::abi::sys_log::sys_log_device::serial);
-
-    // Log arguments
-    ker::logging::log("testprog: argc = ", 0, ker::abi::sys_log::sys_log_device::serial);
-    char buf[32];
-    int n = argc;
-    int i = 0;
-    if (n == 0) {
-        buf[i++] = '0';
-    } else {
-        char temp[32];
-        int j = 0;
-        while (n > 0) {
-            temp[j++] = '0' + (n % 10);
-            n /= 10;
-        }
-        while (j > 0) {
-            buf[i++] = temp[--j];
-        }
+    FILE* tty = fopen("/dev/tty0", "r+");
+    if (tty == nullptr) {
+        std::print("testprog: Failed to open /dev/tty0\n");
+        return 1;
     }
-    buf[i] = '\0';
-    ker::logging::logLine(buf, 0, ker::abi::sys_log::sys_log_device::serial);
+    std::print("testprog: Opened /dev/tty0 successfully\n");
 
+    setvbuf(tty, nullptr, _IONBF, 0);
+    std::freopen("/dev/tty0", "r+", stdin);
+    std::freopen("/dev/tty0", "r+", stdout);
+    std::freopen("/dev/tty0", "r+", stderr);
+    std::println("testprog: main() called");
+    // Log argc
+    std::println("testprog: argc = {}", argc);
     // Log each argument
     for (int arg = 0; arg < argc; arg++) {
-        ker::logging::log("testprog: argv[", 0, ker::abi::sys_log::sys_log_device::serial);
-        // Convert arg to string
-        n = arg;
-        i = 0;
-        if (n == 0) {
-            buf[i++] = '0';
-        } else {
-            char temp[32];
-            int j = 0;
-            while (n > 0) {
-                temp[j++] = '0' + (n % 10);
-                n /= 10;
-            }
-            while (j > 0) {
-                buf[i++] = temp[--j];
-            }
-        }
-        buf[i] = '\0';
-        ker::logging::log(buf, 0, ker::abi::sys_log::sys_log_device::serial);
-        ker::logging::log("] = ", 0, ker::abi::sys_log::sys_log_device::serial);
-        ker::logging::logLine(argv[arg], 0, ker::abi::sys_log::sys_log_device::serial);
+        std::println("testprog: argv[{}] = {}", arg, argv[arg]);
     }
+
+    const auto* rootDir = "/dev";  // assuming FAT32 is mounted here
+    std::println("testprog: Attempting to open root directory");
+    DIR* dirp = opendir(rootDir);
+    if (dirp == nullptr) {
+        std::println("testprog: Failed to open root directory");
+    } else {
+        std::println("testprog: Successfully opened root directory");
+        std::println("testprog: files in root directory:");
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dirp)) != nullptr) {
+            std::println("{}", static_cast<const char*>(entry->d_name));
+        }
+        closedir(dirp);
+    }
+
+    // attempt mmap
+    void* addr = (void*)0x123456780000;
+    size_t size = 0x2000;  // 8KB
+    int prot = PROT_READ | PROT_WRITE;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    auto mmap_result = reinterpret_cast<int64_t>(mmap(addr, size, prot, flags, -1, 0));
+    if (mmap_result < 0) {
+        std::println("testprog: mmap failed with error code {}", mmap_result);
+        return 1;
+    }
+    std::println("testprog: mmap succeeded at address {}", addr);
 
     return 0;
 }

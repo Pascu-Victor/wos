@@ -1,6 +1,7 @@
 #pragma once
 #include <limine.h>
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/boot/handover.hpp>
@@ -13,7 +14,7 @@
 
 namespace ker::mod::smt {
 
-typedef void (*CpuGotoAddr)(struct limine_smp_info*);
+using CpuGotoAddr = void (*)(struct limine_smp_info*);
 
 struct CpuInfo {
     uint32_t processor_id;
@@ -23,18 +24,18 @@ struct CpuInfo {
     sched::task::Task* currentTask = nullptr;
 };
 
-uint64_t getCoreCount(void);
-const CpuInfo getCpu(uint64_t number);
+auto getCoreCount() -> uint64_t;
+auto getCpu(uint64_t number) -> const CpuInfo&;
 
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp);
 
 void init();
 
-const CpuInfo thisCpuInfo();
+auto thisCpuInfo() -> const CpuInfo&;
 
 template <typename T>
 class PerCpuVar {
-    static_assert(std::is_default_constructible<T>::value || std::is_arithmetic<T>::value,
+    static_assert(std::is_default_constructible_v<T> || std::is_arithmetic_v<T>,
                   "T must have a default constructor or be a primitive type");
 
    private:
@@ -49,13 +50,13 @@ class PerCpuVar {
 
     T& get() { return _data[cpu::currentCpu()]; }
 
-    T* operator->() { return &_data[cpu::currentCpu()]; }
+    auto operator->() -> T* { return &_data[cpu::currentCpu()]; }
 
     void set(const T& data) { _data[cpu::currentCpu()] = data; }
 
-    T& operator=(const T& data) {
+    auto operator=(const T& data) -> PerCpuVar& {
         _data[cpu::currentCpu()] = data;
-        return _data[cpu::currentCpu()];
+        return *this;
     }
 };
 
@@ -65,23 +66,24 @@ class PerCpuCrossAccess {
     T* _data;
 
    public:
-    PerCpuCrossAccess(T defaultValue = T()) {
-        _data = new T[getCoreCount()];
-        for (uint64_t i = 0; i < getCoreCount(); ++i) _data[i] = defaultValue;
+    PerCpuCrossAccess(T defaultValue = T()) : _data(new T[getCoreCount()]) {
+        for (uint64_t i = 0; i < getCoreCount(); ++i) {
+            _data[i] = defaultValue;
+        }
     }
 
-    T* thisCpu() { return &_data[cpu::currentCpu()]; }
+    auto thisCpu() -> T* { return &_data[cpu::currentCpu()]; }
 
-    T* thatCpu(uint64_t cpu) { return &_data[cpu]; }
+    auto thatCpu(uint64_t cpu) -> T* { return &_data[cpu]; }
 
     void setThisCpu(const T& data) { _data[cpu::currentCpu()] = data; }
 
     void setThatCpu(const T& data, uint64_t cpu) { _data[cpu] = data; }
 };
 
-inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack) {
-    uint64_t getCpuNode(uint64_t cpuNo);
+auto getCpuNode(uint64_t cpuNo) -> uint64_t;
 
+inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack) {
     auto cpu = getCpuNode(cpuNo);
     auto cpuData = getCpu(cpu);
 
@@ -90,13 +92,12 @@ inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack
     stack.sp++;
 
     __atomic_store_n(&cpuData.stack_pointer_ref, stack.sp, __ATOMIC_SEQ_CST);
-    __atomic_store_n(cpuData.goto_address, reinterpret_cast<CpuGotoAddr>(task), __ATOMIC_SEQ_CST);
+    __atomic_store_n(cpuData.goto_address, task, __ATOMIC_SEQ_CST);
 }
 
 template <typename... FuncArgs>
 constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
-    mm::Stack<4096>* initStacks;
-    initStacks = new mm::Stack<4096>[getCoreCount()];
+    auto* initStacks = new mm::Stack<4096>[getCoreCount()];
     for (uint64_t i = 0; i < getCoreCount(); i++) {
         if (i == cpu::currentCpu()) {
             continue;
@@ -105,8 +106,8 @@ constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
     }
 }
 
-uint64_t cpuCount();
+auto cpuCount() -> uint64_t;
 
-uint64_t setTcb(void* tcb);
+auto setTcb(void* tcb) -> uint64_t;
 
 }  // namespace ker::mod::smt

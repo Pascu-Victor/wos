@@ -53,12 +53,3 @@ target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 add_custom_command(TARGET ${KERNEL} POST_BUILD
     COMMAND printf '\\003' | dd of=$<TARGET_FILE:${KERNEL}> bs=1 count=1 seek=16 conv=notrunc 2>/dev/null
 )
-
-# Produce separate debug symbol file (.debug) next to the built kernel and
-# add a gnu debug link so tools/gdb can find the external debug info.
-add_custom_command(TARGET ${KERNEL} POST_BUILD
-    COMMAND ${CMAKE_SYSROOT}/bin/llvm-objcopy --only-keep-debug $<TARGET_FILE:${KERNEL}> $<TARGET_FILE:${KERNEL}>.debug
-    COMMAND ${CMAKE_SYSROOT}/bin/llvm-objcopy --add-gnu-debuglink=$<TARGET_FILE:${KERNEL}>.debug $<TARGET_FILE:${KERNEL}>
-    COMMENT "Generating separate debug symbols for ${KERNEL}"
-)
-

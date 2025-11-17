@@ -132,6 +132,5 @@
     "C_Cpp.default.compilerArgs": [
         "--target=x86_64-pc-wos",
         "--sysroot=${workspaceFolder}/toolchain/target1",
-        "-fsanitize=safe-stack"
     ],
 }

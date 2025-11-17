@@ -39,11 +39,9 @@ target_link_options(${TARGET} PRIVATE
     "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"
 )
 
-# Produce separate debug symbol file for the userspace init binary and
-# add a gnu debuglink so gdb can automatically find external debug info.
-add_custom_command(TARGET ${TARGET} POST_BUILD
-    COMMAND ${CMAKE_SYSROOT}/bin/llvm-objcopy --only-keep-debug $<TARGET_FILE:${TARGET}> $<TARGET_FILE:${TARGET}>.debug
-    COMMAND ${CMAKE_SYSROOT}/bin/llvm-objcopy --add-gnu-debuglink=$<TARGET_FILE:${TARGET}>.debug $<TARGET_FILE:${TARGET}>
-    COMMENT "Generating separate debug symbols for ${TARGET}"
+target_link_libraries(${TARGET} PRIVATE
+    c++abi
+    c++
+    c
+    unwind
 )
-

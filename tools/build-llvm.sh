@@ -7,15 +7,19 @@ OLD_PATH=$PATH
 TARGET_ARCH=x86_64-pc-wos
 export NINJA_STATUS="[%f/%t %e] "
 
+
 # 1. Clone repositories
 mkdir -p $B/src
 cd $B/src
+
 
 # Clone required repositories if they don't exist
 [ ! -d mlibc ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/mlibc.git
 [ ! -d llvm-project ] && git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
 
 # 2. Build stage1 clang/lld for the host
+export CFLAGS="-std=c23"
+export CXXFLAGS="-std=c++23"
 mkdir -p $B/stage1-build
 cd $B/stage1-build
 cmake -G Ninja \
@@ -98,6 +102,9 @@ $CC -O3 -c empty.c       -o $B/target1/lib/crti.o
 $CC -O3 -c empty.c       -o $B/target1/lib/crtn.o
 
 # 5. Build compiler-rt builtins
+export CFLAGS="--sysroot=$B/target1 -std=c23 -fno-sanitize=safe-stack "
+export CXXFLAGS="--sysroot=$B/target1 -std=c++23 -fno-sanitize=safe-stack "
+export LDFLAGS="--sysroot=$B/target1"
 mkdir -p $B/compiler-rt-build
 cd $B/compiler-rt-build
 cmake -G Ninja \
@@ -107,9 +114,9 @@ cmake -G Ninja \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_SYSTEM_NAME=WOS \
- -DCMAKE_C_FLAGS="-fdiagnostics-color=always" \
- -DCMAKE_CXX_FLAGS="-fdiagnostics-color=always" \
- -DCMAKE_ASM_FLAGS="-fdiagnostics-color=always" \
+ -DCMAKE_C_FLAGS="-fno-sanitize=safe-stack -fdiagnostics-color=always" \
+ -DCMAKE_CXX_FLAGS="-fno-sanitize=safe-stack -fdiagnostics-color=always" \
+ -DCMAKE_ASM_FLAGS="-fno-sanitize=safe-stack -fdiagnostics-color=always" \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
@@ -119,13 +126,12 @@ cmake -G Ninja \
  -DCOMPILER_RT_BUILD_BUILTINS=ON \
  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
  -DCOMPILER_RT_BUILD_ORC=OFF \
- -DCOMPILER_RT_HAS_SAFESTACK=ON \
+ -DCOMPILER_RT_HAS_SAFESTACK=OFF \
  -DCOMPILER_RT_OS_DIR="" \
  -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
  -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
  -DCOMPILER_RT_BUILD_XRAY=OFF \
- -DCOMPILER_RT_BUILD_SANITIZERS=ON \
- -DCOMPILER_RT_SANITIZERS_TO_BUILD="safestack" \
+ -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
  -DCOMPILER_RT_STANDALONE_BUILD=ON \
  -DCOMPILER_RT_INTERCEPT_LIBDISPATCH=OFF \
  -DCOMPILER_RT_HAS_PTHREAD_LIB=OFF \
@@ -172,8 +178,8 @@ cmake -G Ninja \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
  -DLIBCXX_CXX_ABI=libcxxabi \
  -DLIBCXX_USE_COMPILER_RT=On \
- -DLIBCXX_HAS_PTHREAD_API=Off \
- -DLIBCXX_HAS_PTHREAD_LIB=Off \
+ -DLIBCXX_HAS_PTHREAD_API=On \
+ -DLIBCXX_HAS_PTHREAD_LIB=On \
  -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
  -DLIBCXX_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_ENABLE_STATIC=OFF \
@@ -181,8 +187,8 @@ cmake -G Ninja \
  -DLIBCXX_INSTALL_HEADERS=ON \
  -DLIBCXXABI_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
- -DLIBCXXABI_HAS_PTHREAD_API=OFF \
- -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_API=ON \
+ -DLIBCXXABI_HAS_PTHREAD_LIB=ON \
  -DLIBCXXABI_USE_COMPILER_RT=ON \
  -DHAVE_LIBPTHREAD=OFF \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
@@ -215,8 +221,8 @@ EOF
 
 # Reset flags because the compiler gods want to i guess :D
 unset CFLAGS CXXFLAGS LDFLAGS
-export CFLAGS="--sysroot=$B/target1"
-export CXXFLAGS="--sysroot=$B/target1"
+export CFLAGS="--sysroot=$B/target1 -std=c23 -fno-sanitize=safe-stack "
+export CXXFLAGS="--sysroot=$B/target1 -std=c++23 -fno-sanitize=safe-stack "
 export LDFLAGS="--sysroot=$B/target1"
 
 mkdir -p $B/mlibc-build
@@ -233,6 +239,7 @@ meson setup --prefix=$B/target1 \
   -Duse_freestnd_hdrs=enabled \
   -Dposix_option=enabled \
   -Dbsd_option=enabled \
+  -Db_sanitize=none \
   $B/src/mlibc
 
 ninja && ninja install
@@ -246,8 +253,8 @@ cmake -G Ninja \
  -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
  -DLIBCXXABI_USE_COMPILER_RT=On \
  -DLIBCXXABI_INCLUDE_TESTS=OFF \
- -DLIBCXXABI_HAS_PTHREAD_LIB=OFF \
- -DLIBCXXABI_HAS_PTHREAD_API=OFF \
+ -DLIBCXXABI_HAS_PTHREAD_LIB=ON \
+ -DLIBCXXABI_HAS_PTHREAD_API=ON \
  -DLIBCXXABI_ENABLE_STATIC=ON \
  -DLIBCXXABI_ENABLE_SHARED=ON \
  -DLIBUNWIND_ENABLE_SHARED=ON \
@@ -256,8 +263,8 @@ cmake -G Ninja \
  -DLIBCXX_INSTALL_HEADERS=ON \
  -DLIBCXX_INCLUDE_TESTS=OFF \
  -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
- -DLIBCXX_HAS_PTHREAD_LIB=Off \
- -DLIBCXX_HAS_PTHREAD_API=Off \
+ -DLIBCXX_HAS_PTHREAD_LIB=On \
+ -DLIBCXX_HAS_PTHREAD_API=On \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  -DLIBCXX_ENABLE_FILESYSTEM=OFF \
  -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
@@ -268,19 +275,19 @@ cmake -G Ninja \
  -DCMAKE_SYSTEM_NAME=WOS \
  -DCMAKE_SYSROOT=$B/target1 \
  -DCMAKE_INSTALL_PREFIX=$B/target1 \
- -DCMAKE_CXX_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always" \
+ -DCMAKE_CXX_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fno-sanitize=safe-stack -fdiagnostics-color=always" \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_CXX_COMPILER_WORKS=ON \
  -DCMAKE_CXX_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_CROSSCOMPILING=True \
- -DCMAKE_C_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fsanitize=safe-stack -fdiagnostics-color=always" \
+ -DCMAKE_C_FLAGS="-I$B/target1/include --sysroot=$B/target1 -fno-sanitize=safe-stack -fdiagnostics-color=always" \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_C_COMPILER_WORKS=ON \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
- -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=safe-stack -L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
+ -DCMAKE_SHARED_LINKER_FLAGS="-L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
+ -DCMAKE_EXE_LINKER_FLAGS="-L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
  -DWOS=ON \
  $B/src/llvm-project/runtimes
 

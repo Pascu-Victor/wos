@@ -13,6 +13,12 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->elfBuffer = nullptr;  // No ELF buffer by default
     this->elfBufferSize = 0;
     this->hasRun = false;  // Task hasn't run yet, context.frame contains initial setup
+
+    // Initialize file descriptor table to null
+    for (unsigned i = 0; i < FD_TABLE_SIZE; ++i) {
+        this->fds[i] = nullptr;
+    }
+
     if (type == TaskType::IDLE) {
         return;
     }

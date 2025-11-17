@@ -29,8 +29,10 @@ _wOS_asm_enterUsermode:
 
     swapgs
     ; init usermode stack on rsi
-    mov rbp, rsi
-    mov rsp, rbp
+    mov rsp, rsi
+
+    ; According to x86-64 System V ABI, RBP should be 0 at program entry
+    xor rbp, rbp
 
     ; set segment selectors
     mov ax, 0x1B ; RPL 11 -> RING 3 AND THIRD GDT SELECTOR

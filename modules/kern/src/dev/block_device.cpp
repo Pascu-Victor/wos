@@ -7,6 +7,8 @@
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
+#include "device.hpp"
+
 namespace ker::dev {
 
 // Block device registry
@@ -34,6 +36,20 @@ auto block_device_register(BlockDevice* bdev) -> int {
     mod::io::serial::write("block_device_register: registered ");
     mod::io::serial::write(bdev->name.data());
     mod::io::serial::write("\n");
+
+    // Also register as a device node in /dev
+    // Create a Device wrapper for this block device
+    static Device block_dev_nodes[MAX_BLOCK_DEVICES];  // NOLINT
+    Device* dev_node = &block_dev_nodes[device_count - 1];
+
+    dev_node->major = bdev->major;
+    dev_node->minor = bdev->minor;
+    dev_node->name = bdev->name.data();
+    dev_node->type = DeviceType::BLOCK;
+    dev_node->private_data = bdev;
+    dev_node->char_ops = nullptr;  // Block devices don't use char ops
+
+    dev_register(dev_node);
 
     return 0;
 }
@@ -130,7 +146,6 @@ auto block_device_init() -> void {
         int mount_result = ker::vfs::mount_filesystem("/mnt/disk", "fat32", sdb);
         if (mount_result == 0) {
             ker::mod::dbg::log("FAT32 mount successful!");
-            ker::vfs::set_fat32_mounted(true);  // Mark FAT32 as mounted for VFS routing
         } else {
             ker::mod::dbg::log("FAT32 mount failed with error: %d", mount_result);
         }

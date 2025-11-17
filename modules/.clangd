@@ -10,6 +10,7 @@ CompileFlags:
         - -I../toolchain/target1/include
         - -I../modules/defines
         - -I../modules/extern
+        - -std=c++23
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword

@@ -1,6 +1,7 @@
 #include "sys_log.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 #include "abi/callnums/sys_log.h"
 #include "mod/io/serial/serial.hpp"
@@ -11,6 +12,12 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
     switch (op) {
         case abi::sys_log::sys_log_ops::log:
             if (device == abi::sys_log::sys_log_device::serial) {
+                if (str == nullptr) {
+                    return 1;
+                }
+                if (len == 0) {
+                    len = std::strlen(str);
+                }
                 mod::io::serial::write(str, len);
             } else if (device == abi::sys_log::sys_log_device::vga) {
                 mod::dbg::logFbOnly(str);
@@ -24,6 +31,12 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
             break;
         case ker::abi::sys_log::sys_log_ops::logLine:
             if (device == abi::sys_log::sys_log_device::serial) {
+                if (str == nullptr) {
+                    return 1;
+                }
+                if (len == 0) {
+                    len = std::strlen(str);
+                }
                 mod::io::serial::write(str, len);
                 mod::io::serial::write("\n");
             } else if (device == abi::sys_log::sys_log_device::vga) {

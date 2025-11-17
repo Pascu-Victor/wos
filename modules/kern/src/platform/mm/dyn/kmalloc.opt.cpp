@@ -1,10 +1,14 @@
 #include "kmalloc.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
 
 #include "minimalist_malloc/mini_malloc.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/mm/phys.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::mod::mm::dyn::kmalloc {
 // static tlsf_t tlsf = nullptr;
@@ -74,23 +78,26 @@ void* malloc(uint64_t size) {
         // Round up to page size (4KB)
         uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
         uint64_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
-
+#ifdef DEBUG_KMALLOC
         ker::mod::io::serial::write("kmalloc: Large allocation (");
         ker::mod::io::serial::writeHex(size);
         ker::mod::io::serial::write(" bytes), using pageAlloc (");
         ker::mod::io::serial::writeHex(alloc_size);
         ker::mod::io::serial::write(" bytes)\n");
-
+#endif
         // Allocate physical pages (pageAlloc returns virtual address already)
         void* virt_ptr = phys::pageAlloc(alloc_size);
         if (virt_ptr == nullptr) {
+#ifdef DEBUG_KMALLOC
             ker::mod::io::serial::write("kmalloc: pageAlloc failed for large allocation\n");
+#endif
             return nullptr;
         }
-
+#ifdef DEBUG_KMALLOC
         ker::mod::io::serial::write("kmalloc: Large allocation successful, virt=");
         ker::mod::io::serial::writeHex((uint64_t)virt_ptr);
         ker::mod::io::serial::write("\n");
+#endif
 
         // Track the allocation so we can free it later
         trackAllocation(virt_ptr, alloc_size);
@@ -133,13 +140,14 @@ void free(void* ptr) {
     // First check if this is a large allocation tracked by kmalloc
     uint64_t trackedSize = 0;
     if (untrackAllocation(ptr, trackedSize)) {
+#ifdef DEBUG_KMALLOC
         // It's a large allocation we directly allocated via pageAlloc
         ker::mod::io::serial::write("kmalloc: Freeing large allocation at ");
         ker::mod::io::serial::writeHex((uint64_t)ptr);
         ker::mod::io::serial::write(" (");
         ker::mod::io::serial::writeHex(trackedSize);
         ker::mod::io::serial::write(" bytes)\n");
-
+#endif
         kmallocLock->unlock();
         phys::pageFree(ptr);
         return;

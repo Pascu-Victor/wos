@@ -4,6 +4,8 @@
 #include <defines/defines.hpp>
 #include <dev/ahci.hpp>
 #include <dev/block_device.hpp>
+#include <dev/console.hpp>
+#include <dev/device.hpp>
 #include <dev/pci.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
@@ -19,22 +21,7 @@
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
-// Minimal forward-declarations to avoid including the project's in-tree std headers
-extern "C" __attribute__((noreturn)) void hcf() noexcept;
-
-__attribute__((used, section(".requests"))) static volatile LIMINE_BASE_REVISION(3);
-
-__attribute__((used, section(".requests_start_marker"))) static volatile LIMINE_REQUESTS_START_MARKER;
-
-__attribute__((used, section(".requests"))) static volatile limine_module_request kernelModuleRequest = {
-    .id = LIMINE_MODULE_REQUEST,
-    .revision = 1,
-    .response = nullptr,
-    .internal_module_count = 0,
-    .internal_modules = nullptr,
-};
-
-__attribute__((used, section(".requests_end_marker"))) static volatile LIMINE_REQUESTS_END_MARKER;
+#include "platform/asm/cpu.hpp"
 
 using namespace ker::mod;
 
@@ -47,8 +34,8 @@ extern void (*__init_array_end[])();
 extern void (*__fini_array_start[])();
 extern void (*__fini_array_end[])();
 }
-
-static void callGlobalConstructors() {
+namespace {
+void callGlobalConstructors() {
     for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
         (*ctor)();
     }
@@ -58,12 +45,28 @@ static void callGlobalConstructors() {
     }
 }
 
-static void callGlobalDestructors() {
+void callGlobalDestructors() {
     for (auto* dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
         --dtor;
         (*dtor)();
     }
 }
+
+__attribute__((used, section(".requests"))) volatile LIMINE_BASE_REVISION(3);  // NOLINT
+
+__attribute__((used, section(".requests_start_marker"))) volatile LIMINE_REQUESTS_START_MARKER;  // NOLINT
+
+__attribute__((used, section(".requests"))) volatile limine_module_request kernelModuleRequest = {
+    .id = LIMINE_MODULE_REQUEST,
+    .revision = 1,
+    .response = nullptr,
+    .internal_module_count = 0,
+    .internal_modules = nullptr,
+};
+
+__attribute__((used, section(".requests_end_marker"))) volatile LIMINE_REQUESTS_END_MARKER;  // NOLINT
+
+}  // namespace
 
 // Kernel entry point.
 extern "C" void _start(void) {
@@ -90,7 +93,7 @@ extern "C" void _start(void) {
     // Enable FSGSBASE instructions
     cpu::enableFSGSBASE();
 
-    uint8_t* stack;
+    uint8_t* stack = stack;
     // Init gds.
     asm volatile("mov %%rsp, %0" : "=r"(stack));
     ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
@@ -102,6 +105,12 @@ extern "C" void _start(void) {
     // Init interrupts.
     ker::mod::interrupt::init();
     ker::mod::sys::init();
+
+    // Init device subsystem
+    ker::dev::dev_init();
+
+    // Init console devices
+    ker::dev::console::console_init();
 
     // Init AHCI controller
     ker::dev::ahci::ahci_controller_init();
@@ -142,6 +151,7 @@ extern "C" void _start(void) {
     // Init smt
     ker::mod::smt::startSMT(modules, (uint64_t)stack);
 
+    callGlobalDestructors();
     // Kernel should halt and catch fire if it reaches this point.
     hcf();
 }

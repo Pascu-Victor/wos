@@ -15,6 +15,7 @@
 #include <platform/sched/task.hpp>
 #include <span>
 #include <string_view>
+#include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::syscall::process {
@@ -139,6 +140,21 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     dbg::log("wos_proc_exec: Entry point = 0x%x, RIP = 0x%x", newTask->entry, newTask->context.frame.rip);
 
     newTask->parentPid = parentPid;
+
+    // Initialize fd table to null
+    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
+        newTask->fds[i] = nullptr;
+    }
+
+    // Copy file descriptors from parent task (inherit stdin/stdout/stderr)
+    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
+        if (parentTask->fds[i] != nullptr) {
+            auto* file = static_cast<vfs::File*>(parentTask->fds[i]);
+            newTask->fds[i] = file;
+            // Increment refcount since both parent and child now share this File
+            file->refcount++;
+        }
+    }
 
     newTask->elfBuffer = elfBuffer;
     newTask->elfBufferSize = fileSize;

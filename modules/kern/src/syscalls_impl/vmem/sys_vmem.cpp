@@ -23,11 +23,11 @@ constexpr uint64_t MMAP_START = 0x0000700000000000ULL;        // Typical mmap ba
 
 namespace {
 // Get the current task
-inline ker::mod::sched::task::Task* getCurrentTask() { return ker::mod::sched::getCurrentTask(); }
+inline auto getCurrentTask() -> ker::mod::sched::task::Task* { return ker::mod::sched::getCurrentTask(); }
 
 // Find a free virtual address range of the given size
 // Uses a simple linear search through allocated regions
-uint64_t findFreeRange(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint) {
+auto findFreeRange(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint) -> uint64_t {
     if (task == nullptr || task->pagemap == nullptr) {
         return 0;
     }
@@ -80,7 +80,7 @@ uint64_t findFreeRange(ker::mod::sched::task::Task* task, uint64_t size, uint64_
 }
 
 // Convert protection flags to page table flags
-uint64_t protToPageFlags(uint64_t prot) {
+auto protToPageFlags(uint64_t prot) -> uint64_t {
     uint64_t flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER;
 
     if ((prot & ker::abi::vmem::PROT_WRITE) != 0) {
@@ -96,7 +96,7 @@ uint64_t protToPageFlags(uint64_t prot) {
 }
 
 // Allocate anonymous memory
-uint64_t anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) {
+auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {
     // Get current task
     auto* task = getCurrentTask();
     if (task == nullptr) {
@@ -177,7 +177,7 @@ uint64_t anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flag
 }
 
 // Free anonymous memory
-uint64_t anonFree(uint64_t addr, uint64_t size) {
+auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
     // Get current task
     auto* task = getCurrentTask();
     if (task == nullptr) {
@@ -237,7 +237,7 @@ uint64_t anonFree(uint64_t addr, uint64_t size) {
 }  // anonymous namespace
 
 // Main syscall handler
-uint64_t sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
     switch (static_cast<ker::abi::vmem::ops>(op)) {
         case ker::abi::vmem::ops::anon_allocate: {
             // a1: hint address
@@ -257,6 +257,17 @@ uint64_t sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a
             ker::mod::dbg::log("vmem: invalid operation %llu", op);
             return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
     }
+}
+
+auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
+    // For now, only support anonymous mappings
+    if (fd != (uint64_t)(-1)) {
+        ker::mod::dbg::log("vmem_map: only anonymous mappings supported");
+        return (uint64_t)(-ker::abi::vmem::VMEM_ENOSYS);
+    }
+
+    // Use anonAllocate for anonymous mappings
+    return anonAllocate(hint, size, prot, flags);
 }
 
 }  // namespace ker::syscall::vmem

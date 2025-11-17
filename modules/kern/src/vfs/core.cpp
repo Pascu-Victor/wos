@@ -3,38 +3,19 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <string_view>
+#include <vfs/fs/devfs.hpp>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/mount.hpp>
 
 #include "file.hpp"
+#include "fs/devfs.hpp"
 #include "fs/fat32.hpp"
 #include "fs/tmpfs.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "vfs.hpp"
 
 namespace ker::vfs {
-
-// Function to mark FAT32 as mounted (called from main after successful mount)
-namespace {
-bool fat32_mounted = false;
-}
-
-void set_fat32_mounted(bool mounted) { fat32_mounted = mounted; }
-
-namespace {
-// Check if path starts with a FAT32 mount point
-auto is_fat32_path(const char* path) -> bool {
-    // For now, only support /mnt/ and /fat32/ as FAT32 mount points
-    if (path == nullptr) {
-        return false;
-    }
-    if (path[0] != '/') {
-        return false;
-    }
-    return (path[1] == 'm' && path[2] == 'n' && path[3] == 't' && path[4] == '/') ||
-           (path[1] == 'f' && path[2] == 'a' && path[3] == 't' && path[4] == '3' && path[5] == '2' && path[6] == '/');
-}
-}  // namespace
 
 auto vfs_open(std::string_view path, int flags, int mode) -> int {
     mod::io::serial::write("vfs_open: opening file\n");
@@ -54,21 +35,41 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return -1;
     }
 
+    // Find the mount point for this path
+    MountPoint* mount = find_mount_point(pathBuffer);
+    if (mount == nullptr) {
+        mod::io::serial::write("vfs_open: no mount point found for path\n");
+        return -1;
+    }
+
     ker::vfs::File* f = nullptr;
 
-    // Route to the appropriate filesystem driver
-    if (fat32_mounted && is_fat32_path(pathBuffer)) {
-        // FAT32 path
-        f = ker::vfs::fat32::fat32_open_path(pathBuffer, flags, mode);
-        if (f != nullptr) {
-            f->fops = ker::vfs::fat32::get_fat32_fops();
-        }
-    } else {
-        // Default to tmpfs
-        f = ker::vfs::tmpfs::tmpfs_open_path(pathBuffer, flags, mode);
-        if (f != nullptr) {
-            f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
-        }
+    // Route to the appropriate filesystem driver based on mount point
+    switch (mount->fs_type) {
+        case FSType::DEVFS:
+            f = ker::vfs::devfs::devfs_open_path(pathBuffer, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::devfs::get_devfs_fops();
+                f->fs_type = FSType::DEVFS;
+            }
+            break;
+        case FSType::FAT32:
+            f = ker::vfs::fat32::fat32_open_path(pathBuffer, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::fat32::get_fat32_fops();
+                f->fs_type = FSType::FAT32;
+            }
+            break;
+        case FSType::TMPFS:
+            f = ker::vfs::tmpfs::tmpfs_open_path(pathBuffer, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
+                f->fs_type = FSType::TMPFS;
+            }
+            break;
+        default:
+            mod::io::serial::write("vfs_open: unknown filesystem type\n");
+            return -1;
     }
 
     if (f == nullptr) {
@@ -93,15 +94,24 @@ auto vfs_close(int fd) -> int {
     if (f == nullptr) {
         return -1;
     }
-    if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
-        f->fops->vfs_close(f);
-    }
+    
+    // Decrement reference count
+    f->refcount--;
+    
     // Release the FD from the task's file descriptor table
     vfs_release_fd(t, fd);
-    // Free the File descriptor object (just the handle/wrapper)
-    // but keep the underlying fs node (f->private_data) intact
-    // so the file can be reopened later
-    ker::mod::mm::dyn::kmalloc::free((void*)f);
+    
+    // Only call close and free if no more references
+    if (f->refcount <= 0) {
+        if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
+            f->fops->vfs_close(f);
+        }
+        // Free the File descriptor object (just the handle/wrapper)
+        // but keep the underlying fs node (f->private_data) intact
+        // so the file can be reopened later
+        ker::mod::mm::dyn::kmalloc::free((void*)f);
+    }
+    
     return 0;
 }
 
@@ -208,12 +218,65 @@ auto vfs_isatty(int fd) -> bool {
     return f->fops->vfs_isatty(f);
 }
 
+auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
+    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    if (t == nullptr) {
+        return -1;
+    }
+    ker::vfs::File* f = vfs_get_file(t, fd);
+    if (f == nullptr) {
+        return -1;
+    }
+
+    // Check if this is a directory
+    if (!f->is_directory) {
+        return -ENOTDIR;
+    }
+
+    if ((f->fops == nullptr) || (f->fops->vfs_readdir == nullptr)) {
+        return -ENOSYS;
+    }
+
+    // Buffer must be large enough for at least one DirEntry
+    if (buffer == nullptr || max_size < sizeof(DirEntry)) {
+        return -EINVAL;
+    }
+
+    auto* entries = static_cast<DirEntry*>(buffer);
+    size_t max_entries = max_size / sizeof(DirEntry);
+    size_t entries_read = 0;
+
+    // Read directory entries using the current position as index
+    size_t start_index = static_cast<size_t>(f->pos);
+
+    for (size_t i = 0; i < max_entries; ++i) {
+        int ret = f->fops->vfs_readdir(f, &entries[i], start_index + i);
+        if (ret != 0) {
+            // End of directory or error
+            break;
+        }
+        entries_read++;
+    }
+
+    // Update file position
+    f->pos += static_cast<off_t>(entries_read);
+
+    return static_cast<ssize_t>(entries_read * sizeof(DirEntry));
+}
+
 void init() {
     mod::io::serial::write("vfs: init\n");
     // Register tmpfs as a minimal root filesystem
     ker::vfs::tmpfs::register_tmpfs();
+    // Mount tmpfs at root
+    mount_filesystem("/", "tmpfs", nullptr);
+
     // Register FAT32 driver (will be mounted when a disk is available)
     ker::vfs::fat32::register_fat32();
+
+    // Register and mount devfs for device files
+    ker::vfs::devfs::devfs_init();
+    mount_filesystem("/dev", "devfs", nullptr);
 }
 
 }  // namespace ker::vfs

@@ -25,5 +25,6 @@ constexpr int VMEM_ENOMEM = 12;     // Out of memory
 constexpr int VMEM_EINVAL = 22;     // Invalid argument
 constexpr int VMEM_EFAULT = 14;     // Bad address
 constexpr int VMEM_EOVERFLOW = 75;  // Value too large
+constexpr int VMEM_ENOSYS = 38;     // Function not implemented
 
 }  // namespace ker::abi::vmem

@@ -6,11 +6,16 @@
 #include <cstring>
 #include <string_view>
 
+#include "platform/asm/cpu.hpp"
+#include "platform/asm/msr.hpp"
 #include "platform/boot/handover.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
+#include "vfs/fs/devfs.hpp"
 
 __attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
     .id = LIMINE_SMP_REQUEST,
@@ -19,19 +24,11 @@ __attribute__((used, section(".requests"))) const static volatile limine_smp_req
     .flags = 1,
 };
 namespace ker::mod::smt {
+namespace {
 static PerCpuCrossAccess<CpuInfo>* cpuData;
 uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t cpu_count;
-
-uint64_t getCoreCount(void) { return cpu_count; }
-
-const CpuInfo getCpu(uint64_t number) { return *cpuData->thatCpu(number); }
-
-const CpuInfo thisCpuInfo() { return *cpuData->thisCpu(); }
-
-// Future NUMA support here
-uint64_t getCpuNode(uint64_t cpuNo) { return cpuNo; }
 
 void cpuParamInit() {
     apic::initApicMP();
@@ -61,6 +58,30 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         const auto& module = modStruct.modules[i];
         auto* newTask = new sched::task::Task(module.name, (uint64_t)module.entry, kernelRsp, sched::task::TaskType::PROCESS);
 
+        // Setup stdin/stdout/stderr for init process
+        // Open /dev/console as fd 0, 1, 2
+        ker::vfs::File* console_stdin = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+        ker::vfs::File* console_stdout = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+        ker::vfs::File* console_stderr = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+
+        if (console_stdin != nullptr && console_stdout != nullptr && console_stderr != nullptr) {
+            console_stdin->fops = ker::vfs::devfs::get_devfs_fops();
+            console_stdout->fops = ker::vfs::devfs::get_devfs_fops();
+            console_stderr->fops = ker::vfs::devfs::get_devfs_fops();
+
+            // Assign file descriptors 0, 1, 2
+            newTask->fds[0] = console_stdin;
+            console_stdin->fd = 0;
+            newTask->fds[1] = console_stdout;
+            console_stdout->fd = 1;
+            newTask->fds[2] = console_stderr;
+            console_stderr->fd = 2;
+
+            dbg::log("Setup stdin/stdout/stderr for task %s", module.name);
+        } else {
+            dbg::log("WARNING: Failed to open /dev/console for task %s", module.name);
+        }
+
         // Setup minimal argc/argv/envp on user stack
         uint64_t userStackVirt = newTask->thread->stack;
         uint64_t currentVirtOffset = 0;
@@ -84,8 +105,9 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
 
             auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
             std::memcpy(destPtr, data, size);
+#ifdef TASK_DEBUG
             dbg::log("Pushed %d bytes: virt=0x%x, phys=0x%x, data[0]=0x%x", size, virtAddr, pagePhys, *(uint32_t*)data);
-
+#endif
             return virtAddr;
         };
 
@@ -109,8 +131,9 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
 
             auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
             std::memcpy(destPtr, str, len);
+#ifdef TASK_DEBUG
             dbg::log("Pushed string '%s' at virt=0x%x (len=%d)", str, virtAddr, len);
-
+#endif
             return virtAddr;
         };
 
@@ -160,15 +183,28 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         newTask->context.regs.rdi = argc;
         newTask->context.regs.rsi = argvPtr;
         newTask->context.regs.rdx = envpPtr;
-
+#ifdef TASK_DEBUG
         dbg::log("Task %s: argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", module.name, argc, argvPtr, envpPtr, newTask->context.frame.rsp);
         dbg::log("  userStackVirt=0x%x, currentVirtOffset=0x%x, argv0=0x%x", userStackVirt, currentVirtOffset, argv0);
+#endif
 
         sched::postTask(newTask);
     }
+#ifdef TASK_DEBUG
     dbg::log("Posted task for main thread");
+#endif
     sched::startScheduler();
 }
+}  // namespace
+
+auto thisCpuInfo() -> const CpuInfo& { return *cpuData->thisCpu(); }
+
+// Future NUMA support here
+auto getCpuNode(uint64_t cpuNo) -> uint64_t { return cpuNo; }
+
+auto getCoreCount() -> uint64_t { return cpu_count; }
+
+auto getCpu(uint64_t number) -> const CpuInfo& { return *cpuData->thatCpu(number); }
 
 void init() {
     assert(smp_request.response != nullptr);
@@ -200,17 +236,21 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     hcf();
 }
 
-uint64_t cpuCount() { return cpu_count; }
+auto cpuCount() -> uint64_t { return cpu_count; }
 
 // update fsbase in current thread and switch the fs_base register
-uint64_t setTcb(void* tcb) {
+auto setTcb(void* tcb) -> uint64_t {
+#ifdef SMT_DEBUG
     mod::dbg::log("setTcb called with tcb = 0x%x", (uint64_t)tcb);
+#endif
     asm volatile("cli");
     cpuData->thisCpu()->currentTask->thread->fsbase = (uint64_t)tcb;
     *(uint64_t*)tcb = (uint64_t)tcb;
     cpu::wrfsbase((uint64_t)tcb);
     asm volatile("sti");
+#ifdef SMT_DEBUG
     mod::dbg::log("setTcb: fsbase set to 0x%x", (uint64_t)tcb);
+#endif
     return 0;
 }
 
