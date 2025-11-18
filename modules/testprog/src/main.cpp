@@ -15,17 +15,6 @@
 // Alternative main function for testing with argc/argv
 auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
-    FILE* tty = fopen("/dev/tty0", "r+");
-    if (tty == nullptr) {
-        std::print("testprog: Failed to open /dev/tty0\n");
-        return 1;
-    }
-    std::print("testprog: Opened /dev/tty0 successfully\n");
-
-    setvbuf(tty, nullptr, _IONBF, 0);
-    std::freopen("/dev/tty0", "r+", stdin);
-    std::freopen("/dev/tty0", "r+", stdout);
-    std::freopen("/dev/tty0", "r+", stderr);
     std::println("testprog: main() called");
     // Log argc
     std::println("testprog: argc = {}", argc);
