@@ -36,6 +36,13 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     apic::oneShotTimer(timerQuantum);
 }
 
+extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
+    auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
+    auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
+
+    sched::jumpToNextTask(*gpr_ptr, *frame_ptr);
+}
+
 void startSchedTimer() {
     timerQuantum = apic::calibrateTimer(400);
     apic::oneShotTimer(timerQuantum);

@@ -68,5 +68,5 @@ struct Task {
     void saveContext(cpu::GPRegs* gpr);
 } __attribute__((packed));
 
-uint64_t getNextPid();
+auto getNextPid() -> uint64_t;
 }  // namespace ker::mod::sched::task

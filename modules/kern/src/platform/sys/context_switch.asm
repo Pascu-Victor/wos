@@ -70,3 +70,46 @@ task_switch_handler:
     add rsp, 16  ; Skip intNum and errCode
     sti
     iretq
+
+; Jump to next task without saving current task state
+; Used when a task is exiting and doesn't need its context preserved
+extern _wOS_jumpToNextTaskNoSave
+global jump_to_next_task_no_save
+jump_to_next_task_no_save:
+    ; Push dummy GPRegs structure
+    push 0  ; rax
+    push 0  ; rbx
+    push 0  ; rcx
+    push 0  ; rdx
+    push 0  ; rsi
+    push 0  ; rdi
+    push 0  ; rbp
+    push 0  ; r8
+    push 0  ; r9
+    push 0  ; r10
+    push 0  ; r11
+    push 0  ; r12
+    push 0  ; r13
+    push 0  ; r14
+    push 0  ; r15
+
+    ; Push dummy interrupt frame
+    push 0  ; SS
+    push 0  ; RSP
+    push 0  ; RFLAGS
+    push 0  ; CS
+    push 0  ; RIP
+    push 0  ; errCode
+    push 0  ; intNum
+
+    mov rdi, rsp
+    call _wOS_jumpToNextTaskNoSave
+
+    popq
+    cmp qword [rsp + 32], qword 0x1b
+    jne .no_swapgs_exit
+    swapgs
+    .no_swapgs_exit:
+    add rsp, 16  ; Skip intNum and errCode
+    sti
+    iretq

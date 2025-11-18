@@ -142,8 +142,8 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     newTask->parentPid = parentPid;
 
     // Initialize fd table to null
-    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
-        newTask->fds[i] = nullptr;
+    for (auto& fd : newTask->fds) {
+        fd = nullptr;
     }
 
     // Copy file descriptors from parent task (inherit stdin/stdout/stderr)

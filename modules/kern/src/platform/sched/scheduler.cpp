@@ -7,9 +7,13 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 
+#include "platform/acpi/apic/apic.hpp"
+#include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
+#include "platform/interrupt/gates.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sys/context_switch.hpp"
 
 namespace ker::mod::sched {
 // One run queue per cpu
@@ -53,6 +57,18 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
 
     runQueues->thisCpu()->activeTasks.pop_front();
     runQueues->thisCpu()->activeTasks.push_back(currentTask);
+    task::Task* nextTask = runQueues->thisCpu()->activeTasks.front();
+
+    // Mark the next task as having run
+    nextTask->hasRun = true;
+
+    sys::context_switch::switchTo(gpr, frame, nextTask);
+}
+
+// Jump to the next task without saving the current task's state
+void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
+    apic::eoi();
+    runQueues->thisCpu()->activeTasks.pop_front();
     task::Task* nextTask = runQueues->thisCpu()->activeTasks.front();
 
     // Mark the next task as having run

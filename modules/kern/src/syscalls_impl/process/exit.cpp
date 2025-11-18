@@ -4,6 +4,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::syscall::process {
@@ -44,11 +45,8 @@ void wos_proc_exit(int status) {
 
     ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");
 
-    // Remove this task from the runqueue
-    ker::mod::sched::removeCurrentTask();
-
-    // This will never return
-    asm volatile("int $0x20");
+    // This function will not return
+    jump_to_next_task_no_save();
 
     __builtin_unreachable();
 }

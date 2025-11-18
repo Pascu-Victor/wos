@@ -162,7 +162,7 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     } else {
         if (!isIrq(frame.intNum)) {
             ker::mod::apic::eoi();
-            ker::mod::io::serial::write("No handler for interrupt");
+            ker::mod::io::serial::write("No handler for interrupt ");
             ker::mod::io::serial::write(frame.intNum);
             ker::mod::io::serial::write("\n");
             hcf();
