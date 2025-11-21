@@ -2,6 +2,8 @@
 
 Welcome to WOS, a multi-system, multi-tasking operating system.
 
+**Warning** here be daemons! this is an in-development project you will need to compile the toolchain using the instructions in build-llvm.sh this project for now is in a "works on my system" basis.
+
 ## Overview
 
 WOS aims to create a modern, efficient, and seamless multitasking system that scales across multiple networked computers
