@@ -20,6 +20,8 @@ cd $B/src
 # 2. Build stage1 clang/lld for the host
 export CFLAGS="-std=c23"
 export CXXFLAGS="-std=c++23"
+export CC=clang
+export CXX=clang++
 mkdir -p $B/stage1-build
 cd $B/stage1-build
 cmake -G Ninja \
@@ -109,7 +111,7 @@ mkdir -p $B/compiler-rt-build
 cd $B/compiler-rt-build
 cmake -G Ninja \
  -DCMAKE_BUILD_TYPE=Release \
- -DCMAKE_INSTALL_PREFIX=$B/target1/lib/clang/21/target \
+ -DCMAKE_INSTALL_PREFIX=$B/target1/lib/clang/22/target \
  -DCMAKE_C_COMPILER=$CC \
  -DCMAKE_CXX_COMPILER=$CXX \
  -DCMAKE_SYSROOT=$B/target1 \
@@ -142,19 +144,19 @@ cmake -G Ninja \
 
 ninja && ninja install
 
-mkdir -p $B/target1/lib/clang/21/lib/$TARGET_ARCH
-mv $B/target1/lib/clang/21/target/lib/* $B/target1/lib/clang/21/lib/$TARGET_ARCH
-mv $B/target1/lib/clang/21/target/include $B/target1/lib/clang/21/include
+mkdir -p $B/target1/lib/clang/22/lib/$TARGET_ARCH
+mv $B/target1/lib/clang/22/target/lib/* $B/target1/lib/clang/22/lib/$TARGET_ARCH
+mv $B/target1/lib/clang/22/target/include $B/target1/lib/clang/22/include
 
-rm -rf $B/target1/lib/clang/21/target
+rm -rf $B/target1/lib/clang/22/target
 
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.builtins.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtbegin.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/22/lib/libclang_rt.builtins.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/22/lib/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/22/lib/libclang_rt.crtend.a
 
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.builtins.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
-ln -fs $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/21/lib/$TARGET_ARCH/libclang_rt.crtend.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.builtins.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
+ln -fs $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $B/target1/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend.a
 
 # 6.1 fail building libcxx for it's headers see {{cxx-headers}} maybe
 
@@ -199,6 +201,7 @@ cmake -G Ninja \
 ninja && ninja install
 
 #copy $B/libcxx-build/include to $B/target1/include
+
 cp -r $B/libcxx-build/include/* $B/target1/include/
 
 # 6. Build mlibc
@@ -207,8 +210,8 @@ cp -r $B/libcxx-build/include/* $B/target1/include/
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/21/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/22/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/22/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 
@@ -286,8 +289,8 @@ cmake -G Ninja \
  -DCMAKE_C_COMPILER_TARGET=$TARGET_ARCH \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_ASM_COMPILER_TARGET=$TARGET_ARCH \
- -DCMAKE_SHARED_LINKER_FLAGS="-L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
- -DCMAKE_EXE_LINKER_FLAGS="-L$B/target1/lib/clang/21/lib/$TARGET_ARCH" \
+ -DCMAKE_SHARED_LINKER_FLAGS="-L$B/target1/lib/clang/22/lib/$TARGET_ARCH" \
+ -DCMAKE_EXE_LINKER_FLAGS="-L$B/target1/lib/clang/22/lib/$TARGET_ARCH" \
  -DWOS=ON \
  $B/src/llvm-project/runtimes
 
