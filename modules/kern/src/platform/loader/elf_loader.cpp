@@ -882,7 +882,8 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                 break;
 
             case PT_DYNAMIC:
-                mod::dbg::log("WARN: PT_DYNAMIC skipped FIXME!");
+                // TODO: should be fine since mlibc loads these
+                // mod::dbg::log("WARN: PT_DYNAMIC skipped FIXME!");
                 break;
 
             case PT_NOTE:
