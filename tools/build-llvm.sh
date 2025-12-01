@@ -85,6 +85,7 @@ meson setup --prefix=$B/target1 \
     --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
     -Dbindir=bin \
     -Dwos_option=enabled \
+    -D_GNU_SOURCE \
     -Dglibc_option=enabled \
     -Db_staticpic=false \
     $B/src/mlibc
@@ -210,7 +211,7 @@ cp -r $B/libcxx-build/include/* $B/target1/include/
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/22/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/lib/clang/22/include', '-isystem', '$B/target1/include', '-mcmodel=small']
 cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$B/target1', '-isystem', '$B/target1/include/c++/v1', '-isystem', '$B/target1/lib/clang/22/include', '-isystem', '$B/target1/include', '-fno-PIC', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
@@ -238,7 +239,7 @@ meson setup --prefix=$B/target1 \
   -Dheaders_only=false \
   -Dwos_option=enabled \
   -Dglibc_option=enabled \
-  -Ddefault_library=static \
+  -Ddefault_library=both \
   -Duse_freestnd_hdrs=enabled \
   -Dposix_option=enabled \
   -Dbsd_option=enabled \
