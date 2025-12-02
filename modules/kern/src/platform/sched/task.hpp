@@ -23,7 +23,7 @@ enum TaskType {
 
 struct Context {
     uint64_t syscallKernelStack;
-    uint64_t syscallUserStack;
+    uint64_t syscallScratchArea;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
 
     cpu::GPRegs regs;
 

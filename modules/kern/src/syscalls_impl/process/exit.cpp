@@ -4,7 +4,11 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/mm.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/threading.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <vfs/vfs.hpp>
 
@@ -62,14 +66,16 @@ void wos_proc_exit(int status) {
         }
     }
 
-    // Cleanup task resources
+    // CLEANUP TASK RESOURCES
 
+    // Close all open file descriptors
     for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
         if (currentTask->fds[i] != nullptr) {
             ker::vfs::vfs_close(static_cast<int>(i));
         }
     }
 
+    // Free ELF buffer
     if (currentTask->elfBuffer != nullptr) {
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Freeing ELF buffer of size %d", currentTask->elfBufferSize);
@@ -79,13 +85,43 @@ void wos_proc_exit(int status) {
         currentTask->elfBufferSize = 0;
     }
 
-    // TODO: Free other resources:
-    // - User stack memory
-    // - Kernel stack memory
-    // - Thread/TLS structures
-    // - Page tables
-    // - Signal handlers
-    // TODO: Signal handling:
+    // Free the entire user address space (user stack, mmap regions, code pages, etc.)
+    if (currentTask->pagemap != nullptr) {
+#ifdef EXIT_DEBUG
+        ker::mod::dbg::log("wos_proc_exit: Destroying user address space for PID %x", currentTask->pid);
+#endif
+        // Switch to kernel pagemap first to avoid using the pagemap we're about to free
+        ker::mod::mm::virt::switchToKernelPagemap();
+
+        // Free all user-space pages and page tables
+        ker::mod::mm::virt::destroyUserSpace(currentTask->pagemap);
+
+        // Free the PML4 page table itself
+        ker::mod::mm::phys::pageFree(currentTask->pagemap);
+        currentTask->pagemap = nullptr;
+    }
+
+    // Free thread resources (TLS, user stack)
+    if (currentTask->thread != nullptr) {
+        ker::mod::sched::threading::destroyThread(currentTask->thread);
+        currentTask->thread = nullptr;
+    }
+
+    // Free kernel stack memory (allocated separately for syscall handling)
+    if (currentTask->context.syscallKernelStack != 0) {
+        // We need to free from the base (bottom) of the stack
+        void* stackBase = (void*)(currentTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
+        ker::mod::mm::phys::pageFree(stackBase);
+        currentTask->context.syscallKernelStack = 0;
+    }
+
+    // Free syscall scratch area (allocated with new uint8_t[256])
+    if (currentTask->context.syscallScratchArea != 0) {
+        delete[] reinterpret_cast<uint8_t*>(currentTask->context.syscallScratchArea);
+        currentTask->context.syscallScratchArea = 0;
+    }
+
+    // TODO: Handle signal handlers cleanup
 
 #ifdef EXIT_DEBUG
     ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");

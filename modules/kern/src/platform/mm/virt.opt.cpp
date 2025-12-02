@@ -348,4 +348,63 @@ void mapRangeToKernelPageTable(Range range, uint64_t flags) {
     mapRange(kernelPagemap, range, flags, addr::getHHDMOffset());
 }
 
+// Helper to free a page table level recursively
+// level: 4=PML4, 3=PML3, 2=PML2, 1=PML1
+static void freePageTableLevel(PageTable* table, int level) {
+    if (table == nullptr || level < 1) {
+        return;
+    }
+
+    // For user space, only process entries 0-255 at PML4 level
+    // Entries 256-511 are kernel space and must not be touched
+    size_t maxEntry = (level == 4) ? 256 : 512;
+
+    for (size_t i = 0; i < maxEntry; i++) {
+        if (table->entries[i].present == 0) {
+            continue;
+        }
+
+        uint64_t physAddr = static_cast<uint64_t>(table->entries[i].frame) << paging::PAGE_SHIFT;
+        if (physAddr == 0) {
+            continue;
+        }
+
+        if (level > 1) {
+            // This entry points to another page table - recurse
+            // Check for huge pages (2MB at level 2, 1GB at level 3)
+            if (table->entries[i].pagesize != 0) {
+                // Huge page - the frame is the actual data, not a page table
+                // Don't recurse, just clear the entry
+                // Note: We don't free huge pages here as they may be specially allocated
+            } else {
+                PageTable* nextLevel = reinterpret_cast<PageTable*>(addr::getVirtPointer(physAddr));
+                freePageTableLevel(nextLevel, level - 1);
+                // Free the page table page itself
+                phys::pageFree(nextLevel);
+            }
+        } else {
+            // Level 1 (PML1) - entries point to actual data pages
+            void* pageVirt = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
+            phys::pageFree(pageVirt);
+        }
+
+        // Clear the entry
+        table->entries[i] = paging::purgePageTableEntry();
+    }
+}
+
+void destroyUserSpace(PageTable* pagemap) {
+    if (pagemap == nullptr) {
+        return;
+    }
+
+    // Free all user-space mappings (PML4 entries 0-255)
+    // This recursively frees all page tables and data pages
+    freePageTableLevel(pagemap, 4);
+
+    // Invalidate TLB for this address space
+    // Note: We should already be on a different pagemap when calling this
+    wrcr3(rdcr3());
+}
+
 }  // namespace ker::mod::mm::virt

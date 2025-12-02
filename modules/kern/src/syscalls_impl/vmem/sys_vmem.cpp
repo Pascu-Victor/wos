@@ -154,12 +154,14 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
         // Allocate a physical page
         void* physPage = ker::mod::mm::phys::pageAlloc();
         if (physPage == nullptr) {
-            // Out of physical memory - unmap what we've allocated so far
+            // Out of physical memory - dump allocation info and unmap what we've allocated so far
             for (uint64_t j = 0; j < i; j++) {
                 uint64_t unmapVaddr = vaddr + (j * ker::mod::mm::paging::PAGE_SIZE);
                 ker::mod::mm::virt::unmapPage(task->pagemap, unmapVaddr);
             }
-            ker::mod::dbg::log("vmem: out of physical memory at page %llu/%llu", i, numPages);
+            ker::mod::dbg::log("vmem: out of physical memory at page %d/%d", i, numPages);
+            ker::mod::mm::phys::dumpPageAllocationsOOM();
+            // TODO: implement process termination on OOM here for now dump will HCF
             return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
         }
 

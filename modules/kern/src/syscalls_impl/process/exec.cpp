@@ -23,21 +23,12 @@ namespace ker::syscall::process {
 
 namespace {
 auto allocateKernelStack() -> uint64_t {
-    constexpr size_t KERNEL_STACK_PAGES = 4;
-    uint64_t stackBase = 0;
-
-    for (size_t i = 0; i < KERNEL_STACK_PAGES; i++) {
-        auto page = (uint64_t)ker::mod::mm::phys::pageAlloc();
-        if (page == 0) {
-            // TODO: free previously allocated pages
-            return 0;
-        }
-        if (i == 0) {
-            stackBase = page;
-        }
+    auto stackBase = (uint64_t)ker::mod::mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    if (stackBase == 0) {
+        return 0;
     }
 
-    return stackBase + (KERNEL_STACK_PAGES * ker::mod::mm::paging::PAGE_SIZE);
+    return stackBase + KERNEL_STACK_SIZE;
 }
 
 }  // namespace

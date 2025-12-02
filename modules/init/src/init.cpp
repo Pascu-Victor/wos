@@ -80,25 +80,27 @@ auto main() -> int {
     // Test: Process execution
     std::println("init: TEST: Process Execution");
     std::println("init: Testing process exec");
+    int pids[30000] = {};
+    for (int& pid : pids) {
+        const char* progPath = "/mnt/disk/testprog";
+        std::array<const char*, 4> argv = {"/mnt/disk/testprog", "arg1", "arg2", nullptr};
+        std::array<const char*, 1> envp = {nullptr};
 
-    const char* progPath = "/mnt/disk/testprog";
-    std::array<const char*, 4> argv = {"/mnt/disk/testprog", "arg1", "arg2", nullptr};
-    std::array<const char*, 1> envp = {nullptr};
+        std::println("init: Calling exec");
 
-    std::println("init: Calling exec");
-
-    uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
-
-    if (child_pid < 0) {
-        std::println("init: exec failed (this is expected if testprog not in VFS)");
-    } else {
-        std::println("init: exec succeeded!");
+        uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
+        pid = static_cast<int>(child_pid);
+        if (child_pid < 0) {
+            std::println("init: exec failed (this is expected if testprog not in VFS)");
+        } else {
+            std::println("init: exec succeeded!");
+        }
     }
-
-    int child_exit_code = 0;
-    ker::process::waitpid(child_pid, &child_exit_code, 0);
-    std::println("init: Child process exited with code {}", child_exit_code);
-
+    for (int& pid : pids) {
+        int child_exit_code = 0;
+        ker::process::waitpid(pid, &child_exit_code, 0);
+        std::println("init: Child process {} exited with code {}", pid, child_exit_code);
+    }
     std::println("init: All tests complete, looping...");
 
     // Loop forever

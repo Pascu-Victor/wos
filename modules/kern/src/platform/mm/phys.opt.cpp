@@ -4,12 +4,15 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/smt/smt.hpp>
 
 #include "buddy_alloc/buddy_alloc.hpp"
 #include "limine.h"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/sys/spinlock.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::mod::mm::phys {
 
@@ -18,6 +21,9 @@ sys::Spinlock memlock;
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
 }  // namespace
 
+auto getZones() -> paging::PageZone* { return zones; }
+
+namespace {
 auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone* {
     auto* zone = (paging::PageZone*)base;
 
@@ -33,6 +39,23 @@ auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone*
 
     return zone;
 }
+
+auto findFreeBlock(uint64_t size) -> void* {
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if (zone->len < size) {
+            continue;
+        }
+        void* const block = buddy_malloc(zone->buddyInstance, size);
+        if (block == nullptr) {
+            [[unlikely]] continue;
+        }
+        return block;
+    }
+
+    return nullptr;
+}
+
+}  // namespace
 
 void init(limine_memmap_response* memmapResponse) {
     if (memmapResponse == nullptr) {
@@ -66,27 +89,17 @@ void init(limine_memmap_response* memmapResponse) {
     zones_tail->next = nullptr;
 }
 
-static auto findFreeBlock(uint64_t size) -> void* {
-    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-        if (zone->len < size) {
-            continue;
-        }
-        void* const block = buddy_malloc(zone->buddyInstance, size);
-        if (block == nullptr) {
-            [[unlikely]] continue;
-        }
-        return block;
-    }
-
-    return nullptr;
-}
-
 auto pageAlloc(uint64_t size) -> void* {
     memlock.lock();
     void* block = findFreeBlock(size);
 
     if (block == nullptr) {
         [[unlikely]] memlock.unlock();
+        // OOM condition - dump allocation info for debugging
+        io::serial::write("OOM: pageAlloc failed for size ");
+        io::serial::writeHex(size);
+        io::serial::write(" bytes\n");
+        dumpPageAllocationsOOM();
         return nullptr;
     }
 

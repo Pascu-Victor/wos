@@ -1,6 +1,7 @@
 #pragma once
 
 #include <buddy_alloc/buddy_alloc.hpp>
+#include <cstdint>
 #include <defines/defines.hpp>
 
 #define PAGE_ALIGN_UP(addr) (((addr) + ker::mod::mm::paging::PAGE_SIZE - 1) & (~(ker::mod::mm::paging::PAGE_SIZE - 1)))

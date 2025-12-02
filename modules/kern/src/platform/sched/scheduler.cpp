@@ -72,6 +72,7 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
 // Jump to the next task without saving the current task's state
 void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
     apic::eoi();
+    runQueues->thisCpu()->expiredTasks.push_back(getCurrentTask());
     runQueues->thisCpu()->activeTasks.pop_front();
     task::Task* nextTask = runQueues->thisCpu()->activeTasks.front();
 
@@ -96,7 +97,7 @@ void startScheduler() {
     firstTask->hasRun = true;
 
     cpuSetMSR(IA32_KERNEL_GS_BASE, firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
-    cpuSetMSR(IA32_GS_BASE, firstTask->context.syscallUserStack - USER_STACK_SIZE);
+    cpuSetMSR(IA32_GS_BASE, firstTask->context.syscallScratchArea);  // Scratch area base, not end
     cpuSetMSR(IA32_FS_BASE, firstTask->thread->fsbase);
     wrgsbase(firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
 
@@ -249,6 +250,21 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
             asm volatile("hlt");
         }
     }
+}
+
+auto getRunQueueStats(uint64_t cpuNo) -> RunQueueStats {
+    RunQueueStats stats = {0, 0, 0};
+    if (runQueues == nullptr) {
+        return stats;
+    }
+    auto* runQueue = runQueues->thatCpu(cpuNo);
+    if (runQueue == nullptr) {
+        return stats;
+    }
+    stats.activeTaskCount = runQueue->activeTasks.size();
+    stats.expiredTaskCount = runQueue->expiredTasks.size();
+    stats.waitQueueCount = runQueue->waitQueue.size();
+    return stats;
 }
 
 }  // namespace ker::mod::sched

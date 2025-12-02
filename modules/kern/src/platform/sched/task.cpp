@@ -38,7 +38,8 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->type = type;
     this->cpu = cpu::currentCpu();
     this->context.syscallKernelStack = kernelRsp;
-    this->context.syscallUserStack = (uint64_t)(new uint8_t[USER_STACK_SIZE]) + USER_STACK_SIZE;
+    // Allocate a small scratch area for syscall handler (stores RIP, RSP, RFLAGS, DS, ES)
+    this->context.syscallScratchArea = (uint64_t)(new uint8_t[256]);
     this->pid = sched::task::getNextPid();
 
     // FIXED: Parse ELF first to get actual TLS size, then create thread
@@ -98,8 +99,8 @@ Task::Task(const Task& task) {
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 
 void Task::saveContext(cpu::GPRegs* gpr) {
-    cpuSetMSR(IA32_GS_BASE, (uint64_t)this->context.syscallUserStack - USER_STACK_SIZE);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)this->context.syscallKernelStack - KERNEL_STACK_SIZE);
+    cpuSetMSR(IA32_GS_BASE, this->context.syscallScratchArea);  // Scratch area base
+    cpuSetMSR(IA32_KERNEL_GS_BASE, this->context.syscallKernelStack - KERNEL_STACK_SIZE);
     *gpr = context.regs;
 }
 

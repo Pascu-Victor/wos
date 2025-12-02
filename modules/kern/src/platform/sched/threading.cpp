@@ -133,14 +133,31 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     thread->stack = tlsVirtAddr;
     thread->fsbase = reinterpret_cast<uint64_t>(tcbVirtAddr);
 
+    // Store the physical (HHDM) pointers for cleanup
+    thread->tlsPhysPtr = reinterpret_cast<uint64_t>(tls);
+    thread->stackPhysPtr = reinterpret_cast<uint64_t>(stack);
+
     activeThreads.push_back(thread);
     return thread;
 }
 
 void destroyThread(Thread* thread) {
+    if (thread == nullptr) {
+        return;
+    }
+
     activeThreads.remove(thread);
-    mm::phys::pageFree((void*)thread->fsbase);
-    mm::phys::pageFree((void*)thread->stack);
+
+    // Free the actual physical allocations using the stored HHDM pointers
+    if (thread->tlsPhysPtr != 0) {
+        mm::phys::pageFree(reinterpret_cast<void*>(thread->tlsPhysPtr));
+    }
+    if (thread->stackPhysPtr != 0) {
+        mm::phys::pageFree(reinterpret_cast<void*>(thread->stackPhysPtr));
+    }
+
     delete thread;
 }
+
+auto getActiveThreadCount() -> uint64_t { return activeThreads.size(); }
 }  // namespace ker::mod::sched::threading

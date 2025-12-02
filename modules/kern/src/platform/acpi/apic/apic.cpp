@@ -1,7 +1,16 @@
 #include "apic.hpp"
 
+#include <cstdint>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
+
+#include "mod/io/serial/serial.hpp"
+#include "platform/acpi/acpi.hpp"
+#include "platform/acpi/madt/madt.hpp"
+#include "platform/asm/cpu.hpp"
+#include "platform/asm/msr.hpp"
+#include "platform/mm/addr.hpp"
+#include "util/hcf.hpp"
 namespace ker::mod::apic {
 void writeReg(uint32_t reg, uint64_t value) { cpuSetMSR(reg, value); }
 
@@ -22,7 +31,7 @@ void selfIpi(uint8_t vector) { cpuSetMSR((uint32_t)X2APICMSRs::SELF_IPI, vector,
 
 void resetApicCounter() { writeReg((uint32_t)APICRegisters::TMR_INIT_CNT, 0xFFFFFFFF); }
 
-bool checkX2APICSupport() {
+auto checkX2APICSupport() -> bool {
     cpu::CpuidContext cpuidContext;
     cpuidContext.function = 0x1;
     cpu::cpuid(&cpuidContext);
@@ -30,18 +39,15 @@ bool checkX2APICSupport() {
 }
 
 void init() {
-    acpi::madt::ApicInfo apicInfo;
     char ident[] = "APIC";
     acpi::ACPIResult madt = acpi::parseAcpiTables(ident);
     if (madt.success) {
-        apicInfo = acpi::madt::parseMadt(madt.data);
+        acpi::madt::ApicInfo apicInfo = acpi::madt::parseMadt(madt.data);
+        APIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
     } else {
         io::serial::write("Failed to parse MADT table\n");
         hcf();
     }
-
-    APIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
-    // mm::virt::mapToKernelPageTable((uint64_t)APIC_BASE, (uint64_t)apicInfo.lapicAddr, mm::paging::pageTypes::KERNEL);
 }
 
 void initApicMP() {
@@ -57,7 +63,7 @@ void initApicMP() {
     writeReg((uint32_t)X2APICMSRs::SPURIOUS_INT_VEC, 0x1FF | (1 << 8));  // interrupt vector 0x1FF, enable APIC
 }
 
-uint32_t calibrateTimer(uint64_t us) {
+auto calibrateTimer(uint64_t us) -> uint32_t {
     writeReg((uint32_t)X2APICMSRs::TIMER_DIVIDE_CONFIG, 0x3);
     writeReg((uint32_t)X2APICMSRs::TIMER_INIT_COUNT, 0xFFFFFFFF);
     uint64_t start = rdtsc();

@@ -42,6 +42,15 @@ void startScheduler();
 void percpuInit();
 void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);
 void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);
+
+// OOM diagnostics - get queue sizes for a specific CPU
+struct RunQueueStats {
+    uint64_t activeTaskCount;
+    uint64_t expiredTaskCount;
+    uint64_t waitQueueCount;
+};
+auto getRunQueueStats(uint64_t cpuNo) -> RunQueueStats;
+
 }  // namespace ker::mod::sched
 extern "C" auto _wOS_getCurrentTask() -> ker::mod::sched::task::Task*;
 extern "C" const uint64_t _wOS_DEFERRED_TASK_SWITCH_OFFSET;

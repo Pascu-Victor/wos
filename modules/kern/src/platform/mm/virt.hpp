@@ -40,4 +40,9 @@ void mapRangeToKernelPageTable(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset
 void mapRangeToKernelPageTable(Range range, uint64_t flags);
 paddr_t translate(PageTable* pageTable, vaddr_t vaddr);
+
+// Free all user-space pages and page tables in a pagemap
+// Only frees the lower half (user space), keeps kernel mappings intact
+// After calling this, the pagemap itself should be freed with phys::pageFree
+void destroyUserSpace(PageTable* pagemap);
 }  // namespace ker::mod::mm::virt

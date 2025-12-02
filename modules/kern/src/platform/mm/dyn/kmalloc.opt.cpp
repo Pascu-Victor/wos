@@ -51,6 +51,7 @@ static void trackAllocation(void* ptr, uint64_t size) {
     ker::mod::io::serial::write("kmalloc: tracker is full, unable to track large allocation at ");
     ker::mod::io::serial::writeHex((uint64_t)ptr);
     ker::mod::io::serial::write("\n");
+    mm::phys::dumpPageAllocationsOOM();
 }
 
 static auto untrackAllocation(void* ptr, uint64_t& outSize) -> bool {
