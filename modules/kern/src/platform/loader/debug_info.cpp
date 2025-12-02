@@ -15,7 +15,9 @@ void registerProcess(uint64_t pid, const char* name, uint64_t baseAddr, uint64_t
     info.sections = std::vector<DebugSection>();
 
     debugRegistry.push_back(info);
+#ifdef ELF_DEBUG
     ker::mod::dbg::log("Registered process for debugging: pid=%x, name=%s, base=%x, entry=%x", pid, name, baseAddr, entryPoint);
+#endif
 }
 
 void addDebugSection(uint64_t pid, const char* name, uint64_t vaddr, uint64_t paddr, uint64_t size, uint64_t fileOffset, uint32_t type) {
