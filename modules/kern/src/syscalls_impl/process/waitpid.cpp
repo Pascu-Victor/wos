@@ -15,7 +15,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
 
     auto* currentTask = ker::mod::sched::getCurrentTask();
     if (currentTask == nullptr) {
+#ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Current task is null");
+#endif
         return static_cast<uint64_t>(-1);
     }
 
@@ -29,13 +31,17 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
     // Find the task with the given PID
     auto* targetTask = ker::mod::sched::findTaskByPid(pid);
     if (targetTask == nullptr) {
+#ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x not found", pid);
+#endif
         return static_cast<uint64_t>(-1);  // Task not found
     }
 
     // Check if the target task has already exited
     if (targetTask->hasExited) {
+#ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x has already exited with status %d", pid, targetTask->exitStatus);
+#endif
         if (status != nullptr) {
             *status = targetTask->exitStatus;
         }
@@ -44,7 +50,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
 
     // Add the current task's PID to the target task's awaitee list
     if (targetTask->awaitee_on_exit_count >= ker::mod::sched::task::Task::MAX_AWAITEE_COUNT) {
+#ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Awaitee list full for PID %x", pid);
+#endif
         return static_cast<uint64_t>(-1);  // Awaitee list is full
     }
 
