@@ -26,20 +26,20 @@ auto guid_compare(const uint8_t* guid1, const uint8_t* guid2) -> bool {
 // Find FAT32 partition on a GPT-partitioned disk
 auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     if (device == nullptr) {
-        ker::mod::io::serial::write("gpt_find_fat32_partition: Invalid device\n");
+        gpt_log("gpt_find_fat32_partition: Invalid device\n");
         return 0;
     }
 
     // Allocate buffer for one sector
     auto* sector_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(device->block_size));
     if (sector_buf == nullptr) {
-        ker::mod::io::serial::write("gpt_find_fat32_partition: Memory allocation failed\n");
+        gpt_log("gpt_find_fat32_partition: Memory allocation failed\n");
         return 0;
     }
 
     // Read GPT header from LBA 1 (primary GPT header)
     if (ker::dev::block_read(device, 1, 1, sector_buf) != 0) {
-        ker::mod::io::serial::write("gpt_find_fat32_partition: Failed to read GPT header\n");
+        gpt_log("gpt_find_fat32_partition: Failed to read GPT header\n");
         // Note: Not freeing to avoid kmalloc::free() issues
         return 0;
     }
@@ -48,33 +48,33 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
 
     // Validate GPT signature "EFI PART"
     if (gpt_header->signature != 0x5452415020494645ULL) {
-        ker::mod::io::serial::write("gpt_find_fat32_partition: Invalid GPT signature\n");
+        gpt_log("gpt_find_fat32_partition: Invalid GPT signature\n");
         // Note: Not freeing to avoid kmalloc::free() issues
         return 0;
     }
 
-    ker::mod::io::serial::write("gpt_find_fat32_partition: Valid GPT found\n");
-    ker::mod::io::serial::write("gpt_find_fat32_partition: Looking for FAT32 GUID: ");
+    gpt_log("gpt_find_fat32_partition: Valid GPT found\n");
+    gpt_log("gpt_find_fat32_partition: Looking for FAT32 GUID: ");
     for (int j = 0; j < 16; ++j) {
-        ker::mod::io::serial::writeHex(FAT32_PARTITION_GUID[j]);
-        if (j < 15) ker::mod::io::serial::write(" ");
+        gpt_log_hex(FAT32_PARTITION_GUID[j]);
+        if (j < 15) gpt_log(" ");
     }
-    ker::mod::io::serial::write("\n");
-    ker::mod::io::serial::write("gpt_find_fat32_partition: Partition entries at LBA 0x");
-    ker::mod::io::serial::writeHex(gpt_header->partition_entries_lba);
-    ker::mod::io::serial::write(", count: ");
-    ker::mod::io::serial::writeHex(gpt_header->num_partition_entries);
-    ker::mod::io::serial::write(", entry size: ");
-    ker::mod::io::serial::writeHex(gpt_header->partition_entry_size);
-    ker::mod::io::serial::write("\n");
+    gpt_log("\n");
+    gpt_log("gpt_find_fat32_partition: Partition entries at LBA 0x");
+    gpt_log_hex(gpt_header->partition_entries_lba);
+    gpt_log(", count: ");
+    gpt_log_hex(gpt_header->num_partition_entries);
+    gpt_log(", entry size: ");
+    gpt_log_hex(gpt_header->partition_entry_size);
+    gpt_log("\n");
 
     // Read partition entries one sector at a time to avoid large allocations
     uint32_t entries_per_sector = device->block_size / gpt_header->partition_entry_size;
     uint32_t num_sectors_needed = (gpt_header->num_partition_entries + entries_per_sector - 1) / entries_per_sector;
 
-    ker::mod::io::serial::write("gpt_find_fat32_partition: Reading ");
-    ker::mod::io::serial::writeHex(num_sectors_needed);
-    ker::mod::io::serial::write(" sectors of partition entries\n");
+    gpt_log("gpt_find_fat32_partition: Reading ");
+    gpt_log_hex(num_sectors_needed);
+    gpt_log(" sectors of partition entries\n");
 
     // Reuse sector_buf to read one sector at a time
     uint64_t fat32_start_lba = 0;
@@ -83,9 +83,9 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     for (uint32_t sector = 0; sector < num_sectors_needed && !found; ++sector) {
         // Read one sector of partition entries
         if (ker::dev::block_read(device, gpt_header->partition_entries_lba + sector, 1, sector_buf) != 0) {
-            ker::mod::io::serial::write("gpt_find_fat32_partition: Failed to read partition entries sector ");
-            ker::mod::io::serial::writeHex(sector);
-            ker::mod::io::serial::write("\n");
+            gpt_log("gpt_find_fat32_partition: Failed to read partition entries sector ");
+            gpt_log_hex(sector);
+            gpt_log("\n");
             // Note: Intentionally not freeing memory to avoid kmalloc::free() issues
             return 0;
         }
@@ -112,39 +112,39 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
 
             if (!is_empty) {
                 // Print the GUID we found
-                ker::mod::io::serial::write("gpt: Partition ");
-                ker::mod::io::serial::writeHex(sector * entries_per_sector + i);
-                ker::mod::io::serial::write(" GUID: ");
+                gpt_log("gpt: Partition ");
+                gpt_log_hex(sector * entries_per_sector + i);
+                gpt_log(" GUID: ");
                 for (int j = 0; j < 16; ++j) {
-                    ker::mod::io::serial::writeHex(entry->partition_type_guid[j]);
-                    if (j < 15) ker::mod::io::serial::write(" ");
+                    gpt_log_hex(entry->partition_type_guid[j]);
+                    if (j < 15) gpt_log(" ");
                 }
-                ker::mod::io::serial::write("\n");
+                gpt_log("\n");
 
                 // Check if partition type matches FAT32
                 if (guid_compare(entry->partition_type_guid, FAT32_PARTITION_GUID)) {
                     fat32_start_lba = entry->starting_lba;
-                    ker::mod::io::serial::write("gpt_find_fat32_partition: Found FAT32 partition at LBA 0x");
-                    ker::mod::io::serial::writeHex(fat32_start_lba);
-                    ker::mod::io::serial::write("\n");
+                    gpt_log("gpt_find_fat32_partition: Found FAT32 partition at LBA 0x");
+                    gpt_log_hex(fat32_start_lba);
+                    gpt_log("\n");
                     found = true;
                 }
 
                 // Also check for Microsoft Basic Data partition (commonly used for FAT32)
                 if (!found && guid_compare(entry->partition_type_guid, BASIC_DATA_PARTITION_GUID)) {
                     fat32_start_lba = entry->starting_lba;
-                    ker::mod::io::serial::write("gpt_find_fat32_partition: Found Basic Data partition at LBA 0x");
-                    ker::mod::io::serial::writeHex(fat32_start_lba);
-                    ker::mod::io::serial::write("\n");
+                    gpt_log("gpt_find_fat32_partition: Found Basic Data partition at LBA 0x");
+                    gpt_log_hex(fat32_start_lba);
+                    gpt_log("\n");
                     found = true;
                 }
 
                 // Also check for Linux filesystem data partition (used by guestfish)
                 if (!found && guid_compare(entry->partition_type_guid, LINUX_DATA_PARTITION_GUID)) {
                     fat32_start_lba = entry->starting_lba;
-                    ker::mod::io::serial::write("gpt_find_fat32_partition: Found Linux data partition at LBA 0x");
-                    ker::mod::io::serial::writeHex(fat32_start_lba);
-                    ker::mod::io::serial::write("\n");
+                    gpt_log("gpt_find_fat32_partition: Found Linux data partition at LBA 0x");
+                    gpt_log_hex(fat32_start_lba);
+                    gpt_log("\n");
                     found = true;
                 }
             }
@@ -155,7 +155,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     // This is acceptable as GPT parsing happens once during initialization
 
     if (fat32_start_lba == 0) {
-        ker::mod::io::serial::write("gpt_find_fat32_partition: No FAT32 partition found\n");
+        gpt_log("gpt_find_fat32_partition: No FAT32 partition found\n");
     }
 
     return fat32_start_lba;

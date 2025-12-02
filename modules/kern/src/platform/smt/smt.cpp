@@ -72,10 +72,14 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
             // Assign file descriptors 0, 1, 2
             newTask->fds[0] = console_stdin;
             console_stdin->fd = 0;
+            dbg::log("Setup fd 0 (stdin): %p", console_stdin);
             newTask->fds[1] = console_stdout;
             console_stdout->fd = 1;
+            dbg::log("Setup fd 1 (stdout): %p", console_stdout);
             newTask->fds[2] = console_stderr;
             console_stderr->fd = 2;
+            dbg::log("Setup fd 2 (stderr): %p", console_stderr);
+            dbg::log("Verifying: fds[0]=%p, fds[1]=%p, fds[2]=%p", newTask->fds[0], newTask->fds[1], newTask->fds[2]);
 
             dbg::log("Setup stdin/stdout/stderr for task %s", module.name);
         } else {

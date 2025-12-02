@@ -93,33 +93,51 @@ void initPagemap() {
     for (size_t i = 0; i < memmapResponse->entry_count; i++) {
         char typeBuf[32];
         switch (memmapResponse->entries[i]->type) {
-            case LIMINE_MEMMAP_USABLE:
-                std::strncpy(typeBuf, "USABLE", 32);
+            case LIMINE_MEMMAP_USABLE: {
+                constexpr char usableStr[] = "USABLE";
+                std::strncpy(typeBuf, usableStr, sizeof(usableStr));
                 break;
-            case LIMINE_MEMMAP_RESERVED:
-                std::strncpy(typeBuf, "RESERVED", 32);
+            }
+            case LIMINE_MEMMAP_RESERVED: {
+                constexpr char reservedStr[] = "RESERVED";
+                std::strncpy(typeBuf, reservedStr, sizeof(reservedStr));
                 break;
-            case LIMINE_MEMMAP_ACPI_RECLAIMABLE:
-                std::strncpy(typeBuf, "ACPI_RECLAIMABLE", 32);
+            }
+            case LIMINE_MEMMAP_ACPI_RECLAIMABLE: {
+                constexpr char acpiReclaimableStr[] = "ACPI_RECLAIMABLE";
+                std::strncpy(typeBuf, acpiReclaimableStr, sizeof(acpiReclaimableStr));
                 break;
-            case LIMINE_MEMMAP_ACPI_NVS:
-                std::strncpy(typeBuf, "ACPI_NVS", 32);
+            }
+            case LIMINE_MEMMAP_ACPI_NVS: {
+                constexpr char acpiNvsStr[] = "ACPI_NVS";
+                std::strncpy(typeBuf, acpiNvsStr, sizeof(acpiNvsStr));
                 break;
-            case LIMINE_MEMMAP_BAD_MEMORY:
-                std::strncpy(typeBuf, "BAD_MEMORY", 32);
+            }
+            case LIMINE_MEMMAP_BAD_MEMORY: {
+                constexpr char badMemoryStr[] = "BAD_MEMORY";
+                std::strncpy(typeBuf, badMemoryStr, sizeof(badMemoryStr));
                 break;
-            case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE:
-                std::strncpy(typeBuf, "BOOTLOADER_RECLAIMABLE", 32);
+            }
+            case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE: {
+                constexpr char bootloaderReclaimableStr[] = "BOOTLOADER_RECLAIMABLE";
+                std::strncpy(typeBuf, bootloaderReclaimableStr, sizeof(bootloaderReclaimableStr));
                 break;
-            case LIMINE_MEMMAP_KERNEL_AND_MODULES:
-                std::strncpy(typeBuf, "KERNEL_AND_MODULES", 32);
+            }
+            case LIMINE_MEMMAP_KERNEL_AND_MODULES: {
+                constexpr char kernelAndModulesStr[] = "KERNEL_AND_MODULES";
+                std::strncpy(typeBuf, kernelAndModulesStr, sizeof(kernelAndModulesStr));
                 break;
-            case LIMINE_MEMMAP_FRAMEBUFFER:
-                std::strncpy(typeBuf, "FRAMEBUFFER", 32);
+            }
+            case LIMINE_MEMMAP_FRAMEBUFFER: {
+                constexpr char framebufferStr[] = "FRAMEBUFFER";
+                std::strncpy(typeBuf, framebufferStr, sizeof(framebufferStr));
                 break;
-            default:
-                std::strncpy(typeBuf, "UNKNOWN", 32);
+            }
+            default: {
+                constexpr char unknownStr[] = "UNKNOWN";
+                std::strncpy(typeBuf, unknownStr, sizeof(unknownStr));
                 break;
+            }
         }
         dbg::log("Memory map entry %d: %x - %x (%s)", i, memmapResponse->entries[i]->base,
                  memmapResponse->entries[i]->base + memmapResponse->entries[i]->length, typeBuf);

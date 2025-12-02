@@ -10,9 +10,29 @@
 #include <cstdint>
 
 // Include BlockDevice from common header
+#include <mod/io/serial/serial.hpp>
+
 #include "block_device.hpp"
 
 namespace ker::dev::ahci {
+
+// AHCI logging control - define AHCI_DEBUG to enable debug logging
+// Helper inline functions for logging (optimizes away when AHCI_DEBUG is not defined)
+inline void ahci_log(const char* msg) {
+#ifdef AHCI_DEBUG
+    ker::mod::io::serial::write(msg);
+#else
+    (void)msg;
+#endif
+}
+
+inline void ahci_log_hex(uint64_t value) {
+#ifdef AHCI_DEBUG
+    ker::mod::io::serial::writeHex(value);
+#else
+    (void)value;
+#endif
+}
 
 // FIS Types
 enum FIS_TYPE {

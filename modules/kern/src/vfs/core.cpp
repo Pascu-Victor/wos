@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -18,7 +19,7 @@
 namespace ker::vfs {
 
 auto vfs_open(std::string_view path, int flags, int mode) -> int {
-    mod::io::serial::write("vfs_open: opening file\n");
+    vfs_debug_log("vfs_open: opening file\n");
 
     // Convert string_view to null-terminated string
     constexpr size_t MAX_PATH_LEN = 512;
@@ -31,14 +32,14 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     auto* current = ker::mod::sched::getCurrentTask();
     if (current == nullptr) {
-        mod::io::serial::write("vfs_open: no current task\n");
+        vfs_debug_log("vfs_open: no current task\n");
         return -1;
     }
 
     // Find the mount point for this path
     MountPoint* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) {
-        mod::io::serial::write("vfs_open: no mount point found for path\n");
+        vfs_debug_log("vfs_open: no mount point found for path\n");
         return -1;
     }
 
@@ -54,7 +55,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             }
             break;
         case FSType::FAT32:
-            f = ker::vfs::fat32::fat32_open_path(pathBuffer, flags, mode);
+            f = ker::vfs::fat32::fat32_open_path(pathBuffer, flags, mode,
+                                                 static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
             if (f != nullptr) {
                 f->fops = ker::vfs::fat32::get_fat32_fops();
                 f->fs_type = FSType::FAT32;
@@ -68,12 +70,12 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             }
             break;
         default:
-            mod::io::serial::write("vfs_open: unknown filesystem type\n");
+            vfs_debug_log("vfs_open: unknown filesystem type\n");
             return -1;
     }
 
     if (f == nullptr) {
-        mod::io::serial::write("vfs_open: failed to open file\n");
+        vfs_debug_log("vfs_open: failed to open file\n");
         return -1;
     }
 
@@ -115,7 +117,7 @@ auto vfs_close(int fd) -> int {
     return 0;
 }
 
-auto vfs_read(int fd, void* buf, size_t count) -> ssize_t {
+auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
     if (t == nullptr) {
         return -1;
@@ -128,13 +130,17 @@ auto vfs_read(int fd, void* buf, size_t count) -> ssize_t {
         return -1;
     }
     ssize_t r = f->fops->vfs_read(f, buf, count, (size_t)f->pos);
-    if (r > 0) {
+    if (r >= 0) {
         f->pos += r;
+        if (actual_size != nullptr) {
+            *actual_size = static_cast<size_t>(r);
+        }
+        return 0;
     }
     return r;
 }
 
-auto vfs_write(int fd, const void* buf, size_t count) -> ssize_t {
+auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
     if (t == nullptr) {
         return -1;
@@ -147,8 +153,12 @@ auto vfs_write(int fd, const void* buf, size_t count) -> ssize_t {
         return -1;
     }
     ssize_t r = f->fops->vfs_write(f, buf, count, (size_t)f->pos);
-    if (r > 0) {
+    if (r >= 0) {
         f->pos += r;
+        if (actual_size != nullptr) {
+            *actual_size = static_cast<size_t>(r);
+        }
+        return 0;
     }
     return r;
 }
@@ -265,7 +275,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 }
 
 void init() {
-    mod::io::serial::write("vfs: init\n");
+    vfs_debug_log("vfs: init\n");
     // Register tmpfs as a minimal root filesystem
     ker::vfs::tmpfs::register_tmpfs();
     // Mount tmpfs at root

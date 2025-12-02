@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +67,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     }
     uint64_t parentPid = parentTask->pid;
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Loading '%.*s'", (int)str.size(), str.data());
+#endif
 
     int fd = vfs::vfs_open(str, 0, 0);
     if (fd < 0) {
@@ -74,7 +77,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
-    off_t fileSize = vfs::vfs_lseek(fd, 0, 2);
+    ssize_t fileSize = vfs::vfs_lseek(fd, 0, 2);
     if (fileSize <= 0) {
         dbg::log("wos_proc_exec: Invalid file size: %d", fileSize);
         vfs::vfs_close(fd);
@@ -89,7 +92,8 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
-    ssize_t bytesRead = vfs::vfs_read(fd, elfBuffer, fileSize);
+    ssize_t bytesRead = 0;
+    vfs::vfs_read(fd, elfBuffer, fileSize, (size_t*)&bytesRead);
     vfs::vfs_close(fd);
 
     if (bytesRead != fileSize) {
@@ -119,7 +123,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         }
     }
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Creating task for '%s', parent PID: %x", processName, parentPid);
+#endif
 
     uint64_t kernelRsp = allocateKernelStack();
     if (kernelRsp == 0) {
@@ -136,15 +142,12 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Task constructor completed successfully");
     dbg::log("wos_proc_exec: Entry point = 0x%x, RIP = 0x%x", newTask->entry, newTask->context.frame.rip);
+#endif
 
     newTask->parentPid = parentPid;
-
-    // Initialize fd table to null
-    for (auto& fd : newTask->fds) {
-        fd = nullptr;
-    }
 
     // Copy file descriptors from parent task (inherit stdin/stdout/stderr)
     for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
@@ -159,7 +162,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     newTask->elfBuffer = elfBuffer;
     newTask->elfBufferSize = fileSize;
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Task created with PID: %x, parent: %x", newTask->pid, newTask->parentPid);
+#endif
 
     uint64_t userStackVirt = newTask->thread->stack;
 
@@ -279,9 +284,11 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     newTask->context.regs.rsi = argvPtr;
     newTask->context.regs.rdx = envpPtr;
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Setup stack - argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", argc, argvPtr, envpPtr, newTask->context.frame.rsp);
     dbg::log("wos_proc_exec: Entry point (RIP) = 0x%x", newTask->context.frame.rip);
     dbg::log("wos_proc_exec: Task entry field = 0x%x", newTask->entry);
+#endif
 
     if (!sched::postTask(newTask)) {
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
@@ -290,7 +297,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
+#ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Successfully posted task '%s' to scheduler", processName);
+#endif
 
     return newTask->pid;
 

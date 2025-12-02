@@ -12,7 +12,6 @@
 #include <cstring>
 #include <print>
 
-// Alternative main function for testing with argc/argv
 auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
     std::println("testprog: main() called");
@@ -23,16 +22,48 @@ auto main(int argc, char** argv, char** envp) -> int {
         std::println("testprog: argv[{}] = {}", arg, argv[arg]);
     }
 
-    const auto* rootDir = "/dev";  // assuming FAT32 is mounted here
-    std::println("testprog: Attempting to open root directory");
+    FILE* fileptr = fopen("/mnt/disk/hello.txt", "r");
+    if (fileptr == nullptr) {
+        std::println("testprog: Failed to open /mnt/disk/hello.txt");
+    } else {
+        std::println("testprog: Successfully opened /mnt/disk/hello.txt");
+        constexpr size_t buffer_size = 128;
+        std::array<char, buffer_size> buffer = {0};
+        size_t bytes_read = fread(buffer.data(), 1, buffer_size - 1, fileptr);
+        if (bytes_read > 0) {
+            std::println("testprog: Read {} bytes from file:", bytes_read);
+            std::println("{}", buffer.data());
+        } else {
+            std::println("testprog: Failed to read from file");
+        }
+        fclose(fileptr);
+    }
+
+    const auto* rootDir = "/mnt/disk";
+    std::println("testprog: Attempting to open directory");
     DIR* dirp = opendir(rootDir);
     if (dirp == nullptr) {
-        std::println("testprog: Failed to open root directory");
+        std::println("testprog: Failed to open directory");
     } else {
-        std::println("testprog: Successfully opened root directory");
-        std::println("testprog: files in root directory:");
+        std::println("testprog: Successfully opened directory");
+        std::println("testprog: files in {}:", rootDir);
         struct dirent* entry = nullptr;
         while ((entry = readdir(dirp)) != nullptr) {
+            std::println("{}", static_cast<const char*>(entry->d_name));
+        }
+        closedir(dirp);
+    }
+
+    const auto* bootdir = "/boot";
+    std::println("testprog: Attempting to open directory");
+    DIR* bootdirp = opendir(bootdir);
+    if (bootdirp == nullptr) {
+        std::println("testprog: Failed to open directory");
+    } else {
+        std::println("testprog: Successfully opened directory");
+        std::println("testprog: files in {}:", bootdir);
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(bootdirp)) != nullptr) {
             std::println("{}", static_cast<const char*>(entry->d_name));
         }
         closedir(dirp);
@@ -50,5 +81,5 @@ auto main(int argc, char** argv, char** envp) -> int {
     }
     std::println("testprog: mmap succeeded at address {}", addr);
 
-    return 0;
+    return 1234;
 }

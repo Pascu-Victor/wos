@@ -12,7 +12,11 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->parentPid = 0;        // Initialize to 0 (no parent by default, will be set by exec or fork)
     this->elfBuffer = nullptr;  // No ELF buffer by default
     this->elfBufferSize = 0;
-    this->hasRun = false;  // Task hasn't run yet, context.frame contains initial setup
+    this->hasRun = false;              // Task hasn't run yet, context.frame contains initial setup
+    this->exitStatus = 0;              // Initialize exit status
+    this->hasExited = false;           // Task hasn't exited yet
+    this->awaitee_on_exit_count = 0;   // Initialize awaitee counter
+    this->deferredTaskSwitch = false;  // No deferred switch by default
 
     // Initialize file descriptor table to null
     for (unsigned i = 0; i < FD_TABLE_SIZE; ++i) {

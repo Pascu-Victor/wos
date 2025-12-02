@@ -11,6 +11,7 @@
 #include "abi/callnums/process.h"
 #include "abi/callnums/sys_log.h"
 #include "mod/io/serial/serial.hpp"
+#include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/interrupt/gdt.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
@@ -37,7 +38,7 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
         case abi::callnums::time:
             return ker::syscall::time::sys_time_get(a1, (void*)a2, (void*)a3);
         case abi::callnums::vfs:
-            return ker::syscall::vfs::sys_vfs(a1, a2, a3, a4);
+            return ker::syscall::vfs::sys_vfs(a1, a2, a3, a4, a5);
         case abi::callnums::net:
             return ker::syscall::net::sys_net(a1, a2, a3, a4, a5);
         case abi::callnums::vmem:
@@ -45,7 +46,7 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
         case abi::callnums::vmem_map:
             return ker::syscall::vmem::sys_vmem_map(a1, a2, a3, a4, a5, a6);
         case abi::callnums::process:
-            return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(a1), a2, a3, a4, a5);
+            return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(a1), a2, a3, a4, a5, regs);
 
         default:
             io::serial::write("Syscall undefined\n");

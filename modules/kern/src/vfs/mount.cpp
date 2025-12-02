@@ -31,12 +31,12 @@ auto fstype_to_enum(const char* fstype) -> FSType {
 
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
     if (path == nullptr || fstype == nullptr) {
-        mod::io::serial::write("mount_filesystem: invalid arguments\n");
+        vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -1;
     }
 
     if (mount_count >= MAX_MOUNTS) {
-        mod::io::serial::write("mount_filesystem: mount table full\n");
+        vfs_debug_log("mount_filesystem: mount table full\n");
         return -1;
     }
 
@@ -52,7 +52,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (fstype[0] == 'f' && fstype[1] == 'a' && fstype[2] == 't' && fstype[3] == '3' && fstype[4] == '2' && fstype[5] == '\0') {
         // FAT32 filesystem
         if (device == nullptr) {
-            mod::io::serial::write("mount_filesystem: FAT32 requires a block device\n");
+            vfs_debug_log("mount_filesystem: FAT32 requires a block device\n");
             delete mount;
             return -1;
         }
@@ -62,16 +62,20 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         partition_start_lba = ker::dev::gpt::gpt_find_fat32_partition(device);
 
         if (partition_start_lba == 0) {
-            mod::io::serial::write("mount_filesystem: No FAT32 partition found (assuming raw FAT32 at LBA 0)\n");
+            vfs_debug_log("mount_filesystem: No FAT32 partition found (assuming raw FAT32 at LBA 0)\n");
             partition_start_lba = 0;
         }
 
         // Initialize FAT32 with the device and partition offset
-        if (ker::vfs::fat32::fat32_init_device(device, partition_start_lba) != 0) {
-            mod::io::serial::write("mount_filesystem: FAT32 initialization failed\n");
+        auto* context = ker::vfs::fat32::fat32_init_device(device, partition_start_lba);
+        if (context == nullptr) {
+            vfs_debug_log("mount_filesystem: FAT32 initialization failed\n");
             delete mount;
             return -1;
         }
+
+        // Store mount context for per-mount use
+        mount->private_data = context;
 
         mount->fops = ker::vfs::fat32::get_fat32_fops();
     } else if (fstype[0] == 't' && fstype[1] == 'm' && fstype[2] == 'p' && fstype[3] == 'f' && fstype[4] == 's' && fstype[5] == '\0') {
@@ -81,7 +85,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         // devfs filesystem
         mount->fops = ker::vfs::devfs::get_devfs_fops();
     } else {
-        mod::io::serial::write("mount_filesystem: unknown filesystem type\n");
+        vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         delete mount;
         return -1;
     }
@@ -89,11 +93,11 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     mounts[mount_count] = mount;
     mount_count++;
 
-    mod::io::serial::write("mount_filesystem: mounted ");
-    mod::io::serial::write(fstype);
-    mod::io::serial::write(" at ");
-    mod::io::serial::write(path);
-    mod::io::serial::write("\n");
+    vfs_debug_log("mount_filesystem: mounted ");
+    vfs_debug_log(fstype);
+    vfs_debug_log(" at ");
+    vfs_debug_log(path);
+    vfs_debug_log("\n");
 
     return 0;
 }
@@ -112,9 +116,9 @@ auto unmount_filesystem(const char* path) -> int {
             if (path[j] == '\0' && mounts[i]->path[j] == '\0') {
                 delete mounts[i];
                 mounts[i] = nullptr;
-                mod::io::serial::write("unmount_filesystem: unmounted ");
-                mod::io::serial::write(path);
-                mod::io::serial::write("\n");
+                vfs_debug_log("unmount_filesystem: unmounted ");
+                vfs_debug_log(path);
+                vfs_debug_log("\n");
                 return 0;
             }
         }

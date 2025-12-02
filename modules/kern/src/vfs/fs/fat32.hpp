@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mod/io/serial/serial.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -12,6 +13,39 @@ struct BlockDevice;
 }
 
 namespace ker::vfs::fat32 {
+
+// FAT32 logging control - define FAT32_DISABLE_LOGGING to disable all logging
+// Helper inline functions for logging (optimizes away when FAT32_DISABLE_LOGGING is defined)
+inline void fat32_log(const char* msg) {
+#ifdef FAT32_DEBUG
+    ker::mod::io::serial::writeHex(msg);
+#else
+    (void)msg;
+#endif
+}
+
+inline void fat32_log_hex(uint64_t value) {
+#ifdef FAT32_DEBUG
+    ker::mod::io::serial::writeHex(value);
+#else
+    (void)value;
+#endif
+}
+
+// FAT32 Mount Context - stores per-mount filesystem information
+struct FAT32MountContext {
+    ker::dev::BlockDevice* device;  // Block device for this mount
+    uint64_t partition_offset;      // Partition start LBA
+    uint32_t* fat_table;            // FAT table in memory
+    uint32_t bytes_per_sector;
+    uint8_t sectors_per_cluster;
+    uint16_t reserved_sectors;
+    uint32_t sectors_per_fat;
+    uint8_t num_fats;
+    uint32_t data_start_sector;
+    uint32_t total_sectors;
+    uint32_t root_cluster;
+};
 
 // FAT32 Boot Sector Structure (simplified)
 struct __attribute__((packed)) FAT32BootSector {
@@ -81,11 +115,11 @@ constexpr uint32_t FAT32_BAD_CLUSTER = 0x0FFFFFF7;
 // Initialize FAT32 driver
 auto fat32_init(void* disk_buffer, size_t disk_size) -> int;
 
-// Initialize FAT32 with a block device
-auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_lba = 0) -> int;
+// Initialize FAT32 with a block device - returns mount context
+auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_lba = 0) -> FAT32MountContext*;
 
 // FAT32 filesystem operations
-auto fat32_open_path(const char* path, int flags, int mode) -> File*;
+auto fat32_open_path(const char* path, int flags, int mode, FAT32MountContext* ctx) -> File*;
 
 // FAT32 I/O operations
 auto fat32_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t;

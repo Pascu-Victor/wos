@@ -22,8 +22,8 @@ constexpr static uint64_t GDT_ENTRY_COUNT = 7 - GDT_TSS_OFFSET;
 constexpr static uint64_t GDT_KERN_CS = 0x08;
 constexpr static uint64_t GDT_KERN_DS = 0x10;
 
-constexpr static uint64_t GDT_USER_CS = 0x18;
-constexpr static uint64_t GDT_USER_DS = 0x20;
+constexpr static uint64_t GDT_USER_CS = 0x23;
+constexpr static uint64_t GDT_USER_DS = 0x1b;
 
 constexpr static uint64_t GDT_RING3 = 0x3;
 
@@ -87,5 +87,5 @@ struct Gdt {
     GdtPtr ptr;
 } __attribute__((packed));
 
-void initDescriptors(uint64_t *stackPointer);
+void initDescriptors(uint64_t* stackPointer);
 }  // namespace ker::mod::desc::gdt

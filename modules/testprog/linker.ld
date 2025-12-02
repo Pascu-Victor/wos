@@ -15,7 +15,7 @@ SECTIONS
     /* ELF header*/
     PROVIDE_HIDDEN(__ehdr_start = 0x1000);
 
-    . = 0x500000;
+    . = 0x800000;
 
     /* Code sections */
     .text : ALIGN(4K) {

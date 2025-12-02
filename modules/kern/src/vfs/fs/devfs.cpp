@@ -1,11 +1,13 @@
 #include "devfs.hpp"
 
+#include <cerrno>
 #include <cstring>
 #include <dev/device.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 
 #include "vfs/file_operations.hpp"
+#include "vfs/vfs.hpp"
 
 namespace ker::vfs::devfs {
 
@@ -19,21 +21,21 @@ namespace {
 
 auto devfs_close(File* f) -> int {
     if (f == nullptr) {
-        mod::io::serial::write("devfs_close: file is null\n");
+        vfs_debug_log("devfs_close: file is null\n");
         return -1;
     }
 
-    mod::io::serial::write("devfs_close: closing device file\n");
+    vfs_debug_log("devfs_close: closing device file\n");
 
     // Directory has no private_data
     if (f->private_data == nullptr) {
-        mod::io::serial::write("devfs_close: directory or no private_data\n");
+        vfs_debug_log("devfs_close: directory or no private_data\n");
         return 0;
     }
 
     auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device == nullptr) {
-        mod::io::serial::write("devfs_close: device pointer is null\n");
+        vfs_debug_log("devfs_close: device pointer is null\n");
         delete devfs_file;
         f->private_data = nullptr;
         return 0;
@@ -81,8 +83,7 @@ auto devfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> s
 }
 
 auto devfs_lseek(File* /*f*/, off_t /*offset*/, int /*whence*/) -> off_t {
-    // Devices don't support seeking
-    return -1;
+    return ESPIPE;  // devfs does not support seeking
 }
 
 auto devfs_isatty(File* f) -> bool {
@@ -176,7 +177,7 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
         file->fs_type = FSType::DEVFS;
         file->refcount = 1;
 
-        mod::io::serial::write("devfs: opened /dev directory\n");
+        vfs_debug_log("devfs: opened /dev directory\n");
         return file;
     }
 
@@ -189,17 +190,17 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     // Look up the device
     ker::dev::Device* device = ker::dev::dev_find_by_name(device_name);
     if (device == nullptr) {
-        mod::io::serial::write("devfs: device not found: ");
-        mod::io::serial::write(device_name);
-        mod::io::serial::write("\n");
+        vfs_debug_log("devfs: device not found: ");
+        vfs_debug_log(device_name);
+        vfs_debug_log("\n");
         return nullptr;
     }
 
     // Check that it's a character device
     if (device->type != ker::dev::DeviceType::CHAR) {
-        mod::io::serial::write("devfs: not a character device: ");
-        mod::io::serial::write(device_name);
-        mod::io::serial::write("\n");
+        vfs_debug_log("devfs: not a character device: ");
+        vfs_debug_log(device_name);
+        vfs_debug_log("\n");
         return nullptr;
     }
 
@@ -234,17 +235,17 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
         }
     }
 
-    mod::io::serial::write("devfs: opened device: ");
-    mod::io::serial::write(device_name);
-    mod::io::serial::write("\n");
+    vfs_debug_log("devfs: opened device: ");
+    vfs_debug_log(device_name);
+    vfs_debug_log("\n");
 
     return file;
 }
 
-void register_devfs() { mod::io::serial::write("devfs: registered\n"); }
+void register_devfs() { vfs_debug_log("devfs: registered\n"); }
 
 void devfs_init() {
-    mod::io::serial::write("devfs: initializing\n");
+    vfs_debug_log("devfs: initializing\n");
     register_devfs();
 }
 

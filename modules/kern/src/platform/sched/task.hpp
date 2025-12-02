@@ -1,5 +1,8 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
@@ -7,6 +10,7 @@
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/threading.hpp>
+#include <util/list.hpp>
 // Avoid pulling in in-tree std headers into kernel translation units from here.
 
 namespace ker::mod::sched::task {
@@ -63,6 +67,23 @@ struct Task {
     // Small fixed-size table for now; will be moved/made dynamic when process struct is available.
     static constexpr unsigned FD_TABLE_SIZE = 256;
     void* fds[FD_TABLE_SIZE];  // opaque pointers to kernel file descriptor objects (ker::vfs::File)
+
+    // Exit status of this process (set when process exits, used by waitpid)
+    int exitStatus;
+    bool hasExited;
+
+    // List of task IDs waiting for this task to exit
+    // When this task exits, all tasks in this list will be rescheduled on their respective CPUs
+    static constexpr unsigned MAX_AWAITEE_COUNT = 512;
+    uint64_t awaitee_on_exit[MAX_AWAITEE_COUNT];
+    uint64_t awaitee_on_exit_count;
+
+    // Flag indicating that this task should be moved to wait queue after syscall returns
+    bool deferredTaskSwitch;
+
+    // Waitpid state: when this task is waiting for another task to exit
+    uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
+    uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
 
     void loadContext(cpu::GPRegs* gpr);
     void saveContext(cpu::GPRegs* gpr);

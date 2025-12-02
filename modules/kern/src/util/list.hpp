@@ -138,6 +138,9 @@ class list {
 
     auto size() -> uint64_t { return this->m_size; }
 
+    Node* getHead() const { return head; }
+    Node* getTail() const { return tail; }
+
    private:
     Node* head;
     Node* tail;

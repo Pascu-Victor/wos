@@ -2,8 +2,27 @@
 
 #include <cstdint>
 #include <dev/block_device.hpp>
+#include <mod/io/serial/serial.hpp>
 
 namespace ker::dev::gpt {
+
+// GPT logging control - define GPT_DEBUG to enable debug logging
+// Helper inline functions for logging (optimizes away when GPT_DEBUG is not defined)
+inline void gpt_log(const char* msg) {
+#ifdef GPT_DEBUG
+    ker::mod::io::serial::write(msg);
+#else
+    (void)msg;
+#endif
+}
+
+inline void gpt_log_hex(uint64_t value) {
+#ifdef GPT_DEBUG
+    ker::mod::io::serial::writeHex(value);
+#else
+    (void)value;
+#endif
+}
 
 // GPT Partition Type GUIDs
 constexpr uint8_t EFI_SYSTEM_PARTITION_GUID[16] = {0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2,

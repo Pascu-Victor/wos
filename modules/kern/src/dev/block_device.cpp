@@ -140,6 +140,16 @@ auto block_device_init() -> void {
 
     // Mount FAT32 if block device is available for now just sdb
     // TODO: implement some type of fstab
+    BlockDevice* sda = block_device_find_by_name("sda");
+    if (sda != nullptr) {
+        ker::mod::dbg::log("Found sda, attempting FAT32 mount at /boot");
+        int mount_result = ker::vfs::mount_filesystem("/boot", "fat32", sda);
+        if (mount_result == 0) {
+            ker::mod::dbg::log("FAT32 mount successful!");
+        } else {
+            ker::mod::dbg::log("FAT32 mount failed with error: %d", mount_result);
+        }
+    }
     BlockDevice* sdb = block_device_find_by_name("sdb");
     if (sdb != nullptr) {
         ker::mod::dbg::log("Found sdb, attempting FAT32 mount at /mnt/disk");

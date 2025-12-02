@@ -3,15 +3,15 @@
 #include <stdarg.h>
 
 namespace _std {
-size_t strlen(const char *str) {
+__attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
     size_t len = 0;
-    while (str[len]) {
+    while (str[len] != '\0') {
         len++;
     }
     return len;
 }
 
-char *strcpy(char *dest, const char *src) {
+__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) {
     size_t i = 0;
     for (; src[i] != '\0'; i++) {
         dest[i] = src[i];
@@ -21,7 +21,7 @@ char *strcpy(char *dest, const char *src) {
     return dest;
 }
 
-char *strncpy(char *dest, const char *src, size_t n) {
+__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
     size_t i = 0;
     for (; src[i] != '\0' && i < n; i++) {
         dest[i] = src[i];
@@ -31,7 +31,7 @@ char *strncpy(char *dest, const char *src, size_t n) {
     return dest;
 }
 
-void reverse(char s[]) {
+__attribute__((no_builtin("strlen"))) void reverse(char s[]) {
     int c, i, j;
 
     for (i = 0, j = strlen(s) - 1; i < j; i++, j--) {
@@ -118,7 +118,7 @@ int u64toh(uint64_t n, char s[]) {
 
 namespace std = _std;
 
-char *snprintf(char *str, size_t size, const char *format, ...) {
+char* snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);
     _std::vsnprintf(str, size, format, args);
@@ -126,7 +126,7 @@ char *snprintf(char *str, size_t size, const char *format, ...) {
     return str;
 }
 
-char *strcat(char *dest, const char *src) {
+char* strcat(char* dest, const char* src) {
     size_t dest_len = _std::strlen(dest);
     size_t i;
 
@@ -139,7 +139,7 @@ char *strcat(char *dest, const char *src) {
     return dest;
 }
 
-size_t strlcat(char *dest, const char *src, size_t size) {
+size_t strlcat(char* dest, const char* src, size_t size) {
     size_t dest_len = _std::strlen(dest);
     size_t src_len = _std::strlen(src);
     size_t i;
@@ -157,7 +157,7 @@ size_t strlcat(char *dest, const char *src, size_t size) {
     return dest_len + src_len;
 }
 
-int strncmp(const char *str1, const char *str2, size_t n) {
+int strncmp(const char* str1, const char* str2, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (str1[i] != str2[i]) {
             return str1[i] - str2[i];
@@ -166,9 +166,9 @@ int strncmp(const char *str1, const char *str2, size_t n) {
     return 0;
 }
 
-char *strdup(const char *str) {
+char* strdup(const char* str) {
     size_t len = _std::strlen(str);
-    char *new_str = new char[len + 1];
+    char* new_str = new char[len + 1];
     strncpy(new_str, str, len);
     return new_str;
 }
@@ -176,13 +176,13 @@ char *strdup(const char *str) {
 
 // Expose functions as extern "C"
 extern "C" {
-size_t strlen(const char *str) { return _std::strlen(str); }
+__attribute__((no_builtin("strlen"))) size_t strlen(const char* str) { return _std::strlen(str); }
 
-char *strcpy(char *dest, const char *src) { return _std::strcpy(dest, src); }
+__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) { return _std::strcpy(dest, src); }
 
-char *strncpy(char *dest, const char *src, size_t n) { return _std::strncpy(dest, src, n); }
+__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) { return _std::strncpy(dest, src, n); }
 
-void reverse(char s[]) { _std::reverse(s); }
+__attribute__((no_builtin("strlen"))) void reverse(char s[]) { _std::reverse(s); }
 
 int itoa(int n, char s[], int base) { return _std::itoa(n, s, base); }
 
@@ -190,19 +190,19 @@ int u64toa(uint64_t n, char s[], int base) { return _std::u64toa(n, s, base); }
 
 int u64toh(uint64_t n, char s[]) { return _std::u64toh(n, s); }
 
-char *snprintf(char *str, size_t size, const char *format, ...) {
+char* snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    char *result = _std::snprintf(str, size, format, args);
+    char* result = _std::snprintf(str, size, format, args);
     va_end(args);
     return result;
 }
 
-char *strcat(char *dest, const char *src) { return _std::strcat(dest, src); }
+char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }
 
-size_t strlcat(char *dest, const char *src, size_t size) { return _std::strlcat(dest, src, size); }
+size_t strlcat(char* dest, const char* src, size_t size) { return _std::strlcat(dest, src, size); }
 
-int strncmp(const char *str1, const char *str2, size_t n) { return _std::strncmp(str1, str2, n); }
+int strncmp(const char* str1, const char* str2, size_t n) { return _std::strncmp(str1, str2, n); }
 
-char *strdup(const char *str) { return _std::strdup(str); }
+char* strdup(const char* str) { return _std::strdup(str); }
 }

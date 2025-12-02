@@ -65,11 +65,6 @@ _LIBCPP_WEAK void __libcpp_verbose_abort(char const* format, ...) noexcept {
     hcf();
 }
 
-[[noreturn]] _LIBCPP_WEAK void __throw_length_error(const char* msg) {
-    ker::mod::dbg::log("%s", msg ? msg : "length_error");
-    hcf();
-}
-
 [[noreturn]] _LIBCPP_WEAK void __throw_bad_array_new_length() {
     ker::mod::dbg::log("%s", "bad_array_new_length");
     hcf();

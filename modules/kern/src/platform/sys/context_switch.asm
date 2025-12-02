@@ -63,7 +63,8 @@ task_switch_handler:
     call _wOS_schedTimer
 
     popq
-    cmp qword [rsp + 32], qword 0x1b
+    ; Check if returning to userspace (CS at offset 24 == 0x23)
+    cmp qword [rsp + 24], qword 0x23
     jne .no_swapgs_exit
     swapgs
     .no_swapgs_exit:
@@ -106,10 +107,76 @@ jump_to_next_task_no_save:
     call _wOS_jumpToNextTaskNoSave
 
     popq
-    cmp qword [rsp + 32], qword 0x1b
-    jne .no_swapgs_exit
+    ; Check if returning to userspace (CS at offset 24 == 0x23)
+    cmp qword [rsp + 24], qword 0x23
+    jne .no_swapgs_exit_jump
     swapgs
-    .no_swapgs_exit:
+    .no_swapgs_exit_jump:
     add rsp, 16  ; Skip intNum and errCode
     sti
     iretq
+
+; Return from deferred task switch
+; rdi = pointer to GPRegs structure in memory
+; rsi = pointer to interruptFrame structure in memory
+;
+; GPRegs layout (120 bytes): r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
+; interruptFrame layout (56 bytes): intNum, errCode, rip, cs, flags, rsp, ss
+;
+; We need to:
+; 1. Build a proper stack with interruptFrame for iretq
+; 2. Restore all GPRegs
+; 3. Check if we need swapgs (if returning to userspace)
+; 4. Execute iretq
+global _wOS_deferredTaskSwitchReturn
+_wOS_deferredTaskSwitchReturn:
+    ; rdi = GPRegs*, rsi = interruptFrame*
+
+    ; First, build the interrupt frame on the stack for iretq
+    ; iretq expects (from bottom to top): ss, rsp, flags, cs, rip
+    ; We push in reverse order
+    push qword [rsi + 48]    ; ss
+    push qword [rsi + 40]    ; rsp
+    push qword [rsi + 32]    ; flags
+    push qword [rsi + 24]    ; cs
+    push qword [rsi + 16]    ; rip
+
+    ; Save cs value for swapgs check later (use stack space)
+    mov rax, [rsi + 24]
+    push rax                 ; save cs for later check
+
+    ; Now restore all GPRegs from memory
+    ; We need to be careful about order - restore rdi last since we need it
+    mov r15, [rdi + 0]
+    mov r14, [rdi + 8]
+    mov r13, [rdi + 16]
+    mov r12, [rdi + 24]
+    mov r11, [rdi + 32]
+    mov r10, [rdi + 40]
+    mov r9,  [rdi + 48]
+    mov r8,  [rdi + 56]
+    mov rbp, [rdi + 64]
+    ; skip rdi (offset 72) for now
+    mov rsi, [rdi + 80]
+    mov rdx, [rdi + 88]
+    mov rcx, [rdi + 96]
+    mov rbx, [rdi + 104]
+    mov rax, [rdi + 112]
+
+    ; Now restore rdi
+    mov rdi, [rdi + 72]
+
+    ; Check if we need swapgs (cs == 0x1b means userspace)
+    cmp qword [rsp], 0x1b
+    jne .no_swapgs_deferred
+    swapgs
+.no_swapgs_deferred:
+    ; Remove the saved cs from stack
+    add rsp, 8
+
+    ; Enable interrupts and return
+    sti
+    iretq
+
+
+

@@ -36,6 +36,7 @@ auto _kstrcmp(const char* a, const char* b) -> int {
 namespace ker::vfs::tmpfs {
 
 constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
+constexpr int O_CREAT = 0x100;  // File creation flag
 
 enum class TmpNodeType : uint8_t { FILE, DIRECTORY };
 
@@ -97,7 +98,7 @@ auto find_child_by_name(const char* name) -> TmpNode* {
 }  // namespace
 
 void register_tmpfs() {
-    mod::io::serial::write("tmpfs: register_tmpfs called\n");
+    vfs_debug_log("tmpfs: register_tmpfs called\n");
     if (rootNode == nullptr) {
         rootNode = new TmpNode;
         rootNode->data = nullptr;
@@ -123,6 +124,7 @@ auto create_root_file() -> ker::vfs::File* {
 }
 
 auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
+    (void)mode;  // Unused parameter
     if (path == nullptr) {
         return nullptr;
     }
@@ -139,6 +141,11 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
     }
     TmpNode* n = find_child_by_name(name);
     if (n == nullptr) {
+        // Only auto-create if O_CREAT flag is set
+        // Otherwise, file/directory doesn't exist - return nullptr
+        if ((flags & O_CREAT) == 0) {
+            return nullptr;
+        }
         // create node by name - default to FILE type
         n = create_node_for_name(name, TmpNodeType::FILE);
     }

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdarg>
+#include <cstring>
 #include <util/mem.hpp>
 
 namespace _std {
@@ -27,7 +28,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
                             // %.*s - precision-limited string
                             int precision = va_arg(args, int);
                             const char* s = va_arg(args, const char*);
-                            int len = strlen(s);
+                            int len = static_cast<int>(strlen(s));
                             int copy_len = (precision < len) ? precision : len;
                             if (j + copy_len < size) {
                                 strncpy(str + j, s, copy_len);
@@ -57,8 +58,13 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
                 }
                 case 's': {
                     const char* s = va_arg(args, const char*);
-                    strncpy(str + j, s, size - j);
-                    j += strlen(s);
+                    size_t src_len = strlen(s);
+                    size_t space_left = (j < size) ? (size - j - 1) : 0;
+                    size_t to_copy = (src_len < space_left) ? src_len : space_left;
+                    if (to_copy > 0) {
+                        strncpy(str + j, s, to_copy);
+                        j += to_copy;
+                    }
                     break;
                 }
                 case 'c': {

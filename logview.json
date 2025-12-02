@@ -2,12 +2,12 @@
     "lookups": [
         {
             "from": "0x400000",
-            "to": "0x500000",
+            "to": "0x700000",
             "path": "./build/modules/init/init"
         },
         {
-            "from": "0x500000",
-            "to": "0x600000",
+            "from": "0x800000",
+            "to": "0x900000",
             "path": "./build/modules/testprog/testprog"
         },
         {

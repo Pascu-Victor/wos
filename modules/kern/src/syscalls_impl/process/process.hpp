@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/smt/smt.hpp>
 #include <syscalls_impl/log/log.hpp>
@@ -17,5 +18,5 @@
 #include <util/mem.hpp>
 
 namespace ker::syscall::process {
-auto process(abi::process::procmgmt_ops op, u_int64_t a1, u_int64_t a2, u_int64_t a3, u_int64_t a4) -> u_int64_t;
+auto process(abi::process::procmgmt_ops op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, ker::mod::cpu::GPRegs& gpr) -> uint64_t;
 }

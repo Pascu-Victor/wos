@@ -57,4 +57,21 @@ void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, 
 // Enumerate PCI devices and find SATA controllers
 auto pci_find_ahci_controller() -> PCIDevice*;
 
+// PCI Logging Control
+inline void pci_log(const char* msg) {
+#ifdef PCI_DEBUG
+    ker::mod::io::serial::write(msg);
+#else
+    (void)msg;
+#endif
+}
+
+inline void pci_log_hex(uint64_t value) {
+#ifdef PCI_DEBUG
+    ker::mod::io::serial::writeHex(value);
+#else
+    (void)value;
+#endif
+}
+
 }  // namespace ker::dev::pci

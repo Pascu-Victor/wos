@@ -90,7 +90,7 @@ void start_cmd(volatile HBA_PORT* port) {
     constexpr size_t MAX_TIMEOUT = 1000000;
     while ((port->cmd & HBA_PxCMD_CR) != 0U) {
         if (timeout++ == MAX_TIMEOUT) {
-            ker::mod::io::serial::write("start_cmd: timeout waiting for CR to clear\n");
+            ahci_log("start_cmd: timeout waiting for CR to clear\n");
             break;
         }
     }
@@ -188,12 +188,13 @@ auto find_cmdslot(volatile HBA_PORT* port) -> uint32_t {
         }
         slots >>= 1;
     }
-    ker::mod::io::serial::write("Cannot find free command list entry\n");
+    ahci_log("Cannot find free command list entry\n");
     return -1;
 }
 
-// Read sectors from disk
-auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
+// Generic function to read/write sectors from/to disk
+auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf, bool write_op)
+    -> bool {
     port->is = static_cast<uint32_t>(-1);  // Clear pending interrupt bits
     uint32_t slot = find_cmdslot(port);
     if (slot == UINT32_MAX) {
@@ -208,7 +209,7 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
     HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
 
     cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);         // Command FIS size
-    cmdheader->w = 0;                                                // Read from device
+    cmdheader->w = write_op ? 1 : 0;                                 // Write flag
     cmdheader->prdtl = static_cast<uint16_t>((count - 1) >> 4) + 1;  // PRDT entries count
 
     // Get command table using stored virtual address
@@ -219,6 +220,7 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
     uint64_t buf_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(buf));
 
     // 8K bytes (16 sectors) per PRDT
+    uint32_t remaining_sectors = count;
     size_t i = 0;
     for (; i < cmdheader->prdtl - 1; i++) {
         cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
@@ -226,20 +228,20 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
         cmdtbl->prdt_entry[i].dbc = (8 * 1024) - 1;  // 8K bytes
         cmdtbl->prdt_entry[i].i = 1;
         buf_phys += 4 * 1024 * 2;  // 4K words = 8K bytes
-        count -= 16;               // 16 sectors
+        remaining_sectors -= 16;   // 16 sectors
     }
 
     // Last entry
     cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
     cmdtbl->prdt_entry[i].dbau = static_cast<uint32_t>((buf_phys >> 32) & UINT32_MAX);
-    cmdtbl->prdt_entry[i].dbc = (count << 9) - 1;  // 512 bytes per sector
+    cmdtbl->prdt_entry[i].dbc = (remaining_sectors << 9) - 1;  // 512 bytes per sector
     cmdtbl->prdt_entry[i].i = 1;
 
     // Setup command FIS
     auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1;  // Command
-    cmdfis->command = ATA_CMD_READ_DMA_EX;
+    cmdfis->command = write_op ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX;
 
     cmdfis->lba0 = static_cast<uint8_t>(startl);
     cmdfis->lba1 = static_cast<uint8_t>(startl >> 8);
@@ -260,7 +262,7 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
         spin++;
     }
     if (spin == MAX_SPIN) {
-        ker::mod::io::serial::write("Port is hung\n");
+        ahci_log("Port is hung\n");
         return false;
     }
 
@@ -273,18 +275,36 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
             break;
         }
         if ((port->is & HBA_PxIS_TFES) != 0U) {  // Task file error
-            ker::mod::io::serial::write("Read disk error\n");
+            if (write_op) {
+                ahci_log("Write disk error\n");
+            } else {
+                ahci_log("Read disk error\n");
+            }
             return false;
         }
     }
 
     // Check again
     if ((port->is & HBA_PxIS_TFES) != 0U) {
-        ker::mod::io::serial::write("Read disk error\n");
+        if (write_op) {
+            ahci_log("Write disk error\n");
+        } else {
+            ahci_log("Read disk error\n");
+        }
         return false;
     }
 
     return true;
+}
+
+// Read sectors from disk
+auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
+    return read_write_disk(port, portno, startl, starth, count, buf, false);
+}
+
+// Write sectors to disk
+auto write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
+    return read_write_disk(port, portno, startl, starth, count, buf, true);
 }
 
 // Wrapper for block device read
@@ -307,11 +327,26 @@ auto ahci_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* buf
     return result ? 0 : -1;
 }
 
-// Wrapper for block device write (stub for now)
+// Wrapper for block device write
 auto ahci_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const void* buffer) -> int {
-    // TODO: Implement write
-    ker::mod::io::serial::write("ahci_write_blocks: Not implemented yet\n");
-    return -1;
+    if (bdev == nullptr || bdev->private_data == nullptr || buffer == nullptr) {
+        return -1;
+    }
+
+    auto* dev = static_cast<AHCIDevice*>(bdev->private_data);
+    if (dev->port_num >= MAX_PORTS) {
+        return -1;
+    }
+
+    volatile HBA_PORT* port = &hba_mem->ports[dev->port_num];
+
+    auto startl = static_cast<uint32_t>(block & UINT32_MAX);
+    auto starth = static_cast<uint32_t>((block >> 32) & UINT32_MAX);
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    bool result =
+        write_disk(port, dev->port_num, startl, starth, static_cast<uint32_t>(count), static_cast<uint8_t*>(const_cast<void*>(buffer)));
+    return result ? 0 : -1;
 }
 
 // Probe all ports for devices
@@ -322,9 +357,9 @@ void probe_port(volatile HBA_MEM* abar) {
         if ((port_implemented & 1) != 0U) {
             int dt = check_type(&abar->ports[i]);
             if (dt == AHCI_DEV_SATA) {
-                ker::mod::io::serial::write("SATA drive found at port ");
-                ker::mod::io::serial::writeHex(i);
-                ker::mod::io::serial::write("\n");
+                ahci_log("SATA drive found at port ");
+                ahci_log_hex(i);
+                ahci_log("\n");
 
                 // Register device
                 if (device_count < MAX_PORTS) {
@@ -354,13 +389,13 @@ void probe_port(volatile HBA_MEM* abar) {
                     device_count++;
                 }
             } else if (dt == AHCI_DEV_SATAPI) {
-                ker::mod::io::serial::write("SATAPI drive found at port ");
-                ker::mod::io::serial::writeHex(i);
-                ker::mod::io::serial::write("\n");
+                ahci_log("SATAPI drive found at port ");
+                ahci_log_hex(i);
+                ahci_log("\n");
             } else if (dt != AHCI_DEV_NULL) {
-                ker::mod::io::serial::write("Other device found at port ");
-                ker::mod::io::serial::writeHex(i);
-                ker::mod::io::serial::write("\n");
+                ahci_log("Other device found at port ");
+                ahci_log_hex(i);
+                ahci_log("\n");
             }
         }
 
@@ -374,27 +409,27 @@ void probe_port(volatile HBA_MEM* abar) {
 // Main AHCI initialization
 auto ahci_init() -> int {
     if (hba_mem == nullptr) {
-        ker::mod::io::serial::write("ahci_init: HBA memory not set\n");
+        ahci_log("ahci_init: HBA memory not set\n");
         return -1;
     }
 
-    ker::mod::io::serial::write("ahci_init: Initializing AHCI driver\n");
+    ahci_log("ahci_init: Initializing AHCI driver\n");
 
     // Enable AHCI mode and interrupts
     hba_mem->ghc |= HBA_GHC_AE;
     hba_mem->ghc |= HBA_GHC_IE;
 
-    ker::mod::io::serial::write("ahci_init: GHC = 0x");
-    ker::mod::io::serial::writeHex(hba_mem->ghc);
-    ker::mod::io::serial::write("\n");
+    ahci_log("ahci_init: GHC = 0x");
+    ahci_log_hex(hba_mem->ghc);
+    ahci_log("\n");
 
     // Probe and initialize ports
     uint32_t port_implemented = hba_mem->pi;
     for (size_t i = 0; i < MAX_PORTS; i++) {
         if (((port_implemented & (1 << i)) != 0U)) {
-            ker::mod::io::serial::write("ahci_init: Rebasing port ");
-            ker::mod::io::serial::writeHex(i);
-            ker::mod::io::serial::write("\n");
+            ahci_log("ahci_init: Rebasing port ");
+            ahci_log_hex(i);
+            ahci_log("\n");
             port_rebase(&hba_mem->ports[i], i);
         }
     }
@@ -408,9 +443,9 @@ auto ahci_init() -> int {
 // Set AHCI base address
 auto ahci_set_base(volatile uint32_t* base) -> void {
     hba_mem = reinterpret_cast<volatile HBA_MEM*>(base);
-    ker::mod::io::serial::write("ahci_set_base: AHCI base = 0x");
-    ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(base));
-    ker::mod::io::serial::write("\n");
+    ahci_log("ahci_set_base: AHCI base = 0x");
+    ahci_log_hex(reinterpret_cast<uint64_t>(base));
+    ahci_log("\n");
 }
 
 // Initializes AHCI controller by discovering and setting up the AHCI device

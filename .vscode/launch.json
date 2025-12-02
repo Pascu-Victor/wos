@@ -40,12 +40,13 @@
             ],
             "initCommands": [
                 "settings set target.x86-disassembly-flavor intel",
-                "settings set target.load-script-from-symbol-file false",
+                "settings set target.load-script-from-symbol-file true",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
                 "settings set target.process.thread.step-avoid-regexp ''",
                 "settings set target.skip-prologue false",
+                "settings set target.prefer-dynamic-value auto-generated",
             ],
             "preLaunchTask": "Build and Start QEMU",
-        },
+        }
     ]
 }
