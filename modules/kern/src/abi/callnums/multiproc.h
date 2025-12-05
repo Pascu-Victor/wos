@@ -7,6 +7,6 @@ enum class threadInfoOps : uint64_t {
     nativeThreadCount,
 };
 enum class threadControlOps : uint64_t {
-    setTCB,
+    setTCB = 0x100,  // Offset to avoid overlap with threadInfoOps
 };
 }  // namespace ker::abi::multiproc

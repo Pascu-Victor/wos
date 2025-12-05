@@ -1,5 +1,6 @@
 #include "scheduler.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <platform/asm/segment.hpp>
@@ -19,21 +20,66 @@
 #include "platform/sched/task.hpp"
 #include "platform/sys/context_switch.hpp"
 
+// Kernel idle loop - defined in context_switch.asm
+extern "C" void _wOS_kernel_idle_loop();
+
 namespace ker::mod::sched {
 // One run queue per cpu
 static smt::PerCpuCrossAccess<RunQueue>* runQueues;
 
+// Debug: Per-CPU current task pointers at fixed address for panic inspection
+// Located at physical address 0x500000 (5 MB mark - safe area in our memory layout)
+// This allows debugger/panic handler to examine current task state on each CPU
+// Access via: x/2xg 0xffff800000500000  (for 2 CPUs)
+// Then: p *(Task*)0x<address> to see task details
+static constexpr uint64_t DEBUG_TASK_PTR_BASE = 0xffff800000500000ULL;  // Higher half mapping
+
 // TODO: may be unique_ptr
 auto postTask(task::Task* task) -> bool {
-    runQueues->thisCpu()->activeTasks.push_back(task);
+    // thisCpu access doesn't need locking - only current CPU accesses it
+    auto* rq = runQueues->thisCpu();
+    rq->activeTasks.push_back(task);
     return true;
 }
 
 bool postTaskForCpu(uint64_t cpuNo, task::Task* task) {
-    runQueues->thatCpu(cpuNo)->activeTasks.push_back(task);
+#ifdef SCHED_DEBUG
+    dbg::log("postTaskForCpu: posting task '%s' (PID %x) to CPU %d (current CPU: %d)", task->name, task->pid, cpuNo, cpu::currentCpu());
+#endif
+
+    task->cpu = cpuNo;
+
+    // Memory barrier to ensure all task fields are visible to other CPUs before posting
+    // This is critical for cross-CPU task posting to prevent other CPUs from seeing
+    // partially-initialized task objects
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    // Use PerCpuCrossAccess locking for cross-CPU access to add task
+    runQueues->withLockVoid(cpuNo, [task](RunQueue* rq) { rq->activeTasks.push_back(task); });
+
+    // TODO: IPIs disabled temporarily - they cause race conditions with idle loop
+    // For now, idle CPUs will wake on timer and check for work
+    // Send IPI to wake up the target CPU ONLY if it's halted (waiting for work)
+    /*
+    if (cpuNo != cpu::currentCpu()) {
+        std::atomic<bool>& isIdleAtomic = runQueues->thatCpu(cpuNo)->isIdle;
+        bool expected = true;
+        if (isIdleAtomic.compare_exchange_strong(expected, false, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            uint32_t targetLapicId = smt::getCpu(cpuNo).lapic_id;
+            apic::IPIConfig ipi = {};
+            ipi.vector = 0x30;
+            ipi.deliveryMode = apic::IPIDeliveryMode::FIXED;
+            ipi.destinationMode = apic::IPIDestinationMode::PHYSICAL;
+            ipi.level = apic::IPILevel::ASSERT;
+            ipi.triggerMode = apic::IPITriggerMode::EDGE;
+            ipi.destinationShorthand = apic::IPIDestinationShorthand::NONE;
+            apic::sendIpi(ipi, targetLapicId);
+        }
+    }
+    */
+
     return true;
 }
-
 task::Task* getCurrentTask() {
     task::Task* task = runQueues->thisCpu()->activeTasks.front();
     return task;
@@ -43,7 +89,9 @@ void removeCurrentTask() {
     runQueues->thisCpu()->activeTasks.pop_front();
 
     if (runQueues->thisCpu()->activeTasks.size() == 0) {
+#ifdef SCHED_DEBUG
         dbg::log("No more tasks in runqueue, halting CPU");
+#endif
         for (;;) {
             asm volatile("hlt");
         }
@@ -51,17 +99,45 @@ void removeCurrentTask() {
 }
 
 void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
-    apic::eoi();
+    // Note: EOI is called by _wOS_schedTimer before calling this function
     auto* currentTask = getCurrentTask();
 
-    if (currentTask->hasRun) {
+    // Only save context for non-idle tasks that have run
+    if (currentTask->hasRun && currentTask->type != task::TaskType::IDLE) {
         currentTask->context.regs = gpr;
         currentTask->context.frame = frame;
     }
 
-    runQueues->thisCpu()->activeTasks.pop_front();
-    runQueues->thisCpu()->activeTasks.push_back(currentTask);
-    task::Task* nextTask = runQueues->thisCpu()->activeTasks.front();
+    // Use locked access since other CPUs can post tasks to our queue
+    task::Task* nextTask = runQueues->thisCpuLocked([currentTask](RunQueue* rq) -> task::Task* {
+        rq->activeTasks.pop_front();
+        rq->activeTasks.push_back(currentTask);
+        task::Task* next = rq->activeTasks.front();
+
+        // Skip idle tasks if there are other tasks available
+        size_t taskCount = rq->activeTasks.size();
+        size_t checked = 0;
+        while (next->type == task::TaskType::IDLE && taskCount > 1 && checked < taskCount) {
+            rq->activeTasks.pop_front();
+            rq->activeTasks.push_back(next);
+            next = rq->activeTasks.front();
+            checked++;
+        }
+        return next;
+    });
+
+    // If we only have idle task, just return to the interrupt handler.
+    // The handler will do iretq which returns to wherever we were (likely hlt loop).
+    // The timer is already armed by _wOS_schedTimer, so we'll get another interrupt.
+    // This avoids nested interrupts from halting inside this function.
+    if (nextTask->type == task::TaskType::IDLE) {
+        // Mark CPU as idle so other CPUs know to send IPI when posting tasks
+        runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
+        return;
+    }
+
+    // Mark CPU as not idle since we have a real task to run
+    runQueues->thisCpu()->isIdle.store(false, std::memory_order_release);
 
     // Mark the next task as having run
     nextTask->hasRun = true;
@@ -72,9 +148,62 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
 // Jump to the next task without saving the current task's state
 void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
     apic::eoi();
-    runQueues->thisCpu()->expiredTasks.push_back(getCurrentTask());
-    runQueues->thisCpu()->activeTasks.pop_front();
-    task::Task* nextTask = runQueues->thisCpu()->activeTasks.front();
+
+    // Use locked access since other CPUs can post tasks to our queue
+    task::Task* nextTask = runQueues->thisCpuLocked([](RunQueue* rq) -> task::Task* {
+        task::Task* current = rq->activeTasks.front();
+        rq->expiredTasks.push_back(current);
+        rq->activeTasks.pop_front();
+
+        // Check if we have any tasks left
+        if (rq->activeTasks.size() == 0) {
+            return nullptr;
+        }
+        return rq->activeTasks.front();
+    });
+
+    if (nextTask == nullptr) {
+        // No more tasks - should not happen if idle task exists
+#ifdef SCHED_DEBUG
+        dbg::log("CPU %d: No tasks left after exit, halting forever", cpu::currentCpu());
+#endif
+        // Just halt forever - no tasks means system is essentially dead
+        runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
+        for (;;) {
+            asm volatile("sti");
+            asm volatile("hlt");
+        }
+    }
+
+    // If only idle task remains, we CANNOT switch to it because idle tasks
+    // don't have valid usermode context. We need to enter a kernel idle loop
+    // that properly cleans up the stack.
+    //
+    // The trick: set up a frame that returns to a kernel-mode halt routine.
+    // We'll create a simple idle loop in kernel space.
+    if (nextTask->type == task::TaskType::IDLE) {
+        // Mark CPU as idle so other CPUs know to send IPI when posting tasks
+        runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
+
+        // Arm the timer so we wake up periodically to check for new tasks
+        apic::oneShotTimer(apic::calibrateTimer(10000));  // 10ms timer
+
+        // Instead of returning to userspace (which idle task doesn't have),
+        // we'll modify the frame to do an infinite halt loop when iretq runs.
+        // We set CS to kernel mode (0x8) and set up a simple hlt loop.
+        frame.rip = (uint64_t)_wOS_kernel_idle_loop;
+        frame.cs = 0x08;                                         // Kernel code segment
+        frame.ss = 0x10;                                         // Kernel data segment
+        frame.rsp = (uint64_t)mm::phys::pageAlloc(4096) + 4096;  // Allocate a small stack for idle
+        frame.flags = 0x202;                                     // IF=1, reserved=1
+
+        // Clear GPRegs
+        gpr = cpu::GPRegs();
+        return;
+    }
+
+    // Mark CPU as not idle since we have a real task to run
+    runQueues->thisCpu()->isIdle = false;
 
     // Mark the next task as having run
     nextTask->hasRun = true;
@@ -91,63 +220,180 @@ void percpuInit() {
 
 void startScheduler() {
     dbg::log("Starting scheduler, CPU:%x", cpu::currentCpu());
+
+    // Check if we only have idle task(s)
     auto* firstTask = runQueues->thisCpu()->activeTasks.front();
+
+    // If the first task is an idle task (no entry point), wait for real tasks
+    if (firstTask->type == task::TaskType::IDLE || firstTask->entry == 0) {
+        dbg::log("CPU %d: Only idle task, waiting for work...", cpu::currentCpu());
+        // Enable interrupts and wait - arm a timer so we wake periodically to check for tasks
+        for (;;) {
+            // Mark CPU as idle before halting so other CPUs know to send IPI
+            runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
+
+            // Arm a short timer to wake us up periodically to check for new tasks
+            // This replaces the need for IPIs while we debug the race conditions
+            apic::oneShotTimer(apic::calibrateTimer(1000));  // Wake every 1ms
+
+            asm volatile("sti");
+            asm volatile("hlt");  // Wait for interrupt (timer will wake us)
+            asm volatile("cli");  // Disable interrupts before checking
+            // Mark CPU as no longer idle after waking
+            runQueues->thisCpu()->isIdle.store(false, std::memory_order_release);
+
+            // Check if we have any non-idle tasks now - use locked access since
+            // other CPUs can post tasks to our queue via postTaskForCpu
+            bool foundTask = runQueues->thisCpuLocked([&firstTask](RunQueue* rq) -> bool {
+                uint64_t taskCount = rq->activeTasks.size();
+                if (taskCount > 1) {
+                    // Save the idle task before we move it
+                    task::Task* idleTask = firstTask;
+
+                    // Move idle to back, get the real task from front
+                    rq->activeTasks.pop_front();          // Remove idle from front
+                    rq->activeTasks.push_back(idleTask);  // Put idle at back
+                    firstTask = rq->activeTasks.front();  // Get the real task
+
+                    // Validate the task before accepting it - protect against race conditions
+                    // where task is posted but not fully initialized
+                    if (firstTask != nullptr && firstTask->thread != nullptr) {
+                        return true;
+                    }
+
+                    // Task not ready yet, restore idle to front and wait more
+                    rq->activeTasks.pop_back();            // Remove idle from back
+                    rq->activeTasks.push_front(idleTask);  // Put idle back at front
+                    firstTask = idleTask;                  // Reset to idle
+                    return false;
+                }
+                return false;
+            });
+
+            if (foundTask) {
+                dbg::log("CPU %d: Found task, switching to real task", cpu::currentCpu());
+                break;  // Exit with interrupts disabled
+            }
+        }
+    }
 
     // Mark the first task as having run since we're entering it directly
     firstTask->hasRun = true;
 
-    cpuSetMSR(IA32_KERNEL_GS_BASE, firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
-    cpuSetMSR(IA32_GS_BASE, firstTask->context.syscallScratchArea);  // Scratch area base, not end
+    // NOTE: IA32_KERNEL_GS_BASE was already set by cpuParamInit to this CPU's kernel stack.
+    // We must NOT overwrite it with the task's stored value, because that value was set
+    // when the task was created (possibly on a different CPU).
+    // The kernel GS base is per-CPU, not per-task.
+
+    // Validate task before entering
+    if (firstTask == nullptr || firstTask->thread == nullptr) {
+        dbg::log("CPU %d: ERROR - Invalid task or thread pointer!", cpu::currentCpu());
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
+
+    // User GS_BASE = TLS/stack base (user-accessible), KERNEL_GS_BASE = scratch area location
+    // After swapgs in syscall: GS swaps with KERNEL_GS, so kernel gets scratch area
+    dbg::log("Setting MSRs: fsbase=0x%x, gsbase=0x%x, scratchArea=0x%x", 
+             firstTask->thread->fsbase, firstTask->thread->gsbase, firstTask->context.syscallScratchArea);
+    cpuSetMSR(IA32_GS_BASE, firstTask->thread->gsbase);  // User's TLS/stack base
+    cpuSetMSR(IA32_KERNEL_GS_BASE, firstTask->context.syscallScratchArea);  // Scratch area for kernel
     cpuSetMSR(IA32_FS_BASE, firstTask->thread->fsbase);
-    wrgsbase(firstTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
 
     mm::virt::switchPagemap(firstTask);
 
     // Write TLS self-pointer after switching pagemaps so it goes to the correct user-mapped physical memory
     *((uint64_t*)firstTask->thread->fsbase) = firstTask->thread->fsbase;
+
+    // Update debug task pointer for panic inspection
+    auto** debug_ptrs = reinterpret_cast<task::Task**>(DEBUG_TASK_PTR_BASE);
+    debug_ptrs[cpu::currentCpu()] = firstTask;
+
+    // Start the scheduler timer now that everything is set up
     sys::context_switch::startSchedTimer();
+
     for (;;) {
         _wOS_asm_enterUsermode(firstTask->entry, firstTask->context.frame.rsp);
     }
 }
 
+// IPI handler for scheduler wake-up (vector 0x30)
+// When a CPU is halted waiting for work, another CPU can send this IPI to wake it.
+// We must immediately check for tasks and context switch if available, because:
+// 1. The CPU might be in _wOS_kernel_idle_loop with no valid userspace context
+// 2. We can't just return and wait for the timer - the kernel idle loop doesn't set up proper frames
+// 3. If we have a task to run, we must switch to it NOW, not wait for the next timer tick
+static void schedulerWakeHandler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::interruptFrame frame) {
+    // Send EOI immediately so APIC can accept more interrupts
+    apic::eoi();
+
+#ifdef SCHED_DEBUG
+    dbg::log("CPU %d: Received scheduler wake IPI, checking for tasks", cpu::currentCpu());
+#endif
+
+    // Just check if we have work - don't manipulate the queue!
+    // The idle loop in startScheduler() will handle task switching properly
+    bool hasWork = runQueues->thisCpuLocked([](RunQueue* rq) -> bool {
+        // Check if we have more than just the idle task
+        return rq->activeTasks.size() > 1;
+    });
+
+    if (hasWork) {
+#ifdef SCHED_DEBUG
+        dbg::log("CPU %d: IPI detected work in queue, waking CPU", cpu::currentCpu());
+#endif
+        // Mark CPU as not idle so idle loop knows to check for real tasks
+        runQueues->thisCpu()->isIdle.store(false, std::memory_order_release);
+    }
+
+    // Return to wherever we were - idle loop will check queue and switch if needed
+}
+
 void init() {
     ker::mod::smt::init();
     runQueues = new smt::PerCpuCrossAccess<RunQueue>();
-}
 
+    // Register the scheduler wake IPI handler
+    gates::setInterruptHandler(0x30, schedulerWakeHandler);
+    dbg::log("Registered scheduler wake IPI handler for vector 0x30");
+}
 auto findTaskByPid(uint64_t pid) -> task::Task* {
     // Search all CPUs for a task with the given PID
     for (uint64_t cpuNo = 0; cpuNo < smt::getCoreCount(); ++cpuNo) {
-        auto* runQueue = runQueues->thatCpu(cpuNo);
-
-        // Search wait queue
-        for (auto* node = runQueue->waitQueue.getHead(); node != nullptr; node = node->next) {
-            if (node->data != nullptr && node->data->pid == pid) {
-                return node->data;
+        task::Task* found = runQueues->withLock(cpuNo, [pid](RunQueue* runQueue) -> task::Task* {
+            // Search wait queue
+            for (auto* node = runQueue->waitQueue.getHead(); node != nullptr; node = node->next) {
+                if (node->data != nullptr && node->data->pid == pid) {
+                    return node->data;
+                }
             }
-        }
 
-        // Search active tasks
-        for (auto* node = runQueue->activeTasks.getHead(); node != nullptr; node = node->next) {
-            if (node->data != nullptr && node->data->pid == pid) {
-                return node->data;
+            // Search active tasks
+            for (auto* node = runQueue->activeTasks.getHead(); node != nullptr; node = node->next) {
+                if (node->data != nullptr && node->data->pid == pid) {
+                    return node->data;
+                }
             }
-        }
 
-        // Search expired tasks
-        for (auto* node = runQueue->expiredTasks.getHead(); node != nullptr; node = node->next) {
-            if (node->data != nullptr && node->data->pid == pid) {
-                return node->data;
+            // Search expired tasks
+            for (auto* node = runQueue->expiredTasks.getHead(); node != nullptr; node = node->next) {
+                if (node->data != nullptr && node->data->pid == pid) {
+                    return node->data;
+                }
             }
+            return nullptr;
+        });
+        if (found != nullptr) {
+            return found;
         }
     }
     return nullptr;
 }
 
 void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task) {
-    // Add the task to the active tasks list for the specified CPU
-    runQueues->thatCpu(cpuNo)->activeTasks.push_back(task);
+    // Add the task to the active tasks list for the specified CPU with proper locking
+    runQueues->withLockVoid(cpuNo, [task](RunQueue* rq) { rq->activeTasks.push_back(task); });
 }
 
 void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
@@ -257,14 +503,54 @@ auto getRunQueueStats(uint64_t cpuNo) -> RunQueueStats {
     if (runQueues == nullptr) {
         return stats;
     }
-    auto* runQueue = runQueues->thatCpu(cpuNo);
-    if (runQueue == nullptr) {
-        return stats;
+    return runQueues->withLock(cpuNo, [](RunQueue* runQueue) -> RunQueueStats {
+        RunQueueStats s = {0, 0, 0};
+        if (runQueue == nullptr) {
+            return s;
+        }
+        s.activeTaskCount = runQueue->activeTasks.size();
+        s.expiredTaskCount = runQueue->expiredTasks.size();
+        s.waitQueueCount = runQueue->waitQueue.size();
+        return s;
+    });
+}
+
+// Find the CPU with the least number of active tasks for load balancing
+auto getLeastLoadedCpu() -> uint64_t {
+    if (runQueues == nullptr) {
+        return 0;
     }
-    stats.activeTaskCount = runQueue->activeTasks.size();
-    stats.expiredTaskCount = runQueue->expiredTasks.size();
-    stats.waitQueueCount = runQueue->waitQueue.size();
-    return stats;
+
+    uint64_t cpuCount = smt::getCoreCount();
+    if (cpuCount <= 1) {
+        return 0;
+    }
+
+    uint64_t leastLoadedCpu = 0;
+    uint64_t minTasks = UINT64_MAX;
+
+    for (uint64_t i = 0; i < cpuCount; i++) {
+        uint64_t taskCount = runQueues->withLock(i, [](RunQueue* runQueue) -> uint64_t {
+            if (runQueue == nullptr) {
+                return UINT64_MAX;
+            }
+            return runQueue->activeTasks.size();
+        });
+
+        if (taskCount < minTasks) {
+            minTasks = taskCount;
+            leastLoadedCpu = i;
+        }
+    }
+
+    return leastLoadedCpu;
+}
+
+// Post a task to the least loaded CPU for load balancing
+auto postTaskBalanced(task::Task* task) -> bool {
+    uint64_t targetCpu = getLeastLoadedCpu();
+    task->cpu = targetCpu;
+    return postTaskForCpu(targetCpu, task);
 }
 
 }  // namespace ker::mod::sched

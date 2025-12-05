@@ -15,6 +15,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
+#include "platform/sys/syscall.hpp"
 #include "vfs/fs/devfs.hpp"
 
 __attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
@@ -30,26 +31,63 @@ uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t cpu_count;
 
-void cpuParamInit() {
-    apic::initApicMP();
-    uint64_t cpuNo = apic::getApicId();
-
-    cpuSetMSR(IA32_KERNEL_GS_BASE, (uint64_t)cpuData->thatCpu(cpuNo)->stack_pointer_ref - KERNEL_STACK_SIZE);
-
+void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
+    // Set up per-CPU data first
+    cpuSetMSR(IA32_KERNEL_GS_BASE, stackTop - KERNEL_STACK_SIZE);
     cpu::setCurrentCpuid(cpuNo);
+
+    // Enable CPU features (must be done on each CPU)
+    cpu::enableFSGSBASE();
+    cpu::enableSSE();
+
+    // Initialize GDT for this CPU (includes per-CPU TSS)
+    desc::gdt::initDescriptors((uint64_t*)stackTop);
+
+    // Initialize IDT for this CPU (loads the shared IDT)
     desc::idt::idtInit();
+
+    // Initialize syscall MSRs for this CPU
+    sys::init();
+
+    // Initialize APIC for this CPU
+    apic::initApicMP();
+
+    // Initialize scheduler for this CPU
     sched::percpuInit();
-    auto idleTask = new sched::task::Task("idle", 0, 0, sched::task::TaskType::IDLE);
+
+    // Create idle task for this CPU
+    // Pass the kernel stack pointer so the PerCpu structure gets initialized correctly
+    uint64_t kernelStack = stackTop - KERNEL_STACK_SIZE;
+    auto idleTask = new sched::task::Task("idle", 0, kernelStack, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
+
+    dbg::log("CPU %d initialized and ready", cpuNo);
+
+    // Start the scheduler on this CPU
     sched::startScheduler();
 }
 
-void nonPrimaryCpuInit() {
-    desc::idt::loadIdt();
-    for (;;) {
-        asm volatile("hlt");
+void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
+    // FIRST: Switch to kernel page table before accessing any kernel data
+    mm::virt::switchToKernelPagemap();
+
+    uint64_t cpuNo = 0;
+
+    // Find our CPU number from the LAPIC ID
+    for (uint64_t i = 0; i < cpu_count; i++) {
+        if (smp_request.response->cpus[i]->lapic_id == smpInfo->lapic_id) {
+            cpuNo = i;
+            break;
+        }
     }
-    cpuParamInit();
+
+    uint64_t stackTop = (uint64_t)cpuData->thatCpu(cpuNo)->stack_pointer_ref;
+
+    // Initialize this CPU fully
+    cpuParamInit(cpuNo, stackTop);
+
+    // Should never reach here
+    hcf();
 }
 
 void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
@@ -192,7 +230,7 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         dbg::log("  userStackVirt=0x%x, currentVirtOffset=0x%x, argv0=0x%x", userStackVirt, currentVirtOffset, argv0);
 #endif
 
-        sched::postTask(newTask);
+        sched::postTaskBalanced(newTask);
     }
 #ifdef TASK_DEBUG
     dbg::log("Posted task for main thread");
@@ -225,17 +263,40 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
 
     cpuData = new PerCpuCrossAccess<CpuInfo>();
 
+    // Initialize CPU info for all CPUs first
     for (uint64_t i = 0; i < getCoreCount(); i++) {
         cpuData->thatCpu(i)->processor_id = smp_request.response->cpus[i]->processor_id;
         cpuData->thatCpu(i)->lapic_id = smp_request.response->cpus[i]->lapic_id;
         cpuData->thatCpu(i)->goto_address = &smp_request.response->cpus[i]->goto_address;
         cpuData->thatCpu(i)->stack_pointer_ref = (uint64_t*)(smp_request.response->cpus[i]->extra_argument);
     }
-    for (uint64_t i = 1; i < smp_request.response->cpu_count; i++) {
+
+    // Allocate stacks and start secondary CPUs
+    for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
+        // Skip BSP - it's already running
+        if (smp_request.response->cpus[i]->lapic_id == bsp_lapic_id) {
+            // Allocate a stack for BSP too and store it
+            auto stack = mm::Stack();
+            cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
+            continue;
+        }
+
+        // Allocate stack for this CPU
         auto stack = mm::Stack();
         cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
-        startCpuTask(i, reinterpret_cast<CpuGotoAddr>(nonPrimaryCpuInit), stack);
+
+        dbg::log("Starting CPU %d (LAPIC ID: %d)", i, smp_request.response->cpus[i]->lapic_id);
+
+        // Use Limine's goto_address to start the CPU
+        // The CPU will call nonPrimaryCpuInit with its limine_smp_info as argument
+        __atomic_store_n(&smp_request.response->cpus[i]->goto_address, (limine_goto_address)nonPrimaryCpuInit, __ATOMIC_SEQ_CST);
     }
+
+    // Small delay to let secondary CPUs start
+    for (volatile int i = 0; i < 10000000; i++) {
+    }
+
+    dbg::log("All CPUs started, running handover tasks on BSP");
     runHandoverTasks(modules, kernelRsp);
     hcf();
 }
@@ -248,7 +309,9 @@ auto setTcb(void* tcb) -> uint64_t {
     mod::dbg::log("setTcb called with tcb = 0x%x", (uint64_t)tcb);
 #endif
     asm volatile("cli");
-    cpuData->thisCpu()->currentTask->thread->fsbase = (uint64_t)tcb;
+    // Use scheduler's getCurrentTask() to get the correct per-CPU task
+    auto* currentTask = sched::getCurrentTask();
+    currentTask->thread->fsbase = (uint64_t)tcb;
     *(uint64_t*)tcb = (uint64_t)tcb;
     cpu::wrfsbase((uint64_t)tcb);
     asm volatile("sti");

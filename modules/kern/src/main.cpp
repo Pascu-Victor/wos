@@ -147,6 +147,7 @@ extern "C" void _start(void) {
     // Enable SSE instructions
     // Here so we can fail hard for sse instructions in the kernel easily for as long as possible
     cpu::enableSSE();
+    ker::mod::io::serial::markCpuIdAvailable();
 
     // Init smt
     ker::mod::smt::startSMT(modules, (uint64_t)stack);

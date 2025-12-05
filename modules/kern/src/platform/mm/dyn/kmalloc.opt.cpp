@@ -15,6 +15,7 @@
 namespace ker::mod::mm::dyn::kmalloc {
 // static tlsf_t tlsf = nullptr;
 static ker::mod::sys::Spinlock* kmallocLock;
+static ker::mod::sys::Spinlock trackerLock;  // Static spinlock for tracker - works before init()
 
 // Threshold for large allocations (2KB)
 constexpr uint64_t LARGE_ALLOC_THRESHOLD = 0x800;
@@ -44,11 +45,13 @@ static auto trackerArraySize(size_t capacity) -> uint64_t {
 }
 
 static void initTracker() {
+    trackerLock.lock();
     if (!trackedAllocsInitialized) {
         uint64_t allocSize = trackerArraySize(MIN_TRACKED_ALLOCS);
         trackedAllocs = static_cast<LargeAllocationTracker*>(phys::pageAlloc(allocSize));
         if (trackedAllocs == nullptr) {
             ker::mod::io::serial::write("kmalloc: FATAL - failed to allocate initial tracker array\n");
+            trackerLock.unlock();
             return;
         }
         trackedAllocsCapacity = MIN_TRACKED_ALLOCS;
@@ -60,6 +63,7 @@ static void initTracker() {
         }
         trackedAllocsInitialized = true;
     }
+    trackerLock.unlock();
 }
 
 // Resize the tracker array (grow or shrink)
@@ -136,6 +140,25 @@ static void maybeShrinkTracker() {
 }
 
 static void trackAllocation(void* ptr, uint64_t size) {
+    // Ensure tracker is initialized (handles early allocations before init() is called)
+    if (!trackedAllocsInitialized) {
+        // Note: caller already holds trackerLock, so we need unlocked version
+        uint64_t allocSize = trackerArraySize(MIN_TRACKED_ALLOCS);
+        trackedAllocs = static_cast<LargeAllocationTracker*>(phys::pageAlloc(allocSize));
+        if (trackedAllocs == nullptr) {
+            ker::mod::io::serial::write("kmalloc: FATAL - failed to allocate initial tracker array\n");
+            return;
+        }
+        trackedAllocsCapacity = MIN_TRACKED_ALLOCS;
+        trackedAllocsCount = 0;
+        for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
+            trackedAllocs[i].virt_addr = nullptr;
+            trackedAllocs[i].size = 0;
+            trackedAllocs[i].in_use = false;
+        }
+        trackedAllocsInitialized = true;
+    }
+
     // Check if we need to grow before adding
     maybeGrowTracker();
 
@@ -204,8 +227,10 @@ void* malloc(uint64_t size) {
         ker::mod::io::serial::write("\n");
 #endif
 
-        // Track the allocation so we can free it later
+        // Track the allocation so we can free it later (under lock)
+        trackerLock.lock();
         trackAllocation(virt_ptr, alloc_size);
+        trackerLock.unlock();
 
         return virt_ptr;
     }
@@ -252,8 +277,12 @@ auto realloc(void* ptr, int sz) -> void* {
     uint64_t newSize = static_cast<uint64_t>(sz);
 
     // Check if this is a tracked large allocation
+    trackerLock.lock();
     uint64_t oldSize = 0;
-    if (findTrackedAllocation(ptr, oldSize)) {
+    bool isTracked = findTrackedAllocation(ptr, oldSize);
+    trackerLock.unlock();
+
+    if (isTracked) {
         // It's a large allocation - handle with pageAlloc directly
         uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
         uint64_t newAllocSize = (newSize + page_size - 1) & ~(page_size - 1);
@@ -274,7 +303,9 @@ auto realloc(void* ptr, int sz) -> void* {
         memcpy(newPtr, ptr, copySize);
 
         // Update tracking: change the entry to point to new allocation
+        trackerLock.lock();
         updateTrackedAllocation(ptr, newPtr, newAllocSize);
+        trackerLock.unlock();
 
         // Free old pages
         phys::pageFree(ptr);
@@ -298,7 +329,9 @@ auto realloc(void* ptr, int sz) -> void* {
         memcpy(newPtr, ptr, newSize);
 
         // Track the new large allocation
+        trackerLock.lock();
         trackAllocation(newPtr, newAllocSize);
+        trackerLock.unlock();
 
         // Free the old small allocation
         kmallocLock->lock();
@@ -334,11 +367,13 @@ void free(void* ptr) {
         return;
     }
 
-    kmallocLock->lock();
-
     // First check if this is a large allocation tracked by kmalloc
+    trackerLock.lock();
     uint64_t trackedSize = 0;
-    if (untrackAllocation(ptr, trackedSize)) {
+    bool wasTracked = untrackAllocation(ptr, trackedSize);
+    trackerLock.unlock();
+
+    if (wasTracked) {
 #ifdef DEBUG_KMALLOC
         // It's a large allocation we directly allocated via pageAlloc
         ker::mod::io::serial::write("kmalloc: Freeing large allocation at ");
@@ -347,13 +382,13 @@ void free(void* ptr) {
         ker::mod::io::serial::writeHex(trackedSize);
         ker::mod::io::serial::write(" bytes)\n");
 #endif
-        kmallocLock->unlock();
         phys::pageFree(ptr);
         return;
     }
 
     // Otherwise, try to free via mini_malloc
     // mini_malloc handles both its own large allocations and slab allocations
+    kmallocLock->lock();
     mini_free(ptr);
 
     kmallocLock->unlock();

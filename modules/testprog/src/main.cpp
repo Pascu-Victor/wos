@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <sys/logging.h>
 #include <sys/mman.h>
+#include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -15,7 +16,7 @@
 auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
     std::println("testprog: main() called");
-    int pid = ker::process::getpid();
+    int pid = ker::abi::multiproc::getcpunum();
     // Log argc
     std::println("testprog[{}]: argc = {}", pid, argc);
     // Log each argument

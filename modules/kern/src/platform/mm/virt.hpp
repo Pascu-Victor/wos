@@ -30,6 +30,7 @@ void mapRange(PageTable* pageTable, Range range, uint64_t flags, uint64_t offset
 void unmapPage(PageTable* pageTable, vaddr_t vaddr);
 
 void switchToKernelPagemap(void);
+PageTable* getKernelPagemap(void);
 void initPagemap(void);
 PageTable* createPagemap(void);
 void copyKernelMappings(sched::task::Task* t);

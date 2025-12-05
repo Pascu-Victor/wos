@@ -107,19 +107,12 @@ void wos_proc_exit(int status) {
         currentTask->thread = nullptr;
     }
 
-    // Free kernel stack memory (allocated separately for syscall handling)
-    if (currentTask->context.syscallKernelStack != 0) {
-        // We need to free from the base (bottom) of the stack
-        void* stackBase = (void*)(currentTask->context.syscallKernelStack - KERNEL_STACK_SIZE);
-        ker::mod::mm::phys::pageFree(stackBase);
-        currentTask->context.syscallKernelStack = 0;
-    }
-
-    // Free syscall scratch area (allocated with new uint8_t[256])
-    if (currentTask->context.syscallScratchArea != 0) {
-        delete[] reinterpret_cast<uint8_t*>(currentTask->context.syscallScratchArea);
-        currentTask->context.syscallScratchArea = 0;
-    }
+    // NOTE: We CANNOT free the kernel stack here because we're still running on it!
+    // The kernel stack will be freed later when the task is fully cleaned up
+    // (after switching to a different task's kernel stack).
+    // The syscallKernelStack and syscallScratchArea are left intact for now.
+    // They will be cleaned up by jumpToNextTask when it moves the task to expiredTasks,
+    // and eventually by a garbage collection mechanism.
 
     // TODO: Handle signal handlers cleanup
 
@@ -127,7 +120,8 @@ void wos_proc_exit(int status) {
     ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");
 #endif
 
-    // This function will not return
+    // This function will not return - it switches to the next task
+    // The current task is moved to expiredTasks list by jumpToNextTask
     jump_to_next_task_no_save();
 
     __builtin_unreachable();

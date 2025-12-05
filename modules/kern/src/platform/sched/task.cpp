@@ -6,6 +6,8 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 
+#include "platform/asm/msr.hpp"
+
 namespace ker::mod::sched::task {
 Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
     this->name = name;
@@ -24,6 +26,22 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     }
 
     if (type == TaskType::IDLE) {
+        // Idle tasks use the kernel pagemap
+        this->pagemap = mm::virt::getKernelPagemap();
+        this->type = type;
+        this->cpu = cpu::currentCpu();
+        this->context.syscallKernelStack = kernelRsp;
+
+        // Initialize syscall scratch area even for idle tasks
+        // This is needed because switchTo() sets GS_BASE from this field
+        this->context.syscallScratchArea = (uint64_t)(new cpu::PerCpu());
+        cpu::PerCpu* scratchArea = (cpu::PerCpu*)this->context.syscallScratchArea;
+        scratchArea->syscallStack = kernelRsp;
+        scratchArea->cpuId = cpu::currentCpu();
+
+        this->pid = sched::task::getNextPid();
+        this->entry = 0;
+        this->thread = nullptr;
         return;
     }
     // this->entry = entry;
@@ -38,21 +56,50 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->type = type;
     this->cpu = cpu::currentCpu();
     this->context.syscallKernelStack = kernelRsp;
-    // Allocate a small scratch area for syscall handler (stores RIP, RSP, RFLAGS, DS, ES)
-    this->context.syscallScratchArea = (uint64_t)(new uint8_t[256]);
+    
     this->pid = sched::task::getNextPid();
+
+    // CRITICAL: Copy kernel mappings FIRST so we can access kernel memory (like elfBuffer)
+    // The elfStart pointer points to kernel heap memory allocated by the parent process
+    mm::virt::copyKernelMappings(this);
+
+    // Validate ELF pointer before any operations
+    if (elfStart == 0) {
+        dbg::log("ERROR: Task created with null ELF pointer");
+        hcf();
+    }
+
+    // Add compiler memory barrier to ensure elfStart is fully visible
+    __asm__ volatile("mfence" ::: "memory");
+
+    // Validate ELF magic bytes before proceeding
+    auto* elfHeader = (uint8_t*)elfStart;
+
+    if (elfHeader[0] != 0x7F || elfHeader[1] != 'E' || elfHeader[2] != 'L' || elfHeader[3] != 'F') {
+        dbg::log("ERROR: Invalid ELF magic at 0x%p: [0x%x 0x%x 0x%x 0x%x]", (void*)elfStart, elfHeader[0], elfHeader[1], elfHeader[2],
+                 elfHeader[3]);
+        dbg::log("Expected ELF magic: [0x7F 'E' 'L' 'F'] = [0x7F 0x45 0x4C 0x46]");
+        hcf();
+    }
 
     // FIXED: Parse ELF first to get actual TLS size, then create thread
     ker::loader::elf::TlsModule actualTlsInfo = loader::elf::extractTlsInfo((void*)elfStart);
     this->thread = threading::createThread(USER_STACK_SIZE, actualTlsInfo.tlsSize, this->pagemap, actualTlsInfo);
 
+    // Use the bottom of user stack as syscall scratch area (GS_BASE will point here)
+    this->context.syscallScratchArea = this->thread->gsbase;
+    
+    // Initialize the scratch area with kernel stack pointer
+    // Note: We need to translate to physical address to write to it before pagemap switch
+    uint64_t scratchPhys = mm::virt::translate(this->pagemap, this->context.syscallScratchArea);
+    if (scratchPhys != 0) {
+        cpu::PerCpu* scratchArea = (cpu::PerCpu*)mm::addr::getPhysPointer(scratchPhys);
+        scratchArea->syscallStack = kernelRsp;
+        scratchArea->cpuId = cpu::currentCpu();
+    }
+
     this->context.frame.rsp = this->thread->stack;
 
-    mm::virt::copyKernelMappings(this);
-    if (elfStart == 0) {
-        dbg::log("No elf start\n halting");
-        hcf();
-    }
     loader::elf::ElfLoadResult elfResult = loader::elf::loadElf((loader::elf::ElfFile*)elfStart, this->pagemap, this->pid, this->name);
     if (elfResult.entryPoint == 0) {
         dbg::log("Failed to load ELF for task %s", name);
@@ -99,8 +146,7 @@ Task::Task(const Task& task) {
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 
 void Task::saveContext(cpu::GPRegs* gpr) {
-    cpuSetMSR(IA32_GS_BASE, this->context.syscallScratchArea);  // Scratch area base
-    cpuSetMSR(IA32_KERNEL_GS_BASE, this->context.syscallKernelStack - KERNEL_STACK_SIZE);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, this->context.syscallScratchArea);
     *gpr = context.regs;
 }
 

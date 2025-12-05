@@ -21,7 +21,15 @@ void init(limine_memmap_response* _memmapResponse, limine_kernel_file_response* 
 
 void switchToKernelPagemap() { wrcr3((uint64_t)addr::getPhysPointer((paddr_t)kernelPagemap)); }
 
-PageTable* createPagemap() { return (PageTable*)phys::pageAlloc(); }
+PageTable* getKernelPagemap() { return kernelPagemap; }
+
+PageTable* createPagemap() {
+    auto* pageTable = (PageTable*)phys::pageAlloc();
+    if (pageTable) {
+        memset(pageTable, 0, paging::PAGE_SIZE);
+    }
+    return pageTable;
+}
 
 void copyKernelMappings(sched::task::Task* t) {
     for (size_t i = 256; i < 512; i++) {

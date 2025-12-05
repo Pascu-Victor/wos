@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gates.hpp>
@@ -17,9 +18,10 @@ struct RunQueue {
     std::list<task::Task*> expiredTasks;  // TODO: replace with fast priority queue should also be fast to search
     std::list<task::Task*> waitQueue;     // Tasks waiting on I/O or other events (e.g., waitpid)
     task::Task* currentTask;
+    std::atomic<bool> isIdle;  // True when CPU is halted waiting for work (only send IPI when idle)
     [[nodiscard]]
     RunQueue()
-        : activeTasks(), expiredTasks(), waitQueue(), currentTask(nullptr) {}
+        : activeTasks(), expiredTasks(), waitQueue(), currentTask(nullptr), isIdle(false) {}
 };
 
 struct SchedEntry {
@@ -30,6 +32,8 @@ struct SchedEntry {
 void init();
 auto postTask(task::Task* task) -> bool;
 auto postTaskForCpu(uint64_t cpuNo, task::Task* task) -> bool;
+auto postTaskBalanced(task::Task* task) -> bool;  // Post to least loaded CPU
+auto getLeastLoadedCpu() -> uint64_t;             // Get CPU with least tasks
 auto getCurrentTask() -> task::Task*;
 void removeCurrentTask();                                     // Remove current task from runqueue (for exit)
 auto findTaskByPid(uint64_t pid) -> task::Task*;              // Find a task by PID across all CPUs

@@ -9,6 +9,14 @@ bits 64
     .%1:
 %endmacro
 
+; Kernel-mode idle loop - used when there are no user tasks to run
+; This runs in ring 0 and just halts, waiting for interrupts
+global _wOS_kernel_idle_loop
+_wOS_kernel_idle_loop:
+    sti         ; Enable interrupts
+    hlt         ; Halt until interrupt
+    jmp _wOS_kernel_idle_loop  ; Loop forever
+
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:
     ;clear registers
@@ -69,7 +77,6 @@ task_switch_handler:
     swapgs
     .no_swapgs_exit:
     add rsp, 16  ; Skip intNum and errCode
-    sti
     iretq
 
 ; Jump to next task without saving current task state
@@ -77,7 +84,17 @@ task_switch_handler:
 extern _wOS_jumpToNextTaskNoSave
 global jump_to_next_task_no_save
 jump_to_next_task_no_save:
-    ; Push dummy GPRegs structure
+    ; Push dummy interrupt frame FIRST (will be at higher addresses)
+    ; Layout expected by C++: GPRegs at stack_ptr, interruptFrame at stack_ptr + sizeof(GPRegs)
+    push 0  ; SS
+    push 0  ; RSP
+    push 0  ; RFLAGS
+    push 0  ; CS
+    push 0  ; RIP
+    push 0  ; errCode
+    push 0  ; intNum
+
+    ; Push dummy GPRegs structure (will be at lower addresses = RSP after this)
     push 0  ; rax
     push 0  ; rbx
     push 0  ; rcx
@@ -93,15 +110,6 @@ jump_to_next_task_no_save:
     push 0  ; r13
     push 0  ; r14
     push 0  ; r15
-
-    ; Push dummy interrupt frame
-    push 0  ; SS
-    push 0  ; RSP
-    push 0  ; RFLAGS
-    push 0  ; CS
-    push 0  ; RIP
-    push 0  ; errCode
-    push 0  ; intNum
 
     mov rdi, rsp
     call _wOS_jumpToNextTaskNoSave

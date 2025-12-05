@@ -18,7 +18,6 @@
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
 #include "util/hcf.hpp"
-
 // TLS relocation support
 namespace {
 
@@ -66,7 +65,30 @@ auto headerIsValid(const Elf64_Ehdr& ehdr) -> bool {
 auto parseElf(uint8_t* base) -> ElfFile {
     ElfFile elf{};
     elf.base = base;
+
+    // Validate base pointer before dereferencing
+    if (base == nullptr) {
+        mod::dbg::log("ERROR: parseElf called with null base pointer");
+        return elf;  // Return empty ElfFile
+    }
+
+    // Copy ELF header first and validate magic numbers before using offsets
     elf.elfHead = *(Elf64_Ehdr*)base;
+
+    // Validate ELF magic numbers immediately to catch corruption
+    if (elf.elfHead.e_ident[EI_MAG0] != ELFMAG0 || elf.elfHead.e_ident[EI_MAG1] != ELFMAG1 || elf.elfHead.e_ident[EI_MAG2] != ELFMAG2 ||
+        elf.elfHead.e_ident[EI_MAG3] != ELFMAG3) {
+        mod::dbg::log("ERROR: Invalid ELF magic: 0x%x 0x%x 0x%x 0x%x", elf.elfHead.e_ident[EI_MAG0], elf.elfHead.e_ident[EI_MAG1],
+                      elf.elfHead.e_ident[EI_MAG2], elf.elfHead.e_ident[EI_MAG3]);
+        return elf;  // Return with invalid header
+    }
+
+    // Validate offsets are reasonable before dereferencing
+    if (elf.elfHead.e_phoff == 0 || elf.elfHead.e_shoff == 0) {
+        mod::dbg::log("ERROR: Invalid ELF offsets - phoff: 0x%x, shoff: 0x%x", elf.elfHead.e_phoff, elf.elfHead.e_shoff);
+        return elf;
+    }
+
     elf.pgHead = (Elf64_Phdr*)(base + elf.elfHead.e_phoff);
     elf.seHead = (Elf64_Shdr*)(base + elf.elfHead.e_shoff);
     elf.sctHeadStrTab = (Elf64_Shdr*)(elf.elfHead.e_shoff +                                // Section header offset
@@ -736,9 +758,23 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 
 auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName, bool registerSpecialSymbols)
     -> ElfLoadResult {
+    // Validate input pointer
+    if (elf == nullptr) {
+        mod::dbg::log("ERROR: loadElf called with null ELF pointer (pid=%d)", pid);
+        return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
+    }
+
     ElfFile elfFile = parseElf((uint8_t*)elf);
 
     if (!headerIsValid(elfFile.elfHead)) {
+        mod::dbg::log("ERROR: Invalid ELF header (pid=%d)", pid);
+        mod::dbg::log("  ELF base: 0x%p", elf);
+        mod::dbg::log("  e_ident: [0x%x 0x%x 0x%x 0x%x] (expected [0x%x 0x%x 0x%x 0x%x])", elfFile.elfHead.e_ident[EI_MAG0],
+                      elfFile.elfHead.e_ident[EI_MAG1], elfFile.elfHead.e_ident[EI_MAG2], elfFile.elfHead.e_ident[EI_MAG3], ELFMAG0,
+                      ELFMAG1, ELFMAG2, ELFMAG3);
+        mod::dbg::log("  e_ident[EI_CLASS]: 0x%x (expected ELFCLASS64=0x%x)", elfFile.elfHead.e_ident[EI_CLASS], ELFCLASS64);
+        mod::dbg::log("  e_type: 0x%x (expected ET_EXEC=0x%x or ET_DYN=0x%x)", elfFile.elfHead.e_type, ET_EXEC, ET_DYN);
+        mod::dbg::log("  e_phoff: 0x%x, e_shoff: 0x%x", elfFile.elfHead.e_phoff, elfFile.elfHead.e_shoff);
         return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
     }
 
@@ -746,10 +782,11 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     debug::registerProcess(pid, processName, (uint64_t)elfFile.base, elfFile.elfHead.e_entry + elfFile.loadBase);
 
     // Filter program headers: only include PT_PHDR, PT_DYNAMIC, PT_TLS, PT_INTERP
+    // PT_DYNAMIC is CRITICAL for the dynamic linker to find .dynamic section
     std::vector<Elf64_Phdr> filteredHeaders;
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
         auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
-        if (ph->p_type == PT_PHDR || ph->p_type == PT_TLS || ph->p_type == PT_INTERP) {
+        if (ph->p_type == PT_PHDR || ph->p_type == PT_DYNAMIC || ph->p_type == PT_TLS || ph->p_type == PT_INTERP) {
             filteredHeaders.push_back(*ph);
         }
     }
@@ -1075,20 +1112,33 @@ auto extractTlsInfo(void* elfData) -> TlsModule {
     mod::dbg::log("extractTlsInfo: Starting TLS extraction from ELF data at 0x%x", (uint64_t)elfData);
 #endif
 
+    // Validate input pointer
+    if (elfData == nullptr) {
+        mod::dbg::log("ERROR: extractTlsInfo called with null elfData pointer");
+        return tlsInfo;
+    }
+
     // Parse the ELF to find PT_TLS segment
     ElfFile elfFile = parseElf((uint8_t*)elfData);
+
+    // Check if parsing was successful (parseElf validates magic numbers)
+    if (elfFile.elfHead.e_ident[EI_MAG0] != ELFMAG0 || elfFile.elfHead.e_ident[EI_MAG1] != ELFMAG1 ||
+        elfFile.elfHead.e_ident[EI_MAG2] != ELFMAG2 || elfFile.elfHead.e_ident[EI_MAG3] != ELFMAG3) {
+        mod::dbg::log("ERROR: extractTlsInfo - Invalid ELF magic in parsed data");
+        return tlsInfo;
+    }
 
 #ifdef ELF_DEBUG
     mod::dbg::log("extractTlsInfo: ELF has %d program headers", elfFile.elfHead.e_phnum);
 #endif
 
-    // Look for PT_TLS segment
+    // Look for PT_TLS segment - use a local pointer instead of modifying elfFile.pgHead
     for (uint32_t i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        elfFile.pgHead = (Elf64_Phdr*)(elfFile.base + elfFile.elfHead.e_phoff + (static_cast<size_t>(i * elfFile.elfHead.e_phentsize)));
+        auto* currentPhdr = (Elf64_Phdr*)(elfFile.base + elfFile.elfHead.e_phoff + (static_cast<size_t>(i * elfFile.elfHead.e_phentsize)));
 
-        if (elfFile.pgHead->p_type == PT_TLS) {
-            tlsInfo.tlsSize = elfFile.pgHead->p_memsz;
-            tlsInfo.tcbOffset = elfFile.pgHead->p_memsz;  // TCB goes after TLS data
+        if (currentPhdr->p_type == PT_TLS) {
+            tlsInfo.tlsSize = currentPhdr->p_memsz;
+            tlsInfo.tcbOffset = currentPhdr->p_memsz;  // TCB goes after TLS data
 #ifdef ELF_DEBUG
             mod::dbg::log("extractTlsInfo: Found PT_TLS segment with size %d bytes", tlsInfo.tlsSize);
 #endif

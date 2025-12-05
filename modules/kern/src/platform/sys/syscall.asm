@@ -51,8 +51,8 @@ _wOS_asm_syscallHandler:
 
     ; rax now contains current task pointer
     ; Check if deferredTaskSwitch flag is set at the calculated offset
-    mov rcx, [rel _wOS_DEFERRED_TASK_SWITCH_OFFSET]  ; Load offset value
-    movzx edx, byte [rax + rcx]                      ; Load flag from task at offset
+    mov r8, [rel _wOS_DEFERRED_TASK_SWITCH_OFFSET]  ; Load offset value
+    movzx edx, byte [rax + r8]                      ; Load flag from task at offset
     cmp edx, 0
     je .no_deferred_switch
 

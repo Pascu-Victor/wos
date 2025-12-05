@@ -7,6 +7,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sys/spinlock.hpp>
 
 #include "slab_allocator.hpp"
 
@@ -35,6 +36,9 @@ constexpr size_t MAX_LARGE_ALLOCS = 128;
 // Large allocation tracking
 std::array<LargeAllocation, MAX_LARGE_ALLOCS> large_allocs;
 bool large_allocs_initialized = false;
+
+// Spinlock for large allocation tracking
+ker::mod::sys::Spinlock largeAllocLock;
 
 void free_from_slab(SlabHeader<1, 1>& generic_slab, void* address) {
     switch (generic_slab.size) {
@@ -120,6 +124,8 @@ auto mini_malloc(size_t size) -> void* {
 
     // Handle large allocations (> 0x1000 bytes)
     if (size > LARGE_ALLOC_THRESHOLD) {
+        largeAllocLock.lock();
+
         // Round up size to page boundary (0x1000 = 4KB)
         size_t alloc_size = (size + 0xFFF) & ~0xFFF;
 
@@ -133,17 +139,38 @@ auto mini_malloc(size_t size) -> void* {
         }
 
         if (slot == MAX_LARGE_ALLOCS) {
+            largeAllocLock.unlock();
             ker::mod::io::serial::write("mini_malloc: no free slots for large allocation\n");
             return nullptr;
         }
 
-        // Allocate physical pages
+        // Allocate physical pages (pageAlloc has its own lock)
+        largeAllocLock.unlock();  // Release lock during potentially slow pageAlloc
         void* phys_addr = ker::mod::mm::phys::pageAlloc(alloc_size);
         if (phys_addr == nullptr) {
             ker::mod::io::serial::write("mini_malloc: physical page allocation failed for size 0x");
             ker::mod::io::serial::writeHex(alloc_size);
             ker::mod::io::serial::write("\n");
             return nullptr;
+        }
+        largeAllocLock.lock();  // Re-acquire lock to update tracking
+
+        // Re-check slot is still free (another thread might have taken it)
+        if (large_allocs[slot].in_use) {
+            // Find another slot
+            slot = MAX_LARGE_ALLOCS;
+            for (size_t i = 0; i < MAX_LARGE_ALLOCS; ++i) {
+                if (!large_allocs[i].in_use) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == MAX_LARGE_ALLOCS) {
+                largeAllocLock.unlock();
+                ker::mod::mm::phys::pageFree(phys_addr);
+                ker::mod::io::serial::write("mini_malloc: no free slots after pageAlloc\n");
+                return nullptr;
+            }
         }
 
         // pageAlloc returns a virtual address already (HHDM mapped), not a physical address
@@ -156,6 +183,7 @@ auto mini_malloc(size_t size) -> void* {
         large_allocs[slot].size = alloc_size;
         large_allocs[slot].in_use = true;
 
+        largeAllocLock.unlock();
         return virt_addr;
     }
 
@@ -189,19 +217,23 @@ void mini_free(void* address) {
     }
 
     // Check if this is a large allocation
+    largeAllocLock.lock();
     for (auto& large_alloc : large_allocs) {
         if (large_alloc.in_use && large_alloc.virt_addr == address) {
-            // Free the physical pages
-            ker::mod::mm::phys::pageFree(large_alloc.phys_addr);
-
-            // Mark slot as free
+            // Mark slot as free first
+            void* phys_to_free = large_alloc.phys_addr;
             large_alloc.virt_addr = nullptr;
             large_alloc.phys_addr = nullptr;
             large_alloc.size = 0;
             large_alloc.in_use = false;
+            largeAllocLock.unlock();
+
+            // Free the physical pages (pageFree has its own lock)
+            ker::mod::mm::phys::pageFree(phys_to_free);
             return;
         }
     }
+    largeAllocLock.unlock();
 
     // Not a large allocation, must be from slab allocator
     auto* block = reinterpret_cast<MemoryBlock<0>*>(uintptr_t(address) - sizeof(MemoryBlock<0>::slab_ptr));

@@ -130,8 +130,19 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     thread->tlsBaseVirt = tlsVirtAddr;
     thread->safestackPtrValue = safestackPtrValue;
 
-    thread->stack = tlsVirtAddr;
+    // Stack grows downward, so thread->stack points to the TOP of the stack
+    // Reserve space at the BOTTOM of stack for PerCpu scratch area (used by syscall handler after swapgs)
+    uint64_t scratchAreaSize = sizeof(cpu::PerCpu);
+    thread->stack = stackVirtAddr + stackSize - scratchAreaSize;  // Stack starts above scratch area
     thread->fsbase = reinterpret_cast<uint64_t>(tcbVirtAddr);
+    // User GS_BASE points to TLS/stack base area (user-accessible)
+    thread->gsbase = stackVirtAddr;  // Bottom of stack where scratch area lives
+    
+    // Initialize the scratch area at the bottom of the stack
+    auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(stack);
+    memset(scratchArea, 0, sizeof(cpu::PerCpu));
+    scratchArea->syscallStack = 0;  // Will be set by task initialization
+    scratchArea->cpuId = 0;          // Will be set by task initialization
 
     // Store the physical (HHDM) pointers for cleanup
     thread->tlsPhysPtr = reinterpret_cast<uint64_t>(tls);

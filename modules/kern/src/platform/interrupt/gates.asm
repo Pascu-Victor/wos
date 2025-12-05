@@ -20,7 +20,8 @@ __idt_isr_handler:
     popq
     isr_swapgs exit
     add rsp, 16
-    sti
+    ; Don't manually enable interrupts - iretq will restore them from saved RFLAGS
+    ; Having sti here can cause race conditions if another interrupt arrives between sti and iretq
     iretq
 
 global load_idt

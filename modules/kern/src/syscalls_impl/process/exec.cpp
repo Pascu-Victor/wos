@@ -93,7 +93,11 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
+    // Add memory barrier after reading to ensure visibility
+    __asm__ volatile("mfence" ::: "memory");
+
     auto* elfHeader = reinterpret_cast<Elf64_Ehdr*>(elfBuffer);
+
     if (elfHeader->e_ident[EI_MAG0] != ELFMAG0 || elfHeader->e_ident[EI_MAG1] != ELFMAG1 || elfHeader->e_ident[EI_MAG2] != ELFMAG2 ||
         elfHeader->e_ident[EI_MAG3] != ELFMAG3) {
         dbg::log("wos_proc_exec: Not a valid ELF file");
@@ -281,7 +285,8 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     dbg::log("wos_proc_exec: Task entry field = 0x%x", newTask->entry);
 #endif
 
-    if (!sched::postTask(newTask)) {
+    // Use load-balanced task posting to distribute across CPUs
+    if (!sched::postTaskBalanced(newTask)) {
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
         delete newTask;
         delete[] elfBuffer;
@@ -289,7 +294,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Successfully posted task '%s' to scheduler", processName);
+    dbg::log("wos_proc_exec: Successfully posted task '%s' to CPU %d", processName, newTask->cpu);
 #endif
 
     return newTask->pid;

@@ -23,8 +23,8 @@ void init() {
 
     auto hpetAddr = mm::addr::getVirtPointer(*(uint64_t*)((uint64_t)hpetResult.data + HPET_OFFSET));
 
-    mm::virt::mapPage((mm::paging::PageTable*)mm::addr::getVirtPointer(rdcr3()), (uint64_t)hpetAddr,
-                      (uint64_t)mm::addr::getPhysPointer((uint64_t)hpetAddr), mm::virt::pageTypes::KERNEL);
+    // Map HPET to the kernel page table so all CPUs can access it
+    mm::virt::mapToKernelPageTable((uint64_t)hpetAddr, (uint64_t)mm::addr::getPhysPointer((uint64_t)hpetAddr), mm::virt::pageTypes::KERNEL);
 
     hpet = (Hpet*)hpetAddr;
     tickPeriod = (hpet->capabilities >> 32) & 0xFFFFFFFF;

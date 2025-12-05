@@ -1,6 +1,7 @@
 #include "syscall.hpp"
 
 #include <cstdint>
+#include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
@@ -34,6 +35,10 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
             return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
                                              static_cast<abi::sys_log::sys_log_device>(a4));
         case abi::callnums::threading:
+            // Dispatch based on operation - threadControlOps start at 0x100
+            if (a1 >= 0x100) {
+                return ker::syscall::multiproc::threadControl(static_cast<abi::multiproc::threadControlOps>(a1), (void*)a2);
+            }
             return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
         case abi::callnums::time:
             return ker::syscall::time::sys_time_get(a1, (void*)a2, (void*)a3);

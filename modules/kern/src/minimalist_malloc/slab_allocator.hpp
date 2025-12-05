@@ -4,6 +4,7 @@
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/sys/spinlock.hpp>
 
 #include "bitmap.hpp"
 
@@ -38,12 +39,19 @@ class Slab {
     SlabHeader<slab_size, memory_size, MAX_BLOCKS> header;
     MemoryBlock<slab_size> blocks[MAX_BLOCKS];
 
+    // Static spinlock shared across all slabs of the same size for thread safety
+    static inline ker::mod::sys::Spinlock slabLock;
+
     bool is_address_in_slab(void* address);
     void* alloc_in_current_slab(size_t block_index);
     void* alloc_in_new_slab();
     void free_from_current_slab(size_t block_index);
     void* request_memory_from_os(size_t size);
     void free_memory_to_os(void* addrss, size_t size);
+
+    // Internal unlocked versions for use when lock is already held
+    void* alloc_unlocked();
+    void free_unlocked(void* address);
 
    public:
     void init(Slab* prev = nullptr);
@@ -63,7 +71,7 @@ void Slab<slab_size, memory_size>::init(Slab* prev) {
 }
 
 template <size_t slab_size, size_t memory_size>
-void* Slab<slab_size, memory_size>::alloc() {
+void* Slab<slab_size, memory_size>::alloc_unlocked() {
     assert(header.magic == MAGIC);
     assert(header.size == slab_size);
 
@@ -71,14 +79,22 @@ void* Slab<slab_size, memory_size>::alloc() {
     if (header.free_blocks && ((block_index = header.mem_map.find_unused(header.next_fit_block)) != BITMAP_NO_BITS_LEFT)) {
         return alloc_in_current_slab(block_index);
     } else if (header.next) {
-        return header.next->alloc();
+        return header.next->alloc_unlocked();
     } else {
         return alloc_in_new_slab();
     }
 }
 
 template <size_t slab_size, size_t memory_size>
-void Slab<slab_size, memory_size>::free(void* address) {
+void* Slab<slab_size, memory_size>::alloc() {
+    slabLock.lock();
+    void* result = alloc_unlocked();
+    slabLock.unlock();
+    return result;
+}
+
+template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::free_unlocked(void* address) {
     assert(header.magic == MAGIC);
     assert(header.size == slab_size);
     assert(is_address_in_slab(address));
@@ -86,6 +102,13 @@ void Slab<slab_size, memory_size>::free(void* address) {
     size_t block_index = (uintptr_t(address) - uintptr_t(blocks)) / sizeof(MemoryBlock<slab_size>);
     assert(header.mem_map.check_used(block_index));
     free_from_current_slab(block_index);
+}
+
+template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::free(void* address) {
+    slabLock.lock();
+    free_unlocked(address);
+    slabLock.unlock();
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -106,7 +129,8 @@ void* Slab<slab_size, memory_size>::alloc_in_new_slab() {
     }
     new_slab->init(this);
     header.next = new_slab;
-    return new_slab->alloc();
+    // Call alloc_unlocked since we already hold the lock
+    return new_slab->alloc_unlocked();
 }
 
 template <size_t slab_size, size_t memory_size>

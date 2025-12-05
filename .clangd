@@ -45,3 +45,12 @@ InlayHints:
 
 Hover:
     ShowAKA: true
+
+# Ignore .log files completely (no diagnostics, no background indexing)
+If:
+    PathMatch: ".*\\.log$"
+    Then:
+        Index:
+            Background: false
+        Diagnostics:
+            Suppress: true

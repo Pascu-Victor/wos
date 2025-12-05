@@ -1,6 +1,7 @@
 #pragma once
 #include <limine.h>
 
+#include <atomic>
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/asm/cpu.hpp>
@@ -65,20 +66,76 @@ class PerCpuCrossAccess {
    private:
     T* _data;
 
-   public:
-    PerCpuCrossAccess(T defaultValue = T()) : _data(new T[getCoreCount()]) {
-        for (uint64_t i = 0; i < getCoreCount(); ++i) {
-            _data[i] = defaultValue;
+    // Per-element spinlocks for fine-grained locking
+    std::atomic<bool>* _locks;
+
+    void lockCpu(uint64_t cpu) {
+        while (_locks[cpu].exchange(true, std::memory_order_acquire)) {
+            // Spin with pause hint
+            asm volatile("pause");
         }
     }
 
+    void unlockCpu(uint64_t cpu) { _locks[cpu].store(false, std::memory_order_release); }
+
+   public:
+    PerCpuCrossAccess() : _data(new T[getCoreCount()]), _locks(new std::atomic<bool>[getCoreCount()]) {
+        for (uint64_t i = 0; i < getCoreCount(); ++i) {
+            new (&_data[i]) T();  // Default construct each element (supports non-copyable types like std::atomic)
+            _locks[i].store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // Access current CPU's data (no locking needed - only this CPU accesses it)
+    // WARNING: Use thisCpuLocked() if other CPUs might be modifying via withLock!
     auto thisCpu() -> T* { return &_data[cpu::currentCpu()]; }
 
+    // Locked access to current CPU's data - use when other CPUs might modify via withLock
+    template <typename Func>
+    auto thisCpuLocked(Func&& func) -> decltype(func(std::declval<T*>())) {
+        uint64_t cpu = cpu::currentCpu();
+        lockCpu(cpu);
+        auto result = func(&_data[cpu]);
+        unlockCpu(cpu);
+        return result;
+    }
+
+    // Locked access to current CPU's data without return value
+    template <typename Func>
+    void thisCpuLockedVoid(Func&& func) {
+        uint64_t cpu = cpu::currentCpu();
+        lockCpu(cpu);
+        func(&_data[cpu]);
+        unlockCpu(cpu);
+    }
+
+    // Access another CPU's data with locking
     auto thatCpu(uint64_t cpu) -> T* { return &_data[cpu]; }
+
+    // Locked access to another CPU's data - use when modifying cross-CPU
+    template <typename Func>
+    auto withLock(uint64_t cpu, Func&& func) -> decltype(func(std::declval<T*>())) {
+        lockCpu(cpu);
+        auto result = func(&_data[cpu]);
+        unlockCpu(cpu);
+        return result;
+    }
+
+    // Locked access without return value
+    template <typename Func>
+    void withLockVoid(uint64_t cpu, Func&& func) {
+        lockCpu(cpu);
+        func(&_data[cpu]);
+        unlockCpu(cpu);
+    }
 
     void setThisCpu(const T& data) { _data[cpu::currentCpu()] = data; }
 
-    void setThatCpu(const T& data, uint64_t cpu) { _data[cpu] = data; }
+    void setThatCpu(const T& data, uint64_t cpu) {
+        lockCpu(cpu);
+        _data[cpu] = data;
+        unlockCpu(cpu);
+    }
 };
 
 auto getCpuNode(uint64_t cpuNo) -> uint64_t;

@@ -24,7 +24,8 @@ uint32_t readReg(uint32_t reg) {
 void eoi() { cpuSetMSR((uint32_t)X2APICMSRs::EOI, 0); }
 
 void sendIpi(IPIConfig messageType, uint32_t destination) {
-    writeReg((uint32_t)X2APICMSRs::ICR, (((uint64_t)destination) << 32) | messageType.packedValue);
+    uint64_t icrValue = (((uint64_t)destination) << 32) | messageType.packedValue;
+    writeReg((uint32_t)X2APICMSRs::ICR, icrValue);
 }
 
 void selfIpi(uint8_t vector) { cpuSetMSR((uint32_t)X2APICMSRs::SELF_IPI, vector, 0); }
