@@ -30,12 +30,12 @@ void switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     // User GS_BASE = TLS/stack base, KERNEL_GS_BASE = scratch area for kernel after swapgs
     if (nextTask->thread) {
-        cpuSetMSR(IA32_GS_BASE, nextTask->thread->gsbase);  // User's TLS/stack base
+        cpu::wrgsbase(nextTask->thread->gsbase);                               // User's TLS/stack base
         cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->context.syscallScratchArea);  // Scratch for kernel
-        cpuSetMSR(IA32_FS_BASE, nextTask->thread->fsbase);
+        cpu::wrfsbase(nextTask->thread->fsbase);
     } else {
         // Idle task uses kernel-allocated scratch area for both
-        cpuSetMSR(IA32_GS_BASE, nextTask->context.syscallScratchArea);
+        cpu::wrgsbase(nextTask->context.syscallScratchArea);
         cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->context.syscallScratchArea);
     }
 
