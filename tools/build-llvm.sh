@@ -87,7 +87,7 @@ meson setup --prefix=$B/target1 \
     -Dwos_option=enabled \
     -D_GNU_SOURCE \
     -Dglibc_option=enabled \
-    -Db_staticpic=false \
+    -Db_staticpic=disabled \
     $B/src/mlibc
 ninja install
 

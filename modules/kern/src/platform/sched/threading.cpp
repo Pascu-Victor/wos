@@ -25,11 +25,6 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     // Use the actual TLS size from PT_TLS segment if available, otherwise use provided size
     uint64_t actualTlsSize = (tlsInfo.tlsSize > 0) ? tlsInfo.tlsSize : tlsSize;
 
-    if (actualTlsSize < 176) {
-        mod::dbg::log("  Expanding TLS size from %d to 176 to match linker expectations", actualTlsSize);
-        actualTlsSize = 176;  // Match what the linker expected when calculating -176 offset
-    }
-
     // Allocate memory for TLS + TCB + SafeStack
     // TCB structure is ~136 bytes + stack canary + padding
     uint64_t tcbSize = 256;          // Extra space for mlibc's Tcb structure

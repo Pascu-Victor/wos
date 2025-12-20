@@ -21,7 +21,7 @@ const char* const text = "hello-vfs";
 }  // namespace
 
 auto main() -> int {
-    int cpuno = ker::multiproc::getcpunum();
+    int cpuno = ker::multiproc::currentThreadId();
 
     // Test: Basic tmpfs operations
     std::println("init[{}]: TEST: TMPFS Basic Operations", cpuno);

@@ -16,7 +16,7 @@
 auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
     std::println("testprog: main() called");
-    int pid = ker::abi::multiproc::getcpunum();
+    int pid = ker::multiproc::currentThreadId();
     // Log argc
     std::println("testprog[{}]: argc = {}", pid, argc);
     // Log each argument
