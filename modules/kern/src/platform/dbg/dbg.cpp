@@ -82,55 +82,59 @@ inline void serialLog(const char* str) {
 inline void serialNewline() { io::serial::write('\n'); }
 
 inline void fbLog(const char* str) {
-    uint64_t line = linesLogged;
-    if (linesLogged >= gfx::fb::viewportHeightChars()) {
-        gfx::fb::scroll();
-        line = gfx::fb::viewportHeightChars() - 1;
-    }
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        uint64_t line = linesLogged;
+        if (linesLogged >= gfx::fb::viewportHeightChars()) {
+            gfx::fb::scroll();
+            line = gfx::fb::viewportHeightChars() - 1;
+        }
 
-    gfx::fb::drawChar(0, line, '[');
-    // todo maybe print cpu id
-    int stampLen = 1;
-    if (isTimeAvailable) [[likely]] {
-        char timeSec[10] = {0};  // good enough for 30 years of uptime
-        char timeMs[5] = {0};
-        int logTime = time::getMs();
-        int logTimeMsPart = logTime % 1000;
-        int logTimeSecPart = logTime / 1000;
-        auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
-            if (n == 0) {
-                s[0] = '0';
-                s[1] = '\0';
-                return 1;
-            }
-            char buf[32];
-            int i = 0;
-            while (n > 0) {
-                int digit = n % base;
-                buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
-                n /= base;
-            }
-            int j = 0;
-            while (i > 0) {
-                s[j++] = buf[--i];
-            }
-            s[j] = '\0';
-            return j;
-        };
-        int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
-        int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
-        gfx::fb::drawString(stampLen, line, timeSec);
-        stampLen += secLen;
-        gfx::fb::drawChar(stampLen, line, '.');
+        gfx::fb::drawChar(0, line, '[');
+        // todo maybe print cpu id
+        int stampLen = 1;
+        if (isTimeAvailable) [[likely]] {
+            char timeSec[10] = {0};  // good enough for 30 years of uptime
+            char timeMs[5] = {0};
+            int logTime = time::getMs();
+            int logTimeMsPart = logTime % 1000;
+            int logTimeSecPart = logTime / 1000;
+            auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
+                if (n == 0) {
+                    s[0] = '0';
+                    s[1] = '\0';
+                    return 1;
+                }
+                char buf[32];
+                int i = 0;
+                while (n > 0) {
+                    int digit = n % base;
+                    buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                    n /= base;
+                }
+                int j = 0;
+                while (i > 0) {
+                    s[j++] = buf[--i];
+                }
+                s[j] = '\0';
+                return j;
+            };
+            int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
+            int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
+            gfx::fb::drawString(stampLen, line, timeSec);
+            stampLen += secLen;
+            gfx::fb::drawChar(stampLen, line, '.');
+            stampLen++;
+            gfx::fb::drawString(stampLen, line, timeMs);
+            stampLen += msLen;
+        }
+        gfx::fb::drawChar(stampLen, line, ']');
         stampLen++;
-        gfx::fb::drawString(stampLen, line, timeMs);
-        stampLen += msLen;
+        gfx::fb::drawChar(stampLen, line, ':');
+        stampLen++;
+        linesLogged += gfx::fb::drawString(stampLen, line, str);
+    } else {
+        mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
     }
-    gfx::fb::drawChar(stampLen, line, ']');
-    stampLen++;
-    gfx::fb::drawChar(stampLen, line, ':');
-    stampLen++;
-    linesLogged += gfx::fb::drawString(stampLen, line, str);
 }
 
 void logNewLineNoSync(void) {
@@ -140,7 +144,9 @@ void logNewLineNoSync(void) {
 
 void logNoSync(const char* str) {
     serialLog(str);
-    fbLog(str);
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        fbLog(str);
+    }
 }
 
 void logString(const char* str) {

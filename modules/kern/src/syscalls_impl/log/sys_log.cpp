@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "abi/callnums/sys_log.h"
+#include "mod/gfx/fb.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "platform/dbg/dbg.hpp"
 
@@ -20,7 +21,14 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
                 }
                 mod::io::serial::write(str, len);
             } else if (device == abi::sys_log::sys_log_device::vga) {
-                mod::dbg::logFbOnly(str);
+                if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
+                    mod::dbg::logFbOnly(str);
+                } else {
+                    mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
+                    mod::io::serial::write((uint64_t)device);
+                    mod::io::serial::write("\n");
+                    return 1;
+                }
             } else {
                 mod::io::serial::write("Invalid sysLog device: ");
                 mod::io::serial::write((uint64_t)device);
@@ -40,8 +48,15 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
                 mod::io::serial::write(str, len);
                 mod::io::serial::write("\n");
             } else if (device == abi::sys_log::sys_log_device::vga) {
-                mod::dbg::logFbOnly(str);
-                mod::dbg::logFbAdvance();
+                if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
+                    mod::dbg::logFbOnly(str);
+                    mod::dbg::logFbAdvance();
+                } else {
+                    mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
+                    mod::io::serial::write((uint64_t)device);
+                    mod::io::serial::write("\n");
+                    return 1;
+                }
             } else {
                 mod::io::serial::write("Invalid sysLog device: ");
                 mod::io::serial::write((uint64_t)device);

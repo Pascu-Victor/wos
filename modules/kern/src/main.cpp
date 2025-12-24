@@ -77,17 +77,19 @@ extern "C" void _start(void) {
     callGlobalConstructors();
 
     // Init the framebuffer.
-    gfx::fb::init();
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        gfx::fb::init();
+    }
     // Init logging.
     dbg::init();
     dbg::log("Hi from WOs");
 
     // Init memory manager.
     ker::mod::mm::init();
-
-    gfx::fb::mapFramebuffer();
-
-    dbg::log("Framebuffer mapped");
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        gfx::fb::mapFramebuffer();
+        dbg::log("Framebuffer mapped");
+    }
     dbg::log("Pages mapped");
 
     // Enable FSGSBASE instructions
