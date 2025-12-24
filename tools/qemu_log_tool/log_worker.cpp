@@ -30,29 +30,7 @@ extern "C" {
 #include <iostream>
 #include <sstream>
 
-enum class EntryType { INSTRUCTION, INTERRUPT, REGISTER, BLOCK, SEPARATOR, OTHER };
-
-struct LogEntry {
-    int lineNumber{};
-    EntryType type{};
-    std::string address;
-    std::string function;
-    std::string hexBytes;
-    std::string assembly;
-    std::string originalLine;
-    uint64_t addressValue{};
-
-    // For grouped entries (like interrupts)
-    bool isExpanded{};
-    std::vector<LogEntry> childEntries;
-    bool isChild{};
-
-    // Interrupt-specific fields
-    std::string interruptNumber;
-    std::string cpuStateInfo;
-
-    LogEntry() = default;
-};
+#include "log_entry.h"
 
 // CapstoneDisassembler implementation (same as main)
 class CapstoneDisassembler {
@@ -149,8 +127,9 @@ class LogWorker {
     static LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, bfd* kernelBfd,
                                 asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd, asymbol** initSymbols, long initSymCount);
 
-    static std::string getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount,
-                                                  bfd* initBfd, asymbol** initSymbols, long initSymCount);
+    static void resolveAddressInfo(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
+                                   asymbol** initSymbols, long initSymCount, std::string& function, std::string& sourceFile,
+                                   int& sourceLine);
 
     QJsonObject logEntryToJson(const LogEntry& entry);
 };
@@ -175,26 +154,44 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
 
     // Open executables for symbol resolution
     bfd* kernelBfd = bfd_openr("./build/modules/kern/wos", nullptr);
+    if (!kernelBfd) {
+        qDebug() << "Failed to open kernel binary:" << bfd_errmsg(bfd_get_error());
+    }
     bfd* initBfd = bfd_openr("./build/modules/init/init", nullptr);
+    if (!initBfd) {
+        qDebug() << "Failed to open init binary:" << bfd_errmsg(bfd_get_error());
+    }
 
     asymbol** kernelSymbols = nullptr;
     asymbol** initSymbols = nullptr;
     long kernelSymCount = 0;
     long initSymCount = 0;
 
-    if (kernelBfd && bfd_check_format(kernelBfd, bfd_object)) {
-        long storage = bfd_get_symtab_upper_bound(kernelBfd);
-        if (storage > 0) {
-            kernelSymbols = (asymbol**)malloc(storage);
-            kernelSymCount = bfd_canonicalize_symtab(kernelBfd, kernelSymbols);
+    if (kernelBfd) {
+        if (bfd_check_format(kernelBfd, bfd_object)) {
+            long storage = bfd_get_symtab_upper_bound(kernelBfd);
+            if (storage > 0) {
+                kernelSymbols = (asymbol**)malloc(storage);
+                kernelSymCount = bfd_canonicalize_symtab(kernelBfd, kernelSymbols);
+            } else {
+                qDebug() << "Kernel binary has no symbols (storage size 0)";
+            }
+        } else {
+            qDebug() << "Kernel binary format check failed:" << bfd_errmsg(bfd_get_error());
         }
     }
 
-    if (initBfd && bfd_check_format(initBfd, bfd_object)) {
-        long storage = bfd_get_symtab_upper_bound(initBfd);
-        if (storage > 0) {
-            initSymbols = (asymbol**)malloc(storage);
-            initSymCount = bfd_canonicalize_symtab(initBfd, initSymbols);
+    if (initBfd) {
+        if (bfd_check_format(initBfd, bfd_object)) {
+            long storage = bfd_get_symtab_upper_bound(initBfd);
+            if (storage > 0) {
+                initSymbols = (asymbol**)malloc(storage);
+                initSymCount = bfd_canonicalize_symtab(initBfd, initSymbols);
+            } else {
+                qDebug() << "Init binary has no symbols (storage size 0)";
+            }
+        } else {
+            qDebug() << "Init binary format check failed:" << bfd_errmsg(bfd_get_error());
         }
     }
 
@@ -313,7 +310,10 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
     QString trimmedLine = line.trimmed();
 
     // Pre-compile static regexes for better performance
-    static const QRegularExpression instrRegex(R"(^0x([0-9a-fA-F]+):\s+([0-9a-fA-F]{2}(?:\s[0-9a-fA-F]{2})*)\s{2,}(.+)$)");
+    // Relaxed regex to handle variable spacing
+    // Matches: 0x[hex]: [hex bytes] [assembly]
+    // Example: 0x0000000000401000: 48 89 e5                 mov    rbp,rsp
+    static const QRegularExpression instrRegex(R"(^0x([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)(.+)$)");
     static const QRegularExpression intRegex(R"(^Servicing hardware INT=0x([0-9a-fA-F]+))");
     static const QRegularExpression excRegex(R"(^check_exception\s+old:\s*0x([0-9a-fA-F]+)\s+new\s+0x([0-9a-fA-F]+))");
     static const QRegularExpression regRegex(R"(^\s*(\d+):\s+v=([0-9a-fA-F]+)\s+e=([0-9a-fA-F]+))");
@@ -327,8 +327,8 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
         bool ok;
         entry.addressValue = instrMatch.captured(1).toULongLong(&ok, 16);
         if (ok) {
-            entry.function = getFunctionNameFromAddress(entry.addressValue, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols,
-                                                        initSymCount);
+            resolveAddressInfo(entry.addressValue, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols, initSymCount,
+                               entry.function, entry.sourceFile, entry.sourceLine);
 
             QString hexStr = instrMatch.captured(2).simplified();
             hexStr.remove(' ');
@@ -336,9 +336,21 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
 
             QString asmStr = instrMatch.captured(3).trimmed();
             entry.assembly = disassembler.convertToIntel(asmStr.toStdString());
+
+            // Debug logging for disassembly
+            // qDebug() << "Parsed instruction:" << QString::fromStdString(entry.address) << QString::fromStdString(entry.assembly);
         }
 
         return entry;
+    } else {
+        // Debug why regex failed for lines that look like instructions
+        if (trimmedLine.startsWith("0x") && trimmedLine.contains(":")) {
+            static int failCount = 0;
+            if (failCount < 5) {
+                qDebug() << "Regex failed for line:" << trimmedLine;
+                failCount++;
+            }
+        }
     }
 
     // Check for hardware interrupt
@@ -346,16 +358,16 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
     if (intMatch.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
         entry.interruptNumber = intMatch.captured(1).toStdString();
-        entry.assembly = "Hardware INT=0x" + entry.interruptNumber + " (click to expand)";
+        entry.assembly = "Hardware Interrupt " + entry.interruptNumber;
         return entry;
     }
 
-    // Check for exception entries: "check_exception old: 0xffffffff new 0xe"
+    // Check for exception
     auto excMatch = excRegex.match(trimmedLine);
     if (excMatch.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
-        entry.interruptNumber = excMatch.captured(2).toStdString();
-        entry.assembly = "Exception 0x" + entry.interruptNumber + " (old: 0x" + excMatch.captured(1).toStdString() + ") (click to expand)";
+        entry.interruptNumber = excMatch.captured(2).toStdString();  // new vector
+        entry.assembly = "Exception " + entry.interruptNumber;
         return entry;
     }
 
@@ -384,84 +396,113 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
     return entry;
 }
 
-auto LogWorker::getFunctionNameFromAddress(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
-                                           asymbol** initSymbols, long initSymCount) -> std::string {
-    // Same implementation as in main processor
+void LogWorker::resolveAddressInfo(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
+                                   asymbol** initSymbols, long initSymCount, std::string& function, std::string& sourceFile,
+                                   int& sourceLine) {
+    function = "";
+    sourceFile = "";
+    sourceLine = 0;
+
     bfd* targetBfd = nullptr;
     asymbol** targetSymbols = nullptr;
     long targetSymCount = 0;
 
-    if (address < 0x100000) {
-        targetBfd = initBfd;
-        targetSymbols = initSymbols;
-        targetSymCount = initSymCount;
-    } else {
+    if (address >= 0xffffffff80000000ULL) {
         targetBfd = kernelBfd;
         targetSymbols = kernelSymbols;
         targetSymCount = kernelSymCount;
+    } else {
+        targetBfd = initBfd;
+        targetSymbols = initSymbols;
+        targetSymCount = initSymCount;
     }
 
     if (!targetBfd || !targetSymbols || targetSymCount <= 0) {
-        if (targetBfd == kernelBfd) {
-            targetBfd = initBfd;
-            targetSymbols = initSymbols;
-            targetSymCount = initSymCount;
-        } else {
-            targetBfd = kernelBfd;
-            targetSymbols = kernelSymbols;
-            targetSymCount = kernelSymCount;
-        }
-
-        if (!targetBfd || !targetSymbols || targetSymCount <= 0) {
-            return "";
-        }
+        return;
     }
 
-    asymbol* bestMatch = nullptr;
-    bfd_vma bestDistance = UINT64_MAX;
-
-    for (long i = 0; i < targetSymCount; i++) {
-        asymbol* sym = targetSymbols[i];
-        if (!sym || !sym->name) {
+    // Try to find source line info using bfd_find_nearest_line
+    asection* section = targetBfd->sections;
+    while (section) {
+        if ((bfd_section_flags(section) & SEC_ALLOC) == 0) {
+            section = section->next;
             continue;
         }
 
-        if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) {
-            continue;
+        bfd_vma vma = bfd_section_vma(section);
+        bfd_size_type size = bfd_section_size(section);
+
+        if (address >= vma && address < vma + size) {
+            const char* filename = nullptr;
+            const char* functionname = nullptr;
+            unsigned int line = 0;
+
+            if (bfd_find_nearest_line(targetBfd, section, targetSymbols, address - vma, &filename, &functionname, &line)) {
+                if (filename) sourceFile = filename;
+                if (functionname) {
+                    std::string name = functionname;
+                    if (name.length() > 2 && name.substr(0, 2) == "_Z") {
+                        int status = 0;
+                        char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
+                        if (status == 0 && demangled) {
+                            name = demangled;
+                            free(demangled);
+                        }
+                    }
+                    function = name;
+                }
+                sourceLine = line;
+            }
+            break;
+        }
+        section = section->next;
+    }
+
+    if (function.empty()) {
+        asymbol* bestMatch = nullptr;
+        bfd_vma bestDistance = UINT64_MAX;
+
+        for (long i = 0; i < targetSymCount; i++) {
+            asymbol* sym = targetSymbols[i];
+            if (!sym || !sym->name) {
+                continue;
+            }
+
+            if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) {
+                continue;
+            }
+
+            bfd_vma symAddr = bfd_asymbol_value(sym);
+            if (symAddr <= address) {
+                bfd_vma distance = address - symAddr;
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestMatch = sym;
+                }
+            }
         }
 
-        bfd_vma symAddr = bfd_asymbol_value(sym);
-        if (symAddr <= address) {
-            bfd_vma distance = address - symAddr;
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestMatch = sym;
+        if (bestMatch && bestMatch->name) {
+            std::string name = bestMatch->name;
+
+            if (name.length() > 2 && name.substr(0, 2) == "_Z") {
+                int status = 0;
+                char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
+                if (status == 0 && demangled) {
+                    name = demangled;
+                    free(demangled);
+                }
+            }
+
+            if (bestDistance > 0) {
+                std::ostringstream oss;
+                oss << name << "+0x" << std::hex << bestDistance;
+                function = oss.str();
+            } else {
+                function = name;
             }
         }
     }
-
-    if (bestMatch && bestMatch->name) {
-        std::string name = bestMatch->name;
-
-        if (name.length() > 2 && name.substr(0, 2) == "_Z") {
-            int status = 0;
-            char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
-            if (status == 0 && demangled) {
-                name = demangled;
-                free(demangled);
-            }
-        }
-
-        if (bestDistance > 0) {
-            std::ostringstream oss;
-            oss << name << "+0x" << std::hex << bestDistance;
-            return oss.str();
-        }
-
-        return name;
-    }
-
-    return "";
 }
 
 auto LogWorker::logEntryToJson(const LogEntry& entry) -> QJsonObject {
@@ -478,6 +519,8 @@ auto LogWorker::logEntryToJson(const LogEntry& entry) -> QJsonObject {
     obj["isChild"] = entry.isChild;
     obj["interruptNumber"] = QString::fromStdString(entry.interruptNumber);
     obj["cpuStateInfo"] = QString::fromStdString(entry.cpuStateInfo);
+    obj["sourceFile"] = QString::fromStdString(entry.sourceFile);
+    obj["sourceLine"] = entry.sourceLine;
 
     // Handle child entries
     QJsonArray childArray;

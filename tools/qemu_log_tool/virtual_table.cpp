@@ -52,6 +52,19 @@ void VirtualRowCache::setRow(int logicalRow, const std::vector<QString>& cells, 
     updateLRUOrder(logicalRow);
 }
 
+void VirtualRowCache::removeRow(int logicalRow) {
+    auto it = cachedRows.find(logicalRow);
+    if (it != cachedRows.end()) {
+        cachedRows.erase(it);
+
+        // Also remove from LRU order
+        auto lruIt = std::find(lruOrder.begin(), lruOrder.end(), logicalRow);
+        if (lruIt != lruOrder.end()) {
+            lruOrder.erase(lruIt);
+        }
+    }
+}
+
 void VirtualRowCache::clear() {
     cachedRows.clear();
     lruOrder.clear();
@@ -111,6 +124,7 @@ QVariant VirtualTableModel::data(const QModelIndex& index, int role) const {
     const VirtualRowCache::CachedRow* cachedRow = cache.getRow(index.row());
 
     if (!cachedRow || !cachedRow->isValid) {
+        if (index.row() < 5) qDebug() << "VirtualTableModel::data: Row" << index.row() << "not in cache or invalid";
         return QVariant();
     }
 
@@ -159,6 +173,11 @@ void VirtualTableModel::invalidateRows(int startRow, int endRow) {
         return;
     }
 
+    // Clear from cache so they are re-fetched
+    for (int i = startRow; i <= endRow; ++i) {
+        cache.removeRow(i);
+    }
+
     emit dataChanged(index(startRow, 0), index(endRow, columnCount() - 1));
 }
 
@@ -175,9 +194,20 @@ void VirtualTableModel::resetModel() {
     endResetModel();
 }
 
+void VirtualTableModel::setRowCount(int rowCount) {
+    beginResetModel();
+    totalRowCount = rowCount;
+    cache.clear();
+    endResetModel();
+}
+
 void VirtualTableModel::ensureRowLoaded(int logicalRow) const {
     // Check if already cached
     if (cache.getRow(logicalRow) != nullptr) {
+        return;
+    }
+
+    if (!loadingEnabled) {
         return;
     }
 
@@ -186,8 +216,15 @@ void VirtualTableModel::ensureRowLoaded(int logicalRow) const {
         std::vector<QString> cells;
         QColor bgColor = Qt::transparent;
         dataProvider(logicalRow, cells, bgColor);
+
+        if (logicalRow < 5)
+            qDebug() << "VirtualTableModel::ensureRowLoaded: Provider returned" << cells.size() << "cells for row" << logicalRow;
+
         // Cast away const to fill cache
         const_cast<VirtualTableModel*>(this)->cache.setRow(logicalRow, cells, bgColor);
+
+        // Debug logging for first few rows
+        if (logicalRow < 5) qDebug() << "VirtualTableModel loaded row" << logicalRow << "cells:" << cells.size();
     }
 }
 
@@ -249,6 +286,7 @@ void VirtualTableView::resizeEvent(QResizeEvent* event) {
 void VirtualTableView::scrollContentsBy(int dx, int dy) {
     QTableView::scrollContentsBy(dx, dy);
     if (dy != 0) {
+        if (virtualModel) virtualModel->setLoadingEnabled(false);
         scrollDebounceTimer->stop();
         scrollDebounceTimer->start();
     }
@@ -256,6 +294,7 @@ void VirtualTableView::scrollContentsBy(int dx, int dy) {
 
 void VirtualTableView::onVerticalScrollBarValueChanged(int value) {
     Q_UNUSED(value)
+    if (virtualModel) virtualModel->setLoadingEnabled(false);
     scrollDebounceTimer->stop();
     scrollDebounceTimer->start();
 }
@@ -263,11 +302,15 @@ void VirtualTableView::onVerticalScrollBarValueChanged(int value) {
 void VirtualTableView::updateVisibleRows() {
     if (!virtualModel) return;
 
+    virtualModel->setLoadingEnabled(true);
+
     int currentStart = getViewportStartRow();
 
-    if (currentStart == lastVisibleRowStart) {
-        return;
-    }
+    // Always update if we are here, because the timer fired meaning we stopped scrolling
+    // or we need to refresh.
+    // if (currentStart == lastVisibleRowStart) {
+    //    return;
+    // }
 
     lastVisibleRowStart = currentStart;
 
@@ -290,4 +333,7 @@ void VirtualTableView::updateVisibleRows() {
 
     // Trigger loading
     virtualModel->invalidateRows(startPreload, endPreload);
+
+    // Force a repaint of the viewport to ensure new data is drawn
+    viewport()->update();
 }

@@ -27,6 +27,7 @@ extern "C" {
 #include <QtWidgets/QApplication>
 #include <algorithm>
 
+#include "log_processor.h"
 #include "qemu_log_viewer.h"
 
 // LogProcessor implementation
@@ -150,6 +151,16 @@ void LogProcessor::startWorkerProcesses() {
         connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &LogProcessor::onWorkerFinished);
         connect(worker, &QProcess::errorOccurred, this, &LogProcessor::onWorkerError);
 
+        // Forward worker output to debug console
+        connect(worker, &QProcess::readyReadStandardOutput, [worker]() {
+            QByteArray data = worker->readAllStandardOutput();
+            qDebug() << "Worker stdout:" << data;
+        });
+        connect(worker, &QProcess::readyReadStandardError, [worker]() {
+            QByteArray data = worker->readAllStandardError();
+            qDebug() << "Worker stderr:" << data;
+        });
+
         // Start the worker process
         QString workerPath = QCoreApplication::applicationDirPath() + "/log_worker";
         worker->start(workerPath, {chunkFile, resultFile});
@@ -167,6 +178,7 @@ void LogProcessor::onWorkerFinished(int exitCode, QProcess::ExitStatus exitStatu
 
     if (completedWorkers == totalWorkers) {
         // All workers finished, merge results
+        qDebug() << "All workers finished. Merging results...";
         mergeResults();
     }
 }
@@ -193,6 +205,8 @@ void LogProcessor::mergeResults() {
         QByteArray data = file.readAll();
         QJsonDocument doc = QJsonDocument::fromJson(data);
         QJsonArray array = doc.array();
+
+        qDebug() << "Chunk" << i << "entries:" << array.size();
 
         file.close();
 
@@ -233,8 +247,45 @@ void LogProcessor::mergeResults() {
         }
     }
 
+    // Initialize visible entries (default: show all)
+    visibleEntries.clear();
+    visibleEntries.reserve(entries.size());
+    for (const auto& entry : entries) {
+        visibleEntries.push_back(&entry);
+    }
+
     emit progressUpdate(100);
+    qDebug() << "Processing complete. Total entries:" << entries.size();
     emit processingComplete();
+}
+
+void LogProcessor::setFilter(bool hideStructural, const QString& interruptFilter) {
+    visibleEntries.clear();
+    visibleEntries.reserve(entries.size());
+
+    std::string interruptFilterStd = interruptFilter.toStdString();
+    bool filterInterrupts = !interruptFilter.isEmpty();
+
+    for (const auto& entry : entries) {
+        // Structural filtering
+        if (hideStructural) {
+            if (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK || entry.type == EntryType::OTHER) {
+                continue;
+            }
+        }
+
+        // Interrupt filtering (if enabled)
+        if (filterInterrupts) {
+            // If filtering by interrupt, we only show entries that match the interrupt
+            // Note: This changes behavior from original viewer which only navigated.
+            // But for a remote viewer, filtering is more bandwidth efficient.
+            if (entry.type != EntryType::INTERRUPT || entry.interruptNumber != interruptFilterStd) {
+                continue;
+            }
+        }
+
+        visibleEntries.push_back(&entry);
+    }
 }
 
 auto LogProcessor::parseLogEntryFromJson(const QJsonObject& json) -> LogEntry {
@@ -247,6 +298,8 @@ auto LogProcessor::parseLogEntryFromJson(const QJsonObject& json) -> LogEntry {
     entry.hexBytes = json["hexBytes"].toString().toStdString();
     entry.assembly = json["assembly"].toString().toStdString();
     entry.originalLine = json["originalLine"].toString().toStdString();
+    entry.sourceFile = json["sourceFile"].toString().toStdString();
+    entry.sourceLine = json["sourceLine"].toInt();
     entry.addressValue = static_cast<uint64_t>(json["addressValue"].toVariant().toULongLong());
     entry.isExpanded = json["isExpanded"].toBool();
     entry.isChild = json["isChild"].toBool();
@@ -261,17 +314,4 @@ auto LogProcessor::parseLogEntryFromJson(const QJsonObject& json) -> LogEntry {
     }
 
     return entry;
-}
-
-auto main(int argc, char* argv[]) -> int {
-    QApplication app(argc, argv);
-
-    QApplication::setApplicationName("QEMU Log Viewer");
-    QApplication::setApplicationVersion("1.0");
-    QApplication::setOrganizationName("WOS Kernel Project");
-
-    QemuLogViewer viewer;
-    viewer.show();
-
-    return QApplication::exec();
 }

@@ -29,7 +29,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt components
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
 
 # Find other required libraries
 find_package(PkgConfig REQUIRED)
@@ -55,9 +55,12 @@ pkg_check_modules(CAPSTONE REQUIRED capstone>=4.0)
 
 # Add main executable
 add_executable(qemu_log_viewer
+    main.cpp
     qemu_log_viewer.h
     qemu_log_viewer.cpp
     log_processor.cpp
+    log_server.cpp
+    log_client.cpp
     config.h
     config.cpp
     virtual_table.h
@@ -78,6 +81,7 @@ add_executable(log_worker
 target_link_libraries(qemu_log_viewer
     Qt6::Core
     Qt6::Widgets
+    Qt6::Network
     ${CAPSTONE_LIBRARIES}
     iberty
     z

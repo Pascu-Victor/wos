@@ -12,13 +12,16 @@
 #include <qtreewidget.h>
 #include <qwidget.h>
 
+#include <QDir>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "config.h"
+#include "log_client.h"
 #include "virtual_table.h"
+#include "virtual_table_integration.h"
 
 // Work around BFD config.h requirement
 #define PACKAGE "qemu_log_viewer"
@@ -876,8 +879,8 @@ class SyntaxHighlightDelegate : public QStyledItemDelegate {
     }
 };
 
-QemuLogViewer::QemuLogViewer(QWidget* parent)
-    : QMainWindow(parent), currentSearchIndex(-1), preSearchPosition(-1), searchActive(false), nextStringBuffer(0) {
+QemuLogViewer::QemuLogViewer(LogClient* client, QWidget* parent)
+    : QMainWindow(parent), currentSearchIndex(-1), preSearchPosition(-1), searchActive(false), client(client), nextStringBuffer(0) {
     disassembler = std::make_unique<CapstoneDisassembler>();
 
     // Initialize search debounce timer
@@ -889,9 +892,6 @@ QemuLogViewer::QemuLogViewer(QWidget* parent)
     // Initialize performance optimizations first
     initializePerformanceOptimizations();
 
-    // Initialize configuration service
-    ConfigService::instance().initialize();
-
     setupDarkTheme();
     setupUI();
 
@@ -901,10 +901,24 @@ QemuLogViewer::QemuLogViewer(QWidget* parent)
 
     // Set up table syntax highlighting delegate
     tableDelegate = new SyntaxHighlightDelegate(this);
+    // logTable is VirtualTableView, it uses delegate?
+    // VirtualTableView uses QStyledItemDelegate internally or custom painting?
+    // VirtualTableView inherits QTableView.
+    // We can set delegate on it.
     logTable->setItemDelegate(tableDelegate);
 
     connectSignals();
-    loadLogFiles();
+
+    // Connect client signals
+    connect(client, &LogClient::fileListReceived, this, &QemuLogViewer::onFileListReceived);
+    connect(client, &LogClient::configReceived, this, &QemuLogViewer::onConfigReceived);
+    connect(client, &LogClient::fileReady, this, &QemuLogViewer::onFileReady);
+    connect(client, &LogClient::dataReceived, this, &QemuLogViewer::onDataReceived);
+    connect(client, &LogClient::searchResults, this, &QemuLogViewer::onSearchResults);
+    connect(client, &LogClient::interruptsReceived, this, &QemuLogViewer::onInterruptsReceived);
+    connect(client, &LogClient::filterApplied, this, &QemuLogViewer::onFilterApplied);
+    connect(client, &LogClient::progress, this, &QemuLogViewer::onProgressUpdate);
+
     // Initialize interrupt navigation state
     currentSelectedInterrupt.clear();
     currentInterruptIndex = -1;
@@ -1301,6 +1315,10 @@ void QemuLogViewer::setupToolbar() {
     fileSelector->setMinimumWidth(200);
     toolbar->addWidget(fileSelector);
 
+    refreshFilesBtn = new QPushButton("↻");
+    refreshFilesBtn->setToolTip("Refresh file list");
+    toolbar->addWidget(refreshFilesBtn);
+
     toolbar->addSeparator();
 
     // Search controls
@@ -1412,6 +1430,8 @@ void QemuLogViewer::setupMainContent() {
     // Details pane for interrupt information
     detailsPane = new QTextBrowser();
     detailsPane->setReadOnly(true);
+    detailsPane->setOpenExternalLinks(false);     // Handle links manually
+    detailsPane->setOpenLinks(false);             // Disable default link handling to prevent "No document for..." errors
     detailsPane->setFont(QFont("Consolas", 12));  // Increased from 10 to 12
     detailsPane->setPlaceholderText("Interrupt details will be displayed here...");
     rightSplitter->addWidget(detailsPane);
@@ -1425,82 +1445,21 @@ void QemuLogViewer::setupMainContent() {
 }
 
 void QemuLogViewer::setupTable() {
-    // Create virtual table view
-    logTable = new VirtualTableView(nullptr);
-
-    // Create virtual model
-    QStringList headers = {"Line", "Type", "Address", "Function", "Hex Bytes", "Assembly"};
-    virtualTableModel = new VirtualTableModel(0, headers, logTable);  // 0 rows initially
-
-    virtualTableModel->setDataProvider([this](int row, std::vector<QString>& cells, QColor& bgColor) {
-        if (row < 0 || row >= static_cast<int>(visibleEntryPointers.size())) {
-            cells.clear();
-            bgColor = Qt::transparent;
-            return;
-        }
-
-        const LogEntry* entry = visibleEntryPointers[row];
-        if (!entry) {
-            cells.clear();
-            bgColor = Qt::transparent;
-            return;
-        }
-
-        // Format cell data
-        cells.clear();
-        cells.reserve(6);
-
-        cells.push_back(QString::number(entry->lineNumber));
-
-        QString typeStr;
-        switch (entry->type) {
-            case EntryType::INSTRUCTION:
-                typeStr = "INSTRUCTION";
-                break;
-            case EntryType::INTERRUPT:
-                typeStr = "INTERRUPT";
-                break;
-            case EntryType::REGISTER:
-                typeStr = "REGISTER";
-                break;
-            case EntryType::BLOCK:
-                typeStr = "BLOCK";
-                break;
-            case EntryType::SEPARATOR:
-                typeStr = "SEPARATOR";
-                break;
-            case EntryType::OTHER:
-                typeStr = "OTHER";
-                break;
-        }
-        cells.push_back(typeStr);
-        cells.push_back(formatAddress(entry->address));
-        cells.push_back(formatFunction(entry->function));
-        cells.push_back(formatHexBytes(entry->hexBytes));
-        cells.push_back(formatAssembly(entry->assembly));
-
-        // Set background color based on type
-        bgColor = getEntryTypeColor(entry->type);
-    });
-
-    logTable->setVirtualModel(virtualTableModel);
-
-    // Configure appearance
-    logTable->horizontalHeader()->resizeSection(0, 60);         // Line
-    logTable->horizontalHeader()->resizeSection(1, 80);         // Type
-    logTable->horizontalHeader()->resizeSection(2, 120);        // Address
-    logTable->horizontalHeader()->resizeSection(3, 200);        // Function
-    logTable->horizontalHeader()->resizeSection(4, 140);        // Hex Bytes
-    logTable->horizontalHeader()->setStretchLastSection(true);  // Assembly
-
-    logTable->setFont(QFont("Consolas", 11));
-    logTable->verticalHeader()->setDefaultSectionSize(24);
-    logTable->verticalHeader()->hide();
+    // Use integration helper to create virtual table
+    logTable = VirtualTableIntegration::initializeVirtualTable(this, client);
+    virtualTableModel = static_cast<VirtualTableModel*>(logTable->model());
     logTable->setMouseTracking(true);
+
+    // Connect signals
+    connect(logTable, &QTableView::clicked, this, [this](const QModelIndex& index) { onTableCellClicked(index.row(), index.column()); });
+
+    // Connect selection changed
+    connect(logTable->selectionModel(), &QItemSelectionModel::selectionChanged, this, &QemuLogViewer::onTableSelectionChanged);
 }
 
 void QemuLogViewer::connectSignals() {
     connect(fileSelector, QOverload<const QString&>::of(&QComboBox::currentTextChanged), this, &QemuLogViewer::onFileSelected);
+    connect(refreshFilesBtn, &QPushButton::clicked, client, &LogClient::requestFileList);
 
     connect(searchEdit, &QLineEdit::textChanged, this, &QemuLogViewer::onSearchTextChanged);
 
@@ -1568,6 +1527,9 @@ void QemuLogViewer::connectSignals() {
         }
     });
     interruptsPanel->setContextMenuPolicy(Qt::CustomContextMenu);
+
+    // Connect row for line received signal
+    connect(client, &LogClient::rowForLineReceived, this, &QemuLogViewer::onRowForLineReceived);
 }
 
 void QemuLogViewer::loadLogFiles() {
@@ -1612,28 +1574,23 @@ void QemuLogViewer::loadLogFiles() {
 }
 
 void QemuLogViewer::onFileSelected(const QString& filename) {
-    if (filename.isEmpty()) {
-        return;
-    }
+    if (filename.isEmpty()) return;
 
-    // Disable UI elements during processing
+    // Disable UI
     fileSelector->setEnabled(false);
     searchEdit->setEnabled(false);
     navigationEdit->setEnabled(false);
     logTable->setEnabled(false);
 
-    statusLabel->setText("Opening file...");
+    statusLabel->setText("Requesting file...");
     progressBar->setVisible(true);
     progressBar->setValue(0);
-    progressBar->setFormat("Opening file... %p%");
+    progressBar->setFormat("Requesting file... %p%");
 
     // Clear current data
-    // For virtual table: reset model row count to 0
     if (virtualTableModel) {
-        virtualTableModel->resetModel();
+        virtualTableModel->setRowCount(0);
     }
-    logEntries.clear();
-    visibleEntryPointers.clear();
     searchMatches.clear();
     currentSearchIndex = -1;
 
@@ -1642,122 +1599,94 @@ void QemuLogViewer::onFileSelected(const QString& filename) {
     disassemblyView->clear();
     detailsPane->clear();
 
-    // Start processing in background
-    processor = std::make_unique<LogProcessor>(filename, this);
-    connect(processor.get(), &LogProcessor::progressUpdate, this, &QemuLogViewer::onProgressUpdate);
-    connect(processor.get(), &LogProcessor::processingComplete, this, &QemuLogViewer::onProcessingComplete);
-    connect(processor.get(), &LogProcessor::errorOccurred, [this](const QString& error) {
-        QMessageBox::critical(this, "Error", error);
-        progressBar->setVisible(false);
-        progressBar->setFormat("");
-        statusLabel->setText("Error occurred");
-
-        // Re-enable UI
-        fileSelector->setEnabled(true);
-        searchEdit->setEnabled(true);
-        navigationEdit->setEnabled(true);
-        logTable->setEnabled(true);
-    });
-
-    processor->startProcessing();
+    // Request file from client
+    client->selectFile(filename);
 }
 
 void QemuLogViewer::onProgressUpdate(int percentage) {
     progressBar->setValue(percentage);
-
-    // Update progress bar text based on percentage ranges
-    if (percentage < 10) {
-        progressBar->setFormat("Reading file... %p%");
-        statusLabel->setText("Reading log file...");
-    } else if (percentage < 50) {
-        progressBar->setFormat("Parsing entries... %p%");
-        statusLabel->setText("Parsing log entries...");
-    } else if (percentage < 90) {
-        progressBar->setFormat("Processing data... %p%");
-        statusLabel->setText("Processing log data...");
-    } else {
-        progressBar->setFormat("Finalizing... %p%");
-        statusLabel->setText("Finalizing...");
-    }
-
-    // Force GUI update
-    QApplication::processEvents();
+    progressBar->setFormat("Processing... %p%");
 }
 
-void QemuLogViewer::onProcessingComplete() {
-    if (!processor) return;
+void QemuLogViewer::onFileReady(int totalLines) {
+    qDebug() << "QemuLogViewer::onFileReady totalLines=" << totalLines;
+    // Update model
+    if (virtualTableModel) {
+        virtualTableModel->setRowCount(totalLines);
+    }
 
-    logEntries = processor->getEntries();
-
-    // Show progress for optimization phase
-    progressBar->setFormat("Building lookup maps... %p%");
-    statusLabel->setText("Building lookup maps...");
-    progressBar->setValue(92);
-    QApplication::processEvents();
-
-    // Build fast lookup maps
-    buildLookupMaps();
-
-    // Show progress for table population
-    progressBar->setFormat("Populating table... %p%");
-    statusLabel->setText("Populating table...");
-    progressBar->setValue(95);
-    QApplication::processEvents();
-
-    // Use optimized table population
-    populateTable();
-
-    // Build searchable rows after table is populated
-    progressBar->setFormat("Building search index... %p%");
-    statusLabel->setText("Building search index...");
-    progressBar->setValue(98);
-    QApplication::processEvents();
-
-    buildSearchableRows();
-
-    progressBar->setValue(100);
-    progressBar->setFormat("Complete");
-    statusLabel->setText(QString("Loaded %1 entries").arg(logEntries.size()));
-
-    // Hide progress bar after a short delay
-    QTimer::singleShot(1000, [this]() {
-        progressBar->setVisible(false);
-        progressBar->setFormat("");
-    });
-
-    // Re-enable UI elements
+    // Re-enable UI
     fileSelector->setEnabled(true);
     searchEdit->setEnabled(true);
     navigationEdit->setEnabled(true);
     logTable->setEnabled(true);
 
-    // Populate interrupt filter dropdown
-    populateInterruptFilter();
-    // Populate the left interrupts panel for fast navigation
-    buildInterruptPanel();
+    progressBar->setVisible(false);
+    statusLabel->setText(QString("Loaded %1 lines").arg(totalLines));
 
-    // Re-run search if there was one
-    if (!searchEdit->text().isEmpty()) {
-        performSearchOptimized();
+    // Request interrupts
+    client->requestInterrupts();
+}
+
+void QemuLogViewer::onFileListReceived(const QStringList& files) {
+    QString current = fileSelector->currentText();
+    fileSelector->blockSignals(true);
+    fileSelector->clear();
+    fileSelector->addItems(files);
+
+    int index = fileSelector->findText(current);
+    if (index != -1) {
+        fileSelector->setCurrentIndex(index);
+    }
+
+    fileSelector->blockSignals(false);
+
+    if (!files.isEmpty()) {
+        statusLabel->setText(QString("Found %1 log files").arg(files.size()));
     }
 }
 
-// Populate the interrupt filter dropdown with unique interrupt numbers present
-void QemuLogViewer::populateInterruptFilter() {
-    if (!interruptFilterCombo) return;
-    interruptFilterCombo->blockSignals(true);
-    interruptFilterCombo->clear();
-    std::vector<QString> interrupts;
-    std::unordered_set<std::string> seen;
+void QemuLogViewer::onConfigReceived() {
+    const auto& lookups = client->getConfig().getAddressLookups();
+    statusLabel->setText(statusLabel->text() + QString(" • Config: %1 symbol lookups").arg(lookups.size()));
+}
 
-    for (const auto& entry : logEntries) {
-        if (entry.type == EntryType::INTERRUPT) {
-            if (entry.interruptNumber.empty()) continue;
-            if (seen.insert(entry.interruptNumber).second) {
-                interrupts.push_back(QString::fromStdString(entry.interruptNumber));
-            }
+void QemuLogViewer::onDataReceived(int startLine, int count) {
+    if (virtualTableModel) {
+        virtualTableModel->invalidateRows(startLine, startLine + count - 1);
+        // Force repaint to ensure "Loading..." is replaced immediately
+        logTable->viewport()->update();
+    }
+
+    // Check if currently selected row is in range and update details pane if so
+    if (logTable->selectionModel()->hasSelection()) {
+        int currentRow = logTable->currentIndex().row();
+        if (currentRow >= startLine && currentRow < startLine + count) {
+            updateDetailsPane(currentRow);
         }
     }
+}
+
+void QemuLogViewer::onSearchResults(const std::vector<int>& matches) {
+    searchMatches = matches;
+    currentSearchIndex = -1;
+
+    bool hasMatches = !searchMatches.empty();
+    searchNextBtn->setEnabled(hasMatches);
+    searchPrevBtn->setEnabled(hasMatches);
+
+    if (hasMatches) {
+        currentSearchIndex = 0;
+        statusLabel->setText(QString("Match 1 of %1").arg(searchMatches.size()));
+        scrollToRowForSearch(searchMatches[0]);
+    } else {
+        statusLabel->setText("No matches found");
+    }
+}
+
+void QemuLogViewer::onInterruptsReceived(const std::vector<LogEntry>& interrupts) {
+    interruptsPanel->clear();
+    std::map<std::string, QTreeWidgetItem*> groups;
 
     // Common x86 exception names for nicer display
     std::unordered_map<int, std::string> irqNames{{0x0, "Divide Error"},
@@ -1780,126 +1709,123 @@ void QemuLogViewer::populateInterruptFilter() {
                                                   {0x12, "Machine Check"},
                                                   {0x13, "SIMD Floating-Point Exception"}};
 
-    interruptFilterCombo->addItem("All");
-    for (const auto& s : interrupts) {
-        bool ok;
-        int val = s.toInt(&ok, 16);
-        QString display;
-        if (ok) {
-            auto it = irqNames.find(val);
-            if (it != irqNames.end()) {
-                display = QString("0x%1 - %2").arg(s).arg(QString::fromStdString(it->second));
-            } else {
-                display = QString("0x%1").arg(s);
-            }
-        } else {
-            display = s;
-        }
-        // Store raw number as userData for matching
-        interruptFilterCombo->addItem(display, QVariant(s));
+    if (interruptFilterCombo) {
+        interruptFilterCombo->blockSignals(true);
+        interruptFilterCombo->clear();
+        interruptFilterCombo->addItem("All");
     }
 
-    interruptFilterCombo->setEnabled(!interrupts.empty());
-    // Reset navigation state
-    currentSelectedInterrupt.clear();
-    currentInterruptIndex = -1;
-    interruptPrevBtn->setEnabled(false);
-    interruptNextBtn->setEnabled(false);
-    interruptFilterCombo->blockSignals(false);
+    std::unordered_set<std::string> seenInterrupts;
+
+    for (const auto& entry : interrupts) {
+        std::string intNum = entry.interruptNumber;
+
+        // Populate Panel
+        if (groups.find(intNum) == groups.end()) {
+            auto* item = new QTreeWidgetItem(interruptsPanel);
+
+            // Format interrupt name
+            QString s = QString::fromStdString(intNum);
+            bool ok;
+            int val = s.toInt(&ok, 16);
+            QString display;
+            if (ok) {
+                auto it = irqNames.find(val);
+                if (it != irqNames.end()) {
+                    display = QString("0x%1 - %2").arg(s).arg(QString::fromStdString(it->second));
+                } else {
+                    display = QString("0x%1").arg(s);
+                }
+            } else {
+                display = s;
+            }
+
+            item->setText(0, display);
+            item->setData(0, Qt::UserRole, QString::fromStdString(intNum));
+            groups[intNum] = item;
+        }
+
+        auto* groupItem = groups[intNum];
+        auto* child = new QTreeWidgetItem(groupItem);
+        child->setText(0, QString("Line %1: %2").arg(entry.lineNumber).arg(QString::fromStdString(entry.cpuStateInfo)));
+        child->setData(0, Qt::UserRole, entry.lineNumber);
+
+        // Populate Combo Box
+        if (interruptFilterCombo && seenInterrupts.insert(intNum).second) {
+            QString s = QString::fromStdString(intNum);
+            bool ok;
+            int val = s.toInt(&ok, 16);
+            QString display;
+            if (ok) {
+                auto it = irqNames.find(val);
+                if (it != irqNames.end()) {
+                    display = QString("0x%1 - %2").arg(s).arg(QString::fromStdString(it->second));
+                } else {
+                    display = QString("0x%1").arg(s);
+                }
+            } else {
+                display = s;
+            }
+            interruptFilterCombo->addItem(display, QVariant(s));
+        }
+    }
+
+    // Update occurrences count
+    for (auto const& [key, item] : groups) {
+        item->setText(1, QString::number(item->childCount()));
+    }
+
+    if (interruptFilterCombo) {
+        interruptFilterCombo->setEnabled(!interrupts.empty());
+        interruptFilterCombo->blockSignals(false);
+    }
+}
+
+void QemuLogViewer::onFilterApplied(int totalLines) {
+    if (virtualTableModel) {
+        virtualTableModel->setRowCount(totalLines);
+    }
+    statusLabel->setText(QString("Filtered: %1 lines").arg(totalLines));
+}
+
+// Populate the interrupt filter dropdown with unique interrupt numbers present
+void QemuLogViewer::populateInterruptFilter() {
+    // Deprecated: handled by onInterruptsReceived
+}
+
+void QemuLogViewer::buildInterruptPanel() {
+    // Deprecated: handled by onInterruptsReceived
 }
 
 // Slot fired when the interrupt filter selection changes
 void QemuLogViewer::onInterruptFilterChanged(const QString& text) {
-    if (text.isEmpty() || text == "All") {
-        populateTable();
-        currentSelectedInterrupt.clear();
-        currentInterruptIndex = -1;
-        interruptPrevBtn->setEnabled(false);
-        interruptNextBtn->setEnabled(false);
-        return;
+    if (client) {
+        bool hideStructural = hideStructuralCheckbox->isChecked();
+        QString interruptFilter = text;
+        if (interruptFilter == "All") interruptFilter = "";
+
+        client->setFilter(hideStructural, interruptFilter);
     }
-    // Extract raw interrupt number from item userData if available
-    QVariant data = interruptFilterCombo->currentData();
-    QString raw;
-    if (data.isValid() && data.canConvert<QString>()) raw = data.toString();
-    if (raw.isEmpty()) raw = text;  // fallback
-
-    currentSelectedInterrupt = raw.toStdString();
-
-    // Ensure table is populated according to current hideStructural/onlyInterrupts state
-    populateTable();
-
-    // Build list of visible rows containing this interrupt
-    std::vector<int> rows;
-    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
-        const LogEntry* e = visibleEntryPointers[row];
-        if (e && e->type == EntryType::INTERRUPT && e->interruptNumber == currentSelectedInterrupt) {
-            rows.push_back(static_cast<int>(row));
-        }
-    }
-
-    if (rows.empty()) {
-        statusLabel->setText("Selected interrupt not visible (may be hidden by filters)");
-        currentInterruptIndex = -1;
-        interruptPrevBtn->setEnabled(false);
-        interruptNextBtn->setEnabled(false);
-        return;
-    }
-
-    // Jump to first occurrence
-    currentInterruptIndex = 0;
-    int targetRow = rows[currentInterruptIndex];
-    logTable->selectRow(targetRow);
-    scrollToRow(targetRow);
-    updateDetailsPane(targetRow);
-    statusLabel->setText(QString("Jumped to interrupt %1 (occurrence %2 of %3)").arg(text).arg(currentInterruptIndex + 1).arg(rows.size()));
-
-    // Enable navigation buttons if multiple occurrences
-    interruptPrevBtn->setEnabled(rows.size() > 1);
-    interruptNextBtn->setEnabled(rows.size() > 1);
 }
 
 // Move to next occurrence of currently selected interrupt
 void QemuLogViewer::onInterruptNext() {
-    if (currentSelectedInterrupt.empty()) return;
-
-    // Rebuild visible rows for current interrupt
-    std::vector<int> rows;
-    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
-        const LogEntry* e = visibleEntryPointers[row];
-        if (e && e->type == EntryType::INTERRUPT && e->interruptNumber == currentSelectedInterrupt) {
-            rows.push_back(static_cast<int>(row));
-        }
+    // With server-side filtering, the view only contains the interrupts.
+    // So we just move to the next row.
+    int currentRow = logTable->currentIndex().row();
+    if (currentRow < logTable->model()->rowCount() - 1) {
+        logTable->selectRow(currentRow + 1);
+        scrollToRow(currentRow + 1);
     }
-    if (rows.empty()) return;
-
-    currentInterruptIndex = (currentInterruptIndex + 1) % static_cast<int>(rows.size());
-    int targetRow = rows[currentInterruptIndex];
-    logTable->selectRow(targetRow);
-    scrollToRow(targetRow);
-    updateDetailsPane(targetRow);
-    statusLabel->setText(QString("Jumped to interrupt (occurrence %1 of %2)").arg(currentInterruptIndex + 1).arg(rows.size()));
 }
 
 // Move to previous occurrence of currently selected interrupt
 void QemuLogViewer::onInterruptPrevious() {
-    if (currentSelectedInterrupt.empty()) return;
-
-    std::vector<int> rows;
-    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
-        const LogEntry* e = visibleEntryPointers[row];
-        if (e && e->type == EntryType::INTERRUPT && e->interruptNumber == currentSelectedInterrupt) {
-            rows.push_back(static_cast<int>(row));
-        }
+    int currentRow = logTable->currentIndex().row();
+    if (currentRow > 0) {
+        logTable->selectRow(currentRow - 1);
+        scrollToRow(currentRow - 1);
     }
-    if (rows.empty()) return;
-
-    currentInterruptIndex = (currentInterruptIndex - 1 + static_cast<int>(rows.size())) % static_cast<int>(rows.size());
-    int targetRow = rows[currentInterruptIndex];
-    logTable->selectRow(targetRow);
-    scrollToRow(targetRow);
-    updateDetailsPane(targetRow);
-    statusLabel->setText(QString("Jumped to interrupt (occurrence %1 of %2)").arg(currentInterruptIndex + 1).arg(rows.size()));
 }
 
 void QemuLogViewer::onSearchTextChanged() {
@@ -1988,7 +1914,14 @@ void QemuLogViewer::onRegexToggled(bool enabled) {
 
 void QemuLogViewer::onHideStructuralToggled(bool enabled) {
     Q_UNUSED(enabled)
-    populateTable();
+
+    if (client) {
+        bool hideStructural = hideStructuralCheckbox->isChecked();
+        QString interruptFilter = interruptFilterCombo->currentText();
+        if (interruptFilter == "All") interruptFilter = "";
+
+        client->setFilter(hideStructural, interruptFilter);
+    }
 
     // Re-run search if there was one
     if (!searchEdit->text().isEmpty()) {
@@ -2011,90 +1944,27 @@ void QemuLogViewer::highlightSearchMatches() {
 }
 
 void QemuLogViewer::jumpToAddress(uint64_t address) {
-    // Use fast lookup map
-    auto it = addressToEntryMap.find(address);
-    if (it == addressToEntryMap.end()) {
-        statusLabel->setText("Address not found");
-        return;
+    if (client) {
+        client->search(QString("0x%1").arg(address, 0, 16), false);
     }
-
-    const LogEntry* targetEntry = &logEntries[it->second];
-
-    // Find the corresponding visible row
-    for (size_t i = 0; i < visibleEntryPointers.size(); ++i) {
-        if (visibleEntryPointers[i] == targetEntry) {
-            scrollToRow(static_cast<int>(i));
-            statusLabel->setText(QString("Jumped to address 0x%1").arg(address, 0, 16));
-            return;
-        }
-    }
-
-    statusLabel->setText("Address not visible (may be hidden)");
 }
 
-void QemuLogViewer::jumpToLine(int lineNumber) {
-    // Use fast lookup map
-    auto it = lineToEntryMap.find(lineNumber);
-    if (it == lineToEntryMap.end()) {
-        // Find the closest line >= lineNumber
-        const LogEntry* targetEntry = nullptr;
-        for (const auto& entry : logEntries) {
-            if (entry.lineNumber >= lineNumber) {
-                targetEntry = &entry;
-                break;
-            }
-        }
-
-        if (!targetEntry) {
-            statusLabel->setText("Line not found");
-            return;
-        }
-
-        // Find the corresponding visible row
-        for (size_t i = 0; i < visibleEntryPointers.size(); ++i) {
-            if (visibleEntryPointers[i] == targetEntry) {
-                scrollToRow(static_cast<int>(i));
-                statusLabel->setText(QString("Jumped to line %1").arg(lineNumber));
-                return;
-            }
-        }
-
-        statusLabel->setText("Line not visible (may be hidden)");
-        return;
-    }
-
-    const LogEntry* targetEntry = &logEntries[it->second];
-
-    // Find the corresponding visible row
-    for (size_t i = 0; i < visibleEntryPointers.size(); ++i) {
-        if (visibleEntryPointers[i] == targetEntry) {
-            scrollToRow(static_cast<int>(i));
-            statusLabel->setText(QString("Jumped to line %1").arg(lineNumber));
-            return;
-        }
-    }
-
-    statusLabel->setText("Line not visible (may be hidden)");
-}
+void QemuLogViewer::jumpToLine(int /*lineNumber*/) { statusLabel->setText("Jump to line not supported in remote mode yet"); }
 
 void QemuLogViewer::scrollToRow(int row) {
-    if (row >= 0 && row < static_cast<int>(visibleEntryPointers.size())) {
-        if (logTable) {
-            logTable->scrollToLogicalRow(row, QAbstractItemView::PositionAtCenter);
-            logTable->selectRow(row);
-        }
+    if (logTable && row >= 0 && row < logTable->model()->rowCount()) {
+        logTable->selectRow(row);
+        logTable->scrollTo(logTable->model()->index(row, 0), QAbstractItemView::PositionAtCenter);
     }
 }
 
 void QemuLogViewer::scrollToRowForSearch(int row) {
-    if (row >= 0 && row < static_cast<int>(visibleEntryPointers.size())) {
-        if (logTable) {
-            // For virtual table, use scrollToLogicalRow which handles loading
-            logTable->scrollToLogicalRow(row, QAbstractItemView::PositionAtCenter);
-            // Select the row
-            logTable->selectRow(row);
-            updateDetailsPane(row);
-        }
+    if (logTable && row >= 0 && row < logTable->model()->rowCount()) {
+        // For virtual table, use scrollToLogicalRow which handles loading
+        logTable->scrollToLogicalRow(row, QAbstractItemView::PositionAtCenter);
+        // Select the row
+        logTable->selectRow(row);
+        updateDetailsPane(row);
     }
 }
 
@@ -2106,8 +1976,8 @@ void QemuLogViewer::onTableSelectionChanged() {
     }
 
     int row = selectedRows.first().row();
-    if (row >= 0 && row < static_cast<int>(visibleEntryPointers.size())) {
-        const LogEntry* entry = visibleEntryPointers[row];
+    if (client && row >= 0 && row < logTable->model()->rowCount()) {
+        const LogEntry* entry = client->getEntry(row);
         if (entry) {
             updateHexView(*entry);
             updateDisassemblyView(*entry);
@@ -2169,12 +2039,12 @@ void QemuLogViewer::updateDisassemblyView(const LogEntry& entry) {
 }
 
 void QemuLogViewer::updateDetailsPane(int row) {
-    if (row < 0 || row >= static_cast<int>(visibleEntryPointers.size())) {
+    if (!client || !logTable || row < 0 || row >= logTable->model()->rowCount()) {
         detailsPane->clear();
         return;
     }
 
-    const LogEntry* entry = visibleEntryPointers[row];
+    const LogEntry* entry = client->getEntry(row);
     if (!entry) {
         detailsPane->clear();
         return;
@@ -2237,15 +2107,11 @@ void QemuLogViewer::updateDetailsPane(int row) {
     detailsText += QString("\n");
 
     // Try to get source code for INSTRUCTION entries
-    if (entry->type == EntryType::INSTRUCTION && entry->addressValue != 0) {
-        const Config& config = ConfigService::instance().getConfig();
-        QString symbolFilePath = config.findSymbolFileForAddress(entry->addressValue);
-        if (!symbolFilePath.isEmpty()) {
-            QString sourceHtml = getSourceCodeForAddress(entry->addressValue, symbolFilePath);
-            if (!sourceHtml.isEmpty()) {
-                detailsText += "=== Source Code ===\n";
-                // We'll append this as HTML later
-            }
+    if (entry->type == EntryType::INSTRUCTION && !entry->sourceFile.empty() && entry->sourceLine > 0) {
+        QString sourceHtml = getSourceCodeSnippet(QString::fromStdString(entry->sourceFile), entry->sourceLine);
+        if (!sourceHtml.isEmpty()) {
+            detailsText += "=== Source Code ===\n";
+            // We'll append this as HTML later
         }
     }
 
@@ -2283,11 +2149,9 @@ void QemuLogViewer::updateDetailsPane(int row) {
 
     // Build HTML if we have source code to display
     QString htmlContent;
-    if (entry->type == EntryType::INSTRUCTION && entry->addressValue != 0) {
-        const Config& config = ConfigService::instance().getConfig();
-        QString symbolFilePath = config.findSymbolFileForAddress(entry->addressValue);
-        if (!symbolFilePath.isEmpty()) {
-            QString sourceHtml = getSourceCodeForAddress(entry->addressValue, symbolFilePath);
+    if (entry->type == EntryType::INSTRUCTION) {
+        if (!entry->sourceFile.empty() && entry->sourceLine > 0) {
+            QString sourceHtml = getSourceCodeSnippet(QString::fromStdString(entry->sourceFile), entry->sourceLine);
             if (!sourceHtml.isEmpty()) {
                 htmlContent = QString("<pre>%1</pre>\n").arg(detailsText.toHtmlEscaped());
                 htmlContent += "<hr>\n";
@@ -2312,6 +2176,25 @@ void QemuLogViewer::onDetailsPaneLinkClicked(const QUrl& url) {
     // Handle VS Code links - open external URL
     if (url.scheme() == "vscode") {
         QDesktopServices::openUrl(url);
+    } else if (url.scheme() == "wos-remote") {
+        // Format: wos-remote://path:line
+        QString path = url.path();  // /path/to/file:line
+        // Remove leading slash if present (Qt adds it for host-less URLs sometimes)
+        // But here we used wos-remote://path:line, so host is empty, path is /path:line
+
+        // Actually, let's parse it manually from string to be safe
+        QString urlStr = url.toString();
+        QString prefix = "wos-remote://";
+        if (urlStr.startsWith(prefix)) {
+            QString content = urlStr.mid(prefix.length());
+            int lastColon = content.lastIndexOf(':');
+            if (lastColon != -1) {
+                QString file = content.left(lastColon);
+                int line = content.mid(lastColon + 1).toInt();
+
+                client->requestOpenSourceFile(file, line);
+            }
+        }
     }
 }
 
@@ -2414,74 +2297,16 @@ void QemuLogViewer::initializePerformanceOptimizations() {
 }
 
 void QemuLogViewer::buildLookupMaps() {
-    // Build fast lookup maps for address and line navigation
-    addressToEntryMap.clear();
-    lineToEntryMap.clear();
-
-    addressToEntryMap.reserve(logEntries.size());
-    lineToEntryMap.reserve(logEntries.size());
-
-    for (size_t i = 0; i < logEntries.size(); ++i) {
-        const auto& entry = logEntries[i];
-        if (entry.addressValue != 0) {
-            addressToEntryMap[entry.addressValue] = i;
-        }
-        if (entry.lineNumber > 0) {
-            lineToEntryMap[entry.lineNumber] = i;
-        }
-    }
+    // Deprecated in client-server mode
 }
 
 void QemuLogViewer::buildSearchableRows() {
-    // Build shadow search structure for fast text searching
-    searchableRows.clear();
-    searchableRows.reserve(visibleEntryPointers.size());
-
-    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
-        SearchableRow searchableRow;
-        searchableRow.originalRowIndex = static_cast<int>(row);
-
-        // Concatenate all column text with separators for comprehensive searching
-        QString& combinedText = searchableRow.combinedText;
-        combinedText.reserve(512);
-
-        if (visibleEntryPointers[row]) {
-            const LogEntry* entry = visibleEntryPointers[row];
-
-            // Combine all fields for searching
-            combinedText = QString::number(entry->lineNumber);
-            combinedText += '\t';
-            combinedText += QString::fromStdString(entry->address);
-            combinedText += '\t';
-            combinedText += QString::fromStdString(entry->function);
-            combinedText += '\t';
-            combinedText += QString::fromStdString(entry->hexBytes);
-            combinedText += '\t';
-            combinedText += QString::fromStdString(entry->assembly);
-            combinedText += '\t';
-            combinedText += QString::fromStdString(entry->originalLine);
-        }
-
-        searchableRows.push_back(std::move(searchableRow));
-    }
+    // Deprecated in client-server mode
 }
 
-QTableWidgetItem* QemuLogViewer::getPooledItem() {
-    // Always create a new item since Qt takes ownership
-    // The item pool approach doesn't work well with Qt's ownership model
-    QTableWidgetItem* item = new QTableWidgetItem();
+QTableWidgetItem* QemuLogViewer::getPooledItem() { return new QTableWidgetItem(); }
 
-    // Set default properties
-    item->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-
-    return item;
-}
-
-void QemuLogViewer::returnItemToPool(QTableWidgetItem* item) {
-    // Items are reused, so we don't actually return them
-    // This is for future implementation if needed
-    Q_UNUSED(item)
-}
+void QemuLogViewer::returnItemToPool(QTableWidgetItem* item) { Q_UNUSED(item) }
 
 QString& QemuLogViewer::getStringBuffer() {
     QString& buffer = stringBuffers[nextStringBuffer];
@@ -2490,306 +2315,49 @@ QString& QemuLogViewer::getStringBuffer() {
     return buffer;
 }
 
-void QemuLogViewer::preAllocateTableItems(int rowCount) {
-    Q_UNUSED(rowCount)
-    // Virtual table doesn't need pre-allocation
-    // Rows are created on-demand as needed
-}
+void QemuLogViewer::preAllocateTableItems(int rowCount) { Q_UNUSED(rowCount) }
 
-void QemuLogViewer::batchUpdateTable(const std::vector<const LogEntry*>& entries) {
-    Q_UNUSED(entries)
-    // Virtual table doesn't need batch updates
-    // Rows are created on-demand via the data provider
-}
+void QemuLogViewer::batchUpdateTable(const std::vector<const LogEntry*>& entries) { Q_UNUSED(entries) }
 
 int QemuLogViewer::findNextIretLine(int startLineNumber) const {
-    // Find the next iret instruction after the given line number
-    for (size_t i = 0; i < logEntries.size(); ++i) {
-        const auto& entry = logEntries[i];
-        if (entry.lineNumber > startLineNumber && entry.type == EntryType::INSTRUCTION) {
-            // Check if the assembly contains 'iret' (case-insensitive)
-            std::string assemblyLower = entry.assembly;
-            std::transform(assemblyLower.begin(), assemblyLower.end(), assemblyLower.begin(), ::tolower);
-            if (assemblyLower.find("iret") != std::string::npos) {
-                return entry.lineNumber;
-            }
-        }
-    }
-    return INT_MAX;  // No iret found
+    Q_UNUSED(startLineNumber)
+    return INT_MAX;
 }
 
 void QemuLogViewer::populateTable() {
-    // Filter visible entries first
-    bool hideStructural = hideStructuralCheckbox->isChecked();
-    bool onlyInterrupts = onlyInterruptsCheckbox->isChecked();
-
-    std::vector<const LogEntry*> visibleEntries;
-    visibleEntries.reserve(logEntries.size());
-
-    for (size_t i = 0; i < logEntries.size(); ++i) {
-        const auto& entry = logEntries[i];
-        // Only process parent entries
-        if (entry.isChild) continue;
-
-        // Apply filters
-        if (hideStructural && (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK)) {
-            continue;
-        }
-
-        if (onlyInterrupts && entry.type != EntryType::INTERRUPT) {
-            continue;
-        }
-
-        // Apply interrupt filter if selected
-        if (!currentSelectedInterrupt.empty() && entry.type == EntryType::INTERRUPT) {
-            if (entry.interruptNumber != currentSelectedInterrupt) {
-                continue;
-            }
-        }
-
-        // Check if this interrupt is folded
-        if (entry.type == EntryType::INTERRUPT && foldedInterruptEntryIndices.count(i)) {
-            // Add the interrupt itself
-            visibleEntries.push_back(&entry);
-
-            // Find the next iret and skip everything until then
-            int iretLine = findNextIretLine(entry.lineNumber);
-
-            // Skip all entries between this interrupt and the iret
-            for (size_t j = i + 1; j < logEntries.size(); ++j) {
-                const auto& nextEntry = logEntries[j];
-                if (nextEntry.lineNumber >= iretLine) {
-                    // We've reached or passed the iret, continue normal processing
-                    i = j - 1;  // Will be incremented by loop
-                    break;
-                }
-            }
-            continue;
-        }
-
-        visibleEntries.push_back(&entry);
-    }
-
-    // Store visible entries for selection handling
-    visibleEntryPointers = std::move(visibleEntries);
-
-    // Update virtual model row count and signal refresh
-    if (virtualTableModel) {
-        // Need to update the model's row count before resetting
-        virtualTableModel->setRowCount(static_cast<int>(visibleEntryPointers.size()));
-        virtualTableModel->resetModel();
-        if (!visibleEntryPointers.empty()) {
-            virtualTableModel->invalidateRows(0, static_cast<int>(visibleEntryPointers.size()) - 1);
-        }
-    }
-
-    // Build fast map from logEntries index to visible row for O(1) jumps from panel
-    entryIndexToVisibleRow.clear();
-    for (size_t row = 0; row < visibleEntryPointers.size(); ++row) {
-        const LogEntry* e = visibleEntryPointers[row];
-        if (!e) continue;
-        // Use lineToEntryMap to find the index in logEntries
-        auto it = lineToEntryMap.find(e->lineNumber);
-        if (it != lineToEntryMap.end()) {
-            entryIndexToVisibleRow[it->second] = static_cast<int>(row);
-        }
-    }
-
-    // Rebuild searchable rows after table content changes
-    buildSearchableRows();
-}
-
-void QemuLogViewer::buildInterruptPanel() {
-    if (!interruptsPanel) return;
-    interruptsPanel->clear();
-
-    // Map interrupt number -> list of logEntries indices
-    std::unordered_map<std::string, std::vector<size_t>> map;
-    for (size_t i = 0; i < logEntries.size(); ++i) {
-        const auto& e = logEntries[i];
-        if (e.type == EntryType::INTERRUPT) {
-            if (e.interruptNumber.empty()) continue;
-            map[e.interruptNumber].push_back(i);
-        }
-    }
-
-    if (map.empty()) return;
-
-    // Same name map as used elsewhere
-    std::unordered_map<int, std::string> irqNames{{0x0, "Divide Error"},
-                                                  {0x1, "Debug"},
-                                                  {0x2, "NMI"},
-                                                  {0x3, "Breakpoint"},
-                                                  {0x4, "Overflow"},
-                                                  {0x5, "BOUND Range Exceeded"},
-                                                  {0x6, "Invalid Opcode"},
-                                                  {0x7, "Device Not Available"},
-                                                  {0x8, "Double Fault"},
-                                                  {0x9, "Coprocessor Segment Overrun"},
-                                                  {0xa, "Invalid TSS"},
-                                                  {0xb, "Segment Not Present"},
-                                                  {0xc, "Stack-Segment Fault"},
-                                                  {0xd, "General Protection Fault"},
-                                                  {0xe, "Page Fault"},
-                                                  {0x10, "x87 FPU Floating-Point Error"},
-                                                  {0x11, "Alignment Check"},
-                                                  {0x12, "Machine Check"},
-                                                  {0x13, "SIMD Floating-Point Exception"}};
-
-    // Create top-level items in order of first appearance
-    for (const auto& [irq, indices] : map) {
-        QString qirq = QString::fromStdString(irq);
-        bool ok;
-        int val = qirq.toInt(&ok, 16);
-        QString title = qirq;
-        if (ok) {
-            auto it = irqNames.find(val);
-            if (it != irqNames.end())
-                title = QString("0x%1 - %2").arg(qirq).arg(QString::fromStdString(it->second));
-            else
-                title = QString("0x%1").arg(qirq);
-        }
-
-        QTreeWidgetItem* top = new QTreeWidgetItem(interruptsPanel);
-
-        // Add children for each occurrence with entry index stored
-        for (size_t idx : indices) {
-            const auto& e = logEntries[idx];
-            QString childText = QString("Line %1").arg(e.lineNumber);
-
-            // Add fold indicator if this occurrence is folded
-            if (foldedInterruptEntryIndices.count(idx)) {
-                childText = QString("[▼ FOLDED] ") + childText;
-            } else {
-                childText = QString("[▲] ") + childText;
-            }
-
-            QTreeWidgetItem* child = new QTreeWidgetItem();
-            child->setText(0, childText);
-            child->setText(1, QString::fromStdString(e.address));
-            // store entry index as user data (this uniquely identifies this specific interrupt occurrence)
-            child->setData(0, Qt::UserRole, QVariant::fromValue(static_cast<qulonglong>(idx)));
-            top->addChild(child);
-        }
-
-        top->setText(0, title);
-        top->setText(1, QString::number(indices.size()));
-
-        interruptsPanel->addTopLevelItem(top);
-    }
-
-    interruptsPanel->expandAll();
+    // Deprecated in client-server mode
 }
 
 void QemuLogViewer::onInterruptPanelActivated(QTreeWidgetItem* item, int /*column*/) {
-    if (!item) return;
+    if (!item || !item->parent()) return;
 
-    // If top-level item was activated, expand/collapse
-    if (!item->parent()) {
-        item->setExpanded(!item->isExpanded());
-        return;
-    }
-
-    // Child item: retrieve entry index
+    // Child item: retrieve line number
     QVariant v = item->data(0, Qt::UserRole);
     if (!v.isValid()) return;
-    size_t entryIndex = static_cast<size_t>(v.toULongLong());
+    int lineNumber = v.toInt();
 
-    // Try to map entryIndex to visible row
-    auto it = entryIndexToVisibleRow.find(entryIndex);
-    if (it != entryIndexToVisibleRow.end()) {
-        int row = it->second;
-        logTable->selectRow(row);
-        scrollToRow(row);
-        updateDetailsPane(row);
-        statusLabel->setText(QString("Jumped to interrupt (line %1)").arg(QString::number(logEntries[entryIndex].lineNumber)));
-        return;
-    }
+    // Request row for line from server
+    statusLabel->setText(QString("Jumping to line %1...").arg(lineNumber));
+    client->requestRowForLine(lineNumber);
+}
 
-    // If mapping not found (entry not visible), repopulate table and try again
-    populateTable();
-    it = entryIndexToVisibleRow.find(entryIndex);
-    if (it != entryIndexToVisibleRow.end()) {
-        int row = it->second;
-        logTable->selectRow(row);
+void QemuLogViewer::onRowForLineReceived(int row) {
+    if (row >= 0) {
         scrollToRow(row);
-        updateDetailsPane(row);
-        statusLabel->setText(QString("Jumped to interrupt (line %1)").arg(QString::number(logEntries[entryIndex].lineNumber)));
+        statusLabel->setText(QString("Jumped to row %1").arg(row));
     } else {
-        statusLabel->setText("Selected interrupt occurrence not visible (may be hidden by filters)");
+        statusLabel->setText("Could not find row for line (maybe filtered out?)");
     }
 }
 
 void QemuLogViewer::onInterruptToggleFold(QTreeWidgetItem* item, int /*column*/) {
-    if (!item) {
-        return;
-    }
-
-    // Handle child items (individual interrupt occurrences)
-    if (item->parent()) {
-        QVariant v = item->data(0, Qt::UserRole);
-        if (!v.isValid()) {
-            return;
-        }
-
-        size_t entryIndex = static_cast<size_t>(v.toULongLong());
-        if (entryIndex >= logEntries.size()) {
-            return;
-        }
-
-        // Toggle the folded state for this specific occurrence
-        if (foldedInterruptEntryIndices.count(entryIndex)) {
-            foldedInterruptEntryIndices.erase(entryIndex);
-            statusLabel->setText(QString("Interrupt at line %1 unfolded").arg(logEntries[entryIndex].lineNumber));
-        } else {
-            foldedInterruptEntryIndices.insert(entryIndex);
-            statusLabel->setText(QString("Interrupt at line %1 folded").arg(logEntries[entryIndex].lineNumber));
-        }
-
-        // Rebuild interrupt panel to update visual indicators and repopulate table
-        buildInterruptPanel();
-        populateTable();
-        return;
-    }
-
-    // Handle top-level items (fold all occurrences of this interrupt type)
-    // First, collect all child entry indices
-    for (int i = 0; i < item->childCount(); ++i) {
-        QTreeWidgetItem* child = item->child(i);
-        if (!child) {
-            continue;
-        }
-
-        QVariant v = child->data(0, Qt::UserRole);
-        if (!v.isValid()) {
-            continue;
-        }
-
-        size_t entryIndex = static_cast<size_t>(v.toULongLong());
-        if (entryIndex >= logEntries.size()) {
-            continue;
-        }
-
-        // Toggle the folded state for each occurrence
-        if (foldedInterruptEntryIndices.count(entryIndex)) {
-            foldedInterruptEntryIndices.erase(entryIndex);
-        } else {
-            foldedInterruptEntryIndices.insert(entryIndex);
-        }
-    }
-
-    // Rebuild interrupt panel to update visual indicators and repopulate table
-    buildInterruptPanel();
-    populateTable();
+    Q_UNUSED(item)
+    // Folding not supported in remote mode yet
 }
 
 void QemuLogViewer::performSearchOptimized() {
-    searchMatches.clear();
-    searchMatches.reserve(searchableRows.size() / 10);  // Estimate 10% match rate
-
     QString searchText = searchEdit->text().trimmed();
     if (searchText.isEmpty()) {
-        // If search text is empty, cancel search and return to original position
         if (searchActive && preSearchPosition >= 0) {
             scrollToRow(preSearchPosition);
             searchActive = false;
@@ -2798,104 +2366,34 @@ void QemuLogViewer::performSearchOptimized() {
         currentSearchIndex = -1;
         searchNextBtn->setEnabled(false);
         searchPrevBtn->setEnabled(false);
+        searchMatches.clear();
         highlightSearchMatches();
         return;
     }
 
-    // Store current position before starting search (only on first search)
     if (!searchActive) {
         auto selectedRows = logTable->selectionModel()->selectedRows();
         if (!selectedRows.isEmpty()) {
             preSearchPosition = selectedRows.first().row();
         } else {
-            // Get the top visible row if no selection
             preSearchPosition = logTable->rowAt(0);
         }
         searchActive = true;
     }
 
-    // Create search pattern
-    if (regexCheckbox->isChecked()) {
-        searchRegex = QRegularExpression(searchText, QRegularExpression::CaseInsensitiveOption);
-        if (!searchRegex.isValid()) {
-            statusLabel->setText("Invalid regex pattern");
-            return;
-        }
-    } else {
-        QString pattern = searchText;
-        pattern.replace(QRegularExpression("([\\^\\$\\*\\+\\?\\{\\}\\[\\]\\(\\)\\|\\\\])"), "\\\\1");
-        searchRegex = QRegularExpression(pattern, QRegularExpression::CaseInsensitiveOption);
-    }
-
-    // Fast search using shadow search structure - this can be vectorized by the compiler
-    for (const auto& searchableRow : searchableRows) {
-        if (searchRegex.match(searchableRow.combinedText).hasMatch()) {
-            searchMatches.push_back(searchableRow.originalRowIndex);
-        }
-    }
-
-    // Update UI state
-    bool hasMatches = !searchMatches.empty();
-    searchNextBtn->setEnabled(hasMatches);
-    searchPrevBtn->setEnabled(hasMatches);
-
-    if (hasMatches) {
-        // Find the nearest match to the current view
-        int currentViewRow = preSearchPosition >= 0 ? preSearchPosition : 0;
-
-        // Find the closest match
-        int nearestIndex = 0;
-        int minDistance = std::abs(searchMatches[0] - currentViewRow);
-
-        for (size_t i = 1; i < searchMatches.size(); ++i) {
-            int distance = std::abs(searchMatches[i] - currentViewRow);
-            if (distance < minDistance) {
-                minDistance = distance;
-                nearestIndex = static_cast<int>(i);
-            }
-        }
-
-        currentSearchIndex = nearestIndex;
-        statusLabel->setText(QString("Match %1 of %2").arg(currentSearchIndex + 1).arg(searchMatches.size()));
-        highlightSearchMatches();
-        scrollToRowForSearch(searchMatches[currentSearchIndex]);
-    } else {
-        statusLabel->setText("No matches found");
-        highlightSearchMatches();
-    }
+    client->search(searchText, regexCheckbox->isChecked());
+    statusLabel->setText("Searching...");
 }
 
-QString QemuLogViewer::getSourceCodeForAddress(uint64_t address, const QString& binaryPath) {
-    // Use addr2line to get source file and line number
-    QProcess addr2line;
-    addr2line.start("addr2line", {"-e", binaryPath, QString("0x%1").arg(address, 0, 16)});
-
-    if (!addr2line.waitForFinished(5000)) {
-        return "";
-    }
-
-    QString output = addr2line.readAllStandardOutput().trimmed();
-    if (output.isEmpty() || output.contains("??")) {
-        return "";
-    }
-
-    // Parse output: "filename:linenumber" or "filename:linenumber:column"
-    QStringList parts = output.split(":");
-    if (parts.size() < 2) {
-        return "";
-    }
-
-    QString filename = parts[0];
-    bool lineOk = false;
-    int lineNumber = parts[1].toInt(&lineOk);
-
-    if (!lineOk || lineNumber <= 0) {
+QString QemuLogViewer::getSourceCodeSnippet(const QString& filename, int lineNumber) {
+    if (filename.isEmpty() || lineNumber <= 0) {
         return "";
     }
 
     // Try to read the source file
     QFile sourceFile(filename);
     if (!sourceFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qDebug() << "Could not open source file:" << filename << "CWD:" << QDir::currentPath();
         // Return just the filename:line if we can't read the file
         return QString("%1:%2").arg(QFileInfo(filename).fileName()).arg(lineNumber);
     }
@@ -2914,10 +2412,10 @@ QString QemuLogViewer::getSourceCodeForAddress(uint64_t address, const QString& 
     // Build HTML with syntax highlighting and clickable lines
     QString html;
     html += QString("<b>%1:%2</b><br>").arg(QFileInfo(filename).fileName()).arg(lineNumber);
-    html += "<pre style='font-family: Consolas, monospace; font-size: 10px; margin: 5px 0;'>";
+    html += "<pre style='font-family: Consolas, monospace; margin: 5px 0;'>";
 
-    int startLine = std::max(0, lineNumber - 3);
-    int endLine = std::min(static_cast<int>(lines.size()), lineNumber + 2);
+    int startLine = std::max(0, lineNumber - 11);
+    int endLine = std::min(static_cast<int>(lines.size()), lineNumber + 10);
 
     for (int i = startLine; i < endLine; ++i) {
         int displayLine = i + 1;
@@ -2936,12 +2434,12 @@ QString QemuLogViewer::getSourceCodeForAddress(uint64_t address, const QString& 
     html += "</pre>";
 
     // Add clickable link to open in VS Code with proper format
-    // VS Code URI scheme: vscode://file/ABSOLUTE_PATH:LINE:COLUMN
+    // Use custom scheme to intercept click
     QFileInfo fileInfo(filename);
     QString absolutePath = fileInfo.absoluteFilePath();
     // URL encode the path
     absolutePath.replace(" ", "%20");
-    html += QString("<br><a href='vscode://file/%1:%2:1' style='color: #4da6ff; text-decoration: underline;'>Open in VS Code</a>")
+    html += QString("<br><a href='wos-remote://%1:%2' style='color: #4da6ff; text-decoration: underline;'>Open in VS Code</a>")
                 .arg(absolutePath)
                 .arg(lineNumber);
 

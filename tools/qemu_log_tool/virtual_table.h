@@ -45,6 +45,11 @@ class VirtualRowCache {
     void clear();
 
     /**
+     * Remove a specific row from the cache
+     */
+    void removeRow(int logicalRow);
+
+    /**
      * Get cache statistics
      */
     void getStats(size_t& outCachedRows, size_t& outHits, size_t& outMisses) const;
@@ -116,12 +121,18 @@ class VirtualTableModel : public QAbstractTableModel {
     /**
      * Set the total row count (must be called before resetting)
      */
-    void setRowCount(int rowCount) { totalRowCount = rowCount; }
+    void setRowCount(int rowCount);
+
+    /**
+     * Enable or disable data loading (useful for scrolling)
+     */
+    void setLoadingEnabled(bool enabled) { loadingEnabled = enabled; }
 
    private:
     QStringList columnHeaders;
     int totalRowCount;
     VirtualRowCache cache;
+    bool loadingEnabled = true;
     std::function<void(int, std::vector<QString>&, QColor&)> dataProvider;
     std::function<bool(const QString&)> highlightPredicate;
 

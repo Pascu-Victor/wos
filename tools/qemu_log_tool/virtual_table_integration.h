@@ -6,6 +6,7 @@
 #include <QtCore/QObject>
 #include <vector>
 
+#include "log_client.h"
 #include "qemu_log_viewer.h"
 #include "virtual_table.h"
 
@@ -20,17 +21,15 @@ class VirtualTableIntegration : public QObject {
     /**
      * Initialize virtual table for the viewer
      * @param viewer The QemuLogViewer instance
-     * @param entries Reference to the log entries vector
-     * @param visibleEntries Reference to the visible entry pointers
+     * @param client The LogClient instance
      * @return The created VirtualTableView
      */
-    static auto initializeVirtualTable(QemuLogViewer* viewer, const std::vector<LogEntry>& entries,
-                                       std::vector<const LogEntry*>& visibleEntries) -> VirtualTableView*;
+    static auto initializeVirtualTable(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView*;
 
     /**
      * Create a data provider function for loading rows
      */
-    static std::function<void(int, std::vector<QString>&, QColor&)> createDataProvider(const std::vector<const LogEntry*>& visibleEntries);
+    static std::function<void(int, std::vector<QString>&, QColor&)> createDataProvider(LogClient* client);
 
     /**
      * Get formatted cell data for a row

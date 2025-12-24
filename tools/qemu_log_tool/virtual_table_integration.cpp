@@ -13,19 +13,16 @@
 #include "qemu_log_viewer.h"
 #include "virtual_table.h"
 
-auto VirtualTableIntegration::initializeVirtualTable(QemuLogViewer* viewer, const std::vector<LogEntry>& entries,
-                                                     std::vector<const LogEntry*>& visibleEntries) -> VirtualTableView* {
-    Q_UNUSED(entries)
-
+auto VirtualTableIntegration::initializeVirtualTable(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView* {
     // Create virtual view
     auto virtualView = new VirtualTableView(viewer);
 
-    // Create model with appropriate row count
+    // Create model with appropriate row count (initially 0)
     QStringList headers = {"Line", "Type", "Address", "Function", "Hex Bytes", "Assembly"};
-    auto model = new VirtualTableModel(static_cast<int>(visibleEntries.size()), headers, virtualView);
+    auto model = new VirtualTableModel(0, headers, virtualView);
 
     // Set data provider
-    auto dataProvider = createDataProvider(visibleEntries);
+    auto dataProvider = createDataProvider(client);
     model->setDataProvider(dataProvider);
 
     // Set model
@@ -46,19 +43,22 @@ auto VirtualTableIntegration::initializeVirtualTable(QemuLogViewer* viewer, cons
     return virtualView;
 }
 
-auto VirtualTableIntegration::createDataProvider(const std::vector<const LogEntry*>& visibleEntries)
-    -> std::function<void(int, std::vector<QString>&, QColor&)> {
-    return [&visibleEntries](int row, std::vector<QString>& outCells, QColor& outBgColor) {
-        if (row < 0 || row >= static_cast<int>(visibleEntries.size())) {
+auto VirtualTableIntegration::createDataProvider(LogClient* client) -> std::function<void(int, std::vector<QString>&, QColor&)> {
+    return [client](int row, std::vector<QString>& outCells, QColor& outBgColor) {
+        if (row < 0 || row >= client->getTotalLines()) {
             outCells.clear();
-            outBgColor = Qt::white;
+            outBgColor = Qt::darkGray;
             return;
         }
 
-        const LogEntry* entry = visibleEntries[row];
+        const LogEntry* entry = client->getEntry(row);
         if (!entry) {
+            // Data not available yet (loading)
+            if (row < 5) qDebug() << "VirtualTableIntegration: Entry not found for row" << row;
             outCells.clear();
-            outBgColor = Qt::white;
+            outCells.push_back(QString::number(row + 1));  // Line number
+            outCells.push_back("Loading...");
+            outBgColor = Qt::black;
             return;
         }
 
