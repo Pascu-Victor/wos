@@ -186,6 +186,13 @@ AddressLookup Config::parseAddressLookup(const QJsonObject& obj) const {
     lookup.toAddress = parseAddress(obj["to"].toString());
     lookup.symbolFilePath = obj["path"].toString();
 
+    // Load offset is optional - defaults to 0 (no offset, addresses match file)
+    if (obj.contains("offset")) {
+        lookup.loadOffset = parseAddress(obj["offset"].toString());
+    } else {
+        lookup.loadOffset = 0;
+    }
+
     // Validate the path is not empty
     if (lookup.symbolFilePath.isEmpty()) {
         throw std::runtime_error("Symbol file path cannot be empty");
@@ -199,6 +206,9 @@ QJsonObject Config::serializeAddressLookup(const AddressLookup& lookup) const {
     obj["from"] = formatAddress(lookup.fromAddress);
     obj["to"] = formatAddress(lookup.toAddress);
     obj["path"] = lookup.symbolFilePath;
+    if (lookup.loadOffset != 0) {
+        obj["offset"] = formatAddress(lookup.loadOffset);
+    }
     return obj;
 }
 

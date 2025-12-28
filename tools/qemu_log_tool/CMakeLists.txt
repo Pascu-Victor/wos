@@ -1,7 +1,7 @@
 # Qt GUI Application for QEMU Log Viewer
 cmake_minimum_required(VERSION 3.16)
 
-project(qemu_log_viewer VERSION 1.0.0 LANGUAGES CXX)
+project(qemu_log_viewer VERSION 1.0.0 LANGUAGES C CXX)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -70,6 +70,10 @@ add_executable(qemu_log_viewer
 )
 
 
+# Find LLVM for demangling support
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+
 # Add worker executable
 add_executable(log_worker
     log_worker.cpp
@@ -93,6 +97,7 @@ target_link_libraries(log_worker
     Qt6::Core
     ${BFD_LIBRARY}
     ${CAPSTONE_LIBRARIES}
+    LLVMDemangle
     iberty
     z
     dl
@@ -107,6 +112,7 @@ target_include_directories(qemu_log_viewer PRIVATE
 target_include_directories(log_worker PRIVATE
     ${BFD_INCLUDE_DIR}
     ${CAPSTONE_INCLUDE_DIRS}
+    ${LLVM_INCLUDE_DIRS}
 )
 
 # Compiler definitions for main executable

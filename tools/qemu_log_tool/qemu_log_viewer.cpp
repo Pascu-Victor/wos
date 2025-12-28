@@ -2066,16 +2066,15 @@ void QemuLogViewer::updateDetailsPane(int row) {
     if (!entry->address.empty()) {
         detailsText += QString("Address: %1\n").arg(QString::fromStdString(entry->address));
 
-        // Try to find symbol information using the config
-        if (entry->addressValue != 0) {
+        // Show symbol resolution status based on whether we found a function
+        if (!entry->function.empty()) {
+            detailsText += QString("Symbol Lookup: Resolved\n");
+        } else if (entry->addressValue != 0) {
             const Config& config = ConfigService::instance().getConfig();
             QString symbolFilePath = config.findSymbolFileForAddress(entry->addressValue);
             if (!symbolFilePath.isEmpty()) {
                 detailsText += QString("Symbol File: %1\n").arg(symbolFilePath);
-
-                // TODO: In the future, we could add actual symbol lookup using binutils/objdump
-                // For now, just show that a symbol file mapping exists
-                detailsText += QString("Symbol Lookup: Available (mapping found)\n");
+                detailsText += QString("Symbol Lookup: No symbol found at this address\n");
             } else {
                 detailsText += QString("Symbol Lookup: No mapping found for this address range\n");
             }
@@ -2087,10 +2086,11 @@ void QemuLogViewer::updateDetailsPane(int row) {
         QString funcName = formatFunction(entry->function);
         detailsText += QString("Function: %1\n").arg(funcName);
 
-        // Try to extract source code location from the function string
-        QString fileInfo = extractFileInfo(entry->function);
-        if (!fileInfo.isEmpty()) {
-            detailsText += QString("Source: %1\n").arg(fileInfo);
+        // Show source info if available
+        if (!entry->sourceFile.empty() && entry->sourceLine > 0) {
+            detailsText += QString("Source: %1:%2\n").arg(QString::fromStdString(entry->sourceFile)).arg(entry->sourceLine);
+        } else if (!entry->sourceFile.empty()) {
+            detailsText += QString("Source File: %1\n").arg(QString::fromStdString(entry->sourceFile));
         }
     }
 

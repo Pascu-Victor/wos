@@ -15,6 +15,9 @@ class LogProcessor : public QObject {
    public:
     LogProcessor(const QString& filename, QObject* parent = nullptr);
     void startProcessing();
+
+    // Set the config file path for symbol resolution
+    void setConfigPath(const QString& path) { configPath = path; }
     std::vector<LogEntry> getEntries() const { return entries; }
 
     // Filtering support
@@ -37,6 +40,7 @@ class LogProcessor : public QObject {
 
    private:
     QString filename;
+    QString configPath;  // Path to config file for symbol resolution
     std::vector<LogEntry> entries;
     std::vector<const LogEntry*> visibleEntries;
     QTemporaryDir tempDir;

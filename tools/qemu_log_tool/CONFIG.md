@@ -17,7 +17,13 @@ The QEMU Log Viewer supports a configuration file called `logview.json` in the c
         {
             "from": "0xffffffff80000000",
             "to": "0xffffffffffffffff",
-            "path": "./build/kernel/kernel.elf"
+            "path": "./build/modules/kern/wos"
+        },
+        {
+            "from": "0x7f0000000000",
+            "to": "0x7fffffffffff",
+            "path": "./toolchain/mlibc-build/libc.so",
+            "offset": "0x7f0000000000"
         }
     ]
 }
@@ -29,6 +35,7 @@ The QEMU Log Viewer supports a configuration file called `logview.json` in the c
 -   **from**: Starting address of the range (hex string with 0x prefix)
 -   **to**: Ending address of the range (hex string with 0x prefix)
 -   **path**: Path to the symbol file (executable, ELF file, etc.)
+-   **offset**: (Optional) Runtime load offset for shared libraries. This value is subtracted from the runtime address to get the file-relative address for symbol lookups. For shared libraries loaded at a specific base address, set this to the base address.
 
 ### Address Ranges
 
@@ -38,12 +45,21 @@ Common address ranges for different types of binaries:
 -   **Kernel space (x86_64)**: `0xffffffff80000000` to `0xffffffffffffffff`
 -   **Shared libraries**: `0x7f0000000000` to `0x7fffffffffff`
 
+### Load Offset Explained
+
+For position-independent executables (PIE) and shared libraries, the addresses in the QEMU log are runtime virtual addresses where the binary was loaded. The ELF file contains symbols at file-relative addresses (typically starting from 0 for shared objects).
+
+To correctly resolve symbols:
+- **Kernel**: Usually linked at a fixed address (`0xffffffff80000000`), no offset needed
+- **Init/user programs**: Linked at a fixed address (`0x400000`), no offset needed  
+- **Shared libraries (libc.so, etc.)**: Loaded at runtime base address. Set `offset` to the load base address so runtime addresses can be converted to file-relative addresses.
+
 ### Default Configuration
 
 If no `logview.json` file is found, the application will use these default mappings:
 
 1. `0x400000-0x800000` → `./build/modules/init/init`
-2. `0xffffffff80000000-0xffffffffffffffff` → `./build/kernel/kernel.elf`
+2. `0xffffffff80000000-0xffffffffffffffff` → `./build/modules/kern/wos`
 3. `0x7f0000000000-0x7fffffffffff` → `./build/lib/libc.so`
 
 ### Usage

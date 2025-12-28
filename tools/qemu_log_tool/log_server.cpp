@@ -143,6 +143,12 @@ void LogServer::processMessage(MessageType type, QDataStream& in) {
             filteredIndices.clear();
 
             processor = new LogProcessor(filename);
+
+            // Pass config path to processor for symbol resolution
+            // Use absolute path based on current working directory
+            QString configPath = QDir::currentPath() + "/logview.json";
+            processor->setConfigPath(configPath);
+
             connect(processor, &LogProcessor::progressUpdate, this, &LogServer::onProcessingProgress);
             connect(processor, &LogProcessor::processingComplete, this, &LogServer::onProcessingComplete);
             connect(processor, &LogProcessor::errorOccurred, this, &LogServer::onProcessingError);

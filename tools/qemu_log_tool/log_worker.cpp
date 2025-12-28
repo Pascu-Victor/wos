@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 #define PACKAGE "qemu_log_worker"
@@ -16,11 +17,13 @@ extern "C" {
 #include <bfd.h>
 }
 #include <capstone/capstone.h>
-#include <cxxabi.h>
+#include <llvm/Demangle/Demangle.h>
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDebug>
+#include <QtCore/QDir>
 #include <QtCore/QFile>
+#include <QtCore/QFileInfo>
 #include <QtCore/QIODevice>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
@@ -30,7 +33,21 @@ extern "C" {
 #include <iostream>
 #include <sstream>
 
+#include "config.h"
 #include "log_entry.h"
+
+// Helper function to demangle C++ symbols using LLVM's demangler
+// This handles modern C++20 features like concepts that cxxabi can't
+static std::string demangleSymbol(const std::string& mangled) {
+    if (mangled.length() > 2 && mangled.substr(0, 2) == "_Z") {
+        std::string demangled = llvm::demangle(mangled);
+        // llvm::demangle returns the original string if it can't demangle
+        if (demangled != mangled) {
+            return demangled;
+        }
+    }
+    return mangled;
+}
 
 // CapstoneDisassembler implementation (same as main)
 class CapstoneDisassembler {
@@ -118,23 +135,119 @@ auto CapstoneDisassembler::hexStringToBytes(const std::string& hex) -> std::vect
     return bytes;
 }
 
+// Structure to hold BFD binary info
+struct BinaryInfo {
+    bfd* abfd = nullptr;
+    asymbol** symbols = nullptr;
+    long symCount = 0;
+    uint64_t fromAddress = 0;
+    uint64_t toAddress = 0;
+    uint64_t loadOffset = 0;  // Runtime load offset to subtract from addresses
+    QString path;
+
+    ~BinaryInfo() {
+        if (symbols) {
+            free(symbols);
+        }
+        if (abfd) {
+            bfd_close(abfd);
+        }
+    }
+
+    bool containsAddress(uint64_t addr) const { return addr >= fromAddress && addr <= toAddress; }
+
+    // Convert runtime address to file-relative address for BFD lookups
+    uint64_t toFileAddress(uint64_t runtimeAddress) const { return runtimeAddress - loadOffset; }
+};
+
 class LogWorker {
    public:
     LogWorker();
+    ~LogWorker();
+
+    void loadConfig(const QString& configPath);
     void processChunk(const QString& inputFile, const QString& outputFile);
 
    private:
-    static LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, bfd* kernelBfd,
-                                asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd, asymbol** initSymbols, long initSymCount);
+    std::vector<std::unique_ptr<BinaryInfo>> binaries;
 
-    static void resolveAddressInfo(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
-                                   asymbol** initSymbols, long initSymCount, std::string& function, std::string& sourceFile,
-                                   int& sourceLine);
+    BinaryInfo* findBinaryForAddress(uint64_t address);
+
+    LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler);
+
+    void resolveAddressInfo(uint64_t address, std::string& function, std::string& sourceFile, int& sourceLine);
 
     QJsonObject logEntryToJson(const LogEntry& entry);
 };
 
-LogWorker::LogWorker() {}
+LogWorker::LogWorker() { bfd_init(); }
+
+LogWorker::~LogWorker() { binaries.clear(); }
+
+void LogWorker::loadConfig(const QString& configPath) {
+    Config config;
+
+    // Get the directory containing the config file for relative path resolution
+    QFileInfo configFileInfo(configPath);
+    QString configDir = configFileInfo.absolutePath();
+
+    if (!config.loadFromFile(configPath)) {
+        qDebug() << "Failed to load config from" << configPath << ", using defaults";
+    }
+
+    const auto& lookups = config.getAddressLookups();
+    qDebug() << "Loading" << lookups.size() << "address lookups from config";
+
+    for (const auto& lookup : lookups) {
+        auto info = std::make_unique<BinaryInfo>();
+        info->fromAddress = lookup.fromAddress;
+        info->toAddress = lookup.toAddress;
+        info->loadOffset = lookup.loadOffset;
+
+        // Resolve relative paths against the config file directory
+        QString binaryPath = lookup.symbolFilePath;
+        if (!QFileInfo(binaryPath).isAbsolute()) {
+            binaryPath = configDir + "/" + binaryPath;
+        }
+        info->path = binaryPath;
+
+        qDebug() << "Loading binary:" << binaryPath << "for range" << QString("0x%1").arg(lookup.fromAddress, 0, 16) << "-"
+                 << QString("0x%1").arg(lookup.toAddress, 0, 16) << "offset" << QString("0x%1").arg(lookup.loadOffset, 0, 16);
+
+        info->abfd = bfd_openr(binaryPath.toStdString().c_str(), nullptr);
+        if (!info->abfd) {
+            qDebug() << "Failed to open binary:" << binaryPath << "-" << bfd_errmsg(bfd_get_error());
+            continue;
+        }
+
+        if (!bfd_check_format(info->abfd, bfd_object)) {
+            qDebug() << "Binary format check failed:" << binaryPath << "-" << bfd_errmsg(bfd_get_error());
+            bfd_close(info->abfd);
+            info->abfd = nullptr;
+            continue;
+        }
+
+        long storage = bfd_get_symtab_upper_bound(info->abfd);
+        if (storage > 0) {
+            info->symbols = (asymbol**)malloc(storage);
+            info->symCount = bfd_canonicalize_symtab(info->abfd, info->symbols);
+            qDebug() << "Loaded" << info->symCount << "symbols from" << binaryPath;
+        } else {
+            qDebug() << "Binary has no symbols:" << binaryPath;
+        }
+
+        binaries.push_back(std::move(info));
+    }
+}
+
+BinaryInfo* LogWorker::findBinaryForAddress(uint64_t address) {
+    for (auto& info : binaries) {
+        if (info->containsAddress(address)) {
+            return info.get();
+        }
+    }
+    return nullptr;
+}
 
 void LogWorker::processChunk(const QString& inputFile, const QString& outputFile) {
     QFile file(inputFile);
@@ -149,52 +262,6 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
 
     CapstoneDisassembler disassembler;
 
-    // Initialize BFD
-    bfd_init();
-
-    // Open executables for symbol resolution
-    bfd* kernelBfd = bfd_openr("./build/modules/kern/wos", nullptr);
-    if (!kernelBfd) {
-        qDebug() << "Failed to open kernel binary:" << bfd_errmsg(bfd_get_error());
-    }
-    bfd* initBfd = bfd_openr("./build/modules/init/init", nullptr);
-    if (!initBfd) {
-        qDebug() << "Failed to open init binary:" << bfd_errmsg(bfd_get_error());
-    }
-
-    asymbol** kernelSymbols = nullptr;
-    asymbol** initSymbols = nullptr;
-    long kernelSymCount = 0;
-    long initSymCount = 0;
-
-    if (kernelBfd) {
-        if (bfd_check_format(kernelBfd, bfd_object)) {
-            long storage = bfd_get_symtab_upper_bound(kernelBfd);
-            if (storage > 0) {
-                kernelSymbols = (asymbol**)malloc(storage);
-                kernelSymCount = bfd_canonicalize_symtab(kernelBfd, kernelSymbols);
-            } else {
-                qDebug() << "Kernel binary has no symbols (storage size 0)";
-            }
-        } else {
-            qDebug() << "Kernel binary format check failed:" << bfd_errmsg(bfd_get_error());
-        }
-    }
-
-    if (initBfd) {
-        if (bfd_check_format(initBfd, bfd_object)) {
-            long storage = bfd_get_symtab_upper_bound(initBfd);
-            if (storage > 0) {
-                initSymbols = (asymbol**)malloc(storage);
-                initSymCount = bfd_canonicalize_symtab(initBfd, initSymbols);
-            } else {
-                qDebug() << "Init binary has no symbols (storage size 0)";
-            }
-        } else {
-            qDebug() << "Init binary format check failed:" << bfd_errmsg(bfd_get_error());
-        }
-    }
-
     // Pre-compile regexes for CPU state detection (instead of compiling per-line)
     static const QRegularExpression cpuStateRegex(
         R"(RAX=|RBX=|RCX=|RDX=|RSI=|RDI=|RBP=|RSP=|R\d+=|RIP=|RFL=|[CEDFGS]S =|LDT=|TR =|[GI]DT=|CR[0234]=|DR[0-7]=|CC[CDs]=|CCO=|EFER=)");
@@ -206,8 +273,7 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     while (!in.atEnd()) {
         line = in.readLine();
 
-        LogEntry entry =
-            processLine(line, lineNumber, disassembler, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols, initSymCount);
+        LogEntry entry = processLine(line, lineNumber, disassembler);
 
         // Handle interrupt grouping and extract key information
         if (entry.type == EntryType::INTERRUPT) {
@@ -271,19 +337,6 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     }
 
     // Cleanup BFD resources
-    if (kernelSymbols) {
-        free(kernelSymbols);
-    }
-    if (initSymbols) {
-        free(initSymbols);
-    }
-    if (kernelBfd) {
-        bfd_close(kernelBfd);
-    }
-    if (initBfd) {
-        bfd_close(initBfd);
-    }
-
     // Write results to JSON file
     QJsonArray jsonArray;
     for (const auto& entry : entries) {
@@ -299,9 +352,7 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     }
 }
 
-auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler, bfd* kernelBfd,
-                            asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd, asymbol** initSymbols, long initSymCount)
-    -> LogEntry {
+auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler) -> LogEntry {
     LogEntry entry;
     entry.lineNumber = lineNumber;
     entry.originalLine = line.toStdString();
@@ -327,8 +378,7 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
         bool ok;
         entry.addressValue = instrMatch.captured(1).toULongLong(&ok, 16);
         if (ok) {
-            resolveAddressInfo(entry.addressValue, kernelBfd, kernelSymbols, kernelSymCount, initBfd, initSymbols, initSymCount,
-                               entry.function, entry.sourceFile, entry.sourceLine);
+            resolveAddressInfo(entry.addressValue, entry.function, entry.sourceFile, entry.sourceLine);
 
             QString hexStr = instrMatch.captured(2).simplified();
             hexStr.remove(' ');
@@ -396,110 +446,78 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
     return entry;
 }
 
-void LogWorker::resolveAddressInfo(uint64_t address, bfd* kernelBfd, asymbol** kernelSymbols, long kernelSymCount, bfd* initBfd,
-                                   asymbol** initSymbols, long initSymCount, std::string& function, std::string& sourceFile,
-                                   int& sourceLine) {
+void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std::string& sourceFile, int& sourceLine) {
     function = "";
     sourceFile = "";
     sourceLine = 0;
 
-    bfd* targetBfd = nullptr;
-    asymbol** targetSymbols = nullptr;
-    long targetSymCount = 0;
-
-    if (address >= 0xffffffff80000000ULL) {
-        targetBfd = kernelBfd;
-        targetSymbols = kernelSymbols;
-        targetSymCount = kernelSymCount;
-    } else {
-        targetBfd = initBfd;
-        targetSymbols = initSymbols;
-        targetSymCount = initSymCount;
-    }
-
-    if (!targetBfd || !targetSymbols || targetSymCount <= 0) {
+    BinaryInfo* binary = findBinaryForAddress(address);
+    if (!binary || !binary->abfd || !binary->symbols || binary->symCount <= 0) {
         return;
     }
 
-    // Try to find source line info using bfd_find_nearest_line
-    asection* section = targetBfd->sections;
-    while (section) {
-        if ((bfd_section_flags(section) & SEC_ALLOC) == 0) {
-            section = section->next;
+    bfd* targetBfd = binary->abfd;
+    asymbol** targetSymbols = binary->symbols;
+    long targetSymCount = binary->symCount;
+
+    // Convert runtime address to file-relative address
+    uint64_t fileAddress = binary->toFileAddress(address);
+
+    // STEP 1: Find the best matching symbol first (this works reliably)
+    asymbol* bestMatch = nullptr;
+    bfd_vma bestDistance = UINT64_MAX;
+
+    for (long i = 0; i < targetSymCount; i++) {
+        asymbol* sym = targetSymbols[i];
+        if (!sym || !sym->name) {
             continue;
         }
 
-        bfd_vma vma = bfd_section_vma(section);
-        bfd_size_type size = bfd_section_size(section);
-
-        if (address >= vma && address < vma + size) {
-            const char* filename = nullptr;
-            const char* functionname = nullptr;
-            unsigned int line = 0;
-
-            if (bfd_find_nearest_line(targetBfd, section, targetSymbols, address - vma, &filename, &functionname, &line)) {
-                if (filename) sourceFile = filename;
-                if (functionname) {
-                    std::string name = functionname;
-                    if (name.length() > 2 && name.substr(0, 2) == "_Z") {
-                        int status = 0;
-                        char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
-                        if (status == 0 && demangled) {
-                            name = demangled;
-                            free(demangled);
-                        }
-                    }
-                    function = name;
-                }
-                sourceLine = line;
-            }
-            break;
+        if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) {
+            continue;
         }
-        section = section->next;
+
+        bfd_vma symAddr = bfd_asymbol_value(sym);
+        if (symAddr <= fileAddress) {
+            bfd_vma distance = fileAddress - symAddr;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestMatch = sym;
+            }
+        }
     }
 
-    if (function.empty()) {
-        asymbol* bestMatch = nullptr;
-        bfd_vma bestDistance = UINT64_MAX;
+    if (bestMatch && bestMatch->name) {
+        std::string name = demangleSymbol(bestMatch->name);
 
-        for (long i = 0; i < targetSymCount; i++) {
-            asymbol* sym = targetSymbols[i];
-            if (!sym || !sym->name) {
-                continue;
-            }
-
-            if (!(sym->flags & (BSF_FUNCTION | BSF_GLOBAL | BSF_LOCAL))) {
-                continue;
-            }
-
-            bfd_vma symAddr = bfd_asymbol_value(sym);
-            if (symAddr <= address) {
-                bfd_vma distance = address - symAddr;
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    bestMatch = sym;
-                }
-            }
+        if (bestDistance > 0) {
+            std::ostringstream oss;
+            oss << name << "+0x" << std::hex << bestDistance;
+            function = oss.str();
+        } else {
+            function = name;
         }
 
-        if (bestMatch && bestMatch->name) {
-            std::string name = bestMatch->name;
+        // STEP 2: Try to get source file info using the symbol we found
+        // Use bfd_find_line which takes a symbol directly
+        const char* filename = nullptr;
+        unsigned int line = 0;
 
-            if (name.length() > 2 && name.substr(0, 2) == "_Z") {
-                int status = 0;
-                char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
-                if (status == 0 && demangled) {
-                    name = demangled;
-                    free(demangled);
-                }
-            }
+        if (bfd_find_line(targetBfd, targetSymbols, bestMatch, &filename, &line)) {
+            if (filename) sourceFile = filename;
+            sourceLine = line;
+        }
 
-            if (bestDistance > 0) {
-                std::ostringstream oss;
-                oss << name << "+0x" << std::hex << bestDistance;
-                function = oss.str();
-            } else {
-                function = name;
+        // If bfd_find_line didn't work, try bfd_find_nearest_line with the symbol's section
+        if (sourceFile.empty() && bestMatch->section) {
+            const char* functionname = nullptr;
+            bfd_vma symAddr = bfd_asymbol_value(bestMatch);
+            bfd_vma sectionVma = bfd_section_vma(bestMatch->section);
+
+            if (bfd_find_nearest_line(targetBfd, bestMatch->section, targetSymbols, fileAddress - sectionVma, &filename, &functionname,
+                                      &line)) {
+                if (filename) sourceFile = filename;
+                sourceLine = line;
             }
         }
     }
@@ -535,15 +553,21 @@ auto LogWorker::logEntryToJson(const LogEntry& entry) -> QJsonObject {
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
 
-    if (argc != 3) {
-        qDebug() << "Usage: log_worker <input_file> <output_file>";
+    if (argc < 3) {
+        qDebug() << "Usage: log_worker <input_file> <output_file> [config_file]";
         return 1;
     }
 
     QString inputFile = argv[1];
     QString outputFile = argv[2];
+    QString configFile = (argc >= 4) ? argv[3] : QString();
 
     LogWorker worker;
+
+    if (!configFile.isEmpty()) {
+        worker.loadConfig(configFile);
+    }
+
     worker.processChunk(inputFile, outputFile);
 
     return 0;

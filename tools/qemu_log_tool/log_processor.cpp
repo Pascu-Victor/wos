@@ -53,8 +53,8 @@ void LogProcessor::splitFileIntoChunks() {
         return;
     }
 
-    // Determine number of worker processes (use CPU cores, max 8)
-    totalWorkers = std::min(4, QThread::idealThreadCount());
+    // Determine number of worker processes
+    totalWorkers = std::max(4, QThread::idealThreadCount());
 
     // Get file size for better chunk estimation
     qint64 fileSize = file.size();
@@ -163,7 +163,14 @@ void LogProcessor::startWorkerProcesses() {
 
         // Start the worker process
         QString workerPath = QCoreApplication::applicationDirPath() + "/log_worker";
-        worker->start(workerPath, {chunkFile, resultFile});
+        QStringList args = {chunkFile, resultFile};
+
+        // Pass config path to worker if available
+        if (!configPath.isEmpty()) {
+            args << configPath;
+        }
+
+        worker->start(workerPath, args);
     }
 }
 
