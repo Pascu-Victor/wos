@@ -50,7 +50,9 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         scratchArea->syscallStack = kernelRsp;
         scratchArea->cpuId = cpu::currentCpu();
 
-        this->pid = sched::task::getNextPid();
+        // Idle tasks get PID 0 (kernel/swapper convention) - they don't consume real PIDs
+        // This ensures the first user process (init) always gets PID 1 regardless of core count
+        this->pid = 0;
         this->entry = 0;
         this->thread = nullptr;
         return;

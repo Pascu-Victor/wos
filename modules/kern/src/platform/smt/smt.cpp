@@ -33,6 +33,11 @@ uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t cpu_count;
 
+// Array to store kernel PerCpu structure addresses for each CPU
+// These are the PerCpu structures allocated during boot that have correct cpuId
+// Used to restore GS_BASE when entering idle loop (no task context)
+static cpu::PerCpu** kernelPerCpuPtrs = nullptr;
+
 void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     // Enable CPU features FIRST (must be done on each CPU)
     // FSGSBASE must be enabled before using wrgsbase instruction
@@ -56,6 +61,11 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
 
     // Write cpuId directly to the memory location to verify
     perCpuData->cpuId = cpuNo;
+
+    // Store the per-CPU PerCpu pointer for later retrieval (e.g., when entering idle loop)
+    if (kernelPerCpuPtrs != nullptr) {
+        kernelPerCpuPtrs[cpuNo] = perCpuData;
+    }
 
     // Also use setCurrentCpuid for consistency
     cpu::setCurrentCpuid(cpuNo);
@@ -117,8 +127,9 @@ void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
     hcf();
 }
 
-void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
-    sched::percpuInit();
+// Create init task(s) from handover modules WITHOUT starting scheduler
+// This is called early to ensure init gets PID 1
+void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
     for (uint64_t i = 0; i < modStruct.count; i++) {
         const auto& module = modStruct.modules[i];
         auto* newTask = new sched::task::Task(module.name, (uint64_t)module.entry, kernelRsp, sched::task::TaskType::PROCESS);
@@ -265,9 +276,10 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         sched::postTaskBalanced(newTask);
     }
 #ifdef TASK_DEBUG
-    dbg::log("Posted task for main thread");
+    dbg::log("Posted init task(s)");
 #endif
-    sched::startScheduler();
+    // NOTE: Do NOT start scheduler here - it will be started in startSMT()
+    // after secondary CPUs are initialized
 }
 }  // namespace
 
@@ -312,6 +324,12 @@ void init() {
     bsp_lapic_id = smp_request.response->bsp_lapic_id;
     cpu_count = smp_request.response->cpu_count;
 
+    // Allocate the kernel PerCpu pointers array
+    kernelPerCpuPtrs = new cpu::PerCpu*[cpu_count];
+    for (uint64_t i = 0; i < cpu_count; ++i) {
+        kernelPerCpuPtrs[i] = nullptr;
+    }
+
     // Register the halt IPI handler so we can broadcast a halting IPI in panic/OOM paths.
     gates::setInterruptHandler(HALT_IPI_VECTOR, haltIpiHandler);
     dbg::log("Registered halt IPI handler for vector 0x%x", (int)HALT_IPI_VECTOR);
@@ -320,18 +338,29 @@ void init() {
 // init per cpu data
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp) {
     assert(smp_request.response != nullptr);
-    // Set both GS_BASE and KERNEL_GS_BASE for BSP boot
-    uint64_t perCpuAddr = kernelRsp - KERNEL_STACK_SIZE;
+    
+    // Allocate a dedicated PerCpu structure for BSP (like APs do in cpuParamInit)
+    // Don't reuse stack bottom as that can cause issues
+    auto* bspPerCpu = new cpu::PerCpu();
+    uint64_t perCpuAddr = (uint64_t)bspPerCpu;
 
     // Zero out the PerCpu area before use
     memset((void*)perCpuAddr, 0, sizeof(cpu::PerCpu));
+    
+    // Store kernel stack in the PerCpu structure
+    bspPerCpu->syscallStack = kernelRsp;
 
     cpu::wrgsbase(perCpuAddr);
     cpuSetMSR(IA32_KERNEL_GS_BASE, perCpuAddr);
 
     // Write cpuId directly to the memory location
-    ((cpu::PerCpu*)perCpuAddr)->cpuId = 0;
+    bspPerCpu->cpuId = 0;
     cpu::setCurrentCpuid(0);
+    
+    // Store the BSP's PerCpu pointer for later retrieval
+    if (kernelPerCpuPtrs != nullptr) {
+        kernelPerCpuPtrs[0] = bspPerCpu;
+    }
 
     // Verify the write worked
     uint64_t readBack = cpu::currentCpu();
@@ -349,19 +378,24 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
         cpuData->thatCpu(i)->stack_pointer_ref = (uint64_t*)(smp_request.response->cpus[i]->extra_argument);
     }
 
-    // Allocate stacks and start secondary CPUs
+    // Allocate stacks for all CPUs first (don't start secondary CPUs yet)
+    for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
+        auto stack = mm::Stack();
+        cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
+    }
+
+    // CRITICAL: Initialize scheduler and create init task BEFORE starting secondary CPUs
+    // This ensures init gets PID 1, regardless of how many CPUs exist
+    sched::percpuInit();
+    dbg::log("Creating init task(s) on BSP BEFORE starting secondary CPUs to ensure PID 1");
+    createInitTasks(modules, kernelRsp);
+
+    // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)
     for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
         // Skip BSP - it's already running
         if (smp_request.response->cpus[i]->lapic_id == bsp_lapic_id) {
-            // Allocate a stack for BSP too and store it
-            auto stack = mm::Stack();
-            cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
             continue;
         }
-
-        // Allocate stack for this CPU
-        auto stack = mm::Stack();
-        cpuData->thatCpu(i)->stack_pointer_ref = stack.sp;
 
         dbg::log("Starting CPU %d (LAPIC ID: %d)", i, smp_request.response->cpus[i]->lapic_id);
 
@@ -374,8 +408,11 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     for (volatile int i = 0; i < 10000000; i++) {
     }
 
-    dbg::log("All CPUs started, running handover tasks on BSP");
-    runHandoverTasks(modules, kernelRsp);
+    dbg::log("All CPUs started, starting scheduler on BSP");
+    // Create idle task for BSP (gets PID 0 like all idle tasks)
+    auto idleTask = new sched::task::Task("idle", 0, kernelRsp, sched::task::TaskType::IDLE);
+    sched::postTask(idleTask);
+    sched::startScheduler();
     hcf();
 }
 
@@ -445,6 +482,15 @@ void haltOtherCores() {
         bool halted = cpuData->withLock(i, [](CpuInfo* c) -> bool { return c->isHaltedForOom.load(std::memory_order_acquire); });
         dbg::log("  CPU %d halted=%d", (int)i, (int)halted);
     }
+}
+
+// Get the kernel PerCpu structure for a given CPU index
+// This is used when entering idle loop to restore GS_BASE to a valid PerCpu with correct cpuId
+cpu::PerCpu* getKernelPerCpu(uint64_t cpuIndex) {
+    if (kernelPerCpuPtrs == nullptr || cpuIndex >= cpu_count) {
+        return nullptr;
+    }
+    return kernelPerCpuPtrs[cpuIndex];
 }
 
 extern "C" void ker_smt_halt_other_cpus(void) { haltOtherCores(); }

@@ -33,6 +33,10 @@ auto getCpu(uint64_t number) -> CpuInfo&;
 // Get logical CPU index from APIC ID (reliable, doesn't depend on GS)
 auto getCpuIndexFromApicId(uint32_t apicId) -> uint64_t;
 
+// Get the kernel PerCpu structure for a given CPU index
+// Used to restore GS_BASE when entering idle loop (no task context)
+cpu::PerCpu* getKernelPerCpu(uint64_t cpuIndex);
+
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp);
 
 void init();

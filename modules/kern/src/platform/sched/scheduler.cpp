@@ -36,6 +36,18 @@ static smt::PerCpuCrossAccess<RunQueue>* runQueues;
 // Instead, use a statically allocated array in kernel BSS.
 static task::Task* debug_task_ptrs[256] = {nullptr};  // Support up to 256 CPUs
 
+// Helper function to properly restore GS_BASE before entering idle loop
+// This ensures cpu::currentCpu() returns the correct CPU index when
+// timer interrupts wake us from idle and call processTasks.
+static inline void restoreKernelGsForIdle() {
+    uint32_t apicId = apic::getApicId();
+    uint64_t cpuIdx = smt::getCpuIndexFromApicId(apicId);
+    cpu::PerCpu* kernelPerCpu = smt::getKernelPerCpu(cpuIdx);
+    if (kernelPerCpu != nullptr) {
+        cpu::wrgsbase((uint64_t)kernelPerCpu);
+    }
+}
+
 // TODO: may be unique_ptr
 auto postTask(task::Task* task) -> bool {
     // Must use locked access because timer interrupts can modify the queue
@@ -194,8 +206,11 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
         return next;
     });
 
-    // DEBUG: Periodically log init (PID 2) status - check ALL CPUs
-    // Note: PID 1 is CPU 1's idle task, PID 2 is init
+    // DEBUG: Periodically log scheduler status - check ALL CPUs
+    // NOTE: PID assignment order:
+    //   - PID 0: All idle tasks (kernel/swapper convention)
+    //   - PID 1: init process (first user process)
+    //   - PID 2+: spawned processes
     static uint64_t debugCounter = 0;
     if (cpu::currentCpu() == 0 && (++debugCounter % 1000) == 0) {
         bool foundInit = false;
@@ -203,33 +218,33 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
             uint64_t activeCount = 0;
             for (auto* node = runQueues->thatCpu(cpuNo)->activeTasks.getHead(); node != nullptr; node = node->next) {
                 activeCount++;
-                if (node->data && node->data->pid == 2) {
+                if (node->data && node->data->pid == 1) {
                     foundInit = true;
-                    dbg::log("DEBUG: init (PID 2) in CPU %d activeTasks, state=%d, activeCount=%d", cpuNo,
+                    dbg::log("DEBUG: init (PID 1) in CPU %d activeTasks, state=%d, activeCount=%d", cpuNo,
                              (int)node->data->state.load(std::memory_order_acquire), activeCount);
                     break;
                 }
             }
             if (foundInit) break;
             for (auto* node = runQueues->thatCpu(cpuNo)->waitQueue.getHead(); node != nullptr; node = node->next) {
-                if (node->data && node->data->pid == 2) {
+                if (node->data && node->data->pid == 1) {
                     foundInit = true;
-                    dbg::log("DEBUG: init (PID 2) in CPU %d waitQueue!", cpuNo);
+                    dbg::log("DEBUG: init (PID 1) in CPU %d waitQueue!", cpuNo);
                     break;
                 }
             }
             if (foundInit) break;
             for (auto* node = runQueues->thatCpu(cpuNo)->expiredTasks.getHead(); node != nullptr; node = node->next) {
-                if (node->data && node->data->pid == 2) {
+                if (node->data && node->data->pid == 1) {
                     foundInit = true;
-                    dbg::log("DEBUG: init (PID 2) in CPU %d expiredTasks!", cpuNo);
+                    dbg::log("DEBUG: init (PID 1) in CPU %d expiredTasks!", cpuNo);
                     break;
                 }
             }
             if (foundInit) break;
         }
         if (!foundInit) {
-            dbg::log("DEBUG: init (PID 2) NOT FOUND on ANY CPU!");
+            dbg::log("DEBUG: init (PID 1) NOT FOUND on ANY CPU!");
         }
     }
 
@@ -396,6 +411,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         // Exit critical section before idling to allow GC to proceed
         EpochManager::exitCritical();
+        
+        // Restore GS_BASE to kernel PerCpu before entering idle loop
+        // This ensures cpu::currentCpu() returns correct value when timer wakes us
+        restoreKernelGsForIdle();
 
         asm volatile(
             "mov %0, %%rsp\n"
@@ -417,6 +436,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
         EpochManager::exitCritical();
+        
+        // Restore GS_BASE to kernel PerCpu before entering idle loop
+        restoreKernelGsForIdle();
+        
         asm volatile(
             "mov %0, %%rsp\n"
             "sti\n"
@@ -451,6 +474,9 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         // Exit critical section before idling
         EpochManager::exitCritical();
+        
+        // Restore GS_BASE to kernel PerCpu before entering idle loop
+        restoreKernelGsForIdle();
 
         asm volatile(
             "mov %0, %%rsp\n"
@@ -475,6 +501,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
         EpochManager::exitCritical();
+        
+        // Restore GS_BASE to kernel PerCpu before entering idle loop
+        restoreKernelGsForIdle();
+        
         asm volatile(
             "mov %0, %%rsp\n"
             "sti\n"
@@ -511,6 +541,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
         runQueues->thisCpu()->currentTask = nullptr;
         runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
         apic::oneShotTimer(apic::calibrateTimer(10000));
+        
+        // Restore GS_BASE to kernel PerCpu before entering idle loop via iretq
+        restoreKernelGsForIdle();
+        
         frame.rip = (uint64_t)_wOS_kernel_idle_loop;
         frame.cs = 0x08;
         frame.ss = 0x10;
@@ -622,9 +656,12 @@ void startScheduler() {
     // be swapped so user gets GS_BASE=TLS and kernel (after next swapgs) gets GS_BASE=scratch.
     //
     // CRITICAL: Update cpuId in the scratch area to reflect THIS CPU!
-    // The scratch area was created when the task was spawned (possibly on a different CPU).
+    // Use APIC ID to get the real CPU ID, not cpu::currentCpu() which reads from GS
+    // (GS might still point to per-CPU data or another task's scratch area with wrong cpuId).
+    uint32_t apicId = apic::getApicId();
+    uint64_t realCpuId = smt::getCpuIndexFromApicId(apicId);
     auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(firstTask->context.syscallScratchArea);
-    scratchArea->cpuId = cpu::currentCpu();
+    scratchArea->cpuId = realCpuId;
 
     dbg::log("Setting MSRs: fsbase=0x%x, gsbase=0x%x, scratchArea=0x%x", firstTask->thread->fsbase, firstTask->thread->gsbase,
              firstTask->context.syscallScratchArea);
@@ -1049,6 +1086,10 @@ void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interrupt
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
             runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
             apic::oneShotTimer(apic::calibrateTimer(10000));
+            
+            // Restore GS_BASE to kernel PerCpu before entering idle loop via iretq
+            restoreKernelGsForIdle();
+            
             frame.rip = (uint64_t)_wOS_kernel_idle_loop;
             frame.cs = 0x08;
             frame.ss = 0x10;
@@ -1137,8 +1178,12 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
         // CRITICAL: Update cpuId in the scratch area before switching to it!
         // The scratch area was created when the task was spawned (possibly on a different CPU),
         // so we must update cpuId to reflect which CPU is actually running this task now.
+        // Use APIC ID to get the real CPU ID, not cpu::currentCpu() which reads from GS
+        // (the current task's GS might have wrong cpuId if it migrated).
+        uint32_t apicId = apic::getApicId();
+        uint64_t realCpuId = smt::getCpuIndexFromApicId(apicId);
         auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(nextTask->context.syscallScratchArea);
-        scratchArea->cpuId = cpu::currentCpu();
+        scratchArea->cpuId = realCpuId;
 
         if (nextTask->thread) {
             cpu::wrgsbase(nextTask->context.syscallScratchArea);

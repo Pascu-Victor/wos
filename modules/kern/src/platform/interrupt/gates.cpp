@@ -1,5 +1,6 @@
 #include "gates.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -19,12 +20,24 @@ interruptHandler_t interruptHandlers[256] = {nullptr};
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // CRITICAL: Prevent nested panics by detecting recursion
-    static volatile bool inPanicHandler = false;
+    // Use atomic int to track which CPU owns the panic handler (-1 = none)
+    static std::atomic<int64_t> panicOwnerCpu{-1};
 
-    // If we're already in the panic handler, immediately halt to prevent infinite recursion
-    if (inPanicHandler) {
-        io::serial::acquireLock();
-        dbg::log("NESTED PANIC DETECTED! Halting immediately to prevent infinite loop.");
+    int64_t myApicId = apic::getApicId();
+    int64_t expectedOwner = -1;
+
+    // Try to claim ownership of the panic handler
+    if (!panicOwnerCpu.compare_exchange_strong(expectedOwner, myApicId, std::memory_order_acq_rel)) {
+        // Another CPU already owns the panic handler
+        if (expectedOwner == myApicId) {
+            // We already own it - this is a nested panic on the same CPU
+            io::serial::enterPanicMode();
+            dbg::log("CPU %d: NESTED PANIC DETECTED! Halting immediately.", myApicId);
+        } else {
+            // Different CPU owns it - just print minimal info and halt
+            io::serial::enterPanicMode();
+            dbg::log("CPU %d: FAULT while CPU %d is handling panic. Halting.", myApicId, expectedOwner);
+        }
         asm volatile("cli; hlt");
         __builtin_unreachable();
     }
@@ -56,6 +69,15 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     uint64_t cpl = frame.cs & 0x3;
     if (cpl == 3) {
         auto* currentTaskForDump = ker::mod::sched::getCurrentTask();
+
+        // DEBUG: Log detailed info about the mismatch between currentTask and CR3
+        uint64_t cpuIdFromGs = cpu::currentCpu();
+        uint32_t apicId = apic::getApicId();
+        uint64_t cpuIdFromApic = smt::getCpuIndexFromApicId(apicId);
+        dbg::log("USERFAULT DEBUG: cpuFromGs=%d apicId=%d cpuFromApic=%d task=%p taskPid=%x cr3=0x%x taskPagemap=%p", cpuIdFromGs, apicId,
+                 cpuIdFromApic, currentTaskForDump, currentTaskForDump ? currentTaskForDump->pid : 0xDEAD, cr3,
+                 currentTaskForDump ? (void*)currentTaskForDump->pagemap : nullptr);
+
         ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
         if (frame.intNum == 14) {
@@ -100,8 +122,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // faulted while holding a spinlock (e.g., in pageAlloc).
     // Coredumps are only for userspace crashes, handled above.
 
-    // Mark that we're in the panic handler
-    inPanicHandler = true;
+    // We already claimed ownership via CAS at the top of this function.
 
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
     // or its fields while we're printing panic info. We do this BEFORE acquiring
@@ -109,11 +130,10 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // If epoch management is broken, this is a no-op (safe).
     ker::mod::sched::EpochManager::enterCritical();
 
-    // Acquire serial lock for the entire panic dump to prevent interleaving.
-    // The lock is reentrant, so subsequent dbg::log() calls will still work.
-    // We never release it since we're halting - this blocks other CPUs from
-    // writing to serial and keeps the panic output contiguous.
-    io::serial::acquireLock();
+    // Enter panic mode for serial output. This disables the serial lock entirely
+    // to prevent deadlocks when CPU ID detection is unreliable during panic.
+    // All subsequent serial writes (including from dbg::log) will proceed without locking.
+    io::serial::enterPanicMode();
 
     dbg::log("PANIC!");
 

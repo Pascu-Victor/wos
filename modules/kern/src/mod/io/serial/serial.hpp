@@ -24,6 +24,10 @@ void releaseLock();
 // Call this after per-CPU data is initialized to enable proper CPU ID tracking
 void markCpuIdAvailable();
 
+// Enter panic mode - disables all locking to prevent deadlocks during panic.
+// Call this early in the panic handler before any dbg::log() calls.
+void enterPanicMode();
+
 // Unlocked write variants - caller must hold lock via acquireLock()/releaseLock()
 void writeUnlocked(const char* str);
 void writeUnlocked(const char* str, uint64_t len);

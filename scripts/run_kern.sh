@@ -15,12 +15,26 @@ else
   GFX_ARGS=""
 fi
 
+# Check for debug flag
+DEBUG_ARGS=""
+for arg in "$@"
+do
+    if [ "$arg" == "--debug" ]; then
+        # Explicit GDB bind to IPv4 loopback
+        DEBUG_ARGS="-gdb tcp:127.0.0.1:1234 -S"
+        # ISA-DebugCon on port 23456 (telnet)
+        DEBUG_ARGS="$DEBUG_ARGS -chardev socket,id=debugger,port=23456,host=0.0.0.0,server=on,wait=off,telnet=on -device isa-debugcon,iobase=0x402,chardev=debugger"
+        # Additional Monitor on port 3002
+        DEBUG_ARGS="$DEBUG_ARGS -monitor tcp:0.0.0.0:3002,server,nowait"
+    fi
+done
+
 echo "STARTING BOOT:"
 
-qemu-system-x86_64 -M q35 -cpu max -enable-kvm -m 32G \
+qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m 8G \
   -drive file=disk.qcow2,if=none,id=drive0,format=qcow2 \
   -device ahci,id=ahci \
   -device ide-hd,drive=drive0,bus=ahci.0 \
   -drive file=test_fat32.qcow2,if=none,id=drive1,format=qcow2 \
   -device ide-hd,drive=drive1,bus=ahci.1 \
-  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 3
+  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 10

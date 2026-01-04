@@ -14,8 +14,15 @@ static constexpr uint64_t EARLY_BOOT_CPU = UINT64_MAX - 1;
 static std::atomic<uint64_t> lockOwner{NO_OWNER};
 static std::atomic<uint64_t> lockDepth{0};
 static std::atomic<bool> cpuIdAvailable{false};
+static std::atomic<bool> inPanicMode{false};
 
 void markCpuIdAvailable() { cpuIdAvailable.store(true, std::memory_order_release); }
+
+void enterPanicMode() {
+    // Once in panic mode, all lock operations become no-ops.
+    // This prevents deadlocks when CPU ID detection is unreliable during panic.
+    inPanicMode.store(true, std::memory_order_release);
+}
 
 static uint64_t getCurrentCpuId() {
     if (cpuIdAvailable.load(std::memory_order_acquire)) {
@@ -26,6 +33,11 @@ static uint64_t getCurrentCpuId() {
 }
 
 void acquireLock() {
+    // In panic mode, skip all locking to avoid deadlocks from unreliable CPU ID
+    if (inPanicMode.load(std::memory_order_acquire)) {
+        return;
+    }
+
     uint64_t cpu = getCurrentCpuId();
 
     // If we already own the lock, just increment depth
@@ -44,6 +56,11 @@ void acquireLock() {
 }
 
 void releaseLock() {
+    // In panic mode, skip all locking
+    if (inPanicMode.load(std::memory_order_acquire)) {
+        return;
+    }
+
     uint64_t depth = lockDepth.fetch_sub(1, std::memory_order_relaxed);
     if (depth == 1) {
         // Last release - actually unlock

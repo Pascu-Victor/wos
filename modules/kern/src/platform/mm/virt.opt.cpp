@@ -457,9 +457,6 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
 
     if (entry.present == 0) {
         // Page doesn't exist, nothing to modify
-        if (vaddr >= 0x83e000 && vaddr < 0x83f000) {
-            dbg::log("unifyPageFlags: vaddr=0x%x NOT PRESENT before update", vaddr);
-        }
         return;
     }
 
@@ -475,11 +472,6 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
         *raw_entry |= (1ULL << NX_BIT_POSITION);  // Set NX bit
     } else {
         *raw_entry &= ~(1ULL << NX_BIT_POSITION);  // Clear NX bit
-    }
-
-    if (vaddr >= 0x83e000 && vaddr < 0x83f000) {
-        dbg::log("unifyPageFlags: vaddr=0x%x flags=0x%x -> present=%d user=%d rw=%d nx=%d raw=0x%x", vaddr, flags, entry.present,
-                 entry.user, entry.writable, entry.noExecute, *raw_entry);
     }
 
     invlpg(vaddr);

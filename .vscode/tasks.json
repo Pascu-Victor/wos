@@ -74,40 +74,44 @@
         },
         {
             "label": "Start QEMU Debug",
-            "command": "${workspaceFolder}/scripts/run_kern.sh",
+            "command": "source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_kern.sh --debug",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "--init-file",
-                        "${workspaceFolder}/.vscode/wos-env.sh"
-                    ]
+                    "args": ["-c"]
                 }
             },
-            "args": [],
             "isBackground": true,
             "problemMatcher": [
                 {
                     "pattern": [
                         {
-                            "regexp": ".",
+                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
                             "file": 1,
-                            "location": 2,
+                            "line": 2,
                             "message": 3
                         }
                     ],
                     "background": {
                         "activeOnStart": true,
-                        "beginsPattern": ".",
-                        "endsPattern": "QEMU.*monitor"
+                        "beginsPattern": "STARTING BOOT:",
+                        "endsPattern": "QEMU .* monitor - type 'help' for more information"
                     }
                 }
             ],
             "presentation": {
                 "reveal": "always"
             },
+            "group": "build"
+        },
+        {
+            "label": "Build QEMU Log Viewer",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "build/tools", "--target", "qemu_log_viewer"],
+            "isBackground": false,
             "group": "build"
         }
     ]
