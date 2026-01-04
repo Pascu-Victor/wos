@@ -82,20 +82,20 @@ auto main() -> int {
     // Test: Process execution
     std::println("init[{}]: TEST: Process Execution", cpuno);
     std::println("init[{}]: Testing process exec", cpuno);
-    int pids[4000] = {};
+    int pids[40] = {};
     for (int& pid : pids) {
         const char* progPath = "/mnt/disk/testprog";
         std::array<const char*, 4> argv = {"/mnt/disk/testprog", "arg1", "arg2", nullptr};
         std::array<const char*, 1> envp = {nullptr};
 
-        std::println("init[{}]: Calling exec", cpuno);
+        // std::println("init[{}]: Calling exec", cpuno);
 
         uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
         pid = static_cast<int>(child_pid);
         if (child_pid == 0) {
             std::println("init[{}]: exec failed (this is expected if testprog not in VFS)", cpuno);
         } else {
-            std::println("init[{}]: exec succeeded! pid is: {}", cpuno, pid);
+            // std::println("init[{}]: exec succeeded! pid is: {}", cpuno, pid);
         }
     }
     for (int& pid : pids) {

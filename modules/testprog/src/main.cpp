@@ -18,26 +18,27 @@ auto main(int argc, char** argv, char** envp) -> int {
     (void)a;
     int pid = ker::process::getpid();
     (void)envp;
-    std::println("testprog: main() called");
+    (void)argv;
+    // std::println("testprog: main() called");
     int tid = ker::multiproc::currentThreadId();
     // Log argc
     std::println("testprog[t:{},p:{}]: argc = {}", tid, pid, argc);
     // Log each argument
     for (int arg = 0; arg < argc; arg++) {
-        std::println("testprog[t:{},p:{}]: argv[{}] = {}", tid, pid, arg, argv[arg]);
+        // std::println("testprog[t:{},p:{}]: argv[{}] = {}", tid, pid, arg, argv[arg]);
     }
 
     FILE* fileptr = fopen("/mnt/disk/hello.txt", "r");
     if (fileptr == nullptr) {
         std::println("testprog[t:{},p:{}]: Failed to open /mnt/disk/hello.txt", tid, pid);
     } else {
-        std::println("testprog[t:{},p:{}]: Successfully opened /mnt/disk/hello.txt", tid, pid);
+        // std::println("testprog[t:{},p:{}]: Successfully opened /mnt/disk/hello.txt", tid, pid);
         constexpr size_t buffer_size = 128;
         std::array<char, buffer_size> buffer = {0};
         size_t bytes_read = fread(buffer.data(), 1, buffer_size - 1, fileptr);
         if (bytes_read > 0) {
-            std::println("testprog[t:{},p:{}]: Read {} bytes from file:", tid, pid, bytes_read);
-            std::println("testprog[t:{},p:{}]: {}", tid, pid, buffer.data());
+            // std::println("testprog[t:{},p:{}]: Read {} bytes from file:", tid, pid, bytes_read);
+            // std::println("testprog[t:{},p:{}]: {}", tid, pid, buffer.data());
         } else {
             std::println("testprog[t:{},p:{}]: Failed to read from file", tid, pid);
         }
@@ -45,31 +46,31 @@ auto main(int argc, char** argv, char** envp) -> int {
     }
 
     const auto* rootDir = "/mnt/disk";
-    std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
+    // std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
     DIR* dirp = opendir(rootDir);
     if (dirp == nullptr) {
         std::println("testprog[t:{},p:{}]: Failed to open directory", tid, pid);
     } else {
-        std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
-        std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, rootDir);
+        // std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
+        // std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, rootDir);
         struct dirent* entry = nullptr;
         while ((entry = readdir(dirp)) != nullptr) {
-            std::println("testprog[t:{},p:{}]: {}", tid, pid, static_cast<const char*>(entry->d_name));
+            // std::println("testprog[t:{},p:{}]: {}", tid, pid, static_cast<const char*>(entry->d_name));
         }
         closedir(dirp);
     }
 
     const auto* bootdir = "/boot";
-    std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
+    // std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
     DIR* bootdirp = opendir(bootdir);
     if (bootdirp == nullptr) {
         std::println("testprog[t:{},p:{}]: Failed to open directory", tid, pid);
     } else {
-        std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
-        std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, bootdir);
+        // std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
+        // std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, bootdir);
         struct dirent* entry = nullptr;
         while ((entry = readdir(bootdirp)) != nullptr) {
-            std::println("testprog[t:{},p:{}]: {}", tid, pid, static_cast<const char*>(entry->d_name));
+            // std::println("testprog[t:{},p:{}]: {}", tid, pid, static_cast<const char*>(entry->d_name));
         }
         closedir(bootdirp);  // Fixed: was closing wrong directory handle
     }
@@ -84,7 +85,7 @@ auto main(int argc, char** argv, char** envp) -> int {
         std::println("testprog[t:{},p:{}]: mmap failed with error code {}", tid, pid, mmap_result);
         return 1;
     }
-    std::println("testprog[t:{},p:{}]: mmap succeeded at address {}", tid, pid, addr);
+    // std::println("testprog[t:{},p:{}]: mmap succeeded at address {}", tid, pid, addr);
 
     // gigantic number of mallocs to test memory allocation
     constexpr int num_allocs = 1000;
@@ -101,7 +102,7 @@ auto main(int argc, char** argv, char** envp) -> int {
         memset(allocations[i], (randodata) ^ (uint64_t)(allocations[randodata % num_allocs]), alloc_size);
         randodata = (randodata + 37) % num_allocs;  // Fixed: use num_allocs not alloc_size
     }
-    std::println("testprog[t:{},p:{}]: Completed {} mallocs of size {} bytes", tid, pid, num_allocs, alloc_size);
+    // std::println("testprog[t:{},p:{}]: Completed {} mallocs of size {} bytes", tid, pid, num_allocs, alloc_size);
 
     return tid;
 }

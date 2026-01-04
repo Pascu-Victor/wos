@@ -26,6 +26,7 @@ void dumpPageAllocationsOOM();
 // Additional OOM helpers
 void dumpMiniMallocStats();
 void dumpKmallocTrackedAllocs();
+void dumpAllocStats();  // Dump allocation/free counters for debugging
 
 template <typename T>
 inline static void pageFree(T* page) {

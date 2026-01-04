@@ -25,7 +25,27 @@ namespace ker::mod::mm::phys {
 namespace {
 sys::Spinlock memlock;
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
+
+// Allocation tracking counters
+static uint64_t totalAllocatedBytes = 0;
+static uint64_t totalFreedBytes = 0;
+static uint64_t allocCount = 0;
+static uint64_t freeCount = 0;
 }  // namespace
+
+void dumpAllocStats() {
+    io::serial::write("Physical alloc stats: allocated=");
+    io::serial::writeHex(totalAllocatedBytes);
+    io::serial::write(" freed=");
+    io::serial::writeHex(totalFreedBytes);
+    io::serial::write(" delta=");
+    io::serial::writeHex(totalAllocatedBytes - totalFreedBytes);
+    io::serial::write(" allocCount=");
+    io::serial::writeHex(allocCount);
+    io::serial::write(" freeCount=");
+    io::serial::writeHex(freeCount);
+    io::serial::write("\n");
+}
 
 auto getZones() -> paging::PageZone* { return zones; }
 
@@ -37,11 +57,18 @@ auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone*
     len -= paging::PAGE_SIZE;
 
     zone->start = base;
-    zone->len = len;
     zone->name = "Physical Memory";
-    zone->pageCount = len / paging::PAGE_SIZE;
     zone->zoneNum = zoneNum;
     zone->buddyInstance = buddy_embed_alignment((uint8_t*)base, len, paging::PAGE_SIZE);
+
+    // Use the actual allocatable arena size from buddy, not the full length!
+    // The buddy reserves space at the end for its metadata.
+    if (zone->buddyInstance != nullptr) {
+        zone->len = buddy_arena_size(zone->buddyInstance);
+    } else {
+        zone->len = 0;  // No buddy = no allocatable space
+    }
+    zone->pageCount = zone->len / paging::PAGE_SIZE;
 
     return zone;
 }
@@ -103,7 +130,8 @@ auto pageAlloc(uint64_t size) -> void* {
     void* block = findFreeBlock(size);
 
     if (block != nullptr) {
-        // dbg::log("pageAlloc: size=%x returned=%p", size, block);
+        totalAllocatedBytes += size;
+        allocCount++;
     }
 
     if (block == nullptr) {
@@ -152,18 +180,25 @@ auto pageAlloc(uint64_t size) -> void* {
 void pageFree(void* page) {
     memlock.lock();
 
+    bool freed = false;
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-        if ((uint64_t)page < zone->start || (uint64_t)page > zone->start + zone->len) {
+        if ((uint64_t)page < zone->start || (uint64_t)page >= zone->start + zone->len) {
             continue;
         }
 
-        // Get the buddy instance dynamically since it's in RELATIVE_MODE
-        buddy* buddyPtr = buddy_get_embed_at((uint8_t*)zone->start, zone->len);
+        // Use the stored buddy instance directly - don't recalculate!
+        buddy* buddyPtr = zone->buddyInstance;
         if (buddyPtr != nullptr) {
+            // Use buddy_free which doesn't require size - it finds the allocation automatically
             buddy_free(buddyPtr, page);
+            freed = true;
+            freeCount++;
+            // Note: We don't know the actual size freed, so tracking is approximate
+            totalFreedBytes += paging::PAGE_SIZE;
         }
         break;
     }
+
     memlock.unlock();
 }
 

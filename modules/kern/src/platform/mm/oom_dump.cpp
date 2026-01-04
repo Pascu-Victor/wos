@@ -623,6 +623,7 @@ void dumpPageAllocationsOOM() {
     // For now just call the raw dumps so they appear early in the log for visibility.
     mini_dump_stats();
     ker::mod::mm::dyn::kmalloc::dumpTrackedAllocations();
+    dumpAllocStats();  // Dump page allocation counters
 
     // Reset tracking arrays
     oomTaskCount = 0;

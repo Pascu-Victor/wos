@@ -206,6 +206,7 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
         return next;
     });
 
+#ifdef SCHED_INIT_LIFETIME_DEBUG
     // DEBUG: Periodically log scheduler status - check ALL CPUs
     // NOTE: PID assignment order:
     //   - PID 0: All idle tasks (kernel/swapper convention)
@@ -247,6 +248,7 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
             dbg::log("DEBUG: init (PID 1) NOT FOUND on ANY CPU!");
         }
     }
+#endif
 
     // Validate task state before use - task might have started exiting after we got it
     if (nextTask->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
@@ -330,7 +332,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
         // is in the exit syscall, causing it to no longer be at the front.
         rq->activeTasks.remove(exitingTask);
         rq->expiredTasks.push_back(exitingTask);
-
+#ifdef SCHED_DEBUG
+        dbg::log("jumpToNextTask: Moved PID %x to expiredTasks (state=%d)", exitingTask ? exitingTask->pid : 0,
+                 exitingTask ? (int)exitingTask->state.load() : -1);
+#endif
         // Check if we have any tasks left
         if (rq->activeTasks.size() == 0) {
             rq->currentTask = nullptr;
@@ -411,7 +416,7 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         // Exit critical section before idling to allow GC to proceed
         EpochManager::exitCritical();
-        
+
         // Restore GS_BASE to kernel PerCpu before entering idle loop
         // This ensures cpu::currentCpu() returns correct value when timer wakes us
         restoreKernelGsForIdle();
@@ -436,10 +441,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
         EpochManager::exitCritical();
-        
+
         // Restore GS_BASE to kernel PerCpu before entering idle loop
         restoreKernelGsForIdle();
-        
+
         asm volatile(
             "mov %0, %%rsp\n"
             "sti\n"
@@ -474,7 +479,7 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         // Exit critical section before idling
         EpochManager::exitCritical();
-        
+
         // Restore GS_BASE to kernel PerCpu before entering idle loop
         restoreKernelGsForIdle();
 
@@ -501,10 +506,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
 
         uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
         EpochManager::exitCritical();
-        
+
         // Restore GS_BASE to kernel PerCpu before entering idle loop
         restoreKernelGsForIdle();
-        
+
         asm volatile(
             "mov %0, %%rsp\n"
             "sti\n"
@@ -541,10 +546,10 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
         runQueues->thisCpu()->currentTask = nullptr;
         runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
         apic::oneShotTimer(apic::calibrateTimer(10000));
-        
+
         // Restore GS_BASE to kernel PerCpu before entering idle loop via iretq
         restoreKernelGsForIdle();
-        
+
         frame.rip = (uint64_t)_wOS_kernel_idle_loop;
         frame.cs = 0x08;
         frame.ss = 0x10;
@@ -690,7 +695,7 @@ void startScheduler() {
 // from tasks that have exited and whose epoch grace period has elapsed.
 void gcExpiredTasks() {
     for (uint64_t cpuNo = 0; cpuNo < smt::getCoreCount(); ++cpuNo) {
-        runQueues->withLockVoid(cpuNo, [](RunQueue* rq) {
+        runQueues->withLockVoid(cpuNo, [cpuNo](RunQueue* rq) {
             // Use restart-from-head approach because list::remove() now removes ALL
             // occurrences, which could invalidate our saved nextNode pointer.
             bool madeProgress = true;
@@ -718,10 +723,7 @@ void gcExpiredTasks() {
                             for (uint64_t checkCpu = 0; checkCpu < smt::getCoreCount(); ++checkCpu) {
                                 if (runQueues->thatCpu(checkCpu)->currentTask == taskToCheck) {
                                     stillInUse = true;
-#ifdef SCHED_DEBUG
-                                    dbg::log("GC: Task %p (PID %x) still currentTask on CPU %d, skipping", taskToCheck, taskToCheck->pid,
-                                             checkCpu);
-#endif
+                                    dbg::log("GC: PID %x still currentTask on CPU %d", taskToCheck->pid, checkCpu);
                                     break;
                                 }
                             }
@@ -734,6 +736,9 @@ void gcExpiredTasks() {
                             // Check refcount is 1 (only scheduler owns it)
                             uint32_t rc = taskToCheck->refCount.load(std::memory_order_acquire);
                             if (rc == 1) {
+#ifdef SCHED_DEBUG
+                                dbg::log("GC: Reclaiming PID %x from CPU %d", taskToCheck->pid, cpuNo);
+#endif
                                 // Sanity check: validate task struct looks valid before freeing
                                 // A corrupted task would have garbage pointers that could crash destroyUserSpace
                                 bool taskLooksValid = true;
@@ -903,6 +908,13 @@ void gcExpiredTasks() {
                                 // Restart from head since remove() may have invalidated nextNode
                                 madeProgress = true;
                                 break;
+                            }
+                        } else {
+                            // Epoch not safe yet
+                            // Only log occasionally to avoid spam
+                            static uint64_t epochSkipCount = 0;
+                            if (++epochSkipCount % 1000 == 1) {
+                                dbg::log("GC: PID %x deathEpoch=%d not safe yet", taskToCheck->pid, deathEpoch);
                             }
                         }
                     }
@@ -1086,10 +1098,10 @@ void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interrupt
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
             runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
             apic::oneShotTimer(apic::calibrateTimer(10000));
-            
+
             // Restore GS_BASE to kernel PerCpu before entering idle loop via iretq
             restoreKernelGsForIdle();
-            
+
             frame.rip = (uint64_t)_wOS_kernel_idle_loop;
             frame.cs = 0x08;
             frame.ss = 0x10;

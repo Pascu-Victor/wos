@@ -252,7 +252,9 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
             // Tail slab, simple unlink
             header.prev->header.next = nullptr;
         }
+#ifdef SLAB_DEBUG
         ker::mod::dbg::log("slab: freeing empty slab %p (size=%d)", this, (unsigned long)slab_size);
+#endif
         // free diagnostic arrays if allocated
         if (header.last_free_caller) {
             free_memory_to_os(header.last_free_caller, sizeof(uintptr_t) * MAX_BLOCKS);

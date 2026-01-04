@@ -6,8 +6,6 @@
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 
-#define WAITPID_DEBUG
-
 namespace ker::syscall::process {
 
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
