@@ -21,3 +21,6 @@ build
 
 #ccache
 .cache
+
+#core dumps
+coredumps

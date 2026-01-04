@@ -87,5 +87,5 @@ struct Gdt {
     GdtPtr ptr;
 } __attribute__((packed));
 
-void initDescriptors(uint64_t* stackPointer);
+void initDescriptors(uint64_t* stackPointer, uint64_t cpuId);
 }  // namespace ker::mod::desc::gdt

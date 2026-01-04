@@ -5,6 +5,12 @@
 
 namespace ker::mod::mm::dyn::kmalloc {
 void init();
+
+// Dump tracked large allocations for kmalloc (safe to call from OOM)
+void dumpTrackedAllocations();
+
+// Fill outCount and outBytes with totals for tracked large allocations
+void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes);
 auto malloc(uint64_t size) -> void*;
 void free(void* ptr);
 auto realloc(void* ptr, size_t size) -> void*;

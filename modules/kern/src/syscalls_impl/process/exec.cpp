@@ -2,6 +2,8 @@
 
 #include <extern/elf.h>
 
+// #define EXEC_DEBUG
+
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -17,6 +19,7 @@
 #include <span>
 #include <string_view>
 #include <vfs/file.hpp>
+#include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::syscall::process {
@@ -130,8 +133,11 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     }
 
     auto* newTask = new sched::task::Task(processName, (uint64_t)elfBuffer, kernelRsp, sched::task::TaskType::PROCESS);
-    if (newTask == nullptr) {
-        dbg::log("wos_proc_exec: Failed to allocate task");
+    if (newTask == nullptr || newTask->thread == nullptr || newTask->pagemap == nullptr) {
+        dbg::log("wos_proc_exec: Failed to create task (OOM during thread/pagemap allocation)");
+        if (newTask != nullptr) {
+            delete newTask;
+        }
         // TODO: Free kernel stack pages
         delete[] elfBuffer;
         return 0;
@@ -144,13 +150,21 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
     newTask->parentPid = parentPid;
 
-    // Copy file descriptors from parent task (inherit stdin/stdout/stderr)
-    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
+    // Re-open file descriptors for the child process instead of sharing File objects.
+    // This prevents race conditions when multiple processes access the same File
+    // (e.g., concurrent readdir calls racing on f->pos).
+    // For fd 0, 1, 2 (stdin/stdout/stderr), re-open /dev/console.
+    // Other file descriptors are not inherited for now.
+    for (unsigned i = 0; i < 3; ++i) {
         if (parentTask->fds[i] != nullptr) {
-            auto* file = static_cast<vfs::File*>(parentTask->fds[i]);
-            newTask->fds[i] = file;
-            // Increment refcount since both parent and child now share this File
-            file->refcount++;
+            // Re-open /dev/console for stdin/stdout/stderr
+            vfs::File* newFile = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+            if (newFile != nullptr) {
+                newFile->fops = vfs::devfs::get_devfs_fops();
+                newFile->fd = static_cast<int>(i);
+                newFile->refcount = 1;
+                newTask->fds[i] = newFile;
+            }
         }
     }
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
+#include <platform/sys/spinlock.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -45,6 +46,7 @@ struct FAT32MountContext {
     uint32_t data_start_sector;
     uint32_t total_sectors;
     uint32_t root_cluster;
+    ker::mod::sys::Spinlock lock;   // Protects concurrent access to this mount
 };
 
 // FAT32 Boot Sector Structure (simplified)

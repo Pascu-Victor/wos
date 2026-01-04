@@ -1,6 +1,7 @@
 #include "task.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
@@ -10,7 +11,17 @@
 
 namespace ker::mod::sched::task {
 Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
-    this->name = name;
+    // CRITICAL: Copy the name string to kernel heap memory!
+    // The passed 'name' might point to Limine boot memory or user memory
+    // which won't be mapped when we switch pagemaps.
+    if (name != nullptr) {
+        size_t nameLen = strlen(name);
+        char* nameCopy = new char[nameLen + 1];
+        memcpy(nameCopy, name, nameLen + 1);
+        this->name = nameCopy;
+    } else {
+        this->name = nullptr;
+    }
     this->parentPid = 0;        // Initialize to 0 (no parent by default, will be set by exec or fork)
     this->elfBuffer = nullptr;  // No ELF buffer by default
     this->elfBufferSize = 0;
@@ -56,7 +67,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->type = type;
     this->cpu = cpu::currentCpu();
     this->context.syscallKernelStack = kernelRsp;
-    
+
     this->pid = sched::task::getNextPid();
 
     // CRITICAL: Copy kernel mappings FIRST so we can access kernel memory (like elfBuffer)
@@ -85,18 +96,22 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     // FIXED: Parse ELF first to get actual TLS size, then create thread
     ker::loader::elf::TlsModule actualTlsInfo = loader::elf::extractTlsInfo((void*)elfStart);
     this->thread = threading::createThread(USER_STACK_SIZE, actualTlsInfo.tlsSize, this->pagemap, actualTlsInfo);
-
-    // Use the bottom of user stack as syscall scratch area (GS_BASE will point here)
-    this->context.syscallScratchArea = this->thread->gsbase;
-    
-    // Initialize the scratch area with kernel stack pointer
-    // Note: We need to translate to physical address to write to it before pagemap switch
-    uint64_t scratchPhys = mm::virt::translate(this->pagemap, this->context.syscallScratchArea);
-    if (scratchPhys != 0) {
-        cpu::PerCpu* scratchArea = (cpu::PerCpu*)mm::addr::getPhysPointer(scratchPhys);
-        scratchArea->syscallStack = kernelRsp;
-        scratchArea->cpuId = cpu::currentCpu();
+    if (this->thread == nullptr) {
+        dbg::log("Failed to create thread for task %s - OOM", name);
+        // Can't continue without a thread - this is a fatal error for the task
+        // Mark task as invalid so it won't be scheduled
+        this->type = TaskType::IDLE;  // Abuse IDLE type to prevent scheduling
+        this->pagemap = nullptr;
+        return;
     }
+
+    // Allocate a KERNEL-space PerCpu structure for syscall scratch area
+    // This must be in kernel memory, not user memory! The user's gsbase/TLS is separate.
+    // After swapgs in syscall entry: GS_BASE will point to this kernel scratch area.
+    auto* perCpu = new cpu::PerCpu();
+    perCpu->syscallStack = kernelRsp;
+    perCpu->cpuId = cpu::currentCpu();
+    this->context.syscallScratchArea = (uint64_t)perCpu;
 
     this->context.frame.rsp = this->thread->stack;
 
@@ -123,7 +138,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         uint64_t destVaddr = this->thread->tlsBaseVirt + ssym->rawValue;  // rawValue stores st_value (TLS offset)
         uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
         if (destPaddr != 0) {
-            auto* destPtr = (uint64_t*)mm::addr::getPhysPointer(destPaddr);
+            auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
             *destPtr = this->thread->safestackPtrValue;
             dbg::log("Wrote SafeStack ptr for PID %x at vaddr=%x (phys=%x) value=%x", this->pid, destVaddr, destPaddr,
                      this->thread->safestackPtrValue);
@@ -133,15 +148,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     }
 }
 
-Task::Task(const Task& task) {
-    this->name = task.name;
-    this->entry = task.entry;
-    this->context = task.context;
-    this->pagemap = task.pagemap;
-    this->type = task.type;
-    this->cpu = task.cpu;
-    this->thread = task.thread;
-}
+// Copy constructor deleted - tasks should only be referenced, never copied
 
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 

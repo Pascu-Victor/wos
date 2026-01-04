@@ -13,7 +13,7 @@ extern "C" {
 // __assert_fail. Print to kernel log then halt the CPU.
 __attribute__((noreturn)) void __assert_fail(const char* expr, const char* file, unsigned int line, const char* func) {
     using namespace ker::mod::dbg;
-    log("Assertion failed: %s, at %s:%u (%s)", expr ? expr : "(null)", file ? file : "(unknown)", line, func ? func : "(unknown)");
+    log("Assertion failed: %s, at %s:%d (%s)", expr ? expr : "(null)", file ? file : "(unknown)", line, func ? func : "(unknown)");
     hcf();
 }
 

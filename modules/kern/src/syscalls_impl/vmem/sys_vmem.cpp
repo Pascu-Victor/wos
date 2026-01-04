@@ -19,7 +19,7 @@ namespace ker::syscall::vmem {
 // Kernel space: 0xFFFF800000000000 - 0xFFFFFFFFFFFFFFFF
 constexpr uint64_t USER_SPACE_START = 0x0000000000400000ULL;  // Start after first 4MB (for NULL protection and low mem)
 constexpr uint64_t USER_SPACE_END = 0x00007FFFFFFFFFFFULL;    // Linux canonical address limit
-constexpr uint64_t MMAP_START = 0x0000700000000000ULL;        // Typical mmap base on Linux
+constexpr uint64_t MMAP_START = 0x0000100000000000ULL;        // mmap base - avoid collision with ELF debug info at 0x700000000000
 
 namespace {
 // Get the current task
@@ -106,6 +106,13 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
 
     if (task->pagemap == nullptr) {
         ker::mod::dbg::error("vmem: task has no pagemap");
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    // Validate pagemap pointer is in valid HHDM range (not kernel static range)
+    uintptr_t pmAddr = reinterpret_cast<uintptr_t>(task->pagemap);
+    if (pmAddr >= 0xffffffff80000000ULL || pmAddr < 0xffff800000000000ULL) {
+        ker::mod::dbg::log("vmem: task PID %x has corrupted pagemap ptr 0x%x", task->pid, pmAddr);
         return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
     }
 

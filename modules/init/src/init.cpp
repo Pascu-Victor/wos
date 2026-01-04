@@ -92,10 +92,10 @@ auto main() -> int {
 
         uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
         pid = static_cast<int>(child_pid);
-        if (child_pid < 0) {
+        if (child_pid == 0) {
             std::println("init[{}]: exec failed (this is expected if testprog not in VFS)", cpuno);
         } else {
-            std::println("init[{}]: exec succeeded!", cpuno);
+            std::println("init[{}]: exec succeeded! pid is: {}", cpuno, pid);
         }
     }
     for (int& pid : pids) {

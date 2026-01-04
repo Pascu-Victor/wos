@@ -1,8 +1,11 @@
 #include "context_switch.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <platform/asm/msr.hpp>
+#include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/smt/smt.hpp>
 
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
@@ -13,13 +16,82 @@
 namespace ker::mod::sys::context_switch {
 
 // Debug helper: update per-CPU task pointer for panic inspection
-static constexpr uint64_t DEBUG_TASK_PTR_BASE = 0xffff800000500000ULL;
-static inline void updateDebugTaskPtr(sched::task::Task* task) {
-    auto** debug_ptrs = reinterpret_cast<sched::task::Task**>(DEBUG_TASK_PTR_BASE);
-    debug_ptrs[cpu::currentCpu()] = task;
+// NOTE: The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
+// Now we just use the scheduler's getCurrentTask() instead of a separate debug array.
+// This function is now a no-op since the scheduler tracks currentTask internally.
+static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpuId) {
+    // No-op: scheduler's runQueues->thisCpu()->currentTask is the authoritative source
 }
 
-void switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask) {
+bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask) {
+    // CRITICAL: We must do ALL validation BEFORE modifying any state.
+    // If we modify gpr/frame but fail to switch pagemap, the iretq will use
+    // the new task's RIP/RSP with the wrong pagemap - causing a crash.
+
+    // First state check - bail out immediately if task is not ACTIVE
+    if (nextTask->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
+        dbg::log("switchTo: FAIL early - PID %x not ACTIVE (state=%d)", nextTask->pid,
+                 (int)nextTask->state.load(std::memory_order_relaxed));
+        return false;
+    }
+
+    // Capture all values we need from the task BEFORE modifying anything.
+    // This creates a consistent snapshot even if task starts exiting mid-switch.
+    // Note: thread and pagemap pointers could become stale, but we defer their
+    // freeing to GC so they remain valid during this epoch critical section.
+
+    // Validate task has required resources for a user task
+    // Idle tasks have no pagemap (run in kernel space) so we check type
+    if (nextTask->type != sched::task::TaskType::IDLE) {
+        // User process must have pagemap
+        if (nextTask->pagemap == nullptr) {
+            dbg::log("switchTo: FAIL - PID %x pagemap==nullptr", nextTask->pid);
+            // Task is being torn down, don't switch to it
+            return false;
+        }
+
+        // Validate pagemap pointer is in valid HHDM range (not kernel static range)
+        uintptr_t pmAddr = reinterpret_cast<uintptr_t>(nextTask->pagemap);
+        if (pmAddr >= 0xffffffff80000000ULL || pmAddr < 0xffff800000000000ULL) {
+            dbg::log("switchTo: FAIL - PID %x pagemap ptr invalid (pmAddr=0x%x)", nextTask->pid, pmAddr);
+            // Corrupted pagemap pointer - task struct was freed/corrupted
+            return false;
+        }
+
+        // Validate thread pointer if present
+        if (nextTask->thread != nullptr) {
+            uintptr_t threadAddr = reinterpret_cast<uintptr_t>(nextTask->thread);
+            // Accept either HHDM or kernel-static addresses as valid
+            bool thInHHDM = (threadAddr >= 0xffff800000000000ULL && threadAddr < 0xffff900000000000ULL);
+            bool thInKernelStatic = (threadAddr >= 0xffffffff80000000ULL && threadAddr < 0xffffffffc0000000ULL);
+            if (!thInHHDM && !thInKernelStatic) {
+                dbg::log("switchTo: FAIL - PID %x thread ptr invalid (thread=0x%lx)", nextTask->pid, threadAddr);
+                // Corrupted thread pointer - task struct was freed/corrupted
+                return false;
+            }
+        }
+    }
+
+    // Second state check after reading resources - task might have started exiting
+    if (nextTask->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
+        dbg::log("switchTo: FAIL 2nd check - PID %x changed state (state=%d)", nextTask->pid,
+                 (int)nextTask->state.load(std::memory_order_relaxed));
+        return false;
+    }
+
+    // === POINT OF NO RETURN ===
+    // After this point, we MUST complete the context switch.
+    // The epoch guard in processTasks ensures the task struct and its resources
+    // (thread, pagemap) won't be freed until after we exit the critical section.
+
+    // Get real CPU ID from APIC
+    uint32_t apicId = apic::getApicId();
+    uint64_t realCpuId = smt::getCpuIndexFromApicId(apicId);
+
+    // Update debug task pointer for panic inspection
+    updateDebugTaskPtr(nextTask, realCpuId);
+
+    // Now safe to modify interrupt frame and registers
     frame.rip = nextTask->context.frame.rip;
     frame.rsp = nextTask->context.frame.rsp;
     frame.cs = nextTask->context.frame.cs;
@@ -28,10 +100,14 @@ void switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     gpr = nextTask->context.regs;
 
-    // User GS_BASE = TLS/stack base, KERNEL_GS_BASE = scratch area for kernel after swapgs
+    // Update scratch area cpuId
+    auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(nextTask->context.syscallScratchArea);
+    scratchArea->cpuId = realCpuId;
+
+    // Set up GS/FS bases
     if (nextTask->thread) {
-        cpu::wrgsbase(nextTask->thread->gsbase);                               // User's TLS/stack base
-        cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->context.syscallScratchArea);  // Scratch for kernel
+        cpu::wrgsbase(nextTask->context.syscallScratchArea);
+        cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->thread->gsbase);
         cpu::wrfsbase(nextTask->thread->fsbase);
     } else {
         // Idle task uses kernel-allocated scratch area for both
@@ -39,10 +115,19 @@ void switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
         cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->context.syscallScratchArea);
     }
 
-    mm::virt::switchPagemap(nextTask);
+    // Switch pagemap for user tasks
+    // We've already validated pagemap != nullptr for user tasks above
+    if (nextTask->pagemap != nullptr) {
+        mm::virt::switchPagemap(nextTask);
+    }
+
+    return true;
 }
 
 static long timerQuantum;
+
+// Tick counter for periodic epoch advancement and garbage collection
+static std::atomic<uint64_t> timerTickCount{0};
 
 extern "C" void _wOS_schedTimer(void* stack_ptr) {
     // The stack layout at this point (from low to high address):
@@ -56,6 +141,19 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     // [SS]
 
     apic::eoi();
+
+    // Advance epoch and run garbage collection periodically on CPU 0 only.
+    // This ensures consistent epoch advancement and avoids contention.
+    // Every 10 timer ticks (~100ms at 10ms timer) we advance the epoch
+    // and collect dead tasks whose grace period has elapsed.
+    // Increased frequency (from 100 to 10) to prevent memory buildup when
+    // processes exit faster than GC can reclaim.
+    uint64_t ticks = timerTickCount.fetch_add(1, std::memory_order_relaxed);
+    if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
+        sched::EpochManager::advanceEpoch();
+        sched::gcExpiredTasks();
+    }
+
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 

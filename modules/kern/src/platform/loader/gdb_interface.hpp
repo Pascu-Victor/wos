@@ -50,6 +50,7 @@ void initGdbDebugInfo();
 void addGdbDebugInfo(uint64_t pid, const char* name, uint64_t baseAddr, uint64_t entryPoint);
 void updateGdbDebugSection(uint64_t pid, const char* sectionName, uint64_t addr, uint64_t size);
 void finalizeGdbDebugInfo(uint64_t pid);
+void removeGdbDebugInfo(uint64_t pid);
 
 // Function to be called by GDB to get debug info
 extern "C" GdbDebugInfo* getGdbDebugInfo();

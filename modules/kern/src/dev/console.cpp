@@ -29,10 +29,8 @@ ssize_t serial_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
     if (buf == nullptr) {
         return -1;
     }
-    const char* str = static_cast<const char*>(buf);
-    for (size_t i = 0; i < count; ++i) {
-        ker::mod::io::serial::write(str[i]);
-    }
+    // Use batch write - serial module's internal lock holds for entire buffer
+    ker::mod::io::serial::write(static_cast<const char*>(buf), count);
     return static_cast<ssize_t>(count);
 }
 
@@ -64,10 +62,8 @@ ssize_t vga_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
     }
     // TODO: Implement VGA output when we have VGA text mode driver
     // For now, also write to serial
-    const char* str = static_cast<const char*>(buf);
-    for (size_t i = 0; i < count; ++i) {
-        ker::mod::io::serial::write(str[i]);
-    }
+    // Use batch write - serial module's internal lock holds for entire buffer
+    ker::mod::io::serial::write(static_cast<const char*>(buf), count);
     return static_cast<ssize_t>(count);
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
@@ -21,6 +22,14 @@ enum TaskType {
     IDLE,
 };
 
+// Task lifecycle state for lock-free scheduling
+// Transitions: ACTIVE -> EXITING -> DEAD
+enum class TaskState : uint32_t {
+    ACTIVE = 0,   // Task is runnable/running
+    EXITING = 1,  // Task is in exit process, resources being freed
+    DEAD = 2,     // Task fully dead, safe to reclaim memory after epoch grace period
+};
+
 struct Context {
     uint64_t syscallKernelStack;
     uint64_t syscallScratchArea;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
@@ -39,7 +48,7 @@ struct Task {
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
-    Task(const Task& task);
+    Task(const Task& task) = delete;
 
     mm::paging::PageTable* pagemap;
     Context context;
@@ -85,9 +94,44 @@ struct Task {
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
     uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
 
+    // Lock-free lifecycle management (epoch-based reclamation)
+    // These must be aligned for atomic operations
+    alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
+    alignas(4) std::atomic<uint32_t> refCount{1};  // Scheduler owns initial reference
+    alignas(8) std::atomic<uint64_t> deathEpoch{0};  // Epoch when task became DEAD
+
     void loadContext(cpu::GPRegs* gpr);
     void saveContext(cpu::GPRegs* gpr);
-} __attribute__((packed));
+
+    // Try to acquire a reference to this task.
+    // Returns false if task is EXITING or DEAD.
+    // Caller MUST call release() when done with the task pointer.
+    bool tryAcquire() {
+        uint32_t count = refCount.load(std::memory_order_acquire);
+        while (count > 0) {
+            if (refCount.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Double-check state after acquiring
+                TaskState s = state.load(std::memory_order_acquire);
+                if (s == TaskState::DEAD || s == TaskState::EXITING) {
+                    refCount.fetch_sub(1, std::memory_order_release);
+                    return false;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Release a reference to this task
+    void release() {
+        refCount.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    // Atomically transition task state. Returns true if transition succeeded.
+    bool transitionState(TaskState from, TaskState to) {
+        return state.compare_exchange_strong(from, to, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+};  // Removed __attribute__((packed)) - was causing misalignment of atomic fields and potential corruption
 
 auto getNextPid() -> uint64_t;
 }  // namespace ker::mod::sched::task

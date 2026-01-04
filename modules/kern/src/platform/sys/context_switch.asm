@@ -74,6 +74,24 @@ task_switch_handler:
     ; Check if returning to userspace (CS at offset 24 == 0x23)
     cmp qword [rsp + 24], qword 0x23
     jne .no_swapgs_exit
+    
+    ; Returning to userspace - set up data segment selectors
+    push rax
+    push r8
+    push r9
+    mov ax, 0x1b        ; User data segment selector
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
+    
     swapgs
     .no_swapgs_exit:
     add rsp, 16  ; Skip intNum and errCode
@@ -118,6 +136,24 @@ jump_to_next_task_no_save:
     ; Check if returning to userspace (CS at offset 24 == 0x23)
     cmp qword [rsp + 24], qword 0x23
     jne .no_swapgs_exit_jump
+    
+    ; Returning to userspace - set up data segment selectors
+    push rax
+    push r8
+    push r9
+    mov ax, 0x1b        ; User data segment selector
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
+    
     swapgs
     .no_swapgs_exit_jump:
     add rsp, 16  ; Skip intNum and errCode
@@ -174,9 +210,26 @@ _wOS_deferredTaskSwitchReturn:
     ; Now restore rdi
     mov rdi, [rdi + 72]
 
-    ; Check if we need swapgs (cs == 0x1b means userspace)
-    cmp qword [rsp], 0x1b
+    ; Check if we need swapgs (cs == 0x23 means userspace)
+    cmp qword [rsp], 0x23
     jne .no_swapgs_deferred
+    
+    ; Returning to userspace - set up data segment selectors
+    ; Must do this BEFORE swapgs since we need scratch registers
+    push rax
+    mov ax, 0x1b        ; User data segment selector
+    mov ds, ax
+    mov es, ax
+    ; FS and GS bases are already set via MSRs, but we need the selectors too
+    ; Save FS/GS bases, set selectors, restore bases
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop rax
+    
     swapgs
 .no_swapgs_deferred:
     ; Remove the saved cs from stack

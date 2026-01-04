@@ -26,7 +26,7 @@ struct Thread {
     uint64_t tlsPhysPtr;    // HHDM pointer to TLS+TCB+SafeStack allocation
     uint64_t stackPhysPtr;  // HHDM pointer to stack allocation
 
-    int magic = 0;
+    uint32_t magic = 0;
 } __attribute__((packed));
 
 void initThreading();

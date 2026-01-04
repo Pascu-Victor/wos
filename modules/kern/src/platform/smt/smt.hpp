@@ -23,10 +23,15 @@ struct CpuInfo {
     CpuGotoAddr* goto_address = nullptr;
     uint64_t* stack_pointer_ref = nullptr;
     sched::task::Task* currentTask = nullptr;
+    // Used by panic/OOM to indicate this CPU has entered the halted state for diagnostics
+    std::atomic<bool> isHaltedForOom{false};
 };
 
 auto getCoreCount() -> uint64_t;
-auto getCpu(uint64_t number) -> const CpuInfo&;
+auto getCpu(uint64_t number) -> CpuInfo&;
+
+// Get logical CPU index from APIC ID (reliable, doesn't depend on GS)
+auto getCpuIndexFromApicId(uint32_t apicId) -> uint64_t;
 
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp);
 
@@ -142,7 +147,7 @@ auto getCpuNode(uint64_t cpuNo) -> uint64_t;
 
 inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack) {
     auto cpu = getCpuNode(cpuNo);
-    auto cpuData = getCpu(cpu);
+    auto& cpuData = getCpu(cpu);
 
     // push function arguments to the stack of the target CPU
     *stack.sp = reinterpret_cast<uint64_t>(task);
@@ -150,6 +155,17 @@ inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack
 
     __atomic_store_n(&cpuData.stack_pointer_ref, stack.sp, __ATOMIC_SEQ_CST);
     __atomic_store_n(cpuData.goto_address, task, __ATOMIC_SEQ_CST);
+}
+
+// Overload accepting a CpuGotoAddr-compatible function (takes limine_smp_info*).
+constexpr void execOnAllCpus(CpuGotoAddr func) {
+    auto* initStacks = new mm::Stack<4096>[getCoreCount()];
+    for (uint64_t i = 0; i < getCoreCount(); i++) {
+        if (i == cpu::currentCpu()) {
+            continue;
+        }
+        startCpuTask(i, func, initStacks[i]);
+    }
 }
 
 template <typename... FuncArgs>
@@ -166,5 +182,13 @@ constexpr void execOnAllCpus(void (*func)(FuncArgs...), FuncArgs... data) {
 auto cpuCount() -> uint64_t;
 
 auto setTcb(void* tcb) -> uint64_t;
+
+// Halt all other CPUs immediately by scheduling a HLT loop on them.
+// This is safe to call from panic/OOM paths where we want other cores
+// quiesced to avoid further concurrent access to global state.
+void haltOtherCores();
+
+// C-linkage wrapper used by external C code to request halting other CPUs.
+extern "C" void ker_smt_halt_other_cpus(void);
 
 }  // namespace ker::mod::smt

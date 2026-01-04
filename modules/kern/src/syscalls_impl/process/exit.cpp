@@ -7,6 +7,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/sys/context_switch.hpp>
@@ -19,6 +20,19 @@ void wos_proc_exit(int status) {
     if (currentTask == nullptr) {
         return;
     }
+
+    // CRITICAL: Atomically transition to EXITING state.
+    // This prevents other CPUs from scheduling this task while we're cleaning up.
+    // If this fails, another CPU already started our exit (shouldn't happen).
+    if (!currentTask->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
+        // Already exiting - this shouldn't happen but handle it gracefully
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
+
+    // Memory barrier to ensure state change is visible to all CPUs
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 #ifdef EXIT_DEBUG
     ker::mod::dbg::log("wos_proc_exit: Task PID %x exiting with status %d", currentTask->pid, status);
@@ -35,7 +49,8 @@ void wos_proc_exit(int status) {
         ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waitingPid);
 #endif
 
-        auto* waitingTask = ker::mod::sched::findTaskByPid(waitingPid);
+        // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
+        auto* waitingTask = ker::mod::sched::findTaskByPidSafe(waitingPid);
         if (waitingTask != nullptr) {
             // Set the return value of waitpid (RAX = child PID that exited)
             waitingTask->context.regs.rax = currentTask->pid;
@@ -59,6 +74,9 @@ void wos_proc_exit(int status) {
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);
 #endif
+
+            // Release the reference we acquired from findTaskByPidSafe
+            waitingTask->release();
         } else {
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Could not find waiting task PID %x", waitingPid);
@@ -85,27 +103,29 @@ void wos_proc_exit(int status) {
         currentTask->elfBufferSize = 0;
     }
 
-    // Free the entire user address space (user stack, mmap regions, code pages, etc.)
+    // CRITICAL: Do NOT modify or destroy pagemap/thread here!
+    // Another CPU might be in switchTo() and about to:
+    //   - Load our pagemap into CR3
+    //   - Read thread->gsbase/fsbase
+    //
+    // Even calling destroyUserSpace() is unsafe because it MODIFIES the pagemap
+    // contents (clears page table entries) while another CPU might be using it.
+    //
+    // ALL pagemap and thread cleanup is deferred to gcExpiredTasks() which runs
+    // after the epoch grace period, ensuring no CPU is still using these resources.
+    //
+    // The downside is user pages remain allocated ~1 second longer, but this is
+    // necessary for correctness in the face of concurrent scheduling.
     if (currentTask->pagemap != nullptr) {
 #ifdef EXIT_DEBUG
-        ker::mod::dbg::log("wos_proc_exit: Destroying user address space for PID %x", currentTask->pid);
+        ker::mod::dbg::log("wos_proc_exit: Deferring pagemap destruction for PID %x to GC", currentTask->pid);
 #endif
-        // Switch to kernel pagemap first to avoid using the pagemap we're about to free
+        // Switch to kernel pagemap so we don't use our own pagemap anymore
         ker::mod::mm::virt::switchToKernelPagemap();
-
-        // Free all user-space pages and page tables
-        ker::mod::mm::virt::destroyUserSpace(currentTask->pagemap);
-
-        // Free the PML4 page table itself
-        ker::mod::mm::phys::pageFree(currentTask->pagemap);
-        currentTask->pagemap = nullptr;
+        // Pagemap destruction deferred to gcExpiredTasks()
     }
 
-    // Free thread resources (TLS, user stack)
-    if (currentTask->thread != nullptr) {
-        ker::mod::sched::threading::destroyThread(currentTask->thread);
-        currentTask->thread = nullptr;
-    }
+    // Thread destruction deferred to gcExpiredTasks()
 
     // NOTE: We CANNOT free the kernel stack here because we're still running on it!
     // The kernel stack will be freed later when the task is fully cleaned up
@@ -115,6 +135,11 @@ void wos_proc_exit(int status) {
     // and eventually by a garbage collection mechanism.
 
     // TODO: Handle signal handlers cleanup
+
+    // Transition to DEAD state and record death epoch for garbage collection.
+    // The task will be reclaimed once all CPUs have passed through the grace period.
+    currentTask->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+    currentTask->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
 
 #ifdef EXIT_DEBUG
     ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");

@@ -104,17 +104,18 @@ class list {
         return data;
     }
 
-    T front() { return head->data; }
+    T front() { return head ? head->data : T(); }
 
-    T back() { return tail->data; }
+    T back() { return tail ? tail->data : T(); }
 
-    T* begin() { return &head->data; }
+    T* begin() { return head ? &head->data : nullptr; }
 
-    T* end() { return &tail->data; }
+    T* end() { return tail ? &tail->data : nullptr; }
 
     void remove(const T& data) {
         Node* current = head;
         while (current) {
+            Node* nextNode = current->next;  // Save next before potentially deleting current
             if (current->data == data) {
                 if (current->prev) {
                     current->prev->next = current->next;
@@ -130,9 +131,9 @@ class list {
 
                 delete current;
                 m_size--;
-                return;
+                // Continue to remove ALL occurrences, not just the first
             }
-            current = current->next;
+            current = nextNode;
         }
     }
 

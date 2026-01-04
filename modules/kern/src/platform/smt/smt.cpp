@@ -6,10 +6,12 @@
 #include <cstring>
 #include <string_view>
 
+#include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/boot/handover.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/interrupt/gates.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
@@ -32,16 +34,42 @@ uint32_t bsp_lapic_id;
 uint64_t cpu_count;
 
 void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
-    // Set up per-CPU data first
-    cpuSetMSR(IA32_KERNEL_GS_BASE, stackTop - KERNEL_STACK_SIZE);
-    cpu::setCurrentCpuid(cpuNo);
-
-    // Enable CPU features (must be done on each CPU)
+    // Enable CPU features FIRST (must be done on each CPU)
+    // FSGSBASE must be enabled before using wrgsbase instruction
     cpu::enableFSGSBASE();
     cpu::enableSSE();
 
+    // Set up per-CPU data
+    // Allocate a dedicated PerCpu structure for this CPU (don't reuse stack bottom
+    // as that can corrupt adjacent memory or heap metadata)
+    auto* perCpuData = new cpu::PerCpu();
+    uint64_t perCpuAddr = (uint64_t)perCpuData;
+
+    // Zero out the PerCpu area
+    memset((void*)perCpuAddr, 0, sizeof(cpu::PerCpu));
+
+    // Store kernel stack in the PerCpu structure
+    perCpuData->syscallStack = stackTop;
+
+    cpu::wrgsbase(perCpuAddr);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, perCpuAddr);
+
+    // Write cpuId directly to the memory location to verify
+    perCpuData->cpuId = cpuNo;
+
+    // Also use setCurrentCpuid for consistency
+    cpu::setCurrentCpuid(cpuNo);
+
+    // Verify the write worked
+    uint64_t readBack = cpu::currentCpu();
+    if (readBack != cpuNo) {
+        // Use serial directly since dbg might not be ready
+        dbg::log("CPU INIT ERROR: wrote cpuId=%d but read back %d, perCpuAddr=%p\n", cpuNo, readBack, perCpuAddr);
+    }
+
     // Initialize GDT for this CPU (includes per-CPU TSS)
-    desc::gdt::initDescriptors((uint64_t*)stackTop);
+    // NOTE: GDT/IDT asm routines no longer load GS selector to preserve GS.base
+    desc::gdt::initDescriptors((uint64_t*)stackTop, cpuNo);
 
     // Initialize IDT for this CPU (loads the shared IDT)
     desc::idt::idtInit();
@@ -56,9 +84,8 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     sched::percpuInit();
 
     // Create idle task for this CPU
-    // Pass the kernel stack pointer so the PerCpu structure gets initialized correctly
-    uint64_t kernelStack = stackTop - KERNEL_STACK_SIZE;
-    auto idleTask = new sched::task::Task("idle", 0, kernelStack, sched::task::TaskType::IDLE);
+    // Pass the kernel stack TOP (stack grows downward, so syscall needs to start from top)
+    auto idleTask = new sched::task::Task("idle", 0, stackTop, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
 
     dbg::log("CPU %d initialized and ready", cpuNo);
@@ -95,6 +122,11 @@ void runHandoverTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
     for (uint64_t i = 0; i < modStruct.count; i++) {
         const auto& module = modStruct.modules[i];
         auto* newTask = new sched::task::Task(module.name, (uint64_t)module.entry, kernelRsp, sched::task::TaskType::PROCESS);
+
+        if (newTask == nullptr || newTask->thread == nullptr || newTask->pagemap == nullptr) {
+            dbg::log("FATAL: Failed to create handover task %s - OOM", module.name);
+            hcf();
+        }
 
         // Setup stdin/stdout/stderr for init process
         // Open /dev/console as fd 0, 1, 2
@@ -246,20 +278,66 @@ auto getCpuNode(uint64_t cpuNo) -> uint64_t { return cpuNo; }
 
 auto getCoreCount() -> uint64_t { return cpu_count; }
 
-auto getCpu(uint64_t number) -> const CpuInfo& { return *cpuData->thatCpu(number); }
+auto getCpu(uint64_t number) -> CpuInfo& { return *cpuData->thatCpu(number); }
+
+// Get logical CPU index from APIC ID - doesn't depend on GS register
+auto getCpuIndexFromApicId(uint32_t apicId) -> uint64_t {
+    for (uint64_t i = 0; i < cpu_count; i++) {
+        if (cpuData->thatCpu(i)->lapic_id == apicId) {
+            return i;
+        }
+    }
+    // Fallback - shouldn't happen
+    return 0;
+}
+
+// IPI vector used for halting other CPUs (must not conflict with existing vectors)
+constexpr uint8_t HALT_IPI_VECTOR = 0x31;
+
+// Helper interrupt handler executed on other CPUs to halt them in a tight HLT loop.
+static void haltIpiHandler(ker::mod::cpu::GPRegs gpr, ker::mod::gates::interruptFrame frame) {
+    (void)gpr;
+    (void)frame;
+    // Mark this CPU as halted for the OOM/panic sequence so the sender can wait
+    cpuData->thisCpuLockedVoid([](CpuInfo* c) { c->isHaltedForOom.store(true, std::memory_order_release); });
+    asm volatile("cli");
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
 
 void init() {
     assert(smp_request.response != nullptr);
     flags = smp_request.response->flags;
     bsp_lapic_id = smp_request.response->bsp_lapic_id;
     cpu_count = smp_request.response->cpu_count;
+
+    // Register the halt IPI handler so we can broadcast a halting IPI in panic/OOM paths.
+    gates::setInterruptHandler(HALT_IPI_VECTOR, haltIpiHandler);
+    dbg::log("Registered halt IPI handler for vector 0x%x", (int)HALT_IPI_VECTOR);
 }
 
 // init per cpu data
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp) {
     assert(smp_request.response != nullptr);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, kernelRsp - KERNEL_STACK_SIZE);
+    // Set both GS_BASE and KERNEL_GS_BASE for BSP boot
+    uint64_t perCpuAddr = kernelRsp - KERNEL_STACK_SIZE;
+
+    // Zero out the PerCpu area before use
+    memset((void*)perCpuAddr, 0, sizeof(cpu::PerCpu));
+
+    cpu::wrgsbase(perCpuAddr);
+    cpuSetMSR(IA32_KERNEL_GS_BASE, perCpuAddr);
+
+    // Write cpuId directly to the memory location
+    ((cpu::PerCpu*)perCpuAddr)->cpuId = 0;
     cpu::setCurrentCpuid(0);
+
+    // Verify the write worked
+    uint64_t readBack = cpu::currentCpu();
+    if (readBack != 0) {
+        dbg::log("BSP CPU INIT ERROR: wrote cpuId=0 but read back %d, perCpuAddr=%p\n", readBack, perCpuAddr);
+    }
 
     cpuData = new PerCpuCrossAccess<CpuInfo>();
 
@@ -305,20 +383,70 @@ auto cpuCount() -> uint64_t { return cpu_count; }
 
 // update fsbase in current thread and switch the fs_base register
 auto setTcb(void* tcb) -> uint64_t {
-#ifdef SMT_DEBUG
-    mod::dbg::log("setTcb called with tcb = 0x%x", (uint64_t)tcb);
-#endif
     asm volatile("cli");
     // Use scheduler's getCurrentTask() to get the correct per-CPU task
     auto* currentTask = sched::getCurrentTask();
+#ifdef TASK_DEBUG
+    mod::dbg::log("setTcb: task=%s pid=%d tcb=0x%x old_fsbase=0x%x", currentTask->name ? currentTask->name : "null", currentTask->pid,
+                  (uint64_t)tcb, currentTask->thread ? currentTask->thread->fsbase : 0);
+#endif
     currentTask->thread->fsbase = (uint64_t)tcb;
     *(uint64_t*)tcb = (uint64_t)tcb;
     cpu::wrfsbase((uint64_t)tcb);
     asm volatile("sti");
-#ifdef SMT_DEBUG
-    mod::dbg::log("setTcb: fsbase set to 0x%x", (uint64_t)tcb);
-#endif
     return 0;
 }
+
+void haltOtherCores() {
+    uint64_t coreCount = getCoreCount();
+
+    // Clear halted flags on all cpus first (so stale flags won't confuse us)
+    for (uint64_t i = 0; i < coreCount; ++i) {
+        if (i == cpu::currentCpu()) continue;
+        cpuData->withLockVoid(i, [](CpuInfo* c) { c->isHaltedForOom.store(false, std::memory_order_relaxed); });
+    }
+
+    // Use APIC to broadcast an IPI to all other CPUs without allocating memory.
+    ker::mod::apic::IPIConfig ipi = {};
+    ipi.vector = HALT_IPI_VECTOR;
+    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::FIXED;
+    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.level = ker::mod::apic::IPILevel::ASSERT;
+    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
+    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+
+    // Destination is ignored when using ALL_EXCLUDING_SELF shorthand but provide a value anyway.
+    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+
+    // Wait for other CPUs to set their halted flag, with a timeout. Best-effort.
+    const uint64_t MAX_ITER = 2000000;  // tuned for reasonable timeout
+    uint64_t iter = 0;
+    while (iter++ < MAX_ITER) {
+        bool allHalted = true;
+        for (uint64_t i = 0; i < coreCount; ++i) {
+            if (i == cpu::currentCpu()) continue;
+            bool halted = cpuData->withLock(i, [](CpuInfo* c) -> bool { return c->isHaltedForOom.load(std::memory_order_acquire); });
+            if (!halted) {
+                allHalted = false;
+                break;
+            }
+        }
+        if (allHalted) {
+            dbg::log("haltOtherCores: all other CPUs reported halted");
+            return;
+        }
+        asm volatile("pause");
+    }
+
+    // Timed out waiting - log which cpus did not report halt (best-effort)
+    dbg::log("haltOtherCores: timeout waiting for halted CPUs");
+    for (uint64_t i = 0; i < coreCount; ++i) {
+        if (i == cpu::currentCpu()) continue;
+        bool halted = cpuData->withLock(i, [](CpuInfo* c) -> bool { return c->isHaltedForOom.load(std::memory_order_acquire); });
+        dbg::log("  CPU %d halted=%d", (int)i, (int)halted);
+    }
+}
+
+extern "C" void ker_smt_halt_other_cpus(void) { haltOtherCores(); }
 
 }  // namespace ker::mod::smt

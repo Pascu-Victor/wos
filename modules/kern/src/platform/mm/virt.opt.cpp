@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #include "platform/mm/paging.hpp"
 namespace ker::mod::mm::virt {
@@ -58,6 +59,14 @@ void switchPagemap(sched::task::Task* t) {
 
 void pagefaultHandler(uint64_t controlRegister, int errCode) {
     PageFault pagefault = paging::createPageFault(errCode, true);
+
+    if (pagefault.user) {
+        auto* currentTask = sched::getCurrentTask();
+        dbg::log("Segmentation fault in task %s (PID %d) at 0x%x", currentTask ? currentTask->name : "unknown",
+                 currentTask ? currentTask->pid : -1, controlRegister);
+        hcf();
+        return;
+    }
 
     // if (pagefault.present) {
     //     // PANIC!
@@ -152,9 +161,25 @@ void initPagemap() {
         memset(typeBuf, 0, 32);
     }
 
+    size_t totalPagesMapped = 0;
     for (size_t i = 0; i < memmapResponse->entry_count; i++) {
         auto entry = memmapResponse->entries[i];
-        for (size_t j = 0; j < entry->length / paging::PAGE_SIZE; j++) {
+        size_t numPages = entry->length / paging::PAGE_SIZE;
+
+        // Log high-memory entry specifically
+        if (entry->base >= 0x100000000ULL) {
+            io::serial::write("Mapping entry ");
+            io::serial::writeHex(i);
+            io::serial::write(": phys ");
+            io::serial::writeHex(entry->base);
+            io::serial::write(" - ");
+            io::serial::writeHex(entry->base + entry->length);
+            io::serial::write(" (");
+            io::serial::writeHex(numPages);
+            io::serial::write(" pages)\n");
+        }
+
+        for (size_t j = 0; j < numPages; j++) {
             paddr_t vaddr = (paddr_t)addr::getVirtPointer(entry->base + j * paging::PAGE_SIZE);
             mapPage(kernelPagemap,
                     vaddr,                                                      // virtual address
@@ -165,6 +190,77 @@ void initPagemap() {
                         ? paging::pageTypes::READONLY                           // becomes read-only
                         : paging::pageTypes::KERNEL                             // otherwise kernel memory
             );
+            totalPagesMapped++;
+        }
+
+        if (entry->base >= 0x100000000ULL) {
+            io::serial::write("  Done mapping entry ");
+            io::serial::writeHex(i);
+            io::serial::write("\n");
+        }
+    }
+    io::serial::write("Total pages mapped: ");
+    io::serial::writeHex(totalPagesMapped);
+    io::serial::write("\n");
+
+    // Verify high memory mapping - check specific addresses that were causing crashes
+    constexpr uint64_t testPhys = 0x161800000ULL;  // Physical address that was crashing (updated)
+    vaddr_t testVaddr = (vaddr_t)addr::getVirtPointer(testPhys);
+
+    // Debug: Walk page tables manually and print RAW entry values
+    io::serial::write("DEBUG: Checking page tables for vaddr ");
+    io::serial::writeHex(testVaddr);
+    io::serial::write(" (phys ");
+    io::serial::writeHex(testPhys);
+    io::serial::write(")\n");
+
+    size_t pml4idx = (testVaddr >> 39) & 0x1FF;
+    uint64_t pml4_raw = *reinterpret_cast<uint64_t*>(&kernelPagemap->entries[pml4idx]);
+    io::serial::write("  PML4[");
+    io::serial::writeHex(pml4idx);
+    io::serial::write("] raw=");
+    io::serial::writeHex(pml4_raw);
+    io::serial::write("\n");
+
+    if (kernelPagemap->entries[pml4idx].present) {
+        uint64_t pml3_phys = kernelPagemap->entries[pml4idx].frame << 12;
+        auto* pml3 = (PageTable*)addr::getVirtPointer(pml3_phys);
+        size_t pml3idx = (testVaddr >> 30) & 0x1FF;
+        uint64_t pml3_raw = *reinterpret_cast<uint64_t*>(&pml3->entries[pml3idx]);
+        io::serial::write("  PML3[");
+        io::serial::writeHex(pml3idx);
+        io::serial::write("] raw=");
+        io::serial::writeHex(pml3_raw);
+        io::serial::write(" (pml3 at phys ");
+        io::serial::writeHex(pml3_phys);
+        io::serial::write(")\n");
+
+        if (pml3->entries[pml3idx].present) {
+            uint64_t pml2_phys = pml3->entries[pml3idx].frame << 12;
+            auto* pml2 = (PageTable*)addr::getVirtPointer(pml2_phys);
+            size_t pml2idx = (testVaddr >> 21) & 0x1FF;
+            uint64_t pml2_raw = *reinterpret_cast<uint64_t*>(&pml2->entries[pml2idx]);
+            io::serial::write("  PML2[");
+            io::serial::writeHex(pml2idx);
+            io::serial::write("] raw=");
+            io::serial::writeHex(pml2_raw);
+            io::serial::write(" (pml2 at phys ");
+            io::serial::writeHex(pml2_phys);
+            io::serial::write(")\n");
+
+            if (pml2->entries[pml2idx].present) {
+                uint64_t pml1_phys = pml2->entries[pml2idx].frame << 12;
+                auto* pml1 = (PageTable*)addr::getVirtPointer(pml1_phys);
+                size_t pml1idx = (testVaddr >> 12) & 0x1FF;
+                uint64_t pml1_raw = *reinterpret_cast<uint64_t*>(&pml1->entries[pml1idx]);
+                io::serial::write("  PML1[");
+                io::serial::writeHex(pml1idx);
+                io::serial::write("] raw=");
+                io::serial::writeHex(pml1_raw);
+                io::serial::write(" (pml1 at phys ");
+                io::serial::writeHex(pml1_phys);
+                io::serial::write(")\n");
+            }
         }
     }
 
@@ -177,6 +273,75 @@ void initPagemap() {
         );
     }
 
+    // CRITICAL: Ensure all page table pages are mapped in the HHDM.
+    // Page tables allocated by advancePageTable() might be from physical addresses
+    // above 4GB that haven't been mapped yet in our kernel pagemap.
+    // We must iterate until no new mappings are needed, because mapping a page
+    // table page might allocate NEW page table pages that also need mapping.
+    size_t ptPagesMappped = 0;
+    size_t iteration = 0;
+    bool madeProgress = true;
+
+    while (madeProgress) {
+        madeProgress = false;
+        iteration++;
+        size_t mappedThisRound = 0;
+
+        for (size_t pml4i = 256; pml4i < 512; pml4i++) {  // Only kernel half
+            PageTableEntry& pml4e = kernelPagemap->entries[pml4i];
+            if (!pml4e.present) continue;
+
+            paddr_t pml3Phys = pml4e.frame << paging::PAGE_SHIFT;
+            vaddr_t pml3Virt = (vaddr_t)addr::getVirtPointer(pml3Phys);
+            if (!isPageMapped(kernelPagemap, pml3Virt)) {
+                mapPage(kernelPagemap, pml3Virt, pml3Phys, paging::pageTypes::KERNEL);
+                ptPagesMappped++;
+                mappedThisRound++;
+                madeProgress = true;
+            }
+
+            auto* pml3 = (PageTable*)pml3Virt;
+            for (size_t pml3i = 0; pml3i < 512; pml3i++) {
+                PageTableEntry& pml3e = pml3->entries[pml3i];
+                if (!pml3e.present) continue;
+
+                paddr_t pml2Phys = pml3e.frame << paging::PAGE_SHIFT;
+                vaddr_t pml2Virt = (vaddr_t)addr::getVirtPointer(pml2Phys);
+                if (!isPageMapped(kernelPagemap, pml2Virt)) {
+                    mapPage(kernelPagemap, pml2Virt, pml2Phys, paging::pageTypes::KERNEL);
+                    ptPagesMappped++;
+                    mappedThisRound++;
+                    madeProgress = true;
+                }
+
+                auto* pml2 = (PageTable*)pml2Virt;
+                for (size_t pml2i = 0; pml2i < 512; pml2i++) {
+                    PageTableEntry& pml2e = pml2->entries[pml2i];
+                    if (!pml2e.present) continue;
+
+                    paddr_t pml1Phys = pml2e.frame << paging::PAGE_SHIFT;
+                    vaddr_t pml1Virt = (vaddr_t)addr::getVirtPointer(pml1Phys);
+                    if (!isPageMapped(kernelPagemap, pml1Virt)) {
+                        mapPage(kernelPagemap, pml1Virt, pml1Phys, paging::pageTypes::KERNEL);
+                        ptPagesMappped++;
+                        mappedThisRound++;
+                        madeProgress = true;
+                    }
+                }
+            }
+        }
+
+        if (mappedThisRound > 0) {
+            dbg::log("Page table fixup iteration %d: mapped %d pages", iteration, mappedThisRound);
+        }
+    }
+    dbg::log("Total page table pages mapped into HHDM: %d (in %d iterations)", ptPagesMappped, iteration);
+
+    // CRITICAL: Clear PML4[0] to ensure null pointer dereferences cause page faults!
+    // Limine may leave identity mappings in the lower half which mask null pointer bugs.
+    kernelPagemap->entries[0] = PageTableEntry{};
+    dbg::log("Cleared PML4[0] - null derefs will now fault");
+
     switchToKernelPagemap();
 }
 
@@ -184,24 +349,26 @@ void initPagemap() {
 static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t level, uint64_t flags) {
     PageTableEntry entry = pageTable->entries[level];
     if (entry.present) {
+        bool changed = false;
         if (flags & paging::PAGE_WRITE && !entry.writable) {
             entry.writable = 1;
-            pageTable->entries[level] = entry;
+            changed = true;
         }
         if (flags & paging::PAGE_USER && !entry.user) {
             entry.user = 1;
-            pageTable->entries[level] = entry;
+            changed = true;
         }
 
-        bool desired_nx = (flags & paging::PAGE_NX) != 0;
-        if (entry.noExecute != desired_nx) {
-            entry.noExecute = desired_nx ? 1 : 0;
+        // Only clear NX bit if we are mapping executable code.
+        // Never set NX bit on intermediate entries as it affects all children.
+        if (!(flags & paging::PAGE_NX) && entry.noExecute) {
+            entry.noExecute = 0;
             auto* raw_entry = (uint64_t*)&entry;
-            if (!desired_nx) {
-                *raw_entry &= ~(1ULL << 63);  // Clear NX bit
-            } else {
-                *raw_entry |= (1ULL << 63);  // Set NX bit
-            }
+            *raw_entry &= ~(1ULL << 63);  // Clear NX bit
+            changed = true;
+        }
+
+        if (changed) {
             pageTable->entries[level] = entry;
             // Force full TLB flush
             wrcr3(rdcr3());
@@ -262,10 +429,11 @@ bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
 
     PageTable* table = pageTable;
     for (int i = 4; i > 1; i--) {
-        table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
-        if (!addr::getPhysPointer((vaddr_t)table)) {
+        // Check if the entry is present before following the pointer
+        if (!table->entries[index_of(vaddr, i)].present) {
             return false;
         }
+        table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
     }
 
     return table->entries[index_of(vaddr, 1)].present;
@@ -289,6 +457,9 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
 
     if (entry.present == 0) {
         // Page doesn't exist, nothing to modify
+        if (vaddr >= 0x83e000 && vaddr < 0x83f000) {
+            dbg::log("unifyPageFlags: vaddr=0x%x NOT PRESENT before update", vaddr);
+        }
         return;
     }
 
@@ -306,9 +477,16 @@ void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags) {
         *raw_entry &= ~(1ULL << NX_BIT_POSITION);  // Clear NX bit
     }
 
+    if (vaddr >= 0x83e000 && vaddr < 0x83f000) {
+        dbg::log("unifyPageFlags: vaddr=0x%x flags=0x%x -> present=%d user=%d rw=%d nx=%d raw=0x%x", vaddr, flags, entry.present,
+                 entry.user, entry.writable, entry.noExecute, *raw_entry);
+    }
+
+    invlpg(vaddr);
+
 #ifdef ELF_DEBUG
     if (vaddr >= 0x501000 && vaddr < 0x580000) {
-        mod::dbg::log("unifyPageFlags: vaddr=0x%x, flags=0x%llx, entry_after=0x%llx, nx=%d present=%d", vaddr, flags, *raw_entry,
+        mod::dbg::log("unifyPageFlags: vaddr=0x%x, flags=0x%x, entry_after=0x%x, nx=%d present=%d", vaddr, flags, *raw_entry,
                       static_cast<int>((*raw_entry >> NX_BIT_POSITION) & 1U), static_cast<int>(entry.present));
     }
 #endif
@@ -326,11 +504,17 @@ void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
         table = advancePageTable(table, index_of(vaddr, i), 0);
     }
 
-    uint64_t addr = table->entries[index_of(vaddr, 1)].frame;
+    uint64_t frame = table->entries[index_of(vaddr, 1)].frame;
     table->entries[index_of(vaddr, 1)] = paging::purgePageTableEntry();
 
     invlpg(vaddr);
-    phys::pageFree<>((void*)addr);
+
+    // Convert frame number to physical address, then to HHDM pointer for pageFree
+    if (frame != 0) {
+        uint64_t physAddr = frame << paging::PAGE_SHIFT;
+        void* virtPtr = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
+        phys::pageFree(virtPtr);
+    }
 }
 
 void mapRange(PageTable* pageTable, Range range, uint64_t flags, uint64_t offset) {

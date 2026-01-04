@@ -1,8 +1,14 @@
 #include "gates.hpp"
 
 #include <cstdint>
+#include <platform/dbg/coredump.hpp>
+#include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
+#include <platform/sched/epoch.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <syscalls_impl/process/exit.hpp>
 
 #include "mod/io/serial/serial.hpp"
 
@@ -12,6 +18,17 @@ interruptHandler_t interruptHandlers[256] = {nullptr};
 }
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
+    // CRITICAL: Prevent nested panics by detecting recursion
+    static volatile bool inPanicHandler = false;
+
+    // If we're already in the panic handler, immediately halt to prevent infinite recursion
+    if (inPanicHandler) {
+        io::serial::acquireLock();
+        dbg::log("NESTED PANIC DETECTED! Halting immediately to prevent infinite loop.");
+        asm volatile("cli; hlt");
+        __builtin_unreachable();
+    }
+
     // FIXME: disabled direct map page fault handling for now
     // TODO: implement proper page fault handling
     //  if (frame.intNum == 14) {
@@ -33,314 +50,324 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
     asm volatile("mov %%cr4, %0" : "=r"(cr4));
     asm volatile("mov %%cr8, %0" : "=r"(cr8));
-    {
-        ker::mod::io::serial::ScopedLock lock;
 
-        ker::mod::io::serial::write("PANIC!\n");
+    // If an exception occurs while returning to or running in userspace,
+    // it must not take down the whole kernel. Treat it as a process crash.
+    uint64_t cpl = frame.cs & 0x3;
+    if (cpl == 3) {
+        auto* currentTaskForDump = ker::mod::sched::getCurrentTask();
+        ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
-        // stack trace
-        ker::mod::io::serial::write("\nStack trace:\n");
-        auto* rsp = (uint64_t*)frame.rsp;
+        if (frame.intNum == 14) {
+            dbg::log("Userspace page fault: cr2=0x%x err=%d rip=0x%x pid=%x", cr2, frame.errCode, frame.rip,
+                     ker::mod::sched::getCurrentTask() ? ker::mod::sched::getCurrentTask()->pid : 0);
+
+            auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer(cr3 & ~0xFFF);
+            uint64_t idx4 = (cr2 >> 39) & 0x1FF;
+            uint64_t idx3 = (cr2 >> 30) & 0x1FF;
+            uint64_t idx2 = (cr2 >> 21) & 0x1FF;
+            uint64_t idx1 = (cr2 >> 12) & 0x1FF;
+
+            dbg::log("PML4[%d]: present=%d frame=0x%x", idx4, pml4->entries[idx4].present, pml4->entries[idx4].frame);
+            if (pml4->entries[idx4].present) {
+                auto* pml3 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer(pml4->entries[idx4].frame << 12);
+                dbg::log(" PML3[%d]: present=%d frame=0x%x", idx3, pml3->entries[idx3].present, pml3->entries[idx3].frame);
+                if (pml3->entries[idx3].present) {
+                    auto* pml2 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer(pml3->entries[idx3].frame << 12);
+                    dbg::log("  PML2[%d]: present=%d frame=0x%x", idx2, pml2->entries[idx2].present, pml2->entries[idx2].frame);
+                    if (pml2->entries[idx2].present) {
+                        auto* pml1 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer(pml2->entries[idx2].frame << 12);
+                        dbg::log("   PML1[%d]: present=%d frame=0x%x user=%d rw=%d nx=%d", idx1, pml1->entries[idx1].present,
+                                 pml1->entries[idx1].frame, pml1->entries[idx1].user, pml1->entries[idx1].writable,
+                                 pml1->entries[idx1].noExecute);
+                    }
+                }
+            }
+
+            // Conventional exit code for a segfault-like crash.
+            ker::syscall::process::wos_proc_exit(139);
+            __builtin_unreachable();
+        }
+
+        dbg::log("Userspace exception: int=%d err=%d rip=0x%x pid=%x", frame.intNum, frame.errCode, frame.rip,
+                 ker::mod::sched::getCurrentTask() ? ker::mod::sched::getCurrentTask()->pid : 0);
+        ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
+        __builtin_unreachable();
+    }
+
+    // Kernel-mode exception - this is a kernel bug, don't try to write coredumps
+    // as that would require memory allocation which could cause deadlocks if we
+    // faulted while holding a spinlock (e.g., in pageAlloc).
+    // Coredumps are only for userspace crashes, handled above.
+
+    // Mark that we're in the panic handler
+    inPanicHandler = true;
+
+    // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
+    // or its fields while we're printing panic info. We do this BEFORE acquiring
+    // the serial lock to minimize the window where GC can corrupt task data.
+    // If epoch management is broken, this is a no-op (safe).
+    ker::mod::sched::EpochManager::enterCritical();
+
+    // Acquire serial lock for the entire panic dump to prevent interleaving.
+    // The lock is reentrant, so subsequent dbg::log() calls will still work.
+    // We never release it since we're halting - this blocks other CPUs from
+    // writing to serial and keeps the panic output contiguous.
+    io::serial::acquireLock();
+
+    dbg::log("PANIC!");
+
+    // stack trace - validate RSP before dereferencing
+    dbg::log("Stack trace:");
+    auto* rsp = (uint64_t*)frame.rsp;
+    uintptr_t rspAddr = reinterpret_cast<uintptr_t>(rsp);
+    bool rspValid = (rspAddr >= 0xffff800000000000ULL && rspAddr < 0xffff900000000000ULL) ||
+                    (rspAddr >= 0xffffffff80000000ULL && rspAddr < 0xffffffffc0000000ULL);
+
+    if (rspValid) {
         constexpr uint64_t MAX_STACK_TRACE = 32;
         for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
-            ker::mod::io::serial::write(i);
-            ker::mod::io::serial::write(":");
-            ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::writeHex(rsp[i]);
-            ker::mod::io::serial::write("\n");
+            dbg::log("%d: 0x%x", i, rsp[i]);
+        }
+    } else {
+        dbg::log("Invalid RSP: 0x%x - skipping stack trace", rspAddr);
+    }
+
+    // Dump current task information - use getCurrentTask() instead of hardcoded address
+    // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
+    uint64_t cpuId = apic::getApicId();
+    sched::task::Task* currentTask = sched::getCurrentTask();
+
+    dbg::log("=== Current Task Info ===");
+    dbg::log("debug_task_ptrs[%d] = 0x%x", cpuId, (uint64_t)currentTask);
+
+    if (currentTask != nullptr) {
+        // CRITICAL: Validate task pointer is in valid memory range before dereferencing
+        // This prevents nested faults if GC is freeing the task concurrently
+        uintptr_t taskAddr = reinterpret_cast<uintptr_t>(currentTask);
+        bool inHHDM = (taskAddr >= 0xffff800000000000ULL && taskAddr < 0xffff900000000000ULL);
+        bool inKernelStatic = (taskAddr >= 0xffffffff80000000ULL && taskAddr < 0xffffffffc0000000ULL);
+
+        if (!inHHDM && !inKernelStatic) {
+            dbg::log("WARNING: currentTask pointer 0x%x is out of valid kernel range!", (uint64_t)currentTask);
+            dbg::log("=========================");
+            goto skip_task_dump;
         }
 
-        // Dump current task information
-        uint64_t cpuId = apic::getApicId();
-        constexpr uint64_t DEBUG_TASK_PTR_BASE = 0xffff800000500000ULL;
-        auto** debug_task_ptrs = reinterpret_cast<sched::task::Task**>(DEBUG_TASK_PTR_BASE);
-        sched::task::Task* currentTask = debug_task_ptrs[cpuId];
+        // Use volatile access to detect if memory is being freed (may contain garbage)
+        dbg::log("Task address: 0x%x", (uint64_t)currentTask);
 
-        if (false && currentTask != nullptr) {
-            ker::mod::io::serial::write("\n=== Current Task Info ===\n");
-            ker::mod::io::serial::write("Task address: 0x");
-            ker::mod::io::serial::writeHex((uint64_t)currentTask);
-            ker::mod::io::serial::write("\n");
+        // Validate and print name with extreme caution
+        const char* namePtr = currentTask->name;
+        if (namePtr != nullptr) {
+            uintptr_t nameAddr = reinterpret_cast<uintptr_t>(namePtr);
+            bool nameInHHDM = (nameAddr >= 0xffff800000000000ULL && nameAddr < 0xffff900000000000ULL);
+            bool nameInKStatic = (nameAddr >= 0xffffffff80000000ULL && nameAddr < 0xffffffffc0000000ULL);
 
-            ker::mod::io::serial::write("Task name ptr: 0x");
-            ker::mod::io::serial::writeHex((uint64_t)currentTask->name);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("PID: 0x");
-            ker::mod::io::serial::writeHex(currentTask->pid);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("Type: ");
-            ker::mod::io::serial::write(currentTask->type == sched::task::TaskType::PROCESS ? "PROCESS" : "IDLE");
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("Entry: 0x");
-            ker::mod::io::serial::writeHex(currentTask->entry);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("Pagemap: 0x");
-            ker::mod::io::serial::writeHex((uint64_t)currentTask->pagemap);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("Thread: 0x");
-            ker::mod::io::serial::writeHex((uint64_t)currentTask->thread);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("\nTask Context Frame:\n");
-            ker::mod::io::serial::write("  frame.rip: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.frame.rip);
-            ker::mod::io::serial::write("\n");
-            ker::mod::io::serial::write("  frame.cs: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.frame.cs);
-            ker::mod::io::serial::write("\n");
-            ker::mod::io::serial::write("  frame.rsp: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.frame.rsp);
-            ker::mod::io::serial::write("\n");
-            ker::mod::io::serial::write("  frame.ss: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.frame.ss);
-            ker::mod::io::serial::write("\n");
-            ker::mod::io::serial::write("  frame.flags: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.frame.flags);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("\nTask Context:\n");
-            ker::mod::io::serial::write("  syscallKernelStack: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.syscallKernelStack);
-            ker::mod::io::serial::write("\n");
-            ker::mod::io::serial::write("  syscallScratchArea: 0x");
-            ker::mod::io::serial::writeHex(currentTask->context.syscallScratchArea);
-            ker::mod::io::serial::write("\n");
-
-            ker::mod::io::serial::write("=========================\n\n");
+            if (nameInHHDM || nameInKStatic) {
+                // Check first byte without assuming string is valid
+                volatile const char* volatileNamePtr = namePtr;
+                volatile char firstChar = volatileNamePtr[0];
+                if (firstChar >= 0x20 && firstChar <= 0x7e) {
+                    dbg::log("Task name: %s", namePtr);
+                } else {
+                    dbg::log("Task name: <invalid: first byte 0x%x>", (unsigned char)firstChar);
+                }
+            } else {
+                dbg::log("Task name ptr: 0x%x <out of range>", nameAddr);
+            }
+        } else {
+            dbg::log("Task name: <null>");
         }
 
-        // print frame info
-        ker::mod::io::serial::write("CPU: ");
-        ker::mod::io::serial::write((uint64_t)cpuId);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Interrupt number: ");
-        ker::mod::io::serial::write(frame.intNum);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Error code: ");
-        ker::mod::io::serial::write(frame.errCode);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RIP: ");
-        ker::mod::io::serial::writeHex(frame.rip);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("CS: ");
-        ker::mod::io::serial::writeHex(frame.cs);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("CALCULATED PRIVILEGE LEVEL: ");
-        ker::mod::io::serial::write(frame.cs & 0x3);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RFLAGS: ");
-        ker::mod::io::serial::writeHex(frame.flags);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RSP: ");
-        ker::mod::io::serial::writeHex(frame.rsp);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("SS: ");
-        ker::mod::io::serial::writeHex(frame.ss);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("CR0: ");
-        ker::mod::io::serial::writeBin(cr0);
-        ker::mod::io::serial::write(" (0x");
-        ker::mod::io::serial::writeHex(cr0);
-        ker::mod::io::serial::write(")\n");
-        ker::mod::io::serial::write("CR2: ");
-        ker::mod::io::serial::writeBin(cr2);
-        ker::mod::io::serial::write(" (0x");
-        ker::mod::io::serial::writeHex(cr2);
-        ker::mod::io::serial::write(")\n");
-        ker::mod::io::serial::write("CR3: ");
-        ker::mod::io::serial::writeBin(cr3);
-        ker::mod::io::serial::write(" (0x");
-        ker::mod::io::serial::writeHex(cr3);
-        ker::mod::io::serial::write(")\n");
-        ker::mod::io::serial::write("CR4: ");
-        ker::mod::io::serial::writeBin(cr4);
-        ker::mod::io::serial::write(" (0x");
-        ker::mod::io::serial::writeHex(cr4);
-        ker::mod::io::serial::write(")\n");
-        ker::mod::io::serial::write("CR8: ");
-        ker::mod::io::serial::writeBin(cr8);
-        ker::mod::io::serial::write(" (0x");
-        ker::mod::io::serial::writeHex(cr8);
-        ker::mod::io::serial::write(")\n");
+        // Print primitive fields (safe - no pointer dereference)
+        dbg::log("PID: 0x%x", currentTask->pid);
+        dbg::log("Type: 0x%x", (uint64_t)currentTask->type);
+        dbg::log("Entry: 0x%x", currentTask->entry);
+        dbg::log("Pagemap: 0x%x", (uint64_t)currentTask->pagemap);
+        dbg::log("Thread: 0x%x", (uint64_t)currentTask->thread);
 
-        // print general purpose registers
-        ker::mod::io::serial::write("\nGeneral purpose registers:\n");
-        ker::mod::io::serial::write("RAX: ");
-        ker::mod::io::serial::writeHex(gpr.rax);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RBX: ");
-        ker::mod::io::serial::writeHex(gpr.rbx);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RCX: ");
-        ker::mod::io::serial::writeHex(gpr.rcx);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RDX: ");
-        ker::mod::io::serial::writeHex(gpr.rdx);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RDI: ");
-        ker::mod::io::serial::writeHex(gpr.rdi);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RSI: ");
-        ker::mod::io::serial::writeHex(gpr.rsi);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("RBP: ");
-        ker::mod::io::serial::writeHex(gpr.rbp);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R8: ");
-        ker::mod::io::serial::writeHex(gpr.r8);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R9: ");
-        ker::mod::io::serial::writeHex(gpr.r9);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R10: ");
-        ker::mod::io::serial::writeHex(gpr.r10);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R11: ");
-        ker::mod::io::serial::writeHex(gpr.r11);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R12: ");
-        ker::mod::io::serial::writeHex(gpr.r12);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R13: ");
-        ker::mod::io::serial::writeHex(gpr.r13);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R14: ");
-        ker::mod::io::serial::writeHex(gpr.r14);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("R15: ");
-        ker::mod::io::serial::writeHex(gpr.r15);
-        ker::mod::io::serial::write("\n");
+        dbg::log("Task Context Frame:");
+        dbg::log("  frame.rip: 0x%x", currentTask->context.frame.rip);
+        dbg::log("  frame.cs: 0x%x", currentTask->context.frame.cs);
+        dbg::log("  frame.rsp: 0x%x", currentTask->context.frame.rsp);
+        dbg::log("  frame.ss: 0x%x", currentTask->context.frame.ss);
+        dbg::log("  frame.flags: 0x%x", currentTask->context.frame.flags);
 
-        // print segment selectors and descriptors
-        ker::mod::io::serial::write("\nSegment selectors and descriptors:\n");
-        struct GDTR {
-            uint16_t limit;
-            uint64_t base;
-        } __attribute__((packed)) gdtr;
-        asm volatile("sgdt %0" : "=m"(gdtr));
+        dbg::log("Task Context:");
+        dbg::log("  syscallKernelStack: 0x%x", currentTask->context.syscallKernelStack);
+        dbg::log("  syscallScratchArea: 0x%x", currentTask->context.syscallScratchArea);
+    } else {
+        dbg::log("WARNING: currentTask is NULL!");
+    }
+    dbg::log("=========================");
 
-        auto rdmsr = [](uint32_t msr) -> uint64_t {
-            uint32_t lo, hi;
-            asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
-            return ((uint64_t)hi << 32) | lo;
-        };
+skip_task_dump:
 
-        uint16_t sel_cs, sel_ds, sel_es, sel_fs, sel_gs, sel_ss, sel_tr;
-        asm volatile("mov %%cs, %0" : "=r"(sel_cs));
-        asm volatile("mov %%ds, %0" : "=r"(sel_ds));
-        asm volatile("mov %%es, %0" : "=r"(sel_es));
-        asm volatile("mov %%fs, %0" : "=r"(sel_fs));
-        asm volatile("mov %%gs, %0" : "=r"(sel_gs));
-        asm volatile("mov %%ss, %0" : "=r"(sel_ss));
-        asm volatile("str %0" : "=r"(sel_tr));
+    // Check if page 0 is mapped (it should NOT be - null derefs should crash)
+    uint64_t* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
+    uint64_t pml4e = pml4[0];                                   // Entry for VA 0x0
+    dbg::log("Page 0 check: PML4[0] = 0x%x (Present=%d)", pml4e, (pml4e & 1) ? 1 : 0);
+    if (pml4e & 1) {
+        dbg::log("WARNING: Page 0 is mapped! NULL derefs won't crash!");
+    }
 
-        auto printSelector = [&](const char* name, uint16_t sel) {
-            ker::mod::io::serial::write(name);
-            ker::mod::io::serial::write(": 0x");
-            ker::mod::io::serial::writeHex(sel);
-            ker::mod::io::serial::write(" (index=");
-            ker::mod::io::serial::write((uint64_t)(sel >> 3));
-            ker::mod::io::serial::write(", rpl=");
-            ker::mod::io::serial::write((uint64_t)(sel & 0x3));
-            ker::mod::io::serial::write(")\n");
+    // print frame info
+    dbg::log("CPU: %d", (uint64_t)cpuId);
+    dbg::log("Interrupt number: %d", frame.intNum);
+    dbg::log("Error code: %d", frame.errCode);
+    dbg::log("RIP: 0x%x", frame.rip);
+    dbg::log("CS: 0x%x", frame.cs);
+    dbg::log("CALCULATED PRIVILEGE LEVEL: %d", frame.cs & 0x3);
+    dbg::log("RFLAGS: 0x%x", frame.flags);
+    dbg::log("RSP: 0x%x", frame.rsp);
+    dbg::log("SS: 0x%x", frame.ss);
+    dbg::log("CR0: 0x%x", cr0);
+    dbg::log("CR2: 0x%x", cr2);
+    dbg::log("CR3: 0x%x", cr3);
+    dbg::log("CR4: 0x%x", cr4);
+    dbg::log("CR8: 0x%x", cr8);
 
-            if (sel == 0) {
-                ker::mod::io::serial::write("  NULL selector\n");
-                return;
-            }
+    // print general purpose registers
+    dbg::log("General purpose registers:");
+    dbg::log("RAX: 0x%x", gpr.rax);
+    dbg::log("RBX: 0x%x", gpr.rbx);
+    dbg::log("RCX: 0x%x", gpr.rcx);
+    dbg::log("RDX: 0x%x", gpr.rdx);
+    dbg::log("RDI: 0x%x", gpr.rdi);
+    dbg::log("RSI: 0x%x", gpr.rsi);
+    dbg::log("RBP: 0x%x", gpr.rbp);
+    dbg::log("R8: 0x%x", gpr.r8);
+    dbg::log("R9: 0x%x", gpr.r9);
+    dbg::log("R10: 0x%x", gpr.r10);
+    dbg::log("R11: 0x%x", gpr.r11);
+    dbg::log("R12: 0x%x", gpr.r12);
+    dbg::log("R13: 0x%x", gpr.r13);
+    dbg::log("R14: 0x%x", gpr.r14);
+    dbg::log("R15: 0x%x", gpr.r15);
 
-            uint64_t gdt_base = gdtr.base;
-            uint64_t index = (sel >> 3);
-            uint64_t desc_addr = gdt_base + index * 8;
-            uint64_t desc = *(uint64_t*)(desc_addr);
+    // print segment selectors and descriptors
+    dbg::log("Segment selectors and descriptors:");
+    struct GDTR {
+        uint16_t limit;
+        uint64_t base;
+    } __attribute__((packed)) gdtr;
+    asm volatile("sgdt %0" : "=m"(gdtr));
 
-            ker::mod::io::serial::write("  Raw descriptor: 0x");
-            ker::mod::io::serial::writeHex(desc);
-            ker::mod::io::serial::write("\n");
+    // Validate GDTR before using it
+    bool gdtr_valid = (gdtr.base >= 0xffff800000000000ULL || gdtr.base >= 0xffffffff80000000ULL);
+    dbg::log("GDTR: base=0x%x, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
 
-            uint64_t limit_low = desc & 0xFFFF;
-            uint64_t base_0_15 = (desc >> 16) & 0xFFFF;
-            uint64_t base_16_23 = (desc >> 32) & 0xFF;
-            uint64_t access = (desc >> 40) & 0xFF;
-            uint64_t limit_16_19 = (desc >> 48) & 0xF;
-            uint64_t flags = (desc >> 52) & 0xF;
-            uint64_t base_24_31 = (desc >> 56) & 0xFF;
+    auto rdmsr = [](uint32_t msr) -> uint64_t {
+        uint32_t lo, hi;
+        asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+        return ((uint64_t)hi << 32) | lo;
+    };
 
-            uint64_t limit = limit_low | (limit_16_19 << 16);
-            bool gran = (flags >> 3) & 1;
-            if (gran) {
-                limit = (limit << 12) | 0xFFF;
-            }
+    uint16_t sel_cs, sel_ds, sel_es, sel_fs, sel_gs, sel_ss, sel_tr;
+    asm volatile("mov %%cs, %0" : "=r"(sel_cs));
+    asm volatile("mov %%ds, %0" : "=r"(sel_ds));
+    asm volatile("mov %%es, %0" : "=r"(sel_es));
+    asm volatile("mov %%fs, %0" : "=r"(sel_fs));
+    asm volatile("mov %%gs, %0" : "=r"(sel_gs));
+    asm volatile("mov %%ss, %0" : "=r"(sel_ss));
+    asm volatile("str %0" : "=r"(sel_tr));
 
-            uint64_t base = base_0_15 | (base_16_23 << 16) | (base_24_31 << 24);
+    auto printSelector = [&](const char* name, uint16_t sel) {
+        dbg::log("%s: 0x%x (index=%d, rpl=%d)", name, sel, (uint64_t)(sel >> 3), (uint64_t)(sel & 0x3));
 
-            bool s_bit = (access >> 4) & 1;  // 0 = system, 1 = code/data
-            if (!s_bit) {
-                // system descriptor (e.g., TSS) -- read second qword for full base
-                uint64_t desc_high = *(uint64_t*)(desc_addr + 8);
+        if (sel == 0) {
+            dbg::log("  NULL selector");
+            return;
+        }
+
+        if (!gdtr_valid) {
+            dbg::log("  Skipping descriptor dump (invalid GDTR)");
+            return;
+        }
+
+        uint64_t gdt_base = gdtr.base;
+        uint64_t index = (sel >> 3);
+        uint64_t desc_addr = gdt_base + index * 8;
+
+        // Validate descriptor address is in valid kernel memory
+        bool desc_addr_valid = (desc_addr >= 0xffff800000000000ULL && desc_addr < 0xffff900000000000ULL) ||
+                               (desc_addr >= 0xffffffff80000000ULL && desc_addr < 0xffffffffc0000000ULL);
+
+        if (!desc_addr_valid) {
+            dbg::log("  Invalid descriptor address: 0x%x", desc_addr);
+            return;
+        }
+
+        uint64_t desc = *(uint64_t*)(desc_addr);
+
+        dbg::log("  Raw descriptor: 0x%x", desc);
+
+        uint64_t limit_low = desc & 0xFFFF;
+        uint64_t base_0_15 = (desc >> 16) & 0xFFFF;
+        uint64_t base_16_23 = (desc >> 32) & 0xFF;
+        uint64_t access = (desc >> 40) & 0xFF;
+        uint64_t limit_16_19 = (desc >> 48) & 0xF;
+        uint64_t flags = (desc >> 52) & 0xF;
+        uint64_t base_24_31 = (desc >> 56) & 0xFF;
+
+        uint64_t limit = limit_low | (limit_16_19 << 16);
+        bool gran = (flags >> 3) & 1;
+        if (gran) {
+            limit = (limit << 12) | 0xFFF;
+        }
+
+        uint64_t base = base_0_15 | (base_16_23 << 16) | (base_24_31 << 24);
+
+        bool s_bit = (access >> 4) & 1;  // 0 = system, 1 = code/data
+        if (!s_bit) {
+            // system descriptor (e.g., TSS) -- read second qword for full base
+            uint64_t desc_addr_high = desc_addr + 8;
+            bool desc_addr_high_valid = (desc_addr_high >= 0xffff800000000000ULL && desc_addr_high < 0xffff900000000000ULL) ||
+                                        (desc_addr_high >= 0xffffffff80000000ULL && desc_addr_high < 0xffffffffc0000000ULL);
+
+            if (desc_addr_high_valid) {
+                uint64_t desc_high = *(uint64_t*)(desc_addr_high);
                 uint64_t base_high = desc_high & 0xFFFFFFFF;
                 uint64_t full_base = base | (base_high << 32);
-                ker::mod::io::serial::write("  System descriptor (likely TSS). Base: 0x");
-                ker::mod::io::serial::writeHex(full_base);
-                ker::mod::io::serial::write(", Limit: 0x");
-                ker::mod::io::serial::writeHex(limit);
-                ker::mod::io::serial::write("\n");
-                ker::mod::io::serial::write("  Access: 0x");
-                ker::mod::io::serial::writeHex(access);
-                ker::mod::io::serial::write(", Flags: 0x");
-                ker::mod::io::serial::writeHex(flags);
-                ker::mod::io::serial::write("\n");
-                ker::mod::io::serial::write("  Raw high: 0x");
-                ker::mod::io::serial::writeHex(desc_high);
-                ker::mod::io::serial::write("\n");
+                dbg::log("  System descriptor (likely TSS). Base: 0x%x, Limit: 0x%x", full_base, limit);
+                dbg::log("  Access: 0x%x, Flags: 0x%x", access, flags);
+                dbg::log("  Raw high: 0x%x", desc_high);
             } else {
-                // code/data descriptor
-                ker::mod::io::serial::write("  Code/Data descriptor. Base: 0x");
-                ker::mod::io::serial::writeHex(base);
-                ker::mod::io::serial::write(", Limit: 0x");
-                ker::mod::io::serial::writeHex(limit);
-                ker::mod::io::serial::write("\n");
-                ker::mod::io::serial::write("  Access: 0x");
-                ker::mod::io::serial::writeHex(access);
-                ker::mod::io::serial::write(", Flags: 0x");
-                ker::mod::io::serial::writeHex(flags);
-                ker::mod::io::serial::write("\n");
+                dbg::log("  System descriptor (TSS). Base (partial): 0x%x, Limit: 0x%x", base, limit);
+                dbg::log("  Access: 0x%x, Flags: 0x%x (high descriptor invalid)", access, flags);
             }
-        };
-
-        printSelector("CS", sel_cs);
-        printSelector("DS", sel_ds);
-        printSelector("ES", sel_es);
-        printSelector("FS", sel_fs);
-        printSelector("GS", sel_gs);
-        printSelector("SS", sel_ss);
-        printSelector("TR", sel_tr);
-
-        // print common MSRs
-        ker::mod::io::serial::write("\nCommon MSRs:\n");
-        struct MsrInfo {
-            const char* name;
-            uint32_t id;
-        };
-        MsrInfo msrs[] = {{"IA32_EFER", 0xC0000080},          {"IA32_STAR", 0xC0000081},      {"IA32_LSTAR", 0xC0000082},
-                          {"IA32_FMASK", 0xC0000084},         {"IA32_APIC_BASE", 0x1B},       {"IA32_PAT", 0x277},
-                          {"IA32_MISC_ENABLE", 0x1A0},        {"IA32_FS_BASE", IA32_FS_BASE}, {"IA32_GS_BASE", IA32_GS_BASE},
-                          {"IA32_KERNEL_GS_BASE", 0xC0000102}};
-        for (auto& m : msrs) {
-            uint64_t val = rdmsr(m.id);
-            ker::mod::io::serial::write(m.name);
-            ker::mod::io::serial::write(": 0x");
-            ker::mod::io::serial::writeHex(val);
-            ker::mod::io::serial::write("\n");
+        } else {
+            // code/data descriptor
+            dbg::log("  Code/Data descriptor. Base: 0x%x, Limit: 0x%x", base, limit);
+            dbg::log("  Access: 0x%x, Flags: 0x%x", access, flags);
         }
+    };
 
-        ker::mod::io::serial::write("Halting\n");
+    printSelector("CS", sel_cs);
+    printSelector("DS", sel_ds);
+    printSelector("ES", sel_es);
+    printSelector("FS", sel_fs);
+    printSelector("GS", sel_gs);
+    printSelector("SS", sel_ss);
+    printSelector("TR", sel_tr);
+
+    // print common MSRs
+    dbg::log("Common MSRs:");
+    struct MsrInfo {
+        const char* name;
+        uint32_t id;
+    };
+    MsrInfo msrs[] = {{"IA32_EFER", 0xC0000080},          {"IA32_STAR", 0xC0000081},      {"IA32_LSTAR", 0xC0000082},
+                      {"IA32_FMASK", 0xC0000084},         {"IA32_APIC_BASE", 0x1B},       {"IA32_PAT", 0x277},
+                      {"IA32_MISC_ENABLE", 0x1A0},        {"IA32_FS_BASE", IA32_FS_BASE}, {"IA32_GS_BASE", IA32_GS_BASE},
+                      {"IA32_KERNEL_GS_BASE", 0xC0000102}};
+    for (auto& m : msrs) {
+        uint64_t val = rdmsr(m.id);
+        dbg::log("%s: 0x%x", m.name, val);
     }
+
+    dbg::log("Halting");
     hcf();
 }
 

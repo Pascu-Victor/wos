@@ -6,7 +6,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 
-// #define WAITPID_DEBUG
+#define WAITPID_DEBUG
 
 namespace ker::syscall::process {
 

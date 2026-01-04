@@ -13,8 +13,14 @@
 
 namespace ker::vfs::fat32 {
 
+// Forward declarations for helpers defined later in this translation unit.
+auto flush_fat_table(const FAT32MountContext* ctx) -> int;
+
 // FAT32 filesystem context
 namespace {
+
+// Keep this in sync with the VFS/tmpfs O_CREAT convention.
+constexpr int O_CREAT = 0x100;
 
 // Simple file node for FAT32
 struct FAT32Node {
@@ -28,6 +34,119 @@ struct FAT32Node {
     uint32_t dir_entry_cluster;  // Which cluster contains the directory entry
     uint32_t dir_entry_offset;   // Offset within that cluster (in bytes)
 };
+
+// Long File Name entry (FAT32 VFAT). Packed on-disk.
+struct __attribute__((packed)) FAT32LongNameEntry {
+    uint8_t order;
+    uint16_t name1[5];
+    uint8_t attr;
+    uint8_t type;
+    uint8_t checksum;
+    uint16_t name2[6];
+    uint16_t first_cluster_low;
+    uint16_t name3[2];
+};
+
+constexpr uint8_t FAT32_LFN_ATTR = 0x0F;
+
+auto lfn_checksum_83(const char shortName[11]) -> uint8_t {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; ++i) {
+        sum = static_cast<uint8_t>(((sum & 1) ? 0x80 : 0) + (sum >> 1) + static_cast<uint8_t>(shortName[i]));
+    }
+    return sum;
+}
+
+auto hex_digit(uint8_t v) -> char {
+    v &= 0xF;
+    return (v < 10) ? static_cast<char>('0' + v) : static_cast<char>('A' + (v - 10));
+}
+
+auto hash32_djb2(const char* s) -> uint32_t {
+    uint32_t h = 5381u;
+    if (s == nullptr) {
+        return h;
+    }
+    for (size_t i = 0; s[i] != '\0'; ++i) {
+        h = ((h << 5) + h) + static_cast<uint8_t>(s[i]);
+    }
+    return h;
+}
+
+auto make_short_alias_83(const char* longName, char out11[11]) -> void {
+    // Deterministic alias: "CD" + 6 hex digits, extension "BIN".
+    // This is sufficient for our coredump use-case and avoids needing full collision handling.
+    uint32_t h = hash32_djb2(longName);
+    uint32_t v = h & 0xFFFFFFu;
+
+    out11[0] = 'C';
+    out11[1] = 'D';
+    out11[2] = hex_digit((v >> 20) & 0xF);
+    out11[3] = hex_digit((v >> 16) & 0xF);
+    out11[4] = hex_digit((v >> 12) & 0xF);
+    out11[5] = hex_digit((v >> 8) & 0xF);
+    out11[6] = hex_digit((v >> 4) & 0xF);
+    out11[7] = hex_digit(v & 0xF);
+    out11[8] = 'B';
+    out11[9] = 'I';
+    out11[10] = 'N';
+}
+
+auto write_lfn_entries(FAT32DirectoryEntry* entryTable, size_t startIndex, size_t lfnCount, const char* longName, uint8_t checksum)
+    -> void {
+    // Writes entries in on-disk order: (lfnCount|0x40), ..., 1.
+    // Each LFN entry stores up to 13 UTF-16 code units. We only support ASCII here.
+    size_t nameLen = 0;
+    while (longName[nameLen] != '\0') {
+        ++nameLen;
+    }
+
+    // Emit from the end of the name backward in 13-char chunks.
+    for (size_t idx = 0; idx < lfnCount; ++idx) {
+        size_t seq = lfnCount - idx;  // lfnCount..1
+        auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(&entryTable[startIndex + idx]);
+
+        memset(lfn, 0, sizeof(FAT32LongNameEntry));
+        uint8_t order = static_cast<uint8_t>(seq);
+        if (seq == lfnCount) {
+            order |= 0x40;  // last entry flag
+        }
+        lfn->order = order;
+        lfn->attr = FAT32_LFN_ATTR;
+        lfn->type = 0;
+        lfn->checksum = checksum;
+        lfn->first_cluster_low = 0;
+
+        // Fill all chars with 0xFFFF by default.
+        for (int i = 0; i < 5; ++i) lfn->name1[i] = 0xFFFF;
+        for (int i = 0; i < 6; ++i) lfn->name2[i] = 0xFFFF;
+        for (int i = 0; i < 2; ++i) lfn->name3[i] = 0xFFFF;
+
+        // Determine the slice for this entry.
+        size_t chunkStart = (seq - 1) * 13;
+        auto put = [&](size_t posInChunk, uint16_t val) {
+            if (posInChunk < 5) {
+                lfn->name1[posInChunk] = val;
+            } else if (posInChunk < 11) {
+                lfn->name2[posInChunk - 5] = val;
+            } else {
+                lfn->name3[posInChunk - 11] = val;
+            }
+        };
+
+        for (size_t p = 0; p < 13; ++p) {
+            size_t srcIndex = chunkStart + p;
+            if (srcIndex < nameLen) {
+                put(p, static_cast<uint16_t>(static_cast<uint8_t>(longName[srcIndex])));
+            } else if (srcIndex == nameLen) {
+                put(p, 0x0000);  // terminator
+                break;
+            } else {
+                // Keep 0xFFFF padding
+            }
+        }
+    }
+}
 
 }  // namespace
 
@@ -242,7 +361,7 @@ auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
 }
 
 // Open a file by path
-auto fat32_open_path(const char* path, int /*flags*/, int /*mode*/, FAT32MountContext* ctx) -> ker::vfs::File* {
+auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContext* ctx) -> ker::vfs::File* {
     fat32_log("fat32_open_path: called with path='");
     fat32_log(path);
     fat32_log("'\n");
@@ -360,8 +479,169 @@ search_done:
 
     if (!found) {
         fat32_log("fat32_open_path: file not found\n");
+        // Create file if requested.
+        if ((flags & O_CREAT) == 0) {
+            delete[] cluster_buf;
+            return nullptr;
+        }
+
+        // We only support creating files in the root directory for now.
+        // filename at this point is already the post-mount relative component.
+
+        // Prepare short 8.3 alias (required even when we emit LFN entries).
+        char short83[11];
+        make_short_alias_83(filename, short83);
+        uint8_t csum = lfn_checksum_83(short83);
+
+        // Determine how many LFN entries we need.
+        size_t nameLen = 0;
+        while (filename[nameLen] != '\0') {
+            ++nameLen;
+        }
+        size_t lfnCount = (nameLen + 12) / 13;
+        if (lfnCount == 0) {
+            lfnCount = 1;
+        }
+        size_t needed = lfnCount + 1;  // LFN entries + short entry
+
+        // Scan for a contiguous free run in the root directory clusters.
+        uint32_t dir_cluster = ctx->root_cluster;
+        uint32_t last_dir_cluster = dir_cluster;
+        size_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+
+        auto alloc_dir_cluster = [&]() -> uint32_t {
+            // Allocate a new cluster and clear it.
+            uint32_t new_cluster = 0;
+            for (uint32_t i = 2; i < FAT32_EOC; ++i) {
+                if ((ctx->fat_table[i] & FAT32_EOC) == 0) {
+                    new_cluster = i;
+                    ctx->fat_table[i] = FAT32_EOC;
+                    break;
+                }
+            }
+            if (new_cluster == 0) {
+                return 0;
+            }
+
+            // Link from last_dir_cluster -> new_cluster.
+            ctx->fat_table[last_dir_cluster] = new_cluster;
+
+            // Zero the on-disk cluster.
+            auto* zero = new uint8_t[cluster_size];
+            memset(zero, 0, cluster_size);
+            uint64_t lba =
+                ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(new_cluster) - 2) * ctx->sectors_per_cluster);
+            (void)ker::dev::block_write(ctx->device, lba, ctx->sectors_per_cluster, zero);
+            delete[] zero;
+
+            // Flush FAT updates.
+            (void)flush_fat_table(ctx);
+            return new_cluster;
+        };
+
+        bool created = false;
+        uint32_t created_entry_cluster = 0;
+        uint32_t created_entry_offset = 0;
+
+        for (;;) {
+            if (read_cluster(ctx, dir_cluster, cluster_buf) != 0) {
+                fat32_log("fat32_open_path: failed to read root dir cluster for create\n");
+                break;
+            }
+
+            auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
+            size_t num_entries = cluster_size / sizeof(FAT32DirectoryEntry);
+
+            size_t run_start = 0;
+            size_t run_len = 0;
+            for (size_t i = 0; i < num_entries; ++i) {
+                bool freeEntry = (entries[i].name[0] == 0x00) || (entries[i].name[0] == (char)0xE5);
+                if (freeEntry) {
+                    if (run_len == 0) {
+                        run_start = i;
+                    }
+                    run_len++;
+                    if (run_len >= needed) {
+                        // Write LFN entries + short entry.
+                        write_lfn_entries(entries, run_start, lfnCount, filename, csum);
+
+                        FAT32DirectoryEntry* shortEntry = &entries[run_start + lfnCount];
+                        memset(shortEntry, 0, sizeof(FAT32DirectoryEntry));
+                        memcpy(shortEntry->name, short83, 11);
+                        shortEntry->attributes = FAT32_ATTR_ARCHIVE;
+                        shortEntry->cluster_low = 0;
+                        shortEntry->cluster_high = 0;
+                        shortEntry->file_size = 0;
+
+                        // Write directory cluster back.
+                        uint64_t cluster_lba = ctx->partition_offset + ctx->data_start_sector +
+                                               ((static_cast<uint64_t>(dir_cluster) - 2) * ctx->sectors_per_cluster);
+                        if (ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, cluster_buf) != 0) {
+                            fat32_log("fat32_open_path: failed to write root dir cluster for create\n");
+                            break;
+                        }
+
+                        created = true;
+                        created_entry_cluster = dir_cluster;
+                        created_entry_offset = static_cast<uint32_t>((run_start + lfnCount) * sizeof(FAT32DirectoryEntry));
+                        break;
+                    }
+                } else {
+                    run_len = 0;
+                }
+
+                // If this is end-of-directory marker, we can treat the rest as free.
+                if (entries[i].name[0] == 0x00) {
+                    // run_len already accounts for it.
+                    // We can continue scanning; remaining entries are also free.
+                }
+            }
+
+            if (created) {
+                break;
+            }
+
+            // Move to next cluster in root dir chain or extend.
+            uint32_t next = get_next_cluster(ctx, dir_cluster);
+            if (next == 0) {
+                last_dir_cluster = dir_cluster;
+                next = alloc_dir_cluster();
+                if (next == 0) {
+                    fat32_log("fat32_open_path: no space to extend root directory\n");
+                    break;
+                }
+            }
+            last_dir_cluster = dir_cluster;
+            dir_cluster = next;
+        }
+
         delete[] cluster_buf;
-        return nullptr;
+
+        if (!created) {
+            return nullptr;
+        }
+
+        // Create file node for the newly created file.
+        auto* node = new FAT32Node;
+        node->start_cluster = 0;  // Allocate on first write
+        node->file_size = 0;
+        node->attributes = FAT32_ATTR_ARCHIVE;
+        node->name = nullptr;
+        node->is_directory = false;
+        node->context = ctx;
+        node->dir_entry_cluster = created_entry_cluster;
+        node->dir_entry_offset = created_entry_offset;
+
+        auto* f = new File;
+        f->private_data = node;
+        f->fd = -1;
+        f->pos = 0;
+        f->fops = nullptr;
+        f->is_directory = false;
+        f->fs_type = FSType::FAT32;
+
+        fat32_log("fat32_open_path: created new file\n");
+        return f;
     }
 
     // Create file node
@@ -409,7 +689,10 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         return -1;
     }
 
-    const FAT32MountContext* ctx = node->context;
+    FAT32MountContext* ctx = node->context;
+
+    // Lock the mount context for the duration of the read
+    ctx->lock.lock();
 
     fat32_log("fat32_read: file_size=0x");
     fat32_log_hex(node->file_size);
@@ -418,6 +701,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     fat32_log("\n");
 
     if ((buf == nullptr) || count == 0) {
+        ctx->lock.unlock();
         return 0;
     }
 
@@ -430,6 +714,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     fat32_log("\n");
 
     if (to_read == 0) {
+        ctx->lock.unlock();
         return 0;
     }
 
@@ -463,6 +748,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     for (uint32_t i = 0; i < cluster_offset; ++i) {
         current_cluster = get_next_cluster(ctx, current_cluster);
         if (current_cluster == 0) {
+            ctx->lock.unlock();
             return -1;
         }
     }
@@ -479,6 +765,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     fat32_log("\n");
     if (cluster_buf == nullptr) {
         fat32_log("fat32_read: failed to allocate cluster buffer\n");
+        ctx->lock.unlock();
         return -1;
     }
 
@@ -494,7 +781,16 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         }
 
         size_t bytes_in_cluster = std::min(to_read - bytes_read, cluster_size - byte_offset);
+
+        fat32_log("fat32_read: copying 0x");
+        fat32_log_hex(bytes_in_cluster);
+        fat32_log(" bytes to dest 0x");
+        fat32_log_hex(reinterpret_cast<uintptr_t>(dest));
+        fat32_log("\n");
+
         memcpy(dest, cluster_buf + byte_offset, bytes_in_cluster);
+
+        fat32_log("fat32_read: copy done\n");
 
         bytes_read += bytes_in_cluster;
         dest += bytes_in_cluster;
@@ -502,8 +798,10 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         current_cluster = get_next_cluster(ctx, current_cluster);
     }
 
-    // Note: Not freeing cluster_buf to avoid kmalloc::free issues
+    // Free the cluster buffer
+    ker::mod::mm::dyn::kmalloc::free(cluster_buf);
 
+    ctx->lock.unlock();
     return (ssize_t)bytes_read;
 }
 
@@ -582,6 +880,12 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
 
     // Update the file size
     entry->file_size = new_size;
+
+    // Also persist the file's start cluster. Newly created files are emitted with
+    // cluster_low/high = 0 and the first cluster is allocated on first write.
+    // If we don't write it back, the file will not be readable after reboot.
+    entry->cluster_low = static_cast<uint16_t>(node->start_cluster & 0xFFFFu);
+    entry->cluster_high = static_cast<uint16_t>((node->start_cluster >> 16) & 0xFFFFu);
 
     fat32_log("update_directory_entry: updated entry, writing cluster back\n");
 
@@ -810,9 +1114,16 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
         fat32_log("fat32_readdir: no mount context\n");
         return -1;
     }
-    size_t cluster_size = node->context->bytes_per_sector * node->context->sectors_per_cluster;
+
+    FAT32MountContext* ctx = node->context;
+
+    // Lock the mount context for the duration of the readdir
+    ctx->lock.lock();
+
+    size_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
     auto* cluster_buf = new uint8_t[cluster_size];
     if (cluster_buf == nullptr) {
+        ctx->lock.unlock();
         return -1;
     }
 
@@ -822,8 +1133,9 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
 
     while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
         // Read the cluster
-        if (read_cluster(node->context, current_cluster, cluster_buf) != 0) {
+        if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
             delete[] cluster_buf;
+            ctx->lock.unlock();
             return -1;
         }
 
@@ -837,6 +1149,7 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
             // End of directory
             if (dir_entry->name[0] == 0x00) {
                 delete[] cluster_buf;
+                ctx->lock.unlock();
                 return -1;  // No more entries
             }
 
@@ -897,10 +1210,11 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
         }
 
         // Get next cluster
-        current_cluster = get_next_cluster(node->context, current_cluster);
+        current_cluster = get_next_cluster(ctx, current_cluster);
     }
 
     delete[] cluster_buf;
+    ctx->lock.unlock();
     return found ? 0 : -1;
 }
 

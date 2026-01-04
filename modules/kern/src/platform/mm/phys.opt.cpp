@@ -11,8 +11,14 @@
 #include "limine.h"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
+#include "platform/mm/virt.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "util/hcf.hpp"
+
+namespace {
+// Forward declaration - we'll get kernel pagemap physical address once during init
+static uint64_t kernelCr3 = 0;
+}  // anonymous namespace
 
 namespace ker::mod::mm::phys {
 
@@ -35,7 +41,7 @@ auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone*
     zone->name = "Physical Memory";
     zone->pageCount = len / paging::PAGE_SIZE;
     zone->zoneNum = zoneNum;
-    zone->buddyInstance = buddy_embed((uint8_t*)base, len);
+    zone->buddyInstance = buddy_embed_alignment((uint8_t*)base, len, paging::PAGE_SIZE);
 
     return zone;
 }
@@ -45,6 +51,7 @@ auto findFreeBlock(uint64_t size) -> void* {
         if (zone->len < size) {
             continue;
         }
+
         void* const block = buddy_malloc(zone->buddyInstance, size);
         if (block == nullptr) {
             [[unlikely]] continue;
@@ -72,7 +79,7 @@ void init(limine_memmap_response* memmapResponse) {
         }
 
         paging::PageZone* zone =
-            initPageZone((uint64_t)addr::getVirtPointer(memmap.entries[i]->base), memmap.entries[i]->length - 1, zoneNum++);
+            initPageZone((uint64_t)addr::getVirtPointer(memmap.entries[i]->base), memmap.entries[i]->length, zoneNum++);
 
         if (zones_tail == nullptr) {
             zones = zone;  // set the head
@@ -89,9 +96,15 @@ void init(limine_memmap_response* memmapResponse) {
     zones_tail->next = nullptr;
 }
 
+void setKernelCr3(uint64_t cr3) { kernelCr3 = cr3; }
+
 auto pageAlloc(uint64_t size) -> void* {
     memlock.lock();
     void* block = findFreeBlock(size);
+
+    if (block != nullptr) {
+        // dbg::log("pageAlloc: size=%x returned=%p", size, block);
+    }
 
     if (block == nullptr) {
         [[unlikely]] memlock.unlock();
@@ -103,7 +116,34 @@ auto pageAlloc(uint64_t size) -> void* {
         return nullptr;
     }
 
+    // Validate the returned address is in a reasonable HHDM range
+    auto blockAddr = (uint64_t)block;
+    uint64_t hhdmBase = 0xffff800000000000ULL;
+    uint64_t hhdmEnd = 0xffff808000000000ULL;  // ~512GB max physical
+    if (blockAddr < hhdmBase || blockAddr >= hhdmEnd) {
+        io::serial::write("FATAL: buddy returned invalid HHDM addr: ");
+        io::serial::writeHex(blockAddr);
+        io::serial::write("\n");
+        memlock.unlock();
+        hcf();
+    }
+
+    // If we're not using kernel CR3, temporarily switch for memset
+    // This handles the case where userspace pagemaps don't have complete HHDM
+    uint64_t savedCr3 = 0;
+    if (kernelCr3 != 0) {
+        uint64_t currentCr3 = rdcr3();
+        if (currentCr3 != kernelCr3) {
+            savedCr3 = currentCr3;
+            wrcr3(kernelCr3);
+        }
+    }
+
     memset(block, 0, size);
+
+    if (savedCr3 != 0) {
+        wrcr3(savedCr3);
+    }
 
     memlock.unlock();
     return block;
@@ -111,6 +151,7 @@ auto pageAlloc(uint64_t size) -> void* {
 
 void pageFree(void* page) {
     memlock.lock();
+
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if ((uint64_t)page < zone->start || (uint64_t)page > zone->start + zone->len) {
             continue;
@@ -125,5 +166,9 @@ void pageFree(void* page) {
     }
     memlock.unlock();
 }
+
+void dumpMiniMallocStats() { ::mini_dump_stats(); }
+
+void dumpKmallocTrackedAllocs() { ker::mod::mm::dyn::kmalloc::dumpTrackedAllocations(); }
 
 }  // namespace ker::mod::mm::phys

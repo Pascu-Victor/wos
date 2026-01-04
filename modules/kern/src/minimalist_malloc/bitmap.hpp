@@ -17,6 +17,10 @@ class Bitmap {
     unsigned find_used(unsigned search_start = 0);
     bool check_used(unsigned position);
     bool check_unused(unsigned position);
+
+    // Diagnostic accessors for debugging only
+    [[nodiscard]] unsigned word_count() const { return SIZE; }
+    [[nodiscard]] uint32_t word_at(unsigned i) const { return m_bitmap_data[i]; }
 };
 
 template <size_t SIZE>
@@ -41,7 +45,8 @@ unsigned Bitmap<SIZE>::find_unused(unsigned search_start) {
     assert(search_start < SIZE);
     size_t bit_index = search_start;
     while (bit_index < SIZE) {
-        if (m_bitmap_data[bit_index / 32] == 0xFF) {
+        // If all 32 bits in this word are set, skip the whole word
+        if (m_bitmap_data[bit_index / 32] == 0xFFFFFFFFU) {
             bit_index += 32;
             continue;
         }
@@ -57,11 +62,14 @@ unsigned Bitmap<SIZE>::find_used(unsigned search_start) {
     assert(search_start < SIZE);
     size_t bit_index = search_start;
     while (bit_index < SIZE) {
-        if (m_bitmap_data[bit_index / 32] == 0) {
+        // If all 32 bits in this word are clear, skip the whole word
+        if (m_bitmap_data[bit_index / 32] == 0U) {
             bit_index += 32;
             continue;
         }
-        if (CHECK_BIT(m_bitmap_data[bit_index / 32], bit_index % 32)) return bit_index;
+        if (CHECK_BIT(m_bitmap_data[bit_index / 32], bit_index % 32)) {
+            return bit_index;
+        }
 
         bit_index++;
     }

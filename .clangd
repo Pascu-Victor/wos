@@ -2,6 +2,7 @@ Diagnostics:
     ClangTidy:
         Add:
             - "bugprone-*"
+            - "clang-analyzer-*"
             - "readability-*"
             - "performance-*"
             - "misc-*"

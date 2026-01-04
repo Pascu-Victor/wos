@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <cstring>
 
-#include "buddy_alloc/buddy_alloc.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "phys.hpp"
 #include "platform/mm/addr.hpp"
@@ -11,6 +10,13 @@
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
 #include "platform/smt/smt.hpp"
+#include "util/hcf.hpp"
+
+// Atomic flag to ensure only one CPU enters OOM dump
+// Uses __atomic builtins to safely coordinate between CPUs
+namespace {
+volatile uint64_t oomDumpInProgress = 0;
+}
 // ============================================================================
 // OOM DUMP PRE-ALLOCATED MEMORY
 // All buffers are reserved at compile time to avoid any allocations during OOM
@@ -58,7 +64,7 @@ __attribute__((section(".bss"))) size_t oomKnownPagemapCount;
 struct MemoryRegionStats {
     uint64_t codePages;   // Low addresses (typically 0x400000 - 0x1000000) - ELF code/data
     uint64_t heapPages;   // Heap region (brk area, typically after code)
-    uint64_t mmapPages;   // mmap region (0x700000000000+) - where mlibc arenas live
+    uint64_t mmapPages;   // mmap region (0x100000000000+) - where mlibc arenas live
     uint64_t stackPages;  // Stack region (high addresses near 0x7FFFFFFFFFFF)
     uint64_t otherPages;  // Other mapped pages
     uint64_t totalPages;
@@ -66,15 +72,14 @@ struct MemoryRegionStats {
     uint64_t rxPages;  // Read-execute pages (likely code)
     uint64_t roPages;  // Read-only pages
 };
-__attribute__((section(".bss"))) MemoryRegionStats oomRegionStats;
 
 // Address range constants for categorization
 constexpr uint64_t CODE_REGION_START = 0x400000ULL;
 constexpr uint64_t CODE_REGION_END = 0x10000000ULL;  // 256MB for code/data
 constexpr uint64_t HEAP_REGION_START = 0x10000000ULL;
 constexpr uint64_t HEAP_REGION_END = 0x100000000000ULL;    // Up to mmap region
-constexpr uint64_t MMAP_REGION_START = 0x700000000000ULL;  // mlibc mmap base
-constexpr uint64_t MMAP_REGION_END = 0x7F0000000000ULL;
+constexpr uint64_t MMAP_REGION_START = 0x100000000000ULL;  // mlibc mmap base (changed from 0x700000000000)
+constexpr uint64_t MMAP_REGION_END = 0x700000000000ULL;    // Up to ELF debug info region
 constexpr uint64_t STACK_REGION_START = 0x7F0000000000ULL;
 constexpr uint64_t STACK_REGION_END = 0x800000000000ULL;  // End of canonical user space
 
@@ -595,10 +600,29 @@ void collectTaskInfo(sched::task::Task* task, bool isActive) {
 // This function uses only pre-allocated static buffers and serial output
 void dumpPageAllocationsOOM() {
     asm volatile("cli");  // Disable interrupts to avoid concurrency issues during OOM dump
+
+    // Atomically try to claim the OOM dump - only one CPU can proceed
+    // Other CPUs that hit OOM will just halt immediately
+    uint64_t expected = 0;
+    if (!__atomic_compare_exchange_n(&oomDumpInProgress, &expected, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        // Another CPU is already doing the OOM dump - just halt
+        hcf();
+    }
+
+    // Halt all other CPUs immediately so they won't modify global state
+    // while we perform a defensive OOM analysis on this core.
+    ker::mod::smt::haltOtherCores();
+
     io::serial::write("\n");
     io::serial::write("╔══════════════════════════════════════════════════════════════════════╗\n");
     io::serial::write("║                    OOM PAGE ALLOCATION DUMP                          ║\n");
     io::serial::write("╚══════════════════════════════════════════════════════════════════════╝\n\n");
+
+    // We'll print allocator stats later after the MEMORY SUMMARY so we can
+    // use the computed totals there to refine the unaccounted memory estimate.
+    // For now just call the raw dumps so they appear early in the log for visibility.
+    mini_dump_stats();
+    ker::mod::mm::dyn::kmalloc::dumpTrackedAllocations();
 
     // Reset tracking arrays
     oomTaskCount = 0;
@@ -621,7 +645,6 @@ void dumpPageAllocationsOOM() {
 
     size_t zoneCount = 0;
     uint64_t totalMemory = 0;
-    uint64_t totalFree = 0;
 
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         zoneCount++;
@@ -642,7 +665,6 @@ void dumpPageAllocationsOOM() {
         io::serial::write(u64ToDecNoAlloc(zone->len, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" bytes (");
         constexpr uint64_t BYTES_PER_MB_ZONE = 1024ULL * 1024ULL;
-        constexpr uint64_t BYTES_PER_KB_ZONE = 1024ULL;
         io::serial::write(u64ToDecNoAlloc(zone->len / BYTES_PER_MB_ZONE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" MB)\n");
 
@@ -652,52 +674,10 @@ void dumpPageAllocationsOOM() {
 
         totalMemory += zone->len;
 
-        // Get buddy allocator stats if available
-        buddy* buddyPtr = buddy_get_embed_at((uint8_t*)zone->start, zone->len);
-        if (buddyPtr != nullptr) {
-            uint64_t freeSize = buddy_arena_free_size(buddyPtr);
-            uint64_t arenaSize = buddy_arena_size(buddyPtr);
-
-            io::serial::write("  Arena size: ");
-            io::serial::write(u64ToDecNoAlloc(arenaSize, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write(" bytes\n");
-
-            io::serial::write("  Free size: ");
-            io::serial::write(u64ToDecNoAlloc(freeSize, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write(" bytes (");
-            io::serial::write(u64ToDecNoAlloc(freeSize / BYTES_PER_KB_ZONE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write(" KB)\n");
-
-            io::serial::write("  Used size: ");
-            io::serial::write(u64ToDecNoAlloc(arenaSize - freeSize, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write(" bytes\n");
-
-            // Calculate usage percentage (avoid floating point)
-            if (arenaSize > 0) {
-                constexpr uint64_t PERCENT_MULTIPLIER = 100;
-                uint64_t usedPercent = ((arenaSize - freeSize) * PERCENT_MULTIPLIER) / arenaSize;
-                io::serial::write("  Usage: ");
-                io::serial::write(u64ToDecNoAlloc(usedPercent, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-                io::serial::write("%\n");
-            }
-
-            // Get fragmentation level
-            constexpr uint8_t MAX_FRAGMENTATION = 255;
-            unsigned char frag = buddy_fragmentation(buddyPtr);
-            io::serial::write("  Fragmentation: ");
-            io::serial::write(u64ToDecNoAlloc(frag, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write("/");
-            io::serial::write(u64ToDecNoAlloc(MAX_FRAGMENTATION, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-            io::serial::write("\n");
-
-            io::serial::write("  Is full: ");
-            io::serial::write(buddy_is_full(buddyPtr) ? "YES" : "NO");
-            io::serial::write("\n");
-
-            totalFree += freeSize;
-        } else {
-            io::serial::write("  WARNING: Could not get buddy allocator handle\n");
-        }
+        // Skip buddy_arena_free_size entirely during OOM dump - it walks the buddy
+        // tree which can access corrupted metadata and cause page faults. The zone
+        // length is sufficient for diagnostics.
+        io::serial::write("  Arena free: (skipped during OOM - unsafe to walk buddy tree)\n");
 
         io::serial::write("\n");
     }
@@ -917,6 +897,46 @@ void dumpPageAllocationsOOM() {
     io::serial::write(u64ToDecNoAlloc(totalExpiredTaskNodes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
 
+    // Print any expired tasks with their refcounts (useful for debugging leaks).
+    // We print ALL entries by iterating in fixed-size blocks to avoid dynamic allocation.
+    io::serial::write("\nExpired tasks (PID : refcount) per CPU (all entries shown in blocks):\n");
+    for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
+        constexpr size_t BLOCK = 128;
+        uint64_t pids[BLOCK];
+        uint32_t refs[BLOCK];
+
+        io::serial::write("  CPU ");
+        io::serial::write(u64ToDecNoAlloc(cpuNo, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(": ");
+
+        size_t startIndex = 0;
+        bool printedAny = false;
+        while (true) {
+            size_t n = ker::mod::sched::getExpiredTaskRefcounts(cpuNo, pids, refs, BLOCK, startIndex);
+            if (n == 0) {
+                if (!printedAny) {
+                    io::serial::write("(none)");
+                }
+                break;
+            }
+
+            // Print this block
+            for (size_t i = 0; i < n; ++i) {
+                printedAny = true;
+                io::serial::write("PID=");
+                io::serial::write(u64ToDecNoAlloc(pids[i], oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+                io::serial::write(" ref=");
+                io::serial::write(u64ToDecNoAlloc(refs[i], oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+                io::serial::write("  ");
+            }
+
+            // Advance start index; if fewer than BLOCK returned, we've reached the end
+            startIndex += n;
+            if (n < BLOCK) break;
+        }
+        io::serial::write("\n");
+    }
+
     io::serial::write("    Total waitQueue nodes:    ");
     io::serial::write(u64ToDecNoAlloc(totalWaitQueueNodes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
@@ -986,15 +1006,8 @@ void dumpPageAllocationsOOM() {
     io::serial::write(u64ToDecNoAlloc(totalMemory, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" bytes)\n");
 
-    io::serial::write("  Free memory: ");
-    io::serial::write(u64ToDecNoAlloc(totalFree / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-    io::serial::write(" KB (");
-    io::serial::write(u64ToDecNoAlloc(totalFree, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-    io::serial::write(" bytes)\n");
-
-    io::serial::write("  Used memory: ");
-    io::serial::write(u64ToDecNoAlloc((totalMemory - totalFree) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-    io::serial::write(" KB\n\n");
+    io::serial::write("  Free memory: (unavailable - buddy tree walk unsafe during OOM)\n");
+    io::serial::write("  Used memory: (unavailable)\n\n");
 
     io::serial::write("Process Memory:\n");
     io::serial::write("  Total tasks tracked: ");
@@ -1041,22 +1054,33 @@ void dumpPageAllocationsOOM() {
     io::serial::write("│ MEMORY ACCOUNTING                                                   │\n");
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
-    uint64_t usedMemory = totalMemory - totalFree;
-
-    io::serial::write("Used physical memory: ");
-    io::serial::write(u64ToDecNoAlloc(usedMemory / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write("(Buddy tree walk skipped - unsafe during OOM condition)\n");
+    io::serial::write("Total physical memory: ");
+    io::serial::write(u64ToDecNoAlloc(totalMemory / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" KB\n");
 
     io::serial::write("Accounted process memory: ");
     io::serial::write(u64ToDecNoAlloc(totalProcessMem / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" KB\n");
 
-    if (usedMemory > totalProcessMem) {
-        uint64_t unaccounted = usedMemory - totalProcessMem;
-        io::serial::write("Unaccounted memory (kernel, drivers, buffers): ");
-        io::serial::write(u64ToDecNoAlloc(unaccounted / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" KB\n");
-    }
+    // Show allocator-level accounting
+    uint64_t kmallocCount = 0, kmallocBytes = 0;
+    ker::mod::mm::dyn::kmalloc::getTrackedAllocTotals(kmallocCount, kmallocBytes);
+    uint64_t slabBytes = mini_get_total_slab_bytes();
+
+    io::serial::write("\nAllocator accounting:\n");
+    io::serial::write("  kmalloc tracked large allocations: ");
+    io::serial::write(u64ToDecNoAlloc(kmallocCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" entries, ");
+    io::serial::write(u64ToDecNoAlloc(kmallocBytes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" bytes (");
+    io::serial::write(u64ToDecNoAlloc(kmallocBytes / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" KB)\n");
+    io::serial::write("  total slab memory (mini): ");
+    io::serial::write(u64ToDecNoAlloc(slabBytes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" bytes (");
+    io::serial::write(u64ToDecNoAlloc(slabBytes / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" KB)\n");
 
     io::serial::write("\n");
     io::serial::write("╔══════════════════════════════════════════════════════════════════════╗\n");

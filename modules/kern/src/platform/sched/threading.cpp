@@ -7,6 +7,7 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <util/list.hpp>
 
 #include "platform/mm/paging.hpp"
@@ -14,11 +15,16 @@
 
 namespace ker::mod::sched::threading {
 std::list<Thread*> activeThreads;
+static sys::Spinlock activeThreadsLock;
 
 void initThreading() {}
 
 Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable* pageTable, const ker::loader::elf::TlsModule& tlsInfo) {
     auto* thread = new Thread();
+    if (thread == nullptr) {
+        dbg::log("createThread: Failed to allocate Thread object");
+        return nullptr;
+    }
     thread->stackSize = stackSize;
     thread->tlsSize = tlsSize;
 
@@ -32,7 +38,19 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     uint64_t totalTlsSize = actualTlsSize + tcbSize + safestackSize;
 
     void* tls = mm::phys::pageAlloc(PAGE_ALIGN_UP(totalTlsSize));
+    if (tls == nullptr) {
+        dbg::log("createThread: Failed to allocate TLS memory (%d bytes)", PAGE_ALIGN_UP(totalTlsSize));
+        delete thread;
+        return nullptr;
+    }
+
     void* stack = mm::phys::pageAlloc(stackSize);
+    if (stack == nullptr) {
+        dbg::log("createThread: Failed to allocate stack memory (%d bytes)", stackSize);
+        mm::phys::pageFree(tls);
+        delete thread;
+        return nullptr;
+    }
 
     // CRITICAL FIX: Use page-aligned size for virtual address calculation too
     uint64_t alignedTotalSize = PAGE_ALIGN_UP(totalTlsSize);
@@ -143,7 +161,9 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     thread->tlsPhysPtr = reinterpret_cast<uint64_t>(tls);
     thread->stackPhysPtr = reinterpret_cast<uint64_t>(stack);
 
+    activeThreadsLock.lock();
     activeThreads.push_back(thread);
+    activeThreadsLock.unlock();
     return thread;
 }
 
@@ -152,7 +172,9 @@ void destroyThread(Thread* thread) {
         return;
     }
 
+    activeThreadsLock.lock();
     activeThreads.remove(thread);
+    activeThreadsLock.unlock();
 
     // Free the actual physical allocations using the stored HHDM pointers
     if (thread->tlsPhysPtr != 0) {
@@ -165,5 +187,10 @@ void destroyThread(Thread* thread) {
     delete thread;
 }
 
-auto getActiveThreadCount() -> uint64_t { return activeThreads.size(); }
+auto getActiveThreadCount() -> uint64_t {
+    activeThreadsLock.lock();
+    uint64_t count = activeThreads.size();
+    activeThreadsLock.unlock();
+    return count;
+}
 }  // namespace ker::mod::sched::threading

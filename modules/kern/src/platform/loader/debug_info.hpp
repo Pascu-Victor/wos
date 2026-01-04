@@ -74,4 +74,7 @@ ProcessDebugInfo* getProcessDebugInfo(uint64_t pid);
 void printDebugInfo(uint64_t pid);
 DebugSymbol* getProcessSymbol(uint64_t pid, const char* name);
 
+// Cleanup function - removes all debug info for a process
+void unregisterProcess(uint64_t pid);
+
 }  // namespace ker::loader::debug

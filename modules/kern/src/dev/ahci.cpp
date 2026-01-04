@@ -5,6 +5,7 @@
 
 #include "ahci.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "pci.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::dev::ahci {
 
@@ -62,6 +64,14 @@ struct PortMemory {
 };
 
 PortMemory port_memory[MAX_PORTS];  // NOLINT
+
+// Per-port spinlocks to protect concurrent disk I/O operations
+// This prevents race conditions when multiple CPUs try to access the same disk simultaneously
+ker::mod::sys::Spinlock port_locks[MAX_PORTS];  // NOLINT
+
+// Software-level tracking of which command slots are in use
+// This prevents the race where we release the lock but hardware hasn't updated ci yet
+std::atomic<uint32_t> port_slots_in_use[MAX_PORTS] = {};  // NOLINT
 
 // Stop command engine on a port
 void stop_cmd(volatile HBA_PORT* port) {
@@ -177,10 +187,15 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     start_cmd(port);  // Start command engine
 }
 
-// Find a free command slot
-auto find_cmdslot(volatile HBA_PORT* port) -> uint32_t {
-    // If not set in SACT and CI, the slot is free
-    uint32_t slots = (port->sact | port->ci);
+// Find a free command slot (must be called with port lock held)
+auto find_cmdslot(volatile HBA_PORT* port, int portno) -> uint32_t {
+    // Check both hardware registers AND software tracking for busy slots
+    // The software tracking handles the race where we've issued a command but hardware hasn't updated ci yet
+    uint32_t hw_slots = (port->sact | port->ci);
+    uint32_t sw_slots = (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) 
+                        ? port_slots_in_use[portno].load(std::memory_order_acquire) 
+                        : 0;
+    uint32_t slots = hw_slots | sw_slots;
     uint32_t cmdslots = (hba_mem->cap & 0x1F00) >> 8;  // Number of command slots
     for (uint32_t i = 0; i < cmdslots; i++) {
         if ((slots & 1) == 0) {
@@ -195,10 +210,27 @@ auto find_cmdslot(volatile HBA_PORT* port) -> uint32_t {
 // Generic function to read/write sectors from/to disk
 auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf, bool write_op)
     -> bool {
+    uint32_t slot = UINT32_MAX;
+    
+    // Acquire per-port lock only for the critical section: finding a slot and issuing the command
+    // We must NOT hold the lock during the busy-wait for completion, as that would cause livelock
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].lock();
+    }
+
     port->is = static_cast<uint32_t>(-1);  // Clear pending interrupt bits
-    uint32_t slot = find_cmdslot(port);
+    slot = find_cmdslot(port, portno);
     if (slot == UINT32_MAX) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_locks[portno].unlock();
+        }
         return false;
+    }
+    
+    // Mark this slot as in-use in software BEFORE releasing the lock
+    // This prevents other CPUs from grabbing the same slot before hardware updates ci
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
     }
 
     // Get kernel page table for physical address translation
@@ -255,7 +287,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     cmdfis->countl = count & 0xFF;
     cmdfis->counth = (count >> 8) & 0xFF;
 
-    // Wait for port to be ready
+    // Wait for port to be ready (still holding lock - this should be quick)
     int spin = 0;
     constexpr int MAX_SPIN = 1000000;
     while (((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
@@ -263,13 +295,23 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     }
     if (spin == MAX_SPIN) {
         ahci_log("Port is hung\n");
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
         return false;
     }
 
     // Issue command
     port->ci = 1 << slot;
+    
+    // Release lock after issuing command - the slot is now ours and we just need to wait
+    // Other concurrent I/O operations can use different command slots
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].unlock();
+    }
 
-    // Wait for completion
+    // Wait for completion (without holding lock - this can take a long time)
     while (true) {
         if ((port->ci & (1 << slot)) == 0) {
             break;
@@ -280,8 +322,14 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
             } else {
                 ahci_log("Read disk error\n");
             }
+            // Clear the software slot tracking on error
+            if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+                port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            }
             return false;
         }
+        // Yield to other threads/allow interrupts during long waits
+        asm volatile("pause");
     }
 
     // Check again
@@ -291,9 +339,18 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         } else {
             ahci_log("Read disk error\n");
         }
+        // Clear the software slot tracking on error
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+        }
         return false;
     }
 
+    // Clear the software slot tracking on success
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+    }
+    
     return true;
 }
 

@@ -1,6 +1,7 @@
 #include "dbg.hpp"
 
 #include <cstdarg>
+#include <platform/smt/smt.hpp>
 #include <util/string.hpp>
 
 namespace ker::mod::dbg {
@@ -25,22 +26,28 @@ void init() {
 void enableTime(void) {
     if (isTimeAvailable) {
         // Panic! should only be called once when ktime is initialized
-        hcf();
+        panicHandler("Kernel time was already initialized");
     }
     isTimeAvailable = true;
     log("Kernel time is now available");
 }
 
+void breakIntoDebugger(void) { __asm__ volatile("int $3"); }
+
 void enableKmalloc(void) {
     if (isKmallocAvailable) {
         // Panic! should only be called once when kmalloc is initialized
-        hcf();
+        panicHandler("Kernel kmalloc already initialized");
     }
     isKmallocAvailable = true;
     log("Kernel memory allocator is now available");
 }
 
-inline void serialLog(const char* str) {
+// Write a complete log line atomically to serial (timestamp + message + newline)
+inline void serialLogLine(const char* str) {
+    // Hold the serial lock for the entire log line to prevent interleaving
+    io::serial::ScopedLock lock;
+
     if (isTimeAvailable) [[likely]] {
         char timeSec[10] = {0};
         char timeMs[5] = {0};
@@ -70,16 +77,15 @@ inline void serialLog(const char* str) {
         };
         u64toa_local(logTimeMsPart, timeMs, 10);
         u64toa_local(logTimeSecPart, timeSec, 10);
-        io::serial::write('[');
-        io::serial::write(timeSec);
-        io::serial::write('.');
-        io::serial::write(timeMs);
-        io::serial::write("]:");
+        io::serial::writeUnlocked('[');
+        io::serial::writeUnlocked(timeSec);
+        io::serial::writeUnlocked('.');
+        io::serial::writeUnlocked(timeMs);
+        io::serial::writeUnlocked("]:");
     }
-    io::serial::write(str);
+    io::serial::writeUnlocked(str);
+    io::serial::writeUnlocked('\n');
 }
-
-inline void serialNewline() { io::serial::write('\n'); }
 
 inline void fbLog(const char* str) {
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
@@ -137,29 +143,54 @@ inline void fbLog(const char* str) {
     }
 }
 
-void logNewLineNoSync(void) {
-    serialNewline();
-    linesLogged++;
-}
-
-void logNoSync(const char* str) {
-    serialLog(str);
+void logString(const char* str) {
+    logLock.lock();
+    // Write atomically to serial (includes newline)
+    serialLogLine(str);
+    // Framebuffer logging
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
         fbLog(str);
     }
-}
-
-void logString(const char* str) {
-    logLock.lock();
-    logNoSync(str);
-    logNewLineNoSync();
+    linesLogged++;
     logLock.unlock();
 }
 
 void logVa(const char* format, va_list& args) {
     // 4k should be enough for everyone
     char buf[4096];
-    std::vsnprintf(buf, 4096ul, format, args);
+
+    // Defensive: avoid dereferencing potentially-invalid %s pointers from varargs.
+    // Replace simple "%s" specifiers with "%p" so vsnprintf prints the pointer
+    // value instead of calling strlen() on an invalid address.
+    char safe_fmt[1024];
+    size_t si = 0;
+    for (size_t i = 0; format[i] != '\0' && si + 2 < sizeof(safe_fmt); ++i) {
+        if (format[i] == '%') {
+            // Copy the '%' first
+            safe_fmt[si++] = '%';
+            char next = format[i + 1];
+            if (next == '%') {
+                // literal %% -> copy one % and advance past second
+                ++i;
+                safe_fmt[si - 1] = '%';
+            } else if (next == 's') {
+                // replace %s with %p
+                safe_fmt[si++] = 'p';
+                ++i;  // skip 's'
+            } else {
+                // copy next char as-is (handles %d, %x, %u etc.)
+                if (next != '\0') {
+                    safe_fmt[si++] = next;
+                    ++i;
+                }
+            }
+        } else {
+            safe_fmt[si++] = format[i];
+        }
+    }
+    safe_fmt[si] = '\0';
+
+    std::vsnprintf(buf, sizeof(buf), safe_fmt, args);
     logString(buf);
 }
 
@@ -187,6 +218,18 @@ void error(const char* str) {
     log(str);
     // TODO: pretty print error
     logLock.unlock();
+}
+
+void panicHandler(const char* msg) {
+    // Log the panic message
+    log("KERNEL PANIC: %s", msg);
+
+    // Try to halt other CPUs to stabilize global state for any dump/inspection
+    ker::mod::smt::haltOtherCores();
+
+    // If stacktrace printing is desired and available, it can be called here.
+    // Finally, stop this CPU.
+    hcf();
 }
 
 }  // namespace ker::mod::dbg

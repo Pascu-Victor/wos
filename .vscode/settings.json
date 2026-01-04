@@ -131,6 +131,35 @@
     ],
     "C_Cpp.default.compilerArgs": [
         "--target=x86_64-pc-wos",
-        "--sysroot=${workspaceFolder}/toolchain/target1",
+        "--sysroot=${workspaceFolder}/toolchain/target1"
     ],
+
+    // ===== Clangd Configuration (Static Analysis) =====
+    // Disable MS IntelliSense in favor of clangd
+    "C_Cpp.intelliSenseEngine": "disabled",
+
+    // Clangd settings
+    "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--background-index",
+        "--clang-tidy",
+        "--header-insertion=iwyu",
+        "--completion-style=detailed",
+        "--function-arg-placeholders",
+        "--fallback-style=llvm",
+        "--query-driver=${workspaceFolder}/toolchain/target1/bin/clang,${workspaceFolder}/toolchain/target1/bin/clang++",
+        "--log=error"
+    ],
+    "clangd.onConfigChanged": "restart",
+    "clangd.checkUpdates": false,
+
+    // Editor integration
+    "editor.semanticHighlighting.enabled": true,
+    "[cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    }
 }

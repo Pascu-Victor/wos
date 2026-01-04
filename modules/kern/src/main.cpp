@@ -98,7 +98,7 @@ extern "C" void _start(void) {
     uint8_t* stack = stack;
     // Init gds.
     asm volatile("mov %%rsp, %0" : "=r"(stack));
-    ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE);
+    ker::mod::desc::gdt::initDescriptors((uint64_t*)stack + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
     // asm volatile("mov %0, %%rsp" ::"r"((uint64_t)stack + KERNEL_STACK_SIZE));
 
     // Init kmalloc

@@ -3,10 +3,12 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sys/spinlock.hpp>
 
 namespace ker::loader::debug {
 
 GdbDebugInfo* gdbDebugInfoChain = nullptr;
+static ker::mod::sys::Spinlock gdbDebugInfoLock;
 
 void initGdbDebugInfo() {
     gdbDebugInfoChain = nullptr;
@@ -95,6 +97,32 @@ void finalizeGdbDebugInfo(uint64_t pid) {
         }
         current = (GdbDebugInfo*)current->nextProcessAddr;
     }
+}
+
+void removeGdbDebugInfo(uint64_t pid) {
+    gdbDebugInfoLock.lock();
+    GdbDebugInfo* prev = nullptr;
+    GdbDebugInfo* current = gdbDebugInfoChain;
+
+    while (current != nullptr) {
+        if (current->pid == pid) {
+            // Remove from linked list
+            if (prev == nullptr) {
+                // Head of list
+                gdbDebugInfoChain = (GdbDebugInfo*)current->nextProcessAddr;
+            } else {
+                prev->nextProcessAddr = current->nextProcessAddr;
+            }
+
+            // Free the page that was allocated for this debug info
+            ker::mod::mm::phys::pageFree(current);
+            gdbDebugInfoLock.unlock();
+            return;
+        }
+        prev = current;
+        current = (GdbDebugInfo*)current->nextProcessAddr;
+    }
+    gdbDebugInfoLock.unlock();
 }
 
 // Function to be called by GDB to get debug info

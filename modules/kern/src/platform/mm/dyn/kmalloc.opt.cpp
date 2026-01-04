@@ -8,6 +8,7 @@
 #include <mod/io/serial/serial.hpp>
 
 #include "minimalist_malloc/mini_malloc.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -200,6 +201,54 @@ void init() {
     kmallocLock = (ker::mod::sys::Spinlock*)mini_malloc(sizeof(ker::mod::sys::Spinlock));
 }
 
+void dumpTrackedAllocations() {
+    trackerLock.lock();
+    uint64_t totalBytes = 0;
+    uint64_t used = 0;
+    ker::mod::io::serial::write("kmalloc: Tracked large allocations:\n");
+    if (!trackedAllocsInitialized) {
+        ker::mod::io::serial::write("  tracker not initialized\n");
+        trackerLock.unlock();
+        return;
+    }
+    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
+        if (trackedAllocs[i].in_use) {
+            used++;
+            totalBytes += trackedAllocs[i].size;
+            ker::mod::io::serial::write("  idx=");
+            ker::mod::io::serial::writeHex(i);
+            ker::mod::io::serial::write(" addr=0x");
+            ker::mod::io::serial::writeHex((uint64_t)trackedAllocs[i].virt_addr);
+            ker::mod::io::serial::write(" size=");
+            ker::mod::io::serial::writeHex(trackedAllocs[i].size);
+            ker::mod::io::serial::write("\n");
+        }
+    }
+    ker::mod::io::serial::write("  total_entries=");
+    ker::mod::io::serial::writeHex(used);
+    ker::mod::io::serial::write(" total_bytes=");
+    ker::mod::io::serial::writeHex(totalBytes);
+    ker::mod::io::serial::write("\n");
+    trackerLock.unlock();
+}
+
+void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
+    trackerLock.lock();
+    outCount = 0;
+    outBytes = 0;
+    if (!trackedAllocsInitialized) {
+        trackerLock.unlock();
+        return;
+    }
+    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
+        if (trackedAllocs[i].in_use) {
+            outCount++;
+            outBytes += trackedAllocs[i].size;
+        }
+    }
+    trackerLock.unlock();
+}
+
 void* malloc(uint64_t size) {
     // For large allocations, use direct page allocation
     if (size >= LARGE_ALLOC_THRESHOLD) {
@@ -345,6 +394,11 @@ auto realloc(void* ptr, int sz) -> void* {
     kmallocLock->lock();
     void* newPtr = mini_malloc(newSize);
     if (newPtr != nullptr) [[likely]] {
+        // If the allocator happens to return the same pointer, don't free it - avoid double-free
+        if (newPtr == ptr) {
+            kmallocLock->unlock();
+            return newPtr;
+        }
         // Copy old data
         memcpy(newPtr, ptr, newSize);
         mini_free(ptr);
@@ -388,6 +442,18 @@ void free(void* ptr) {
 
     // Otherwise, try to free via mini_malloc
     // mini_malloc handles both its own large allocations and slab allocations
+
+    // If ptr is outside the valid kernel memory range, log the caller here to help
+    // diagnose frees of invalid addresses (avoid flooding: only log when outside valid ranges)
+    // Valid ranges: HHDM (0xffff800000000000-0xffff900000000000) or kernel static (0xffffffff80000000-0xffffffffc0000000)
+    uintptr_t ptrVal = reinterpret_cast<uintptr_t>(ptr);
+    bool inHHDM = (ptrVal >= 0xffff800000000000ULL && ptrVal < 0xffff900000000000ULL);
+    bool inKernelStatic = (ptrVal >= 0xffffffff80000000ULL && ptrVal < 0xffffffffc0000000ULL);
+    if (!inHHDM && !inKernelStatic) {
+        ker::mod::dbg::log("kmalloc::free: caller=%p freeing ptr=%p outside valid kernel range (will call mini_free to be defensive)",
+                           __builtin_return_address(0), ptr);
+    }
+
     kmallocLock->lock();
     mini_free(ptr);
 

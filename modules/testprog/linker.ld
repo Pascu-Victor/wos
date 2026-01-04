@@ -3,7 +3,8 @@ ENTRY(_start)
 
 PHDRS
 {
-    text PT_LOAD FLAGS(5);          /* R+X */
+    headers PT_PHDR PHDRS;
+    text PT_LOAD FLAGS(5) FILEHDR PHDRS;          /* R+X */
     rodata PT_LOAD FLAGS(4);        /* R */
     data PT_LOAD FLAGS(6);          /* RW */
     tls PT_TLS FLAGS(4);            /* R (TLS template) */
@@ -12,9 +13,6 @@ PHDRS
 
 SECTIONS
 {
-    /* ELF header*/
-    PROVIDE_HIDDEN(__ehdr_start = 0x1000);
-
     . = 0x800000;
 
     /* Code sections */

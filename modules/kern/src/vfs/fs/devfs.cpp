@@ -4,6 +4,7 @@
 #include <cstring>
 #include <dev/device.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 
 #include "vfs/file_operations.hpp"
@@ -14,6 +15,8 @@ namespace ker::vfs::devfs {
 // devfs-specific data stored in File->private_data
 struct DevFSFile {
     ker::dev::Device* device;
+    // Magic value to detect use-after-free / corruption
+    uint32_t magic = 0xDEADBEEF;
 };
 
 // devfs file operations
@@ -34,8 +37,27 @@ auto devfs_close(File* f) -> int {
     }
 
     auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    // Defensive: validate pointer is in valid kernel memory range before deleting
+    // Valid ranges: HHDM (0xffff800000000000-0xffff900000000000) or kernel static (0xffffffff80000000-0xffffffffc0000000)
+    uintptr_t dfAddr = reinterpret_cast<uintptr_t>(devfs_file);
+    bool inHHDM = (dfAddr >= 0xffff800000000000ULL && dfAddr < 0xffff900000000000ULL);
+    bool inKernelStatic = (dfAddr >= 0xffffffff80000000ULL && dfAddr < 0xffffffffc0000000ULL);
+    if (!inHHDM && !inKernelStatic) {
+        ker::mod::dbg::log("devfs_close: devfs_file %p out of valid kernel range; skipping delete\n", devfs_file);
+        f->private_data = nullptr;
+        return 0;
+    }
+
+    if (devfs_file->magic != 0xDEADBEEF) {
+        ker::mod::dbg::log("devfs_close: devfs_file %p has invalid magic 0x%x; skipping delete\n", devfs_file, devfs_file->magic);
+        f->private_data = nullptr;
+        return 0;
+    }
+
     if (devfs_file->device == nullptr) {
         vfs_debug_log("devfs_close: device pointer is null\n");
+        // clear magic before freeing
+        devfs_file->magic = 0;
         delete devfs_file;
         f->private_data = nullptr;
         return 0;
@@ -46,7 +68,8 @@ auto devfs_close(File* f) -> int {
         devfs_file->device->char_ops->close(f);
     }
 
-    // Free devfs-specific data
+    // Clear magic and free devfs-specific data
+    devfs_file->magic = 0;
     delete devfs_file;
     f->private_data = nullptr;
     return 0;
@@ -210,13 +233,14 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
         return nullptr;
     }
 
-    auto* devfs_file = static_cast<DevFSFile*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(DevFSFile)));
+    auto* devfs_file = new DevFSFile();
     if (devfs_file == nullptr) {
         ker::mod::mm::dyn::kmalloc::free(file);
         return nullptr;
     }
 
     devfs_file->device = device;
+    // magic is now correctly initialized to 0xDEADBEEF by the default member initializer
 
     file->fd = -1;  // Will be assigned by VFS
     file->private_data = devfs_file;
@@ -229,7 +253,7 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     // Call device open
     if (device->char_ops != nullptr && device->char_ops->open != nullptr) {
         if (device->char_ops->open(file) != 0) {
-            ker::mod::mm::dyn::kmalloc::free(devfs_file);
+            delete devfs_file;
             ker::mod::mm::dyn::kmalloc::free(file);
             return nullptr;
         }

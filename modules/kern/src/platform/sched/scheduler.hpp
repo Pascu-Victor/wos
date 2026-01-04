@@ -37,7 +37,9 @@ auto getLeastLoadedCpu() -> uint64_t;             // Get CPU with least tasks
 auto getCurrentTask() -> task::Task*;
 void removeCurrentTask();                                     // Remove current task from runqueue (for exit)
 auto findTaskByPid(uint64_t pid) -> task::Task*;              // Find a task by PID across all CPUs
+auto findTaskByPidSafe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
 void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task);  // Reschedule a specific task on a specific CPU
+void gcExpiredTasks();                                        // Garbage collect dead tasks from expired lists
 void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr,
                           ker::mod::gates::interruptFrame& frame);  // Move current task to wait queue with context saved
 extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr,
@@ -54,6 +56,11 @@ struct RunQueueStats {
     uint64_t waitQueueCount;
 };
 auto getRunQueueStats(uint64_t cpuNo) -> RunQueueStats;
+
+// Return up to maxEntries expired task PIDs and their refcounts for diagnostics,
+// starting at `startIndex` into the expired list. Returns the number of entries written.
+// If you want all entries, call repeatedly in fixed-size blocks with increasing startIndex.
+size_t getExpiredTaskRefcounts(uint64_t cpuNo, uint64_t* pids, uint32_t* refcounts, size_t maxEntries, size_t startIndex = 0);
 
 }  // namespace ker::mod::sched
 extern "C" auto _wOS_getCurrentTask() -> ker::mod::sched::task::Task*;
