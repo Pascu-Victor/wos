@@ -1049,8 +1049,9 @@ auto findTaskByPidSafe(uint64_t pid) -> task::Task* {
 }
 
 void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task) {
+#ifdef SCHED_DEBUG
     dbg::log("rescheduleTaskForCpu: Rescheduling PID %x on CPU %d", task->pid, cpuNo);
-
+#endif
     // Remove from wait queue (if present) and add to active tasks list for the specified CPU
     // The task might be on a different CPU's wait queue than the target CPU, so we need to
     // search all CPUs' wait queues to find and remove it.
@@ -1060,7 +1061,9 @@ void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task) {
 
     // Now add to the target CPU's active tasks
     runQueues->withLockVoid(cpuNo, [task](RunQueue* rq) { rq->activeTasks.push_back(task); });
+#ifdef SCHED_DEBUG
     dbg::log("rescheduleTaskForCpu: Done rescheduling PID %x", task->pid);
+#endif
 }
 
 void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
@@ -1180,6 +1183,38 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
 
     // Get the next task in the active queue
     if (nextTask != nullptr) {
+        // CRITICAL FIX: If the next task is an idle task, we cannot switch to it
+        // using _wOS_deferredTaskSwitchReturn because idle tasks don't have valid
+        // usermode context. Instead, we need to enter the kernel idle loop.
+        if (nextTask->type == task::TaskType::IDLE) {
+#ifdef SCHED_DEBUG
+            dbg::log("deferredTaskSwitch: Next task is idle, entering kernel idle loop");
+#endif
+            // Set currentTask to the idle task
+            runQueues->thisCpu()->currentTask = nextTask;
+            debug_task_ptrs[apic::getApicId() < smt::getCoreCount() ? smt::getCpuIndexFromApicId(apic::getApicId()) : 0] = nextTask;
+            // Mark CPU as idle so other CPUs know to send IPI when posting tasks
+            runQueues->thisCpu()->isIdle.store(true, std::memory_order_release);
+
+            // Arm the timer so we wake up periodically to check for new tasks
+            apic::oneShotTimer(apic::calibrateTimer(10000));  // 10ms timer
+
+            // Allocate a fresh stack for the idle loop
+            uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
+
+            // Restore GS_BASE to kernel PerCpu before entering idle loop
+            restoreKernelGsForIdle();
+
+            asm volatile(
+                "mov %0, %%rsp\n"
+                "sti\n"
+                "jmp _wOS_kernel_idle_loop"
+                :
+                : "r"(idleStack)
+                : "memory");
+            __builtin_unreachable();
+        }
+
         nextTask->hasRun = true;
 
         // Set up GS for the next task before switching pagemap

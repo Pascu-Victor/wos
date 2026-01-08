@@ -82,8 +82,7 @@ auto main() -> int {
     // Test: Process execution
     std::println("init[{}]: TEST: Process Execution", cpuno);
     std::println("init[{}]: Testing process exec", cpuno);
-    int pids[40] = {};
-    for (int& pid : pids) {
+    while (true) {
         const char* progPath = "/mnt/disk/testprog";
         std::array<const char*, 4> argv = {"/mnt/disk/testprog", "arg1", "arg2", nullptr};
         std::array<const char*, 1> envp = {nullptr};
@@ -91,24 +90,14 @@ auto main() -> int {
         // std::println("init[{}]: Calling exec", cpuno);
 
         uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
-        pid = static_cast<int>(child_pid);
         if (child_pid == 0) {
             std::println("init[{}]: exec failed (this is expected if testprog not in VFS)", cpuno);
         } else {
-            // std::println("init[{}]: exec succeeded! pid is: {}", cpuno, pid);
+            int child_exit_code = 0;
+            std::println("waitpid: Waiting for child process {}", child_pid);
+            ker::process::waitpid((int64_t)child_pid, &child_exit_code, 0);
+            std::println("init[{}]: Child process {} exited with code {}", cpuno, child_pid, child_exit_code);
         }
-    }
-    for (int& pid : pids) {
-        int child_exit_code = 0;
-        ker::process::waitpid(pid, &child_exit_code, 0);
-        std::println("init[{}]: Child process {} exited with code {}", cpuno, pid, child_exit_code);
-    }
-    std::println("init[{}]: All tests complete, looping...", cpuno);
-
-    // Loop forever
-    // TODO: replace with idle process, init should not busy-wait but cannot exit
-    while (true) {
-        asm volatile("pause");
     }
 
     return 0;
