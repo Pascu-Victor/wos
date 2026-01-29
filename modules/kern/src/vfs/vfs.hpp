@@ -51,6 +51,16 @@ auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
 auto vfs_isatty(int fd) -> bool;
 auto vfs_read_dir_entries(int fd, void* buffer, std::size_t max_size) -> ssize_t;
 
+// Symlink operations
+auto vfs_symlink(const char* target, const char* linkpath) -> int;
+auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+
+// Directory operations
+auto vfs_mkdir(const char* path, int mode) -> int;
+
+// Mount operations (called from userspace via syscall)
+auto vfs_mount(const char* source, const char* target, const char* fstype) -> int;
+
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;

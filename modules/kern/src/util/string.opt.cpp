@@ -157,6 +157,14 @@ size_t strlcat(char* dest, const char* src, size_t size) {
     return dest_len + src_len;
 }
 
+int strcmp(const char* str1, const char* str2) {
+    while (*str1 != '\0' && *str1 == *str2) {
+        str1++;
+        str2++;
+    }
+    return static_cast<unsigned char>(*str1) - static_cast<unsigned char>(*str2);
+}
+
 int strncmp(const char* str1, const char* str2, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (str1[i] != str2[i]) {
@@ -201,6 +209,8 @@ char* snprintf(char* str, size_t size, const char* format, ...) {
 char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }
 
 size_t strlcat(char* dest, const char* src, size_t size) { return _std::strlcat(dest, src, size); }
+
+int strcmp(const char* str1, const char* str2) { return _std::strcmp(str1, str2); }
 
 int strncmp(const char* str1, const char* str2, size_t n) { return _std::strncmp(str1, str2, n); }
 

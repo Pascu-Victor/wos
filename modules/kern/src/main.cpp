@@ -18,6 +18,8 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
+#include <vfs/fs/devfs.hpp>
+#include <vfs/initramfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
@@ -122,6 +124,29 @@ extern "C" void _start(void) {
 
     // Init VFS
     ker::vfs::init();
+
+    // Populate /dev/disk/by-partuuid/ symlinks from GPT partitions
+    ker::vfs::devfs::devfs_populate_partition_symlinks();
+
+    // Unpack CPIO initramfs from Limine modules into tmpfs root
+    if (kernelModuleRequest.response != nullptr) {
+        for (size_t i = 0; i < kernelModuleRequest.response->module_count; i++) {
+            auto* mod_data = static_cast<uint8_t*>(
+                kernelModuleRequest.response->modules[i]->address);
+            size_t mod_size = kernelModuleRequest.response->modules[i]->size;
+            // Check for CPIO newc magic "070701"
+            if (mod_size >= 6 &&
+                mod_data[0] == '0' && mod_data[1] == '7' &&
+                mod_data[2] == '0' && mod_data[3] == '7' &&
+                mod_data[4] == '0' && mod_data[5] == '1') {
+                dbg::log("Found CPIO initramfs module at index %u (%u bytes)",
+                         static_cast<unsigned>(i),
+                         static_cast<unsigned>(mod_size));
+                ker::vfs::initramfs::unpack_initramfs(mod_data, mod_size);
+            }
+        }
+    }
+
     ker::mod::sched::init();
 
     boot::HandoverModules modules;

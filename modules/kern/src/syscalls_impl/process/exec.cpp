@@ -67,7 +67,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
     int fd = vfs::vfs_open(str, 0, 0);
     if (fd < 0) {
-        dbg::log("wos_proc_exec: Failed to open file");
+        dbg::log("wos_proc_exec: Failed to open file '%.*s'", (int)str.size(), str.data());
         return 0;
     }
 

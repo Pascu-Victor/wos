@@ -11,6 +11,8 @@
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::vfs::fat32 {
 
 // Forward declarations for helpers defined later in this translation unit.
@@ -368,25 +370,13 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 
     if (ctx == nullptr) {
         fat32_log("fat32_open_path: mount context is null\n");
+        ker::mod::dbg::log("fat32_open_path: mount context is null");
         return nullptr;
     }
 
-    // Skip mount point prefix (e.g., "/mnt/disk/")
+    // The path is now filesystem-relative (mount point prefix already stripped by VFS layer)
+    // Empty path means opening the root directory
     const char* filename = path;
-    if (filename[0] == '/') {
-        filename++;
-        // Skip "mnt/"
-        if (filename[0] == 'm' && filename[1] == 'n' && filename[2] == 't' && filename[3] == '/') {
-            filename += 4;
-        }
-        // Skip "disk/" or similar
-        while (*filename && *filename != '/') {
-            filename++;
-        }
-        if (*filename == '/') {
-            filename++;
-        }
-    }
 
     fat32_log("fat32_open_path: searching for '");
     fat32_log(filename);
@@ -1221,13 +1211,14 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
 // Static storage for FAT32 FileOperations
 namespace {
 ker::vfs::FileOperations fat32_fops_instance = {
-    .vfs_open = nullptr,          // vfs_open
-    .vfs_close = fat32_close,     // vfs_close
-    .vfs_read = fat32_read,       // vfs_read
-    .vfs_write = fat32_write,     // vfs_write
-    .vfs_lseek = fat32_lseek,     // vfs_lseek
-    .vfs_isatty = fat32_isatty,   // vfs_isatty
-    .vfs_readdir = fat32_readdir  // vfs_readdir
+    .vfs_open = nullptr,           // vfs_open
+    .vfs_close = fat32_close,      // vfs_close
+    .vfs_read = fat32_read,        // vfs_read
+    .vfs_write = fat32_write,      // vfs_write
+    .vfs_lseek = fat32_lseek,      // vfs_lseek
+    .vfs_isatty = fat32_isatty,    // vfs_isatty
+    .vfs_readdir = fat32_readdir,  // vfs_readdir
+    .vfs_readlink = nullptr        // FAT32 doesn't support symlinks
 };
 }
 

@@ -81,6 +81,32 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             return static_cast<int64_t>(ret);
         }
+        case ops::mount: {
+            const auto* source = reinterpret_cast<const char*>(a1);
+            const auto* target = reinterpret_cast<const char*>(a2);
+            const auto* fstype = reinterpret_cast<const char*>(a3);
+            int ret = ker::vfs::vfs_mount(source, target, fstype);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::mkdir: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            int mode = static_cast<int>(a2);
+            int ret = ker::vfs::vfs_mkdir(path, mode);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::readlink: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            auto* buf = reinterpret_cast<char*>(a2);
+            auto bufsize = static_cast<size_t>(a3);
+            ssize_t ret = ker::vfs::vfs_readlink(path, buf, bufsize);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::symlink: {
+            const auto* target = reinterpret_cast<const char*>(a1);
+            const auto* linkpath = reinterpret_cast<const char*>(a2);
+            int ret = ker::vfs::vfs_symlink(target, linkpath);
+            return static_cast<int64_t>(ret);
+        }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");
             return static_cast<int64_t>(ENOSYS);

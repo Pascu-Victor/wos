@@ -1,11 +1,11 @@
 #include "block_device.hpp"
 
 #include <cstddef>
+#include <cstring>
+#include <dev/gpt.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
-#include <vfs/mount.hpp>
-#include <vfs/vfs.hpp>
 
 #include "device.hpp"
 
@@ -134,34 +134,150 @@ auto block_flush(BlockDevice* bdev) -> int {
     return bdev->flush(bdev);
 }
 
-// Initializes block devices and mounts FAT32 filesystems
+auto block_device_count() -> size_t { return device_count; }
+
+auto block_device_at(size_t index) -> BlockDevice* {
+    if (index >= device_count) {
+        return nullptr;
+    }
+    return block_devices[index];
+}
+
+auto block_device_find_by_partuuid(const char* uuid_str) -> BlockDevice* {
+    if (uuid_str == nullptr) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < device_count; i++) {
+        if (block_devices[i] != nullptr && block_devices[i]->is_partition) {
+            // Compare PARTUUID strings
+            bool match = true;
+            for (size_t j = 0; j < PARTUUID_STRING_SIZE - 1; ++j) {
+                if (block_devices[i]->partuuid_str[j] != uuid_str[j]) {
+                    match = false;
+                    break;
+                }
+                if (uuid_str[j] == '\0') {
+                    break;
+                }
+            }
+            if (match && uuid_str[PARTUUID_STRING_SIZE - 1] == '\0') {
+                return block_devices[i];
+            }
+        }
+    }
+    return nullptr;
+}
+
+namespace {
+// Read function for partition block devices: offsets LBA by partition start
+auto partition_read(BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
+    if (dev == nullptr || dev->parent_disk == nullptr) {
+        return -1;
+    }
+    return block_read(dev->parent_disk, dev->partition_start_lba + block, count, buffer);
+}
+
+// Write function for partition block devices: offsets LBA by partition start
+auto partition_write(BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
+    if (dev == nullptr || dev->parent_disk == nullptr) {
+        return -1;
+    }
+    return block_write(dev->parent_disk, dev->partition_start_lba + block, count, buffer);
+}
+
+auto partition_flush(BlockDevice* dev) -> int {
+    if (dev == nullptr || dev->parent_disk == nullptr) {
+        return -1;
+    }
+    return block_flush(dev->parent_disk);
+}
+
+}  // namespace
+
+auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba,
+                                   const uint8_t* partuuid, uint32_t partition_index) -> BlockDevice* {
+    if (parent_disk == nullptr || partuuid == nullptr) {
+        return nullptr;
+    }
+
+    auto* part = new BlockDevice;
+    part->major = parent_disk->major;
+    part->minor = static_cast<unsigned>(partition_index + 1);
+
+    // Build name: e.g. "sda" + "1" -> "sda1"
+    // Find end of parent name
+    size_t parent_name_len = 0;
+    while (parent_name_len < BLOCK_NAME_SIZE - 1 && parent_disk->name[parent_name_len] != '\0') {
+        parent_name_len++;
+    }
+    // Copy parent name
+    for (size_t i = 0; i < parent_name_len; ++i) {
+        part->name[i] = parent_disk->name[i];
+    }
+    // Append 1-based partition number (simple: single digit for index < 9, two digits otherwise)
+    uint32_t part_num = partition_index + 1;
+    if (part_num < 10) {
+        part->name[parent_name_len] = static_cast<char>('0' + part_num);
+        part->name[parent_name_len + 1] = '\0';
+    } else {
+        part->name[parent_name_len] = static_cast<char>('0' + (part_num / 10));
+        part->name[parent_name_len + 1] = static_cast<char>('0' + (part_num % 10));
+        part->name[parent_name_len + 2] = '\0';
+    }
+
+    part->block_size = parent_disk->block_size;
+    part->total_blocks = end_lba - start_lba + 1;
+    part->read_blocks = partition_read;
+    part->write_blocks = partition_write;
+    part->flush = partition_flush;
+    part->private_data = nullptr;
+
+    part->is_partition = true;
+    for (size_t i = 0; i < 16; ++i) {
+        part->partuuid[i] = partuuid[i];
+    }
+    gpt::guid_to_string(partuuid, part->partuuid_str.data());
+    part->parent_disk = parent_disk;
+    part->partition_start_lba = start_lba;
+    part->partition_end_lba = end_lba;
+
+    block_device_register(part);
+
+    ker::mod::dbg::log("Created partition %s PARTUUID=%s", part->name.data(), part->partuuid_str.data());
+
+    return part;
+}
+
+// Initializes block devices and enumerates GPT partitions on all registered disks
 auto block_device_init() -> void {
     ker::mod::dbg::log("Initializing block devices");
 
-    // Mount FAT32 if block device is available for now just sdb
-    // TODO: implement some type of fstab
-    BlockDevice* sda = block_device_find_by_name("sda");
-    if (sda != nullptr) {
-        ker::mod::dbg::log("Found sda, attempting FAT32 mount at /boot");
-        int mount_result = ker::vfs::mount_filesystem("/boot", "fat32", sda);
-        if (mount_result == 0) {
-            ker::mod::dbg::log("FAT32 mount successful!");
-        } else {
-            ker::mod::dbg::log("FAT32 mount failed with error: %d", mount_result);
+    // Enumerate GPT partitions on all registered whole-disk block devices
+    // We snapshot the current count since enumeration will register new partition devices
+    size_t disk_count = device_count;
+    for (size_t i = 0; i < disk_count; ++i) {
+        BlockDevice* disk = block_devices[i];
+        if (disk == nullptr || disk->is_partition) {
+            continue;
+        }
+
+        gpt::GPTDiskInfo disk_info{};
+        if (gpt::gpt_enumerate_partitions(disk, &disk_info) != 0) {
+            ker::mod::dbg::log("No GPT found on %s", disk->name.data());
+            continue;
+        }
+
+        ker::mod::dbg::log("GPT: %s has %d partitions", disk->name.data(), disk_info.partition_count);
+
+        for (uint32_t p = 0; p < disk_info.partition_count; ++p) {
+            auto& part = disk_info.partitions[p];
+            block_device_create_partition(disk, part.starting_lba, part.ending_lba,
+                                          part.unique_partition_guid.data(), p);
         }
     }
-    BlockDevice* sdb = block_device_find_by_name("sdb");
-    if (sdb != nullptr) {
-        ker::mod::dbg::log("Found sdb, attempting FAT32 mount at /mnt/disk");
-        int mount_result = ker::vfs::mount_filesystem("/mnt/disk", "fat32", sdb);
-        if (mount_result == 0) {
-            ker::mod::dbg::log("FAT32 mount successful!");
-        } else {
-            ker::mod::dbg::log("FAT32 mount failed with error: %d", mount_result);
-        }
-    } else {
-        ker::mod::dbg::log("No block devices found (sdb not available)");
-    }
+
+    ker::mod::dbg::log("Block device init complete: %u devices registered",
+                        static_cast<unsigned>(device_count));
 }
 
 }  // namespace ker::dev

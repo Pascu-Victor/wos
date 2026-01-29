@@ -159,38 +159,7 @@ void logVa(const char* format, va_list& args) {
     // 4k should be enough for everyone
     char buf[4096];
 
-    // Defensive: avoid dereferencing potentially-invalid %s pointers from varargs.
-    // Replace simple "%s" specifiers with "%p" so vsnprintf prints the pointer
-    // value instead of calling strlen() on an invalid address.
-    char safe_fmt[1024];
-    size_t si = 0;
-    for (size_t i = 0; format[i] != '\0' && si + 2 < sizeof(safe_fmt); ++i) {
-        if (format[i] == '%') {
-            // Copy the '%' first
-            safe_fmt[si++] = '%';
-            char next = format[i + 1];
-            if (next == '%') {
-                // literal %% -> copy one % and advance past second
-                ++i;
-                safe_fmt[si - 1] = '%';
-            } else if (next == 's') {
-                // replace %s with %p
-                safe_fmt[si++] = 'p';
-                ++i;  // skip 's'
-            } else {
-                // copy next char as-is (handles %d, %x, %u etc.)
-                if (next != '\0') {
-                    safe_fmt[si++] = next;
-                    ++i;
-                }
-            }
-        } else {
-            safe_fmt[si++] = format[i];
-        }
-    }
-    safe_fmt[si] = '\0';
-
-    std::vsnprintf(buf, sizeof(buf), safe_fmt, args);
+    std::vsnprintf(buf, sizeof(buf), format, args);
     logString(buf);
 }
 

@@ -11,6 +11,8 @@ struct BlockDevice;
 
 namespace ker::vfs {
 
+constexpr size_t MAX_MOUNTS = 32;
+
 // Mount point structure
 struct MountPoint {
     const char* path;               // Mount path (e.g., "/mnt/disk0")

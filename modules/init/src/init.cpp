@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <print>
 #include <span>
@@ -17,87 +18,249 @@
 
 namespace {
 constexpr size_t buffer_size = 64;
-const char* const text = "hello-vfs";
+constexpr int NUM_SUB_INITS = 20;
+constexpr size_t FSTAB_BUF_SIZE = 4096;
+constexpr size_t FIELD_MAX = 256;
+
+// Simple atoi implementation
+int simple_atoi(const char* str) {
+    int result = 0;
+    while (*str >= '0' && *str <= '9') {
+        result = result * 10 + (*str - '0');
+        str++;
+    }
+    return result;
+}
+
+// Simple itoa for small numbers (0-99)
+void int_to_str(int val, char* buf) {
+    if (val == 0) {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return;
+    }
+    int i = 0;
+    char tmp[16];
+    while (val > 0) {
+        tmp[i++] = '0' + (val % 10);
+        val /= 10;
+    }
+    int j = 0;
+    while (i > 0) {
+        buf[j++] = tmp[--i];
+    }
+    buf[j] = '\0';
+}
+
 }  // namespace
 
-auto main() -> int {
+auto main(int argc, char** argv) -> int {
     int cpuno = ker::multiproc::currentThreadId();
 
-    // Test: Basic tmpfs operations
-    std::println("init[{}]: TEST: TMPFS Basic Operations", cpuno);
+    // Determine our role based on argc:
+    // argc == 1: We are the root init - spawn sub-inits
+    // argc >= 3: We are a sub-init - argv[1] = count, argv[2] = program to spawn
 
-    const char* const path = "/test";
-    int fd = ker::abi::vfs::open(path, 0, 0);
-    if (fd < 0) {
-        std::println("init[{}]: open failed", cpuno);
-    } else {
-        ker::abi::vfs::write(fd, text, strlen(text));
-        std::println("init[{}]: wrote to /test", cpuno);
-        ker::abi::vfs::close(fd);
-        std::println("init[{}]: closed fd for /test", cpuno);
-        fd = ker::abi::vfs::open(path, 0, 0);
-        std::println("init[{}]: re-opened /test", cpuno);
-        std::array<char, buffer_size> buf = {0};
-        ker::abi::vfs::read(fd, buf.data(), sizeof(buf) - 1);
-        std::println("init[{}]: read buffer", cpuno);
-        std::println("init[{}]: buffer was: '{}'", cpuno, buf.data());
-        ker::abi::vfs::close(fd);
+    if (argc >= 3) {
+        // === SUB-INIT MODE ===
+        // argv[0] = our path
+        // argv[1] = number of programs to spawn
+        // argv[2] = program path to spawn
+        int spawn_count = simple_atoi(argv[1]);
+        const char* prog_path = argv[2];
+
+        std::println("sub-init[{}]: Starting - will spawn {} instances of '{}'", cpuno, spawn_count, prog_path);
+
+        for (int i = 0; i < spawn_count; i++) {
+            std::array<const char*, 4> child_argv = {prog_path, "child-arg1", "child-arg2", nullptr};
+            std::array<const char*, 1> child_envp = {nullptr};
+
+            uint64_t child_pid = ker::process::exec(prog_path, child_argv.data(), child_envp.data());
+            if (child_pid == 0) {
+                std::println("sub-init[{}]: Failed to exec '{}' (instance {})", cpuno, prog_path, i);
+            } else {
+                std::println("sub-init[{}]: Spawned '{}' as PID {} (instance {}/{})", cpuno, prog_path, child_pid, i + 1, spawn_count);
+                int exit_code = 0;
+                ker::process::waitpid((int64_t)child_pid, &exit_code, 0);
+                std::println("sub-init[{}]: Child PID {} exited with code {}", cpuno, child_pid, exit_code);
+            }
+        }
+
+        std::println("sub-init[{}]: All children completed, exiting", cpuno);
+        return 0;
     }
 
-    std::println("init[{}]: TMPFS test complete", cpuno);
+    // === ROOT INIT MODE ===
+    std::println("init[{}]: ROOT INIT starting", cpuno);
 
-    // Test: FAT32 Mount
-    std::println("init[{}]: TEST: FAT32 Filesystem Access", cpuno);
-    std::println("init[{}]: Attempting to open /mnt/disk/hello.txt", cpuno);
-    // kernel automatically mounts FAT32 at /mnt/disk if ATA device is found
-    // Try to open and read from the mounted filesystem
-    int fd_disk = ker::abi::vfs::open("/mnt/disk/hello.txt", 0, 0);
+    // --- Mount filesystems from /etc/fstab ---
+    {
+        int fstab_fd = ker::abi::vfs::open("/etc/fstab", 0, 0);
+        if (fstab_fd >= 0) {
+            std::array<char, FSTAB_BUF_SIZE> fstab_buf{};
+            ssize_t bytes_read = ker::abi::vfs::read(
+                fstab_fd, fstab_buf.data(), FSTAB_BUF_SIZE - 1);
+            ker::abi::vfs::close(fstab_fd);
 
-    if (fd_disk >= 0) {
-        std::println("init[{}]: Successfully opened /mnt/disk/hello.txt!", cpuno);
+            if (bytes_read > 0) {
+                fstab_buf[static_cast<size_t>(bytes_read)] = '\0';
+                std::println("init[{}]: parsing /etc/fstab ({} bytes)",
+                             cpuno, bytes_read);
 
-        constexpr size_t file_buf_size = 256;
-        std::array<char, file_buf_size> disk_buf = {0};
-        ssize_t bytes_read = ker::abi::vfs::read(fd_disk, disk_buf.data(), file_buf_size - 1);
+                // Parse line by line
+                char* line_start = fstab_buf.data();
+                while (*line_start != '\0') {
+                    // Find end of line
+                    char* line_end = line_start;
+                    while (*line_end != '\0' && *line_end != '\n') {
+                        line_end++;
+                    }
+                    char saved = *line_end;
+                    *line_end = '\0';
 
-        if (bytes_read > 0) {
-            std::println("init[{}]: FAT32 File content: '{}'", cpuno, disk_buf.data());
+                    // Skip whitespace
+                    char* p = line_start;
+                    while (*p == ' ' || *p == '\t') {
+                        p++;
+                    }
+
+                    // Skip comments and empty lines
+                    if (*p != '#' && *p != '\0') {
+                        // Extract fields: device mountpoint fstype options
+                        std::array<char, FIELD_MAX> device{};
+                        std::array<char, FIELD_MAX> mountpoint{};
+                        std::array<char, FIELD_MAX> fstype{};
+
+                        // Parse device field
+                        size_t fi = 0;
+                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
+                               fi < FIELD_MAX - 1) {
+                            device[fi++] = *p++;
+                        }
+                        device[fi] = '\0';
+
+                        // Skip whitespace
+                        while (*p == ' ' || *p == '\t') {
+                            p++;
+                        }
+
+                        // Parse mountpoint field
+                        fi = 0;
+                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
+                               fi < FIELD_MAX - 1) {
+                            mountpoint[fi++] = *p++;
+                        }
+                        mountpoint[fi] = '\0';
+
+                        // Skip whitespace
+                        while (*p == ' ' || *p == '\t') {
+                            p++;
+                        }
+
+                        // Parse fstype field
+                        fi = 0;
+                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
+                               fi < FIELD_MAX - 1) {
+                            fstype[fi++] = *p++;
+                        }
+                        fstype[fi] = '\0';
+
+                        if (device[0] != '\0' && mountpoint[0] != '\0' &&
+                            fstype[0] != '\0') {
+                            // Create mount point directory
+                            ker::abi::vfs::mkdir(mountpoint.data(), 0755);
+
+                            // Mount filesystem
+                            int ret = ker::abi::vfs::mount(
+                                device.data(), mountpoint.data(),
+                                fstype.data());
+                            if (ret == 0) {
+                                std::println(
+                                    "init[{}]: mounted {} at {} ({})",
+                                    cpuno, device.data(), mountpoint.data(),
+                                    fstype.data());
+                            } else {
+                                std::println(
+                                    "init[{}]: FAILED to mount {} at {} "
+                                    "({}): error {}",
+                                    cpuno, device.data(), mountpoint.data(),
+                                    fstype.data(), ret);
+                            }
+                        }
+                    }
+
+                    // Advance to next line
+                    if (saved == '\0') {
+                        break;
+                    }
+                    line_start = line_end + 1;
+                }
+            } else {
+                std::println("init[{}]: /etc/fstab is empty", cpuno);
+            }
         } else {
-            std::println("init[{}]: Failed to read from file", cpuno);
+            std::println("init[{}]: no /etc/fstab found, skipping mounts",
+                         cpuno);
         }
-
-        // attempt to write to the file
-        const char* write_text = "\nAppended by init process.";
-        ssize_t bytes_written = ker::abi::vfs::write(fd_disk, write_text, strlen(write_text));
-        if (bytes_written > 0) {
-            std::println("init[{}]: Successfully wrote to /mnt/disk/hello.txt", cpuno);
-        } else {
-            std::println("init[{}]: Failed to write to file (expected if filesystem is read-only)", cpuno);
-        }
-        ker::abi::vfs::close(fd_disk);
-    } else {
-        std::println("init[{}]: Failed to open /mnt/disk/hello.txt (device not mounted or file missing)", cpuno);
     }
 
-    // Test: Process execution
-    std::println("init[{}]: TEST: Process Execution", cpuno);
-    std::println("init[{}]: Testing process exec", cpuno);
-    while (true) {
-        const char* progPath = "/mnt/disk/testprog";
-        std::array<const char*, 4> argv = {"/mnt/disk/testprog", "arg1", "arg2", nullptr};
-        std::array<const char*, 1> envp = {nullptr};
+    // --- Spawn sub-init processes ---
+    std::println("init[{}]: Will spawn {} sub-init processes", cpuno, NUM_SUB_INITS);
 
-        // std::println("init[{}]: Calling exec", cpuno);
+    // Configuration for each sub-init: (spawn_count, program_path)
+    struct SubInitConfig {
+        int spawn_count;
+        const char* program;
+    };
 
-        uint64_t child_pid = ker::process::exec(progPath, argv.data(), envp.data());
-        if (child_pid == 0) {
-            std::println("init[{}]: exec failed (this is expected if testprog not in VFS)", cpuno);
+    std::array<SubInitConfig, NUM_SUB_INITS> configs = {{
+        {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
+        {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
+        {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"},
+        {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
+        {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
+    }};
+
+    // Spawn sub-inits
+    std::array<uint64_t, NUM_SUB_INITS> sub_init_pids = {0};
+
+    for (int i = 0; i < NUM_SUB_INITS; i++) {
+        char count_str[16];
+        int_to_str(configs[i].spawn_count, count_str);
+
+        // argv: [init_path, spawn_count, program_path, nullptr]
+        std::array<const char*, 4> sub_argv = {"/sbin/init",        // argv[0]: our own path
+                                               count_str,           // argv[1]: number of programs to spawn
+                                               configs[i].program,  // argv[2]: program to spawn
+                                               nullptr};
+        std::array<const char*, 1> sub_envp = {nullptr};
+
+        uint64_t pid = ker::process::exec("/sbin/init", sub_argv.data(), sub_envp.data());
+        if (pid == 0) {
+            std::println("init[{}]: Failed to spawn sub-init {}", cpuno, i);
         } else {
-            int child_exit_code = 0;
-            std::println("waitpid: Waiting for child process {}", child_pid);
-            ker::process::waitpid((int64_t)child_pid, &child_exit_code, 0);
-            std::println("init[{}]: Child process {} exited with code {}", cpuno, child_pid, child_exit_code);
+            sub_init_pids[i] = pid;
+            std::println("init[{}]: Spawned sub-init {} as PID {} (will spawn {} x '{}')", cpuno, i, pid, configs[i].spawn_count,
+                         configs[i].program);
         }
+    }
+
+    // Wait for all sub-inits to complete
+    std::println("init[{}]: Waiting for all sub-inits to complete...", cpuno);
+    for (int i = 0; i < NUM_SUB_INITS; i++) {
+        if (sub_init_pids[i] != 0) {
+            int exit_code = 0;
+            ker::process::waitpid((int64_t)sub_init_pids[i], &exit_code, 0);
+            std::println("init[{}]: Sub-init {} (PID {}) exited with code {}", cpuno, i, sub_init_pids[i], exit_code);
+        }
+    }
+
+    std::println("init[{}]: All sub-inits completed! Process tree demo finished.", cpuno);
+    std::println("init[{}]: Total processes spawned: {} sub-inits + {} leaf programs", cpuno, NUM_SUB_INITS, 2 + 3 + 1 + 2 + 1);
+
+    // Keep init alive
+    for (;;) {
+        asm volatile("pause");
     }
 
     return 0;

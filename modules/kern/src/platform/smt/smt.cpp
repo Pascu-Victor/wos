@@ -19,6 +19,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sys/syscall.hpp"
 #include "vfs/fs/devfs.hpp"
+#include "vfs/fs/tmpfs.hpp"
 
 __attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
     .id = LIMINE_SMP_REQUEST,
@@ -130,6 +131,21 @@ void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
 // Create init task(s) from handover modules WITHOUT starting scheduler
 // This is called early to ensure init gets PID 1
 void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
+    // Try loading /sbin/init from tmpfs (unpacked from CPIO initramfs)
+    auto* init_node = ker::vfs::tmpfs::tmpfs_walk_path("sbin/init", false);
+    if (init_node != nullptr &&
+        init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE &&
+        init_node->data != nullptr) {
+        dbg::log("Loading init from tmpfs (/sbin/init, %u bytes)",
+                 static_cast<unsigned>(init_node->size));
+        // Override modules with the tmpfs init binary
+        modStruct.count = 1;
+        modStruct.modules[0].name = "/sbin/init";
+        modStruct.modules[0].entry = init_node->data;
+        modStruct.modules[0].size = init_node->size;
+        modStruct.modules[0].cmdline = "/sbin/init";
+    }
+
     for (uint64_t i = 0; i < modStruct.count; i++) {
         const auto& module = modStruct.modules[i];
         auto* newTask = new sched::task::Task(module.name, (uint64_t)module.entry, kernelRsp, sched::task::TaskType::PROCESS);

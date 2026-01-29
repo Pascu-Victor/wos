@@ -10,6 +10,10 @@ enum class ops : uint64_t {
     lseek,
     isatty,
     read_dir_entries,
+    mount,
+    mkdir,
+    readlink,
+    symlink,
 };
 
 }  // namespace ker::abi::vfs

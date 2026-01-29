@@ -14,8 +14,6 @@
 #include <print>
 
 auto main(int argc, char** argv, char** envp) -> int {
-    int a = *((int*)0x10 - 0x10);
-    (void)a;
     int pid = ker::process::getpid();
     (void)envp;
     (void)argv;
@@ -49,7 +47,7 @@ auto main(int argc, char** argv, char** envp) -> int {
     // std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
     DIR* dirp = opendir(rootDir);
     if (dirp == nullptr) {
-        std::println("testprog[t:{},p:{}]: Failed to open directory", tid, pid);
+        std::println("testprog[t:{},p:{}]: Failed to open directory. {}", tid, pid, rootDir);
     } else {
         // std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
         // std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, rootDir);
@@ -64,7 +62,7 @@ auto main(int argc, char** argv, char** envp) -> int {
     // std::println("testprog[t:{},p:{}]: Attempting to open directory", tid, pid);
     DIR* bootdirp = opendir(bootdir);
     if (bootdirp == nullptr) {
-        std::println("testprog[t:{},p:{}]: Failed to open directory", tid, pid);
+        std::println("testprog[t:{},p:{}]: Failed to open directory. {}", tid, pid, bootdir);
     } else {
         // std::println("testprog[t:{},p:{}]: Successfully opened directory", tid, pid);
         // std::println("testprog[t:{},p:{}]: files in {}:", tid, pid, bootdir);
@@ -83,7 +81,7 @@ auto main(int argc, char** argv, char** envp) -> int {
     auto mmap_result = reinterpret_cast<int64_t>(mmap(addr, size, prot, flags, -1, 0));
     if (mmap_result < 0) {
         std::println("testprog[t:{},p:{}]: mmap failed with error code {}", tid, pid, mmap_result);
-        return 1;
+        return 3;
     }
     // std::println("testprog[t:{},p:{}]: mmap succeeded at address {}", tid, pid, addr);
 
@@ -104,5 +102,5 @@ auto main(int argc, char** argv, char** envp) -> int {
     }
     // std::println("testprog[t:{},p:{}]: Completed {} mallocs of size {} bytes", tid, pid, num_allocs, alloc_size);
 
-    return tid;
+    return pid;
 }
