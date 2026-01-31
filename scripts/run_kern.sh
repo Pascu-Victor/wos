@@ -29,6 +29,29 @@ do
     fi
 done
 
+# Network configuration
+# Set WOS_NET=user for QEMU user-mode networking (built-in DHCP server at 10.0.2.2)
+# Default: TAP device wos-tap0 attached to bridge wos-br0 (requires host DHCP server)
+if [ "$WOS_NET" = "user" ]; then
+  NET_ARGS="-netdev user,id=net0"
+  NET_ARGS="$NET_ARGS -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"
+  echo "Using QEMU user-mode networking (DHCP: 10.0.2.2, IP: 10.0.2.15)"
+else
+  # Setup: sudo ip tuntap add dev wos-tap0 mode tap user $USER
+  #        sudo ip link set wos-tap0 master wos-br0
+  #        sudo ip link set wos-tap0 up
+  NET_ARGS="-netdev tap,id=net0,ifname=wos-tap0,script=no,downscript=no"
+  NET_ARGS="$NET_ARGS -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"
+  echo "Using TAP networking via wos-tap0 (set WOS_NET=user for built-in DHCP)"
+fi
+# NET_ARGS="$NET_ARGS -netdev user,id=net1,hostfwd=tcp::8081-:81"
+# NET_ARGS="$NET_ARGS -device e1000e,netdev=net1,mac=52:54:00:12:34:57"
+# NET_ARGS="$NET_ARGS -device qemu-xhci,id=xhci"
+# NET_ARGS="$NET_ARGS -netdev user,id=net2"
+# NET_ARGS="$NET_ARGS -device usb-net,netdev=net2,bus=xhci.0"
+# Optional ivshmem for inter-VM DMA networking (requires two QEMU instances sharing /dev/shm/wos-ivshmem):
+# NET_ARGS="$NET_ARGS -object memory-backend-file,size=16M,share=on,mem-path=/dev/shm/wos-ivshmem,id=hmem -device ivshmem-plain,memdev=hmem"
+
 echo "STARTING BOOT:"
 
 qemu-system-x86_64 -M q35 -cpu max -m 8G \
@@ -37,4 +60,5 @@ qemu-system-x86_64 -M q35 -cpu max -m 8G \
   -device ide-hd,drive=drive0,bus=ahci.0 \
   -drive file=test_fat32.qcow2,if=none,id=drive1,format=qcow2 \
   -device ide-hd,drive=drive1,bus=ahci.1 \
+  $NET_ARGS \
   -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 2

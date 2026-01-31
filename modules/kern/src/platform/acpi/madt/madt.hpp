@@ -82,4 +82,5 @@ struct ApicInfo {
 } __attribute__((packed));
 
 ApicInfo parseMadt(void* madt);
+auto getApicInfo() -> const ApicInfo&;
 }  // namespace ker::mod::acpi::madt

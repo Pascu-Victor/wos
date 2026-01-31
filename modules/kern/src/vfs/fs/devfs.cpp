@@ -4,6 +4,8 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
+#include <net/netdevice.hpp>
+#include <net/netif.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -550,6 +552,158 @@ void devfs_init() {
     vfs_debug_log("devfs: initialized with ");
     vfs_debug_log_hex(root_node.children_count);
     vfs_debug_log(" device nodes\n");
+}
+
+void devfs_populate_net_nodes() {
+    // Create /dev/net/ directory
+    walk_path("net", true);
+    auto* net_dir = walk_path("net");
+    if (net_dir == nullptr) {
+        return;
+    }
+
+    size_t count = ker::net::netdev_count();
+    for (size_t i = 0; i < count; i++) {
+        auto* netdev = ker::net::netdev_at(i);
+        if (netdev == nullptr) {
+            continue;
+        }
+
+        // Skip if node already exists
+        if (find_child(net_dir, netdev->name) != nullptr) {
+            continue;
+        }
+
+        // Create device node (not a real char device, just stores netdev pointer)
+        auto* node = create_node(netdev->name, DevFSNodeType::DEVICE);
+        if (node == nullptr) {
+            continue;
+        }
+
+        // Allocate a Device struct to hold the netdev pointer
+        auto* dev = static_cast<ker::dev::Device*>(
+            ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::dev::Device)));
+        if (dev == nullptr) {
+            continue;
+        }
+
+        // Net stats read handler
+        static ker::dev::CharDeviceOps net_stats_ops = {
+            .open = nullptr,
+            .close = nullptr,
+            .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
+                if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
+                    return -EINVAL;
+                }
+                auto* df = static_cast<DevFSFile*>(f->private_data);
+                if (df->device == nullptr || df->device->private_data == nullptr) {
+                    return -EINVAL;
+                }
+                auto* nd = static_cast<ker::net::NetDevice*>(df->device->private_data);
+
+                // Format stats into a temporary buffer
+                char stats[512];
+                size_t pos = 0;
+
+                // Helper to append string
+                auto append_str = [&](const char* s) {
+                    while (*s != '\0' && pos < sizeof(stats) - 1) {
+                        stats[pos++] = *s++;
+                    }
+                };
+                // Helper to append uint64 as decimal
+                auto append_u64 = [&](uint64_t val) {
+                    if (val == 0) {
+                        if (pos < sizeof(stats) - 1) stats[pos++] = '0';
+                        return;
+                    }
+                    char tmp[21];
+                    int ti = 0;
+                    while (val > 0) {
+                        tmp[ti++] = '0' + static_cast<char>(val % 10);
+                        val /= 10;
+                    }
+                    for (int j = ti - 1; j >= 0 && pos < sizeof(stats) - 1; j--) {
+                        stats[pos++] = tmp[j];
+                    }
+                };
+                // Helper to append hex byte
+                auto append_hex_byte = [&](uint8_t b) {
+                    const char hex[] = "0123456789abcdef";
+                    if (pos < sizeof(stats) - 2) {
+                        stats[pos++] = hex[b >> 4];
+                        stats[pos++] = hex[b & 0xF];
+                    }
+                };
+
+                append_str("name: ");
+                append_str(nd->name);
+                append_str("\nstate: ");
+                append_str(nd->state != 0 ? "up" : "down");
+                append_str("\nmac: ");
+                for (int m = 0; m < 6; m++) {
+                    if (m > 0) append_str(":");
+                    append_hex_byte(nd->mac[m]);
+                }
+                append_str("\nmtu: ");
+                append_u64(nd->mtu);
+
+                // Show IPv4 addresses if configured
+                auto* nif = ker::net::netif_get(nd);
+                if (nif != nullptr && nif->ipv4_addr_count > 0) {
+                    append_str("\nipv4: ");
+                    uint32_t addr = nif->ipv4_addrs[0].addr;
+                    append_u64((addr >> 24) & 0xFF); append_str(".");
+                    append_u64((addr >> 16) & 0xFF); append_str(".");
+                    append_u64((addr >> 8) & 0xFF); append_str(".");
+                    append_u64(addr & 0xFF);
+                    append_str("/");
+                    // Count prefix length from netmask
+                    uint32_t mask = nif->ipv4_addrs[0].netmask;
+                    int prefix = 0;
+                    for (int b = 31; b >= 0; b--) {
+                        if ((mask >> b) & 1) prefix++;
+                        else break;
+                    }
+                    append_u64(static_cast<uint64_t>(prefix));
+                }
+
+                append_str("\nrx_packets: "); append_u64(nd->rx_packets);
+                append_str("\ntx_packets: "); append_u64(nd->tx_packets);
+                append_str("\nrx_bytes: "); append_u64(nd->rx_bytes);
+                append_str("\ntx_bytes: "); append_u64(nd->tx_bytes);
+                append_str("\n");
+                stats[pos] = '\0';
+
+                // Apply file position offset
+                auto offset = static_cast<size_t>(f->pos);
+                if (offset >= pos) {
+                    return 0;  // EOF
+                }
+                size_t available = pos - offset;
+                size_t to_copy = (count < available) ? count : available;
+                std::memcpy(buf, stats + offset, to_copy);
+                f->pos += static_cast<off_t>(to_copy);
+                return static_cast<ssize_t>(to_copy);
+            },
+            .write = nullptr,
+            .isatty = nullptr,
+        };
+
+        dev->major = 10;
+        dev->minor = static_cast<unsigned>(200 + i);
+        dev->name = netdev->name;
+        dev->type = ker::dev::DeviceType::CHAR;
+        dev->private_data = netdev;
+        dev->char_ops = &net_stats_ops;
+
+        node->device = dev;
+        add_child(net_dir, node);
+    }
+
+    vfs_debug_log("devfs: net nodes populated (");
+    vfs_debug_log_hex(count);
+    vfs_debug_log(" devices)\n");
 }
 
 }  // namespace ker::vfs::devfs

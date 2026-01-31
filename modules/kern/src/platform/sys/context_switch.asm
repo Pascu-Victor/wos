@@ -217,6 +217,8 @@ _wOS_deferredTaskSwitchReturn:
     ; Returning to userspace - set up data segment selectors
     ; Must do this BEFORE swapgs since we need scratch registers
     push rax
+    push r8
+    push r9
     mov ax, 0x1b        ; User data segment selector
     mov ds, ax
     mov es, ax
@@ -228,6 +230,8 @@ _wOS_deferredTaskSwitchReturn:
     mov gs, ax
     wrfsbase r8
     wrgsbase r9
+    pop r9
+    pop r8
     pop rax
     
     swapgs

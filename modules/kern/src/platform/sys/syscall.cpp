@@ -45,7 +45,7 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
         case abi::callnums::vfs:
             return ker::syscall::vfs::sys_vfs(a1, a2, a3, a4, a5);
         case abi::callnums::net:
-            return ker::syscall::net::sys_net(a1, a2, a3, a4, a5);
+            return ker::syscall::net::sys_net(a1, a2, a3, a4, a5, a6);
         case abi::callnums::vmem:
             return ker::syscall::vmem::sys_vmem(a1, a2, a3, a4, a5);
         case abi::callnums::vmem_map:

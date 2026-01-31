@@ -30,6 +30,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->hasExited = false;           // Task hasn't exited yet
     this->awaitee_on_exit_count = 0;   // Initialize awaitee counter
     this->deferredTaskSwitch = false;  // No deferred switch by default
+    this->yieldSwitch = false;
 
     // Initialize file descriptor table to null
     for (unsigned i = 0; i < FD_TABLE_SIZE; ++i) {

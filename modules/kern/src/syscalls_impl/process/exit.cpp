@@ -52,24 +52,27 @@ void wos_proc_exit(int status) {
         // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
         auto* waitingTask = ker::mod::sched::findTaskByPidSafe(waitingPid);
         if (waitingTask != nullptr) {
-            // Set the return value of waitpid (RAX = child PID that exited)
-            waitingTask->context.regs.rax = currentTask->pid;
+            // Only modify the waiting task's saved context when it's safely in waitQueue
+            // (deferredTaskSwitch is false). When deferredTaskSwitch is true, the task is
+            // still running on another CPU - writing to context.regs is a data race and the
+            // values would be overwritten by deferredTaskSwitch's context save anyway.
+            // In that case, deferredTaskSwitch() will detect hasExited==true and set rax
+            // correctly before re-scheduling the task (see scheduler.cpp deferredTaskSwitch).
+            if (!waitingTask->deferredTaskSwitch) {
+                waitingTask->context.regs.rax = currentTask->pid;
 
-            // CRITICAL: Clear the deferred task switch flag so the task doesn't
-            // immediately get moved back to wait queue on its next syscall
-            waitingTask->deferredTaskSwitch = false;
-
-            // Write exit status to the status pointer if provided
-            if (waitingTask->waitStatusPhysAddr != 0) {
-                // Get kernel-accessible pointer via HHDM offset
-                auto* statusPtr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waitingTask->waitStatusPhysAddr));
-                *statusPtr = status;
+                if (waitingTask->waitStatusPhysAddr != 0) {
+                    auto* statusPtr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waitingTask->waitStatusPhysAddr));
+                    *statusPtr = status;
 #ifdef EXIT_DEBUG
-                ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", status, waitingPid);
+                    ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", status, waitingPid);
 #endif
+                }
             }
 
-            // Reschedule the waiting task on its original CPU
+            // Reschedule the waiting task on its original CPU.
+            // rescheduleTaskForCpu validates state and removes from all queues before
+            // adding, preventing double-queuing even if the task is still currentTask.
             ker::mod::sched::rescheduleTaskForCpu(waitingTask->cpu, waitingTask);
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);

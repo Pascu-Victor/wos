@@ -194,8 +194,8 @@ auto partition_flush(BlockDevice* dev) -> int {
 
 }  // namespace
 
-auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba,
-                                   const uint8_t* partuuid, uint32_t partition_index) -> BlockDevice* {
+auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba, const uint8_t* partuuid,
+                                   uint32_t partition_index) -> BlockDevice* {
     if (parent_disk == nullptr || partuuid == nullptr) {
         return nullptr;
     }
@@ -271,13 +271,11 @@ auto block_device_init() -> void {
 
         for (uint32_t p = 0; p < disk_info.partition_count; ++p) {
             auto& part = disk_info.partitions[p];
-            block_device_create_partition(disk, part.starting_lba, part.ending_lba,
-                                          part.unique_partition_guid.data(), p);
+            block_device_create_partition(disk, part.starting_lba, part.ending_lba, part.unique_partition_guid.data(), p);
         }
     }
 
-    ker::mod::dbg::log("Block device init complete: %u devices registered",
-                        static_cast<unsigned>(device_count));
+    ker::mod::dbg::log("Block device init complete: %d devices registered", static_cast<unsigned>(device_count));
 }
 
 }  // namespace ker::dev

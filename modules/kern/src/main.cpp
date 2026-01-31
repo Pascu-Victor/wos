@@ -6,9 +6,20 @@
 #include <dev/block_device.hpp>
 #include <dev/console.hpp>
 #include <dev/device.hpp>
+#include <dev/e1000e/e1000e.hpp>
+#include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/pci.hpp>
+#include <dev/usb/cdc_ether.hpp>
+#include <dev/usb/xhci.hpp>
+#include <dev/virtio/virtio_net.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/net.hpp>
+#include <net/netif.hpp>
+#include <net/proto/ipv6.hpp>
+#include <net/proto/ndp.hpp>
+#include <net/route.hpp>
+#include <platform/acpi/ioapic/ioapic.hpp>
 #include <platform/boot/handover.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
@@ -110,8 +121,14 @@ extern "C" void _start(void) {
     ker::mod::interrupt::init();
     ker::mod::sys::init();
 
+    // Init IO APIC for IRQ routing (needed by NIC drivers)
+    ker::mod::ioapic::init();
+
     // Init device subsystem
     ker::dev::dev_init();
+
+    // Enumerate all PCI devices (replaces AHCI-only scan)
+    ker::dev::pci::pci_enumerate_all();
 
     // Init console devices
     ker::dev::console::console_init();
@@ -128,20 +145,55 @@ extern "C" void _start(void) {
     // Populate /dev/disk/by-partuuid/ symlinks from GPT partitions
     ker::vfs::devfs::devfs_populate_partition_symlinks();
 
+    // Init networking stack
+    ker::net::init();
+
+    // Probe and init NIC drivers
+    ker::dev::virtio::virtio_net_init();
+    ker::dev::e1000e::e1000e_init();
+
+    // Register USB class drivers before probing controllers
+    ker::dev::usb::cdc_ether_init();
+
+    // Probe USB host controllers (will enumerate devices and match class drivers)
+    ker::dev::usb::xhci_init();
+
+    // Probe ivshmem DMA devices (for inter-VM networking)
+    ker::dev::ivshmem::ivshmem_net_init();
+
+    // Init NDP neighbor cache
+    ker::net::proto::ndp_init();
+
+    // Network interfaces are configured by userspace netd daemon via DHCP
+    // IPv6 link-local is still configured here (does not require DHCP)
+    {
+        auto* eth0 = ker::net::netdev_find_by_name("eth0");
+        if (eth0 != nullptr) {
+            uint8_t ll_addr[16];
+            ker::net::proto::ipv6_make_link_local(ll_addr, eth0->mac);
+            ker::net::netif_add_ipv6(eth0, ll_addr, 64);
+        }
+
+        auto* eth1 = ker::net::netdev_find_by_name("eth1");
+        if (eth1 != nullptr) {
+            uint8_t ll_addr[16];
+            ker::net::proto::ipv6_make_link_local(ll_addr, eth1->mac);
+            ker::net::netif_add_ipv6(eth1, ll_addr, 64);
+        }
+    }
+
+    // Populate /dev/net/ nodes for registered network interfaces
+    ker::vfs::devfs::devfs_populate_net_nodes();
+
     // Unpack CPIO initramfs from Limine modules into tmpfs root
     if (kernelModuleRequest.response != nullptr) {
         for (size_t i = 0; i < kernelModuleRequest.response->module_count; i++) {
-            auto* mod_data = static_cast<uint8_t*>(
-                kernelModuleRequest.response->modules[i]->address);
+            auto* mod_data = static_cast<uint8_t*>(kernelModuleRequest.response->modules[i]->address);
             size_t mod_size = kernelModuleRequest.response->modules[i]->size;
             // Check for CPIO newc magic "070701"
-            if (mod_size >= 6 &&
-                mod_data[0] == '0' && mod_data[1] == '7' &&
-                mod_data[2] == '0' && mod_data[3] == '7' &&
+            if (mod_size >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' &&
                 mod_data[4] == '0' && mod_data[5] == '1') {
-                dbg::log("Found CPIO initramfs module at index %u (%u bytes)",
-                         static_cast<unsigned>(i),
-                         static_cast<unsigned>(mod_size));
+                dbg::log("Found CPIO initramfs module at index %u (%u bytes)", static_cast<unsigned>(i), static_cast<unsigned>(mod_size));
                 ker::vfs::initramfs::unpack_initramfs(mod_data, mod_size);
             }
         }

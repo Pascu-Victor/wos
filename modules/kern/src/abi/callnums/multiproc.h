@@ -8,5 +8,6 @@ enum class threadInfoOps : uint64_t {
 };
 enum class threadControlOps : uint64_t {
     setTCB = 0x100,  // Offset to avoid overlap with threadInfoOps
+    yield = 0x101,
 };
 }  // namespace ker::abi::multiproc

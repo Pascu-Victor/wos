@@ -89,6 +89,8 @@ struct Task {
 
     // Flag indicating that this task should be moved to wait queue after syscall returns
     bool deferredTaskSwitch;
+    // When true, deferredTaskSwitch puts task in expired queue (yield) instead of wait queue (block)
+    bool yieldSwitch;
 
     // Waitpid state: when this task is waiting for another task to exit
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)

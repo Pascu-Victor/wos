@@ -1,7 +1,17 @@
+#define _DEFAULT_SOURCE 1
+
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <sys/ioctl.h>
 #include <sys/logging.h>
 #include <sys/process.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstdint>
@@ -98,14 +108,12 @@ auto main(int argc, char** argv) -> int {
         int fstab_fd = ker::abi::vfs::open("/etc/fstab", 0, 0);
         if (fstab_fd >= 0) {
             std::array<char, FSTAB_BUF_SIZE> fstab_buf{};
-            ssize_t bytes_read = ker::abi::vfs::read(
-                fstab_fd, fstab_buf.data(), FSTAB_BUF_SIZE - 1);
+            ssize_t bytes_read = ker::abi::vfs::read(fstab_fd, fstab_buf.data(), FSTAB_BUF_SIZE - 1);
             ker::abi::vfs::close(fstab_fd);
 
             if (bytes_read > 0) {
                 fstab_buf[static_cast<size_t>(bytes_read)] = '\0';
-                std::println("init[{}]: parsing /etc/fstab ({} bytes)",
-                             cpuno, bytes_read);
+                std::println("init[{}]: parsing /etc/fstab ({} bytes)", cpuno, bytes_read);
 
                 // Parse line by line
                 char* line_start = fstab_buf.data();
@@ -133,8 +141,7 @@ auto main(int argc, char** argv) -> int {
 
                         // Parse device field
                         size_t fi = 0;
-                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
-                               fi < FIELD_MAX - 1) {
+                        while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
                             device[fi++] = *p++;
                         }
                         device[fi] = '\0';
@@ -146,8 +153,7 @@ auto main(int argc, char** argv) -> int {
 
                         // Parse mountpoint field
                         fi = 0;
-                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
-                               fi < FIELD_MAX - 1) {
+                        while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
                             mountpoint[fi++] = *p++;
                         }
                         mountpoint[fi] = '\0';
@@ -159,32 +165,24 @@ auto main(int argc, char** argv) -> int {
 
                         // Parse fstype field
                         fi = 0;
-                        while (*p != '\0' && *p != ' ' && *p != '\t' &&
-                               fi < FIELD_MAX - 1) {
+                        while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
                             fstype[fi++] = *p++;
                         }
                         fstype[fi] = '\0';
 
-                        if (device[0] != '\0' && mountpoint[0] != '\0' &&
-                            fstype[0] != '\0') {
+                        if (device[0] != '\0' && mountpoint[0] != '\0' && fstype[0] != '\0') {
                             // Create mount point directory
                             ker::abi::vfs::mkdir(mountpoint.data(), 0755);
 
                             // Mount filesystem
-                            int ret = ker::abi::vfs::mount(
-                                device.data(), mountpoint.data(),
-                                fstype.data());
+                            int ret = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data());
                             if (ret == 0) {
-                                std::println(
-                                    "init[{}]: mounted {} at {} ({})",
-                                    cpuno, device.data(), mountpoint.data(),
-                                    fstype.data());
+                                std::println("init[{}]: mounted {} at {} ({})", cpuno, device.data(), mountpoint.data(), fstype.data());
                             } else {
                                 std::println(
                                     "init[{}]: FAILED to mount {} at {} "
                                     "({}): error {}",
-                                    cpuno, device.data(), mountpoint.data(),
-                                    fstype.data(), ret);
+                                    cpuno, device.data(), mountpoint.data(), fstype.data(), ret);
                             }
                         }
                     }
@@ -199,8 +197,54 @@ auto main(int argc, char** argv) -> int {
                 std::println("init[{}]: /etc/fstab is empty", cpuno);
             }
         } else {
-            std::println("init[{}]: no /etc/fstab found, skipping mounts",
-                         cpuno);
+            std::println("init[{}]: no /etc/fstab found, skipping mounts", cpuno);
+        }
+    }
+
+    // --- Spawn netd (DHCP network daemon) ---
+    {
+        std::println("init[{}]: spawning netd (DHCP daemon)", cpuno);
+        std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
+        std::array<const char*, 1> netd_envp = {nullptr};
+        uint64_t netd_pid = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
+        if (netd_pid == 0) {
+            std::println("init[{}]: FAILED to spawn netd", cpuno);
+        } else {
+            std::println("init[{}]: netd spawned as PID {}", cpuno, netd_pid);
+        }
+
+        // Poll eth0 for IP address readiness (wait for DHCP to complete)
+        int poll_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (poll_sock >= 0) {
+            struct ifreq ifr{};
+            strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+
+            constexpr long poll_timeout_secs = 10;
+            struct timespec poll_start{};
+            clock_gettime(CLOCK_MONOTONIC, &poll_start);
+            bool net_ready = false;
+            for (;;) {
+                if (ioctl(poll_sock, SIOCGIFADDR, &ifr) == 0) {
+                    auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
+                    if (addr->sin_addr.s_addr != 0) {
+                        char ip_str[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                        std::println("init[{}]: eth0 configured with IP {}", cpuno, ip_str);
+                        net_ready = true;
+                        break;
+                    }
+                }
+                struct timespec now{};
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec - poll_start.tv_sec >= poll_timeout_secs) {
+                    break;
+                }
+                sched_yield();
+            }
+            close(poll_sock);
+            if (!net_ready) {
+                std::println("init[{}]: WARNING: eth0 not configured after polling, continuing anyway", cpuno);
+            }
         }
     }
 
@@ -225,12 +269,12 @@ auto main(int argc, char** argv) -> int {
     std::array<uint64_t, NUM_SUB_INITS> sub_init_pids = {0};
 
     for (int i = 0; i < NUM_SUB_INITS; i++) {
-        char count_str[16];
-        int_to_str(configs[i].spawn_count, count_str);
+        std::array<char, 16> count_str = {};
+        int_to_str(configs[i].spawn_count, count_str.data());
 
         // argv: [init_path, spawn_count, program_path, nullptr]
         std::array<const char*, 4> sub_argv = {"/sbin/init",        // argv[0]: our own path
-                                               count_str,           // argv[1]: number of programs to spawn
+                                               count_str.data(),    // argv[1]: number of programs to spawn
                                                configs[i].program,  // argv[2]: program to spawn
                                                nullptr};
         std::array<const char*, 1> sub_envp = {nullptr};

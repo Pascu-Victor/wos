@@ -25,6 +25,15 @@ mkdir -p "$INITRAMFS_DIR/etc"
 cp "$INIT_BINARY" "$INITRAMFS_DIR/sbin/init"
 echo "  initramfs: added /sbin/init ($(du -h "$INIT_BINARY" | cut -f1))"
 
+# Copy netd binary (DHCP network daemon)
+NETD_BINARY="build/modules/netd/netd"
+if [ -f "$NETD_BINARY" ]; then
+    cp "$NETD_BINARY" "$INITRAMFS_DIR/sbin/netd"
+    echo "  initramfs: added /sbin/netd ($(du -h "$NETD_BINARY" | cut -f1))"
+else
+    echo "WARNING: netd binary not found at $NETD_BINARY, skipping"
+fi
+
 # Generate /etc/fstab from disk configuration
 if [ -f "configs/disks.conf" ]; then
     # shellcheck source=configs/disks.conf

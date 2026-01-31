@@ -416,6 +416,16 @@ void* calloc(int sz) {
     return ptr;
 }
 
+auto calloc(size_t nmemb, size_t size) -> void* {
+    size_t total = nmemb * size;
+    kmallocLock->lock();
+    void* ptr = mini_malloc(total);
+    kmallocLock->unlock();
+    if (ptr) [[likely]]
+        memset(ptr, 0, total);
+    return ptr;
+}
+
 void free(void* ptr) {
     if (ptr == nullptr) {
         return;

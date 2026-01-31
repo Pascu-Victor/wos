@@ -145,8 +145,25 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
     // If currentTask is null, we are in the idle loop.
     // We should check if there are any tasks to run.
     if (currentTask == nullptr) {
-        // Check if we have any active tasks
-        bool hasWork = runQueues->thisCpuLocked([](RunQueue* rq) -> bool { return rq->activeTasks.size() > 0; });
+        // Check for non-idle runnable tasks; if only idle in active, swap expired→active
+        bool hasWork = runQueues->thisCpuLocked([](RunQueue* rq) -> bool {
+            // Look for a non-idle task in activeTasks
+            for (auto* node = rq->activeTasks.getHead(); node != nullptr; node = node->next) {
+                if (node->data != nullptr && node->data->type != task::TaskType::IDLE) {
+                    return true;
+                }
+            }
+            // Only idle tasks in active — swap expired→active and check again
+            if (rq->expiredTasks.size() > 0) {
+                std::swap(rq->activeTasks, rq->expiredTasks);
+                for (auto* node = rq->activeTasks.getHead(); node != nullptr; node = node->next) {
+                    if (node->data != nullptr && node->data->type != task::TaskType::IDLE) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        });
 
         if (hasWork) {
             // We have work! Switch to the next task.
@@ -172,36 +189,48 @@ void processTasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& f
         // is running a syscall, causing currentTask to no longer be at the front.
         rq->activeTasks.remove(currentTask);
         rq->activeTasks.push_back(currentTask);
-        task::Task* next = rq->activeTasks.front();
 
-        // Skip idle tasks, non-ACTIVE tasks (EXITING/DEAD), and tasks not yet initialized
-        size_t taskCount = rq->activeTasks.size();
-        size_t checked = 0;
-        while (checked < taskCount) {
-            // Skip idle tasks
-            bool isIdle = (next->type == task::TaskType::IDLE);
-            // Skip tasks that are exiting or dead
-            bool isNotActive = (next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE);
-            // Skip tasks that are not fully initialized (missing thread or pagemap for user tasks)
-            bool notReady = false;
-            if (!isIdle) {
-                if (next->thread == nullptr || next->pagemap == nullptr) {
+        // Helper: scan activeTasks for a runnable non-idle task, rotating past
+        // idle/dead/not-ready tasks. Returns the best candidate (may be idle if
+        // no other tasks are available).
+        auto scanActive = [](RunQueue* rq) -> task::Task* {
+            task::Task* next = rq->activeTasks.front();
+            size_t taskCount = rq->activeTasks.size();
+            size_t checked = 0;
+            while (checked < taskCount) {
+                bool isIdle = (next->type == task::TaskType::IDLE);
+                bool isNotActive = (next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE);
+                bool notReady = false;
+                if (!isIdle) {
+                    if (next->thread == nullptr || next->pagemap == nullptr) {
 #ifdef SCHED_DEBUG
-                    dbg::log("processTasks: Skipping PID %x not ready (thread=%p pagemap=%p)", next->pid, next->thread, next->pagemap);
+                        dbg::log("processTasks: Skipping PID %x not ready (thread=%p pagemap=%p)", next->pid, next->thread, next->pagemap);
 #endif
-                    notReady = true;
+                        notReady = true;
+                    }
+                }
+
+                if ((isIdle || isNotActive || notReady) && taskCount > 1) {
+                    rq->activeTasks.pop_front();
+                    rq->activeTasks.push_back(next);
+                    next = rq->activeTasks.front();
+                    checked++;
+                } else {
+                    break;
                 }
             }
+            return next;
+        };
 
-            if ((isIdle || isNotActive || notReady) && taskCount > 1) {
-                rq->activeTasks.pop_front();
-                rq->activeTasks.push_back(next);
-                next = rq->activeTasks.front();
-                checked++;
-            } else {
-                break;
-            }
+        task::Task* next = scanActive(rq);
+
+        // If only idle/dead tasks in activeTasks but expiredTasks has runnable tasks
+        // (e.g. tasks that called sched_yield), swap them back into activeTasks.
+        if (next->type == task::TaskType::IDLE && rq->expiredTasks.size() > 0) {
+            std::swap(rq->activeTasks, rq->expiredTasks);
+            next = scanActive(rq);
         }
+
         // DON'T update currentTask here - do it after we're sure we're switching
         return next;
     });
@@ -327,10 +356,12 @@ void jumpToNextTask(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame&
         dbg::log("jumpToNextTask(lambda): CPU %d active=%d expired=%d (before remove), exitingPID=%x", cpu::currentCpu(),
                  (unsigned)rq->activeTasks.size(), (unsigned)rq->expiredTasks.size(), exitingTask ? exitingTask->pid : 0);
 #endif
-        // CRITICAL FIX: Remove the exiting task from wherever it is in the queue (not just front!)
+        // CRITICAL FIX: Remove the exiting task from ALL queues (not just front of activeTasks!)
         // This is necessary because new tasks can be posted to the queue while the task
         // is in the exit syscall, causing it to no longer be at the front.
+        // Also remove from waitQueue to prevent dangling pointers after GC frees the task.
         rq->activeTasks.remove(exitingTask);
+        rq->waitQueue.remove(exitingTask);
         rq->expiredTasks.push_back(exitingTask);
 #ifdef SCHED_DEBUG
         dbg::log("jumpToNextTask: Moved PID %x to expiredTasks (state=%d)", exitingTask ? exitingTask->pid : 0,
@@ -1052,14 +1083,31 @@ void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task) {
 #ifdef SCHED_DEBUG
     dbg::log("rescheduleTaskForCpu: Rescheduling PID %x on CPU %d", task->pid, cpuNo);
 #endif
-    // Remove from wait queue (if present) and add to active tasks list for the specified CPU
-    // The task might be on a different CPU's wait queue than the target CPU, so we need to
-    // search all CPUs' wait queues to find and remove it.
-    for (uint64_t searchCpu = 0; searchCpu < smt::getCoreCount(); ++searchCpu) {
-        runQueues->withLockVoid(searchCpu, [task](RunQueue* rq) { rq->waitQueue.remove(task); });
+    // Don't reschedule tasks that are exiting or dead
+    auto state = task->state.load(std::memory_order_acquire);
+    if (state != task::TaskState::ACTIVE) {
+#ifdef SCHED_DEBUG
+        dbg::log("rescheduleTaskForCpu: Skipping PID %x - not ACTIVE (state=%d)", task->pid, (int)state);
+#endif
+        return;
     }
 
-    // Now add to the target CPU's active tasks
+    // Remove from ALL queues on ALL CPUs to prevent double-queuing.
+    // Previously only waitQueue was cleaned, leaving stale entries in activeTasks
+    // or expiredTasks that could cause a task to be scheduled multiple times or
+    // after it had already exited and corrupted its own stack.
+    for (uint64_t searchCpu = 0; searchCpu < smt::getCoreCount(); ++searchCpu) {
+        runQueues->withLockVoid(searchCpu, [task](RunQueue* rq) {
+            rq->waitQueue.remove(task);
+            rq->activeTasks.remove(task);
+            rq->expiredTasks.remove(task);
+        });
+    }
+
+    // Add to the target CPU's active tasks.
+    // If the task is also currentTask on this CPU, this creates a same-CPU duplicate
+    // that is harmless: processTasks calls remove() (which removes ALL occurrences)
+    // then push_back(), resulting in exactly one entry.
     runQueues->withLockVoid(cpuNo, [task](RunQueue* rq) { rq->activeTasks.push_back(task); });
 #ifdef SCHED_DEBUG
     dbg::log("rescheduleTaskForCpu: Done rescheduling PID %x", task->pid);
@@ -1130,6 +1178,11 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
         return;
     }
 
+    // Enter epoch critical section - protects task pointers from being freed
+    // by GC on another CPU while we're accessing them.  Without this guard,
+    // isSafeToReclaim could return true for a task we're about to switch to.
+    EpochGuard epochGuard;
+
     auto* currentTask = getCurrentTask();
     if (currentTask == nullptr) {
         return;
@@ -1147,7 +1200,24 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
     asm volatile("movq %%gs:0x30, %0" : "=r"(returnFlags));
     asm volatile("movq %%gs:0x08, %0" : "=r"(userRsp));
 
-    // The syscall handler clobbered these, but we saved the originals at entry
+    // Save all general-purpose registers from the syscall stack.
+    // Without this, a yield/block context switch would restore stale register values
+    // when the task is rescheduled, corrupting callee-saved registers (r12-r15, rbx, rbp).
+    // Note: syscall.asm passes rsp+8 in RDI (designed for syscallHandler's by-value
+    // parameter passing where call's return-address push provides the correct alignment).
+    // The actual GPRegs block on the stack starts 8 bytes earlier at rsp+0.
+    auto* stackRegs = reinterpret_cast<cpu::GPRegs*>(reinterpret_cast<uint8_t*>(gpr_ptr) - 8);
+    currentTask->context.regs = *stackRegs;
+
+    // Fix up RAX: the GPRegs block on the stack still has the original RAX from syscall
+    // entry (i.e. the syscall number), because syscall.asm stores the return value in a
+    // separate slot at offset sizeof(GPRegs) past the GPRegs block (rsp+0x78 vs GPRegs.rax
+    // at rsp+0x70). The normal sysret path handles this with an extra `pop rax` after popq,
+    // but the deferred path must read the return value from that slot explicitly.
+    auto* returnValueSlot = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(stackRegs) + sizeof(cpu::GPRegs));
+    currentTask->context.regs.rax = *returnValueSlot;
+
+    // The syscall handler clobbered RCX and R11, but we saved the originals at entry
     currentTask->context.regs.rcx = returnRip;    // RCX had return RIP
     currentTask->context.regs.r11 = returnFlags;  // R11 had RFLAGS
 
@@ -1163,13 +1233,57 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
     currentTask->context.frame.rsp = userRsp;                // User stack pointer
     currentTask->context.frame.ss = desc::gdt::GDT_USER_DS;  // User data segment
 
-    // Remove from active tasks and add to wait queue (must be locked)
-    task::Task* nextTask = runQueues->thisCpuLocked([currentTask](RunQueue* rq) -> task::Task* {
+    // Check if this is a yield (re-schedulable) or a blocking wait
+    bool isYield = currentTask->yieldSwitch;
+    currentTask->yieldSwitch = false;
+    currentTask->deferredTaskSwitch = false;
+
+    // For blocking waits (e.g. waitpid), check if the target has already exited.
+    // This handles the race where the child exits between the syscall setting
+    // deferredTaskSwitch=true and us reaching here. Without this check, the task
+    // would enter waitQueue with nobody to wake it (rescheduleTaskForCpu already fired).
+    bool skipWaitQueue = false;
+    if (!isYield && currentTask->waitingForPid != 0) {
+        auto* target = findTaskByPid(currentTask->waitingForPid);
+        if (target != nullptr && target->hasExited) {
+            skipWaitQueue = true;
+            currentTask->context.regs.rax = target->pid;
+            if (currentTask->waitStatusPhysAddr != 0) {
+                auto* statusPtr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(currentTask->waitStatusPhysAddr));
+                *statusPtr = target->exitStatus;
+            }
+            currentTask->waitingForPid = 0;
+        }
+    }
+
+    // Remove from active tasks and add to appropriate queue (must be locked)
+    task::Task* nextTask = runQueues->thisCpuLocked([currentTask, isYield, skipWaitQueue](RunQueue* rq) -> task::Task* {
         rq->activeTasks.remove(currentTask);
-        rq->waitQueue.push_back(currentTask);
+        if (isYield || skipWaitQueue) {
+            rq->expiredTasks.push_back(currentTask);  // Yield or target already exited: immediately re-schedulable
+        } else {
+            rq->waitQueue.push_back(currentTask);  // Block: waiting on I/O
+        }
+        // Find a non-idle task in activeTasks
+        for (auto* node = rq->activeTasks.getHead(); node != nullptr; node = node->next) {
+            if (node->data != nullptr && node->data->type != task::TaskType::IDLE) {
+                rq->currentTask = node->data;
+                return node->data;
+            }
+        }
+        // Only idle tasks remain — swap expired→active and look again
+        if (rq->expiredTasks.size() > 0) {
+            std::swap(rq->activeTasks, rq->expiredTasks);
+            for (auto* node = rq->activeTasks.getHead(); node != nullptr; node = node->next) {
+                if (node->data != nullptr && node->data->type != task::TaskType::IDLE) {
+                    rq->currentTask = node->data;
+                    return node->data;
+                }
+            }
+        }
+        // No runnable tasks — return idle task if present, else nullptr
         if (rq->activeTasks.size() > 0) {
             task::Task* next = rq->activeTasks.front();
-            // Update currentTask to track which task is actually running
             rq->currentTask = next;
             return next;
         }
@@ -1178,7 +1292,7 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
     });
 
 #ifdef SCHED_DEBUG
-    dbg::log("deferredTaskSwitch: Moved PID %x to wait queue", currentTask->pid);
+    dbg::log("deferredTaskSwitch: Moved PID %x to %s", currentTask->pid, isYield ? "expired queue" : "wait queue");
 #endif
 
     // Get the next task in the active queue
@@ -1199,8 +1313,9 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
             // Arm the timer so we wake up periodically to check for new tasks
             apic::oneShotTimer(apic::calibrateTimer(10000));  // 10ms timer
 
-            // Allocate a fresh stack for the idle loop
-            uint64_t idleStack = (uint64_t)mm::phys::pageAlloc(4096) + 4096;
+            // Reuse the idle task's kernel stack instead of allocating a fresh
+            // page every time (the old pageAlloc leaked on every idle entry).
+            uint64_t idleStack = nextTask->context.syscallKernelStack;
 
             // Restore GS_BASE to kernel PerCpu before entering idle loop
             restoreKernelGsForIdle();
@@ -1242,6 +1357,31 @@ extern "C" void deferredTaskSwitch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unuse
         }
 
         mm::virt::switchPagemap(nextTask);
+
+        // Validate context before restoring — catch corruption before it causes a crash
+        // in userspace where debugging is much harder.
+        if (nextTask->context.frame.cs != desc::gdt::GDT_USER_CS) {
+            dbg::log("deferredTaskSwitch: CORRUPT cs=0x%x (expected 0x%x) PID %x",
+                     nextTask->context.frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        if (nextTask->context.frame.ss != desc::gdt::GDT_USER_DS) {
+            dbg::log("deferredTaskSwitch: CORRUPT ss=0x%x (expected 0x%x) PID %x",
+                     nextTask->context.frame.ss, desc::gdt::GDT_USER_DS, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        // RIP should be in user-space range (below 0x800000000000 for canonical low half)
+        if (nextTask->context.frame.rip >= 0x800000000000ULL) {
+            dbg::log("deferredTaskSwitch: CORRUPT rip=0x%x (kernel addr?) PID %x",
+                     nextTask->context.frame.rip, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        // RSP should be in user-space range
+        if (nextTask->context.frame.rsp >= 0x800000000000ULL) {
+            dbg::log("deferredTaskSwitch: CORRUPT rsp=0x%x (kernel addr?) PID %x",
+                     nextTask->context.frame.rsp, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
 
         // Pass pointers to the next task's saved context for restoration
         _wOS_deferredTaskSwitchReturn(&nextTask->context.regs, &nextTask->context.frame);

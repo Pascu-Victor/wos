@@ -16,6 +16,17 @@
 namespace ker::mod::gates {
 namespace {
 interruptHandler_t interruptHandlers[256] = {nullptr};
+
+// Context-based IRQ handlers (parallel array)
+struct IrqContext {
+    irq_handler_fn handler = nullptr;
+    void* data = nullptr;
+    const char* name = nullptr;
+};
+IrqContext irq_contexts[256] = {};
+
+// Next vector to try for allocation (48+ to avoid legacy ISA range)
+uint8_t next_alloc_vector = 48;
 }
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
@@ -396,6 +407,14 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
         exception_handler(gpr, frame);
         return;
     }
+
+    // Check context-based handler first (for device drivers)
+    if (irq_contexts[frame.intNum].handler != nullptr) {
+        irq_contexts[frame.intNum].handler(static_cast<uint8_t>(frame.intNum), irq_contexts[frame.intNum].data);
+        ker::mod::apic::eoi();
+        return;
+    }
+
     if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
     } else {
@@ -422,4 +441,41 @@ void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
 void removeInterruptHandler(uint8_t intNum) { interruptHandlers[intNum] = nullptr; }
 
 bool isInterruptHandlerSet(uint8_t intNum) { return interruptHandlers[intNum] != nullptr; }
+
+auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
+    if (interruptHandlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
+        ker::mod::io::serial::write("requestIrq: vector already in use\n");
+        return -1;
+    }
+    irq_contexts[vector].handler = handler;
+    irq_contexts[vector].data = data;
+    irq_contexts[vector].name = name;
+    return 0;
+}
+
+void freeIrq(uint8_t vector) {
+    irq_contexts[vector].handler = nullptr;
+    irq_contexts[vector].data = nullptr;
+    irq_contexts[vector].name = nullptr;
+}
+
+auto allocateVector() -> uint8_t {
+    // Find a free vector starting from 48 (above legacy IRQ range)
+    // Vectors 0-31 are exceptions, 32-47 are legacy ISA IRQs
+    // 48-255 are available for MSI/dynamic allocation
+    for (uint16_t v = next_alloc_vector; v < 256; v++) {
+        if (interruptHandlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+            next_alloc_vector = static_cast<uint8_t>(v + 1);
+            return static_cast<uint8_t>(v);
+        }
+    }
+    // Wrap around and search from 48
+    for (uint16_t v = 48; v < next_alloc_vector; v++) {
+        if (interruptHandlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+            return static_cast<uint8_t>(v);
+        }
+    }
+    return 0;  // No free vector found
+}
+
 }  // namespace ker::mod::gates

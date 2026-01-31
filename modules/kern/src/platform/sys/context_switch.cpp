@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <net/proto/tcp.hpp>
 #include <platform/asm/msr.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -9,6 +10,7 @@
 
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
+#include "platform/interrupt/gdt.hpp"
 #include "platform/interrupt/gates.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
@@ -100,6 +102,31 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     gpr = nextTask->context.regs;
 
+    // Validate context before restoring — catch corruption before it causes a crash
+    // in userspace where debugging is much harder.
+    if (nextTask->type != sched::task::TaskType::IDLE) {
+        if (frame.cs != desc::gdt::GDT_USER_CS) {
+            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x",
+                     frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        if (frame.ss != desc::gdt::GDT_USER_DS) {
+            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x",
+                     frame.ss, desc::gdt::GDT_USER_DS, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        if (frame.rip >= 0x800000000000ULL) {
+            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x",
+                     frame.rip, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+        if (frame.rsp >= 0x800000000000ULL) {
+            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x",
+                     frame.rsp, nextTask->pid);
+            for (;;) asm volatile("hlt");
+        }
+    }
+
     // Update scratch area cpuId
     auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(nextTask->context.syscallScratchArea);
     scratchArea->cpuId = realCpuId;
@@ -152,6 +179,12 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();
         sched::gcExpiredTasks();
+    }
+
+    // Run TCP timers on CPU 0 every 10 ticks (~100ms).
+    // Each tick is ~10ms, so ticks * 10 gives approximate milliseconds.
+    if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
+        ker::net::proto::tcp_timer_tick(ticks * 10);
     }
 
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);

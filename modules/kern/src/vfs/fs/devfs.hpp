@@ -53,4 +53,8 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
 // Call after block_device_init() has enumerated GPT partitions.
 void devfs_populate_partition_symlinks();
 
+// Populate /dev/net/<ifname> nodes for each registered network device.
+// Reading returns interface stats. Call after network device registration.
+void devfs_populate_net_nodes();
+
 }  // namespace ker::vfs::devfs

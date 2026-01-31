@@ -11,6 +11,7 @@ enum class FSType : uint8_t {
     TMPFS,
     FAT32,
     DEVFS,
+    SOCKET,
 };
 
 struct File {

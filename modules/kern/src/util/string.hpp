@@ -19,6 +19,29 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
     while (format[i] != '\0') {
         if (format[i] == '%') {
             i++;
+
+            // Parse width specifier
+            int width = 0;
+            bool width_from_arg = false;
+            char pad_char = ' ';
+
+            // Check for zero-padding
+            if (format[i] == '0') {
+                pad_char = '0';
+                i++;
+            }
+
+            // Check for width from argument (*) or numeric width
+            if (format[i] == '*') {
+                width_from_arg = true;
+                i++;
+            } else {
+                while (format[i] >= '0' && format[i] <= '9') {
+                    width = width * 10 + (format[i] - '0');
+                    i++;
+                }
+            }
+
             switch (format[i]) {
                 case '.':
                     i++;
@@ -43,15 +66,122 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
                     str[j++] = format[i];
                     break;
                 case 'd': {
+                    if (width_from_arg) {
+                        width = va_arg(args, int);
+                    }
                     int n = va_arg(args, int);
                     int len = itoa(n, buf);
+
+                    // Apply padding
+                    int pad_len = width - len;
+                    if (pad_len > 0 && j + pad_len < size) {
+                        for (int k = 0; k < pad_len; k++) {
+                            str[j++] = pad_char;
+                        }
+                    }
+
                     strncpy(str + j, buf, size - j);
                     j += len;
                     break;
                 }
                 case 'x': {
+                    if (width_from_arg) {
+                        width = va_arg(args, int);
+                    }
                     uint64_t n = va_arg(args, uint64_t);
                     int len = u64toh(n, buf);
+
+                    // Apply padding
+                    int pad_len = width - len;
+                    if (pad_len > 0 && j + pad_len < size) {
+                        for (int k = 0; k < pad_len; k++) {
+                            str[j++] = pad_char;
+                        }
+                    }
+
+                    strncpy(str + j, buf, size - j);
+                    j += len;
+                    break;
+                }
+                case 'z': {
+                    // Length modifier for size_t
+                    i++;
+                    if (format[i] == 'u') {
+                        if (width_from_arg) {
+                            width = va_arg(args, int);
+                        }
+                        size_t n = va_arg(args, size_t);
+
+                        // Convert unsigned to decimal string
+                        int len = 0;
+                        if (n == 0) {
+                            buf[len++] = '0';
+                        } else {
+                            char temp[64];
+                            int temp_len = 0;
+                            while (n > 0) {
+                                temp[temp_len++] = '0' + (n % 10);
+                                n /= 10;
+                            }
+                            // Reverse into buf
+                            for (int k = 0; k < temp_len; k++) {
+                                buf[k] = temp[temp_len - 1 - k];
+                            }
+                            len = temp_len;
+                        }
+                        buf[len] = '\0';
+
+                        // Apply padding
+                        int pad_len = width - len;
+                        if (pad_len > 0 && j + pad_len < size) {
+                            for (int k = 0; k < pad_len; k++) {
+                                str[j++] = pad_char;
+                            }
+                        }
+
+                        strncpy(str + j, buf, size - j);
+                        j += len;
+                    } else {
+                        // Unsupported z modifier
+                        str[j++] = '%';
+                        str[j++] = 'z';
+                        str[j++] = format[i];
+                    }
+                    break;
+                }
+                case 'u': {
+                    if (width_from_arg) {
+                        width = va_arg(args, int);
+                    }
+                    unsigned int n = va_arg(args, unsigned int);
+
+                    // Convert unsigned to decimal string
+                    int len = 0;
+                    if (n == 0) {
+                        buf[len++] = '0';
+                    } else {
+                        char temp[64];
+                        int temp_len = 0;
+                        while (n > 0) {
+                            temp[temp_len++] = '0' + (n % 10);
+                            n /= 10;
+                        }
+                        // Reverse into buf
+                        for (int k = 0; k < temp_len; k++) {
+                            buf[k] = temp[temp_len - 1 - k];
+                        }
+                        len = temp_len;
+                    }
+                    buf[len] = '\0';
+
+                    // Apply padding
+                    int pad_len = width - len;
+                    if (pad_len > 0 && j + pad_len < size) {
+                        for (int k = 0; k < pad_len; k++) {
+                            str[j++] = pad_char;
+                        }
+                    }
+
                     strncpy(str + j, buf, size - j);
                     j += len;
                     break;

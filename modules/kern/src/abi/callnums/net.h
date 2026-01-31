@@ -11,6 +11,16 @@ enum class ops : uint64_t {
     send,
     recv,
     close,
+    sendto,
+    recvfrom,
+    setsockopt,
+    getsockopt,
+    shutdown,
+    getpeername,
+    getsockname,
+    select,
+    poll,
+    ioctl_net,
 };
 
 }  // namespace ker::abi::net
