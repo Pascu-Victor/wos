@@ -29,6 +29,8 @@ mkfs fat /dev/sda1
 mount /dev/sda1 /
 mkdir /testdata
 copy-in $CWD/build/modules/testprog/testprog /
+copy-in $CWD/build/modules/init/init /
+copy-in $CWD/configs/drive/srv /
 write /hello.txt "Hello from FAT32 filesystem!"
 write /test.bin "Binary test data 1234567890ABCDEF"
 _EOF_

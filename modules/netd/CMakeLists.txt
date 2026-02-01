@@ -7,8 +7,7 @@ set(CXXFILES src/main.cpp)
 add_executable(${TARGET} ${CXXFILES})
 
 target_compile_options(${TARGET} PRIVATE
-    -g
-    -O2
+    -O3
     -std=c++23
     -Wall
     -mcmodel=small
@@ -18,7 +17,7 @@ include_directories(src ../extern ../ ../extern/limine)
 
 set_target_properties(${TARGET} PROPERTIES
     POSITION_INDEPENDENT_CODE ON
-    INTERPROCEDURAL_OPTIMIZATION OFF
+    INTERPROCEDURAL_OPTIMIZATION ON
 )
 
 set_target_properties(${TARGET} PROPERTIES LINK_OPTIONS "")

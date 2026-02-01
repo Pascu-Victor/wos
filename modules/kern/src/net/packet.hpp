@@ -14,11 +14,12 @@ constexpr size_t PKT_POOL_SIZE = 512;
 
 struct PacketBuffer {
     uint8_t storage[PKT_BUF_SIZE];
-    uint8_t* data;           // current data pointer
-    size_t len;              // current data length
-    PacketBuffer* next;      // freelist / queue linkage
-    NetDevice* dev;          // source/dest device
-    uint16_t protocol;       // EtherType (host byte order)
+    uint8_t* data;       // current data pointer
+    size_t len;          // current data length
+    PacketBuffer* next;  // freelist / queue linkage
+    NetDevice* dev;      // source/dest device
+    uint16_t protocol;   // EtherType (host byte order)
+    uint8_t src_mac[6];  // incoming source MAC (for reply use)
 
     // Prepend: move data pointer back by n bytes, increase length
     auto push(size_t n) -> uint8_t* {

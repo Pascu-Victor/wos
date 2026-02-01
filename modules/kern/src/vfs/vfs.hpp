@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
 #include <string_view>
+#include <vfs/stat.hpp>
 
 #include "bits/off_t.h"
 #include "bits/ssize_t.h"
@@ -50,10 +51,15 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = null
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
 auto vfs_isatty(int fd) -> bool;
 auto vfs_read_dir_entries(int fd, void* buffer, std::size_t max_size) -> ssize_t;
+auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 
 // Symlink operations
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+
+// Stat operations
+auto vfs_stat(const char* path, stat* statbuf) -> int;
+auto vfs_fstat(int fd, stat* statbuf) -> int;
 
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;

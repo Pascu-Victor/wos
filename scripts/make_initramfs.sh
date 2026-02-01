@@ -34,6 +34,15 @@ else
     echo "WARNING: netd binary not found at $NETD_BINARY, skipping"
 fi
 
+# Copy httpd binary (HTTP server)
+HTTPD_BINARY="build/modules/httpd/httpd"
+if [ -f "$HTTPD_BINARY" ]; then
+    cp "$HTTPD_BINARY" "$INITRAMFS_DIR/sbin/httpd"
+    echo "  initramfs: added /sbin/httpd ($(du -h "$HTTPD_BINARY" | cut -f1))"
+else
+    echo "WARNING: httpd binary not found at $HTTPD_BINARY, skipping"
+fi
+
 # Generate /etc/fstab from disk configuration
 if [ -f "configs/disks.conf" ]; then
     # shellcheck source=configs/disks.conf

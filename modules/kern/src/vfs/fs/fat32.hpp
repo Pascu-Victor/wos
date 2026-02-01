@@ -46,7 +46,7 @@ struct FAT32MountContext {
     uint32_t data_start_sector;
     uint32_t total_sectors;
     uint32_t root_cluster;
-    ker::mod::sys::Spinlock lock;   // Protects concurrent access to this mount
+    ker::mod::sys::Spinlock lock;  // Protects concurrent access to this mount
 };
 
 // FAT32 Boot Sector Structure (simplified)
@@ -129,6 +129,10 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
 auto fat32_lseek(File* f, off_t offset, int whence) -> off_t;
 auto fat32_close(File* f) -> int;
 constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
+
+// FAT32 stat operations
+auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ctx) -> int;
+auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int;
 
 // Get FAT32 FileOperations structure
 auto get_fat32_fops() -> FileOperations*;

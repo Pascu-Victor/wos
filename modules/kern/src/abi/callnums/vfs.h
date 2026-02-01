@@ -14,6 +14,9 @@ enum class ops : uint64_t {
     mkdir,
     readlink,
     symlink,
+    sendfile,
+    stat,
+    fstat,
 };
 
 }  // namespace ker::abi::vfs

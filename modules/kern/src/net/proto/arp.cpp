@@ -249,4 +249,25 @@ auto arp_resolve(NetDevice* dev, uint32_t ip, uint8_t* dst_mac, PacketBuffer* pe
     return -1;  // EAGAIN - pending
 }
 
+void arp_learn(uint32_t ip, const uint8_t* mac) {
+    // Dynamic ARP learning from incoming packets
+    // When we receive a packet from an IP, record its MAC
+    if (mac == nullptr) {
+        return;
+    }
+
+    arp_lock.lock();
+
+    auto* entry = cache_alloc(ip);
+    if (entry != nullptr) {
+        std::memcpy(entry->mac, mac, 6);
+        entry->state = ArpState::REACHABLE;
+#ifdef DEBUG_ARP
+        ker::mod::dbg::log("arp_learn: learned IP=%u.%u.%u.%u\n", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+#endif
+    }
+
+    arp_lock.unlock();
+}
+
 }  // namespace ker::net::proto

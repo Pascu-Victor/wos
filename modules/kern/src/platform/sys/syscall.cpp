@@ -1,6 +1,7 @@
 #include "syscall.hpp"
 
 #include <cstdint>
+#include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
 #include <syscalls_impl/time/time.hpp>
@@ -8,6 +9,7 @@
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 
 #include "abi/callnums.hpp"
+#include "abi/callnums/futex.h"
 #include "abi/callnums/multiproc.h"
 #include "abi/callnums/process.h"
 #include "abi/callnums/sys_log.h"
@@ -34,6 +36,8 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
         case abi::callnums::sys_log:
             return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
                                              static_cast<abi::sys_log::sys_log_device>(a4));
+        case abi::callnums::futex:
+            return ker::syscall::futex::sys_futex(a1, a2, a3, a4);
         case abi::callnums::threading:
             // Dispatch based on operation - threadControlOps start at 0x100
             if (a1 >= 0x100) {

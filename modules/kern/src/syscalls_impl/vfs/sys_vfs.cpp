@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
+#include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::syscall::vfs {
@@ -105,6 +106,26 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const auto* target = reinterpret_cast<const char*>(a1);
             const auto* linkpath = reinterpret_cast<const char*>(a2);
             int ret = ker::vfs::vfs_symlink(target, linkpath);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::sendfile: {
+            int outfd = static_cast<int>(a1);
+            int infd = static_cast<int>(a2);
+            auto* offset = reinterpret_cast<off_t*>(a3);
+            auto count = static_cast<size_t>(a4);
+            ssize_t ret = ker::vfs::vfs_sendfile(outfd, infd, offset, count);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::stat: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            auto* statbuf = reinterpret_cast<ker::vfs::stat*>(a2);
+            int ret = ker::vfs::vfs_stat(path, statbuf);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::fstat: {
+            int fd = static_cast<int>(a1);
+            auto* statbuf = reinterpret_cast<ker::vfs::stat*>(a2);
+            int ret = ker::vfs::vfs_fstat(fd, statbuf);
             return static_cast<int64_t>(ret);
         }
         default:

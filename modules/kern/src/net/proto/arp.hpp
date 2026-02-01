@@ -46,6 +46,9 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt);
 // Returns -1 if pending (sends ARP request, queues pkt for later).
 auto arp_resolve(NetDevice* dev, uint32_t ip, uint8_t* dst_mac, PacketBuffer* pending_pkt) -> int;
 
+// Learn MAC address from incoming packets (dynamic ARP learning)
+void arp_learn(uint32_t ip, const uint8_t* mac);
+
 void arp_init();
 
 }  // namespace ker::net::proto

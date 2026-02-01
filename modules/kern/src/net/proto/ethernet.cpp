@@ -21,6 +21,9 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     uint16_t ethertype = ntohs(hdr->ethertype);
     pkt->protocol = ethertype;
 
+    // Preserve source MAC for reply use
+    std::memcpy(pkt->src_mac, hdr->src, 6);
+
     // Strip ethernet header
     pkt->pull(ETH_HLEN);
 

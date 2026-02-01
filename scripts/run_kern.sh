@@ -63,4 +63,4 @@ qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m 24G \
   -drive file=test_fat32.qcow2,if=none,id=drive1,format=qcow2 \
   -device ide-hd,drive=drive1,bus=ahci.1 \
   $NET_ARGS \
-  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 8
+  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 2

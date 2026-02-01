@@ -1,5 +1,6 @@
 #pragma once
 
+#include <syscalls_impl/futex/sys_futex.hpp>
 #include <syscalls_impl/log/log.hpp>
 #include <syscalls_impl/multiproc/multiproc.hpp>
 #include <syscalls_impl/net/sys_net.hpp>

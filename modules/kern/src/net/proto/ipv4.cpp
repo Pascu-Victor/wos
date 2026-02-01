@@ -63,6 +63,9 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     uint32_t src = ntohl(hdr->src_addr);
     uint8_t proto = hdr->protocol;
 
+    // Learn sender's MAC via ARP (dynamic learning from incoming packets)
+    arp_learn(src, pkt->src_mac);
+
     // Check if this packet is for us
     bool for_us = false;
 
@@ -159,7 +162,15 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
     // Determine next hop (guard against null route)
     uint32_t next_hop = dst;
     if (route != nullptr && route->gateway != 0) {
-        next_hop = route->gateway;
+        // Check if destination is on the same subnet as the route
+        // If so, send directly to the destination (don't use gateway)
+        uint32_t dst_net = dst & route->netmask;
+        uint32_t route_net = route->dest & route->netmask;
+        if (dst_net != route_net) {
+            // Different subnet - use gateway as next hop
+            next_hop = route->gateway;
+        }
+        // else: same subnet - keep next_hop = dst
     }
 
     // If the device is loopback, bypass ARP

@@ -14,12 +14,11 @@ CompileFlags:
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword
-        - -f
         - -fsanitize=safe-stack
         - -felf64
         - -fPIE
         - -pie
-        - -resource-dir=/usr/lib/clang/20
+        - -resource-dir=/usr/lib/clang/21
 Diagnostics:
     ClangTidy:
         Remove:

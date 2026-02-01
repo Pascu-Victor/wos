@@ -25,7 +25,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++ modules" FORCE)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(
     # Common flags for C and C++
-    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-fdiagnostics-color=always;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-fno-stack-protector;-fno-stack-check;-fno-lto;-mno-sse;-m64;-march=x86-64;-mno-red-zone;-Wformat;-Wformat-security;-Werror=format-security;--sysroot=${SYSROOT_PATH};-fno-sanitize=safe-stack;-fno-omit-frame-pointer>"
+    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g;-fdiagnostics-color=always;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-fno-stack-protector;-fno-stack-check;-fno-lto;-mno-sse;-m64;-march=x86-64;-mno-red-zone;-Wformat;-Wformat-security;-Werror=format-security;--sysroot=${SYSROOT_PATH};-fno-sanitize=safe-stack;-fno-omit-frame-pointer>"
     # C-specific flags
     "$<$<COMPILE_LANGUAGE:C>:-std=gnu11>"
     # C++-specific flags
@@ -54,3 +54,4 @@ add_subdirectory(kern)
 add_subdirectory(init)
 add_subdirectory(testprog)
 add_subdirectory(netd)
+add_subdirectory(httpd)

@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <mod/io/serial/serial.hpp>
@@ -10,6 +11,7 @@
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/tmpfs.hpp>
 #include <vfs/mount.hpp>
+#include <vfs/stat.hpp>
 
 #include "file.hpp"
 #include "fs/devfs.hpp"
@@ -59,8 +61,7 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 
         if (comp_start[0] == '.' && comp_start[1] == '\0') {
             // "." - skip
-        } else if (comp_start[0] == '.' && comp_start[1] == '.' &&
-                   comp_start[2] == '\0') {
+        } else if (comp_start[0] == '.' && comp_start[1] == '.' && comp_start[2] == '\0') {
             // ".." - pop last component
             if (num_components > 0) {
                 num_components--;
@@ -194,9 +195,9 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
             if (prefix_len + target_len >= bufsize) {
                 return -1;
             }
-            memcpy(new_path, resolved_buf, prefix_len);                        // NOLINT
-            memcpy(new_path + prefix_len, node->symlink_target, target_len);   // NOLINT
-            new_path[prefix_len + target_len] = '\0';                          // NOLINT
+            memcpy(new_path, resolved_buf, prefix_len);                       // NOLINT
+            memcpy(new_path + prefix_len, node->symlink_target, target_len);  // NOLINT
+            new_path[prefix_len + target_len] = '\0';                         // NOLINT
             memcpy(resolved_buf, new_path, prefix_len + target_len + 1);
         }
     }
@@ -656,6 +657,178 @@ auto vfs_mkdir(const char* path, int mode) -> int {
     return (node != nullptr) ? 0 : -1;
 }
 
+auto vfs_stat(const char* path, stat* statbuf) -> int {
+    if (path == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    // Canonicalize path
+    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    size_t path_len = 0;
+    while (path[path_len] != '\0' && path_len < MAX_PATH_LEN - 1) {
+        pathBuffer[path_len] = path[path_len];
+        path_len++;
+    }
+    pathBuffer[path_len] = '\0';
+
+    canonicalize_path(pathBuffer, MAX_PATH_LEN);
+
+    // Find mount point
+    MountPoint* mount = find_mount_point(pathBuffer);
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+
+    // Strip mount prefix
+    size_t mount_len = 0;
+    while (mount->path[mount_len] != '\0') {
+        mount_len++;
+    }
+
+    const char* fs_path = pathBuffer;
+    if (mount_len == 1 && mount->path[0] == '/') {
+        fs_path = pathBuffer + 1;
+    } else if (pathBuffer[mount_len] == '/') {
+        fs_path = pathBuffer + mount_len + 1;
+    } else if (pathBuffer[mount_len] == '\0') {
+        fs_path = "";
+    } else {
+        fs_path = pathBuffer + mount_len;
+    }
+
+    // Initialize stat buffer
+    memset(statbuf, 0, sizeof(stat));
+
+    switch (mount->fs_type) {
+        case FSType::TMPFS: {
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+            if (node == nullptr) {
+                return -ENOENT;
+            }
+            statbuf->st_dev = 0;
+            statbuf->st_ino = reinterpret_cast<ino_t>(node);  // Use node address as inode
+            statbuf->st_nlink = 1;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = static_cast<off_t>(node->size);
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = (node->size + 511) / 512;
+            switch (node->type) {
+                case ker::vfs::tmpfs::TmpNodeType::FILE:
+                    statbuf->st_mode = S_IFREG | 0644;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
+                    statbuf->st_mode = S_IFDIR | 0755;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
+                    statbuf->st_mode = S_IFLNK | 0777;
+                    break;
+            }
+            return 0;
+        }
+        case FSType::FAT32: {
+            return ker::vfs::fat32::fat32_stat(fs_path, statbuf, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+        }
+        case FSType::DEVFS: {
+            // Device files - report as character devices
+            statbuf->st_dev = 0;
+            statbuf->st_ino = 1;
+            statbuf->st_nlink = 1;
+            statbuf->st_mode = S_IFCHR | 0666;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = 0;
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = 0;
+            return 0;
+        }
+        default:
+            return -ENOSYS;
+    }
+}
+
+auto vfs_fstat(int fd, stat* statbuf) -> int {
+    if (statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::getCurrentTask();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* file = vfs_get_file(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    // Initialize stat buffer
+    memset(statbuf, 0, sizeof(stat));
+
+    switch (file->fs_type) {
+        case FSType::TMPFS: {
+            auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
+            if (node == nullptr) {
+                return -EBADF;
+            }
+            statbuf->st_dev = 0;
+            statbuf->st_ino = reinterpret_cast<ino_t>(node);
+            statbuf->st_nlink = 1;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = static_cast<off_t>(node->size);
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = (node->size + 511) / 512;
+            switch (node->type) {
+                case ker::vfs::tmpfs::TmpNodeType::FILE:
+                    statbuf->st_mode = S_IFREG | 0644;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
+                    statbuf->st_mode = S_IFDIR | 0755;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
+                    statbuf->st_mode = S_IFLNK | 0777;
+                    break;
+            }
+            return 0;
+        }
+        case FSType::FAT32: {
+            return ker::vfs::fat32::fat32_fstat(file, statbuf);
+        }
+        case FSType::DEVFS: {
+            statbuf->st_dev = 0;
+            statbuf->st_ino = 1;
+            statbuf->st_nlink = 1;
+            statbuf->st_mode = S_IFCHR | 0666;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = 0;
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = 0;
+            return 0;
+        }
+        case FSType::SOCKET: {
+            statbuf->st_dev = 0;
+            statbuf->st_ino = 1;
+            statbuf->st_nlink = 1;
+            statbuf->st_mode = S_IFSOCK | 0666;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = 0;
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = 0;
+            return 0;
+        }
+        default:
+            return -ENOSYS;
+    }
+}
+
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
     if (target == nullptr || fstype == nullptr) {
         return -EINVAL;
@@ -666,9 +839,8 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
     if (source != nullptr) {
         // Check for PARTUUID= prefix
         constexpr size_t PARTUUID_PREFIX_LEN = 9;  // "PARTUUID="
-        bool is_partuuid = (source[0] == 'P' && source[1] == 'A' && source[2] == 'R' &&
-                            source[3] == 'T' && source[4] == 'U' && source[5] == 'U' &&
-                            source[6] == 'I' && source[7] == 'D' && source[8] == '=');
+        bool is_partuuid = (source[0] == 'P' && source[1] == 'A' && source[2] == 'R' && source[3] == 'T' && source[4] == 'U' &&
+                            source[5] == 'U' && source[6] == 'I' && source[7] == 'D' && source[8] == '=');
 
         if (is_partuuid) {
             bdev = ker::dev::block_device_find_by_partuuid(source + PARTUUID_PREFIX_LEN);
@@ -678,8 +850,7 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
                 ker::mod::io::serial::write("\n");
                 return -ENOENT;
             }
-        } else if (source[0] == '/' && source[1] == 'd' && source[2] == 'e' &&
-                   source[3] == 'v' && source[4] == '/') {
+        } else if (source[0] == '/' && source[1] == 'd' && source[2] == 'e' && source[3] == 'v' && source[4] == '/') {
             // /dev/XXX - lookup by device name
             bdev = ker::dev::block_device_find_by_name(source + 5);
             if (bdev == nullptr) {
@@ -710,6 +881,84 @@ void init() {
     // Register and mount devfs for device files
     ker::vfs::devfs::devfs_init();
     mount_filesystem("/dev", "devfs", nullptr);
+}
+
+auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
+    // Get the current task
+    auto* task = mod::sched::getCurrentTask();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    // Get input file
+    auto* infile = vfs_get_file(task, infd);
+    if (infile == nullptr) {
+        return -EBADF;
+    }
+
+    // Get output file
+    auto* outfile = vfs_get_file(task, outfd);
+    if (outfile == nullptr) {
+        return -EBADF;
+    }
+
+    // Allocate buffer for reading/writing
+    constexpr size_t BUF_SIZE = 65536;  // 64KB buffer
+    auto* buffer = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
+    if (buffer == nullptr) {
+        return -ENOMEM;
+    }
+
+    ssize_t total_sent = 0;
+
+    while (total_sent < static_cast<ssize_t>(count)) {
+        size_t to_read = (count - total_sent) > BUF_SIZE ? BUF_SIZE : (count - total_sent);
+
+        // If offset is provided, seek to that position first
+        if (offset != nullptr) {
+            off_t seek_result = vfs_lseek(infd, *offset, SEEK_SET);
+            if (seek_result < 0) {
+                ker::mod::mm::dyn::kmalloc::free(buffer);
+                return seek_result;
+            }
+        }
+
+        // Read from input file
+        size_t bytes_read = 0;
+        ssize_t read_result = vfs_read(infd, buffer, to_read, &bytes_read);
+        if (read_result < 0) {
+            ker::mod::mm::dyn::kmalloc::free(buffer);
+            return read_result;
+        }
+
+        // If we read 0 bytes, we're at EOF
+        if (bytes_read == 0) {
+            break;
+        }
+
+        // Write to output file
+        size_t bytes_written = 0;
+        ssize_t write_result = vfs_write(outfd, buffer, bytes_read, &bytes_written);
+        if (write_result < 0) {
+            ker::mod::mm::dyn::kmalloc::free(buffer);
+            return write_result;
+        }
+
+        // Update offset if provided
+        if (offset != nullptr) {
+            *offset += bytes_written;
+        }
+
+        total_sent += bytes_written;
+
+        // If we wrote less than we read, the output device might be full
+        if (bytes_written < bytes_read) {
+            break;
+        }
+    }
+
+    ker::mod::mm::dyn::kmalloc::free(buffer);
+    return total_sent;
 }
 
 }  // namespace ker::vfs

@@ -47,7 +47,7 @@ namespace ker::vfs::tmpfs {
 
 constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 8;
-constexpr int O_CREAT = 0x100;
+constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 
 namespace {
 TmpNode* rootNode = nullptr;
@@ -490,13 +490,13 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 // --- FileOperations instance ---
 
 ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,
-                                                 .vfs_close = tmpfs_fops_close,
-                                                 .vfs_read = tmpfs_fops_read,
-                                                 .vfs_write = tmpfs_fops_write,
-                                                 .vfs_lseek = tmpfs_fops_lseek,
-                                                 .vfs_isatty = tmpfs_fops_isatty,
-                                                 .vfs_readdir = tmpfs_fops_readdir,
-                                                 .vfs_readlink = tmpfs_fops_readlink};
+                                                .vfs_close = tmpfs_fops_close,
+                                                .vfs_read = tmpfs_fops_read,
+                                                .vfs_write = tmpfs_fops_write,
+                                                .vfs_lseek = tmpfs_fops_lseek,
+                                                .vfs_isatty = tmpfs_fops_isatty,
+                                                .vfs_readdir = tmpfs_fops_readdir,
+                                                .vfs_readlink = tmpfs_fops_readlink};
 }  // namespace
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }

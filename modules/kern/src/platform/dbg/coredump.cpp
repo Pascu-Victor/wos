@@ -21,7 +21,7 @@ constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534full;  // "WOSCODMP" little
 constexpr uint32_t COREDUMP_VERSION = 1;
 
 // Keep this in sync with tmpfs' internal flag.
-constexpr int O_CREAT = 0x100;
+constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 
 bool is_ram(uint64_t phys) {
     for (auto* zone = ker::mod::mm::phys::getZones(); zone != nullptr; zone = zone->next) {
