@@ -234,9 +234,9 @@ auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
             ker::mod::mm::virt::unmapPage(task->pagemap, currentVaddr);
         }
     }
-
+#ifdef VMEM_DEBUG
     ker::mod::dbg::log("vmem: freed %x bytes at %p", size, addr);
-
+#endif
     return 0;  // Success
 }
 
