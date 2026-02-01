@@ -351,6 +351,30 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     return html;
 }
 
+// Send all data, handling partial sends
+auto send_all(int fd, const void* data, size_t len) -> ssize_t {
+    const auto* ptr = static_cast<const char*>(data);
+    size_t remaining = len;
+    size_t total_sent = 0;
+
+    while (remaining > 0) {
+        ssize_t sent = send(fd, ptr, remaining, 0);
+        if (sent < 0) {
+            // Error occurred
+            return sent;
+        }
+        if (sent == 0) {
+            // Connection closed
+            break;
+        }
+        ptr += sent;
+        remaining -= sent;
+        total_sent += sent;
+    }
+
+    return static_cast<ssize_t>(total_sent);
+}
+
 // Send an HTTP response with custom headers
 auto send_response(int client_fd, int status_code, const char* status_text, const char* content_type, const void* body, size_t body_len)
     -> ssize_t {
@@ -365,15 +389,15 @@ auto send_response(int client_fd, int status_code, const char* status_text, cons
                               "\r\n",
                               status_code, status_text, content_type, body_len);
 
-    // Send header
-    ssize_t sent = send(client_fd, header.data(), header_len, 0);
+    // Send header (using send_all to handle partial sends)
+    ssize_t sent = send_all(client_fd, header.data(), header_len);
     if (sent < 0) {
         return sent;
     }
 
-    // Send body
+    // Send body (using send_all to handle partial sends)
     if (body != nullptr && body_len > 0) {
-        sent = send(client_fd, body, body_len, 0);
+        sent = send_all(client_fd, body, body_len);
     }
     return sent;
 }

@@ -1,5 +1,3 @@
-#include "tcp.hpp"
-
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -8,6 +6,8 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+
+#include "tcp.hpp"
 
 namespace ker::net::proto {
 
@@ -31,8 +31,7 @@ void wake_socket(Socket* sock) {
 }
 
 // Handle SYN on a listening socket: create child TCB + socket, send SYN-ACK
-void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr,
-                       uint32_t src_ip, uint32_t dst_ip) {
+void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, uint32_t dst_ip) {
     Socket* listen_sock = listener->socket;
     if (listen_sock == nullptr) {
         return;
@@ -87,8 +86,11 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr,
         const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
         size_t opts_len = hdr_len - sizeof(TcpHeader);
         for (size_t i = 0; i < opts_len;) {
-            if (opts[i] == 0) break;        // End of options
-            if (opts[i] == 1) { i++; continue; }  // NOP
+            if (opts[i] == 0) break;  // End of options
+            if (opts[i] == 1) {
+                i++;
+                continue;
+            }  // NOP
             if (i + 1 >= opts_len) break;
             uint8_t opt_len = opts[i + 1];
             if (opt_len < 2 || i + opt_len > opts_len) break;
@@ -107,8 +109,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr,
 }
 }  // namespace
 
-void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload,
-                         size_t payload_len, uint32_t src_ip, uint32_t dst_ip) {
+void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, uint32_t src_ip, uint32_t dst_ip) {
     uint8_t flags = hdr->flags;
     uint32_t seg_seq = ntohl(hdr->seq);
     uint32_t seg_ack = ntohl(hdr->ack);
@@ -136,7 +137,10 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         size_t opts_len = hdr_len - sizeof(TcpHeader);
                         for (size_t i = 0; i < opts_len;) {
                             if (opts[i] == 0) break;
-                            if (opts[i] == 1) { i++; continue; }
+                            if (opts[i] == 1) {
+                                i++;
+                                continue;
+                            }
                             if (i + 1 >= opts_len) break;
                             uint8_t opt_len = opts[i + 1];
                             if (opt_len < 2 || i + opt_len > opts_len) break;
@@ -208,8 +212,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             // Process ACK
             if ((flags & TCP_ACK) != 0) {
-                if (tcp_seq_after(seg_ack, cb->snd_una) &&
-                    !tcp_seq_after(seg_ack, cb->snd_nxt)) {
+                if (tcp_seq_after(seg_ack, cb->snd_una) && !tcp_seq_after(seg_ack, cb->snd_nxt)) {
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = seg_wnd;
 
@@ -227,6 +230,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                             break;
                         }
                     }
+
+                    // Wake tasks waiting to send (window opened)
+                    wake_socket(cb->socket);
                 }
             }
 
@@ -400,14 +406,12 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     // No matching connection or listener — send RST
     if ((hdr->flags & TCP_RST) == 0) {
         if ((hdr->flags & TCP_ACK) != 0) {
-            tcp_send_rst(dst_ip, src_ip, dst_port, src_port,
-                         ntohl(hdr->ack), 0, 0);
+            tcp_send_rst(dst_ip, src_ip, dst_port, src_port, ntohl(hdr->ack), 0, 0);
         } else {
             uint32_t ack_seq = ntohl(hdr->seq) + static_cast<uint32_t>(payload_len);
             if ((hdr->flags & TCP_SYN) != 0) ack_seq++;
             if ((hdr->flags & TCP_FIN) != 0) ack_seq++;
-            tcp_send_rst(dst_ip, src_ip, dst_port, src_port,
-                         0, ack_seq, TCP_ACK);
+            tcp_send_rst(dst_ip, src_ip, dst_port, src_port, 0, ack_seq, TCP_ACK);
         }
     }
 
