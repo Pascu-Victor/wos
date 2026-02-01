@@ -40,6 +40,10 @@ uint64_t cpu_count;
 // Used to restore GS_BASE when entering idle loop (no task context)
 static cpu::PerCpu** kernelPerCpuPtrs = nullptr;
 
+// Atomic counter to track how many CPUs have completed GS_BASE initialization
+// The last CPU to reach cpu_count enables per-CPU allocations globally
+static std::atomic<uint64_t> cpusInitialized{0};
+
 void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     // Enable CPU features FIRST (must be done on each CPU)
     // FSGSBASE must be enabled before using wrgsbase instruction
@@ -100,11 +104,16 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     auto idleTask = new sched::task::Task("idle", 0, stackTop, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
 
-    // Enable per-CPU allocations now that GS_BASE is set up
-    mm::phys::enablePerCpuAllocations();
-    mm::dyn::kmalloc::enablePerCpuAllocations();
+    // Atomically increment the counter of initialized CPUs
+    // If we're the last CPU, enable per-CPU allocations globally
+    uint64_t initializedCount = cpusInitialized.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (initializedCount == cpu_count) {
+        dbg::log("CPU %d: Last CPU initialized, enabling per-CPU allocations globally", cpuNo);
+        mm::phys::enablePerCpuAllocations();
+        mm::dyn::kmalloc::enablePerCpuAllocations();
+    }
 
-    dbg::log("CPU %d initialized and ready", cpuNo);
+    dbg::log("CPU %d initialized and ready (%d/%d CPUs ready)", cpuNo, initializedCount, cpu_count);
 
     // Start the scheduler on this CPU
     sched::startScheduler();
@@ -434,9 +443,15 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     auto idleTask = new sched::task::Task("idle", 0, kernelRsp, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
 
-    // Enable per-CPU allocations now that BSP GS_BASE is set up
-    mm::phys::enablePerCpuAllocations();
-    mm::dyn::kmalloc::enablePerCpuAllocations();
+    // BSP will participate in the atomic counter via cpuParamInit-style logic
+    // We need to call the same logic here for BSP
+    uint64_t initializedCount = cpusInitialized.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (initializedCount == cpu_count) {
+        dbg::log("BSP: Last CPU initialized, enabling per-CPU allocations globally");
+        mm::phys::enablePerCpuAllocations();
+        mm::dyn::kmalloc::enablePerCpuAllocations();
+    }
+    dbg::log("BSP ready (%d/%d CPUs ready)", initializedCount, cpu_count);
 
     sched::startScheduler();
     hcf();

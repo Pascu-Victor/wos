@@ -56,7 +56,7 @@ echo "STARTING BOOT:"
 
 LOG_ARGS="-d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log"
 
-qemu-system-x86_64 -M q35 -cpu max -m 24G \
+qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m 24G \
   -drive file=disk.qcow2,if=none,id=drive0,format=qcow2 \
   -device ahci,id=ahci \
   -device ide-hd,drive=drive0,bus=ahci.0 \
