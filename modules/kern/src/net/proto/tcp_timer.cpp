@@ -2,7 +2,11 @@
 
 #include <cstring>
 #include <net/proto/ipv4.hpp>
+#include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 
 namespace ker::net::proto {
 
@@ -106,6 +110,30 @@ void tcp_timer_tick(uint64_t now_ms) {
     }
 
     tcb_list_lock.unlock();
+}
+
+[[noreturn]] void tcp_timer_thread() {
+    uint64_t last_tick_ms = 0;
+    for (;;) {
+        uint64_t now_ms = ker::mod::time::getUs() / 1000;
+        if (now_ms - last_tick_ms >= 100) {
+            tcp_timer_tick(now_ms);
+            last_tick_ms = now_ms;
+        }
+        // Sleep until next interrupt (~10ms timer tick).
+        // The scheduler will preempt this thread if other tasks need CPU time.
+        asm volatile("sti\nhlt" ::: "memory");
+    }
+}
+
+void tcp_timer_thread_start() {
+    auto* task = ker::mod::sched::task::Task::createKernelThread("tcp_timer", tcp_timer_thread);
+    if (task == nullptr) {
+        ker::mod::dbg::log("FATAL: Failed to create TCP timer kernel thread");
+        return;
+    }
+    ker::mod::sched::postTaskBalanced(task);
+    ker::mod::dbg::log("TCP timer kernel thread created (PID %x)", task->pid);
 }
 
 }  // namespace ker::net::proto

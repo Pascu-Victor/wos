@@ -1,8 +1,9 @@
 #pragma once
 
-#include <buddy_alloc/buddy_alloc.hpp>
 #include <cstdint>
 #include <defines/defines.hpp>
+
+namespace ker::mod::mm { struct PageAllocator; }  // forward-declare
 
 #define PAGE_ALIGN_UP(addr) (((addr) + ker::mod::mm::paging::PAGE_SIZE - 1) & (~(ker::mod::mm::paging::PAGE_SIZE - 1)))
 #define PAGE_ALIGN_DOWN(addr) ((addr) & ~(ker::mod::mm::paging::PAGE_SIZE - 1))
@@ -12,7 +13,7 @@ const static uint64_t PAGE_SHIFT = 12;
 const static uint64_t PAGE_SIZE = 0x1000;
 struct PageZone {
     PageZone* next;
-    buddy* buddyInstance;
+    mm::PageAllocator* allocator;
     uint64_t start;
     uint64_t len;
     size_t pageCount;

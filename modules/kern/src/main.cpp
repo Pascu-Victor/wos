@@ -200,6 +200,7 @@ extern "C" void _start(void) {
     }
 
     ker::mod::sched::init();
+    ker::mod::mm::phys::enable_stack_overlap_check();
 
     boot::HandoverModules modules;
 

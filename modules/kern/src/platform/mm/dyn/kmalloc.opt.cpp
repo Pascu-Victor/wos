@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <platform/acpi/apic/apic.hpp>
+#include <platform/asm/cpu.hpp>
+#include <platform/smt/smt.hpp>
 
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "platform/dbg/dbg.hpp"
@@ -14,303 +18,313 @@
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::mod::mm::dyn::kmalloc {
-// static tlsf_t tlsf = nullptr;
-static ker::mod::sys::Spinlock* kmallocLock;
-static ker::mod::sys::Spinlock trackerLock;  // Static spinlock for tracker - works before init()
 
-// Threshold for large allocations (2KB)
-constexpr uint64_t LARGE_ALLOC_THRESHOLD = 0x800;
+// Per-CPU mini_malloc instances for reduced contention
+struct PerCpuAllocator {
+    sys::Spinlock lock;
+    bool initialized;
 
-// Track large allocations made directly via pageAlloc
-struct LargeAllocationTracker {
-    void* virt_addr;
-    uint64_t size;
-    bool in_use;
+    PerCpuAllocator() : initialized(false) {}
 };
 
-// Dynamic tracking array - starts at MIN capacity and grows/shrinks as needed
-constexpr size_t MIN_TRACKED_ALLOCS = 8192;
-constexpr size_t GROW_THRESHOLD_PERCENT = 75;    // Grow when 75% full
-constexpr size_t SHRINK_THRESHOLD_PERCENT = 25;  // Shrink when 25% full (but not below MIN)
+static PerCpuAllocator* perCpuAllocators = nullptr;
+static size_t numCpus = 0;
+static sys::Spinlock globalAllocLock;         // Fallback lock
+static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures are initialized
 
-static LargeAllocationTracker* trackedAllocs = nullptr;
-static size_t trackedAllocsCapacity = 0;
-static size_t trackedAllocsCount = 0;  // Number of in_use entries
-static bool trackedAllocsInitialized = false;
-
-// Calculate size in bytes for a given capacity
-static auto trackerArraySize(size_t capacity) -> uint64_t {
-    uint64_t size = capacity * sizeof(LargeAllocationTracker);
-    uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
-    return (size + page_size - 1) & ~(page_size - 1);  // Round up to page size
+// Safe CPU ID getter - falls back to APIC ID during early boot
+static inline uint64_t getCurrentCpuId() {
+    if (perCpuReady.load(std::memory_order_acquire)) {
+        return cpu::currentCpu();
+    }
+    // Early boot: use APIC ID
+    uint32_t apicId = apic::getApicId();
+    if (numCpus > 0) {
+        uint64_t cpuIdx = smt::getCpuIndexFromApicId(apicId);
+        return cpuIdx;
+    }
+    return 0;  // BSP during very early init
 }
 
-static void initTracker() {
-    trackerLock.lock();
-    if (!trackedAllocsInitialized) {
-        uint64_t allocSize = trackerArraySize(MIN_TRACKED_ALLOCS);
-        trackedAllocs = static_cast<LargeAllocationTracker*>(phys::pageAlloc(allocSize));
-        if (trackedAllocs == nullptr) {
-            ker::mod::io::serial::write("kmalloc: FATAL - failed to allocate initial tracker array\n");
-            trackerLock.unlock();
-            return;
-        }
-        trackedAllocsCapacity = MIN_TRACKED_ALLOCS;
-        trackedAllocsCount = 0;
-        for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-            trackedAllocs[i].virt_addr = nullptr;
-            trackedAllocs[i].size = 0;
-            trackedAllocs[i].in_use = false;
-        }
-        trackedAllocsInitialized = true;
-    }
-    trackerLock.unlock();
-}
+// Allocation size boundaries:
+// 0x1 - 0x800: mini_malloc (slab allocator)
+// 0x801 - 0xFFFF: medium allocations (regular pageAlloc with tracking)
+// 0x10000+: large allocations (pageAllocHuge with tracking)
+constexpr uint64_t SLAB_MAX_SIZE = 0x800;     // 2KB - maximum size mini_malloc handles
+constexpr uint64_t MEDIUM_MAX_SIZE = 0xFFFF;  // ~64KB - maximum size for medium allocations
 
-// Resize the tracker array (grow or shrink)
-// Returns true on success, false on failure
-static auto resizeTrackerArray(size_t newCapacity) -> bool {
-    if (newCapacity < MIN_TRACKED_ALLOCS) {
-        newCapacity = MIN_TRACKED_ALLOCS;
-    }
-    if (newCapacity == trackedAllocsCapacity) {
-        return true;  // No change needed
-    }
+// Medium allocation header for sizes 0x801 - 0xFFFF
+struct MediumAllocationHeader {
+    MediumAllocationHeader* next;
+    uint64_t size;   // Total allocation size including header
+    uint64_t magic;  // For validation
+    // Data follows immediately after this header
+};
 
-    uint64_t newAllocSize = trackerArraySize(newCapacity);
-    auto* newArray = static_cast<LargeAllocationTracker*>(phys::pageAlloc(newAllocSize));
-    if (newArray == nullptr) {
-        return false;  // Allocation failed
-    }
+constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
 
-    // Initialize new array
-    for (size_t i = 0; i < newCapacity; ++i) {
-        newArray[i].virt_addr = nullptr;
-        newArray[i].size = 0;
-        newArray[i].in_use = false;
-    }
+// Large allocation header for sizes >= 0x10000
+struct LargeAllocationHeader {
+    LargeAllocationHeader* next;
+    uint64_t size;
+    uint64_t magic;  // For validation
+    // Data follows immediately after this header
+};
 
-    // Copy existing entries to new array (compact them)
-    size_t newIndex = 0;
-    for (size_t i = 0; i < trackedAllocsCapacity && newIndex < newCapacity; ++i) {
-        if (trackedAllocs[i].in_use) {
-            newArray[newIndex] = trackedAllocs[i];
-            newIndex++;
-        }
-    }
+constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
 
-    // Free old array
-    phys::pageFree(trackedAllocs);
+static MediumAllocationHeader* mediumAllocList = nullptr;
+static sys::Spinlock mediumAllocLock;
 
-    trackedAllocs = newArray;
-    trackedAllocsCapacity = newCapacity;
-    // trackedAllocsCount stays the same
-
-    return true;
-}
-
-// Check if we need to grow the array
-static void maybeGrowTracker() {
-    if (trackedAllocsCapacity == 0) {
-        return;
-    }
-
-    size_t threshold = (trackedAllocsCapacity * GROW_THRESHOLD_PERCENT) / 100;
-    if (trackedAllocsCount >= threshold) {
-        size_t newCapacity = trackedAllocsCapacity * 2;
-        if (!resizeTrackerArray(newCapacity)) {
-            ker::mod::io::serial::write("kmalloc: WARNING - failed to grow tracker array\n");
-        }
-    }
-}
-
-// Check if we should shrink the array
-static void maybeShrinkTracker() {
-    if (trackedAllocsCapacity <= MIN_TRACKED_ALLOCS) {
-        return;
-    }
-
-    size_t threshold = (trackedAllocsCapacity * SHRINK_THRESHOLD_PERCENT) / 100;
-    if (trackedAllocsCount <= threshold) {
-        size_t newCapacity = trackedAllocsCapacity / 2;
-        newCapacity = std::max(newCapacity, MIN_TRACKED_ALLOCS);
-        if (newCapacity < trackedAllocsCapacity) {
-            resizeTrackerArray(newCapacity);  // Shrink failure is not critical
-        }
-    }
-}
-
-static void trackAllocation(void* ptr, uint64_t size) {
-    // Ensure tracker is initialized (handles early allocations before init() is called)
-    if (!trackedAllocsInitialized) {
-        // Note: caller already holds trackerLock, so we need unlocked version
-        uint64_t allocSize = trackerArraySize(MIN_TRACKED_ALLOCS);
-        trackedAllocs = static_cast<LargeAllocationTracker*>(phys::pageAlloc(allocSize));
-        if (trackedAllocs == nullptr) {
-            ker::mod::io::serial::write("kmalloc: FATAL - failed to allocate initial tracker array\n");
-            return;
-        }
-        trackedAllocsCapacity = MIN_TRACKED_ALLOCS;
-        trackedAllocsCount = 0;
-        for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-            trackedAllocs[i].virt_addr = nullptr;
-            trackedAllocs[i].size = 0;
-            trackedAllocs[i].in_use = false;
-        }
-        trackedAllocsInitialized = true;
-    }
-
-    // Check if we need to grow before adding
-    maybeGrowTracker();
-
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (!trackedAllocs[i].in_use) {
-            trackedAllocs[i].virt_addr = ptr;
-            trackedAllocs[i].size = size;
-            trackedAllocs[i].in_use = true;
-            trackedAllocsCount++;
-            return;
-        }
-    }
-    ker::mod::io::serial::write("kmalloc: tracker is full, unable to track large allocation at ");
-    ker::mod::io::serial::writeHex((uint64_t)ptr);
-    ker::mod::io::serial::write("\n");
-    mm::phys::dumpPageAllocationsOOM();
-}
-
-static auto untrackAllocation(void* ptr, uint64_t& outSize) -> bool {
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (trackedAllocs[i].in_use && trackedAllocs[i].virt_addr == ptr) {
-            outSize = trackedAllocs[i].size;
-            trackedAllocs[i].virt_addr = nullptr;
-            trackedAllocs[i].size = 0;
-            trackedAllocs[i].in_use = false;
-            trackedAllocsCount--;
-
-            // Check if we should shrink after removing
-            maybeShrinkTracker();
-            return true;
-        }
-    }
-    return false;
-}
+static LargeAllocationHeader* largeAllocList = nullptr;
+static sys::Spinlock largeAllocLock;
 
 void init() {
-    initTracker();
+    // Initialize per-CPU allocators
+    numCpus = smt::getCoreCount();
+    if (numCpus == 0) numCpus = 1;
+
     mini_malloc_init();
-    kmallocLock = (ker::mod::sys::Spinlock*)mini_malloc(sizeof(ker::mod::sys::Spinlock));
+
+    // Allocate per-CPU allocator structures using mini_malloc
+    perCpuAllocators = static_cast<PerCpuAllocator*>(mini_malloc(sizeof(PerCpuAllocator) * numCpus));
+    if (perCpuAllocators != nullptr) {
+        for (size_t i = 0; i < numCpus; i++) {
+            new (&perCpuAllocators[i]) PerCpuAllocator();
+            perCpuAllocators[i].initialized = true;
+        }
+    }
 }
 
+void enablePerCpuAllocations() { perCpuReady.store(true, std::memory_order_release); }
+
 void dumpTrackedAllocations() {
-    trackerLock.lock();
-    uint64_t totalBytes = 0;
-    uint64_t used = 0;
-    ker::mod::io::serial::write("kmalloc: Tracked large allocations:\n");
-    if (!trackedAllocsInitialized) {
-        ker::mod::io::serial::write("  tracker not initialized\n");
-        trackerLock.unlock();
-        return;
-    }
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (trackedAllocs[i].in_use) {
-            used++;
-            totalBytes += trackedAllocs[i].size;
-            ker::mod::io::serial::write("  idx=");
-            ker::mod::io::serial::writeHex(i);
-            ker::mod::io::serial::write(" addr=0x");
-            ker::mod::io::serial::writeHex((uint64_t)trackedAllocs[i].virt_addr);
+    mediumAllocLock.lock();
+    uint64_t mediumTotalBytes = 0;
+    uint64_t mediumCount = 0;
+    ker::mod::io::serial::write("kmalloc: Medium allocations (0x801-0xFFFF):\n");
+
+    for (MediumAllocationHeader* curr = mediumAllocList; curr != nullptr; curr = curr->next) {
+        if (curr->magic == MEDIUM_ALLOC_MAGIC) {
+            mediumCount++;
+            mediumTotalBytes += curr->size;
+            ker::mod::io::serial::write("  addr=0x");
+            ker::mod::io::serial::writeHex((uint64_t)(curr + 1));
             ker::mod::io::serial::write(" size=");
-            ker::mod::io::serial::writeHex(trackedAllocs[i].size);
+            ker::mod::io::serial::writeHex(curr->size);
             ker::mod::io::serial::write("\n");
         }
     }
-    ker::mod::io::serial::write("  total_entries=");
-    ker::mod::io::serial::writeHex(used);
-    ker::mod::io::serial::write(" total_bytes=");
-    ker::mod::io::serial::writeHex(totalBytes);
-    ker::mod::io::serial::write("\n");
-    trackerLock.unlock();
+    mediumAllocLock.unlock();
+
+    ker::mod::io::serial::write("  medium_total: ");
+    ker::mod::io::serial::writeHex(mediumCount);
+    ker::mod::io::serial::write(" entries, ");
+    ker::mod::io::serial::writeHex(mediumTotalBytes);
+    ker::mod::io::serial::write(" bytes\n");
+
+    largeAllocLock.lock();
+    uint64_t largeTotalBytes = 0;
+    uint64_t largeCount = 0;
+    ker::mod::io::serial::write("kmalloc: Large allocations (>=0x10000):\n");
+
+    for (LargeAllocationHeader* curr = largeAllocList; curr != nullptr; curr = curr->next) {
+        if (curr->magic == LARGE_ALLOC_MAGIC) {
+            largeCount++;
+            largeTotalBytes += curr->size;
+            ker::mod::io::serial::write("  addr=0x");
+            ker::mod::io::serial::writeHex((uint64_t)(curr + 1));  // Data starts after header
+            ker::mod::io::serial::write(" size=");
+            ker::mod::io::serial::writeHex(curr->size);
+            ker::mod::io::serial::write("\n");
+        }
+    }
+
+    ker::mod::io::serial::write("  large_total: ");
+    ker::mod::io::serial::writeHex(largeCount);
+    ker::mod::io::serial::write(" entries, ");
+    ker::mod::io::serial::writeHex(largeTotalBytes);
+    ker::mod::io::serial::write(" bytes\n");
+    largeAllocLock.unlock();
 }
 
 void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
-    trackerLock.lock();
+    mediumAllocLock.lock();
     outCount = 0;
     outBytes = 0;
-    if (!trackedAllocsInitialized) {
-        trackerLock.unlock();
-        return;
-    }
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (trackedAllocs[i].in_use) {
+
+    for (MediumAllocationHeader* curr = mediumAllocList; curr != nullptr; curr = curr->next) {
+        if (curr->magic == MEDIUM_ALLOC_MAGIC) {
             outCount++;
-            outBytes += trackedAllocs[i].size;
+            outBytes += curr->size;
         }
     }
-    trackerLock.unlock();
+    mediumAllocLock.unlock();
+
+    largeAllocLock.lock();
+    for (LargeAllocationHeader* curr = largeAllocList; curr != nullptr; curr = curr->next) {
+        if (curr->magic == LARGE_ALLOC_MAGIC) {
+            outCount++;
+            outBytes += curr->size;
+        }
+    }
+    largeAllocLock.unlock();
 }
 
 void* malloc(uint64_t size) {
-    // For large allocations, use direct page allocation
-    if (size >= LARGE_ALLOC_THRESHOLD) {
-        // Round up to page size (4KB)
+    if (size == 0) {
+        return nullptr;
+    }
+
+    // Tier 1: Small allocations (0x1 - 0x800) - use mini_malloc slab allocator
+    if (size <= SLAB_MAX_SIZE) {
+        if (perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+            uint64_t cpuId = getCurrentCpuId();
+            if (cpuId < numCpus && perCpuAllocators[cpuId].initialized) {
+                perCpuAllocators[cpuId].lock.lock();
+                void* ptr = mini_malloc(size);
+                perCpuAllocators[cpuId].lock.unlock();
+                return ptr;
+            }
+        }
+
+        // Fallback to global lock if per-CPU not available
+        globalAllocLock.lock();
+        void* ptr = mini_malloc(size);
+        globalAllocLock.unlock();
+        return ptr;
+    }
+
+    // Tier 2: Medium allocations (0x801 - 0xFFFF) - use regular pageAlloc with tracking
+    if (size <= MEDIUM_MAX_SIZE) {
         uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
-        uint64_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
+        uint64_t total_size = size + sizeof(MediumAllocationHeader);
+        uint64_t alloc_size = (total_size + page_size - 1) & ~(page_size - 1);
+
 #ifdef DEBUG_KMALLOC
-        ker::mod::io::serial::write("kmalloc: Large allocation (");
+        ker::mod::io::serial::write("kmalloc: Medium allocation (");
         ker::mod::io::serial::writeHex(size);
         ker::mod::io::serial::write(" bytes), using pageAlloc (");
         ker::mod::io::serial::writeHex(alloc_size);
         ker::mod::io::serial::write(" bytes)\n");
 #endif
-        // Allocate physical pages (pageAlloc returns virtual address already)
-        void* virt_ptr = phys::pageAlloc(alloc_size);
-        if (virt_ptr == nullptr) {
+
+        void* alloc_ptr = phys::pageAlloc(alloc_size);
+        if (alloc_ptr == nullptr) {
+#ifdef DEBUG_KMALLOC
+            ker::mod::io::serial::write("kmalloc: pageAlloc failed for medium allocation\n");
+#endif
+            return nullptr;
+        }
+
+        // Set up header with tracking info
+        auto* header = static_cast<MediumAllocationHeader*>(alloc_ptr);
+        header->size = alloc_size;
+        header->magic = MEDIUM_ALLOC_MAGIC;
+
+        // Add to linked list
+        mediumAllocLock.lock();
+        header->next = mediumAllocList;
+        mediumAllocList = header;
+        mediumAllocLock.unlock();
+
+        // Return pointer to data (after header)
+        return static_cast<void*>(header + 1);
+    }
+
+    // Tier 3: Large allocations (>= 0x10000) - use pageAllocHuge with tracking
+    uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
+    uint64_t total_size = size + sizeof(LargeAllocationHeader);
+    uint64_t alloc_size = (total_size + page_size - 1) & ~(page_size - 1);
+
+#ifdef DEBUG_KMALLOC
+    ker::mod::io::serial::write("kmalloc: Large allocation (");
+    ker::mod::io::serial::writeHex(size);
+    ker::mod::io::serial::write(" bytes), using pageAllocHuge (");
+    ker::mod::io::serial::writeHex(alloc_size);
+    ker::mod::io::serial::write(" bytes)\n");
+#endif
+
+    // Allocate from huge page zone
+    void* alloc_ptr = phys::pageAllocHuge(alloc_size);
+    if (alloc_ptr == nullptr) {
+        // Fallback to regular pageAlloc if huge zone is full
+        alloc_ptr = phys::pageAlloc(alloc_size);
+        if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
             ker::mod::io::serial::write("kmalloc: pageAlloc failed for large allocation\n");
 #endif
             return nullptr;
         }
-#ifdef DEBUG_KMALLOC
-        ker::mod::io::serial::write("kmalloc: Large allocation successful, virt=");
-        ker::mod::io::serial::writeHex((uint64_t)virt_ptr);
-        ker::mod::io::serial::write("\n");
-#endif
-
-        // Track the allocation so we can free it later (under lock)
-        trackerLock.lock();
-        trackAllocation(virt_ptr, alloc_size);
-        trackerLock.unlock();
-
-        return virt_ptr;
     }
 
-    // For small allocations, use mini_malloc
-    kmallocLock->lock();
-    void* ptr = mini_malloc(size);
-    kmallocLock->unlock();
-    return ptr;
+    // Set up header with tracking info
+    auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
+    header->size = alloc_size;
+    header->magic = LARGE_ALLOC_MAGIC;
+
+    // Add to linked list
+    largeAllocLock.lock();
+    header->next = largeAllocList;
+    largeAllocList = header;
+    largeAllocLock.unlock();
+
+    // Return pointer to data (after header)
+    return static_cast<void*>(header + 1);
 }
 
-// Helper to find tracked allocation without removing it
-static auto findTrackedAllocation(void* ptr, uint64_t& outSize) -> bool {
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (trackedAllocs[i].in_use && trackedAllocs[i].virt_addr == ptr) {
-            outSize = trackedAllocs[i].size;
+// Helper to find and remove from medium alloc list
+static auto findAndRemoveMediumAlloc(void* dataPtr, uint64_t& outSize) -> bool {
+    // dataPtr points to the data, header is just before it
+    auto* header = static_cast<MediumAllocationHeader*>(dataPtr) - 1;
+
+    // Validate magic
+    if (header->magic != MEDIUM_ALLOC_MAGIC) {
+        return false;
+    }
+
+    mediumAllocLock.lock();
+
+    // Remove from linked list
+    MediumAllocationHeader** prev = &mediumAllocList;
+    for (MediumAllocationHeader* curr = mediumAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
+        if (curr == header) {
+            *prev = curr->next;
+            outSize = curr->size;
+            mediumAllocLock.unlock();
             return true;
         }
     }
+
+    mediumAllocLock.unlock();
     return false;
 }
 
-// Helper to update tracked allocation pointer and size
-static void updateTrackedAllocation(void* oldPtr, void* newPtr, uint64_t newSize) {
-    for (size_t i = 0; i < trackedAllocsCapacity; ++i) {
-        if (trackedAllocs[i].in_use && trackedAllocs[i].virt_addr == oldPtr) {
-            trackedAllocs[i].virt_addr = newPtr;
-            trackedAllocs[i].size = newSize;
-            return;
+// Helper to find and remove from large alloc list
+static auto findAndRemoveLargeAlloc(void* dataPtr, uint64_t& outSize) -> bool {
+    // dataPtr points to the data, header is just before it
+    auto* header = static_cast<LargeAllocationHeader*>(dataPtr) - 1;
+
+    // Validate magic
+    if (header->magic != LARGE_ALLOC_MAGIC) {
+        return false;
+    }
+
+    largeAllocLock.lock();
+
+    // Remove from linked list
+    LargeAllocationHeader** prev = &largeAllocList;
+    for (LargeAllocationHeader* curr = largeAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
+        if (curr == header) {
+            *prev = curr->next;
+            outSize = curr->size;
+            largeAllocLock.unlock();
+            return true;
         }
     }
+
+    largeAllocLock.unlock();
+    return false;
 }
 
 auto realloc(void* ptr, int sz) -> void* {
@@ -325,104 +339,195 @@ auto realloc(void* ptr, int sz) -> void* {
 
     uint64_t newSize = static_cast<uint64_t>(sz);
 
-    // Check if this is a tracked large allocation
-    trackerLock.lock();
-    uint64_t oldSize = 0;
-    bool isTracked = findTrackedAllocation(ptr, oldSize);
-    trackerLock.unlock();
+    // Determine the type of the existing allocation by checking headers
+    auto* potentialLargeHeader = static_cast<LargeAllocationHeader*>(ptr) - 1;
+    auto* potentialMediumHeader = static_cast<MediumAllocationHeader*>(ptr) - 1;
 
-    if (isTracked) {
-        // It's a large allocation - handle with pageAlloc directly
-        uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
-        uint64_t newAllocSize = (newSize + page_size - 1) & ~(page_size - 1);
+    // Case 1: Current allocation is LARGE (>= 0x10000)
+    if (potentialLargeHeader->magic == LARGE_ALLOC_MAGIC) {
+        uint64_t oldSize = potentialLargeHeader->size - sizeof(LargeAllocationHeader);
 
-        // If the new size fits in the current allocation and is the same page count, return same pointer
-        if (newAllocSize == oldSize) {
-            return ptr;
+        // Staying in large range?
+        if (newSize > MEDIUM_MAX_SIZE) {
+            uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
+            uint64_t newAllocSize = (newSize + sizeof(LargeAllocationHeader) + page_size - 1) & ~(page_size - 1);
+
+            // If the new size fits in the current allocation, return same pointer
+            if (newAllocSize == potentialLargeHeader->size) {
+                return ptr;
+            }
+
+            // Need to reallocate - allocate new, copy, free old
+            void* newAlloc = phys::pageAllocHuge(newAllocSize);
+            if (newAlloc == nullptr) {
+                newAlloc = phys::pageAlloc(newAllocSize);
+                if (newAlloc == nullptr) {
+                    return nullptr;
+                }
+            }
+
+            auto* newHeader = static_cast<LargeAllocationHeader*>(newAlloc);
+            newHeader->size = newAllocSize;
+            newHeader->magic = LARGE_ALLOC_MAGIC;
+
+            uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
+            memcpy(newHeader + 1, ptr, copySize);
+
+            // Update linked list
+            largeAllocLock.lock();
+            LargeAllocationHeader** prev = &largeAllocList;
+            for (LargeAllocationHeader* curr = largeAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
+                if (curr == potentialLargeHeader) {
+                    *prev = curr->next;
+                    break;
+                }
+            }
+            newHeader->next = largeAllocList;
+            largeAllocList = newHeader;
+            largeAllocLock.unlock();
+
+            phys::pageFree(potentialLargeHeader);
+            return static_cast<void*>(newHeader + 1);
         }
 
-        // Need to reallocate (grow or shrink): allocate new pages directly
-        void* newPtr = phys::pageAlloc(newAllocSize);
-        if (newPtr == nullptr) {
-            return nullptr;  // Allocation failed, original ptr still valid
+        // Transitioning from large to medium or small
+        void* newPtr = malloc(newSize);
+        if (newPtr != nullptr) {
+            uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
+            memcpy(newPtr, ptr, copySize);
+            free(ptr);
         }
-
-        // Copy old data to new location (copy the smaller of old/new sizes)
-        uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
-        memcpy(newPtr, ptr, copySize);
-
-        // Update tracking: change the entry to point to new allocation
-        trackerLock.lock();
-        updateTrackedAllocation(ptr, newPtr, newAllocSize);
-        trackerLock.unlock();
-
-        // Free old pages
-        phys::pageFree(ptr);
-
         return newPtr;
     }
 
-    // Check if new size should be a large allocation
-    if (newSize >= LARGE_ALLOC_THRESHOLD) {
-        // Transitioning from small (mini_malloc) to large (pageAlloc)
-        uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
-        uint64_t newAllocSize = (newSize + page_size - 1) & ~(page_size - 1);
+    // Case 2: Current allocation is MEDIUM (0x801 - 0xFFFF)
+    if (potentialMediumHeader->magic == MEDIUM_ALLOC_MAGIC) {
+        uint64_t oldSize = potentialMediumHeader->size - sizeof(MediumAllocationHeader);
 
-        void* newPtr = phys::pageAlloc(newAllocSize);
-        if (newPtr == nullptr) {
-            return nullptr;
+        // Staying in medium range?
+        if (newSize > SLAB_MAX_SIZE && newSize <= MEDIUM_MAX_SIZE) {
+            uint64_t page_size = ker::mod::mm::paging::PAGE_SIZE;
+            uint64_t newAllocSize = (newSize + sizeof(MediumAllocationHeader) + page_size - 1) & ~(page_size - 1);
+
+            // If the new size fits in the current allocation, return same pointer
+            if (newAllocSize == potentialMediumHeader->size) {
+                return ptr;
+            }
+
+            // Need to reallocate - allocate new, copy, free old
+            void* newAlloc = phys::pageAlloc(newAllocSize);
+            if (newAlloc == nullptr) {
+                return nullptr;
+            }
+
+            auto* newHeader = static_cast<MediumAllocationHeader*>(newAlloc);
+            newHeader->size = newAllocSize;
+            newHeader->magic = MEDIUM_ALLOC_MAGIC;
+
+            uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
+            memcpy(newHeader + 1, ptr, copySize);
+
+            // Update linked list
+            mediumAllocLock.lock();
+            MediumAllocationHeader** prev = &mediumAllocList;
+            for (MediumAllocationHeader* curr = mediumAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
+                if (curr == potentialMediumHeader) {
+                    *prev = curr->next;
+                    break;
+                }
+            }
+            newHeader->next = mediumAllocList;
+            mediumAllocList = newHeader;
+            mediumAllocLock.unlock();
+
+            phys::pageFree(potentialMediumHeader);
+            return static_cast<void*>(newHeader + 1);
         }
 
-        // Copy old data - we don't know the old size, so copy up to newSize
-        // This is safe as long as the caller knows what they're doing
-        memcpy(newPtr, ptr, newSize);
-
-        // Track the new large allocation
-        trackerLock.lock();
-        trackAllocation(newPtr, newAllocSize);
-        trackerLock.unlock();
-
-        // Free the old small allocation
-        kmallocLock->lock();
-        mini_free(ptr);
-        kmallocLock->unlock();
-
+        // Transitioning from medium to large or small
+        void* newPtr = malloc(newSize);
+        if (newPtr != nullptr) {
+            uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
+            memcpy(newPtr, ptr, copySize);
+            free(ptr);
+        }
         return newPtr;
     }
 
-    // Small allocation staying small - use mini_malloc
-    kmallocLock->lock();
-    void* newPtr = mini_malloc(newSize);
-    if (newPtr != nullptr) [[likely]] {
-        // If the allocator happens to return the same pointer, don't free it - avoid double-free
-        if (newPtr == ptr) {
-            kmallocLock->unlock();
+    // Case 3: Current allocation is SMALL (<= 0x800) - from mini_malloc
+    // We don't know the exact old size, so we'll allocate new and copy what we can
+
+    // Staying in small range?
+    if (newSize <= SLAB_MAX_SIZE) {
+        // Try mini_malloc realloc (it might give same pointer if it fits)
+        uint64_t cpuId = getCurrentCpuId();
+        if (perCpuAllocators != nullptr && cpuId < numCpus && perCpuAllocators[cpuId].initialized &&
+            perCpuReady.load(std::memory_order_acquire)) {
+            perCpuAllocators[cpuId].lock.lock();
+            void* newPtr = mini_malloc(newSize);
+            if (newPtr != nullptr) {
+                // Copy old data - we don't know exact old size, so copy up to newSize
+                // This is safe because mini_malloc slabs are at least the requested size
+                if (newPtr != ptr) {
+                    memcpy(newPtr, ptr, newSize);
+                    mini_free(ptr);
+                }
+            }
+            perCpuAllocators[cpuId].lock.unlock();
+            return newPtr;
+        } else {
+            globalAllocLock.lock();
+            void* newPtr = mini_malloc(newSize);
+            if (newPtr != nullptr) {
+                if (newPtr != ptr) {
+                    memcpy(newPtr, ptr, newSize);
+                    mini_free(ptr);
+                }
+            }
+            globalAllocLock.unlock();
             return newPtr;
         }
-        // Copy old data
-        memcpy(newPtr, ptr, newSize);
-        mini_free(ptr);
     }
-    kmallocLock->unlock();
+
+    // Transitioning from small to medium or large
+    void* newPtr = malloc(newSize);
+    if (newPtr != nullptr) {
+        // We don't know the old size, but it's at most SLAB_MAX_SIZE
+        // Copy up to newSize (safe because old allocation is at least as large as requested)
+        uint64_t copySize = (SLAB_MAX_SIZE < newSize) ? SLAB_MAX_SIZE : newSize;
+        memcpy(newPtr, ptr, copySize);
+        free(ptr);
+    }
     return newPtr;
 }
 
 void* calloc(int sz) {
-    kmallocLock->lock();
-    void* ptr = mini_malloc(sz);
-    kmallocLock->unlock();
-    if (ptr) [[likely]]
+    if (sz <= 0) {
+        return nullptr;
+    }
+
+    void* ptr = malloc(static_cast<uint64_t>(sz));
+    if (ptr) [[likely]] {
         memset(ptr, 0, sz);
+    }
     return ptr;
 }
 
 auto calloc(size_t nmemb, size_t size) -> void* {
+    if (nmemb == 0 || size == 0) {
+        return nullptr;
+    }
+
+    // Check for overflow
+    if (nmemb > SIZE_MAX / size) {
+        return nullptr;
+    }
+
     size_t total = nmemb * size;
-    kmallocLock->lock();
-    void* ptr = mini_malloc(total);
-    kmallocLock->unlock();
-    if (ptr) [[likely]]
+    void* ptr = malloc(total);
+    if (ptr) [[likely]] {
         memset(ptr, 0, total);
+    }
     return ptr;
 }
 
@@ -431,43 +536,63 @@ void free(void* ptr) {
         return;
     }
 
-    // First check if this is a large allocation tracked by kmalloc
-    trackerLock.lock();
-    uint64_t trackedSize = 0;
-    bool wasTracked = untrackAllocation(ptr, trackedSize);
-    trackerLock.unlock();
-
-    if (wasTracked) {
-#ifdef DEBUG_KMALLOC
-        // It's a large allocation we directly allocated via pageAlloc
-        ker::mod::io::serial::write("kmalloc: Freeing large allocation at ");
-        ker::mod::io::serial::writeHex((uint64_t)ptr);
-        ker::mod::io::serial::write(" (");
-        ker::mod::io::serial::writeHex(trackedSize);
-        ker::mod::io::serial::write(" bytes)\n");
-#endif
-        phys::pageFree(ptr);
-        return;
-    }
-
-    // Otherwise, try to free via mini_malloc
-    // mini_malloc handles both its own large allocations and slab allocations
-
-    // If ptr is outside the valid kernel memory range, log the caller here to help
-    // diagnose frees of invalid addresses (avoid flooding: only log when outside valid ranges)
-    // Valid ranges: HHDM (0xffff800000000000-0xffff900000000000) or kernel static (0xffffffff80000000-0xffffffffc0000000)
+    // Validate ptr is in a reasonable range
     uintptr_t ptrVal = reinterpret_cast<uintptr_t>(ptr);
     bool inHHDM = (ptrVal >= 0xffff800000000000ULL && ptrVal < 0xffff900000000000ULL);
     bool inKernelStatic = (ptrVal >= 0xffffffff80000000ULL && ptrVal < 0xffffffffc0000000ULL);
     if (!inHHDM && !inKernelStatic) {
-        ker::mod::dbg::log("kmalloc::free: caller=%p freeing ptr=%p outside valid kernel range (will call mini_free to be defensive)",
-                           __builtin_return_address(0), ptr);
+        ker::mod::dbg::log("kmalloc::free: caller=%p freeing ptr=%p outside valid kernel range", __builtin_return_address(0), ptr);
+        return;
     }
 
-    kmallocLock->lock();
-    mini_free(ptr);
+    // Check if this is a large allocation (>= 0x10000) by examining the header
+    auto* potentialLargeHeader = static_cast<LargeAllocationHeader*>(ptr) - 1;
+    if (potentialLargeHeader->magic == LARGE_ALLOC_MAGIC) {
+        uint64_t size = 0;
+        if (findAndRemoveLargeAlloc(ptr, size)) {
+#ifdef DEBUG_KMALLOC
+            ker::mod::io::serial::write("kmalloc: Freeing large allocation at ");
+            ker::mod::io::serial::writeHex((uint64_t)ptr);
+            ker::mod::io::serial::write(" (");
+            ker::mod::io::serial::writeHex(size);
+            ker::mod::io::serial::write(" bytes)\n");
+#endif
+            phys::pageFree(potentialLargeHeader);  // Free from header, not data ptr
+            return;
+        }
+    }
 
-    kmallocLock->unlock();
+    // Check if this is a medium allocation (0x801 - 0xFFFF) by examining the header
+    auto* potentialMediumHeader = static_cast<MediumAllocationHeader*>(ptr) - 1;
+    if (potentialMediumHeader->magic == MEDIUM_ALLOC_MAGIC) {
+        uint64_t size = 0;
+        if (findAndRemoveMediumAlloc(ptr, size)) {
+#ifdef DEBUG_KMALLOC
+            ker::mod::io::serial::write("kmalloc: Freeing medium allocation at ");
+            ker::mod::io::serial::writeHex((uint64_t)ptr);
+            ker::mod::io::serial::write(" (");
+            ker::mod::io::serial::writeHex(size);
+            ker::mod::io::serial::write(" bytes)\n");
+#endif
+            phys::pageFree(potentialMediumHeader);  // Free from header, not data ptr
+            return;
+        }
+    }
+
+    // Otherwise, it's a small allocation (<= 0x800) - free via mini_malloc
+    if (perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+        uint64_t cpuId = getCurrentCpuId();
+        if (cpuId < numCpus && perCpuAllocators[cpuId].initialized) {
+            perCpuAllocators[cpuId].lock.lock();
+            mini_free(ptr);
+            perCpuAllocators[cpuId].lock.unlock();
+            return;
+        }
+    }
+
+    globalAllocLock.lock();
+    mini_free(ptr);
+    globalAllocLock.unlock();
 }
 
 }  // namespace ker::mod::mm::dyn::kmalloc

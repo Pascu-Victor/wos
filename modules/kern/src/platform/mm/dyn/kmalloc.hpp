@@ -5,6 +5,7 @@
 
 namespace ker::mod::mm::dyn::kmalloc {
 void init();
+void enablePerCpuAllocations();  // Call after cpuParamInit to enable per-CPU allocators
 
 // Dump tracked large allocations for kmalloc (safe to call from OOM)
 void dumpTrackedAllocations();

@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <net/proto/tcp.hpp>
 #include <platform/asm/msr.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -10,8 +9,8 @@
 
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
-#include "platform/interrupt/gdt.hpp"
 #include "platform/interrupt/gates.hpp"
+#include "platform/interrupt/gdt.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
 
@@ -43,8 +42,8 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
     // freeing to GC so they remain valid during this epoch critical section.
 
     // Validate task has required resources for a user task
-    // Idle tasks have no pagemap (run in kernel space) so we check type
-    if (nextTask->type != sched::task::TaskType::IDLE) {
+    // IDLE and DAEMON tasks use the kernel pagemap and have no user thread
+    if (nextTask->type == sched::task::TaskType::PROCESS) {
         // User process must have pagemap
         if (nextTask->pagemap == nullptr) {
             dbg::log("switchTo: FAIL - PID %x pagemap==nullptr", nextTask->pid);
@@ -104,27 +103,32 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     // Validate context before restoring — catch corruption before it causes a crash
     // in userspace where debugging is much harder.
-    if (nextTask->type != sched::task::TaskType::IDLE) {
+    // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
+    if (nextTask->type == sched::task::TaskType::PROCESS) {
         if (frame.cs != desc::gdt::GDT_USER_CS) {
-            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x",
-                     frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
+            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
             for (;;) asm volatile("hlt");
         }
         if (frame.ss != desc::gdt::GDT_USER_DS) {
-            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x",
-                     frame.ss, desc::gdt::GDT_USER_DS, nextTask->pid);
+            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x", frame.ss, desc::gdt::GDT_USER_DS, nextTask->pid);
             for (;;) asm volatile("hlt");
         }
         if (frame.rip >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x",
-                     frame.rip, nextTask->pid);
+            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x", frame.rip, nextTask->pid);
             for (;;) asm volatile("hlt");
         }
         if (frame.rsp >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x",
-                     frame.rsp, nextTask->pid);
+            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x", frame.rsp, nextTask->pid);
             for (;;) asm volatile("hlt");
         }
+    }
+
+    // DIAGNOSTIC: Catch bad RBP immediately after context restore
+    if (gpr.rbp == 0xffffff00000003ULL) {
+        dbg::log("switchTo: BAD RBP=0xffffff00000003 after restore! PID %x CPU %d", nextTask->pid, (int)realCpuId);
+        dbg::log("  task=%p name='%s' entry=0x%x", nextTask, (nextTask->name != nullptr) ? nextTask->name : "?", nextTask->entry);
+        dbg::log("  saved regs.rbp=0x%x frame.rip=0x%x frame.rsp=0x%x", nextTask->context.regs.rbp, frame.rip, frame.rsp);
+        asm volatile("int3");  // breakpoint trap — attach GDB here
     }
 
     // Update scratch area cpuId
@@ -179,12 +183,6 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();
         sched::gcExpiredTasks();
-    }
-
-    // Run TCP timers on CPU 0 every 10 ticks (~100ms).
-    // Each tick is ~10ms, so ticks * 10 gives approximate milliseconds.
-    if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
-        ker::net::proto::tcp_timer_tick(ticks * 10);
     }
 
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);

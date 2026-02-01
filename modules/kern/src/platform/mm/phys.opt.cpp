@@ -1,14 +1,19 @@
 #include "phys.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <platform/acpi/apic/apic.hpp>
+#include <platform/asm/cpu.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 
-#include "buddy_alloc/buddy_alloc.hpp"
 #include "limine.h"
+#include "page_alloc.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
@@ -23,52 +28,129 @@ static uint64_t kernelCr3 = 0;
 namespace ker::mod::mm::phys {
 
 namespace {
-sys::Spinlock memlock;
-__attribute__((section(".data"))) paging::PageZone* zones = nullptr;
+// Per-CPU page cache for reducing lock contention
+struct PerCpuPageCache {
+    static constexpr size_t CACHE_SIZE = 16;  // Pages per CPU cache
+    void* pages[CACHE_SIZE];
+    size_t count;
+    sys::Spinlock lock;  // Fine-grained per-CPU lock
 
-// Allocation tracking counters
-static uint64_t totalAllocatedBytes = 0;
-static uint64_t totalFreedBytes = 0;
-static uint64_t allocCount = 0;
-static uint64_t freeCount = 0;
+    PerCpuPageCache() : count(0) {
+        for (size_t i = 0; i < CACHE_SIZE; i++) {
+            pages[i] = nullptr;
+        }
+    }
+};
+
+sys::Spinlock memlock;  // Global lock for zone list and large allocations
+__attribute__((section(".data"))) paging::PageZone* zones = nullptr;
+__attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // Dedicated zone for huge allocations
+
+// Per-CPU caches (initialized in init())
+static PerCpuPageCache* perCpuCaches = nullptr;
+static size_t numCpus = 0;
+static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures are initialized
+
+// Per-CPU cache deferred initialization info
+static uint64_t perCpuCachesPhysBase = 0;
+static uint64_t perCpuCachesSize = 0;
+
+// Huge page zone deferred initialization info
+static uint64_t hugePageBase = 0;
+static uint64_t hugePageSize = 0;
+
+// Allocation tracking counters (now atomic for multi-CPU safety)
+static std::atomic<uint64_t> totalAllocatedBytes{0};
+static std::atomic<uint64_t> totalFreedBytes{0};
+static std::atomic<uint64_t> allocCount{0};
+static std::atomic<uint64_t> freeCount{0};
+bool stack_overlap_check_enabled = false;
+
+// Safe CPU ID getter - falls back to APIC ID during early boot
+static inline uint64_t getCurrentCpuId() {
+    if (perCpuReady.load(std::memory_order_acquire)) {
+        return cpu::currentCpu();
+    }
+    // Early boot: use APIC ID
+    uint32_t apicId = apic::getApicId();
+    if (numCpus > 0) {
+        uint64_t cpuIdx = smt::getCpuIndexFromApicId(apicId);
+        return cpuIdx;
+    }
+    return 0;  // BSP during very early init
+}
 }  // namespace
+
+void enable_stack_overlap_check() { stack_overlap_check_enabled = true; }
 
 void dumpAllocStats() {
     io::serial::write("Physical alloc stats: allocated=");
-    io::serial::writeHex(totalAllocatedBytes);
+    io::serial::writeHex(totalAllocatedBytes.load());
     io::serial::write(" freed=");
-    io::serial::writeHex(totalFreedBytes);
+    io::serial::writeHex(totalFreedBytes.load());
     io::serial::write(" delta=");
-    io::serial::writeHex(totalAllocatedBytes - totalFreedBytes);
+    io::serial::writeHex(totalAllocatedBytes.load() - totalFreedBytes.load());
     io::serial::write(" allocCount=");
-    io::serial::writeHex(allocCount);
+    io::serial::writeHex(allocCount.load());
     io::serial::write(" freeCount=");
-    io::serial::writeHex(freeCount);
+    io::serial::writeHex(freeCount.load());
     io::serial::write("\n");
 }
 
 auto getZones() -> paging::PageZone* { return zones; }
+auto getHugePageZone() -> paging::PageZone* { return hugePageZone; }
 
 namespace {
+// Forward declaration
+auto findFreeBlock(uint64_t size) -> void*;
+
 auto initPageZone(uint64_t base, uint64_t len, int zoneNum) -> paging::PageZone* {
     auto* zone = (paging::PageZone*)base;
 
     base = PAGE_ALIGN_UP(base + sizeof(paging::PageZone));
     len -= paging::PAGE_SIZE;
 
-    zone->start = base;
     zone->name = "Physical Memory";
     zone->zoneNum = zoneNum;
-    zone->buddyInstance = buddy_embed_alignment((uint8_t*)base, len, paging::PAGE_SIZE);
 
-    // Use the actual allocatable arena size from buddy, not the full length!
-    // The buddy reserves space at the end for its metadata.
-    if (zone->buddyInstance != nullptr) {
-        zone->len = buddy_arena_size(zone->buddyInstance);
-    } else {
-        zone->len = 0;  // No buddy = no allocatable space
+    // Initialise the page allocator; metadata is embedded at the start of the region.
+    auto* allocator = reinterpret_cast<PageAllocator*>(base);
+    allocator->init(base, len);
+    zone->allocator = allocator;
+    zone->start = base;
+    zone->len = (uint64_t)allocator->getUsablePages() * paging::PAGE_SIZE;
+    zone->pageCount = allocator->getUsablePages();
+
+    return zone;
+}
+
+auto initHugePageZone(uint64_t base, uint64_t len) -> paging::PageZone* {
+    // Allocate zone structure from regular memory (which is already mapped)
+    // Don't use the huge page region itself for metadata since it's not mapped yet
+    auto* zone = (paging::PageZone*)findFreeBlock(paging::PAGE_SIZE);
+    if (zone == nullptr) {
+        return nullptr;  // OOM
     }
-    zone->pageCount = zone->len / paging::PAGE_SIZE;
+
+    // Allocate PageAllocator structure from regular memory too
+    auto* allocator = reinterpret_cast<PageAllocator*>(findFreeBlock(paging::PAGE_SIZE));
+    if (allocator == nullptr) {
+        return nullptr;  // OOM
+    }
+
+    // Convert huge page region base to virtual address for initialization
+    auto virt_base = reinterpret_cast<uint64_t>(addr::getVirtPointer(base));
+
+    zone->name = "Huge Pages";
+    zone->zoneNum = 9999;  // Special zone number for huge pages
+
+    // Initialize allocator with the huge page region (all virtual addresses now)
+    allocator->init(virt_base, len);
+    zone->allocator = allocator;
+    zone->start = virt_base;
+    zone->len = (uint64_t)allocator->getUsablePages() * paging::PAGE_SIZE;
+    zone->pageCount = allocator->getUsablePages();
+    zone->next = nullptr;
 
     return zone;
 }
@@ -79,7 +161,7 @@ auto findFreeBlock(uint64_t size) -> void* {
             continue;
         }
 
-        void* const block = buddy_malloc(zone->buddyInstance, size);
+        void* const block = zone->allocator->alloc(size);
         if (block == nullptr) {
             [[unlikely]] continue;
         }
@@ -87,6 +169,14 @@ auto findFreeBlock(uint64_t size) -> void* {
     }
 
     return nullptr;
+}
+
+auto findFreeBlockHuge(uint64_t size) -> void* {
+    if (hugePageZone == nullptr || hugePageZone->len < size) {
+        return nullptr;
+    }
+
+    return hugePageZone->allocator->alloc(size);
 }
 
 }  // namespace
@@ -98,11 +188,61 @@ void init(limine_memmap_response* memmapResponse) {
     }
     limine_memmap_response memmap = *(memmapResponse);
 
+    // Initialize per-CPU caches
+    numCpus = smt::getCoreCount();
+    if (numCpus == 0) numCpus = 1;  // Fallback to single CPU
+
+    // Reserve per-CPU caches region (will be mapped and initialized after virt::initPagemap)
+    // We'll allocate these from the first usable memory region
+    perCpuCachesSize = PAGE_ALIGN_UP(sizeof(PerCpuPageCache) * numCpus);
+    for (size_t i = 0; i < memmap.entry_count; i++) {
+        if (memmap.entries[i]->type == LIMINE_MEMMAP_USABLE && memmap.entries[i]->length >= perCpuCachesSize + paging::PAGE_SIZE) {
+            // Save the physical address for later mapping
+            perCpuCachesPhysBase = memmap.entries[i]->base;
+            // Carve it out from the memory map
+            memmap.entries[i]->base += perCpuCachesSize;
+            memmap.entries[i]->length -= perCpuCachesSize;
+            break;
+        }
+    }
+
+    if (perCpuCachesPhysBase == 0) {
+        hcf();  // Can't allocate per-CPU caches
+    }
+
+    // Find the largest usable region for huge pages (reserve ~10% or largest region > 128MB)
+    limine_memmap_entry* hugePageEntry = nullptr;
+    uint64_t largestSize = 0;
+    size_t hugePageIdx = 0;
+
+    for (size_t i = 0; i < memmap.entry_count; i++) {
+        if (memmap.entries[i]->type == LIMINE_MEMMAP_USABLE && memmap.entries[i]->length > largestSize) {
+            largestSize = memmap.entries[i]->length;
+            hugePageEntry = memmap.entries[i];
+            hugePageIdx = i;
+        }
+    }
+
     paging::PageZone* zones_tail = nullptr;
     size_t zoneNum = 0;
+
     for (size_t i = 0; i < memmap.entry_count; i++) {
         if (memmap.entries[i]->type != LIMINE_MEMMAP_USABLE || memmap.entries[i]->length == paging::PAGE_SIZE) {
             continue;
+        }
+
+        // If this is the huge page entry and it's large enough, split it
+        if (i == hugePageIdx && largestSize > 128 * 1024 * 1024) {
+            uint64_t hugeSz = largestSize / 4;  // 25% for huge pages
+            hugeSz = std::max<uint64_t>(hugeSz, static_cast<const unsigned long>(16 * 1024 * 1024));
+            hugeSz = PAGE_ALIGN_UP(hugeSz);
+
+            // Save huge page region info for later initialization (after virt::initPagemap)
+            hugePageBase = memmap.entries[i]->base + memmap.entries[i]->length - hugeSz;
+            hugePageSize = hugeSz;
+
+            // Reduce the main zone size
+            memmap.entries[i]->length -= hugeSz;
         }
 
         paging::PageZone* zone =
@@ -125,13 +265,116 @@ void init(limine_memmap_response* memmapResponse) {
 
 void setKernelCr3(uint64_t cr3) { kernelCr3 = cr3; }
 
+void initHugePageZoneDeferred() {
+    // Map and initialize per-CPU caches first
+    if (perCpuCachesSize > 0 && perCpuCachesPhysBase != 0) {
+        io::serial::write("Mapping per-CPU caches: base=0x");
+        io::serial::writeHex(perCpuCachesPhysBase);
+        io::serial::write(" size=0x");
+        io::serial::writeHex(perCpuCachesSize);
+        io::serial::write("\n");
+
+        for (uint64_t offset = 0; offset < perCpuCachesSize; offset += paging::PAGE_SIZE) {
+            uint64_t phys = perCpuCachesPhysBase + offset;
+            auto virt = (uint64_t)addr::getVirtPointer(phys);
+            virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
+        }
+
+        io::serial::write("Per-CPU caches mapped, initializing structures\n");
+
+        // Now we can safely access the memory
+        void* cacheMemory = addr::getVirtPointer(perCpuCachesPhysBase);
+        perCpuCaches = static_cast<PerCpuPageCache*>(cacheMemory);
+        for (size_t i = 0; i < numCpus; i++) {
+            new (&perCpuCaches[i]) PerCpuPageCache();  // Placement new
+        }
+
+        io::serial::write("Per-CPU caches initialized for ");
+        io::serial::writeHex(numCpus);
+        io::serial::write(" CPUs\n");
+    }
+
+    // Initialize the huge page zone after virt::initPagemap() has set up the kernel page map
+    // This ensures the zone metadata is in mapped memory
+    if (hugePageSize > 0 && hugePageBase != 0) {
+        io::serial::write("Mapping huge page region: base=0x");
+        io::serial::writeHex(hugePageBase);
+        io::serial::write(" size=0x");
+        io::serial::writeHex(hugePageSize);
+        io::serial::write("\n");
+
+        for (uint64_t offset = 0; offset < hugePageSize; offset += paging::PAGE_SIZE) {
+            uint64_t phys = hugePageBase + offset;
+            auto virt = (uint64_t)addr::getVirtPointer(phys);
+            virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
+        }
+
+        io::serial::write("Huge page region mapped, initializing zone\n");
+
+        memlock.lock();
+        // Pass physical addresses - initHugePageZone will convert to virtual
+        hugePageZone = initHugePageZone(hugePageBase, hugePageSize);
+        memlock.unlock();
+
+        if (hugePageZone != nullptr) {
+            io::serial::write("Huge page zone initialized: base=0x");
+            io::serial::writeHex(hugePageBase);
+            io::serial::write(" size=0x");
+            io::serial::writeHex(hugePageSize);
+            io::serial::write(" usable=");
+            io::serial::writeHex(hugePageZone->len);
+            io::serial::write("\n");
+        } else {
+            io::serial::write("WARNING: Failed to initialize huge page zone\n");
+        }
+    }
+}
+
+void enablePerCpuAllocations() { perCpuReady.store(true, std::memory_order_release); }
+
 auto pageAlloc(uint64_t size) -> void* {
+    // Try per-CPU cache first for single-page allocations
+    if (size == paging::PAGE_SIZE && perCpuCaches != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+        uint64_t cpuId = getCurrentCpuId();
+        if (cpuId < numCpus) {
+            PerCpuPageCache& cache = perCpuCaches[cpuId];
+            cache.lock.lock();
+
+            if (cache.count > 0) {
+                // Fast path: pop from cache
+                void* page = cache.pages[--cache.count];
+                cache.lock.unlock();
+
+                totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+                allocCount.fetch_add(1, std::memory_order_relaxed);
+
+                // Zero the page
+                uint64_t savedCr3 = 0;
+                if (kernelCr3 != 0) {
+                    uint64_t currentCr3 = rdcr3();
+                    if (currentCr3 != kernelCr3) {
+                        savedCr3 = currentCr3;
+                        wrcr3(kernelCr3);
+                    }
+                }
+                memset(page, 0, size);
+                if (savedCr3 != 0) {
+                    wrcr3(savedCr3);
+                }
+
+                return page;
+            }
+            cache.lock.unlock();
+        }
+    }
+
+    // Slow path: allocate from zones
     memlock.lock();
     void* block = findFreeBlock(size);
 
     if (block != nullptr) {
-        totalAllocatedBytes += size;
-        allocCount++;
+        totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+        allocCount.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (block == nullptr) {
@@ -149,12 +392,40 @@ auto pageAlloc(uint64_t size) -> void* {
     uint64_t hhdmBase = 0xffff800000000000ULL;
     uint64_t hhdmEnd = 0xffff808000000000ULL;  // ~512GB max physical
     if (blockAddr < hhdmBase || blockAddr >= hhdmEnd) {
-        io::serial::write("FATAL: buddy returned invalid HHDM addr: ");
+        io::serial::write("FATAL: pageAlloc returned invalid HHDM addr: ");
         io::serial::writeHex(blockAddr);
         io::serial::write("\n");
         memlock.unlock();
         hcf();
     }
+
+    // DIAGNOSTIC: Check if returned page overlaps with current task's kernel stack.
+    // This catches the page allocator returning a page that's already in use.
+    if (stack_overlap_check_enabled) {
+        auto* ct = sched::getCurrentTask();
+        if (ct != nullptr && ct->context.syscallKernelStack != 0) {
+            uint64_t stack_top = ct->context.syscallKernelStack;
+            uint64_t stack_bot = stack_top - KERNEL_STACK_SIZE;
+            uint64_t b_start = blockAddr;
+            uint64_t b_end = blockAddr + size;
+            if (b_start < stack_top && b_end > stack_bot) {
+                memlock.unlock();
+                io::serial::write("FATAL: pageAlloc overlaps active kernel stack!\n");
+                io::serial::write("  block=");
+                io::serial::writeHex(b_start);
+                io::serial::write(" size=");
+                io::serial::writeHex(size);
+                io::serial::write("\n  stack=");
+                io::serial::writeHex(stack_bot);
+                io::serial::write(" - ");
+                io::serial::writeHex(stack_top);
+                io::serial::write(" PID=");
+                io::serial::writeHex(ct->pid);
+                io::serial::write("\n");
+                hcf();
+            }
+        }
+    }  // stack_overlap_check_enabled
 
     // If we're not using kernel CR3, temporarily switch for memset
     // This handles the case where userspace pagemaps don't have complete HHDM
@@ -177,24 +448,91 @@ auto pageAlloc(uint64_t size) -> void* {
     return block;
 }
 
+auto pageAllocHuge(uint64_t size) -> void* {
+    // Allocate from dedicated huge page zone
+    memlock.lock();
+    void* block = findFreeBlockHuge(size);
+
+    if (block != nullptr) {
+        totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+        allocCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (block == nullptr) {
+        [[unlikely]] memlock.unlock();
+        io::serial::write("OOM: pageAllocHuge failed for size ");
+        io::serial::writeHex(size);
+        io::serial::write(" bytes\n");
+        return nullptr;
+    }
+
+    // Zero the allocated memory
+    uint64_t savedCr3 = 0;
+    if (kernelCr3 != 0) {
+        uint64_t currentCr3 = rdcr3();
+        if (currentCr3 != kernelCr3) {
+            savedCr3 = currentCr3;
+            wrcr3(kernelCr3);
+        }
+    }
+
+    memset(block, 0, size);
+
+    if (savedCr3 != 0) {
+        wrcr3(savedCr3);
+    }
+
+    memlock.unlock();
+    return block;
+}
+
 void pageFree(void* page) {
+    // Try to return single pages to per-CPU cache
+    if (perCpuCaches != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+        uint64_t cpuId = getCurrentCpuId();
+        if (cpuId < numCpus) {
+            PerCpuPageCache& cache = perCpuCaches[cpuId];
+            cache.lock.lock();
+
+            if (cache.count < PerCpuPageCache::CACHE_SIZE) {
+                // Fast path: push to cache
+                cache.pages[cache.count++] = page;
+                cache.lock.unlock();
+
+                freeCount.fetch_add(1, std::memory_order_relaxed);
+                totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+                return;
+            }
+            cache.lock.unlock();
+        }
+    }
+
+    // Slow path: return to zone
     memlock.lock();
 
-    bool freed = false;
+    // Try huge page zone first
+    if (hugePageZone != nullptr) {
+        if ((uint64_t)page >= hugePageZone->start && (uint64_t)page < hugePageZone->start + hugePageZone->len) {
+            if (hugePageZone->allocator != nullptr) {
+                hugePageZone->allocator->free(page);
+                freeCount.fetch_add(1, std::memory_order_relaxed);
+                totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+            }
+            memlock.unlock();
+            return;
+        }
+    }
+
+    // Check regular zones
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if ((uint64_t)page < zone->start || (uint64_t)page >= zone->start + zone->len) {
             continue;
         }
 
-        // Use the stored buddy instance directly - don't recalculate!
-        buddy* buddyPtr = zone->buddyInstance;
-        if (buddyPtr != nullptr) {
-            // Use buddy_free which doesn't require size - it finds the allocation automatically
-            buddy_free(buddyPtr, page);
-            freed = true;
-            freeCount++;
-            // Note: We don't know the actual size freed, so tracking is approximate
-            totalFreedBytes += paging::PAGE_SIZE;
+        if (zone->allocator != nullptr) {
+            zone->allocator->free(page);
+            freeCount.fetch_add(1, std::memory_order_relaxed);
+            totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
         }
         break;
     }

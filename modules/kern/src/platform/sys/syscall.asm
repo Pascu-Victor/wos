@@ -71,7 +71,31 @@ _wOS_asm_syscallHandler:
 
     popq
     pop rax
+
+    ; DIAGNOSTIC: Validate RCX before sysret.
+    ; RCX should match the user return RIP saved at syscall entry (gs:0x28).
+    ; If it doesn't, the kernel stack was corrupted during the syscall handler.
+    ; Must check BEFORE swapgs since we need kernel GS to read the scratch area.
+    cmp rcx, [gs:0x28]
+    jne .sysret_rcx_corrupt
+
     mov rsp, [gs:0x08] ; restore usermode stack
     swapgs
     sti
     o64 sysret
+
+.sysret_rcx_corrupt:
+    ; RCX was corrupted — don't sysret or we'll execute at a wrong/kernel address.
+    ; Call C diagnostic function. Stack is at kernel stack top, safe for calls.
+    ; Save rax (syscall return value) so the panic handler can report it.
+    push rax
+    extern _wOS_sysret_corrupt_panic
+    mov rdi, rcx         ; arg1 = actual RCX (corrupted value)
+    mov rsi, [gs:0x28]   ; arg2 = expected RCX (saved at entry)
+    mov rdx, [gs:0x08]   ; arg3 = user RSP
+    sub rsp, 8           ; align stack for call
+    call _wOS_sysret_corrupt_panic
+    ; should not return, but halt just in case
+.sysret_halt:
+    hlt
+    jmp .sysret_halt

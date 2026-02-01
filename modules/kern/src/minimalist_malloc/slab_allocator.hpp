@@ -235,7 +235,7 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
     }
     if (header.last_free_caller && header.free_count) {
         // Record the external caller (skip one more frame) so we can see who invoked free()
-        header.last_free_caller[block_index] = (uintptr_t)__builtin_return_address(2);
+        header.last_free_caller[block_index] = (uintptr_t)__builtin_return_address(2);  // NOLINT
     }
 
     header.next_fit_block = block_index;

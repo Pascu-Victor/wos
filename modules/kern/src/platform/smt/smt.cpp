@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "mod/io/serial/serial.hpp"
+#include "net/proto/tcp.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/boot/handover.hpp"
@@ -99,6 +100,10 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     auto idleTask = new sched::task::Task("idle", 0, stackTop, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
 
+    // Enable per-CPU allocations now that GS_BASE is set up
+    mm::phys::enablePerCpuAllocations();
+    mm::dyn::kmalloc::enablePerCpuAllocations();
+
     dbg::log("CPU %d initialized and ready", cpuNo);
 
     // Start the scheduler on this CPU
@@ -133,11 +138,8 @@ void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
 void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
     // Try loading /sbin/init from tmpfs (unpacked from CPIO initramfs)
     auto* init_node = ker::vfs::tmpfs::tmpfs_walk_path("sbin/init", false);
-    if (init_node != nullptr &&
-        init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE &&
-        init_node->data != nullptr) {
-        dbg::log("Loading init from tmpfs (/sbin/init, %u bytes)",
-                 static_cast<unsigned>(init_node->size));
+    if (init_node != nullptr && init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE && init_node->data != nullptr) {
+        dbg::log("Loading init from tmpfs (/sbin/init, %u bytes)", static_cast<unsigned>(init_node->size));
         // Override modules with the tmpfs init binary
         modStruct.count = 1;
         modStruct.modules[0].name = "/sbin/init";
@@ -354,7 +356,7 @@ void init() {
 // init per cpu data
 __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp) {
     assert(smp_request.response != nullptr);
-    
+
     // Allocate a dedicated PerCpu structure for BSP (like APs do in cpuParamInit)
     // Don't reuse stack bottom as that can cause issues
     auto* bspPerCpu = new cpu::PerCpu();
@@ -362,7 +364,7 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
 
     // Zero out the PerCpu area before use
     memset((void*)perCpuAddr, 0, sizeof(cpu::PerCpu));
-    
+
     // Store kernel stack in the PerCpu structure
     bspPerCpu->syscallStack = kernelRsp;
 
@@ -372,7 +374,7 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     // Write cpuId directly to the memory location
     bspPerCpu->cpuId = 0;
     cpu::setCurrentCpuid(0);
-    
+
     // Store the BSP's PerCpu pointer for later retrieval
     if (kernelPerCpuPtrs != nullptr) {
         kernelPerCpuPtrs[0] = bspPerCpu;
@@ -406,6 +408,9 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     dbg::log("Creating init task(s) on BSP BEFORE starting secondary CPUs to ensure PID 1");
     createInitTasks(modules, kernelRsp);
 
+    // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
+    ker::net::proto::tcp_timer_thread_start();
+
     // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)
     for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
         // Skip BSP - it's already running
@@ -428,6 +433,11 @@ __attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t
     // Create idle task for BSP (gets PID 0 like all idle tasks)
     auto idleTask = new sched::task::Task("idle", 0, kernelRsp, sched::task::TaskType::IDLE);
     sched::postTask(idleTask);
+
+    // Enable per-CPU allocations now that BSP GS_BASE is set up
+    mm::phys::enablePerCpuAllocations();
+    mm::dyn::kmalloc::enablePerCpuAllocations();
+
     sched::startScheduler();
     hcf();
 }

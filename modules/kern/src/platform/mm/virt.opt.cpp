@@ -203,67 +203,6 @@ void initPagemap() {
     io::serial::writeHex(totalPagesMapped);
     io::serial::write("\n");
 
-    // Verify high memory mapping - check specific addresses that were causing crashes
-    constexpr uint64_t testPhys = 0x161800000ULL;  // Physical address that was crashing (updated)
-    vaddr_t testVaddr = (vaddr_t)addr::getVirtPointer(testPhys);
-
-    // Debug: Walk page tables manually and print RAW entry values
-    io::serial::write("DEBUG: Checking page tables for vaddr ");
-    io::serial::writeHex(testVaddr);
-    io::serial::write(" (phys ");
-    io::serial::writeHex(testPhys);
-    io::serial::write(")\n");
-
-    size_t pml4idx = (testVaddr >> 39) & 0x1FF;
-    uint64_t pml4_raw = *reinterpret_cast<uint64_t*>(&kernelPagemap->entries[pml4idx]);
-    io::serial::write("  PML4[");
-    io::serial::writeHex(pml4idx);
-    io::serial::write("] raw=");
-    io::serial::writeHex(pml4_raw);
-    io::serial::write("\n");
-
-    if (kernelPagemap->entries[pml4idx].present) {
-        uint64_t pml3_phys = kernelPagemap->entries[pml4idx].frame << 12;
-        auto* pml3 = (PageTable*)addr::getVirtPointer(pml3_phys);
-        size_t pml3idx = (testVaddr >> 30) & 0x1FF;
-        uint64_t pml3_raw = *reinterpret_cast<uint64_t*>(&pml3->entries[pml3idx]);
-        io::serial::write("  PML3[");
-        io::serial::writeHex(pml3idx);
-        io::serial::write("] raw=");
-        io::serial::writeHex(pml3_raw);
-        io::serial::write(" (pml3 at phys ");
-        io::serial::writeHex(pml3_phys);
-        io::serial::write(")\n");
-
-        if (pml3->entries[pml3idx].present) {
-            uint64_t pml2_phys = pml3->entries[pml3idx].frame << 12;
-            auto* pml2 = (PageTable*)addr::getVirtPointer(pml2_phys);
-            size_t pml2idx = (testVaddr >> 21) & 0x1FF;
-            uint64_t pml2_raw = *reinterpret_cast<uint64_t*>(&pml2->entries[pml2idx]);
-            io::serial::write("  PML2[");
-            io::serial::writeHex(pml2idx);
-            io::serial::write("] raw=");
-            io::serial::writeHex(pml2_raw);
-            io::serial::write(" (pml2 at phys ");
-            io::serial::writeHex(pml2_phys);
-            io::serial::write(")\n");
-
-            if (pml2->entries[pml2idx].present) {
-                uint64_t pml1_phys = pml2->entries[pml2idx].frame << 12;
-                auto* pml1 = (PageTable*)addr::getVirtPointer(pml1_phys);
-                size_t pml1idx = (testVaddr >> 12) & 0x1FF;
-                uint64_t pml1_raw = *reinterpret_cast<uint64_t*>(&pml1->entries[pml1idx]);
-                io::serial::write("  PML1[");
-                io::serial::writeHex(pml1idx);
-                io::serial::write("] raw=");
-                io::serial::writeHex(pml1_raw);
-                io::serial::write(" (pml1 at phys ");
-                io::serial::writeHex(pml1_phys);
-                io::serial::write(")\n");
-            }
-        }
-    }
-
     for (size_t i = 0; i <= kernelFileResponse->kernel_file->size; i++) {
         vaddr_t vaddr = kernelAddressResponse->virtual_base + i * paging::PAGE_SIZE;
         mapPage(kernelPagemap,

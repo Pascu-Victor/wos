@@ -132,7 +132,32 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         return 0;
     }
 
+    // DIAGNOSTIC: Detect stack corruption during Task constructor
+    // Save known canary values on stack, check after constructor
+    volatile uint64_t canary1 = 0xDEAD'BEEF'CAFE'BABEULL;
+    volatile uint64_t canary2 = 0x1234'5678'9ABC'DEF0ULL;
+
     auto* newTask = new sched::task::Task(processName, (uint64_t)elfBuffer, kernelRsp, sched::task::TaskType::PROCESS);
+
+    // Check canaries for stack corruption
+    if (canary1 != 0xDEAD'BEEF'CAFE'BABEULL || canary2 != 0x1234'5678'9ABC'DEF0ULL) {
+        dbg::log("STACK CORRUPTION DETECTED in exec!");
+        dbg::log("  canary1=%lx (expect DEADBEEFCAFEBABE)", canary1);
+        dbg::log("  canary2=%lx (expect 123456789ABCDEF0)", canary2);
+        dbg::log("  newTask=%p, &canary1=%p, &canary2=%p", newTask, &canary1, &canary2);
+        dbg::log("  stack RSP approx %p, kernelRsp=%lx", &newTask, kernelRsp);
+    }
+
+    // Also check if newTask is suspiciously not in HHDM range
+    uintptr_t task_addr = reinterpret_cast<uintptr_t>(newTask);
+    if (task_addr != 0 && (task_addr < 0xffff800000000000ULL || task_addr >= 0xffff900000000000ULL)) {
+        dbg::log("EXEC BUG: operator new returned non-HHDM ptr: %p", newTask);
+        dbg::log("  expected range: 0xffff800000000000 - 0xffff900000000000");
+        dbg::log("  &newTask on stack = %p, kernelRsp = %lx", &newTask, kernelRsp);
+        delete[] elfBuffer;
+        return 0;
+    }
+
     if (newTask == nullptr || newTask->thread == nullptr || newTask->pagemap == nullptr) {
         dbg::log("wos_proc_exec: Failed to create task (OOM during thread/pagemap allocation)");
         if (newTask != nullptr) {

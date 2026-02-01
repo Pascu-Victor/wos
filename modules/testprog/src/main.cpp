@@ -111,19 +111,15 @@ auto ping(const char* ip_str) -> bool {
         if (received != -11) {  // -11 is EAGAIN
             break;
         }
-        // Yield to allow packet processing
-        sched_yield();
     }
 
     close(sock);
 
     if (received > 0) {
-        // std::println("testprog[t:{},p:{}]: Received {} bytes from {}", tid, pid, received, ip_str);
         return true;
-    } else {
-        std::println("testprog[t:{},p:{}]: No response from {} (received={})", tid, pid, ip_str, received);
-        return false;
     }
+    std::println("testprog[t:{},p:{}]: No response from {} (received={})", tid, pid, ip_str, received);
+    return false;
 }
 
 // Get network interface information
@@ -197,11 +193,11 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     // Test 1: Ping loopback
     // std::println("testprog[t:{},p:{}]: === Test 1: Ping loopback ===", tid, pid);
-    // ping("127.0.0.1");
+    ping("127.0.0.1");
 
     // // Test 2: Get eth0 info and ping gateway
     // std::println("testprog[t:{},p:{}]: === Test 2: Get eth0 info ===", tid, pid);
-    get_interface_info("eth0");
+    // get_interface_info("eth0");
 
     std::println("testprog[t:{},p:{}]: Network tests complete", tid, pid);
 

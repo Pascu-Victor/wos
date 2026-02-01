@@ -5,6 +5,8 @@
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/mm.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
 #include "platform/asm/msr.hpp"
@@ -31,6 +33,17 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->awaitee_on_exit_count = 0;   // Initialize awaitee counter
     this->deferredTaskSwitch = false;  // No deferred switch by default
     this->yieldSwitch = false;
+    this->kthreadEntry = nullptr;
+
+    // EEVDF scheduling fields
+    this->vruntime = 0;
+    this->vdeadline = 0;
+    this->schedWeight = 1024;    // nice-0 baseline
+    this->sliceNs = 10'000'000;  // 10ms
+    this->sliceUsedNs = 0;
+    this->heapIndex = -1;
+    this->schedQueue = SchedQueue::NONE;
+    this->schedNext = nullptr;
 
     // Initialize file descriptor table to null
     for (unsigned i = 0; i < FD_TABLE_SIZE; ++i) {
@@ -47,7 +60,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         // Initialize syscall scratch area even for idle tasks
         // This is needed because switchTo() sets GS_BASE from this field
         this->context.syscallScratchArea = (uint64_t)(new cpu::PerCpu());
-        cpu::PerCpu* scratchArea = (cpu::PerCpu*)this->context.syscallScratchArea;
+        auto* scratchArea = (cpu::PerCpu*)this->context.syscallScratchArea;
         scratchArea->syscallStack = kernelRsp;
         scratchArea->cpuId = cpu::currentCpu();
 
@@ -55,9 +68,39 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         // This ensures the first user process (init) always gets PID 1 regardless of core count
         this->pid = 0;
         this->entry = 0;
+        this->kthreadEntry = nullptr;
         this->thread = nullptr;
         return;
     }
+
+    if (type == TaskType::DAEMON) {
+        // Kernel thread: ring 0, kernel pagemap, no user thread/TLS, no ELF
+        this->pagemap = mm::virt::getKernelPagemap();
+        this->type = type;
+        this->cpu = cpu::currentCpu();
+        this->context.syscallKernelStack = kernelRsp;
+        this->thread = nullptr;
+
+        auto* perCpu = new cpu::PerCpu();
+        perCpu->syscallStack = kernelRsp;
+        perCpu->cpuId = cpu::currentCpu();
+        this->context.syscallScratchArea = (uint64_t)perCpu;
+
+        this->pid = sched::task::getNextPid();
+        this->entry = 0;
+
+        // Ring 0 interrupt frame for kernel-mode execution
+        this->context.frame.rip = 0;        // Set by createKernelThread
+        this->context.frame.cs = 0x08;      // GDT_KERN_CS
+        this->context.frame.ss = 0x10;      // GDT_KERN_DS
+        this->context.frame.flags = 0x202;  // IF=1, reserved bit 1
+        this->context.frame.rsp = kernelRsp;
+        this->context.frame.intNum = 0;
+        this->context.frame.errCode = 0;
+        this->context.regs = cpu::GPRegs();
+        return;
+    }
+
     // this->entry = entry;
     // this->regs.ip = entry;
     this->pagemap = mm::virt::createPagemap();
@@ -151,7 +194,19 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     }
 }
 
-// Copy constructor deleted - tasks should only be referenced, never copied
+Task* Task::createKernelThread(const char* name, void (*entryFunc)()) {
+    auto stackBase = (uint64_t)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    if (stackBase == 0) {
+        dbg::log("createKernelThread: OOM allocating kernel stack for '%s'", name);
+        return nullptr;
+    }
+    uint64_t kernelRsp = stackBase + KERNEL_STACK_SIZE;
+
+    auto* task = new Task(name, 0, kernelRsp, TaskType::DAEMON);
+    task->kthreadEntry = entryFunc;
+    task->context.frame.rip = (uint64_t)entryFunc;
+    return task;
+}
 
 void Task::loadContext(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 

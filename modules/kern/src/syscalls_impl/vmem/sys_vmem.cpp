@@ -110,9 +110,9 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
     }
 
     // Validate pagemap pointer is in valid HHDM range (not kernel static range)
-    uintptr_t pmAddr = reinterpret_cast<uintptr_t>(task->pagemap);
-    if (pmAddr >= 0xffffffff80000000ULL || pmAddr < 0xffff800000000000ULL) {
-        ker::mod::dbg::log("vmem: task PID %x has corrupted pagemap ptr 0x%x", task->pid, pmAddr);
+    auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);
+    if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
+        ker::mod::dbg::log("vmem: task PID %x has corrupted pagemap ptr 0x%x", task->pid, pm_addr);
         return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
     }
 
@@ -151,35 +151,32 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
     }
 
     // Convert protection flags to page flags
-    uint64_t pageFlags = protToPageFlags(prot);
+    auto page_flags = protToPageFlags(prot);
 
     // Allocate and map pages
-    uint64_t numPages = size / ker::mod::mm::paging::PAGE_SIZE;
-    for (uint64_t i = 0; i < numPages; i++) {
-        uint64_t currentVaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+    auto num_pages = size / ker::mod::mm::paging::PAGE_SIZE;
 
-        // Allocate a physical page
-        void* physPage = ker::mod::mm::phys::pageAlloc();
-        if (physPage == nullptr) {
-            // Out of physical memory - dump allocation info and unmap what we've allocated so far
-            for (uint64_t j = 0; j < i; j++) {
-                uint64_t unmapVaddr = vaddr + (j * ker::mod::mm::paging::PAGE_SIZE);
-                ker::mod::mm::virt::unmapPage(task->pagemap, unmapVaddr);
-            }
-            ker::mod::dbg::log("vmem: out of physical memory at page %d/%d", i, numPages);
-            ker::mod::mm::phys::dumpPageAllocationsOOM();
-            // TODO: implement process termination on OOM here for now dump will HCF
-            return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
-        }
+    // Allocate all physical pages at once for efficiency
+    void* phys_pages = ker::mod::mm::phys::pageAlloc(size);
+    if (phys_pages == nullptr) {
+        ker::mod::dbg::log("vmem: out of physical memory for %llu pages", num_pages);
+        ker::mod::mm::phys::dumpPageAllocationsOOM();
+        // TODO: implement process termination on OOM here for now dump will HCF
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+    }
+
+    for (uint64_t i = 0; i < num_pages; i++) {
+        auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+        auto* phys_page = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(phys_pages) + (i * ker::mod::mm::paging::PAGE_SIZE));
 
         // Get physical address
-        uint64_t paddr = (uint64_t)ker::mod::mm::addr::getPhysPointer((uint64_t)physPage);
+        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(phys_page)));
 
         // Zero out the page for security
-        memset(physPage, 0, ker::mod::mm::paging::PAGE_SIZE);
+        memset(phys_page, 0, ker::mod::mm::paging::PAGE_SIZE);
 
         // Map the page
-        ker::mod::mm::virt::mapPage(task->pagemap, currentVaddr, paddr, pageFlags);
+        ker::mod::mm::virt::mapPage(task->pagemap, current_vaddr, paddr, page_flags);
     }
 
     return vaddr;

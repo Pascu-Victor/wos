@@ -82,6 +82,41 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
     }
 }
 
+// Called from syscall.asm when RCX (return RIP) was corrupted during syscall handling.
+// This means the kernel stack has been overwritten between pushq (entry) and popq (exit).
+extern "C" [[noreturn]] void _wOS_sysret_corrupt_panic(uint64_t actualRcx, uint64_t expectedRcx, uint64_t userRsp) {
+    io::serial::write("\n!!! SYSRET CORRUPTION DETECTED !!!\n");
+    io::serial::write("  RCX (actual):   0x");
+    io::serial::write(actualRcx);
+    io::serial::write("\n  RCX (expected): 0x");
+    io::serial::write(expectedRcx);
+    io::serial::write("\n  User RSP:       0x");
+    io::serial::write(userRsp);
+
+    // Dump CPU and task info
+    io::serial::write("\n  CPU: ");
+    io::serial::write((uint64_t)cpu::currentCpu());
+
+    // Read the scratch area fields that might explain what happened
+    uint64_t gsKernStack = 0;
+    asm volatile("movq %%gs:0x0, %0" : "=r"(gsKernStack));
+    io::serial::write("\n  gs:0x00 (kernel stack): 0x");
+    io::serial::write(gsKernStack);
+
+    uint64_t gsSavedRip = 0;
+    asm volatile("movq %%gs:0x28, %0" : "=r"(gsSavedRip));
+    io::serial::write("\n  gs:0x28 (saved RIP):    0x");
+    io::serial::write(gsSavedRip);
+
+    uint64_t gsCpuId = 0;
+    asm volatile("movq %%gs:0x10, %0" : "=r"(gsCpuId));
+    io::serial::write("\n  gs:0x10 (cpuId):        0x");
+    io::serial::write(gsCpuId);
+
+    io::serial::write("\n  Halting.\n");
+    for (;;) asm volatile("hlt");
+}
+
 void init() {
     uint64_t efer = 0;
     cpuGetMSR(IA32_EFER, &efer);

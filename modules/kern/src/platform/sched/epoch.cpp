@@ -51,6 +51,25 @@ void EpochManager::enterCritical() {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+void EpochManager::enterCriticalAPIC() {
+    uint64_t apicId = apic::getApicId();
+
+    if (cpuEpochs == nullptr) {
+        dbg::log("EpochManager::enterCriticalAPIC: cpuEpochs not initialized! CRITICAL FAILURE.");
+        return;
+    }
+    // Mark that we're entering a critical section
+    cpuEpochs[apicId].inCriticalSection.store(true, std::memory_order_relaxed);
+
+    // Read the current global epoch and store it as our local epoch.
+    // This must happen AFTER setting inCriticalSection to ensure proper ordering.
+    uint64_t epoch = globalEpoch.load(std::memory_order_acquire);
+    cpuEpochs[apicId].localEpoch.store(epoch, std::memory_order_release);
+
+    // Full barrier to ensure all the above is visible before we access any task pointers
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 void EpochManager::exitCritical() {
     uint64_t cpuId = cpu::currentCpu();
 
@@ -61,13 +80,9 @@ void EpochManager::exitCritical() {
     cpuEpochs[cpuId].inCriticalSection.store(false, std::memory_order_release);
 }
 
-auto EpochManager::currentEpoch() -> uint64_t {
-    return globalEpoch.load(std::memory_order_acquire);
-}
+auto EpochManager::currentEpoch() -> uint64_t { return globalEpoch.load(std::memory_order_acquire); }
 
-void EpochManager::advanceEpoch() {
-    globalEpoch.fetch_add(1, std::memory_order_acq_rel);
-}
+void EpochManager::advanceEpoch() { globalEpoch.fetch_add(1, std::memory_order_acq_rel); }
 
 auto EpochManager::isSafeToReclaim(uint64_t deathEpoch) -> bool {
     uint64_t current = globalEpoch.load(std::memory_order_acquire);

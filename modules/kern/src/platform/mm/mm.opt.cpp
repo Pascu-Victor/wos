@@ -35,8 +35,12 @@ void init(void) {
     virt::init(memmapRequest.response, kernelFileRequest.response, kernelAddressRequest.response);
     dbg::log("Virtual memory manager initialized\n");
     virt::initPagemap();
+    dbg::log("Kernel page map initialized\n");
     // Set kernel CR3 for safe memset in pageAlloc when called from userspace context
     phys::setKernelCr3((uint64_t)addr::getPhysPointer((uint64_t)virt::getKernelPagemap()));
+    // Now initialize huge page zone after page map is ready
+    phys::initHugePageZoneDeferred();
+    dbg::log("Huge page zone initialized\n");
     // Now that all HHDM is mapped, allow allocations from high memory
 }
 }  // namespace ker::mod::mm

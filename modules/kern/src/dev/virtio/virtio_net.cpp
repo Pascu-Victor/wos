@@ -25,12 +25,10 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
     if (addr >= 0xffffffff80000000ULL) {
         // Kernel static mapping — requires page table walk
-        return ker::mod::mm::virt::translate(
-            ker::mod::mm::virt::getKernelPagemap(), addr);
+        return ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
     }
     // HHDM mapping — simple offset subtraction
-    return reinterpret_cast<uint64_t>(
-        ker::mod::mm::addr::getPhysPointer(addr));
+    return reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(addr));
 }
 
 // Fill RX virtqueue with packet buffers
@@ -124,9 +122,7 @@ int virtio_net_open(ker::net::NetDevice* netdev) {
     return 0;
 }
 
-void virtio_net_close(ker::net::NetDevice* netdev) {
-    netdev->state = 0;
-}
+void virtio_net_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
 
 int virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
     auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
@@ -183,9 +179,7 @@ ker::net::NetDeviceOps virtio_net_ops = {
 };
 
 // Write device status byte
-void write_status(uint16_t io_base, uint8_t status) {
-    ::outb(io_base + VIRTIO_REG_DEVICE_STATUS, status);
-}
+void write_status(uint16_t io_base, uint8_t status) { ::outb(io_base + VIRTIO_REG_DEVICE_STATUS, status); }
 
 // Initialize a single virtio-net PCI device
 auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
@@ -201,11 +195,9 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     // Enable PCI bus mastering and I/O space
     ker::dev::pci::pci_enable_bus_master(pci_dev);
-    uint16_t cmd = ker::dev::pci::pci_config_read16(
-        pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND);
+    uint16_t cmd = ker::dev::pci::pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND);
     cmd |= ker::dev::pci::PCI_COMMAND_IO_SPACE;
-    ker::dev::pci::pci_config_write16(
-        pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND, cmd);
+    ker::dev::pci::pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND, cmd);
 
     // === VirtIO device initialization sequence (legacy) ===
 
@@ -232,8 +224,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     ::outl(io_base + VIRTIO_REG_GUEST_FEATURES, our_features);
 
     // 6. Allocate VirtIONetDevice
-    auto* dev = static_cast<VirtIONetDevice*>(
-        ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(VirtIONetDevice)));
+    auto* dev = static_cast<VirtIONetDevice*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(VirtIONetDevice)));
     if (dev == nullptr) {
         write_status(io_base, VIRTIO_STATUS_FAILED);
         return -1;
@@ -268,8 +259,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     // Tell device the physical address of the queue (page-aligned, divided by 4096)
     uint64_t rxq_phys = virt_to_phys(dev->rxq->desc);
-    ::outl(io_base + VIRTIO_REG_QUEUE_ADDR,
-                              static_cast<uint32_t>(rxq_phys / 4096));
+    ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(rxq_phys / 4096));
 
     // Select queue 1 (TX)
     ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 1);
@@ -295,8 +285,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     dev->txq->queue_index = 1;
 
     uint64_t txq_phys = virt_to_phys(dev->txq->desc);
-    ::outl(io_base + VIRTIO_REG_QUEUE_ADDR,
-                              static_cast<uint32_t>(txq_phys / 4096));
+    ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(txq_phys / 4096));
 
     // 8. Read MAC address
     if ((our_features & VIRTIO_NET_F_MAC) != 0) {

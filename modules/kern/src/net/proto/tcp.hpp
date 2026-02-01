@@ -110,6 +110,8 @@ constexpr size_t MAX_TCP_BINDINGS = 128;
 // TCP protocol layer
 void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip);
 void tcp_timer_tick(uint64_t now_ms);
+[[noreturn]] void tcp_timer_thread();
+void tcp_timer_thread_start();
 auto get_tcp_proto_ops() -> SocketProtoOps*;
 
 // TCP output helpers (used by tcp.cpp and tcp_input.cpp)

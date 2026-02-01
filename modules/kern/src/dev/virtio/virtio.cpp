@@ -34,12 +34,11 @@ auto virtq_total_size(uint16_t qsz) -> size_t {
 
 auto virtq_alloc(uint16_t size) -> Virtqueue* {
     if (size == 0 || size > VIRTQ_MAX_SIZE) {
-        mod::dbg::log("virtq_alloc: invalid size %u (max %u)\n", size, VIRTQ_MAX_SIZE);
+        mod::dbg::log("virtq_alloc: invalid size %u (max %u)", size, VIRTQ_MAX_SIZE);
         return nullptr;
     }
 
-    mod::dbg::log("virtq_alloc: sizeof(Virtqueue)=%u, using new\n", sizeof(Virtqueue));
-
+    mod::dbg::log("virtq_alloc: sizeof(Virtqueue)=%u, using new", sizeof(Virtqueue));
     // Allocate the Virtqueue control structure with zero initialization
     auto* vq = new Virtqueue{};
 
@@ -47,11 +46,11 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     size_t total = virtq_total_size(size);
     size_t pages_needed = align_up(total, 4096);
 
-    mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u\n", size, total, pages_needed);
+    mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u", size, total, pages_needed);
 
     auto* mem = ker::mod::mm::phys::pageAlloc(pages_needed);
     if (mem == nullptr) {
-        mod::dbg::log("virtq_alloc: pageAlloc(%u) failed\n", pages_needed);
+        mod::dbg::log("virtq_alloc: pageAlloc(%u) failed", pages_needed);
         delete vq;
         return nullptr;
     }

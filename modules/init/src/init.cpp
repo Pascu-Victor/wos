@@ -28,7 +28,7 @@
 
 namespace {
 constexpr size_t buffer_size = 64;
-constexpr int NUM_SUB_INITS = 20;
+constexpr int NUM_SUB_INITS = 1;
 constexpr size_t FSTAB_BUF_SIZE = 4096;
 constexpr size_t FIELD_MAX = 256;
 
@@ -258,49 +258,99 @@ auto main(int argc, char** argv) -> int {
     };
 
     std::array<SubInitConfig, NUM_SUB_INITS> configs = {{
-        {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
-        {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
-        {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"},
-        {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
-        {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
+        // {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
+        {.spawn_count = 1, .program = "/mnt/disk/testprog"},
+        //  {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
+        // {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {3, "/mnt/disk/testprog"},
+        // {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"},
+        // {3, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"}, {2, "/mnt/disk/testprog"}, {1, "/mnt/disk/testprog"},
     }};
 
     // Spawn sub-inits
     std::array<uint64_t, NUM_SUB_INITS> sub_init_pids = {0};
 
-    for (int i = 0; i < NUM_SUB_INITS; i++) {
-        std::array<char, 16> count_str = {};
-        int_to_str(configs[i].spawn_count, count_str.data());
+    // for (int i = 0; i < NUM_SUB_INITS; i++) {
+    //     std::array<char, 16> count_str = {};
+    //     int_to_str(configs[i].spawn_count, count_str.data());
 
-        // argv: [init_path, spawn_count, program_path, nullptr]
-        std::array<const char*, 4> sub_argv = {"/sbin/init",        // argv[0]: our own path
-                                               count_str.data(),    // argv[1]: number of programs to spawn
-                                               configs[i].program,  // argv[2]: program to spawn
-                                               nullptr};
-        std::array<const char*, 1> sub_envp = {nullptr};
+    //     // argv: [init_path, spawn_count, program_path, nullptr]
+    //     std::array<const char*, 4> sub_argv = {"/sbin/init",        // argv[0]: our own path
+    //                                            count_str.data(),    // argv[1]: number of programs to spawn
+    //                                            configs[i].program,  // argv[2]: program to spawn
+    //                                            nullptr};
+    //     std::array<const char*, 1> sub_envp = {nullptr};
 
-        uint64_t pid = ker::process::exec("/sbin/init", sub_argv.data(), sub_envp.data());
-        if (pid == 0) {
-            std::println("init[{}]: Failed to spawn sub-init {}", cpuno, i);
-        } else {
-            sub_init_pids[i] = pid;
-            std::println("init[{}]: Spawned sub-init {} as PID {} (will spawn {} x '{}')", cpuno, i, pid, configs[i].spawn_count,
-                         configs[i].program);
-        }
-    }
+    //     uint64_t pid = ker::process::exec("/sbin/init", sub_argv.data(), sub_envp.data());
+    //     if (pid == 0) {
+    //         std::println("init[{}]: Failed to spawn sub-init {}", cpuno, i);
+    //     } else {
+    //         sub_init_pids[i] = pid;
+    //         std::println("init[{}]: Spawned sub-init {} as PID {} (will spawn {} x '{}')", cpuno, i, pid, configs[i].spawn_count,
+    //                      configs[i].program);
+    //     }
+    // }
 
-    // Wait for all sub-inits to complete
-    std::println("init[{}]: Waiting for all sub-inits to complete...", cpuno);
-    for (int i = 0; i < NUM_SUB_INITS; i++) {
-        if (sub_init_pids[i] != 0) {
-            int exit_code = 0;
-            ker::process::waitpid((int64_t)sub_init_pids[i], &exit_code, 0);
-            std::println("init[{}]: Sub-init {} (PID {}) exited with code {}", cpuno, i, sub_init_pids[i], exit_code);
-        }
-    }
+    // // Wait for all sub-inits to complete
+    // std::println("init[{}]: Waiting for all sub-inits to complete...", cpuno);
+    // for (int i = 0; i < NUM_SUB_INITS; i++) {
+    //     if (sub_init_pids[i] != 0) {
+    //         int exit_code = 0;
+    //         ker::process::waitpid((int64_t)sub_init_pids[i], &exit_code, 0);
+    //         std::println("init[{}]: Sub-init {} (PID {}) exited with code {}", cpuno, i, sub_init_pids[i], exit_code);
+    //     }
+    // }
 
     std::println("init[{}]: All sub-inits completed! Process tree demo finished.", cpuno);
     std::println("init[{}]: Total processes spawned: {} sub-inits + {} leaf programs", cpuno, NUM_SUB_INITS, 2 + 3 + 1 + 2 + 1);
+
+    // --- Stress test: spawn 50,000 testprog instances in batches ---
+    {
+        constexpr int STRESS_TOTAL = 50000;
+        constexpr int STRESS_BATCH = 500;
+
+        std::println("init[{}]: === STRESS TEST: spawning {} processes in batches of {} ===", cpuno, STRESS_TOTAL, STRESS_BATCH);
+
+        int total_spawned = 0;
+        int total_completed = 0;
+        int total_failed = 0;
+
+        for (int batch = 0; total_spawned + total_failed < STRESS_TOTAL; batch++) {
+            int this_batch = STRESS_BATCH;
+            if (total_spawned + total_failed + this_batch > STRESS_TOTAL) {
+                this_batch = STRESS_TOTAL - total_spawned - total_failed;
+            }
+
+            std::array<uint64_t, STRESS_BATCH> pids = {};
+            int spawned = 0;
+
+            // Spawn entire batch before waiting
+            for (int i = 0; i < this_batch; i++) {
+                std::array<const char*, 2> child_argv = {"/mnt/disk/testprog", nullptr};
+                std::array<const char*, 1> child_envp = {nullptr};
+                uint64_t pid = ker::process::exec("/mnt/disk/testprog", child_argv.data(), child_envp.data());
+                if (pid != 0) {
+                    pids[spawned++] = pid;
+                } else {
+                    total_failed++;
+                }
+            }
+            total_spawned += spawned;
+
+            // Wait for all in this batch
+            for (int i = 0; i < spawned; i++) {
+                int exit_code = 0;
+                ker::process::waitpid(static_cast<int64_t>(pids[i]), &exit_code, 0);
+                std::println("init[{}]: stress batch {}: child PID {} exited with code {}", cpuno, batch, pids[i], exit_code);
+                total_completed++;
+            }
+
+            std::println("init[{}]: stress batch {}: spawned={}, done={}/{}, failed={}", cpuno, batch, spawned, total_completed,
+                         STRESS_TOTAL, total_failed);
+        }
+
+        std::println("init[{}]: === STRESS TEST COMPLETE: spawned={}, completed={}, failed={} ===", cpuno, total_spawned, total_completed,
+                     total_failed);
+    }
 
     // Keep init alive
     for (;;) {

@@ -12,6 +12,7 @@
 #include <syscalls_impl/process/exit.hpp>
 
 #include "mod/io/serial/serial.hpp"
+#include "platform/sched/scheduler.hpp"
 
 namespace ker::mod::gates {
 namespace {
@@ -27,7 +28,7 @@ IrqContext irq_contexts[256] = {};
 
 // Next vector to try for allocation (48+ to avoid legacy ISA range)
 uint8_t next_alloc_vector = 48;
-}
+}  // namespace
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // CRITICAL: Prevent nested panics by detecting recursion
@@ -43,11 +44,21 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         if (expectedOwner == myApicId) {
             // We already own it - this is a nested panic on the same CPU
             io::serial::enterPanicMode();
-            dbg::log("CPU %d: NESTED PANIC DETECTED! Halting immediately.", myApicId);
+            dbg::log(
+                "CPU %d: NESTED PANIC DETECTED! Halting immediately. Frame info: intNum=%d, errCode=%d, rip=0x%x, cs=0x%x, flags=0x%x, "
+                "rsp=0x%x, ss=0x%x. GPRegs: rax=0x%x, rbx=0x%x, rcx=0x%x, rdx=0x%x, rdi=0x%x, rsi=0x%x, rbp=0x%x, r8=0x%x, r9=0x%x, "
+                "r10=0x%x, r11=0x%x, r12=0x%x, r13=0x%x, r14=0x%x, r15=0x%x",
+                myApicId, frame.intNum, frame.errCode, frame.rip, frame.cs, frame.flags, frame.rsp, frame.ss, gpr.rax, gpr.rbx, gpr.rcx,
+                gpr.rdx, gpr.rdi, gpr.rsi, gpr.rbp, gpr.r8, gpr.r9, gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
         } else {
             // Different CPU owns it - just print minimal info and halt
             io::serial::enterPanicMode();
-            dbg::log("CPU %d: FAULT while CPU %d is handling panic. Halting.", myApicId, expectedOwner);
+            dbg::log(
+                "CPU %d: FAULT while CPU %d is handling panic. Halting. Frame info: intNum=%d, errCode=%d, rip=0x%x, cs=0x%x, flags=0x%x, "
+                "rsp=0x%x, ss=0x%x. GPRegs: rax=0x%x, rbx=0x%x, rcx=0x%x, rdx=0x%x, rdi=0x%x, rsi=0x%x, rbp=0x%x, r8=0x%x, r9=0x%x, "
+                "r10=0x%x, r11=0x%x, r12=0x%x, r13=0x%x, r14=0x%x, r15=0x%x",
+                myApicId, expectedOwner, frame.intNum, frame.errCode, frame.rip, frame.cs, frame.flags, frame.rsp, frame.ss, gpr.rax,
+                gpr.rbx, gpr.rcx, gpr.rdx, gpr.rdi, gpr.rsi, gpr.rbp, gpr.r8, gpr.r9, gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
         }
         asm volatile("cli; hlt");
         __builtin_unreachable();
@@ -82,12 +93,11 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         auto* currentTaskForDump = ker::mod::sched::getCurrentTask();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
-        uint64_t cpuIdFromGs = cpu::currentCpu();
         uint32_t apicId = apic::getApicId();
         uint64_t cpuIdFromApic = smt::getCpuIndexFromApicId(apicId);
-        dbg::log("USERFAULT DEBUG: cpuFromGs=%d apicId=%d cpuFromApic=%d task=%p taskPid=%x cr3=0x%x taskPagemap=%p", cpuIdFromGs, apicId,
-                 cpuIdFromApic, currentTaskForDump, currentTaskForDump ? currentTaskForDump->pid : 0xDEAD, cr3,
-                 currentTaskForDump ? (void*)currentTaskForDump->pagemap : nullptr);
+        dbg::log("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%x cr3=0x%x taskPagemap=%p", apicId, cpuIdFromApic,
+                 currentTaskForDump, (currentTaskForDump != nullptr) ? currentTaskForDump->pid : 0xDEAD, cr3,
+                 (currentTaskForDump != nullptr) ? (void*)currentTaskForDump->pagemap : nullptr);
 
         ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
@@ -139,7 +149,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // or its fields while we're printing panic info. We do this BEFORE acquiring
     // the serial lock to minimize the window where GC can corrupt task data.
     // If epoch management is broken, this is a no-op (safe).
-    ker::mod::sched::EpochManager::enterCritical();
+    ker::mod::sched::EpochManager::enterCriticalAPIC();
 
     // Enter panic mode for serial output. This disables the serial lock entirely
     // to prevent deadlocks when CPU ID detection is unreliable during panic.
@@ -156,7 +166,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
                     (rspAddr >= 0xffffffff80000000ULL && rspAddr < 0xffffffffc0000000ULL);
 
     if (rspValid) {
-        constexpr uint64_t MAX_STACK_TRACE = 32;
+        constexpr uint64_t MAX_STACK_TRACE = 64;
         for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
             dbg::log("%d: 0x%x", i, rsp[i]);
         }
@@ -167,7 +177,14 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // Dump current task information - use getCurrentTask() instead of hardcoded address
     // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
     uint64_t cpuId = apic::getApicId();
-    sched::task::Task* currentTask = sched::getCurrentTask();
+    sched::task::Task* currentTask = nullptr;
+
+    if (!sched::hasRunQueues()) {
+        dbg::log("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
+        goto skip_task_dump;  // NOLINT
+    }
+
+    currentTask = sched::getCurrentTask();
 
     dbg::log("=== Current Task Info ===");
     dbg::log("debug_task_ptrs[%d] = 0x%x", cpuId, (uint64_t)currentTask);
@@ -182,7 +199,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         if (!inHHDM && !inKernelStatic) {
             dbg::log("WARNING: currentTask pointer 0x%x is out of valid kernel range!", (uint64_t)currentTask);
             dbg::log("=========================");
-            goto skip_task_dump;
+            goto skip_task_dump;  // NOLINT
         }
 
         // Use volatile access to detect if memory is being freed (may contain garbage)
@@ -389,10 +406,11 @@ skip_task_dump:
         const char* name;
         uint32_t id;
     };
-    MsrInfo msrs[] = {{"IA32_EFER", 0xC0000080},          {"IA32_STAR", 0xC0000081},      {"IA32_LSTAR", 0xC0000082},
-                      {"IA32_FMASK", 0xC0000084},         {"IA32_APIC_BASE", 0x1B},       {"IA32_PAT", 0x277},
-                      {"IA32_MISC_ENABLE", 0x1A0},        {"IA32_FS_BASE", IA32_FS_BASE}, {"IA32_GS_BASE", IA32_GS_BASE},
-                      {"IA32_KERNEL_GS_BASE", 0xC0000102}};
+    MsrInfo msrs[] = {{.name = "IA32_EFER", .id = 0xC0000080},      {.name = "IA32_STAR", .id = 0xC0000081},
+                      {.name = "IA32_LSTAR", .id = 0xC0000082},     {.name = "IA32_FMASK", .id = 0xC0000084},
+                      {.name = "IA32_APIC_BASE", .id = 0x1B},       {.name = "IA32_PAT", .id = 0x277},
+                      {.name = "IA32_MISC_ENABLE", .id = 0x1A0},    {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
+                      {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
     for (auto& m : msrs) {
         uint64_t val = rdmsr(m.id);
         dbg::log("%s: 0x%x", m.name, val);
@@ -430,7 +448,15 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     ker::mod::apic::eoi();
 }
 
+// Vector 32 (0x20) is the timer interrupt, hardcoded in gates.asm (isr32 -> task_switch_handler).
+// It must NEVER be assigned to any other handler.
+static constexpr uint8_t TIMER_VECTOR = 32;
+
 void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
+    if (intNum == TIMER_VECTOR) {
+        ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
+        return;
+    }
     if (interruptHandlers[intNum] != nullptr) {
         ker::mod::io::serial::write("Handler already set\n");
         return;
@@ -443,6 +469,10 @@ void removeInterruptHandler(uint8_t intNum) { interruptHandlers[intNum] = nullpt
 bool isInterruptHandlerSet(uint8_t intNum) { return interruptHandlers[intNum] != nullptr; }
 
 auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
+    if (vector == TIMER_VECTOR) {
+        ker::mod::io::serial::write("requestIrq: vector 32 is reserved for timer\n");
+        return -1;
+    }
     if (interruptHandlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
         ker::mod::io::serial::write("requestIrq: vector already in use\n");
         return -1;
@@ -460,9 +490,12 @@ void freeIrq(uint8_t vector) {
 }
 
 auto allocateVector() -> uint8_t {
-    // Find a free vector starting from 48 (above legacy IRQ range)
-    // Vectors 0-31 are exceptions, 32-47 are legacy ISA IRQs
-    // 48-255 are available for MSI/dynamic allocation
+    // Find a free vector starting from 48 (above legacy IRQ range).
+    // Vectors 0-31 are CPU exceptions.
+    // Vector 32 (0x20) is the timer interrupt — hardcoded in gates.asm
+    // (isr32 -> task_switch_handler). NEVER allocate it.
+    // Vectors 33-47 are reserved for legacy ISA IRQs.
+    // Vectors 48-255 are available for MSI/dynamic allocation.
     for (uint16_t v = next_alloc_vector; v < 256; v++) {
         if (interruptHandlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
             next_alloc_vector = static_cast<uint8_t>(v + 1);

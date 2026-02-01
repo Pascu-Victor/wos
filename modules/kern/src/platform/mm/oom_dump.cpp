@@ -5,6 +5,7 @@
 #include "mod/io/serial/serial.hpp"
 #include "phys.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
@@ -675,10 +676,14 @@ void dumpPageAllocationsOOM() {
 
         totalMemory += zone->len;
 
-        // Skip buddy_arena_free_size entirely during OOM dump - it walks the buddy
-        // tree which can access corrupted metadata and cause page faults. The zone
-        // length is sufficient for diagnostics.
-        io::serial::write("  Arena free: (skipped during OOM - unsafe to walk buddy tree)\n");
+        // Report free/usable page counts from the allocator (O(1), no tree walk).
+        if (zone->allocator != nullptr) {
+            io::serial::write("  Free pages: ");
+            io::serial::write(u64ToDecNoAlloc(zone->allocator->getFreePages(), oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+            io::serial::write(" / ");
+            io::serial::write(u64ToDecNoAlloc(zone->allocator->getUsablePages(), oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+            io::serial::write("\n");
+        }
 
         io::serial::write("\n");
     }
@@ -850,14 +855,11 @@ void dumpPageAllocationsOOM() {
     io::serial::write("│ KERNEL DYNAMIC BUFFERS                                              │\n");
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
-    io::serial::write("\nScheduler Run Queues (per-CPU):\n");
+    io::serial::write("\nScheduler Run Queues (per-CPU, EEVDF — zero dynamic allocations):\n");
 
-    // Each node is sizeof(std::list<Task*>::Node) = 24 bytes (data + next + prev)
-    constexpr uint64_t LIST_NODE_SIZE = 24;
-
-    uint64_t totalActiveTaskNodes = 0;
-    uint64_t totalExpiredTaskNodes = 0;
-    uint64_t totalWaitQueueNodes = 0;
+    uint64_t totalRunnableCount = 0;
+    uint64_t totalDeadCount = 0;
+    uint64_t totalWaitCount = 0;
 
     for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
         sched::RunQueueStats rqStats = sched::getRunQueueStats(cpuNo);
@@ -866,41 +868,34 @@ void dumpPageAllocationsOOM() {
         io::serial::write(u64ToDecNoAlloc(cpuNo, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(":\n");
 
-        io::serial::write("    activeTasks:   ");
+        io::serial::write("    runnableHeap:  ");
         io::serial::write(u64ToDecNoAlloc(rqStats.activeTaskCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" nodes (");
-        io::serial::write(u64ToDecNoAlloc(rqStats.activeTaskCount * LIST_NODE_SIZE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" bytes)\n");
+        io::serial::write(" tasks\n");
 
-        io::serial::write("    expiredTasks:  ");
+        io::serial::write("    deadList:      ");
         io::serial::write(u64ToDecNoAlloc(rqStats.expiredTaskCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" nodes (");
-        io::serial::write(u64ToDecNoAlloc(rqStats.expiredTaskCount * LIST_NODE_SIZE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" bytes)\n");
+        io::serial::write(" tasks\n");
 
-        io::serial::write("    waitQueue:     ");
+        io::serial::write("    waitList:      ");
         io::serial::write(u64ToDecNoAlloc(rqStats.waitQueueCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" nodes (");
-        io::serial::write(u64ToDecNoAlloc(rqStats.waitQueueCount * LIST_NODE_SIZE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-        io::serial::write(" bytes)\n");
+        io::serial::write(" tasks\n");
 
-        totalActiveTaskNodes += rqStats.activeTaskCount;
-        totalExpiredTaskNodes += rqStats.expiredTaskCount;
-        totalWaitQueueNodes += rqStats.waitQueueCount;
+        totalRunnableCount += rqStats.activeTaskCount;
+        totalDeadCount += rqStats.expiredTaskCount;
+        totalWaitCount += rqStats.waitQueueCount;
     }
 
     io::serial::write("\n  Totals across all CPUs:\n");
-    io::serial::write("    Total activeTasks nodes:  ");
-    io::serial::write(u64ToDecNoAlloc(totalActiveTaskNodes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write("    Total runnable (heap): ");
+    io::serial::write(u64ToDecNoAlloc(totalRunnableCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
 
-    io::serial::write("    Total expiredTasks nodes: ");
-    io::serial::write(u64ToDecNoAlloc(totalExpiredTaskNodes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write("    Total dead (GC):       ");
+    io::serial::write(u64ToDecNoAlloc(totalDeadCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
 
-    // Print any expired tasks with their refcounts (useful for debugging leaks).
-    // We print ALL entries by iterating in fixed-size blocks to avoid dynamic allocation.
-    io::serial::write("\nExpired tasks (PID : refcount) per CPU (all entries shown in blocks):\n");
+    // Print dead tasks with their refcounts (useful for debugging leaks).
+    io::serial::write("\nDead tasks (PID : refcount) per CPU:\n");
     for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
         constexpr size_t BLOCK = 128;
         uint64_t pids[BLOCK];
@@ -938,21 +933,22 @@ void dumpPageAllocationsOOM() {
         io::serial::write("\n");
     }
 
-    io::serial::write("    Total waitQueue nodes:    ");
-    io::serial::write(u64ToDecNoAlloc(totalWaitQueueNodes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write("    Total waitList nodes:     ");
+    io::serial::write(u64ToDecNoAlloc(totalWaitCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
 
-    uint64_t totalSchedListBytes = (totalActiveTaskNodes + totalExpiredTaskNodes + totalWaitQueueNodes) * LIST_NODE_SIZE;
-    io::serial::write("    Total scheduler list memory: ");
-    io::serial::write(u64ToDecNoAlloc(totalSchedListBytes, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
-    io::serial::write(" bytes\n");
+    // Scheduler queues use zero dynamic allocations (array-backed heap + intrusive lists)
+    uint64_t totalSchedListBytes = 0;
+    io::serial::write("    Scheduler list memory: 0 bytes (zero-alloc EEVDF)\n");
 
     io::serial::write("\nThread Tracking:\n");
     uint64_t activeThreadCount = sched::threading::getActiveThreadCount();
+    // std::list<Thread*> node: prev + next + data = 24 bytes each
+    constexpr uint64_t STD_LIST_NODE_SIZE = 24;
     io::serial::write("  activeThreads list: ");
     io::serial::write(u64ToDecNoAlloc(activeThreadCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" nodes (");
-    io::serial::write(u64ToDecNoAlloc(activeThreadCount * LIST_NODE_SIZE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(activeThreadCount * STD_LIST_NODE_SIZE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" bytes)\n");
 
     // Estimate Task structure size - includes all fields
@@ -1007,8 +1003,19 @@ void dumpPageAllocationsOOM() {
     io::serial::write(u64ToDecNoAlloc(totalMemory, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" bytes)\n");
 
-    io::serial::write("  Free memory: (unavailable - buddy tree walk unsafe during OOM)\n");
-    io::serial::write("  Used memory: (unavailable)\n\n");
+    // Sum free pages across all zones
+    uint64_t totalFreePages = 0;
+    for (paging::PageZone* z = getZones(); z != nullptr; z = z->next) {
+        if (z->allocator != nullptr) totalFreePages += z->allocator->getFreePages();
+    }
+    io::serial::write("  Free memory: ");
+    io::serial::write(u64ToDecNoAlloc(totalFreePages * paging::PAGE_SIZE / BYTES_PER_MB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" MB (");
+    io::serial::write(u64ToDecNoAlloc(totalFreePages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" pages)\n");
+    io::serial::write("  Used memory: ");
+    io::serial::write(u64ToDecNoAlloc((totalMemory - totalFreePages * paging::PAGE_SIZE) / BYTES_PER_MB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(" MB\n\n");
 
     io::serial::write("Process Memory:\n");
     io::serial::write("  Total tasks tracked: ");

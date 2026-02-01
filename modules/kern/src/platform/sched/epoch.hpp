@@ -18,7 +18,7 @@ struct CpuEpoch {
 // Provides lock-free read-side critical sections with deferred freeing.
 // Objects can only be freed once all CPUs have passed through a quiescent point.
 class EpochManager {
-public:
+   public:
     // Number of epochs that must pass before memory can be reclaimed.
     // Higher values are safer but delay memory reclamation.
     // Reduced from 2 to 1 to speed up GC under memory pressure.
@@ -31,6 +31,10 @@ public:
     // While in a critical section, the CPU promises not to access freed memory.
     // Call this before accessing task pointers outside of locks.
     static void enterCritical();
+
+    // Enter a read-side critical section using APIC ID.
+    // Used in contexts where CPU ID cannot be obtained normally.
+    static void enterCriticalAPIC();
 
     // Exit a read-side critical section.
     // After this, the CPU no longer holds references to task pointers.
@@ -47,7 +51,7 @@ public:
     // Returns true if all CPUs have advanced past the death epoch.
     static auto isSafeToReclaim(uint64_t deathEpoch) -> bool;
 
-private:
+   private:
     static std::atomic<uint64_t> globalEpoch;
     static CpuEpoch* cpuEpochs;  // Per-CPU epoch state array
 };
@@ -55,7 +59,7 @@ private:
 // RAII guard for epoch critical sections.
 // Use this in scheduler functions that access task pointers.
 class EpochGuard {
-public:
+   public:
     EpochGuard() { EpochManager::enterCritical(); }
     ~EpochGuard() { EpochManager::exitCritical(); }
 

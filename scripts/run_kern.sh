@@ -54,11 +54,13 @@ fi
 
 echo "STARTING BOOT:"
 
-qemu-system-x86_64 -M q35 -cpu max -m 8G \
+LOG_ARGS="-d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log"
+
+qemu-system-x86_64 -M q35 -cpu max -m 24G \
   -drive file=disk.qcow2,if=none,id=drive0,format=qcow2 \
   -device ahci,id=ahci \
   -device ide-hd,drive=drive0,bus=ahci.0 \
   -drive file=test_fat32.qcow2,if=none,id=drive1,format=qcow2 \
   -device ide-hd,drive=drive1,bus=ahci.1 \
   $NET_ARGS \
-  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS -d cpu_reset,int,tid,in_asm,guest_errors,page,trace:ps2_keyboard_set_translation -D qemu.%d.log -no-reboot -smp 2
+  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 8

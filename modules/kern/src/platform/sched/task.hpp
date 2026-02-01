@@ -48,11 +48,16 @@ struct Task {
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
+    // Factory for kernel threads (DAEMON tasks).
+    // entryFunc: [[noreturn]] void func() — the kernel thread body.
+    static Task* createKernelThread(const char* name, void (*entryFunc)());
+
     Task(const Task& task) = delete;
 
     mm::paging::PageTable* pagemap;
     Context context;
     uint64_t entry;
+    void (*kthreadEntry)();  // Kernel thread entry (DAEMON only), nullptr otherwise
 
     const char* name;
     TaskType type;
@@ -80,6 +85,7 @@ struct Task {
     // Exit status of this process (set when process exits, used by waitpid)
     int exitStatus;
     bool hasExited;
+    bool waitedOn;  // Set to true when parent retrieves exit status via waitpid
 
     // List of task IDs waiting for this task to exit
     // When this task exits, all tasks in this list will be rescheduled on their respective CPUs
@@ -96,10 +102,38 @@ struct Task {
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
     uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
 
+    // === EEVDF scheduling fields ===
+    // Virtual runtime: cumulative weighted CPU time consumed.
+    // Advances by (actual_ns * 1024 / weight) each tick. Signed for wrap-safe comparison.
+    int64_t vruntime;
+
+    // Virtual deadline: vruntime + (sliceNs * 1024 / weight).
+    // Tasks with earlier deadlines are scheduled first among eligible tasks.
+    int64_t vdeadline;
+
+    // Task weight (nice-level analog). 1024 = default (nice 0).
+    uint32_t schedWeight;
+
+    // Time slice in nanoseconds. Default 10ms.
+    uint32_t sliceNs;
+
+    // Accumulated wall-clock runtime within current slice (ns).
+    uint32_t sliceUsedNs;
+
+    // Index into the per-CPU RunHeap array. -1 if not in any heap.
+    int32_t heapIndex;
+
+    // Which scheduling queue the task is logically in.
+    enum class SchedQueue : uint8_t { NONE = 0, RUNNABLE = 1, WAITING = 2, DEAD_GC = 3 };
+    SchedQueue schedQueue;
+
+    // Intrusive list pointer for wait queue and dead list (zero allocations).
+    Task* schedNext;
+
     // Lock-free lifecycle management (epoch-based reclamation)
     // These must be aligned for atomic operations
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
-    alignas(4) std::atomic<uint32_t> refCount{1};  // Scheduler owns initial reference
+    alignas(4) std::atomic<uint32_t> refCount{1};    // Scheduler owns initial reference
     alignas(8) std::atomic<uint64_t> deathEpoch{0};  // Epoch when task became DEAD
 
     void loadContext(cpu::GPRegs* gpr);
@@ -125,9 +159,7 @@ struct Task {
     }
 
     // Release a reference to this task
-    void release() {
-        refCount.fetch_sub(1, std::memory_order_acq_rel);
-    }
+    void release() { refCount.fetch_sub(1, std::memory_order_acq_rel); }
 
     // Atomically transition task state. Returns true if transition succeeded.
     bool transitionState(TaskState from, TaskState to) {

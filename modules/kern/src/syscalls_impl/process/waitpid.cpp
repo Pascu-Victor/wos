@@ -43,6 +43,8 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
         if (status != nullptr) {
             *status = targetTask->exitStatus;
         }
+        // Mark that the parent has retrieved the exit status (zombie can now be reaped)
+        targetTask->waitedOn = true;
         return pid;  // Return the PID of the exited process
     }
 

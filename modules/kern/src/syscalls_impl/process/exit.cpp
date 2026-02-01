@@ -70,10 +70,18 @@ void wos_proc_exit(int status) {
                 }
             }
 
-            // Reschedule the waiting task on its original CPU.
+            // Mark that this waiter has consumed the exit status (zombie can now be reaped)
+            // Note: If multiple processes wait for the same child (not typical but possible),
+            // only the first one marks waitedOn. In Linux, only one waiter succeeds anyway.
+            if (i == 0) {  // First waiter marks the process as waited-on
+                currentTask->waitedOn = true;
+            }
+
+            // Reschedule the waiting task on the least loaded CPU.
             // rescheduleTaskForCpu validates state and removes from all queues before
             // adding, preventing double-queuing even if the task is still currentTask.
-            ker::mod::sched::rescheduleTaskForCpu(waitingTask->cpu, waitingTask);
+            uint64_t targetCpu = ker::mod::sched::getLeastLoadedCpu();
+            ker::mod::sched::rescheduleTaskForCpu(targetCpu, waitingTask);
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);
 #endif
