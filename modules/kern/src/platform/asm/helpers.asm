@@ -1,4 +1,4 @@
-%macro pushl 0
+%macro pushq 0
     push rax
     push rbx
     push rcx
@@ -16,7 +16,7 @@
     push r15
 %endmacro
 
-%macro popl 0
+%macro popq 0
     pop r15
     pop r14
     pop r13

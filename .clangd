@@ -1,0 +1,57 @@
+Diagnostics:
+    ClangTidy:
+        Add:
+            - "bugprone-*"
+            - "clang-analyzer-*"
+            - "readability-*"
+            - "performance-*"
+            - "misc-*"
+            - "modernize-*"
+            - "cppcoreguidelines-*"
+        Remove:
+            - readability-identifier-length
+            - cppcoreguidelines-pro-type-reinterpret-cast
+            - cppcoreguidelines-owning-memory
+            - cppcoreguidelines-pro-bounds-pointer-arithmetic
+            - cppcoreguidelines-avoid-non-const-global-variables
+            - cppcoreguidelines-pro-type-cstyle-cast
+            - bugprone-easily-swappable-parameters
+            - bugprone-reserved-identifier
+
+    Includes:
+        IgnoreHeader: ".*toolchain/target1/.*"
+    UnusedIncludes: Strict
+    MissingIncludes: Strict
+
+CompileFlags:
+    Add:
+        - -std=c++23
+    Remove:
+        - -w-reloc-rel-dword
+        - -w-reloc-abs-qword
+        - -f
+        - -fsanitize=safe-stack
+        - -felf64
+        - -fPIE
+        - -pie
+        - -resource-dir=/usr/lib/clang/20
+
+Index:
+    Background: Build
+
+InlayHints:
+    Enabled: true
+    ParameterNames: true
+    DeducedTypes: true
+
+Hover:
+    ShowAKA: true
+
+# Ignore .log files completely (no diagnostics, no background indexing)
+If:
+    PathMatch: ".*\\.log$"
+    Then:
+        Index:
+            Background: false
+        Diagnostics:
+            Suppress: true

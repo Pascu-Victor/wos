@@ -2,17 +2,46 @@ cmake_minimum_required(VERSION 3.10)
 project(init_service CXX)
 
 set(TARGET init)
-file(GLOB_RECURSE CXXFILES src/*.cpp)
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffreestanding -g -O0 -std=c++23 -mno-sse -mno-sse2 -Wall")
+# Build only the entry source; exclude any local ABI shims
+set(CXXFILES src/init.cpp)
 
 add_executable(${TARGET} ${CXXFILES})
 
-target_link_libraries(${TARGET} std)
+# Set target-specific compile options to ensure -O0 is respected
+target_compile_options(${TARGET} PRIVATE
+    -g
+    -O0
+    -std=c++23
+    -Wall
+    -mcmodel=small
+)
 
-target_include_directories(${TARGET} PRIVATE ../stdlib/src)
-target_include_directories(${TARGET} PRIVATE ../kern/src)
-target_include_directories(${TARGET} PRIVATE ../)
+include_directories(src ../extern ../ ../extern/limine)
 
-set_target_properties(${TARGET} PROPERTIES LINK_FLAGS "-T${CMAKE_SOURCE_DIR}/modules/init/service.ld -static -nostdlib")
+# Do not include kernel source headers; rely exclusively on toolchain/sysroot headers
 
+set_target_properties(${TARGET} PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    INTERPROCEDURAL_OPTIMIZATION OFF
+)
+
+# Clear the global link options and set our own
+set_target_properties(${TARGET} PROPERTIES LINK_OPTIONS "")
+
+# Use static linking with custom linker script
+target_link_options(${TARGET} PRIVATE
+    "--sysroot=${CMAKE_SYSROOT}"
+    "-fuse-ld=lld"
+    "-L${CMAKE_SYSROOT}/lib"
+    "-static"
+    "-mcmodel=small"
+    "-Wl,-z,now"        # bind-now: resolve all PLT entries at load time
+    "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"
+)
+
+target_link_libraries(${TARGET} PRIVATE
+    c++abi
+    c++
+    c
+    unwind
+)

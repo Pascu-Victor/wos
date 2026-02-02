@@ -6,8 +6,8 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/task.hpp>
-#include <std/list.hpp>
-#include <std/mem.hpp>
+#include <util/list.hpp>
+#include <util/mem.hpp>
 
 namespace ker::mod::time {
 

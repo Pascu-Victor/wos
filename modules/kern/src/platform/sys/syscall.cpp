@@ -1,8 +1,29 @@
 #include "syscall.hpp"
 
+#include <cstdint>
+#include <syscalls_impl/futex/futex.hpp>
+#include <syscalls_impl/multiproc/threadControl.hpp>
+#include <syscalls_impl/net/sys_net.hpp>
+#include <syscalls_impl/time/time.hpp>
+#include <syscalls_impl/vfs/sys_vfs.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
+
+#include "abi/callnums.hpp"
+#include "abi/callnums/futex.h"
+#include "abi/callnums/multiproc.h"
+#include "abi/callnums/process.h"
+#include "abi/callnums/sys_log.h"
+#include "mod/io/serial/serial.hpp"
+#include "platform/asm/cpu.hpp"
+#include "platform/asm/msr.hpp"
+#include "platform/interrupt/gdt.hpp"
+#include "syscalls_impl/log/sys_log.hpp"
+#include "syscalls_impl/multiproc/threadInfo.hpp"
+#include "syscalls_impl/process/process.hpp"
+
 namespace ker::mod::sys {
 
-extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
+extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
     auto callnum = static_cast<abi::callnums>(regs.rax);
     uint64_t a1 = regs.rdi;
     uint64_t a2 = regs.rsi;
@@ -12,11 +33,30 @@ extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
     uint64_t a6 = regs.r10;
 
     switch (callnum) {
-        case abi::callnums::sysLog:
-            return ker::syscall::log::sysLog(static_cast<abi::inter::sysLog::sys_log_ops>(a1), (const char*)a2, a3,
-                                             static_cast<abi::inter::sysLog::sys_log_device>(a4));
-        case abi::callnums::threadInfo:
-            return ker::syscall::multiproc::threadInfo(static_cast<abi::inter::multiproc::threadInfoOps>(a1));
+        case abi::callnums::sys_log:
+            return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
+                                             static_cast<abi::sys_log::sys_log_device>(a4));
+        case abi::callnums::futex:
+            return ker::syscall::futex::sys_futex(a1, a2, a3, a4);
+        case abi::callnums::threading:
+            // Dispatch based on operation - threadControlOps start at 0x100
+            if (a1 >= 0x100) {
+                return ker::syscall::multiproc::threadControl(static_cast<abi::multiproc::threadControlOps>(a1), (void*)a2);
+            }
+            return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
+        case abi::callnums::time:
+            return ker::syscall::time::sys_time_get(a1, (void*)a2, (void*)a3);
+        case abi::callnums::vfs:
+            return ker::syscall::vfs::sys_vfs(a1, a2, a3, a4, a5);
+        case abi::callnums::net:
+            return ker::syscall::net::sys_net(a1, a2, a3, a4, a5, a6);
+        case abi::callnums::vmem:
+            return ker::syscall::vmem::sys_vmem(a1, a2, a3, a4, a5);
+        case abi::callnums::vmem_map:
+            return ker::syscall::vmem::sys_vmem_map(a1, a2, a3, a4, a5, a6);
+        case abi::callnums::process:
+            return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(a1), a2, a3, a4, a5, regs);
+
         default:
             io::serial::write("Syscall undefined\n");
             io::serial::write("Callnum: ");
@@ -44,6 +84,41 @@ extern "C" uint64_t syscallHandler(cpu::GPRegs regs) {
             hcf();
             break;
     }
+}
+
+// Called from syscall.asm when RCX (return RIP) was corrupted during syscall handling.
+// This means the kernel stack has been overwritten between pushq (entry) and popq (exit).
+extern "C" [[noreturn]] void _wOS_sysret_corrupt_panic(uint64_t actualRcx, uint64_t expectedRcx, uint64_t userRsp) {
+    io::serial::write("\n!!! SYSRET CORRUPTION DETECTED !!!\n");
+    io::serial::write("  RCX (actual):   0x");
+    io::serial::write(actualRcx);
+    io::serial::write("\n  RCX (expected): 0x");
+    io::serial::write(expectedRcx);
+    io::serial::write("\n  User RSP:       0x");
+    io::serial::write(userRsp);
+
+    // Dump CPU and task info
+    io::serial::write("\n  CPU: ");
+    io::serial::write((uint64_t)cpu::currentCpu());
+
+    // Read the scratch area fields that might explain what happened
+    uint64_t gsKernStack = 0;
+    asm volatile("movq %%gs:0x0, %0" : "=r"(gsKernStack));
+    io::serial::write("\n  gs:0x00 (kernel stack): 0x");
+    io::serial::write(gsKernStack);
+
+    uint64_t gsSavedRip = 0;
+    asm volatile("movq %%gs:0x28, %0" : "=r"(gsSavedRip));
+    io::serial::write("\n  gs:0x28 (saved RIP):    0x");
+    io::serial::write(gsSavedRip);
+
+    uint64_t gsCpuId = 0;
+    asm volatile("movq %%gs:0x10, %0" : "=r"(gsCpuId));
+    io::serial::write("\n  gs:0x10 (cpuId):        0x");
+    io::serial::write(gsCpuId);
+
+    io::serial::write("\n  Halting.\n");
+    for (;;) asm volatile("hlt");
 }
 
 void init() {

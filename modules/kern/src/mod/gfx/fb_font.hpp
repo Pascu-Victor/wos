@@ -1,7 +1,8 @@
 #pragma once
+#include <string.h>
+
 #include <defines/defines.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
+#include <util/mem.hpp>
 namespace ker::mod::gfx::fb {
 class FbFont {
    public:

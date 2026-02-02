@@ -1,7 +1,6 @@
 #pragma once
-#include <std/hcf.hpp>
-
-#define CHAR_BIT 8
+#include <cstring>
+#include <util/hcf.hpp>
 
 #define __always_inline __inline __attribute__((__always_inline__))
 

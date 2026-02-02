@@ -49,4 +49,10 @@ void setInterruptHandler(uint8_t intNum, interruptHandler_t handler);
 void removeInterruptHandler(uint8_t intNum);
 bool isInterruptHandlerSet(uint8_t intNum);
 
+// Context-based IRQ handler (for device drivers with private_data)
+using irq_handler_fn = void (*)(uint8_t vector, void* private_data);
+auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int;
+void freeIrq(uint8_t vector);
+auto allocateVector() -> uint8_t;  // find free vector >= 48
+
 }  // namespace ker::mod::gates

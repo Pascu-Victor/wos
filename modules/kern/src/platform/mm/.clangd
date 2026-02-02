@@ -1,0 +1,4 @@
+Diagnostics:
+    ClangTidy:
+        Remove:
+            - cppcoreguidelines-pro-bounds-array-to-pointer-decay

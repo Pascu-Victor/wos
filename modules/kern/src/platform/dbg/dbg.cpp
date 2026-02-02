@@ -1,114 +1,165 @@
 #include "dbg.hpp"
 
+#include <cstdarg>
+#include <platform/smt/smt.hpp>
+#include <util/string.hpp>
+
 namespace ker::mod::dbg {
+namespace {
+sys::Spinlock logLock{};
 bool isInit = false;
 bool isTimeAvailable = false;
 bool isKmallocAvailable = false;
-sys::Spinlock logLock;
+uint64_t linesLogged = 0;
+}  // namespace
+
 using namespace ker::mod;
 
-uint64_t linesLogged = 0;
-
-void init(void) {
+void init() {
     if (isInit) {
         return;
     }
     io::serial::init();
-    logLock = sys::Spinlock();
     isInit = true;
 }
 
 void enableTime(void) {
     if (isTimeAvailable) {
         // Panic! should only be called once when ktime is initialized
-        hcf();
+        panicHandler("Kernel time was already initialized");
     }
     isTimeAvailable = true;
     log("Kernel time is now available");
 }
 
+void breakIntoDebugger(void) { __asm__ volatile("int $3"); }
+
 void enableKmalloc(void) {
     if (isKmallocAvailable) {
         // Panic! should only be called once when kmalloc is initialized
-        hcf();
+        panicHandler("Kernel kmalloc already initialized");
     }
     isKmallocAvailable = true;
     log("Kernel memory allocator is now available");
 }
 
-inline void serialLog(const char* str) {
+// Write a complete log line atomically to serial (timestamp + message + newline)
+inline void serialLogLine(const char* str) {
+    // Hold the serial lock for the entire log line to prevent interleaving
+    io::serial::ScopedLock lock;
+
     if (isTimeAvailable) [[likely]] {
         char timeSec[10] = {0};
         char timeMs[5] = {0};
         int logTime = time::getMs();
         int logTimeMsPart = logTime % 1000;
         int logTimeSecPart = logTime / 1000;
-        std::u64toa(logTimeMsPart, timeMs, 10);
-        std::u64toa(logTimeSecPart, timeSec, 10);
-        io::serial::write('[');
-        io::serial::write(timeSec);
-        io::serial::write('.');
-        io::serial::write(timeMs);
-        io::serial::write("]:");
+        // simple u64 to ascii helper (avoid depending on userspace std here)
+        auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
+            if (n == 0) {
+                s[0] = '0';
+                s[1] = '\0';
+                return 1;
+            }
+            char buf[32];
+            int i = 0;
+            while (n > 0) {
+                int digit = n % base;
+                buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                n /= base;
+            }
+            int j = 0;
+            while (i > 0) {
+                s[j++] = buf[--i];
+            }
+            s[j] = '\0';
+            return j;
+        };
+        u64toa_local(logTimeMsPart, timeMs, 10);
+        u64toa_local(logTimeSecPart, timeSec, 10);
+        io::serial::writeUnlocked('[');
+        io::serial::writeUnlocked(timeSec);
+        io::serial::writeUnlocked('.');
+        io::serial::writeUnlocked(timeMs);
+        io::serial::writeUnlocked("]:");
     }
-    io::serial::write(str);
+    io::serial::writeUnlocked(str);
+    io::serial::writeUnlocked('\n');
 }
-
-inline void serialNewline() { io::serial::write('\n'); }
 
 inline void fbLog(const char* str) {
-    uint64_t line = linesLogged;
-    if (linesLogged >= gfx::fb::viewportHeightChars()) {
-        gfx::fb::scroll();
-        line = gfx::fb::viewportHeightChars() - 1;
-    }
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        uint64_t line = linesLogged;
+        if (linesLogged >= gfx::fb::viewportHeightChars()) {
+            gfx::fb::scroll();
+            line = gfx::fb::viewportHeightChars() - 1;
+        }
 
-    gfx::fb::drawChar(0, line, '[');
-    // todo maybe print cpu id
-    int stampLen = 1;
-    if (isTimeAvailable) [[likely]] {
-        char timeSec[10] = {0};  // good enough for 30 years of uptime
-        char timeMs[5] = {0};
-        int logTime = time::getMs();
-        int logTimeMsPart = logTime % 1000;
-        int logTimeSecPart = logTime / 1000;
-        int msLen = std::u64toa(logTimeMsPart, timeMs, 10);
-        int secLen = std::u64toa(logTimeSecPart, timeSec, 10);
-        gfx::fb::drawString(stampLen, line, timeSec);
-        stampLen += secLen;
-        gfx::fb::drawChar(stampLen, line, '.');
+        gfx::fb::drawChar(0, line, '[');
+        // todo maybe print cpu id
+        int stampLen = 1;
+        if (isTimeAvailable) [[likely]] {
+            char timeSec[10] = {0};  // good enough for 30 years of uptime
+            char timeMs[5] = {0};
+            int logTime = time::getMs();
+            int logTimeMsPart = logTime % 1000;
+            int logTimeSecPart = logTime / 1000;
+            auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
+                if (n == 0) {
+                    s[0] = '0';
+                    s[1] = '\0';
+                    return 1;
+                }
+                char buf[32];
+                int i = 0;
+                while (n > 0) {
+                    int digit = n % base;
+                    buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                    n /= base;
+                }
+                int j = 0;
+                while (i > 0) {
+                    s[j++] = buf[--i];
+                }
+                s[j] = '\0';
+                return j;
+            };
+            int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
+            int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
+            gfx::fb::drawString(stampLen, line, timeSec);
+            stampLen += secLen;
+            gfx::fb::drawChar(stampLen, line, '.');
+            stampLen++;
+            gfx::fb::drawString(stampLen, line, timeMs);
+            stampLen += msLen;
+        }
+        gfx::fb::drawChar(stampLen, line, ']');
         stampLen++;
-        gfx::fb::drawString(stampLen, line, timeMs);
-        stampLen += msLen;
+        gfx::fb::drawChar(stampLen, line, ':');
+        stampLen++;
+        linesLogged += gfx::fb::drawString(stampLen, line, str);
+    } else {
+        mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
     }
-    gfx::fb::drawChar(stampLen, line, ']');
-    stampLen++;
-    gfx::fb::drawChar(stampLen, line, ':');
-    stampLen++;
-    linesLogged += gfx::fb::drawString(stampLen, line, str);
-}
-
-void logNewLineNoSync(void) {
-    serialNewline();
-    linesLogged++;
-}
-
-void logNoSync(const char* str) {
-    serialLog(str);
-    fbLog(str);
 }
 
 void logString(const char* str) {
     logLock.lock();
-    logNoSync(str);
-    logNewLineNoSync();
+    // Write atomically to serial (includes newline)
+    serialLogLine(str);
+    // Framebuffer logging
+    if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
+        fbLog(str);
+    }
+    linesLogged++;
     logLock.unlock();
 }
 
 void logVa(const char* format, va_list& args) {
     // 4k should be enough for everyone
     char buf[4096];
-    std::vsnprintf(buf, 4096ul, format, args);
+
+    std::vsnprintf(buf, sizeof(buf), format, args);
     logString(buf);
 }
 
@@ -136,6 +187,18 @@ void error(const char* str) {
     log(str);
     // TODO: pretty print error
     logLock.unlock();
+}
+
+void panicHandler(const char* msg) {
+    // Log the panic message
+    log("KERNEL PANIC: %s", msg);
+
+    // Try to halt other CPUs to stabilize global state for any dump/inspection
+    ker::mod::smt::haltOtherCores();
+
+    // If stacktrace printing is desired and available, it can be called here.
+    // Finally, stop this CPU.
+    hcf();
 }
 
 }  // namespace ker::mod::dbg

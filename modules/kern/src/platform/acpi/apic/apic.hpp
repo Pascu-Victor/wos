@@ -67,24 +67,62 @@ enum class X2APICMSRs {
 
 };
 
-enum class ICR0MessageType {
-    SINGLE = (0 << 18),
-    SELF = (1 << 18),
-    BROADCAST = (2 << 18),
-    BROADCAST_EXCLUSIVE = (3 << 18),
+const uint32_t IPI_BROADCAST_ID = 0xFFFFFFFF;
+
+enum class IPIDeliveryMode : uint8_t {
+    FIXED = 0,
+    LOWEST_PRIORITY = 1,
+    SMI = 2,
+    NMI = 4,
+    INIT = 5,
+    STARTUP = 6,
+    EXTINT = 7,
 };
 
-enum class APICQueries : uint32_t {
-    ICR0_DELIVERY_STATUS = (1 << 12),
+enum class IPIDestinationMode : uint8_t {
+    PHYSICAL = 0,
+    LOGICAL = 1,
 };
 
-void writeReg(uint32_t reg, uint32_t value);
+enum class IPILevel : uint8_t {
+    DEASSERT = 0,
+    ASSERT = 1,
+};
+
+enum class IPIDestinationShorthand : uint8_t {
+    NONE = 0,
+    SELF = 1,
+    ALL_INCLUDING_SELF = 2,
+    ALL_EXCLUDING_SELF = 3,
+};
+
+enum class IPITriggerMode : uint8_t {
+    EDGE = 0,
+    LEVEL = 1,
+};
+
+union IPIConfig {
+    struct {
+        uint8_t vector;
+        IPIDeliveryMode deliveryMode : 3;
+        IPIDestinationMode destinationMode : 1;
+        uint8_t reserved1 : 2;
+        IPILevel level : 1;
+        IPITriggerMode triggerMode : 1;
+        uint8_t reserved2 : 2;
+        IPIDestinationShorthand destinationShorthand : 2;
+        uint32_t reserved3 : 12;
+    } __attribute__((packed));
+    uint32_t packedValue;
+};
+
+void writeReg(uint32_t reg, uint64_t value);
 
 uint32_t readReg(uint32_t reg);
 
 void eoi();
 
-void sendIpi(uint32_t lapicId, uint32_t vector, ICR0MessageType messageType);
+void sendIpi(IPIConfig messageType, uint32_t destination);
 
 void resetApicCounter();
 

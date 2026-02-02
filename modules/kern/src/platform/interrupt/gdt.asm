@@ -13,7 +13,8 @@ loadGdt:
         mov ax, 0x10
         mov ds, ax
         mov fs, ax
-        mov gs, ax
+        ; NOTE: Do NOT load GS here - we use GS.base for per-CPU data
+        ; and loading a selector into GS zeroes GS.base on x86-64
         mov ss, ax
         mov es, ax
         ret

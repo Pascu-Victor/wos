@@ -1,0 +1,61 @@
+---
+# Clang-Tidy configuration for WOS kernel
+# Run: clang-tidy -p build <file.cpp>
+
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-no-malloc,
+  -cppcoreguidelines-special-member-functions,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -misc-no-recursion,
+
+# Kernel code needs these exceptions
+WarningsAsErrors: ''
+
+HeaderFilterRegex: 'modules/(kern|init|testprog)/.*'
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.MemberCase
+    value: lower_case
+  - key: readability-identifier-naming.ConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: modernize-use-override.IgnoreDestructors
+    value: true
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'StringRef;ArrayRef'
+  - key: cppcoreguidelines-avoid-do-while.IgnoreMacros
+    value: true
+...

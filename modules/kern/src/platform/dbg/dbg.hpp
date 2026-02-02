@@ -5,26 +5,28 @@
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <std/function.hpp>
-#include <std/hcf.hpp>
-#include <std/mem.hpp>
-#include <std/string.hpp>
+#include <util/hcf.hpp>
+#include <util/mem.hpp>
 
 namespace ker::mod::dbg {
 void init(void);
-void __logVar(const char *format, ...);
-void logString(const char *str);
+void __logVar(const char* format, ...);
+void logString(const char* str);
 template <typename... Args>
-void log(const char *format, Args... args) {
+void log(const char* format, Args... args) {
     if (sizeof...(args) == 0) {
         logString(format);
     } else {
         __logVar(format, args...);
     }
 }
-void logFbOnly(const char *str);
+void logFbOnly(const char* str);
 void logFbAdvance(void);
-void error(const char *str);
+void error(const char* str);
 void enableTime(void);
+void breakIntoDebugger(void);
+
+// Panic handler which halts other CPUs and stops the system.
+void panicHandler(const char* msg);
 
 }  // namespace ker::mod::dbg

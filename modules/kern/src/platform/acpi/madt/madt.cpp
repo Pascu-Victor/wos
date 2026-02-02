@@ -90,4 +90,6 @@ ApicInfo parseMadt(void *madtBasePtr) {
     dbg::log("MADT OEM Table ID: %s", tableString);
     return apicDevice;
 }
+
+auto getApicInfo() -> const ApicInfo& { return apicDevice; }
 }  // namespace ker::mod::acpi::madt

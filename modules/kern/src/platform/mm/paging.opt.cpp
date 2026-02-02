@@ -4,7 +4,7 @@ namespace ker::mod::mm::paging {
 static inline bool isFlagSet(uint64_t flags, uint64_t flag) { return flags >> flag & 1; }
 
 PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
-    PageTableEntry entry;
+    PageTableEntry entry = {};  // CRITICAL: Zero-initialize to clear reserved bits and pagesize
     entry.frame = frame >> PAGE_SHIFT;
     entry.present = (flags & PAGE_PRESENT) > 0;
     entry.writable = (flags & PAGE_WRITE) > 0;
@@ -13,8 +13,11 @@ PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
     entry.cacheDisabled = 0;
     entry.accessed = 0;
     entry.dirty = 0;
+    entry.pagesize = 0;  // 4KB pages, not large pages
     entry.global = 0;
     entry.available = 0;
+    entry.reserved = 0;  // x86-64 requires reserved bits to be 0
+    entry.noExecute = (flags & PAGE_NX) ? 1 : 0;
     return entry;
 }
 

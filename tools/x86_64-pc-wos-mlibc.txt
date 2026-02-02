@@ -1,0 +1,11 @@
+[binaries]
+c = ['clang', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/target1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include/c++/v1', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/target1/include', '-fno-PIC', '-mcmodel=small']
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+
+[host_machine]
+system = 'wos'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

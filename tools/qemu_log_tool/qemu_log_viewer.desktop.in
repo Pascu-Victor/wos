@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QEMU Log Viewer
+Comment=Interactive QEMU execution trace viewer for WOS kernel debugging
+Exec=@CMAKE_INSTALL_PREFIX@/bin/qemu_log_viewer
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;Debugger;
+Keywords=qemu;debug;assembly;disassembly;kernel;trace;
+MimeType=text/plain;

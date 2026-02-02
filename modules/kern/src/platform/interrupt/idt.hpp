@@ -31,9 +31,11 @@ struct IdtPtr {
     uint64_t base;
 } __attribute__((packed));
 
-void idtSetEntry(IdtEntry* entry, void* isr, uint8_t flags);
+void idtSetEntry(IdtEntry* entry, void* isr, uint8_t flags, uint8_t dpl = 0);
 
 void idtInit(void);
+
+void loadIdt(void);
 
 extern "C" {
 #define isr(n) void isr##n(void)

@@ -5,36 +5,44 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "(gdb) Launch",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/modules/kern/wos",
-            "args": [],
-            "stopAtEntry": true,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "miDebuggerServerAddress": "localhost:1234",
-            "setupCommands": [
-                {
-                    "description": "Enable pretty-printing for gdb",
-                    "text": "-enable-pretty-printing",
-                    "ignoreFailures": true
-                },
-                {
-                    "description": "Set Disassembly Flavor to Intel",
-                    "text": "-gdb-set disassembly-flavor intel",
-                    "ignoreFailures": true
-                },
-                {
-                    "description": "Load init process symbols",
-                    "text": "add-symbol-file ${workspaceFolder}/build/modules/init/init -readnow",
-                    "ignoreFailures": false
-                }
+            "name": "Debug WOS Kernel",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos"
             ],
-            "serverLaunchTimeout": 1000000,
-            "preLaunchTask": "runWosKern"
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b break set --hardware",
+                "command alias hbreak break set --hardware"
+            ],
+            "terminateCommands": ["process kill"],
+            "attachCommands": ["gdb-remote 127.0.0.1:1234"],
+            "preLaunchTask": "Build and Start QEMU"
+        },
+        {
+            "name": "Debug WOS Userspace (Init Process)",
+            "type": "lldb-dap",
+            "request": "attach",
+            "attachCommands": ["!gdb-remote 127.0.0.1:1234"],
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file true",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.process.thread.step-avoid-regexp ''",
+                "settings set target.skip-prologue false"
+            ],
+            "preLaunchTask": "Build and Start QEMU"
         }
     ]
 }

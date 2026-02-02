@@ -1,30 +1,27 @@
 cmake_minimum_required(VERSION 3.20)
 
-#llvm in tools/llvm-build/bin
-#set path to llvm
-set(LLVM_PATH ${CMAKE_SOURCE_DIR}/tools/llvm-build/bin)
-set(CMAKE_C_COMPILER "${LLVM_PATH}/clang" CACHE INTERNAL "Path to clang")
-set(CMAKE_CXX_COMPILER "${LLVM_PATH}/clang++" CACHE INTERNAL "Path to clang++")
-set(CMAKE_LINKER_TYPE "LLD")
-
-project(wos C CXX ASM_NASM)
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-add_compile_options(
-    # Common flags for C and C++
-    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g;-pipe;-Wall;-Wextra;-nostdinc;-ffreestanding;-fno-stack-protector;-fno-stack-check;-fno-lto;-fPIE;-m64;-march=x86-64;-mno-80387;-mno-mmx;-mno-sse;-mno-sse2;-mno-red-zone;-Wformat;-Wformat-security;-Werror=format-security>"
-    # C-specific flags
-    "$<$<COMPILE_LANGUAGE:C>:-std=gnu11>"
-    # C++-specific flags
-    "$<$<COMPILE_LANGUAGE:CXX>:-std=c++23;-fomit-frame-pointer>"
-    # NASM flags
-    "$<$<COMPILE_LANGUAGE:ASM_NASM>:-g;-Wall;-felf64;-Isrc;-w-reloc-abs-qword;-w-reloc-rel-dword>"
+include(ExternalProject)
+ExternalProject_Add(wos_tools_build
+    SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
+    BINARY_DIR ${CMAKE_BINARY_DIR}/tools
+    CMAKE_ARGS
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+        -DCMAKE_BUILD_TYPE=Release
+    INSTALL_COMMAND ""
+    USES_TERMINAL_CONFIGURE TRUE
+    USES_TERMINAL_BUILD TRUE
 )
 
-#set target
-set(TARGET wos)
+# Always run the build step
+ExternalProject_Add_StepTargets(wos_tools_build build)
+add_custom_target(wos_tools_build_always ALL
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools
+    DEPENDS wos_tools_build-build
+    COMMENT "Building WOS tools..."
+)
 
-#build subprojects
-add_subdirectory(modules/stdlib)
-add_subdirectory(modules/kern)
-add_subdirectory(modules/init)
+project(wos NONE)
+
+#WOs modules
+add_subdirectory(modules)

@@ -14,7 +14,7 @@ struct CpuidContext {
     int function;
 };
 
-void cpuid(struct CpuidContext *cpuid_context);
+void cpuid(struct CpuidContext* cpuid_context);
 uint64_t currentCpu(void);
 void setCurrentCpuid(uint64_t id);
 
@@ -37,9 +37,13 @@ struct GPRegs {
 } __attribute__((packed));
 
 struct PerCpu {
-    uint64_t syscallStack;
-    uint64_t kernelStack;
-    uint64_t cpuId;
+    uint64_t syscallStack;     // 0x00
+    uint64_t userRsp;          // 0x08 - saved user RSP at syscall entry
+    uint64_t cpuId;            // 0x10
+    uint64_t savedDs;          // 0x18 - saved DS segment
+    uint64_t savedEs;          // 0x20 - saved ES segment
+    uint64_t syscallRetRip;    // 0x28 - RCX at syscall entry (return RIP)
+    uint64_t syscallRetFlags;  // 0x30 - R11 at syscall entry (RFLAGS)
 } __attribute__((packed));
 
 static __always_inline uint64_t rdfsbase(void) {
@@ -64,10 +68,12 @@ static __always_inline void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %
 
 static __always_inline void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
 
-static __always_inline void rdcr4(uint64_t *val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
+static __always_inline void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
 
 void enablePAE(void);
 void enablePSE(void);
+void enableSSE(void);
+void enableFSGSBASE(void);
 
 #define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

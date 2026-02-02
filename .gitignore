@@ -2,20 +2,25 @@
 **/bin
 **/obj
 **/CMakeFiles
-# libc
-**/musl
-#kernel images
-disk.qcow2
+#qcow images
+*.qcow2
 #log files
 **/*.log
 **/extern/clang/*
 
 #tool binaries
-resolve_addresses
+**/tools/bin/*
 
 #clang dir
 **/extern/clang/*
 
 #build directory
 llvm-build
+libcxx-build
 build
+
+#ccache
+.cache
+
+#core dumps
+coredumps

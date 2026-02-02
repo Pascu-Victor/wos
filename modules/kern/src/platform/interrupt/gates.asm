@@ -14,12 +14,14 @@ extern iterrupt_handler
 __idt_isr_handler:
     cld
     isr_swapgs entry
-    pushl
+    pushq
     mov rdi, rsp
     call iterrupt_handler
-    popl
+    popq
     isr_swapgs exit
     add rsp, 16
+    ; Don't manually enable interrupts - iretq will restore them from saved RFLAGS
+    ; Having sti here can cause race conditions if another interrupt arrives between sti and iretq
     iretq
 
 global load_idt
@@ -35,7 +37,8 @@ load_idt:
         mov ds, ax
         mov es, ax
         mov fs, ax
-        mov gs, ax
+        ; NOTE: Do NOT load GS here - we use GS.base for per-CPU data
+        ; and loading a selector into GS zeroes GS.base on x86-64
         mov ss, ax
         sti
         ret
@@ -77,19 +80,21 @@ isr_except 14
 %assign i i + 1
 %endrep
 
-; global isr32
-; extern task_switch_handler
-; isr32:
-;     push qword 0
-;     push qword 32
-;     cmp [rsp + 24], dword 8 ; Check if we're in userspace
-;     je .isr32_entry
-;     ; swapgs
-;     .isr32_entry:
-;     jmp task_switch_handler
+; IRQ32 (timer) needs special handling for context switching
+; We can't go through iterrupt_handler because it receives the frame by value (copy),
+; so modifications to the frame don't affect the actual stack
+global isr32
+extern task_switch_handler
+isr32:
+    push qword 0   ; errCode (none for IRQ)
+    push qword 32  ; intNum
+    cld
+    isr_swapgs isr32_entry
+    pushq
+    jmp task_switch_handler
 
-%assign i 32
-%rep 16
+%assign i 33
+%rep 15
     isr i
 %assign i i + 1
 %endrep

@@ -2,11 +2,109 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "Check Headers",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && sh scripts/check_headers.sh modules/kern && sh scripts/check_headers.sh modules/init",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "silent"
+            }
+        },
+        {
+            "label": "CMake Build",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && cmake -B build -GNinja . && cmake --build build",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Create Test Disk",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/create_fat32_test_disk.sh",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Make Boot Image",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/make_image.sh",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Build WOS",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Check Headers",
+                "CMake Build",
+                "Create Test Disk",
+                "Make Boot Image"
+            ],
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
             "label": "runWosKern",
             "command": "${workspaceFolder}/scripts/run_kern.sh",
             "type": "shell",
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "--init-file",
+                        "${workspaceFolder}/.vscode/wos-env.sh"
+                    ]
+                }
             },
             "args": [],
             "isBackground": true,
@@ -31,30 +129,66 @@
             "presentation": {
                 "reveal": "always"
             },
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            }
+            "group": "build"
         },
         {
-            "type": "cppbuild",
-            "label": "C/C++: g++ build active file",
-            "command": "${workspaceFolder}/tools/llvm-build/bin/clang++",
-            "args": [
-                "-fdiagnostics-color=always",
-                "-g",
-                "${file}",
-                "-o",
-                "${fileDirname}/${fileBasenameNoExtension}"
+            "label": "Build and Start QEMU",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build WOS",
+                "Start QEMU Debug"
             ],
+            "problemMatcher": [],
+            "group": "build"
+        },
+        {
+            "label": "Start QEMU Debug",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_kern.sh --debug",
+            "type": "shell",
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
             },
+            "isBackground": true,
             "problemMatcher": [
-                "$gcc"
+                {
+                    "pattern": [
+                        {
+                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
+                            "file": 1,
+                            "line": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": "STARTING BOOT:",
+                        "endsPattern": "QEMU .* monitor - type 'help' for more information"
+                    }
+                }
             ],
-            "group": "build",
-            "detail": "Task generated by Debugger."
+            "presentation": {
+                "reveal": "always"
+            },
+            "group": "build"
+        },
+        {
+            "label": "Build QEMU Log Viewer",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "build/tools",
+                "--target",
+                "qemu_log_viewer"
+            ],
+            "isBackground": false,
+            "group": "build"
         }
     ]
 }
