@@ -47,6 +47,7 @@ constexpr uint8_t MAGIC_COOKIE[4] = {99, 130, 83, 99};
 constexpr int RECV_TIMEOUT_SECS = 5;  // real-time timeout for DHCP responses
 constexpr int MAX_DISCOVER_RETRIES = 5;
 constexpr int MAX_REQUEST_RETRIES = 3;
+constexpr int MAX_NAK_RESTARTS = 3;  // restart from DISCOVER on NAK
 
 // ---- BOOTP/DHCP packet ----
 
@@ -79,13 +80,13 @@ struct DhcpLease {
 
 // ---- Helpers ----
 
-auto get_mac(int sock, const char* ifname, uint8_t* mac) -> bool {
+auto get_mac(int sock, const char* ifname, std::array<uint8_t, 6>& mac) -> bool {
     struct ifreq ifr{};
     std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0) {
         return false;
     }
-    std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    std::memcpy(mac.data(), ifr.ifr_hwaddr.sa_data, 6);
     return true;
 }
 
@@ -350,7 +351,7 @@ auto main(int argc, char** argv) -> int {
     }
 
     // Get our MAC address
-    uint8_t mac[6]{};
+    std::array<uint8_t, 6> mac{};
     {
         int tmp = socket(AF_INET, SOCK_DGRAM, 0);
         if (tmp >= 0) {
@@ -366,20 +367,29 @@ auto main(int argc, char** argv) -> int {
     dst_addr.sin_port = htons(67);
     dst_addr.sin_addr.s_addr = htonl(0xFFFFFFFF);
 
-    uint32_t xid = 0x4E455444;  // "NETD" in ASCII
+    // Derive xid from MAC address to ensure uniqueness across VMs
+    uint32_t xid = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) |
+                   (static_cast<uint32_t>(mac[4]) << 8) | static_cast<uint32_t>(mac[5]);
     DhcpPacket pkt{};
     std::array<uint8_t, 1500> recv_buf{};
     DhcpLease lease{};
+    int nak_restarts = 0;
 
+nak_restart:
     // === DHCP DISCOVER ===
     bool got_offer = false;
+    lease = {};  // reset lease on restart
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
         std::println("netd: sending DISCOVER (attempt {}/{})", attempt + 1, MAX_DISCOVER_RETRIES);
-        size_t pkt_len = build_discover(&pkt, mac, xid);
+        size_t pkt_len = build_discover(&pkt, mac.data(), xid);
         sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
-        ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
-        if (n > 0) {
+        // Keep receiving until timeout, draining stale packets with wrong xid
+        while (!got_offer) {
+            ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
+            if (n <= 0) {
+                break;  // timeout, try next attempt
+            }
             uint8_t msg = parse_reply(recv_buf.data(), static_cast<size_t>(n), xid, &lease);
             if (msg == DHCPOFFER) {
                 got_offer = true;
@@ -389,6 +399,7 @@ auto main(int argc, char** argv) -> int {
                 ip_to_str(lease.router, gw_str, sizeof(gw_str));
                 std::println("netd: received OFFER: ip={} mask={} gw={}", ip_str, mask_str, gw_str);
             }
+            // msg == 0 or other types: wrong xid or irrelevant, keep trying until timeout
         }
     }
 
@@ -402,11 +413,15 @@ auto main(int argc, char** argv) -> int {
     bool got_ack = false;
     for (int attempt = 0; attempt < MAX_REQUEST_RETRIES && !got_ack; attempt++) {
         std::println("netd: sending REQUEST (attempt {}/{})", attempt + 1, MAX_REQUEST_RETRIES);
-        size_t pkt_len = build_request(&pkt, mac, xid, htonl(lease.your_ip), htonl(lease.server_ip));
+        size_t pkt_len = build_request(&pkt, mac.data(), xid, htonl(lease.your_ip), htonl(lease.server_ip));
         sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
-        ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
-        if (n > 0) {
+        // Keep receiving until timeout, draining stale packets with wrong xid
+        while (!got_ack) {
+            ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
+            if (n <= 0) {
+                break;  // timeout, try next attempt
+            }
             DhcpLease ack_lease{};
             uint8_t msg = parse_reply(recv_buf.data(), static_cast<size_t>(n), xid, &ack_lease);
             if (msg == DHCPACK) {
@@ -418,11 +433,19 @@ auto main(int argc, char** argv) -> int {
                 if (ack_lease.your_ip != 0) lease.your_ip = ack_lease.your_ip;
                 got_ack = true;
             } else if (msg == DHCPNAK) {
-                std::println("netd: received NAK, restarting");
-                break;
+                nak_restarts++;
+                if (nak_restarts < MAX_NAK_RESTARTS) {
+                    std::println("netd: received NAK, restarting from DISCOVER (attempt {}/{})", nak_restarts, MAX_NAK_RESTARTS);
+                    ++xid;  // use new transaction ID on restart
+                    goto nak_restart;
+                }
+                std::println("netd: received NAK, max restarts exceeded");
+                goto request_failed;
             }
+            // msg == 0 means wrong xid or invalid packet, keep trying until timeout
         }
     }
+request_failed:
 
     if (!got_ack) {
         std::println("netd: DHCP failed - no ACK received");
@@ -473,7 +496,7 @@ auto main(int argc, char** argv) -> int {
         std::println("netd: T1 reached, sending renewal REQUEST");
         ++xid;
 
-        size_t pkt_len = build_renewal(&pkt, mac, xid, lease.your_ip);
+        size_t pkt_len = build_renewal(&pkt, mac.data(), xid, lease.your_ip);
 
         // Renewal: unicast to DHCP server
         struct sockaddr_in server{};

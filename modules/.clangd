@@ -25,3 +25,4 @@ Diagnostics:
             - performance-no-int-to-ptr
             - readability-function-cognitive-complexity
             - cppcoreguidelines-pro-bounds-constant-array-index
+            - misc-non-private-member-variables-in-classes

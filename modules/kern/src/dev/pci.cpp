@@ -265,6 +265,55 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int {
     return 0;
 }
 
+auto pci_enable_msix(PCIDevice* dev, uint8_t vector) -> int {
+    uint8_t msix_off = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+    if (msix_off == 0) return -1;
+
+    // MSI-X capability layout:
+    // +0: Cap ID (8) | Next (8) | Message Control (16)
+    //     Message Control: bits 10:0 = table size - 1, bit 14 = function mask, bit 15 = enable
+    // +4: Table Offset/BIR (32)
+    //     bits 2:0 = BAR index, bits 31:3 = offset within BAR
+    // +8: PBA Offset/BIR (32)
+
+    uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, msix_off + 2);
+
+    uint32_t table_off_bir = pci_config_read32(dev->bus, dev->slot, dev->function, msix_off + 4);
+    uint8_t table_bir = table_off_bir & 0x7;
+    uint32_t table_offset = table_off_bir & ~0x7u;
+
+    // Ensure memory space is enabled for the table BAR
+    pci_enable_memory_space(dev);
+
+    // Map the BAR containing the MSI-X table
+    auto* bar_base = pci_map_bar(dev, table_bir);
+    if (bar_base == nullptr) return -1;
+
+    auto* table = reinterpret_cast<volatile uint32_t*>(
+        reinterpret_cast<volatile uint8_t*>(bar_base) + table_offset);
+
+    // Enable MSI-X with Function Mask set (mask all vectors while configuring)
+    msg_ctrl |= (1u << 15) | (1u << 14);
+    pci_config_write16(dev->bus, dev->slot, dev->function, msix_off + 2, msg_ctrl);
+
+    // Configure entry 0 (each entry is 4 x 32-bit words = 16 bytes)
+    table[0] = 0xFEE00000;  // Message Address Lower (BSP, physical destination mode)
+    table[1] = 0;            // Message Address Upper
+    table[2] = vector;       // Message Data (interrupt vector)
+    table[3] = 0;            // Vector Control (0 = unmasked)
+
+    // Clear Function Mask to enable delivery
+    msg_ctrl &= ~(1u << 14);
+    pci_config_write16(dev->bus, dev->slot, dev->function, msix_off + 2, msg_ctrl);
+
+    // Disable legacy INTx
+    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
+    cmd |= PCI_COMMAND_INT_DISABLE;
+    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+
+    return 0;
+}
+
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
     if (bar_idx < 0 || bar_idx >= BAR_COUNT) return 0;
 

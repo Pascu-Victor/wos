@@ -22,9 +22,18 @@ constexpr uint16_t VIRTIO_REG_QUEUE_NOTIFY = 0x10;       // 16-bit R/W
 constexpr uint16_t VIRTIO_REG_DEVICE_STATUS = 0x12;      // 8-bit  R/W
 constexpr uint16_t VIRTIO_REG_ISR_STATUS = 0x13;         // 8-bit  R
 
-// VirtIO-Net specific config registers (legacy, offset from BAR0 + 0x14)
-constexpr uint16_t VIRTIO_NET_CFG_MAC = 0x14;            // 6 bytes
-constexpr uint16_t VIRTIO_NET_CFG_STATUS = 0x1A;         // 16-bit
+// MSI-X vector configuration (legacy I/O bar, present when MSI-X is enabled)
+constexpr uint16_t VIRTIO_MSI_CONFIG_VECTOR = 0x14;      // 16-bit R/W
+constexpr uint16_t VIRTIO_MSI_QUEUE_VECTOR = 0x16;       // 16-bit R/W
+constexpr uint16_t VIRTIO_MSI_NO_VECTOR = 0xFFFF;
+
+// VirtIO-Net specific config registers (legacy, offset from BAR0)
+// Without MSI-X: device config starts at 0x14
+// With MSI-X:    device config starts at 0x18 (shifted by 4 for MSI-X vector fields)
+constexpr uint16_t VIRTIO_NET_CFG_MAC = 0x14;            // 6 bytes (no MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_MAC_MSIX = 0x18;       // 6 bytes (with MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_STATUS = 0x1A;         // 16-bit (no MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_STATUS_MSIX = 0x1E;    // 16-bit (with MSI-X)
 
 // Device status bits
 constexpr uint8_t VIRTIO_STATUS_ACKNOWLEDGE = 1;

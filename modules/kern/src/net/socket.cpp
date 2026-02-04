@@ -1,5 +1,6 @@
 #include "socket.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <net/proto/raw.hpp>
 #include <net/proto/tcp.hpp>
@@ -12,9 +13,7 @@ namespace ker::net {
 auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
     lock.lock();
     size_t to_write = len;
-    if (to_write > free_space()) {
-        to_write = free_space();
-    }
+    to_write = std::min(to_write, free_space());
     if (to_write == 0) {
         lock.unlock();
         return 0;
@@ -33,9 +32,7 @@ auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
 auto RingBuffer::read(void* buf, size_t len) -> ssize_t {
     lock.lock();
     size_t to_read = len;
-    if (to_read > used) {
-        to_read = used;
-    }
+    to_read = std::min(to_read, used);
     if (to_read == 0) {
         lock.unlock();
         return 0;

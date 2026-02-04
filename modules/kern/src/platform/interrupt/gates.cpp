@@ -436,6 +436,13 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
     } else {
+        // No handler registered - log and handle appropriately
+        ker::mod::io::serial::write("UNHANDLED INT: vector=");
+        ker::mod::io::serial::writeHex(static_cast<uint8_t>(frame.intNum));
+        ker::mod::io::serial::write(" rip=");
+        ker::mod::io::serial::writeHex(frame.rip);
+        ker::mod::io::serial::write("\n");
+
         if (!isIrq(frame.intNum)) {
             exception_handler(gpr, frame);
             ker::mod::apic::eoi();
@@ -477,6 +484,11 @@ auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* 
         ker::mod::io::serial::write("requestIrq: vector already in use\n");
         return -1;
     }
+    ker::mod::io::serial::write("requestIrq: allocated vector ");
+    ker::mod::io::serial::writeHex(vector);
+    ker::mod::io::serial::write(" for ");
+    ker::mod::io::serial::write(name);
+    ker::mod::io::serial::write("\n");
     irq_contexts[vector].handler = handler;
     irq_contexts[vector].data = data;
     irq_contexts[vector].name = name;

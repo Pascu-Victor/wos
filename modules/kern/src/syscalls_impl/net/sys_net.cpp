@@ -1,6 +1,7 @@
 #include "sys_net.hpp"
 
 #include <abi/callnums/net.h>
+
 #include <cerrno>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
@@ -85,8 +86,7 @@ auto allocate_socket_fd(ker::net::Socket* sock) -> int {
         return -1;
     }
 
-    auto* file = static_cast<ker::vfs::File*>(
-        ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::vfs::File)));
+    auto* file = static_cast<ker::vfs::File*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::vfs::File)));
     if (file == nullptr) {
         return -1;
     }
@@ -267,8 +267,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            ssize_t result = sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3),
-                                                     static_cast<int>(a4),
+            ssize_t result = sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
                                                      reinterpret_cast<const void*>(a5), alen);
             return static_cast<uint64_t>(result);
         }
@@ -283,8 +282,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            ssize_t result = sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3),
-                                                       static_cast<int>(a4),
+            ssize_t result = sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
                                                        reinterpret_cast<void*>(a5), &alen);
             return static_cast<uint64_t>(result);
         }
@@ -298,9 +296,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->setsockopt == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int result =
-                sock->proto_ops->setsockopt(sock, static_cast<int>(a2), static_cast<int>(a3),
-                                            reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
+            int result = sock->proto_ops->setsockopt(sock, static_cast<int>(a2), static_cast<int>(a3), reinterpret_cast<const void*>(a4),
+                                                     static_cast<size_t>(a5));
             return static_cast<uint64_t>(result);
         }
 
@@ -313,9 +310,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->getsockopt == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int result =
-                sock->proto_ops->getsockopt(sock, static_cast<int>(a2), static_cast<int>(a3),
-                                            reinterpret_cast<void*>(a4), reinterpret_cast<size_t*>(a5));
+            int result = sock->proto_ops->getsockopt(sock, static_cast<int>(a2), static_cast<int>(a3), reinterpret_cast<void*>(a4),
+                                                     reinterpret_cast<size_t*>(a5));
             return static_cast<uint64_t>(result);
         }
 
@@ -372,16 +368,16 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
             // ifreq layout: name[16] + union[16+]
             // sockaddr_in within ifreq: offset 16=sa_family(2), 18=sin_port(2), 20=sin_addr(4)
-            constexpr uint32_t SIOC_GIFFLAGS    = 0x8913;
-            constexpr uint32_t SIOC_SIFFLAGS    = 0x8914;
-            constexpr uint32_t SIOC_GIFADDR     = 0x8915;
-            constexpr uint32_t SIOC_SIFADDR     = 0x8916;
-            constexpr uint32_t SIOC_GIFNETMASK  = 0x891B;
-            constexpr uint32_t SIOC_SIFNETMASK  = 0x891C;
-            constexpr uint32_t SIOC_GIFHWADDR   = 0x8927;
-            constexpr uint32_t SIOC_GIFINDEX    = 0x8933;
-            constexpr uint32_t SIOC_ADDRT       = 0x890B;
-            constexpr uint32_t SIOC_DELRT       = 0x890C;
+            constexpr uint32_t SIOC_GIFFLAGS = 0x8913;
+            constexpr uint32_t SIOC_SIFFLAGS = 0x8914;
+            constexpr uint32_t SIOC_GIFADDR = 0x8915;
+            constexpr uint32_t SIOC_SIFADDR = 0x8916;
+            constexpr uint32_t SIOC_GIFNETMASK = 0x891B;
+            constexpr uint32_t SIOC_SIFNETMASK = 0x891C;
+            constexpr uint32_t SIOC_GIFHWADDR = 0x8927;
+            constexpr uint32_t SIOC_GIFINDEX = 0x8933;
+            constexpr uint32_t SIOC_ADDRT = 0x890B;
+            constexpr uint32_t SIOC_DELRT = 0x890C;
 
             if (request == SIOC_ADDRT || request == SIOC_DELRT) {
                 // rtentry layout (x86_64):
@@ -391,11 +387,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 // offset 56: rt_flags (uint16_t)
                 auto* rt = arg;
                 uint32_t dst = *reinterpret_cast<uint32_t*>(rt + 12);
-                uint32_t gw  = *reinterpret_cast<uint32_t*>(rt + 28);
+                uint32_t gw = *reinterpret_cast<uint32_t*>(rt + 28);
                 uint32_t mask = *reinterpret_cast<uint32_t*>(rt + 44);
                 // Convert from network byte order
                 dst = ker::net::ntohl(dst);
-                gw  = ker::net::ntohl(gw);
+                gw = ker::net::ntohl(gw);
                 mask = ker::net::ntohl(mask);
 
                 if (request == SIOC_ADDRT) {
@@ -405,7 +401,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (gw != 0) {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                             auto* d = ker::net::netdev_at(i);
-                            if (d == nullptr || d->state != 1 || std::strcmp(d->name, "lo") == 0) {
+                            if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
                             auto* nif = ker::net::netif_get(d);
@@ -423,7 +419,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (rdev == nullptr) {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                             auto* d = ker::net::netdev_at(i);
-                            if (d != nullptr && d->state == 1 && std::strcmp(d->name, "lo") != 0) {
+                            if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
                                 rdev = d;
                                 break;
                             }
@@ -437,9 +433,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             // All other SIOC* ioctls use ifreq: name at offset 0, data at offset 16
-            char ifname[16] = {};
-            std::memcpy(ifname, arg, 16);
-            ifname[15] = '\0';
+            std::string_view ifname(reinterpret_cast<char*>(arg), strnlen(reinterpret_cast<char*>(arg), 16));
 
             auto* dev = ker::net::netdev_find_by_name(ifname);
             if (dev == nullptr) {
@@ -449,7 +443,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             switch (request) {
                 case SIOC_GIFFLAGS: {
                     int16_t flags = 0;
-                    if (dev->state != 0) flags |= 0x0001;  // IFF_UP
+                    if (dev->state != 0) {
+                        flags |= 0x0001;  // IFF_UP
+                    }
                     flags |= 0x0040;  // IFF_RUNNING
                     *reinterpret_cast<int16_t*>(arg + 16) = flags;
                     return 0;
@@ -513,7 +509,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     // sa_family = ARPHRD_ETHER (1), then 6 bytes of MAC
                     std::memset(arg + 16, 0, 16);
                     *reinterpret_cast<uint16_t*>(arg + 16) = 1;  // ARPHRD_ETHER
-                    std::memcpy(arg + 18, dev->mac, 6);
+                    std::memcpy(arg + 18, dev->mac.data(), 6);
                     return 0;
                 }
                 case SIOC_GIFINDEX: {
@@ -559,12 +555,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 if (file->fs_type == ker::vfs::FSType::SOCKET) {
                     auto* sock = static_cast<ker::net::Socket*>(file->private_data);
                     if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
-                        fds[i].revents = static_cast<int16_t>(
-                            sock->proto_ops->poll_check(sock, fds[i].events));
+                        fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
                     }
                 } else {
                     // Non-socket fds (regular files, devices) are always ready
-                    fds[i].revents = fds[i].events & (0x0001 | 0x0004);  // POLLIN|POLLOUT
+                    fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));  // POLLIN|POLLOUT
                 }
 
                 if (fds[i].revents != 0) {

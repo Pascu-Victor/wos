@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <dev/pci.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -121,6 +122,9 @@ struct E1000Device {
 
     uint8_t irq_vector = 0;
     ker::mod::sys::Spinlock tx_lock;
+
+    // NAPI state for deferred packet processing
+    ker::net::NapiStruct napi{};
 };
 
 // ── Driver entry point ──────────────────────────────────────────────────

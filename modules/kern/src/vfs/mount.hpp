@@ -31,4 +31,8 @@ auto find_mount_point(const char* path) -> MountPoint*;
 // Helper to convert fstype string to FSType enum
 auto fstype_to_enum(const char* fstype) -> FSType;
 
+// D9: Iteration API for auto-discovery of exportable mount points
+auto get_mount_count() -> size_t;
+auto get_mount_at(size_t index) -> MountPoint*;
+
 }  // namespace ker::vfs

@@ -7,18 +7,18 @@ void cpuid(struct CpuidContext* cpuid_context) {
                  : "a"(cpuid_context->function));
 }
 
-uint64_t currentCpu(void) {
+uint64_t currentCpu() {
     // After swapgs in syscall/interrupt handler, GS_BASE points to the per-task
     // scratch area (PerCpu structure). cpuId is at offset 0x10 in PerCpu.
     // We must read via gs: segment, NOT from KERNEL_GS_BASE (which holds user's TLS after swapgs).
     uint64_t cpuId;
-    asm volatile("mov %%gs:0x10, %0" : "=r"(cpuId) :: "memory");
+    asm volatile("mov %%gs:0x10, %0" : "=r"(cpuId)::"memory");
     return cpuId;
 }
 
 void setCurrentCpuid(uint64_t id) {
     // Write cpuId to gs:0x10 (offset of cpuId in PerCpu structure)
-    asm volatile("mov %0, %%gs:0x10" :: "r"(id) : "memory");
+    asm volatile("mov %0, %%gs:0x10" ::"r"(id) : "memory");
 }
 
 void enablePAE(void) {

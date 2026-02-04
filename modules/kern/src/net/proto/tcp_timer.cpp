@@ -1,5 +1,4 @@
-#include "tcp.hpp"
-
+#include <algorithm>
 #include <cstring>
 #include <net/proto/ipv4.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -7,6 +6,8 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+
+#include "tcp.hpp"
 
 namespace ker::net::proto {
 
@@ -28,8 +29,8 @@ void retransmit_segment(TcpCB* cb, RetransmitEntry* entry) {
         return;
     }
 
-    std::memcpy(pkt->storage, entry->pkt->storage, PKT_BUF_SIZE);
-    pkt->data = pkt->storage + (entry->pkt->data - entry->pkt->storage);
+    std::memcpy(pkt->storage.data(), entry->pkt->storage.data(), PKT_BUF_SIZE);
+    pkt->data = pkt->storage.data() + (entry->pkt->data - entry->pkt->storage.data());
     pkt->len = entry->pkt->len;
 
     ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64);
@@ -72,8 +73,8 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         // Retransmit timeout
-        if (cb->retransmit_head != nullptr && cb->state != TcpState::CLOSED &&
-            cb->state != TcpState::TIME_WAIT && cb->state != TcpState::LISTEN) {
+        if (cb->retransmit_head != nullptr && cb->state != TcpState::CLOSED && cb->state != TcpState::TIME_WAIT &&
+            cb->state != TcpState::LISTEN) {
             if (now_ms >= cb->retransmit_deadline) {
                 auto* entry = cb->retransmit_head;
 
@@ -91,15 +92,11 @@ void tcp_timer_tick(uint64_t now_ms) {
                     retransmit_segment(cb, entry);
 
                     cb->rto_ms = cb->rto_ms * 2;
-                    if (cb->rto_ms > 60000) {
-                        cb->rto_ms = 60000;
-                    }
+                    cb->rto_ms = std::min<uint64_t>(cb->rto_ms, 60000);
                     cb->retransmit_deadline = now_ms + cb->rto_ms;
 
                     cb->ssthresh = cb->cwnd / 2;
-                    if (cb->ssthresh < 2 * cb->snd_mss) {
-                        cb->ssthresh = 2 * cb->snd_mss;
-                    }
+                    cb->ssthresh = std::max<uint32_t>(cb->ssthresh, 2 * cb->snd_mss);
                     cb->cwnd = cb->snd_mss;
                 }
             }

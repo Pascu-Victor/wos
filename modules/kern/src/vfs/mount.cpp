@@ -10,6 +10,10 @@
 #include "vfs/fs/devfs.hpp"
 #include "vfs/fs/tmpfs.hpp"
 
+#include <net/wki/event.hpp>
+#include <net/wki/wire.hpp>
+#include <net/wki/wki.hpp>
+
 namespace ker::vfs {
 
 // Mount point registry
@@ -27,6 +31,9 @@ auto fstype_to_enum(const char* fstype) -> FSType {
     }
     if (std::strcmp(fstype, "devfs") == 0) {
         return FSType::DEVFS;
+    }
+    if (std::strcmp(fstype, "remote") == 0) {
+        return FSType::REMOTE;
     }
     return FSType::TMPFS;
 }
@@ -114,6 +121,9 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     } else if (std::strcmp(fstype, "devfs") == 0) {
         // devfs filesystem
         mount->fops = ker::vfs::devfs::get_devfs_fops();
+    } else if (std::strcmp(fstype, "remote") == 0) {
+        // Remote VFS — fops and private_data set by caller after mount_filesystem returns
+        mount->fops = nullptr;
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         delete mount;
@@ -128,6 +138,13 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     vfs_debug_log(" at ");
     vfs_debug_log(path);
     vfs_debug_log("\n");
+
+    // Emit WKI storage mount event (if WKI is active)
+    if (ker::net::wki::g_wki.initialized) {
+        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE,
+                                          ker::net::wki::EVENT_STORAGE_MOUNT, path,
+                                          static_cast<uint16_t>(std::strlen(path) + 1));
+    }
 
     return 0;
 }
@@ -152,6 +169,14 @@ auto unmount_filesystem(const char* path) -> int {
             vfs_debug_log("unmount_filesystem: unmounted ");
             vfs_debug_log(path);
             vfs_debug_log("\n");
+
+            // Emit WKI storage unmount event (if WKI is active)
+            if (ker::net::wki::g_wki.initialized) {
+                ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE,
+                                                  ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
+                                                  static_cast<uint16_t>(std::strlen(path) + 1));
+            }
+
             return 0;
         }
     }
@@ -191,6 +216,15 @@ auto find_mount_point(const char* path) -> MountPoint* {
     }
 
     return best_match;
+}
+
+auto get_mount_count() -> size_t { return mount_count; }
+
+auto get_mount_at(size_t index) -> MountPoint* {
+    if (index >= mount_count) {
+        return nullptr;
+    }
+    return mounts[index];
 }
 
 }  // namespace ker::vfs

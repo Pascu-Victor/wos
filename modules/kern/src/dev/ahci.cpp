@@ -16,6 +16,7 @@
 
 #include "block_device.hpp"
 #include "pci.hpp"
+#include <net/wki/remotable.hpp>
 #include "platform/mm/addr.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -51,6 +52,30 @@ enum : uint8_t { AHCI_DEV_NULL = 0, AHCI_DEV_SATA = 1, AHCI_DEV_SEMB = 2, AHCI_D
 
 // Global state
 namespace {
+
+// WKI remotable ops for AHCI block devices
+auto remotable_can_remote() -> bool { return true; }
+auto remotable_can_share() -> bool { return true; }
+auto remotable_can_passthrough() -> bool { return false; }
+auto remotable_on_attach(uint16_t node_id) -> int {
+    ker::mod::dbg::log("[AHCI] remote attach from 0x%04x", node_id);
+    return 0;
+}
+void remotable_on_detach(uint16_t node_id) {
+    ker::mod::dbg::log("[AHCI] remote detach from 0x%04x", node_id);
+}
+void remotable_on_fault(uint16_t node_id) {
+    ker::mod::dbg::log("[AHCI] remote fault for 0x%04x", node_id);
+}
+const ker::net::wki::RemotableOps s_remotable_ops = {
+    .can_remote = remotable_can_remote,
+    .can_share = remotable_can_share,
+    .can_passthrough = remotable_can_passthrough,
+    .on_remote_attach = remotable_on_attach,
+    .on_remote_detach = remotable_on_detach,
+    .on_remote_fault = remotable_on_fault,
+};
+
 volatile HBA_MEM* hba_mem = nullptr;
 constexpr size_t MAX_PORTS = 32;
 AHCIDevice devices[MAX_PORTS];  // NOLINT
@@ -440,6 +465,7 @@ void probe_port(volatile HBA_MEM* abar) {
                     dev->bdev.write_blocks = ahci_write_blocks;
                     dev->bdev.flush = nullptr;
                     dev->bdev.private_data = dev;
+                    dev->bdev.remotable = &s_remotable_ops;
 
                     // Register with block device manager
                     block_device_register(&dev->bdev);

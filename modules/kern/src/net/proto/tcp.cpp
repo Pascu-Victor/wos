@@ -45,9 +45,7 @@ auto generate_iss() -> uint32_t {
 }
 
 // Allocate an ephemeral port
-auto alloc_ephemeral_port() -> uint16_t {
-    return tcp_ephemeral_port++;
-}
+auto alloc_ephemeral_port() -> uint16_t { return tcp_ephemeral_port++; }
 
 // TCP socket protocol operations
 int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
@@ -69,8 +67,7 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     // Check for existing binding
     if (!sock->reuse_port) {
         for (auto& b : tcp_bindings) {
-            if (b.cb != nullptr && b.local_port == port &&
-                (b.local_ip == ip || b.local_ip == 0 || ip == 0)) {
+            if (b.cb != nullptr && b.local_port == port && (b.local_ip == ip || b.local_ip == 0 || ip == 0)) {
                 tcp_bind_lock.unlock();
                 return -1;  // EADDRINUSE
             }
@@ -277,9 +274,7 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
         return 0;  // EOF
     }
 
-    if (cb->state != TcpState::ESTABLISHED &&
-        cb->state != TcpState::FIN_WAIT_1 &&
-        cb->state != TcpState::FIN_WAIT_2) {
+    if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::FIN_WAIT_1 && cb->state != TcpState::FIN_WAIT_2) {
         return -1;  // Not in a readable state
     }
 
@@ -291,15 +286,11 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
     return -EAGAIN;
 }
 
-auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags,
-                const void*, size_t) -> ssize_t {
+auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags, const void*, size_t) -> ssize_t {
     return tcp_send(sock, buf, len, flags);
 }
 
-auto tcp_recvfrom(Socket* sock, void* buf, size_t len, int flags,
-                  void*, size_t*) -> ssize_t {
-    return tcp_recv(sock, buf, len, flags);
-}
+auto tcp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void*, size_t*) -> ssize_t { return tcp_recv(sock, buf, len, flags); }
 
 void tcp_close_op(Socket* sock) {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
@@ -422,8 +413,7 @@ auto get_tcp_proto_ops() -> SocketProtoOps* { return &tcp_ops; }
 auto tcp_now_ms() -> uint64_t { return tcp_ms_counter; }
 
 auto tcp_alloc_cb() -> TcpCB* {
-    auto* cb = static_cast<TcpCB*>(
-        ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(TcpCB)));
+    auto* cb = static_cast<TcpCB*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(TcpCB)));
     if (cb == nullptr) {
         return nullptr;
     }
@@ -464,16 +454,13 @@ void tcp_free_cb(TcpCB* cb) {
         pp = &(*pp)->next;
     }
     tcb_list_lock.unlock();
-
     ker::mod::mm::dyn::kmalloc::free(cb);
 }
 
-auto tcp_find_cb(uint32_t local_ip, uint16_t local_port,
-                 uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
+auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
     tcb_list_lock.lock();
     for (auto* cb = tcb_list_head; cb != nullptr; cb = cb->next) {
-        if (cb->local_port == local_port && cb->remote_port == remote_port &&
-            (cb->local_ip == local_ip || cb->local_ip == 0) &&
+        if (cb->local_port == local_port && cb->remote_port == remote_port && (cb->local_ip == local_ip || cb->local_ip == 0) &&
             cb->remote_ip == remote_ip) {
             tcb_list_lock.unlock();
             return cb;
@@ -486,8 +473,7 @@ auto tcp_find_cb(uint32_t local_ip, uint16_t local_port,
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
     tcb_list_lock.lock();
     for (auto* cb = tcb_list_head; cb != nullptr; cb = cb->next) {
-        if (cb->state == TcpState::LISTEN && cb->local_port == local_port &&
-            (cb->local_ip == local_ip || cb->local_ip == 0)) {
+        if (cb->state == TcpState::LISTEN && cb->local_port == local_port && (cb->local_ip == local_ip || cb->local_ip == 0)) {
             tcb_list_lock.unlock();
             return cb;
         }

@@ -40,10 +40,9 @@ __attribute__((no_builtin("strlen"))) void reverse(char s[]) {
         s[j] = c;
     }
 }
-
-int itoa(int n, char s[], int base) {
+auto itoa(int n, std::span<char> s, int base) -> int {
     int i = 0;
-    bool isNegative = false;
+    bool is_negative = false;
 
     if (n == 0) {
         s[i++] = '0';
@@ -52,27 +51,27 @@ int itoa(int n, char s[], int base) {
     }
 
     if (n < 0 && base == 10) {
-        isNegative = true;
+        is_negative = true;
         n = -n;
     }
 
     while (n != 0) {
         int rem = n % base;
-        s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
         n = n / base;
     }
 
-    if (isNegative) {
+    if (is_negative) {
         s[i++] = '-';
     }
 
     s[i] = '\0';
 
-    reverse(s);
+    reverse(s.data());
     return i;
 }
 
-int u64toa(uint64_t n, char s[], int base) {
+auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int {
     int i = 0;
 
     if (n == 0) {
@@ -82,14 +81,36 @@ int u64toa(uint64_t n, char s[], int base) {
     }
 
     while (n != 0) {
-        int rem = n % base;
-        s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        int rem = static_cast<int>(n % base);
+        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
         n = n / base;
     }
 
     s[i] = '\0';
 
-    reverse(s);
+    reverse(s.data());
+
+    return i;
+}
+
+auto u64toh(uint64_t n, std::span<char> s) -> int {
+    int i = 0;
+
+    if (n == 0) {
+        s[i++] = '0';
+        s[i] = '\0';
+        return 1;
+    }
+
+    while (n != 0) {
+        int rem = static_cast<int>(n % 16);
+        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
+        n = n / 16;
+    }
+
+    s[i] = '\0';
+
+    reverse(s.data());
 
     return i;
 }
@@ -192,11 +213,11 @@ __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src
 
 __attribute__((no_builtin("strlen"))) void reverse(char s[]) { _std::reverse(s); }
 
-int itoa(int n, char s[], int base) { return _std::itoa(n, s, base); }
+int itoa(int n, std::span<char> s, int base) { return _std::itoa(n, s, base); }
 
-int u64toa(uint64_t n, char s[], int base) { return _std::u64toa(n, s, base); }
+int u64toa(uint64_t n, std::span<char> s, int base) { return _std::u64toa(n, s, base); }
 
-int u64toh(uint64_t n, char s[]) { return _std::u64toh(n, s); }
+int u64toh(uint64_t n, std::span<char> s) { return _std::u64toh(n, s); }
 
 char* snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
@@ -215,4 +236,10 @@ int strcmp(const char* str1, const char* str2) { return _std::strcmp(str1, str2)
 int strncmp(const char* str1, const char* str2, size_t n) { return _std::strncmp(str1, str2, n); }
 
 char* strdup(const char* str) { return _std::strdup(str); }
+
+size_t strnlen(const char* s, size_t n) {
+    size_t len = 0;
+    while (len < n && s[len]) ++len;
+    return len;
+}
 }

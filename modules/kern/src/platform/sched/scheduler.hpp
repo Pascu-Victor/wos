@@ -43,6 +43,7 @@ struct RunQueue {
 };
 
 void init();
+void setupQueues();  // Called separately after EpochManager::init() for dependency system
 auto postTask(task::Task* task) -> bool;
 auto postTaskForCpu(uint64_t cpuNo, task::Task* task) -> bool;
 auto postTaskBalanced(task::Task* task) -> bool;  // Post to least loaded CPU
@@ -52,6 +53,7 @@ void removeCurrentTask();                                     // Remove current 
 auto findTaskByPid(uint64_t pid) -> task::Task*;              // Find a task by PID (O(1) via PID registry)
 auto findTaskByPidSafe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
 void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task);  // Reschedule a specific task on a specific CPU
+void insertIntoDeadList(task::Task* task);                    // Place a task into CPU 0's dead list for GC
 void gcExpiredTasks();                                        // Garbage collect dead tasks from dead lists
 void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr,
                           ker::mod::gates::interruptFrame& frame);  // Move current task to wait queue with context saved
@@ -73,6 +75,12 @@ auto getRunQueueStats(uint64_t cpuNo) -> RunQueueStats;
 // Return up to maxEntries dead task PIDs and their refcounts for diagnostics,
 // starting at `startIndex` into the dead list. Returns the number of entries written.
 size_t getExpiredTaskRefcounts(uint64_t cpuNo, uint64_t* pids, uint32_t* refcounts, size_t maxEntries, size_t startIndex = 0);
+
+// D17: Function pointer for WKI remote task placement.
+// When non-null, postTaskBalanced() calls this before local placement.
+// If it returns true, the task was submitted remotely and will not be scheduled locally.
+// Set by WKI subsystem init; nullptr when WKI is not active.
+extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 }  // namespace ker::mod::sched
 extern "C" auto _wOS_getCurrentTask() -> ker::mod::sched::task::Task*;

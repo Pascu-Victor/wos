@@ -31,6 +31,9 @@ extern "C" void _wOS_kernel_idle_loop();
 
 namespace ker::mod::sched {
 
+// D17: WKI remote placement hook (nullptr when WKI not active)
+bool (*wki_try_remote_placement_fn)(task::Task* task) = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
 // ============================================================================
 // Global state
 // ============================================================================
@@ -250,6 +253,21 @@ void init() {
     }
 }
 
+void setupQueues() {
+    // This is the portion of init() after smt::init() and EpochManager::init()
+    // Used by the init dependency system for finer-grained control
+    runQueues = new smt::PerCpuCrossAccess<RunQueue>();
+
+    // Allocate a dedicated vector for scheduler wake IPIs.
+    wake_ipi_vector = gates::allocateVector();
+    if (wake_ipi_vector != 0) {
+        gates::setInterruptHandler(wake_ipi_vector, schedulerWakeHandler);
+        dbg::log("Registered scheduler wake IPI handler at vector 0x%x", wake_ipi_vector);
+    } else {
+        dbg::log("WARNING: No free interrupt vector for scheduler wake IPI");
+    }
+}
+
 void percpuInit() {
     auto cpuNo = cpu::currentCpu();
     dbg::log("Initializing scheduler, CPU:%x", cpuNo);
@@ -308,6 +326,13 @@ bool postTaskForCpu(uint64_t cpuNo, task::Task* task) {
 }
 
 auto postTaskBalanced(task::Task* task) -> bool {
+    // D17: Try remote placement if WKI is active and task is a user process
+    if (wki_try_remote_placement_fn != nullptr && task->type == task::TaskType::PROCESS) {
+        if (wki_try_remote_placement_fn(task)) {
+            return true;  // Successfully submitted remotely
+        }
+    }
+
     uint64_t targetCpu = getLeastLoadedCpu();
     task->cpu = targetCpu;
     return postTaskForCpu(targetCpu, task);
@@ -1093,6 +1118,14 @@ auto findTaskByPidSafe(uint64_t pid) -> task::Task* {
 // ============================================================================
 // Garbage collection
 // ============================================================================
+
+void insertIntoDeadList(task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    task->schedQueue = task::Task::SchedQueue::DEAD_GC;
+    runQueues->withLockVoid(0, [task](RunQueue* rq) { rq->deadList.push(task); });
+}
 
 void gcExpiredTasks() {
     for (uint64_t cpuNo = 0; cpuNo < smt::getCoreCount(); ++cpuNo) {

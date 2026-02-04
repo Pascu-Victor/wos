@@ -511,7 +511,6 @@ void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std:
         // If bfd_find_line didn't work, try bfd_find_nearest_line with the symbol's section
         if (sourceFile.empty() && bestMatch->section) {
             const char* functionname = nullptr;
-            bfd_vma symAddr = bfd_asymbol_value(bestMatch);
             bfd_vma sectionVma = bfd_section_vma(bestMatch->section);
 
             if (bfd_find_nearest_line(targetBfd, bestMatch->section, targetSymbols, fileAddress - sectionVma, &filename, &functionname,

@@ -1,15 +1,17 @@
 #include "netdevice.hpp"
 
+#include <array>
 #include <cstring>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <string_view>
 
 namespace ker::net {
 
 namespace {
-NetDevice* devices[MAX_NET_DEVICES] = {};
+std::array<NetDevice*, MAX_NET_DEVICES> devices = {};
 size_t device_count = 0;
 uint32_t next_ifindex = 1;
 uint32_t next_eth_index = 0;
@@ -25,18 +27,21 @@ auto netdev_register(NetDevice* dev) -> int {
     // Auto-name if the device name is empty
     if (dev->name[0] == '\0') {
         // Name format: "ethN"
-        char buf[NETDEV_NAME_LEN] = "eth";
+        std::array<char, NETDEV_NAME_LEN> buf = {};
+        buf[0] = 'e';
+        buf[1] = 't';
+        buf[2] = 'h';
         uint32_t idx = next_eth_index++;
         // Simple integer-to-string for index
         if (idx < 10) {
-            buf[3] = '0' + static_cast<char>(idx);
+            buf[3] = static_cast<char>('0' + static_cast<char>(idx));
             buf[4] = '\0';
         } else {
-            buf[3] = '0' + static_cast<char>(idx / 10);
-            buf[4] = '0' + static_cast<char>(idx % 10);
+            buf[3] = static_cast<char>('0' + static_cast<char>(idx / 10));
+            buf[4] = static_cast<char>('0' + static_cast<char>(idx % 10));
             buf[5] = '\0';
         }
-        std::memcpy(dev->name, buf, NETDEV_NAME_LEN);
+        dev->name = buf;
     }
 
     devices[device_count] = dev;
@@ -50,12 +55,12 @@ auto netdev_register(NetDevice* dev) -> int {
     return 0;
 }
 
-auto netdev_find_by_name(const char* name) -> NetDevice* {
-    if (name == nullptr) {
+auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
+    if (NAME.empty()) {
         return nullptr;
     }
     for (size_t i = 0; i < device_count; i++) {
-        if (std::strcmp(devices[i]->name, name) == 0) {
+        if (std::string_view(devices[i]->name.data()) == NAME) {
             return devices[i];
         }
     }
@@ -72,10 +77,6 @@ auto netdev_at(size_t i) -> NetDevice* {
 }
 
 // Forward declaration - will be implemented in ethernet.cpp
-namespace proto {
-void eth_rx(NetDevice* dev, PacketBuffer* pkt);
-}
-
 void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     if (dev == nullptr || pkt == nullptr) {
         return;
@@ -88,6 +89,12 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     pkt->dev = dev;
     dev->rx_packets++;
     dev->rx_bytes += pkt->len;
+
+    // D11: Forward packet to WKI remote consumers (if any are attached)
+    if (dev->wki_rx_forward != nullptr) {
+        dev->wki_rx_forward(dev, pkt);
+        // Original packet still processed locally
+    }
 
     // Loopback device sends raw IP packets (no Ethernet header)
     // Check if this is loopback by name
@@ -104,7 +111,8 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
             if (version == 4) {
                 proto::ipv4_rx(dev, pkt);
                 return;
-            } else if (version == 6) {
+            }
+            if (version == 6) {
                 proto::ipv6_rx(dev, pkt);
                 return;
             }

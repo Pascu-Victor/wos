@@ -20,6 +20,8 @@
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "vfs.hpp"
 
+#include <net/wki/remote_vfs.hpp>
+
 namespace ker::vfs {
 
 namespace {
@@ -303,6 +305,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
             }
+            break;
+        case FSType::REMOTE:
+            f = ker::net::wki::wki_remote_vfs_open_path(fs_relative_path, flags, mode, mount->private_data);
             break;
         default:
             vfs_debug_log("vfs_open: unknown filesystem type\n");
@@ -744,6 +749,9 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             statbuf->st_blocks = 0;
             return 0;
         }
+        case FSType::REMOTE: {
+            return ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
+        }
         default:
             return -ENOSYS;
     }
@@ -824,6 +832,20 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             statbuf->st_blocks = 0;
             return 0;
         }
+        case FSType::REMOTE: {
+            // Remote files — report basic file info from position
+            statbuf->st_dev = 0;
+            statbuf->st_ino = 1;
+            statbuf->st_nlink = 1;
+            statbuf->st_mode = S_IFREG | 0644;
+            statbuf->st_uid = 0;
+            statbuf->st_gid = 0;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = file->pos;
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = 0;
+            return 0;
+        }
         default:
             return -ENOSYS;
     }
@@ -881,6 +903,84 @@ void init() {
     // Register and mount devfs for device files
     ker::vfs::devfs::devfs_init();
     mount_filesystem("/dev", "devfs", nullptr);
+}
+
+auto vfs_open_file(const char* path, int flags, int mode) -> File* {
+    if (path == nullptr) {
+        return nullptr;
+    }
+
+    // Canonicalize path
+    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    size_t path_len = 0;
+    while (path[path_len] != '\0' && path_len < MAX_PATH_LEN - 1) {
+        pathBuffer[path_len] = path[path_len];
+        path_len++;
+    }
+    pathBuffer[path_len] = '\0';
+
+    canonicalize_path(static_cast<char*>(pathBuffer), MAX_PATH_LEN);
+
+    // Resolve symlinks
+    char resolved[MAX_PATH_LEN];  // NOLINT
+    int resolve_ret = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN);
+    if (resolve_ret == 0) {
+        std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+    }
+
+    // Find mount point
+    MountPoint* mount = find_mount_point(pathBuffer);
+    if (mount == nullptr) {
+        return nullptr;
+    }
+
+    // Strip mount prefix
+    const char* fs_relative_path = pathBuffer;
+    size_t mount_len = 0;
+    while (mount->path[mount_len] != '\0') {
+        mount_len++;
+    }
+
+    if (mount_len > 0 && pathBuffer[mount_len - 1] == '/' && mount_len == 1) {
+        fs_relative_path = pathBuffer + 1;
+    } else if (pathBuffer[mount_len] == '/') {
+        fs_relative_path = pathBuffer + mount_len + 1;
+    } else if (pathBuffer[mount_len] == '\0') {
+        fs_relative_path = "";
+    } else {
+        fs_relative_path = pathBuffer + mount_len;
+    }
+
+    File* f = nullptr;
+
+    switch (mount->fs_type) {
+        case FSType::DEVFS:
+            f = ker::vfs::devfs::devfs_open_path(fs_relative_path, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::devfs::get_devfs_fops();
+                f->fs_type = FSType::DEVFS;
+            }
+            break;
+        case FSType::FAT32:
+            f = ker::vfs::fat32::fat32_open_path(fs_relative_path, flags, mode,
+                                                 static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            if (f != nullptr) {
+                f->fops = ker::vfs::fat32::get_fat32_fops();
+                f->fs_type = FSType::FAT32;
+            }
+            break;
+        case FSType::TMPFS:
+            f = ker::vfs::tmpfs::tmpfs_open_path(fs_relative_path, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
+                f->fs_type = FSType::TMPFS;
+            }
+            break;
+        default:
+            return nullptr;
+    }
+
+    return f;
 }
 
 auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {

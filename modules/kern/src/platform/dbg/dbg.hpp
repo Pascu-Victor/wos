@@ -24,6 +24,7 @@ void logFbOnly(const char* str);
 void logFbAdvance(void);
 void error(const char* str);
 void enableTime(void);
+void enableKmalloc(void);
 void breakIntoDebugger(void);
 
 // Panic handler which halts other CPUs and stops the system.

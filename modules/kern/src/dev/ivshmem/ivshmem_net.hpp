@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <dev/pci.hpp>
 #include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::dev::ivshmem {
@@ -56,8 +57,14 @@ struct IvshmemNetDevice {
     uint8_t irq_vector;
     bool active;
     ker::mod::sys::Spinlock tx_lock;
+
+    // NAPI state for deferred packet processing
+    ker::net::NapiStruct napi{};
 };
 
 auto ivshmem_net_init() -> int;
+
+// Check if a PCI device has already been claimed by ivshmem_net
+auto ivshmem_net_is_claimed(pci::PCIDevice* dev) -> bool;
 
 }  // namespace ker::dev::ivshmem

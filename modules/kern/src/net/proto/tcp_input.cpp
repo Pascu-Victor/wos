@@ -129,6 +129,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->rcv_nxt = seg_seq + 1;
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = seg_wnd;
+                    cb->lock.unlock();
 
                     // Parse MSS from SYN-ACK
                     uint8_t hdr_len = (hdr->data_offset >> 4) * 4;

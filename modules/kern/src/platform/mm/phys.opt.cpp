@@ -64,7 +64,6 @@ static std::atomic<uint64_t> totalAllocatedBytes{0};
 static std::atomic<uint64_t> totalFreedBytes{0};
 static std::atomic<uint64_t> allocCount{0};
 static std::atomic<uint64_t> freeCount{0};
-bool stack_overlap_check_enabled = false;
 
 // Safe CPU ID getter - falls back to APIC ID during early boot
 static inline uint64_t getCurrentCpuId() {
@@ -80,8 +79,6 @@ static inline uint64_t getCurrentCpuId() {
     return 0;  // BSP during very early init
 }
 }  // namespace
-
-void enable_stack_overlap_check() { stack_overlap_check_enabled = true; }
 
 void dumpAllocStats() {
     io::serial::write("Physical alloc stats: allocated=");
@@ -398,34 +395,6 @@ auto pageAlloc(uint64_t size) -> void* {
         memlock.unlock();
         hcf();
     }
-
-    // DIAGNOSTIC: Check if returned page overlaps with current task's kernel stack.
-    // This catches the page allocator returning a page that's already in use.
-    if (stack_overlap_check_enabled) {
-        auto* ct = sched::getCurrentTask();
-        if (ct != nullptr && ct->context.syscallKernelStack != 0) {
-            uint64_t stack_top = ct->context.syscallKernelStack;
-            uint64_t stack_bot = stack_top - KERNEL_STACK_SIZE;
-            uint64_t b_start = blockAddr;
-            uint64_t b_end = blockAddr + size;
-            if (b_start < stack_top && b_end > stack_bot) {
-                memlock.unlock();
-                io::serial::write("FATAL: pageAlloc overlaps active kernel stack!\n");
-                io::serial::write("  block=");
-                io::serial::writeHex(b_start);
-                io::serial::write(" size=");
-                io::serial::writeHex(size);
-                io::serial::write("\n  stack=");
-                io::serial::writeHex(stack_bot);
-                io::serial::write(" - ");
-                io::serial::writeHex(stack_top);
-                io::serial::write(" PID=");
-                io::serial::writeHex(ct->pid);
-                io::serial::write("\n");
-                hcf();
-            }
-        }
-    }  // stack_overlap_check_enabled
 
     // If we're not using kernel CR3, temporarily switch for memset
     // This handles the case where userspace pagemaps don't have complete HHDM

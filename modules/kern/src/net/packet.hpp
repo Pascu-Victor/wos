@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -10,16 +11,19 @@ struct NetDevice;
 
 constexpr size_t PKT_BUF_SIZE = 2048;
 constexpr size_t PKT_HEADROOM = 64;
-constexpr size_t PKT_POOL_SIZE = 512;
+// Minimum pool size (used before NIC count is known)
+constexpr size_t PKT_POOL_MIN_SIZE = 1024;
+// Buffers to allocate per NIC (RX ring + TX ring + headroom)
+constexpr size_t PKT_POOL_PER_NIC = 1024;
 
 struct PacketBuffer {
-    uint8_t storage[PKT_BUF_SIZE];
-    uint8_t* data;       // current data pointer
-    size_t len;          // current data length
-    PacketBuffer* next;  // freelist / queue linkage
-    NetDevice* dev;      // source/dest device
-    uint16_t protocol;   // EtherType (host byte order)
-    uint8_t src_mac[6];  // incoming source MAC (for reply use)
+    std::array<uint8_t, PKT_BUF_SIZE> storage;
+    uint8_t* data;                   // current data pointer
+    size_t len;                      // current data length
+    PacketBuffer* next;              // freelist / queue linkage
+    NetDevice* dev;                  // source/dest device
+    uint16_t protocol;               // EtherType (host byte order)
+    std::array<uint8_t, 6> src_mac;  // incoming source MAC (for reply use)
 
     // Prepend: move data pointer back by n bytes, increase length
     auto push(size_t n) -> uint8_t* {
@@ -43,11 +47,13 @@ struct PacketBuffer {
         return tail;
     }
 
-    auto headroom() const -> size_t { return static_cast<size_t>(data - storage); }
-    auto tailroom() const -> size_t { return PKT_BUF_SIZE - headroom() - len; }
+    [[nodiscard]] auto headroom() const -> size_t { return static_cast<size_t>(data - storage.data()); }
+    [[nodiscard]] auto tailroom() const -> size_t { return PKT_BUF_SIZE - headroom() - len; }
 };
 
 void pkt_pool_init();
+void pkt_pool_expand_for_nics();  // Call after NIC drivers have registered
+auto pkt_pool_size() -> size_t;   // Get current pool size
 auto pkt_alloc() -> PacketBuffer*;
 void pkt_free(PacketBuffer* pkt);
 

@@ -112,6 +112,7 @@ void pci_enable_memory_space(PCIDevice* dev);
 // PCI Capability support
 auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t;  // config offset, 0 = not found
 auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int;           // 0 = success
+auto pci_enable_msix(PCIDevice* dev, uint8_t vector) -> int;          // 0 = success, configures entry 0
 
 // BAR address resolution (handles 64-bit BARs)
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t;

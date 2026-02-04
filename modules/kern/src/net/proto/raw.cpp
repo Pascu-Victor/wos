@@ -214,7 +214,9 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
     pkt_free(pkt);
 }
 
-static SocketProtoOps raw_proto_ops = {
+namespace {
+
+SocketProtoOps raw_proto_ops = {
     .bind = raw_bind,
     .listen = nullptr,
     .accept = nullptr,
@@ -229,6 +231,8 @@ static SocketProtoOps raw_proto_ops = {
     .getsockopt = nullptr,
     .poll_check = nullptr,
 };
+
+}
 
 auto get_raw_proto_ops() -> SocketProtoOps* { return &raw_proto_ops; }
 

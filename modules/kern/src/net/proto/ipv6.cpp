@@ -11,28 +11,23 @@
 namespace ker::net::proto {
 
 // Well-known IPv6 addresses
-const uint8_t IPV6_SOLICITED_NODE_PREFIX[13] = {
-    0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01, 0xFF
-};
+const std::array<uint8_t, 13> IPV6_SOLICITED_NODE_PREFIX = {0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF};
 
-const uint8_t IPV6_ALL_NODES_MULTICAST[16] = {
-    0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
-};
+const std::array<uint8_t, 16> IPV6_ALL_NODES_MULTICAST = {0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                                          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
 
-const uint8_t IPV6_UNSPECIFIED[16] = {};
+const std::array<uint8_t, 16> IPV6_UNSPECIFIED = {};
 
-const uint8_t IPV6_LINK_LOCAL_PREFIX[2] = {0xFE, 0x80};
+const std::array<uint8_t, 2> IPV6_LINK_LOCAL_PREFIX = {0xFE, 0x80};
 
-void ipv6_make_link_local(uint8_t* out, const uint8_t* mac) {
+void ipv6_make_link_local(std::array<uint8_t, 16>& out, const std::array<uint8_t, 6>& mac) {
     // fe80::MAC[0]^02:MAC[1]:MAC[2]:ff:fe:MAC[3]:MAC[4]:MAC[5]
-    std::memset(out, 0, 16);
+    std::memset(out.data(), 0, 16);
     out[0] = 0xFE;
     out[1] = 0x80;
     // bytes 2-7 are zero (interface ID starts at byte 8)
-    out[8]  = mac[0] ^ 0x02;  // flip universal/local bit
-    out[9]  = mac[1];
+    out[8] = mac[0] ^ 0x02;  // flip universal/local bit
+    out[9] = mac[1];
     out[10] = mac[2];
     out[11] = 0xFF;
     out[12] = 0xFE;
@@ -41,16 +36,16 @@ void ipv6_make_link_local(uint8_t* out, const uint8_t* mac) {
     out[15] = mac[5];
 }
 
-void ipv6_make_solicited_node(uint8_t* out, const uint8_t* addr) {
+void ipv6_make_solicited_node(std::array<uint8_t, 16>& out, const std::array<uint8_t, 16>& addr) {
     // ff02::1:ffXX:XXYY where XX:XXYY are last 3 bytes of addr
-    std::memset(out, 0, 16);
-    std::memcpy(out, IPV6_SOLICITED_NODE_PREFIX, 13);
+    std::memset(out.data(), 0, 16);
+    std::memcpy(out.data(), IPV6_SOLICITED_NODE_PREFIX.data(), 13);
     out[13] = addr[13];
     out[14] = addr[14];
     out[15] = addr[15];
 }
 
-void ipv6_multicast_to_mac(uint8_t* out_mac, const uint8_t* ipv6_mcast) {
+void ipv6_multicast_to_mac(std::array<uint8_t, 6>& out_mac, const std::array<uint8_t, 16>& ipv6_mcast) {
     // 33:33:XX:XX:XX:XX (last 4 bytes of IPv6 multicast)
     out_mac[0] = 0x33;
     out_mac[1] = 0x33;
@@ -62,9 +57,9 @@ void ipv6_multicast_to_mac(uint8_t* out_mac, const uint8_t* ipv6_mcast) {
 
 namespace {
 // Check if an IPv6 address is one of ours (unicast or multicast)
-bool is_our_address(NetDevice* dev, const uint8_t* addr) {
+bool is_our_address(NetDevice* dev, const std::array<uint8_t, 16>& addr) {
     // Check all-nodes multicast
-    if (std::memcmp(addr, IPV6_ALL_NODES_MULTICAST, 16) == 0) {
+    if (std::memcmp(addr.data(), IPV6_ALL_NODES_MULTICAST.data(), 16) == 0) {
         return true;
     }
 
@@ -80,9 +75,9 @@ bool is_our_address(NetDevice* dev, const uint8_t* addr) {
         auto* iface = netif_get(dev);
         if (iface != nullptr) {
             for (size_t i = 0; i < iface->ipv6_addr_count; i++) {
-                uint8_t sn[16];
+                std::array<uint8_t, 16> sn{};
                 ipv6_make_solicited_node(sn, iface->ipv6_addrs[i].addr);
-                if (std::memcmp(addr, sn, 16) == 0) {
+                if (std::memcmp(addr.data(), sn.data(), 16) == 0) {
                     return true;
                 }
             }
@@ -99,7 +94,7 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    auto* hdr = reinterpret_cast<const IPv6Header*>(pkt->data);
+    const auto* hdr = reinterpret_cast<const IPv6Header*>(pkt->data);
 
     // Verify version == 6
     uint8_t version = (ntohl(hdr->version_tc_flow) >> 28) & 0x0F;
@@ -124,9 +119,10 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
     // Save src/dst for protocol handlers
-    uint8_t src[16], dst[16];
-    std::memcpy(src, hdr->src, 16);
-    std::memcpy(dst, hdr->dst, 16);
+    std::array<uint8_t, 16> src{};
+    std::array<uint8_t, 16> dst{};
+    std::memcpy(src.data(), hdr->src.data(), hdr->src.size());
+    std::memcpy(dst.data(), hdr->dst.data(), hdr->dst.size());
 
     // Strip IPv6 header
     pkt->pull(IPV6_HLEN);
@@ -152,8 +148,8 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 }
 
-void ipv6_tx(PacketBuffer* pkt, const uint8_t* src, const uint8_t* dst,
-             uint8_t next_header, uint8_t hop_limit, NetDevice* dev) {
+void ipv6_tx(PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst, uint8_t next_header,
+             uint8_t hop_limit, NetDevice* dev) {
     if (dev == nullptr || pkt == nullptr) {
         if (pkt != nullptr) {
             pkt_free(pkt);
@@ -161,7 +157,7 @@ void ipv6_tx(PacketBuffer* pkt, const uint8_t* src, const uint8_t* dst,
         return;
     }
 
-    uint16_t payload_len = static_cast<uint16_t>(pkt->len);
+    auto payload_len = static_cast<uint16_t>(pkt->len);
 
     // Prepend IPv6 header
     auto* hdr = reinterpret_cast<IPv6Header*>(pkt->push(IPV6_HLEN));
@@ -171,11 +167,11 @@ void ipv6_tx(PacketBuffer* pkt, const uint8_t* src, const uint8_t* dst,
     hdr->payload_length = htons(payload_len);
     hdr->next_header = next_header;
     hdr->hop_limit = hop_limit;
-    std::memcpy(hdr->src, src, 16);
-    std::memcpy(hdr->dst, dst, 16);
+    std::memcpy(hdr->src.data(), src.data(), hdr->src.size());
+    std::memcpy(hdr->dst.data(), dst.data(), hdr->dst.size());
 
     // Determine destination MAC
-    uint8_t dst_mac[6];
+    std::array<uint8_t, 6> dst_mac{};
     if (dst[0] == 0xFF) {
         // Multicast: derive MAC from IPv6 address
         ipv6_multicast_to_mac(dst_mac, dst);

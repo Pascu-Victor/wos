@@ -28,7 +28,7 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    auto* hdr = reinterpret_cast<const IPv4Header*>(pkt->data);
+    const auto* hdr = reinterpret_cast<const IPv4Header*>(pkt->data);
 
     // Validate version
     uint8_t version = (hdr->ihl_version >> 4) & 0xF;
@@ -147,7 +147,7 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
         // Broadcast fallback: no route needed, use first UP non-loopback device
         for (size_t i = 0; i < netdev_count(); i++) {
             auto* d = netdev_at(i);
-            if (d != nullptr && d->state == 1 && std::strcmp(d->name, "lo") != 0) {
+            if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
                 out_dev = d;
                 break;
             }
@@ -174,7 +174,7 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
     }
 
     // If the device is loopback, bypass ARP
-    if (std::strcmp(out_dev->name, "lo") == 0) {
+    if (std::strcmp(out_dev->name.data(), "lo") == 0) {
 #ifdef DEBUG_IPV4
         ker::mod::dbg::log("ipv4_tx: loopback device, calling start_xmit\n");
 #endif
@@ -182,7 +182,7 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
     }
 
     // Resolve MAC address via ARP
-    uint8_t dst_mac[6];
+    std::array<uint8_t, 6> dst_mac{};
     int arp_result = arp_resolve(out_dev, next_hop, dst_mac, pkt);
     if (arp_result < 0) {
         // Packet queued in ARP pending list or dropped on timeout

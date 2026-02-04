@@ -37,7 +37,7 @@ auto getCpuIndexFromApicId(uint32_t apicId) -> uint64_t;
 // Used to restore GS_BASE when entering idle loop (no task context)
 cpu::PerCpu* getKernelPerCpu(uint64_t cpuIndex);
 
-__attribute__((noreturn)) void startSMT(boot::HandoverModules& modules, uint64_t kernelRsp);
+void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp);
 
 void init();
 

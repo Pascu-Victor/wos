@@ -1,5 +1,6 @@
 #include "ndp.hpp"
 
+#include <array>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -13,12 +14,12 @@
 namespace ker::net::proto {
 
 namespace {
-NdpEntry ndp_cache[NDP_CACHE_SIZE] = {};
+std::array<NdpEntry, NDP_CACHE_SIZE> ndp_cache = {};
 ker::mod::sys::Spinlock ndp_lock;
 
-auto find_entry(const uint8_t* ip) -> NdpEntry* {
+auto find_entry(const std::array<uint8_t, 16>& ip) -> NdpEntry* {
     for (auto& e : ndp_cache) {
-        if (e.state != NdpEntry::FREE && std::memcmp(e.ip, ip, 16) == 0) {
+        if (e.state != NdpEntry::FREE && e.ip == ip) {
             return &e;
         }
     }
@@ -54,7 +55,7 @@ auto alloc_entry() -> NdpEntry* {
 }
 
 // Parse NDP options to extract link-layer address
-bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, uint8_t* out_mac) {
+bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, std::array<uint8_t, 6>& out_mac) {
     size_t offset = 0;
     while (offset + 2 <= opts_len) {
         uint8_t opt_type = opts[offset];
@@ -68,7 +69,7 @@ bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, 
         }
         if (opt_type == type && opt_bytes >= 8) {
             // Link-layer address starts at offset+2
-            std::memcpy(out_mac, opts + offset + 2, 6);
+            std::memcpy(out_mac.data(), opts + offset + 2, 6);
             return true;
         }
         offset += opt_bytes;
@@ -77,18 +78,17 @@ bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, 
 }
 
 // Send a Neighbor Solicitation for the given target address
-void send_ns(NetDevice* dev, const uint8_t* target_ip, const uint8_t* src_ip) {
+void send_ns(NetDevice* dev, const std::array<uint8_t, 16>& target_ip, const std::array<uint8_t, 16>& src_ip) {
     auto* pkt = pkt_alloc();
     if (pkt == nullptr) {
         return;
     }
 
     // ICMPv6 Header (4) + NS body (4 + 16) + Source LLA option (8) = 32 bytes
-    constexpr size_t ns_len = sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit) +
-                              sizeof(NdpOptionHeader) + 6;
+    constexpr size_t NS_LEN = sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit) + sizeof(NdpOptionHeader) + 6;
 
-    auto* data = pkt->put(ns_len);
-    std::memset(data, 0, ns_len);
+    auto* data = pkt->put(NS_LEN);
+    std::memset(data, 0, NS_LEN);
 
     auto* icmp = reinterpret_cast<ICMPv6Header*>(data);
     icmp->type = ICMPV6_NEIGHBOR_SOLICIT;
@@ -96,39 +96,36 @@ void send_ns(NetDevice* dev, const uint8_t* target_ip, const uint8_t* src_ip) {
 
     auto* ns = reinterpret_cast<NdpNeighborSolicit*>(data + sizeof(ICMPv6Header));
     ns->reserved = 0;
-    std::memcpy(ns->target, target_ip, 16);
+    std::memcpy(ns->target.data(), target_ip.data(), 16);
 
     // Source Link-Layer Address option
     auto* opt = reinterpret_cast<NdpOptionHeader*>(data + sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit));
     opt->type = NDP_OPT_SRC_LINK_ADDR;
     opt->length = 1;  // 8 bytes
-    std::memcpy(reinterpret_cast<uint8_t*>(opt) + 2, dev->mac, 6);
+    std::memcpy(reinterpret_cast<uint8_t*>(opt) + 2, dev->mac.data(), 6);
 
     // Compute checksum
-    uint8_t dst_mcast[16];
+    std::array<uint8_t, 16> dst_mcast = {};
     ipv6_make_solicited_node(dst_mcast, target_ip);
 
     icmp->checksum = 0;
-    icmp->checksum = checksum_pseudo_ipv6(src_ip, dst_mcast, IPV6_PROTO_ICMPV6,
-                                          static_cast<uint32_t>(pkt->len),
-                                          pkt->data, pkt->len);
+    icmp->checksum = checksum_pseudo_ipv6(src_ip, dst_mcast, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len);
 
     ipv6_tx(pkt, src_ip, dst_mcast, IPV6_PROTO_ICMPV6, 255, dev);
 }
 
 // Send a Neighbor Advertisement in response to a Solicitation
-void send_na(NetDevice* dev, const uint8_t* target_ip, const uint8_t* dst_ip, bool solicited) {
+void send_na(NetDevice* dev, const std::array<uint8_t, 16>& target_ip, const std::array<uint8_t, 16>& dst_ip, bool solicited) {
     auto* pkt = pkt_alloc();
     if (pkt == nullptr) {
         return;
     }
 
     // ICMPv6 Header (4) + NA body (4 + 16) + Target LLA option (8) = 32 bytes
-    constexpr size_t na_len = sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert) +
-                              sizeof(NdpOptionHeader) + 6;
+    constexpr size_t NA_LEN = sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert) + sizeof(NdpOptionHeader) + 6;
 
-    auto* data = pkt->put(na_len);
-    std::memset(data, 0, na_len);
+    auto* data = pkt->put(NA_LEN);
+    std::memset(data, 0, NA_LEN);
 
     auto* icmp = reinterpret_cast<ICMPv6Header*>(data);
     icmp->type = ICMPV6_NEIGHBOR_ADVERT;
@@ -140,31 +137,28 @@ void send_na(NetDevice* dev, const uint8_t* target_ip, const uint8_t* dst_ip, bo
         flags |= NDP_NA_FLAG_SOLICITED;
     }
     na->flags = htonl(flags);
-    std::memcpy(na->target, target_ip, 16);
+    std::memcpy(na->target.data(), target_ip.data(), 16);
 
     // Target Link-Layer Address option
     auto* opt = reinterpret_cast<NdpOptionHeader*>(data + sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert));
     opt->type = NDP_OPT_TGT_LINK_ADDR;
     opt->length = 1;  // 8 bytes
-    std::memcpy(reinterpret_cast<uint8_t*>(opt) + 2, dev->mac, 6);
+    std::memcpy(reinterpret_cast<uint8_t*>(opt) + 2, dev->mac.data(), 6);
 
     icmp->checksum = 0;
-    icmp->checksum = checksum_pseudo_ipv6(target_ip, dst_ip, IPV6_PROTO_ICMPV6,
-                                          static_cast<uint32_t>(pkt->len),
-                                          pkt->data, pkt->len);
+    icmp->checksum = checksum_pseudo_ipv6(target_ip, dst_ip, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len);
 
     ipv6_tx(pkt, target_ip, dst_ip, IPV6_PROTO_ICMPV6, 255, dev);
 }
 }  // namespace
 
-void ndp_handle_ns(NetDevice* dev, PacketBuffer* pkt,
-                   const uint8_t* src, const uint8_t* /*dst*/) {
+void ndp_handle_ns(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& /*dst*/) {
     if (pkt->len < sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit)) {
         pkt_free(pkt);
         return;
     }
 
-    auto* ns = reinterpret_cast<const NdpNeighborSolicit*>(pkt->data + sizeof(ICMPv6Header));
+    const auto* ns = reinterpret_cast<const NdpNeighborSolicit*>(pkt->data + sizeof(ICMPv6Header));
 
     // Check if the target address is ours
     auto* nif = netif_find_by_ipv6(ns->target);
@@ -176,19 +170,19 @@ void ndp_handle_ns(NetDevice* dev, PacketBuffer* pkt,
     // Extract source link-layer address option (if present)
     const uint8_t* opts = pkt->data + sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit);
     size_t opts_len = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborSolicit);
-    uint8_t src_mac[6] = {};
+    std::array<uint8_t, 6> src_mac = {};
     bool has_src_mac = parse_link_addr_option(opts, opts_len, NDP_OPT_SRC_LINK_ADDR, src_mac);
 
     // Update neighbor cache with source
-    if (has_src_mac && std::memcmp(src, IPV6_UNSPECIFIED, 16) != 0) {
+    if (has_src_mac && src != IPV6_UNSPECIFIED) {
         ndp_lock.lock();
         auto* entry = find_entry(src);
         if (entry == nullptr) {
             entry = alloc_entry();
         }
         if (entry != nullptr) {
-            std::memcpy(entry->ip, src, 16);
-            std::memcpy(entry->mac, src_mac, 6);
+            entry->ip = src;
+            entry->mac = src_mac;
             entry->state = NdpEntry::REACHABLE;
         }
         ndp_lock.unlock();
@@ -198,26 +192,25 @@ void ndp_handle_ns(NetDevice* dev, PacketBuffer* pkt,
 
     // Send Neighbor Advertisement
     // If source was unspecified (DAD), reply to all-nodes multicast
-    if (std::memcmp(src, IPV6_UNSPECIFIED, 16) == 0) {
+    if (src == IPV6_UNSPECIFIED) {
         send_na(dev, ns->target, IPV6_ALL_NODES_MULTICAST, false);
     } else {
         send_na(dev, ns->target, src, true);
     }
 }
 
-void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt,
-                   const uint8_t* /*src*/, const uint8_t* /*dst*/) {
+void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& /*src*/, const std::array<uint8_t, 16>& /*dst*/) {
     if (pkt->len < sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert)) {
         pkt_free(pkt);
         return;
     }
 
-    auto* na = reinterpret_cast<const NdpNeighborAdvert*>(pkt->data + sizeof(ICMPv6Header));
+    const auto* na = reinterpret_cast<const NdpNeighborAdvert*>(pkt->data + sizeof(ICMPv6Header));
 
     // Extract target link-layer address option
     const uint8_t* opts = pkt->data + sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert);
     size_t opts_len = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborAdvert);
-    uint8_t target_mac[6] = {};
+    std::array<uint8_t, 6> target_mac = {};
     bool has_mac = parse_link_addr_option(opts, opts_len, NDP_OPT_TGT_LINK_ADDR, target_mac);
 
     if (!has_mac) {
@@ -229,14 +222,13 @@ void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt,
     ndp_lock.lock();
     auto* entry = find_entry(na->target);
     if (entry != nullptr) {
-        std::memcpy(entry->mac, target_mac, 6);
+        std::memcpy(entry->mac.data(), target_mac.data(), 6);
         entry->state = NdpEntry::REACHABLE;
 
         // Send any pending packet
         PacketBuffer* pending = entry->pending;
         entry->pending = nullptr;
         ndp_lock.unlock();
-
         if (pending != nullptr) {
             eth_tx(dev, pending, target_mac, ETH_TYPE_IPV6);
         }
@@ -244,8 +236,8 @@ void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt,
         // Create new entry
         entry = alloc_entry();
         if (entry != nullptr) {
-            std::memcpy(entry->ip, na->target, 16);
-            std::memcpy(entry->mac, target_mac, 6);
+            entry->ip = na->target;
+            entry->mac = target_mac;
             entry->state = NdpEntry::REACHABLE;
         }
         ndp_lock.unlock();
@@ -254,12 +246,12 @@ void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt,
     pkt_free(pkt);
 }
 
-bool ndp_resolve(NetDevice* dev, const uint8_t* ip, uint8_t* dst_mac, PacketBuffer* pkt) {
+bool ndp_resolve(NetDevice* dev, const std::array<uint8_t, 16>& ip, std::array<uint8_t, 6>& dst_mac, PacketBuffer* pkt) {
     ndp_lock.lock();
     auto* entry = find_entry(ip);
 
     if (entry != nullptr && (entry->state == NdpEntry::REACHABLE || entry->state == NdpEntry::STALE)) {
-        std::memcpy(dst_mac, entry->mac, 6);
+        dst_mac = entry->mac;
         ndp_lock.unlock();
         return true;
     }
@@ -272,7 +264,7 @@ bool ndp_resolve(NetDevice* dev, const uint8_t* ip, uint8_t* dst_mac, PacketBuff
             pkt_free(pkt);
             return false;
         }
-        std::memcpy(entry->ip, ip, 16);
+        entry->ip = ip;
         entry->state = NdpEntry::INCOMPLETE;
     }
 
@@ -293,7 +285,10 @@ bool ndp_resolve(NetDevice* dev, const uint8_t* ip, uint8_t* dst_mac, PacketBuff
 }
 
 void ndp_init() {
-    std::memset(ndp_cache, 0, sizeof(ndp_cache));
+    for (auto& e : ndp_cache) {
+        e.state = NdpEntry::FREE;
+        e.pending = nullptr;
+    }
 }
 
 }  // namespace ker::net::proto

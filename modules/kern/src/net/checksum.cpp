@@ -1,5 +1,6 @@
 #include "checksum.hpp"
 
+#include <array>
 #include <net/endian.hpp>
 
 namespace ker::net {
@@ -63,8 +64,8 @@ auto checksum_pseudo_ipv4(uint32_t src, uint32_t dst, uint8_t proto, uint16_t le
     return fold_checksum(sum);
 }
 
-auto checksum_pseudo_ipv6(const uint8_t* src, const uint8_t* dst, uint8_t next_header,
-                          uint32_t payload_len, const void* data, size_t data_len) -> uint16_t {
+auto checksum_pseudo_ipv6(const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst, uint8_t next_header, uint32_t payload_len,
+                          const void* data, size_t data_len) -> uint16_t {
     uint32_t sum = 0;
 
     // IPv6 pseudo-header: src(128) + dst(128) + payload_len(32) + zero(24) + next_header(8)

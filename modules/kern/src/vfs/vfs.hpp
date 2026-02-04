@@ -45,6 +45,11 @@ struct VNode {
 
 // Open a path and return a file descriptor-like opaque pointer
 auto vfs_open(std::string_view path, int flags, int mode) -> int;
+
+// Open a path and return a File* directly (no FD allocation, no task context).
+// Used by server-side subsystems (e.g. WKI remote VFS) that operate on files
+// outside of any userspace task context.
+auto vfs_open_file(const char* path, int flags, int mode) -> File*;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;

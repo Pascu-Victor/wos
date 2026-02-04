@@ -12,6 +12,7 @@ enum class FSType : uint8_t {
     FAT32,
     DEVFS,
     SOCKET,
+    REMOTE,
 };
 
 struct File {

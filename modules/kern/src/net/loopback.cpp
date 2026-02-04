@@ -1,5 +1,6 @@
 #include "loopback.hpp"
 
+#include <array>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
@@ -38,8 +39,8 @@ NetDeviceOps lo_ops = {
 
 void loopback_init() {
     std::memset(&lo_dev, 0, sizeof(lo_dev));
-    std::memcpy(lo_dev.name, "lo", 3);
-    std::memset(lo_dev.mac, 0, 6);
+    std::memcpy(lo_dev.name.data(), "lo", 3);
+    std::memset(lo_dev.mac.data(), 0, 6);
     lo_dev.mtu = 65535;
     lo_dev.state = 1;  // always up
     lo_dev.ops = &lo_ops;
@@ -56,7 +57,7 @@ void loopback_init() {
     route_add(lo_net, lo_mask, 0, 0, &lo_dev);  // 0 gateway, 0 metric
 
     // Assign ::1/128
-    uint8_t lo_ipv6[16] = {};
+    std::array<uint8_t, 16> lo_ipv6 = {};
     lo_ipv6[15] = 1;
     netif_add_ipv6(&lo_dev, lo_ipv6, 128);
 

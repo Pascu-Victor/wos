@@ -134,14 +134,11 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + len));
     udp->checksum = 0;  // Optional for IPv4
 
-    return ipv4_tx(pkt, sock->local_v4.addr, sock->remote_v4.addr, IPPROTO_UDP, 64) == 0
-               ? static_cast<ssize_t>(len)
-               : static_cast<ssize_t>(-1);
+    return ipv4_tx(pkt, sock->local_v4.addr, sock->remote_v4.addr, IPPROTO_UDP, 64) == 0 ? static_cast<ssize_t>(len)
+                                                                                         : static_cast<ssize_t>(-1);
 }
 
-auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
-    return sock->rcvbuf.read(buf, len);
-}
+auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t { return sock->rcvbuf.read(buf, len); }
 
 auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
     if (addr_raw == nullptr || addr_len < 8) {
@@ -180,9 +177,7 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
     udp->checksum = 0;
 
     uint32_t src = sock->local_v4.addr;
-    return ipv4_tx(pkt, src, ip, IPPROTO_UDP, 64) == 0
-               ? static_cast<ssize_t>(len)
-               : static_cast<ssize_t>(-1);
+    return ipv4_tx(pkt, src, ip, IPPROTO_UDP, 64) == 0 ? static_cast<ssize_t>(len) : static_cast<ssize_t>(-1);
 }
 
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_raw, size_t* addr_len) -> ssize_t {

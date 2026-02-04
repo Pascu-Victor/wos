@@ -1,8 +1,11 @@
 #include "e1000e.hpp"
 
+#include <array>
 #include <cstring>
 #include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
 #include <net/packet.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
@@ -13,6 +16,30 @@
 namespace ker::dev::e1000e {
 
 namespace {
+
+// WKI remotable ops for E1000E devices
+auto remotable_can_remote() -> bool { return true; }
+auto remotable_can_share() -> bool { return true; }
+auto remotable_can_passthrough() -> bool { return false; }
+auto remotable_on_attach(uint16_t node_id) -> int {
+    ker::mod::dbg::log("[E1000E] remote attach from 0x%04x", node_id);
+    return 0;
+}
+void remotable_on_detach(uint16_t node_id) {
+    ker::mod::dbg::log("[E1000E] remote detach from 0x%04x", node_id);
+}
+void remotable_on_fault(uint16_t node_id) {
+    ker::mod::dbg::log("[E1000E] remote fault for 0x%04x", node_id);
+}
+const ker::net::wki::RemotableOps s_remotable_ops = {
+    .can_remote = remotable_can_remote,
+    .can_share = remotable_can_share,
+    .can_passthrough = remotable_can_passthrough,
+    .on_remote_attach = remotable_on_attach,
+    .on_remote_detach = remotable_on_detach,
+    .on_remote_fault = remotable_on_fault,
+};
+
 constexpr size_t MAX_E1000_DEVICES = 4;
 E1000Device* devices[MAX_E1000_DEVICES] = {};  // NOLINT
 size_t device_count = 0;
@@ -23,10 +50,13 @@ struct DeviceID {
     const char* name;
 };
 
-constexpr DeviceID supported_devices[] = {
-    {0x100E, "82540EM (e1000)"}, {0x10D3, "82574L (e1000e)"}, {0x1539, "I211-AT"}, {0x153A, "I217-LM"}, {0x15B8, "I219-V"},
-};
-constexpr size_t NUM_SUPPORTED = sizeof(supported_devices) / sizeof(supported_devices[0]);
+constexpr std::array<DeviceID, 5> SUPPORTED_DEVICES = {{
+    {.id = 0x100E, .name = "82540EM (e1000)"},
+    {.id = 0x10D3, .name = "82574L (e1000e)"},
+    {.id = 0x1539, .name = "I211-AT"},
+    {.id = 0x153A, .name = "I217-LM"},
+    {.id = 0x15B8, .name = "I219-V"},
+}};
 
 // ── MMIO access ─────────────────────────────────────────────────────────
 inline auto reg_read(E1000Device* dev, uint32_t offset) -> uint32_t { return dev->mmio[offset / 4]; }
@@ -60,7 +90,7 @@ auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
     reg_write(dev, REG_EERD, (static_cast<uint32_t>(addr) << 8) | EERD_START);
 
     // Poll for completion
-    uint32_t val;
+    uint32_t val = 0;
     for (int i = 0; i < 10000; i++) {
         val = reg_read(dev, REG_EERD);
         if ((val & EERD_DONE) != 0) {
@@ -115,10 +145,10 @@ void init_rx(E1000Device* dev) {
             ker::mod::dbg::log("e1000e: Failed to allocate RX buffer %d", i);
             break;
         }
-        pkt->data = pkt->storage;
+        pkt->data = pkt->storage.data();
         pkt->len = 0;
         dev->rx_bufs[i] = pkt;
-        descs[i].addr = virt_to_phys(pkt->storage);
+        descs[i].addr = virt_to_phys(pkt->storage.data());
         descs[i].status = 0;
     }
 
@@ -156,17 +186,19 @@ void init_tx(E1000Device* dev) {
 
     // Set Inter-Packet Gap (recommended values from Intel datasheet)
     // IPGT=10, IPGR1=8, IPGR2=6
-    reg_write(dev, REG_TIPG, (6u << 20) | (8u << 10) | 10u);
+    reg_write(dev, REG_TIPG, (6U << 20) | (8U << 10) | 10U);
 
     // Enable transmitter
-    uint32_t tctl = TCTL_EN | TCTL_PSP | (15u << TCTL_CT_SHIFT) |  // Collision Threshold
-                    (64u << TCTL_COLD_SHIFT);                      // Collision Distance (full duplex)
+    uint32_t tctl = TCTL_EN | TCTL_PSP | (15U << TCTL_CT_SHIFT) |  // Collision Threshold
+                    (64U << TCTL_COLD_SHIFT);                      // Collision Distance (full duplex)
     reg_write(dev, REG_TCTL, tctl);
 }
 
-// ── Process received packets ────────────────────────────────────────────
-void process_rx(E1000Device* dev) {
-    while (true) {
+// ── Process received packets (budget-limited for NAPI) ──────────────────
+int process_rx_budget(E1000Device* dev, int budget) {
+    int processed = 0;
+
+    while (processed < budget) {
         uint16_t idx = dev->rx_tail;
         auto* desc = &dev->rx_descs[idx];
 
@@ -177,35 +209,35 @@ void process_rx(E1000Device* dev) {
         if ((desc->status & RX_STATUS_EOP) != 0 && desc->errors == 0) {
             auto* pkt = dev->rx_bufs[idx];
             if (pkt != nullptr) {
-                pkt->data = pkt->storage;
+                pkt->data = pkt->storage.data();
                 pkt->len = desc->length;
                 pkt->dev = &dev->netdev;
 
                 // Hand off to network stack
                 ker::net::netdev_rx(&dev->netdev, pkt);
+                processed++;
 
                 // Allocate replacement buffer
                 auto* new_pkt = ker::net::pkt_alloc();
                 if (new_pkt != nullptr) {
-                    new_pkt->data = new_pkt->storage;
+                    new_pkt->data = new_pkt->storage.data();
                     new_pkt->len = 0;
                     dev->rx_bufs[idx] = new_pkt;
-                    desc->addr = virt_to_phys(new_pkt->storage);
+                    desc->addr = virt_to_phys(new_pkt->storage.data());
                 } else {
-                    // No buffer available — reuse old descriptor
+                    // No buffer available — mark slot as empty
                     dev->rx_bufs[idx] = nullptr;
                     desc->addr = 0;
                 }
             }
-        } else {
-            // Error packet — just recycle the buffer
-            dev->netdev.rx_bytes += 0;  // don't count errored packets
         }
 
         desc->status = 0;
         reg_write(dev, REG_RDT, idx);
         dev->rx_tail = (idx + 1) % NUM_RX_DESC;
     }
+
+    return processed;
 }
 
 // ── Process TX completions ──────────────────────────────────────────────
@@ -220,24 +252,43 @@ void process_tx(E1000Device* dev) {
     }
 }
 
-// ── IRQ handler ─────────────────────────────────────────────────────────
+// ── NAPI poll function - called from worker thread context ──────────────
+int e1000_poll(ker::net::NapiStruct* napi, int budget) {
+    auto* dev = reinterpret_cast<E1000Device*>(napi->dev);
+    int processed = 0;
+
+    // Process RX packets up to budget
+    processed = process_rx_budget(dev, budget);
+
+    // Process TX completions (with lock since start_xmit also accesses)
+    dev->tx_lock.lock();
+    process_tx(dev);
+    dev->tx_lock.unlock();
+
+    // If we processed less than budget, we're done - re-enable IRQs
+    if (processed < budget) {
+        ker::net::napi_complete(napi);
+        // Re-enable interrupts
+        reg_write(dev, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
+    }
+
+    return processed;
+}
+
+// ── Minimal IRQ handler (NAPI model) ────────────────────────────────────
 void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     auto* dev = static_cast<E1000Device*>(private_data);
     if (dev == nullptr) {
         return;
     }
 
-    // Read and acknowledge interrupt cause
+    // Read and acknowledge interrupt cause (auto-clears on read)
     uint32_t icr = reg_read(dev, REG_ICR);
-
-    if ((icr & (ICR_RXT0 | ICR_RXDMT0 | ICR_RXO)) != 0) {
-        process_rx(dev);
+    if (icr == 0) {
+        return;  // Not our interrupt
     }
 
-    if ((icr & (ICR_TXDW | ICR_TXQE)) != 0) {
-        process_tx(dev);
-    }
-
+    // Handle link status change immediately (doesn't need deferral)
     if ((icr & ICR_LSC) != 0) {
         uint32_t status = reg_read(dev, REG_STATUS);
         if ((status & 0x02) != 0) {
@@ -245,6 +296,15 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
         } else {
             ker::mod::dbg::log("e1000e: Link down");
         }
+    }
+
+    // For RX/TX, disable interrupts and schedule NAPI poll
+    if ((icr & (ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_TXDW | ICR_TXQE)) != 0) {
+        // Disable interrupts until poll completes
+        reg_write(dev, REG_IMC, 0xFFFFFFFF);
+
+        // Schedule NAPI poll - all real work happens in worker thread
+        ker::net::napi_schedule(&dev->napi);
     }
 }
 
@@ -256,6 +316,7 @@ void e1000_close(ker::net::NetDevice* /*ndev*/) {}
 int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     auto* dev = reinterpret_cast<E1000Device*>(ndev);
 
+    // Use regular lock (we're in thread context, not IRQ)
     dev->tx_lock.lock();
 
     uint16_t idx = dev->tx_tail;
@@ -307,9 +368,9 @@ ker::net::NetDeviceOps e1000_netdev_ops = {
 
 // ── Check if PCI device is supported ────────────────────────────────────
 auto find_device_name(uint16_t device_id) -> const char* {
-    for (size_t i = 0; i < NUM_SUPPORTED; i++) {
-        if (supported_devices[i].id == device_id) {
-            return supported_devices[i].name;
+    for (auto supported_device : SUPPORTED_DEVICES) {
+        if (supported_device.id == device_id) {
+            return supported_device.name;
         }
     }
     return nullptr;
@@ -407,9 +468,14 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     dev->netdev.state = 1;  // UP
     dev->netdev.ops = &e1000_netdev_ops;
     dev->netdev.private_data = dev;
+    dev->netdev.remotable = &s_remotable_ops;
 
     // Register with network stack
     ker::net::netdev_register(&dev->netdev);
+
+    // Initialize and enable NAPI for deferred packet processing
+    ker::net::napi_init(&dev->napi, &dev->netdev, e1000_poll, 64);
+    ker::net::napi_enable(&dev->napi);
 
     devices[device_count] = dev;
     device_count++;
@@ -420,7 +486,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     // Enable interrupts: RX timer, RX overrun, link status change, TX done
     reg_write(dev, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
 
-    ker::mod::dbg::log("e1000e: %s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s)", name, dev->netdev.mac[0],
+    ker::mod::dbg::log("e1000e: %s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s) napi", name, dev->netdev.mac[0],
                        dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5], dev->irq_vector,
                        msi_result == 0 ? "MSI" : "legacy");
 }
