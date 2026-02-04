@@ -189,8 +189,9 @@ void wki_lsa_generate_and_flood() {
     wki_routing_recompute();
 
     s_last_own_lsa_time = wki_now_us();
-
+#ifdef DEBUG_WKI_ROUTING
     ker::mod::dbg::log("[WKI] Generated own LSA seq=%u nbrs=%u", lsa->lsa_seq, num_nbrs);
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -258,8 +259,9 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
 
     // Flood to all direct neighbors except the one that sent this to us
     flood_lsa(payload, payload_len, hdr->src_node);
-
+#ifdef DEBUG_WKI_ROUTING
     ker::mod::dbg::log("[WKI] LSA from 0x%04x seq=%u nbrs=%u", lsa->origin_node, lsa->lsa_seq, lsa->num_neighbors);
+#endif
 }
 
 }  // namespace detail
