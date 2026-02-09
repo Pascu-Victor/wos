@@ -7,6 +7,9 @@
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
+#include <net/wki/dev_proxy.hpp>
+#include <net/wki/remotable.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 
@@ -17,13 +20,13 @@ namespace ker::vfs::devfs {
 
 namespace {
 
-// ── DevFSNode tree root ──────────────────────────────────────────────
+// -- DevFSNode tree root ----------------------------------------------
 
 DevFSNode root_node;
 
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 16;
 
-// ── Tree helpers ─────────────────────────────────────────────────────
+// -- Tree helpers -----------------------------------------------------
 
 void ensure_children_capacity(DevFSNode* node) {
     if (node->children_count < node->children_capacity) {
@@ -63,6 +66,23 @@ void add_child(DevFSNode* parent, DevFSNode* child) {
     }
     child->parent = parent;
     parent->children[parent->children_count++] = child;
+}
+
+void remove_child(DevFSNode* parent, DevFSNode* child) {
+    if (parent == nullptr || child == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < parent->children_count; i++) {
+        if (parent->children[i] == child) {
+            // Shift remaining children left
+            for (size_t j = i; j + 1 < parent->children_count; j++) {
+                parent->children[j] = parent->children[j + 1];
+            }
+            parent->children_count--;
+            child->parent = nullptr;
+            return;
+        }
+    }
 }
 
 auto create_node(const char* name, DevFSNodeType type) -> DevFSNode* {
@@ -133,7 +153,7 @@ auto walk_path(const char* path, bool create_intermediate = false) -> DevFSNode*
     return current;
 }
 
-// ── DevFSFile wrapper (stored in File->private_data) ─────────────────
+// -- DevFSFile wrapper (stored in File->private_data) -----------------
 
 struct DevFSFile {
     DevFSNode* node = nullptr;
@@ -141,7 +161,7 @@ struct DevFSFile {
     uint32_t magic = 0xDEADBEEF;
 };
 
-// ── File operations ──────────────────────────────────────────────────
+// -- File operations --------------------------------------------------
 
 auto devfs_close(File* f) -> int {
     if (f == nullptr) {
@@ -304,9 +324,11 @@ FileOperations devfs_fops = {
 
 }  // anonymous namespace
 
-// ── Public interface ─────────────────────────────────────────────────
+// -- Public interface -------------------------------------------------
 
 auto get_devfs_fops() -> FileOperations* { return &devfs_fops; }
+
+auto devfs_walk_path(const char* path) -> DevFSNode* { return walk_path(path, false); }
 
 auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     if (path == nullptr) {
@@ -681,6 +703,554 @@ void devfs_populate_net_nodes() {
     vfs_debug_log("devfs: net nodes populated (");
     vfs_debug_log_hex(count);
     vfs_debug_log(" devices)\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WKI remotable resource nodes — /dev/wki/
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Persistent directory pointers (lazily initialized)
+DevFSNode* g_wki_dir = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_zone = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_peer = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_wki_type_counters[7] = {};  // indexed by ResourceType (1-6), slot 0 unused // NOLINT
+size_t g_wki_total = 0;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// ResourceType → directory name
+auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
+    using RT = ker::net::wki::ResourceType;
+    switch (type) {
+        case RT::BLOCK:
+            return "block";
+        case RT::CHAR:
+            return "char";
+        case RT::NET:
+            return "net";
+        case RT::VFS:
+            return "vfs";
+        case RT::COMPUTE:
+            return "compute";
+        case RT::CUSTOM:
+            return "custom";
+    }
+    return "unknown";
+}
+
+// ResourceType → device name prefix
+auto wki_type_prefix(ker::net::wki::ResourceType type) -> const char* {
+    using RT = ker::net::wki::ResourceType;
+    switch (type) {
+        case RT::BLOCK:
+            return "blk";
+        case RT::CHAR:
+            return "chr";
+        case RT::NET:
+            return "eth";
+        case RT::VFS:
+            return "vfs";
+        case RT::COMPUTE:
+            return "cmp";
+        case RT::CUSTOM:
+            return "cst";
+    }
+    return "unk";
+}
+
+auto wki_type_name(ker::net::wki::ResourceType type) -> const char* {
+    using RT = ker::net::wki::ResourceType;
+    switch (type) {
+        case RT::BLOCK:
+            return "block";
+        case RT::CHAR:
+            return "char";
+        case RT::NET:
+            return "net";
+        case RT::VFS:
+            return "vfs";
+        case RT::COMPUTE:
+            return "compute";
+        case RT::CUSTOM:
+            return "custom";
+    }
+    return "unknown";
+}
+
+// Per-resource context stored in Device::private_data
+struct WkiDevfsCtx {
+    ker::net::wki::ResourceType resource_type;
+    uint16_t peer_node_id;
+    uint16_t rdma_zone_id;
+    uint32_t resource_id;
+    uint8_t flags;
+    char remote_name[64];  // NOLINT(modernize-avoid-c-arrays)
+    char dev_name[64];     // NOLINT(modernize-avoid-c-arrays) — persistent name for Device::name
+};
+
+// Read handler for WKI device nodes
+ker::dev::CharDeviceOps wki_resource_ops = {
+    .open = nullptr,
+    .close = nullptr,
+    .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
+        if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
+            return -EINVAL;
+        }
+        auto* df = static_cast<DevFSFile*>(f->private_data);
+        if (df->device == nullptr || df->device->private_data == nullptr) {
+            return -EINVAL;
+        }
+        auto* ctx = static_cast<WkiDevfsCtx*>(df->device->private_data);
+
+        char stats[512];
+        size_t pos = 0;
+
+        auto append_str = [&](const char* s) {
+            while (*s != '\0' && pos < sizeof(stats) - 1) {
+                stats[pos++] = *s++;
+            }
+        };
+        auto append_u64 = [&](uint64_t val) {
+            if (val == 0) {
+                if (pos < sizeof(stats) - 1) stats[pos++] = '0';
+                return;
+            }
+            char tmp[21];
+            int ti = 0;
+            while (val > 0) {
+                tmp[ti++] = '0' + static_cast<char>(val % 10);
+                val /= 10;
+            }
+            for (int j = ti - 1; j >= 0 && pos < sizeof(stats) - 1; j--) {
+                stats[pos++] = tmp[j];
+            }
+        };
+
+        append_str("type: ");
+        append_str(wki_type_name(ctx->resource_type));
+        append_str("\npeer: ");
+        append_u64(ctx->peer_node_id);
+        append_str("\nzone: ");
+        append_u64(ctx->rdma_zone_id);
+        append_str("\nresource_id: ");
+        append_u64(ctx->resource_id);
+        append_str("\nflags:");
+        if (ctx->flags & ker::net::wki::RESOURCE_FLAG_SHAREABLE) {
+            append_str(" shareable");
+        }
+        if (ctx->flags & ker::net::wki::RESOURCE_FLAG_PASSTHROUGH_CAPABLE) {
+            append_str(" passthrough");
+        }
+        if (ctx->flags == 0) {
+            append_str(" none");
+        }
+        append_str("\nremote_name: ");
+        append_str(ctx->remote_name);
+        append_str("\n");
+        stats[pos] = '\0';
+
+        auto offset = static_cast<size_t>(f->pos);
+        if (offset >= pos) {
+            return 0;
+        }
+        size_t available = pos - offset;
+        size_t to_copy = (count < available) ? count : available;
+        std::memcpy(buf, stats + offset, to_copy);
+        f->pos += static_cast<off_t>(to_copy);
+        return static_cast<ssize_t>(to_copy);
+    },
+    .write = nullptr,
+    .isatty = nullptr,
+};
+
+// Format a uint32 into a char buffer, returns bytes written
+auto fmt_u32(char* buf, size_t cap, uint32_t val) -> size_t {
+    if (val == 0) {
+        if (cap > 0) {
+            buf[0] = '0';
+        }
+        return 1;
+    }
+    char tmp[11];
+    int ti = 0;
+    while (val > 0) {
+        tmp[ti++] = '0' + static_cast<char>(val % 10);
+        val /= 10;
+    }
+    size_t w = 0;
+    for (int j = ti - 1; j >= 0 && w < cap; j--) {
+        buf[w++] = tmp[j];
+    }
+    return w;
+}
+
+// Format a uint16 as 4-character lowercase hex into buf, returns 4
+auto fmt_u16_hex4(char* buf, size_t cap, uint16_t val) -> size_t {
+    constexpr char hex[] = "0123456789abcdef";
+    if (cap < 4) {
+        return 0;
+    }
+    buf[0] = hex[(val >> 12) & 0xF];
+    buf[1] = hex[(val >> 8) & 0xF];
+    buf[2] = hex[(val >> 4) & 0xF];
+    buf[3] = hex[val & 0xF];
+    return 4;
+}
+
+// Build a WKI device name into buf: rz{zone_hex4}p{peer_hex4}{prefix}{counter}
+void wki_build_dev_name(char* buf, size_t cap, uint16_t zone_id, uint16_t peer_id, ker::net::wki::ResourceType type, uint32_t local_num) {
+    size_t p = 0;
+    auto app_str = [&](const char* s) {
+        while (*s != '\0' && p < cap - 1) {
+            buf[p++] = *s++;
+        }
+    };
+    auto app_num = [&](uint32_t val) { p += fmt_u32(buf + p, cap - 1 - p, val); };
+    auto app_hex4 = [&](uint16_t val) { p += fmt_u16_hex4(buf + p, cap - 1 - p, val); };
+    app_str("rz");
+    app_hex4(zone_id);
+    app_str("p");
+    app_hex4(peer_id);
+    app_str(wki_type_prefix(type));
+    app_num(local_num);
+    buf[p] = '\0';
+}
+
+// Ensure the /dev/wki/ directory hierarchy exists. Returns false on failure.
+auto wki_ensure_dirs() -> bool {
+    if (g_wki_dir != nullptr) {
+        return true;
+    }
+    g_wki_dir = walk_path("wki", true);
+    if (g_wki_dir == nullptr) {
+        return false;
+    }
+    g_wki_by_zone = walk_path("wki/by-zone", true);
+    if (g_wki_by_zone == nullptr) {
+        return false;
+    }
+    g_wki_by_peer = walk_path("wki/by-peer", true);
+    return g_wki_by_peer != nullptr;
+}
+
+// Add a symlink named `name` under `parent_dir`, pointing to `target`.
+void wki_add_symlink(DevFSNode* parent_dir, const char* name, const char* target) {
+    auto* link = create_node(name, DevFSNodeType::SYMLINK);
+    if (link == nullptr) {
+        return;
+    }
+    size_t tlen = std::strlen(target);
+    if (tlen >= DEVFS_SYMLINK_MAX) {
+        tlen = DEVFS_SYMLINK_MAX - 1;
+    }
+    std::memcpy(link->symlink_target.data(), target, tlen);
+    link->symlink_target[tlen] = '\0';
+    add_child(parent_dir, link);
+}
+
+// Find or create a hex-named subdirectory (e.g. "0000", "0003") under parent.
+auto wki_ensure_hex_subdir(DevFSNode* parent, uint16_t num) -> DevFSNode* {
+    char name[8] = {};  // NOLINT(modernize-avoid-c-arrays)
+    fmt_u16_hex4(name, sizeof(name) - 1, num);
+    name[4] = '\0';
+    DevFSNode* sub = find_child(parent, name);
+    if (sub == nullptr) {
+        sub = create_node(name, DevFSNodeType::DIRECTORY);
+        if (sub != nullptr) {
+            add_child(parent, sub);
+        }
+    }
+    return sub;
+}
+
+// Remove a named child (symlink or device) from a directory and free the node.
+void wki_remove_named_child(DevFSNode* dir, const char* name) {
+    if (dir == nullptr) {
+        return;
+    }
+    DevFSNode* child = find_child(dir, name);
+    if (child == nullptr) {
+        return;
+    }
+    remove_child(dir, child);
+    // Free associated allocations for device nodes
+    if (child->type == DevFSNodeType::DEVICE && child->device != nullptr) {
+        if (child->device->private_data != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(child->device->private_data);
+        }
+        ker::mod::mm::dyn::kmalloc::free(child->device);
+    }
+    delete child;
+}
+
+// Find the WKI device node matching (node_id, type, resource_id) in a type directory.
+// Returns the node, or nullptr if not found.
+auto wki_find_device_in_type_dir(DevFSNode* type_dir, uint16_t node_id, ker::net::wki::ResourceType res_type, uint32_t resource_id)
+    -> DevFSNode* {
+    if (type_dir == nullptr) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < type_dir->children_count; i++) {
+        auto* child = type_dir->children[i];
+        if (child->type != DevFSNodeType::DEVICE || child->device == nullptr) {
+            continue;
+        }
+        auto* ctx = static_cast<WkiDevfsCtx*>(child->device->private_data);
+        if (ctx == nullptr) {
+            continue;
+        }
+        if (ctx->peer_node_id == node_id && ctx->resource_type == res_type && ctx->resource_id == resource_id) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+// Remove a device node and its by-zone/by-peer symlinks given the device name and zone/peer IDs.
+void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node, const WkiDevfsCtx* ctx) {
+    const char* name = ctx->dev_name;
+
+    // Remove symlink from by-zone subdirectory
+    {
+        char zone_str[8] = {};  // NOLINT(modernize-avoid-c-arrays)
+        fmt_u16_hex4(zone_str, sizeof(zone_str) - 1, ctx->rdma_zone_id);
+        zone_str[4] = '\0';
+        DevFSNode* zone_sub = find_child(g_wki_by_zone, zone_str);
+        if (zone_sub != nullptr) {
+            wki_remove_named_child(zone_sub, name);
+        }
+    }
+
+    // Remove symlink from by-peer subdirectory
+    {
+        char peer_str[8] = {};  // NOLINT(modernize-avoid-c-arrays)
+        fmt_u16_hex4(peer_str, sizeof(peer_str) - 1, ctx->peer_node_id);
+        peer_str[4] = '\0';
+        DevFSNode* peer_sub = find_child(g_wki_by_peer, peer_str);
+        if (peer_sub != nullptr) {
+            wki_remove_named_child(peer_sub, name);
+        }
+    }
+
+    // Remove device node from type directory (frees ctx and Device)
+    remove_child(type_dir, device_node);
+    if (device_node->device != nullptr) {
+        if (device_node->device->private_data != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(device_node->device->private_data);
+        }
+        ker::mod::mm::dyn::kmalloc::free(device_node->device);
+    }
+    delete device_node;
+}
+
+}  // namespace
+
+void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name) {
+    if (!wki_ensure_dirs()) {
+        return;
+    }
+
+    auto type = static_cast<ker::net::wki::ResourceType>(resource_type);
+    auto type_idx = static_cast<uint16_t>(type);
+    if (type_idx == 0 || type_idx > 6) {
+        return;
+    }
+
+    // Look up peer to get rdma_zone_id
+    auto* peer = ker::net::wki::wki_peer_find(node_id);
+    uint16_t zone_id = (peer != nullptr) ? peer->rdma_zone_id : 0;
+
+    // Assign local counter
+    uint32_t local_num = g_wki_type_counters[type_idx]++;
+
+    // Ensure type subdirectory exists under wki/
+    const char* type_dir_name = wki_type_dir(type);
+    DevFSNode* type_dir = find_child(g_wki_dir, type_dir_name);
+    if (type_dir == nullptr) {
+        type_dir = create_node(type_dir_name, DevFSNodeType::DIRECTORY);
+        if (type_dir == nullptr) {
+            return;
+        }
+        add_child(g_wki_dir, type_dir);
+    }
+
+    // Allocate context (also holds persistent dev_name for Device::name)
+    auto* rctx = static_cast<WkiDevfsCtx*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(WkiDevfsCtx)));
+    if (rctx == nullptr) {
+        return;
+    }
+    rctx->resource_type = type;
+    rctx->peer_node_id = node_id;
+    rctx->rdma_zone_id = zone_id;
+    rctx->resource_id = resource_id;
+    rctx->flags = flags;
+    {
+        size_t nlen = std::strlen(name);
+        if (nlen >= sizeof(rctx->remote_name)) {
+            nlen = sizeof(rctx->remote_name) - 1;
+        }
+        std::memcpy(rctx->remote_name, name, nlen);
+        rctx->remote_name[nlen] = '\0';
+    }
+    wki_build_dev_name(rctx->dev_name, sizeof(rctx->dev_name), zone_id, node_id, type, local_num);
+
+    // Allocate Device struct
+    auto* dev = static_cast<ker::dev::Device*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::dev::Device)));
+    if (dev == nullptr) {
+        return;
+    }
+    dev->major = 11;
+    dev->minor = static_cast<unsigned>(g_wki_total);
+    dev->name = rctx->dev_name;  // points into heap-allocated ctx
+    dev->type = (type == ker::net::wki::ResourceType::BLOCK) ? ker::dev::DeviceType::BLOCK : ker::dev::DeviceType::CHAR;
+    dev->private_data = rctx;
+    dev->char_ops = &wki_resource_ops;
+
+    // Create device node under type directory
+    auto* node = create_node(rctx->dev_name, DevFSNodeType::DEVICE);
+    if (node == nullptr) {
+        return;
+    }
+    node->device = dev;
+    add_child(type_dir, node);
+
+    // Build symlink target: /dev/wki/{type_dir}/{dev_name}
+    char target[128] = {};  // NOLINT(modernize-avoid-c-arrays)
+    {
+        size_t p = 0;
+        auto app = [&](const char* s) {
+            while (*s != '\0' && p < sizeof(target) - 1) {
+                target[p++] = *s++;
+            }
+        };
+        app("/dev/wki/");
+        app(type_dir_name);
+        app("/");
+        app(rctx->dev_name);
+        target[p] = '\0';
+    }
+
+    // Symlink in by-zone/{zone_id}/
+    DevFSNode* zone_sub = wki_ensure_hex_subdir(g_wki_by_zone, zone_id);
+    if (zone_sub != nullptr) {
+        wki_add_symlink(zone_sub, rctx->dev_name, target);
+    }
+
+    // Symlink in by-peer/{peer_id}/
+    DevFSNode* peer_sub = wki_ensure_hex_subdir(g_wki_by_peer, node_id);
+    if (peer_sub != nullptr) {
+        wki_add_symlink(peer_sub, rctx->dev_name, target);
+    }
+
+    g_wki_total++;
+}
+
+void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id) {
+    if (g_wki_dir == nullptr) {
+        return;
+    }
+
+    auto type = static_cast<ker::net::wki::ResourceType>(resource_type);
+    const char* type_dir_name = wki_type_dir(type);
+    DevFSNode* type_dir = find_child(g_wki_dir, type_dir_name);
+    if (type_dir == nullptr) {
+        return;
+    }
+
+    DevFSNode* device_node = wki_find_device_in_type_dir(type_dir, node_id, type, resource_id);
+    if (device_node == nullptr) {
+        return;
+    }
+
+    auto* ctx = static_cast<WkiDevfsCtx*>(device_node->device->private_data);
+    wki_remove_device_and_symlinks(type_dir, device_node, ctx);
+}
+
+void devfs_wki_remove_peer_resources(uint16_t node_id) {
+    if (g_wki_dir == nullptr) {
+        return;
+    }
+
+    // Scan all type directories under wki/
+    // Iterate in reverse because wki_remove_device_and_symlinks modifies children arrays
+    for (size_t d = 0; d < g_wki_dir->children_count; d++) {
+        auto* type_dir = g_wki_dir->children[d];
+        if (type_dir->type != DevFSNodeType::DIRECTORY) {
+            continue;
+        }
+        // Skip by-zone and by-peer directories
+        if (std::strcmp(type_dir->name.data(), "by-zone") == 0) {
+            continue;
+        }
+        if (std::strcmp(type_dir->name.data(), "by-peer") == 0) {
+            continue;
+        }
+
+        // Collect matching nodes first (removal modifies children array)
+        DevFSNode* to_remove[64] = {};  // NOLINT(modernize-avoid-c-arrays)
+        size_t remove_count = 0;
+
+        for (size_t i = 0; i < type_dir->children_count && remove_count < 64; i++) {
+            auto* child = type_dir->children[i];
+            if (child->type != DevFSNodeType::DEVICE || child->device == nullptr) {
+                continue;
+            }
+            auto* ctx = static_cast<WkiDevfsCtx*>(child->device->private_data);
+            if (ctx != nullptr && ctx->peer_node_id == node_id) {
+                to_remove[remove_count++] = child;
+            }
+        }
+
+        for (size_t i = 0; i < remove_count; i++) {
+            auto* ctx = static_cast<WkiDevfsCtx*>(to_remove[i]->device->private_data);
+            wki_remove_device_and_symlinks(type_dir, to_remove[i], ctx);
+        }
+    }
+}
+
+void devfs_populate_wki() {
+    if (!wki_ensure_dirs()) {
+        return;
+    }
+
+    // Populate from current discovered resources
+    ker::net::wki::wki_resource_foreach(
+        [](const ker::net::wki::DiscoveredResource& res, void* /*ctx*/) {
+            devfs_wki_add_resource(res.node_id, static_cast<uint16_t>(res.resource_type), res.resource_id, res.flags,
+                                   static_cast<const char*>(res.name));
+        },
+        nullptr);
+
+    vfs_debug_log("devfs: wki nodes populated (");
+    vfs_debug_log_hex(g_wki_total);
+    vfs_debug_log(" resources)\n");
+}
+
+auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
+    auto* node = devfs_walk_path(path);
+    if (node == nullptr || node->type != DevFSNodeType::DEVICE || node->device == nullptr) {
+        return nullptr;
+    }
+    if (node->device->type != ker::dev::DeviceType::BLOCK) {
+        return nullptr;
+    }
+
+    // Check if already registered as a block device
+    auto* existing = ker::dev::block_device_find_by_name(node->device->name);
+    if (existing != nullptr) {
+        return existing;
+    }
+
+    // WKI block resource — trigger proxy attach
+    if (node->device->major == 11 && node->device->private_data != nullptr) {
+        auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
+        if (ctx->resource_type == ker::net::wki::ResourceType::BLOCK) {
+            return ker::net::wki::wki_dev_proxy_attach_block(
+                ctx->peer_node_id, ctx->resource_id, static_cast<const char*>(ctx->dev_name));
+        }
+    }
+
+    return nullptr;
 }
 
 }  // namespace ker::vfs::devfs

@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <dev/block_device.hpp>
+#include <dev/device.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/remote_vfs.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <string_view>
@@ -19,8 +21,6 @@
 #include "fs/tmpfs.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "vfs.hpp"
-
-#include <net/wki/remote_vfs.hpp>
 
 namespace ker::vfs {
 
@@ -736,17 +736,31 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             return ker::vfs::fat32::fat32_stat(fs_path, statbuf, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
         }
         case FSType::DEVFS: {
-            // Device files - report as character devices
+            // Walk devfs tree to determine if directory or device
+            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            if (node == nullptr) {
+                return -ENOENT;
+            }
             statbuf->st_dev = 0;
-            statbuf->st_ino = 1;
+            statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
-            statbuf->st_mode = S_IFCHR | 0666;
             statbuf->st_uid = 0;
             statbuf->st_gid = 0;
             statbuf->st_rdev = 0;
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
+
+            // Set mode based on node type
+            if (node->type == ker::vfs::devfs::DevFSNodeType::DIRECTORY) {
+                statbuf->st_mode = S_IFDIR | 0755;
+            } else if (node->type == ker::vfs::devfs::DevFSNodeType::SYMLINK) {
+                statbuf->st_mode = S_IFLNK | 0777;
+            } else if (node->device != nullptr && node->device->type == ker::dev::DeviceType::BLOCK) {
+                statbuf->st_mode = S_IFBLK | 0660;
+            } else {
+                statbuf->st_mode = S_IFCHR | 0666;
+            }
             return 0;
         }
         case FSType::REMOTE: {
@@ -810,13 +824,19 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             statbuf->st_dev = 0;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
-            statbuf->st_mode = S_IFCHR | 0666;
             statbuf->st_uid = 0;
             statbuf->st_gid = 0;
             statbuf->st_rdev = 0;
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
+
+            // Set mode based on whether this is a directory or device
+            if (file->is_directory) {
+                statbuf->st_mode = S_IFDIR | 0755;
+            } else {
+                statbuf->st_mode = S_IFCHR | 0666;
+            }
             return 0;
         }
         case FSType::SOCKET: {
@@ -875,6 +895,11 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
         } else if (source[0] == '/' && source[1] == 'd' && source[2] == 'e' && source[3] == 'v' && source[4] == '/') {
             // /dev/XXX - lookup by device name
             bdev = ker::dev::block_device_find_by_name(source + 5);
+            if (bdev == nullptr) {
+                // Walk devfs tree — handles subdirectory paths like wki/block/<name>
+                // and triggers WKI proxy attach for remote block devices
+                bdev = ker::vfs::devfs::devfs_resolve_block_device(source + 5);
+            }
             if (bdev == nullptr) {
                 ker::mod::io::serial::write("vfs_mount: device not found: ");
                 ker::mod::io::serial::write(source);

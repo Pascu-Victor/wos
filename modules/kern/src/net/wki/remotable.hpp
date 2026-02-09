@@ -60,6 +60,10 @@ auto wki_resource_find_by_name(const char* name) -> DiscoveredResource*;
 // Remove all discovered resources for a fenced peer.
 void wki_resources_invalidate_for_peer(uint16_t node_id);
 
+// Iterate all valid discovered resources via callback.
+using ResourceVisitor = void (*)(const DiscoveredResource& res, void* ctx);
+void wki_resource_foreach(ResourceVisitor visitor, void* ctx);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal — RX message handlers (called from wki.cpp dispatch)
 // ─────────────────────────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -36,7 +37,7 @@ auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
 
 auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
-        if (p->active && p->owner_node == owner_node && p->assigned_channel == channel_id) {
+        if ((p->active || p->op_pending) && p->owner_node == owner_node && p->assigned_channel == channel_id) {
             return p.get();
         }
     }
@@ -106,14 +107,18 @@ auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count,
             return -1;
         }
 
-        // Spin-wait for response
+        // Spin-wait for response with memory fence
         uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         while (state->op_pending) {
+            asm volatile("mfence" ::: "memory");
+            if (!state->op_pending) {
+                break;
+            }
             if (wki_now_us() >= deadline) {
                 state->op_pending = false;
                 return -1;
             }
-            asm volatile("pause" ::: "memory");
+            wki_spin_yield();
         }
 
         if (state->op_status != 0) {
@@ -185,14 +190,18 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
             return -1;
         }
 
-        // Spin-wait for response
+        // Spin-wait for response with memory fence
         uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         while (state->op_pending) {
+            asm volatile("mfence" ::: "memory");
+            if (!state->op_pending) {
+                break;
+            }
             if (wki_now_us() >= deadline) {
                 state->op_pending = false;
                 return -1;
             }
-            asm volatile("pause" ::: "memory");
+            wki_spin_yield();
         }
 
         if (state->op_status != 0) {
@@ -233,14 +242,18 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
         return -1;
     }
 
-    // Spin-wait for response
+    // Spin-wait for response with memory fence
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->op_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             state->op_pending = false;
             return -1;
         }
-        asm volatile("pause" ::: "memory");
+        wki_spin_yield();
     }
 
     return static_cast<int>(state->op_status);
@@ -272,7 +285,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     state->owner_node = owner_node;
     state->resource_id = resource_id;
 
-    // Send DEV_ATTACH_REQ
+    // Send DEV_ATTACH_REQ with retry logic
     DevAttachReqPayload attach_req = {};
     attach_req.target_node = owner_node;
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
@@ -284,22 +297,60 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     state->attach_status = 0;
     state->attach_channel = 0;
 
-    int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
-    if (send_ret != WKI_OK) {
-        g_proxies.pop_back();
-        return nullptr;
+#ifdef DEBUG_WKI_TRANSPORT
+    ker::mod::dbg::log("[WKI-DBG] attach_block: starting attach to node=0x%04x res_id=%u cpu=%u proxies=%u", owner_node, resource_id,
+                       static_cast<unsigned>(ker::mod::cpu::currentCpu()), static_cast<unsigned>(g_proxies.size()));
+#endif
+
+    constexpr int MAX_ATTACH_RETRIES = 3;
+    for (int retry = 0; retry < MAX_ATTACH_RETRIES; retry++) {
+        if (retry > 0) {
+            ker::mod::dbg::log("[WKI] Dev proxy attach retry %d: node=0x%04x res_id=%u pending=%d", retry, owner_node, resource_id,
+                               state->attach_pending ? 1 : 0);
+            state->attach_pending = true;
+        }
+
+        int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+        if (send_ret != WKI_OK) {
+#ifdef DEBUG_WKI_TRANSPORT
+            ker::mod::dbg::log("[WKI-DBG] attach_block: send failed err=%d retry=%d", send_ret, retry);
+#endif
+            continue;  // Retry on send failure
+        }
+
+        // Spin-wait for attach ACK with memory fence to see updates from other CPUs
+        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+        while (state->attach_pending) {
+            // Memory fence to ensure we see updates from the handler running on another CPU
+            asm volatile("mfence" ::: "memory");
+            if (!state->attach_pending) {
+                break;
+            }
+            if (wki_now_us() >= deadline) {
+                break;  // Timeout, try again
+            }
+            // Short pause to reduce CPU usage, then check again
+            // Using pause instead of hlt because hlt only wakes on THIS CPU's interrupts
+            wki_spin_yield();
+        }
+
+        if (!state->attach_pending) {
+#ifdef DEBUG_WKI_TRANSPORT
+            ker::mod::dbg::log("[WKI-DBG] attach_block: ACK received on retry=%d", retry);
+#endif
+            break;  // Got ACK, exit retry loop
+        }
     }
 
-    // Spin-wait for attach ACK
-    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-    while (state->attach_pending) {
-        if (wki_now_us() >= deadline) {
-            state->attach_pending = false;
-            g_proxies.pop_back();
-            ker::mod::dbg::log("[WKI] Dev proxy attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
-            return nullptr;
-        }
-        asm volatile("pause" ::: "memory");
+    if (state->attach_pending) {
+#ifdef DEBUG_WKI_TRANSPORT
+        ker::mod::dbg::log("[WKI-DBG] attach_block: TIMEOUT - setting attach_pending=false, popping proxy");
+#endif
+        state->attach_pending = false;
+        g_proxies.pop_back();
+        ker::mod::dbg::log("[WKI] Dev proxy attach timeout after %d retries: node=0x%04x res_id=%u proxies_left=%u", MAX_ATTACH_RETRIES,
+                           owner_node, resource_id, static_cast<unsigned>(g_proxies.size()));
+        return nullptr;
     }
 
     // Check attach result
@@ -328,8 +379,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     state->op_resp_len = 0;
     state->lock.unlock();
 
-    send_ret = wki_send(owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &info_req, sizeof(info_req));
+    int send_ret = wki_send(owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &info_req, sizeof(info_req));
     if (send_ret != WKI_OK) {
+        mod::dbg::log("[WKI] Dev proxy block info request send failed: node=0x%04x res_id=%u err=%d", owner_node, resource_id, send_ret);
         // Clean up: send detach and remove
         DevDetachPayload det = {};
         det.target_node = owner_node;
@@ -340,15 +392,20 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         return nullptr;
     }
 
-    // Spin-wait for info response
-    deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    // Spin-wait for info response with memory fence
+    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->op_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
+            mod::dbg::log("[WKI] Dev proxy block info request timeout: node=0x%04x res_id=%u", owner_node, resource_id);
             state->op_pending = false;
             g_proxies.pop_back();
             return nullptr;
         }
-        asm volatile("pause" ::: "memory");
+        wki_spin_yield();
     }
 
     if (state->op_status != 0 || state->op_resp_len < 16) {
@@ -486,17 +543,44 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
 namespace detail {
 
 void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+#ifdef DEBUG_WKI_TRANSPORT
+    ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: src=0x%04x ch=%u payload_len=%u", hdr->src_node, hdr->channel_id, payload_len);
+#endif
+
     if (payload_len < sizeof(DevAttachAckPayload)) {
+#ifdef DEBUG_WKI_TRANSPORT
+        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: payload too small (%u < %u)", payload_len,
+                           static_cast<unsigned>(sizeof(DevAttachAckPayload)));
+#endif
         return;
     }
 
     const auto* ack = reinterpret_cast<const DevAttachAckPayload*>(payload);
 
+#ifdef DEBUG_WKI_TRANSPORT
+    ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: status=%u assigned_ch=%u max_op=%u", ack->status, ack->assigned_channel,
+                       ack->max_op_size);
+
     // Find the pending attach for this owner node
+    ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: searching %u proxies for node 0x%04x (cpu=%u)",
+                       static_cast<unsigned>(g_proxies.size()), hdr->src_node, static_cast<unsigned>(ker::mod::cpu::currentCpu()));
+    for (size_t i = 0; i < g_proxies.size(); i++) {
+        auto& p = g_proxies[i];
+        ker::mod::dbg::log("[WKI-DBG]   proxy[%u]: owner=0x%04x attach_pending=%d active=%d", static_cast<unsigned>(i), p->owner_node,
+                           p->attach_pending ? 1 : 0, p->active ? 1 : 0);
+    }
+#endif
     ProxyBlockState* state = find_proxy_by_attach(hdr->src_node);
     if (state == nullptr) {
+#ifdef DEBUG_WKI_TRANSPORT
+        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: NO proxy found for node 0x%04x", hdr->src_node);
+#endif
         return;
     }
+
+#ifdef DEBUG_WKI_TRANSPORT
+    ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: proxy found, clearing attach_pending");
+#endif
 
     state->attach_status = ack->status;
     state->attach_channel = ack->assigned_channel;

@@ -25,10 +25,10 @@ constexpr size_t WKI_MAX_TRANSPORTS = 8;
 constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
 
 // Heartbeat defaults (in milliseconds to fit in uint16_t for wire format)
-constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 300;  // 1 second
-constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 100;      // 100 ms
-constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 1000;     // 5 seconds
-constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 5;            // 5 misses = 5 second timeout
+constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
+constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 300;       // 300 ms
+constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
+constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 5;             // 5 misses = 5 second timeout
 
 // Grace period for newly connected peers
 constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = 5000;  // 5 seconds after connection
@@ -288,6 +288,9 @@ void wki_transport_unregister(WkiTransport* transport);
 // Find peer by node ID (returns nullptr if not found)
 auto wki_peer_find(uint16_t node_id) -> WkiPeer*;
 
+// List peers in a specific RDMA zone
+auto wki_peer_list_by_zone(uint8_t zone_id) -> auto;
+
 // Allocate a new peer slot
 auto wki_peer_alloc(uint16_t node_id) -> WkiPeer*;
 
@@ -339,6 +342,11 @@ void wki_timer_tick(uint64_t now_us);
 // ─────────────────────────────────────────────────────────────────────────────
 
 auto wki_now_us() -> uint64_t;
+
+// Yield from a spin-wait: drive inline NAPI polling and timer ticks so that
+// incoming packets (e.g. ACKs) are processed even when the caller is busy-
+// waiting on the current CPU.  Call this instead of bare `pause` loops.
+void wki_spin_yield();
 
 // CRC32 checksum (used for WKI header + payload integrity)
 auto wki_crc32(const void* data, size_t len) -> uint32_t;

@@ -256,7 +256,13 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
         ker::mod::dbg::log("[WKI] Dev attach: node=0x%04x res_id=%u ch=%u", hdr->src_node, req->resource_id, ch->channel_id);
 
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
+        // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
+        // The dynamic channel ID is communicated via ack.assigned_channel in the payload.
+        int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        if (ack_ret != WKI_OK) {
+            ker::mod::dbg::log("[WKI] Dev attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
+        }
     } else if (res_type == ResourceType::VFS) {
         // Find the VFS export
         VfsExport* exp = wki_remote_vfs_find_export(req->resource_id);
@@ -292,7 +298,13 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s", hdr->src_node, req->resource_id, ch->channel_id,
                            static_cast<const char*>(exp->export_path));
 
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
+        // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
+        // The dynamic channel ID is communicated via ack.assigned_channel in the payload.
+        int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        if (ack_ret != WKI_OK) {
+            ker::mod::dbg::log("[WKI] VFS attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
+        }
     } else if (res_type == ResourceType::NET) {
         // Find the net device
         ker::net::NetDevice* ndev = find_net_device_by_resource_id(req->resource_id);
@@ -346,7 +358,13 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
         ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u", hdr->src_node, req->resource_id, ch->channel_id);
 
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
+        // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
+        // The dynamic channel ID is communicated via ack.assigned_channel in the payload.
+        int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        if (ack_ret != WKI_OK) {
+            ker::mod::dbg::log("[WKI] NET attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
+        }
     } else {
         ack.status = static_cast<uint8_t>(DevAttachStatus::NOT_FOUND);
         wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));

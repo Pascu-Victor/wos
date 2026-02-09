@@ -85,7 +85,6 @@ meson setup --prefix=$B/target1 \
     --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
     -Dbindir=bin \
     -Dwos_option=enabled \
-    -D_GNU_SOURCE \
     -Dglibc_option=enabled \
     -Db_staticpic=disabled \
     $B/src/mlibc

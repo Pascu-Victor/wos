@@ -132,14 +132,20 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
         return;
     }
 
-    // Spin-wait for response
+    // Spin-wait for response with memory fence
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->op_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             state->op_pending = false;
             return;
         }
-        asm volatile("pause" ::: "memory");
+        for (int i = 0; i < 1000; i++) {
+            asm volatile("pause" ::: "memory");
+        }
     }
 
     // Update local MAC on success
@@ -305,16 +311,22 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         return nullptr;
     }
 
-    // Spin-wait for attach ACK
+    // Spin-wait for attach ACK with memory fence
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->attach_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->attach_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             state->attach_pending = false;
             g_net_proxies.pop_back();
             ker::mod::dbg::log("[WKI] Remote NIC attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
             return nullptr;
         }
-        asm volatile("pause" ::: "memory");
+        for (int i = 0; i < 1000; i++) {
+            asm volatile("pause" ::: "memory");
+        }
     }
 
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {

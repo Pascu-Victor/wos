@@ -7,6 +7,7 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <vfs/fs/devfs.hpp>
 
 namespace ker::net::wki {
 
@@ -188,8 +189,19 @@ auto wki_resource_find_by_name(const char* name) -> DiscoveredResource* {
 }
 
 void wki_resources_invalidate_for_peer(uint16_t node_id) {
+    // Remove from devfs /dev/wki/ tree before erasing from discovered table
+    ker::vfs::devfs::devfs_wki_remove_peer_resources(node_id);
+
     // Use erase-remove idiom to remove all entries from the fenced peer
     std::erase_if(g_discovered, [node_id](const DiscoveredResource& res) { return res.node_id == node_id; });
+}
+
+void wki_resource_foreach(ResourceVisitor visitor, void* ctx) {
+    for (const auto& res : g_discovered) {
+        if (res.valid) {
+            visitor(res, ctx);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,6 +255,11 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
 
     g_discovered.push_back(res);
 
+    // Update devfs /dev/wki/ tree
+    ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type,
+                                            adv->resource_id, adv->flags,
+                                            static_cast<const char*>(res.name));
+
     ker::mod::dbg::log("[WKI] Discovered resource: node=0x%04x type=%u id=%u name=%s", adv->node_id, adv->resource_type, adv->resource_id,
                        static_cast<const char*>(res.name));
 }
@@ -254,6 +271,9 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
 
     const auto* adv = reinterpret_cast<const ResourceAdvertPayload*>(payload);
     auto type = static_cast<ResourceType>(adv->resource_type);
+
+    // Remove from devfs /dev/wki/ tree
+    ker::vfs::devfs::devfs_wki_remove_resource(adv->node_id, adv->resource_type, adv->resource_id);
 
     // Remove from discovered table
     std::erase_if(g_discovered, [&](const DiscoveredResource& res) {

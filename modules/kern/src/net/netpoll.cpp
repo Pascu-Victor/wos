@@ -56,12 +56,21 @@ void unregister_napi(NapiStruct* napi) {
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
     for (;;) {
-        // Check if we have work (atomic load, no lock needed)
+        // Disable interrupts BEFORE checking the work flag so that no
+        // IRQ can sneak in between the check and the sti;hlt below.
+        // The sti;hlt pair is architecturally atomic on x86: if an
+        // interrupt is already pending when sti executes, the CPU
+        // enters hlt and immediately wakes, so no wakeup is lost.
+        asm volatile("cli" ::: "memory");
+
         if (!napi->has_work.load(std::memory_order_acquire)) {
-            // No work - sleep until woken by IRQ or timer
+            // No work - atomically enable interrupts and halt
             asm volatile("sti\nhlt" ::: "memory");
             continue;
         }
+
+        // Work available - re-enable interrupts before polling
+        asm volatile("sti" ::: "memory");
 
         // Transition SCHEDULED -> POLLING
         NapiState expected = NapiState::SCHEDULED;
@@ -196,6 +205,16 @@ bool napi_schedule(NapiStruct* napi) {
     // Set work flag for interface worker thread
     napi->has_work.store(true, std::memory_order_release);
 
+    // Wake the worker thread if it is sleeping (via sti;hlt) on another CPU.
+    // The NIC IRQ may have been delivered to a different CPU than the one
+    // the worker is halted on.  We send a lightweight IPI to break it out
+    // of hlt.  Note: rescheduleTaskForCpu does NOT work here because the
+    // worker is the currentTask on its CPU (just halted), so the scheduler
+    // sees it as "already running" and aborts.
+    if (napi->worker != nullptr) {
+        ker::mod::sched::wakeCpu(napi->worker->cpu);
+    }
+
     return true;
 }
 
@@ -207,6 +226,54 @@ void napi_complete(NapiStruct* napi) {
     napi->state.compare_exchange_strong(expected, NapiState::IDLE, std::memory_order_acq_rel, std::memory_order_acquire);
 
     // Driver should re-enable device interrupts after calling this
+}
+
+int napi_poll_inline(NetDevice* dev) {
+    if (dev == nullptr) {
+        return 0;
+    }
+
+    // Find the NapiStruct for this device
+    NapiStruct* napi = nullptr;
+    g_registry_lock.lock();
+    for (size_t i = 0; i < g_napi_count; ++i) {
+        if (g_napi_registry[i] != nullptr && g_napi_registry[i]->dev == dev) {
+            napi = g_napi_registry[i];
+            break;
+        }
+    }
+    g_registry_lock.unlock();
+
+    if (napi == nullptr) {
+        return 0;
+    }
+
+    // Try to enter POLLING from IDLE or SCHEDULED.
+    // If the worker is already POLLING, don't interfere.
+    NapiState expected = NapiState::IDLE;
+    if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        expected = NapiState::SCHEDULED;
+        if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return 0;  // already polling or disabled
+        }
+    }
+
+    // Poll once with normal budget
+    int processed = napi->poll(napi, napi->weight);
+    napi->poll_count++;
+
+    // Complete — transition back to IDLE
+    napi_complete(napi);
+
+    // Clear work flag so worker doesn't spin unnecessarily
+    napi->has_work.store(false, std::memory_order_release);
+
+    // Re-check for race: if an IRQ arrived during our poll, re-arm
+    if (napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED) {
+        napi->has_work.store(true, std::memory_order_release);
+    }
+
+    return processed;
 }
 
 }  // namespace ker::net

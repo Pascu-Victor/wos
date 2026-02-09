@@ -12,7 +12,7 @@ namespace ker::net::wki {
 // ─────────────────────────────────────────────────────────────────────────────
 
 constexpr size_t WKI_MAX_ZONES = 256;
-constexpr size_t WKI_ZONE_MAX_MSG_DATA = 1024;  // max data bytes per zone read/write message
+constexpr size_t WKI_ZONE_MAX_MSG_DATA = 1024;   // max data bytes per zone read/write message
 constexpr uint64_t WKI_ZONE_TIMEOUT_US = 50000;  // 50 ms timeout for blocking zone ops
 
 // Zone error codes
@@ -38,8 +38,7 @@ enum class ZoneState : uint8_t {
 // Zone Notify Handler — callback for PRE/POST notifications
 // ─────────────────────────────────────────────────────────────────────────────
 
-using ZoneNotifyHandler = void (*)(uint32_t zone_id, uint32_t offset,
-                                   uint32_t length, uint8_t op_type);
+using ZoneNotifyHandler = void (*)(uint32_t zone_id, uint32_t offset, uint32_t length, uint8_t op_type);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WkiZone — per-zone state
@@ -51,35 +50,35 @@ struct WkiZone {
     ZoneState state = ZoneState::NONE;
 
     // Local memory backing
-    void* local_vaddr = nullptr;       // HHDM ptr (pageAlloc) or BAR2 ptr (ivshmem)
-    uint64_t local_phys_addr = 0;      // physical address of local allocation
-    uint32_t size = 0;                 // page-aligned zone size in bytes
+    void* local_vaddr = nullptr;   // HHDM ptr (pageAlloc) or BAR2 ptr (ivshmem)
+    uint64_t local_phys_addr = 0;  // physical address of local allocation
+    uint32_t size = 0;             // page-aligned zone size in bytes
 
     // Access policy and notifications
-    uint8_t access_policy = 0;         // ZONE_ACCESS_* bits from wire.hpp
+    uint8_t access_policy = 0;  // ZONE_ACCESS_* bits from wire.hpp
     ZoneNotifyMode notify_mode = ZoneNotifyMode::NONE;
     ZoneTypeHint type_hint = ZoneTypeHint::BUFFER;
 
     // RDMA state
     bool is_rdma = false;
-    uint32_t local_rkey = 0;           // our RDMA key (if RDMA-backed)
-    uint32_t remote_rkey = 0;          // peer's RDMA key (if RDMA-backed)
-    uint64_t remote_phys_addr = 0;     // peer's physical address (from ACK)
+    uint32_t local_rkey = 0;        // our RDMA key (if RDMA-backed)
+    uint32_t remote_rkey = 0;       // peer's RDMA key (if RDMA-backed)
+    uint64_t remote_phys_addr = 0;  // peer's physical address (from ACK)
 
     // Ownership
-    bool is_initiator = false;         // true if we sent ZONE_CREATE_REQ
+    bool is_initiator = false;  // true if we sent ZONE_CREATE_REQ
 
     // Notification callbacks
     ZoneNotifyHandler pre_handler = nullptr;
     ZoneNotifyHandler post_handler = nullptr;
 
     // Synchronous read/write state (for message-based zones)
-    volatile bool read_pending = false;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    volatile bool read_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
     void* read_dest_buf = nullptr;
     uint32_t read_result_len = 0;
     int read_status = 0;
 
-    volatile bool write_pending = false;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    volatile bool write_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
     int write_status = 0;
 
     ker::mod::sys::Spinlock lock;
@@ -95,8 +94,7 @@ void wki_zone_init();
 // Create a shared memory zone with a peer.
 // Sends ZONE_CREATE_REQ and blocks until ACK (or timeout).
 // Returns WKI_OK on success, negative error code on failure.
-auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size,
-                     uint8_t access_policy, ZoneNotifyMode notify,
+auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify,
                      ZoneTypeHint hint = ZoneTypeHint::BUFFER) -> int;
 
 // Destroy a shared memory zone. Sends ZONE_DESTROY to peer.
@@ -122,6 +120,8 @@ void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHa
 
 // Destroy all zones associated with a peer (called during fencing).
 void wki_zones_destroy_for_peer(uint16_t node_id);
+
+auto wki_zones_list() -> auto;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal — RX message handlers (called from wki.cpp dispatch)

@@ -186,14 +186,18 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         return -1;
     }
 
-    // Spin-wait for response
+    // Spin-wait for response with memory fence
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->op_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             state->op_pending = false;
             return -1;
         }
-        asm volatile("pause" ::: "memory");
+        wki_spin_yield();
     }
 
     return static_cast<int>(state->op_status);
@@ -1238,16 +1242,20 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         return -1;
     }
 
-    // Spin-wait for attach ACK
+    // Spin-wait for attach ACK with memory fence
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->attach_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!state->attach_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             state->attach_pending = false;
             g_vfs_proxies.pop_back();
             ker::mod::dbg::log("[WKI] Remote VFS attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
             return -1;
         }
-        asm volatile("pause" ::: "memory");
+        wki_spin_yield();
     }
 
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {

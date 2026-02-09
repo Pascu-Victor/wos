@@ -11,6 +11,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+#include <vector>
 
 namespace ker::net::wki {
 
@@ -183,6 +184,10 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     // Spin-wait for ACK (zone transitions to ACTIVE or back to NONE)
     uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
     while (zone->state == ZoneState::NEGOTIATING) {
+        asm volatile("mfence" ::: "memory");
+        if (zone->state != ZoneState::NEGOTIATING) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             // Timeout — clean up
             s_zone_table_lock.lock();
@@ -191,8 +196,9 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
             s_zone_table_lock.unlock();
             return WKI_ERR_ZONE_TIMEOUT;
         }
-        // Yield — in a real scheduler this would be a proper wait
-        asm volatile("pause");  // NOLINT(hicpp-no-assembler)
+        for (int i = 0; i < 1000; i++) {
+            asm volatile("pause" ::: "memory");
+        }
     }
 
     if (zone->state == ZoneState::ACTIVE) {
@@ -308,14 +314,20 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
             return ret;
         }
 
-        // Spin-wait for response
+        // Spin-wait for response with memory fence
         uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
         while (zone->read_pending) {
+            asm volatile("mfence" ::: "memory");
+            if (!zone->read_pending) {
+                break;
+            }
             if (wki_now_us() >= deadline) {
                 zone->read_pending = false;
                 return WKI_ERR_ZONE_TIMEOUT;
             }
-            asm volatile("pause");  // NOLINT(hicpp-no-assembler)
+            for (int i = 0; i < 1000; i++) {
+                asm volatile("pause" ::: "memory");
+            }
         }
 
         if (zone->read_status != 0) {
@@ -395,14 +407,20 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
             return ret;
         }
 
-        // Spin-wait for ACK
+        // Spin-wait for ACK with memory fence
         uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
         while (zone->write_pending) {
+            asm volatile("mfence" ::: "memory");
+            if (!zone->write_pending) {
+                break;
+            }
             if (wki_now_us() >= deadline) {
                 zone->write_pending = false;
                 return WKI_ERR_ZONE_TIMEOUT;
             }
-            asm volatile("pause");  // NOLINT(hicpp-no-assembler)
+            for (int i = 0; i < 1000; i++) {
+                asm volatile("pause" ::: "memory");
+            }
         }
 
         if (zone->write_status != 0) {
@@ -472,6 +490,22 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
     }
 
     s_zone_table_lock.unlock();
+}
+
+// -----------------------------------------------------------------------------
+// Public API — Zone listing
+// -----------------------------------------------------------------------------
+
+auto wki_zones_list() -> auto {
+    s_zone_table_lock.lock();
+    auto zones = std::vector<WkiZone*>{};
+    for (auto& zone : s_zone_table) {
+        if (zone.state != ZoneState::NONE) {
+            zones.push_back(&zone);
+        }
+    }
+    s_zone_table_lock.unlock();
+    return zones;
 }
 
 // -----------------------------------------------------------------------------

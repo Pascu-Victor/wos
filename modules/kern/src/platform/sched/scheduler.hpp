@@ -53,6 +53,7 @@ void removeCurrentTask();                                     // Remove current 
 auto findTaskByPid(uint64_t pid) -> task::Task*;              // Find a task by PID (O(1) via PID registry)
 auto findTaskByPidSafe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
 void rescheduleTaskForCpu(uint64_t cpuNo, task::Task* task);  // Reschedule a specific task on a specific CPU
+void wakeCpu(uint64_t cpuNo);                                 // Send wake IPI to a CPU (unconditional, for hlt wakeup)
 void insertIntoDeadList(task::Task* task);                    // Place a task into CPU 0's dead list for GC
 void gcExpiredTasks();                                        // Garbage collect dead tasks from dead lists
 void placeTaskInWaitQueue(ker::mod::cpu::GPRegs& gpr,

@@ -243,13 +243,19 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     SubmittedTask* task_ptr = &g_submitted_tasks.back();
 
     while (task_ptr->response_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!task_ptr->response_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             task_ptr->response_pending = false;
             task_ptr->active = false;
             ker::mod::dbg::log("[WKI] Task submit timeout: task_id=%u target=0x%04x", task_id, target_node);
             return 0;
         }
-        asm volatile("pause" ::: "memory");
+        for (int i = 0; i < 1000; i++) {
+            asm volatile("pause" ::: "memory");
+        }
     }
 
     if (task_ptr->accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
@@ -276,11 +282,17 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
 
     uint64_t deadline = wki_now_us() + timeout_us;
     while (task->complete_pending) {
+        asm volatile("mfence" ::: "memory");
+        if (!task->complete_pending) {
+            break;
+        }
         if (wki_now_us() >= deadline) {
             task->complete_pending = false;
             return -1;
         }
-        asm volatile("pause" ::: "memory");
+        for (int i = 0; i < 1000; i++) {
+            asm volatile("pause" ::: "memory");
+        }
     }
 
     if (exit_status != nullptr) {

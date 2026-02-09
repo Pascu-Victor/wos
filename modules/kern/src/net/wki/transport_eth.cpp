@@ -194,4 +194,8 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s", netdev->name.data());
 }
 
+auto wki_eth_get_netdev() -> net::NetDevice* {
+    return s_eth_priv.netdev;
+}
+
 }  // namespace ker::net::wki

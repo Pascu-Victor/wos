@@ -12,7 +12,7 @@ namespace ker::net::wki {
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-constexpr uint64_t WKI_DEV_PROXY_TIMEOUT_US = 200000;  // 200 ms
+constexpr uint64_t WKI_DEV_PROXY_TIMEOUT_US = 2000000;  // 2000 ms
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ProxyBlockState — one per remote block device attachment (consumer side)

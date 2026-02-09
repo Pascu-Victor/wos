@@ -193,6 +193,25 @@ static void wakeIdleCpu(uint64_t cpuNo) {
     apic::sendIpi(ipi, lapicId);
 }
 
+// Unconditional wake IPI — breaks a CPU out of hlt regardless of scheduler
+// idle state.  Used by NAPI to wake worker threads that sleep via sti;hlt
+// as the currentTask (so isIdle is false, and wakeIdleCpu would skip them).
+void wakeCpu(uint64_t cpuNo) {
+    if (wake_ipi_vector == 0) return;
+    if (cpuNo == cpu::currentCpu()) return;
+
+    apic::IPIConfig ipi{};
+    ipi.vector = wake_ipi_vector;
+    ipi.deliveryMode = apic::IPIDeliveryMode::FIXED;
+    ipi.destinationMode = apic::IPIDestinationMode::PHYSICAL;
+    ipi.level = apic::IPILevel::ASSERT;
+    ipi.triggerMode = apic::IPITriggerMode::EDGE;
+    ipi.destinationShorthand = apic::IPIDestinationShorthand::NONE;
+
+    uint32_t lapicId = smt::getCpu(cpuNo).lapic_id;
+    apic::sendIpi(ipi, lapicId);
+}
+
 // Enter the kernel idle loop on the idle task's stack. Does NOT return.
 [[noreturn]] static void enterIdleLoop(RunQueue* rq) {
     rq->isIdle.store(true, std::memory_order_release);

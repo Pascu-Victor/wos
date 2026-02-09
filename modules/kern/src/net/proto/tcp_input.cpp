@@ -174,6 +174,23 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 if (seg_ack == cb->snd_nxt) {
                     cb->state = TcpState::ESTABLISHED;
                     cb->snd_una = seg_ack;
+
+                    // Clear the SYN-ACK from the retransmit queue now that
+                    // the handshake is complete.  Without this the timer
+                    // keeps resending the SYN-ACK after ESTABLISHED.
+                    while (cb->retransmit_head != nullptr) {
+                        auto* entry = cb->retransmit_head;
+                        uint32_t entry_end = entry->seq + static_cast<uint32_t>(entry->len);
+                        if (!tcp_seq_after(entry_end, seg_ack)) {
+                            cb->retransmit_head = entry->next;
+                            if (entry->pkt != nullptr) {
+                                pkt_free(entry->pkt);
+                            }
+                            ker::mod::mm::dyn::kmalloc::free(entry);
+                        } else {
+                            break;
+                        }
+                    }
                     cb->snd_wnd = seg_wnd;
 
                     // Enqueue into parent's accept queue

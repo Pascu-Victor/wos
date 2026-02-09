@@ -61,8 +61,12 @@ void tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     if (len > 0) {
         cb->snd_nxt += static_cast<uint32_t>(len);
     }
-    // SYN and FIN each consume one sequence number (already accounted for
-    // by the caller incrementing snd_nxt after setting iss for SYN)
+    // SYN consumes one sequence number (already accounted for by the
+    // caller incrementing snd_nxt after setting iss).
+    // FIN also consumes one sequence number.
+    if ((flags & TCP_FIN) != 0) {
+        cb->snd_nxt++;
+    }
 
     // Add to retransmit queue if this carries data or SYN/FIN
     if (len > 0 || (flags & (TCP_SYN | TCP_FIN)) != 0) {
