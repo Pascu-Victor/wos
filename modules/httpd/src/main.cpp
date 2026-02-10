@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/logging.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
@@ -381,16 +382,27 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     return html;
 }
 
-// Send all data, handling partial sends
+// Send all data, handling partial sends and EAGAIN
 auto send_all(int fd, const void* data, size_t len) -> ssize_t {
     const auto* ptr = static_cast<const char*>(data);
     size_t remaining = len;
     size_t total_sent = 0;
+    int retries = 0;
+    constexpr int MAX_SEND_RETRIES = 10000;
 
     while (remaining > 0) {
         ssize_t sent = send(fd, ptr, remaining, 0);
         if (sent < 0) {
-            // Error occurred
+            // EAGAIN (-11): window full or buffer exhaustion — retry
+            if (sent == -11 && retries < MAX_SEND_RETRIES) {
+                retries++;
+                sched_yield();
+                continue;
+            }
+            // Other error or too many retries
+            if (total_sent > 0) {
+                return static_cast<ssize_t>(total_sent);
+            }
             return sent;
         }
         if (sent == 0) {
@@ -400,6 +412,7 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
         ptr += sent;
         remaining -= sent;
         total_sent += sent;
+        retries = 0;  // Reset retry counter on progress
     }
 
     return static_cast<ssize_t>(total_sent);

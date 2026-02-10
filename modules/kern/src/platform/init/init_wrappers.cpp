@@ -200,7 +200,7 @@ void initramfs_init() {
 }
 
 void sched_init() {
-    mod::sched::setupQueues();
+    mod::sched::setup_queues();
 
     // Build HandoverModules from limine module request
     mod::boot::HandoverModules modules{};
@@ -230,6 +230,6 @@ void sched_init() {
     mod::smt::start_smt(modules, get_kernel_rsp());
 }
 
-void kernel_start() { mod::sched::startScheduler(); }
+void kernel_start() { mod::sched::start_scheduler(); }
 
 }  // namespace ker::init::fns

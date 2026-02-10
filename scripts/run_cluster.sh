@@ -3,9 +3,10 @@ set -e
 
 # -- run_cluster.sh — Launch an N-node WKI cluster --------------------------
 #
-# Usage:  ./scripts/run_cluster.sh [N]
+# Usage:  ./scripts/run_cluster.sh [N] [--skip N]
 #
 # Launches N QEMU VMs (default 2) configured for WKI inter-kernel communication.
+# --skip N    Start VM IDs from N instead of 0 (useful for adding to existing cluster)
 # Each VM gets:
 #   - A CoW overlay disk (preserves base images)
 #   - Unique VM ID, MAC addresses, serial/QEMU logs
@@ -21,10 +22,26 @@ set -e
 #   WOS_NET=user   — Use QEMU user-mode networking instead of TAP for eth0
 # ----------------------------------------------------------------------------
 
-NUM_VMS="${1:-2}"
+NUM_VMS=2
+SKIP=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "=== WKI Cluster: launching ${NUM_VMS} VMs ==="
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --skip)
+      SKIP="$2"
+      shift 2
+      ;;
+    *)
+      NUM_VMS="$1"
+      shift
+      ;;
+  esac
+done
+
+SPAWNED=$((NUM_VMS - SKIP))
+echo "=== WKI Cluster: launching ${SPAWNED} VMs (total cluster size: ${NUM_VMS}, starting from VM ID ${SKIP}) ==="
 
 # Verify base disk images exist
 if [ ! -f disk.qcow2 ]; then
@@ -69,7 +86,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for ((i = 0; i < NUM_VMS; i++)); do
+for ((i = SKIP; i < NUM_VMS; i++)); do
   echo "--- Preparing VM${i} ---"
 
   # Create CoW overlay disks (recreate each run for clean state)
@@ -102,8 +119,8 @@ for ((i = 0; i < NUM_VMS; i++)); do
 done
 
 echo ""
-echo "=== All ${NUM_VMS} VMs launched ==="
-echo "    Serial logs: serial-vm{0..$(($NUM_VMS - 1))}.log"
+echo "=== All ${SPAWNED} VMs launched (IDs ${SKIP}-$((NUM_VMS - 1))) ==="
+echo "    Serial logs: serial-vm{$SKIP..$(($NUM_VMS - 1))}.log"
 echo "    Overlays:    ${OVERLAY_DIR}/"
 echo "    ivshmem:     ${IVSHMEM_PATH}"
 echo ""

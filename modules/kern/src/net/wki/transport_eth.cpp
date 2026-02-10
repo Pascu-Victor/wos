@@ -86,6 +86,23 @@ struct EthTransportPrivate {
 static WkiTransport s_eth_transport;
 static EthTransportPrivate s_eth_priv;
 static bool s_eth_initialized = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Secondary transport pool — auto-registered for non-primary NICs that
+// receive WKI frames (e.g. a debug VM whose only NIC is the data bridge).
+// ─────────────────────────────────────────────────────────────────────────────
+
+constexpr size_t MAX_SECONDARY_ETH_TRANSPORTS = 4;
+
+struct EthTransportSlot {
+    WkiTransport transport{};
+    EthTransportPrivate priv{};
+    bool active = false;
+};
+
+static std::array<EthTransportSlot, MAX_SECONDARY_ETH_TRANSPORTS> s_secondary_transports;
+static ker::mod::sys::Spinlock s_secondary_lock;
+
 namespace {
 
 // TX: send a WKI frame over Ethernet
@@ -100,7 +117,12 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
     if (neighbor_id == WKI_NODE_BROADCAST) {
         dst_mac = proto::ETH_BROADCAST;
     } else {
-        if (!eth_neighbor_find_mac(neighbor_id, dst_mac)) {
+        // Fast path: peer->mac is already in L1 cache from the send path's
+        // earlier wki_peer_find() lookup. Avoids separate neighbor table lock.
+        WkiPeer* peer = wki_peer_find(neighbor_id);
+        if (peer != nullptr) {
+            memcpy(dst_mac.data(), peer->mac.data(), 6);
+        } else if (!eth_neighbor_find_mac(neighbor_id, dst_mac)) {
             return -1;  // unknown neighbor MAC
         }
     }
@@ -125,6 +147,33 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
     return proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
 }
 
+// Zero-copy TX: caller pre-built the WKI frame directly in pkt->data.
+// We just resolve the MAC, set the device, and hand to eth_tx.
+int eth_wki_tx_pkt(WkiTransport* self, uint16_t neighbor_id, net::PacketBuffer* pkt) {
+    auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
+    if ((priv == nullptr) || (priv->netdev == nullptr)) {
+        pkt_free(pkt);
+        return -1;
+    }
+
+    std::array<uint8_t, 6> dst_mac{};
+
+    if (neighbor_id == WKI_NODE_BROADCAST) {
+        dst_mac = proto::ETH_BROADCAST;
+    } else {
+        WkiPeer* peer = wki_peer_find(neighbor_id);
+        if (peer != nullptr) {
+            memcpy(dst_mac.data(), peer->mac.data(), 6);
+        } else if (!eth_neighbor_find_mac(neighbor_id, dst_mac)) {
+            pkt_free(pkt);
+            return -1;
+        }
+    }
+
+    pkt->dev = priv->netdev;
+    return proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
+}
+
 // Set RX handler
 void eth_wki_set_rx_handler(WkiTransport* self, WkiRxHandler handler) {
     auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
@@ -136,7 +185,66 @@ void eth_wki_set_rx_handler(WkiTransport* self, WkiRxHandler handler) {
 // RX entry point — called from ethernet.cpp's eth_rx() switch
 // -----------------------------------------------------------------------------
 
-void wki_eth_rx(net::NetDevice* /*dev*/, net::PacketBuffer* pkt) {
+namespace {
+
+// Resolve (or auto-create) the WkiTransport for the actual ingress NIC.
+// If the frame arrived on the primary WKI NIC we return &s_eth_transport.
+// Otherwise we allocate a lightweight secondary transport so that the
+// peer record stores the correct NIC for TX replies.
+auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
+    // Primary NIC — fast path
+    if (dev == s_eth_priv.netdev) {
+        return &s_eth_transport;
+    }
+
+    s_secondary_lock.lock();
+
+    // Already have a transport for this NIC?
+    for (auto& slot : s_secondary_transports) {
+        if (slot.active && slot.priv.netdev == dev) {
+            s_secondary_lock.unlock();
+            return &slot.transport;
+        }
+    }
+
+    // Allocate a new secondary transport
+    for (auto& slot : s_secondary_transports) {
+        if (!slot.active) {
+            slot.priv.netdev = dev;
+            slot.priv.rx_handler = nullptr;
+
+            slot.transport.name = "wki-eth";
+            slot.transport.mtu = static_cast<uint16_t>(dev->mtu - proto::ETH_HLEN - WKI_HEADER_SIZE);
+            slot.transport.rdma_capable = false;
+            slot.transport.private_data = &slot.priv;
+            slot.transport.tx = eth_wki_tx;
+            slot.transport.tx_pkt = eth_wki_tx_pkt;
+            slot.transport.set_rx_handler = eth_wki_set_rx_handler;
+            slot.transport.rdma_register_region = nullptr;
+            slot.transport.rdma_read = nullptr;
+            slot.transport.rdma_write = nullptr;
+            slot.transport.doorbell = nullptr;
+            slot.transport.next = nullptr;
+            slot.active = true;
+
+            s_secondary_lock.unlock();
+
+            // Register with WKI core — sets the RX handler on this transport
+            wki_transport_register(&slot.transport);
+
+            ker::mod::dbg::log("[WKI] Secondary Ethernet transport auto-registered on %s", dev->name.data());
+            return &slot.transport;
+        }
+    }
+
+    s_secondary_lock.unlock();
+    // Pool exhausted — fall back to primary (best effort)
+    return &s_eth_transport;
+}
+
+}  // namespace
+
+void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
     // The Ethernet header has already been stripped by eth_rx().
     // pkt->data points to the WKI header. pkt->src_mac has the sender's MAC.
 
@@ -145,9 +253,20 @@ void wki_eth_rx(net::NetDevice* /*dev*/, net::PacketBuffer* pkt) {
         return;
     }
 
-    // Deliver to the WKI RX handler if registered
-    if (s_eth_priv.rx_handler != nullptr) {
-        s_eth_priv.rx_handler(&s_eth_transport, pkt->data, static_cast<uint16_t>(pkt->len));
+    if (!s_eth_initialized) {
+        pkt_free(pkt);
+        return;
+    }
+
+    // Resolve the transport for the ingress NIC — auto-creates a secondary
+    // transport when the frame arrived on a NIC other than the primary WKI NIC.
+    // This ensures that handle_hello() records the correct transport for the
+    // peer, so HELLO_ACK and resource adverts go back on the right interface.
+    WkiTransport* transport = get_or_create_eth_transport(dev);
+    auto* priv = static_cast<EthTransportPrivate*>(transport->private_data);
+
+    if (priv->rx_handler != nullptr) {
+        priv->rx_handler(transport, pkt->data, static_cast<uint16_t>(pkt->len));
     }
 
     pkt_free(pkt);
@@ -177,6 +296,7 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     s_eth_transport.rdma_capable = false;
     s_eth_transport.private_data = &s_eth_priv;
     s_eth_transport.tx = eth_wki_tx;
+    s_eth_transport.tx_pkt = eth_wki_tx_pkt;
     s_eth_transport.set_rx_handler = eth_wki_set_rx_handler;
     s_eth_transport.rdma_register_region = nullptr;
     s_eth_transport.rdma_read = nullptr;
@@ -194,8 +314,6 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s", netdev->name.data());
 }
 
-auto wki_eth_get_netdev() -> net::NetDevice* {
-    return s_eth_priv.netdev;
-}
+auto wki_eth_get_netdev() -> net::NetDevice* { return s_eth_priv.netdev; }
 
 }  // namespace ker::net::wki

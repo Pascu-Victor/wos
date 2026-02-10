@@ -54,6 +54,7 @@ echo "=== Setting up WKI bridge for ${NUM_VMS} VMs ==="
 if ! ip link show "$BRIDGE" &>/dev/null; then
   echo "  Creating bridge: ${BRIDGE}"
   ip link add "$BRIDGE" type bridge
+  ip link set "$BRIDGE" mtu 9000
   ip link set "$BRIDGE" up
   # Disable STP — small isolated segment, no loops
   echo 0 > /sys/class/net/${BRIDGE}/bridge/stp_state 2>/dev/null || true
@@ -73,6 +74,7 @@ for ((i = 0; i < NUM_VMS; i++)); do
   echo "  Creating TAP: ${TAP} (owner: ${REAL_USER})"
   ip tuntap add dev "$TAP" mode tap user "$REAL_USER"
   ip link set "$TAP" master "$BRIDGE"
+  ip link set "$TAP" mtu 9000
   ip link set "$TAP" up
 done
 

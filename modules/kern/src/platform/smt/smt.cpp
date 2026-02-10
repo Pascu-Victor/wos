@@ -98,12 +98,12 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     apic::initApicMP();
 
     // Initialize scheduler for this CPU
-    sched::percpuInit();
+    sched::percpu_init();
 
     // Create idle task for this CPU
     // Pass the kernel stack TOP (stack grows downward, so syscall needs to start from top)
     auto idleTask = new sched::task::Task("idle", 0, stackTop, sched::task::TaskType::IDLE);
-    sched::postTask(idleTask);
+    sched::post_task(idleTask);
 
     // Atomically increment the counter of initialized CPUs
     // If we're the last CPU, enable per-CPU allocations globally
@@ -117,7 +117,7 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     dbg::log("CPU %d initialized and ready (%d/%d CPUs ready)", cpuNo, initializedCount, cpu_count);
 
     // Start the scheduler on this CPU
-    sched::startScheduler();
+    sched::start_scheduler();
 }
 
 void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
@@ -301,7 +301,7 @@ void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
         dbg::log("  userStackVirt=0x%x, currentVirtOffset=0x%x, argv0=0x%x", userStackVirt, currentVirtOffset, argv0);
 #endif
 
-        sched::postTaskBalanced(newTask);
+        sched::post_task_balanced(newTask);
     }
 #ifdef TASK_DEBUG
     dbg::log("Posted init task(s)");
@@ -317,6 +317,12 @@ auto thisCpuInfo() -> const CpuInfo& { return *cpuData->thisCpu(); }
 auto getCpuNode(uint64_t cpuNo) -> uint64_t { return cpuNo; }
 
 auto getCoreCount() -> uint64_t { return cpu_count; }
+
+auto getEarlyCpuCount() -> uint64_t {
+    if (cpu_count > 0) return cpu_count;
+    if (smp_request.response != nullptr) return smp_request.response->cpu_count;
+    return 1;
+}
 
 auto getCpu(uint64_t number) -> CpuInfo& { return *cpuData->thatCpu(number); }
 
@@ -418,7 +424,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
     // CRITICAL: Initialize scheduler and create init task BEFORE starting secondary CPUs
     // This ensures init gets PID 1, regardless of how many CPUs exist
-    sched::percpuInit();
+    sched::percpu_init();
     dbg::log("Creating init task(s) on BSP BEFORE starting secondary CPUs to ensure PID 1");
     createInitTasks(modules, kernel_rsp);
 
@@ -445,7 +451,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     dbg::log("All CPUs started, starting scheduler on BSP");
     // Create idle task for BSP (gets PID 0 like all idle tasks)
     auto* idle_task = new sched::task::Task("idle", 0, kernel_rsp, sched::task::TaskType::IDLE);
-    sched::postTask(idle_task);
+    sched::post_task(idle_task);
 
     // BSP will participate in the atomic counter via cpuParamInit-style logic
     // We need to call the same logic here for BSP
@@ -464,7 +470,7 @@ auto cpuCount() -> uint64_t { return cpu_count; }
 auto setTcb(void* tcb) -> uint64_t {
     asm volatile("cli");
     // Use scheduler's getCurrentTask() to get the correct per-CPU task
-    auto* currentTask = sched::getCurrentTask();
+    auto* currentTask = sched::get_current_task();
 #ifdef TASK_DEBUG
     mod::dbg::log("setTcb: task=%s pid=%d tcb=0x%x old_fsbase=0x%x", currentTask->name ? currentTask->name : "null", currentTask->pid,
                   (uint64_t)tcb, currentTask->thread ? currentTask->thread->fsbase : 0);

@@ -61,7 +61,7 @@ void pagefaultHandler(uint64_t controlRegister, int errCode) {
     PageFault pagefault = paging::createPageFault(errCode, true);
 
     if (pagefault.user) {
-        auto* currentTask = sched::getCurrentTask();
+        auto* currentTask = sched::get_current_task();
         dbg::log("Segmentation fault in task %s (PID %d) at 0x%x", currentTask ? currentTask->name : "unknown",
                  currentTask ? currentTask->pid : -1, controlRegister);
         hcf();

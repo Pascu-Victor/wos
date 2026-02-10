@@ -12,6 +12,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sched/scheduler.hpp>
 
 namespace ker::net::wki {
 
@@ -57,10 +58,33 @@ auto find_proxy_by_attach(uint16_t owner_node) -> ProxyBlockState* {
 // Remote block device function pointers
 // -----------------------------------------------------------------------------
 
+// Block until the proxy is no longer fenced, or until the fence timeout expires.
+// Returns true if the proxy came back, false if the fence timed out (proxy torn down).
+auto wait_for_fence_lift(ProxyBlockState* state) -> bool {
+    while (state->fenced) {
+        // Check if the fence timeout has expired (hard teardown will clear active)
+        if (!state->active) {
+            return false;
+        }
+        asm volatile("pause" ::: "memory");
+        // Yield the current task so other kernel work (including the WKI timer
+        // thread that processes reconnection) can make progress.
+        ker::mod::sched::kern_yield();
+    }
+    return state->active;
+}
+
 auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
     auto* state = find_proxy_by_bdev(dev);
     if (state == nullptr || !state->active) {
         return -1;
+    }
+
+    // If the peer is fenced, block until it reconnects or the fence times out
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
     }
 
     auto* dest = static_cast<uint8_t*>(buffer);
@@ -107,10 +131,11 @@ auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count,
             return -1;
         }
 
-        // Spin-wait for response with memory fence
+        // Spin-wait for response — targeted single-channel tick
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
         uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         while (state->op_pending) {
-            asm volatile("mfence" ::: "memory");
+            asm volatile("pause" ::: "memory");
             if (!state->op_pending) {
                 break;
             }
@@ -118,7 +143,7 @@ auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count,
                 state->op_pending = false;
                 return -1;
             }
-            wki_spin_yield();
+            wki_spin_yield_channel(ch);
         }
 
         if (state->op_status != 0) {
@@ -137,6 +162,13 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
     auto* state = find_proxy_by_bdev(dev);
     if (state == nullptr || !state->active) {
         return -1;
+    }
+
+    // If the peer is fenced, block until it reconnects or the fence times out
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
     }
 
     const auto* src = static_cast<const uint8_t*>(buffer);
@@ -190,10 +222,11 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
             return -1;
         }
 
-        // Spin-wait for response with memory fence
+        // Spin-wait for response — targeted single-channel tick
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
         uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         while (state->op_pending) {
-            asm volatile("mfence" ::: "memory");
+            asm volatile("pause" ::: "memory");
             if (!state->op_pending) {
                 break;
             }
@@ -201,7 +234,7 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
                 state->op_pending = false;
                 return -1;
             }
-            wki_spin_yield();
+            wki_spin_yield_channel(ch);
         }
 
         if (state->op_status != 0) {
@@ -220,6 +253,13 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
     auto* state = find_proxy_by_bdev(dev);
     if (state == nullptr || !state->active) {
         return -1;
+    }
+
+    // If the peer is fenced, block until it reconnects or the fence times out
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
     }
 
     // Build request: DevOpReqPayload with no data
@@ -242,10 +282,11 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
         return -1;
     }
 
-    // Spin-wait for response with memory fence
+    // Spin-wait for response — targeted single-channel tick
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!state->op_pending) {
             break;
         }
@@ -253,7 +294,7 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
             state->op_pending = false;
             return -1;
         }
-        wki_spin_yield();
+        wki_spin_yield_channel(ch);
     }
 
     return static_cast<int>(state->op_status);
@@ -318,20 +359,18 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             continue;  // Retry on send failure
         }
 
-        // Spin-wait for attach ACK with memory fence to see updates from other CPUs
+        // Spin-wait for attach ACK — targeted single-channel tick
+        WkiChannel* res_ch = wki_channel_get(owner_node, WKI_CHAN_RESOURCE);
         uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         while (state->attach_pending) {
-            // Memory fence to ensure we see updates from the handler running on another CPU
-            asm volatile("mfence" ::: "memory");
+            asm volatile("pause" ::: "memory");
             if (!state->attach_pending) {
                 break;
             }
             if (wki_now_us() >= deadline) {
                 break;  // Timeout, try again
             }
-            // Short pause to reduce CPU usage, then check again
-            // Using pause instead of hlt because hlt only wakes on THIS CPU's interrupts
-            wki_spin_yield();
+            wki_spin_yield_channel(res_ch);
         }
 
         if (!state->attach_pending) {
@@ -392,10 +431,11 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         return nullptr;
     }
 
-    // Spin-wait for info response with memory fence
+    // Spin-wait for info response — targeted single-channel tick
+    WkiChannel* info_ch = wki_channel_get(owner_node, state->assigned_channel);
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!state->op_pending) {
             break;
         }
@@ -405,7 +445,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             g_proxies.pop_back();
             return nullptr;
         }
-        wki_spin_yield();
+        wki_spin_yield_channel(info_ch);
     }
 
     if (state->op_status != 0 || state->op_resp_len < 16) {
@@ -497,8 +537,104 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
 }
 
 // -----------------------------------------------------------------------------
-// Fencing cleanup
+// Fencing — suspend / resume / hard teardown
 // -----------------------------------------------------------------------------
+
+void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
+    uint64_t now = wki_now_us();
+    for (auto& p : g_proxies) {
+        if (!p->active || p->owner_node != node_id) {
+            continue;
+        }
+
+        // Fail any in-flight operation so the spin-wait unblocks,
+        // but keep the proxy registered — callers will see fenced==true
+        // on retry and block in wait_for_fence_lift().
+        if (p->op_pending) {
+            p->op_status = -1;
+            p->op_pending = false;
+        }
+
+        // Close the dynamic channel (stale seq/ack state)
+        WkiChannel* ch = wki_channel_get(p->owner_node, p->assigned_channel);
+        if (ch != nullptr) {
+            wki_channel_close(ch);
+        }
+
+        p->fenced = true;
+        p->fence_time_us = now;
+
+        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x — I/O will block until reconnect or %llu s timeout",
+                           p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
+    }
+}
+
+void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
+    for (auto& p : g_proxies) {
+        if (!p->active || !p->fenced || p->owner_node != node_id) {
+            continue;
+        }
+
+        // Re-attach: send DEV_ATTACH_REQ to get a fresh dynamic channel
+        DevAttachReqPayload attach_req = {};
+        attach_req.target_node = node_id;
+        attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
+        attach_req.resource_id = p->resource_id;
+        attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
+        attach_req.requested_channel = 0;  // auto-assign
+
+        p->attach_pending = true;
+        p->attach_status = 0;
+        p->attach_channel = 0;
+
+        constexpr int MAX_RESUME_RETRIES = 5;
+        bool attached = false;
+        for (int retry = 0; retry < MAX_RESUME_RETRIES; retry++) {
+            if (retry > 0) {
+                p->attach_pending = true;
+            }
+
+            int send_ret = wki_send(node_id, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+            if (send_ret != WKI_OK) {
+                continue;
+            }
+
+            WkiChannel* res_ch = wki_channel_get(node_id, WKI_CHAN_RESOURCE);
+            uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+            while (p->attach_pending) {
+                asm volatile("pause" ::: "memory");
+                if (!p->attach_pending) {
+                    break;
+                }
+                if (wki_now_us() >= deadline) {
+                    break;
+                }
+                wki_spin_yield_channel(res_ch);
+            }
+
+            if (!p->attach_pending && p->attach_status == static_cast<uint8_t>(DevAttachStatus::OK)) {
+                attached = true;
+                break;
+            }
+        }
+
+        if (!attached) {
+            ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x — will hard-detach", p->bdev.name.data(),
+                               node_id);
+            p->attach_pending = false;
+            // Leave fenced=true; the fence_timeout_tick will clean it up
+            continue;
+        }
+
+        p->assigned_channel = p->attach_channel;
+        p->max_op_size = p->attach_max_op_size;
+        p->fenced = false;
+        p->fence_time_us = 0;
+
+        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u — blocked I/O will now proceed", p->bdev.name.data(), node_id,
+                           p->assigned_channel);
+    }
+}
 
 void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
     for (auto& p : g_proxies) {
@@ -521,8 +657,9 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
         // Unregister from block device subsystem
         ker::dev::block_device_unregister(&p->bdev);
 
-        ker::mod::dbg::log("[WKI] Dev proxy fenced: %s node=0x%04x", p->bdev.name.data(), node_id);
+        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: %s node=0x%04x", p->bdev.name.data(), node_id);
 
+        p->fenced = false;
         p->active = false;
     }
 
@@ -532,6 +669,38 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
             it = g_proxies.erase(it);
         } else {
             ++it;
+        }
+    }
+}
+
+void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
+    bool need_cleanup = false;
+    for (auto& p : g_proxies) {
+        if (!p->active || !p->fenced) {
+            continue;
+        }
+
+        uint64_t elapsed = now_us - p->fence_time_us;
+        if (elapsed >= WKI_DEV_PROXY_FENCE_WAIT_US) {
+            ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x — tearing down", elapsed / 1000000ULL,
+                               p->bdev.name.data(), p->owner_node);
+
+            // Unregister from block device subsystem
+            ker::dev::block_device_unregister(&p->bdev);
+
+            p->fenced = false;
+            p->active = false;
+            need_cleanup = true;
+        }
+    }
+
+    if (need_cleanup) {
+        for (auto it = g_proxies.begin(); it != g_proxies.end();) {
+            if (!(*it)->active) {
+                it = g_proxies.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 }

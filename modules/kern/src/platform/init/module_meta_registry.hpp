@@ -53,22 +53,20 @@ inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     // =========================================================================
     // PHASE 3: Subsystems
     // =========================================================================
+    make_meta("smt", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"sys"}),
+    make_meta("epoch_manager", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"smt"}),
     make_meta("dev", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"ioapic"}),
     make_meta("pci", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"dev"}),
     make_meta("console", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"pci"}),
     make_meta("ahci", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"pci"}),
-    make_meta("block_device", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"ahci"}),
+    make_meta("block_device", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"ahci"}, Dependency{"epoch_manager"}),
     make_meta("vfs", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"block_device"}),
     make_meta("devfs_partitions", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"vfs"}),
     make_meta("net", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"kmalloc"}),
 
     // =========================================================================
-    // PHASE 4: Scheduler Setup (smt and epoch_manager before drivers)
-    // smt depends on: gates, irqs (initialized in PHASE_2)
-    // epoch_manager depends on: smt
+    // PHASE 4: Scheduler Setup (sched depends on smt + epoch_manager from PHASE_3)
     // =========================================================================
-    make_meta("smt", BootPhase::PHASE_4_SCHEDULER_SETUP, Dependency{"sys"}),
-    make_meta("epoch_manager", BootPhase::PHASE_4_SCHEDULER_SETUP, Dependency{"smt"}),
     make_meta("sched", BootPhase::PHASE_4_SCHEDULER_SETUP, Dependency{"epoch_manager"}, Dependency("smt"), Dependency("ioapic")),
     make_meta("initramfs", BootPhase::PHASE_4_SCHEDULER_SETUP, Dependency{"vfs"}),
 

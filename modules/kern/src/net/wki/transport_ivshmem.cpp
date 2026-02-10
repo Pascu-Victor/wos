@@ -11,6 +11,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/sched/scheduler.hpp>
 
 namespace ker::net::wki {
 

@@ -174,6 +174,16 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     if (processed < budget) {
         ker::net::napi_complete(napi);
         virtio_net_irq_enable(dev);
+
+        // Guard against the missed-notification race: the device may have
+        // added used buffers while MSI-X vectors were set to NO_VECTOR,
+        // suppressing the notification.  After re-enabling, check if there
+        // is pending work.  If so, disable IRQs again and re-schedule so
+        // the worker picks up the missed buffers.
+        if (virtq_has_pending(dev->rxq) || virtq_has_pending(dev->txq)) {
+            virtio_net_irq_disable(dev);
+            ker::net::napi_schedule(napi);
+        }
     }
 
     return processed;
@@ -441,7 +451,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     // 12. Register as a network device
     dev->netdev.ops = &virtio_net_ops;
-    dev->netdev.mtu = 1500;
+    dev->netdev.mtu = 9000;  // jumbo frames: reduces WKI chunking for block I/O
     dev->netdev.state = 1;
     dev->netdev.private_data = dev;
     dev->netdev.name[0] = '\0';  // Auto-assign name

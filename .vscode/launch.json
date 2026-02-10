@@ -19,26 +19,40 @@
                 "command alias b break set --hardware",
                 "command alias hbreak break set --hardware"
             ],
-            "terminateCommands": [
-                "process kill"
-            ],
-            "attachCommands": [
-                "gdb-remote 127.0.0.1:1234"
-            ],
+            "terminateCommands": ["process kill"],
+            "attachCommands": ["gdb-remote 127.0.0.1:1234"],
             "preLaunchTask": "Build and Start QEMU"
+        },
+        {
+            "name": "Debug WOS Cluster (VM0)",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b break set --hardware",
+                "command alias hbreak break set --hardware"
+            ],
+            "terminateCommands": ["process kill"],
+            "attachCommands": ["gdb-remote 127.0.0.1:1234"],
+            "preLaunchTask": "Build and Start Cluster Debug"
         },
         {
             "name": "Debug WOS Userspace (Init Process)",
             "type": "lldb-dap",
             "request": "attach",
-            "attachCommands": [
-                "!gdb-remote 127.0.0.1:1234"
-            ],
+            "attachCommands": ["!gdb-remote 127.0.0.1:1234"],
             "preRunCommands": [
                 "target create ${workspaceFolder}/build/modules/kern/wos",
                 "target modules add ${workspaceFolder}/build/modules/init/init",
                 "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
                 "target modules add ${workspaceFolder}/build/modules/netd/netd",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
                 "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.a",
                 "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.a"
             ],

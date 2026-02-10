@@ -150,6 +150,7 @@ fi
 if ! ip link show "$BRIDGE" &>/dev/null; then
   echo "  Creating bridge: ${BRIDGE}"
   ip link add "$BRIDGE" type bridge
+  ip link set "$BRIDGE" mtu 9000
   # Disable STP — small isolated segment, no loops
   echo 0 > /sys/class/net/${BRIDGE}/bridge/stp_state 2>/dev/null || true
 else
@@ -254,6 +255,7 @@ for ((i = 0; i < NUM_VMS; i++)); do
   ip tuntap add dev "$TAP" mode tap
   chown "$REAL_USER" /dev/net/tun
   ip link set "$TAP" master "$BRIDGE"
+  ip link set "$TAP" mtu 9000
   ip link set "$TAP" up
 done
 

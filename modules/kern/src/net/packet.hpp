@@ -9,8 +9,8 @@ namespace ker::net {
 // Forward declaration
 struct NetDevice;
 
-constexpr size_t PKT_BUF_SIZE = 2048;
-constexpr size_t PKT_HEADROOM = 64;
+constexpr size_t PKT_BUF_SIZE = 10240;  // supports jumbo frames (9000 MTU + headers)
+constexpr size_t PKT_HEADROOM = 128;    // room for VirtIO + Ethernet + headroom
 // Minimum pool size (used before NIC count is known)
 constexpr size_t PKT_POOL_MIN_SIZE = 1024;
 // Buffers to allocate per NIC (RX ring + TX ring + headroom)
@@ -52,9 +52,11 @@ struct PacketBuffer {
 };
 
 void pkt_pool_init();
-void pkt_pool_expand_for_nics();  // Call after NIC drivers have registered
-auto pkt_pool_size() -> size_t;   // Get current pool size
+void pkt_pool_expand_for_nics();       // Call after NIC drivers have registered
+auto pkt_pool_size() -> size_t;        // Get current pool size
+auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
 auto pkt_alloc() -> PacketBuffer*;
+auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)
 void pkt_free(PacketBuffer* pkt);
 
 }  // namespace ker::net

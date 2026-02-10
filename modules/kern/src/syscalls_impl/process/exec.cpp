@@ -54,7 +54,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
     using namespace ker::mod;
 
-    auto* parentTask = sched::getCurrentTask();
+    auto* parentTask = sched::get_current_task();
     if (parentTask == nullptr) {
         dbg::log("wos_proc_exec: No current task");
         return 0;
@@ -325,7 +325,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 #endif
 
     // Use load-balanced task posting to distribute across CPUs
-    if (!sched::postTaskBalanced(newTask)) {
+    if (!sched::post_task_balanced(newTask)) {
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
         delete newTask;
         delete[] elfBuffer;

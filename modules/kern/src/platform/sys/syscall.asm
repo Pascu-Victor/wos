@@ -50,19 +50,19 @@ _wOS_asm_syscallHandler:
     add rsp, 8  ; Restore stack
 
     ; rax now contains current task pointer
-    ; Check if deferredTaskSwitch flag is set at the calculated offset
+    ; Check if deferred_task_switch flag is set at the calculated offset
     mov r8, [rel _wOS_DEFERRED_TASK_SWITCH_OFFSET]  ; Load offset value
     movzx edx, byte [rax + r8]                      ; Load flag from task at offset
     cmp edx, 0
     je .no_deferred_switch
 
-    ; Call deferredTaskSwitch with GPRegs and frame pointers
-    extern deferredTaskSwitch
+    ; Call deferred_task_switch with GPRegs and frame pointers
+    extern deferred_task_switch
     lea rdi, [rsp+8]       ; GPRegs pointer
     lea rsi, [rsp+136]     ; Frame pointer (after GPRegs)
     sub rsp, 8  ; Align stack for call
-    call deferredTaskSwitch
-    ; deferredTaskSwitch will not return - it switches tasks
+    call deferred_task_switch
+    ; deferred_task_switch will not return - it switches tasks
 
 .no_deferred_switch:
     ; restore usermode segment ds and es

@@ -13,6 +13,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sched/scheduler.hpp>
 
 namespace ker::net::wki {
 
@@ -132,10 +133,11 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
         return;
     }
 
-    // Spin-wait for response with memory fence
+    // Spin-wait for response — targeted single-channel tick
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->op_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!state->op_pending) {
             break;
         }
@@ -143,9 +145,7 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
             state->op_pending = false;
             return;
         }
-        for (int i = 0; i < 1000; i++) {
-            asm volatile("pause" ::: "memory");
-        }
+        wki_spin_yield_channel(ch);
     }
 
     // Update local MAC on success
@@ -311,10 +311,11 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         return nullptr;
     }
 
-    // Spin-wait for attach ACK with memory fence
+    // Spin-wait for attach ACK — targeted single-channel tick
+    WkiChannel* res_ch = wki_channel_get(owner_node, WKI_CHAN_RESOURCE);
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     while (state->attach_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!state->attach_pending) {
             break;
         }
@@ -324,9 +325,7 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
             ker::mod::dbg::log("[WKI] Remote NIC attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
             return nullptr;
         }
-        for (int i = 0; i < 1000; i++) {
-            asm volatile("pause" ::: "memory");
-        }
+        wki_spin_yield_channel(res_ch);
     }
 
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {

@@ -18,8 +18,8 @@ constexpr uint16_t WKI_NODE_BROADCAST = 0xFFFF;
 constexpr uint8_t WKI_DEFAULT_TTL = 16;
 constexpr size_t WKI_HEADER_SIZE = 32;
 
-// Maximum WKI payload on standard Ethernet: 1500 - 14 (eth hdr) - 32 (wki hdr)
-constexpr size_t WKI_ETH_MAX_PAYLOAD = 1454;
+// Maximum WKI payload with jumbo frames: 9000 - 14 (eth hdr) - 32 (wki hdr)
+constexpr size_t WKI_ETH_MAX_PAYLOAD = 8954;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Header Flags (lower 4 bits of version_flags byte)

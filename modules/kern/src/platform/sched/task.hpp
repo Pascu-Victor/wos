@@ -98,6 +98,11 @@ struct Task {
     // When true, deferredTaskSwitch puts task in expired queue (yield) instead of wait queue (block)
     bool yieldSwitch;
 
+    // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
+    // in a syscall wait loop).  The scheduler may preempt it as if it were a DAEMON,
+    // saving and restoring kernel-mode context.  Set before hlt, cleared after wake.
+    volatile bool voluntaryBlock = false;
+
     // Waitpid state: when this task is waiting for another task to exit
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
     uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)

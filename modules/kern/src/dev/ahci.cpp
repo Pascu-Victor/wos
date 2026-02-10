@@ -10,13 +10,14 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #include "block_device.hpp"
 #include "pci.hpp"
-#include <net/wki/remotable.hpp>
 #include "platform/mm/addr.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -61,12 +62,8 @@ auto remotable_on_attach(uint16_t node_id) -> int {
     ker::mod::dbg::log("[AHCI] remote attach from 0x%04x", node_id);
     return 0;
 }
-void remotable_on_detach(uint16_t node_id) {
-    ker::mod::dbg::log("[AHCI] remote detach from 0x%04x", node_id);
-}
-void remotable_on_fault(uint16_t node_id) {
-    ker::mod::dbg::log("[AHCI] remote fault for 0x%04x", node_id);
-}
+void remotable_on_detach(uint16_t node_id) { ker::mod::dbg::log("[AHCI] remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { ker::mod::dbg::log("[AHCI] remote fault for 0x%04x", node_id); }
 const ker::net::wki::RemotableOps s_remotable_ops = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
@@ -217,9 +214,8 @@ auto find_cmdslot(volatile HBA_PORT* port, int portno) -> uint32_t {
     // Check both hardware registers AND software tracking for busy slots
     // The software tracking handles the race where we've issued a command but hardware hasn't updated ci yet
     uint32_t hw_slots = (port->sact | port->ci);
-    uint32_t sw_slots = (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) 
-                        ? port_slots_in_use[portno].load(std::memory_order_acquire) 
-                        : 0;
+    uint32_t sw_slots =
+        (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) ? port_slots_in_use[portno].load(std::memory_order_acquire) : 0;
     uint32_t slots = hw_slots | sw_slots;
     uint32_t cmdslots = (hba_mem->cap & 0x1F00) >> 8;  // Number of command slots
     for (uint32_t i = 0; i < cmdslots; i++) {
@@ -236,7 +232,7 @@ auto find_cmdslot(volatile HBA_PORT* port, int portno) -> uint32_t {
 auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf, bool write_op)
     -> bool {
     uint32_t slot = UINT32_MAX;
-    
+
     // Acquire per-port lock only for the critical section: finding a slot and issuing the command
     // We must NOT hold the lock during the busy-wait for completion, as that would cause livelock
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -251,7 +247,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         }
         return false;
     }
-    
+
     // Mark this slot as in-use in software BEFORE releasing the lock
     // This prevents other CPUs from grabbing the same slot before hardware updates ci
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -329,7 +325,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
 
     // Issue command
     port->ci = 1 << slot;
-    
+
     // Release lock after issuing command - the slot is now ours and we just need to wait
     // Other concurrent I/O operations can use different command slots
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -375,7 +371,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
         port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
     }
-    
+
     return true;
 }
 

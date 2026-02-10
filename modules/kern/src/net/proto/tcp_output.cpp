@@ -8,10 +8,10 @@
 
 namespace ker::net::proto {
 
-void tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
-    auto* pkt = pkt_alloc();
+bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
-        return;
+        return false;
     }
 
     // Build TCP options for SYN segments (MSS option)
@@ -71,7 +71,7 @@ void tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     // Add to retransmit queue if this carries data or SYN/FIN
     if (len > 0 || (flags & (TCP_SYN | TCP_FIN)) != 0) {
         // Clone packet for retransmit
-        auto* rtx_pkt = pkt_alloc();
+        auto* rtx_pkt = pkt_alloc_tx();
         if (rtx_pkt != nullptr) {
             std::memcpy(rtx_pkt->storage.data(), pkt->storage.data(), PKT_BUF_SIZE);
             rtx_pkt->data = rtx_pkt->storage.data() + (pkt->data - pkt->storage.data());
@@ -105,6 +105,7 @@ void tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
 
     // Send via IP
     ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64);  // proto=TCP(6), TTL=64
+    return true;
 }
 
 void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t extra_flags) {

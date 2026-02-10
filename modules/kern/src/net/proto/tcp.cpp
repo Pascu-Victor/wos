@@ -1,5 +1,6 @@
 #include "tcp.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <net/checksum.hpp>
@@ -59,7 +60,7 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
-        return -1;
+        return -ENOTCONN;
     }
 
     tcp_bind_lock.lock();
@@ -105,7 +106,7 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 int tcp_listen(Socket* sock, int backlog) {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
-        return -1;
+        return -ENOTCONN;
     }
 
     cb->state = TcpState::LISTEN;
@@ -121,7 +122,7 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     sock->lock.lock();
     if (sock->aq_count == 0) {
         sock->lock.unlock();
-        auto* task = ker::mod::sched::getCurrentTask();
+        auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
             task->deferredTaskSwitch = true;
         }
@@ -154,24 +155,33 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
         return -1;
     }
 
-    // Check if already connected (retry after wake)
+    // Already connected
     if (cb->state == TcpState::ESTABLISHED) {
         sock->state = SocketState::CONNECTED;
         return 0;
     }
 
+    // Connect in progress
+    if (cb->state == TcpState::SYN_SENT) {
+        if (sock->nonblock) {
+            return -EINPROGRESS;
+        }
+        // Blocking connect: wait until handshake completes or fails
+        for (;;) {
+            if (cb->state == TcpState::ESTABLISHED) {
+                sock->state = SocketState::CONNECTED;
+                return 0;
+            }
+            if (cb->state == TcpState::CLOSED) {
+                return -ECONNREFUSED;
+            }
+            ker::mod::sched::kern_yield();
+        }
+    }
+
     // Connection failed (RST received while we were waiting)
     if (cb->state == TcpState::CLOSED && sock->state == SocketState::CONNECTING) {
         return -ECONNREFUSED;
-    }
-
-    // Still waiting for SYN-ACK (retry after wake, but not yet established)
-    if (cb->state == TcpState::SYN_SENT) {
-        auto* task = ker::mod::sched::getCurrentTask();
-        if (task != nullptr) {
-            task->deferredTaskSwitch = true;
-        }
-        return -EINPROGRESS;
     }
 
     // First connect call — initiate connection
@@ -204,12 +214,21 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
 
     tcp_send_segment(cb, TCP_SYN, nullptr, 0);
 
-    // Defer task switch — userspace retries until ESTABLISHED
-    auto* task = ker::mod::sched::getCurrentTask();
-    if (task != nullptr) {
-        task->deferredTaskSwitch = true;
+    if (sock->nonblock) {
+        return -EINPROGRESS;
     }
-    return -EINPROGRESS;
+
+    // Blocking connect: wait for SYN-ACK / RST
+    for (;;) {
+        if (cb->state == TcpState::ESTABLISHED) {
+            sock->state = SocketState::CONNECTED;
+            return 0;
+        }
+        if (cb->state == TcpState::CLOSED) {
+            return -ECONNREFUSED;
+        }
+        ker::mod::sched::kern_yield();
+    }
 }
 
 auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
@@ -222,11 +241,17 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
     size_t sent = 0;
 
     while (sent < len) {
+        cb->lock.lock();
+
+        // Re-check state under lock (may have changed concurrently)
+        if (cb->state != TcpState::ESTABLISHED) {
+            cb->lock.unlock();
+            return (sent > 0) ? static_cast<ssize_t>(sent) : -1;
+        }
+
         // Send in MSS-sized chunks
         size_t chunk = len - sent;
-        if (chunk > cb->snd_mss) {
-            chunk = cb->snd_mss;
-        }
+        chunk = std::min<size_t>(chunk, cb->snd_mss);
 
         // Limit by send window
         uint32_t window = cb->snd_wnd;
@@ -235,12 +260,13 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
         }
         uint32_t in_flight = cb->snd_nxt - cb->snd_una;
         if (in_flight >= window) {
+            cb->lock.unlock();
             // Window full — if we already sent some data, return partial.
             // Otherwise defer and return EAGAIN so userspace retries.
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
-            auto* task = ker::mod::sched::getCurrentTask();
+            auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
                 task->deferredTaskSwitch = true;
             }
@@ -251,7 +277,20 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
             chunk = available;
         }
 
-        tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
+        bool ok = tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
+        cb->lock.unlock();
+
+        if (!ok) {
+            // Buffer exhaustion — return partial or EAGAIN
+            if (sent > 0) {
+                return static_cast<ssize_t>(sent);
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task != nullptr) {
+                task->deferredTaskSwitch = true;
+            }
+            return -EAGAIN;
+        }
         sent += chunk;
     }
 
@@ -266,24 +305,57 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
 
     // If data available, read it immediately
     if (sock->rcvbuf.available() > 0) {
-        return sock->rcvbuf.read(buf, len);
+        ssize_t n = sock->rcvbuf.read(buf, len);
+        if (n > 0) {
+            // Update receive window and send window update if it
+            // opened significantly (>= MSS).  This unblocks the
+            // sender when it was stalled on a zero/small window.
+            uint32_t old_wnd = cb->rcv_wnd;
+            cb->rcv_wnd = sock->rcvbuf.free_space();
+            if (cb->rcv_wnd >= cb->rcv_mss && old_wnd < cb->rcv_mss) {
+                tcp_send_ack(cb);
+            }
+        }
+        return n;
     }
 
-    // No data — check connection state
-    if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED) {
+    // No data — check connection state.
+    // After we have sent our FIN (FIN_WAIT_*) and the peer has also
+    // closed (TIME_WAIT, CLOSING), or the peer closed first
+    // (CLOSE_WAIT), there will be no more data — return EOF.
+    if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
+        cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
         return 0;  // EOF
     }
 
     if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::FIN_WAIT_1 && cb->state != TcpState::FIN_WAIT_2) {
-        return -1;  // Not in a readable state
+        return -EAGAIN;  // Not in a readable state yet
     }
 
-    // No data yet, connection still open — defer and let userspace retry
-    auto* task = ker::mod::sched::getCurrentTask();
-    if (task != nullptr) {
-        task->deferredTaskSwitch = true;
+    // Nonblocking sockets: report would-block immediately.
+    if (sock->nonblock) {
+        return -EAGAIN;
     }
-    return -EAGAIN;
+
+    // Blocking sockets: sleep until data arrives or the peer closes.
+    for (;;) {
+        if (sock->rcvbuf.available() > 0) {
+            ssize_t n = sock->rcvbuf.read(buf, len);
+            if (n > 0) {
+                uint32_t old_wnd = cb->rcv_wnd;
+                cb->rcv_wnd = sock->rcvbuf.free_space();
+                if (cb->rcv_wnd >= cb->rcv_mss && old_wnd < cb->rcv_mss) {
+                    tcp_send_ack(cb);
+                }
+            }
+            return n;
+        }
+        if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
+            cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
+            return 0;  // EOF while waiting
+        }
+        ker::mod::sched::kern_yield();
+    }
 }
 
 auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags, const void*, size_t) -> ssize_t {
@@ -299,6 +371,16 @@ void tcp_close_op(Socket* sock) {
     }
 
     cb->lock.lock();
+    // Drain any outstanding retransmit entries — no further retransmissions
+    // after close() regardless of state.
+    while (cb->retransmit_head != nullptr) {
+        auto* entry = cb->retransmit_head;
+        cb->retransmit_head = entry->next;
+        if (entry->pkt != nullptr) {
+            pkt_free(entry->pkt);
+        }
+        ker::mod::mm::dyn::kmalloc::free(entry);
+    }
     switch (cb->state) {
         case TcpState::CLOSED:
         case TcpState::LISTEN:
@@ -310,13 +392,31 @@ void tcp_close_op(Socket* sock) {
             break;
 
         case TcpState::ESTABLISHED:
-            tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0);
-            cb->state = TcpState::FIN_WAIT_1;
+            if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+                cb->state = TcpState::FIN_WAIT_1;
+            } else {
+                // Buffer exhaustion — force RST and close
+                cb->state = TcpState::CLOSED;
+            }
             break;
 
         case TcpState::CLOSE_WAIT:
-            tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0);
-            cb->state = TcpState::LAST_ACK;
+            if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+                cb->state = TcpState::LAST_ACK;
+            } else {
+                cb->state = TcpState::CLOSED;
+            }
+            break;
+
+        case TcpState::FIN_WAIT_1:
+        case TcpState::FIN_WAIT_2:
+        case TcpState::CLOSING:
+            // FIN already sent by a prior shutdown(); nothing more to send.
+            // The TCB will transition to TIME_WAIT when the peer ACKs/FINs.
+            break;
+
+        case TcpState::TIME_WAIT:
+            // Already in TIME_WAIT; timer thread will free the TCB.
             break;
 
         default:
@@ -335,9 +435,14 @@ void tcp_close_op(Socket* sock) {
     }
     tcp_bind_lock.unlock();
 
-    // Don't free TCB immediately if in TIME_WAIT — timer will clean up
+    // Detach the socket from the TCB.  For states where the TCP
+    // connection is still winding down (FIN_WAIT_*, TIME_WAIT, etc.)
+    // the TCB stays on the global list so the timer / input path can
+    // finish the handshake, but the socket object is freed by the
+    // caller.  For CLOSED, free the TCB right away.
+    sock->proto_data = nullptr;
+    cb->socket = nullptr;
     if (cb->state == TcpState::CLOSED) {
-        sock->proto_data = nullptr;
         tcp_free_cb(cb);
     }
 }
@@ -349,10 +454,17 @@ int tcp_shutdown_op(Socket* sock, int how) {
         return -1;
     }
 
+    cb->lock.lock();
     if (cb->state == TcpState::ESTABLISHED) {
-        tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0);
-        cb->state = TcpState::FIN_WAIT_1;
+        if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+            cb->state = TcpState::FIN_WAIT_1;
+        }
+    } else if (cb->state == TcpState::CLOSE_WAIT) {
+        if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+            cb->state = TcpState::LAST_ACK;
+        }
     }
+    cb->lock.unlock();
     return 0;
 }
 
@@ -418,6 +530,8 @@ auto tcp_alloc_cb() -> TcpCB* {
         return nullptr;
     }
 
+    cb->refcnt.store(1, std::memory_order_relaxed);
+
     tcb_list_lock.lock();
     cb->next = tcb_list_head;
     tcb_list_head = cb;
@@ -426,7 +540,15 @@ auto tcp_alloc_cb() -> TcpCB* {
     return cb;
 }
 
-void tcp_free_cb(TcpCB* cb) {
+void tcp_cb_acquire(TcpCB* cb) {
+    if (cb == nullptr) {
+        return;
+    }
+    cb->refcnt.fetch_add(1, std::memory_order_acq_rel);
+}
+
+namespace {
+void tcp_cb_destroy(TcpCB* cb) {
     if (cb == nullptr) {
         return;
     }
@@ -441,20 +563,43 @@ void tcp_free_cb(TcpCB* cb) {
         ker::mod::mm::dyn::kmalloc::free(entry);
         entry = next;
     }
-    cb->retransmit_head = nullptr;
+
+    ker::mod::mm::dyn::kmalloc::free(cb);
+}
+}  // namespace
+
+void tcp_cb_release(TcpCB* cb) {
+    if (cb == nullptr) {
+        return;
+    }
+    if (cb->refcnt.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        tcp_cb_destroy(cb);
+    }
+}
+
+void tcp_free_cb(TcpCB* cb) {
+    if (cb == nullptr) {
+        return;
+    }
 
     // Remove from global list
+    bool removed = false;
     tcb_list_lock.lock();
     TcpCB** pp = &tcb_list_head;
     while (*pp != nullptr) {
         if (*pp == cb) {
             *pp = cb->next;
+            removed = true;
             break;
         }
         pp = &(*pp)->next;
     }
     tcb_list_lock.unlock();
-    ker::mod::mm::dyn::kmalloc::free(cb);
+
+    // Drop the list's reference if we removed it
+    if (removed) {
+        tcp_cb_release(cb);
+    }
 }
 
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
@@ -462,6 +607,7 @@ auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uin
     for (auto* cb = tcb_list_head; cb != nullptr; cb = cb->next) {
         if (cb->local_port == local_port && cb->remote_port == remote_port && (cb->local_ip == local_ip || cb->local_ip == 0) &&
             cb->remote_ip == remote_ip) {
+            tcp_cb_acquire(cb);
             tcb_list_lock.unlock();
             return cb;
         }

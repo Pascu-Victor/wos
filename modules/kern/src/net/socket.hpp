@@ -11,6 +11,10 @@ namespace ker::net {
 constexpr size_t SOCKET_BUF_SIZE = 65536;
 constexpr size_t SOCKET_ACCEPT_QUEUE = 128;
 
+// Socket flags (Linux-compatible values for ease of userspace reuse)
+constexpr int SOCK_NONBLOCK = 0x800;  // matches Linux SOCK_NONBLOCK
+constexpr int SOCK_TYPE_MASK = 0xF;   // low bits carry SOCK_STREAM/…
+
 // Simple ring buffer for socket data
 struct RingBuffer {
     uint8_t* data = nullptr;
@@ -57,8 +61,8 @@ struct SocketProtoOps {
 };
 
 struct Socket {
-    int domain;             // AF_INET, AF_INET6
-    uint8_t type;           // SOCK_STREAM, SOCK_DGRAM
+    int domain;    // AF_INET, AF_INET6
+    uint8_t type;  // SOCK_STREAM, SOCK_DGRAM
     int protocol;
     SocketState state = SocketState::UNBOUND;
 
@@ -77,7 +81,7 @@ struct Socket {
     RingBuffer rcvbuf;
     RingBuffer sndbuf;
 
-    void* proto_data = nullptr;       // TCP: TcpCB*
+    void* proto_data = nullptr;  // TCP: TcpCB*
     SocketProtoOps* proto_ops = nullptr;
 
     // Accept queue (for listening sockets)
@@ -90,6 +94,7 @@ struct Socket {
     uint64_t owner_pid = 0;
     bool reuse_addr = false;
     bool reuse_port = false;
+    bool nonblock = false;
 
     ker::mod::sys::Spinlock lock;
 };

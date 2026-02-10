@@ -234,7 +234,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
     }
 
-    auto* current = ker::mod::sched::getCurrentTask();
+    auto* current = ker::mod::sched::get_current_task();
     if (current == nullptr) {
         vfs_debug_log("vfs_open: no current task\n");
         return -1;
@@ -319,6 +319,18 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return -1;
     }
 
+    // Store the absolute VFS path for mount-overlay directory listing
+    size_t path_len = std::strlen(pathBuffer);
+    auto* path_copy = static_cast<char*>(
+        ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
+    if (path_copy != nullptr) {
+        std::memcpy(path_copy, pathBuffer, path_len + 1);
+        f->vfs_path = path_copy;
+    } else {
+        f->vfs_path = nullptr;
+    }
+    f->dir_fs_count = static_cast<size_t>(-1);
+
     int fd = vfs_alloc_fd(current, f);
     if (fd < 0) {
         return -1;
@@ -328,7 +340,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
 auto vfs_close(int fd) -> int {
     // Release FD from current task
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return -1;
     }
@@ -348,6 +360,10 @@ auto vfs_close(int fd) -> int {
         if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
             f->fops->vfs_close(f);
         }
+        // Free the VFS path string if allocated
+        if (f->vfs_path != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(f->vfs_path));
+        }
         // Free the File descriptor object (just the handle/wrapper)
         // but keep the underlying fs node (f->private_data) intact
         // so the file can be reopened later
@@ -358,7 +374,7 @@ auto vfs_close(int fd) -> int {
 }
 
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return -1;
     }
@@ -381,7 +397,7 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
 }
 
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return -1;
     }
@@ -404,7 +420,7 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
 }
 
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return -1;
     }
@@ -454,7 +470,7 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
 }
 
 auto vfs_isatty(int fd) -> bool {
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return false;
     }
@@ -469,7 +485,7 @@ auto vfs_isatty(int fd) -> bool {
 }
 
 auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
-    ker::mod::sched::task::Task* t = ker::mod::sched::getCurrentTask();
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
         return -1;
     }
@@ -483,14 +499,13 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
         return -ENOTDIR;
     }
 
-    if ((f->fops == nullptr) || (f->fops->vfs_readdir == nullptr)) {
-        return -ENOSYS;
-    }
-
     // Buffer must be large enough for at least one DirEntry
     if (buffer == nullptr || max_size < sizeof(DirEntry)) {
         return -EINVAL;
     }
+
+    // We allow vfs_readdir to be null — the directory may contain only mount children
+    bool has_fs_readdir = (f->fops != nullptr) && (f->fops->vfs_readdir != nullptr);
 
     auto* entries = static_cast<DirEntry*>(buffer);
     size_t max_entries = max_size / sizeof(DirEntry);
@@ -500,12 +515,135 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     size_t start_index = static_cast<size_t>(f->pos);
 
     for (size_t i = 0; i < max_entries; ++i) {
-        int ret = f->fops->vfs_readdir(f, &entries[i], start_index + i);
-        if (ret != 0) {
-            // End of directory or error
-            break;
+        size_t actual_index = start_index + i;
+
+        // Phase 1: try filesystem readdir
+        if (has_fs_readdir && (f->dir_fs_count == static_cast<size_t>(-1) || actual_index < f->dir_fs_count)) {
+            int ret = f->fops->vfs_readdir(f, &entries[entries_read], actual_index);
+            if (ret == 0) {
+                entries_read++;
+                continue;
+            }
+            // FS entries exhausted at this index
+            f->dir_fs_count = actual_index;
         }
-        entries_read++;
+
+        // Phase 2: inject mount-point children as synthetic directory entries.
+        // For each mount whose path starts with vfs_path, extract the first
+        // path component after vfs_path as a child directory name.
+        // Deduplicate against FS entries and against earlier mounts that
+        // yield the same child component.
+        bool found_mount_child = false;
+        if (f->vfs_path != nullptr) {
+            size_t fs_count = has_fs_readdir ? f->dir_fs_count : 0;
+            size_t mount_idx = actual_index - fs_count;
+
+            size_t dir_len = std::strlen(f->vfs_path);
+            size_t child_count = 0;
+
+            for (size_t mi = 0; mi < get_mount_count(); ++mi) {
+                MountPoint* mp = get_mount_at(mi);
+                if (mp == nullptr || mp->path == nullptr) continue;
+
+                size_t mp_len = std::strlen(mp->path);
+                const char* child_start = nullptr;
+                size_t child_len = 0;
+
+                if (dir_len == 1 && f->vfs_path[0] == '/') {
+                    // Root directory: child is first component of "/xxx[/...]"
+                    if (mp_len > 1 && mp->path[0] == '/') {
+                        child_start = mp->path + 1;
+                    }
+                } else {
+                    // Non-root: mount must start with dir_path + "/"
+                    if (mp_len > dir_len &&
+                        std::memcmp(mp->path, f->vfs_path, dir_len) == 0 &&
+                        mp->path[dir_len] == '/') {
+                        child_start = mp->path + dir_len + 1;
+                    }
+                }
+
+                if (child_start == nullptr || *child_start == '\0') continue;
+
+                // Extract only the first path component
+                const char* p = child_start;
+                while (*p != '\0' && *p != '/') p++;
+                child_len = static_cast<size_t>(p - child_start);
+                if (child_len == 0) continue;
+
+                // Dedup against earlier mounts that yield the same child name
+                bool dup_mount = false;
+                for (size_t mj = 0; mj < mi; ++mj) {
+                    MountPoint* mp2 = get_mount_at(mj);
+                    if (mp2 == nullptr || mp2->path == nullptr) continue;
+                    size_t mp2_len = std::strlen(mp2->path);
+                    const char* c2 = nullptr;
+
+                    if (dir_len == 1 && f->vfs_path[0] == '/') {
+                        if (mp2_len > 1 && mp2->path[0] == '/') c2 = mp2->path + 1;
+                    } else {
+                        if (mp2_len > dir_len &&
+                            std::memcmp(mp2->path, f->vfs_path, dir_len) == 0 &&
+                            mp2->path[dir_len] == '/') {
+                            c2 = mp2->path + dir_len + 1;
+                        }
+                    }
+                    if (c2 == nullptr || *c2 == '\0') continue;
+
+                    const char* p2 = c2;
+                    while (*p2 != '\0' && *p2 != '/') p2++;
+                    size_t c2_len = static_cast<size_t>(p2 - c2);
+
+                    if (c2_len == child_len && std::memcmp(child_start, c2, child_len) == 0) {
+                        dup_mount = true;
+                        break;
+                    }
+                }
+                if (dup_mount) continue;
+
+                // Dedup against FS readdir entries
+                if (has_fs_readdir && fs_count > 0) {
+                    bool already_in_fs = false;
+                    DirEntry probe = {};
+                    for (size_t pi = 0; pi < fs_count; ++pi) {
+                        int pret = f->fops->vfs_readdir(f, &probe, pi);
+                        if (pret != 0) break;
+                        size_t dn_len = std::strlen(probe.d_name.data());
+                        if (dn_len == child_len &&
+                            std::memcmp(probe.d_name.data(), child_start, child_len) == 0) {
+                            already_in_fs = true;
+                            break;
+                        }
+                    }
+                    if (already_in_fs) continue;
+                }
+
+                if (child_count == mount_idx) {
+                    // Fill the synthetic DirEntry
+                    entries[entries_read].d_ino = reinterpret_cast<uint64_t>(mp);
+                    entries[entries_read].d_off = actual_index + 1;
+                    entries[entries_read].d_reclen = sizeof(DirEntry);
+                    entries[entries_read].d_type = DT_DIR;
+
+                    size_t copy_len = child_len < DIRENT_NAME_MAX - 1
+                                          ? child_len : DIRENT_NAME_MAX - 1;
+                    std::memcpy(entries[entries_read].d_name.data(), child_start, copy_len);
+                    entries[entries_read].d_name[copy_len] = '\0';
+
+                    entries_read++;
+                    found_mount_child = true;
+                    break;
+                }
+                child_count++;
+            }
+        }
+
+        if (found_mount_child) {
+            continue;
+        }
+
+        // No more entries from either FS or mount children
+        break;
     }
 
     // Update file position
@@ -776,7 +914,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::getCurrentTask();
+    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -1005,12 +1143,26 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File* {
             return nullptr;
     }
 
+    // Store the absolute VFS path for mount-overlay directory listing
+    if (f != nullptr) {
+        size_t pl = std::strlen(pathBuffer);
+        auto* pc = static_cast<char*>(
+            ker::mod::mm::dyn::kmalloc::malloc(pl + 1));
+        if (pc != nullptr) {
+            std::memcpy(pc, pathBuffer, pl + 1);
+            f->vfs_path = pc;
+        } else {
+            f->vfs_path = nullptr;
+        }
+        f->dir_fs_count = static_cast<size_t>(-1);
+    }
+
     return f;
 }
 
 auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     // Get the current task
-    auto* task = mod::sched::getCurrentTask();
+    auto* task = mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }

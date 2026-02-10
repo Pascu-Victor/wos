@@ -219,13 +219,63 @@ void wki_transport_unregister(WkiTransport* transport) {
 }
 
 // -----------------------------------------------------------------------------
-// Peer management
+// Peer management — compact hash with multiplicative hashing + linear probing
 // -----------------------------------------------------------------------------
 
+namespace {
+
+inline auto peer_hash_slot(uint16_t node_id) -> uint8_t {
+    return static_cast<uint8_t>((static_cast<uint32_t>(node_id) * 0x9E37U) >> 8);
+}
+
+void peer_hash_insert(uint16_t node_id, int16_t peer_idx) {
+    uint8_t slot = peer_hash_slot(node_id);
+    for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
+        auto& entry = g_wki.peer_hash[(slot + probe) & (WKI_PEER_HASH_SIZE - 1)];
+        if (entry.node_id == WKI_NODE_INVALID) {
+            entry.node_id = node_id;
+            entry.peer_idx = peer_idx;
+            return;
+        }
+    }
+}
+
+[[maybe_unused]] void peer_hash_remove(uint16_t node_id) {
+    uint8_t slot = peer_hash_slot(node_id);
+    for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
+        size_t idx = (slot + probe) & (WKI_PEER_HASH_SIZE - 1);
+        auto& entry = g_wki.peer_hash[idx];
+        if (entry.node_id == node_id) {
+            entry.node_id = WKI_NODE_INVALID;
+            entry.peer_idx = -1;
+            // Re-insert any entries that were displaced past this slot
+            size_t next = (idx + 1) & (WKI_PEER_HASH_SIZE - 1);
+            while (g_wki.peer_hash[next].node_id != WKI_NODE_INVALID) {
+                auto displaced = g_wki.peer_hash[next];
+                g_wki.peer_hash[next].node_id = WKI_NODE_INVALID;
+                g_wki.peer_hash[next].peer_idx = -1;
+                peer_hash_insert(displaced.node_id, displaced.peer_idx);
+                next = (next + 1) & (WKI_PEER_HASH_SIZE - 1);
+            }
+            return;
+        }
+        if (entry.node_id == WKI_NODE_INVALID) {
+            return;  // not found
+        }
+    }
+}
+
+}  // namespace
+
 auto wki_peer_find(uint16_t node_id) -> WkiPeer* {
-    for (auto& peer : g_wki.peers) {
-        if (peer.node_id == node_id && peer.state != PeerState::UNKNOWN) {
-            return &peer;
+    uint8_t slot = peer_hash_slot(node_id);
+    for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
+        auto& entry = g_wki.peer_hash[(slot + probe) & (WKI_PEER_HASH_SIZE - 1)];
+        if (entry.node_id == node_id) {
+            return &g_wki.peers[entry.peer_idx];
+        }
+        if (entry.node_id == WKI_NODE_INVALID) {
+            return nullptr;
         }
     }
     return nullptr;
@@ -245,12 +295,13 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer* {
     }
 
     // Find an empty slot
-    for (auto& peer : g_wki.peers) {
-        if (peer.node_id == WKI_NODE_INVALID) {
-            new (&peer) WkiPeer();  // placement new to reset
-            peer.node_id = node_id;
+    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
+        if (g_wki.peers[i].node_id == WKI_NODE_INVALID) {
+            new (&g_wki.peers[i]) WkiPeer();  // placement new to reset
+            g_wki.peers[i].node_id = node_id;
             g_wki.peer_count++;
-            return &peer;
+            peer_hash_insert(node_id, static_cast<int16_t>(i));
+            return &g_wki.peers[i];
         }
     }
     return nullptr;  // peer table full
@@ -259,12 +310,11 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer* {
 auto wki_peer_count() -> uint16_t { return g_wki.peer_count; }
 
 // -----------------------------------------------------------------------------
-// Channel management
+// Channel management — per-peer O(1) lookup via peer->channels[channel_id]
 // -----------------------------------------------------------------------------
 
-// Per-peer channel storage: each peer has an inline array of channels
-// We use a simple approach — channels are stored in a flat pool keyed by
-// (peer_index, channel_id). For Phase 1, we use a global flat array.
+// Channels are allocated from a contiguous flat pool (cache-friendly) but
+// indexed via per-peer pointer arrays for O(1) lookup without global locks.
 
 constexpr size_t CHANNEL_POOL_SIZE = 1024;
 namespace {
@@ -282,130 +332,146 @@ void channel_pool_init() {
     s_channel_pool_init = true;
 }
 
+// Free a retransmit entry — checks whether it's the inline pre-allocated entry
+// (part of the channel struct) or a heap-allocated fallback, and acts accordingly.
+void rt_entry_free(WkiChannel* ch, WkiRetransmitEntry* rt) {
+    if (rt == &ch->tx_rt_entry) {
+        // Inline entry: just mark as available, don't free memory
+        ch->tx_rt_entry_in_use = false;
+    } else {
+        // Heap-allocated fallback
+        ker::mod::mm::dyn::kmalloc::free(rt->data);
+        ker::mod::mm::dyn::kmalloc::free(rt);
+    }
+}
+
+// Initialize a freshly allocated channel with default values
+void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, PriorityClass prio, uint16_t credits) {
+    ch->channel_id = chan_id;
+    ch->peer_node_id = peer_node;
+    ch->priority = prio;
+    ch->active = true;
+    ch->tx_seq = 0;
+    ch->tx_ack = 0;
+    ch->rx_seq = 0;
+    ch->rx_ack_pending = 0;
+    ch->ack_pending = false;
+    ch->tx_credits = credits;
+    ch->rx_credits = credits;
+    ch->retransmit_head = nullptr;
+    ch->retransmit_tail = nullptr;
+    ch->retransmit_count = 0;
+    ch->reorder_head = nullptr;
+    ch->reorder_count = 0;
+    ch->dup_ack_count = 0;
+    ch->rto_us = WKI_INITIAL_RTO_US;
+    ch->srtt_us = 0;
+    ch->rttvar_us = 0;
+    ch->bytes_sent = 0;
+    ch->bytes_received = 0;
+    ch->retransmits = 0;
+    ch->tx_rt_entry_in_use = false;
+}
+
+// Allocate a pool slot and register in peer->channels[].
+// Caller must hold s_channel_pool_lock.
+auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id,
+                        PriorityClass prio, uint16_t credits) -> WkiChannel* {
+    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
+        if (!s_channel_pool[i].active) {
+            WkiChannel* ch = &s_channel_pool[i];
+            channel_init(ch, peer_node, chan_id, prio, credits);
+            peer->channels[chan_id] = ch;
+            return ch;
+        }
+    }
+    return nullptr;
+}
+
+auto default_credits_for_channel(uint16_t channel_id) -> uint16_t {
+    switch (channel_id) {
+        case WKI_CHAN_CONTROL: return WKI_CREDITS_CONTROL;
+        case WKI_CHAN_ZONE_MGMT: return WKI_CREDITS_ZONE_MGMT;
+        case WKI_CHAN_EVENT_BUS: return WKI_CREDITS_EVENT_BUS;
+        case WKI_CHAN_RESOURCE: return WKI_CREDITS_RESOURCE;
+        default: return WKI_CREDITS_DYNAMIC;
+    }
+}
+
+auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
+    return (channel_id <= WKI_CHAN_RESOURCE) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
+}
+
 }  // namespace
 
 auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel* {
     channel_pool_init();
 
-    s_channel_pool_lock.lock();
+    if (channel_id >= WKI_MAX_CHANNELS) {
+        return nullptr;
+    }
 
-    // Search for existing
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (s_channel_pool[i].active && s_channel_pool[i].peer_node_id == peer_node && s_channel_pool[i].channel_id == channel_id) {
-            s_channel_pool_lock.unlock();
-            return &s_channel_pool[i];
+    // Fast path: O(1) lookup via peer->channels[]
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer != nullptr) {
+        WkiChannel* ch = peer->channels[channel_id];
+        if (ch != nullptr && ch->active) {
+            return ch;
         }
     }
 
-    // Create a new one for well-known channels OR dynamic channels
-    // Dynamic channels are auto-created on first receive to support asymmetric allocation
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (!s_channel_pool[i].active) {
-            WkiChannel* ch = &s_channel_pool[i];
-            ch->channel_id = channel_id;
-            ch->peer_node_id = peer_node;
-            ch->active = true;
-            ch->tx_seq = 0;
-            ch->tx_ack = 0;
-            ch->rx_seq = 0;
-            ch->rx_ack_pending = 0;
-            ch->ack_pending = false;
-            ch->retransmit_head = nullptr;
-            ch->retransmit_tail = nullptr;
-            ch->retransmit_count = 0;
-            ch->reorder_head = nullptr;
-            ch->reorder_count = 0;
-            ch->dup_ack_count = 0;
-            ch->bytes_sent = 0;
-            ch->bytes_received = 0;
-            ch->retransmits = 0;
-            ch->rto_us = WKI_INITIAL_RTO_US;
-            ch->srtt_us = 0;
-            ch->rttvar_us = 0;
+    // Slow path: allocate a new channel from the global pool
+    s_channel_pool_lock.lock();
 
-            // Assign default credits based on channel
-            switch (channel_id) {
-                case WKI_CHAN_CONTROL:
-                    ch->tx_credits = WKI_CREDITS_CONTROL;
-                    break;
-                case WKI_CHAN_ZONE_MGMT:
-                    ch->tx_credits = WKI_CREDITS_ZONE_MGMT;
-                    break;
-                case WKI_CHAN_EVENT_BUS:
-                    ch->tx_credits = WKI_CREDITS_EVENT_BUS;
-                    break;
-                case WKI_CHAN_RESOURCE:
-                    ch->tx_credits = WKI_CREDITS_RESOURCE;
-                    break;
-                default:
-                    ch->tx_credits = WKI_CREDITS_DYNAMIC;
-                    break;
-            }
-            ch->rx_credits = ch->tx_credits;
-
-            // Priority
-            if (channel_id <= WKI_CHAN_RESOURCE) {
-                ch->priority = PriorityClass::LATENCY;
-            } else {
-                ch->priority = PriorityClass::THROUGHPUT;
-            }
-
+    // Re-check under lock (another CPU may have allocated while we were unlocked)
+    if (peer != nullptr) {
+        WkiChannel* ch = peer->channels[channel_id];
+        if (ch != nullptr && ch->active) {
             s_channel_pool_lock.unlock();
             return ch;
         }
     }
 
+    // Need peer for per-peer index; if peer doesn't exist yet, fall back
+    if (peer == nullptr) {
+        s_channel_pool_lock.unlock();
+        return nullptr;
+    }
+
+    uint16_t credits = default_credits_for_channel(channel_id);
+    PriorityClass prio = default_priority_for_channel(channel_id);
+
+    WkiChannel* ch = channel_pool_alloc(peer, peer_node, channel_id, prio, credits);
     s_channel_pool_lock.unlock();
-    return nullptr;
+    return ch;
 }
 
 auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel* {
     channel_pool_init();
 
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer == nullptr) {
+        return nullptr;
+    }
+
     s_channel_pool_lock.lock();
 
-    // Find next free dynamic channel ID for this peer
+    // Find next free dynamic channel ID for this peer via per-peer array
     uint16_t next_id = WKI_CHAN_DYNAMIC_BASE;
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (s_channel_pool[i].active && s_channel_pool[i].peer_node_id == peer_node && s_channel_pool[i].channel_id >= next_id) {
-            next_id = s_channel_pool[i].channel_id + 1;
+    for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_MAX_CHANNELS; i++) {
+        if (peer->channels[i] != nullptr && peer->channels[i]->active) {
+            next_id = i + 1;
         }
     }
 
-    // Find a free slot
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (!s_channel_pool[i].active) {
-            WkiChannel* ch = &s_channel_pool[i];
-            ch->channel_id = next_id;
-            ch->peer_node_id = peer_node;
-            ch->priority = priority;
-            ch->active = true;
-            ch->tx_seq = 0;
-            ch->tx_ack = 0;
-            ch->rx_seq = 0;
-            ch->rx_ack_pending = 0;
-            ch->ack_pending = false;
-            ch->tx_credits = WKI_CREDITS_DYNAMIC;
-            ch->rx_credits = WKI_CREDITS_DYNAMIC;
-            ch->retransmit_head = nullptr;
-            ch->retransmit_tail = nullptr;
-            ch->retransmit_count = 0;
-            ch->reorder_head = nullptr;
-            ch->reorder_count = 0;
-            ch->dup_ack_count = 0;
-            ch->rto_us = WKI_INITIAL_RTO_US;
-            ch->srtt_us = 0;
-            ch->rttvar_us = 0;
-            ch->bytes_sent = 0;
-            ch->bytes_received = 0;
-            ch->retransmits = 0;
-            s_channel_pool_lock.unlock();
-            return ch;
-        }
+    if (next_id >= WKI_MAX_CHANNELS) {
+        s_channel_pool_lock.unlock();
+        return nullptr;
     }
 
+    WkiChannel* ch = channel_pool_alloc(peer, peer_node, next_id, priority, WKI_CREDITS_DYNAMIC);
     s_channel_pool_lock.unlock();
-    return nullptr;
+    return ch;
 }
 
 void wki_channel_close(WkiChannel* ch) {
@@ -419,8 +485,7 @@ void wki_channel_close(WkiChannel* ch) {
     WkiRetransmitEntry* rt = ch->retransmit_head;
     while (rt != nullptr) {
         WkiRetransmitEntry* next = rt->next;
-        ker::mod::mm::dyn::kmalloc::free(rt->data);
-        ker::mod::mm::dyn::kmalloc::free(rt);
+        rt_entry_free(ch, rt);
         rt = next;
     }
 
@@ -433,16 +498,24 @@ void wki_channel_close(WkiChannel* ch) {
         ro = next;
     }
 
+    // Clear per-peer index entry
+    WkiPeer* peer = wki_peer_find(ch->peer_node_id);
+    if (peer != nullptr && ch->channel_id < WKI_MAX_CHANNELS) {
+        peer->channels[ch->channel_id] = nullptr;
+    }
+
     ch->active = false;
     ch->lock.unlock();
 }
 
 void wki_channels_close_for_peer(uint16_t node_id) {
     channel_pool_init();
+
+    WkiPeer* peer = wki_peer_find(node_id);
+
     s_channel_pool_lock.lock();
     for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
         if (s_channel_pool[i].active && s_channel_pool[i].peer_node_id == node_id) {
-            // Close channel while holding pool lock to prevent reallocation during cleanup
             WkiChannel* ch = &s_channel_pool[i];
             ch->lock.lock();
 
@@ -450,8 +523,7 @@ void wki_channels_close_for_peer(uint16_t node_id) {
             WkiRetransmitEntry* rt = ch->retransmit_head;
             while (rt != nullptr) {
                 WkiRetransmitEntry* next = rt->next;
-                ker::mod::mm::dyn::kmalloc::free(rt->data);
-                ker::mod::mm::dyn::kmalloc::free(rt);
+                rt_entry_free(ch, rt);
                 rt = next;
             }
 
@@ -472,6 +544,11 @@ void wki_channels_close_for_peer(uint16_t node_id) {
         }
     }
     s_channel_pool_lock.unlock();
+
+    // Clear all per-peer channel pointers
+    if (peer != nullptr) {
+        peer->channels.fill(nullptr);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -580,14 +657,43 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         memcpy(frame + WKI_HEADER_SIZE, payload, payload_len);
     }
 
-    // Compute CRC32 over header (with checksum=0) + payload
-    hdr->checksum = wki_crc32(frame, frame_len);
+    // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
+    WkiPeer* peer = wki_peer_find(dst_node);
+    if (peer != nullptr && peer->is_direct) {
+        hdr->checksum = 0;
+    } else {
+        hdr->checksum = wki_crc32(frame, frame_len);
+    }
 
-    int ret = transport->tx(transport, dst_node == WKI_NODE_BROADCAST ? WKI_NODE_BROADCAST : next_hop, frame, frame_len);
+    int ret;
+
+    if (dst_node == WKI_NODE_BROADCAST) {
+        // Broadcast on ALL registered transports so that peers reachable on
+        // different L2 networks (e.g. data bridge vs WKI bridge) all receive
+        // the HELLO / broadcast message.
+        ret = WKI_ERR_NO_ROUTE;
+        g_wki.transport_lock.lock();
+        WkiTransport* t = g_wki.transports;
+        while (t != nullptr) {
+            int r = t->tx(t, WKI_NODE_BROADCAST, frame, frame_len);
+            if (r >= 0) {
+                ret = WKI_OK;
+            }
+            t = t->next;
+        }
+        g_wki.transport_lock.unlock();
+    } else {
+        ret = transport->tx(transport, next_hop, frame, frame_len);
+        if (ret < 0) {
+            ret = WKI_ERR_TX_FAILED;
+        } else {
+            ret = WKI_OK;
+        }
+    }
 
     delete[] frame;
 
-    return ret < 0 ? WKI_ERR_TX_FAILED : WKI_OK;
+    return ret;
 }
 
 // -----------------------------------------------------------------------------
@@ -612,32 +718,36 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         return WKI_ERR_NO_MEM;
     }
 
-    ch->lock.lock();
-
-    // Check credits
-    if (ch->tx_credits == 0) {
-        ch->lock.unlock();
-        return WKI_ERR_NO_CREDITS;
-    }
-
     WkiTransport* transport = find_transport_for_peer(dst_node);
     if (transport == nullptr) {
-        ch->lock.unlock();
         return WKI_ERR_NO_ROUTE;
     }
 
     uint16_t next_hop = resolve_next_hop(dst_node);
     if (next_hop == WKI_NODE_INVALID) {
-        ch->lock.unlock();
         return WKI_ERR_NO_ROUTE;
     }
 
-    // Build frame
+    // Zero-copy TX: allocate PacketBuffer up front and build the WKI frame
+    // directly in pkt->data, avoiding the extra memcpy in eth_wki_tx().
+    // pkt_alloc() sets data = storage + PKT_HEADROOM (64 bytes), leaving room
+    // for eth_tx() to prepend the 14-byte Ethernet header via push().
     uint16_t frame_len = WKI_HEADER_SIZE + payload_len;
-    auto* frame = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(frame_len));
-    if (frame == nullptr) {
-        ch->lock.unlock();
+    net::PacketBuffer* pkt = net::pkt_alloc();
+    if (pkt == nullptr) {
         return WKI_ERR_NO_MEM;
+    }
+
+    // Build frame directly in packet buffer data region
+    uint8_t* frame = pkt->data;
+
+    ch->lock.lock();
+
+    // Check credits
+    if (ch->tx_credits == 0) {
+        ch->lock.unlock();
+        net::pkt_free(pkt);
+        return WKI_ERR_NO_CREDITS;
     }
 
     uint8_t flags = 0;
@@ -668,35 +778,56 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         memcpy(frame + WKI_HEADER_SIZE, payload, payload_len);
     }
 
-    // Compute CRC32 over header (with checksum=0) + payload
-    hdr->checksum = wki_crc32(frame, frame_len);
+    pkt->len = frame_len;
 
-    // Queue for retransmit
-    auto* rt_entry = static_cast<WkiRetransmitEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiRetransmitEntry)));
+    // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
+    if (peer->is_direct) {
+        hdr->checksum = 0;  // RX path skips validation when checksum == 0
+    } else {
+        hdr->checksum = wki_crc32(frame, frame_len);
+    }
+
+    // Queue for retransmit — use inline entry if available, else kmalloc
+    WkiRetransmitEntry* rt_entry = nullptr;
+    uint8_t* rt_data = nullptr;
+
+    if (!ch->tx_rt_entry_in_use && frame_len <= WkiChannel::WKI_RT_INLINE_SIZE) {
+        // Fast path: use pre-allocated inline buffers (fits small frames)
+        rt_entry = &ch->tx_rt_entry;
+        rt_data = ch->tx_rt_buf.data();
+        ch->tx_rt_entry_in_use = true;
+    } else {
+        // Slow path: frame too large for inline buffer or multiple in-flight
+        rt_entry = static_cast<WkiRetransmitEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiRetransmitEntry)));
+        if (rt_entry != nullptr) {
+            rt_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(frame_len));
+            if (rt_data == nullptr) {
+                ker::mod::mm::dyn::kmalloc::free(rt_entry);
+                rt_entry = nullptr;
+            }
+        }
+    }
+
     if (rt_entry != nullptr) {
-        rt_entry->data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(frame_len));
-        if (rt_entry->data != nullptr) {
-            memcpy(rt_entry->data, frame, frame_len);
-            rt_entry->len = frame_len;
-            rt_entry->seq = ch->tx_seq;
-            rt_entry->send_time_us = wki_now_us();
-            rt_entry->retries = 0;
-            rt_entry->next = nullptr;
+        memcpy(rt_data, frame, frame_len);
+        rt_entry->data = rt_data;
+        rt_entry->len = frame_len;
+        rt_entry->seq = ch->tx_seq;
+        rt_entry->send_time_us = wki_now_us();
+        rt_entry->retries = 0;
+        rt_entry->next = nullptr;
 
-            if (ch->retransmit_tail != nullptr) {
-                ch->retransmit_tail->next = rt_entry;
-            } else {
-                ch->retransmit_head = rt_entry;
-            }
-            ch->retransmit_tail = rt_entry;
-            ch->retransmit_count++;
-
-            // Set retransmit deadline
-            if (ch->retransmit_count == 1) {
-                ch->retransmit_deadline = rt_entry->send_time_us + ch->rto_us;
-            }
+        if (ch->retransmit_tail != nullptr) {
+            ch->retransmit_tail->next = rt_entry;
         } else {
-            ker::mod::mm::dyn::kmalloc::free(rt_entry);
+            ch->retransmit_head = rt_entry;
+        }
+        ch->retransmit_tail = rt_entry;
+        ch->retransmit_count++;
+
+        // Set retransmit deadline
+        if (ch->retransmit_count == 1) {
+            ch->retransmit_deadline = rt_entry->send_time_us + ch->rto_us;
         }
     }
 
@@ -716,9 +847,10 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
     ch->lock.unlock();
 
-    // Transmit
-    int ret = transport->tx(transport, next_hop, frame, frame_len);
-    ker::mod::mm::dyn::kmalloc::free(frame);
+    // Zero-copy transmit: pkt already has the WKI frame at pkt->data,
+    // transport just prepends link header and sends.  Transport takes
+    // ownership of pkt (frees on error).
+    int ret = transport->tx_pkt(transport, next_hop, pkt);
 
     return ret < 0 ? WKI_ERR_TX_FAILED : WKI_OK;
 }
@@ -943,8 +1075,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
                     }
 
-                    ker::mod::mm::dyn::kmalloc::free(rt->data);
-                    ker::mod::mm::dyn::kmalloc::free(rt);
+                    rt_entry_free(ch, rt);
                 }
             }
 
@@ -1067,7 +1198,43 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     ker::mod::mm::dyn::kmalloc::free(ro);
                     ch->lock.lock();
                 }
+                // For LATENCY channels, send ACK immediately instead of waiting
+                // for wki_timer_tick() (~10ms cadence).  The response message
+                // piggybacks an ACK, but the ACK of the *response itself* has
+                // no piggyback vehicle and would otherwise stall up to 10ms.
+                bool imm_ack = (ch->priority == PriorityClass::LATENCY && ch->ack_pending);
+                WkiHeader imm_ack_hdr = {};
+                uint16_t imm_ack_peer = 0;
+                if (imm_ack) {
+                    imm_ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
+                    imm_ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);
+                    imm_ack_hdr.src_node = g_wki.my_node_id;
+                    imm_ack_hdr.dst_node = ch->peer_node_id;
+                    imm_ack_hdr.channel_id = ch->channel_id;
+                    imm_ack_hdr.seq_num = 0;
+                    imm_ack_hdr.ack_num = ch->rx_ack_pending;
+                    imm_ack_hdr.payload_len = 0;
+                    imm_ack_hdr.credits = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
+                    imm_ack_hdr.hop_ttl = WKI_DEFAULT_TTL;
+                    imm_ack_hdr.checksum = 0;
+                    imm_ack_hdr.reserved = 0;
+                    imm_ack_peer = ch->peer_node_id;
+                    ch->ack_pending = false;
+                    ch->dup_ack_count = 0;
+                }
+
                 ch->lock.unlock();
+
+                // TX outside the lock to avoid deadlock with RX interrupt
+                if (imm_ack) {
+                    WkiTransport* transport = find_transport_for_peer(imm_ack_peer);
+                    if (transport != nullptr) {
+                        uint16_t next_hop = resolve_next_hop(imm_ack_peer);
+                        if (next_hop != WKI_NODE_INVALID) {
+                            transport->tx(transport, next_hop, &imm_ack_hdr, WKI_HEADER_SIZE);
+                        }
+                    }
+                }
 
             } else if (seq_after(hdr->seq_num, ch->rx_seq)) {
                 // Out-of-order: buffer in reorder queue, send dup ACK
@@ -1110,6 +1277,104 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             return;
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Single-channel timer tick (used by wki_spin_yield_channel)
+// -----------------------------------------------------------------------------
+
+namespace {
+
+void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
+    if (ch == nullptr || !ch->active) {
+        return;
+    }
+
+    uint8_t* retransmit_data = nullptr;
+    uint16_t retransmit_len = 0;
+    uint16_t retransmit_peer = 0;
+    bool do_retransmit = false;
+
+    WkiHeader ack_hdr = {};
+    uint16_t ack_peer = 0;
+    bool do_ack = false;
+
+    ch->lock.lock();
+
+    if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
+        WkiRetransmitEntry* rt = ch->retransmit_head;
+
+        retransmit_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rt->len));
+        if (retransmit_data != nullptr) {
+            memcpy(retransmit_data, rt->data, rt->len);
+            retransmit_len = rt->len;
+            retransmit_peer = ch->peer_node_id;
+            do_retransmit = true;
+
+            rt->retries++;
+            rt->send_time_us = now_us;
+            ch->retransmits++;
+
+            ch->rto_us *= 2;
+            ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
+        }
+
+        ch->retransmit_deadline = now_us + ch->rto_us;
+    }
+
+    if (ch->ack_pending) {
+        ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
+        ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);
+        ack_hdr.src_node = g_wki.my_node_id;
+        ack_hdr.dst_node = ch->peer_node_id;
+        ack_hdr.channel_id = ch->channel_id;
+        ack_hdr.seq_num = 0;
+        ack_hdr.ack_num = ch->rx_ack_pending;
+        ack_hdr.payload_len = 0;
+        ack_hdr.credits = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
+        ack_hdr.hop_ttl = WKI_DEFAULT_TTL;
+        ack_hdr.checksum = 0;
+        ack_hdr.reserved = 0;
+        ack_peer = ch->peer_node_id;
+        do_ack = true;
+
+        ch->ack_pending = false;
+        ch->dup_ack_count = 0;
+    }
+
+    ch->lock.unlock();
+
+    if (do_retransmit) {
+        WkiTransport* transport = find_transport_for_peer(retransmit_peer);
+        if (transport != nullptr) {
+            uint16_t next_hop = resolve_next_hop(retransmit_peer);
+            if (next_hop != WKI_NODE_INVALID) {
+                transport->tx(transport, next_hop, retransmit_data, retransmit_len);
+            }
+        }
+        ker::mod::mm::dyn::kmalloc::free(retransmit_data);
+    }
+
+    if (do_ack) {
+        WkiTransport* transport = find_transport_for_peer(ack_peer);
+        if (transport != nullptr) {
+            uint16_t next_hop = resolve_next_hop(ack_peer);
+            if (next_hop != WKI_NODE_INVALID) {
+                transport->tx(transport, next_hop, &ack_hdr, WKI_HEADER_SIZE);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void wki_spin_yield_channel(WkiChannel* ch) {
+    net::NetDevice* dev = wki_eth_get_netdev();
+    if (dev != nullptr) {
+        net::napi_poll_inline(dev);
+    }
+
+    wki_timer_tick_single(ch, wki_now_us());
 }
 
 // -----------------------------------------------------------------------------

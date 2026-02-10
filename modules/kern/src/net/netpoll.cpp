@@ -19,7 +19,7 @@ ker::mod::sys::Spinlock g_registry_lock;
 
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
-    auto* current = ker::mod::sched::getCurrentTask();
+    auto* current = ker::mod::sched::get_current_task();
     for (size_t i = 0; i < g_napi_count; ++i) {
         if (g_napi_registry[i] != nullptr && g_napi_registry[i]->worker == current) {
             return g_napi_registry[i];
@@ -65,7 +65,7 @@ void unregister_napi(NapiStruct* napi) {
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
             // No work - atomically enable interrupts and halt
-            asm volatile("sti\nhlt" ::: "memory");
+            ker::mod::sched::kern_yield();
             continue;
         }
 
@@ -141,6 +141,9 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
 }
 
 void napi_enable(NapiStruct* napi) {
+    // Set direct pointer for lock-free inline poll lookup
+    napi->dev->napi = napi;
+
     // Register in global registry first (so worker can find it)
     register_napi(napi);
 
@@ -162,7 +165,7 @@ void napi_enable(NapiStruct* napi) {
     }
 
     // Schedule the worker thread
-    ker::mod::sched::postTaskBalanced(napi->worker);
+    ker::mod::sched::post_task_balanced(napi->worker);
 
     // Transition to IDLE state (ready to receive IRQs)
     napi->state.store(NapiState::IDLE, std::memory_order_release);
@@ -191,6 +194,9 @@ void napi_disable(NapiStruct* napi) {
     // Unregister from global registry
     unregister_napi(napi);
 
+    // Clear direct pointer
+    napi->dev->napi = nullptr;
+
     ker::mod::dbg::log("netpoll: disabled for %s", napi->dev->name.data());
 }
 
@@ -212,7 +218,7 @@ bool napi_schedule(NapiStruct* napi) {
     // worker is the currentTask on its CPU (just halted), so the scheduler
     // sees it as "already running" and aborts.
     if (napi->worker != nullptr) {
-        ker::mod::sched::wakeCpu(napi->worker->cpu);
+        ker::mod::sched::wake_cpu(napi->worker->cpu);
     }
 
     return true;
@@ -233,17 +239,8 @@ int napi_poll_inline(NetDevice* dev) {
         return 0;
     }
 
-    // Find the NapiStruct for this device
-    NapiStruct* napi = nullptr;
-    g_registry_lock.lock();
-    for (size_t i = 0; i < g_napi_count; ++i) {
-        if (g_napi_registry[i] != nullptr && g_napi_registry[i]->dev == dev) {
-            napi = g_napi_registry[i];
-            break;
-        }
-    }
-    g_registry_lock.unlock();
-
+    // Lock-free lookup via direct dev->napi pointer (set by napi_enable)
+    NapiStruct* napi = dev->napi;
     if (napi == nullptr) {
         return 0;
     }
@@ -258,19 +255,36 @@ int napi_poll_inline(NetDevice* dev) {
         }
     }
 
-    // Poll once with normal budget
+    // Poll once with normal budget.
+    // NOTE: The driver's poll function (e.g. virtio_net_poll) calls
+    // napi_complete() + re-enables IRQs internally when processed < budget.
+    // We must NOT call napi_complete() again in that case, or we corrupt
+    // the NAPI state machine — an IRQ arriving between the driver's
+    // napi_complete() and ours could schedule the worker (IDLE→SCHEDULED→
+    // POLLING), and our stale napi_complete() would yank it back to IDLE,
+    // losing packets.
     int processed = napi->poll(napi, napi->weight);
     napi->poll_count++;
 
-    // Complete — transition back to IDLE
-    napi_complete(napi);
-
-    // Clear work flag so worker doesn't spin unnecessarily
-    napi->has_work.store(false, std::memory_order_release);
-
-    // Re-check for race: if an IRQ arrived during our poll, re-arm
-    if (napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED) {
+    if (processed >= napi->weight) {
+        // Driver did NOT call napi_complete() (more work pending).
+        // Transition back to SCHEDULED so the worker can pick up the
+        // remaining work and re-enable IRQs when it's done.
+        NapiState exp = NapiState::POLLING;
+        napi->state.compare_exchange_strong(exp, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire);
         napi->has_work.store(true, std::memory_order_release);
+        if (napi->worker != nullptr) {
+            ker::mod::sched::wake_cpu(napi->worker->cpu);
+        }
+    } else {
+        // Driver already called napi_complete() and re-enabled IRQs.
+        // Clear work flag so worker doesn't spin unnecessarily.
+        napi->has_work.store(false, std::memory_order_release);
+
+        // Re-check for race: if an IRQ arrived during our poll, re-arm
+        if (napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED) {
+            napi->has_work.store(true, std::memory_order_release);
+        }
     }
 
     return processed;

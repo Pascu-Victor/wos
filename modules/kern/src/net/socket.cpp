@@ -59,13 +59,17 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
     new (&sock->rcvbuf.lock) ker::mod::sys::Spinlock();
     new (&sock->sndbuf.lock) ker::mod::sys::Spinlock();
 
+    int base_type = type & SOCK_TYPE_MASK;
+    sock->nonblock = (type & SOCK_NONBLOCK) != 0;
+
     sock->domain = domain;
-    sock->type = static_cast<uint8_t>(type);
+    sock->type = static_cast<uint8_t>(base_type);
     sock->protocol = protocol;
     sock->state = SocketState::UNBOUND;
 
     // Assign protocol-specific ops
-    if (type == 1) {  // SOCK_STREAM
+    // TODO: Extract me into enums
+    if (base_type == 1) {  // SOCK_STREAM
         sock->proto_ops = proto::get_tcp_proto_ops();
         // Allocate TCP control block
         auto* cb = proto::tcp_alloc_cb();
@@ -73,9 +77,9 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
             cb->socket = sock;
             sock->proto_data = cb;
         }
-    } else if (type == 2) {  // SOCK_DGRAM
+    } else if (base_type == 2) {  // SOCK_DGRAM
         sock->proto_ops = proto::get_udp_proto_ops();
-    } else if (type == 3) {  // SOCK_RAW
+    } else if (base_type == 3) {  // SOCK_RAW
         sock->proto_ops = proto::get_raw_proto_ops();
         // Auto-bind raw sockets to receive packets
         if (sock->proto_ops != nullptr && sock->proto_ops->bind != nullptr) {

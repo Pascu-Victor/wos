@@ -66,7 +66,7 @@ ker::vfs::FileOperations socket_fops = {
 
 // Get socket from fd using VFS helpers
 auto fd_to_socket(uint64_t fd_num) -> ker::net::Socket* {
-    auto* task = ker::mod::sched::getCurrentTask();
+    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return nullptr;
     }
@@ -81,7 +81,7 @@ auto fd_to_socket(uint64_t fd_num) -> ker::net::Socket* {
 
 // Allocate fd for a socket using VFS helpers
 auto allocate_socket_fd(ker::net::Socket* sock) -> int {
-    auto* task = ker::mod::sched::getCurrentTask();
+    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -1;
     }
@@ -143,7 +143,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             // Set owner PID so wake_socket() can find and wake this task
-            auto* task = ker::mod::sched::getCurrentTask();
+            auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
                 sock->owner_pid = task->pid;
             }
@@ -199,7 +199,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(result);
             }
             // Set owner PID on accepted socket for wake_socket()
-            auto* cur_task = ker::mod::sched::getCurrentTask();
+            auto* cur_task = ker::mod::sched::get_current_task();
             if (cur_task != nullptr) {
                 new_sock->owner_pid = cur_task->pid;
             }
@@ -532,7 +532,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto nfds = static_cast<size_t>(a2);
             auto timeout = static_cast<int>(static_cast<int64_t>(a3));
 
-            auto* task = ker::mod::sched::getCurrentTask();
+            auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
             }

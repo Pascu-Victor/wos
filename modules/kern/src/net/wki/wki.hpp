@@ -16,6 +16,15 @@ struct WkiPeer;
 struct WkiChannel;
 struct WkiTransport;
 
+}  // namespace ker::net::wki
+
+// Forward declare PacketBuffer in its own namespace for tx_pkt
+namespace ker::net {
+struct PacketBuffer;
+}  // namespace ker::net
+
+namespace ker::net::wki {
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,11 +45,11 @@ constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = 5000;  // 5 seconds after connecti
 // Jitter range for heartbeat timing (percentage of interval)
 constexpr uint8_t WKI_HEARTBEAT_JITTER_PERCENT = 25;  // +/- 25% jitter
 
-// Reliability defaults
-constexpr uint32_t WKI_INITIAL_RTO_US = 100000;    // 100 ms (conservative for VM environment)
-constexpr uint32_t WKI_MIN_RTO_US = 50000;         // 50 ms
-constexpr uint32_t WKI_MAX_RTO_US = 500000;        // 500 ms
-constexpr uint32_t WKI_ACK_DELAY_US = 1000;        // 1 ms
+// Reliability defaults (tuned for single-hop switched Ethernet, ~5-20us RTT)
+constexpr uint32_t WKI_INITIAL_RTO_US = 500;       // 500 us (Jacobson/Karels adapts to actual RTT)
+constexpr uint32_t WKI_MIN_RTO_US = 100;           // 100 us (floor: 5-10x single-hop RTT)
+constexpr uint32_t WKI_MAX_RTO_US = 50000;         // 50 ms (cap for pathological cases)
+constexpr uint32_t WKI_ACK_DELAY_US = 0;           // 0: immediate ACK on LATENCY channels
 constexpr uint8_t WKI_FAST_RETRANSMIT_THRESH = 3;  // 3 dup ACKs
 
 // Credit defaults
@@ -91,8 +100,13 @@ struct WkiTransport {
     bool rdma_capable;
     void* private_data;
 
-    // Transmit a frame to a direct neighbor
+    // Transmit a frame to a direct neighbor (copies data into a new PacketBuffer)
     int (*tx)(WkiTransport* self, uint16_t neighbor_id, const void* data, uint16_t len);
+
+    // Zero-copy transmit: caller provides a pre-built PacketBuffer with WKI
+    // frame already at pkt->data.  Transport prepends link header and sends.
+    // The transport takes ownership of pkt (frees on error).
+    int (*tx_pkt)(WkiTransport* self, uint16_t neighbor_id, ker::net::PacketBuffer* pkt);
 
     // Set the receive handler
     void (*set_rx_handler)(WkiTransport* self, WkiRxHandler handler);
@@ -152,6 +166,10 @@ struct WkiPeer {
     uint64_t hello_sent_time = 0;
     uint8_t hello_retries = 0;
 
+    // Per-peer channel index — O(1) lookup by channel_id
+    // Pointers into the global channel pool; nullptr = not allocated.
+    std::array<WkiChannel*, WKI_MAX_CHANNELS> channels = {};
+
     ker::mod::sys::Spinlock lock;
 
     WkiPeer() = default;
@@ -190,6 +208,9 @@ struct WkiReorderEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 // Channel — per-peer, per-channel reliability and flow control
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Max frame size: WKI header + max Ethernet payload
+constexpr size_t WKI_MAX_FRAME_SIZE = WKI_HEADER_SIZE + WKI_ETH_MAX_PAYLOAD;
 
 struct WkiChannel {
     uint16_t channel_id = 0;
@@ -230,12 +251,31 @@ struct WkiChannel {
     uint64_t bytes_received = 0;
     uint32_t retransmits = 0;
 
+    // Pre-allocated inline retransmit buffers — eliminates kmalloc for
+    // typical small messages (control, ACKs, small payloads).  Frames
+    // larger than WKI_RT_INLINE_SIZE fall back to kmalloc.
+    // With zero-copy TX, outgoing frames are built directly in PacketBuffer
+    // so no separate tx_frame_buf is needed.
+    static constexpr size_t WKI_RT_INLINE_SIZE = 1500;
+    std::array<uint8_t, WKI_RT_INLINE_SIZE> tx_rt_buf = {};
+    WkiRetransmitEntry tx_rt_entry = {};
+    bool tx_rt_entry_in_use = false;  // true while inline entry is in the retransmit queue
+
     ker::mod::sys::Spinlock lock;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global WKI State
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Peer hash table entry — compact open-addressing index for O(1) peer lookup.
+// The entire table fits in ~1KB (~16 cache lines).
+struct PeerHashEntry {
+    uint16_t node_id = WKI_NODE_INVALID;
+    int16_t peer_idx = -1;  // index into WkiState::peers[]
+};
+
+constexpr size_t WKI_PEER_HASH_SIZE = 256;
 
 struct WkiState {
     uint16_t my_node_id = WKI_NODE_INVALID;
@@ -246,6 +286,9 @@ struct WkiState {
     std::array<WkiPeer, WKI_MAX_PEERS> peers;
     uint16_t peer_count = 0;
     ker::mod::sys::Spinlock peer_lock;
+
+    // Peer hash index — multiplicative hash with linear probing
+    std::array<PeerHashEntry, WKI_PEER_HASH_SIZE> peer_hash = {};
 
     // Transport registry (linked list)
     WkiTransport* transports = nullptr;
@@ -347,6 +390,11 @@ auto wki_now_us() -> uint64_t;
 // incoming packets (e.g. ACKs) are processed even when the caller is busy-
 // waiting on the current CPU.  Call this instead of bare `pause` loops.
 void wki_spin_yield();
+
+// Targeted yield: like wki_spin_yield() but only checks retransmit/ACK
+// deadlines for the single channel the caller is waiting on, avoiding the
+// O(CHANNEL_POOL_SIZE) scan of wki_timer_tick().
+void wki_spin_yield_channel(WkiChannel* ch);
 
 // CRC32 checksum (used for WKI header + payload integrity)
 auto wki_crc32(const void* data, size_t len) -> uint32_t;

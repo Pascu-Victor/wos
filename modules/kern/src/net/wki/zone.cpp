@@ -11,6 +11,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <vector>
 
 namespace ker::net::wki {
@@ -184,7 +185,7 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     // Spin-wait for ACK (zone transitions to ACTIVE or back to NONE)
     uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
     while (zone->state == ZoneState::NEGOTIATING) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (zone->state != ZoneState::NEGOTIATING) {
             break;
         }
@@ -195,9 +196,6 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
             zone->zone_id = 0;
             s_zone_table_lock.unlock();
             return WKI_ERR_ZONE_TIMEOUT;
-        }
-        for (int i = 0; i < 1000; i++) {
-            asm volatile("pause" ::: "memory");
         }
     }
 
@@ -317,16 +315,13 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         // Spin-wait for response with memory fence
         uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
         while (zone->read_pending) {
-            asm volatile("mfence" ::: "memory");
+            asm volatile("pause" ::: "memory");
             if (!zone->read_pending) {
                 break;
             }
             if (wki_now_us() >= deadline) {
                 zone->read_pending = false;
                 return WKI_ERR_ZONE_TIMEOUT;
-            }
-            for (int i = 0; i < 1000; i++) {
-                asm volatile("pause" ::: "memory");
             }
         }
 
@@ -410,16 +405,13 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         // Spin-wait for ACK with memory fence
         uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
         while (zone->write_pending) {
-            asm volatile("mfence" ::: "memory");
+            asm volatile("pause" ::: "memory");
             if (!zone->write_pending) {
                 break;
             }
             if (wki_now_us() >= deadline) {
                 zone->write_pending = false;
                 return WKI_ERR_ZONE_TIMEOUT;
-            }
-            for (int i = 0; i < 1000; i++) {
-                asm volatile("pause" ::: "memory");
             }
         }
 

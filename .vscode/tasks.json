@@ -9,9 +9,7 @@
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
+                    "args": ["-c"]
                 }
             },
             "isBackground": false,
@@ -28,9 +26,7 @@
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
+                    "args": ["-c"]
                 }
             },
             "isBackground": false,
@@ -47,9 +43,7 @@
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
+                    "args": ["-c"]
                 }
             },
             "isBackground": false,
@@ -66,9 +60,7 @@
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
+                    "args": ["-c"]
                 }
             },
             "isBackground": false,
@@ -134,10 +126,7 @@
         {
             "label": "Build and Start QEMU",
             "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build WOS",
-                "Start QEMU Debug"
-            ],
+            "dependsOn": ["Build WOS", "Start QEMU Debug"],
             "problemMatcher": [],
             "group": "build"
         },
@@ -149,9 +138,7 @@
                 "cwd": "${workspaceFolder}",
                 "shell": {
                     "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
+                    "args": ["-c"]
                 }
             },
             "isBackground": true,
@@ -178,15 +165,58 @@
             "group": "build"
         },
         {
+            "label": "Start Cluster Background",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": ["-c"]
+                }
+            },
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                    "pattern": [
+                        {
+                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
+                            "file": 1,
+                            "line": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": "=== WKI Cluster:",
+                        "endsPattern": "Press Ctrl\\+C to stop all VMs"
+                    }
+                }
+            ],
+            "presentation": {
+                "reveal": "always"
+            },
+            "group": "build"
+        },
+        {
+            "label": "Start Cluster and Debug VM",
+            "dependsOrder": "parallel",
+            "dependsOn": ["Start Cluster Background", "Start QEMU Debug"],
+            "problemMatcher": [],
+            "group": "build"
+        },
+        {
+            "label": "Build and Start Cluster Debug",
+            "dependsOrder": "sequence",
+            "dependsOn": ["Build WOS", "Start Cluster and Debug VM"],
+            "problemMatcher": [],
+            "group": "build"
+        },
+        {
             "label": "Build QEMU Log Viewer",
             "type": "shell",
             "command": "cmake",
-            "args": [
-                "--build",
-                "build/tools",
-                "--target",
-                "qemu_log_viewer"
-            ],
+            "args": ["--build", "build/tools", "--target", "qemu_log_viewer"],
             "isBackground": false,
             "group": "build"
         }

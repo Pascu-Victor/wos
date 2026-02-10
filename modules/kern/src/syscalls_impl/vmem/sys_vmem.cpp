@@ -23,7 +23,7 @@ constexpr uint64_t MMAP_START = 0x0000100000000000ULL;        // mmap base - avo
 
 namespace {
 // Get the current task
-inline auto getCurrentTask() -> ker::mod::sched::task::Task* { return ker::mod::sched::getCurrentTask(); }
+inline auto getCurrentTask() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
 // Find a free virtual address range of the given size
 // Uses a simple linear search through allocated regions

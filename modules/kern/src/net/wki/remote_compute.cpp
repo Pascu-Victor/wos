@@ -116,8 +116,8 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> bool {
     if (cpu_count > 0) {
         uint16_t total_runnable = 0;
         for (uint16_t c = 0; c < cpu_count; c++) {
-            auto stats = ker::mod::sched::getRunQueueStats(c);
-            total_runnable += static_cast<uint16_t>(stats.activeTaskCount);
+            auto stats = ker::mod::sched::get_run_queue_stats(c);
+            total_runnable += static_cast<uint16_t>(stats.active_task_count);
         }
         auto pct = static_cast<uint16_t>((static_cast<uint32_t>(total_runnable) * 1000U) / cpu_count);
         local_load = std::min<uint16_t>(pct, 1000);
@@ -149,7 +149,7 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> bool {
     task->hasExited = true;
     task->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
     task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
-    ker::mod::sched::insertIntoDeadList(task);
+    ker::mod::sched::insert_into_dead_list(task);
 
     ker::mod::dbg::log("[WKI] D17: Task '%s' remotely placed on node 0x%04x (task_id=%u)", task->name, best_node, tid);
     return true;
@@ -238,12 +238,13 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
         return 0;
     }
 
-    // Spin-wait for accept/reject
+    // Spin-wait for accept/reject — targeted single-channel tick
+    WkiChannel* res_ch = wki_channel_get(target_node, WKI_CHAN_RESOURCE);
     uint64_t deadline = wki_now_us() + WKI_TASK_SUBMIT_TIMEOUT_US;
     SubmittedTask* task_ptr = &g_submitted_tasks.back();
 
     while (task_ptr->response_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!task_ptr->response_pending) {
             break;
         }
@@ -253,9 +254,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             ker::mod::dbg::log("[WKI] Task submit timeout: task_id=%u target=0x%04x", task_id, target_node);
             return 0;
         }
-        for (int i = 0; i < 1000; i++) {
-            asm volatile("pause" ::: "memory");
-        }
+        wki_spin_yield_channel(res_ch);
     }
 
     if (task_ptr->accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
@@ -280,9 +279,11 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
 
     task->complete_pending = true;
 
+    // Spin-wait for completion — targeted single-channel tick
+    WkiChannel* res_ch = wki_channel_get(task->target_node, WKI_CHAN_RESOURCE);
     uint64_t deadline = wki_now_us() + timeout_us;
     while (task->complete_pending) {
-        asm volatile("mfence" ::: "memory");
+        asm volatile("pause" ::: "memory");
         if (!task->complete_pending) {
             break;
         }
@@ -290,9 +291,7 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
             task->complete_pending = false;
             return -1;
         }
-        for (int i = 0; i < 1000; i++) {
-            asm volatile("pause" ::: "memory");
-        }
+        wki_spin_yield_channel(res_ch);
     }
 
     if (exit_status != nullptr) {
@@ -356,10 +355,10 @@ void wki_load_report_send() {
     auto* per_cpu = reinterpret_cast<uint16_t*>(&buf[sizeof(LoadReportPayload)]);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
 
     for (uint16_t c = 0; c < report_cpus; c++) {
-        auto stats = ker::mod::sched::getRunQueueStats(c);
-        auto cpu_load = static_cast<uint16_t>(stats.activeTaskCount + stats.waitQueueCount);
+        auto stats = ker::mod::sched::get_run_queue_stats(c);
+        auto cpu_load = static_cast<uint16_t>(stats.active_task_count + stats.wait_queue_count);
         per_cpu[c] = cpu_load;
-        total_runnable += static_cast<uint16_t>(stats.activeTaskCount);
+        total_runnable += static_cast<uint16_t>(stats.active_task_count);
     }
 
     report.runnable_tasks = total_runnable;
@@ -475,7 +474,7 @@ void wki_remote_compute_check_completions() {
         int32_t exit_status = -1;
         bool completed = false;
 
-        auto* task = ker::mod::sched::findTaskByPid(rt.local_pid);
+        auto* task = ker::mod::sched::find_task_by_pid(rt.local_pid);
         if (task == nullptr) {
             // Task was garbage collected — treat as exited with unknown status
             completed = true;
@@ -593,7 +592,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len) -> ExecResult {
     }
 
     // Post to scheduler
-    if (!ker::mod::sched::postTaskBalanced(new_task)) {
+    if (!ker::mod::sched::post_task_balanced(new_task)) {
         delete new_task;
         delete[] elf_buffer;
         delete output_cap;
@@ -891,7 +890,7 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         return;
     }
 
-    auto* task = ker::mod::sched::findTaskByPid(rt->local_pid);
+    auto* task = ker::mod::sched::find_task_by_pid(rt->local_pid);
     if (task != nullptr && !task->hasExited) {
         // Best-effort force-kill: transition to EXITING, set exit status, then DEAD.
         // The scheduler will skip DEAD tasks and GC will reclaim resources.

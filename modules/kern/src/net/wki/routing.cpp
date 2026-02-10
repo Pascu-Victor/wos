@@ -500,11 +500,11 @@ void wki_routing_timer_tick(uint64_t now_us) {
             continue;
         }
 
-        if (now_us - s_lsdb[i].received_time_us > max_age_us) {
-            ker::mod::dbg::log("[WKI] Aging out LSDB entry for 0x%04x", s_lsdb[i].origin_node);
-            s_lsdb[i].valid = false;
-            topology_changed = true;
-        }
+        // if (now_us - s_lsdb[i].received_time_us > max_age_us) {
+        //     ker::mod::dbg::log("[WKI] Aging out LSDB entry for 0x%04x", s_lsdb[i].origin_node);
+        //     s_lsdb[i].valid = false;
+        //     topology_changed = true;
+        // }
     }
     s_routing_lock.unlock();
 

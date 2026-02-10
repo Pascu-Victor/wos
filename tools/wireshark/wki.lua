@@ -366,6 +366,16 @@ local pf_load_free_mem = ProtoField.uint16("wki.load.free_mem_pages", "Free Memo
 -- Payload data
 local pf_payload_data = ProtoField.bytes("wki.payload", "Payload Data")
 
+-- Analysis fields (computed by dissector, not on wire)
+local pf_analysis_retransmit = ProtoField.bool("wki.analysis.retransmit", "Retransmission")
+local pf_analysis_dup_ack = ProtoField.bool("wki.analysis.dup_ack", "Duplicate ACK")
+local pf_analysis_out_of_order = ProtoField.bool("wki.analysis.out_of_order", "Out of Order")
+local pf_analysis_rtt = ProtoField.double("wki.analysis.rtt", "Round Trip Time (ms)")
+local pf_analysis_req_frame = ProtoField.framenum("wki.analysis.req_frame", "Request Frame", base.NONE, frametype.REQUEST)
+local pf_analysis_resp_frame = ProtoField.framenum("wki.analysis.resp_frame", "Response Frame", base.NONE, frametype.RESPONSE)
+local pf_analysis_resp_time = ProtoField.double("wki.analysis.response_time", "Response Time (ms)")
+local pf_analysis_credit_zero = ProtoField.bool("wki.analysis.credit_zero", "Zero Credits (Stalled)")
+
 -- Add all fields to protocol
 wki_proto.fields = {
     -- Header
@@ -407,7 +417,110 @@ wki_proto.fields = {
     pf_load_num_cpus, pf_load_runnable, pf_load_avg, pf_load_free_mem,
     -- Payload
     pf_payload_data,
+    -- Analysis
+    pf_analysis_retransmit, pf_analysis_dup_ack, pf_analysis_out_of_order,
+    pf_analysis_rtt, pf_analysis_req_frame, pf_analysis_resp_frame,
+    pf_analysis_resp_time, pf_analysis_credit_zero,
 }
+
+-- =========================================================================
+-- Analysis State (tracks seq numbers, request-response pairs, per-channel)
+-- =========================================================================
+
+-- Per-direction stream state: keyed by "src_node:dst_node:channel_id"
+-- Tracks expected next seq to detect retransmits and out-of-order
+local stream_state = {}  -- [stream_key] = { next_seq, seen_seqs={} }
+
+-- Request-response correlation: keyed by "src_node:dst_node:channel_id:seq_num"
+-- For DEV_OP_REQ (0x43) -> DEV_OP_RESP (0x44) matching
+local pending_requests = {}  -- [key] = { frame_num, timestamp, op_id }
+-- Reverse map: response frame -> request info
+local response_info = {}  -- [frame_num] = { req_frame, latency_ms, op_id }
+-- Forward map: request frame -> response info
+local request_info = {}  -- [frame_num] = { resp_frame }
+
+-- ACK tracking: keyed by "src_node:dst_node:channel_id:seq_num"
+-- When a data frame is sent, record timestamp. When ACK arrives, compute RTT.
+local sent_frames = {}  -- [key] = { frame_num, timestamp }
+local ack_rtt_info = {} -- [frame_num] = { rtt_ms }
+
+-- Per-peer statistics
+local peer_stats = {}  -- [node_id] = { tx_frames, rx_frames, tx_bytes, rx_bytes, retransmits }
+-- Per-channel statistics
+local channel_stats = {} -- [stream_key] = { msg_counts={}, total_frames, credits_zero_count }
+-- Per-operation latency tracking
+local op_latencies = {} -- [op_name] = { values={}, count, sum, min, max }
+
+-- REQ/RESP message type pairs for correlation
+local req_resp_pairs = {
+    [0x43] = 0x44,  -- DEV_OP_REQ -> DEV_OP_RESP
+    [0x40] = 0x41,  -- DEV_ATTACH_REQ -> DEV_ATTACH_ACK
+    [0x20] = 0x21,  -- ZONE_CREATE_REQ -> ZONE_CREATE_ACK
+    [0x25] = 0x26,  -- ZONE_READ_REQ -> ZONE_READ_RESP
+    [0x27] = 0x28,  -- ZONE_WRITE_REQ -> ZONE_WRITE_ACK
+    [0x50] = 0x51,  -- TASK_SUBMIT -> TASK_ACCEPT (or TASK_REJECT)
+    [0x46] = 0x47,  -- CHANNEL_OPEN -> CHANNEL_OPEN_ACK
+}
+-- Build reverse map
+local resp_req_pairs = {}
+for req, resp in pairs(req_resp_pairs) do
+    resp_req_pairs[resp] = req
+end
+-- TASK_SUBMIT can also get TASK_REJECT
+resp_req_pairs[0x52] = 0x50
+
+local function reset_analysis_state()
+    stream_state = {}
+    pending_requests = {}
+    response_info = {}
+    request_info = {}
+    sent_frames = {}
+    ack_rtt_info = {}
+    peer_stats = {}
+    channel_stats = {}
+    op_latencies = {}
+end
+
+local function ensure_peer_stats(node_id)
+    if not peer_stats[node_id] then
+        peer_stats[node_id] = {
+            tx_frames = 0, rx_frames = 0,
+            tx_bytes = 0, rx_bytes = 0,
+            retransmits = 0, rtt_sum = 0, rtt_count = 0
+        }
+    end
+    return peer_stats[node_id]
+end
+
+local function ensure_channel_stats(key)
+    if not channel_stats[key] then
+        channel_stats[key] = {
+            msg_counts = {}, total_frames = 0,
+            credits_zero_count = 0, total_bytes = 0
+        }
+    end
+    return channel_stats[key]
+end
+
+local function record_op_latency(op_name, latency_ms)
+    if not op_latencies[op_name] then
+        op_latencies[op_name] = { values = {}, count = 0, sum = 0, min = math.huge, max = 0 }
+    end
+    local entry = op_latencies[op_name]
+    table.insert(entry.values, latency_ms)
+    entry.count = entry.count + 1
+    entry.sum = entry.sum + latency_ms
+    if latency_ms < entry.min then entry.min = latency_ms end
+    if latency_ms > entry.max then entry.max = latency_ms end
+end
+
+local function compute_percentile(sorted_values, pct)
+    if #sorted_values == 0 then return 0 end
+    local idx = math.ceil(#sorted_values * pct / 100)
+    if idx < 1 then idx = 1 end
+    if idx > #sorted_values then idx = #sorted_values end
+    return sorted_values[idx]
+end
 
 -- Dissector function
 function wki_proto.dissector(buffer, pinfo, tree)
@@ -439,6 +552,138 @@ function wki_proto.dissector(buffer, pinfo, tree)
         format_node_id(dst_node),
         channel_name,
         seq_num)
+
+    -- =====================================================================
+    -- Analysis: retransmit/out-of-order detection, request-response matching
+    -- =====================================================================
+    local is_retransmit = false
+    local is_dup_ack = false
+    local is_out_of_order = false
+    local is_credit_zero = (credits == 0)
+    local matched_rtt_ms = nil
+    local matched_resp_time_ms = nil
+    local matched_req_frame = nil
+    local matched_resp_frame = nil
+
+    -- Only run analysis on first pass (not when user clicks on a packet)
+    if not pinfo.visited then
+        local fwd_key = string.format("%d:%d:%d", src_node, dst_node, channel_id)
+        local frame_num = pinfo.number
+        local timestamp = pinfo.abs_ts
+
+        -- Update peer statistics
+        local src_stats = ensure_peer_stats(src_node)
+        src_stats.tx_frames = src_stats.tx_frames + 1
+        src_stats.tx_bytes = src_stats.tx_bytes + payload_len
+        local dst_stats = ensure_peer_stats(dst_node)
+        dst_stats.rx_frames = dst_stats.rx_frames + 1
+        dst_stats.rx_bytes = dst_stats.rx_bytes + payload_len
+
+        -- Update channel statistics
+        local ch_stats = ensure_channel_stats(fwd_key)
+        ch_stats.total_frames = ch_stats.total_frames + 1
+        ch_stats.total_bytes = ch_stats.total_bytes + payload_len
+        ch_stats.msg_counts[msg_type] = (ch_stats.msg_counts[msg_type] or 0) + 1
+        if is_credit_zero then
+            ch_stats.credits_zero_count = ch_stats.credits_zero_count + 1
+        end
+
+        -- Sequence analysis: detect retransmits and out-of-order for reliable messages
+        -- (skip unreliable control messages: HELLO, HELLO_ACK, HEARTBEAT, HEARTBEAT_ACK)
+        if msg_type ~= 0x01 and msg_type ~= 0x02 and msg_type ~= 0x03 and msg_type ~= 0x04 then
+            if not stream_state[fwd_key] then
+                stream_state[fwd_key] = { next_seq = seq_num, seen_seqs = {} }
+            end
+            local state = stream_state[fwd_key]
+
+            if state.seen_seqs[seq_num] then
+                -- Already saw this seq on this stream: retransmit
+                is_retransmit = true
+                src_stats.retransmits = src_stats.retransmits + 1
+            else
+                state.seen_seqs[seq_num] = frame_num
+                if seq_num ~= state.next_seq and seq_num > 0 then
+                    -- Arrived out of order (seq > expected)
+                    if seq_num > state.next_seq then
+                        is_out_of_order = true
+                    end
+                end
+                if seq_num >= state.next_seq then
+                    state.next_seq = seq_num + 1
+                end
+            end
+
+            -- Track sent frame timestamps for RTT calculation
+            sent_frames[fwd_key .. ":" .. seq_num] = { frame_num = frame_num, timestamp = timestamp }
+        end
+
+        -- ACK processing: if ACK_PRESENT, compute RTT for the acked frame
+        if bit.band(flags, 0x08) ~= 0 then
+            -- The ACK is from src_node to dst_node, acknowledging dst_node's seq
+            -- Reverse key: original sender was dst_node -> src_node on this channel
+            local rev_key = string.format("%d:%d:%d", dst_node, src_node, channel_id)
+            local ack_sent_key = rev_key .. ":" .. ack_num
+            local original = sent_frames[ack_sent_key]
+            if original then
+                local rtt_ms = (timestamp - original.timestamp) * 1000
+                ack_rtt_info[frame_num] = { rtt_ms = rtt_ms }
+                matched_rtt_ms = rtt_ms
+                -- Update peer RTT stats
+                dst_stats.rtt_sum = dst_stats.rtt_sum + rtt_ms
+                dst_stats.rtt_count = dst_stats.rtt_count + 1
+            end
+        end
+
+        -- Request-Response correlation
+        if req_resp_pairs[msg_type] then
+            -- This is a request message, record it
+            local op_id = nil
+            if (msg_type == 0x43 or msg_type == 0x44) and payload_len >= 2 then
+                op_id = buffer(WKI_HEADER_SIZE, 2):le_uint()
+            end
+            -- Key: responder will send from dst_node to src_node on same channel
+            local resp_key = string.format("%d:%d:%d:%d", dst_node, src_node, channel_id, msg_type)
+            pending_requests[resp_key] = {
+                frame_num = frame_num, timestamp = timestamp, op_id = op_id
+            }
+        elseif resp_req_pairs[msg_type] then
+            -- This is a response, find the matching request
+            local req_type = resp_req_pairs[msg_type]
+            local req_key = string.format("%d:%d:%d:%d", src_node, dst_node, channel_id, req_type)
+            local req = pending_requests[req_key]
+            if req then
+                local latency_ms = (timestamp - req.timestamp) * 1000
+                response_info[frame_num] = {
+                    req_frame = req.frame_num, latency_ms = latency_ms, op_id = req.op_id
+                }
+                request_info[req.frame_num] = { resp_frame = frame_num }
+                matched_resp_time_ms = latency_ms
+                matched_req_frame = req.frame_num
+
+                -- Record per-operation latency
+                local op_name = msg_types[req_type] or "UNKNOWN"
+                if req.op_id then
+                    op_name = op_ids[req.op_id] or string.format("OP_0x%04X", req.op_id)
+                end
+                record_op_latency(op_name, latency_ms)
+
+                pending_requests[req_key] = nil  -- consumed
+            end
+        end
+    else
+        -- Visited: retrieve cached analysis results
+        local frame_num = pinfo.number
+        if ack_rtt_info[frame_num] then
+            matched_rtt_ms = ack_rtt_info[frame_num].rtt_ms
+        end
+        if response_info[frame_num] then
+            matched_resp_time_ms = response_info[frame_num].latency_ms
+            matched_req_frame = response_info[frame_num].req_frame
+        end
+        if request_info[frame_num] then
+            matched_resp_frame = request_info[frame_num].resp_frame
+        end
+    end
 
     -- Add to tree
     local subtree = tree:add(wki_proto, buffer(), "WKI Protocol")
@@ -473,6 +718,54 @@ function wki_proto.dissector(buffer, pinfo, tree)
     hdr_tree:add_le(pf_dst_port, buffer(22, 2))
     hdr_tree:add_le(pf_checksum, buffer(24, 4))
     hdr_tree:add_le(pf_reserved, buffer(28, 4))
+
+    -- Analysis subtree
+    local has_analysis = is_retransmit or is_dup_ack or is_out_of_order or
+                         matched_rtt_ms or matched_resp_time_ms or
+                         matched_req_frame or matched_resp_frame or is_credit_zero
+    if has_analysis then
+        local analysis_tree = subtree:add(wki_proto, buffer(0, 0), "Analysis")
+        if is_retransmit then
+            local item = analysis_tree:add(pf_analysis_retransmit, true)
+            item:set_generated(true)
+            item:add_expert_info(PI_SEQUENCE, PI_NOTE, "WKI retransmission detected")
+            pinfo.cols.info:append(" [Retransmission]")
+        end
+        if is_dup_ack then
+            local item = analysis_tree:add(pf_analysis_dup_ack, true)
+            item:set_generated(true)
+        end
+        if is_out_of_order then
+            local item = analysis_tree:add(pf_analysis_out_of_order, true)
+            item:set_generated(true)
+            item:add_expert_info(PI_SEQUENCE, PI_WARN, "WKI out-of-order packet")
+            pinfo.cols.info:append(" [Out-of-Order]")
+        end
+        if matched_rtt_ms then
+            local item = analysis_tree:add(pf_analysis_rtt, matched_rtt_ms)
+            item:set_generated(true)
+            item:append_text(string.format(" (%.3f ms)", matched_rtt_ms))
+        end
+        if matched_req_frame then
+            local item = analysis_tree:add(pf_analysis_req_frame, matched_req_frame)
+            item:set_generated(true)
+        end
+        if matched_resp_frame then
+            local item = analysis_tree:add(pf_analysis_resp_frame, matched_resp_frame)
+            item:set_generated(true)
+        end
+        if matched_resp_time_ms then
+            local item = analysis_tree:add(pf_analysis_resp_time, matched_resp_time_ms)
+            item:set_generated(true)
+            item:append_text(string.format(" (%.3f ms)", matched_resp_time_ms))
+            pinfo.cols.info:append(string.format(" [RTT=%.3fms]", matched_resp_time_ms))
+        end
+        if is_credit_zero then
+            local item = analysis_tree:add(pf_analysis_credit_zero, true)
+            item:set_generated(true)
+            item:add_expert_info(PI_SEQUENCE, PI_WARN, "Zero credits - sender may be stalled")
+        end
+    end
 
     -- Parse payload based on message type
     if payload_len > 0 and length >= WKI_HEADER_SIZE + payload_len then
@@ -755,6 +1048,136 @@ function wki_proto.dissector(buffer, pinfo, tree)
     return length
 end
 
+-- =========================================================================
+-- Statistics Window (Statistics -> WKI Protocol Statistics)
+-- =========================================================================
+
+local function show_wki_statistics()
+    local win = TextWindow.new("WKI Protocol Statistics")
+    local lines = {}
+
+    -- Header
+    table.insert(lines, "=" .. string.rep("=", 78))
+    table.insert(lines, "  WKI Protocol Statistics")
+    table.insert(lines, "=" .. string.rep("=", 78))
+
+    -- Per-Peer Statistics
+    table.insert(lines, "")
+    table.insert(lines, "--- Per-Peer Summary ---")
+    table.insert(lines, string.format("  %-12s %8s %8s %10s %10s %8s %10s",
+        "Node", "TX Frm", "RX Frm", "TX Bytes", "RX Bytes", "Retrans", "Avg RTT"))
+    table.insert(lines, "  " .. string.rep("-", 72))
+
+    local sorted_peers = {}
+    for node_id, _ in pairs(peer_stats) do
+        table.insert(sorted_peers, node_id)
+    end
+    table.sort(sorted_peers)
+
+    for _, node_id in ipairs(sorted_peers) do
+        local s = peer_stats[node_id]
+        local avg_rtt = s.rtt_count > 0 and string.format("%.3f ms", s.rtt_sum / s.rtt_count) or "N/A"
+        table.insert(lines, string.format("  %-12s %8d %8d %10d %10d %8d %10s",
+            format_node_id(node_id), s.tx_frames, s.rx_frames,
+            s.tx_bytes, s.rx_bytes, s.retransmits, avg_rtt))
+    end
+
+    -- Per-Channel Statistics
+    table.insert(lines, "")
+    table.insert(lines, "--- Per-Channel Summary ---")
+    table.insert(lines, string.format("  %-30s %8s %10s %8s",
+        "Stream (src:dst:ch)", "Frames", "Bytes", "Cred=0"))
+    table.insert(lines, "  " .. string.rep("-", 60))
+
+    local sorted_channels = {}
+    for key, _ in pairs(channel_stats) do
+        table.insert(sorted_channels, key)
+    end
+    table.sort(sorted_channels)
+
+    for _, key in ipairs(sorted_channels) do
+        local s = channel_stats[key]
+        table.insert(lines, string.format("  %-30s %8d %10d %8d",
+            key, s.total_frames, s.total_bytes, s.credits_zero_count))
+        -- Show message type breakdown
+        local sorted_types = {}
+        for mt, _ in pairs(s.msg_counts) do
+            table.insert(sorted_types, mt)
+        end
+        table.sort(sorted_types)
+        for _, mt in ipairs(sorted_types) do
+            local mt_name = msg_types[mt] or string.format("0x%02X", mt)
+            table.insert(lines, string.format("    %-26s %8d", mt_name, s.msg_counts[mt]))
+        end
+    end
+
+    -- Per-Operation Latency Statistics
+    table.insert(lines, "")
+    table.insert(lines, "--- Request-Response Latency ---")
+    table.insert(lines, string.format("  %-20s %8s %10s %10s %10s %10s %10s",
+        "Operation", "Count", "Avg (ms)", "Min (ms)", "p50 (ms)", "p99 (ms)", "Max (ms)"))
+    table.insert(lines, "  " .. string.rep("-", 82))
+
+    local sorted_ops = {}
+    for op_name, _ in pairs(op_latencies) do
+        table.insert(sorted_ops, op_name)
+    end
+    table.sort(sorted_ops)
+
+    for _, op_name in ipairs(sorted_ops) do
+        local entry = op_latencies[op_name]
+        if entry.count > 0 then
+            -- Sort values for percentile calculation
+            local sorted = {}
+            for _, v in ipairs(entry.values) do table.insert(sorted, v) end
+            table.sort(sorted)
+
+            local avg = entry.sum / entry.count
+            local p50 = compute_percentile(sorted, 50)
+            local p99 = compute_percentile(sorted, 99)
+
+            table.insert(lines, string.format("  %-20s %8d %10.3f %10.3f %10.3f %10.3f %10.3f",
+                op_name, entry.count, avg, entry.min, p50, p99, entry.max))
+        end
+    end
+
+    -- p99.9 latency summary (across all ops)
+    table.insert(lines, "")
+    table.insert(lines, "--- Overall Latency Percentiles ---")
+    local all_latencies = {}
+    for _, entry in pairs(op_latencies) do
+        for _, v in ipairs(entry.values) do
+            table.insert(all_latencies, v)
+        end
+    end
+    if #all_latencies > 0 then
+        table.sort(all_latencies)
+        local total = #all_latencies
+        table.insert(lines, string.format("  Total request-response pairs: %d", total))
+        table.insert(lines, string.format("  p50:   %.3f ms", compute_percentile(all_latencies, 50)))
+        table.insert(lines, string.format("  p90:   %.3f ms", compute_percentile(all_latencies, 90)))
+        table.insert(lines, string.format("  p99:   %.3f ms", compute_percentile(all_latencies, 99)))
+        table.insert(lines, string.format("  p99.9: %.3f ms", compute_percentile(all_latencies, 99.9)))
+        table.insert(lines, string.format("  Min:   %.3f ms", all_latencies[1]))
+        table.insert(lines, string.format("  Max:   %.3f ms", all_latencies[total]))
+        table.insert(lines, string.format("  Avg:   %.3f ms",
+            (function() local s=0; for _,v in ipairs(all_latencies) do s=s+v end; return s/total end)()))
+    else
+        table.insert(lines, "  No request-response pairs captured.")
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, "=" .. string.rep("=", 78))
+
+    win:set(table.concat(lines, "\n"))
+end
+
+-- Register the statistics menu item
+register_menu("WKI/Protocol Statistics", show_wki_statistics, MENU_TOOLS_UNSORTED)
+
+-- Register a post-dissector listener to reset state on new capture
+wki_proto.init = reset_analysis_state
+
 -- Register with Ethernet dissector table
 local eth_table = DissectorTable.get("ethertype")
 eth_table:add(WKI_ETHERTYPE, wki_proto)
@@ -763,4 +1186,4 @@ eth_table:add(WKI_ETHERTYPE, wki_proto)
 local udp_table = DissectorTable.get("udp.port")
 udp_table:add(0x88B7, wki_proto)
 
-print("WKI Protocol dissector loaded (EtherType 0x88B7)")
+print("WKI Protocol dissector loaded (EtherType 0x88B7) with statistics support")

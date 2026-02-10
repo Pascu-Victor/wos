@@ -13,6 +13,8 @@ struct RemotableOps;
 
 namespace ker::net {
 
+struct NapiStruct;
+
 constexpr size_t MAX_NET_DEVICES = 16;
 constexpr size_t NETDEV_NAME_LEN = 16;
 
@@ -36,6 +38,9 @@ struct NetDevice {
 
     // WKI remotable trait — set by drivers that support remote access
     wki::RemotableOps const* remotable = nullptr;
+
+    // NAPI context — set by napi_enable(), used for lock-free inline poll lookup
+    NapiStruct* napi = nullptr;
 
     // D11: WKI RX forward hook — set by dev_server when a remote consumer is attached.
     // Called from netdev_rx() to forward received packets to remote consumers.

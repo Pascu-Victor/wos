@@ -40,9 +40,29 @@ fi
 
 # Check for debug flag
 DEBUG_ARGS=""
+IS_DEBUG=0
 for arg in "$@"
 do
     if [ "$arg" == "--debug" ]; then
+        IS_DEBUG=1
+        # Create debug-specific overlays independent of cluster overlays
+        OVERLAY_DIR="cluster-overlays"
+        mkdir -p "$OVERLAY_DIR"
+        
+        DEBUG_DISK0="${OVERLAY_DIR}/debug-disk-vm${VM_ID}.qcow2"
+        DEBUG_DISK1="${OVERLAY_DIR}/debug-fat32-vm${VM_ID}.qcow2"
+        
+        # Remove old debug overlays for clean state
+        rm -f "$DEBUG_DISK0" "$DEBUG_DISK1"
+        
+        # Create fresh debug overlays
+        qemu-img create -f qcow2 -b "$(pwd)/disk.qcow2" -F qcow2 "$DEBUG_DISK0" >/dev/null
+        qemu-img create -f qcow2 -b "$(pwd)/test_fat32.qcow2" -F qcow2 "$DEBUG_DISK1" >/dev/null
+        
+        # Override disk paths to use debug overlays
+        DISK0="$DEBUG_DISK0"
+        DISK1="$DEBUG_DISK1"
+        
         DEBUG_PORT=$((1234 + VM_ID))
         DEBUGCON_PORT=$((23456 + VM_ID))
         MONITOR_PORT=$((3002 + VM_ID))
@@ -69,7 +89,16 @@ else
   echo "[VM${VM_ID}] eth0: TAP networking via ${TAP_DEV} MAC: 52:54:00:12:34:${MAC_BYTE} (set WOS_NET=user for built-in DHCP)"
 fi
 
-# -- WKI NIC (eth1 — e1000e, dedicated inter-kernel bridge) ------------------
+# -- WKI NIC (eth1 — virtio-net, dedicated inter-kernel bridge) --------------
+# Auto-detect: if WOS_WKI_TAP is not set but debug mode and bridge exists, use wos-wki-tap<VM_ID>
+if [ -z "$WOS_WKI_TAP" ] && [ "$IS_DEBUG" -eq 1 ]; then
+  AUTO_WKI_TAP="wos-wki-tap${VM_ID}"
+  if ip link show "$AUTO_WKI_TAP" &>/dev/null 2>&1; then
+    WOS_WKI_TAP="$AUTO_WKI_TAP"
+    echo "[VM${VM_ID}] Auto-detected WKI TAP: ${WOS_WKI_TAP}"
+  fi
+fi
+
 if [ -n "$WOS_WKI_TAP" ]; then
   NET_ARGS="$NET_ARGS -netdev tap,id=net1,ifname=${WOS_WKI_TAP},script=no,downscript=no"
   NET_ARGS="$NET_ARGS -device virtio-net-pci,netdev=net1,mac=52:54:00:12:35:${MAC_BYTE}"
@@ -87,7 +116,7 @@ echo "[VM${VM_ID}] STARTING BOOT:"
 
 LOG_ARGS="-d cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation -D ${QEMU_LOG}"
 
-qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m ${MEM} \
+qemu-system-x86_64 -M q35 -cpu host --enable-kvm -m ${MEM} \
   -drive file=${DISK0},if=none,id=drive0,format=qcow2 \
   -device ahci,id=ahci \
   -device ide-hd,drive=drive0,bus=ahci.0 \

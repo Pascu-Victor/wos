@@ -29,12 +29,9 @@ void idt_init();
 void sys_init();
 void ioapic_init();
 
-// PHASE 3: Scheduler Setup
+// PHASE 3: Subsystems (includes smt/epoch_manager before block devices)
 void smt_init();
 void epoch_manager_init();
-void sched_init();
-
-// PHASE 4: Subsystems
 void dev_init();
 void pci_enumerate();
 void console_init();
@@ -43,6 +40,10 @@ void block_device_init();
 void vfs_init();
 void devfs_populate_partitions();
 void net_init();
+
+// PHASE 4: Scheduler Setup
+void sched_init();
+void initramfs_init();
 
 // PHASE 5: Drivers
 void virtio_net_init();
@@ -54,7 +55,6 @@ void pkt_pool_expand();
 void ndp_init();
 void wki_init();
 void devfs_populate_net();
-void initramfs_init();
 
 // PHASE 6: Post-Scheduler (flattened from sched::init)
 void wki_eth_transport_init();
@@ -98,23 +98,23 @@ inline constexpr std::array<ModuleDesc, 8> PHASE_2_MODULES = {{
 }};
 
 // PHASE 3: Subsystems
-inline constexpr std::array<ModuleDesc, 8> PHASE_3_MODULES = {{
-    {.name = "dev", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::dev_init},                    // depends: ioapic
-    {.name = "pci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::pci_enumerate},               // depends: dev
-    {.name = "console", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::console_init},            // depends: pci
-    {.name = "ahci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::ahci_init},                  // depends: pci
-    {.name = "block_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::block_device_init},  // depends: ahci
-    {.name = "vfs", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::vfs_init},                    // depends: block_device
+inline constexpr std::array<ModuleDesc, 10> PHASE_3_MODULES = {{
+    {.name = "smt", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::smt_init},                      // depends: sys
+    {.name = "epoch_manager", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::epoch_manager_init},  // depends: smt
+    {.name = "dev", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::dev_init},                      // depends: ioapic
+    {.name = "pci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::pci_enumerate},                 // depends: dev
+    {.name = "console", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::console_init},              // depends: pci
+    {.name = "ahci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::ahci_init},                    // depends: pci
+    {.name = "block_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::block_device_init},    // depends: ahci, epoch_manager
+    {.name = "vfs", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::vfs_init},                      // depends: block_device
     {.name = "devfs_partitions", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::devfs_populate_partitions},  // depends: vfs
     {.name = "net", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::net_init},                                // depends: kmalloc
 }};
 
 // PHASE 4: Scheduler Setup
-inline constexpr std::array<ModuleDesc, 4> PHASE_4_MODULES = {{
-    {.name = "smt", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::smt_init},                      // depends: gates, irqs
-    {.name = "epoch_manager", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::epoch_manager_init},  // depends: smt
-    {.name = "initramfs", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::initramfs_init},          // depends: vfs
-    {.name = "sched", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::sched_init},                  // depends: smt
+inline constexpr std::array<ModuleDesc, 2> PHASE_4_MODULES = {{
+    {.name = "initramfs", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::initramfs_init},  // depends: vfs
+    {.name = "sched", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::sched_init},          // depends: epoch_manager, smt
 }};
 
 // PHASE 5: Drivers

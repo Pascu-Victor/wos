@@ -212,6 +212,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         g_wki.peer_lock.unlock();
         ker::mod::dbg::log("[WKI] Peer 0x%04x reconnected, reconciling", peer_node);
         newly_connected = true;
+
+        // Resume any suspended block device proxies — re-attach channels
+        // so that blocked I/O can proceed.
+        wki_dev_proxy_resume_for_peer(peer_node);
     }
 
     // Only run topology updates and resource discovery on actual state transitions
@@ -322,8 +326,8 @@ void wki_peer_send_heartbeats() {
     uint16_t total_runnable = 0;
     uint64_t cpu_count = ker::mod::smt::getCoreCount();
     for (uint64_t c = 0; c < cpu_count; c++) {
-        auto stats = ker::mod::sched::getRunQueueStats(c);
-        total_runnable += static_cast<uint16_t>(stats.activeTaskCount);
+        auto stats = ker::mod::sched::get_run_queue_stats(c);
+        total_runnable += static_cast<uint16_t>(stats.active_task_count);
     }
 
     HeartbeatPayload hb = {};
@@ -374,8 +378,8 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
     uint16_t ack_runnable = 0;
     uint64_t ack_cpu_count = ker::mod::smt::getCoreCount();
     for (uint64_t c = 0; c < ack_cpu_count; c++) {
-        auto stats = ker::mod::sched::getRunQueueStats(c);
-        ack_runnable += static_cast<uint16_t>(stats.activeTaskCount);
+        auto stats = ker::mod::sched::get_run_queue_stats(c);
+        ack_runnable += static_cast<uint16_t>(stats.active_task_count);
     }
 
     HeartbeatPayload ack = {};
@@ -457,8 +461,10 @@ void wki_peer_fence(WkiPeer* peer) {
     // Detach all device server bindings for this peer
     wki_dev_server_detach_all_for_peer(fenced_id);
 
-    // Detach all device proxy attachments for this peer
-    wki_dev_proxy_detach_all_for_peer(fenced_id);
+    // Suspend device proxy attachments — block device stays registered but
+    // I/O operations will block until the peer reconnects or a 30s timeout
+    // expires, at which point we do the hard teardown.
+    wki_dev_proxy_suspend_for_peer(fenced_id);
 
     // Clean up remote VFS proxies and server FDs for this peer
     wki_remote_vfs_cleanup_for_peer(fenced_id);
@@ -648,6 +654,10 @@ void wki_peer_timer_tick(uint64_t now_us) {
     // D1: Retransmit reliable events that haven't been ACKed
     wki_event_timer_tick(now_us);
 
+    // Check for fenced block device proxies that have timed out waiting
+    // for reconnection — perform hard teardown after WKI_DEV_PROXY_FENCE_WAIT_US
+    wki_dev_proxy_fence_timeout_tick(now_us);
+
     // Send periodic load reports to peers
     wki_load_report_send();
 
@@ -683,7 +693,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         wki_peer_timer_tick(now_us);
         // Sleep until next interrupt (~10ms scheduler tick).
         // The scheduler will preempt this thread if other tasks need CPU time.
-        asm volatile("sti\nhlt" ::: "memory");
+        ker::mod::sched::kern_yield();
     }
 }
 
@@ -693,7 +703,7 @@ void wki_timer_thread_start() {
         ker::mod::dbg::log("[WKI] Failed to create WKI timer kernel thread");
         return;
     }
-    ker::mod::sched::postTaskBalanced(task);
+    ker::mod::sched::post_task_balanced(task);
     ker::mod::dbg::log("[WKI] Timer kernel thread started (PID %d)", task->pid);
 }
 

@@ -1,4 +1,8 @@
+#include <fcntl.h>
+
 #include <cstdio>
+
+#include "abi-bits/fcntl.h"
 #define _DEFAULT_SOURCE 1
 
 #include <arpa/inet.h>
@@ -220,7 +224,7 @@ auto main(int argc, char** argv) -> int {
             struct ifreq ifr{};
             strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
 
-            constexpr long poll_timeout_secs = 10;
+            constexpr long POLL_TIMEOUT_SECS = 10;
             struct timespec poll_start{};
             clock_gettime(CLOCK_MONOTONIC, &poll_start);
             bool net_ready = false;
@@ -237,7 +241,7 @@ auto main(int argc, char** argv) -> int {
                 }
                 struct timespec now{};
                 clock_gettime(CLOCK_MONOTONIC, &now);
-                if (now.tv_sec - poll_start.tv_sec >= poll_timeout_secs) {
+                if (now.tv_sec - poll_start.tv_sec >= POLL_TIMEOUT_SECS) {
                     break;
                 }
                 sched_yield();
@@ -263,26 +267,26 @@ auto main(int argc, char** argv) -> int {
     }
 
     // --- Spawn sub-init processes ---
-    std::println("init[{}]: Will spawn {} sub-init processes", cpuno, NUM_SUB_INITS);
+    // std::println("init[{}]: Will spawn {} sub-init processes", cpuno, NUM_SUB_INITS);
 
-    // Configuration for each sub-init: (spawn_count, program_path)
-    struct SubInitConfig {
-        int spawn_count;
-        const char* program;
-    };
+    // // Configuration for each sub-init: (spawn_count, program_path)
+    // struct SubInitConfig {
+    //     int spawn_count;
+    //     const char* program;
+    // };
 
-    std::array<SubInitConfig, NUM_SUB_INITS> configs = {{
-        {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 3, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 3, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 3, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 3, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
-        {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
-    }};
+    // std::array<SubInitConfig, NUM_SUB_INITS> configs = {{
+    //     {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 3, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 3, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 3, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 1, .program = "/mnt/disk/testprog"}, {.spawn_count = 2, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 3, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
+    //     {.spawn_count = 2, .program = "/mnt/disk/testprog"}, {.spawn_count = 1, .program = "/mnt/disk/testprog"},
+    // }};
 
     // Spawn sub-inits
     // std::array<uint64_t, NUM_SUB_INITS> sub_init_pids = {0};
