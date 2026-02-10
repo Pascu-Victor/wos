@@ -26,8 +26,8 @@ struct File {
     int refcount;  // reference count for shared file descriptors (fork/exec)
 
     // Mount-overlay directory listing support
-    const char* vfs_path;       // Absolute VFS path (heap-allocated, set by vfs_open)
-    size_t dir_fs_count;        // Cached FS readdir entry count ((size_t)-1 = unknown)
+    const char* vfs_path;  // Absolute VFS path (heap-allocated, set by vfs_open)
+    size_t dir_fs_count;   // Cached FS readdir entry count ((size_t)-1 = unknown)
 };
 
 }  // namespace ker::vfs

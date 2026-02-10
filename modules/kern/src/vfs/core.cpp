@@ -321,8 +321,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     // Store the absolute VFS path for mount-overlay directory listing
     size_t path_len = std::strlen(pathBuffer);
-    auto* path_copy = static_cast<char*>(
-        ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
+    auto* path_copy = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
     if (path_copy != nullptr) {
         std::memcpy(path_copy, pathBuffer, path_len + 1);
         f->vfs_path = path_copy;
@@ -556,9 +555,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     }
                 } else {
                     // Non-root: mount must start with dir_path + "/"
-                    if (mp_len > dir_len &&
-                        std::memcmp(mp->path, f->vfs_path, dir_len) == 0 &&
-                        mp->path[dir_len] == '/') {
+                    if (mp_len > dir_len && std::memcmp(mp->path, f->vfs_path, dir_len) == 0 && mp->path[dir_len] == '/') {
                         child_start = mp->path + dir_len + 1;
                     }
                 }
@@ -582,9 +579,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     if (dir_len == 1 && f->vfs_path[0] == '/') {
                         if (mp2_len > 1 && mp2->path[0] == '/') c2 = mp2->path + 1;
                     } else {
-                        if (mp2_len > dir_len &&
-                            std::memcmp(mp2->path, f->vfs_path, dir_len) == 0 &&
-                            mp2->path[dir_len] == '/') {
+                        if (mp2_len > dir_len && std::memcmp(mp2->path, f->vfs_path, dir_len) == 0 && mp2->path[dir_len] == '/') {
                             c2 = mp2->path + dir_len + 1;
                         }
                     }
@@ -609,8 +604,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                         int pret = f->fops->vfs_readdir(f, &probe, pi);
                         if (pret != 0) break;
                         size_t dn_len = std::strlen(probe.d_name.data());
-                        if (dn_len == child_len &&
-                            std::memcmp(probe.d_name.data(), child_start, child_len) == 0) {
+                        if (dn_len == child_len && std::memcmp(probe.d_name.data(), child_start, child_len) == 0) {
                             already_in_fs = true;
                             break;
                         }
@@ -625,8 +619,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     entries[entries_read].d_reclen = sizeof(DirEntry);
                     entries[entries_read].d_type = DT_DIR;
 
-                    size_t copy_len = child_len < DIRENT_NAME_MAX - 1
-                                          ? child_len : DIRENT_NAME_MAX - 1;
+                    size_t copy_len = child_len < DIRENT_NAME_MAX - 1 ? child_len : DIRENT_NAME_MAX - 1;
                     std::memcpy(entries[entries_read].d_name.data(), child_start, copy_len);
                     entries[entries_read].d_name[copy_len] = '\0';
 
@@ -1146,8 +1139,7 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File* {
     // Store the absolute VFS path for mount-overlay directory listing
     if (f != nullptr) {
         size_t pl = std::strlen(pathBuffer);
-        auto* pc = static_cast<char*>(
-            ker::mod::mm::dyn::kmalloc::malloc(pl + 1));
+        auto* pc = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(pl + 1));
         if (pc != nullptr) {
             std::memcpy(pc, pathBuffer, pl + 1);
             f->vfs_path = pc;
