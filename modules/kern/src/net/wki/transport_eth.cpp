@@ -87,10 +87,10 @@ static WkiTransport s_eth_transport;
 static EthTransportPrivate s_eth_priv;
 static bool s_eth_initialized = false;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Secondary transport pool — auto-registered for non-primary NICs that
 // receive WKI frames (e.g. a debug VM whose only NIC is the data bridge).
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 constexpr size_t MAX_SECONDARY_ETH_TRANSPORTS = 4;
 

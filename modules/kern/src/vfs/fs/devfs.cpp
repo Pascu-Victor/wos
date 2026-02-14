@@ -705,9 +705,9 @@ void devfs_populate_net_nodes() {
     vfs_debug_log(" devices)\n");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // WKI remotable resource nodes — /dev/wki/
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace {
 
@@ -1245,8 +1245,7 @@ auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
     if (node->device->major == 11 && node->device->private_data != nullptr) {
         auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
         if (ctx->resource_type == ker::net::wki::ResourceType::BLOCK) {
-            return ker::net::wki::wki_dev_proxy_attach_block(
-                ctx->peer_node_id, ctx->resource_id, static_cast<const char*>(ctx->dev_name));
+            return ker::net::wki::wki_dev_proxy_attach_block(ctx->peer_node_id, ctx->resource_id, static_cast<const char*>(ctx->dev_name));
         }
     }
 

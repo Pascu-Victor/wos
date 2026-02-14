@@ -25,12 +25,8 @@ auto remotable_on_attach(uint16_t node_id) -> int {
     ker::mod::dbg::log("[E1000E] remote attach from 0x%04x", node_id);
     return 0;
 }
-void remotable_on_detach(uint16_t node_id) {
-    ker::mod::dbg::log("[E1000E] remote detach from 0x%04x", node_id);
-}
-void remotable_on_fault(uint16_t node_id) {
-    ker::mod::dbg::log("[E1000E] remote fault for 0x%04x", node_id);
-}
+void remotable_on_detach(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote fault for 0x%04x", node_id); }
 const ker::net::wki::RemotableOps s_remotable_ops = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
@@ -58,12 +54,12 @@ constexpr std::array<DeviceID, 5> SUPPORTED_DEVICES = {{
     {.id = 0x15B8, .name = "I219-V"},
 }};
 
-// ── MMIO access ─────────────────────────────────────────────────────────
+// -- MMIO access ---------------------------------------------------------
 inline auto reg_read(E1000Device* dev, uint32_t offset) -> uint32_t { return dev->mmio[offset / 4]; }
 
 inline void reg_write(E1000Device* dev, uint32_t offset, uint32_t value) { dev->mmio[offset / 4] = value; }
 
-// ── Physical address conversion ─────────────────────────────────────────
+// -- Physical address conversion -----------------------------------------
 auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
     auto hhdm_offset = ker::mod::mm::addr::getHHDMOffset();
@@ -84,7 +80,7 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     return 0;
 }
 
-// ── EEPROM read ─────────────────────────────────────────────────────────
+// -- EEPROM read ---------------------------------------------------------
 auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
     // Write address and start bit
     reg_write(dev, REG_EERD, (static_cast<uint32_t>(addr) << 8) | EERD_START);
@@ -101,7 +97,7 @@ auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
     return 0;  // Timeout
 }
 
-// ── Read MAC address ────────────────────────────────────────────────────
+// -- Read MAC address ----------------------------------------------------
 void read_mac(E1000Device* dev) {
     // Try reading from RAL/RAH first (already programmed by EEPROM autoload)
     uint32_t ral = reg_read(dev, REG_RAL);
@@ -130,7 +126,7 @@ void read_mac(E1000Device* dev) {
     dev->netdev.mac[5] = static_cast<uint8_t>(w2 >> 8);
 }
 
-// ── Initialize RX ring ──────────────────────────────────────────────────
+// -- Initialize RX ring --------------------------------------------------
 void init_rx(E1000Device* dev) {
     // Allocate descriptor ring (physically contiguous, 16-byte aligned)
     size_t ring_size = NUM_RX_DESC * sizeof(E1000RxDesc);
@@ -167,7 +163,7 @@ void init_rx(E1000Device* dev) {
     reg_write(dev, REG_RCTL, rctl);
 }
 
-// ── Initialize TX ring ──────────────────────────────────────────────────
+// -- Initialize TX ring --------------------------------------------------
 void init_tx(E1000Device* dev) {
     size_t ring_size = NUM_TX_DESC * sizeof(E1000TxDesc);
     auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::pageAlloc(ring_size));
@@ -194,7 +190,7 @@ void init_tx(E1000Device* dev) {
     reg_write(dev, REG_TCTL, tctl);
 }
 
-// ── Process received packets (budget-limited for NAPI) ──────────────────
+// -- Process received packets (budget-limited for NAPI) ------------------
 int process_rx_budget(E1000Device* dev, int budget) {
     int processed = 0;
 
@@ -240,7 +236,7 @@ int process_rx_budget(E1000Device* dev, int budget) {
     return processed;
 }
 
-// ── Process TX completions ──────────────────────────────────────────────
+// -- Process TX completions ----------------------------------------------
 void process_tx(E1000Device* dev) {
     for (size_t i = 0; i < NUM_TX_DESC; i++) {
         auto* desc = &dev->tx_descs[i];
@@ -252,7 +248,7 @@ void process_tx(E1000Device* dev) {
     }
 }
 
-// ── NAPI poll function - called from worker thread context ──────────────
+// -- NAPI poll function - called from worker thread context --------------
 int e1000_poll(ker::net::NapiStruct* napi, int budget) {
     auto* dev = reinterpret_cast<E1000Device*>(napi->dev);
     int processed = 0;
@@ -275,7 +271,7 @@ int e1000_poll(ker::net::NapiStruct* napi, int budget) {
     return processed;
 }
 
-// ── Minimal IRQ handler (NAPI model) ────────────────────────────────────
+// -- Minimal IRQ handler (NAPI model) ------------------------------------
 void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     auto* dev = static_cast<E1000Device*>(private_data);
     if (dev == nullptr) {
@@ -308,7 +304,7 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     }
 }
 
-// ── NetDevice operations ────────────────────────────────────────────────
+// -- NetDevice operations ------------------------------------------------
 int e1000_open(ker::net::NetDevice* /*ndev*/) { return 0; }
 
 void e1000_close(ker::net::NetDevice* /*ndev*/) {}
@@ -366,7 +362,7 @@ ker::net::NetDeviceOps e1000_netdev_ops = {
     .set_mac = e1000_set_mac,
 };
 
-// ── Check if PCI device is supported ────────────────────────────────────
+// -- Check if PCI device is supported ------------------------------------
 auto find_device_name(uint16_t device_id) -> const char* {
     for (auto supported_device : SUPPORTED_DEVICES) {
         if (supported_device.id == device_id) {
@@ -376,7 +372,7 @@ auto find_device_name(uint16_t device_id) -> const char* {
     return nullptr;
 }
 
-// ── Initialize a single e1000e device ───────────────────────────────────
+// -- Initialize a single e1000e device -----------------------------------
 void init_device(pci::PCIDevice* pci_dev, const char* name) {
     if (device_count >= MAX_E1000_DEVICES) {
         return;

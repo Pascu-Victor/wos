@@ -8,17 +8,17 @@
 
 namespace ker::net::wki {
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Configuration
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 constexpr uint64_t WKI_DEV_PROXY_TIMEOUT_US = 100000;       // 100 ms per-operation timeout
 constexpr uint64_t WKI_DEV_PROXY_FENCE_WAIT_US = 30000000;  // 30 s — max time to wait for fence lift before teardown
 constexpr uint64_t WKI_DEV_PROXY_FENCE_POLL_US = 50000;     // 50 ms — poll interval while waiting for fence lift
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // ProxyBlockState — one per remote block device attachment (consumer side)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 struct ProxyBlockState {
     bool active = false;
@@ -48,9 +48,9 @@ struct ProxyBlockState {
     ker::mod::sys::Spinlock lock;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Public API
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 // Initialize the device proxy subsystem. Called from wki_init().
 void wki_dev_proxy_init();
@@ -81,9 +81,9 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id);
 // WKI_DEV_PROXY_FENCE_WAIT_US.  Called from wki_peer_timer_tick().
 void wki_dev_proxy_fence_timeout_tick(uint64_t now_us);
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Internal — RX message handlers (called from wki.cpp dispatch)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace detail {
 

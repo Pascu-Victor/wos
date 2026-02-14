@@ -11,9 +11,9 @@
 
 namespace ker::net::wki {
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Storage
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace {
 
@@ -31,9 +31,9 @@ bool event_matches(uint16_t sub_class, uint16_t sub_id, uint16_t pub_class, uint
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // D1: Pending reliable events — awaiting ACK from remote subscribers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 constexpr uint8_t RELIABLE_MAX_RETRIES = 5;
 constexpr uint64_t RELIABLE_RETRY_US = 50000;  // 50ms
@@ -51,9 +51,9 @@ struct PendingReliableEvent {
 
 std::deque<PendingReliableEvent> g_pending_reliable;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // D2: Event log ring buffer — replay matching events to new subscribers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 constexpr size_t EVENT_LOG_MAX = 128;
 
@@ -66,9 +66,9 @@ struct EventLogEntry {
     std::array<uint8_t, 256> data = {};
 };
 
-std::array<EventLogEntry, EVENT_LOG_MAX> g_event_log;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_event_log_head = 0;                                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_event_log_count = 0;                               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<EventLogEntry, EVENT_LOG_MAX> g_event_log;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_event_log_head = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_event_log_count = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 void event_log_push(uint16_t event_class, uint16_t event_id, uint16_t origin_node, const void* data, uint16_t data_len) {
     auto& entry = g_event_log[g_event_log_head];
@@ -126,9 +126,9 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
 
 }  // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Init
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_init() {
     if (g_event_initialized) {
@@ -138,9 +138,9 @@ void wki_event_init() {
     ker::mod::dbg::log("[WKI] Event bus subsystem initialized");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Subscribe / Unsubscribe — outgoing requests to a remote node
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_subscribe(uint16_t peer_node, uint16_t event_class, uint16_t event_id, uint8_t delivery_mode) {
     if (!g_event_initialized) {
@@ -167,9 +167,9 @@ void wki_event_unsubscribe(uint16_t peer_node, uint16_t event_class, uint16_t ev
     wki_send(peer_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_UNSUBSCRIBE, &unsub, sizeof(unsub));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Publish — send event to matching remote subscribers + invoke local handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data, uint16_t data_len) {
     if (!g_event_initialized) {
@@ -239,9 +239,9 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Local handler registration
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_register_handler(uint16_t event_class, uint16_t event_id, EventHandlerFn handler) {
     if (handler == nullptr) {
@@ -261,9 +261,9 @@ void wki_event_unregister_handler(EventHandlerFn handler) {
     std::erase_if(g_local_handlers, [handler](const WkiEventHandler& h) { return h.handler == handler; });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // D1: Timer tick — retransmit reliable events that haven't been ACKed
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_timer_tick(uint64_t now_us) {
     if (!g_event_initialized || g_pending_reliable.empty()) {
@@ -285,31 +285,28 @@ void wki_event_timer_tick(uint64_t now_us) {
         }
 
         // Retransmit
-        wki_send(pending.subscriber_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_PUBLISH, pending.payload.data(),
-                 pending.payload_len);
+        wki_send(pending.subscriber_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_PUBLISH, pending.payload.data(), pending.payload_len);
         pending.send_time_us = now_us;
         pending.retries++;
     }
 
     if (any_removed) {
-        std::erase_if(g_pending_reliable,
-                       [](const PendingReliableEvent& p) { return p.subscriber_node == WKI_NODE_INVALID; });
+        std::erase_if(g_pending_reliable, [](const PendingReliableEvent& p) { return p.subscriber_node == WKI_NODE_INVALID; });
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Fencing cleanup — remove all subscriptions and pending events for a fenced peer
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_event_cleanup_for_peer(uint16_t node_id) {
     std::erase_if(g_subscriptions, [node_id](const WkiEventSubscription& sub) { return sub.subscriber_node == node_id; });
-    std::erase_if(g_pending_reliable,
-                   [node_id](const PendingReliableEvent& p) { return p.subscriber_node == node_id; });
+    std::erase_if(g_pending_reliable, [node_id](const PendingReliableEvent& p) { return p.subscriber_node == node_id; });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // RX handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace detail {
 
@@ -340,9 +337,8 @@ void handle_event_subscribe(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     g_subscriptions.push_back(entry);
 
-    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node,
-                       sub->event_class, sub->event_id,
-                       (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
+    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node, sub->event_class,
+                       sub->event_id, (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
 
     // D2: Replay matching events from log to the new subscriber
     event_log_replay_to(hdr->src_node, sub->event_class, sub->event_id);

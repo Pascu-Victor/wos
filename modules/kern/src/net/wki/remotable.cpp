@@ -11,18 +11,18 @@
 
 namespace ker::net::wki {
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Storage — discovered resources from remote peers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace {
 std::deque<DiscoveredResource> g_discovered;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remotable_initialized = false;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Init
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 void wki_remotable_init() {
     if (g_remotable_initialized) {
@@ -32,9 +32,9 @@ void wki_remotable_init() {
     ker::mod::dbg::log("[WKI] Remotable subsystem initialized");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Local resource advertisement — iterate block devices with remotable != nullptr
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace {
 
@@ -163,9 +163,9 @@ void wki_resource_advertise_all() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Discovered resource table
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 auto wki_resource_find(uint16_t node_id, ResourceType type, uint32_t resource_id) -> DiscoveredResource* {
     for (auto& res : g_discovered) {
@@ -204,9 +204,9 @@ void wki_resource_foreach(ResourceVisitor visitor, void* ctx) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // RX handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 namespace detail {
 
@@ -256,8 +256,7 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     g_discovered.push_back(res);
 
     // Update devfs /dev/wki/ tree
-    ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type,
-                                            adv->resource_id, adv->flags,
+    ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type, adv->resource_id, adv->flags,
                                             static_cast<const char*>(res.name));
 
     ker::mod::dbg::log("[WKI] Discovered resource: node=0x%04x type=%u id=%u name=%s", adv->node_id, adv->resource_type, adv->resource_id,

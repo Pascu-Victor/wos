@@ -24,7 +24,7 @@ constexpr uint32_t IVSHMEM_REG_INTRSTATUS = 0x04;
 constexpr uint32_t IVSHMEM_REG_IVPOSITION = 0x08;
 constexpr uint32_t IVSHMEM_REG_DOORBELL = 0x0C;
 
-// ── IRQ enable/disable helpers ──
+// -- IRQ enable/disable helpers --
 void ivshmem_irq_disable(IvshmemNetDevice* dev) {
     // Mask all interrupts
     dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0;
@@ -35,7 +35,7 @@ void ivshmem_irq_enable(IvshmemNetDevice* dev) {
     dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
 }
 
-// ── Ring buffer operations ──
+// -- Ring buffer operations --
 
 // Write a packet to the ring. Returns 0 on success, -1 if ring full.
 int ring_write(RingBuffer* ring, const uint8_t* data, uint16_t len) {
@@ -106,7 +106,7 @@ uint16_t ring_read(RingBuffer* ring, uint8_t* buf, uint16_t buf_size) {
     return copy_len;
 }
 
-// ── NetDevice operations ──
+// -- NetDevice operations --
 int ivshmem_open(ker::net::NetDevice* netdev) {
     netdev->state = 1;
     return 0;
@@ -147,7 +147,7 @@ ker::net::NetDeviceOps ivshmem_ops = {
     .set_mac = ivshmem_set_mac,
 };
 
-// ── IRQ handler (minimal - just schedule NAPI) ──
+// -- IRQ handler (minimal - just schedule NAPI) --
 void ivshmem_irq(uint8_t, void* data) {
     auto* dev = static_cast<IvshmemNetDevice*>(data);
     if (dev == nullptr || !dev->active) return;
@@ -162,7 +162,7 @@ void ivshmem_irq(uint8_t, void* data) {
     ker::net::napi_schedule(&dev->napi);
 }
 
-// ── Device init ──
+// -- Device init --
 auto init_device(pci::PCIDevice* pci_dev) -> int {
     if (device_count >= MAX_IVSHMEM_DEVICES) return -1;
 
@@ -303,7 +303,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
 }
 }  // namespace
 
-// ── NAPI poll function (runs in worker thread context) ──
+// -- NAPI poll function (runs in worker thread context) --
 int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
     auto* dev = static_cast<IvshmemNetDevice*>(napi->dev->private_data);
     if (dev == nullptr || !dev->active) {
