@@ -11,6 +11,7 @@ constexpr uint16_t ETH_TYPE_IPV4 = 0x0800;
 constexpr uint16_t ETH_TYPE_ARP = 0x0806;
 constexpr uint16_t ETH_TYPE_IPV6 = 0x86DD;
 constexpr uint16_t ETH_TYPE_WKI = 0x88B7;
+constexpr uint16_t ETH_TYPE_WKI_ROCE = 0x88B8;
 
 constexpr size_t ETH_HLEN = 14;
 constexpr size_t ETH_ALEN = 6;

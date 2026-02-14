@@ -348,6 +348,13 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
         return 0;
     }
 
+    // Disable memory decoding before BAR sizing to prevent KVM from trying
+    // to map intermediate bogus addresses (e.g. writing 0xFFFFFFFF to a
+    // 64-bit BAR while the high half still holds the original value).
+    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
+    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND,
+                       cmd & ~PCI_COMMAND_MEM_SPACE);
+
     // Write all 1s to determine size
     pci_config_write32(dev->bus, dev->slot, dev->function, reg, 0xFFFFFFFF);
     uint32_t readback = pci_config_read32(dev->bus, dev->slot, dev->function, reg);
@@ -355,7 +362,11 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
     pci_config_write32(dev->bus, dev->slot, dev->function, reg, original);
 
     readback &= ~0xFU;  // mask type/prefetch bits
-    if (readback == 0) return 0;
+    if (readback == 0) {
+        // Restore command register and return
+        pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+        return 0;
+    }
 
     uint8_t type = (original >> 1) & 0x3;
     if (type == 0x02 && bar_idx + 1 < BAR_COUNT) {
@@ -366,9 +377,15 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
         uint32_t readback_hi = pci_config_read32(dev->bus, dev->slot, dev->function, reg_hi);
         pci_config_write32(dev->bus, dev->slot, dev->function, reg_hi, orig_hi);
 
+        // Re-enable memory decoding now that BARs are restored
+        pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+
         uint64_t mask = (static_cast<uint64_t>(readback_hi) << 32) | readback;
         return (~mask) + 1;
     }
+
+    // Re-enable memory decoding now that BAR is restored
+    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
 
     // 32-bit BAR
     return static_cast<uint64_t>(~readback + 1);

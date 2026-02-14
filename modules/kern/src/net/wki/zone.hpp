@@ -61,9 +61,11 @@ struct WkiZone {
 
     // RDMA state
     bool is_rdma = false;
+    bool is_roce = false;           // true if RDMA via RoCE (needs explicit rdma_write/read sync)
     uint32_t local_rkey = 0;        // our RDMA key (if RDMA-backed)
     uint32_t remote_rkey = 0;       // peer's RDMA key (if RDMA-backed)
     uint64_t remote_phys_addr = 0;  // peer's physical address (from ACK)
+    WkiTransport* rdma_transport = nullptr;  // transport for RDMA ops (RoCE; nullptr for ivshmem)
 
     // Ownership
     bool is_initiator = false;  // true if we sent ZONE_CREATE_REQ

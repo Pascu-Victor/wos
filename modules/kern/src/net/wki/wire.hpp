@@ -11,6 +11,7 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 
 constexpr uint16_t WKI_ETHERTYPE = 0x88B7;
+constexpr uint16_t WKI_ETHERTYPE_ROCE = 0x88B8;  // RoCE RDMA data frames (L2, MAC-based GIDs)
 constexpr uint8_t WKI_VERSION = 1;
 constexpr uint32_t WKI_HELLO_MAGIC = 0x574B4900;  // "WKI\0"
 constexpr uint16_t WKI_NODE_INVALID = 0x0000;
@@ -464,11 +465,15 @@ struct DevAttachAckPayload {
     uint8_t status;  // DevAttachStatus
     uint8_t reserved;
     uint16_t assigned_channel;
-    uint16_t max_op_size;  // max payload size for DEV_OP_REQ
-    uint16_t reserved2;
+    uint16_t max_op_size;       // max payload size for DEV_OP_REQ
+    uint16_t rdma_flags;        // bit 0: RDMA block ring zone available
+    uint32_t blk_zone_id;       // RDMA zone ID for block ring (0 = not available)
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckPayload) == 8, "DevAttachAckPayload must be 8 bytes");
+static_assert(sizeof(DevAttachAckPayload) == 12, "DevAttachAckPayload must be 12 bytes");
+
+// RDMA flags for DevAttachAckPayload
+constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload — 8 bytes

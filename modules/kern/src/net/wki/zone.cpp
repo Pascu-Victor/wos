@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <net/netpoll.hpp>
 #include <net/wki/event.hpp>
+#include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -46,18 +48,19 @@ auto alloc_zone_slot() -> WkiZone* {
 
 void free_zone_backing(WkiZone* zone) {
     if (zone->local_vaddr != nullptr) {
-        if (zone->is_rdma) {
-            // RDMA-backed: free from ivshmem RDMA pool
-            // Compute offset from the RDMA base pointer
+        if (zone->is_rdma && !zone->is_roce) {
+            // ivshmem RDMA-backed: free from ivshmem RDMA pool
             auto offset = static_cast<int64_t>(zone->local_phys_addr);
             wki_ivshmem_rdma_free(offset, zone->size);
         } else {
+            // RoCE-backed or non-RDMA: regular kernel pages
             ker::mod::mm::phys::pageFree(zone->local_vaddr);
         }
     }
     zone->local_vaddr = nullptr;
     zone->local_phys_addr = 0;
     zone->local_rkey = 0;
+    zone->rdma_transport = nullptr;
 }
 
 auto allocate_zone_backing(uint32_t size) -> void* {
@@ -65,13 +68,54 @@ auto allocate_zone_backing(uint32_t size) -> void* {
     return ker::mod::mm::phys::pageAlloc(size);
 }
 
-// Check if a peer has an RDMA-capable transport
+// Check if a peer has any RDMA-capable transport (ivshmem or RoCE)
 auto peer_has_rdma(uint16_t node_id) -> bool {
     WkiPeer* peer = wki_peer_find(node_id);
-    if (peer == nullptr || peer->transport == nullptr) {
+    if (peer == nullptr) {
         return false;
     }
-    return peer->transport->rdma_capable;
+    // Check dedicated RDMA transport (RoCE or ivshmem set during HELLO)
+    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
+        return true;
+    }
+    // Fallback: check primary message transport (ivshmem has rdma_capable=true)
+    if (peer->transport != nullptr && peer->transport->rdma_capable) {
+        return true;
+    }
+    return false;
+}
+
+// Get the RDMA transport for a peer (prefers rdma_transport, falls back to transport)
+auto peer_rdma_transport(uint16_t node_id) -> WkiTransport* {
+    WkiPeer* peer = wki_peer_find(node_id);
+    if (peer == nullptr) {
+        return nullptr;
+    }
+    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
+        return peer->rdma_transport;
+    }
+    if (peer->transport != nullptr && peer->transport->rdma_capable) {
+        return peer->transport;
+    }
+    return nullptr;
+}
+
+// Check if the peer's RDMA transport is RoCE (not ivshmem shared memory)
+auto peer_rdma_is_roce(uint16_t node_id) -> bool {
+    WkiPeer* peer = wki_peer_find(node_id);
+    if (peer == nullptr) {
+        return false;
+    }
+    // If rdma_transport is set and it's NOT the same as the primary transport,
+    // it's the RoCE overlay. Also check if the primary transport is not rdma_capable.
+    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
+        // If the primary transport is also rdma_capable, it's ivshmem (preferred)
+        if (peer->transport != nullptr && peer->transport->rdma_capable) {
+            return false;  // ivshmem
+        }
+        return true;  // RoCE
+    }
+    return false;
 }
 
 // Allocate RDMA-backed zone memory from ivshmem shared region.
@@ -84,6 +128,27 @@ auto allocate_rdma_zone_backing(uint32_t size, int64_t& out_offset) -> void* {
     }
     out_offset = offset;
     return wki_ivshmem_rdma_ptr(offset);
+}
+
+// Allocate RoCE-backed zone memory: kernel pages registered with the RoCE transport.
+// Each side has separate local memory; RDMA write/read must be used to synchronize.
+// Returns the local virtual pointer and sets out_rkey to the registered RDMA key.
+auto allocate_roce_zone_backing(WkiTransport* transport, uint32_t size, uint32_t& out_rkey) -> void* {
+    if (transport == nullptr || transport->rdma_register_region == nullptr) {
+        return nullptr;
+    }
+    void* backing = ker::mod::mm::phys::pageAlloc(size);
+    if (backing == nullptr) {
+        return nullptr;
+    }
+    uint32_t rkey = 0;
+    int ret = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(backing), size, &rkey);
+    if (ret != 0) {
+        ker::mod::mm::phys::pageFree(backing);
+        return nullptr;
+    }
+    out_rkey = rkey;
+    return backing;
 }
 
 }  // namespace
@@ -183,6 +248,9 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     }
 
     // Spin-wait for ACK (zone transitions to ACTIVE or back to NONE)
+    // Poll the NIC and yield during the spin-wait so incoming packets (including
+    // the ZONE_CREATE_ACK) can be processed.  napi_poll_inline() will harmlessly
+    // return 0 if we are already inside the NAPI poll handler (re-entrancy safe).
     uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
     while (zone->state == ZoneState::NEGOTIATING) {
         asm volatile("pause" ::: "memory");
@@ -197,6 +265,15 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
             s_zone_table_lock.unlock();
             return WKI_ERR_ZONE_TIMEOUT;
         }
+        // Drive NIC polling + yield so the zone create ACK can be received.
+        // When called from the timer thread (the deferred zone creation path),
+        // this allows the ACK to be processed.  When called from inside the
+        // NAPI poll handler, napi_poll_inline returns 0 (harmless).
+        net::NetDevice* net_dev = wki_eth_get_netdev();
+        if (net_dev != nullptr) {
+            net::napi_poll_inline(net_dev);
+        }
+        ker::mod::sched::kern_yield();
     }
 
     if (zone->state == ZoneState::ACTIVE) {
@@ -546,20 +623,40 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
         return;
     }
 
-    // Try RDMA allocation first if peer has RDMA-capable transport
+    // Try RDMA allocation: ivshmem first, then RoCE, then message-based fallback
     bool use_rdma = false;
+    bool use_roce = false;
     void* backing = nullptr;
     uint64_t phys_addr = 0;
     int64_t rdma_offset = -1;
     uint32_t rkey = 0;
+    WkiTransport* zone_rdma_transport = nullptr;
 
     if (peer_has_rdma(src_node)) {
+        // Try ivshmem shared memory first (zero-copy, lowest latency)
         backing = allocate_rdma_zone_backing(req->size, rdma_offset);
         if (backing != nullptr) {
             use_rdma = true;
             phys_addr = static_cast<uint64_t>(rdma_offset);
             rkey = static_cast<uint32_t>(rdma_offset);
             memset(backing, 0, req->size);
+        }
+
+        // Try RoCE RDMA if ivshmem unavailable
+        if (backing == nullptr) {
+            WkiTransport* roce = peer_rdma_transport(src_node);
+            if (roce != nullptr) {
+                uint32_t roce_rkey = 0;
+                backing = allocate_roce_zone_backing(roce, req->size, roce_rkey);
+                if (backing != nullptr) {
+                    use_rdma = true;
+                    use_roce = true;
+                    rkey = roce_rkey;
+                    phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+                    zone_rdma_transport = roce;
+                    memset(backing, 0, req->size);
+                }
+            }
         }
     }
 
@@ -589,10 +686,12 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     zone->notify_mode = static_cast<ZoneNotifyMode>(req->notify_mode);
     zone->type_hint = static_cast<ZoneTypeHint>(req->zone_type_hint);
     zone->is_rdma = use_rdma;
+    zone->is_roce = use_roce;
     zone->is_initiator = false;
     zone->local_rkey = rkey;
     zone->remote_rkey = 0;
     zone->remote_phys_addr = 0;
+    zone->rdma_transport = zone_rdma_transport;
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
     zone->read_pending = false;
@@ -609,8 +708,8 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d)", req->zone_id, src_node, req->size,
-                       use_rdma ? 1 : 0);
+    ker::mod::dbg::log("[WKI] Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", req->zone_id, src_node, req->size,
+                       use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &req->zone_id, sizeof(req->zone_id));
 }
@@ -640,14 +739,34 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     if (status == ZoneCreateStatus::ACCEPTED) {
         bool use_rdma = false;
+        bool use_roce = false;
         void* backing = nullptr;
         int64_t rdma_offset = -1;
+        uint32_t local_rkey = 0;
+        WkiTransport* zone_rdma_transport = nullptr;
 
         // If responder provided an rkey, try RDMA allocation on our side too
         if (ack->rkey != 0 && peer_has_rdma(hdr->src_node)) {
+            // Try ivshmem first
             backing = allocate_rdma_zone_backing(zone->size, rdma_offset);
             if (backing != nullptr) {
                 use_rdma = true;
+                local_rkey = static_cast<uint32_t>(rdma_offset);
+            }
+
+            // Try RoCE if ivshmem unavailable
+            if (backing == nullptr) {
+                WkiTransport* roce = peer_rdma_transport(hdr->src_node);
+                if (roce != nullptr) {
+                    uint32_t roce_rkey = 0;
+                    backing = allocate_roce_zone_backing(roce, zone->size, roce_rkey);
+                    if (backing != nullptr) {
+                        use_rdma = true;
+                        use_roce = true;
+                        local_rkey = roce_rkey;
+                        zone_rdma_transport = roce;
+                    }
+                }
             }
         }
 
@@ -669,13 +788,14 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         memset(backing, 0, zone->size);
 
         zone->local_vaddr = backing;
-        if (use_rdma) {
+        zone->is_rdma = use_rdma;
+        zone->is_roce = use_roce;
+        zone->local_rkey = local_rkey;
+        zone->rdma_transport = zone_rdma_transport;
+        if (use_rdma && !use_roce) {
             zone->local_phys_addr = static_cast<uint64_t>(rdma_offset);
-            zone->local_rkey = static_cast<uint32_t>(rdma_offset);
-            zone->is_rdma = true;
         } else {
             zone->local_phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
-            zone->is_rdma = false;
         }
         zone->remote_phys_addr = ack->phys_addr;
         zone->remote_rkey = ack->rkey;
@@ -683,8 +803,21 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
 
         s_zone_table_lock.unlock();
 
-        ker::mod::dbg::log("[WKI] Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d)", ack->zone_id, hdr->src_node, zone->size,
-                           use_rdma ? 1 : 0);
+        // For RoCE zones: tell the responder our local_rkey so it can RDMA
+        // write/read our zone memory.  The ACK only carries the responder's
+        // rkey (responder → initiator); we send ours back via a ZONE_NOTIFY_POST
+        // with op_type=0xFE (rkey-exchange).  The rkey is encoded in the offset field.
+        if (use_roce && local_rkey != 0) {
+            ZoneNotifyPayload rkey_notify = {};
+            rkey_notify.zone_id = ack->zone_id;
+            rkey_notify.offset = local_rkey;  // encode our rkey
+            rkey_notify.length = 0;
+            rkey_notify.op_type = 0xFE;  // rkey-exchange sentinel
+            wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify));
+        }
+
+        ker::mod::dbg::log("[WKI] Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node,
+                           zone->size, use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack->zone_id, sizeof(ack->zone_id));
     } else {
@@ -769,6 +902,14 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
         return;
     }
     if (zone->peer_node_id != hdr->src_node) {
+        return;
+    }
+
+    // op_type=0xFE: rkey-exchange — the initiator is telling us its RDMA rkey
+    // so we can write/read its zone memory.  Store it in remote_rkey.
+    if (notify->op_type == 0xFE) {
+        zone->remote_rkey = notify->offset;  // rkey encoded in offset field
+        // No ACK needed for rkey-exchange — the initiator doesn't wait.
         return;
     }
 

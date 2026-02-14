@@ -137,6 +137,7 @@ struct WkiPeer {
     uint16_t node_id = WKI_NODE_INVALID;
     std::array<uint8_t, 6> mac = {};
     WkiTransport* transport = nullptr;
+    WkiTransport* rdma_transport = nullptr;  // RDMA-capable overlay (ivshmem or RoCE)
     PeerState state = PeerState::UNKNOWN;
     uint64_t last_heartbeat = 0;                                         // timestamp of last recv'd heartbeat (microseconds)
     uint64_t connected_time = 0;                                         // timestamp when peer transitioned to CONNECTED

@@ -6,6 +6,7 @@
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
 #include <net/wki/transport_eth.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::net::proto {
@@ -51,6 +52,9 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
             break;
         case ETH_TYPE_WKI:
             ker::net::wki::wki_eth_rx(dev, pkt);
+            break;
+        case ETH_TYPE_WKI_ROCE:
+            ker::net::wki::roce_rx(dev, pkt);
             break;
         default:
             pkt_free(pkt);

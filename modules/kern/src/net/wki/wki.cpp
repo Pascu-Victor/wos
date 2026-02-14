@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <net/netpoll.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/event.hpp>
@@ -14,10 +15,10 @@
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
 #include <net/wki/transport_eth.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
-#include <net/netpoll.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -124,6 +125,9 @@ void wki_init() {
     // Init zone subsystem (shared memory zones)
     wki_zone_init();
 
+    // Init RoCE RDMA transport (L2, MAC-based GIDs)
+    wki_roce_transport_init();
+
     // Init remotable subsystem (device remoting)
     wki_remotable_init();
 
@@ -224,9 +228,7 @@ void wki_transport_unregister(WkiTransport* transport) {
 
 namespace {
 
-inline auto peer_hash_slot(uint16_t node_id) -> uint8_t {
-    return static_cast<uint8_t>((static_cast<uint32_t>(node_id) * 0x9E37U) >> 8);
-}
+inline auto peer_hash_slot(uint16_t node_id) -> uint8_t { return static_cast<uint8_t>((static_cast<uint32_t>(node_id) * 0x9E37U) >> 8); }
 
 void peer_hash_insert(uint16_t node_id, int16_t peer_idx) {
     uint8_t slot = peer_hash_slot(node_id);
@@ -375,8 +377,7 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
 
 // Allocate a pool slot and register in peer->channels[].
 // Caller must hold s_channel_pool_lock.
-auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id,
-                        PriorityClass prio, uint16_t credits) -> WkiChannel* {
+auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id, PriorityClass prio, uint16_t credits) -> WkiChannel* {
     for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
         if (!s_channel_pool[i].active) {
             WkiChannel* ch = &s_channel_pool[i];
@@ -390,11 +391,16 @@ auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id,
 
 auto default_credits_for_channel(uint16_t channel_id) -> uint16_t {
     switch (channel_id) {
-        case WKI_CHAN_CONTROL: return WKI_CREDITS_CONTROL;
-        case WKI_CHAN_ZONE_MGMT: return WKI_CREDITS_ZONE_MGMT;
-        case WKI_CHAN_EVENT_BUS: return WKI_CREDITS_EVENT_BUS;
-        case WKI_CHAN_RESOURCE: return WKI_CREDITS_RESOURCE;
-        default: return WKI_CREDITS_DYNAMIC;
+        case WKI_CHAN_CONTROL:
+            return WKI_CREDITS_CONTROL;
+        case WKI_CHAN_ZONE_MGMT:
+            return WKI_CREDITS_ZONE_MGMT;
+        case WKI_CHAN_EVENT_BUS:
+            return WKI_CREDITS_EVENT_BUS;
+        case WKI_CHAN_RESOURCE:
+            return WKI_CREDITS_RESOURCE;
+        default:
+            return WKI_CREDITS_DYNAMIC;
     }
 }
 
@@ -1480,6 +1486,12 @@ void wki_timer_tick(uint64_t now_us) {
     }
 
     // Heartbeat checks are done in peer.cpp's wki_peer_timer_tick()
+
+    // Process deferred RDMA zone creations (must run outside NAPI poll context)
+    wki_dev_server_process_pending_zones();
+
+    // Poll RDMA block ring SQ entries on server bindings
+    wki_dev_server_poll_rings();
 }
 
 }  // namespace ker::net::wki

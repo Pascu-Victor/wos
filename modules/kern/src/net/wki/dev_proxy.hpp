@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <dev/block_device.hpp>
+#include <net/wki/blk_ring.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -41,6 +43,35 @@ struct ProxyBlockState {
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+
+    // RDMA block ring state (Phase 3: shared memory SQ/CQ for block I/O)
+    bool rdma_attached = false;
+    uint32_t rdma_zone_id = 0;
+    void* rdma_zone_ptr = nullptr;
+    uint64_t data_slot_bitmap = 0;  // 1 = slot in use (max 64 slots)
+    uint32_t next_tag = 1;          // monotonically increasing request tag
+
+    // RoCE RDMA state — RoCE zones have separate memory on each side, requiring
+    // explicit rdma_write/read to sync ring state between proxy and server.
+    bool rdma_roce = false;                  // true if zone is RoCE-backed
+    uint32_t rdma_remote_rkey = 0;           // server's RDMA key for their zone copy
+    WkiTransport* rdma_transport = nullptr;  // RoCE transport for rdma_write/read
+
+    // Out-of-order CQ completion cache
+    struct PendingCompletion {
+        bool valid = false;
+        BlkCqEntry cqe = {};
+    };
+    static constexpr uint32_t PENDING_CQ_SIZE = 16;
+    std::array<PendingCompletion, PENDING_CQ_SIZE> pending_cq = {};
+
+    // Read-ahead cache — prefetches a full RDMA data slot worth of blocks
+    // to amortize per-cluster RDMA round-trips for sequential FAT32 reads.
+    uint64_t ra_base_lba = 0;      // starting LBA of cached data
+    uint32_t ra_block_count = 0;   // number of blocks currently cached
+    uint8_t* ra_buffer = nullptr;  // backing buffer (data_slot_size bytes, allocated on attach)
+    uint32_t ra_capacity = 0;      // max blocks that fit in ra_buffer
+    bool ra_valid = false;         // true when cache contains valid data
 
     // Registered block device (callers use this transparently)
     ker::dev::BlockDevice bdev;

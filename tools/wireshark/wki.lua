@@ -1187,3 +1187,291 @@ local udp_table = DissectorTable.get("udp.port")
 udp_table:add(0x88B7, wki_proto)
 
 print("WKI Protocol dissector loaded (EtherType 0x88B7) with statistics support")
+
+-- =========================================================================
+-- WKI RoCE RDMA Transport Dissector (EtherType 0x88B8)
+-- =========================================================================
+
+local WKI_ETHERTYPE_ROCE = 0x88B8
+local ROCE_HEADER_SIZE = 24
+local ROCE_VERSION = 1
+
+local roce_opcodes = {
+    [0x01] = "RDMA_WRITE",
+    [0x02] = "RDMA_READ_REQ",
+    [0x03] = "RDMA_READ_RESP",
+    [0x04] = "DOORBELL",
+}
+
+-- Create the RoCE protocol
+local wki_roce_proto = Proto("wki_roce", "WKI RoCE RDMA Transport")
+
+-- RoCE header fields
+local pf_roce_opcode    = ProtoField.uint8("wki_roce.opcode", "Opcode", base.HEX, roce_opcodes)
+local pf_roce_version   = ProtoField.uint8("wki_roce.version", "Version", base.DEC)
+local pf_roce_src_node  = ProtoField.uint16("wki_roce.src_node", "Source Node", base.HEX)
+local pf_roce_rkey      = ProtoField.uint32("wki_roce.rkey", "Remote Key", base.HEX)
+local pf_roce_offset    = ProtoField.uint64("wki_roce.offset", "Offset", base.DEC)
+local pf_roce_length    = ProtoField.uint32("wki_roce.length", "Length", base.DEC)
+local pf_roce_doorbell  = ProtoField.uint32("wki_roce.doorbell_val", "Doorbell Value", base.HEX)
+local pf_roce_payload   = ProtoField.bytes("wki_roce.payload", "RDMA Payload")
+
+-- Analysis fields
+local pf_roce_is_fragmented  = ProtoField.bool("wki_roce.fragmented", "Fragmented Transfer")
+local pf_roce_payload_preview = ProtoField.string("wki_roce.payload_preview", "Payload Preview")
+
+wki_roce_proto.fields = {
+    pf_roce_opcode, pf_roce_version, pf_roce_src_node, pf_roce_rkey,
+    pf_roce_offset, pf_roce_length, pf_roce_doorbell, pf_roce_payload,
+    pf_roce_is_fragmented, pf_roce_payload_preview,
+}
+
+-- RoCE statistics tracking
+local roce_stats = {
+    total_frames = 0,
+    write_frames = 0,
+    read_req_frames = 0,
+    read_resp_frames = 0,
+    doorbell_frames = 0,
+    total_rdma_bytes = 0,
+}
+
+-- Per-rkey transfer tracking: rkey → { writes, reads, bytes, first_frame, last_frame }
+local roce_rkey_stats = {}
+
+-- Per-node stats: node_id → { tx_writes, tx_reads, tx_doorbells, bytes }
+local roce_node_stats = {}
+
+local function reset_roce_stats()
+    roce_stats = {
+        total_frames = 0,
+        write_frames = 0,
+        read_req_frames = 0,
+        read_resp_frames = 0,
+        doorbell_frames = 0,
+        total_rdma_bytes = 0,
+    }
+    roce_rkey_stats = {}
+    roce_node_stats = {}
+end
+
+-- RoCE dissector function
+function wki_roce_proto.dissector(buffer, pinfo, tree)
+    local length = buffer:len()
+    if length < ROCE_HEADER_SIZE then
+        return 0
+    end
+
+    pinfo.cols.protocol:set("WKI-RoCE")
+
+    local opcode      = buffer(0, 1):uint()
+    local version     = buffer(1, 1):uint()
+    local src_node    = buffer(2, 2):le_uint()
+    local rkey        = buffer(4, 4):le_uint()
+    local offset      = buffer(8, 8):le_uint64()
+    local data_length = buffer(16, 4):le_uint()
+    local doorbell_v  = buffer(20, 4):le_uint()
+    --   uint8_t  opcode;        // offset 0
+    --   uint8_t  version;       // offset 1
+    --   uint16_t src_node;      // offset 2
+    --   uint32_t rkey;          // offset 4
+    --   uint64_t offset;        // offset 8  (8 bytes)
+    --   uint32_t length;        // offset 16
+    --   uint32_t doorbell_val;  // offset 20
+    -- Total = 24 bytes
+
+    local opcode_str = roce_opcodes[opcode] or string.format("UNKNOWN(0x%02X)", opcode)
+    local src_node_str = format_node_id(src_node)
+
+    -- Update info column
+    local info_str
+    if opcode == 0x01 then
+        info_str = string.format("RDMA_WRITE rkey=0x%08X off=%s len=%d from %s",
+            rkey, tostring(offset), data_length, src_node_str)
+    elseif opcode == 0x02 then
+        info_str = string.format("RDMA_READ_REQ rkey=0x%08X off=%s len=%d resp_rkey=0x%08X from %s",
+            rkey, tostring(offset), data_length, doorbell_v, src_node_str)
+    elseif opcode == 0x03 then
+        info_str = string.format("RDMA_READ_RESP rkey=0x%08X off=%s len=%d from %s",
+            rkey, tostring(offset), data_length, src_node_str)
+    elseif opcode == 0x04 then
+        info_str = string.format("DOORBELL val=0x%08X from %s", doorbell_v, src_node_str)
+    else
+        info_str = string.format("%s from %s", opcode_str, src_node_str)
+    end
+    pinfo.cols.info:set(info_str)
+
+    -- Build protocol tree
+    local subtree = tree:add(wki_roce_proto, buffer(0, length), "WKI RoCE RDMA Transport")
+
+    -- Header subtree
+    local hdr_tree = subtree:add(wki_roce_proto, buffer(0, ROCE_HEADER_SIZE), "RoCE Header")
+    hdr_tree:add(pf_roce_opcode, buffer(0, 1))
+    hdr_tree:add(pf_roce_version, buffer(1, 1))
+    hdr_tree:add_le(pf_roce_src_node, buffer(2, 2))
+    hdr_tree:add_le(pf_roce_rkey, buffer(4, 4))
+    hdr_tree:add_le(pf_roce_offset, buffer(8, 8))
+    hdr_tree:add_le(pf_roce_length, buffer(16, 4))
+    hdr_tree:add_le(pf_roce_doorbell, buffer(20, 4))
+
+    -- Version warning
+    if version ~= ROCE_VERSION then
+        hdr_tree:add_expert_info(PI_PROTOCOL, PI_WARN,
+            string.format("Unexpected RoCE version %d (expected %d)", version, ROCE_VERSION))
+    end
+
+    -- Payload for RDMA_WRITE
+    local payload_len = length - ROCE_HEADER_SIZE
+    if payload_len > 0 then
+        local payload_tree = subtree:add(wki_roce_proto, buffer(ROCE_HEADER_SIZE, payload_len), "RDMA Payload")
+        payload_tree:add(pf_roce_payload, buffer(ROCE_HEADER_SIZE, payload_len))
+
+        -- Show a hex preview of the first 32 bytes
+        local preview_len = payload_len < 32 and payload_len or 32
+        local hex_str = ""
+        for i = 0, preview_len - 1 do
+            hex_str = hex_str .. string.format("%02X ", buffer(ROCE_HEADER_SIZE + i, 1):uint())
+        end
+        if payload_len > 32 then
+            hex_str = hex_str .. "..."
+        end
+        payload_tree:add(pf_roce_payload_preview, hex_str)
+
+        -- Mark fragmented transfers (offset > 0 for WRITE suggests a multi-frame write)
+        if opcode == 0x01 and tostring(offset) ~= "0" then
+            local analysis_tree = subtree:add(wki_roce_proto, buffer(0, 0), "Analysis")
+            analysis_tree:add(pf_roce_is_fragmented, true):set_generated()
+            analysis_tree:add(wki_roce_proto, buffer(0, 0),
+                string.format("Fragment at offset %s (continuation of rkey 0x%08X transfer)",
+                    tostring(offset), rkey)):set_generated()
+        end
+    end
+
+    -- Update statistics
+    roce_stats.total_frames = roce_stats.total_frames + 1
+    if opcode == 0x01 then
+        roce_stats.write_frames = roce_stats.write_frames + 1
+        roce_stats.total_rdma_bytes = roce_stats.total_rdma_bytes + data_length
+    elseif opcode == 0x02 then
+        roce_stats.read_req_frames = roce_stats.read_req_frames + 1
+    elseif opcode == 0x03 then
+        roce_stats.read_resp_frames = roce_stats.read_resp_frames + 1
+    elseif opcode == 0x04 then
+        roce_stats.doorbell_frames = roce_stats.doorbell_frames + 1
+    end
+
+    -- Per-rkey stats
+    if rkey ~= 0 then
+        if not roce_rkey_stats[rkey] then
+            roce_rkey_stats[rkey] = { writes = 0, read_reqs = 0, doorbells = 0, bytes = 0 }
+        end
+        local rks = roce_rkey_stats[rkey]
+        if opcode == 0x01 then
+            rks.writes = rks.writes + 1
+            rks.bytes = rks.bytes + data_length
+        elseif opcode == 0x02 then
+            rks.read_reqs = rks.read_reqs + 1
+        end
+    end
+
+    if opcode == 0x04 and doorbell_v ~= 0 then
+        if not roce_rkey_stats[doorbell_v] then
+            roce_rkey_stats[doorbell_v] = { writes = 0, read_reqs = 0, doorbells = 0, bytes = 0 }
+        end
+        roce_rkey_stats[doorbell_v].doorbells = roce_rkey_stats[doorbell_v].doorbells + 1
+    end
+
+    -- Per-node stats
+    if not roce_node_stats[src_node] then
+        roce_node_stats[src_node] = { writes = 0, read_reqs = 0, read_resps = 0, doorbells = 0, bytes = 0 }
+    end
+    local ns = roce_node_stats[src_node]
+    if opcode == 0x01 then
+        ns.writes = ns.writes + 1
+        ns.bytes = ns.bytes + data_length
+    elseif opcode == 0x02 then
+        ns.read_reqs = ns.read_reqs + 1
+    elseif opcode == 0x03 then
+        ns.read_resps = ns.read_resps + 1
+    elseif opcode == 0x04 then
+        ns.doorbells = ns.doorbells + 1
+    end
+
+    return length
+end
+
+-- =========================================================================
+-- RoCE Statistics Window
+-- =========================================================================
+
+local function show_roce_statistics()
+    local win = TextWindow.new("WKI RoCE RDMA Statistics")
+    local lines = {}
+
+    table.insert(lines, "=" .. string.rep("=", 78))
+    table.insert(lines, "  WKI RoCE RDMA Transport Statistics")
+    table.insert(lines, "=" .. string.rep("=", 78))
+
+    -- Summary
+    table.insert(lines, "")
+    table.insert(lines, "--- Frame Summary ---")
+    table.insert(lines, string.format("  Total frames:       %d", roce_stats.total_frames))
+    table.insert(lines, string.format("  RDMA_WRITE:         %d", roce_stats.write_frames))
+    table.insert(lines, string.format("  RDMA_READ_REQ:      %d", roce_stats.read_req_frames))
+    table.insert(lines, string.format("  RDMA_READ_RESP:     %d", roce_stats.read_resp_frames))
+    table.insert(lines, string.format("  DOORBELL:           %d", roce_stats.doorbell_frames))
+    table.insert(lines, string.format("  Total RDMA bytes:   %d", roce_stats.total_rdma_bytes))
+
+    -- Per-node
+    table.insert(lines, "")
+    table.insert(lines, "--- Per-Node Summary ---")
+    table.insert(lines, string.format("  %-12s %8s %8s %8s %8s %12s",
+        "Node", "Writes", "ReadReq", "ReadRsp", "DBells", "Bytes"))
+    table.insert(lines, "  " .. string.rep("-", 62))
+
+    local sorted_nodes = {}
+    for node_id, _ in pairs(roce_node_stats) do
+        table.insert(sorted_nodes, node_id)
+    end
+    table.sort(sorted_nodes)
+
+    for _, node_id in ipairs(sorted_nodes) do
+        local s = roce_node_stats[node_id]
+        table.insert(lines, string.format("  %-12s %8d %8d %8d %8d %12d",
+            format_node_id(node_id), s.writes, s.read_reqs, s.read_resps, s.doorbells, s.bytes))
+    end
+
+    -- Per-rkey
+    table.insert(lines, "")
+    table.insert(lines, "--- Per-Region Key Summary ---")
+    table.insert(lines, string.format("  %-14s %8s %8s %8s %12s",
+        "RKey", "Writes", "ReadReq", "DBells", "Bytes"))
+    table.insert(lines, "  " .. string.rep("-", 56))
+
+    local sorted_rkeys = {}
+    for rkey, _ in pairs(roce_rkey_stats) do
+        table.insert(sorted_rkeys, rkey)
+    end
+    table.sort(sorted_rkeys)
+
+    for _, rkey in ipairs(sorted_rkeys) do
+        local s = roce_rkey_stats[rkey]
+        table.insert(lines, string.format("  0x%08X     %8d %8d %8d %12d",
+            rkey, s.writes, s.read_reqs, s.doorbells, s.bytes))
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, "=" .. string.rep("=", 78))
+
+    win:set(table.concat(lines, "\n"))
+end
+
+register_menu("WKI/RoCE RDMA Statistics", show_roce_statistics, MENU_TOOLS_UNSORTED)
+
+-- Reset RoCE state on new capture
+wki_roce_proto.init = reset_roce_stats
+
+-- Register RoCE with Ethernet dissector table
+eth_table:add(WKI_ETHERTYPE_ROCE, wki_roce_proto)
+
+print("WKI RoCE RDMA dissector loaded (EtherType 0x88B8) with statistics support")

@@ -12,6 +12,7 @@
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
 #include <net/wki/transport_eth.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
@@ -162,6 +163,13 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     peer->last_heartbeat = wki_now_us();
     peer->missed_beats = 0;
 
+    // Select RDMA transport: prefer ivshmem (native doorbell), fall back to RoCE
+    if (transport->rdma_capable) {
+        peer->rdma_transport = transport;  // ivshmem — preferred
+    } else {
+        peer->rdma_transport = wki_roce_transport_get();  // RoCE over Ethernet — fallback
+    }
+
     // Negotiate heartbeat interval (use smaller of both proposals)
     uint16_t proposed = hello->heartbeat_interval_ms;
     proposed = std::max(proposed, WKI_MIN_HEARTBEAT_INTERVAL_MS);
@@ -267,6 +275,13 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->rdma_zone_bitmap = ack->rdma_zone_bitmap;
     peer->is_direct = true;
     peer->hop_count = 1;
+
+    // Select RDMA transport: prefer ivshmem, fall back to RoCE
+    if (transport->rdma_capable) {
+        peer->rdma_transport = transport;
+    } else {
+        peer->rdma_transport = wki_roce_transport_get();
+    }
     peer->link_cost = 1;
     peer->last_heartbeat = wki_now_us();
     peer->missed_beats = 0;
