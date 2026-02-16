@@ -18,8 +18,11 @@
 #include <net/wki/zone.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
+
+#include "platform/mm/phys.hpp"
 
 namespace ker::net::wki {
 
@@ -348,7 +351,7 @@ void wki_peer_send_heartbeats() {
     HeartbeatPayload hb = {};
     hb.send_timestamp = ker::mod::time::getUs() * 1000;  // convert to nanoseconds
     hb.sender_load = total_runnable;
-    hb.sender_mem_free = 0;  // TODO: buddy allocator free page count when API available
+    hb.sender_mem_free = ker::mod::mm::phys::get_free_mem_bytes();
     hb.reserved = 0;
 
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {

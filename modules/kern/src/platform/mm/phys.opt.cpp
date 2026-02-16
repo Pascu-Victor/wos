@@ -95,6 +95,9 @@ static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures ar
 static uint64_t perCpuCachesPhysBase = 0;
 static uint64_t perCpuCachesSize = 0;
 
+// Statistics counters
+static uint64_t mainHeapSize = 0;
+
 // Huge page zone deferred initialization info
 static uint64_t hugePageBase = 0;
 static uint64_t hugePageSize = 0;
@@ -133,6 +136,8 @@ void dumpAllocStats() {
     io::serial::writeHex(freeCount.load());
     io::serial::write("\n");
 }
+
+uint64_t get_free_mem_bytes() { return mainHeapSize - (totalAllocatedBytes.load() - totalFreedBytes.load()); }
 
 auto getZones() -> paging::PageZone* { return zones; }
 auto getHugePageZone() -> paging::PageZone* { return hugePageZone; }
@@ -281,6 +286,8 @@ void init(limine_memmap_response* memmapResponse) {
             // Reduce the main zone size
             memmap.entries[i]->length -= hugeSz;
         }
+
+        mainHeapSize += memmap.entries[i]->length;
 
         paging::PageZone* zone =
             initPageZone((uint64_t)addr::getVirtPointer(memmap.entries[i]->base), memmap.entries[i]->length, zoneNum++);

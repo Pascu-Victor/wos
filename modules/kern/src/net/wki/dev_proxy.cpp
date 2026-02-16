@@ -27,9 +27,6 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 
 namespace {
-// unique_ptr indirection: ProxyBlockState contains Spinlock (std::atomic<bool>) which has
-// deleted move-assignment. std::deque::erase needs to shift elements, so we store via
-// unique_ptr so the deque only moves pointers.
 std::deque<std::unique_ptr<ProxyBlockState>> g_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_dev_proxy_initialized = false;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 

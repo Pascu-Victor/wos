@@ -33,6 +33,8 @@ void dumpKmallocTrackedAllocs();
 void dumpAllocStats();  // Dump allocation/free counters for debugging
 void enable_stack_overlap_check();
 
+uint64_t get_free_mem_bytes();
+
 template <typename T>
 inline static void pageFree(T* page) {
     pageFree((void*)page);
