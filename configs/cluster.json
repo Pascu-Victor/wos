@@ -1,45 +1,44 @@
 {
-  "zones": [
-    {
-      "id": "GLOBAL",
-      "mtu": 9000,
-      "nic_model": "virtio-net-pci",
-      "ivshmem": {
-        "enabled": false,
-        "size": "16M",
-        "root_path": "/dev/shm",
-        "topology": "full-mesh"
-      },
-      "bridge": {
-        "stp": false,
-        "ip": null
-      },
-      "vm": {
-        "memory": "4G",
-        "cpus": 2,
-        "disk0": "disk.qcow2",
-        "disk1": "test_fat32.qcow2"
-      }
-    },
-    {
-      "id": 0,
-      "name": "lan",
-      "nodes": 2,
-      "nic_model": "virtio-net-pci",
-      "bridge": {
-        "uplink": "vmnet1",
-        "ip": "10.10.0.100/16"
-      }
-    },
-    {
-      "id": 1,
-      "name": "wki",
-      "nodes": 2,
-      "nic_model": "virtio-net-pci",
-      "ivshmem": {
-        "enabled": true,
-        "topology": "full-mesh"
-      }
-    }
-  ]
+    "zones": [
+        {
+            "id": "GLOBAL",
+            "mtu": 9000,
+            "nic_model": "virtio-net-pci",
+            "ivshmem": {
+                "enabled": false,
+                "size": "16M",
+                "root_path": "/dev/shm",
+                "topology": "full-mesh"
+            },
+            "bridge": {
+                "stp": false,
+                "ip": null
+            },
+            "vm": {
+                "memory": "4G",
+                "cpus": 2,
+                "disk0": "disk.qcow2",
+                "disk1": "test_fat32.qcow2"
+            }
+        },
+        {
+            "id": 0,
+            "name": "lan",
+            "nodes": 2,
+            "nic_model": "virtio-net-pci",
+            "bridge": {
+                "ip": "10.10.0.100/16"
+            }
+        },
+        {
+            "id": 1,
+            "name": "wki",
+            "nodes": 2,
+            "nic_model": "virtio-net-pci",
+            "ivshmem": {
+                "enabled": true,
+                "topology": "full-mesh"
+            }
+        }
+    ]
 }

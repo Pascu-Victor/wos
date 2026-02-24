@@ -7,11 +7,14 @@ topology: bridges, TAPs, ivshmem shared memory files. Replaces the ad-hoc
 shell scripts with a declarative, per-zone, per-node configurable system.
 
 Usage:
-    sudo python3 scripts/cluster_setup.py                     # setup (default)
-    sudo python3 scripts/cluster_setup.py --setup              # explicit setup
-    sudo python3 scripts/cluster_setup.py --launch             # setup + launch VMs
-    sudo python3 scripts/cluster_setup.py --teardown           # destroy everything
-    sudo python3 scripts/cluster_setup.py --config path.json   # custom config
+    python3 scripts/cluster_setup.py                     # setup (default)
+    python3 scripts/cluster_setup.py --setup              # explicit setup
+    python3 scripts/cluster_setup.py --launch             # setup + launch VMs
+    python3 scripts/cluster_setup.py --teardown           # destroy everything
+    python3 scripts/cluster_setup.py --config path.json   # custom config
+
+Note: sudo is used internally only for privileged operations (network setup).
+      The script will prompt for your password once if needed.
 """
 
 import argparse
@@ -29,6 +32,7 @@ from itertools import combinations
 # ---------------------------------------------------------------------------
 # Config loading and resolution
 # ---------------------------------------------------------------------------
+
 
 def load_config(path: str) -> dict:
     with open(path) as f:
@@ -94,6 +98,7 @@ def get_node_config(zone_cfg: dict, node_id: int) -> dict:
 # Naming conventions — deterministic from config, no state file
 # ---------------------------------------------------------------------------
 
+
 def zone_name(zone_cfg: dict) -> str:
     if "name" in zone_cfg:
         return zone_cfg["name"]
@@ -121,6 +126,7 @@ def mac_addr(zone_id: int, node_id: int, seq: int = 0) -> str:
 # ivshmem topology — compute link pairs
 # ---------------------------------------------------------------------------
 
+
 def ivshmem_links(zone_cfg: dict, num_nodes: int) -> list:
     """Return list of (nodeA, nodeB) pairs based on topology."""
     ivshmem = zone_cfg.get("ivshmem", {})
@@ -140,7 +146,9 @@ def ivshmem_links(zone_cfg: dict, num_nodes: int) -> list:
         explicit = ivshmem.get("ivshmem_links", [])
         return [(min(a, b), max(a, b)) for a, b in explicit]
     else:
-        print(f"WARNING: Unknown ivshmem topology '{topology}', defaulting to full-mesh")
+        print(
+            f"WARNING: Unknown ivshmem topology '{topology}', defaulting to full-mesh"
+        )
         return list(combinations(range(num_nodes), 2))
 
 
@@ -148,8 +156,11 @@ def ivshmem_links(zone_cfg: dict, num_nodes: int) -> list:
 # Shell helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd: str, check=True, quiet=False):
-    """Run a shell command, optionally ignoring errors."""
+
+def run(cmd: str, check=True, quiet=False, privileged=False):
+    """Run a shell command, optionally with sudo, optionally ignoring errors."""
+    if privileged:
+        cmd = f"sudo {cmd}"
     if not quiet:
         print(f"  $ {cmd}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -159,11 +170,21 @@ def run(cmd: str, check=True, quiet=False):
     return True
 
 
+def ensure_sudo():
+    """Validate/cache sudo credentials so the user is prompted once upfront."""
+    result = subprocess.run(["sudo", "-v"], capture_output=False)
+    if result.returncode != 0:
+        print("ERROR: Failed to obtain sudo privileges.", file=sys.stderr)
+        sys.exit(1)
+
+
 def link_exists(name: str) -> bool:
-    return subprocess.run(
-        f"ip link show {name}", shell=True,
-        capture_output=True
-    ).returncode == 0
+    return (
+        subprocess.run(
+            f"ip link show {name}", shell=True, capture_output=True
+        ).returncode
+        == 0
+    )
 
 
 def parse_size(s: str) -> int:
@@ -178,9 +199,61 @@ def parse_size(s: str) -> int:
     return int(s)
 
 
+def reattach_libvirt_vms(bridge: str):
+    """Re-attach any running libvirt VM interfaces that target *bridge*.
+
+    When the cluster setup script (re)creates a bridge, any libvirt TAP
+    interfaces previously enslaved to it lose their master.  This queries
+    ``virsh`` for every running VM and re-attaches interfaces whose
+    configured source bridge matches *bridge*.
+    """
+    # List running VMs via the system connection
+    result = subprocess.run(
+        "virsh -c qemu:///system list --name 2>/dev/null",
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return  # libvirt not available — nothing to do
+
+    vms = [name.strip() for name in result.stdout.splitlines() if name.strip()]
+    for vm in vms:
+        result = subprocess.run(
+            f"virsh -c qemu:///system domiflist {vm} 2>/dev/null",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            cols = line.split()
+            # columns: Interface  Type  Source  Model  MAC
+            if len(cols) >= 3 and cols[2] == bridge:
+                iface = cols[0]
+                if iface == "Interface" or iface.startswith("-"):
+                    continue
+                if not link_exists(iface):
+                    continue
+                # Check if already attached to the correct bridge
+                check = subprocess.run(
+                    f"ip -o link show {iface}",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if f"master {bridge}" in check.stdout:
+                    continue
+                run(f"ip link set {iface} master {bridge}", privileged=True)
+                run(f"ip link set {iface} up", privileged=True)
+                print(f"  Re-attached libvirt VM '{vm}' interface {iface} -> {bridge}")
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+
 
 def setup(config: dict):
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
@@ -190,10 +263,20 @@ def setup(config: dict):
 
     # Disable bridge netfilter so iptables doesn't filter bridged traffic
     # (DHCP, ICMP, ARP all need to pass through bridges unfiltered)
-    run("modprobe br_netfilter 2>/dev/null || true", quiet=True)
-    run("sysctl -q -w net.bridge.bridge-nf-call-iptables=0", quiet=True)
-    run("sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0", quiet=True)
-    run("sysctl -q -w net.bridge.bridge-nf-call-arptables=0", quiet=True)
+    run("modprobe br_netfilter 2>/dev/null || true", quiet=True, privileged=True)
+    run(
+        "sysctl -q -w net.bridge.bridge-nf-call-iptables=0", quiet=True, privileged=True
+    )
+    run(
+        "sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0",
+        quiet=True,
+        privileged=True,
+    )
+    run(
+        "sysctl -q -w net.bridge.bridge-nf-call-arptables=0",
+        quiet=True,
+        privileged=True,
+    )
 
     for zone_cfg in zones:
         zname = zone_name(zone_cfg)
@@ -207,26 +290,34 @@ def setup(config: dict):
         br = bridge_name(zone_cfg)
         bridge_cfg = effective.get("bridge", {})
         if not link_exists(br):
-            run(f"ip link add {br} type bridge")
-            run(f"ip link set {br} mtu {mtu}")
+            run(f"ip link add {br} type bridge", privileged=True)
+            run(f"ip link set {br} mtu {mtu}", privileged=True)
 
             # Disable STP if configured
             if not bridge_cfg.get("stp", False):
-                run(f"echo 0 > /sys/class/net/{br}/bridge/stp_state", quiet=True)
+                run(
+                    f"sh -c 'echo 0 > /sys/class/net/{br}/bridge/stp_state'",
+                    quiet=True,
+                    privileged=True,
+                )
 
-            run(f"ip link set {br} up")
+            run(f"ip link set {br} up", privileged=True)
             print(f"  Created bridge: {br} (MTU {mtu})")
         else:
             print(f"  Bridge {br} already exists")
+
+        # Re-attach any running libvirt VM interfaces that belong on this bridge
+        # (they get detached when the bridge is recreated)
+        reattach_libvirt_vms(br)
 
         # Attach uplink device to bridge (e.g. vmnet1 for router VM access)
         uplink = bridge_cfg.get("uplink")
         if uplink:
             if link_exists(uplink):
                 # Remove existing IP from uplink to avoid conflicts
-                run(f"ip addr flush dev {uplink}", quiet=True)
-                run(f"ip link set {uplink} master {br}")
-                run(f"ip link set {uplink} up")
+                run(f"ip addr flush dev {uplink}", quiet=True, privileged=True)
+                run(f"ip link set {uplink} master {br}", privileged=True)
+                run(f"ip link set {uplink} up", privileged=True)
                 print(f"  Attached uplink: {uplink} -> {br}")
             else:
                 print(f"  WARNING: uplink {uplink} not found — skipping")
@@ -234,18 +325,21 @@ def setup(config: dict):
         # Assign IP to bridge if specified
         ip_addr = bridge_cfg.get("ip")
         if ip_addr:
-            run(f"ip addr add {ip_addr} dev {br}", check=False)
+            run(f"ip addr add {ip_addr} dev {br}", check=False, privileged=True)
             print(f"  Bridge IP: {ip_addr}")
 
         # Create TAP devices
-        real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
+        real_user = os.environ.get("USER", "nobody")
         for node_id in range(num_nodes):
             tap = tap_name(zone_cfg, node_id)
             if not link_exists(tap):
-                run(f"ip tuntap add dev {tap} mode tap user {real_user}")
-                run(f"ip link set {tap} master {br}")
-                run(f"ip link set {tap} mtu {mtu}")
-                run(f"ip link set {tap} up")
+                run(
+                    f"ip tuntap add dev {tap} mode tap user {real_user}",
+                    privileged=True,
+                )
+                run(f"ip link set {tap} master {br}", privileged=True)
+                run(f"ip link set {tap} mtu {mtu}", privileged=True)
+                run(f"ip link set {tap} up", privileged=True)
                 print(f"  Created TAP: {tap}")
             else:
                 print(f"  TAP {tap} already exists")
@@ -261,9 +355,14 @@ def setup(config: dict):
 
             for node_a, node_b in links:
                 fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
-                # Always recreate for clean state
-                run(f"dd if=/dev/zero of={fpath} bs=1M count={size_mb} 2>/dev/null", quiet=True)
-                os.chmod(fpath, 0o666)
+                # Always recreate for clean state; use sudo for dd/chmod in case
+                # a previous root-owned file exists
+                run(
+                    f"dd if=/dev/zero of={fpath} bs=1M count={size_mb} 2>/dev/null",
+                    quiet=True,
+                    privileged=True,
+                )
+                run(f"chmod 666 {fpath}", quiet=True, privileged=True)
                 print(f"  Created ivshmem: {fpath} ({size_str})")
 
         print()
@@ -274,6 +373,7 @@ def setup(config: dict):
 # ---------------------------------------------------------------------------
 # Teardown — stateless, derived from config
 # ---------------------------------------------------------------------------
+
 
 def teardown(config: dict):
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
@@ -292,22 +392,27 @@ def teardown(config: dict):
         bridge_cfg = effective.get("bridge", {})
         uplink = bridge_cfg.get("uplink")
         if uplink and link_exists(uplink):
-            run(f"ip link set {uplink} nomaster", check=False, quiet=True)
+            run(
+                f"ip link set {uplink} nomaster",
+                check=False,
+                quiet=True,
+                privileged=True,
+            )
             print(f"  Detached uplink: {uplink}")
 
         # Delete TAP devices
         for node_id in range(num_nodes):
             tap = tap_name(zone_cfg, node_id)
             if link_exists(tap):
-                run(f"ip link set {tap} down", check=False, quiet=True)
-                run(f"ip tuntap del dev {tap} mode tap", check=False)
+                run(f"ip link set {tap} down", check=False, quiet=True, privileged=True)
+                run(f"ip tuntap del dev {tap} mode tap", check=False, privileged=True)
                 print(f"  Deleted TAP: {tap}")
 
         # Delete bridge
         br = bridge_name(zone_cfg)
         if link_exists(br):
-            run(f"ip link set {br} down", check=False, quiet=True)
-            run(f"ip link delete {br} type bridge", check=False)
+            run(f"ip link set {br} down", check=False, quiet=True, privileged=True)
+            run(f"ip link delete {br} type bridge", check=False, privileged=True)
             print(f"  Deleted bridge: {br}")
 
         # Delete ivshmem files
@@ -318,7 +423,7 @@ def teardown(config: dict):
             for node_a, node_b in links:
                 fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
                 if os.path.exists(fpath):
-                    os.remove(fpath)
+                    run(f"rm -f {fpath}", check=False, quiet=True, privileged=True)
                     print(f"  Deleted ivshmem: {fpath}")
 
         print()
@@ -327,6 +432,7 @@ def teardown(config: dict):
     overlay_dir = "cluster-overlays"
     if os.path.isdir(overlay_dir):
         import shutil
+
         shutil.rmtree(overlay_dir)
         print(f"  Removed {overlay_dir}/")
 
@@ -336,6 +442,7 @@ def teardown(config: dict):
 # ---------------------------------------------------------------------------
 # Launch — setup + start VMs
 # ---------------------------------------------------------------------------
+
 
 def collect_unique_nodes(config: dict) -> dict:
     """Build a map: node_id -> list of (zone_cfg, effective_cfg, node_cfg)."""
@@ -385,22 +492,34 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
     overlay0 = os.path.join(overlay_dir, f"disk-vm{node_id}.qcow2")
     overlay1 = os.path.join(overlay_dir, f"fat32-vm{node_id}.qcow2")
 
-    # Remove old overlays for clean state
+    # Remove old overlays for clean state (may be root-owned from previous sudo run)
     for f in [overlay0, overlay1]:
         if os.path.exists(f):
-            os.remove(f)
+            try:
+                os.remove(f)
+            except PermissionError:
+                run(f"rm -f {f}", quiet=True, privileged=True)
 
     abs_disk0 = os.path.abspath(disk0)
     abs_disk1 = os.path.abspath(disk1)
 
-    subprocess.run(
+    result = subprocess.run(
         f"qemu-img create -f qcow2 -b {abs_disk0} -F qcow2 {overlay0}",
-        shell=True, capture_output=True
+        shell=True,
+        capture_output=True,
+        text=True,
     )
-    subprocess.run(
+    if result.returncode != 0:
+        print(f"  ERROR creating overlay {overlay0}: {result.stderr.strip()}")
+
+    result = subprocess.run(
         f"qemu-img create -f qcow2 -b {abs_disk1} -F qcow2 {overlay1}",
-        shell=True, capture_output=True
+        shell=True,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        print(f"  ERROR creating overlay {overlay1}: {result.stderr.strip()}")
 
     serial_log = f"serial-vm{node_id}.log"
     qemu_log = f"qemu-vm{node_id}.%d.log"
@@ -413,22 +532,37 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
 
     args = [
         "qemu-system-x86_64",
-        "-M", "q35",
-        "-cpu", "host",
+        "-M",
+        "q35",
+        "-cpu",
+        "host",
         "--enable-kvm",
-        "-m", memory,
-        "-smp", str(cpus),
-        "-drive", f"file={overlay0},if=none,id=drive0,format=qcow2",
-        "-device", "ahci,id=ahci",
-        "-device", "ide-hd,drive=drive0,bus=ahci.0",
-        "-drive", f"file={overlay1},if=none,id=drive1,format=qcow2",
-        "-device", "ide-hd,drive=drive1,bus=ahci.1",
-        "-chardev", f"file,id=char0,path={serial_log}",
-        "-serial", "chardev:char0",
-        "-display", "none",
-        "-bios", "/usr/share/OVMF/x64/OVMF.4m.fd",
-        "-d", "cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation",
-        "-D", qemu_log,
+        "-m",
+        memory,
+        "-smp",
+        str(cpus),
+        "-drive",
+        f"file={overlay0},if=none,id=drive0,format=qcow2",
+        "-device",
+        "ahci,id=ahci",
+        "-device",
+        "ide-hd,drive=drive0,bus=ahci.0",
+        "-drive",
+        f"file={overlay1},if=none,id=drive1,format=qcow2",
+        "-device",
+        "ide-hd,drive=drive1,bus=ahci.1",
+        "-chardev",
+        f"file,id=char0,path={serial_log}",
+        "-serial",
+        "chardev:char0",
+        "-display",
+        "none",
+        "-bios",
+        "/usr/share/OVMF/x64/OVMF.4m.fd",
+        "-d",
+        "cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation",
+        "-D",
+        qemu_log,
         "-no-reboot",
     ]
 
@@ -442,10 +576,14 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         tap = tap_name(zone_cfg, node_id)
         mac = mac_addr(zone_id, node_id, 0)
 
-        args.extend([
-            "-netdev", f"tap,id=net{nic_idx},ifname={tap},script=no,downscript=no",
-            "-device", f"{nic_model},netdev=net{nic_idx},mac={mac}",
-        ])
+        args.extend(
+            [
+                "-netdev",
+                f"tap,id=net{nic_idx},ifname={tap},script=no,downscript=no",
+                "-device",
+                f"{nic_model},netdev=net{nic_idx},mac={mac}",
+            ]
+        )
         nic_idx += 1
 
     # Add ivshmem devices — one per ivshmem link involving this node.
@@ -464,10 +602,14 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         for node_a, node_b in links:
             if node_a == node_id or node_b == node_id:
                 fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
-                args.extend([
-                    "-object", f"memory-backend-file,size={size_str},share=on,mem-path={fpath},id=hmem{ivshmem_idx}",
-                    "-device", f"ivshmem-plain,memdev=hmem{ivshmem_idx}",
-                ])
+                args.extend(
+                    [
+                        "-object",
+                        f"memory-backend-file,size={size_str},share=on,mem-path={fpath},id=hmem{ivshmem_idx}",
+                        "-device",
+                        f"ivshmem-plain,memdev=hmem{ivshmem_idx}",
+                    ]
+                )
                 ivshmem_idx += 1
 
     # Debug mode
@@ -477,13 +619,19 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         monitor_port = 3002 + node_id
 
         args.extend(["-gdb", f"tcp:127.0.0.1:{gdb_port}", "-S"])
-        args.extend([
-            "-chardev", f"socket,id=debugger,port={debugcon_port},host=0.0.0.0,server=on,wait=off,telnet=on",
-            "-device", "isa-debugcon,iobase=0x402,chardev=debugger",
-        ])
+        args.extend(
+            [
+                "-chardev",
+                f"socket,id=debugger,port={debugcon_port},host=0.0.0.0,server=on,wait=off,telnet=on",
+                "-device",
+                "isa-debugcon,iobase=0x402,chardev=debugger",
+            ]
+        )
         args.extend(["-monitor", f"tcp:0.0.0.0:{monitor_port},server,nowait"])
 
-        print(f"  [VM{node_id}] DEBUG: gdb=127.0.0.1:{gdb_port} debugcon={debugcon_port} monitor={monitor_port}")
+        print(
+            f"  [VM{node_id}] DEBUG: gdb=127.0.0.1:{gdb_port} debugcon={debugcon_port} monitor={monitor_port}"
+        )
 
     return args
 
@@ -549,20 +697,23 @@ def launch(config: dict):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="WKI cluster topology manager")
-    parser.add_argument("--setup", action="store_true", help="Create topology (default)")
+    parser.add_argument(
+        "--setup", action="store_true", help="Create topology (default)"
+    )
     parser.add_argument("--launch", action="store_true", help="Setup + launch VMs")
     parser.add_argument("--teardown", action="store_true", help="Destroy topology")
-    parser.add_argument("--config", default="configs/cluster.json", help="Config file path")
+    parser.add_argument(
+        "--config", default="configs/cluster.json", help="Config file path"
+    )
     args = parser.parse_args()
 
-    # Root check
-    if os.getuid() != 0:
-        print("ERROR: This script must be run as root (sudo).", file=sys.stderr)
-        sys.exit(1)
-
     config = load_config(args.config)
+
+    # Cache sudo credentials once upfront for privileged network operations
+    ensure_sudo()
 
     if args.teardown:
         teardown(config)

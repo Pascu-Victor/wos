@@ -62,6 +62,8 @@ ker::vfs::FileOperations socket_fops = {
     .vfs_isatty = nullptr,
     .vfs_readdir = nullptr,
     .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,  // Sockets use SocketProtoOps::poll_check instead
 };
 
 // Get socket from fd using VFS helpers
@@ -557,8 +559,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
                         fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
                     }
+                } else if (file->fops != nullptr && file->fops->vfs_poll_check != nullptr) {
+                    // Use per-file poll_check callback (pipes, etc.)
+                    fds[i].revents = static_cast<int16_t>(file->fops->vfs_poll_check(file, fds[i].events));
                 } else {
-                    // Non-socket fds (regular files, devices) are always ready
+                    // Non-socket fds without poll_check (regular files, devices) are always ready
                     fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));  // POLLIN|POLLOUT
                 }
 

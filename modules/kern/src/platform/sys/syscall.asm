@@ -65,6 +65,13 @@ _wOS_asm_syscallHandler:
     ; deferred_task_switch will not return - it switches tasks
 
 .no_deferred_switch:
+    ; Check for pending signals before returning to userspace
+    extern check_pending_signals
+    mov rdi, rsp            ; raw stack pointer (bottom of pushed GPRegs)
+    sub rsp, 8              ; align stack for call
+    call check_pending_signals
+    add rsp, 8
+
     ; restore usermode segment ds and es
     mov ds, [gs:0x18]
     mov es, [gs:0x20]

@@ -557,6 +557,79 @@ void pageFree(void* page) {
     memlock.unlock_irq(flags);
 }
 
+// --- Frame reference counting helpers ---
+
+namespace {
+// Find the PageAllocator and page index for a given HHDM pointer.
+// Returns true if found, populating allocator and pageIdx.
+static bool findAllocatorForPage(void* page, PageAllocator*& outAlloc, uint32_t& outIdx) {
+    auto addr = (uint64_t)page;
+    // Check regular zones first
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if (addr >= zone->start && addr < zone->start + zone->len && zone->allocator != nullptr) {
+            outAlloc = zone->allocator;
+            outIdx = static_cast<uint32_t>((addr - zone->allocator->base) / paging::PAGE_SIZE);
+            if (outIdx < outAlloc->totalPages) return true;
+        }
+    }
+    // Check huge page zone
+    if (hugePageZone != nullptr && addr >= hugePageZone->start && addr < hugePageZone->start + hugePageZone->len &&
+        hugePageZone->allocator != nullptr) {
+        outAlloc = hugePageZone->allocator;
+        outIdx = static_cast<uint32_t>((addr - hugePageZone->allocator->base) / paging::PAGE_SIZE);
+        if (outIdx < outAlloc->totalPages) return true;
+    }
+    return false;
+}
+}  // namespace
+
+void pageRefInc(void* page) {
+    if (page == nullptr) return;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    if (findAllocatorForPage(page, alloc, idx)) {
+        alloc->pageRefcounts[idx]++;
+    }
+    memlock.unlock_irq(flags);
+}
+
+uint32_t pageRefDec(void* page) {
+    if (page == nullptr) return 0;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    if (findAllocatorForPage(page, alloc, idx)) {
+        if (alloc->pageRefcounts[idx] > 0) {
+            alloc->pageRefcounts[idx]--;
+        }
+        uint32_t newRef = alloc->pageRefcounts[idx];
+        if (newRef == 0) {
+            // Refcount reached zero — free the page
+            alloc->free(page);
+            freeCount.fetch_add(1, std::memory_order_relaxed);
+            totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+        }
+        memlock.unlock_irq(flags);
+        return newRef;
+    }
+    memlock.unlock_irq(flags);
+    return 0;
+}
+
+uint32_t pageRefGet(void* page) {
+    if (page == nullptr) return 0;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    uint32_t ref = 0;
+    if (findAllocatorForPage(page, alloc, idx)) {
+        ref = alloc->pageRefcounts[idx];
+    }
+    memlock.unlock_irq(flags);
+    return ref;
+}
+
 void dumpMiniMallocStats() { ::mini_dump_stats(); }
 
 void dumpKmallocTrackedAllocs() { ker::mod::mm::dyn::kmalloc::dumpTrackedAllocations(); }

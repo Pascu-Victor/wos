@@ -37,6 +37,11 @@ struct FAT32Node {
     // Track directory entry location for updating on write
     uint32_t dir_entry_cluster;  // Which cluster contains the directory entry
     uint32_t dir_entry_offset;   // Offset within that cluster (in bytes)
+
+    // POSIX permission model (runtime-only, not persisted to FAT32 disk)
+    uint32_t mode = 0;  // Permission bits (synthesized from FAT32 attributes)
+    uint32_t uid = 0;   // Owner user ID
+    uint32_t gid = 0;   // Owner group ID
 };
 
 // Long File Name entry (FAT32 VFAT). Packed on-disk.
@@ -600,6 +605,9 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     node->context = ctx;
     node->dir_entry_cluster = found_cluster;
     node->dir_entry_offset = static_cast<uint32_t>((found_start_index + lfn_count) * sizeof(FAT32DirectoryEntry));
+    node->mode = 0644;  // Default mode for new files
+    node->uid = 0;
+    node->gid = 0;
 
     auto* f = new File;
     f->private_data = node;
@@ -645,6 +653,9 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         node->file_size = 0;  // Directories don't have a meaningful size
         node->is_directory = true;
         node->context = ctx;  // Store mount context
+        node->mode = 0755;    // Default mode for root directory
+        node->uid = 0;
+        node->gid = 0;
 
         auto* file = new File;
         file->fd = -1;
@@ -865,6 +876,14 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     node->context = ctx;
     node->dir_entry_cluster = final_entry_cluster;
     node->dir_entry_offset = final_entry_offset;
+    // Synthesize POSIX mode from FAT32 attributes
+    if (node->is_directory) {
+        node->mode = 0755;
+    } else {
+        node->mode = (final_entry.attributes & 0x01) != 0 ? 0444u : 0644u;  // read-only attr → no write
+    }
+    node->uid = 0;
+    node->gid = 0;
 
     auto* f = new File;
     f->private_data = node;
@@ -1623,8 +1642,8 @@ auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int {
     statbuf->st_dev = 0;
     statbuf->st_ino = node->start_cluster;
     statbuf->st_nlink = 1;
-    statbuf->st_uid = 0;
-    statbuf->st_gid = 0;
+    statbuf->st_uid = node->uid;
+    statbuf->st_gid = node->gid;
     statbuf->st_rdev = 0;
     statbuf->st_size = static_cast<off_t>(node->file_size);
     if (node->context != nullptr) {
@@ -1635,25 +1654,571 @@ auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int {
     statbuf->st_blocks = (node->file_size + 511) / 512;
 
     if (node->is_directory) {
-        statbuf->st_mode = ker::vfs::S_IFDIR | 0755;
+        statbuf->st_mode = ker::vfs::S_IFDIR | node->mode;
     } else {
-        statbuf->st_mode = ker::vfs::S_IFREG | 0644;
+        statbuf->st_mode = ker::vfs::S_IFREG | node->mode;
     }
 
+    return 0;
+}
+
+// ============================================================================
+// FAT32 cluster and directory helpers
+// ============================================================================
+
+// Write a cluster to disk
+auto write_cluster(const FAT32MountContext* ctx, uint32_t cluster, const void* buffer) -> int {
+    if (ctx == nullptr || ctx->device == nullptr || cluster < 2) return -1;
+    uint64_t cluster_lba = ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(cluster - 2) * ctx->sectors_per_cluster);
+    return ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, buffer);
+}
+
+// Calculate total data clusters for bounds checking FAT scans
+auto total_data_clusters(const FAT32MountContext* ctx) -> uint32_t {
+    uint32_t data_sectors = ctx->total_sectors - ctx->data_start_sector;
+    return data_sectors / ctx->sectors_per_cluster + 2;
+}
+
+// Allocate a single cluster — find first free FAT entry, mark EOC
+auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
+    uint32_t max_cluster = total_data_clusters(ctx);
+    for (uint32_t i = 2; i < max_cluster; ++i) {
+        if ((ctx->fat_table[i] & FAT32_EOC) == 0) {
+            ctx->fat_table[i] = FAT32_EOC;
+            return i;
+        }
+    }
+    return 0;  // disk full
+}
+
+// Free an entire cluster chain starting at start_cluster
+auto free_cluster_chain(FAT32MountContext* ctx, uint32_t start_cluster) -> int {
+    if (start_cluster < 2) return 0;
+    uint32_t cluster = start_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        uint32_t next = ctx->fat_table[cluster] & FAT32_EOC;
+        ctx->fat_table[cluster] = 0;  // free the entry
+        if (next >= FAT32_EOC) break;
+        cluster = next;
+    }
+    return 0;
+}
+
+// Truncate/extend a FAT32 file
+auto fat32_truncate(File* f, off_t length) -> int {
+    if (f == nullptr || f->private_data == nullptr) return -EINVAL;
+    auto* node = static_cast<FAT32Node*>(f->private_data);
+    auto* ctx = node->context;
+    if (ctx == nullptr) return -EIO;
+
+    uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    uint32_t new_size = static_cast<uint32_t>(length);
+
+    if (new_size == node->file_size) return 0;
+
+    if (new_size == 0) {
+        // Truncate to zero — free entire chain
+        if (node->start_cluster >= 2) {
+            free_cluster_chain(ctx, node->start_cluster);
+            node->start_cluster = 0;
+        }
+        node->file_size = 0;
+        update_directory_entry(node, 0);
+        flush_fat_table(ctx);
+        ker::dev::block_flush(ctx->device);
+        return 0;
+    }
+
+    if (new_size < node->file_size) {
+        // Shrinking — walk chain to the cluster containing the last byte of new_size,
+        // then free everything after it
+        if (node->start_cluster < 2) {
+            // File has no data but non-zero old size? Shouldn't happen.
+            node->file_size = new_size;
+            update_directory_entry(node, new_size);
+            return 0;
+        }
+
+        uint32_t clusters_needed = (new_size + cluster_size - 1) / cluster_size;
+        uint32_t current = node->start_cluster;
+        for (uint32_t i = 1; i < clusters_needed; ++i) {
+            uint32_t next = ctx->fat_table[current] & FAT32_EOC;
+            if (next >= FAT32_EOC || next < 2) break;
+            current = next;
+        }
+        // 'current' is the last cluster we need to keep
+        uint32_t next_to_free = ctx->fat_table[current] & FAT32_EOC;
+        ctx->fat_table[current] = FAT32_EOC;  // terminate chain here
+        if (next_to_free >= 2 && next_to_free < FAT32_EOC) {
+            free_cluster_chain(ctx, next_to_free);
+        }
+    } else {
+        // Extending — allocate clusters and zero-fill
+        if (node->start_cluster < 2) {
+            uint32_t first = allocate_cluster(ctx);
+            if (first == 0) return -ENOSPC;
+            node->start_cluster = first;
+            // Zero-fill the new cluster
+            auto* zbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cluster_size));
+            if (zbuf != nullptr) {
+                memset(zbuf, 0, cluster_size);
+                write_cluster(ctx, first, zbuf);
+                ker::mod::mm::dyn::kmalloc::free(zbuf);
+            }
+        }
+        uint32_t clusters_needed = (new_size + cluster_size - 1) / cluster_size;
+        // Walk to the end of the existing chain
+        uint32_t current = node->start_cluster;
+        uint32_t current_count = 1;
+        while (true) {
+            uint32_t next = ctx->fat_table[current] & FAT32_EOC;
+            if (next >= FAT32_EOC || next < 2) break;
+            current = next;
+            current_count++;
+        }
+        // Allocate additional clusters
+        while (current_count < clusters_needed) {
+            uint32_t nc = allocate_cluster(ctx);
+            if (nc == 0) break;  // out of space
+            ctx->fat_table[current] = nc;
+            // Zero-fill
+            auto* zbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cluster_size));
+            if (zbuf != nullptr) {
+                memset(zbuf, 0, cluster_size);
+                write_cluster(ctx, nc, zbuf);
+                ker::mod::mm::dyn::kmalloc::free(zbuf);
+            }
+            current = nc;
+            current_count++;
+        }
+    }
+
+    node->file_size = new_size;
+    update_directory_entry(node, new_size);
+    flush_fat_table(ctx);
+    ker::dev::block_flush(ctx->device);
+    return 0;
+}
+
+// Walk a path to find the parent directory node and final component name.
+// Returns nullptr if parent not found. Sets *out_name to final component.
+auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char** out_name) -> FAT32Node* {
+    if (path == nullptr || *path == '\0') return nullptr;
+
+    // Find last '/'
+    const char* last_slash = nullptr;
+    for (const char* p = path; *p; ++p) {
+        if (*p == '/') last_slash = p;
+    }
+
+    const char* final_name;
+    uint32_t parent_cluster;
+
+    if (last_slash == nullptr) {
+        // Single component — parent is root
+        final_name = path;
+        parent_cluster = ctx->root_cluster;
+    } else {
+        final_name = last_slash + 1;
+        if (*final_name == '\0') return nullptr;  // path ends with /
+
+        // Walk to the parent directory by opening the parent path
+        char parent_path[512];
+        size_t plen = static_cast<size_t>(last_slash - path);
+        if (plen >= sizeof(parent_path)) return nullptr;
+        memcpy(parent_path, path, plen);
+        parent_path[plen] = '\0';
+
+        // Use fat32_open_path to find parent dir
+        auto* pf = fat32_open_path(parent_path, 0, 0, ctx);
+        if (pf == nullptr) return nullptr;
+        auto* pnode = static_cast<FAT32Node*>(pf->private_data);
+        if (pnode == nullptr || !pnode->is_directory) {
+            // Clean up
+            ker::mod::mm::dyn::kmalloc::free(pf);
+            return nullptr;
+        }
+        parent_cluster = pnode->start_cluster;
+        // We need the node to persist, so don't free pf yet — copy needed data
+        // Actually, we need a standalone node. Let's create one.
+        auto* parent_node = new FAT32Node;
+        parent_node->context = ctx;
+        parent_node->start_cluster = pnode->start_cluster;
+        parent_node->file_size = pnode->file_size;
+        parent_node->is_directory = true;
+        parent_node->attributes = pnode->attributes;
+        parent_node->dir_entry_cluster = pnode->dir_entry_cluster;
+        parent_node->dir_entry_offset = pnode->dir_entry_offset;
+        parent_node->mode = pnode->mode;
+
+        // Free the temporary file struct (but NOT its private_data — that's allocated with new)
+        // Actually fat32_open_path allocates both — we need to be careful
+        // Let's just return the node from pf and let the caller manage cleanup
+        *out_name = final_name;
+        // Free the File wrapper but keep node alive — actually pf->private_data IS the node
+        // We can't free pnode separately. Let's just free pf and return parent_node.
+        delete static_cast<FAT32Node*>(pf->private_data);
+        ker::mod::mm::dyn::kmalloc::free(pf);
+        *out_name = final_name;
+        return parent_node;
+    }
+
+    // Parent is root directory
+    auto* root_node = new FAT32Node;
+    root_node->context = ctx;
+    root_node->start_cluster = ctx->root_cluster;
+    root_node->file_size = 0;
+    root_node->is_directory = true;
+    root_node->attributes = FAT32_ATTR_DIRECTORY;
+    root_node->dir_entry_cluster = 0;
+    root_node->dir_entry_offset = 0;
+    root_node->mode = 0755;
+    *out_name = final_name;
+    return root_node;
+}
+
+// Find a directory entry in a directory, returning cluster and offset of SFN entry.
+// Also returns the number of associated LFN entries preceding it.
+struct DirEntryLocation {
+    uint32_t sfn_cluster;        // cluster containing the SFN entry
+    uint32_t sfn_offset;         // byte offset within that cluster
+    uint32_t lfn_first_cluster;  // cluster of first LFN entry
+    uint32_t lfn_first_offset;   // offset of first LFN entry
+    uint32_t total_entries;      // total entries including LFN + SFN
+    FAT32DirectoryEntry sfn;     // copy of the SFN entry
+};
+
+auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const char* name, DirEntryLocation* loc) -> int {
+    if (ctx == nullptr || name == nullptr || loc == nullptr) return -EINVAL;
+
+    uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / 32;
+
+    auto* cluster_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cluster_size));
+    if (cluster_buf == nullptr) return -ENOMEM;
+
+    // Collect LFN entries as we scan
+    constexpr int MAX_LFN = 20;
+    FAT32LongNameEntry lfn_entries[MAX_LFN];
+    int lfn_count = 0;
+    uint32_t lfn_start_cluster = 0;
+    uint32_t lfn_start_offset = 0;
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        if (read_cluster(ctx, cluster, cluster_buf) != 0) {
+            ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+            return -EIO;
+        }
+
+        auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
+        for (uint32_t i = 0; i < entries_per_cluster; ++i) {
+            if (static_cast<uint8_t>(entries[i].name[0]) == 0x00) {
+                // End of directory
+                ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+                return -ENOENT;
+            }
+            if (static_cast<uint8_t>(entries[i].name[0]) == 0xE5) {
+                lfn_count = 0;  // reset LFN collection
+                continue;
+            }
+
+            if (entries[i].attributes == FAT32_ATTR_LONG_NAME) {
+                auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(&entries[i]);
+                if ((lfn->order & 0x40) != 0) {
+                    // First LFN entry (last in sequence)
+                    lfn_count = 0;
+                    lfn_start_cluster = cluster;
+                    lfn_start_offset = i * 32;
+                }
+                if (lfn_count < MAX_LFN) {
+                    lfn_entries[lfn_count++] = *lfn;
+                }
+                continue;
+            }
+
+            // Skip volume ID entries
+            if ((entries[i].attributes & FAT32_ATTR_VOLUME_ID) != 0) {
+                lfn_count = 0;
+                continue;
+            }
+
+            // Regular SFN entry — check if name matches
+            bool matched = false;
+
+            // Check LFN match first
+            if (lfn_count > 0) {
+                char lfn_name[256];
+                extract_lfn_name(lfn_entries, lfn_count, lfn_name, sizeof(lfn_name));
+                // Case-insensitive compare
+                const char* a = lfn_name;
+                const char* b = name;
+                bool eq = true;
+                while (*a && *b) {
+                    char ca = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a;
+                    char cb = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
+                    if (ca != cb) {
+                        eq = false;
+                        break;
+                    }
+                    a++;
+                    b++;
+                }
+                if (eq && *a == '\0' && *b == '\0') matched = true;
+            }
+
+            // Also check SFN match
+            if (!matched) {
+                matched = compare_fat32_name(entries[i].name, name);
+            }
+
+            if (matched) {
+                loc->sfn_cluster = cluster;
+                loc->sfn_offset = i * 32;
+                loc->sfn = entries[i];
+                if (lfn_count > 0) {
+                    loc->lfn_first_cluster = lfn_start_cluster;
+                    loc->lfn_first_offset = lfn_start_offset;
+                    loc->total_entries = static_cast<uint32_t>(lfn_count) + 1;
+                } else {
+                    loc->lfn_first_cluster = cluster;
+                    loc->lfn_first_offset = i * 32;
+                    loc->total_entries = 1;
+                }
+                ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+                return 0;
+            }
+
+            lfn_count = 0;  // reset for next entry
+        }
+
+        cluster = get_next_cluster(ctx, cluster);
+    }
+
+    ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+    return -ENOENT;
+}
+
+// Check if a directory is empty (only . and .. entries)
+auto fat32_dir_is_empty(FAT32MountContext* ctx, uint32_t dir_cluster) -> bool {
+    uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    uint32_t entries_per_cluster = cluster_size / 32;
+
+    auto* cluster_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cluster_size));
+    if (cluster_buf == nullptr) return false;
+
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        if (read_cluster(ctx, cluster, cluster_buf) != 0) break;
+        auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
+        for (uint32_t i = 0; i < entries_per_cluster; ++i) {
+            if (static_cast<uint8_t>(entries[i].name[0]) == 0x00) {
+                ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+                return true;  // End of directory — it's empty
+            }
+            if (static_cast<uint8_t>(entries[i].name[0]) == 0xE5) continue;
+            if (entries[i].attributes == FAT32_ATTR_LONG_NAME) continue;
+            if ((entries[i].attributes & FAT32_ATTR_VOLUME_ID) != 0) continue;
+            // Check for . and ..
+            if (entries[i].name[0] == '.' && entries[i].name[1] == ' ') continue;
+            if (entries[i].name[0] == '.' && entries[i].name[1] == '.' && entries[i].name[2] == ' ') continue;
+            // Found a real entry — not empty
+            ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+            return false;
+        }
+        cluster = get_next_cluster(ctx, cluster);
+    }
+
+    ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+    return true;
+}
+
+// Mark directory entries as deleted (0xE5) — handles LFN + SFN
+auto fat32_delete_dir_entries(FAT32MountContext* ctx, const DirEntryLocation* loc) -> int {
+    // For simplicity, we handle the case where all entries are in the same cluster
+    // (which is how create_file_in_dir creates them — contiguous in one cluster).
+    // A more robust implementation would handle cross-cluster LFN entries.
+
+    uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    auto* cluster_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cluster_size));
+    if (cluster_buf == nullptr) return -ENOMEM;
+
+    if (read_cluster(ctx, loc->sfn_cluster, cluster_buf) != 0) {
+        ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+        return -EIO;
+    }
+
+    // Mark the SFN entry as deleted
+    cluster_buf[loc->sfn_offset] = 0xE5;
+
+    // If LFN entries are in the same cluster, mark them too
+    if (loc->lfn_first_cluster == loc->sfn_cluster && loc->total_entries > 1) {
+        uint32_t lfn_off = loc->lfn_first_offset;
+        for (uint32_t j = 0; j < loc->total_entries - 1; ++j) {
+            cluster_buf[lfn_off] = 0xE5;
+            lfn_off += 32;
+        }
+    }
+
+    // Write cluster back
+    if (write_cluster(ctx, loc->sfn_cluster, cluster_buf) != 0) {
+        ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+        return -EIO;
+    }
+
+    ker::mod::mm::dyn::kmalloc::free(cluster_buf);
+    ker::dev::block_flush(ctx->device);
+    return 0;
+}
+
+// ============================================================================
+// FAT32 unlink, rmdir, rename — called from VFS layer
+// ============================================================================
+
+auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int {
+    const char* entry_name = nullptr;
+    auto* parent = fat32_walk_to_parent(ctx, path, &entry_name);
+    if (parent == nullptr) return -ENOENT;
+
+    DirEntryLocation loc{};
+    int ret = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
+    delete parent;
+    if (ret < 0) return ret;
+
+    // Can't unlink a directory with unlink
+    if ((loc.sfn.attributes & FAT32_ATTR_DIRECTORY) != 0) return -EISDIR;
+
+    // Free the file's cluster chain
+    uint32_t start = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
+    if (start >= 2) {
+        free_cluster_chain(ctx, start);
+        flush_fat_table(ctx);
+    }
+
+    // Delete directory entries
+    return fat32_delete_dir_entries(ctx, &loc);
+}
+
+auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int {
+    const char* entry_name = nullptr;
+    auto* parent = fat32_walk_to_parent(ctx, path, &entry_name);
+    if (parent == nullptr) return -ENOENT;
+
+    DirEntryLocation loc{};
+    int ret = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
+    delete parent;
+    if (ret < 0) return ret;
+
+    if ((loc.sfn.attributes & FAT32_ATTR_DIRECTORY) == 0) return -ENOTDIR;
+
+    uint32_t dir_start = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
+    if (!fat32_dir_is_empty(ctx, dir_start)) return -ENOTEMPTY;
+
+    // Free directory cluster chain
+    if (dir_start >= 2) {
+        free_cluster_chain(ctx, dir_start);
+        flush_fat_table(ctx);
+    }
+
+    return fat32_delete_dir_entries(ctx, &loc);
+}
+
+auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int {
+    // Step 1: Find old entry
+    const char* old_name = nullptr;
+    auto* old_parent = fat32_walk_to_parent(ctx, oldpath, &old_name);
+    if (old_parent == nullptr) return -ENOENT;
+
+    DirEntryLocation old_loc{};
+    int ret = fat32_find_dir_entry(ctx, old_parent->start_cluster, old_name, &old_loc);
+    if (ret < 0) {
+        delete old_parent;
+        return ret;
+    }
+
+    // Step 2: Find new parent directory
+    const char* new_name = nullptr;
+    auto* new_parent = fat32_walk_to_parent(ctx, newpath, &new_name);
+    if (new_parent == nullptr) {
+        delete old_parent;
+        return -ENOENT;
+    }
+
+    // Step 3: If destination already exists, remove it
+    DirEntryLocation dest_loc{};
+    if (fat32_find_dir_entry(ctx, new_parent->start_cluster, new_name, &dest_loc) == 0) {
+        uint32_t dest_start = (static_cast<uint32_t>(dest_loc.sfn.cluster_high) << 16) | dest_loc.sfn.cluster_low;
+        if (dest_start >= 2) {
+            free_cluster_chain(ctx, dest_start);
+        }
+        fat32_delete_dir_entries(ctx, &dest_loc);
+    }
+
+    // Step 4: Create new directory entry in destination, pointing to old file's clusters
+    uint32_t file_start = (static_cast<uint32_t>(old_loc.sfn.cluster_high) << 16) | old_loc.sfn.cluster_low;
+    uint32_t file_size = old_loc.sfn.file_size;
+    uint8_t attrs = old_loc.sfn.attributes;
+
+    // Use create_file_in_dir to create entry, then update it
+    auto* new_file = create_file_in_directory(ctx, new_parent->start_cluster, new_name);
+    if (new_file == nullptr) {
+        delete old_parent;
+        delete new_parent;
+        return -EIO;
+    }
+
+    // Update the new entry to point to the original file's clusters
+    auto* new_node = static_cast<FAT32Node*>(new_file->private_data);
+    new_node->start_cluster = file_start;
+    new_node->file_size = file_size;
+    new_node->attributes = attrs;
+
+    // Persist these to the directory entry on disk
+    update_directory_entry(new_node, file_size);
+
+    // Also update attributes in the dir entry
+    {
+        uint32_t cs = new_node->context->bytes_per_sector * new_node->context->sectors_per_cluster;
+        auto* cbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(cs));
+        if (cbuf != nullptr) {
+            uint64_t lba = ctx->partition_offset + ctx->data_start_sector +
+                           (static_cast<uint64_t>(new_node->dir_entry_cluster - 2) * ctx->sectors_per_cluster);
+            if (ker::dev::block_read(ctx->device, lba, ctx->sectors_per_cluster, cbuf) == 0) {
+                auto* entry = reinterpret_cast<FAT32DirectoryEntry*>(cbuf + new_node->dir_entry_offset);
+                entry->attributes = attrs;
+                ker::dev::block_write(ctx->device, lba, ctx->sectors_per_cluster, cbuf);
+            }
+            ker::mod::mm::dyn::kmalloc::free(cbuf);
+        }
+    }
+
+    // Step 5: Delete old directory entry
+    fat32_delete_dir_entries(ctx, &old_loc);
+
+    // Clean up
+    delete static_cast<FAT32Node*>(new_file->private_data);
+    ker::mod::mm::dyn::kmalloc::free(new_file);
+    delete old_parent;
+    delete new_parent;
+
+    flush_fat_table(ctx);
+    ker::dev::block_flush(ctx->device);
     return 0;
 }
 
 // Static storage for FAT32 FileOperations
 namespace {
 ker::vfs::FileOperations fat32_fops_instance = {
-    .vfs_open = nullptr,           // vfs_open
-    .vfs_close = fat32_close,      // vfs_close
-    .vfs_read = fat32_read,        // vfs_read
-    .vfs_write = fat32_write,      // vfs_write
-    .vfs_lseek = fat32_lseek,      // vfs_lseek
-    .vfs_isatty = fat32_isatty,    // vfs_isatty
-    .vfs_readdir = fat32_readdir,  // vfs_readdir
-    .vfs_readlink = nullptr        // FAT32 doesn't support symlinks
+    .vfs_open = nullptr,             // vfs_open
+    .vfs_close = fat32_close,        // vfs_close
+    .vfs_read = fat32_read,          // vfs_read
+    .vfs_write = fat32_write,        // vfs_write
+    .vfs_lseek = fat32_lseek,        // vfs_lseek
+    .vfs_isatty = fat32_isatty,      // vfs_isatty
+    .vfs_readdir = fat32_readdir,    // vfs_readdir
+    .vfs_readlink = nullptr,         // FAT32 doesn't support symlinks
+    .vfs_truncate = fat32_truncate,  // FAT32 truncate
+    .vfs_poll_check = nullptr,       // Regular files always ready
 };
 }
 

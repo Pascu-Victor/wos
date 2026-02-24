@@ -88,8 +88,9 @@ auto capture_isatty(ker::vfs::File* /*file*/) -> bool { return true; }
 
 ker::vfs::FileOperations g_capture_fops = {
     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-    .vfs_open = nullptr,  .vfs_close = capture_close,   .vfs_read = nullptr,    .vfs_write = capture_write,
-    .vfs_lseek = nullptr, .vfs_isatty = capture_isatty, .vfs_readdir = nullptr, .vfs_readlink = nullptr,
+    .vfs_open = nullptr,     .vfs_close = capture_close,   .vfs_read = nullptr,    .vfs_write = capture_write,
+    .vfs_lseek = nullptr,    .vfs_isatty = capture_isatty, .vfs_readdir = nullptr, .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr, .vfs_poll_check = nullptr,
 };
 
 // -----------------------------------------------------------------------------

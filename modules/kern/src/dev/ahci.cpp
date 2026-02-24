@@ -34,6 +34,7 @@ constexpr uint8_t ATA_DEV_BUSY = 0x80;
 constexpr uint8_t ATA_DEV_DRQ = 0x08;
 constexpr uint8_t ATA_CMD_READ_DMA_EX = 0x25;
 constexpr uint8_t ATA_CMD_WRITE_DMA_EX = 0x35;
+constexpr uint8_t ATA_CMD_FLUSH_CACHE_EXT = 0xEA;
 constexpr uint8_t ATA_CMD_IDENTIFY = 0xEC;
 
 constexpr uint32_t SATA_SIG_ATA = 0x00000101;
@@ -385,6 +386,107 @@ auto write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t s
     return read_write_disk(port, portno, startl, starth, count, buf, true);
 }
 
+// Flush volatile write cache to non-volatile storage
+auto flush_disk(volatile HBA_PORT* port, int portno) -> bool {
+    uint32_t slot = UINT32_MAX;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].lock();
+    }
+
+    port->is = static_cast<uint32_t>(-1);
+    slot = find_cmdslot(port, portno);
+    if (slot == UINT32_MAX) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_locks[portno].unlock();
+        }
+        return false;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
+    }
+
+    HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
+    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmdheader->w = 0;
+    cmdheader->prdtl = 0;  // No data transfer
+
+    auto* cmdtbl = reinterpret_cast<HBA_CMD_TBL*>(port_memory[portno].ctb_virt[slot]);
+    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL));
+
+    auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
+    cmdfis->fis_type = FIS_TYPE_REG_H2D;
+    cmdfis->c = 1;
+    cmdfis->command = ATA_CMD_FLUSH_CACHE_EXT;
+    cmdfis->device = 1 << 6;  // LBA mode
+
+    // Wait for port to be ready
+    int spin = 0;
+    constexpr int MAX_SPIN = 1000000;
+    while (((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
+        spin++;
+    }
+    if (spin == MAX_SPIN) {
+        ahci_log("flush_disk: Port is hung\n");
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
+        return false;
+    }
+
+    port->ci = 1 << slot;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].unlock();
+    }
+
+    // Wait for completion
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) {
+            break;
+        }
+        if ((port->is & HBA_PxIS_TFES) != 0U) {
+            ahci_log("flush_disk: error\n");
+            if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+                port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            }
+            return false;
+        }
+        asm volatile("pause");
+    }
+
+    if ((port->is & HBA_PxIS_TFES) != 0U) {
+        ahci_log("flush_disk: error\n");
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+        }
+        return false;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+    }
+
+    return true;
+}
+
+// Wrapper for block device flush
+auto ahci_flush_blocks(BlockDevice* bdev) -> int {
+    if (bdev == nullptr || bdev->private_data == nullptr) {
+        return -1;
+    }
+
+    auto* dev = static_cast<AHCIDevice*>(bdev->private_data);
+    if (dev->port_num >= MAX_PORTS) {
+        return -1;
+    }
+
+    volatile HBA_PORT* port = &hba_mem->ports[dev->port_num];
+    return flush_disk(port, dev->port_num) ? 0 : -1;
+}
+
 // Wrapper for block device read
 auto ahci_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int {
     if (bdev == nullptr || bdev->private_data == nullptr || buffer == nullptr) {
@@ -459,7 +561,7 @@ void probe_port(volatile HBA_MEM* abar) {
                     dev->bdev.total_blocks = dev->total_sectors;
                     dev->bdev.read_blocks = ahci_read_blocks;
                     dev->bdev.write_blocks = ahci_write_blocks;
-                    dev->bdev.flush = nullptr;
+                    dev->bdev.flush = ahci_flush_blocks;
                     dev->bdev.private_data = dev;
                     dev->bdev.remotable = &s_remotable_ops;
 

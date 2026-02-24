@@ -45,9 +45,18 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->schedQueue = SchedQueue::NONE;
     this->schedNext = nullptr;
 
+    // Signal infrastructure
+    this->sigPending = 0;
+    this->sigMask = 0;
+    this->inSignalHandler = false;
+    this->doSigreturn = false;
+    for (auto& sig_handler : this->sigHandlers) {
+        sig_handler = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};  // SIG_DFL for all
+    }
+
     // Initialize file descriptor table to null
-    for (unsigned i = 0; i < FD_TABLE_SIZE; ++i) {
-        this->fds[i] = nullptr;
+    for (auto& fd : this->fds) {
+        fd = nullptr;
     }
 
     if (type == TaskType::IDLE) {
@@ -60,9 +69,9 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         // Initialize syscall scratch area even for idle tasks
         // This is needed because switchTo() sets GS_BASE from this field
         this->context.syscallScratchArea = (uint64_t)(new cpu::PerCpu());
-        auto* scratchArea = (cpu::PerCpu*)this->context.syscallScratchArea;
-        scratchArea->syscallStack = kernelRsp;
-        scratchArea->cpuId = cpu::currentCpu();
+        auto* scratch_area = (cpu::PerCpu*)this->context.syscallScratchArea;
+        scratch_area->syscallStack = kernelRsp;
+        scratch_area->cpuId = cpu::currentCpu();
 
         // Idle tasks get PID 0 (kernel/swapper convention) - they don't consume real PIDs
         // This ensures the first user process (init) always gets PID 1 regardless of core count

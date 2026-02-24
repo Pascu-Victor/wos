@@ -38,7 +38,9 @@ using vfs_write_fn = ssize_t (*)(struct File*, const void*, size_t, size_t);  //
 using vfs_lseek_fn = off_t (*)(struct File*, off_t, int);                     // f, offset, whence
 using vfs_isatty_fn = bool (*)(struct File*);                                 // f
 using vfs_readdir_fn = int (*)(struct File*, DirEntry*, size_t);              // f, entry, index
-using vfs_readlink_fn = ssize_t (*)(struct File*, char*, size_t);            // f, buf, bufsize
+using vfs_readlink_fn = ssize_t (*)(struct File*, char*, size_t);             // f, buf, bufsize
+using vfs_truncate_fn = int (*)(struct File*, off_t);                         // f, length
+using vfs_poll_check_fn = int (*)(struct File*, int);                         // f, events → ready events
 
 struct FileOperations {
     vfs_open_fn vfs_open;
@@ -47,8 +49,10 @@ struct FileOperations {
     vfs_write_fn vfs_write;
     vfs_lseek_fn vfs_lseek;
     vfs_isatty_fn vfs_isatty;
-    vfs_readdir_fn vfs_readdir;    // For reading directory entries
-    vfs_readlink_fn vfs_readlink;  // For reading symlink targets
+    vfs_readdir_fn vfs_readdir;        // For reading directory entries
+    vfs_readlink_fn vfs_readlink;      // For reading symlink targets
+    vfs_truncate_fn vfs_truncate;      // For truncating file to given length
+    vfs_poll_check_fn vfs_poll_check;  // For checking poll readiness (nullptr = always ready)
 };
 
 }  // namespace ker::vfs

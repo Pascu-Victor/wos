@@ -300,3 +300,75 @@ cmake -G Ninja \
  $B/src/llvm-project/runtimes
 
 ninja && ninja install
+
+# 8. Build busybox for WOS userspace
+cd $B/src
+[ ! -d busybox ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/busybox.git
+
+mkdir -p $B/busybox-build
+cd $B/busybox-build
+
+# Cross-compilation variables
+TARGET_SYSROOT="$B/target1"
+BB_CC="$TARGET_SYSROOT/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+BB_AR="$TARGET_SYSROOT/bin/llvm-ar"
+BB_STRIP="$TARGET_SYSROOT/bin/llvm-strip"
+BB_RANLIB="$TARGET_SYSROOT/bin/llvm-ranlib"
+BB_OBJCOPY="$TARGET_SYSROOT/bin/llvm-objcopy"
+BB_NM="$TARGET_SYSROOT/bin/llvm-nm"
+BB_HOSTCC="gcc"
+BB_CFLAGS="--sysroot=$TARGET_SYSROOT -static -fno-sanitize=safe-stack -fno-stack-protector"
+BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld"
+
+# Use the WOS defconfig from the fork if available, otherwise use default.
+# KCONFIG_ALLCONFIG ensures we start from allnoconfig (everything disabled)
+# and only enable what's explicitly listed in the defconfig.
+if [ -f $B/src/busybox/configs/wos_defconfig ]; then
+    make -C $B/src/busybox O=$B/busybox-build \
+        CROSS_COMPILE="$B/target1/bin/" \
+        CC="$BB_CC" \
+        AR="$BB_AR" \
+        STRIP="$BB_STRIP" \
+        RANLIB="$BB_RANLIB" \
+        OBJCOPY="$BB_OBJCOPY" \
+        NM="$BB_NM" \
+        HOSTCC="$BB_HOSTCC" \
+        CFLAGS="$BB_CFLAGS" \
+        LDFLAGS="$BB_LDFLAGS" \
+        HOSTCC="/usr/bin/clang" \
+        KCONFIG_ALLCONFIG=$B/src/busybox/configs/wos_defconfig \
+        allnoconfig
+else
+    make -C $B/src/busybox O=$B/busybox-build \
+        CROSS_COMPILE="$B/target1/bin/" \
+        CC="$BB_CC" \
+        AR="$BB_AR" \
+        STRIP="$BB_STRIP" \
+        RANLIB="$BB_RANLIB" \
+        OBJCOPY="$BB_OBJCOPY" \
+        NM="$BB_NM" \
+        HOSTCC="$BB_HOSTCC" \
+        CFLAGS="$BB_CFLAGS" \
+        LDFLAGS="$BB_LDFLAGS" \
+        HOSTCC="/usr/bin/clang" \
+        defconfig
+fi
+
+# Build busybox as a static binary targeting WOS
+make -C $B/busybox-build -j$(nproc) \
+    CROSS_COMPILE="$B/target1/bin/" \
+    CC="$BB_CC" \
+    AR="$BB_AR" \
+    STRIP="$BB_STRIP" \
+    RANLIB="$BB_RANLIB" \
+    OBJCOPY="$BB_OBJCOPY" \
+    NM="$BB_NM" \
+    HOSTCC="$BB_HOSTCC" \
+    CFLAGS="$BB_CFLAGS" \
+    LDFLAGS="$BB_LDFLAGS" \
+    HOSTCC="/usr/bin/clang" \
+    busybox
+
+# Install busybox into the sysroot
+cp $B/busybox-build/busybox $B/target1/bin/busybox
+echo "Busybox installed to $B/target1/bin/busybox"

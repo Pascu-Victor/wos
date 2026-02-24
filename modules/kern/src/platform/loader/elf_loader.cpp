@@ -260,20 +260,16 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #endif
                 switch (type) {
                     case R_X86_64_TPOFF64: {
-                        // Put TLS offset (example handling)
-                        constexpr int64_t DEFAULT_SAFESTACK_TLS_OFFSET = -8;
-                        int64_t tlsOffset = DEFAULT_SAFESTACK_TLS_OFFSET;
+                        // TLS offset: S + A (symbol TLS offset plus addend)
                         if (paddr != 0) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
-                            *physPtr = (uint64_t)tlsOffset;
+                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            *physPtr = S + addend;
                         }
                         break;
                     }
                     case R_X86_64_RELATIVE: {
                         if (paddr != 0) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
-                            mod::dbg::log("WARN: CHECK ME!! R_X86_64_RELATIVE: paddr: %x, physPtr: %x loadBase: %x", paddr, physPtr,
-                                          elf.loadBase);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
                             *physPtr = addend + elf.loadBase;
                         }
                         break;
@@ -318,7 +314,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     }
                     case R_X86_64_64: {
                         if (paddr != 0) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
                             *physPtr = S + addend;
                         }
                         break;
@@ -327,11 +323,9 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     case R_X86_64_PLT32: {
                         // 32-bit PC-relative
                         if (paddr != 0) {
-                            auto* physPtr32 = (uint32_t*)mod::mm::addr::getVirtPointer((uint64_t)mod::mm::addr::getPhysPointer(paddr));
+                            auto* physPtr32 = (uint32_t*)mod::mm::addr::getVirtPointer(paddr);
                             uint64_t P64 = P;
                             auto value = (int64_t)(S + (int64_t)addend - (int64_t)P64);
-                            mod::dbg::log("WARN: CHECK ME!! R_X86_64_PC32/R_X86_64_PLT32: paddr: %x, physPtr32: %x value: %x", paddr,
-                                          physPtr32, value);
                             *physPtr32 = (uint32_t)value;
                         }
                         break;

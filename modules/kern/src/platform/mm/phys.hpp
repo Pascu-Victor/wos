@@ -19,6 +19,16 @@ auto pageAlloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE) -> void*;
 auto pageAllocHuge(uint64_t size) -> void*;  // Allocate from huge page zone
 void pageFree(void* page);
 
+// --- Frame reference counting (for COW fork) ---
+// Increment the refcount for a physical page (HHDM pointer).
+// Pages start at refcount 1 after pageAlloc().
+void pageRefInc(void* page);
+// Decrement the refcount. When it reaches 0 the page is freed.
+// Returns the new refcount (0 = freed).
+uint32_t pageRefDec(void* page);
+// Get current refcount for a physical page. Returns 0 for unknown/free pages.
+uint32_t pageRefGet(void* page);
+
 // Get the head of the memory zones list (for OOM diagnostics)
 auto getZones() -> paging::PageZone*;
 auto getHugePageZone() -> paging::PageZone*;

@@ -97,6 +97,18 @@ auto create_node(const char* name, DevFSNodeType type) -> DevFSNode* {
     std::memcpy(node->name.data(), name, len);
     node->name[len] = '\0';
     node->type = type;
+    // Set default POSIX mode based on node type
+    switch (type) {
+        case DevFSNodeType::DIRECTORY:
+            node->mode = 0755;
+            break;
+        case DevFSNodeType::DEVICE:
+            node->mode = 0666;
+            break;
+        case DevFSNodeType::SYMLINK:
+            node->mode = 0777;
+            break;
+    }
     return node;
 }
 
@@ -320,6 +332,8 @@ FileOperations devfs_fops = {
     .vfs_isatty = devfs_isatty,
     .vfs_readdir = devfs_readdir,
     .vfs_readlink = devfs_fops_readlink,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
 };
 
 }  // anonymous namespace

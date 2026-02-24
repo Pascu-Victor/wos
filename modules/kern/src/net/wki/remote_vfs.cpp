@@ -599,6 +599,7 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
     .vfs_open = nullptr,           .vfs_close = remote_vfs_close,   .vfs_read = remote_vfs_read,       .vfs_write = remote_vfs_write,
     .vfs_lseek = remote_vfs_lseek, .vfs_isatty = remote_vfs_isatty, .vfs_readdir = remote_vfs_readdir, .vfs_readlink = remote_vfs_readlink,
+    .vfs_truncate = nullptr,       .vfs_poll_check = nullptr,
 };
 
 }  // namespace

@@ -364,6 +364,10 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 html += url;
                 html += "'/>";
                 html += "<input type='text' name='path' placeholder='/mnt/disk' style='width:120px;margin-right:4px;'/>";
+                html += "<select name='fstype' style='margin-right:4px;'>";
+                html += "<option value='fat32' selected>fat32</option>";
+                html += "<option value='tmpfs'>tmpfs</option>";
+                html += "</select>";
                 html += "<button type='submit'>Mount</button>";
                 html += "</form>";
             } else {
@@ -608,6 +612,10 @@ auto handle_request(int client_fd, std::string_view request) -> void {
         auto body = parse_request_body(request);
         auto device = get_form_field(body, "device");
         auto mount_path = get_form_field(body, "path");
+        auto fstype = get_form_field(body, "fstype");
+        if (fstype.empty()) {
+            fstype = "fat32";
+        }
 
         if (device.empty() || mount_path.empty()) {
             constexpr std::string_view ERR_BODY =
@@ -619,12 +627,35 @@ auto handle_request(int client_fd, std::string_view request) -> void {
             return;
         }
 
-        // Perform the blocking mount
+        // Create the mount point directory, then delegate to busybox mount
         ker::abi::vfs::mkdir(mount_path.c_str(), 0755);
-        int ret = ker::abi::vfs::mount(device.c_str(), mount_path.c_str(), "fat32");
 
-        if (ret == 0) {
-            log_message("httpd[t:{},p:{}]: Mounted {} at {}", tid, pid, device, mount_path);
+        std::array<const char*, 6> argv = {"/bin/mount", "-t", fstype.c_str(), device.c_str(), mount_path.c_str(), nullptr};
+        constexpr std::array<const char*, 1> ENVP = {nullptr};
+        auto exec_res = ker::process::exec("/bin/mount", argv.data(), ENVP.data());
+
+        if (exec_res < 0) {
+            log_message("httpd[t:{},p:{}]: Failed to exec for mount {} at {}", tid, pid, device, mount_path);
+            std::string result_html;
+            result_html.reserve(512);
+            result_html += "<html><head><title>Mount Error</title></head><body>";
+            result_html += "<h1>Error</h1><p>Failed to fork mount process for <b>";
+            result_html += device;
+            result_html += "</b> at <b>";
+            result_html += mount_path;
+            result_html += "</b></p>";
+            result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
+            result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
+            send_response(client_fd, 500, "Internal Server Error", "text/html; charset=utf-8", result_html.data(), result_html.size());
+            return;
+        }
+
+        // Parent: wait for mount to complete
+        int32_t exit_code = 0;
+        ker::process::waitpid(exec_res, &exit_code, 0);
+
+        if (exit_code == 0) {
+            log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
             // Redirect to the newly mounted path so the browser sees the result
             auto redirect = std::format(
                 "HTTP/1.1 303 See Other\r\n"
@@ -635,7 +666,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
                 mount_path);
             send_all(client_fd, redirect.data(), redirect.size());
         } else {
-            log_message("httpd[t:{},p:{}]: Failed to mount {} at {}: error {}", tid, pid, device, mount_path, ret);
+            log_message("httpd[t:{},p:{}]: Failed to mount {} at {} ({}): exit code {}", tid, pid, device, mount_path, fstype, exit_code);
             std::string result_html;
             result_html.reserve(512);
             result_html += "<html><head><title>Mount Error</title></head><body>";
@@ -643,8 +674,8 @@ auto handle_request(int client_fd, std::string_view request) -> void {
             result_html += device;
             result_html += "</b> at <b>";
             result_html += mount_path;
-            result_html += "</b> (error ";
-            result_html += std::to_string(ret);
+            result_html += "</b> (exit code ";
+            result_html += std::to_string(exit_code);
             result_html += ")</p>";
             result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
             result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";

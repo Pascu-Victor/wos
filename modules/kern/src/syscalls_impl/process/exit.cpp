@@ -42,6 +42,22 @@ void wos_proc_exit(int status) {
     currentTask->exitStatus = status;
     currentTask->hasExited = true;
 
+    // Send SIGCHLD to parent process
+    if (currentTask->parentPid != 0) {
+        auto* parent = ker::mod::sched::find_task_by_pid_safe(currentTask->parentPid);
+        if (parent != nullptr) {
+            // Set SIGCHLD (signal 17) pending on parent
+            parent->sigPending |= (1ULL << (17 - 1));
+
+            // If parent is blocked, wake it so it can handle the signal
+            if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
+                uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
+                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
+            }
+            parent->release();
+        }
+    }
+
     // Reschedule all tasks waiting for this process to exit
     for (uint64_t i = 0; i < currentTask->awaitee_on_exit_count; ++i) {
         uint64_t waitingPid = currentTask->awaitee_on_exit[i];

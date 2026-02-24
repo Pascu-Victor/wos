@@ -9,7 +9,7 @@
 namespace ker::dev {
 struct Device;
 struct BlockDevice;
-}
+}  // namespace ker::dev
 
 namespace ker::vfs::devfs {
 
@@ -27,6 +27,11 @@ struct DevFSNode {
     DevFSNode** children = nullptr;
     size_t children_count = 0;
     size_t children_capacity = 0;
+
+    // POSIX permission model
+    uint32_t mode = 0755;  // Permission bits (default: rwxr-xr-x for dirs)
+    uint32_t uid = 0;      // Owner user ID
+    uint32_t gid = 0;      // Owner group ID
 };
 
 // Register devfs as a virtual filesystem
@@ -68,8 +73,7 @@ void devfs_populate_wki();
 
 // Dynamically add a single WKI remotable resource to /dev/wki/.
 // Called from remotable RX handler on RESOURCE_ADVERT.
-void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type,
-                            uint32_t resource_id, uint8_t flags, const char* name);
+void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name);
 
 // Remove a single WKI remotable resource from /dev/wki/.
 // Called from remotable RX handler on RESOURCE_WITHDRAW.

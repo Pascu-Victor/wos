@@ -5,6 +5,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 
+#include "platform/dbg/coredump.hpp"
 #include "platform/mm/paging.hpp"
 namespace ker::mod::mm::virt {
 static paging::PageTable* kernelPagemap;
@@ -57,24 +58,110 @@ void switchPagemap(sched::task::Task* t) {
     wrcr3(phys_pagemap);
 }
 
-void pagefaultHandler(uint64_t controlRegister, int errCode) {
-    PageFault pagefault = paging::createPageFault(errCode, true);
+// Helper: get the raw uint64_t value of a PTE
+static inline uint64_t pteRaw(const paging::PageTableEntry& e) {
+    uint64_t val;
+    __builtin_memcpy(&val, &e, sizeof(val));
+    return val;
+}
 
-    if (pagefault.user) {
-        auto* currentTask = sched::get_current_task();
-        dbg::log("Segmentation fault in task %s (PID %d) at 0x%x", currentTask ? currentTask->name : "unknown",
-                 currentTask ? currentTask->pid : -1, controlRegister);
-        hcf();
-        return;
+// Helper: reconstruct a PTE from raw uint64_t with modified flags
+static inline paging::PageTableEntry pteFromRaw(uint64_t raw) {
+    paging::PageTableEntry e;
+    __builtin_memcpy(&e, &raw, sizeof(e));
+    return e;
+}
+
+bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr) {
+    PageFault pagefault = paging::createPageFault(frame.errCode, true);
+
+    // COW handling for user-space write faults
+    if ((pagefault.user != 0U) && (pagefault.writable != 0U)) {
+        // Walk page tables to find the faulting PTE
+        auto* current_task = sched::get_current_task();
+        if (current_task == nullptr || current_task->pagemap == nullptr) {
+            dbg::log("COW fault: no current task or pagemap");
+            hcf();
+            return false;
+        }
+
+        paging::PageTable* pml4 = current_task->pagemap;
+        uint64_t vaddr = control_register;
+
+        // Walk the 4 levels to find the PML1 entry
+        uint64_t idx4 = (vaddr >> 39) & 0x1FF;
+        uint64_t idx3 = (vaddr >> 30) & 0x1FF;
+        uint64_t idx2 = (vaddr >> 21) & 0x1FF;
+        uint64_t idx1 = (vaddr >> 12) & 0x1FF;
+
+        if (!pml4->entries[idx4].present) {
+            goto not_cow;
+        }
+        {
+            auto* pml3 = (paging::PageTable*)addr::getVirtPointer(pml4->entries[idx4].frame << paging::PAGE_SHIFT);
+            if (!pml3->entries[idx3].present) {
+                goto not_cow;
+            }
+            auto* pml2 = (paging::PageTable*)addr::getVirtPointer(pml3->entries[idx3].frame << paging::PAGE_SHIFT);
+            if (!pml2->entries[idx2].present) {
+                goto not_cow;
+            }
+            auto* pml1 = (paging::PageTable*)addr::getVirtPointer(pml2->entries[idx2].frame << paging::PAGE_SHIFT);
+
+            paging::PageTableEntry& pte = pml1->entries[idx1];
+            if (!pte.present) {
+                goto not_cow;
+            }
+
+            uint64_t raw = pteRaw(pte);
+            if ((raw & paging::PAGE_COW) == 0U) {
+                goto not_cow;
+            }
+
+            // This is a COW page — handle it
+            paddr_t oldPhys = pte.frame << paging::PAGE_SHIFT;
+            void* oldVirt = reinterpret_cast<void*>(addr::getVirtPointer(oldPhys));
+
+            uint32_t refcount = phys::pageRefGet(oldVirt);
+
+            if (refcount <= 1) {
+                // We're the sole owner — just make it writable and clear COW
+                raw &= ~paging::PAGE_COW;
+                raw |= paging::PAGE_WRITE;
+                pte = pteFromRaw(raw);
+                invlpg(vaddr);
+                return true;
+            }
+
+            // Multiple owners — allocate a new page and copy
+            void* newPage = phys::pageAlloc(paging::PAGE_SIZE);
+            if (newPage == nullptr) {
+                dbg::log("COW fault: OOM allocating new page for vaddr 0x%x", vaddr);
+                hcf();
+                return false;
+            }
+
+            memcpy(newPage, oldVirt, paging::PAGE_SIZE);
+
+            // Decrement refcount on old page (may free it if we were last user elsewhere)
+            phys::pageRefDec(oldVirt);
+
+            // Map new page as writable, clear COW
+            auto new_phys = (paddr_t)addr::getPhysPointer((vaddr_t)newPage);
+            raw &= ~paging::PAGE_COW;
+            raw |= paging::PAGE_WRITE;
+            // Replace frame bits
+            raw &= ~(0xFFFFFFFFFFULL << 12);  // clear frame field
+            raw |= (new_phys & ~0xFFFULL);    // set new frame
+            pte = pteFromRaw(raw);
+            invlpg(vaddr);
+            return true;
+        }
     }
 
-    // if (pagefault.present) {
-    //     // PANIC!
-    //     hcf();
-    // }
-
-    mapPage((mm::paging::PageTable*)mm::addr::getVirtPointer((uint64_t)getKernelPageTable()), controlRegister, controlRegister,
-            pagefault.flags);
+not_cow:
+    // Not a COW fault — let the caller handle it (userspace crash / kernel panic).
+    return false;
 }
 
 static inline uint64_t index_of(const uint64_t vaddr, const int offset) { return vaddr >> (12 + 9 * (offset - 1)) & 0x1FF; }
@@ -440,11 +527,11 @@ void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
 
     invlpg(vaddr);
 
-    // Convert frame number to physical address, then to HHDM pointer for pageFree
+    // Convert frame number to physical address, then to HHDM pointer for refcount-aware free
     if (frame != 0) {
         uint64_t physAddr = frame << paging::PAGE_SHIFT;
         void* virtPtr = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
-        phys::pageFree(virtPtr);
+        phys::pageRefDec(virtPtr);
     }
 }
 
@@ -502,13 +589,14 @@ static void freePageTableLevel(PageTable* table, int level) {
             } else {
                 PageTable* nextLevel = reinterpret_cast<PageTable*>(addr::getVirtPointer(physAddr));
                 freePageTableLevel(nextLevel, level - 1);
-                // Free the page table page itself
+                // Free the page table page itself (page tables are never COW-shared)
                 phys::pageFree(nextLevel);
             }
         } else {
             // Level 1 (PML1) - entries point to actual data pages
+            // Use refcount-aware free: COW-shared pages won't be freed until all users unmap
             void* pageVirt = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
-            phys::pageFree(pageVirt);
+            phys::pageRefDec(pageVirt);
         }
 
         // Clear the entry
@@ -528,6 +616,85 @@ void destroyUserSpace(PageTable* pagemap) {
     // Invalidate TLB for this address space
     // Note: We should already be on a different pagemap when calling this
     wrcr3(rdcr3());
+}
+
+bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
+    // Walk the user half (PML4[0..255]) of src.
+    // For each present PML1 entry pointing to a data page:
+    //   1. Mark the src PTE as read-only + COW
+    //   2. Create the same PTE in dst (read-only + COW)
+    //   3. Increment the physical page's refcount
+    // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
+
+    for (size_t i4 = 0; i4 < 256; i4++) {
+        if (!src->entries[i4].present) continue;
+
+        paddr_t srcPml3Phys = src->entries[i4].frame << paging::PAGE_SHIFT;
+        auto* srcPml3 = (PageTable*)addr::getVirtPointer(srcPml3Phys);
+
+        // Allocate a new PML3 for dst
+        auto* dstPml3 = (PageTable*)phys::pageAlloc();
+        if (!dstPml3) return false;
+        memset(dstPml3, 0, paging::PAGE_SIZE);
+
+        // Set PML4 entry in dst (copy flags from src)
+        dst->entries[i4] = src->entries[i4];
+        dst->entries[i4].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml3) >> paging::PAGE_SHIFT;
+
+        for (size_t i3 = 0; i3 < 512; i3++) {
+            if (!srcPml3->entries[i3].present) continue;
+
+            paddr_t srcPml2Phys = srcPml3->entries[i3].frame << paging::PAGE_SHIFT;
+            auto* srcPml2 = (PageTable*)addr::getVirtPointer(srcPml2Phys);
+
+            auto* dstPml2 = (PageTable*)phys::pageAlloc();
+            if (!dstPml2) return false;
+            memset(dstPml2, 0, paging::PAGE_SIZE);
+
+            dstPml3->entries[i3] = srcPml3->entries[i3];
+            dstPml3->entries[i3].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml2) >> paging::PAGE_SHIFT;
+
+            for (size_t i2 = 0; i2 < 512; i2++) {
+                if (!srcPml2->entries[i2].present) continue;
+                if (srcPml2->entries[i2].pagesize) {
+                    // 2MB huge page — just copy the entry (no COW for huge pages)
+                    dstPml2->entries[i2] = srcPml2->entries[i2];
+                    continue;
+                }
+
+                paddr_t srcPml1Phys = srcPml2->entries[i2].frame << paging::PAGE_SHIFT;
+                auto* srcPml1 = (PageTable*)addr::getVirtPointer(srcPml1Phys);
+
+                auto* dstPml1 = (PageTable*)phys::pageAlloc();
+                if (!dstPml1) return false;
+                memset(dstPml1, 0, paging::PAGE_SIZE);
+
+                dstPml2->entries[i2] = srcPml2->entries[i2];
+                dstPml2->entries[i2].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml1) >> paging::PAGE_SHIFT;
+
+                for (size_t i1 = 0; i1 < 512; i1++) {
+                    if (!srcPml1->entries[i1].present) continue;
+
+                    uint64_t raw = pteRaw(srcPml1->entries[i1]);
+
+                    // Mark as read-only + COW in BOTH src and dst
+                    raw &= ~paging::PAGE_WRITE;
+                    raw |= paging::PAGE_COW;
+                    srcPml1->entries[i1] = pteFromRaw(raw);
+                    dstPml1->entries[i1] = pteFromRaw(raw);
+
+                    // Increment refcount on the shared data page
+                    paddr_t dataPhys = srcPml1->entries[i1].frame << paging::PAGE_SHIFT;
+                    void* dataVirt = reinterpret_cast<void*>(addr::getVirtPointer(dataPhys));
+                    phys::pageRefInc(dataVirt);
+                }
+            }
+        }
+    }
+
+    // Flush TLB for the source (parent) since we modified its PTEs
+    wrcr3(rdcr3());
+    return true;
 }
 
 }  // namespace ker::mod::mm::virt

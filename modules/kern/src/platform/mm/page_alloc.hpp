@@ -29,18 +29,19 @@ struct PageAllocator {
     //     10     allocated head    (bits 4-0 = order)
     //     11     allocated continuation / reserved
     static constexpr uint8_t FLAG_FREE_INTERIOR = 0x00;
-    static constexpr uint8_t FLAG_FREE_HEAD     = 0x40;   // | order
-    static constexpr uint8_t FLAG_ALLOC_HEAD    = 0x80;   // | order
-    static constexpr uint8_t FLAG_ALLOC_CONT    = 0xC0;
-    static constexpr uint8_t FLAG_RESERVED      = 0xFF;
+    static constexpr uint8_t FLAG_FREE_HEAD = 0x40;   // | order
+    static constexpr uint8_t FLAG_ALLOC_HEAD = 0x80;  // | order
+    static constexpr uint8_t FLAG_ALLOC_CONT = 0xC0;
+    static constexpr uint8_t FLAG_RESERVED = 0xFF;
 
-    FreeBlock* freeList[MAX_ORDER + 1];   // one singly-linked list per order
-    uint8_t*   pageFlags;                 // 1 byte per page
-    uint64_t   base;                      // HHDM start of the managed region
-    uint32_t   totalPages;                // total pages in the region (incl. metadata)
-    uint32_t   usablePages;               // pages available for allocation
-    uint32_t   freeCount;                 // current free page count
-    uint32_t   metadataPages;             // pages consumed by metadata
+    FreeBlock* freeList[MAX_ORDER + 1];  // one singly-linked list per order
+    uint8_t* pageFlags;                  // 1 byte per page
+    uint32_t* pageRefcounts;             // 1 refcount per page (for COW fork)
+    uint64_t base;                       // HHDM start of the managed region
+    uint32_t totalPages;                 // total pages in the region (incl. metadata)
+    uint32_t usablePages;                // pages available for allocation
+    uint32_t freeCount;                  // current free page count
+    uint32_t metadataPages;              // pages consumed by metadata
 
     // Initialise this allocator over the zone starting at `zoneBase`
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at
@@ -56,7 +57,7 @@ struct PageAllocator {
     // per-page flags — callers do not need to supply the size.
     void free(void* ptr);
 
-    uint32_t getFreePages()   const { return freeCount; }
+    uint32_t getFreePages() const { return freeCount; }
     uint32_t getUsablePages() const { return usablePages; }
 };
 

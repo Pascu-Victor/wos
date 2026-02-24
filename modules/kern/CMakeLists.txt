@@ -5,7 +5,7 @@ project(wos C CXX ASM_NASM)
 set(KERNEL wos)
 
 # Internal flags
-set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z text" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
+set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
 
 # Include directories
 
@@ -20,8 +20,8 @@ add_executable(${KERNEL} ${CFILES} ${ASFILES} ${NASMFILES} ${CXXFILES})
 
 # Kernel-specific compile options: freestanding, no exceptions, no RTTI.
 target_compile_options(${KERNEL} PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-fno-exceptions>
-    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti>
+    $<$<COMPILE_LANGUAGE:C>:-fno-exceptions;-mcmodel=kernel>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel>
 )
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)
@@ -49,7 +49,4 @@ target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 # target_link_libraries(${KERNEL} stdkern)
 
 
-# Custom command to modify the ELF file type
-add_custom_command(TARGET ${KERNEL} POST_BUILD
-    COMMAND printf '\\003' | dd of=$<TARGET_FILE:${KERNEL}> bs=1 count=1 seek=16 conv=notrunc 2>/dev/null
-)
+

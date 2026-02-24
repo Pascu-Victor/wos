@@ -4,15 +4,15 @@
 #include <cstring>
 #include <dev/gpt.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/event.hpp>
+#include <net/wki/wire.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/fs/fat32.hpp>
 
 #include "vfs/fs/devfs.hpp"
+#include "vfs/fs/procfs.hpp"
 #include "vfs/fs/tmpfs.hpp"
-
-#include <net/wki/event.hpp>
-#include <net/wki/wire.hpp>
-#include <net/wki/wki.hpp>
 
 namespace ker::vfs {
 
@@ -26,7 +26,7 @@ auto fstype_to_enum(const char* fstype) -> FSType {
     if (fstype == nullptr) {
         return FSType::TMPFS;
     }
-    if (std::strcmp(fstype, "fat32") == 0) {
+    if (std::strcmp(fstype, "fat32") == 0 || std::strcmp(fstype, "vfat") == 0) {
         return FSType::FAT32;
     }
     if (std::strcmp(fstype, "devfs") == 0) {
@@ -34,6 +34,9 @@ auto fstype_to_enum(const char* fstype) -> FSType {
     }
     if (std::strcmp(fstype, "remote") == 0) {
         return FSType::REMOTE;
+    }
+    if (std::strcmp(fstype, "procfs") == 0) {
+        return FSType::PROCFS;
     }
     return FSType::TMPFS;
 }
@@ -55,8 +58,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     // pointers into userspace memory (e.g. from a mount syscall) that become
     // invalid after the syscall returns.
     size_t path_len = std::strlen(path);
-    auto* path_copy = static_cast<char*>(
-        ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
+    auto* path_copy = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
     if (path_copy == nullptr) {
         delete mount;
         return -1;
@@ -65,8 +67,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     mount->path = path_copy;
 
     size_t fstype_len = std::strlen(fstype);
-    auto* fstype_copy = static_cast<char*>(
-        ker::mod::mm::dyn::kmalloc::malloc(fstype_len + 1));
+    auto* fstype_copy = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(fstype_len + 1));
     if (fstype_copy == nullptr) {
         ker::mod::mm::dyn::kmalloc::free(path_copy);
         delete mount;
@@ -81,7 +82,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     mount->fops = nullptr;
 
     // Initialize the appropriate filesystem
-    if (std::strcmp(fstype, "fat32") == 0) {
+    if (std::strcmp(fstype, "fat32") == 0 || std::strcmp(fstype, "vfat") == 0) {
         // FAT32 filesystem
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 requires a block device\n");
@@ -124,6 +125,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     } else if (std::strcmp(fstype, "remote") == 0) {
         // Remote VFS — fops and private_data set by caller after mount_filesystem returns
         mount->fops = nullptr;
+    } else if (std::strcmp(fstype, "procfs") == 0) {
+        mount->fops = ker::vfs::procfs::get_procfs_fops();
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         delete mount;
@@ -141,9 +144,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
     // Emit WKI storage mount event (if WKI is active)
     if (ker::net::wki::g_wki.initialized) {
-        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE,
-                                          ker::net::wki::EVENT_STORAGE_MOUNT, path,
-                                          static_cast<uint16_t>(std::strlen(path) + 1));
+        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_MOUNT, path,
+                                         static_cast<uint16_t>(std::strlen(path) + 1));
     }
 
     return 0;
@@ -155,8 +157,7 @@ auto unmount_filesystem(const char* path) -> int {
     }
 
     for (size_t i = 0; i < mount_count; ++i) {
-        if (mounts[i] != nullptr && mounts[i]->path != nullptr &&
-            std::strcmp(path, mounts[i]->path) == 0) {
+        if (mounts[i] != nullptr && mounts[i]->path != nullptr && std::strcmp(path, mounts[i]->path) == 0) {
             delete mounts[i];
 
             // Compact: shift remaining entries down
@@ -172,9 +173,8 @@ auto unmount_filesystem(const char* path) -> int {
 
             // Emit WKI storage unmount event (if WKI is active)
             if (ker::net::wki::g_wki.initialized) {
-                ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE,
-                                                  ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
-                                                  static_cast<uint16_t>(std::strlen(path) + 1));
+                ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
+                                                 static_cast<uint16_t>(std::strlen(path) + 1));
             }
 
             return 0;

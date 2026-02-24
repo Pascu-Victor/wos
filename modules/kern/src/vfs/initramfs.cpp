@@ -35,9 +35,7 @@ auto parse_hex8(const char* s) -> uint64_t {
     return val;
 }
 
-auto align_up(size_t val, size_t alignment) -> size_t {
-    return (val + alignment - 1) & ~(alignment - 1);
-}
+auto align_up(size_t val, size_t alignment) -> size_t { return (val + alignment - 1) & ~(alignment - 1); }
 
 // Strip leading "./" or "/" from CPIO path.
 // Returns nullptr for root directory entry (".").
@@ -57,8 +55,7 @@ auto strip_path(const char* name) -> const char* {
 // Split a path into parent + leaf, creating parent directories.
 // Writes the leaf name into leaf_out.
 // Returns the parent TmpNode, or nullptr on failure.
-auto split_and_create_parents(const char* path, char* leaf_out,
-                              size_t leaf_out_size) -> tmpfs::TmpNode* {
+auto split_and_create_parents(const char* path, char* leaf_out, size_t leaf_out_size) -> tmpfs::TmpNode* {
     char path_copy[PATH_BUF_SIZE]{};
     size_t plen = std::strlen(path);
     if (plen >= PATH_BUF_SIZE) {
@@ -103,17 +100,14 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
     size_t offset = 0;
     int entry_count = 0;
 
-    ker::mod::dbg::log("initramfs: unpacking CPIO archive (%u bytes)",
-                       static_cast<unsigned>(size));
+    ker::mod::dbg::log("initramfs: unpacking CPIO archive (%u bytes)", static_cast<unsigned>(size));
 
     while (offset + CPIO_HEADER_SIZE <= size) {
         auto* hdr = reinterpret_cast<const char*>(buf + offset);
 
         // Validate magic "070701"
-        if (hdr[0] != '0' || hdr[1] != '7' || hdr[2] != '0' ||
-            hdr[3] != '7' || hdr[4] != '0' || hdr[5] != '1') {
-            ker::mod::dbg::log("initramfs: invalid magic at offset 0x%x",
-                               static_cast<unsigned>(offset));
+        if (hdr[0] != '0' || hdr[1] != '7' || hdr[2] != '0' || hdr[3] != '7' || hdr[4] != '0' || hdr[5] != '1') {
+            ker::mod::dbg::log("initramfs: invalid magic at offset 0x%x", static_cast<unsigned>(offset));
             return -1;
         }
 
@@ -138,8 +132,7 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
         size_t next_offset = align_up(data_offset + filesize, 4);
 
         // Check for TRAILER
-        if (namesize >= 11 &&
-            std::strncmp(name, "TRAILER!!!", 10) == 0) {
+        if (namesize >= 11 && std::strncmp(name, "TRAILER!!!", 10) == 0) {
             break;
         }
 
@@ -151,19 +144,15 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
             if (file_type == S_IFLNK) {
                 // Symlink: CPIO data is the target path
                 char target[PATH_BUF_SIZE]{};
-                size_t tlen = (filesize < PATH_BUF_SIZE - 1)
-                                  ? static_cast<size_t>(filesize)
-                                  : PATH_BUF_SIZE - 1;
+                size_t tlen = (filesize < PATH_BUF_SIZE - 1) ? static_cast<size_t>(filesize) : PATH_BUF_SIZE - 1;
                 std::memcpy(target, file_data, tlen);
                 target[tlen] = '\0';
 
                 char leaf[tmpfs::TMPFS_NAME_MAX]{};
-                auto* parent = split_and_create_parents(stripped, leaf,
-                                                        tmpfs::TMPFS_NAME_MAX);
+                auto* parent = split_and_create_parents(stripped, leaf, tmpfs::TMPFS_NAME_MAX);
                 if (parent != nullptr) {
                     tmpfs::tmpfs_create_symlink(parent, leaf, target);
-                    ker::mod::dbg::log("initramfs: symlink %s -> %s",
-                                       stripped, target);
+                    ker::mod::dbg::log("initramfs: symlink %s -> %s", stripped, target);
                 }
                 entry_count++;
 
@@ -173,25 +162,19 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
 
             } else if (file_type == S_IFREG) {
                 char leaf[tmpfs::TMPFS_NAME_MAX]{};
-                auto* parent = split_and_create_parents(stripped, leaf,
-                                                        tmpfs::TMPFS_NAME_MAX);
+                auto* parent = split_and_create_parents(stripped, leaf, tmpfs::TMPFS_NAME_MAX);
                 if (parent != nullptr) {
-                    auto* fnode = tmpfs::tmpfs_create_file(parent, leaf);
+                    auto* fnode = tmpfs::tmpfs_create_file(parent, leaf, static_cast<uint32_t>(mode) & 07777);
                     if (fnode != nullptr && filesize > 0) {
-                        fnode->data = static_cast<char*>(
-                            ker::mod::mm::dyn::kmalloc::malloc(
-                                static_cast<size_t>(filesize)));
+                        fnode->data = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(static_cast<size_t>(filesize)));
                         if (fnode->data != nullptr) {
-                            std::memcpy(fnode->data, file_data,
-                                        static_cast<size_t>(filesize));
+                            std::memcpy(fnode->data, file_data, static_cast<size_t>(filesize));
                             fnode->size = static_cast<size_t>(filesize);
                             fnode->capacity = static_cast<size_t>(filesize);
                         }
                     }
                     entry_count++;
-                    ker::mod::dbg::log("initramfs: file %s (%u bytes)",
-                                       stripped,
-                                       static_cast<unsigned>(filesize));
+                    ker::mod::dbg::log("initramfs: file %s (%u bytes)", stripped, static_cast<unsigned>(filesize));
                 }
             }
         }
