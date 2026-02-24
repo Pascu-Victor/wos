@@ -8,7 +8,8 @@
 
 namespace ker::dev {
 struct Device;
-}
+struct BlockDevice;
+}  // namespace ker::dev
 
 namespace ker::vfs::devfs {
 
@@ -26,6 +27,11 @@ struct DevFSNode {
     DevFSNode** children = nullptr;
     size_t children_count = 0;
     size_t children_capacity = 0;
+
+    // POSIX permission model
+    uint32_t mode = 0755;  // Permission bits (default: rwxr-xr-x for dirs)
+    uint32_t uid = 0;      // Owner user ID
+    uint32_t gid = 0;      // Owner group ID
 };
 
 // Register devfs as a virtual filesystem
@@ -49,6 +55,9 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode*;
 // Add a device node to the devfs root
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode*;
 
+// Walk a path and return the DevFSNode (for stat operations)
+auto devfs_walk_path(const char* path) -> DevFSNode*;
+
 // Populate /dev/disk/by-partuuid/<GUID> symlinks from registered block devices.
 // Call after block_device_init() has enumerated GPT partitions.
 void devfs_populate_partition_symlinks();
@@ -56,5 +65,27 @@ void devfs_populate_partition_symlinks();
 // Populate /dev/net/<ifname> nodes for each registered network device.
 // Reading returns interface stats. Call after network device registration.
 void devfs_populate_net_nodes();
+
+// Populate /dev/wki/ hierarchy with discovered remotable resources.
+// Three views: by-type (root), by-zone, and by-peer.
+// Call after WKI peering and resource discovery.
+void devfs_populate_wki();
+
+// Dynamically add a single WKI remotable resource to /dev/wki/.
+// Called from remotable RX handler on RESOURCE_ADVERT.
+void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name);
+
+// Remove a single WKI remotable resource from /dev/wki/.
+// Called from remotable RX handler on RESOURCE_WITHDRAW.
+void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id);
+
+// Remove all WKI resources for a fenced peer from /dev/wki/.
+// Called from wki_resources_invalidate_for_peer().
+void devfs_wki_remove_peer_resources(uint16_t node_id);
+
+// Resolve a devfs-relative path to a BlockDevice*.
+// For WKI block resources, triggers proxy attach if needed.
+// Returns nullptr if the path doesn't refer to a block device.
+auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice*;
 
 }  // namespace ker::vfs::devfs

@@ -81,8 +81,7 @@ static sys::Spinlock largeAllocLock;
 
 void init() {
     // Initialize per-CPU allocators
-    numCpus = smt::getCoreCount();
-    if (numCpus == 0) numCpus = 1;
+    numCpus = smt::getEarlyCpuCount();
 
     mini_malloc_init();
 

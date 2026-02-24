@@ -17,6 +17,7 @@ Diagnostics:
             - cppcoreguidelines-pro-type-cstyle-cast
             - bugprone-easily-swappable-parameters
             - bugprone-reserved-identifier
+            - misc-non-private-member-variables-in-classes
 
     Includes:
         IgnoreHeader: ".*toolchain/target1/.*"

@@ -21,6 +21,63 @@
             }
         },
         {
+            "label": "Build mlibc",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/mlibc-build && ninja -C ${workspaceFolder}/toolchain/mlibc-build install",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Build libcxx",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Build busybox",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/build_busybox.sh",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
             "label": "CMake Build",
             "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && cmake -B build -GNinja . && cmake --build build",
             "type": "shell",
@@ -82,6 +139,9 @@
             "dependsOrder": "sequence",
             "dependsOn": [
                 "Check Headers",
+                "Build mlibc",
+                "Build libcxx",
+                "Build busybox",
                 "CMake Build",
                 "Create Test Disk",
                 "Make Boot Image"
@@ -178,14 +238,70 @@
             "group": "build"
         },
         {
-            "label": "Build QEMU Log Viewer",
+            "label": "Start Cluster Background",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                    "pattern": [
+                        {
+                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
+                            "file": 1,
+                            "line": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": "=== WKI Cluster:",
+                        "endsPattern": "Press Ctrl\\+C to stop all VMs"
+                    }
+                }
+            ],
+            "presentation": {
+                "reveal": "always"
+            },
+            "group": "build"
+        },
+        {
+            "label": "Start Cluster and Debug VM",
+            "dependsOrder": "parallel",
+            "dependsOn": [
+                "Start Cluster Background",
+                "Start QEMU Debug"
+            ],
+            "problemMatcher": [],
+            "group": "build"
+        },
+        {
+            "label": "Build and Start Cluster Debug",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build WOS",
+                "Start Cluster and Debug VM"
+            ],
+            "problemMatcher": [],
+            "group": "build"
+        },
+        {
+            "label": "Build wosdbg",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "build/tools",
                 "--target",
-                "qemu_log_viewer"
+                "wosdbg"
             ],
             "isBackground": false,
             "group": "build"

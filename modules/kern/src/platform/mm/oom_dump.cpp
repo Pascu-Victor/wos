@@ -696,19 +696,19 @@ void dumpPageAllocationsOOM() {
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
     // Collect tasks from all CPUs
-    uint64_t coreCount = smt::getCoreCount();
-    uint64_t totalTaskPages = 0;
-    uint64_t totalPageTablePages = 0;
-    uint64_t exitedTaskPages = 0;
-    uint64_t totalTasksFound = 0;
+    uint64_t core_count = smt::getCoreCount();
+    uint64_t total_task_pages = 0;
+    uint64_t total_page_table_pages = 0;
+    uint64_t exited_task_pages = 0;
+    uint64_t total_tasks_found = 0;
 
     io::serial::write("Scanning ");
-    io::serial::write(u64ToDecNoAlloc(coreCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(core_count, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" CPU(s) for tasks...\n\n");
 
     // Note: We access scheduler internals directly here since we're in OOM state
     // This is safe because we're just reading, not modifying
-    for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
+    for (uint64_t cpuNo = 0; cpuNo < core_count; cpuNo++) {
         io::serial::write("CPU ");
         io::serial::write(u64ToDecNoAlloc(cpuNo, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(":\n");
@@ -730,7 +730,7 @@ void dumpPageAllocationsOOM() {
 
         // Collect up to MAX_OOM_TRACKED_TASKS tasks in this batch
         while (currentPid <= MAX_PID_SCAN && oomTaskCount < MAX_OOM_TRACKED_TASKS) {
-            sched::task::Task* task = sched::findTaskByPid(currentPid);
+            sched::task::Task* task = sched::find_task_by_pid(currentPid);
             if (task != nullptr) {
                 collectTaskInfo(task, !task->hasExited);
             }
@@ -742,7 +742,7 @@ void dumpPageAllocationsOOM() {
             break;
         }
 
-        totalTasksFound += oomTaskCount;
+        total_tasks_found += oomTaskCount;
         batchNumber++;
 
         // Print batch header
@@ -768,7 +768,7 @@ void dumpPageAllocationsOOM() {
             // Status indicator
             if (info.hasExited) {
                 io::serial::write(" [EXITED/ZOMBIE]");
-                exitedTaskPages += info.pageCount;
+                exited_task_pages += info.pageCount;
             } else if (info.isActive) {
                 io::serial::write(" [ACTIVE]");
             } else {
@@ -836,14 +836,14 @@ void dumpPageAllocationsOOM() {
             io::serial::write(u64ToDecNoAlloc(info.rxPages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
             io::serial::write(" pages\n\n");
 
-            totalTaskPages += info.pageCount;
-            totalPageTablePages += info.pageTableCount;
+            total_task_pages += info.pageCount;
+            total_page_table_pages += info.pageTableCount;
         }
     }
 
     // Print total tasks found
     io::serial::write("\nTotal tasks found: ");
-    io::serial::write(u64ToDecNoAlloc(totalTasksFound, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(total_tasks_found, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" (scanned PIDs 1-");
     io::serial::write(u64ToDecNoAlloc(MAX_PID_SCAN, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(")\n");
@@ -861,28 +861,28 @@ void dumpPageAllocationsOOM() {
     uint64_t totalDeadCount = 0;
     uint64_t totalWaitCount = 0;
 
-    for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
-        sched::RunQueueStats rqStats = sched::getRunQueueStats(cpuNo);
+    for (uint64_t cpuNo = 0; cpuNo < core_count; cpuNo++) {
+        sched::RunQueueStats rqStats = sched::get_run_queue_stats(cpuNo);
 
         io::serial::write("  CPU ");
         io::serial::write(u64ToDecNoAlloc(cpuNo, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(":\n");
 
         io::serial::write("    runnableHeap:  ");
-        io::serial::write(u64ToDecNoAlloc(rqStats.activeTaskCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(u64ToDecNoAlloc(rqStats.active_task_count, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" tasks\n");
 
         io::serial::write("    deadList:      ");
-        io::serial::write(u64ToDecNoAlloc(rqStats.expiredTaskCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(u64ToDecNoAlloc(rqStats.expired_task_count, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" tasks\n");
 
         io::serial::write("    waitList:      ");
-        io::serial::write(u64ToDecNoAlloc(rqStats.waitQueueCount, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(u64ToDecNoAlloc(rqStats.wait_queue_count, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" tasks\n");
 
-        totalRunnableCount += rqStats.activeTaskCount;
-        totalDeadCount += rqStats.expiredTaskCount;
-        totalWaitCount += rqStats.waitQueueCount;
+        totalRunnableCount += rqStats.active_task_count;
+        totalDeadCount += rqStats.expired_task_count;
+        totalWaitCount += rqStats.wait_queue_count;
     }
 
     io::serial::write("\n  Totals across all CPUs:\n");
@@ -896,7 +896,7 @@ void dumpPageAllocationsOOM() {
 
     // Print dead tasks with their refcounts (useful for debugging leaks).
     io::serial::write("\nDead tasks (PID : refcount) per CPU:\n");
-    for (uint64_t cpuNo = 0; cpuNo < coreCount; cpuNo++) {
+    for (uint64_t cpuNo = 0; cpuNo < core_count; cpuNo++) {
         constexpr size_t BLOCK = 128;
         uint64_t pids[BLOCK];
         uint32_t refs[BLOCK];
@@ -908,7 +908,7 @@ void dumpPageAllocationsOOM() {
         size_t startIndex = 0;
         bool printedAny = false;
         while (true) {
-            size_t n = ker::mod::sched::getExpiredTaskRefcounts(cpuNo, pids, refs, BLOCK, startIndex);
+            size_t n = ker::mod::sched::get_expired_task_refcounts(cpuNo, pids, refs, BLOCK, startIndex);
             if (n == 0) {
                 if (!printedAny) {
                     io::serial::write("(none)");
@@ -957,11 +957,11 @@ void dumpPageAllocationsOOM() {
 
     io::serial::write("\nEstimated Kernel Object Memory:\n");
 
-    uint64_t taskObjectsMemory = totalTasksFound * TASK_STRUCT_SIZE_ESTIMATE;
+    uint64_t taskObjectsMemory = total_tasks_found * TASK_STRUCT_SIZE_ESTIMATE;
     io::serial::write("  Task objects (~");
     io::serial::write(u64ToDecNoAlloc(TASK_STRUCT_SIZE_ESTIMATE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" bytes each): ");
-    io::serial::write(u64ToDecNoAlloc(totalTasksFound, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(total_tasks_found, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" x ");
     io::serial::write(u64ToDecNoAlloc(TASK_STRUCT_SIZE_ESTIMATE, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" = ");
@@ -1014,27 +1014,28 @@ void dumpPageAllocationsOOM() {
     io::serial::write(u64ToDecNoAlloc(totalFreePages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" pages)\n");
     io::serial::write("  Used memory: ");
-    io::serial::write(u64ToDecNoAlloc((totalMemory - totalFreePages * paging::PAGE_SIZE) / BYTES_PER_MB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(
+        u64ToDecNoAlloc((totalMemory - totalFreePages * paging::PAGE_SIZE) / BYTES_PER_MB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" MB\n\n");
 
     io::serial::write("Process Memory:\n");
     io::serial::write("  Total tasks tracked: ");
-    io::serial::write(u64ToDecNoAlloc(totalTasksFound, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(total_tasks_found, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write("\n");
 
     io::serial::write("  User pages: ");
-    io::serial::write(u64ToDecNoAlloc(totalTaskPages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(total_task_pages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" (");
-    io::serial::write(u64ToDecNoAlloc((totalTaskPages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc((total_task_pages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" KB)\n");
 
     io::serial::write("  Page table pages: ");
-    io::serial::write(u64ToDecNoAlloc(totalPageTablePages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc(total_page_table_pages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" (");
-    io::serial::write(u64ToDecNoAlloc((totalPageTablePages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+    io::serial::write(u64ToDecNoAlloc((total_page_table_pages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" KB)\n");
 
-    uint64_t totalProcessMem = (totalTaskPages + totalPageTablePages) * BYTES_PER_PAGE;
+    uint64_t totalProcessMem = (total_task_pages + total_page_table_pages) * BYTES_PER_PAGE;
     io::serial::write("  Total process memory: ");
     io::serial::write(u64ToDecNoAlloc(totalProcessMem / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
     io::serial::write(" KB\n\n");
@@ -1042,15 +1043,15 @@ void dumpPageAllocationsOOM() {
     // ========================================================================
     // SECTION 4: Dead/Zombie Memory (potential leaks)
     // ========================================================================
-    if (exitedTaskPages > 0) {
+    if (exited_task_pages > 0) {
         io::serial::write("┌─────────────────────────────────────────────────────────────────────┐\n");
         io::serial::write("│    ZOMBIE/DEAD MEMORY DETECTED                                     │\n");
         io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
         io::serial::write("Memory held by exited processes: ");
-        io::serial::write(u64ToDecNoAlloc((exitedTaskPages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(u64ToDecNoAlloc((exited_task_pages * BYTES_PER_PAGE) / BYTES_PER_KB, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" KB (");
-        io::serial::write(u64ToDecNoAlloc(exitedTaskPages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
+        io::serial::write(u64ToDecNoAlloc(exited_task_pages, oomDumpBuffer, OOM_DUMP_BUFFER_SIZE));
         io::serial::write(" pages)\n");
         io::serial::write("This memory can be reclaimed by reaping zombie processes.\n\n");
     }

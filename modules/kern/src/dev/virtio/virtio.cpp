@@ -119,7 +119,7 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
     uint16_t used_idx = vq->last_used_idx % vq->size;
     auto& elem = vq->used->ring[used_idx];
 
-    uint16_t desc_idx = static_cast<uint16_t>(elem.id);
+    auto desc_idx = static_cast<uint16_t>(elem.id);
     if (out_len != nullptr) {
         *out_len = elem.len;
     }

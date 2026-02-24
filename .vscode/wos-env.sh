@@ -12,7 +12,6 @@
 if [ -n "$WOS_ENV_LOADED" ]; then
     return 0
 fi
-
 # Determine the workspace root (assuming this script is in .vscode/ subdirectory)
 WOS_WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WOS_TOOLCHAIN_ROOT="$WOS_WORKSPACE_ROOT/toolchain"

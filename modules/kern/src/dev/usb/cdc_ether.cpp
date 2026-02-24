@@ -1,6 +1,7 @@
 #include "cdc_ether.hpp"
 
 #include <array>
+#include <net/wki/remotable.hpp>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
@@ -16,6 +17,33 @@ extern XhciController* controllers[];
 extern size_t controller_count;
 
 namespace {
+
+// WKI remotable ops for CDC-Ether devices
+auto remotable_can_remote() -> bool { return true; }
+auto remotable_can_share() -> bool { return true; }
+auto remotable_can_passthrough() -> bool { return false; }
+auto remotable_on_attach(uint16_t node_id) -> int {
+    (void)node_id;
+    ker::mod::io::serial::write("cdc-ether: remote attach\n");
+    return 0;
+}
+void remotable_on_detach(uint16_t node_id) {
+    (void)node_id;
+    ker::mod::io::serial::write("cdc-ether: remote detach\n");
+}
+void remotable_on_fault(uint16_t node_id) {
+    (void)node_id;
+    ker::mod::io::serial::write("cdc-ether: remote fault\n");
+}
+const ker::net::wki::RemotableOps s_remotable_ops = {
+    .can_remote = remotable_can_remote,
+    .can_share = remotable_can_share,
+    .can_passthrough = remotable_can_passthrough,
+    .on_remote_attach = remotable_on_attach,
+    .on_remote_detach = remotable_on_detach,
+    .on_remote_fault = remotable_on_fault,
+};
+
 constexpr size_t MAX_CDC_DEVICES = 4;
 std::array<CdcEtherDevice, MAX_CDC_DEVICES> cdc_devices = {};
 size_t cdc_count = 0;
@@ -287,12 +315,13 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     cdc->netdev.state = 1;
     cdc->netdev.private_data = cdc;
     cdc->netdev.name[0] = '\0';  // Auto-assign
+    cdc->netdev.remotable = &s_remotable_ops;
     cdc->active = true;
 
     ker::net::netdev_register(&cdc->netdev);
 
     ker::mod::io::serial::write("cdc-ether: ");
-    ker::mod::io::serial::write(cdc->netdev.name);
+    ker::mod::io::serial::write(cdc->netdev.name.data());
     ker::mod::io::serial::write(" MAC=");
     for (int i = 0; i < 6; i++) {
         if (i > 0) ker::mod::io::serial::write(":");

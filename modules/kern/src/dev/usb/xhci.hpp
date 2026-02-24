@@ -7,7 +7,7 @@
 
 namespace ker::dev::usb {
 
-// ── xHCI Capability Register Offsets (from BAR0) ──
+// -- xHCI Capability Register Offsets (from BAR0) --
 constexpr uint32_t XHCI_CAP_CAPLENGTH = 0x00;   // 1 byte
 constexpr uint32_t XHCI_CAP_HCIVERSION = 0x02;  // 2 bytes
 constexpr uint32_t XHCI_CAP_HCSPARAMS1 = 0x04;  // 4 bytes
@@ -17,7 +17,7 @@ constexpr uint32_t XHCI_CAP_HCCPARAMS1 = 0x10;
 constexpr uint32_t XHCI_CAP_DBOFF = 0x14;   // Doorbell offset
 constexpr uint32_t XHCI_CAP_RTSOFF = 0x18;  // Runtime registers offset
 
-// ── Operational Register Offsets (from BAR0 + CAPLENGTH) ──
+// -- Operational Register Offsets (from BAR0 + CAPLENGTH) --
 constexpr uint32_t XHCI_OP_USBCMD = 0x00;
 constexpr uint32_t XHCI_OP_USBSTS = 0x04;
 constexpr uint32_t XHCI_OP_PAGESIZE = 0x08;
@@ -60,7 +60,7 @@ constexpr uint32_t XHCI_SPEED_SUPER = 4;
 constexpr uint32_t XHCI_PORTSC_W1C_MASK =
     XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_PRC | (1 << 19) | (1 << 20) | (1 << 22) | (1 << 23);
 
-// ── Runtime Register Offsets (from BAR0 + RTSOFF) ──
+// -- Runtime Register Offsets (from BAR0 + RTSOFF) --
 constexpr uint32_t XHCI_RT_IMAN = 0x20;    // Interrupter 0 Management
 constexpr uint32_t XHCI_RT_IMOD = 0x24;    // Interrupter 0 Moderation
 constexpr uint32_t XHCI_RT_ERSTSZ = 0x28;  // Event Ring Segment Table Size
@@ -71,7 +71,7 @@ constexpr uint32_t XHCI_RT_ERDP = 0x38;    // Event Ring Dequeue Pointer (8 byte
 constexpr uint32_t XHCI_IMAN_IP = (1 << 0);  // Interrupt Pending
 constexpr uint32_t XHCI_IMAN_IE = (1 << 1);  // Interrupt Enable
 
-// ── TRB (Transfer Request Block) ──
+// -- TRB (Transfer Request Block) --
 struct Trb {
     uint64_t param;
     uint32_t status;
@@ -116,14 +116,14 @@ constexpr uint32_t TRB_DIR_IN = (1 << 16);  // Data direction IN (for setup TRB)
 constexpr uint32_t TRB_CC_SUCCESS = 1;
 constexpr uint32_t TRB_CC_SHORT_PKT = 13;
 
-// ── Event Ring Segment Table Entry ──
+// -- Event Ring Segment Table Entry --
 struct ErstEntry {
     uint64_t ring_base;
     uint32_t ring_size;
     uint32_t reserved;
 } __attribute__((packed));
 
-// ── Device Context structures ──
+// -- Device Context structures --
 // Slot context (32 bytes)
 struct SlotContext {
     uint32_t data[8];
@@ -149,20 +149,20 @@ struct DeviceContext {
     EndpointContext ep[31];
 } __attribute__((packed));
 
-// ── Ring sizes ──
+// -- Ring sizes --
 constexpr size_t CMD_RING_SIZE = 256;  // TRBs
 constexpr size_t EVENT_RING_SIZE = 256;
 constexpr size_t XFER_RING_SIZE = 256;
 constexpr size_t MAX_XHCI_SLOTS = 64;
 constexpr size_t MAX_XHCI_PORTS = 16;
 
-// ── USB device speed ──
+// -- USB device speed --
 constexpr uint8_t USB_SPEED_FULL = 1;
 constexpr uint8_t USB_SPEED_LOW = 2;
 constexpr uint8_t USB_SPEED_HIGH = 3;
 constexpr uint8_t USB_SPEED_SUPER = 4;
 
-// ── USB Standard Requests ──
+// -- USB Standard Requests --
 constexpr uint8_t USB_REQ_GET_STATUS = 0x00;
 constexpr uint8_t USB_REQ_CLEAR_FEATURE = 0x01;
 constexpr uint8_t USB_REQ_SET_FEATURE = 0x03;
@@ -176,7 +176,7 @@ constexpr uint8_t USB_DESC_CONFIG = 0x02;
 constexpr uint8_t USB_DESC_INTERFACE = 0x04;
 constexpr uint8_t USB_DESC_ENDPOINT = 0x05;
 
-// ── USB Descriptors ──
+// -- USB Descriptors --
 struct UsbDeviceDescriptor {
     uint8_t bLength;
     uint8_t bDescriptorType;
@@ -226,7 +226,7 @@ struct UsbEndpointDescriptor {
     uint8_t bInterval;
 } __attribute__((packed));
 
-// ── USB Setup Packet ──
+// -- USB Setup Packet --
 struct UsbSetupPacket {
     uint8_t bmRequestType;
     uint8_t bRequest;
@@ -235,7 +235,7 @@ struct UsbSetupPacket {
     uint16_t wLength;
 } __attribute__((packed));
 
-// ── USB Endpoint descriptor helpers ──
+// -- USB Endpoint descriptor helpers --
 constexpr uint8_t USB_EP_DIR_IN = 0x80;
 constexpr uint8_t USB_EP_DIR_OUT = 0x00;
 constexpr uint8_t USB_EP_ADDR_MASK = 0x0F;
@@ -245,12 +245,12 @@ constexpr uint8_t USB_EP_TYPE_ISOCH = 1;
 constexpr uint8_t USB_EP_TYPE_BULK = 2;
 constexpr uint8_t USB_EP_TYPE_INTR = 3;
 
-// ── USB Class codes ──
+// -- USB Class codes --
 constexpr uint8_t USB_CLASS_CDC_DATA = 0x0A;
 constexpr uint8_t USB_CLASS_CDC = 0x02;
 constexpr uint8_t USB_CLASS_VENDOR = 0xFF;
 
-// ── USB Device (high-level) ──
+// -- USB Device (high-level) --
 struct UsbEndpoint {
     uint8_t address;  // endpoint address (with direction bit)
     uint8_t type;     // control/bulk/interrupt/isochronous
@@ -281,7 +281,7 @@ struct UsbDevice {
     bool active;
 };
 
-// ── Class Driver Registration ──
+// -- Class Driver Registration --
 struct UsbClassDriver {
     const char* name;
     bool (*probe)(UsbDevice*, UsbInterfaceDescriptor*);
@@ -292,7 +292,7 @@ struct UsbClassDriver {
 
 void usb_register_class_driver(UsbClassDriver* drv);
 
-// ── xHCI Controller ──
+// -- xHCI Controller --
 struct XhciController {
     volatile uint8_t* base;  // MMIO base (BAR0)
     volatile uint8_t* op;    // Operational registers

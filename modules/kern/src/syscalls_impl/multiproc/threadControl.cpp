@@ -1,18 +1,18 @@
-#include "threadInfo.hpp"
-
 #include <platform/sched/scheduler.hpp>
 
+#include "threadInfo.hpp"
+
 namespace ker::syscall::multiproc {
-uint64_t threadControl(abi::multiproc::threadControlOps op, void *arg1) {
+uint64_t threadControl(abi::multiproc::threadControlOps op, void* arg1) {
     switch (op) {
         case abi::multiproc::threadControlOps::setTCB: {
-            void *tcb = arg1;
+            void* tcb = arg1;
             return mod::smt::setTcb(tcb);
         }
 
         case abi::multiproc::threadControlOps::yield: {
             (void)arg1;
-            auto *task = mod::sched::getCurrentTask();
+            auto* task = mod::sched::get_current_task();
             if (task != nullptr) {
                 task->yieldSwitch = true;
                 task->deferredTaskSwitch = true;

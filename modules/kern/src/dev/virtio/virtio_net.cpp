@@ -1,10 +1,14 @@
 #include "virtio_net.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <mod/io/port/port.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
 #include <net/packet.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/acpi/ioapic/ioapic.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
@@ -12,11 +16,40 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::dev::virtio {
 
 namespace {
+
+// WKI remotable ops for VirtIO-Net devices
+auto remotable_can_remote() -> bool { return true; }
+auto remotable_can_share() -> bool { return true; }
+auto remotable_can_passthrough() -> bool { return false; }
+auto remotable_on_attach(uint16_t node_id) -> int {
+    (void)node_id;
+    ker::mod::io::serial::write("virtio-net: remote attach\n");
+    return 0;
+}
+void remotable_on_detach(uint16_t node_id) {
+    (void)node_id;
+    ker::mod::io::serial::write("virtio-net: remote detach\n");
+}
+void remotable_on_fault(uint16_t node_id) {
+    (void)node_id;
+    ker::mod::io::serial::write("virtio-net: remote fault\n");
+}
+const ker::net::wki::RemotableOps s_remotable_ops = {
+    .can_remote = remotable_can_remote,
+    .can_share = remotable_can_share,
+    .can_passthrough = remotable_can_passthrough,
+    .on_remote_attach = remotable_on_attach,
+    .on_remote_detach = remotable_on_detach,
+    .on_remote_fault = remotable_on_fault,
+};
+
 constexpr size_t MAX_VIRTIO_NET_DEVICES = 4;
-VirtIONetDevice* devices[MAX_VIRTIO_NET_DEVICES] = {};
+std::array<VirtIONetDevice*, MAX_VIRTIO_NET_DEVICES> devices = {};
 size_t device_count = 0;
 
 // Get physical address from kernel virtual address
@@ -39,10 +72,10 @@ void fill_rx_queue(VirtIONetDevice* dev) {
             break;
         }
         // Reset data pointer to start of storage (we need space for virtio-net header + data)
-        pkt->data = pkt->storage;
+        pkt->data = pkt->storage.data();
         pkt->len = 0;
 
-        uint64_t phys = virt_to_phys(pkt->storage);
+        uint64_t phys = virt_to_phys(pkt->storage.data());
         // Buffer receives virtio-net header + ethernet frame
         uint32_t buf_len = ker::net::PKT_BUF_SIZE;
 
@@ -51,12 +84,14 @@ void fill_rx_queue(VirtIONetDevice* dev) {
     virtq_kick(dev->rxq);
 }
 
-// Process received packets from the used ring
-void process_rx(VirtIONetDevice* dev) {
+// Process received packets from the used ring (budget-limited for NAPI)
+// Returns number of packets processed
+int process_rx_budget(VirtIONetDevice* dev, int budget) {
+    int processed = 0;
     uint32_t len = 0;
-    uint16_t desc_idx;
+    uint16_t desc_idx = 0;
 
-    while ((desc_idx = virtq_get_buf(dev->rxq, &len)) != 0xFFFF) {
+    while (processed < budget && (desc_idx = virtq_get_buf(dev->rxq, &len)) != 0xFFFF) {
         auto* pkt = dev->rxq->pkt_map[desc_idx];
         dev->rxq->pkt_map[desc_idx] = nullptr;
 
@@ -68,22 +103,25 @@ void process_rx(VirtIONetDevice* dev) {
         }
 
         // Skip virtio-net header, set data to point past it
-        pkt->data = pkt->storage + VIRTIO_NET_HDR_SIZE;
+        pkt->data = pkt->storage.data() + VIRTIO_NET_HDR_SIZE;
         pkt->len = len - VIRTIO_NET_HDR_SIZE;
         pkt->dev = &dev->netdev;
 
         // Deliver to network stack
         ker::net::netdev_rx(&dev->netdev, pkt);
+        processed++;
     }
 
     // Refill RX queue
     fill_rx_queue(dev);
+
+    return processed;
 }
 
 // Process completed TX buffers
 void process_tx(VirtIONetDevice* dev) {
     uint32_t len = 0;
-    uint16_t desc_idx;
+    uint16_t desc_idx = 0;
 
     while ((desc_idx = virtq_get_buf(dev->txq, &len)) != 0xFFFF) {
         auto* pkt = dev->txq->pkt_map[desc_idx];
@@ -94,26 +132,87 @@ void process_tx(VirtIONetDevice* dev) {
     }
 }
 
-// IRQ handler for virtio-net
-void virtio_net_irq(uint8_t, void* private_data) {
+// Disable device interrupts (for NAPI - called from IRQ handler)
+void virtio_net_irq_disable(VirtIONetDevice* dev) {
+    if (dev->msix_enabled) {
+        // MSI-X: disable by setting vectors to NO_VECTOR
+        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, 0);
+        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, VIRTIO_MSI_NO_VECTOR);
+        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, 1);
+        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, VIRTIO_MSI_NO_VECTOR);
+    }
+    // Legacy/MSI: no per-device interrupt disable, rely on NAPI state machine
+}
+
+// Enable device interrupts (for NAPI - called from poll when complete)
+void virtio_net_irq_enable(VirtIONetDevice* dev) {
+    if (dev->msix_enabled) {
+        // MSI-X: re-enable by setting vectors back to 0
+        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, 0);
+        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
+        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, 1);
+        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
+    }
+}
+
+// NAPI poll function - called from worker thread context
+int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
+    auto* dev = static_cast<VirtIONetDevice*>(napi->dev->private_data);
+    int processed = 0;
+
+    // Process RX with regular lock (we're in thread context, not IRQ)
+    dev->rxq->lock.lock();
+    processed = process_rx_budget(dev, budget);
+    dev->rxq->lock.unlock();
+
+    // Process TX completions
+    dev->txq->lock.lock();
+    process_tx(dev);
+    dev->txq->lock.unlock();
+
+    // If we processed less than budget, we're done - re-enable IRQs
+    if (processed < budget) {
+        ker::net::napi_complete(napi);
+        virtio_net_irq_enable(dev);
+
+        // Guard against the missed-notification race: the device may have
+        // added used buffers while MSI-X vectors were set to NO_VECTOR,
+        // suppressing the notification.  After re-enabling, check if there
+        // is pending work.  If so, disable IRQs again and re-schedule so
+        // the worker picks up the missed buffers.
+        if (virtq_has_pending(dev->rxq) || virtq_has_pending(dev->txq)) {
+            virtio_net_irq_disable(dev);
+            ker::net::napi_schedule(napi);
+        }
+    }
+
+    return processed;
+}
+
+// Minimal IRQ handler for virtio-net (NAPI model)
+// Only acknowledges interrupt, disables further interrupts, and schedules poll
+void virtio_net_irq(uint8_t vector, void* private_data) {
+    (void)vector;
+
     auto* dev = static_cast<VirtIONetDevice*>(private_data);
     if (dev == nullptr) {
         return;
     }
 
-    // Read ISR status to acknowledge interrupt
-    uint8_t isr = ::inb(dev->io_base + VIRTIO_REG_ISR_STATUS);
-    if (isr == 0) {
-        return;  // Not our interrupt
+    if (!dev->msix_enabled) {
+        // Legacy/MSI: read ISR status to acknowledge and filter
+        uint8_t isr = ::inb(dev->io_base + VIRTIO_REG_ISR_STATUS);
+        if (isr == 0) {
+            return;  // Not our interrupt
+        }
     }
 
-    // Bit 0: used buffer notification
-    if ((isr & 1) != 0) {
-        process_rx(dev);
-        process_tx(dev);
-    }
+    // Disable device interrupts to prevent further IRQs until poll completes
+    virtio_net_irq_disable(dev);
 
-    // Bit 1: configuration change (ignored for now)
+    // Schedule NAPI poll - all real work happens in worker thread
+    // This is IRQ-safe: only uses atomics and rescheduleTaskForCpu
+    ker::net::napi_schedule(&dev->napi);
 }
 
 // NetDevice operations for virtio-net
@@ -149,7 +248,7 @@ int virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* p
     std::memset(hdr, 0, VIRTIO_NET_HDR_SIZE);
 
     uint64_t phys = virt_to_phys(pkt->data);
-    uint32_t total_len = static_cast<uint32_t>(pkt->len);
+    auto total_len = static_cast<uint32_t>(pkt->len);
 
     int ret = virtq_add_buf(dev->txq, phys, total_len, 0, pkt);
     if (ret < 0) {
@@ -187,7 +286,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
 
-    uint16_t io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3u);
+    auto io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
     if (io_base == 0) {
         ker::mod::io::serial::write("virtio-net: BAR0 is zero\n");
         return -1;
@@ -243,9 +342,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         ker::mod::mm::dyn::kmalloc::free(dev);
         return -1;
     }
-    if (rxq_size > VIRTQ_MAX_SIZE) {
-        rxq_size = VIRTQ_MAX_SIZE;
-    }
+    rxq_size = std::min(rxq_size, VIRTQ_MAX_SIZE);
 
     dev->rxq = virtq_alloc(rxq_size);
     if (dev->rxq == nullptr) {
@@ -270,9 +367,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         ker::mod::mm::dyn::kmalloc::free(dev);
         return -1;
     }
-    if (txq_size > VIRTQ_MAX_SIZE) {
-        txq_size = VIRTQ_MAX_SIZE;
-    }
+    txq_size = std::min(txq_size, VIRTQ_MAX_SIZE);
 
     dev->txq = virtq_alloc(txq_size);
     if (dev->txq == nullptr) {
@@ -287,14 +382,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint64_t txq_phys = virt_to_phys(dev->txq->desc);
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(txq_phys / 4096));
 
-    // 8. Read MAC address
-    if ((our_features & VIRTIO_NET_F_MAC) != 0) {
-        for (int i = 0; i < 6; i++) {
-            dev->netdev.mac[i] = ::inb(io_base + VIRTIO_NET_CFG_MAC + i);
-        }
-    }
-
-    // 9. Set up IRQ
+    // 8. Set up IRQ — try MSI-X first (virtio on QEMU only exposes MSI-X, not MSI)
     uint8_t vector = ker::mod::gates::allocateVector();
     if (vector == 0) {
         ker::mod::io::serial::write("virtio-net: no free IRQ vector\n");
@@ -304,15 +392,53 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
     dev->irq_vector = vector;
 
-    // Try MSI first, fall back to legacy INTx
-    int msi_ret = ker::dev::pci::pci_enable_msi(pci_dev, vector);
-    if (msi_ret != 0) {
-        // Fall back to legacy interrupt
-        // The interrupt_line from PCI config is the legacy IRQ number (GSI)
-        vector = pci_dev->interrupt_line + 32;  // IRQ to vector mapping
-        dev->irq_vector = vector;
-        // Configure the IOAPIC to deliver this GSI as the chosen vector
-        ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
+    int msix_ret = ker::dev::pci::pci_enable_msix(pci_dev, vector);
+    if (msix_ret == 0) {
+        dev->msix_enabled = true;
+
+        // Tell the device which MSI-X table entry to use for config changes
+        ::outw(io_base + VIRTIO_MSI_CONFIG_VECTOR, 0);
+        if (::inw(io_base + VIRTIO_MSI_CONFIG_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
+            ker::mod::io::serial::write("virtio-net: MSI-X config vector rejected\n");
+            dev->msix_enabled = false;
+        }
+    }
+
+    if (dev->msix_enabled) {
+        // Set MSI-X vector for RX queue (queue 0)
+        ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 0);
+        ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
+        if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
+            ker::mod::io::serial::write("virtio-net: MSI-X RX vector rejected\n");
+            dev->msix_enabled = false;
+        }
+
+        // Set MSI-X vector for TX queue (queue 1)
+        ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 1);
+        ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
+        if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
+            ker::mod::io::serial::write("virtio-net: MSI-X TX vector rejected\n");
+            dev->msix_enabled = false;
+        }
+    }
+
+    if (!dev->msix_enabled) {
+        // MSI-X not available or rejected — try MSI, then fall back to legacy INTx
+        int msi_ret = ker::dev::pci::pci_enable_msi(pci_dev, vector);
+        if (msi_ret != 0) {
+            // Fall back to legacy interrupt
+            vector = pci_dev->interrupt_line + 32;  // IRQ to vector mapping
+            dev->irq_vector = vector;
+            ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
+        }
+    }
+
+    // 9. Read MAC address (offset shifts by 4 when MSI-X vector fields are present)
+    uint16_t mac_off = dev->msix_enabled ? VIRTIO_NET_CFG_MAC_MSIX : VIRTIO_NET_CFG_MAC;
+    if ((our_features & VIRTIO_NET_F_MAC) != 0) {
+        for (int i = 0; i < 6; i++) {
+            dev->netdev.mac[i] = ::inb(io_base + mac_off + i);
+        }
     }
 
     ker::mod::gates::requestIrq(vector, virtio_net_irq, dev, "virtio-net");
@@ -325,18 +451,23 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     // 12. Register as a network device
     dev->netdev.ops = &virtio_net_ops;
-    dev->netdev.mtu = 1500;
+    dev->netdev.mtu = 9000;  // jumbo frames: reduces WKI chunking for block I/O
     dev->netdev.state = 1;
     dev->netdev.private_data = dev;
     dev->netdev.name[0] = '\0';  // Auto-assign name
+    dev->netdev.remotable = &s_remotable_ops;
 
     ker::net::netdev_register(&dev->netdev);
+
+    // 13. Initialize and enable NAPI for deferred packet processing
+    ker::net::napi_init(&dev->napi, &dev->netdev, virtio_net_poll, 64);
+    ker::net::napi_enable(&dev->napi);
 
     devices[device_count++] = dev;
 
     // Log success
     ker::mod::io::serial::write("virtio-net: ");
-    ker::mod::io::serial::write(dev->netdev.name);
+    ker::mod::io::serial::write(dev->netdev.name.data());
     ker::mod::io::serial::write(" MAC=");
     for (int i = 0; i < 6; i++) {
         if (i > 0) {
@@ -350,7 +481,8 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     ker::mod::io::serial::writeHex(txq_size);
     ker::mod::io::serial::write(" vec=");
     ker::mod::io::serial::writeHex(vector);
-    ker::mod::io::serial::write(" ready\n");
+    ker::mod::io::serial::write(dev->msix_enabled ? " msix" : " legacy");
+    ker::mod::io::serial::write(" napi ready\n");
 
     return 0;
 }

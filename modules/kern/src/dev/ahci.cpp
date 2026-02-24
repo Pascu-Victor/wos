@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #include "block_device.hpp"
 #include "pci.hpp"
@@ -32,6 +34,7 @@ constexpr uint8_t ATA_DEV_BUSY = 0x80;
 constexpr uint8_t ATA_DEV_DRQ = 0x08;
 constexpr uint8_t ATA_CMD_READ_DMA_EX = 0x25;
 constexpr uint8_t ATA_CMD_WRITE_DMA_EX = 0x35;
+constexpr uint8_t ATA_CMD_FLUSH_CACHE_EXT = 0xEA;
 constexpr uint8_t ATA_CMD_IDENTIFY = 0xEC;
 
 constexpr uint32_t SATA_SIG_ATA = 0x00000101;
@@ -51,6 +54,26 @@ enum : uint8_t { AHCI_DEV_NULL = 0, AHCI_DEV_SATA = 1, AHCI_DEV_SEMB = 2, AHCI_D
 
 // Global state
 namespace {
+
+// WKI remotable ops for AHCI block devices
+auto remotable_can_remote() -> bool { return true; }
+auto remotable_can_share() -> bool { return true; }
+auto remotable_can_passthrough() -> bool { return false; }
+auto remotable_on_attach(uint16_t node_id) -> int {
+    ker::mod::dbg::log("[AHCI] remote attach from 0x%04x", node_id);
+    return 0;
+}
+void remotable_on_detach(uint16_t node_id) { ker::mod::dbg::log("[AHCI] remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { ker::mod::dbg::log("[AHCI] remote fault for 0x%04x", node_id); }
+const ker::net::wki::RemotableOps s_remotable_ops = {
+    .can_remote = remotable_can_remote,
+    .can_share = remotable_can_share,
+    .can_passthrough = remotable_can_passthrough,
+    .on_remote_attach = remotable_on_attach,
+    .on_remote_detach = remotable_on_detach,
+    .on_remote_fault = remotable_on_fault,
+};
+
 volatile HBA_MEM* hba_mem = nullptr;
 constexpr size_t MAX_PORTS = 32;
 AHCIDevice devices[MAX_PORTS];  // NOLINT
@@ -192,9 +215,8 @@ auto find_cmdslot(volatile HBA_PORT* port, int portno) -> uint32_t {
     // Check both hardware registers AND software tracking for busy slots
     // The software tracking handles the race where we've issued a command but hardware hasn't updated ci yet
     uint32_t hw_slots = (port->sact | port->ci);
-    uint32_t sw_slots = (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) 
-                        ? port_slots_in_use[portno].load(std::memory_order_acquire) 
-                        : 0;
+    uint32_t sw_slots =
+        (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) ? port_slots_in_use[portno].load(std::memory_order_acquire) : 0;
     uint32_t slots = hw_slots | sw_slots;
     uint32_t cmdslots = (hba_mem->cap & 0x1F00) >> 8;  // Number of command slots
     for (uint32_t i = 0; i < cmdslots; i++) {
@@ -211,7 +233,7 @@ auto find_cmdslot(volatile HBA_PORT* port, int portno) -> uint32_t {
 auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf, bool write_op)
     -> bool {
     uint32_t slot = UINT32_MAX;
-    
+
     // Acquire per-port lock only for the critical section: finding a slot and issuing the command
     // We must NOT hold the lock during the busy-wait for completion, as that would cause livelock
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -226,7 +248,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         }
         return false;
     }
-    
+
     // Mark this slot as in-use in software BEFORE releasing the lock
     // This prevents other CPUs from grabbing the same slot before hardware updates ci
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -304,7 +326,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
 
     // Issue command
     port->ci = 1 << slot;
-    
+
     // Release lock after issuing command - the slot is now ours and we just need to wait
     // Other concurrent I/O operations can use different command slots
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
@@ -350,7 +372,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
         port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
     }
-    
+
     return true;
 }
 
@@ -362,6 +384,107 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
 // Write sectors to disk
 auto write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
     return read_write_disk(port, portno, startl, starth, count, buf, true);
+}
+
+// Flush volatile write cache to non-volatile storage
+auto flush_disk(volatile HBA_PORT* port, int portno) -> bool {
+    uint32_t slot = UINT32_MAX;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].lock();
+    }
+
+    port->is = static_cast<uint32_t>(-1);
+    slot = find_cmdslot(port, portno);
+    if (slot == UINT32_MAX) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_locks[portno].unlock();
+        }
+        return false;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
+    }
+
+    HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
+    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmdheader->w = 0;
+    cmdheader->prdtl = 0;  // No data transfer
+
+    auto* cmdtbl = reinterpret_cast<HBA_CMD_TBL*>(port_memory[portno].ctb_virt[slot]);
+    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL));
+
+    auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
+    cmdfis->fis_type = FIS_TYPE_REG_H2D;
+    cmdfis->c = 1;
+    cmdfis->command = ATA_CMD_FLUSH_CACHE_EXT;
+    cmdfis->device = 1 << 6;  // LBA mode
+
+    // Wait for port to be ready
+    int spin = 0;
+    constexpr int MAX_SPIN = 1000000;
+    while (((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
+        spin++;
+    }
+    if (spin == MAX_SPIN) {
+        ahci_log("flush_disk: Port is hung\n");
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
+        return false;
+    }
+
+    port->ci = 1 << slot;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].unlock();
+    }
+
+    // Wait for completion
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) {
+            break;
+        }
+        if ((port->is & HBA_PxIS_TFES) != 0U) {
+            ahci_log("flush_disk: error\n");
+            if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+                port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            }
+            return false;
+        }
+        asm volatile("pause");
+    }
+
+    if ((port->is & HBA_PxIS_TFES) != 0U) {
+        ahci_log("flush_disk: error\n");
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+        }
+        return false;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+    }
+
+    return true;
+}
+
+// Wrapper for block device flush
+auto ahci_flush_blocks(BlockDevice* bdev) -> int {
+    if (bdev == nullptr || bdev->private_data == nullptr) {
+        return -1;
+    }
+
+    auto* dev = static_cast<AHCIDevice*>(bdev->private_data);
+    if (dev->port_num >= MAX_PORTS) {
+        return -1;
+    }
+
+    volatile HBA_PORT* port = &hba_mem->ports[dev->port_num];
+    return flush_disk(port, dev->port_num) ? 0 : -1;
 }
 
 // Wrapper for block device read
@@ -438,8 +561,9 @@ void probe_port(volatile HBA_MEM* abar) {
                     dev->bdev.total_blocks = dev->total_sectors;
                     dev->bdev.read_blocks = ahci_read_blocks;
                     dev->bdev.write_blocks = ahci_write_blocks;
-                    dev->bdev.flush = nullptr;
+                    dev->bdev.flush = ahci_flush_blocks;
                     dev->bdev.private_data = dev;
+                    dev->bdev.remotable = &s_remotable_ops;
 
                     // Register with block device manager
                     block_device_register(&dev->bdev);

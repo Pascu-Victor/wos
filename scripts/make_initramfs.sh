@@ -56,6 +56,32 @@ else
     echo "# /etc/fstab - empty (no disks.conf found)" > "$INITRAMFS_DIR/etc/fstab"
 fi
 
+# Create /etc/filesystems for busybox mount auto-detection
+cat > "$INITRAMFS_DIR/etc/filesystems" <<'EOF'
+fat32
+vfat
+tmpfs
+EOF
+echo "  initramfs: added /etc/filesystems"
+
+# Copy busybox binary and create applet symlinks
+BUSYBOX_BINARY="toolchain/target1/bin/busybox"
+if [ -f "$BUSYBOX_BINARY" ]; then
+    mkdir -p "$INITRAMFS_DIR/bin"
+    cp "$BUSYBOX_BINARY" "$INITRAMFS_DIR/bin/busybox"
+    chmod +x "$INITRAMFS_DIR/bin/busybox"
+    echo "  initramfs: added /bin/busybox ($(du -h "$BUSYBOX_BINARY" | cut -f1))"
+
+    # Create symlinks for enabled applets
+    BUSYBOX_APPLETS="mount umount ls cat echo mkdir cp mv rm grep find ps df ifconfig sh"
+    for applet in $BUSYBOX_APPLETS; do
+        ln -sf busybox "$INITRAMFS_DIR/bin/$applet"
+        echo "  initramfs: symlinked /bin/$applet -> busybox"
+    done
+else
+    echo "WARNING: busybox binary not found at $BUSYBOX_BINARY, skipping"
+fi
+
 # Create CPIO newc archive
 (cd "$INITRAMFS_DIR" && find . | cpio -o -H newc --quiet) > "$INITRAMFS_OUT"
 

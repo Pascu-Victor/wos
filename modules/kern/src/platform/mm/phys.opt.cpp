@@ -42,7 +42,47 @@ struct PerCpuPageCache {
     }
 };
 
-sys::Spinlock memlock;  // Global lock for zone list and large allocations
+// Debug spinlock for memlock — records holder CR3, CPU, and caller RIP
+struct TrackedSpinlock {
+    std::atomic<bool> locked{false};
+    volatile uint64_t holder_cr3 = 0;
+    volatile uint64_t holder_cpu = 0;
+    volatile uint64_t holder_rip = 0;
+
+    auto lock_irq() -> uint64_t {
+        // Save RFLAGS and disable interrupts before acquiring
+        uint64_t flags = 0;
+        asm volatile("pushfq; popq %0" : "=r"(flags));
+        asm volatile("cli");
+
+        while (locked.exchange(true, std::memory_order_acquire)) {
+            while (locked.load(std::memory_order_relaxed)) {
+                asm volatile("pause");
+            }
+        }
+        // Record who holds the lock
+        uint64_t cr3;
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        holder_cr3 = cr3;
+        holder_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+        holder_cpu = apic::getApicId();
+        return flags;
+    }
+
+    void unlock_irq(uint64_t flags) {
+        holder_cr3 = 0;
+        holder_cpu = 0;
+        holder_rip = 0;
+        locked.store(false, std::memory_order_release);
+
+        // Restore interrupt state
+        if ((flags & 0x200) != 0) {
+            asm volatile("sti");
+        }
+    }
+};
+
+TrackedSpinlock memlock;  // Global lock for zone list and large allocations
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
 __attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // Dedicated zone for huge allocations
 
@@ -55,6 +95,9 @@ static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures ar
 static uint64_t perCpuCachesPhysBase = 0;
 static uint64_t perCpuCachesSize = 0;
 
+// Statistics counters
+static uint64_t mainHeapSize = 0;
+
 // Huge page zone deferred initialization info
 static uint64_t hugePageBase = 0;
 static uint64_t hugePageSize = 0;
@@ -64,7 +107,6 @@ static std::atomic<uint64_t> totalAllocatedBytes{0};
 static std::atomic<uint64_t> totalFreedBytes{0};
 static std::atomic<uint64_t> allocCount{0};
 static std::atomic<uint64_t> freeCount{0};
-bool stack_overlap_check_enabled = false;
 
 // Safe CPU ID getter - falls back to APIC ID during early boot
 static inline uint64_t getCurrentCpuId() {
@@ -81,8 +123,6 @@ static inline uint64_t getCurrentCpuId() {
 }
 }  // namespace
 
-void enable_stack_overlap_check() { stack_overlap_check_enabled = true; }
-
 void dumpAllocStats() {
     io::serial::write("Physical alloc stats: allocated=");
     io::serial::writeHex(totalAllocatedBytes.load());
@@ -96,6 +136,8 @@ void dumpAllocStats() {
     io::serial::writeHex(freeCount.load());
     io::serial::write("\n");
 }
+
+uint64_t get_free_mem_bytes() { return mainHeapSize - (totalAllocatedBytes.load() - totalFreedBytes.load()); }
 
 auto getZones() -> paging::PageZone* { return zones; }
 auto getHugePageZone() -> paging::PageZone* { return hugePageZone; }
@@ -245,6 +287,8 @@ void init(limine_memmap_response* memmapResponse) {
             memmap.entries[i]->length -= hugeSz;
         }
 
+        mainHeapSize += memmap.entries[i]->length;
+
         paging::PageZone* zone =
             initPageZone((uint64_t)addr::getVirtPointer(memmap.entries[i]->base), memmap.entries[i]->length, zoneNum++);
 
@@ -263,7 +307,16 @@ void init(limine_memmap_response* memmapResponse) {
     zones_tail->next = nullptr;
 }
 
-void setKernelCr3(uint64_t cr3) { kernelCr3 = cr3; }
+void setKernelCr3(uint64_t cr3) {
+    kernelCr3 = cr3;
+
+    // Re-initialize the tracked memlock after pagemap switch so that
+    // stale CR3/RIP values from boot-time Limine pagemaps are cleared.
+    memlock.locked.store(false, std::memory_order_release);
+    memlock.holder_cr3 = 0;
+    memlock.holder_cpu = 0;
+    memlock.holder_rip = 0;
+}
 
 void initHugePageZoneDeferred() {
     // Map and initialize per-CPU caches first
@@ -311,10 +364,10 @@ void initHugePageZoneDeferred() {
 
         io::serial::write("Huge page region mapped, initializing zone\n");
 
-        memlock.lock();
+        uint64_t flags = memlock.lock_irq();
         // Pass physical addresses - initHugePageZone will convert to virtual
         hugePageZone = initHugePageZone(hugePageBase, hugePageSize);
-        memlock.unlock();
+        memlock.unlock_irq(flags);
 
         if (hugePageZone != nullptr) {
             io::serial::write("Huge page zone initialized: base=0x");
@@ -369,16 +422,11 @@ auto pageAlloc(uint64_t size) -> void* {
     }
 
     // Slow path: allocate from zones
-    memlock.lock();
+    uint64_t flags = memlock.lock_irq();
     void* block = findFreeBlock(size);
-
-    if (block != nullptr) {
-        totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
-        allocCount.fetch_add(1, std::memory_order_relaxed);
-    }
+    memlock.unlock_irq(flags);
 
     if (block == nullptr) {
-        [[unlikely]] memlock.unlock();
         // OOM condition - dump allocation info for debugging
         io::serial::write("OOM: pageAlloc failed for size ");
         io::serial::writeHex(size);
@@ -386,6 +434,9 @@ auto pageAlloc(uint64_t size) -> void* {
         dumpPageAllocationsOOM();
         return nullptr;
     }
+
+    totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+    allocCount.fetch_add(1, std::memory_order_relaxed);
 
     // Validate the returned address is in a reasonable HHDM range
     auto blockAddr = (uint64_t)block;
@@ -395,40 +446,10 @@ auto pageAlloc(uint64_t size) -> void* {
         io::serial::write("FATAL: pageAlloc returned invalid HHDM addr: ");
         io::serial::writeHex(blockAddr);
         io::serial::write("\n");
-        memlock.unlock();
         hcf();
     }
 
-    // DIAGNOSTIC: Check if returned page overlaps with current task's kernel stack.
-    // This catches the page allocator returning a page that's already in use.
-    if (stack_overlap_check_enabled) {
-        auto* ct = sched::getCurrentTask();
-        if (ct != nullptr && ct->context.syscallKernelStack != 0) {
-            uint64_t stack_top = ct->context.syscallKernelStack;
-            uint64_t stack_bot = stack_top - KERNEL_STACK_SIZE;
-            uint64_t b_start = blockAddr;
-            uint64_t b_end = blockAddr + size;
-            if (b_start < stack_top && b_end > stack_bot) {
-                memlock.unlock();
-                io::serial::write("FATAL: pageAlloc overlaps active kernel stack!\n");
-                io::serial::write("  block=");
-                io::serial::writeHex(b_start);
-                io::serial::write(" size=");
-                io::serial::writeHex(size);
-                io::serial::write("\n  stack=");
-                io::serial::writeHex(stack_bot);
-                io::serial::write(" - ");
-                io::serial::writeHex(stack_top);
-                io::serial::write(" PID=");
-                io::serial::writeHex(ct->pid);
-                io::serial::write("\n");
-                hcf();
-            }
-        }
-    }  // stack_overlap_check_enabled
-
-    // If we're not using kernel CR3, temporarily switch for memset
-    // This handles the case where userspace pagemaps don't have complete HHDM
+    // Zero outside the lock — the block is exclusively ours now
     uint64_t savedCr3 = 0;
     if (kernelCr3 != 0) {
         uint64_t currentCr3 = rdcr3();
@@ -444,29 +465,26 @@ auto pageAlloc(uint64_t size) -> void* {
         wrcr3(savedCr3);
     }
 
-    memlock.unlock();
     return block;
 }
 
 auto pageAllocHuge(uint64_t size) -> void* {
     // Allocate from dedicated huge page zone
-    memlock.lock();
+    uint64_t flags = memlock.lock_irq();
     void* block = findFreeBlockHuge(size);
-
-    if (block != nullptr) {
-        totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
-        allocCount.fetch_add(1, std::memory_order_relaxed);
-    }
+    memlock.unlock_irq(flags);
 
     if (block == nullptr) {
-        [[unlikely]] memlock.unlock();
         io::serial::write("OOM: pageAllocHuge failed for size ");
         io::serial::writeHex(size);
         io::serial::write(" bytes\n");
         return nullptr;
     }
 
-    // Zero the allocated memory
+    totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+    allocCount.fetch_add(1, std::memory_order_relaxed);
+
+    // Zero outside the lock — the block is exclusively ours now
     uint64_t savedCr3 = 0;
     if (kernelCr3 != 0) {
         uint64_t currentCr3 = rdcr3();
@@ -482,7 +500,6 @@ auto pageAllocHuge(uint64_t size) -> void* {
         wrcr3(savedCr3);
     }
 
-    memlock.unlock();
     return block;
 }
 
@@ -508,7 +525,7 @@ void pageFree(void* page) {
     }
 
     // Slow path: return to zone
-    memlock.lock();
+    uint64_t flags = memlock.lock_irq();
 
     // Try huge page zone first
     if (hugePageZone != nullptr) {
@@ -518,7 +535,7 @@ void pageFree(void* page) {
                 freeCount.fetch_add(1, std::memory_order_relaxed);
                 totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
             }
-            memlock.unlock();
+            memlock.unlock_irq(flags);
             return;
         }
     }
@@ -537,7 +554,80 @@ void pageFree(void* page) {
         break;
     }
 
-    memlock.unlock();
+    memlock.unlock_irq(flags);
+}
+
+// --- Frame reference counting helpers ---
+
+namespace {
+// Find the PageAllocator and page index for a given HHDM pointer.
+// Returns true if found, populating allocator and pageIdx.
+static bool findAllocatorForPage(void* page, PageAllocator*& outAlloc, uint32_t& outIdx) {
+    auto addr = (uint64_t)page;
+    // Check regular zones first
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if (addr >= zone->start && addr < zone->start + zone->len && zone->allocator != nullptr) {
+            outAlloc = zone->allocator;
+            outIdx = static_cast<uint32_t>((addr - zone->allocator->base) / paging::PAGE_SIZE);
+            if (outIdx < outAlloc->totalPages) return true;
+        }
+    }
+    // Check huge page zone
+    if (hugePageZone != nullptr && addr >= hugePageZone->start && addr < hugePageZone->start + hugePageZone->len &&
+        hugePageZone->allocator != nullptr) {
+        outAlloc = hugePageZone->allocator;
+        outIdx = static_cast<uint32_t>((addr - hugePageZone->allocator->base) / paging::PAGE_SIZE);
+        if (outIdx < outAlloc->totalPages) return true;
+    }
+    return false;
+}
+}  // namespace
+
+void pageRefInc(void* page) {
+    if (page == nullptr) return;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    if (findAllocatorForPage(page, alloc, idx)) {
+        alloc->pageRefcounts[idx]++;
+    }
+    memlock.unlock_irq(flags);
+}
+
+uint32_t pageRefDec(void* page) {
+    if (page == nullptr) return 0;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    if (findAllocatorForPage(page, alloc, idx)) {
+        if (alloc->pageRefcounts[idx] > 0) {
+            alloc->pageRefcounts[idx]--;
+        }
+        uint32_t newRef = alloc->pageRefcounts[idx];
+        if (newRef == 0) {
+            // Refcount reached zero — free the page
+            alloc->free(page);
+            freeCount.fetch_add(1, std::memory_order_relaxed);
+            totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+        }
+        memlock.unlock_irq(flags);
+        return newRef;
+    }
+    memlock.unlock_irq(flags);
+    return 0;
+}
+
+uint32_t pageRefGet(void* page) {
+    if (page == nullptr) return 0;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t flags = memlock.lock_irq();
+    uint32_t ref = 0;
+    if (findAllocatorForPage(page, alloc, idx)) {
+        ref = alloc->pageRefcounts[idx];
+    }
+    memlock.unlock_irq(flags);
+    return ref;
 }
 
 void dumpMiniMallocStats() { ::mini_dump_stats(); }

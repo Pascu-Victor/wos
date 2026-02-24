@@ -9,22 +9,31 @@ namespace ker::dev::virtio {
 
 // VirtIO PCI vendor and device IDs
 constexpr uint16_t VIRTIO_VENDOR = 0x1AF4;
-constexpr uint16_t VIRTIO_NET_LEGACY = 0x1000;   // Transitional device
+constexpr uint16_t VIRTIO_NET_LEGACY = 0x1000;  // Transitional device
 constexpr uint16_t VIRTIO_NET_MODERN = 0x1041;
 
 // Legacy device register offsets (relative to BAR0 I/O base)
-constexpr uint16_t VIRTIO_REG_DEVICE_FEATURES = 0x00;    // 32-bit R
-constexpr uint16_t VIRTIO_REG_GUEST_FEATURES = 0x04;     // 32-bit R/W
-constexpr uint16_t VIRTIO_REG_QUEUE_ADDR = 0x08;         // 32-bit R/W
-constexpr uint16_t VIRTIO_REG_QUEUE_SIZE = 0x0C;         // 16-bit R
-constexpr uint16_t VIRTIO_REG_QUEUE_SELECT = 0x0E;       // 16-bit R/W
-constexpr uint16_t VIRTIO_REG_QUEUE_NOTIFY = 0x10;       // 16-bit R/W
-constexpr uint16_t VIRTIO_REG_DEVICE_STATUS = 0x12;      // 8-bit  R/W
-constexpr uint16_t VIRTIO_REG_ISR_STATUS = 0x13;         // 8-bit  R
+constexpr uint16_t VIRTIO_REG_DEVICE_FEATURES = 0x00;  // 32-bit R
+constexpr uint16_t VIRTIO_REG_GUEST_FEATURES = 0x04;   // 32-bit R/W
+constexpr uint16_t VIRTIO_REG_QUEUE_ADDR = 0x08;       // 32-bit R/W
+constexpr uint16_t VIRTIO_REG_QUEUE_SIZE = 0x0C;       // 16-bit R
+constexpr uint16_t VIRTIO_REG_QUEUE_SELECT = 0x0E;     // 16-bit R/W
+constexpr uint16_t VIRTIO_REG_QUEUE_NOTIFY = 0x10;     // 16-bit R/W
+constexpr uint16_t VIRTIO_REG_DEVICE_STATUS = 0x12;    // 8-bit  R/W
+constexpr uint16_t VIRTIO_REG_ISR_STATUS = 0x13;       // 8-bit  R
 
-// VirtIO-Net specific config registers (legacy, offset from BAR0 + 0x14)
-constexpr uint16_t VIRTIO_NET_CFG_MAC = 0x14;            // 6 bytes
-constexpr uint16_t VIRTIO_NET_CFG_STATUS = 0x1A;         // 16-bit
+// MSI-X vector configuration (legacy I/O bar, present when MSI-X is enabled)
+constexpr uint16_t VIRTIO_MSI_CONFIG_VECTOR = 0x14;  // 16-bit R/W
+constexpr uint16_t VIRTIO_MSI_QUEUE_VECTOR = 0x16;   // 16-bit R/W
+constexpr uint16_t VIRTIO_MSI_NO_VECTOR = 0xFFFF;
+
+// VirtIO-Net specific config registers (legacy, offset from BAR0)
+// Without MSI-X: device config starts at 0x14
+// With MSI-X:    device config starts at 0x18 (shifted by 4 for MSI-X vector fields)
+constexpr uint16_t VIRTIO_NET_CFG_MAC = 0x14;          // 6 bytes (no MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_MAC_MSIX = 0x18;     // 6 bytes (with MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_STATUS = 0x1A;       // 16-bit (no MSI-X)
+constexpr uint16_t VIRTIO_NET_CFG_STATUS_MSIX = 0x1E;  // 16-bit (with MSI-X)
 
 // Device status bits
 constexpr uint8_t VIRTIO_STATUS_ACKNOWLEDGE = 1;
@@ -59,21 +68,21 @@ constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);
 
 // Virtqueue structures (packed to match hardware layout)
 struct VirtqDesc {
-    uint64_t addr;     // Physical address of buffer
-    uint32_t len;      // Length of buffer
-    uint16_t flags;    // VRING_DESC_F_* flags
-    uint16_t next;     // Index of next descriptor (if VRING_DESC_F_NEXT)
+    uint64_t addr;   // Physical address of buffer
+    uint32_t len;    // Length of buffer
+    uint16_t flags;  // VRING_DESC_F_* flags
+    uint16_t next;   // Index of next descriptor (if VRING_DESC_F_NEXT)
 } __attribute__((packed));
 
 struct VirtqAvail {
     uint16_t flags;
     uint16_t idx;
-    uint16_t ring[];   // Flexible array member
+    uint16_t ring[];  // Flexible array member
 } __attribute__((packed));
 
 struct VirtqUsedElem {
-    uint32_t id;       // Index of start of used descriptor chain
-    uint32_t len;      // Total bytes written to buffer
+    uint32_t id;   // Index of start of used descriptor chain
+    uint32_t len;  // Total bytes written to buffer
 } __attribute__((packed));
 
 struct VirtqUsed {
@@ -91,25 +100,32 @@ struct Virtqueue {
     uint16_t free_head;      // Head of free descriptor list
     uint16_t last_used_idx;  // Last consumed used ring index
 
-    VirtqDesc* desc;         // Descriptor table (physical-contiguous)
-    VirtqAvail* avail;       // Available ring
-    VirtqUsed* used;         // Used ring
+    VirtqDesc* desc;    // Descriptor table (physical-contiguous)
+    VirtqAvail* avail;  // Available ring
+    VirtqUsed* used;    // Used ring
 
     // Map descriptor index -> PacketBuffer for RX completion
     ker::net::PacketBuffer* pkt_map[VIRTQ_MAX_SIZE];
 
-    uint16_t io_base;        // BAR0 for legacy notify
-    uint16_t queue_index;    // Which queue (0=RX, 1=TX)
+    uint16_t io_base;      // BAR0 for legacy notify
+    uint16_t queue_index;  // Which queue (0=RX, 1=TX)
 
     ker::mod::sys::Spinlock lock;
 };
 
 // Virtqueue management
 auto virtq_alloc(uint16_t size) -> Virtqueue*;
-auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags,
-                   ker::net::PacketBuffer* pkt) -> int;
+auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, ker::net::PacketBuffer* pkt) -> int;
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t;  // returns desc idx, 0xFFFF if empty
 void virtq_kick(Virtqueue* vq);
+
+// Check if device has added buffers to the used ring that the driver
+// hasn't consumed yet.  Used after re-enabling notifications to detect
+// the missed-notification race (device posted while vectors were NO_VECTOR).
+inline bool virtq_has_pending(const Virtqueue* vq) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return vq->last_used_idx != vq->used->idx;
+}
 
 // Calculate virtqueue memory layout sizes
 auto virtq_desc_size(uint16_t qsz) -> size_t;

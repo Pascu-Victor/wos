@@ -14,16 +14,21 @@ constexpr size_t TMPFS_NAME_MAX = 256;
 enum class TmpNodeType : uint8_t { FILE, DIRECTORY, SYMLINK };
 
 struct TmpNode {
-    char* data = nullptr;              // File content buffer (files only)
-    size_t size = 0;                   // Current data size
-    size_t capacity = 0;               // Allocated buffer capacity
+    char* data = nullptr;                     // File content buffer (files only)
+    size_t size = 0;                          // Current data size
+    size_t capacity = 0;                      // Allocated buffer capacity
     std::array<char, TMPFS_NAME_MAX> name{};  // Owned name copy
     TmpNodeType type = TmpNodeType::FILE;
-    TmpNode* parent = nullptr;         // Back-pointer for ".." navigation
-    TmpNode** children = nullptr;      // Child node array (directories only)
+    TmpNode* parent = nullptr;     // Back-pointer for ".." navigation
+    TmpNode** children = nullptr;  // Child node array (directories only)
     size_t children_count = 0;
     size_t children_capacity = 0;
-    char* symlink_target = nullptr;    // Target path (symlinks only)
+    char* symlink_target = nullptr;  // Target path (symlinks only)
+
+    // POSIX permission model
+    uint32_t mode = 0;  // Permission bits (e.g. 0644 for files, 0755 for dirs)
+    uint32_t uid = 0;   // Owner user ID
+    uint32_t gid = 0;   // Owner group ID
 };
 
 // Initialization
@@ -35,7 +40,7 @@ auto get_root_node() -> TmpNode*;
 // Node operations
 auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode*;
 auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode*;
-auto tmpfs_create_file(TmpNode* parent, const char* name) -> TmpNode*;
+auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode = 0644) -> TmpNode*;
 auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target) -> TmpNode*;
 
 // Walk a multi-component path relative to root.

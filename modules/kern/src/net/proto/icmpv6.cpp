@@ -10,8 +10,7 @@
 namespace ker::net::proto {
 
 namespace {
-void handle_echo_request(NetDevice* dev, PacketBuffer* pkt,
-                         const uint8_t* src, const uint8_t* dst) {
+void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst) {
     // Build echo reply with same payload
     size_t payload_len = pkt->len;  // includes ICMPv6 header + echo header + data
 
@@ -33,9 +32,7 @@ void handle_echo_request(NetDevice* dev, PacketBuffer* pkt,
 
     // Compute ICMPv6 checksum (mandatory, uses IPv6 pseudo-header)
     // Reply: src=our dst, dst=their src
-    icmp->checksum = checksum_pseudo_ipv6(dst, src, IPV6_PROTO_ICMPV6,
-                                          static_cast<uint32_t>(reply->len),
-                                          reply->data, reply->len);
+    icmp->checksum = checksum_pseudo_ipv6(dst, src, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(reply->len), reply->data, reply->len);
 
     pkt_free(pkt);
 
@@ -44,20 +41,18 @@ void handle_echo_request(NetDevice* dev, PacketBuffer* pkt,
 }
 }  // namespace
 
-void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const uint8_t* src, const uint8_t* dst) {
+void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst) {
     if (pkt->len < sizeof(ICMPv6Header)) {
         pkt_free(pkt);
         return;
     }
 
-    auto* hdr = reinterpret_cast<const ICMPv6Header*>(pkt->data);
+    const auto* hdr = reinterpret_cast<const ICMPv6Header*>(pkt->data);
 
     // Verify checksum
     uint16_t stored = hdr->checksum;
     if (stored != 0) {
-        uint16_t computed = checksum_pseudo_ipv6(src, dst, IPV6_PROTO_ICMPV6,
-                                                 static_cast<uint32_t>(pkt->len),
-                                                 pkt->data, pkt->len);
+        uint16_t computed = checksum_pseudo_ipv6(src, dst, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len);
         if (computed != 0 && computed != 0xFFFF) {
             pkt_free(pkt);
             return;

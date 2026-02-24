@@ -1,5 +1,6 @@
 #include "ivshmem_net.hpp"
 
+#include <array>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <net/packet.hpp>
@@ -8,6 +9,9 @@
 
 namespace ker::dev::ivshmem {
 
+// Forward declarations for NAPI
+int ivshmem_poll(ker::net::NapiStruct* napi, int budget);
+
 namespace {
 constexpr size_t MAX_IVSHMEM_DEVICES = 2;
 IvshmemNetDevice dev_pool[MAX_IVSHMEM_DEVICES] = {};
@@ -15,12 +19,23 @@ IvshmemNetDevice* devices[MAX_IVSHMEM_DEVICES] = {};
 size_t device_count = 0;
 
 // BAR0 register offsets (ivshmem-plain)
-constexpr uint32_t IVSHMEM_REG_INTRMASK   = 0x00;
+constexpr uint32_t IVSHMEM_REG_INTRMASK = 0x00;
 constexpr uint32_t IVSHMEM_REG_INTRSTATUS = 0x04;
 constexpr uint32_t IVSHMEM_REG_IVPOSITION = 0x08;
-constexpr uint32_t IVSHMEM_REG_DOORBELL   = 0x0C;
+constexpr uint32_t IVSHMEM_REG_DOORBELL = 0x0C;
 
-// ── Ring buffer operations ──
+// -- IRQ enable/disable helpers --
+void ivshmem_irq_disable(IvshmemNetDevice* dev) {
+    // Mask all interrupts
+    dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0;
+}
+
+void ivshmem_irq_enable(IvshmemNetDevice* dev) {
+    // Unmask all interrupts
+    dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
+}
+
+// -- Ring buffer operations --
 
 // Write a packet to the ring. Returns 0 on success, -1 if ring full.
 int ring_write(RingBuffer* ring, const uint8_t* data, uint16_t len) {
@@ -72,8 +87,7 @@ uint16_t ring_read(RingBuffer* ring, uint8_t* buf, uint16_t buf_size) {
     if (head == tail) return 0;  // Empty
 
     // Read length
-    uint16_t len = static_cast<uint16_t>(ring->data[tail % ring->size]) |
-                   (static_cast<uint16_t>(ring->data[(tail + 1) % ring->size]) << 8);
+    uint16_t len = static_cast<uint16_t>(ring->data[tail % ring->size]) | (static_cast<uint16_t>(ring->data[(tail + 1) % ring->size]) << 8);
 
     uint32_t pkt_size = 2 + len;
     uint32_t padded = (pkt_size + 3) & ~3u;
@@ -92,15 +106,13 @@ uint16_t ring_read(RingBuffer* ring, uint8_t* buf, uint16_t buf_size) {
     return copy_len;
 }
 
-// ── NetDevice operations ──
+// -- NetDevice operations --
 int ivshmem_open(ker::net::NetDevice* netdev) {
     netdev->state = 1;
     return 0;
 }
 
-void ivshmem_close(ker::net::NetDevice* netdev) {
-    netdev->state = 0;
-}
+void ivshmem_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
 
 int ivshmem_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
     auto* dev = static_cast<IvshmemNetDevice*>(netdev->private_data);
@@ -135,7 +147,7 @@ ker::net::NetDeviceOps ivshmem_ops = {
     .set_mac = ivshmem_set_mac,
 };
 
-// ── IRQ handler ──
+// -- IRQ handler (minimal - just schedule NAPI) --
 void ivshmem_irq(uint8_t, void* data) {
     auto* dev = static_cast<IvshmemNetDevice*>(data);
     if (dev == nullptr || !dev->active) return;
@@ -143,26 +155,14 @@ void ivshmem_irq(uint8_t, void* data) {
     // Acknowledge interrupt
     dev->regs[IVSHMEM_REG_INTRSTATUS / 4] = dev->regs[IVSHMEM_REG_INTRSTATUS / 4];
 
-    // Process received packets
-    uint8_t buf[2048];
-    while (true) {
-        uint16_t len = ring_read(&dev->rx_ring, buf, sizeof(buf));
-        if (len == 0) break;
+    // Disable device interrupts
+    ivshmem_irq_disable(dev);
 
-        auto* pkt = ker::net::pkt_alloc();
-        if (pkt == nullptr) break;
-
-        auto* dst = pkt->put(len);
-        std::memcpy(dst, buf, len);
-        pkt->dev = &dev->netdev;
-
-        dev->netdev.rx_packets++;
-        dev->netdev.rx_bytes += len;
-        ker::net::netdev_rx(&dev->netdev, pkt);
-    }
+    // Schedule NAPI poll (atomic, IRQ-safe)
+    ker::net::napi_schedule(&dev->napi);
 }
 
-// ── Device init ──
+// -- Device init --
 auto init_device(pci::PCIDevice* pci_dev) -> int {
     if (device_count >= MAX_IVSHMEM_DEVICES) return -1;
 
@@ -270,9 +270,12 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     idev->netdev.mac[5] = static_cast<uint8_t>(idev->my_vm_id);
 
     // Register NetDevice as "dmaN"
-    char name[16] = "dma0";
-    name[3] = '0' + static_cast<char>(device_count);
-    std::memcpy(idev->netdev.name, name, 5);
+    std::array<char, 16> name = {};
+    name[0] = 'd';
+    name[1] = 'm';
+    name[2] = 'a';
+    name[3] = static_cast<char>(static_cast<uint8_t>('0') + device_count);
+    std::memcpy(idev->netdev.name.data(), name.data(), 5);
 
     idev->netdev.ops = &ivshmem_ops;
     idev->netdev.mtu = 9000;  // jumbo frames supported
@@ -281,10 +284,15 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     idev->active = true;
 
     ker::net::netdev_register(&idev->netdev);
+
+    // Initialize and enable NAPI for deferred packet processing
+    ker::net::napi_init(&idev->napi, &idev->netdev, ivshmem_poll, 64);
+    ker::net::napi_enable(&idev->napi);
+
     devices[device_count++] = idev;
 
     ker::mod::io::serial::write("ivshmem-net: ");
-    ker::mod::io::serial::write(idev->netdev.name);
+    ker::mod::io::serial::write(idev->netdev.name.data());
     ker::mod::io::serial::write(" vm_id=");
     ker::mod::io::serial::writeHex(idev->my_vm_id);
     ker::mod::io::serial::write(" shmem=");
@@ -294,6 +302,54 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     return 0;
 }
 }  // namespace
+
+// -- NAPI poll function (runs in worker thread context) --
+int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
+    auto* dev = static_cast<IvshmemNetDevice*>(napi->dev->private_data);
+    if (dev == nullptr || !dev->active) {
+        ker::net::napi_complete(napi);
+        return 0;
+    }
+
+    int processed = 0;
+    uint8_t buf[2048];
+
+    // Process RX packets up to budget
+    while (processed < budget) {
+        uint16_t len = ring_read(&dev->rx_ring, buf, sizeof(buf));
+        if (len == 0) break;
+
+        auto* pkt = ker::net::pkt_alloc();
+        if (pkt == nullptr) break;
+
+        auto* dst = pkt->put(len);
+        std::memcpy(dst, buf, len);
+        pkt->dev = &dev->netdev;
+
+        dev->netdev.rx_packets++;
+        dev->netdev.rx_bytes += len;
+        ker::net::netdev_rx(&dev->netdev, pkt);
+
+        processed++;
+    }
+
+    // If we processed less than budget, we're done - re-enable interrupts
+    if (processed < budget) {
+        ker::net::napi_complete(napi);
+        ivshmem_irq_enable(dev);
+    }
+
+    return processed;
+}
+
+auto ivshmem_net_is_claimed(pci::PCIDevice* dev) -> bool {
+    for (size_t i = 0; i < device_count; i++) {
+        if (devices[i] != nullptr && devices[i]->pci == dev) {
+            return true;
+        }
+    }
+    return false;
+}
 
 auto ivshmem_net_init() -> int {
     int found = 0;

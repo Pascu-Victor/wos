@@ -104,7 +104,9 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
     // Validate context before restoring — catch corruption before it causes a crash
     // in userspace where debugging is much harder.
     // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
-    if (nextTask->type == sched::task::TaskType::PROCESS) {
+    // Skip validation when voluntaryBlock is set — the saved context is legitimately
+    // kernel-mode (task was preempted at a safe blocking point like sti;hlt in a syscall).
+    if (nextTask->type == sched::task::TaskType::PROCESS && !nextTask->voluntaryBlock) {
         if (frame.cs != desc::gdt::GDT_USER_CS) {
             dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
             for (;;) asm volatile("hlt");
@@ -121,14 +123,6 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
             dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x", frame.rsp, nextTask->pid);
             for (;;) asm volatile("hlt");
         }
-    }
-
-    // DIAGNOSTIC: Catch bad RBP immediately after context restore
-    if (gpr.rbp == 0xffffff00000003ULL) {
-        dbg::log("switchTo: BAD RBP=0xffffff00000003 after restore! PID %x CPU %d", nextTask->pid, (int)realCpuId);
-        dbg::log("  task=%p name='%s' entry=0x%x", nextTask, (nextTask->name != nullptr) ? nextTask->name : "?", nextTask->entry);
-        dbg::log("  saved regs.rbp=0x%x frame.rip=0x%x frame.rsp=0x%x", nextTask->context.regs.rbp, frame.rip, frame.rsp);
-        asm volatile("int3");  // breakpoint trap — attach GDB here
     }
 
     // Update scratch area cpuId
@@ -182,7 +176,7 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     uint64_t ticks = timerTickCount.fetch_add(1, std::memory_order_relaxed);
     if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();
-        sched::gcExpiredTasks();
+        // sched::gcExpiredTasks();
     }
 
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
@@ -190,7 +184,7 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
 
     // This may not return if we switch contexts
     // Note: processTasks will arm the timer when appropriate
-    sched::processTasks(*gpr_ptr, *frame_ptr);
+    sched::process_tasks(*gpr_ptr, *frame_ptr);
 
     // Re-arm timer for next quantum (only reached if processTasks returned,
     // meaning we're continuing with idle task or same task)
@@ -201,7 +195,7 @@ extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
-    sched::jumpToNextTask(*gpr_ptr, *frame_ptr);
+    sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
 }
 
 void startSchedTimer() {

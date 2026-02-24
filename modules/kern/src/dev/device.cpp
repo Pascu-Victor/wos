@@ -36,6 +36,19 @@ auto dev_register(Device* device) -> int {
     return 0;
 }
 
+auto dev_unregister(Device* device) -> int {
+    if (device == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < device_count; ++i) {
+        if (devices[i] == device) {
+            devices[i] = nullptr;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 auto dev_find(unsigned major, unsigned minor) -> Device* {
     for (size_t i = 0; i < device_count; ++i) {
         if (devices[i] != nullptr && devices[i]->major == major && devices[i]->minor == minor) {

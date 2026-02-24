@@ -134,6 +134,11 @@ constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
 auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ctx) -> int;
 auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int;
 
+// FAT32 directory modification operations
+auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int;
+auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int;
+auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int;
+
 // Get FAT32 FileOperations structure
 auto get_fat32_fops() -> FileOperations*;
 

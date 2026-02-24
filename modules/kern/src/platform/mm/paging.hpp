@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 
-namespace ker::mod::mm { struct PageAllocator; }  // forward-declare
+namespace ker::mod::mm {
+struct PageAllocator;
+}  // namespace ker::mod::mm
 
 #define PAGE_ALIGN_UP(addr) (((addr) + ker::mod::mm::paging::PAGE_SIZE - 1) & (~(ker::mod::mm::paging::PAGE_SIZE - 1)))
 #define PAGE_ALIGN_DOWN(addr) ((addr) & ~(ker::mod::mm::paging::PAGE_SIZE - 1))
@@ -57,6 +59,10 @@ const static uint64_t PAGE_PRESENT = 0x1;
 const static uint64_t PAGE_WRITE = 0x2;
 const static uint64_t PAGE_USER = 0x4;
 const static uint64_t PAGE_NX = (1ULL << 63);
+
+// COW (Copy-on-Write) flag: stored in PTE bit 9 (first "available" OS bit).
+// When set, the page is shared and read-only; a write fault triggers a copy.
+const static uint64_t PAGE_COW = (1ULL << 9);
 
 namespace pageTypes {
 const static uint64_t READONLY = PAGE_PRESENT;

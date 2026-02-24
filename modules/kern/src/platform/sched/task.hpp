@@ -82,6 +82,23 @@ struct Task {
     static constexpr unsigned FD_TABLE_SIZE = 256;
     void* fds[FD_TABLE_SIZE];  // opaque pointers to kernel file descriptor objects (ker::vfs::File)
 
+    // Current working directory (absolute path, "/" by default)
+    static constexpr unsigned CWD_MAX = 256;
+    char cwd[CWD_MAX] = "/";
+
+    // Executable path (set by exec, used by procfs /proc/self/exe)
+    static constexpr unsigned EXE_PATH_MAX = 256;
+    char exe_path[EXE_PATH_MAX] = "";
+
+    // POSIX credential model
+    uint32_t uid = 0;      // Real user ID
+    uint32_t gid = 0;      // Real group ID
+    uint32_t euid = 0;     // Effective user ID
+    uint32_t egid = 0;     // Effective group ID
+    uint32_t suid = 0;     // Saved set-user-ID
+    uint32_t sgid = 0;     // Saved set-group-ID
+    uint32_t umask = 022;  // File creation mask (default: rw-r--r-- for files)
+
     // Exit status of this process (set when process exits, used by waitpid)
     int exitStatus;
     bool hasExited;
@@ -98,9 +115,36 @@ struct Task {
     // When true, deferredTaskSwitch puts task in expired queue (yield) instead of wait queue (block)
     bool yieldSwitch;
 
+    // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
+    // in a syscall wait loop).  The scheduler may preempt it as if it were a DAEMON,
+    // saving and restoring kernel-mode context.  Set before hlt, cleared after wake.
+    volatile bool voluntaryBlock = false;
+
     // Waitpid state: when this task is waiting for another task to exit
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
     uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
+
+    // --- Signal infrastructure ---
+    // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)
+    uint64_t sigPending;
+    // Bitmask of blocked signals
+    uint64_t sigMask;
+
+    // Signal handler entry (matches Linux ABI struct sigaction layout)
+    struct SigHandler {
+        uint64_t handler;   // SIG_DFL=0, SIG_IGN=1, or function pointer
+        uint64_t flags;     // SA_SIGINFO, SA_RESTART, etc.
+        uint64_t restorer;  // Signal return trampoline (sa_restorer)
+        uint64_t mask;      // Additional signals to block during handler
+    };
+    static constexpr unsigned MAX_SIGNALS = 64;
+    SigHandler sigHandlers[MAX_SIGNALS];
+
+    // Set to true when a signal handler frame is being delivered
+    bool inSignalHandler;
+
+    // Set to true by sigreturn syscall; check_pending_signals will restore context
+    bool doSigreturn;
 
     // === EEVDF scheduling fields ===
     // Virtual runtime: cumulative weighted CPU time consumed.

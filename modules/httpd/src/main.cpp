@@ -2,11 +2,13 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/logging.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,7 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
-#include <fstream>
+#include <iostream>
 #include <print>
 #include <string>
 #include <string_view>
@@ -25,17 +27,19 @@
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
-constexpr const char* SERVE_ROOT = "/mnt/disk/srv";
+// constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
+constexpr const char* SERVE_ROOT = "/";
 
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
-    std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
-    if (log_stream.is_open()) {
-        log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
-        log_stream.close();
-    }
+    std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
+
+    // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
+    // if (log_stream.is_open()) {
+    //     log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
+    //     log_stream.close();
+    // }
 }
 constexpr size_t BUFFER_SIZE = 4096;
 constexpr size_t MAX_FILE_SIZE = static_cast<const size_t>(1024 * 1024);  // 1MB max file size
@@ -246,7 +250,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     html += "</h1>\r\n";
 
     html += "<table>\r\n";
-    html += "<tr><th>Name</th><th>Size</th><th>Type</th></tr>\r\n";
+    html += "<tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
 
     // Parent directory link (if not root)
     if (url_path != "/" && url_path.size() > 1) {
@@ -262,7 +266,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
         }
         html += "<tr><td><span class='icon'>📁</span><a href=\"";
         html += parent;
-        html += "\">..</a></td><td class='size'>-</td><td class='type'>Parent Directory</td></tr>\r\n";
+        html += "\">..</a></td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
     }
 
     // Read directory entries
@@ -270,7 +274,12 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     if (dir == nullptr) {
         html += "<tr><td colspan='3'>Error reading directory</td></tr>\r\n";
     } else {
-        std::vector<std::pair<std::string, bool>> entries;  // name, is_directory
+        struct DirEntry {
+            std::string name;
+            bool is_dir;
+            bool is_blk;
+        };
+        std::vector<DirEntry> entries;
 
         struct dirent* entry = nullptr;
         while ((entry = readdir(dir)) != nullptr) {
@@ -279,7 +288,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 continue;
             }
 
-            // Check if it's a directory
+            // Check if it's a directory or block device
             std::string full_path = fs_path;
             if (full_path.back() != '/') {
                 full_path += '/';
@@ -288,35 +297,37 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
 
             struct stat st{};
             bool is_dir = false;
+            bool is_blk = false;
             if (stat(full_path.c_str(), &st) == 0) {
                 is_dir = S_ISDIR(st.st_mode);
+                is_blk = S_ISBLK(st.st_mode);
             }
 
-            entries.emplace_back(name, is_dir);
+            entries.push_back({name, is_dir, is_blk});
         }
         closedir(dir);
 
         // Sort: directories first, then alphabetically
-        std::ranges::sort(entries, [](const auto& a, const auto& b) {
-            if (a.second != b.second) {
-                return a.second > b.second;  // dirs first
+        std::ranges::sort(entries, [](const DirEntry& a, const DirEntry& b) {
+            if (a.is_dir != b.is_dir) {
+                return a.is_dir > b.is_dir;  // dirs first
             }
-            return a.first < b.first;
+            return a.name < b.name;
         });
 
-        for (const auto& [name, is_dir] : entries) {
+        for (const auto& ent : entries) {
             std::string full_path = fs_path;
             if (full_path.back() != '/') {
                 full_path += '/';
             }
-            full_path += name;
+            full_path += ent.name;
 
             std::string url = std::string(url_path);
             if (url.back() != '/') {
                 url += '/';
             }
-            url += name;
-            if (is_dir) {
+            url += ent.name;
+            if (ent.is_dir) {
                 url += '/';
             }
 
@@ -327,18 +338,42 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             }
 
             html += "<tr><td><span class='icon'>";
-            html += is_dir ? "📁" : "📄";
+            if (ent.is_dir) {
+                html += "📁";
+            } else if (ent.is_blk) {
+                html += "💾";
+            } else {
+                html += "📄";
+            }
             html += "</span><a href=\"";
             html += url;
             html += "\">";
-            html += name;
-            if (is_dir) {
+            html += ent.name;
+            if (ent.is_dir) {
                 html += "/";
             }
             html += "</a></td><td class='size'>";
-            html += is_dir ? "-" : format_size(size);
+            html += ent.is_dir ? "-" : format_size(size);
             html += "</td><td class='type'>";
-            html += is_dir ? "Directory" : get_mime_type(name);
+            if (ent.is_blk) {
+                html += "Block Device";
+                html += "</td><td>";
+                // Mount form for block devices
+                html += "<form method='POST' action='/api/mount' style='display:inline;margin:0;'>";
+                html += "<input type='hidden' name='device' value='";
+                html += url;
+                html += "'/>";
+                html += "<input type='text' name='path' placeholder='/mnt/disk' style='width:120px;margin-right:4px;'/>";
+                html += "<select name='fstype' style='margin-right:4px;'>";
+                html += "<option value='fat32' selected>fat32</option>";
+                html += "<option value='tmpfs'>tmpfs</option>";
+                html += "</select>";
+                html += "<button type='submit'>Mount</button>";
+                html += "</form>";
+            } else {
+                html += ent.is_dir ? "Directory" : get_mime_type(ent.name);
+                html += "</td><td>";
+            }
             html += "</td></tr>\r\n";
         }
     }
@@ -351,16 +386,27 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     return html;
 }
 
-// Send all data, handling partial sends
+// Send all data, handling partial sends and EAGAIN
 auto send_all(int fd, const void* data, size_t len) -> ssize_t {
     const auto* ptr = static_cast<const char*>(data);
     size_t remaining = len;
     size_t total_sent = 0;
+    int retries = 0;
+    constexpr int MAX_SEND_RETRIES = 10000;
 
     while (remaining > 0) {
         ssize_t sent = send(fd, ptr, remaining, 0);
         if (sent < 0) {
-            // Error occurred
+            // EAGAIN (-11): window full or buffer exhaustion — retry
+            if (sent == -11 && retries < MAX_SEND_RETRIES) {
+                retries++;
+                sched_yield();
+                continue;
+            }
+            // Other error or too many retries
+            if (total_sent > 0) {
+                return static_cast<ssize_t>(total_sent);
+            }
             return sent;
         }
         if (sent == 0) {
@@ -370,6 +416,7 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
         ptr += sent;
         remaining -= sent;
         total_sent += sent;
+        retries = 0;  // Reset retry counter on progress
     }
 
     return static_cast<ssize_t>(total_sent);
@@ -472,6 +519,15 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
     return true;
 }
 
+// Parse HTTP method from request line
+auto parse_request_method(std::string_view request) -> std::string_view {
+    auto first_space = request.find(' ');
+    if (first_space == std::string_view::npos) {
+        return "GET";
+    }
+    return request.substr(0, first_space);
+}
+
 // Parse HTTP request to extract the path
 auto parse_request_path(std::string_view request) -> std::string_view {
     // Find the first line (GET /path HTTP/1.1)
@@ -495,6 +551,41 @@ auto parse_request_path(std::string_view request) -> std::string_view {
     return first_line.substr(first_space + 1, second_space - first_space - 1);
 }
 
+// Extract POST body from HTTP request (content after \r\n\r\n)
+auto parse_request_body(std::string_view request) -> std::string_view {
+    auto body_start = request.find("\r\n\r\n");
+    if (body_start == std::string_view::npos) {
+        return {};
+    }
+    return request.substr(body_start + 4);
+}
+
+// Extract a URL-encoded form field value by key from a body like "key1=val1&key2=val2"
+auto get_form_field(std::string_view body, std::string_view key) -> std::string {
+    std::string search_key{key};
+    search_key += '=';
+
+    size_t pos = 0;
+    while (pos < body.size()) {
+        // Check if this position starts with the key
+        if (body.substr(pos).starts_with(search_key)) {
+            pos += search_key.size();
+            auto end = body.find('&', pos);
+            if (end == std::string_view::npos) {
+                end = body.size();
+            }
+            return url_decode(body.substr(pos, end - pos));
+        }
+        // Skip to next field
+        auto amp = body.find('&', pos);
+        if (amp == std::string_view::npos) {
+            break;
+        }
+        pos = amp + 1;
+    }
+    return {};
+}
+
 // Handle an HTTP request and send response
 auto handle_request(int client_fd, std::string_view request) -> void {
     auto path = parse_request_path(request);
@@ -511,6 +602,85 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     if (!is_safe_path(decoded_path)) {
         log_message("httpd[t:{},p:{}]: Rejected unsafe path: {}", tid, pid, decoded_path);
         send(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size(), 0);
+        return;
+    }
+
+    auto method = parse_request_method(request);
+
+    // Handle POST /api/mount
+    if (method == "POST" && decoded_path == "/api/mount") {
+        auto body = parse_request_body(request);
+        auto device = get_form_field(body, "device");
+        auto mount_path = get_form_field(body, "path");
+        auto fstype = get_form_field(body, "fstype");
+        if (fstype.empty()) {
+            fstype = "fat32";
+        }
+
+        if (device.empty() || mount_path.empty()) {
+            constexpr std::string_view ERR_BODY =
+                "<html><head><title>Mount Error</title></head><body>"
+                "<h1>Error</h1><p>Missing device or path parameter.</p>"
+                "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>"
+                "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
+            send_response(client_fd, 400, "Bad Request", "text/html; charset=utf-8", ERR_BODY.data(), ERR_BODY.size());
+            return;
+        }
+
+        // Create the mount point directory, then delegate to busybox mount
+        ker::abi::vfs::mkdir(mount_path.c_str(), 0755);
+
+        std::array<const char*, 6> argv = {"/bin/mount", "-t", fstype.c_str(), device.c_str(), mount_path.c_str(), nullptr};
+        constexpr std::array<const char*, 1> ENVP = {nullptr};
+        auto exec_res = ker::process::exec("/bin/mount", argv.data(), ENVP.data());
+
+        if (exec_res < 0) {
+            log_message("httpd[t:{},p:{}]: Failed to exec for mount {} at {}", tid, pid, device, mount_path);
+            std::string result_html;
+            result_html.reserve(512);
+            result_html += "<html><head><title>Mount Error</title></head><body>";
+            result_html += "<h1>Error</h1><p>Failed to fork mount process for <b>";
+            result_html += device;
+            result_html += "</b> at <b>";
+            result_html += mount_path;
+            result_html += "</b></p>";
+            result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
+            result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
+            send_response(client_fd, 500, "Internal Server Error", "text/html; charset=utf-8", result_html.data(), result_html.size());
+            return;
+        }
+
+        // Parent: wait for mount to complete
+        int32_t exit_code = 0;
+        ker::process::waitpid(exec_res, &exit_code, 0);
+
+        if (exit_code == 0) {
+            log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
+            // Redirect to the newly mounted path so the browser sees the result
+            auto redirect = std::format(
+                "HTTP/1.1 303 See Other\r\n"
+                "Location: {}/\r\n"
+                "Connection: close\r\n"
+                "Server: WOS-httpd/1.0\r\n"
+                "\r\n",
+                mount_path);
+            send_all(client_fd, redirect.data(), redirect.size());
+        } else {
+            log_message("httpd[t:{},p:{}]: Failed to mount {} at {} ({}): exit code {}", tid, pid, device, mount_path, fstype, exit_code);
+            std::string result_html;
+            result_html.reserve(512);
+            result_html += "<html><head><title>Mount Error</title></head><body>";
+            result_html += "<h1>Error</h1><p>Failed to mount <b>";
+            result_html += device;
+            result_html += "</b> at <b>";
+            result_html += mount_path;
+            result_html += "</b> (exit code ";
+            result_html += std::to_string(exit_code);
+            result_html += ")</p>";
+            result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
+            result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
+            send_response(client_fd, 500, "Internal Server Error", "text/html; charset=utf-8", result_html.data(), result_html.size());
+        }
         return;
     }
 
@@ -638,7 +808,7 @@ auto main(int argc, char** argv) -> int {
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
         uint16_t client_port = ntohs(client_addr.sin_port);
 
-        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, client_ip, client_port);
+        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), client_port);
 
         // Read request
         ssize_t received = recv(client_fd, buffer.data(), BUFFER_SIZE - 1, 0);
@@ -657,12 +827,23 @@ auto main(int argc, char** argv) -> int {
         buffer[received] = '\0';
         std::string_view request(buffer.data(), received);
 
-        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, client_ip, client_port);
+        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), client_port);
 
         // Handle request and send response
         handle_request(client_fd, request);
 
-        // Close connection
+        // Graceful close: shut down the write side first so the client
+        // receives FIN, then drain any unread data the client may have
+        // sent (e.g. the browser may pipeline or send trailing bytes).
+        // Without this, close() on a socket with unread data sends RST
+        // instead of FIN, causing NS_ERROR_NET_RESET in the browser.
+        shutdown(client_fd, SHUT_WR);
+        {
+            std::array<char, 512> drain{};
+            while (recv(client_fd, drain.data(), drain.size(), 0) > 0) {
+                // discard
+            }
+        }
         close(client_fd);
         log_message("httpd[t:{},p:{}]: Connection closed", tid, pid);
     }

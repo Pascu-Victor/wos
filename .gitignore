@@ -22,5 +22,8 @@ build
 #ccache
 .cache
 
+#python cache
+**/__pycache__
+
 #core dumps
 coredumps

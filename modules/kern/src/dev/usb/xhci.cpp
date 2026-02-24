@@ -16,7 +16,7 @@ size_t controller_count = 0;
 namespace {
 UsbClassDriver* class_drivers = nullptr;
 
-// ── MMIO helpers ──
+// -- MMIO helpers --
 auto read32(volatile uint8_t* base, uint32_t offset) -> uint32_t { return *reinterpret_cast<volatile uint32_t*>(base + offset); }
 
 void write32(volatile uint8_t* base, uint32_t offset, uint32_t val) { *reinterpret_cast<volatile uint32_t*>(base + offset) = val; }
@@ -55,7 +55,7 @@ auto alloc_pages(size_t bytes) -> Alloc {
     return {v, virt_to_phys(v)};
 }
 
-// ── Ring operations ──
+// -- Ring operations --
 void ring_enqueue(Trb* ring, size_t* enqueue, bool* cycle, size_t ring_size, uint64_t param, uint32_t status, uint32_t control) {
     size_t idx = *enqueue;
     ring[idx].param = param;
@@ -76,7 +76,7 @@ void ring_enqueue(Trb* ring, size_t* enqueue, bool* cycle, size_t ring_size, uin
 
 void ring_doorbell(volatile uint32_t* db, uint32_t slot, uint32_t target) { db[slot] = target; }
 
-// ── Command helpers ──
+// -- Command helpers --
 auto send_command(XhciController* hc, uint64_t param, uint32_t status, uint32_t control) -> int {
     hc->cmd_lock.lock();
     hc->cmd_done = false;
@@ -130,7 +130,7 @@ auto address_device(XhciController* hc, uint8_t slot_id, uint64_t input_ctx_phys
     return send_command(hc, input_ctx_phys, 0, TRB_ADDRESS_DEVICE | (static_cast<uint32_t>(slot_id) << 24));
 }
 
-// ── Endpoint context helpers ──
+// -- Endpoint context helpers --
 // EP context DCI: for EP0 = 1, for EPn OUT = 2*n, for EPn IN = 2*n+1
 auto ep_dci(uint8_t ep_addr) -> uint8_t {
     uint8_t num = ep_addr & 0x0F;
@@ -183,11 +183,11 @@ auto alloc_transfer_ring() -> Trb* {
     return static_cast<Trb*>(a.virt);
 }
 
-// ── Device enumeration ──
+// -- Device enumeration --
 void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed);
 void probe_class_drivers(XhciController* hc, UsbDevice* dev, uint8_t* config_data, size_t config_len);
 
-// ── Event processing ──
+// -- Event processing --
 void process_event(XhciController* hc, Trb* evt) {
     uint32_t type = evt->control & TRB_TYPE_MASK;
 
@@ -272,7 +272,7 @@ void xhci_irq(uint8_t, void* data) {
     process_events(hc);
 }
 
-// ── Device enumeration implementation ──
+// -- Device enumeration implementation --
 void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     // 1. Enable Slot
     int slot = enable_slot(hc);
@@ -422,7 +422,7 @@ void probe_class_drivers(XhciController* hc, UsbDevice* dev, uint8_t* config_dat
     }
 }
 
-// ── Scan ports on init ──
+// -- Scan ports on init --
 void scan_ports(XhciController* hc) {
     for (uint8_t p = 1; p <= hc->max_ports; p++) {
         uint32_t portsc = read32(hc->op, XHCI_OP_PORTSC + (p - 1) * 0x10);
@@ -450,7 +450,7 @@ void scan_ports(XhciController* hc) {
     }
 }
 
-// ── Controller init ──
+// -- Controller init --
 auto init_controller(pci::PCIDevice* pci_dev) -> int {
     if (controller_count >= MAX_XHCI_CONTROLLERS) return -1;
 
@@ -638,7 +638,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
 
 }  // namespace
 
-// ── Public API ──
+// -- Public API --
 
 auto configure_endpoint(XhciController* hc, uint8_t slot_id, uint64_t input_ctx_phys) -> int {
     return send_command(hc, input_ctx_phys, 0, TRB_CONFIG_ENDPOINT | (static_cast<uint32_t>(slot_id) << 24));

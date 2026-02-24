@@ -70,7 +70,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
 
     initFutexTable();
 
-    auto* current_task = mod::sched::getCurrentTask();
+    auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
         return -EINVAL;
     }
@@ -138,7 +138,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
 int64_t futex_wake(int* addr) {  // NOLINT
     initFutexTable();
 
-    auto* current_task = mod::sched::getCurrentTask();
+    auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
         return -EINVAL;
     }
@@ -165,9 +165,9 @@ int64_t futex_wake(int* addr) {  // NOLINT
             futex_waiters[i].active = false;
 
             // Find the task and reschedule it
-            auto* waiter_task = mod::sched::findTaskByPid(waiter_pid);
+            auto* waiter_task = mod::sched::find_task_by_pid(waiter_pid);
             if (waiter_task != nullptr) {
-                mod::sched::rescheduleTaskForCpu(waiter_cpu, waiter_task);
+                mod::sched::reschedule_task_for_cpu(waiter_cpu, waiter_task);
                 woken_count++;
             }
         }

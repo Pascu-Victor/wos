@@ -26,22 +26,20 @@ static inline void* pageToPtr(uint64_t base, uint32_t pageIdx) {
 }
 
 // Convert an HHDM pointer to a page index relative to the zone base.
-static inline uint32_t ptrToPage(uint64_t base, void* ptr) {
-    return (uint32_t)(((uint64_t)ptr - base) / paging::PAGE_SIZE);
-}
+static inline uint32_t ptrToPage(uint64_t base, void* ptr) { return (uint32_t)(((uint64_t)ptr - base) / paging::PAGE_SIZE); }
 
 // Remove a specific FreeBlock from a singly-linked list.
 // Returns true if found and removed.
 static bool listRemove(PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) {
     PageAllocator::FreeBlock** prev = &head;
-    PageAllocator::FreeBlock*  cur  = head;
+    PageAllocator::FreeBlock* cur = head;
     while (cur != nullptr) {
         if (cur == target) {
             *prev = cur->next;
             return true;
         }
         prev = &cur->next;
-        cur  = cur->next;
+        cur = cur->next;
     }
     return false;
 }
@@ -51,30 +49,36 @@ static bool listRemove(PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock
 // ============================================================================
 
 void PageAllocator::init(uint64_t zoneBase, uint64_t sizeBytes) {
-    base       = zoneBase;
+    base = zoneBase;
     totalPages = (uint32_t)(sizeBytes / paging::PAGE_SIZE);
 
     // --- lay out metadata at the beginning of the zone ---
 
     // PageAllocator struct occupies bytes [0, sizeof(*this)).
-    // pageFlags array immediately after.
+    // pageFlags array immediately after, then pageRefcounts array.
     uint64_t flagsOffset = sizeof(PageAllocator);
     pageFlags = reinterpret_cast<uint8_t*>(zoneBase + flagsOffset);
 
-    uint64_t metaBytes = flagsOffset + (uint64_t)totalPages;  // struct + flags array
+    uint64_t refcountsOffset = flagsOffset + (uint64_t)totalPages;
+    // Align refcounts to 4-byte boundary for uint32_t access
+    refcountsOffset = (refcountsOffset + 3) & ~3ULL;
+    pageRefcounts = reinterpret_cast<uint32_t*>(zoneBase + refcountsOffset);
+
+    uint64_t metaBytes = refcountsOffset + (uint64_t)totalPages * sizeof(uint32_t);
     metadataPages = (uint32_t)((metaBytes + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE);
 
     if (metadataPages >= totalPages) {
         // Zone too small to hold any usable pages.
         usablePages = 0;
-        freeCount   = 0;
+        freeCount = 0;
         for (int i = 0; i <= MAX_ORDER; i++) freeList[i] = nullptr;
         memset(pageFlags, FLAG_RESERVED, totalPages);
+        memset(pageRefcounts, 0, totalPages * sizeof(uint32_t));
         return;
     }
 
     usablePages = totalPages - metadataPages;
-    freeCount   = 0;
+    freeCount = 0;
 
     // Zero the free lists.
     for (int i = 0; i <= MAX_ORDER; i++) freeList[i] = nullptr;
@@ -83,6 +87,8 @@ void PageAllocator::init(uint64_t zoneBase, uint64_t sizeBytes) {
     // (prevents false buddy matches during the decomposition loop below).
     memset(pageFlags, FLAG_RESERVED, metadataPages);
     memset(pageFlags + metadataPages, FLAG_ALLOC_CONT, totalPages - metadataPages);
+    // Zero all refcounts (free pages have refcount 0)
+    memset(pageRefcounts, 0, totalPages * sizeof(uint32_t));
 
     // --- decompose usable range into largest aligned power-of-2 blocks ---
 
@@ -93,8 +99,8 @@ void PageAllocator::init(uint64_t zoneBase, uint64_t sizeBytes) {
         int order = 0;
         while (order < MAX_ORDER) {
             uint32_t blockSize = 1u << (order + 1);
-            if ((page & (blockSize - 1)) != 0) break;   // not aligned
-            if (page + blockSize > totalPages)  break;   // doesn't fit
+            if ((page & (blockSize - 1)) != 0) break;  // not aligned
+            if (page + blockSize > totalPages) break;  // doesn't fit
             order++;
         }
 
@@ -108,11 +114,11 @@ void PageAllocator::init(uint64_t zoneBase, uint64_t sizeBytes) {
 
         // Prepend to the order's free list (link through the page itself).
         auto* block = reinterpret_cast<FreeBlock*>(pageToPtr(base, page));
-        block->next       = freeList[order];
-        freeList[order]   = block;
+        block->next = freeList[order];
+        freeList[order] = block;
 
         freeCount += blockSize;
-        page      += blockSize;
+        page += blockSize;
     }
 }
 
@@ -140,7 +146,7 @@ void* PageAllocator::alloc(uint64_t sizeBytes) {
     while (k > order) {
         k--;
         uint32_t buddySize = 1u << k;
-        uint32_t buddyIdx  = pageIdx + buddySize;
+        uint32_t buddyIdx = pageIdx + buddySize;
 
         // Upper buddy becomes a free head at order k.
         pageFlags[buddyIdx] = FLAG_FREE_HEAD | (uint8_t)k;
@@ -150,7 +156,7 @@ void* PageAllocator::alloc(uint64_t sizeBytes) {
 
         auto* buddyBlock = reinterpret_cast<FreeBlock*>(pageToPtr(base, buddyIdx));
         buddyBlock->next = freeList[k];
-        freeList[k]      = buddyBlock;
+        freeList[k] = buddyBlock;
     }
 
     // Mark the allocated block.
@@ -158,6 +164,11 @@ void* PageAllocator::alloc(uint64_t sizeBytes) {
     pageFlags[pageIdx] = FLAG_ALLOC_HEAD | (uint8_t)order;
     for (uint32_t i = 1; i < blockSize; i++) {
         pageFlags[pageIdx + i] = FLAG_ALLOC_CONT;
+    }
+
+    // Set refcount to 1 for all pages in the block
+    for (uint32_t i = 0; i < blockSize; i++) {
+        pageRefcounts[pageIdx + i] = 1;
     }
 
     freeCount -= blockSize;
@@ -185,6 +196,7 @@ void PageAllocator::free(void* ptr) {
     // Clear flags for the entire allocation.
     for (uint32_t i = 0; i < blockSize; i++) {
         pageFlags[pageIdx + i] = FLAG_FREE_INTERIOR;
+        pageRefcounts[pageIdx + i] = 0;
     }
 
     freeCount += blockSize;
@@ -216,8 +228,8 @@ void PageAllocator::free(void* ptr) {
 
     // Prepend to the free list.
     auto* freeBlock = reinterpret_cast<FreeBlock*>(pageToPtr(base, pageIdx));
-    freeBlock->next  = freeList[k];
-    freeList[k]      = freeBlock;
+    freeBlock->next = freeList[k];
+    freeList[k] = freeBlock;
 }
 
 }  // namespace ker::mod::mm

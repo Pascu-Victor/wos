@@ -54,6 +54,29 @@ auto block_device_register(BlockDevice* bdev) -> int {
     return 0;
 }
 
+auto block_device_unregister(BlockDevice* bdev) -> int {
+    if (bdev == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < device_count; i++) {
+        if (block_devices[i] == bdev) {
+            block_devices[i] = nullptr;
+
+            // Also remove the corresponding /dev node
+            Device* dev_node = dev_find_by_name(bdev->name.data());
+            if (dev_node != nullptr && dev_node->private_data == bdev) {
+                dev_unregister(dev_node);
+            }
+
+            mod::io::serial::write("block_device_unregister: removed ");
+            mod::io::serial::write(bdev->name.data());
+            mod::io::serial::write("\n");
+            return 0;
+        }
+    }
+    return -1;
+}
+
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice* {
     for (size_t i = 0; i < device_count; i++) {
         if (block_devices[i] != nullptr && block_devices[i]->major == major && block_devices[i]->minor == minor) {
@@ -231,6 +254,7 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
     part->write_blocks = partition_write;
     part->flush = partition_flush;
     part->private_data = nullptr;
+    part->remotable = parent_disk->remotable;
 
     part->is_partition = true;
     for (size_t i = 0; i < 16; ++i) {

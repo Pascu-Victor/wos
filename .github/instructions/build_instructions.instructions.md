@@ -7,3 +7,4 @@ debugging must be done by the user. When required prompt the user to run the ker
 the kernel binary path is build/modules/kern/wos
 the init binary path is build/modules/init/init
 the testprog binary path is build/modules/testprog/testprog
+the httpd binary path is build/modules/httpd/httpd

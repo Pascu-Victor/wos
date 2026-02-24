@@ -14,7 +14,6 @@ PHDRS
     text    PT_LOAD FILEHDR PHDRS;
     rodata  PT_LOAD;
     data    PT_LOAD;
-    dynamic PT_DYNAMIC;
 }
 
 SECTIONS
@@ -50,11 +49,6 @@ SECTIONS
         KEEP(*(.requests))
         KEEP(*(.requests_end_marker))
     } :data
-
-    /* Dynamic section for relocations, both in its own PHDR and inside data PHDR. */
-    .dynamic : {
-        *(.dynamic)
-    } :data :dynamic
 
     /* Constructors and destructors arrays */
     .preinit_array : {

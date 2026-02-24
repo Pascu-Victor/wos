@@ -11,7 +11,7 @@ namespace ker::syscall::process {
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     (void)options;  // TODO: Handle WNOHANG and other options
 
-    auto* currentTask = ker::mod::sched::getCurrentTask();
+    auto* currentTask = ker::mod::sched::get_current_task();
     if (currentTask == nullptr) {
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Current task is null");
@@ -27,8 +27,8 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
 #endif
 
     // Find the task with the given PID
-    auto* targetTask = ker::mod::sched::findTaskByPid(pid);
-    if (targetTask == nullptr) {
+    auto* target_task = ker::mod::sched::find_task_by_pid(pid);
+    if (target_task == nullptr) {
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x not found", pid);
 #endif
@@ -36,28 +36,28 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
     }
 
     // Check if the target task has already exited
-    if (targetTask->hasExited) {
+    if (target_task->hasExited) {
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x has already exited with status %d", pid, targetTask->exitStatus);
 #endif
         if (status != nullptr) {
-            *status = targetTask->exitStatus;
+            *status = target_task->exitStatus;
         }
         // Mark that the parent has retrieved the exit status (zombie can now be reaped)
-        targetTask->waitedOn = true;
+        target_task->waitedOn = true;
         return pid;  // Return the PID of the exited process
     }
 
     // Add the current task's PID to the target task's awaitee list
-    if (targetTask->awaitee_on_exit_count >= ker::mod::sched::task::Task::MAX_AWAITEE_COUNT) {
+    if (target_task->awaitee_on_exit_count >= ker::mod::sched::task::Task::MAX_AWAITEE_COUNT) {
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Awaitee list full for PID %x", pid);
 #endif
         return static_cast<uint64_t>(-1);  // Awaitee list is full
     }
 
-    targetTask->awaitee_on_exit[targetTask->awaitee_on_exit_count] = currentTask->pid;
-    targetTask->awaitee_on_exit_count++;
+    target_task->awaitee_on_exit[target_task->awaitee_on_exit_count] = currentTask->pid;
+    target_task->awaitee_on_exit_count++;
 #ifdef WAITPID_DEBUG
     ker::mod::dbg::log("wos_proc_waitpid: Added PID %x to awaitee list of PID %x", currentTask->pid, pid);
 #endif

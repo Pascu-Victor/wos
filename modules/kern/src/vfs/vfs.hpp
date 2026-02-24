@@ -45,6 +45,11 @@ struct VNode {
 
 // Open a path and return a file descriptor-like opaque pointer
 auto vfs_open(std::string_view path, int flags, int mode) -> int;
+
+// Open a path and return a File* directly (no FD allocation, no task context).
+// Used by server-side subsystems (e.g. WKI remote VFS) that operate on files
+// outside of any userspace task context.
+auto vfs_open_file(const char* path, int flags, int mode) -> File*;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -66,11 +71,58 @@ auto vfs_mkdir(const char* path, int mode) -> int;
 
 // Mount operations (called from userspace via syscall)
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int;
+auto vfs_umount(const char* target) -> int;
+
+// FD duplication
+auto vfs_dup(int oldfd) -> int;
+auto vfs_dup2(int oldfd, int newfd) -> int;
+
+// Working directory
+auto vfs_getcwd(char* buf, size_t size) -> int;
+auto vfs_chdir(const char* path) -> int;
+
+// Access check
+auto vfs_access(const char* path, int mode) -> int;
+
+// Permission check helper: checks if current task can perform requested access
+// on a file with the given mode/uid/gid. access_bits are R_OK/W_OK/X_OK.
+// Returns 0 on success, -EACCES on failure.
+auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_gid, int access_bits) -> int;
+
+// Positional I/O (does not modify file position)
+auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t;
+auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t;
+
+// File removal / rename
+auto vfs_unlink(const char* path) -> int;
+auto vfs_rmdir(const char* path) -> int;
+auto vfs_rename(const char* oldpath, const char* newpath) -> int;
+
+// Permissions
+auto vfs_chmod(const char* path, int mode) -> int;
+auto vfs_fchmod(int fd, int mode) -> int;
+auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;
+auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
+
+// Truncate
+auto vfs_ftruncate(int fd, off_t length) -> int;
+
+// Pipe
+auto vfs_pipe(int pipefd[2]) -> int;
+
+// File control
+auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
 
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
+
+// Resolve a dirfd-relative pathname to an absolute path.
+// AT_FDCWD (-100) uses task->cwd. Absolute pathnames ignore dirfd.
+// Returns 0 on success, negative errno on failure.
+constexpr int AT_FDCWD = -100;
+auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* resolved, size_t resolved_size) -> int;
 
 // Initialize VFS (register tmpfs, devfs, etc.)
 void init();

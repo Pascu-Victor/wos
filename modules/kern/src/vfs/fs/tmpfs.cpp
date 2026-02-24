@@ -111,11 +111,12 @@ auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode* {
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::DIRECTORY;
+    node->mode = 0755;
     add_child(parent, node);
     return node;
 }
 
-auto tmpfs_create_file(TmpNode* parent, const char* name) -> TmpNode* {
+auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) -> TmpNode* {
     if (parent == nullptr || name == nullptr || parent->type != TmpNodeType::DIRECTORY) {
         return nullptr;
     }
@@ -126,6 +127,7 @@ auto tmpfs_create_file(TmpNode* parent, const char* name) -> TmpNode* {
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::FILE;
+    node->mode = create_mode & 07777;
     add_child(parent, node);
     return node;
 }
@@ -141,6 +143,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::SYMLINK;
+    node->mode = 0777;
     // Allocate and copy the symlink target
     size_t target_len = 0;
     while (target[target_len] != '\0') {
@@ -232,6 +235,7 @@ void register_tmpfs() {
         rootNode = new TmpNode;
         copy_name(rootNode->name, "/");
         rootNode->type = TmpNodeType::DIRECTORY;
+        rootNode->mode = 0755;
     }
 }
 
@@ -251,7 +255,7 @@ auto create_root_file() -> ker::vfs::File* {
 }
 
 auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
-    (void)mode;
+    // mode is now used for O_CREAT
     if (path == nullptr) {
         return nullptr;
     }
@@ -285,7 +289,7 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
         // Single component path (e.g., "file.txt")
         node = tmpfs_lookup(rootNode, rel_path);
         if (node == nullptr && (flags & O_CREAT) != 0) {
-            node = tmpfs_create_file(rootNode, rel_path);
+            node = tmpfs_create_file(rootNode, rel_path, static_cast<uint32_t>(mode) & 07777);
         }
     } else {
         // Multi-component path (e.g., "etc/fstab")
@@ -311,7 +315,7 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
             }
             node = tmpfs_lookup(parent, final_name);
             if (node == nullptr && (flags & O_CREAT) != 0) {
-                node = tmpfs_create_file(parent, final_name);
+                node = tmpfs_create_file(parent, final_name, static_cast<uint32_t>(mode) & 07777);
             }
         }
     }
@@ -489,6 +493,29 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 
 // --- FileOperations instance ---
 
+auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
+    if (f == nullptr || f->private_data == nullptr) return -1;
+    auto* n = static_cast<TmpNode*>(f->private_data);
+    if (n->type != TmpNodeType::FILE) return -EISDIR;
+    auto new_size = static_cast<size_t>(length);
+    if (new_size > n->capacity) {
+        size_t newcap = (n->capacity == 0) ? 4096 : n->capacity;
+        while (newcap < new_size) newcap *= 2;
+        char* nd = new char[newcap];
+        if (n->data != nullptr) {
+            std::memcpy(nd, n->data, n->size);
+        }
+        delete[] n->data;
+        n->data = nd;
+        n->capacity = newcap;
+    }
+    if (new_size > n->size) {
+        std::memset(n->data + n->size, 0, new_size - n->size);
+    }
+    n->size = new_size;
+    return 0;
+}
+
 ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,
                                                 .vfs_close = tmpfs_fops_close,
                                                 .vfs_read = tmpfs_fops_read,
@@ -496,7 +523,9 @@ ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,
                                                 .vfs_lseek = tmpfs_fops_lseek,
                                                 .vfs_isatty = tmpfs_fops_isatty,
                                                 .vfs_readdir = tmpfs_fops_readdir,
-                                                .vfs_readlink = tmpfs_fops_readlink};
+                                                .vfs_readlink = tmpfs_fops_readlink,
+                                                .vfs_truncate = tmpfs_fops_truncate,
+                                                .vfs_poll_check = nullptr};
 }  // namespace
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }

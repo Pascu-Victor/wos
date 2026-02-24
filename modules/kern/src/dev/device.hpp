@@ -36,6 +36,7 @@ struct Device {
 
 // Device registration and management
 int dev_register(Device* device);
+int dev_unregister(Device* device);
 Device* dev_find(unsigned major, unsigned minor);
 Device* dev_find_by_name(const char* name);
 Device* dev_get_at_index(size_t index);

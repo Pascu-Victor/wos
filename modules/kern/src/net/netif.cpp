@@ -1,5 +1,6 @@
 #include "netif.hpp"
 
+#include <array>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 
@@ -49,14 +50,14 @@ auto netif_add_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int {
     nif->ipv4_addr_count++;
 
 #ifdef DEBUG_NETIF
-    ker::mod::dbg::log("net: %s: added IPv4 %d.%d.%d.%d/%d.%d.%d.%d", dev->name, (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF,
-                       addr & 0xFF, (mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF);
+    ker::mod::dbg::log("net: %s: added IPv4 %d.%d.%d.%d/%d.%d.%d.%d", dev->name, (addr >> 24) & 0xFF, (addr >> 16) & 0xFF,
+                       (addr >> 8) & 0xFF, addr & 0xFF, (mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF);
 #endif
 
     return 0;
 }
 
-auto netif_add_ipv6(NetDevice* dev, const uint8_t* addr, uint8_t prefix) -> int {
+auto netif_add_ipv6(NetDevice* dev, const std::array<uint8_t, 16>& addr, uint8_t prefix) -> int {
     auto* nif = netif_get(dev);
     if (nif == nullptr) {
         return -1;
@@ -66,7 +67,7 @@ auto netif_add_ipv6(NetDevice* dev, const uint8_t* addr, uint8_t prefix) -> int 
         return -1;
     }
 
-    std::memcpy(nif->ipv6_addrs[nif->ipv6_addr_count].addr, addr, 16);
+    nif->ipv6_addrs[nif->ipv6_addr_count].addr = addr;
     nif->ipv6_addrs[nif->ipv6_addr_count].prefix_len = prefix;
     nif->ipv6_addr_count++;
 
@@ -88,10 +89,10 @@ auto netif_find_by_ipv4(uint32_t addr) -> NetInterface* {
     return nullptr;
 }
 
-auto netif_find_by_ipv6(const uint8_t* addr) -> NetInterface* {
+auto netif_find_by_ipv6(const std::array<uint8_t, 16>& addr) -> NetInterface* {
     for (size_t i = 0; i < interface_count; i++) {
         for (size_t j = 0; j < interfaces[i].ipv6_addr_count; j++) {
-            if (std::memcmp(interfaces[i].ipv6_addrs[j].addr, addr, 16) == 0) {
+            if (interfaces[i].ipv6_addrs[j].addr == addr) {
                 return &interfaces[i];
             }
         }

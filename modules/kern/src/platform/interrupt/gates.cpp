@@ -31,6 +31,23 @@ uint8_t next_alloc_vector = 48;
 }  // namespace
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
+    // Page fault handler — handles COW faults and user-space segfaults.
+    // This MUST run before the panic ownership CAS below, because page faults
+    // (especially COW resolution) are normal concurrent events. If two CPUs
+    // hit a COW fault at the same time the old code would make the second CPU
+    // think it was a nested panic and halt.
+    if (frame.intNum == 14) {
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+
+        // If pagefault_handler resolved a COW fault, we're done.
+        // Otherwise fall through to the normal exception path which will
+        // crash the userspace process or kernel-panic as appropriate.
+        if (mm::virt::pagefault_handler(cr2, frame, gpr)) {
+            return;
+        }
+    }
+
     // CRITICAL: Prevent nested panics by detecting recursion
     // Use atomic int to track which CPU owns the panic handler (-1 = none)
     static std::atomic<int64_t> panicOwnerCpu{-1};
@@ -64,17 +81,6 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         __builtin_unreachable();
     }
 
-    // FIXME: disabled direct map page fault handling for now
-    // TODO: implement proper page fault handling
-    //  if (frame.intNum == 14) {
-    //      uint64_t cr2;
-    //      asm volatile("mov %%cr2, %0" : "=r"(cr2));
-    //      // dbg::log("Page fault at address %x with error code %b  rip: 0x%x\n", cr2, frame.errCode, frame.rip);
-
-    //     mm::virt::pagefaultHandler(cr2, frame.errCode);
-    //     return;
-    // }
-
     uint64_t cr0{};
     uint64_t cr2{};
     uint64_t cr3{};
@@ -90,7 +96,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // it must not take down the whole kernel. Treat it as a process crash.
     uint64_t cpl = frame.cs & 0x3;
     if (cpl == 3) {
-        auto* currentTaskForDump = ker::mod::sched::getCurrentTask();
+        auto* currentTaskForDump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
         uint32_t apicId = apic::getApicId();
@@ -103,7 +109,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
         if (frame.intNum == 14) {
             dbg::log("Userspace page fault: cr2=0x%x err=%d rip=0x%x pid=%x", cr2, frame.errCode, frame.rip,
-                     ker::mod::sched::getCurrentTask() ? ker::mod::sched::getCurrentTask()->pid : 0);
+                     ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
 
             auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer(cr3 & ~0xFFF);
             uint64_t idx4 = (cr2 >> 39) & 0x1FF;
@@ -133,7 +139,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         }
 
         dbg::log("Userspace exception: int=%d err=%d rip=0x%x pid=%x", frame.intNum, frame.errCode, frame.rip,
-                 ker::mod::sched::getCurrentTask() ? ker::mod::sched::getCurrentTask()->pid : 0);
+                 ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
         ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
         __builtin_unreachable();
     }
@@ -179,12 +185,12 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     uint64_t cpuId = apic::getApicId();
     sched::task::Task* currentTask = nullptr;
 
-    if (!sched::hasRunQueues()) {
+    if (!sched::has_run_queues()) {
         dbg::log("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
         goto skip_task_dump;  // NOLINT
     }
 
-    currentTask = sched::getCurrentTask();
+    currentTask = sched::get_current_task();
 
     dbg::log("=== Current Task Info ===");
     dbg::log("debug_task_ptrs[%d] = 0x%x", cpuId, (uint64_t)currentTask);
@@ -253,10 +259,10 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 skip_task_dump:
 
     // Check if page 0 is mapped (it should NOT be - null derefs should crash)
-    uint64_t* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
-    uint64_t pml4e = pml4[0];                                   // Entry for VA 0x0
+    auto* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
+    uint64_t pml4e = pml4[0];                               // Entry for VA 0x0
     dbg::log("Page 0 check: PML4[0] = 0x%x (Present=%d)", pml4e, (pml4e & 1) ? 1 : 0);
-    if (pml4e & 1) {
+    if ((pml4e & 1) != 0U) {
         dbg::log("WARNING: Page 0 is mapped! NULL derefs won't crash!");
     }
 
@@ -436,6 +442,13 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
     } else {
+        // No handler registered - log and handle appropriately
+        ker::mod::io::serial::write("UNHANDLED INT: vector=");
+        ker::mod::io::serial::writeHex(static_cast<uint8_t>(frame.intNum));
+        ker::mod::io::serial::write(" rip=");
+        ker::mod::io::serial::writeHex(frame.rip);
+        ker::mod::io::serial::write("\n");
+
         if (!isIrq(frame.intNum)) {
             exception_handler(gpr, frame);
             ker::mod::apic::eoi();
@@ -477,6 +490,11 @@ auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* 
         ker::mod::io::serial::write("requestIrq: vector already in use\n");
         return -1;
     }
+    ker::mod::io::serial::write("requestIrq: allocated vector ");
+    ker::mod::io::serial::writeHex(vector);
+    ker::mod::io::serial::write(" for ");
+    ker::mod::io::serial::write(name);
+    ker::mod::io::serial::write("\n");
     irq_contexts[vector].handler = handler;
     irq_contexts[vector].data = data;
     irq_contexts[vector].name = name;

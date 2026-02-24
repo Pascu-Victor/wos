@@ -4,6 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ker::net::wki {
+struct RemotableOps;
+}
+
 namespace ker::dev {
 
 // Forward declaration for function pointer types
@@ -38,6 +42,9 @@ struct BlockDevice {
     // Private driver data
     void* private_data = nullptr;
 
+    // WKI remotable trait — set by drivers that support remote access
+    ker::net::wki::RemotableOps const* remotable = nullptr;
+
     // Partition info (set for partition block devices, not whole disks)
     bool is_partition = false;
     std::array<uint8_t, 16> partuuid{};
@@ -49,6 +56,7 @@ struct BlockDevice {
 
 // Block device registration and management
 auto block_device_register(BlockDevice* bdev) -> int;
+auto block_device_unregister(BlockDevice* bdev) -> int;
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice*;
 auto block_device_find_by_name(const char* name) -> BlockDevice*;
 
