@@ -7,7 +7,7 @@
 
 #include "config.h"
 #include "protocol.h"
-#include "qemu_log_viewer.h"
+#include "wosdbg.h"
 
 class LogServer : public QObject {
     Q_OBJECT

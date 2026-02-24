@@ -1,5 +1,5 @@
-#ifndef QEMU_LOG_VIEWER_H
-#define QEMU_LOG_VIEWER_H
+#ifndef WOSDBG_H
+#define WOSDBG_H
 
 #include <qtmetamacros.h>
 
@@ -52,6 +52,19 @@ class SyntaxHighlightDelegate;
 class VirtualTableView;
 class VirtualTableModel;
 class LogClient;
+
+// Coredump panel forward declarations
+class CoredumpBrowser;
+class CoredumpRegisterPanel;
+class CoredumpSegmentPanel;
+class CoredumpMemoryPanel;
+class CoredumpElfPanel;
+
+namespace wosdbg {
+struct CoreDump;
+class SymbolTable;
+class SectionMap;
+}  // namespace wosdbg
 
 #include "log_entry.h"
 
@@ -111,13 +124,19 @@ class QemuLogViewer : public QMainWindow {
     QCheckBox* onlyInterruptsCheckbox;
 
     // Main content
-    QSplitter* mainSplitter;
     QTableWidget* legacyLogTable;          // Keep for compatibility during transition
     VirtualTableView* logTable;            // New virtual table
     VirtualTableModel* virtualTableModel;  // Model for virtual table
     QTextEdit* hexView;
     QTextEdit* disassemblyView;
     QTextBrowser* detailsPane;
+
+    // Dock widgets for main content panels
+    QDockWidget* interruptsDock_ = nullptr;
+    QDockWidget* hexDock_ = nullptr;
+    QDockWidget* disassemblyDock_ = nullptr;
+    QDockWidget* detailsDock_ = nullptr;
+    QDockWidget* browserDock_ = nullptr;  // Coredump browser dock (stored for tabification)
 
     // Search functionality
     std::vector<int> searchMatches;
@@ -200,6 +219,33 @@ class QemuLogViewer : public QMainWindow {
     void batchUpdateTable(const std::vector<const LogEntry*>& entries);
     void buildInterruptPanel();
     int findNextIretLine(int startLineNumber) const;  // Find the next iret instruction after a given line
+
+    // ----- Coredump integration -----
+    void setupCoredumpPanels();  // Create and wire all coredump dock widgets
+    void openCoredump(const QString& filePath);
+    void closeCoredump();
+    void resolveSymbolsForCoredump();              // Auto-resolve from filename + config
+    void onCoredumpAddressClicked(uint64_t addr);  // Navigate log/memory to address
+    void browseCoredumpDirectory();                // Toolbar: choose coredump directory
+    void extractCoredumps();                       // Toolbar: run extract script
+    void refreshCoredumps();                       // Toolbar: rescan directory
+
+    // Coredump dock panels
+    CoredumpBrowser* coredumpBrowser_ = nullptr;
+    CoredumpRegisterPanel* registerPanel_ = nullptr;
+    CoredumpSegmentPanel* segmentPanel_ = nullptr;
+    CoredumpMemoryPanel* memoryPanel_ = nullptr;
+    CoredumpElfPanel* elfPanel_ = nullptr;
+
+    // Coredump state
+    std::unique_ptr<wosdbg::CoreDump> currentCoreDump_;
+    std::unique_ptr<wosdbg::SymbolTable> coreDumpSymtab_;
+    std::unique_ptr<wosdbg::SectionMap> coreDumpSections_;
+    // Additional symbol sources (kernel, embedded ELF, etc.)
+    std::unique_ptr<wosdbg::SymbolTable> embeddedSymtab_;
+    std::unique_ptr<wosdbg::SectionMap> embeddedSections_;
+    std::unique_ptr<wosdbg::SymbolTable> kernelSymtab_;
+    std::unique_ptr<wosdbg::SectionMap> kernelSections_;
 };
 
-#endif  // QEMU_LOG_VIEWER_H
+#endif  // WOSDBG_H

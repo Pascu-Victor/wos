@@ -33,6 +33,7 @@ extern "C" {
 #include <iostream>
 #include <sstream>
 
+#include "capstone_disasm.h"
 #include "config.h"
 #include "log_entry.h"
 
@@ -49,91 +50,7 @@ static std::string demangleSymbol(const std::string& mangled) {
     return mangled;
 }
 
-// CapstoneDisassembler implementation (same as main)
-class CapstoneDisassembler {
-   public:
-    CapstoneDisassembler();
-    ~CapstoneDisassembler();
-    [[nodiscard]] auto convertToIntel(const std::string& atntAssembly) const -> std::string;
-
-   private:
-    csh handle;
-    static auto extractHexBytes(const std::string& line) -> std::string;
-    static auto hexStringToBytes(const std::string& hex) -> std::vector<uint8_t>;
-};
-
-CapstoneDisassembler::CapstoneDisassembler() : handle(0) {
-    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
-        handle = 0;
-        return;
-    }
-    cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
-}
-
-CapstoneDisassembler::~CapstoneDisassembler() {
-    if (handle) {
-        cs_close(&handle);
-    }
-}
-
-auto CapstoneDisassembler::convertToIntel(const std::string& atntAssembly) const -> std::string {
-    if (!handle) {
-        return atntAssembly;
-    }
-
-    auto hexBytes = extractHexBytes(atntAssembly);
-    if (hexBytes.empty()) {
-        return atntAssembly;
-    }
-
-    std::vector<uint8_t> bytes = hexStringToBytes(hexBytes);
-    if (bytes.empty()) {
-        return atntAssembly;
-    }
-
-    cs_insn* insn;
-    size_t count = cs_disasm(handle, bytes.data(), bytes.size(), 0x1000, 0, &insn);
-
-    if (count > 0) {
-        std::string result = std::string(insn[0].mnemonic) + " " + std::string(insn[0].op_str);
-        cs_free(insn, count);
-        return result;
-    }
-
-    return atntAssembly;
-}
-
-auto CapstoneDisassembler::extractHexBytes(const std::string& line) -> std::string {
-    QRegularExpression hexRegex(R"(:\s*([0-9a-fA-F\s]{2,})\s+)");
-    QString qline = QString::fromStdString(line);
-    auto match = hexRegex.match(qline);
-
-    if (match.hasMatch()) {
-        QString hexStr = match.captured(1).simplified();
-        hexStr.remove(' ');
-        return hexStr.toStdString();
-    }
-
-    return "";
-}
-
-auto CapstoneDisassembler::hexStringToBytes(const std::string& hex) -> std::vector<uint8_t> {
-    std::vector<uint8_t> bytes;
-
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        if (i + 1 < hex.length()) {
-            std::string byteStr = hex.substr(i, 2);
-            try {
-                auto byte = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
-                bytes.push_back(byte);
-            } catch (...) {
-                break;
-            }
-        }
-    }
-
-    return bytes;
-}
+// CapstoneDisassembler: see capstone_disasm.h / capstone_disasm.cpp
 
 // Structure to hold BFD binary info
 struct BinaryInfo {
@@ -498,23 +415,28 @@ void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std:
             function = name;
         }
 
-        // STEP 2: Try to get source file info using the symbol we found
-        // Use bfd_find_line which takes a symbol directly
+        // STEP 2: Try to get source file/line info for the exact address.
+        // Use bfd_find_nearest_line first — it resolves to the actual source line
+        // for the instruction address (via DWARF line tables).
+        // Fall back to bfd_find_line which only gives the symbol's declaration line.
         const char* filename = nullptr;
         unsigned int line = 0;
 
-        if (bfd_find_line(targetBfd, targetSymbols, bestMatch, &filename, &line)) {
-            if (filename) sourceFile = filename;
-            sourceLine = line;
-        }
-
-        // If bfd_find_line didn't work, try bfd_find_nearest_line with the symbol's section
-        if (sourceFile.empty() && bestMatch->section) {
+        if (bestMatch->section) {
             const char* functionname = nullptr;
             bfd_vma sectionVma = bfd_section_vma(bestMatch->section);
 
             if (bfd_find_nearest_line(targetBfd, bestMatch->section, targetSymbols, fileAddress - sectionVma, &filename, &functionname,
                                       &line)) {
+                if (filename) sourceFile = filename;
+                sourceLine = line;
+            }
+        }
+
+        // If bfd_find_nearest_line didn't work, fall back to bfd_find_line
+        // (this only gives the function declaration line, but is better than nothing)
+        if (sourceFile.empty()) {
+            if (bfd_find_line(targetBfd, targetSymbols, bestMatch, &filename, &line)) {
                 if (filename) sourceFile = filename;
                 sourceLine = line;
             }

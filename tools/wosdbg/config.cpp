@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -12,6 +13,10 @@ Config::Config() { loadDefaults(); }
 
 bool Config::loadFromFile(const QString& filePath) {
     QFile file(filePath);
+
+    // Store the base directory for relative path resolution
+    configBaseDir = QFileInfo(filePath).absolutePath();
+
     if (!file.exists()) {
         qDebug() << "Config file" << filePath << "does not exist, using defaults";
         loadDefaults();
@@ -66,6 +71,28 @@ bool Config::loadFromFile(const QString& filePath) {
     }
 
     qDebug() << "Loaded" << addressLookups.size() << "address lookups from config file";
+
+    // Parse coredump directory
+    if (root.contains("coredumpDirectory") && root["coredumpDirectory"].isString()) {
+        coredumpDirectory = root["coredumpDirectory"].toString();
+    }
+
+    // Parse binary mappings
+    binaryMappings.clear();
+    if (root.contains("binaries") && root["binaries"].isArray()) {
+        QJsonArray binariesArray = root["binaries"].toArray();
+        for (const QJsonValue& value : binariesArray) {
+            if (value.isObject()) {
+                QJsonObject obj = value.toObject();
+                if (obj.contains("name") && obj.contains("path")) {
+                    binaryMappings.emplace_back(obj["name"].toString(), obj["path"].toString());
+                }
+            }
+        }
+    }
+    qDebug() << "Loaded" << binaryMappings.size() << "binary mappings,"
+             << "coredump directory:" << coredumpDirectory;
+
     return true;
 }
 
@@ -79,6 +106,19 @@ bool Config::saveToFile(const QString& filePath) const {
     }
 
     root["lookups"] = lookupsArray;
+
+    // Serialize coredump directory
+    root["coredumpDirectory"] = coredumpDirectory;
+
+    // Serialize binary mappings
+    QJsonArray binariesArray;
+    for (const auto& mapping : binaryMappings) {
+        QJsonObject obj;
+        obj["name"] = mapping.name;
+        obj["path"] = mapping.elfPath;
+        binariesArray.append(obj);
+    }
+    root["binaries"] = binariesArray;
 
     QJsonDocument doc(root);
 
@@ -96,7 +136,7 @@ bool Config::saveToFile(const QString& filePath) const {
 QString Config::findSymbolFileForAddress(uint64_t address) const {
     for (const auto& lookup : addressLookups) {
         if (lookup.containsAddress(address)) {
-            return lookup.symbolFilePath;
+            return resolvePath(lookup.symbolFilePath);
         }
     }
     return QString();  // No matching lookup found
@@ -112,6 +152,27 @@ void Config::removeAddressLookup(size_t index) {
 
 void Config::clearAddressLookups() { addressLookups.clear(); }
 
+void Config::addBinaryMapping(const BinaryMapping& mapping) { binaryMappings.push_back(mapping); }
+
+void Config::clearBinaryMappings() { binaryMappings.clear(); }
+
+QString Config::findElfPathForBinary(const QString& binaryName) const {
+    for (const auto& mapping : binaryMappings) {
+        if (mapping.name == binaryName) {
+            return resolvePath(mapping.elfPath);
+        }
+    }
+    return QString();
+}
+
+QString Config::resolvePath(const QString& path) const {
+    if (path.isEmpty()) return path;
+    QFileInfo fi(path);
+    if (fi.isAbsolute()) return path;
+    if (configBaseDir.isEmpty()) return path;
+    return QDir(configBaseDir).absoluteFilePath(path);
+}
+
 void Config::loadDefaults() {
     addressLookups.clear();
 
@@ -122,7 +183,7 @@ void Config::loadDefaults() {
     // addressLookups.emplace_back(0x400000, 0x800000, "./build/modules/init/init");
 
     // Example: Kernel space (x86_64 typical kernel range)
-    addressLookups.emplace_back(0xffffffff80000000ULL, 0xffffffffffffffffULL, "./build/kernel/kernel.elf");
+    addressLookups.emplace_back(0xffffffff80000000ULL, 0xffffffffffffffffULL, "./build/modules/kern/wos");
 
     // Example: Shared libraries (typical range)
     addressLookups.emplace_back(0x7f0000000000ULL, 0x7fffffffULL, "./build/lib/libc.so");

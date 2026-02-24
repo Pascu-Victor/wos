@@ -7,8 +7,8 @@
 #include <vector>
 
 #include "log_client.h"
-#include "qemu_log_viewer.h"
 #include "virtual_table.h"
+#include "wosdbg.h"
 
 /**
  * Integration helper for QemuLogViewer to use VirtualTable

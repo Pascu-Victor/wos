@@ -6,9 +6,10 @@
 #include <QHostAddress>
 #include <memory>
 
+#include "config.h"
 #include "log_client.h"
 #include "log_server.h"
-#include "qemu_log_viewer.h"
+#include "wosdbg.h"
 
 int main(int argc, char* argv[]) {
     // Check for server mode to decide whether to instantiate QApplication or QCoreApplication
@@ -27,12 +28,12 @@ int main(int argc, char* argv[]) {
         app = std::make_unique<QApplication>(argc, argv);
     }
 
-    QCoreApplication::setApplicationName("QEMU Log Viewer");
+    QCoreApplication::setApplicationName("wosdbg");
     QCoreApplication::setApplicationVersion("2.0");
     QCoreApplication::setOrganizationName("WOS Kernel Project");
 
     QCommandLineParser parser;
-    parser.setApplicationDescription("QEMU Log Viewer with Client-Server Architecture");
+    parser.setApplicationDescription("WOS Debugger - Execution Log Viewer & Coredump Analyzer");
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -43,6 +44,20 @@ int main(int argc, char* argv[]) {
     parser.addOption(remoteOption);
 
     parser.process(*app);
+
+    // Initialize config service — search CWD and upward for wosdbg.json
+    {
+        QString configPath = "wosdbg.json";
+        QDir dir = QDir::current();
+        for (int i = 0; i < 5; ++i) {
+            if (QFile::exists(dir.filePath("wosdbg.json"))) {
+                configPath = dir.absoluteFilePath("wosdbg.json");
+                break;
+            }
+            if (!dir.cdUp()) break;
+        }
+        ConfigService::instance().initialize(configPath);
+    }
 
     if (parser.isSet(serverOption)) {
         // Server Mode

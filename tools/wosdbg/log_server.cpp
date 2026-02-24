@@ -146,7 +146,7 @@ void LogServer::processMessage(MessageType type, QDataStream& in) {
 
             // Pass config path to processor for symbol resolution
             // Use absolute path based on current working directory
-            QString configPath = QDir::currentPath() + "/logview.json";
+            QString configPath = QDir::currentPath() + "/wosdbg.json";
             processor->setConfigPath(configPath);
 
             connect(processor, &LogProcessor::progressUpdate, this, &LogServer::onProcessingProgress);

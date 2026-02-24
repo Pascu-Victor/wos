@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=WOS Debugger
+Comment=Interactive execution trace viewer and coredump analyzer for WOS kernel debugging
+Exec=@CMAKE_INSTALL_PREFIX@/bin/wosdbg
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;Debugger;
+Keywords=wos;debug;assembly;disassembly;kernel;trace;coredump;
+MimeType=text/plain;

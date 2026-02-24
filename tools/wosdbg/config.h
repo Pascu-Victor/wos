@@ -24,15 +24,24 @@ struct AddressLookup {
     uint64_t toFileAddress(uint64_t runtimeAddress) const { return runtimeAddress - loadOffset; }
 };
 
+// Maps a binary name (as it appears in coredump filenames) to its ELF path
+struct BinaryMapping {
+    QString name;     // e.g. "httpd", "netd", "init"
+    QString elfPath;  // e.g. "./build/modules/httpd/httpd"
+
+    BinaryMapping() = default;
+    BinaryMapping(const QString& n, const QString& p) : name(n), elfPath(p) {}
+};
+
 class Config {
    public:
     Config();
 
-    // Load configuration from logview.json if it exists
-    bool loadFromFile(const QString& filePath = "logview.json");
+    // Load configuration from wosdbg.json if it exists
+    bool loadFromFile(const QString& filePath = "wosdbg.json");
 
     // Save current configuration to file
-    bool saveToFile(const QString& filePath = "logview.json") const;
+    bool saveToFile(const QString& filePath = "wosdbg.json") const;
 
     // Get all address lookups
     const std::vector<AddressLookup>& getAddressLookups() const { return addressLookups; }
@@ -49,6 +58,21 @@ class Config {
     // Clear all lookups
     void clearAddressLookups();
 
+    // Coredump directory
+    QString getCoredumpDirectory() const { return resolvePath(coredumpDirectory); }
+    void setCoredumpDirectory(const QString& dir) { coredumpDirectory = dir; }
+
+    // Binary mappings for coredump symbol auto-resolution
+    const std::vector<BinaryMapping>& getBinaryMappings() const { return binaryMappings; }
+    void addBinaryMapping(const BinaryMapping& mapping);
+    void clearBinaryMappings();
+
+    // Find ELF path for a binary name (from coredump filename)
+    QString findElfPathForBinary(const QString& binaryName) const;
+
+    // Resolve a potentially-relative path against the config file's directory
+    QString resolvePath(const QString& path) const;
+
     // Get default configuration
     void loadDefaults();
 
@@ -57,6 +81,9 @@ class Config {
 
    private:
     std::vector<AddressLookup> addressLookups;
+    QString coredumpDirectory = "./coredumps";
+    std::vector<BinaryMapping> binaryMappings;
+    QString configBaseDir;  // Directory containing the config file, for resolving relative paths
 
     // Helper functions for JSON parsing
     uint64_t parseAddress(const QString& addressStr) const;
@@ -71,7 +98,7 @@ class ConfigService {
     static ConfigService& instance();
 
     // Initialize the configuration service
-    void initialize(const QString& configPath = "logview.json");
+    void initialize(const QString& configPath = "wosdbg.json");
 
     // Get the configuration
     const Config& getConfig() const { return config; }

@@ -7,7 +7,7 @@
 #include <qtypes.h>
 
 #include <vector>
-#define PACKAGE "qemu_log_viewer"
+#define PACKAGE "wosdbg"
 #define PACKAGE_VERSION "1.0"
 extern "C" {
 #include <bfd.h>
@@ -28,7 +28,7 @@ extern "C" {
 #include <algorithm>
 
 #include "log_processor.h"
-#include "qemu_log_viewer.h"
+#include "wosdbg.h"
 
 // LogProcessor implementation
 LogProcessor::LogProcessor(const QString& filename, QObject* parent)
@@ -162,7 +162,7 @@ void LogProcessor::startWorkerProcesses() {
         });
 
         // Start the worker process
-        QString workerPath = QCoreApplication::applicationDirPath() + "/log_worker";
+        QString workerPath = QCoreApplication::applicationDirPath() + "/wosdbg_worker";
         QStringList args = {chunkFile, resultFile};
 
         // Pass config path to worker if available

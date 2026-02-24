@@ -10,8 +10,8 @@
 #include <functional>
 #include <vector>
 
-#include "qemu_log_viewer.h"
 #include "virtual_table.h"
+#include "wosdbg.h"
 
 auto VirtualTableIntegration::initializeVirtualTable(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView* {
     // Create virtual view
