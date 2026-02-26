@@ -34,6 +34,12 @@ static constexpr int SIG_TSTP = 20;
 // poll event bits (Linux-compatible)
 static constexpr int POLLIN = 0x001;
 static constexpr int POLLOUT = 0x004;
+static constexpr int POLLHUP = 0x010;
+
+// WOS-internal "yield and retry" error code (never reaches userspace applications).
+// Returned by device reads that would block; the mlibc sysdep layer retries internally.
+// Distinct from EAGAIN (11) which is returned for non-blocking I/O.
+static constexpr int WOS_ERESTARTSYS = 512;
 
 // Return a default termios (cooked mode: echo, canonical, signals)
 KTermios default_termios() {
@@ -183,8 +189,10 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     if (rd == 0) {
         // If slave is closed, return EOF
         if (!pair->slave_opened) return 0;
-        // Otherwise would block (no data yet)
-        return -EAGAIN;
+        // Non-blocking fd: return EAGAIN immediately (propagates to application)
+        if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
+        // Blocking fd: return WOS_ERESTARTSYS so the mlibc sysdep layer retries
+        return -WOS_ERESTARTSYS;
     }
     return static_cast<ssize_t>(rd);
 }
@@ -439,6 +447,11 @@ int master_poll_check(ker::vfs::File* file, int events) {
     if ((events & POLLOUT) && pair->m2s.space() > 0) {
         ready |= POLLOUT;
     }
+    // When the slave side is closed, report POLLHUP so readers (e.g. dropbear)
+    // detect the hangup and can clean up the session.
+    if (pair->slave_opened <= 0) {
+        ready |= POLLHUP;
+    }
     return ready;
 }
 
@@ -500,7 +513,10 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     if (rd == 0) {
         // If master is closed, return EOF
         if (!pair->master_opened) return 0;
-        return -EAGAIN;
+        // Non-blocking fd: return EAGAIN immediately
+        if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
+        // Blocking fd: return WOS_ERESTARTSYS so mlibc retries internally.
+        return -WOS_ERESTARTSYS;
     }
     return static_cast<ssize_t>(rd);
 }
@@ -637,6 +653,10 @@ int slave_poll_check(ker::vfs::File* file, int events) {
     }
     if (((events & POLLOUT) != 0) && pair->s2m.space() > 0) {
         ready |= POLLOUT;
+    }
+    // When the master side is closed, report POLLHUP.
+    if (pair->master_opened <= 0) {
+        ready |= POLLHUP;
     }
     return ready;
 }

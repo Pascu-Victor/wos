@@ -576,8 +576,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(num_events);
             }
 
-            // No events and timeout != 0: block via deferred task switch
-            return static_cast<uint64_t>(-EAGAIN);
+            // No events — check for deliverable signals before retrying.
+            {
+                uint64_t deliverable = task->sigPending & ~task->sigMask;
+                if (deliverable != 0) {
+                    return static_cast<uint64_t>(-EINTR);
+                }
+            }
+
+            // No events and no signals: return WOS_ERESTARTSYS (512) so the
+            // mlibc sysdep layer retries.  Distinct from EAGAIN (11).
+            return static_cast<uint64_t>(-512);
         }
 
         default:

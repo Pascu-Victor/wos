@@ -207,9 +207,20 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return ready;
     }
 
-    // No events ready and non-zero timeout: return -EAGAIN so the userspace
-    // wrapper can spin-retry (same pattern as poll()).
-    return -EAGAIN;
+    // No events ready — check for deliverable signals before retrying.
+    // This lets pselect/poll return -EINTR so signal handlers run promptly.
+    // (task was already fetched at the top of this function)
+    {
+        uint64_t deliverable = task->sigPending & ~task->sigMask;
+        if (deliverable != 0) {
+            return -EINTR;
+        }
+    }
+
+    // No events and no signals: return -ERESTARTSYS (512) so the mlibc
+    // sysdep layer retries internally.  Distinct from -EAGAIN (11) which
+    // propagates to the application for non-blocking I/O.
+    return -512;  // WOS_ERESTARTSYS
 }
 
 }  // namespace ker::vfs

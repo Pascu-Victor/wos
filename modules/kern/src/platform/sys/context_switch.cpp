@@ -168,11 +168,6 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     apic::eoi();
 
     // Advance epoch and run garbage collection periodically on CPU 0 only.
-    // This ensures consistent epoch advancement and avoids contention.
-    // Every 10 timer ticks (~100ms at 10ms timer) we advance the epoch
-    // and collect dead tasks whose grace period has elapsed.
-    // Increased frequency (from 100 to 10) to prevent memory buildup when
-    // processes exit faster than GC can reclaim.
     uint64_t ticks = timerTickCount.fetch_add(1, std::memory_order_relaxed);
     if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();

@@ -26,6 +26,9 @@
 
 namespace ker::vfs {
 
+// Keep in sync with userspace fcntl.h (Linux-compatible octal values)
+constexpr int O_NONBLOCK = 04000;
+
 namespace {
 constexpr size_t MAX_PATH_LEN = 512;
 constexpr int MAX_SYMLINK_DEPTH = 8;
@@ -2019,6 +2022,11 @@ auto vfs_pipe(int pipefd[2]) -> int {
         // Buffer empty
         if (st->write_closed) return 0;  // EOF — write end closed
 
+        // Non-blocking: return EAGAIN immediately instead of blocking
+        if (f->open_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+
         // Block: add current task to readers wait queue
         auto* currentTask = ker::mod::sched::get_current_task();
         if (currentTask == nullptr) return -ESRCH;
@@ -2066,7 +2074,12 @@ auto vfs_pipe(int pipefd[2]) -> int {
             return static_cast<ssize_t>(to_write);
         }
 
-        // Buffer full — block
+        // Buffer full
+        if (f->open_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+
+        // Block: add current task to writers wait queue
         auto* currentTask = ker::mod::sched::get_current_task();
         if (currentTask == nullptr) return -ESRCH;
 
