@@ -329,6 +329,11 @@ bool post_task_for_cpu(uint64_t cpuNo, task::Task* task) {
 #endif
     task->cpu = cpuNo;
 
+    // Set start time if not already set
+    if (task->start_time_us == 0) {
+        task->start_time_us = time::getUs();
+    }
+
     // Memory barrier to ensure all task fields are visible to other CPUs
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
@@ -487,6 +492,15 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             delta_us = 1;
         }
         int64_t delta_ns = delta_us * 1000;
+
+        // Process time accounting: attribute delta to user or system time
+        if (currentTask->type != task::TaskType::IDLE) {
+            if (inKernelMode) {
+                currentTask->system_time_us += (uint64_t)delta_us;
+            } else {
+                currentTask->user_time_us += (uint64_t)delta_us;
+            }
+        }
 
         // Update vruntime if task is in the heap
         if (rq->runnableHeap.contains(currentTask)) {
@@ -921,6 +935,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             delta_us = 1;
         }
         int64_t delta_ns = delta_us * 1000;
+
+        // Deferred switch is always from syscall context (kernel mode) — attribute to system time
+        if (current_task->type != task::TaskType::IDLE) {
+            current_task->system_time_us += (uint64_t)delta_us;
+        }
 
         if (rq->runnableHeap.contains(current_task)) {
             int64_t vruntime_delta = (delta_ns * 1024) / (int64_t)current_task->schedWeight;

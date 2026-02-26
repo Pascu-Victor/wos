@@ -474,11 +474,11 @@ auto vfs_close(int fd) -> int {
     // Release FD from current task
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
-        return -1;
+        return -ESRCH;
     }
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
 
     // Decrement reference count
@@ -508,14 +508,14 @@ auto vfs_close(int fd) -> int {
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
-        return -1;
+        return -ESRCH;
     }
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
-        return -1;
+        return -EINVAL;
     }
     ssize_t r = f->fops->vfs_read(f, buf, count, (size_t)f->pos);
     if (r >= 0) {
@@ -531,14 +531,14 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
-        return -1;
+        return -ESRCH;
     }
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
-        return -1;
+        return -EINVAL;
     }
     ssize_t r = f->fops->vfs_write(f, buf, count, (size_t)f->pos);
     if (r >= 0) {
@@ -554,14 +554,14 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
-        return -1;
+        return -ESRCH;
     }
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_lseek == nullptr)) {
-        return -1;
+        return -EINVAL;
     }
     return f->fops->vfs_lseek(f, offset, whence);
 }
@@ -664,11 +664,11 @@ auto vfs_isatty(int fd) -> bool {
 auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
-        return -1;
+        return -ESRCH;
     }
     ker::vfs::File* f = vfs_get_file(t, fd);
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
 
     // Check if this is a directory

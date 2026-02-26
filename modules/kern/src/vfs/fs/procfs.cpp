@@ -16,27 +16,20 @@
 
 namespace ker::vfs::procfs {
 
-// Helper to parse a PID from a path component
-static auto parse_pid(const char* s) -> int64_t {
-    if (s == nullptr || *s == '\0') return -1;
-    int64_t val = 0;
-    for (const char* p = s; *p; ++p) {
-        if (*p < '0' || *p > '9') return -1;
-        val = val * 10 + (*p - '0');
-    }
-    return val;
-}
+namespace {
 
 // Helper: int to decimal string
-static void int_to_str(uint64_t val, char* buf, size_t bufsz) {
-    if (bufsz == 0) return;
-    char tmp[24];
+void int_to_str(uint64_t val, char* buf, size_t bufsz) {
+    if (bufsz == 0) {
+        return;
+    }
+    std::array<char, 24> tmp{};
     int pos = 0;
     if (val == 0) {
         tmp[pos++] = '0';
     } else {
         while (val > 0 && pos < 22) {
-            tmp[pos++] = '0' + static_cast<char>(val % 10);
+            tmp[pos++] = static_cast<char>('0' + static_cast<unsigned char>(val % 10));
             val /= 10;
         }
     }
@@ -48,289 +41,10 @@ static void int_to_str(uint64_t val, char* buf, size_t bufsz) {
     buf[len < static_cast<int>(bufsz) ? len : static_cast<int>(bufsz - 1)] = '\0';
 }
 
-// Generate content for /proc/<pid>/status
-static auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
-    if (task == nullptr) return 0;
-
-    size_t off = 0;
-    auto append = [&](const char* s) {
-        while (*s && off < bufsz - 1) buf[off++] = *s++;
-    };
-    auto append_int = [&](uint64_t v) {
-        char tmp[24];
-        int_to_str(v, tmp, sizeof(tmp));
-        append(tmp);
-    };
-
-    append("Name:\t");
-    append(task->exe_path[0] ? task->exe_path : "(unknown)");
-    append("\nPid:\t");
-    append_int(task->pid);
-    append("\nPPid:\t");
-    append_int(task->parentPid);
-    append("\nUid:\t");
-    append_int(task->uid);
-    append("\t");
-    append_int(task->euid);
-    append("\t");
-    append_int(task->suid);
-    append("\t");
-    append_int(task->uid);
-    append("\nGid:\t");
-    append_int(task->gid);
-    append("\t");
-    append_int(task->egid);
-    append("\t");
-    append_int(task->sgid);
-    append("\t");
-    append_int(task->gid);
-    append("\n");
-
-    buf[off] = '\0';
-    return off;
-}
-
-// Generate content for /proc/<pid>/stat (Linux-compatible format)
-// Format: pid (comm) state ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt
-//         utime stime cutime cstime priority nice nthreads itrealvalue starttime vsize rss ...
-static auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
-    if (task == nullptr) return 0;
-
-    size_t off = 0;
-    auto append = [&](const char* s) {
-        while (*s && off < bufsz - 1) buf[off++] = *s++;
-    };
-    auto append_int = [&](uint64_t v) {
-        char tmp[24];
-        int_to_str(v, tmp, sizeof(tmp));
-        append(tmp);
-    };
-
-    // Extract comm (basename of exe_path)
-    const char* comm = task->exe_path;
-    if (comm[0] != '\0') {
-        const char* p = comm;
-        while (*p) {
-            if (*p == '/') comm = p + 1;
-            p++;
-        }
+auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
+    if (f == nullptr || f->private_data == nullptr) {
+        return -1;
     }
-    if (comm[0] == '\0') comm = task->name ? task->name : "unknown";
-
-    // Determine state character
-    char state = 'S';  // Default sleeping
-    auto ts = task->state.load(std::memory_order_acquire);
-    if (ts == ker::mod::sched::task::TaskState::DEAD)
-        state = 'Z';
-    else if (ts == ker::mod::sched::task::TaskState::EXITING)
-        state = 'Z';
-    else if (task->hasExited)
-        state = 'Z';
-    // Could refine: R for running, but S is a safe default
-
-    // pid (comm) state ppid pgid sid tty_nr tpgid flags
-    append_int(task->pid);
-    append(" (");
-    append(comm);
-    append(") ");
-    buf[off++] = state;
-    append(" ");
-    append_int(task->parentPid);  // ppid
-    append(" ");
-    append_int(task->pgid != 0 ? task->pgid : task->pid);  // pgrp
-    append(" ");
-    append_int(task->session_id != 0 ? task->session_id : task->pid);  // session
-    append(" ");
-    append_int(task->controlling_tty >= 0 ? static_cast<uint64_t>(task->controlling_tty) : 0);  // tty_nr
-    append(" ");
-    append_int(0);  // tpgid
-    append(" ");
-    append_int(0);  // flags
-    append(" ");
-
-    // minflt cminflt majflt cmajflt utime stime cutime cstime
-    for (int i = 0; i < 8; i++) {
-        append("0 ");
-    }
-
-    // priority nice num_threads itrealvalue starttime
-    append("20 ");  // priority
-    append("0 ");   // nice
-    append("1 ");   // num_threads
-    append("0 ");   // itrealvalue
-    append("0 ");   // starttime
-
-    // vsize rss
-    append("0 ");  // vsize
-    append("0");   // rss
-
-    append("\n");
-    buf[off] = '\0';
-    return off;
-}
-
-// Generate content for /proc/<pid>/cmdline (NUL-separated argv)
-static auto generate_cmdline(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
-    if (task == nullptr) return 0;
-
-    // Use exe_path as fallback (most processes won't have a saved argv)
-    const char* path = task->exe_path;
-    if (path[0] == '\0') {
-        path = task->name ? task->name : "";
-    }
-    size_t len = strlen(path);
-    if (len >= bufsz) len = bufsz - 1;
-    memcpy(buf, path, len);
-    buf[len] = '\0';  // NUL terminator (cmdline ends with NUL)
-    return len + 1;   // Include the trailing NUL as part of content length
-}
-
-// Generate content for /proc/mounts
-static auto generate_mounts(char* buf, size_t bufsz) -> size_t {
-    size_t off = 0;
-    auto append = [&](const char* s) {
-        while (*s && off < bufsz - 1) buf[off++] = *s++;
-    };
-
-    // Iterate mount table
-    for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
-        auto* m = ker::vfs::get_mount_at(i);
-        if (m == nullptr) continue;
-        append(m->fstype ? m->fstype : "none");
-        append(" ");
-        append(m->path ? m->path : "/");
-        append(" ");
-        append(m->fstype ? m->fstype : "none");
-        append(" rw 0 0\n");
-    }
-
-    buf[off] = '\0';
-    return off;
-}
-
-// Procfs stores generated content in the File's private_data as ProcFileData.
-
-// --- FileOperations ---
-
-static auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr) return -EINVAL;
-    auto* pfd = static_cast<ProcFileData*>(f->private_data);
-
-    // Lazily generate content
-    if (pfd->content == nullptr) {
-        constexpr size_t MAX_PROCFS_BUF = 4096;
-        pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(MAX_PROCFS_BUF));
-        if (pfd->content == nullptr) return -ENOMEM;
-
-        switch (pfd->node.type) {
-            case ProcNodeType::STATUS_FILE:
-                pfd->content_len = generate_status(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
-                break;
-            case ProcNodeType::STAT_FILE:
-                pfd->content_len = generate_stat(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
-                break;
-            case ProcNodeType::CMDLINE_FILE:
-                pfd->content_len = generate_cmdline(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
-                break;
-            case ProcNodeType::MOUNTS_FILE:
-                pfd->content_len = generate_mounts(pfd->content, MAX_PROCFS_BUF);
-                break;
-            case ProcNodeType::EXE_LINK: {
-                auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
-                if (task != nullptr && task->exe_path[0] != '\0') {
-                    size_t len = strlen(task->exe_path);
-                    memcpy(pfd->content, task->exe_path, len);
-                    pfd->content[len] = '\0';
-                    pfd->content_len = len;
-                } else {
-                    pfd->content[0] = '\0';
-                    pfd->content_len = 0;
-                }
-                break;
-            }
-            default:
-                pfd->content[0] = '\0';
-                pfd->content_len = 0;
-                break;
-        }
-    }
-
-    if (offset >= pfd->content_len) return 0;
-    size_t avail = pfd->content_len - offset;
-    count = std::min(count, avail);
-    memcpy(buf, pfd->content + offset, count);
-    return static_cast<ssize_t>(count);
-}
-
-static auto procfs_close(File* f) -> int {
-    if (f == nullptr) return -EINVAL;
-    if (f->private_data != nullptr) {
-        auto* pfd = static_cast<ProcFileData*>(f->private_data);
-        if (pfd->content != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(pfd->content);
-        }
-        delete pfd;
-        f->private_data = nullptr;
-    }
-    return 0;
-}
-
-static auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
-    if (f == nullptr) return -EINVAL;
-    auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    off_t new_pos = f->pos;
-    switch (whence) {
-        case 0:
-            new_pos = offset;
-            break;  // SEEK_SET
-        case 1:
-            new_pos = f->pos + offset;
-            break;  // SEEK_CUR
-        case 2:
-            new_pos = static_cast<off_t>(pfd->content_len) + offset;
-            break;  // SEEK_END
-        default:
-            return -EINVAL;
-    }
-    if (new_pos < 0) return -EINVAL;
-    f->pos = new_pos;
-    return new_pos;
-}
-
-static auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr) return -EINVAL;
-    auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    if (pfd->node.type != ProcNodeType::EXE_LINK && pfd->node.type != ProcNodeType::SELF_LINK) return -EINVAL;
-
-    if (pfd->node.type == ProcNodeType::SELF_LINK) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task == nullptr) return -ESRCH;
-        char tmp[24];
-        int_to_str(task->pid, tmp, sizeof(tmp));
-        char link[64] = "/proc/";
-        size_t off = 6;
-        for (const char* p = tmp; *p && off < sizeof(link) - 1; ++p, ++off) link[off] = *p;
-        link[off] = '\0';
-        size_t len = off;
-        len = std::min(len, bufsz);
-        memcpy(buf, link, len);
-        return static_cast<ssize_t>(len);
-    }
-
-    // EXE_LINK
-    auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
-    if (task == nullptr) return -ESRCH;
-    size_t len = strlen(task->exe_path);
-    len = std::min(len, bufsz);
-    memcpy(buf, task->exe_path, len);
-    return static_cast<ssize_t>(len);
-}
-
-static auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
-    if (f == nullptr || f->private_data == nullptr) return -1;
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
 
     // Synthetic . and ..
@@ -431,7 +145,353 @@ static auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     return -1;
 }
 
-static FileOperations procfs_fops_instance = {
+// Helper to parse a PID from a path component
+auto parse_pid(const char* s) -> int64_t {
+    if (s == nullptr || *s == '\0') {
+        return -1;
+    }
+    int64_t val = 0;
+    for (const char* p = s; *p != 0; ++p) {
+        if (*p < '0' || *p > '9') {
+            return -1;
+        }
+        val = (val * 10) + (*p - '0');
+    }
+    return val;
+}
+
+// Generate content for /proc/<pid>/status
+auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    if (task == nullptr) {
+        return 0;
+    }
+
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+
+    append("Name:\t");
+    append((task->exe_path[0] != 0) ? static_cast<const char*>(task->exe_path) : "(unknown)");
+    append("\nPid:\t");
+    append_int(task->pid);
+    append("\nPPid:\t");
+    append_int(task->parentPid);
+    append("\nUid:\t");
+    append_int(task->uid);
+    append("\t");
+    append_int(task->euid);
+    append("\t");
+    append_int(task->suid);
+    append("\t");
+    append_int(task->uid);
+    append("\nGid:\t");
+    append_int(task->gid);
+    append("\t");
+    append_int(task->egid);
+    append("\t");
+    append_int(task->sgid);
+    append("\t");
+    append_int(task->gid);
+    append("\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
+// Generate content for /proc/<pid>/stat (Linux-compatible format)
+// Format: pid (comm) state ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt
+//         utime stime cutime cstime priority nice nthreads itrealvalue starttime vsize rss ...
+auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    if (task == nullptr) {
+        return 0;
+    }
+
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+
+    // Extract comm (basename of exe_path)
+    const auto* comm = static_cast<const char*>(task->exe_path);
+    if (comm[0] != '\0') {
+        const char* p = comm;
+        while (*p != 0) {
+            if (*p == '/') {
+                comm = p + 1;
+            }
+            p++;
+        }
+    }
+    if (comm[0] == '\0') {
+        comm = (task->name != nullptr) ? task->name : "unknown";
+    }
+
+    // Determine state character
+    char state = 'S';  // Default sleeping
+    auto ts = task->state.load(std::memory_order_acquire);
+    if (ts == ker::mod::sched::task::TaskState::DEAD || ts == ker::mod::sched::task::TaskState::EXITING || task->hasExited) {
+        state = 'Z';
+    }
+    // Could refine: R for running, but S is a safe default
+
+    // pid (comm) state ppid pgid sid tty_nr tpgid flags
+    append_int(task->pid);
+    append(" (");
+    append(comm);
+    append(") ");
+    buf[off++] = state;
+    append(" ");
+    append_int(task->parentPid);  // ppid
+    append(" ");
+    append_int(task->pgid != 0 ? task->pgid : task->pid);  // pgrp
+    append(" ");
+    append_int(task->session_id != 0 ? task->session_id : task->pid);  // session
+    append(" ");
+    append_int(task->controlling_tty >= 0 ? static_cast<uint64_t>(task->controlling_tty) : 0);  // tty_nr
+    append(" ");
+    append_int(0);  // tpgid
+    append(" ");
+    append_int(0);  // flags
+    append(" ");
+
+    // minflt cminflt majflt cmajflt
+    append("0 ");  // minflt
+    append("0 ");  // cminflt
+    append("0 ");  // majflt
+    append("0 ");  // cmajflt
+
+    // utime stime cutime cstime (in clock ticks, CLK_TCK=100, so 1 tick=10000us)
+    append_int(task->user_time_us / 10000);  // utime
+    append(" ");
+    append_int(task->system_time_us / 10000);  // stime
+    append(" ");
+    append("0 ");  // cutime (children)
+    append("0 ");  // cstime (children)
+
+    // priority nice num_threads itrealvalue starttime
+    append("20 ");                            // priority
+    append("0 ");                             // nice
+    append("1 ");                             // num_threads
+    append("0 ");                             // itrealvalue
+    append_int(task->start_time_us / 10000);  // starttime (in ticks since boot)
+    append(" ");
+
+    // vsize rss
+    append("0 ");  // vsize
+    append("0");   // rss
+
+    append("\n");
+    buf[off] = '\0';
+    return off;
+}
+
+// Generate content for /proc/<pid>/cmdline (NUL-separated argv)
+auto generate_cmdline(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    if (task == nullptr) {
+        return 0;
+    }
+
+    // Use exe_path as fallback (most processes won't have a saved argv)
+    const auto* path = static_cast<const char*>(task->exe_path);
+    if (path[0] == '\0') {
+        path = (task->name != nullptr) ? task->name : "";
+    }
+    size_t len = strlen(path);
+    if (len >= bufsz) {
+        len = bufsz - 1;
+    }
+    memcpy(buf, path, len);
+    buf[len] = '\0';  // NUL terminator (cmdline ends with NUL)
+    return len + 1;   // Include the trailing NUL as part of content length
+}
+
+// Generate content for /proc/mounts
+auto generate_mounts(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+
+    // Iterate mount table
+    for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
+        auto* m = ker::vfs::get_mount_at(i);
+        if (m == nullptr) {
+            continue;
+        }
+        append((m->fstype != nullptr) ? m->fstype : "none");
+        append(" ");
+        append((m->path != nullptr) ? m->path : "/");
+        append(" ");
+        append((m->fstype != nullptr) ? m->fstype : "none");
+        append(" rw 0 0\n");
+    }
+
+    buf[off] = '\0';
+    return off;
+}
+
+// Procfs stores generated content in the File's private_data as ProcFileData.
+
+// --- FileOperations ---
+
+auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EINVAL;
+    }
+    auto* pfd = static_cast<ProcFileData*>(f->private_data);
+
+    // Lazily generate content
+    if (pfd->content == nullptr) {
+        constexpr size_t MAX_PROCFS_BUF = 4096;
+        pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(MAX_PROCFS_BUF));
+        if (pfd->content == nullptr) {
+            return -ENOMEM;
+        }
+
+        switch (pfd->node.type) {
+            case ProcNodeType::STATUS_FILE:
+                pfd->content_len = generate_status(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::STAT_FILE:
+                pfd->content_len = generate_stat(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::CMDLINE_FILE:
+                pfd->content_len = generate_cmdline(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MOUNTS_FILE:
+                pfd->content_len = generate_mounts(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::EXE_LINK: {
+                auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+                if (task != nullptr && task->exe_path[0] != '\0') {
+                    size_t len = strlen(static_cast<const char*>(task->exe_path));
+                    memcpy(pfd->content, static_cast<const char*>(task->exe_path), len);
+                    pfd->content[len] = '\0';
+                    pfd->content_len = len;
+                } else {
+                    pfd->content[0] = '\0';
+                    pfd->content_len = 0;
+                }
+                break;
+            }
+            default:
+                pfd->content[0] = '\0';
+                pfd->content_len = 0;
+                break;
+        }
+    }
+
+    if (offset >= pfd->content_len) {
+        return 0;
+    }
+    size_t avail = pfd->content_len - offset;
+    count = std::min(count, avail);
+    memcpy(buf, pfd->content + offset, count);
+    return static_cast<ssize_t>(count);
+}
+
+auto procfs_close(File* f) -> int {
+    if (f == nullptr) {
+        return -EINVAL;
+    }
+    if (f->private_data != nullptr) {
+        auto* pfd = static_cast<ProcFileData*>(f->private_data);
+        if (pfd->content != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(pfd->content);
+        }
+        delete pfd;
+        f->private_data = nullptr;
+    }
+    return 0;
+}
+
+auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
+    if (f == nullptr) {
+        return -EINVAL;
+    }
+    auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    off_t new_pos = f->pos;
+    switch (whence) {
+        case 0:
+            new_pos = offset;
+            break;  // SEEK_SET
+        case 1:
+            new_pos = f->pos + offset;
+            break;  // SEEK_CUR
+        case 2:
+            new_pos = static_cast<off_t>(pfd->content_len) + offset;
+            break;  // SEEK_END
+        default:
+            return -EINVAL;
+    }
+    if (new_pos < 0) {
+        return -EINVAL;
+    }
+    f->pos = new_pos;
+    return new_pos;
+}
+
+auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EINVAL;
+    }
+    auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    if (pfd->node.type != ProcNodeType::EXE_LINK && pfd->node.type != ProcNodeType::SELF_LINK) {
+        return -EINVAL;
+    }
+
+    if (pfd->node.type == ProcNodeType::SELF_LINK) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task == nullptr) {
+            return -ESRCH;
+        }
+        std::array<char, 24> tmp{};
+        int_to_str(task->pid, tmp.data(), tmp.size());
+        std::array<char, 64> link{};
+        memcpy(link.data(), "/proc/", 6);
+        size_t off = 6;
+        for (const char* p = tmp.data(); (*p != 0) && off < link.size() - 1; ++p, ++off) {
+            link[off] = *p;
+        }
+        link[off] = '\0';
+        size_t len = off;
+        len = std::min(len, bufsz);
+        memcpy(buf, link.data(), len);
+        return static_cast<ssize_t>(len);
+    }
+
+    // EXE_LINK
+    auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    size_t len = strlen(static_cast<const char*>(task->exe_path));
+    len = std::min(len, bufsz);
+    memcpy(buf, static_cast<const char*>(task->exe_path), len);
+    return static_cast<ssize_t>(len);
+}
+
+FileOperations procfs_fops_instance = {
     .vfs_open = nullptr,
     .vfs_close = procfs_close,
     .vfs_read = procfs_read,
@@ -444,6 +504,8 @@ static FileOperations procfs_fops_instance = {
     .vfs_poll_check = nullptr,
 };
 
+}  // namespace
+
 auto get_procfs_fops() -> FileOperations* { return &procfs_fops_instance; }
 
 // --- Open a procfs path ---
@@ -452,13 +514,17 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     (void)flags;
     (void)mode;
 
-    if (path == nullptr) return nullptr;
+    if (path == nullptr) {
+        return nullptr;
+    }
 
     // Skip leading /
-    while (*path == '/') path++;
+    while (*path == '/') {
+        path++;
+    }
 
     auto* task = ker::mod::sched::get_current_task();
-    uint64_t self_pid = task ? task->pid : 0;
+    uint64_t self_pid = (task != nullptr) ? task->pid : 0;
 
     auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir) -> File* {
         auto* pfd = new ProcFileData;
@@ -512,7 +578,7 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/<pid>
     // Find first / in path
     const char* slash = nullptr;
-    for (const char* p = path; *p; ++p) {
+    for (const char* p = path; *p != 0; ++p) {
         if (*p == '/') {
             slash = p;
             break;
@@ -522,21 +588,31 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (slash == nullptr) {
         // Just /proc/<pid>
         int64_t pid = parse_pid(path);
-        if (pid < 0) return nullptr;
+        if (pid < 0) {
+            return nullptr;
+        }
         // Check if task exists
-        if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) return nullptr;
+        if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) {
+            return nullptr;
+        }
         return make_file(ProcNodeType::PID_DIR, static_cast<uint64_t>(pid), true);
     }
 
     // /proc/<pid>/<subpath>
-    char pid_str[24];
-    size_t pid_len = static_cast<size_t>(slash - path);
-    if (pid_len >= sizeof(pid_str)) return nullptr;
-    memcpy(pid_str, path, pid_len);
+    std::array<char, 24> pid_str{};
+    auto pid_len = static_cast<size_t>(slash - path);
+    if (pid_len >= pid_str.size()) {
+        return nullptr;
+    }
+    memcpy(pid_str.data(), path, pid_len);
     pid_str[pid_len] = '\0';
-    int64_t pid = parse_pid(pid_str);
-    if (pid < 0) return nullptr;
-    if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) return nullptr;
+    int64_t pid = parse_pid(pid_str.data());
+    if (pid < 0) {
+        return nullptr;
+    }
+    if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) {
+        return nullptr;
+    }
 
     const char* sub = slash + 1;
     if (strcmp(sub, "exe") == 0) {

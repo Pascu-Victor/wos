@@ -153,6 +153,11 @@ struct Task {
     // Set to true by sigreturn syscall; check_pending_signals will restore context
     bool doSigreturn;
 
+    // === Process time accounting (microseconds) ===
+    uint64_t start_time_us;   // Wall-clock time when task was created
+    uint64_t user_time_us;    // Cumulative user-mode CPU time (microseconds)
+    uint64_t system_time_us;  // Cumulative kernel-mode CPU time (microseconds)
+
     // === EEVDF scheduling fields ===
     // Virtual runtime: cumulative weighted CPU time consumed.
     // Advances by (actual_ns * 1024 / weight) each tick. Signed for wrap-safe comparison.

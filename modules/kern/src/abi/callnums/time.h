@@ -7,5 +7,6 @@ enum class sys_time_ops : uint64_t {
     gettimeofday = 0,
     clock_gettime = 1,
     nanosleep = 2,
+    times = 3,
 };
 }  // namespace ker::abi

@@ -35,6 +35,11 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->yieldSwitch = false;
     this->kthreadEntry = nullptr;
 
+    // Process time accounting
+    this->start_time_us = 0;  // Will be set when task is first scheduled
+    this->user_time_us = 0;
+    this->system_time_us = 0;
+
     // EEVDF scheduling fields
     this->vruntime = 0;
     this->vdeadline = 0;
