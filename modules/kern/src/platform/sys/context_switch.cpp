@@ -176,7 +176,7 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     uint64_t ticks = timerTickCount.fetch_add(1, std::memory_order_relaxed);
     if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();
-        // sched::gcExpiredTasks();
+        sched::gc_expired_tasks();
     }
 
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);

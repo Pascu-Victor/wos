@@ -116,7 +116,7 @@ echo "[VM${VM_ID}] STARTING BOOT:"
 
 LOG_ARGS="-d cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation -D ${QEMU_LOG}"
 
-qemu-system-x86_64 -M q35 -cpu max -m ${MEM} \
+qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m ${MEM} \
   -drive file=${DISK0},if=none,id=drive0,format=qcow2 \
   -device ahci,id=ahci \
   -device ide-hd,drive=drive0,bus=ahci.0 \

@@ -49,8 +49,28 @@ void wos_proc_exit(int status) {
             // Set SIGCHLD (signal 17) pending on parent
             parent->sigPending |= (1ULL << (17 - 1));
 
-            // If parent is blocked, wake it so it can handle the signal
-            if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
+            // If parent is waiting for any child (pid==-1 / WAIT_ANY_CHILD),
+            // set the return value so waitpid returns the exited child's PID.
+            // Only safe when deferredTaskSwitch is false (parent is in wait queue,
+            // its context is stable). If deferredTaskSwitch is still true,
+            // the deferred_task_switch race check will handle it.
+            static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+            if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
+                parent->context.regs.rax = currentTask->pid;
+                if (parent->waitStatusPhysAddr != 0) {
+                    auto* statusPtr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(parent->waitStatusPhysAddr));
+                    *statusPtr = status;
+                }
+                parent->waitingForPid = 0;
+                currentTask->waitedOn = true;
+                // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) —
+                // we must explicitly reschedule it so it actually wakes up.
+                uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
+                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
+            } else if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
+                // Parent is blocked for another reason (or WAIT_ANY_CHILD with
+                // deferredTaskSwitch still true — race check will handle RAX).
+                // Wake it so it can handle the signal / race check.
                 uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
             }
@@ -108,6 +128,18 @@ void wos_proc_exit(int status) {
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Could not find waiting task PID %x", waitingPid);
 #endif
+        }
+    }
+
+    // Reparent all children of this process to init (PID 1), so init can reap them.
+    // This prevents orphaned zombies from accumulating forever.
+    {
+        uint32_t count = ker::mod::sched::get_active_task_count();
+        for (uint32_t i = 0; i < count; i++) {
+            auto* child = ker::mod::sched::get_active_task_at(i);
+            if (child != nullptr && child->parentPid == currentTask->pid && child != currentTask) {
+                child->parentPid = 1;  // Reparent to init
+            }
         }
     }
 

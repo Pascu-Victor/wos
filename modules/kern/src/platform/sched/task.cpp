@@ -124,6 +124,10 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->context.syscallKernelStack = kernelRsp;
 
     this->pid = sched::task::getNextPid();
+    // POSIX: default process group = own pid (processes start in their own group)
+    if (this->pgid == 0) {
+        this->pgid = this->pid;
+    }
 
     // CRITICAL: Copy kernel mappings FIRST so we can access kernel memory (like elfBuffer)
     // The elfStart pointer points to kernel heap memory allocated by the parent process

@@ -18,6 +18,8 @@ struct CharDeviceOps {
     ssize_t (*read)(ker::vfs::File* file, void* buf, size_t count);
     ssize_t (*write)(ker::vfs::File* file, const void* buf, size_t count);
     bool (*isatty)(ker::vfs::File* file);
+    int (*ioctl)(ker::vfs::File* file, unsigned long cmd, unsigned long arg);  // nullptr = not supported
+    int (*poll_check)(ker::vfs::File* file, int events);                       // nullptr = always ready
 };
 
 enum class DeviceType : uint8_t {

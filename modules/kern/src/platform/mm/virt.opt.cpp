@@ -75,8 +75,12 @@ static inline paging::PageTableEntry pteFromRaw(uint64_t raw) {
 bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr) {
     PageFault pagefault = paging::createPageFault(frame.errCode, true);
 
-    // COW handling for user-space write faults
-    if ((pagefault.user != 0U) && (pagefault.writable != 0U)) {
+    // COW handling for write faults to user-space COW pages.
+    // This covers both user-mode writes AND kernel-mode writes to user pages
+    // (e.g. syscall read() copying data into a user buffer via memcpy).
+    // Guard: only handle addresses in the user-space half of the canonical
+    // address space to ensure we never touch kernel page-table entries.
+    if ((pagefault.writable != 0U) && (control_register < 0x0000800000000000ULL)) {
         // Walk page tables to find the faulting PTE
         auto* current_task = sched::get_current_task();
         if (current_task == nullptr || current_task->pagemap == nullptr) {

@@ -35,6 +35,9 @@ void epoch_manager_init();
 void dev_init();
 void pci_enumerate();
 void console_init();
+void null_device_init();
+void random_device_init();
+void pty_init();
 void ahci_init();
 void block_device_init();
 void vfs_init();
@@ -98,15 +101,18 @@ inline constexpr std::array<ModuleDesc, 8> PHASE_2_MODULES = {{
 }};
 
 // PHASE 3: Subsystems
-inline constexpr std::array<ModuleDesc, 10> PHASE_3_MODULES = {{
+inline constexpr std::array<ModuleDesc, 13> PHASE_3_MODULES = {{
     {.name = "smt", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::smt_init},                      // depends: sys
     {.name = "epoch_manager", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::epoch_manager_init},  // depends: smt
     {.name = "dev", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::dev_init},                      // depends: ioapic
     {.name = "pci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::pci_enumerate},                 // depends: dev
     {.name = "console", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::console_init},              // depends: pci
+    {.name = "null_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::null_device_init},      // depends: dev
+    {.name = "random_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::random_device_init},  // depends: dev
     {.name = "ahci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::ahci_init},                    // depends: pci
     {.name = "block_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::block_device_init},    // depends: ahci, epoch_manager
     {.name = "vfs", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::vfs_init},                      // depends: block_device
+    {.name = "pty", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::pty_init},                      // depends: dev, devfs (vfs)
     {.name = "devfs_partitions", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::devfs_populate_partitions},  // depends: vfs
     {.name = "net", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::net_init},                                // depends: kmalloc
 }};

@@ -8,12 +8,14 @@ namespace ker::vfs::procfs {
 
 // Procfs node types
 enum class ProcNodeType : uint8_t {
-    ROOT_DIR,     // /proc
-    PID_DIR,      // /proc/<pid>
-    SELF_LINK,    // /proc/self → /proc/<pid>
-    EXE_LINK,     // /proc/<pid>/exe → exe_path
-    STATUS_FILE,  // /proc/<pid>/status
-    MOUNTS_FILE,  // /proc/mounts
+    ROOT_DIR,      // /proc
+    PID_DIR,       // /proc/<pid>
+    SELF_LINK,     // /proc/self → /proc/<pid>
+    EXE_LINK,      // /proc/<pid>/exe → exe_path
+    STATUS_FILE,   // /proc/<pid>/status
+    MOUNTS_FILE,   // /proc/mounts
+    STAT_FILE,     // /proc/<pid>/stat
+    CMDLINE_FILE,  // /proc/<pid>/cmdline
 };
 
 struct ProcNode {

@@ -270,11 +270,35 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (dir_node == nullptr || dir_node->type != DevFSNodeType::DIRECTORY) {
         return -1;
     }
-    if (index >= dir_node->children_count) {
+
+    // Indices 0 and 1 are synthetic "." and ".." entries
+    if (index == 0) {
+        entry->d_ino = reinterpret_cast<uint64_t>(dir_node);
+        entry->d_off = 1;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '\0';
+        return 0;
+    }
+    if (index == 1) {
+        auto* parent = (dir_node->parent != nullptr) ? dir_node->parent : dir_node;
+        entry->d_ino = reinterpret_cast<uint64_t>(parent);
+        entry->d_off = 2;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '.';
+        entry->d_name[2] = '\0';
+        return 0;
+    }
+
+    size_t child_index = index - 2;
+    if (child_index >= dir_node->children_count) {
         return -1;
     }
 
-    auto* child = dir_node->children[index];
+    auto* child = dir_node->children[child_index];
 
     entry->d_ino = index + 1;
     entry->d_off = index;
@@ -323,6 +347,18 @@ auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
     return static_cast<ssize_t>(copy_len);
 }
 
+auto devfs_poll_check(File* f, int events) -> int {
+    if (f == nullptr || f->private_data == nullptr) {
+        return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT — always ready fallback
+    }
+    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->poll_check != nullptr) {
+        return devfs_file->device->char_ops->poll_check(f, events);
+    }
+    // Default: report requested events as ready (non-blocking device)
+    return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT
+}
+
 FileOperations devfs_fops = {
     .vfs_open = nullptr,
     .vfs_close = devfs_close,
@@ -333,7 +369,7 @@ FileOperations devfs_fops = {
     .vfs_readdir = devfs_readdir,
     .vfs_readlink = devfs_fops_readlink,
     .vfs_truncate = nullptr,
-    .vfs_poll_check = nullptr,
+    .vfs_poll_check = devfs_poll_check,
 };
 
 }  // anonymous namespace
@@ -341,6 +377,17 @@ FileOperations devfs_fops = {
 // -- Public interface -------------------------------------------------
 
 auto get_devfs_fops() -> FileOperations* { return &devfs_fops; }
+
+auto devfs_ioctl(File* f, unsigned long cmd, unsigned long arg) -> int {
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EBADF;
+    }
+    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->ioctl != nullptr) {
+        return devfs_file->device->char_ops->ioctl(f, cmd, arg);
+    }
+    return -ENOTTY;
+}
 
 auto devfs_walk_path(const char* path) -> DevFSNode* { return walk_path(path, false); }
 
@@ -478,12 +525,39 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode* {
 }
 
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode* {
-    auto* node = create_node(name, DevFSNodeType::DEVICE);
+    // If the name contains '/', walk to the parent directory first.
+    // e.g. "pts/0" → find (or create) the "pts" dir, then add node "0" there.
+    const char* slash = nullptr;
+    for (const char* p = name; *p != '\0'; p++) {
+        if (*p == '/') {
+            slash = p;
+        }
+    }
+
+    DevFSNode* parent = &root_node;
+    const char* leaf_name = name;
+
+    if (slash != nullptr) {
+        // Extract the directory portion and walk/create it
+        size_t dir_len = static_cast<size_t>(slash - name);
+        char dir_path[DEVFS_NAME_MAX]{};
+        if (dir_len >= DEVFS_NAME_MAX) dir_len = DEVFS_NAME_MAX - 1;
+        std::memcpy(dir_path, name, dir_len);
+        dir_path[dir_len] = '\0';
+
+        parent = walk_path(dir_path, true);  // create intermediate dirs if needed
+        if (parent == nullptr) {
+            return nullptr;
+        }
+        leaf_name = slash + 1;
+    }
+
+    auto* node = create_node(leaf_name, DevFSNodeType::DEVICE);
     if (node == nullptr) {
         return nullptr;
     }
     node->device = dev;
-    add_child(&root_node, node);
+    add_child(parent, node);
     return node;
 }
 

@@ -110,6 +110,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sgid = parent->sgid;
     child->umask = parent->umask;
 
+    // Copy session, process group, and controlling terminal
+    child->session_id = parent->session_id;
+    child->pgid = (parent->pgid != 0) ? parent->pgid : parent->pid;  // POSIX: pgid must never be 0 for user processes
+    child->controlling_tty = parent->controlling_tty;
+
     // Copy signal dispositions from parent (fork inherits signal handlers)
     child->sigPending = 0;  // Pending signals are NOT inherited
     child->sigMask = parent->sigMask;
@@ -174,9 +179,31 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // Copy parent's register context — child will resume at the same RIP
     child->context.regs = parent->context.regs;
-    child->context.frame = parent->context.frame;
     child->context.intNo = 0;
     child->context.errorCode = 0;
+
+    // Build the child's interrupt frame from the PerCpu scratch area.
+    // parent->context.frame is STALE — it was saved during the last timer
+    // preemption / context switch, NOT during this syscall.  The real
+    // syscall return state lives in the scratch area populated by the
+    // syscall entry path in syscall.asm:
+    //   gs:0x28 = RCX at entry = user return RIP
+    //   gs:0x30 = R11 at entry = user RFLAGS
+    //   gs:0x08 = user RSP at entry
+    {
+        uint64_t returnRip = 0, returnFlags = 0, userRsp = 0;
+        asm volatile("movq %%gs:0x28, %0" : "=r"(returnRip));
+        asm volatile("movq %%gs:0x30, %0" : "=r"(returnFlags));
+        asm volatile("movq %%gs:0x08, %0" : "=r"(userRsp));
+
+        child->context.frame.rip = returnRip;
+        child->context.frame.rsp = userRsp;
+        child->context.frame.flags = returnFlags;
+        child->context.frame.cs = 0x23;  // GDT_USER_CS
+        child->context.frame.ss = 0x1b;  // GDT_USER_DS
+        child->context.frame.intNum = 0;
+        child->context.frame.errCode = 0;
+    }
 
     // Child returns 0 from fork
     child->context.regs.rax = 0;
@@ -322,9 +349,27 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
         return 0;
     }
 
-    if (pid <= 0) {
-        // pid==0 or pid==-1 means "all processes in group" — simplified for now
-        return static_cast<uint64_t>(-ESRCH);
+    if (pid == 0) {
+        // pid==0: send signal to all processes in caller's process group
+        auto* self = sched::get_current_task();
+        if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+        uint64_t pgrp = (self->pgid != 0) ? self->pgid : self->pid;
+        sched::signal_process_group(pgrp, sig);
+        return 0;
+    }
+    if (pid < 0) {
+        // pid < -1: send signal to process group -pid
+        // pid == -1: send to all processes (simplified: send to caller's pgrp)
+        uint64_t pgrp;
+        if (pid == -1) {
+            auto* self = sched::get_current_task();
+            if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+            pgrp = (self->pgid != 0) ? self->pgid : self->pid;
+        } else {
+            pgrp = static_cast<uint64_t>(-pid);
+        }
+        sched::signal_process_group(pgrp, sig);
+        return 0;
     }
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
@@ -463,6 +508,75 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto old_umask = task->umask;
             task->umask = static_cast<uint32_t>(a2) & 0777;
             return old_umask;
+        }
+
+        case abi::process::procmgmt_ops::setsid: {
+            auto* task = ker::mod::sched::get_current_task();
+            if (!task) return static_cast<uint64_t>(-ESRCH);
+            // POSIX: setsid fails if the caller is already a process group leader
+            if (task->pgid == task->pid && task->session_id != 0) {
+                return static_cast<uint64_t>(-EPERM);
+            }
+            task->session_id = task->pid;
+            task->pgid = task->pid;
+            task->controlling_tty = -1;  // POSIX: setsid detaches from controlling terminal
+            return task->pid;
+        }
+        case abi::process::procmgmt_ops::getsid: {
+            auto pid = static_cast<int64_t>(a2);
+            if (pid == 0) {
+                auto* task = ker::mod::sched::get_current_task();
+                if (!task) return static_cast<uint64_t>(-ESRCH);
+                return task->session_id;
+            }
+            // Look up another task by pid
+            auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
+            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            auto sid = target->session_id;
+            target->release();
+            return sid;
+        }
+        case abi::process::procmgmt_ops::setpgid: {
+            auto* task = ker::mod::sched::get_current_task();
+            if (!task) return static_cast<uint64_t>(-ESRCH);
+            auto pid = static_cast<uint64_t>(a2);
+            auto new_pgid = static_cast<uint64_t>(a3);
+            // pid==0 means current process
+            if (pid == 0) pid = task->pid;
+            // pgid==0 means use pid as pgid
+            if (new_pgid == 0) new_pgid = pid;
+            if (pid == task->pid) {
+                task->pgid = new_pgid;
+                return 0;
+            }
+            // Setting pgid for another process (must be a child, same session)
+            auto* target = ker::mod::sched::find_task_by_pid_safe(pid);
+            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if (target->parentPid != task->pid || target->session_id != task->session_id) {
+                target->release();
+                return static_cast<uint64_t>(-EPERM);
+            }
+            target->pgid = new_pgid;
+            target->release();
+            return 0;
+        }
+        case abi::process::procmgmt_ops::getpgid: {
+            auto pid = static_cast<int64_t>(a2);
+            if (pid == 0) {
+                auto* task = ker::mod::sched::get_current_task();
+                if (!task) return static_cast<uint64_t>(-ESRCH);
+                return task->pgid;
+            }
+            auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
+            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            auto pgid = target->pgid;
+            target->release();
+            return pgid;
+        }
+        case abi::process::procmgmt_ops::execve: {
+            // POSIX replace-process execve
+            return wos_proc_execve(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
+                                   reinterpret_cast<const char* const*>(a4), gpr);
         }
 
         default:

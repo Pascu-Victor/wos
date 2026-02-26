@@ -266,6 +266,42 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    // --- Spawn dropbear SSH server ---
+    {
+        // Generate RSA host key if it doesn't exist
+        int key_fd = ker::abi::vfs::open("/etc/dropbear/dropbear_rsa_host_key", 0, 0);
+        if (key_fd >= 0) {
+            ker::abi::vfs::close(key_fd);
+            std::println("init[{}]: dropbear host key already exists", cpuno);
+        } else {
+            std::println("init[{}]: generating dropbear RSA host key...", cpuno);
+            std::array<const char*, 6> keygen_argv = {
+                "/bin/dropbearkey", "-t", "rsa", "-f", "/etc/dropbear/dropbear_rsa_host_key", nullptr};
+            std::array<const char*, 1> keygen_envp = {nullptr};
+            uint64_t keygen_pid = ker::process::exec("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data());
+            if (keygen_pid == 0) {
+                std::println("init[{}]: FAILED to spawn dropbearkey", cpuno);
+            } else {
+                int exit_code = 0;
+                ker::process::waitpid((int64_t)keygen_pid, &exit_code, 0);
+                std::println("init[{}]: dropbearkey exited with code {}", cpuno, exit_code);
+            }
+        }
+
+        // Start dropbear in foreground mode (no fork/daemon)
+        std::println("init[{}]: spawning dropbear SSH server", cpuno);
+        std::array<const char*, 5> dropbear_argv = {"/bin/dropbear", "-r", "/etc/dropbear/dropbear_rsa_host_key",
+                                                    "-F",  // foreground, don't fork
+                                                    nullptr};
+        std::array<const char*, 1> dropbear_envp = {nullptr};
+        uint64_t dropbear_pid = ker::process::exec("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data());
+        if (dropbear_pid == 0) {
+            std::println("init[{}]: FAILED to spawn dropbear", cpuno);
+        } else {
+            std::println("init[{}]: dropbear spawned as PID {}", cpuno, dropbear_pid);
+        }
+    }
+
     // --- Spawn sub-init processes ---
     // std::println("init[{}]: Will spawn {} sub-init processes", cpuno, NUM_SUB_INITS);
 
@@ -375,9 +411,17 @@ auto main(int argc, char** argv) -> int {
     //                  total_failed);
     // }
 
-    // Keep init alive
+    // Keep init alive and reap orphaned zombie children.
+    // When a parent process exits, its children are reparented to init (PID 1).
+    // Init must call waitpid(-1, ..., WNOHANG) periodically to reap them,
+    // otherwise zombie processes accumulate in the process table.
     for (;;) {
-        asm volatile("pause");
+        int32_t reap_status = 0;
+        auto reap_pid = ker::process::waitpid(-1, &reap_status, 1 /* WNOHANG */);
+        if (reap_pid == 0 || reap_pid == static_cast<uint64_t>(-1)) {
+            // No zombie children to reap right now — sleep briefly
+            asm volatile("pause");
+        }
     }
 
     return 0;

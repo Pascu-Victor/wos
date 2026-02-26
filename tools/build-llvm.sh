@@ -372,3 +372,50 @@ make -C $B/busybox-build -j$(nproc) \
 # Install busybox into the sysroot
 cp $B/busybox-build/busybox $B/target1/bin/busybox
 echo "Busybox installed to $B/target1/bin/busybox"
+
+# 9. Build Dropbear SSH for WOS userspace
+cd $B/src
+[ ! -d dropbear ] && git clone --depth=1 https://github.com/Pascu-Victor/dropbear.git
+
+mkdir -p $B/dropbear-build
+cd $B/dropbear-build
+
+# Cross-compilation environment for Dropbear
+TARGET_SYSROOT="$B/target1"
+export CC="$TARGET_SYSROOT/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+export AR="$TARGET_SYSROOT/bin/llvm-ar"
+export RANLIB="$TARGET_SYSROOT/bin/llvm-ranlib"
+export STRIP="$TARGET_SYSROOT/bin/llvm-strip"
+export CFLAGS="--sysroot=$TARGET_SYSROOT -static -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
+export LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld -L$TARGET_SYSROOT/lib"
+
+# Run autoconf if configure doesn't exist yet
+if [ ! -f "$B/src/dropbear/configure" ]; then
+    (cd $B/src/dropbear && autoconf && autoheader)
+fi
+
+# Patch config.sub to recognise WOS as a valid OS
+if ! grep -q 'wos\*' "$B/src/dropbear/src/config.sub" 2>/dev/null; then
+    sed -i 's/| fiwix\* | mlibc\* | cos\* | mbr\* )/| fiwix* | mlibc* | cos* | mbr* | wos* )/' \
+        "$B/src/dropbear/src/config.sub"
+fi
+
+$B/src/dropbear/configure \
+    --host=x86_64-pc-wos \
+    --prefix="$TARGET_SYSROOT" \
+    --enable-static \
+    --enable-bundled-libtom \
+    --disable-zlib \
+    --disable-pam \
+    --disable-wtmp \
+    --disable-utmp \
+    --disable-utmpx \
+    --disable-lastlog \
+    --disable-syslog \
+    --disable-harden
+
+make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+
+# Install dropbearmulti into the sysroot
+cp $B/dropbear-build/dropbearmulti $B/target1/bin/dropbearmulti
+echo "Dropbear installed to $B/target1/bin/dropbearmulti"

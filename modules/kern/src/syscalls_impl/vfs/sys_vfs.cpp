@@ -8,6 +8,8 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/epoll.hpp>
+#include <vfs/file.hpp>
+#include <vfs/fs/devfs.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -277,6 +279,30 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int maxevents = static_cast<int>(a3);
             int timeout = static_cast<int>(static_cast<int64_t>(a4));
             return static_cast<int64_t>(ker::vfs::epoll_pwait(epfd, events, maxevents, timeout));
+        }
+        case ops::ioctl: {
+            int fd = static_cast<int>(a1);
+            auto cmd = static_cast<unsigned long>(a2);
+            auto arg = static_cast<unsigned long>(a3);
+            // Get the file for the fd
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return -ESRCH;
+            if (fd < 0 || fd >= static_cast<int>(ker::mod::sched::task::Task::FD_TABLE_SIZE)) return -EBADF;
+            auto* file = static_cast<ker::vfs::File*>(task->fds[fd]);
+            if (file == nullptr) return -EBADF;
+            if (file->fs_type == ker::vfs::FSType::DEVFS) {
+                return static_cast<int64_t>(ker::vfs::devfs::devfs_ioctl(file, cmd, arg));
+            }
+            return -ENOTTY;
+        }
+        case ops::fsync: {
+            int fd = static_cast<int>(a1);
+            return static_cast<int64_t>(ker::vfs::vfs_fsync(fd));
+        }
+        case ops::link: {
+            auto* oldpath = reinterpret_cast<const char*>(a1);
+            auto* newpath = reinterpret_cast<const char*>(a2);
+            return static_cast<int64_t>(ker::vfs::vfs_link(oldpath, newpath));
         }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");

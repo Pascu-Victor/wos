@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
@@ -400,6 +401,385 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     return newTask->pid;
 
     // Note: elfBuffer is now owned by the task and will be cleaned up when the task exits
+}
+
+auto wos_proc_execve(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+    // POSIX execve: replace current process image with a new one.
+    // On success, the sysret return path is patched to land at the new
+    // binary's entry point (gpr is a local copy and NOT used).
+    (void)gpr;
+
+    using namespace ker::mod;
+
+    auto* task = sched::get_current_task();
+    if (task == nullptr) {
+#ifdef EXEC_DEBUG
+        dbg::log("wos_proc_execve: No current task");
+#endif
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    // --- Read the ELF file ---
+    int fd = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
+    if (fd < 0) {
+#ifdef EXEC_DEBUG
+        dbg::log("wos_proc_execve: Failed to open '%s'", path);
+#endif
+        return static_cast<uint64_t>(-ENOENT);
+    }
+
+    int access_ret = vfs::vfs_access(path, 1 /* X_OK */);
+    if (access_ret < 0) {
+        vfs::vfs_close(fd);
+        return static_cast<uint64_t>(-EACCES);
+    }
+
+    ssize_t fileSize = vfs::vfs_lseek(fd, 0, 2);
+    if (fileSize <= 0) {
+        vfs::vfs_close(fd);
+        return static_cast<uint64_t>(-ENOEXEC);
+    }
+    vfs::vfs_lseek(fd, 0, 0);
+
+    auto* elfBuffer = new uint8_t[fileSize];
+    if (elfBuffer == nullptr) {
+        vfs::vfs_close(fd);
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    ssize_t bytesRead = 0;
+    vfs::vfs_read(fd, elfBuffer, fileSize, (size_t*)&bytesRead);
+    vfs::vfs_close(fd);
+
+    if (bytesRead != fileSize) {
+        delete[] elfBuffer;
+        return static_cast<uint64_t>(-EIO);
+    }
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    auto* elfHeader = reinterpret_cast<Elf64_Ehdr*>(elfBuffer);
+    if (elfHeader->e_ident[EI_MAG0] != ELFMAG0 || elfHeader->e_ident[EI_MAG1] != ELFMAG1 || elfHeader->e_ident[EI_MAG2] != ELFMAG2 ||
+        elfHeader->e_ident[EI_MAG3] != ELFMAG3 || elfHeader->e_ident[EI_CLASS] != ELFCLASS64) {
+        delete[] elfBuffer;
+        return static_cast<uint64_t>(-ENOEXEC);
+    }
+
+    // --- Copy argv/envp strings into kernel memory (before we destroy user mappings) ---
+    size_t argvCount = 0;
+    if (argv != nullptr) {
+        while (argv[argvCount] != nullptr) argvCount++;
+    }
+    size_t envpCount = 0;
+    if (envp != nullptr) {
+        while (envp[envpCount] != nullptr) envpCount++;
+    }
+
+    // Deep-copy strings to kernel heap
+    auto** kArgv = new char*[argvCount + 1];
+    for (size_t i = 0; i < argvCount; i++) {
+        size_t len = std::strlen(argv[i]);
+        kArgv[i] = new char[len + 1];
+        std::memcpy(kArgv[i], argv[i], len + 1);
+    }
+    kArgv[argvCount] = nullptr;
+
+    auto** kEnvp = new char*[envpCount + 1];
+    for (size_t i = 0; i < envpCount; i++) {
+        size_t len = std::strlen(envp[i]);
+        kEnvp[i] = new char[len + 1];
+        std::memcpy(kEnvp[i], envp[i], len + 1);
+    }
+    kEnvp[envpCount] = nullptr;
+
+    // --- Close FD_CLOEXEC file descriptors ---
+    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
+        if (task->fds[i] == nullptr) continue;
+        auto* file = static_cast<vfs::File*>(task->fds[i]);
+        if (file->fd_flags & vfs::FD_CLOEXEC) {
+            vfs::vfs_close(static_cast<int>(i));
+            task->fds[i] = nullptr;
+        }
+    }
+
+    // --- Free old ELF buffer ---
+    if (task->elfBuffer != nullptr) {
+        delete[] task->elfBuffer;
+    }
+
+    // --- Replace the pagemap with a fresh one ---
+    // Note: We are executing in kernel context (syscall handler) so our
+    // kernel mappings are active. We'll create a new user pagemap.
+    auto* oldPagemap = task->pagemap;
+    auto* newPagemap = mm::virt::createPagemap();
+    if (newPagemap == nullptr) {
+        delete[] elfBuffer;
+        for (size_t i = 0; i < argvCount; i++) delete[] kArgv[i];
+        delete[] kArgv;
+        for (size_t i = 0; i < envpCount; i++) delete[] kEnvp[i];
+        delete[] kEnvp;
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    task->pagemap = newPagemap;
+    mm::virt::copyKernelMappings(task);
+
+    // TODO: Properly tear down old pagemap user pages. For now we just leak
+    // them — a full implementation would walk and free old user-space frames.
+    (void)oldPagemap;
+
+    // --- Create new thread (user stack + TLS) ---
+    ker::loader::elf::TlsModule tlsInfo = loader::elf::extractTlsInfo((void*)(uint64_t)elfBuffer);
+    auto* newThread = mod::sched::threading::createThread(USER_STACK_SIZE, tlsInfo.tlsSize, newPagemap, tlsInfo);
+    if (newThread == nullptr) {
+        delete[] elfBuffer;
+        for (size_t i = 0; i < argvCount; i++) delete[] kArgv[i];
+        delete[] kArgv;
+        for (size_t i = 0; i < envpCount; i++) delete[] kEnvp[i];
+        delete[] kEnvp;
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    // Free old thread if present
+    // (note: the old thread's stack pages are in the old pagemap, already orphaned)
+    task->thread = newThread;
+
+    // --- Load ELF into new pagemap ---
+    loader::elf::ElfLoadResult elfResult =
+        loader::elf::loadElf((loader::elf::ElfFile*)(uint64_t)elfBuffer, newPagemap, task->pid, task->name);
+    if (elfResult.entryPoint == 0) {
+#ifdef EXEC_DEBUG
+        dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
+#endif
+        delete[] elfBuffer;
+        for (size_t i = 0; i < argvCount; i++) delete[] kArgv[i];
+        delete[] kArgv;
+        for (size_t i = 0; i < envpCount; i++) delete[] kEnvp[i];
+        delete[] kEnvp;
+        return static_cast<uint64_t>(-ENOEXEC);
+    }
+
+    task->entry = elfResult.entryPoint;
+    task->programHeaderAddr = elfResult.programHeaderAddr;
+    task->elfHeaderAddr = elfResult.elfHeaderAddr;
+    task->elfBuffer = elfBuffer;
+    task->elfBufferSize = fileSize;
+
+    // Update executable path
+    {
+        size_t pathLen = std::strlen(path);
+        if (pathLen >= sched::task::Task::EXE_PATH_MAX) pathLen = sched::task::Task::EXE_PATH_MAX - 1;
+        std::memcpy(task->exe_path, path, pathLen);
+        task->exe_path[pathLen] = '\0';
+    }
+
+    // Handle setuid/setgid from executable
+    {
+        vfs::stat exec_st{};
+        if (vfs::vfs_stat(path, &exec_st) == 0) {
+            if (exec_st.st_mode & 04000) {
+                task->euid = exec_st.st_uid;
+                task->suid = exec_st.st_uid;
+            }
+            if (exec_st.st_mode & 02000) {
+                task->egid = exec_st.st_gid;
+                task->sgid = exec_st.st_gid;
+            }
+        }
+    }
+
+    // Reset signals to default (POSIX: pending signals cleared, handlers reset)
+    task->sigPending = 0;
+    task->inSignalHandler = false;
+    task->doSigreturn = false;
+    for (auto& sh : task->sigHandlers) {
+        sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
+    }
+
+    // Ensure fds 0/1/2 exist
+    for (unsigned i = 0; i < 3; ++i) {
+        if (task->fds[i] == nullptr) {
+            vfs::File* newFile = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+            if (newFile != nullptr) {
+                newFile->fops = vfs::devfs::get_devfs_fops();
+                newFile->fd = static_cast<int>(i);
+                newFile->refcount = 1;
+                task->fds[i] = newFile;
+            }
+        }
+    }
+
+    // --- Set up the user stack with argv/envp/auxv ---
+    uint64_t userStackVirt = task->thread->stack;
+    uint64_t currentVirtOffset = 0;
+
+    auto pushToStack = [&](const void* data, size_t size) -> uint64_t {
+        if (currentVirtOffset + size > USER_STACK_SIZE) return 0;
+        currentVirtOffset += size;
+        uint64_t virtAddr = userStackVirt - currentVirtOffset;
+        uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
+        uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
+        uint64_t pagePhys = mm::virt::translate(newPagemap, pageVirt);
+        if (pagePhys == 0) return 0;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        std::memcpy(destPtr, data, size);
+        return virtAddr;
+    };
+
+    auto pushString = [&](const char* str) -> uint64_t {
+        size_t len = std::strlen(str) + 1;
+        if (currentVirtOffset + len > USER_STACK_SIZE) return 0;
+        currentVirtOffset += len;
+        uint64_t virtAddr = userStackVirt - currentVirtOffset;
+        uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
+        uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
+        uint64_t pagePhys = mm::virt::translate(newPagemap, pageVirt);
+        if (pagePhys == 0) return 0;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        std::memcpy(destPtr, str, len);
+        return virtAddr;
+    };
+
+    auto* argvAddrs = new uint64_t[argvCount + 1];
+    for (size_t i = 0; i < argvCount; i++) {
+        argvAddrs[i] = pushString(kArgv[i]);
+    }
+    argvAddrs[argvCount] = 0;
+
+    auto* envpAddrs = new uint64_t[envpCount + 1];
+    for (size_t i = 0; i < envpCount; i++) {
+        envpAddrs[i] = pushString(kEnvp[i]);
+    }
+    envpAddrs[envpCount] = 0;
+
+    // Free kernel copies of argv/envp strings
+    for (size_t i = 0; i < argvCount; i++) delete[] kArgv[i];
+    delete[] kArgv;
+    for (size_t i = 0; i < envpCount; i++) delete[] kEnvp[i];
+    delete[] kEnvp;
+
+    // Alignment
+    {
+        constexpr uint64_t alignment = 16;
+        uint64_t currentAddr = userStackVirt - currentVirtOffset;
+        uint64_t aligned = currentAddr & ~(alignment - 1);
+        currentVirtOffset += (currentAddr - aligned);
+
+        size_t structuredQwords = 10 + (envpCount + 1) + (argvCount + 1) + 1;
+        if (structuredQwords % 2 != 0) {
+            uint64_t pad = 0;
+            pushToStack(&pad, sizeof(uint64_t));
+        }
+    }
+
+    // auxv
+    {
+        constexpr uint64_t AT_NULL = 0, AT_PAGESZ = 6, AT_ENTRY = 9, AT_PHDR = 3, AT_EHDR = 33;
+        std::array<uint64_t, 10> auxvEntries = {AT_PAGESZ, (uint64_t)mm::paging::PAGE_SIZE,
+                                                AT_ENTRY,  task->entry,
+                                                AT_PHDR,   task->programHeaderAddr,
+                                                AT_EHDR,   task->elfHeaderAddr,
+                                                AT_NULL,   0};
+        for (int j = static_cast<int>(auxvEntries.size()) - 1; j >= 0; j--) {
+            uint64_t val = auxvEntries[static_cast<size_t>(j)];
+            pushToStack(&val, sizeof(uint64_t));
+        }
+    }
+
+    pushToStack(envpAddrs, (envpCount + 1) * sizeof(uint64_t));
+    delete[] envpAddrs;
+
+    uint64_t argvPtr = pushToStack(argvAddrs, (argvCount + 1) * sizeof(uint64_t));
+    delete[] argvAddrs;
+
+    uint64_t argc = argvCount;
+    pushToStack(&argc, sizeof(uint64_t));
+
+    // --- Set up the task context to jump to the new binary ---
+    task->context.frame.rip = elfResult.entryPoint;
+    task->context.frame.rsp = userStackVirt - currentVirtOffset;
+    task->context.frame.ss = 0x1b;
+    task->context.frame.cs = 0x23;
+    task->context.frame.flags = 0x202;
+    task->context.frame.intNum = 0;
+    task->context.frame.errCode = 0;
+
+    // Clear general purpose registers
+    task->context.regs = cpu::GPRegs();
+    task->context.regs.rdi = argc;
+    task->context.regs.rsi = argvPtr;
+
+    // Initialize SafeStack TLS symbol if present
+    auto* ssym = loader::debug::getProcessSymbol(task->pid, "__safestack_unsafe_stack_ptr");
+    if (ssym && ssym->isTlsOffset) {
+        uint64_t destVaddr = task->thread->tlsBaseVirt + ssym->rawValue;
+        uint64_t destPaddr = mm::virt::translate(newPagemap, destVaddr);
+        if (destPaddr != 0) {
+            auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
+            *destPtr = task->thread->safestackPtrValue;
+        }
+    }
+
+    // --- Update the sysret return path so it lands at the new binary ---
+    //
+    // The syscall return in syscall.asm uses `sysret`:
+    //   - RCX (popped from the kernel stack) = return RIP
+    //   - R11 (popped from the kernel stack) = RFLAGS
+    //   - [gs:0x08] = user RSP
+    //   - [gs:0x28] = saved RCX for diagnostic check
+    //   - [gs:0x30] = saved R11 (RFLAGS)
+    //   - CR3 = page table base
+    //
+    // We must update ALL of these to point at the new binary. The `gpr`
+    // reference only modifies a local copy in syscallHandler (passed by
+    // value), so it has no effect on the actual stack-saved registers.
+
+    // 1. Compute the base of the pushq-saved register block on the kernel stack.
+    //    gs:0x0 = kernel stack top (K).  After `sub rsp,8` (retval slot) +
+    //    `pushq` (15 regs × 8 = 120 bytes), RSP = K-128.
+    //    The GPRegs struct maps directly to K-128 (r15 at offset 0, rax at 0x70).
+    //    The compiler accesses this as a stack-passed MEMORY-class parameter at
+    //    the callee's rbp+0x10 = K-128.
+    uint64_t kernStackTop;
+    asm volatile("movq %%gs:0x0, %0" : "=r"(kernStackTop));
+    uint8_t* stack_base = reinterpret_cast<uint8_t*>(kernStackTop - 128);
+
+    // Stack offsets (must match pushq order in syscall.asm / signal.cpp)
+    constexpr int OFF_RCX = 0x60;
+    constexpr int OFF_R11 = 0x20;
+    constexpr int OFF_RDI = 0x48;
+    constexpr int OFF_RSI = 0x50;
+
+    uint64_t newRsp = userStackVirt - currentVirtOffset;
+#ifdef EXEC_DEBUG
+    // Log BEFORE patching the stack — dbg::log uses the stack and would
+    // clobber the patched register slots if called after.
+    dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path, elfResult.entryPoint, newRsp);
+#endif
+    // Compute physical pagemap address before we enter the critical section
+    auto physPagemap = (uint64_t)mm::addr::getPhysPointer((uint64_t)newPagemap);
+
+    // === CRITICAL SECTION: No function calls below this point! ===
+    // Any function call (including dbg::log) would use the kernel stack
+    // and overwrite the patched register values.
+
+    // 2. Patch the on-stack register slots that popq will restore.
+    *reinterpret_cast<uint64_t*>(stack_base + OFF_RCX) = elfResult.entryPoint;
+    *reinterpret_cast<uint64_t*>(stack_base + OFF_R11) = 0x202;  // IF set
+    *reinterpret_cast<uint64_t*>(stack_base + OFF_RDI) = argc;
+    *reinterpret_cast<uint64_t*>(stack_base + OFF_RSI) = argvPtr;
+
+    // 3. Update PerCpu scratch area so sysret diagnostic check passes and
+    //    the correct user RSP is restored.
+    asm volatile("movq %0, %%gs:0x28" : : "r"((uint64_t)elfResult.entryPoint) : "memory");
+    asm volatile("movq %0, %%gs:0x30" : : "r"((uint64_t)0x202) : "memory");
+    asm volatile("movq %0, %%gs:0x08" : : "r"(newRsp) : "memory");
+
+    // 4. Switch CR3 to the new pagemap so user-space sees the new mappings.
+    asm volatile("mov %0, %%cr3" : : "r"(physPagemap) : "memory");
+
+    // Return 0.  The sysret path will pop the patched registers and jump to
+    // the new entry point.
+    return 0;
 }
 
 }  // namespace ker::syscall::process

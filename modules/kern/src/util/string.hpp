@@ -88,7 +88,98 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
                 }
                 case 'l': {
                     i++;
-                    if (format[i] == 'l') {
+                    if (format[i] == 'u') {
+                        // %lu — unsigned long (64-bit on x86_64)
+                        if (width_from_arg) {
+                            width = va_arg(args, int);
+                        }
+                        uint64_t n = va_arg(args, uint64_t);
+
+                        int len = 0;
+                        if (n == 0) {
+                            buf[len++] = '0';
+                        } else {
+                            std::array<char, 64> temp;
+                            int temp_len = 0;
+                            while (n > 0) {
+                                temp[temp_len++] = static_cast<char>('0' + (n % 10));
+                                n /= 10;
+                            }
+                            for (int k = 0; k < temp_len; k++) {
+                                buf[k] = temp[temp_len - 1 - k];
+                            }
+                            len = temp_len;
+                        }
+                        buf[len] = '\0';
+
+                        int pad_len = width - len;
+                        if (pad_len > 0 && j + pad_len < size) {
+                            for (int k = 0; k < pad_len; k++) {
+                                str[j++] = pad_char;
+                            }
+                        }
+
+                        strncpy(str + j, buf.data(), size - j);
+                        j += len;
+                    } else if (format[i] == 'x') {
+                        // %lx — unsigned long hex (64-bit on x86_64)
+                        if (width_from_arg) {
+                            width = va_arg(args, int);
+                        }
+                        uint64_t n = va_arg(args, uint64_t);
+                        int len = u64toh(n, std::span(buf.data(), buf.size()));
+
+                        int pad_len = width - len;
+                        if (pad_len > 0 && j + pad_len < size) {
+                            for (int k = 0; k < pad_len; k++) {
+                                str[j++] = pad_char;
+                            }
+                        }
+
+                        strncpy(str + j, buf.data(), size - j);
+                        j += len;
+                    } else if (format[i] == 'd') {
+                        // %ld — signed long (64-bit on x86_64)
+                        if (width_from_arg) {
+                            width = va_arg(args, int);
+                        }
+                        int64_t sn = va_arg(args, int64_t);
+                        bool negative = sn < 0;
+                        uint64_t n = negative ? static_cast<uint64_t>(-sn) : static_cast<uint64_t>(sn);
+
+                        int len = 0;
+                        if (n == 0) {
+                            buf[len++] = '0';
+                        } else {
+                            std::array<char, 64> temp;
+                            int temp_len = 0;
+                            while (n > 0) {
+                                temp[temp_len++] = static_cast<char>('0' + (n % 10));
+                                n /= 10;
+                            }
+                            for (int k = 0; k < temp_len; k++) {
+                                buf[k] = temp[temp_len - 1 - k];
+                            }
+                            len = temp_len;
+                        }
+                        if (negative) {
+                            // Shift right and prepend '-'
+                            for (int k = len; k > 0; k--) buf[k] = buf[k - 1];
+                            buf[0] = '-';
+                            len++;
+                        }
+                        buf[len] = '\0';
+
+                        int pad_len = width - len;
+                        if (pad_len > 0 && j + pad_len < size) {
+                            for (int k = 0; k < pad_len; k++) {
+                                str[j++] = pad_char;
+                            }
+                        }
+
+                        strncpy(str + j, buf.data(), size - j);
+                        j += len;
+                    } else if (format[i] == 'l') {
                         i++;
                         if (format[i] == 'u') {
                             if (width_from_arg) {

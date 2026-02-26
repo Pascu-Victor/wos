@@ -82,6 +82,57 @@ else
     echo "WARNING: busybox binary not found at $BUSYBOX_BINARY, skipping"
 fi
 
+# Copy dropbearmulti binary and create symlinks
+DROPBEAR_BINARY="toolchain/target1/bin/dropbearmulti"
+if [ -f "$DROPBEAR_BINARY" ]; then
+    mkdir -p "$INITRAMFS_DIR/bin"
+    mkdir -p "$INITRAMFS_DIR/etc/dropbear"
+    mkdir -p "$INITRAMFS_DIR/dev/pts"
+    cp "$DROPBEAR_BINARY" "$INITRAMFS_DIR/bin/dropbearmulti"
+    chmod +x "$INITRAMFS_DIR/bin/dropbearmulti"
+    echo "  initramfs: added /bin/dropbearmulti ($(du -h "$DROPBEAR_BINARY" | cut -f1))"
+
+    # Create symlinks for dropbear applets
+    DROPBEAR_APPLETS="dropbear dbclient dropbearkey scp"
+    for applet in $DROPBEAR_APPLETS; do
+        ln -sf dropbearmulti "$INITRAMFS_DIR/bin/$applet"
+        echo "  initramfs: symlinked /bin/$applet -> dropbearmulti"
+    done
+
+    # Create minimal /etc/passwd for SSH login (key-based auth only)
+    cat > "$INITRAMFS_DIR/etc/passwd" <<'PASSWD'
+root:x:0:0:root:/:/bin/sh
+PASSWD
+    echo "  initramfs: added /etc/passwd"
+
+    # Create minimal /etc/group
+    cat > "$INITRAMFS_DIR/etc/group" <<'GROUP'
+root:x:0:root
+GROUP
+    echo "  initramfs: added /etc/group"
+
+    # Install SSH authorized_keys for root (home is /)
+    # Try ed25519 first, then RSA
+    SSH_PUBKEY=""
+    for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
+        if [ -f "$keyfile" ]; then
+            SSH_PUBKEY="$keyfile"
+            break
+        fi
+    done
+    if [ -n "$SSH_PUBKEY" ]; then
+        mkdir -p "$INITRAMFS_DIR/.ssh"
+        chmod 700 "$INITRAMFS_DIR/.ssh"
+        cp "$SSH_PUBKEY" "$INITRAMFS_DIR/.ssh/authorized_keys"
+        chmod 600 "$INITRAMFS_DIR/.ssh/authorized_keys"
+        echo "  initramfs: added /.ssh/authorized_keys from $SSH_PUBKEY"
+    else
+        echo "WARNING: no SSH public key found, skipping authorized_keys"
+    fi
+else
+    echo "WARNING: dropbearmulti binary not found at $DROPBEAR_BINARY, skipping"
+fi
+
 # Create CPIO newc archive
 (cd "$INITRAMFS_DIR" && find . | cpio -o -H newc --quiet) > "$INITRAMFS_OUT"
 

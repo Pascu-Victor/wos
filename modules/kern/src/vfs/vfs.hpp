@@ -110,6 +110,12 @@ auto vfs_ftruncate(int fd, off_t length) -> int;
 // Pipe
 auto vfs_pipe(int pipefd[2]) -> int;
 
+// Sync
+auto vfs_fsync(int fd) -> int;
+
+// Hard link
+auto vfs_link(const char* oldpath, const char* newpath) -> int;
+
 // File control
 auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
 

@@ -41,6 +41,9 @@ enum class ops : uint64_t {
     epoll_create,      // 35
     epoll_ctl,         // 36
     epoll_pwait,       // 37
+    ioctl,             // 38
+    fsync,             // 39
+    link,              // 40
 };
 
 }  // namespace ker::abi::vfs

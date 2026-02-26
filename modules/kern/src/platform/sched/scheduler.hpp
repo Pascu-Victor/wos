@@ -52,6 +52,7 @@ auto get_current_task() -> task::Task*;
 void remove_current_task();                                       // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;               // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
+void signal_process_group(uint64_t pgid, int sig);                // Send signal to all tasks in a process group
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task);  // Reschedule a specific task on a specific CPU
 void wake_cpu(uint64_t cpu_no);                                   // Send wake IPI to a CPU (unconditional, for hlt wakeup)
 void insert_into_dead_list(task::Task* task);                     // Place a task into CPU 0's dead list for GC
@@ -72,6 +73,10 @@ struct RunQueueStats {
     uint64_t wait_queue_count;    // waitList.count
 };
 auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats;
+
+// Active task enumeration (for procfs)
+auto get_active_task_count() -> uint32_t;
+auto get_active_task_at(uint32_t index) -> task::Task*;
 
 // Return up to maxEntries dead task PIDs and their refcounts for diagnostics,
 // starting at `startIndex` into the dead list. Returns the number of entries written.

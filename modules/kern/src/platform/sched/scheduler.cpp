@@ -48,6 +48,27 @@ struct PidHashEntry {
 };
 static PidHashEntry pidTable[MAX_PIDS];  // BSS, zero-initialized
 
+// Active PID tracking for fast process-group iteration (avoids scanning 16M-entry hash table)
+static constexpr uint32_t MAX_ACTIVE_TASKS = 2048;
+static task::Task* activeTaskList[MAX_ACTIVE_TASKS];  // BSS, zero-initialized
+static uint32_t activeTaskCount = 0;
+
+static void activeListInsert(task::Task* t) {
+    if (activeTaskCount < MAX_ACTIVE_TASKS) {
+        activeTaskList[activeTaskCount++] = t;
+    }
+}
+
+static void activeListRemove(uint64_t pid) {
+    for (uint32_t i = 0; i < activeTaskCount; i++) {
+        if (activeTaskList[i] != nullptr && activeTaskList[i]->pid == pid) {
+            activeTaskList[i] = activeTaskList[--activeTaskCount];
+            activeTaskList[activeTaskCount] = nullptr;
+            return;
+        }
+    }
+}
+
 static inline uint32_t pidHash(uint64_t pid) {
     // Knuth multiplicative hash — spreads sequential PIDs well
     return (uint32_t)((pid * 11400714819323198485ULL) >> 40) & (MAX_PIDS - 1);
@@ -323,6 +344,7 @@ bool post_task_for_cpu(uint64_t cpuNo, task::Task* task) {
     // Register in PID hash table for O(1) lookups
     if (task->pid > 0) {
         pidTableInsert(task);
+        activeListInsert(task);
     }
 
     // Insert into target CPU's runnable heap with EEVDF initialization
@@ -852,19 +874,40 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     current_task->deferredTaskSwitch = false;
 
     // Race check: for blocking waits, verify target hasn't already exited
+    static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
     bool skip_wait_queue = false;
     if (!is_yield && current_task->waitingForPid != 0) {
-        auto* target = find_task_by_pid(current_task->waitingForPid);
-        if (target != nullptr && target->hasExited) {
-            skip_wait_queue = true;
-            current_task->context.regs.rax = target->pid;
-            if (current_task->waitStatusPhysAddr != 0) {
-                auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(current_task->waitStatusPhysAddr));
-                *status_ptr = target->exitStatus;
+        if (current_task->waitingForPid == WAIT_ANY_CHILD) {
+            // Wait-for-any-child: scan for an exited child of this task
+            uint32_t count = get_active_task_count();
+            for (uint32_t i = 0; i < count; i++) {
+                auto* child = get_active_task_at(i);
+                if (child != nullptr && child->parentPid == current_task->pid && child->hasExited && !child->waitedOn) {
+                    skip_wait_queue = true;
+                    current_task->context.regs.rax = child->pid;
+                    if (current_task->waitStatusPhysAddr != 0) {
+                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(current_task->waitStatusPhysAddr));
+                        *status_ptr = child->exitStatus;
+                    }
+                    current_task->waitingForPid = 0;
+                    child->waitedOn = true;
+                    break;
+                }
             }
-            current_task->waitingForPid = 0;
-            // Mark that parent has retrieved exit status (zombie can now be reaped)
-            target->waitedOn = true;
+        } else {
+            // Wait-for-specific-PID
+            auto* target = find_task_by_pid(current_task->waitingForPid);
+            if (target != nullptr && target->hasExited) {
+                skip_wait_queue = true;
+                current_task->context.regs.rax = target->pid;
+                if (current_task->waitStatusPhysAddr != 0) {
+                    auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(current_task->waitStatusPhysAddr));
+                    *status_ptr = target->exitStatus;
+                }
+                current_task->waitingForPid = 0;
+                // Mark that parent has retrieved exit status (zombie can now be reaped)
+                target->waitedOn = true;
+            }
         }
     }
 
@@ -1164,6 +1207,24 @@ auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {
     return nullptr;
 }
 
+auto get_active_task_count() -> uint32_t { return activeTaskCount; }
+
+auto get_active_task_at(uint32_t index) -> task::Task* {
+    if (index >= activeTaskCount) return nullptr;
+    return activeTaskList[index];
+}
+
+void signal_process_group(uint64_t pgid, int sig) {
+    if (pgid == 0 || sig <= 0 || sig > static_cast<int>(task::Task::MAX_SIGNALS)) return;
+    uint64_t mask = 1ULL << (sig - 1);
+    for (uint32_t i = 0; i < activeTaskCount; i++) {
+        auto* t = activeTaskList[i];
+        if (t != nullptr && t->pgid == pgid && !t->hasExited) {
+            t->sigPending |= mask;
+        }
+    }
+}
+
 // ============================================================================
 // Garbage collection
 // ============================================================================
@@ -1288,6 +1349,7 @@ void gc_expired_tasks() {
                     // Clear PID hash table entry
                     if (cur->pid > 0) {
                         pidTableRemove(cur->pid);
+                        activeListRemove(cur->pid);
                     }
 
                     // Free pagemap (DAEMON tasks use the kernel pagemap — must NOT free it)

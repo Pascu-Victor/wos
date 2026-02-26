@@ -88,4 +88,7 @@ void devfs_wki_remove_peer_resources(uint16_t node_id);
 // Returns nullptr if the path doesn't refer to a block device.
 auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice*;
 
+// Dispatch ioctl to the underlying character device
+auto devfs_ioctl(File* f, unsigned long cmd, unsigned long arg) -> int;
+
 }  // namespace ker::vfs::devfs

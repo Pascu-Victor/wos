@@ -22,7 +22,7 @@
         },
         {
             "label": "Build mlibc",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/mlibc-build && ninja -C ${workspaceFolder}/toolchain/mlibc-build install",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build install 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -36,12 +36,12 @@
             "isBackground": false,
             "group": "build",
             "presentation": {
-                "reveal": "always"
+                "reveal": "silent"
             }
         },
         {
             "label": "Build libcxx",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -55,12 +55,12 @@
             "isBackground": false,
             "group": "build",
             "presentation": {
-                "reveal": "always"
+                "reveal": "silent"
             }
         },
         {
             "label": "Build busybox",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/build_busybox.sh",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(${workspaceFolder}/scripts/build_busybox.sh 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -74,7 +74,26 @@
             "isBackground": false,
             "group": "build",
             "presentation": {
-                "reveal": "always"
+                "reveal": "silent"
+            }
+        },
+        {
+            "label": "Build dropbear",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(${workspaceFolder}/scripts/build_dropbear.sh 2>&1) || { echo \"$_out\"; false; }",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                }
+            },
+            "isBackground": false,
+            "group": "build",
+            "presentation": {
+                "reveal": "silent"
             }
         },
         {
@@ -142,6 +161,7 @@
                 "Build mlibc",
                 "Build libcxx",
                 "Build busybox",
+                "Build dropbear",
                 "CMake Build",
                 "Create Test Disk",
                 "Make Boot Image"

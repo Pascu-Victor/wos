@@ -15,6 +15,10 @@
         {
             "name": "netd",
             "path": "./build/modules/netd/netd"
+        },
+        {
+            "name": "dropbear",
+            "path": "./toolchain/dropbear-build/dropbearmulti"
         }
     ],
     "coredumpDirectory": "/home/womywomwoo/git/wos/coredumps",

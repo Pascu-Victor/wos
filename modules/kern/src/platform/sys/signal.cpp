@@ -108,10 +108,16 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     if (handler.handler == WOS_SIG_DFL) {
         // Default action depends on signal:
         // SIGCHLD, SIGURG, SIGWINCH, SIGCONT: ignore
+        // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
         // SIGKILL, SIGTERM, SIGINT, etc: terminate (TODO)
-        // For now, ignore all default signals to avoid crashes during bringup
         if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
             return;  // Ignore
+        }
+        // Job control stop signals: default action is to stop the process
+        if (signo == 20 || signo == 21 || signo == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
+            // Block the task so the scheduler won't run it until SIGCONT
+            task->voluntaryBlock = true;
+            return;
         }
         // Default terminate — for now, just ignore to be safe during development
         // TODO: implement default signal actions (terminate, core dump, stop)

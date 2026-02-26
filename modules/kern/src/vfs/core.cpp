@@ -31,6 +31,40 @@ constexpr size_t MAX_PATH_LEN = 512;
 constexpr int MAX_SYMLINK_DEPTH = 8;
 constexpr size_t MAX_COMPONENTS = 64;
 
+// Convert a possibly-relative path to an absolute path by prepending CWD.
+// If the path is already absolute, copies it as-is.
+// Returns 0 on success, negative on error.
+auto make_absolute(const char* path, char* out, size_t outsize) -> int {
+    if (path == nullptr || out == nullptr || outsize == 0) return -EINVAL;
+    size_t plen = std::strlen(path);
+    if (plen == 0) return -EINVAL;
+
+    if (path[0] == '/') {
+        if (plen + 1 > outsize) return -ENAMETOOLONG;
+        std::memcpy(out, path, plen + 1);
+        return 0;
+    }
+
+    // Relative path — prepend task CWD
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) return -ESRCH;
+
+    size_t cwdlen = std::strlen(task->cwd);
+    // Need: cwd + "/" + path + '\0'
+    bool need_sep = (cwdlen > 1);  // Root "/" doesn't need extra /
+    size_t total = cwdlen + (need_sep ? 1 : 0) + plen + 1;
+    if (total > outsize) return -ENAMETOOLONG;
+
+    std::memcpy(out, task->cwd, cwdlen);
+    if (need_sep) {
+        out[cwdlen] = '/';
+        std::memcpy(out + cwdlen + 1, path, plen + 1);
+    } else {
+        std::memcpy(out + cwdlen, path, plen + 1);
+    }
+    return 0;
+}
+
 // Canonicalize a path in place: resolve ".", "..", and collapse "//".
 // The path must be absolute (start with "/").
 // Returns 0 on success, -ENAMETOOLONG if the path is too long.
@@ -135,6 +169,59 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
             return 0;
         }
 
+        if (mount->fs_type == FSType::PROCFS) {
+            // Handle procfs symlinks (e.g., /proc/self -> /proc/<pid>)
+            size_t mount_len = 0;
+            while (mount->path[mount_len] != '\0') mount_len++;
+            const char* fs_path = resolved_buf;
+            if (mount_len == 1 && mount->path[0] == '/')
+                fs_path = resolved_buf + 1;
+            else if (resolved_buf[mount_len] == '/')
+                fs_path = resolved_buf + mount_len + 1;
+            else if (resolved_buf[mount_len] == '\0')
+                fs_path = "";
+            else
+                fs_path = resolved_buf + mount_len;
+
+            auto* f = ker::vfs::procfs::procfs_open_path(fs_path, 0, 0);
+            if (f == nullptr) return 0;
+            auto* pfd = static_cast<ker::vfs::procfs::ProcFileData*>(f->private_data);
+            bool is_symlink = (pfd != nullptr && (pfd->node.type == ker::vfs::procfs::ProcNodeType::SELF_LINK ||
+                                                  pfd->node.type == ker::vfs::procfs::ProcNodeType::EXE_LINK));
+            if (!is_symlink) {
+                ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
+                delete f;
+                return 0;
+            }
+            char linkbuf[MAX_PATH_LEN];
+            ssize_t link_len = ker::vfs::procfs::get_procfs_fops()->vfs_readlink(f, linkbuf, MAX_PATH_LEN);
+            ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
+            delete f;
+            if (link_len <= 0) return 0;
+            linkbuf[link_len] = '\0';
+            if (linkbuf[0] == '/') {
+                if (static_cast<size_t>(link_len) >= bufsize) return -1;
+                memcpy(resolved_buf, linkbuf, link_len + 1);
+            } else {
+                size_t last_slash = 0;
+                bool found_slash = false;
+                for (size_t i = 0; resolved_buf[i] != '\0'; ++i) {
+                    if (resolved_buf[i] == '/') {
+                        last_slash = i;
+                        found_slash = true;
+                    }
+                }
+                size_t prefix_len = found_slash ? last_slash + 1 : 0;
+                if (prefix_len + static_cast<size_t>(link_len) >= bufsize) return -1;
+                char new_path[MAX_PATH_LEN];
+                memcpy(new_path, resolved_buf, prefix_len);
+                memcpy(new_path + prefix_len, linkbuf, link_len);
+                new_path[prefix_len + link_len] = '\0';
+                memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
+            }
+            continue;  // re-resolve after substitution
+        }
+
         // Only tmpfs supports symlinks currently
         if (mount->fs_type != FSType::TMPFS) {
             return 0;
@@ -222,12 +309,18 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
 
     // Convert string_view to null-terminated string
-    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    char rawPath[MAX_PATH_LEN];  // NOLINT
     if (path.size() >= MAX_PATH_LEN) {
         return -ENAMETOOLONG;
     }
-    std::memcpy(pathBuffer, path.data(), path.size());
-    pathBuffer[path.size()] = '\0';
+    std::memcpy(rawPath, path.data(), path.size());
+    rawPath[path.size()] = '\0';
+
+    // Resolve relative paths to absolute using CWD
+    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    if (make_absolute(rawPath, pathBuffer, MAX_PATH_LEN) < 0) {
+        return -ENOENT;
+    }
 
     // Canonicalize path (resolve ".", "..", collapse "//")
     canonicalize_path(static_cast<char*>(pathBuffer), MAX_PATH_LEN);
@@ -333,7 +426,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     if (f == nullptr) {
         vfs_debug_log("vfs_open: failed to open file\n");
-        return -1;
+        return -ENOENT;
     }
 
     // Store the absolute VFS path for mount-overlay directory listing
@@ -737,8 +830,13 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -EINVAL;
     }
 
+    // Resolve relative linkpath to absolute
+    char absLinkpath[MAX_PATH_LEN];
+    if (make_absolute(linkpath, absLinkpath, MAX_PATH_LEN) < 0) return -ENOENT;
+    canonicalize_path(absLinkpath, MAX_PATH_LEN);
+
     // Find mount point for the linkpath
-    MountPoint* mount = find_mount_point(linkpath);
+    MountPoint* mount = find_mount_point(absLinkpath);
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -754,13 +852,13 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         mount_len++;
     }
 
-    const char* fs_path = linkpath;
+    const char* fs_path = absLinkpath;
     if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = linkpath + 1;
-    } else if (linkpath[mount_len] == '/') {
-        fs_path = linkpath + mount_len + 1;
+        fs_path = absLinkpath + 1;
+    } else if (absLinkpath[mount_len] == '/') {
+        fs_path = absLinkpath + mount_len + 1;
     } else {
-        fs_path = linkpath + mount_len;
+        fs_path = absLinkpath + mount_len;
     }
 
     // Split into parent path and link name
@@ -802,7 +900,12 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
-    MountPoint* mount = find_mount_point(path);
+    // Resolve relative path to absolute
+    char absPath[MAX_PATH_LEN];
+    if (make_absolute(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
+    canonicalize_path(absPath, MAX_PATH_LEN);
+
+    MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -811,13 +914,13 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         // Strip mount prefix for procfs readlink
         size_t ml = 0;
         while (mount->path[ml] != '\0') ml++;
-        const char* fsp = path;
+        const char* fsp = absPath;
         if (ml == 1 && mount->path[0] == '/')
-            fsp = path + 1;
-        else if (path[ml] == '/')
-            fsp = path + ml + 1;
+            fsp = absPath + 1;
+        else if (absPath[ml] == '/')
+            fsp = absPath + ml + 1;
         else
-            fsp = path + ml;
+            fsp = absPath + ml;
 
         auto* f = ker::vfs::procfs::procfs_open_path(fsp, 0, 0);
         if (f == nullptr) return -ENOENT;
@@ -837,13 +940,13 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         mount_len++;
     }
 
-    const char* fs_path = path;
+    const char* fs_path = absPath;
     if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = path + 1;
-    } else if (path[mount_len] == '/') {
-        fs_path = path + mount_len + 1;
+        fs_path = absPath + 1;
+    } else if (absPath[mount_len] == '/') {
+        fs_path = absPath + mount_len + 1;
     } else {
-        fs_path = path + mount_len;
+        fs_path = absPath + mount_len;
     }
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
@@ -870,7 +973,12 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return -EINVAL;
     }
 
-    MountPoint* mount = find_mount_point(path);
+    // Resolve relative path to absolute
+    char absPath[MAX_PATH_LEN];
+    if (make_absolute(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
+    canonicalize_path(absPath, MAX_PATH_LEN);
+
+    MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -885,13 +993,13 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         mount_len++;
     }
 
-    const char* fs_path = path;
+    const char* fs_path = absPath;
     if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = path + 1;
-    } else if (path[mount_len] == '/') {
-        fs_path = path + mount_len + 1;
+        fs_path = absPath + 1;
+    } else if (absPath[mount_len] == '/') {
+        fs_path = absPath + mount_len + 1;
     } else {
-        fs_path = path + mount_len;
+        fs_path = absPath + mount_len;
     }
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, true);
@@ -903,14 +1011,11 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
         return -EINVAL;
     }
 
-    // Canonicalize path
+    // Resolve relative paths and canonicalize
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    size_t path_len = 0;
-    while (path[path_len] != '\0' && path_len < MAX_PATH_LEN - 1) {
-        pathBuffer[path_len] = path[path_len];
-        path_len++;
+    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) {
+        return -ENOENT;
     }
-    pathBuffer[path_len] = '\0';
 
     canonicalize_path(pathBuffer, MAX_PATH_LEN);
 
@@ -1015,10 +1120,18 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
+            auto* pfd = static_cast<ker::vfs::procfs::ProcFileData*>(f->private_data);
+            // Set uid/gid to the actual process owner for PID-based entries
+            if (pfd != nullptr && pfd->node.pid != 0) {
+                auto* ptask = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+                if (ptask != nullptr) {
+                    statbuf->st_uid = ptask->uid;
+                    statbuf->st_gid = ptask->gid;
+                }
+            }
             if (f->is_directory) {
                 statbuf->st_mode = S_IFDIR | 0555;
             } else {
-                auto* pfd = static_cast<ker::vfs::procfs::ProcFileData*>(f->private_data);
                 if (pfd != nullptr && (pfd->node.type == ker::vfs::procfs::ProcNodeType::EXE_LINK ||
                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::SELF_LINK)) {
                     statbuf->st_mode = S_IFLNK | 0777;
@@ -1026,9 +1139,9 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                     statbuf->st_mode = S_IFREG | 0444;
                 }
             }
-            // Clean up temporary file
+            // Clean up temporary file (allocated with new in procfs_open_path)
             ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
-            ker::mod::mm::dyn::kmalloc::free(f);
+            delete f;
             return 0;
         }
         default:
@@ -1294,11 +1407,9 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
 auto vfs_unlink(const char* path) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Canonicalize
+    // Resolve relative path and canonicalize
     char pathBuf[MAX_PATH_LEN];
-    size_t pl = std::strlen(path);
-    if (pl + 1 > MAX_PATH_LEN) return -ENAMETOOLONG;
-    std::memcpy(pathBuf, path, pl + 1);
+    if (make_absolute(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
     canonicalize_path(pathBuf, MAX_PATH_LEN);
 
     MountPoint* mount = find_mount_point(pathBuf);
@@ -1381,10 +1492,9 @@ auto vfs_unlink(const char* path) -> int {
 auto vfs_rmdir(const char* path) -> int {
     if (path == nullptr) return -EINVAL;
 
+    // Resolve relative path and canonicalize
     char pathBuf[MAX_PATH_LEN];
-    size_t pl = std::strlen(path);
-    if (pl + 1 > MAX_PATH_LEN) return -ENAMETOOLONG;
-    std::memcpy(pathBuf, path, pl + 1);
+    if (make_absolute(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
     canonicalize_path(pathBuf, MAX_PATH_LEN);
 
     MountPoint* mount = find_mount_point(pathBuf);
@@ -1461,12 +1571,10 @@ auto vfs_rmdir(const char* path) -> int {
 auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) return -EINVAL;
 
-    // Both paths must be on tmpfs for now
+    // Resolve relative paths and canonicalize
     char oldBuf[MAX_PATH_LEN], newBuf[MAX_PATH_LEN];
-    size_t ol = std::strlen(oldpath), nl = std::strlen(newpath);
-    if (ol + 1 > MAX_PATH_LEN || nl + 1 > MAX_PATH_LEN) return -ENAMETOOLONG;
-    std::memcpy(oldBuf, oldpath, ol + 1);
-    std::memcpy(newBuf, newpath, nl + 1);
+    if (make_absolute(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    if (make_absolute(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
     canonicalize_path(oldBuf, MAX_PATH_LEN);
     canonicalize_path(newBuf, MAX_PATH_LEN);
 
@@ -1589,11 +1697,10 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 auto vfs_chmod(const char* path, int mode) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Resolve mount point
-    char pathBuffer[512];
-    size_t len = strlen(path);
-    if (len >= sizeof(pathBuffer)) return -ENAMETOOLONG;
-    memcpy(pathBuffer, path, len + 1);
+    // Resolve relative path and canonicalize
+    char pathBuffer[MAX_PATH_LEN];
+    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    canonicalize_path(pathBuffer, MAX_PATH_LEN);
 
     auto* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) return -ENOENT;
@@ -1655,10 +1762,10 @@ auto vfs_fchmod(int fd, int mode) -> int {
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
     if (path == nullptr) return -EINVAL;
 
-    char pathBuffer[512];
-    size_t len = strlen(path);
-    if (len >= sizeof(pathBuffer)) return -ENAMETOOLONG;
-    memcpy(pathBuffer, path, len + 1);
+    // Resolve relative path and canonicalize
+    char pathBuffer[MAX_PATH_LEN];
+    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    canonicalize_path(pathBuffer, MAX_PATH_LEN);
 
     auto* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) return -ENOENT;
@@ -1759,6 +1866,23 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
         case 4:  // F_SETFL
             f->open_flags = static_cast<int>(arg);
             return 0;
+        case 1030: {  // F_DUPFD_CLOEXEC — dup to fd >= arg, set close-on-exec
+            f->refcount++;
+            for (unsigned i = static_cast<unsigned>(arg); i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
+                if (task->fds[i] == nullptr) {
+                    task->fds[i] = f;
+                    // Note: fd_flags is stored per-File, not per-fd-slot.
+                    // Only set CLOEXEC if refcount==1 (no other fds share this File).
+                    // TODO: implement proper per-fd flags separate from File object.
+                    if (f->refcount <= 1) {
+                        f->fd_flags = 1;  // FD_CLOEXEC
+                    }
+                    return static_cast<int>(i);
+                }
+            }
+            f->refcount--;
+            return -EMFILE;
+        }
         default:
             return -EINVAL;
     }
@@ -2178,14 +2302,11 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File* {
         return nullptr;
     }
 
-    // Canonicalize path
+    // Resolve relative path and canonicalize
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    size_t path_len = 0;
-    while (path[path_len] != '\0' && path_len < MAX_PATH_LEN - 1) {
-        pathBuffer[path_len] = path[path_len];
-        path_len++;
+    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) {
+        return nullptr;
     }
-    pathBuffer[path_len] = '\0';
 
     canonicalize_path(static_cast<char*>(pathBuffer), MAX_PATH_LEN);
 
@@ -2340,6 +2461,113 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
 
     ker::mod::mm::dyn::kmalloc::free(buffer);
     return total_sent;
+}
+
+auto vfs_fsync(int fd) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) return -ESRCH;
+    auto* file = vfs_get_file(task, fd);
+    if (file == nullptr) return -EBADF;
+
+    switch (file->fs_type) {
+        case FSType::FAT32:
+            return ker::vfs::fat32::fat32_fsync(file);
+        case FSType::TMPFS:
+        case FSType::DEVFS:
+        case FSType::PROCFS:
+            return 0;  // No-op for in-memory filesystems
+        default:
+            return 0;
+    }
+}
+
+auto vfs_link(const char* oldpath, const char* newpath) -> int {
+    if (oldpath == nullptr || newpath == nullptr) return -EINVAL;
+
+    // Resolve relative paths and canonicalize
+    char oldBuf[MAX_PATH_LEN], newBuf[MAX_PATH_LEN];
+    if (make_absolute(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    if (make_absolute(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    canonicalize_path(oldBuf, MAX_PATH_LEN);
+    canonicalize_path(newBuf, MAX_PATH_LEN);
+
+    MountPoint* oldMount = find_mount_point(oldBuf);
+    MountPoint* newMount = find_mount_point(newBuf);
+    if (!oldMount || !newMount) return -ENOENT;
+
+    // Cross-filesystem link is not allowed
+    if (oldMount != newMount) return -EXDEV;
+
+    // FAT32 does not support hard links
+    if (oldMount->fs_type == FSType::FAT32) return -EPERM;
+
+    if (oldMount->fs_type != FSType::TMPFS) return -ENOSYS;
+
+    // --- tmpfs hard link (data-copy) ---
+    auto strip_mount = [](const char* buf, MountPoint* m) -> const char* {
+        size_t ml = std::strlen(m->path);
+        if (ml == 1 && m->path[0] == '/') return buf + 1;
+        if (buf[ml] == '/') return buf + ml + 1;
+        return buf + ml;
+    };
+
+    const char* oldFs = strip_mount(oldBuf, oldMount);
+    const char* newFs = strip_mount(newBuf, newMount);
+
+    // Look up the source node
+    auto* srcNode = ker::vfs::tmpfs::tmpfs_walk_path(oldFs, false);
+    if (srcNode == nullptr) return -ENOENT;
+
+    // Cannot hard link directories
+    if (srcNode->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -EPERM;
+
+    // Walk to new parent, extract new name
+    const char* newLastSlash = nullptr;
+    for (const char* p = newFs; *p; ++p) {
+        if (*p == '/') newLastSlash = p;
+    }
+
+    ker::vfs::tmpfs::TmpNode* newParent = nullptr;
+    const char* newName = nullptr;
+
+    if (newLastSlash == nullptr) {
+        newParent = ker::vfs::tmpfs::get_root_node();
+        newName = newFs;
+    } else {
+        char parentPath[MAX_PATH_LEN];
+        auto plen = static_cast<size_t>(newLastSlash - newFs);
+        if (plen >= MAX_PATH_LEN) return -ENAMETOOLONG;
+        std::memcpy(parentPath, newFs, plen);
+        parentPath[plen] = '\0';
+        newParent = ker::vfs::tmpfs::tmpfs_walk_path(parentPath, false);
+        newName = newLastSlash + 1;
+    }
+
+    if (newParent == nullptr || newName == nullptr || *newName == '\0') return -ENOENT;
+    if (newParent->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -ENOTDIR;
+
+    // Destination must not already exist
+    if (ker::vfs::tmpfs::tmpfs_lookup(newParent, newName) != nullptr) return -EEXIST;
+
+    // Create the new node as a copy of the source
+    if (srcNode->type == ker::vfs::tmpfs::TmpNodeType::SYMLINK) {
+        // Copy symlink
+        ker::vfs::tmpfs::tmpfs_create_symlink(newParent, newName, srcNode->symlink_target);
+    } else {
+        // Regular file — copy data
+        auto* dst = ker::vfs::tmpfs::tmpfs_create_file(newParent, newName, srcNode->mode);
+        if (dst == nullptr) return -ENOMEM;
+        if (srcNode->data != nullptr && srcNode->size > 0) {
+            dst->data = new char[srcNode->size];
+            std::memcpy(dst->data, srcNode->data, srcNode->size);
+            dst->size = srcNode->size;
+            dst->capacity = srcNode->size;
+        }
+        dst->uid = srcNode->uid;
+        dst->gid = srcNode->gid;
+    }
+
+    return 0;
 }
 
 }  // namespace ker::vfs

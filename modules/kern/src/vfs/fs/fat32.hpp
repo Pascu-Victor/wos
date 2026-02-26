@@ -139,6 +139,9 @@ auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int;
 auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int;
 auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int;
 
+// FAT32 fsync - flush FAT table and block device
+auto fat32_fsync(File* f) -> int;
+
 // Get FAT32 FileOperations structure
 auto get_fat32_fops() -> FileOperations*;
 

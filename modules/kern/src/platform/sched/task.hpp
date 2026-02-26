@@ -99,6 +99,13 @@ struct Task {
     uint32_t sgid = 0;     // Saved set-group-ID
     uint32_t umask = 022;  // File creation mask (default: rw-r--r-- for files)
 
+    // Session and process group IDs (for setsid/setpgid/POSIX job control)
+    uint64_t session_id = 0;  // Session ID (0 = inherit from parent, set by setsid)
+    uint64_t pgid = 0;        // Process group ID (0 = same as pid, set by setpgid)
+
+    // Controlling terminal: index into PTY pool, or -1 if none
+    int controlling_tty = -1;
+
     // Exit status of this process (set when process exits, used by waitpid)
     int exitStatus;
     bool hasExited;

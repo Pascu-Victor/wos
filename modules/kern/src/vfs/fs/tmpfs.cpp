@@ -439,11 +439,36 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
         return -1;
     }
 
-    if (index >= n->children_count) {
+    // Indices 0 and 1 are synthetic "." and ".." entries
+    if (index == 0) {
+        entry->d_ino = reinterpret_cast<uint64_t>(n);
+        entry->d_off = 1;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '\0';
+        return 0;
+    }
+    if (index == 1) {
+        TmpNode* parent = (n->parent != nullptr) ? n->parent : n;
+        entry->d_ino = reinterpret_cast<uint64_t>(parent);
+        entry->d_off = 2;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '.';
+        entry->d_name[2] = '\0';
+        return 0;
+    }
+
+    // Real children start at index 2
+    size_t child_index = index - 2;
+
+    if (child_index >= n->children_count) {
         return -1;
     }
 
-    TmpNode* child = n->children[index];
+    TmpNode* child = n->children[child_index];
     if (child == nullptr) {
         return -1;
     }

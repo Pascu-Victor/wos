@@ -18,11 +18,15 @@ Note: sudo is used internally only for privileged operations (network setup).
 """
 
 import argparse
+import base64
 import json
 import os
+import shutil
 import signal
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -251,6 +255,222 @@ def reattach_libvirt_vms(bridge: str):
 
 
 # ---------------------------------------------------------------------------
+# SSH host key management — persistent per-node dropbear keys
+# ---------------------------------------------------------------------------
+
+CLUSTER_DATA_DIR = "cluster-data"
+SSH_KEYS_DIR = os.path.join(CLUSTER_DATA_DIR, "ssh-keys")
+
+
+def _parse_der_length(data: bytes, offset: int) -> tuple:
+    """Parse a DER length field. Returns (length, new_offset)."""
+    b = data[offset]
+    offset += 1
+    if b < 0x80:
+        return b, offset
+    num_bytes = b & 0x7F
+    length = int.from_bytes(data[offset : offset + num_bytes], "big")
+    return length, offset + num_bytes
+
+
+def _parse_der_integer(data: bytes, offset: int) -> tuple:
+    """Parse a DER-encoded INTEGER. Returns (value, new_offset)."""
+    if data[offset] != 0x02:
+        raise ValueError(f"Expected INTEGER tag 0x02, got 0x{data[offset]:02x}")
+    offset += 1
+    length, offset = _parse_der_length(data, offset)
+    value = int.from_bytes(data[offset : offset + length], "big")
+    return value, offset + length
+
+
+def _mpint_to_bytes(n: int) -> bytes:
+    """Encode an integer as SSH mpint payload (without the 4-byte length)."""
+    if n == 0:
+        return b""
+    byte_len = (n.bit_length() + 7) // 8
+    raw = n.to_bytes(byte_len, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return raw
+
+
+def _ssh_string(data: bytes) -> bytes:
+    """Encode bytes as an SSH string (4-byte BE length + data)."""
+    return struct.pack(">I", len(data)) + data
+
+
+def _convert_pem_to_dropbear(pem_path: str, dropbear_path: str):
+    """Convert a PKCS#1 PEM RSA private key to dropbear's native format.
+
+    Parses the DER-encoded RSA key components (n, e, d, p, q) and writes
+    them in the binary format that dropbear's buf_get_priv_key() expects:
+        string "ssh-rsa" | mpint e | mpint n | mpint d | mpint p | mpint q
+    """
+    with open(pem_path) as f:
+        pem = f.read()
+    lines = pem.strip().split("\n")
+    der_b64 = "".join(l for l in lines if not l.startswith("-----"))
+    der = base64.b64decode(der_b64)
+
+    # Parse PKCS#1 RSAPrivateKey SEQUENCE
+    offset = 0
+    if der[offset] != 0x30:
+        raise ValueError("Expected SEQUENCE tag")
+    offset += 1
+    _, offset = _parse_der_length(der, offset)
+
+    _version, offset = _parse_der_integer(der, offset)  # version (0)
+    n, offset = _parse_der_integer(der, offset)
+    e, offset = _parse_der_integer(der, offset)
+    d, offset = _parse_der_integer(der, offset)
+    p, offset = _parse_der_integer(der, offset)
+    q, offset = _parse_der_integer(der, offset)
+    # dp, dq, qinv not needed for dropbear format
+
+    # Build dropbear RSA private key blob
+    buf = b""
+    buf += _ssh_string(b"ssh-rsa")
+    buf += _ssh_string(_mpint_to_bytes(e))
+    buf += _ssh_string(_mpint_to_bytes(n))
+    buf += _ssh_string(_mpint_to_bytes(d))
+    buf += _ssh_string(_mpint_to_bytes(p))
+    buf += _ssh_string(_mpint_to_bytes(q))
+
+    fd = os.open(dropbear_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, buf)
+    finally:
+        os.close(fd)
+
+
+def ensure_ssh_host_keys(node_ids: list):
+    """Generate persistent dropbear RSA host keys for each cluster node.
+
+    Keys are generated once with ssh-keygen and converted to dropbear's
+    native format.  They persist in cluster-data/ssh-keys/vm{N}/ across
+    cluster rebuilds so each node keeps a stable host identity.
+    """
+    os.makedirs(SSH_KEYS_DIR, exist_ok=True)
+    has_dropbearconvert = shutil.which("dropbearconvert") is not None
+
+    for node_id in node_ids:
+        key_dir = os.path.join(SSH_KEYS_DIR, f"vm{node_id}")
+        os.makedirs(key_dir, exist_ok=True)
+
+        dropbear_key = os.path.join(key_dir, "dropbear_rsa_host_key")
+
+        if os.path.exists(dropbear_key):
+            print(f"  [VM{node_id}] SSH host key: {dropbear_key} (existing)")
+            continue
+
+        # Generate OpenSSH RSA key pair (PEM / PKCS#1 format)
+        openssh_key = os.path.join(key_dir, "ssh_host_rsa_key")
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-t",
+                "rsa",
+                "-b",
+                "2048",
+                "-f",
+                openssh_key,
+                "-N",
+                "",
+                "-m",
+                "PEM",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        if has_dropbearconvert:
+            subprocess.run(
+                ["dropbearconvert", "openssh", "dropbear", openssh_key, dropbear_key],
+                check=True,
+                capture_output=True,
+            )
+            print(
+                f"  [VM{node_id}] Generated SSH host key (ssh-keygen + dropbearconvert)"
+            )
+        else:
+            _convert_pem_to_dropbear(openssh_key, dropbear_key)
+            print(f"  [VM{node_id}] Generated SSH host key (ssh-keygen + PEM→dropbear)")
+
+
+def inject_host_key_into_overlay(overlay_path: str, dropbear_key_path: str) -> bool:
+    """Inject a pre-generated dropbear host key into an overlay's initramfs.
+
+    Extracts the base initramfs CPIO from build/initramfs.cpio, adds the
+    host key at /etc/dropbear/dropbear_rsa_host_key, re-packs the CPIO,
+    and writes it into the overlay's boot partition via guestfish.
+    """
+    base_initramfs = os.path.abspath("build/initramfs.cpio")
+    if not os.path.exists(base_initramfs):
+        print(f"  WARNING: {base_initramfs} not found, skipping host key injection")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extract_dir = os.path.join(tmpdir, "rootfs")
+        os.makedirs(extract_dir)
+
+        # Extract base initramfs
+        with open(base_initramfs, "rb") as f:
+            result = subprocess.run(
+                ["cpio", "-idm", "--quiet"],
+                cwd=extract_dir,
+                stdin=f,
+                capture_output=True,
+                text=True,
+            )
+        if result.returncode != 0:
+            print(f"  WARNING: cpio extract failed: {result.stderr}")
+            return False
+
+        # Inject host key
+        dropbear_dir = os.path.join(extract_dir, "etc", "dropbear")
+        os.makedirs(dropbear_dir, exist_ok=True)
+        shutil.copy2(
+            dropbear_key_path,
+            os.path.join(dropbear_dir, "dropbear_rsa_host_key"),
+        )
+        os.chmod(os.path.join(dropbear_dir, "dropbear_rsa_host_key"), 0o600)
+
+        # Re-create CPIO archive
+        new_initramfs = os.path.join(tmpdir, "initramfs.cpio")
+        find_result = subprocess.run(
+            ["find", "."],
+            cwd=extract_dir,
+            capture_output=True,
+        )
+        with open(new_initramfs, "wb") as f:
+            result = subprocess.run(
+                ["cpio", "-o", "-H", "newc", "--quiet"],
+                cwd=extract_dir,
+                input=find_result.stdout,
+                stdout=f,
+                stderr=subprocess.PIPE,
+            )
+        if result.returncode != 0:
+            print(f"  WARNING: cpio create failed: {result.stderr}")
+            return False
+
+        # Upload into overlay's boot partition via guestfish
+        abs_overlay = os.path.abspath(overlay_path)
+        gf_cmds = f"run\nmount /dev/sda1 /\nupload {new_initramfs} /boot/initramfs.cpio\numount /\n"
+        result = subprocess.run(
+            ["guestfish", "--rw", "-a", abs_overlay],
+            input=gf_cmds,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"  WARNING: guestfish failed: {result.stderr}")
+            return False
+
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
@@ -366,6 +586,17 @@ def setup(config: dict):
                 print(f"  Created ivshmem: {fpath} ({size_str})")
 
         print()
+
+    # Generate persistent SSH host keys for all unique nodes
+    all_node_ids = set()
+    for zone_cfg in zones:
+        num_nodes = zone_cfg.get("nodes", 2)
+        for nid in range(num_nodes):
+            all_node_ids.add(nid)
+
+    print("--- SSH Host Keys ---")
+    ensure_ssh_host_keys(sorted(all_node_ids))
+    print()
 
     print("=== Cluster topology ready ===")
 
@@ -655,6 +886,17 @@ def launch(config: dict):
 
         print(f"  [VM{node_id}] zones={zone_names} debug={is_debug}")
         print(f"    cmd: {' '.join(args)}")
+
+        # Inject pre-generated SSH host key into the boot overlay's initramfs
+        overlay0 = os.path.join("cluster-overlays", f"disk-vm{node_id}.qcow2")
+        dropbear_key = os.path.join(
+            SSH_KEYS_DIR, f"vm{node_id}", "dropbear_rsa_host_key"
+        )
+        if os.path.exists(dropbear_key) and os.path.exists(overlay0):
+            if inject_host_key_into_overlay(overlay0, dropbear_key):
+                print(f"    Injected SSH host key into overlay")
+            else:
+                print(f"    WARNING: Failed to inject SSH host key")
 
         proc = subprocess.Popen(args)
         pids.append(proc)

@@ -918,7 +918,33 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                 break;
 
             case PT_NOTE:
-                mod::dbg::log("WARN: PT_NOTE skipped FIXME!");
+                // Note segments contain auxiliary info (build-id, ABI tags, etc.)
+                // Map them read-only so they are accessible at runtime.
+                {
+                    if (currentHeader->p_memsz > 0 && currentHeader->p_vaddr != 0) {
+#ifdef ELF_DEBUG
+                        mod::dbg::log("Loading PT_NOTE segment: vaddr=0x%x, filesz=0x%x, memsz=0x%x, offset=0x%x", currentHeader->p_vaddr,
+                                      currentHeader->p_filesz, currentHeader->p_memsz, currentHeader->p_offset);
+#endif
+                        uint64_t segEnd = currentHeader->p_vaddr + currentHeader->p_memsz;
+                        uint64_t startPageAddr = currentHeader->p_vaddr & ~(mod::mm::virt::PAGE_SIZE - 1);
+                        uint64_t endPageAddr = (segEnd + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
+                        size_t num_pages = (endPageAddr - startPageAddr) / mod::mm::virt::PAGE_SIZE;
+
+                        for (uint64_t j = 0; j < num_pages; j++) {
+                            loadSegment(elfFile.base, pagemap, currentHeader, j, elfFile.loadBase);
+                        }
+
+                        // Mark note pages read-only + NX (notes are data, never executed)
+                        for (uint64_t va = startPageAddr + elfFile.loadBase; va < endPageAddr + elfFile.loadBase;
+                             va += mod::mm::virt::PAGE_SIZE) {
+                            if (mod::mm::virt::isPageMapped(pagemap, va)) {
+                                mod::mm::virt::unifyPageFlags(pagemap, va,
+                                                              mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
+                            }
+                        }
+                    }
+                }
                 break;
 
             case PT_NULL:

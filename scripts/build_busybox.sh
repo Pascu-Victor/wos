@@ -71,6 +71,18 @@ if [ -f "$BB_SRC/configs/wos_defconfig" ]; then
         oldconfig
 fi
 
+# Force relink if any sysroot library is newer than the binary
+if [ -f "$B/busybox-build/busybox" ]; then
+    for lib in "$TARGET_SYSROOT"/lib/libc.a "$TARGET_SYSROOT"/lib/libc++.a \
+               "$TARGET_SYSROOT"/lib/libc++abi.a "$TARGET_SYSROOT"/lib/libm.a; do
+        if [ -f "$lib" ] && [ "$lib" -nt "$B/busybox-build/busybox" ]; then
+            echo "Sysroot library $(basename "$lib") changed — forcing relink"
+            rm -f "$B/busybox-build/busybox"
+            break
+        fi
+    done
+fi
+
 # Build busybox
 make -C "$B/busybox-build" -j"$(nproc)" \
     CC="$BB_CC" \

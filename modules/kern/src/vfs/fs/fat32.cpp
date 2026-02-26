@@ -1072,6 +1072,19 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
     return 0;
 }
 
+// Sync file data to disk
+auto fat32_fsync(File* f) -> int {
+    if (f == nullptr || f->private_data == nullptr) return -EINVAL;
+    auto* node = static_cast<FAT32Node*>(f->private_data);
+    if (node->context == nullptr) return -EINVAL;
+
+    int result = flush_fat_table(node->context);
+    if (result != 0) return result;
+
+    result = ker::dev::block_flush(node->context->device);
+    return result;
+}
+
 // Update file's directory entry on disk
 auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     if (node == nullptr || node->context == nullptr || node->context->device == nullptr) {
@@ -1347,6 +1360,30 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
 
     FAT32MountContext* ctx = node->context;
 
+    // Synthesize "." and ".." entries at indices 0 and 1
+    if (index == 0) {
+        entry->d_ino = node->start_cluster;
+        entry->d_off = 1;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '\0';
+        return 0;
+    }
+    if (index == 1) {
+        entry->d_ino = 0;  // Parent cluster not tracked in FAT32Node
+        entry->d_off = 2;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_DIR;
+        entry->d_name[0] = '.';
+        entry->d_name[1] = '.';
+        entry->d_name[2] = '\0';
+        return 0;
+    }
+
+    // Real entries start at index 2
+    size_t real_index = index - 2;
+
     // Lock the mount context for the duration of the readdir
     ctx->lock.lock();
 
@@ -1394,13 +1431,13 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
                 continue;
             }
 
-            // Skip . and .. entries
+            // Skip . and .. entries from FAT32 (we synthesize our own)
             if (dir_entry->name[0] == '.' && (dir_entry->name[1] == ' ' || dir_entry->name[1] == '.')) {
                 continue;
             }
 
-            // Check if this is the entry we're looking for
-            if (entries_seen == index) {
+            // Check if this is the entry we're looking for (offset by 2 for synthetic . and ..)
+            if (entries_seen == real_index) {
                 // Fill in the dirent structure
                 entry->d_ino = ((uint32_t)dir_entry->cluster_high << 16) | dir_entry->cluster_low;
                 entry->d_off = index + 1;

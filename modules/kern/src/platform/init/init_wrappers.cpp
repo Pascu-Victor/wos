@@ -7,7 +7,10 @@
 #include <dev/device.hpp>
 #include <dev/e1000e/e1000e.hpp>
 #include <dev/ivshmem/ivshmem_net.hpp>
+#include <dev/null_device.hpp>
 #include <dev/pci.hpp>
+#include <dev/pty.hpp>
+#include <dev/random_device.hpp>
 #include <dev/usb/cdc_ether.hpp>
 #include <dev/usb/xhci.hpp>
 #include <dev/virtio/virtio_net.hpp>
@@ -107,6 +110,12 @@ void dev_init() { dev::dev_init(); }
 void pci_enumerate() { dev::pci::pci_enumerate_all(); }
 
 void console_init() { dev::console::console_init(); }
+
+void null_device_init() { dev::null_device::null_device_init(); }
+
+void random_device_init() { dev::random_device::random_device_init(); }
+
+void pty_init() { dev::pty::pty_init(); }
 
 void ahci_init() { dev::ahci::ahci_controller_init(); }
 
