@@ -498,6 +498,7 @@ static_assert(sizeof(DevAttachAckNetPayload) == 28, "DevAttachAckNetPayload must
 // RDMA flags for DevAttachAckPayload
 constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
 constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;       // VFS RDMA available; blk_zone_id carries server write-recv rkey
+constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;      // bulk RDMA transfer supported (large sequential I/O)
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload — 8 bytes
@@ -531,6 +532,8 @@ struct DevOpRespPayload {
 constexpr uint16_t OP_BLOCK_READ = 0x0100;
 constexpr uint16_t OP_BLOCK_WRITE = 0x0101;
 constexpr uint16_t OP_BLOCK_FLUSH = 0x0102;
+constexpr uint16_t OP_BLOCK_BULK_READ = 0x0104;   // Streaming bulk transfer: server RDMA-writes entire range to consumer buffer
+constexpr uint16_t OP_BLOCK_BULK_WRITE = 0x0105;  // Streaming bulk transfer: server RDMA-reads entire range from consumer buffer
 
 constexpr uint16_t OP_CHAR_OPEN = 0x0200;
 constexpr uint16_t OP_CHAR_CLOSE = 0x0201;
@@ -566,6 +569,8 @@ constexpr uint16_t OP_VFS_WRITE_RDMA =
     0x0411;  // RDMA write: consumer rdma_write to server buf first, req={fd:i32,off:i64,len:u32}(16B) resp={bytes:u32}(4B)
 constexpr uint16_t OP_VFS_READDIR_BATCH =
     0x0412;  // Batch readdir: req={fd:i32,start:u32,max:u32}(12B) resp={count:u32,entries:DirEntry[count]}
+constexpr uint16_t OP_VFS_READ_BULK =
+    0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
 
 // -----------------------------------------------------------------------------
 // DEV_IRQ_FWD Payload — 8 bytes

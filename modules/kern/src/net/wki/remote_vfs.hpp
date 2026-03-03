@@ -22,6 +22,11 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 // Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
 
+// Bulk RDMA transfer buffer — used for large sequential reads to reduce round-trips.
+// Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
+// larger buffer instead of looping in 64 KB chunks.
+constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
+
 // -----------------------------------------------------------------------------
 // VfsExport (server side) — explicitly registered export paths
 // -----------------------------------------------------------------------------
@@ -81,6 +86,14 @@ struct ProxyVfsState {
     uint8_t* rdma_bounce_buf = nullptr;   // 64 KB bounce buffer for reads and write staging
     uint32_t rdma_server_write_rkey = 0;  // server's receive region rkey (consumer writes here for writes)
 
+    // Bulk RDMA I/O — larger registered buffer for sequential reads > 64 KB.
+    // Reduces round-trips from N (64 KB chunks) to 1 (up to 2 MB).
+    bool bulk_rdma_capable = false;
+    uint32_t rdma_bulk_rkey = 0;       // our bulk buffer's rkey (server writes large file data here)
+    uint8_t* rdma_bulk_buf = nullptr;  // 2 MB bulk buffer for large reads
+    uint32_t rdma_bulk_size = 0;       // actual allocated size
+    int32_t bulk_owner_fd = -1;        // remote_fd of file that last prefetched into bulk buffer
+
     ker::mod::sys::Spinlock lock;
 };
 
@@ -113,6 +126,12 @@ struct RemoteFileContext {
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;
     WriteBehindBuffer* write_buf = nullptr;
+
+    // Bulk prefetch cache state — tracks which region of the shared
+    // proxy->rdma_bulk_buf belongs to this file.  Valid only when
+    // proxy->bulk_owner_fd == remote_fd.
+    int64_t bulk_cached_offset = -1;
+    uint32_t bulk_cached_len = 0;
 };
 
 // -----------------------------------------------------------------------------

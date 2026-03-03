@@ -350,6 +350,16 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.rdma_flags = DEV_ATTACH_RDMA_BLK_RING;
         ack.blk_zone_id = blk_zone_id;
 
+        // Advertise streaming bulk RDMA transfer support when the peer has an
+        // RDMA-capable transport (ivshmem or RoCE).  The consumer will allocate
+        // and register a staging buffer for direct large-range transfers.
+        {
+            WkiPeer* peer = wki_peer_find(hdr->src_node);
+            if (peer != nullptr && peer->rdma_transport != nullptr) {
+                ack.rdma_flags |= DEV_ATTACH_RDMA_BULK;
+            }
+        }
+
         ker::mod::dbg::log("[WKI] Dev attach: node=0x%04x res_id=%u ch=%u rdma=deferred zone=0x%08x", hdr->src_node, req->resource_id,
                            ch->channel_id, blk_zone_id);
 
@@ -389,14 +399,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // RDMA-backed VFS writes: pre-register a server-side receive buffer so the
         // consumer can rdma_write file data here, avoiding embedding data in messages.
         // rdma_register_region is a local-only operation — safe to call in NAPI context.
-        // Only enabled when the peer's PRIMARY transport is rdma_capable (ivshmem).
-        // RoCE is over the same Ethernet wire as normal messages, so using it for VFS
-        // RDMA would block the NAPI worker for dozens of frames per read, causing
-        // all other in-flight ops to timeout.
         {
             WkiPeer* peer = wki_peer_find(hdr->src_node);
-            if (peer != nullptr && peer->transport != nullptr && peer->transport->rdma_capable && peer->rdma_transport != nullptr &&
-                peer->rdma_transport->rdma_register_region != nullptr) {
+            if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
                 constexpr uint32_t VFS_WRITE_BUF = 65536;
                 auto* wbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_WRITE_BUF));
                 if (wbuf != nullptr) {
@@ -612,10 +617,11 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     // Dispatch VFS operations to remote_vfs handler.
-    // Upper bound is OP_VFS_READDIR_BATCH (0x0412), the highest VFS op code.
-    // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411), and
-    // OP_VFS_READDIR_BATCH (0x0412) all sit above OP_VFS_SEEK_END (0x040E).
-    if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READDIR_BATCH) {
+    // Upper bound is OP_VFS_READ_BULK (0x0413), the highest VFS op code.
+    // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411),
+    // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
+    // sit above OP_VFS_SEEK_END (0x040E).
+    if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) {
         detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path), req->op_id, req_data, req_data_len);
         return;
     }
@@ -863,6 +869,44 @@ void roce_push_completions(DevServerBinding* binding, uint32_t data_slot, uint32
                                             binding->blk_zone_ptr, BLK_RING_HEADER_SIZE);
 }
 
+// Track accumulated RoCE completions for batch push after draining the SQ loop.
+struct BatchCqPush {
+    uint32_t data_slot;
+    uint32_t data_bytes;
+    uint32_t cq_idx;
+};
+
+// RoCE helper: push all accumulated completions in a single burst.
+// Data slots are pushed individually (each may be large), but CQ entries and
+// the header are pushed once at the end — amortizing per-completion frame overhead.
+void roce_push_completions_batch(DevServerBinding* binding, const BatchCqPush* entries, uint32_t count) {
+    if (!binding->blk_roce || binding->blk_rdma_transport == nullptr || count == 0) {
+        return;
+    }
+    auto* hdr = blk_ring_header(binding->blk_zone_ptr);
+
+    // 1. Push all data slots (each slot may be up to 64KB — individual writes)
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].data_bytes > 0 && entries[i].data_slot < hdr->data_slot_count) {
+            uint32_t slot_offset = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (entries[i].data_slot * hdr->data_slot_size);
+            binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey,
+                                                    slot_offset, blk_data_slot(binding->blk_zone_ptr, hdr, entries[i].data_slot),
+                                                    entries[i].data_bytes);
+        }
+    }
+
+    // 2. Push the entire CQ region in one write (64 entries * 16 bytes = 1024 bytes)
+    //    This is cheaper than count individual 16-byte writes when count > 1.
+    uint32_t cq_base = blk_ring_cq_offset(hdr->sq_depth);
+    uint32_t cq_total = blk_ring_cq_size(hdr->cq_depth);
+    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, cq_base,
+                                            static_cast<uint8_t*>(binding->blk_zone_ptr) + cq_base, cq_total);
+
+    // 3. Push updated header last (contains cq_head + sq_tail pointers)
+    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, 0,
+                                            binding->blk_zone_ptr, BLK_RING_HEADER_SIZE);
+}
+
 void blk_ring_server_poll(DevServerBinding* binding) {
     if (!binding->blk_rdma_active || binding->blk_zone_ptr == nullptr) {
         return;
@@ -886,6 +930,11 @@ void blk_ring_server_poll(DevServerBinding* binding) {
     // No need to do an RDMA_READ here — the data is already in blk_zone_ptr.
 
     bool posted_cqe = false;
+
+    // Accumulate RoCE completions for batch push (avoids per-CQE RDMA writes)
+    constexpr uint32_t MAX_BATCH_CQ = 64;
+    std::array<BatchCqPush, MAX_BATCH_CQ> batch_pushes = {};
+    uint32_t batch_count = 0;
 
     while (!blk_sq_empty(hdr)) {
         // Check CQ has space before processing
@@ -940,6 +989,61 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                 cqe.bytes_transferred = 0;
                 break;
             }
+            case BlkOpcode::BULK_READ: {
+                // Streaming bulk read: read blocks from device into a temporary
+                // staging buffer, then RDMA-write the entire range to the
+                // consumer's pre-registered staging buffer (rkey in data_slot).
+                uint32_t consumer_rkey = sqe->data_slot;
+                uint32_t total_bytes = sqe->block_count * hdr->block_size;
+                auto* staging = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(total_bytes));
+                if (staging == nullptr) {
+                    cqe.status = -12;  // ENOMEM
+                    cqe.bytes_transferred = 0;
+                    break;
+                }
+
+                int ret = ker::dev::block_read(binding->block_dev, sqe->lba, sqe->block_count, staging);
+                if (ret == 0 && binding->blk_rdma_transport != nullptr) {
+                    // RDMA-write directly into consumer's staging buffer at offset 0
+                    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, consumer_rkey, 0, staging,
+                                                            total_bytes);
+                    cqe.bytes_transferred = total_bytes;
+                } else {
+                    cqe.bytes_transferred = 0;
+                }
+                cqe.status = ret;
+                ker::mod::mm::dyn::kmalloc::free(staging);
+                // Bulk ops push data directly via RDMA — no ring data slot involved
+                data_bytes = 0;
+                break;
+            }
+            case BlkOpcode::BULK_WRITE: {
+                // Streaming bulk write: RDMA-read entire range from consumer's
+                // registered staging buffer, then write blocks to device.
+                uint32_t consumer_rkey = sqe->data_slot;
+                uint32_t total_bytes = sqe->block_count * hdr->block_size;
+                auto* staging = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(total_bytes));
+                if (staging == nullptr) {
+                    cqe.status = -12;  // ENOMEM
+                    cqe.bytes_transferred = 0;
+                    break;
+                }
+
+                int ret = 0;
+                if (binding->blk_rdma_transport != nullptr) {
+                    // RDMA-read from consumer's staging buffer at offset 0
+                    binding->blk_rdma_transport->rdma_read(binding->blk_rdma_transport, binding->consumer_node, consumer_rkey, 0, staging,
+                                                           total_bytes);
+                    ret = ker::dev::block_write(binding->block_dev, sqe->lba, sqe->block_count, staging);
+                } else {
+                    ret = -1;
+                }
+                cqe.status = ret;
+                cqe.bytes_transferred = 0;
+                ker::mod::mm::dyn::kmalloc::free(staging);
+                data_bytes = 0;
+                break;
+            }
             default: {
                 cqe.status = -1;
                 cqe.bytes_transferred = 0;
@@ -957,10 +1061,23 @@ void blk_ring_server_poll(DevServerBinding* binding) {
         asm volatile("" ::: "memory");
         hdr->cq_head = (hdr->cq_head + 1) % hdr->cq_depth;
 
-        // For RoCE: push completions (data slot + new CQ entry + header) to proxy
-        roce_push_completions(binding, sqe->data_slot, data_bytes, cq_idx);
+        // Accumulate for batch RoCE push (instead of per-CQE push)
+        if (batch_count < MAX_BATCH_CQ) {
+            batch_pushes[batch_count++] = {sqe->data_slot, data_bytes, cq_idx};
+        }
 
         posted_cqe = true;
+    }
+
+    // Batch-push all accumulated RoCE completions in one burst:
+    // - Data slots are pushed individually (each up to 64KB)
+    // - CQ region + header pushed once at the end
+    // For single completions this falls back to the legacy per-CQE path
+    // (equivalent cost: N data + 1 CQ region + 1 header, vs N * (1 data + 1 CQ entry + 1 header)).
+    if (batch_count == 1) {
+        roce_push_completions(binding, batch_pushes[0].data_slot, batch_pushes[0].data_bytes, batch_pushes[0].cq_idx);
+    } else if (batch_count > 1) {
+        roce_push_completions_batch(binding, batch_pushes.data(), batch_count);
     }
 
     // Release poll guard so other CPUs can poll this ring

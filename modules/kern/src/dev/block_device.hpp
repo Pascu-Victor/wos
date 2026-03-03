@@ -19,6 +19,9 @@ using block_read_fn = int (*)(BlockDevice* dev, uint64_t block, size_t count, vo
 using block_write_fn = int (*)(BlockDevice* dev, uint64_t block, size_t count, const void* buffer);
 using block_flush_fn = int (*)(BlockDevice* dev);
 
+// Block device capability flags (advertised during remote attach negotiation)
+constexpr uint32_t BDEV_CAP_BULK_RDMA = 0x0001;  // supports streaming bulk RDMA transfer for large I/O
+
 constexpr size_t BLOCK_NAME_SIZE = 256;
 constexpr size_t PARTUUID_STRING_SIZE = 37;  // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" + NUL
 
@@ -41,6 +44,9 @@ struct BlockDevice {
 
     // Private driver data
     void* private_data = nullptr;
+
+    // Capability flags (BDEV_CAP_* bits) — set during remote attach negotiation
+    uint32_t capabilities = 0;
 
     // WKI remotable trait — set by drivers that support remote access
     ker::net::wki::RemotableOps const* remotable = nullptr;
@@ -68,8 +74,8 @@ auto block_flush(BlockDevice* bdev) -> int;
 // Partition block device management
 // Creates a partition block device that delegates I/O to parent_disk with an LBA offset.
 // The new device is named "<parent_name><1-based partition_index>" (e.g. "sda1").
-auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba,
-                                   const uint8_t* partuuid, uint32_t partition_index) -> BlockDevice*;
+auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba, const uint8_t* partuuid,
+                                   uint32_t partition_index) -> BlockDevice*;
 
 // Find a registered block device by PARTUUID string (lowercase, hyphenated)
 auto block_device_find_by_partuuid(const char* uuid_str) -> BlockDevice*;

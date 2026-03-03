@@ -41,11 +41,17 @@ enum class BlkOpcode : uint8_t {
     READ = 0,
     WRITE = 1,
     FLUSH = 2,
+    BULK_READ = 3,   // Streaming bulk: server RDMA-writes entire block range to consumer's registered buffer
+    BULK_WRITE = 4,  // Streaming bulk: server RDMA-reads entire block range from consumer's registered buffer
 };
 
+// Threshold in bytes above which the bulk transfer path is used instead of the
+// async SQ pipeline.  Transfers <= this size use standard per-slot I/O.
+constexpr uint32_t BLK_RING_BULK_THRESHOLD = 262144;  // 256 KB
+
 struct BlkSqEntry {
-    uint32_t tag;          // unique request ID (consumer-assigned, echoed in CQE)
-    uint8_t opcode;        // BlkOpcode
+    uint32_t tag;    // unique request ID (consumer-assigned, echoed in CQE)
+    uint8_t opcode;  // BlkOpcode
     uint8_t reserved[3];
     uint64_t lba;          // starting logical block address
     uint32_t block_count;  // number of blocks to read/write
@@ -58,13 +64,31 @@ struct BlkSqEntry {
 static_assert(sizeof(BlkSqEntry) == 24, "BlkSqEntry must be 24 bytes");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bulk Transfer SQ Entry — same size as BlkSqEntry, union-compatible.
+// Used with BULK_READ / BULK_WRITE opcodes.  Instead of a data_slot index the
+// consumer passes its RDMA rkey so the server can RDMA-write/read the entire
+// block range directly into/from the consumer's registered buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct BlkBulkSqEntry {
+    uint32_t tag;    // unique request ID (consumer-assigned)
+    uint8_t opcode;  // BlkOpcode::BULK_READ or BULK_WRITE
+    uint8_t reserved[3];
+    uint64_t lba;          // starting logical block address
+    uint32_t block_count;  // number of blocks to transfer
+    uint32_t roce_rkey;    // consumer's RDMA rkey for the registered staging buffer
+} __attribute__((packed));
+
+static_assert(sizeof(BlkBulkSqEntry) == 24, "BlkBulkSqEntry must be 24 bytes (union-compatible with BlkSqEntry)");
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Completion Queue Entry — server writes, consumer reads
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct BlkCqEntry {
-    uint32_t tag;              // echoed from SQE
-    int32_t status;            // 0 = success, negative = error
-    uint32_t data_slot;        // which data slot has the result (for reads)
+    uint32_t tag;                // echoed from SQE
+    int32_t status;              // 0 = success, negative = error
+    uint32_t data_slot;          // which data slot has the result (for reads)
     uint32_t bytes_transferred;  // actual bytes transferred
 } __attribute__((packed));
 
@@ -87,9 +111,9 @@ struct BlkRingHeader {
     uint32_t sq_depth;
     uint32_t cq_depth;
     uint32_t data_slot_count;
-    uint32_t data_slot_size;    // bytes per data slot
-    uint32_t block_size;        // block device block size (e.g. 512, 4096)
-    uint64_t total_blocks;      // block device total blocks
+    uint32_t data_slot_size;  // bytes per data slot
+    uint32_t block_size;      // block device block size (e.g. 512, 4096)
+    uint64_t total_blocks;    // block device total blocks
 
     volatile uint8_t server_ready;  // 1 when server has initialized the ring
     uint8_t reserved[19];           // pad to exactly 64 bytes (cache line)
@@ -126,7 +150,8 @@ inline constexpr auto blk_ring_zone_size(uint32_t sq_depth, uint32_t cq_depth, u
 
 // Default zone size with default parameters
 inline constexpr auto blk_ring_default_zone_size() -> uint32_t {
-    return blk_ring_zone_size(BLK_RING_DEFAULT_SQ_DEPTH, BLK_RING_DEFAULT_CQ_DEPTH, BLK_RING_DEFAULT_DATA_SLOTS, BLK_RING_DEFAULT_DATA_SLOT_SIZE);
+    return blk_ring_zone_size(BLK_RING_DEFAULT_SQ_DEPTH, BLK_RING_DEFAULT_CQ_DEPTH, BLK_RING_DEFAULT_DATA_SLOTS,
+                              BLK_RING_DEFAULT_DATA_SLOT_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -356,6 +356,85 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     auto cur_offset = static_cast<int64_t>(offset);
     ssize_t total_read = 0;
 
+    // ── Bulk RDMA path ────────────────────────────────────────────────────
+    // Two modes:
+    //  (a) Direct bulk — request > 64 KB: issue OP_VFS_READ_BULK for each chunk.
+    //  (b) Prefetch   — request ≤ 64 KB (typical cp/cat): on the first small read
+    //      (or cache miss), pre-fetch up to 2 MB from the server into the bulk
+    //      buffer and serve subsequent sequential reads from it.  This turns
+    //      hundreds of 4 KB RPCs into one bulk RDMA write.
+    //
+    // The bulk buffer is per-mount; `bulk_owner_fd` tracks which open file last
+    // filled it.  When ownership changes the old prefetch is implicitly stale.
+    if (ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_bulk_rkey != 0 &&
+        ctx->proxy->rdma_bulk_buf != nullptr) {
+        // ── (b) Prefetch path: try to satisfy from the existing bulk cache ──
+        if (remaining <= VFS_RDMA_BOUNCE_SIZE && ctx->proxy->bulk_owner_fd == ctx->remote_fd && ctx->bulk_cached_len > 0 &&
+            cur_offset >= ctx->bulk_cached_offset && cur_offset < ctx->bulk_cached_offset + static_cast<int64_t>(ctx->bulk_cached_len)) {
+            auto off_in_buf = static_cast<uint32_t>(cur_offset - ctx->bulk_cached_offset);
+            auto available = ctx->bulk_cached_len - off_in_buf;
+            auto to_copy = std::min(remaining, available);
+
+            memcpy(dest, ctx->proxy->rdma_bulk_buf + off_in_buf, to_copy);
+            dest += to_copy;
+            cur_offset += static_cast<int64_t>(to_copy);
+            remaining -= to_copy;
+            total_read += static_cast<ssize_t>(to_copy);
+
+            if (remaining == 0) {
+                return total_read;
+            }
+            // Partial hit — fall through to refill below
+        }
+
+        // ── Bulk fetch: either (a) direct or (b) prefetch refill ──────────
+        while (remaining > 0) {
+            // For small reads, prefetch the full bulk buffer size; for large
+            // reads, transfer exactly what is needed.
+            uint32_t fetch_size =
+                (remaining <= VFS_RDMA_BOUNCE_SIZE) ? ctx->proxy->rdma_bulk_size : std::min(remaining, ctx->proxy->rdma_bulk_size);
+
+            std::array<uint8_t, 20> req{};
+            memcpy(req.data(), &ctx->remote_fd, sizeof(int32_t));
+            memcpy(req.data() + 4, &fetch_size, sizeof(uint32_t));
+            memcpy(req.data() + 8, &cur_offset, sizeof(int64_t));
+            memcpy(req.data() + 16, &ctx->proxy->rdma_bulk_rkey, sizeof(uint32_t));
+
+            uint32_t bytes_read = 0;
+            int status = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READ_BULK, req.data(), 20, &bytes_read, sizeof(uint32_t));
+            if (status != 0 || bytes_read == 0) {
+                // Invalidate cache on error
+                ctx->bulk_cached_len = 0;
+                ctx->proxy->bulk_owner_fd = -1;
+                break;
+            }
+
+            // Update prefetch cache metadata
+            ctx->proxy->bulk_owner_fd = ctx->remote_fd;
+            ctx->bulk_cached_offset = cur_offset;
+            ctx->bulk_cached_len = bytes_read;
+
+            auto to_copy = std::min(bytes_read, remaining);
+            memcpy(dest, ctx->proxy->rdma_bulk_buf, to_copy);
+
+            dest += to_copy;
+            cur_offset += static_cast<int64_t>(to_copy);
+            remaining -= to_copy;
+            total_read += static_cast<ssize_t>(to_copy);
+
+            if (bytes_read < fetch_size) {
+                break;  // Short read: EOF
+            }
+
+            // For prefetch path, one fetch is enough — subsequent small reads
+            // will hit the cache at the top of this function.
+            if (remaining <= VFS_RDMA_BOUNCE_SIZE) {
+                break;
+            }
+        }
+        return (total_read > 0 || remaining == static_cast<uint32_t>(count)) ? total_read : -1;
+    }
+
     // RDMA path: server rdma_writes file data to our bounce buffer, sends tiny
     // completion — bulk data never touches ethernet. 64 KB per round-trip vs ~1400 B.
     if (ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
@@ -488,6 +567,10 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
         ctx->read_cache->cached_len = 0;
         ctx->read_cache->cached_offset = -1;
     }
+
+    // Invalidate bulk prefetch cache on write
+    ctx->bulk_cached_len = 0;
+    ctx->bulk_cached_offset = -1;
 
     const auto* src = static_cast<const uint8_t*>(buf);
     auto remaining = static_cast<uint32_t>(count);
@@ -1839,6 +1922,77 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             break;
         }
 
+        case OP_VFS_READ_BULK: {
+            // Bulk RDMA read — identical request layout to OP_VFS_READ_RDMA but len
+            // is not capped to 64 KB.  The consumer provides an rkey to a large
+            // (up to 2 MB) registered buffer.  We read from the local file, then
+            // push the entire result in one rdma_write.
+            auto send_bulk_read_err = [&]() {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_READ_BULK;
+                resp.status = -1;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            };
+
+            if (data_len < 20) {
+                send_bulk_read_err();
+                break;
+            }
+
+            int32_t fd_id = 0;
+            uint32_t len = 0;
+            int64_t offset = 0;
+            uint32_t consumer_rkey = 0;
+            memcpy(&fd_id, data, sizeof(int32_t));
+            memcpy(&len, data + 4, sizeof(uint32_t));
+            memcpy(&offset, data + 8, sizeof(int64_t));
+            memcpy(&consumer_rkey, data + 16, sizeof(uint32_t));
+
+            // Cap to the consumer's registered bulk size (VFS_RDMA_BULK_SIZE)
+            len = std::min<uint32_t>(len, VFS_RDMA_BULK_SIZE);
+
+            WkiPeer* peer = wki_peer_find(hdr->src_node);
+            if (peer == nullptr || peer->rdma_transport == nullptr || peer->rdma_transport->rdma_write == nullptr) {
+                send_bulk_read_err();
+                break;
+            }
+
+            s_vfs_lock.lock();
+            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
+                s_vfs_lock.unlock();
+                send_bulk_read_err();
+                break;
+            }
+            touch_remote_fd(rfd);
+            ker::vfs::File* local_file = rfd->file;
+            s_vfs_lock.unlock();
+
+            auto* read_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+            if (read_buf == nullptr) {
+                send_bulk_read_err();
+                break;
+            }
+
+            ssize_t bytes_read = local_file->fops->vfs_read(local_file, read_buf, len, static_cast<size_t>(offset));
+            if (bytes_read > 0) {
+                peer->rdma_transport->rdma_write(peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
+                                                 static_cast<uint32_t>(bytes_read));
+            }
+            ker::mod::mm::dyn::kmalloc::free(read_buf);
+
+            uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
+            std::array<uint8_t, sizeof(DevOpRespPayload) + 4> bulk_resp_buf{};
+            auto* bulk_resp = reinterpret_cast<DevOpRespPayload*>(bulk_resp_buf.data());
+            bulk_resp->op_id = OP_VFS_READ_BULK;
+            bulk_resp->status = (bytes_read >= 0) ? 0 : static_cast<int16_t>(bytes_read);
+            bulk_resp->data_len = 4;
+            memcpy(bulk_resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
+            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, bulk_resp_buf.data(), static_cast<uint16_t>(bulk_resp_buf.size()));
+            break;
+        }
+
         case OP_VFS_WRITE_RDMA: {
             // Request: {fd:i32, off:i64, len:u32} = 16 bytes
             // Consumer already rdma_wrote the data into our pre-registered write buffer
@@ -1983,15 +2137,11 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     state->active = true;
     s_vfs_lock.unlock();
 
-    // RDMA setup: if the server advertised a write-recv rkey AND the primary
-    // transport is truly zero-copy (ivshmem, rdma_capable=true), register a local
-    // bounce buffer.  RoCE is over the same Ethernet wire as normal messages so
-    // it provides no benefit here — the server-side rdma_write would block the NAPI
-    // worker for ~46 frames per 64 KB read, starving all other VFS ops.
+    // RDMA setup: if the server advertised a write-recv rkey, register a local
+    // bounce buffer so the server can rdma_write file data directly into it.
     if (state->rdma_server_write_rkey != 0) {
         WkiPeer* peer = wki_peer_find(owner_node);
-        if (peer != nullptr && peer->transport != nullptr && peer->transport->rdma_capable && peer->rdma_transport != nullptr &&
-            peer->rdma_transport->rdma_register_region != nullptr) {
+        if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
             auto* bbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BOUNCE_SIZE));
             if (bbuf != nullptr) {
                 uint32_t rkey = 0;
@@ -2014,6 +2164,30 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
             }
         } else {
             state->rdma_server_write_rkey = 0;
+        }
+    }
+
+    // Bulk RDMA setup: allocate and register a larger buffer (2 MB) for bulk reads.
+    // This is separate from the 64 KB bounce buffer so that small reads and writes
+    // still use the compact buffer while large sequential reads benefit from fewer
+    // round-trips.
+    if (state->rdma_capable && state->rdma_transport != nullptr && state->rdma_transport->rdma_register_region != nullptr) {
+        auto* bulk_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BULK_SIZE));
+        if (bulk_buf != nullptr) {
+            uint32_t bulk_rkey = 0;
+            int reg_ret = state->rdma_transport->rdma_register_region(state->rdma_transport, reinterpret_cast<uint64_t>(bulk_buf),
+                                                                      VFS_RDMA_BULK_SIZE, &bulk_rkey);
+            if (reg_ret == 0 && bulk_rkey != 0) {
+                state->rdma_bulk_buf = bulk_buf;
+                state->rdma_bulk_rkey = bulk_rkey;
+                state->rdma_bulk_size = VFS_RDMA_BULK_SIZE;
+                state->bulk_rdma_capable = true;
+                ker::mod::dbg::log("[WKI] VFS bulk RDMA enabled: node=0x%04x bulk_rkey=%u size=%u", owner_node, bulk_rkey,
+                                   VFS_RDMA_BULK_SIZE);
+            } else {
+                ker::mod::mm::dyn::kmalloc::free(bulk_buf);
+                ker::mod::dbg::log("[WKI] VFS bulk RDMA region reg failed: node=0x%04x", owner_node);
+            }
         }
     }
 
@@ -2062,6 +2236,13 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
     if (state->rdma_bounce_buf != nullptr) {
         ker::mod::mm::dyn::kmalloc::free(state->rdma_bounce_buf);
         state->rdma_bounce_buf = nullptr;
+    }
+
+    // Free bulk RDMA buffer
+    if (state->rdma_bulk_buf != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free(state->rdma_bulk_buf);
+        state->rdma_bulk_buf = nullptr;
+        state->bulk_rdma_capable = false;
     }
 
     // Remove inactive
@@ -2530,6 +2711,17 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
         // V2: Unmount the remote VFS from the local filesystem
         if (p->local_mount_path[0] != '\0') {
             ker::vfs::unmount_filesystem(p->local_mount_path);
+        }
+
+        // Free RDMA buffers
+        if (p->rdma_bounce_buf != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(p->rdma_bounce_buf);
+            p->rdma_bounce_buf = nullptr;
+        }
+        if (p->rdma_bulk_buf != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(p->rdma_bulk_buf);
+            p->rdma_bulk_buf = nullptr;
+            p->bulk_rdma_capable = false;
         }
 
         ker::mod::dbg::log("[WKI] Remote VFS proxy fenced: %s node=0x%04x", static_cast<const char*>(p->local_mount_path), node_id);

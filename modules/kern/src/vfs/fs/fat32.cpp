@@ -8,6 +8,8 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/blk_ring.hpp>
+#include <net/wki/dev_proxy.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -1003,7 +1005,62 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     size_t bytes_read = 0;
     auto* dest = reinterpret_cast<uint8_t*>(buf);
 
+    // Check if the underlying block device supports streaming bulk RDMA transfer.
+    // If so, we detect contiguous cluster chains and issue a single bulk_read()
+    // for large extents (> BLK_RING_BULK_THRESHOLD bytes), which bypasses the
+    // per-slot SQ/CQ pipeline and transfers data via direct RDMA.
+    bool bulk_capable = (ctx->device != nullptr) && ((ctx->device->capabilities & ker::dev::BDEV_CAP_BULK_RDMA) != 0);
+
     while (bytes_read < to_read && current_cluster >= 2 && current_cluster < FAT32_EOC) {
+        // ── Contiguous extent detection ─────────────────────────────────────
+        // Walk the FAT chain to find the longest run of physically contiguous
+        // clusters starting at current_cluster.
+        uint32_t extent_start = current_cluster;
+        uint32_t extent_len = 1;  // cluster count in the contiguous run
+        if (bulk_capable && byte_offset == 0) {
+            uint32_t probe = current_cluster;
+            while (extent_len < 4096) {  // safety cap
+                uint32_t next = get_next_cluster(ctx, probe);
+                if (next != probe + 1) {
+                    break;  // chain is not contiguous
+                }
+                extent_len++;
+                probe = next;
+            }
+        }
+
+        // Calculate how many bytes the contiguous extent covers
+        size_t extent_bytes = static_cast<size_t>(extent_len) * cluster_size;
+        size_t remaining = to_read - bytes_read;
+
+        // ── Bulk path: contiguous extent exceeds threshold ──────────────────
+        if (bulk_capable && byte_offset == 0 && extent_bytes >= ker::net::wki::BLK_RING_BULK_THRESHOLD && remaining >= extent_bytes) {
+            // Compute the LBA range for the contiguous cluster run
+            uint64_t extent_lba =
+                ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(extent_start - 2) * ctx->sectors_per_cluster);
+            uint32_t extent_sectors = extent_len * ctx->sectors_per_cluster;
+
+            int ret = ker::net::wki::wki_dev_proxy_bulk_read(ctx->device, extent_lba, extent_sectors, dest);
+            if (ret == 0) {
+                size_t bulk_bytes = std::min(remaining, extent_bytes);
+                bytes_read += bulk_bytes;
+                dest += bulk_bytes;
+
+                // Advance cluster chain past the extent we just read
+                current_cluster = extent_start + extent_len;
+                // Verify that we land on a valid cluster (the next one after extent)
+                uint32_t next_after = get_next_cluster(ctx, extent_start + extent_len - 1);
+                if (next_after >= 2 && next_after < FAT32_EOC) {
+                    current_cluster = next_after;
+                } else {
+                    current_cluster = 0;  // end of chain
+                }
+                continue;
+            }
+            // Bulk read failed — fall through to per-cluster path
+        }
+
+        // ── Standard per-cluster path ───────────────────────────────────────
         // Read the cluster from disk
         if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
             fat32_log("fat32_read: failed to read cluster\n");
