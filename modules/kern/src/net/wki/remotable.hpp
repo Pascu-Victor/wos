@@ -64,6 +64,15 @@ void wki_resources_invalidate_for_peer(uint16_t node_id);
 using ResourceVisitor = void (*)(const DiscoveredResource& res, void* ctx);
 void wki_resource_foreach(ResourceVisitor visitor, void* ctx);
 
+// Process deferred VFS auto-mounts.  Called from timer tick (outside NAPI context)
+// because wki_remote_vfs_mount() spin-waits for an attach ACK and napi_poll_inline()
+// re-entrantly returns 0 inside the NAPI poll handler.
+void wki_remotable_process_pending_mounts();
+
+// V2: Process deferred NET auto-attaches. Called from timer tick (outside NAPI context).
+// Same NAPI re-entrance issue as VFS mounts.  [V2§A5]
+void wki_remotable_process_pending_net_attaches();
+
 // -----------------------------------------------------------------------------
 // Internal — RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------

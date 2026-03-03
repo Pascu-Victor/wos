@@ -12,7 +12,7 @@ auto itoa(int n, std::span<char> s, int base = 10) -> int;
 auto u64toh(uint64_t n, std::span<char> s) -> int;
 
 template <typename T>
-auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
+auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
     static_assert(std::is_same_v<T, size_t>, "size must be of type size_t");
     size_t i = 0;
     size_t j = 0;
@@ -394,7 +394,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> char* {
 
     str[j] = '\0';
 
-    return str;
+    return static_cast<int>(j);
 }
 
 }  // namespace _std

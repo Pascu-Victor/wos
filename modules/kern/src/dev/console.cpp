@@ -120,18 +120,23 @@ Device console_device = {
 int tty_open(ker::vfs::File* file) {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr || task->controlling_tty < 0) {
+#ifdef CONSOLE_DEBUG
         ker::mod::io::serial::write("tty_open: no controlling terminal\n");
+#endif
         return -ENXIO;  // No controlling terminal
     }
 
     auto* pair = ker::dev::pty::pty_get(task->controlling_tty);
     if (pair == nullptr) {
+#ifdef CONSOLE_DEBUG
         ker::mod::io::serial::write("tty_open: invalid controlling_tty index\n");
+#endif
         return -ENXIO;
     }
 
+#ifdef CONSOLE_DEBUG
     ker::mod::io::serial::write("tty_open: redirecting to PTY slave\n");
-
+#endif
     // Redirect the DevFSFile to the PTY slave device, so subsequent
     // read/write/ioctl use slave_ops instead of tty_ops.
     struct DevFSFileHack {

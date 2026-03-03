@@ -422,20 +422,20 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     // --- Read the ELF file ---
     int fd = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
     if (fd < 0) {
-#ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: Failed to open '%s'", path);
-#endif
+        dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", path, fd);
         return static_cast<uint64_t>(-ENOENT);
     }
 
     int access_ret = vfs::vfs_access(path, 1 /* X_OK */);
     if (access_ret < 0) {
+        dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", path, access_ret);
         vfs::vfs_close(fd);
         return static_cast<uint64_t>(-EACCES);
     }
 
     ssize_t fileSize = vfs::vfs_lseek(fd, 0, 2);
     if (fileSize <= 0) {
+        dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, fileSize);
         vfs::vfs_close(fd);
         return static_cast<uint64_t>(-ENOEXEC);
     }
@@ -443,6 +443,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     auto* elfBuffer = new uint8_t[fileSize];
     if (elfBuffer == nullptr) {
+        dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", path, fileSize);
         vfs::vfs_close(fd);
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -452,6 +453,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     vfs::vfs_close(fd);
 
     if (bytesRead != fileSize) {
+        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, bytesRead, fileSize);
         delete[] elfBuffer;
         return static_cast<uint64_t>(-EIO);
     }
@@ -461,6 +463,8 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     auto* elfHeader = reinterpret_cast<Elf64_Ehdr*>(elfBuffer);
     if (elfHeader->e_ident[EI_MAG0] != ELFMAG0 || elfHeader->e_ident[EI_MAG1] != ELFMAG1 || elfHeader->e_ident[EI_MAG2] != ELFMAG2 ||
         elfHeader->e_ident[EI_MAG3] != ELFMAG3 || elfHeader->e_ident[EI_CLASS] != ELFCLASS64) {
+        dbg::log("wos_proc_execve: ELF magic check failed for '%s' (bytes: %02x %02x %02x %02x class=%02x)", path, elfHeader->e_ident[0],
+                 elfHeader->e_ident[1], elfHeader->e_ident[2], elfHeader->e_ident[3], elfHeader->e_ident[4]);
         delete[] elfBuffer;
         return static_cast<uint64_t>(-ENOEXEC);
     }

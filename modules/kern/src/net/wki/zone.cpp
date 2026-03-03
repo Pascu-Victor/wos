@@ -3,17 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <net/netpoll.hpp>
 #include <net/wki/event.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
-#include <platform/sched/scheduler.hpp>
 #include <vector>
 
 namespace ker::net::wki {
@@ -237,9 +234,15 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     req.notify_mode = static_cast<uint8_t>(notify);
     req.zone_type_hint = static_cast<uint8_t>(hint);
 
+    // Set up wait entry before send (temporarily use read_wait_entry;
+    // zone is NEGOTIATING so no reads are possible)
+    WkiWaitEntry create_wait = {};
+    zone->read_wait_entry = &create_wait;
+
     int ret = wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
     if (ret != WKI_OK) {
         // Clean up on send failure
+        zone->read_wait_entry = nullptr;
         s_zone_table_lock.lock();
         zone->state = ZoneState::NONE;
         zone->zone_id = 0;
@@ -247,33 +250,16 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
         return ret;
     }
 
-    // Spin-wait for ACK (zone transitions to ACTIVE or back to NONE)
-    // Poll the NIC and yield during the spin-wait so incoming packets (including
-    // the ZONE_CREATE_ACK) can be processed.  napi_poll_inline() will harmlessly
-    // return 0 if we are already inside the NAPI poll handler (re-entrancy safe).
-    uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-    while (zone->state == ZoneState::NEGOTIATING) {
-        asm volatile("pause" ::: "memory");
-        if (zone->state != ZoneState::NEGOTIATING) {
-            break;
-        }
-        if (wki_now_us() >= deadline) {
-            // Timeout — clean up
-            s_zone_table_lock.lock();
-            zone->state = ZoneState::NONE;
-            zone->zone_id = 0;
-            s_zone_table_lock.unlock();
-            return WKI_ERR_ZONE_TIMEOUT;
-        }
-        // Drive NIC polling + yield so the zone create ACK can be received.
-        // When called from the timer thread (the deferred zone creation path),
-        // this allows the ACK to be processed.  When called from inside the
-        // NAPI poll handler, napi_poll_inline returns 0 (harmless).
-        net::NetDevice* net_dev = wki_eth_get_netdev();
-        if (net_dev != nullptr) {
-            net::napi_poll_inline(net_dev);
-        }
-        ker::mod::sched::kern_yield();
+    // Wait for ACK via async wait queue
+    int wait_rc = wki_wait_for_op(&create_wait, WKI_OP_TIMEOUT_US);
+    zone->read_wait_entry = nullptr;
+    if (wait_rc == WKI_ERR_TIMEOUT) {
+        // Timeout — clean up
+        s_zone_table_lock.lock();
+        zone->state = ZoneState::NONE;
+        zone->zone_id = 0;
+        s_zone_table_lock.unlock();
+        return WKI_ERR_ZONE_TIMEOUT;
     }
 
     if (zone->state == ZoneState::ACTIVE) {
@@ -370,8 +356,10 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         chunk = std::min<size_t>(chunk, WKI_ZONE_MAX_MSG_DATA);
 
         // Set up pending read state
+        WkiWaitEntry read_wait = {};
         zone->lock.lock();
-        zone->read_pending = true;
+        zone->read_wait_entry = &read_wait;
+        zone->read_pending.store(true, std::memory_order_release);
         zone->read_dest_buf = dest;
         zone->read_result_len = 0;
         zone->read_status = 0;
@@ -385,21 +373,17 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 
         int ret = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
         if (ret != WKI_OK) {
-            zone->read_pending = false;
+            zone->read_wait_entry = nullptr;
+            zone->read_pending.store(false, std::memory_order_relaxed);
             return ret;
         }
 
-        // Spin-wait for response with memory fence
-        uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-        while (zone->read_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!zone->read_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                zone->read_pending = false;
-                return WKI_ERR_ZONE_TIMEOUT;
-            }
+        // Wait for response via async wait queue
+        int wait_rc = wki_wait_for_op(&read_wait, WKI_OP_TIMEOUT_US);
+        zone->read_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            zone->read_pending.store(false, std::memory_order_relaxed);
+            return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->read_status != 0) {
@@ -466,8 +450,10 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         memcpy(msg_buf + sizeof(ZoneWriteReqPayload), src, chunk);
 
         // Set up pending write state
+        WkiWaitEntry write_wait = {};
         zone->lock.lock();
-        zone->write_pending = true;
+        zone->write_wait_entry = &write_wait;
+        zone->write_pending.store(true, std::memory_order_release);
         zone->write_status = 0;
         zone->lock.unlock();
 
@@ -475,21 +461,17 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         ker::mod::mm::dyn::kmalloc::free(msg_buf);
 
         if (ret != WKI_OK) {
-            zone->write_pending = false;
+            zone->write_wait_entry = nullptr;
+            zone->write_pending.store(false, std::memory_order_relaxed);
             return ret;
         }
 
-        // Spin-wait for ACK with memory fence
-        uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-        while (zone->write_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!zone->write_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                zone->write_pending = false;
-                return WKI_ERR_ZONE_TIMEOUT;
-            }
+        // Wait for ACK via async wait queue
+        int wait_rc = wki_wait_for_op(&write_wait, WKI_OP_TIMEOUT_US);
+        zone->write_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            zone->write_pending.store(false, std::memory_order_relaxed);
+            return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->write_status != 0) {
@@ -552,6 +534,14 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
         }
 
         ker::mod::dbg::log("[WKI] Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
+
+        // Wake any pending waiters with error
+        if (zone.read_wait_entry != nullptr) {
+            wki_wake_op(zone.read_wait_entry, -1);
+        }
+        if (zone.write_wait_entry != nullptr) {
+            wki_wake_op(zone.write_wait_entry, -1);
+        }
 
         free_zone_backing(&zone);
         zone.state = ZoneState::NONE;
@@ -820,13 +810,24 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
                            zone->size, use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack->zone_id, sizeof(ack->zone_id));
+
+        // Wake the creator waiting in wki_zone_create()
+        if (zone->read_wait_entry != nullptr) {
+            wki_wake_op(zone->read_wait_entry, 0);
+        }
     } else {
         // Rejected
         ker::mod::dbg::log("[WKI] Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
 
+        WkiWaitEntry* waiter = zone->read_wait_entry;
         zone->state = ZoneState::NONE;
         zone->zone_id = 0;
         s_zone_table_lock.unlock();
+
+        // Wake the creator waiting in wki_zone_create()
+        if (waiter != nullptr) {
+            wki_wake_op(waiter, 0);
+        }
     }
 }
 
@@ -852,6 +853,14 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
     }
 
     ker::mod::dbg::log("[WKI] Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
+
+    // Wake any pending waiters with error
+    if (zone->read_wait_entry != nullptr) {
+        wki_wake_op(zone->read_wait_entry, -1);
+    }
+    if (zone->write_wait_entry != nullptr) {
+        wki_wake_op(zone->write_wait_entry, -1);
+    }
 
     free_zone_backing(zone);
     zone->state = ZoneState::NONE;
@@ -987,14 +996,17 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
     WkiZone* zone = find_zone_slot(resp->zone_id);
     s_zone_table_lock.unlock();
 
-    if (zone == nullptr || !zone->read_pending) {
+    if (zone == nullptr || !zone->read_pending.load(std::memory_order_acquire)) {
         return;
     }
 
     // Validate data fits
     if (sizeof(ZoneReadRespPayload) + resp->length > payload_len) {
         zone->read_status = WKI_ERR_INVALID;
-        zone->read_pending = false;
+        zone->read_pending.store(false, std::memory_order_release);
+        if (zone->read_wait_entry != nullptr) {
+            wki_wake_op(zone->read_wait_entry, 0);
+        }
         return;
     }
 
@@ -1005,7 +1017,10 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
 
     zone->read_result_len = resp->length;
     zone->read_status = 0;
-    zone->read_pending = false;  // Unblock the waiting caller
+    zone->read_pending.store(false, std::memory_order_release);
+    if (zone->read_wait_entry != nullptr) {
+        wki_wake_op(zone->read_wait_entry, 0);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1068,12 +1083,15 @@ void handle_zone_write_ack(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
     WkiZone* zone = find_zone_slot(ack->zone_id);
     s_zone_table_lock.unlock();
 
-    if (zone == nullptr || !zone->write_pending) {
+    if (zone == nullptr || !zone->write_pending.load(std::memory_order_acquire)) {
         return;
     }
 
     zone->write_status = ack->status;
-    zone->write_pending = false;  // Unblock the waiting caller
+    zone->write_pending.store(false, std::memory_order_release);
+    if (zone->write_wait_entry != nullptr) {
+        wki_wake_op(zone->write_wait_entry, 0);
+    }
 }
 
 }  // namespace detail

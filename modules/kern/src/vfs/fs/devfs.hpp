@@ -83,6 +83,18 @@ void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_
 // Called from wki_resources_invalidate_for_peer().
 void devfs_wki_remove_peer_resources(uint16_t node_id);
 
+// V2: Create /dev/nodes/ hierarchy for node identity [V2§A2]
+void devfs_nodes_init();
+
+// V2: Add a node entry under /dev/nodes/<hostname>/ with id, state, load files
+void devfs_nodes_add_peer(const char* hostname, uint16_t node_id);
+
+// V2: Update peer state in /dev/nodes/<hostname>/state
+void devfs_nodes_update_state(const char* hostname, const char* state_str);
+
+// V2: Remove a stale peer entry from /dev/nodes/<hostname>/
+void devfs_nodes_remove_peer(const char* hostname);
+
 // Resolve a devfs-relative path to a BlockDevice*.
 // For WKI block resources, triggers proxy attach if needed.
 // Returns nullptr if the path doesn't refer to a block device.

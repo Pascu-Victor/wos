@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "abi/callnums/process.h"
+#include "net/wki/remote_compute.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/phys.hpp"
@@ -374,6 +375,9 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
     if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+
+    // Forward SIGKILL/SIGTERM to remote node if target is a WKI proxy task
+    ker::net::wki::wki_proxy_task_forward_signal(target, sig);
 
     // Set the signal pending bit (signal N is bit N-1)
     target->sigPending |= (1ULL << (sig - 1));

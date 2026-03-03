@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -61,10 +62,10 @@ struct WkiZone {
 
     // RDMA state
     bool is_rdma = false;
-    bool is_roce = false;           // true if RDMA via RoCE (needs explicit rdma_write/read sync)
-    uint32_t local_rkey = 0;        // our RDMA key (if RDMA-backed)
-    uint32_t remote_rkey = 0;       // peer's RDMA key (if RDMA-backed)
-    uint64_t remote_phys_addr = 0;  // peer's physical address (from ACK)
+    bool is_roce = false;                    // true if RDMA via RoCE (needs explicit rdma_write/read sync)
+    uint32_t local_rkey = 0;                 // our RDMA key (if RDMA-backed)
+    uint32_t remote_rkey = 0;                // peer's RDMA key (if RDMA-backed)
+    uint64_t remote_phys_addr = 0;           // peer's physical address (from ACK)
     WkiTransport* rdma_transport = nullptr;  // transport for RDMA ops (RoCE; nullptr for ivshmem)
 
     // Ownership
@@ -75,15 +76,17 @@ struct WkiZone {
     ZoneNotifyHandler post_handler = nullptr;
 
     // Synchronous read/write state (for message-based zones)
-    volatile bool read_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> read_pending{false};
     void* read_dest_buf = nullptr;
     uint32_t read_result_len = 0;
     int read_status = 0;
+    WkiWaitEntry* read_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_READ_RESP
 
-    volatile bool write_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> write_pending{false};
     int write_status = 0;
+    WkiWaitEntry* write_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_WRITE_ACK
 
-    ker::mod::sys::Spinlock lock;
+    mod::sys::Spinlock lock;
 };
 
 // -----------------------------------------------------------------------------

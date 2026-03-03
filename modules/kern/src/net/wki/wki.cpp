@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <net/netpoll.hpp>
 #include <net/wki/dev_proxy.hpp>
@@ -22,8 +23,12 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <ranges>
 #include <utility>
+#include <vfs/file.hpp>
+#include <vfs/fs/devfs.hpp>
+#include <vfs/vfs.hpp>
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
@@ -36,7 +41,7 @@ WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 // Time source
 // -----------------------------------------------------------------------------
 
-auto wki_now_us() -> uint64_t { return ker::mod::time::getUs(); }
+auto wki_now_us() -> uint64_t { return mod::time::getUs(); }
 
 void wki_spin_yield() {
     // Drive inline NAPI poll so the NIC's RX queue is drained even when
@@ -89,6 +94,152 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
 }
 
 // -----------------------------------------------------------------------------
+// V2: Async Wait Queue
+// Lock-free polling via kern_yield() — matches existing WKI blocking patterns.
+// The pending list is protected by a spinlock for link/unlink only; the hot
+// path (completed flag check) is a plain volatile read with no lock.
+// -----------------------------------------------------------------------------
+
+static mod::sys::Spinlock s_wait_lock;
+static WkiWaitEntry* s_wait_head = nullptr;
+
+static void wait_list_link(WkiWaitEntry* entry) {
+    s_wait_lock.lock();
+    entry->prev = nullptr;
+    entry->next = s_wait_head;
+    if (s_wait_head != nullptr) {
+        s_wait_head->prev = entry;
+    }
+    s_wait_head = entry;
+    s_wait_lock.unlock();
+}
+
+static void wait_list_unlink(WkiWaitEntry* entry) {
+    s_wait_lock.lock();
+    if (entry->prev != nullptr) {
+        entry->prev->next = entry->next;
+    } else if (s_wait_head == entry) {
+        s_wait_head = entry->next;
+    }
+    if (entry->next != nullptr) {
+        entry->next->prev = entry->prev;
+    }
+    entry->next = nullptr;
+    entry->prev = nullptr;
+    s_wait_lock.unlock();
+}
+
+auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
+    // Record the calling task so wake_op can send an IPI
+    entry->task = mod::sched::get_current_task();
+    entry->completed.store(false, std::memory_order_release);
+    entry->result = 0;
+    entry->deadline_us = (timeout_us > 0) ? (wki_now_us() + timeout_us) : 0;
+
+    // Link into pending list (for timeout scan)
+    wait_list_link(entry);
+
+    // Poll until completed or deadline
+    while (!entry->completed.load(std::memory_order_acquire)) {
+        if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
+            // Timed out — unlink and return error
+            wait_list_unlink(entry);
+            return WKI_ERR_TIMEOUT;
+        }
+        mod::sched::kern_yield();
+    }
+
+    // Completed — unlink and return result
+    wait_list_unlink(entry);
+    return entry->result;
+}
+
+void wki_wake_op(WkiWaitEntry* entry, int result) {
+    entry->result = result;
+    entry->completed.store(true, std::memory_order_release);  // atomic release — visible to polling loop
+
+    // Send wake IPI to break the hlt in kern_yield() for immediate response
+    if (entry->task != nullptr) {
+        mod::sched::wake_cpu(entry->task->cpu);
+    }
+}
+
+void wki_wait_timeout_scan(uint64_t now_us) {
+    // Called from timer tick context — scan for expired waiters.
+    // We only set deadline_us entries to timed-out; the polling loop in
+    // wki_wait_for_op detects this and does the actual unlink + return.
+    // This provides a backstop if the polling task hasn't run yet.
+    s_wait_lock.lock();
+    WkiWaitEntry* cur = s_wait_head;
+    while (cur != nullptr) {
+        WkiWaitEntry* next = cur->next;
+        if (cur->deadline_us != 0 && now_us >= cur->deadline_us && !cur->completed.load(std::memory_order_acquire)) {
+            cur->result = WKI_ERR_TIMEOUT;
+            cur->completed.store(true, std::memory_order_release);
+            // Wake the CPU so the polling loop exits immediately
+            if (cur->task != nullptr) {
+                ker::mod::sched::wake_cpu(cur->task->cpu);
+            }
+        }
+        cur = next;
+    }
+    s_wait_lock.unlock();
+}
+
+// -----------------------------------------------------------------------------
+// V2: Hostname resolution
+// Priority: 1) /etc/hostname  2) fallback "node-{id:04x}"
+// Note: kernel cmdline parsing for wki.hostname= deferred until cmdline API exists
+// -----------------------------------------------------------------------------
+
+static void resolve_local_hostname() {
+    // Try reading /etc/hostname
+    vfs::File* f = vfs::vfs_open_file("/etc/hostname", 0 /*O_RDONLY*/, 0);
+    if (f != nullptr && f->fops != nullptr && f->fops->vfs_read != nullptr) {
+        char buf[WKI_HOSTNAME_MAX + 16] = {};  // extra for whitespace stripping
+        ssize_t n = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
+        if (f->fops->vfs_close != nullptr) {
+            f->fops->vfs_close(f);
+        }
+        if (n > 0) {
+            buf[n] = '\0';
+            // Strip leading/trailing whitespace and newlines
+            char* start = buf;
+            while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
+                start++;
+            }
+            char* end = start + strlen(start);
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) {
+                end--;
+            }
+            *end = '\0';
+
+            // Validate: non-empty, 1-63 bytes, valid chars [a-zA-Z0-9-]
+            size_t len = static_cast<size_t>(end - start);
+            bool valid = (len > 0 && len < WKI_HOSTNAME_MAX);
+            if (valid && (start[0] == '-' || start[len - 1] == '-')) {
+                valid = false;  // no leading/trailing hyphens
+            }
+            for (size_t i = 0; valid && i < len; i++) {
+                char c = start[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) {
+                    valid = false;
+                }
+            }
+            if (valid) {
+                memcpy(g_wki.local_hostname, start, len + 1);
+                return;
+            }
+        }
+    } else if (f != nullptr && f->fops != nullptr && f->fops->vfs_close != nullptr) {
+        f->fops->vfs_close(f);
+    }
+
+    // Fallback: "node-{id:04x}"
+    snprintf(g_wki.local_hostname, WKI_HOSTNAME_MAX, "node-%04x", g_wki.my_node_id);
+}
+
+// -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
 
@@ -105,6 +256,9 @@ void wki_init() {
         id = 0x0001;
     }
     g_wki.my_node_id = id;
+
+    // V2: Resolve local hostname
+    resolve_local_hostname();
 
     // Init peer table
     g_wki.peer_count = 0;
@@ -152,7 +306,26 @@ void wki_init() {
     // Init remote compute subsystem
     wki_remote_compute_init();
 
-    ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x", g_wki.my_node_id);
+    // V2: Create /wki/ base directory for remote VFS mounts
+    ker::vfs::vfs_mkdir("/wki", 0755);
+
+    // Create /wki/<local_hostname> -> / so that local paths are accessible
+    // via the same /wki/<hostname>/... scheme used for every remote peer.
+    // Any system can then refer to /wki/<hostname>/some/path and have it
+    // resolve correctly regardless of whether the node is local or remote.
+    // FIXME:does not seem to link VFS properly inside of subdirs that are on different mounts need to update symlink handling to re-resolve
+    // after crossing mount point
+    {
+        char self_link[WKI_HOSTNAME_MAX + 6];  // "/wki/" + hostname + NUL
+        snprintf(self_link, sizeof(self_link), "/wki/%s", g_wki.local_hostname);
+        ker::vfs::vfs_symlink("/", self_link);
+    }
+
+    // V2: Create /dev/nodes/ hierarchy and register self
+    ker::vfs::devfs::devfs_nodes_init();
+    ker::vfs::devfs::devfs_nodes_add_peer(g_wki.local_hostname, g_wki.my_node_id);
+
+    ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x hostname='%s'", g_wki.my_node_id, g_wki.local_hostname);
 }
 
 void wki_shutdown() {
@@ -1489,6 +1662,12 @@ void wki_timer_tick(uint64_t now_us) {
 
     // Process deferred RDMA zone creations (must run outside NAPI poll context)
     wki_dev_server_process_pending_zones();
+
+    // Process deferred VFS auto-mounts (must run outside NAPI poll context)
+    wki_remotable_process_pending_mounts();
+
+    // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
+    wki_remotable_process_pending_net_attaches();
 
     // Poll RDMA block ring SQ entries on server bindings
     wki_dev_server_poll_rings();

@@ -15,6 +15,7 @@ namespace ker::net::wki {
 namespace {
 std::deque<IrqFwdBinding> g_irq_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_irq_fwd_initialized = false;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static ker::mod::sys::Spinlock s_irq_fwd_lock;
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -39,6 +40,8 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
         return 0;
     }
 
+    s_irq_fwd_lock.lock();
+
     // Allocate a local vector number (not a real hardware vector — just an ID
     // for the binding table). Start from 1 and find the next unused.
     uint8_t local_vec = 1;
@@ -49,6 +52,7 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
     }
     if (local_vec == 0) {
         // Overflow (255 bindings — unlikely)
+        s_irq_fwd_lock.unlock();
         return 0;
     }
 
@@ -73,11 +77,14 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
     ker::mod::dbg::log("[WKI] IRQ fwd registered: node=0x%04x dev=%u vec=%u -> local_vec=%u doorbell=%d", remote_node, device_id,
                        remote_vector, local_vec, static_cast<int>(binding.use_doorbell));
 
+    s_irq_fwd_lock.unlock();
     return local_vec;
 }
 
 void wki_irq_fwd_unregister(uint8_t local_vector) {
+    s_irq_fwd_lock.lock();
     std::erase_if(g_irq_bindings, [local_vector](const IrqFwdBinding& b) { return b.local_vector == local_vector; });
+    s_irq_fwd_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -89,6 +96,8 @@ void wki_irq_fwd_send(uint16_t dst_node, uint16_t device_id, uint16_t irq_vector
         return;
     }
 
+    s_irq_fwd_lock.lock();
+
     // D4: Check if we can use doorbell path for this (device_id, dst_node) pair
     for (const auto& b : g_irq_bindings) {
         if (b.active && b.use_doorbell && b.remote_node == dst_node && b.device_id == device_id && b.remote_vector == irq_vector &&
@@ -99,9 +108,12 @@ void wki_irq_fwd_send(uint16_t dst_node, uint16_t device_id, uint16_t irq_vector
             // ringing the doorbell, so the peer can decode it.
             wki_ivshmem_irq_mailbox_write(b.doorbell_transport, device_id, irq_vector, irq_status);
             b.doorbell_transport->doorbell(b.doorbell_transport, dst_node, 0);
+            s_irq_fwd_lock.unlock();
             return;
         }
     }
+
+    s_irq_fwd_lock.unlock();
 
     // Fallback: send via WKI message (works for any transport, including routed peers)
     DevIrqFwdPayload fwd = {};
@@ -120,7 +132,9 @@ void wki_irq_fwd_send(uint16_t dst_node, uint16_t device_id, uint16_t irq_vector
 // -----------------------------------------------------------------------------
 
 void wki_irq_fwd_cleanup_for_peer(uint16_t node_id) {
+    s_irq_fwd_lock.lock();
     std::erase_if(g_irq_bindings, [node_id](const IrqFwdBinding& b) { return b.remote_node == node_id; });
+    s_irq_fwd_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -135,6 +149,8 @@ void handle_dev_irq_fwd(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     const auto* fwd = reinterpret_cast<const DevIrqFwdPayload*>(payload);
+
+    s_irq_fwd_lock.lock();
 
     // Find matching binding
     for (const auto& b : g_irq_bindings) {
@@ -155,9 +171,11 @@ void handle_dev_irq_fwd(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         if (b.handler != nullptr) {
             b.handler(b.local_vector, b.handler_data);
         }
+        s_irq_fwd_lock.unlock();
         return;
     }
 
+    s_irq_fwd_lock.unlock();
     // No matching binding — ignore silently
 }
 
@@ -170,6 +188,8 @@ void handle_dev_irq_fwd(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
 void wki_irq_fwd_doorbell_rx(uint16_t /*src_node*/, uint16_t device_id, uint16_t irq_vector, uint32_t irq_status) {
     (void)irq_status;  // available for future use
+
+    s_irq_fwd_lock.lock();
 
     // Match by (device_id, irq_vector) — with ivshmem there's only one peer,
     // so src_node is redundant. All doorbell bindings are for direct ivshmem peers.
@@ -184,8 +204,11 @@ void wki_irq_fwd_doorbell_rx(uint16_t /*src_node*/, uint16_t device_id, uint16_t
         if (b.handler != nullptr) {
             b.handler(b.local_vector, b.handler_data);
         }
+        s_irq_fwd_lock.unlock();
         return;
     }
+
+    s_irq_fwd_lock.unlock();
 }
 
 }  // namespace ker::net::wki

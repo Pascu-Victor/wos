@@ -1398,6 +1398,12 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     size_t entries_seen = 0;
     bool found = false;
 
+    // LFN accumulator: collect LFN entries preceding each 8.3 entry so we can
+    // return the original mixed-case long filename instead of the uppercase 8.3 name.
+    constexpr int MAX_LFN = 20;
+    FAT32LongNameEntry lfn_entries[MAX_LFN];  // NOLINT(modernize-avoid-c-arrays)
+    int lfn_count = 0;
+
     while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
         // Read the cluster
         if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
@@ -1420,19 +1426,33 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
                 return -1;  // No more entries
             }
 
-            // Skip deleted entries
-            if (dir_entry->name[0] == (char)0xE5) {
+            // Deleted entry — reset LFN accumulator
+            if (static_cast<uint8_t>(dir_entry->name[0]) == 0xE5) {
+                lfn_count = 0;
                 continue;
             }
 
-            // Skip long filename entries and volume IDs
-            if ((dir_entry->attributes & FAT32_ATTR_LONG_NAME) == FAT32_ATTR_LONG_NAME ||
-                (dir_entry->attributes & FAT32_ATTR_VOLUME_ID) != 0) {
+            // LFN entry — accumulate it
+            if (dir_entry->attributes == FAT32_ATTR_LONG_NAME) {
+                auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(dir_entry);
+                if ((lfn->order & 0x40) != 0) {
+                    lfn_count = 0;  // first (highest-seq) LFN entry, start fresh
+                }
+                if (lfn_count < MAX_LFN) {
+                    lfn_entries[lfn_count++] = *lfn;
+                }
+                continue;
+            }
+
+            // Volume ID — skip and reset LFN accumulator
+            if ((dir_entry->attributes & FAT32_ATTR_VOLUME_ID) != 0) {
+                lfn_count = 0;
                 continue;
             }
 
             // Skip . and .. entries from FAT32 (we synthesize our own)
             if (dir_entry->name[0] == '.' && (dir_entry->name[1] == ' ' || dir_entry->name[1] == '.')) {
+                lfn_count = 0;
                 continue;
             }
 
@@ -1444,32 +1464,36 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
                 entry->d_reclen = sizeof(DirEntry);
                 entry->d_type = (dir_entry->attributes & FAT32_ATTR_DIRECTORY) != 0 ? DT_DIR : DT_REG;
 
-                // Convert FAT32 name to null-terminated string
-                size_t name_idx = 0;
-                // Copy filename part (8 chars)
-                for (int j = 0; j < 8 && dir_entry->name[j] != ' '; ++j) {
-                    entry->d_name[name_idx++] = dir_entry->name[j];
-                }
-                // Add dot if extension exists
-                bool has_ext = false;
-                for (int j = 8; j < 11; ++j) {
-                    if (dir_entry->name[j] != ' ') {
-                        has_ext = true;
-                        break;
-                    }
-                }
-                if (has_ext) {
-                    entry->d_name[name_idx++] = '.';
-                    for (int j = 8; j < 11 && dir_entry->name[j] != ' '; ++j) {
+                // Prefer the LFN name (preserves original case) over the 8.3 uppercase name
+                if (lfn_count > 0) {
+                    extract_lfn_name(lfn_entries, static_cast<size_t>(lfn_count), entry->d_name.data(), entry->d_name.size());
+                } else {
+                    // Fall back to 8.3 short name (uppercase)
+                    size_t name_idx = 0;
+                    for (int j = 0; j < 8 && dir_entry->name[j] != ' '; ++j) {
                         entry->d_name[name_idx++] = dir_entry->name[j];
                     }
+                    bool has_ext = false;
+                    for (int j = 8; j < 11; ++j) {
+                        if (dir_entry->name[j] != ' ') {
+                            has_ext = true;
+                            break;
+                        }
+                    }
+                    if (has_ext) {
+                        entry->d_name[name_idx++] = '.';
+                        for (int j = 8; j < 11 && dir_entry->name[j] != ' '; ++j) {
+                            entry->d_name[name_idx++] = dir_entry->name[j];
+                        }
+                    }
+                    entry->d_name[name_idx] = '\0';
                 }
-                entry->d_name[name_idx] = '\0';
 
                 found = true;
                 break;
             }
             entries_seen++;
+            lfn_count = 0;  // reset accumulator after consuming each 8.3 entry
         }
 
         if (found) {

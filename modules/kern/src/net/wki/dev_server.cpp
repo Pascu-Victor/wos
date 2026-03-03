@@ -5,6 +5,7 @@
 #include <deque>
 #include <dev/block_device.hpp>
 #include <net/netdevice.hpp>
+#include <net/netif.hpp>
 #include <net/packet.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
@@ -25,7 +26,9 @@ namespace ker::net::wki {
 namespace {
 std::deque<DevServerBinding> g_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_dev_server_initialized = false;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_server_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+// s_server_lock must be held by caller
 auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
         if (b.active && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
@@ -35,6 +38,7 @@ auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> Dev
     return nullptr;
 }
 
+// s_server_lock must be held by caller
 auto find_binding_by_zone_id(uint32_t zone_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
         if (b.active && b.blk_rdma_active && b.blk_zone_id == zone_id) {
@@ -86,6 +90,7 @@ void wki_dev_server_init() {
 
 namespace {
 
+// s_server_lock must be held by caller
 auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
     for (const auto& b : g_bindings) {
         if (b.active && b.resource_type == ResourceType::NET && b.net_dev == dev) {
@@ -93,13 +98,6 @@ auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
         }
     }
     return false;
-}
-
-// D11: Uninstall the RX forward hook if no more NET bindings reference this device
-void maybe_uninstall_rx_forward(ker::net::NetDevice* dev) {
-    if (dev != nullptr && !has_net_binding_for_dev(dev)) {
-        dev->wki_rx_forward = nullptr;
-    }
 }
 
 }  // namespace
@@ -122,39 +120,57 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         is_multicast = (!is_broadcast) && ((pkt->data[0] & 0x01) != 0);
     }
 
+    // Collect matching bindings under the lock, then send outside
+    struct RxTarget {
+        uint16_t consumer_node;
+        uint16_t assigned_channel;
+    };
+    constexpr size_t MAX_RX_TARGETS = 32;
+    std::array<RxTarget, MAX_RX_TARGETS> targets = {};
+    size_t target_count = 0;
+
+    s_server_lock.lock();
     for (auto& b : g_bindings) {
         if (!b.active || b.resource_type != ResourceType::NET || b.net_dev != dev) {
             continue;
         }
-
-        // D12: Apply RX filter
+        if (!b.net_nic_opened) {
+            continue;
+        }
+        if (b.net_rx_credits == 0) {
+            b.net_dev->rx_dropped++;
+            continue;
+        }
+        b.net_rx_credits--;
         if (is_broadcast && !b.net_rx_filter.accept_broadcast) {
             continue;
         }
         if (is_multicast && !b.net_rx_filter.accept_multicast) {
             continue;
         }
-        // Unicast: always accepted (accept_unicast defaults to true)
-
-        // Build and send OP_NET_RX_NOTIFY (fire-and-forget, no response expected)
-        auto pkt_data_len = static_cast<uint16_t>(pkt->len);
-        auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + pkt_data_len);
-
-        if (req_total > WKI_ETH_MAX_PAYLOAD) {
-            continue;  // Packet too large for a single WKI message
+        if (target_count < MAX_RX_TARGETS) {
+            targets[target_count++] = {b.consumer_node, b.assigned_channel};
         }
+    }
+    s_server_lock.unlock();
 
+    // Build and send OP_NET_RX_NOTIFY outside the lock (fire-and-forget)
+    auto pkt_data_len = static_cast<uint16_t>(pkt->len);
+    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + pkt_data_len);
+    if (req_total > WKI_ETH_MAX_PAYLOAD) {
+        return;  // Packet too large for a single WKI message
+    }
+
+    for (size_t i = 0; i < target_count; i++) {
         auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
         if (req_buf == nullptr) {
             continue;
         }
-
         auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
         req->op_id = OP_NET_RX_NOTIFY;
         req->data_len = pkt_data_len;
         memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt_data_len);
-
-        wki_send(b.consumer_node, b.assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
         ker::mod::mm::dyn::kmalloc::free(req_buf);
     }
 }
@@ -164,46 +180,89 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
 // -----------------------------------------------------------------------------
 
 void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
+    // Collect work items and cleanup info under the lock
+    struct DetachWork {
+        uint32_t blk_zone_id;
+        bool blk_rdma_active;
+        ker::dev::BlockDevice* block_dev;
+        ker::net::NetDevice* net_dev;
+        uint16_t consumer_node;
+        uint16_t assigned_channel;
+    };
+    constexpr size_t MAX_DETACH = 32;
+    std::array<DetachWork, MAX_DETACH> work = {};
+    size_t work_count = 0;
+
+    constexpr size_t MAX_NET_DEVS = 16;
+    std::array<ker::net::NetDevice*, MAX_NET_DEVS> uninstall_devs = {};
+    size_t uninstall_count = 0;
+
+    s_server_lock.lock();
     for (auto& b : g_bindings) {
         if (!b.active || b.consumer_node != node_id) {
             continue;
         }
-
-        // Destroy RDMA block ring zone if active
-        if (b.blk_rdma_active && b.blk_zone_id != 0) {
-            wki_zone_destroy(b.blk_zone_id);
-            b.blk_rdma_active = false;
-            b.blk_zone_ptr = nullptr;
-            b.blk_zone_id = 0;
+        if (work_count < MAX_DETACH) {
+            work[work_count++] = {.blk_zone_id = b.blk_zone_id,
+                                  .blk_rdma_active = b.blk_rdma_active,
+                                  .block_dev = b.block_dev,
+                                  .net_dev = b.net_dev,
+                                  .consumer_node = b.consumer_node,
+                                  .assigned_channel = b.assigned_channel};
         }
-
-        // Call on_remote_fault if the device supports it
-        if (b.block_dev != nullptr && b.block_dev->remotable != nullptr) {
-            b.block_dev->remotable->on_remote_fault(node_id);
+        b.active = false;
+    }
+    // TODO: RAII for this \/
+    //  Free VFS RDMA write buffers before erasing (DevServerBinding has no destructor)
+    for (auto& b : g_bindings) {
+        if (!b.active && b.vfs_rdma_write_buf != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_write_buf);
+            b.vfs_rdma_write_buf = nullptr;
         }
-        if (b.net_dev != nullptr && b.net_dev->remotable != nullptr) {
-            b.net_dev->remotable->on_remote_fault(node_id);
-        }
+    }
 
-        // Close the dynamic channel
-        WkiChannel* ch = wki_channel_get(b.consumer_node, b.assigned_channel);
+    // Remove inactive entries
+    std::erase_if(g_bindings, [](const DevServerBinding& b) { return !b.active; });
+
+    // Determine which NET devices need their RX forward hook uninstalled
+    for (size_t i = 0; i < work_count; i++) {
+        if (work[i].net_dev == nullptr) {
+            continue;
+        }
+        bool dup = false;
+        for (size_t j = 0; j < uninstall_count; j++) {
+            if (uninstall_devs[j] == work[i].net_dev) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup && uninstall_count < MAX_NET_DEVS && !has_net_binding_for_dev(work[i].net_dev)) {
+            uninstall_devs[uninstall_count++] = work[i].net_dev;
+        }
+    }
+    s_server_lock.unlock();
+
+    // Perform cleanup outside the lock
+    for (size_t i = 0; i < work_count; i++) {
+        if (work[i].blk_rdma_active && work[i].blk_zone_id != 0) {
+            wki_zone_destroy(work[i].blk_zone_id);
+        }
+        if (work[i].block_dev != nullptr && work[i].block_dev->remotable != nullptr) {
+            work[i].block_dev->remotable->on_remote_fault(node_id);
+        }
+        if (work[i].net_dev != nullptr && work[i].net_dev->remotable != nullptr) {
+            work[i].net_dev->remotable->on_remote_fault(node_id);
+        }
+        WkiChannel* ch = wki_channel_get(work[i].consumer_node, work[i].assigned_channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
-
-        b.active = false;
     }
 
     // D11: Uninstall RX forward hooks for NET devices that no longer have bindings
-    for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-        ker::net::NetDevice* dev = ker::net::netdev_at(i);
-        if (dev != nullptr) {
-            maybe_uninstall_rx_forward(dev);
-        }
+    for (size_t i = 0; i < uninstall_count; i++) {
+        uninstall_devs[i]->wki_rx_forward = nullptr;
     }
-
-    // Clean up inactive entries
-    std::erase_if(g_bindings, [](const DevServerBinding& b) { return !b.active; });
 }
 
 // -----------------------------------------------------------------------------
@@ -279,7 +338,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.blk_zone_pending = true;  // processed by wki_dev_server_process_pending_zones()
         binding.blk_rdma_active = false;  // not yet — set when deferred creation succeeds
 
-        g_bindings.push_back(binding);
+        s_server_lock.lock();
+        g_bindings.push_back(std::move(binding));
+        s_server_lock.unlock();
 
         // Send success ACK with the proposed RDMA zone info.
         // The consumer will wait for the zone to appear + server_ready.
@@ -325,14 +386,45 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_id = req->resource_id;
         memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp->export_path), sizeof(binding.vfs_export_path));
 
-        g_bindings.push_back(binding);
+        // RDMA-backed VFS writes: pre-register a server-side receive buffer so the
+        // consumer can rdma_write file data here, avoiding embedding data in messages.
+        // rdma_register_region is a local-only operation — safe to call in NAPI context.
+        // Only enabled when the peer's PRIMARY transport is rdma_capable (ivshmem).
+        // RoCE is over the same Ethernet wire as normal messages, so using it for VFS
+        // RDMA would block the NAPI worker for dozens of frames per read, causing
+        // all other in-flight ops to timeout.
+        {
+            WkiPeer* peer = wki_peer_find(hdr->src_node);
+            if (peer != nullptr && peer->transport != nullptr && peer->transport->rdma_capable && peer->rdma_transport != nullptr &&
+                peer->rdma_transport->rdma_register_region != nullptr) {
+                constexpr uint32_t VFS_WRITE_BUF = 65536;
+                auto* wbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_WRITE_BUF));
+                if (wbuf != nullptr) {
+                    uint32_t rkey = 0;
+                    int reg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(wbuf),
+                                                                             VFS_WRITE_BUF, &rkey);
+                    if (reg_ret == 0 && rkey != 0) {
+                        binding.vfs_rdma_write_buf = wbuf;
+                        binding.vfs_rdma_write_rkey = rkey;
+                        ack.rdma_flags |= DEV_ATTACH_RDMA_VFS;
+                        ack.blk_zone_id = rkey;  // carry server write-recv rkey to consumer
+                    } else {
+                        ker::mod::mm::dyn::kmalloc::free(wbuf);
+                    }
+                }
+            }
+        }
+
+        s_server_lock.lock();
+        g_bindings.push_back(std::move(binding));
+        s_server_lock.unlock();
 
         ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
         ack.assigned_channel = ch->channel_id;
         ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
 
-        ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s", hdr->src_node, req->resource_id, ch->channel_id,
-                           static_cast<const char*>(exp->export_path));
+        ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s rdma=%s", hdr->src_node, req->resource_id, ch->channel_id,
+                           static_cast<const char*>(exp->export_path), (ack.rdma_flags & DEV_ATTACH_RDMA_VFS) ? "yes" : "no");
 
         // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
         // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
@@ -383,21 +475,32 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_id = req->resource_id;
         binding.net_dev = ndev;
 
-        g_bindings.push_back(binding);
+        s_server_lock.lock();
+        g_bindings.push_back(std::move(binding));
+        s_server_lock.unlock();
 
         // D11: Install RX forward hook on the NIC so received packets are forwarded
         ndev->wki_rx_forward = wki_dev_server_forward_net_rx;
 
-        ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
-        ack.assigned_channel = ch->channel_id;
-        ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
+        // V2: Send extended NET attach ACK with owner NIC info
+        DevAttachAckNetPayload net_ack = {};
+        net_ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
+        net_ack.assigned_channel = ch->channel_id;
+        net_ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
+        net_ack.real_mac = ndev->mac;
+        net_ack.link_state = ndev->state;
 
-        ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u", hdr->src_node, req->resource_id, ch->channel_id);
+        // Populate IPv4 info from the network interface config
+        auto* nif = ker::net::netif_get(ndev);
+        if (nif != nullptr && nif->ipv4_addr_count > 0) {
+            net_ack.ipv4_addr = nif->ipv4_addrs[0].addr;
+            net_ack.ipv4_mask = nif->ipv4_addrs[0].netmask;
+        }
 
-        // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
-        // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
-        // The dynamic channel ID is communicated via ack.assigned_channel in the payload.
-        int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+        ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u ip=0x%08x mask=0x%08x", hdr->src_node, req->resource_id,
+                           ch->channel_id, net_ack.ipv4_addr, net_ack.ipv4_mask);
+
+        int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &net_ack, sizeof(net_ack));
         if (ack_ret != WKI_OK) {
             ker::mod::dbg::log("[WKI] NET attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
         }
@@ -414,51 +517,60 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     const auto* det = reinterpret_cast<const DevDetachPayload*>(payload);
 
-    // Find and remove the binding
+    // Collect binding info under the lock, erase from deque, then cleanup outside
+    struct DetachInfo {
+        uint32_t blk_zone_id;
+        bool blk_rdma_active;
+        ker::dev::BlockDevice* block_dev;
+        ker::net::NetDevice* net_dev;
+        uint16_t consumer_node;
+        uint16_t assigned_channel;
+        bool found;
+        bool uninstall_rx_forward;
+    };
+    DetachInfo info = {};
+
+    s_server_lock.lock();
     for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
-        if (!it->active) {
+        if (!it->active || it->consumer_node != hdr->src_node || it->resource_id != det->resource_id) {
             continue;
         }
-        if (it->consumer_node != hdr->src_node) {
-            continue;
-        }
-        if (it->resource_id != det->resource_id) {
-            continue;
-        }
-
-        // Destroy RDMA block ring zone if active
-        if (it->blk_rdma_active && it->blk_zone_id != 0) {
-            wki_zone_destroy(it->blk_zone_id);
-            it->blk_rdma_active = false;
-            it->blk_zone_ptr = nullptr;
-            it->blk_zone_id = 0;
-        }
-
-        // Call on_remote_detach
-        if (it->block_dev != nullptr && it->block_dev->remotable != nullptr) {
-            it->block_dev->remotable->on_remote_detach(hdr->src_node);
-        }
-        if (it->net_dev != nullptr && it->net_dev->remotable != nullptr) {
-            it->net_dev->remotable->on_remote_detach(hdr->src_node);
-        }
-
-        // D11: Save net_dev before erasing so we can check if hook should be removed
-        ker::net::NetDevice* detached_ndev = it->net_dev;
-
-        // Close channel
-        WkiChannel* ch = wki_channel_get(it->consumer_node, it->assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
-        }
-
-        ker::mod::dbg::log("[WKI] Dev detach: node=0x%04x res_id=%u", hdr->src_node, det->resource_id);
-
+        info.found = true;
+        info.blk_zone_id = it->blk_zone_id;
+        info.blk_rdma_active = it->blk_rdma_active;
+        info.block_dev = it->block_dev;
+        info.net_dev = it->net_dev;
+        info.consumer_node = it->consumer_node;
+        info.assigned_channel = it->assigned_channel;
         g_bindings.erase(it);
+        if (info.net_dev != nullptr) {
+            info.uninstall_rx_forward = !has_net_binding_for_dev(info.net_dev);
+        }
+        break;
+    }
+    s_server_lock.unlock();
 
-        // D11: Uninstall RX forward hook if no more NET bindings reference this device
-        maybe_uninstall_rx_forward(detached_ndev);
-
+    if (!info.found) {
         return;
+    }
+
+    // Cleanup outside the lock
+    if (info.blk_rdma_active && info.blk_zone_id != 0) {
+        wki_zone_destroy(info.blk_zone_id);
+    }
+    if (info.block_dev != nullptr && info.block_dev->remotable != nullptr) {
+        info.block_dev->remotable->on_remote_detach(hdr->src_node);
+    }
+    if (info.net_dev != nullptr && info.net_dev->remotable != nullptr) {
+        info.net_dev->remotable->on_remote_detach(hdr->src_node);
+    }
+    WkiChannel* ch = wki_channel_get(info.consumer_node, info.assigned_channel);
+    if (ch != nullptr) {
+        wki_channel_close(ch);
+    }
+    ker::mod::dbg::log("[WKI] Dev detach: node=0x%04x res_id=%u", hdr->src_node, det->resource_id);
+    if (info.uninstall_rx_forward) {
+        info.net_dev->wki_rx_forward = nullptr;
     }
 }
 
@@ -476,8 +588,11 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
-    // Find binding by (src_node, channel_id)
+    // Find binding by (src_node, channel_id) — pointer is stable (std::deque reference stability)
+    s_server_lock.lock();
     DevServerBinding* binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
+    s_server_lock.unlock();
+
     if (binding == nullptr) {
         // D11: OP_NET_RX_NOTIFY is sent server→consumer on the dynamic channel.
         // The consumer has a proxy (not a server binding), so route to the
@@ -496,14 +611,17 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
-    // Dispatch VFS operations to remote_vfs handler
-    if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_SYMLINK) {
+    // Dispatch VFS operations to remote_vfs handler.
+    // Upper bound is OP_VFS_READDIR_BATCH (0x0412), the highest VFS op code.
+    // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411), and
+    // OP_VFS_READDIR_BATCH (0x0412) all sit above OP_VFS_SEEK_END (0x040E).
+    if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READDIR_BATCH) {
         detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path), req->op_id, req_data, req_data_len);
         return;
     }
 
     // Dispatch NET operations to remote_net handler
-    if (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_GET_STATS) {
+    if (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_RX_CREDIT) {
         if (binding->net_dev == nullptr) {
             DevOpRespPayload resp = {};
             resp.op_id = req->op_id;
@@ -512,7 +630,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
             return;
         }
-        detail::handle_net_op(hdr, hdr->channel_id, binding->net_dev, req->op_id, req_data, req_data_len);
+        detail::handle_net_op(hdr, hdr->channel_id, binding->net_dev, req->op_id, req_data, req_data_len, binding);
         return;
     }
 
@@ -666,6 +784,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
         default: {
             // Unknown op
+            mod::dbg::log("[WKI] Unknown block op: node=0x%04x ch=%u op_id=0x%04x", hdr->src_node, hdr->channel_id, req->op_id);
             DevOpRespPayload resp = {};
             resp.op_id = req->op_id;
             resp.status = -1;
@@ -752,13 +871,13 @@ void blk_ring_server_poll(DevServerBinding* binding) {
     // Guard against concurrent poll from timer thread + post_handler on different CPUs.
     // Use atomic test-and-set to ensure only one caller processes the ring at a time.
     bool expected = false;
-    if (!__atomic_compare_exchange_n(&binding->blk_poll_active, &expected, true, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    if (!binding->blk_poll_active.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
         return;  // another CPU is already polling this ring
     }
 
     auto* hdr = blk_ring_header(binding->blk_zone_ptr);
     if (hdr->server_ready == 0) {
-        __atomic_store_n(&binding->blk_poll_active, false, __ATOMIC_RELEASE);
+        binding->blk_poll_active.store(false, std::memory_order_release);
         return;
     }
 
@@ -845,7 +964,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
     }
 
     // Release poll guard so other CPUs can poll this ring
-    __atomic_store_n(&binding->blk_poll_active, false, __ATOMIC_RELEASE);
+    binding->blk_poll_active.store(false, std::memory_order_release);
 
     if (posted_cqe) {
         blk_ring_signal_consumer(binding);
@@ -862,9 +981,15 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 namespace {
 
 void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*length*/, uint8_t /*op_type*/) {
+    s_server_lock.lock();
     auto* binding = find_binding_by_zone_id(zone_id);
     if (binding != nullptr) {
         binding->blk_sq_notified = true;
+    }
+    s_server_lock.unlock();
+
+    // blk_ring_server_poll may do block I/O — call outside the lock
+    if (binding != nullptr) {
         blk_ring_server_poll(binding);
     }
 }
@@ -876,12 +1001,26 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
 // -----------------------------------------------------------------------------
 
 void wki_dev_server_process_pending_zones() {
+    // Collect pending bindings under the lock, then process outside
+    constexpr size_t MAX_PENDING = 32;
+    std::array<DevServerBinding*, MAX_PENDING> pending = {};
+    size_t pending_count = 0;
+
+    s_server_lock.lock();
     for (auto& b : g_bindings) {
         if (!b.active || !b.blk_zone_pending) {
             continue;
         }
-
         b.blk_zone_pending = false;  // only attempt once
+        if (pending_count < MAX_PENDING) {
+            pending[pending_count++] = &b;
+        }
+    }
+    s_server_lock.unlock();
+
+    // Process each pending binding outside the lock (wki_zone_create may block)
+    for (size_t pi = 0; pi < pending_count; pi++) {
+        auto& b = *pending[pi];
 
         uint32_t zone_sz = blk_ring_default_zone_size();
         uint8_t zone_access = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE | ZONE_ACCESS_REMOTE_READ | ZONE_ACCESS_REMOTE_WRITE;
@@ -946,7 +1085,26 @@ void wki_dev_server_process_pending_zones() {
 // Block RDMA ring — periodic poll (called from wki_timer_tick)
 // -----------------------------------------------------------------------------
 
+auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
+    s_server_lock.lock();
+    for (auto& b : g_bindings) {
+        if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
+            uint8_t* buf = b.vfs_rdma_write_buf;
+            s_server_lock.unlock();
+            return buf;
+        }
+    }
+    s_server_lock.unlock();
+    return nullptr;
+}
+
 void wki_dev_server_poll_rings() {
+    // Collect bindings to poll under the lock, then poll outside
+    constexpr size_t MAX_RINGS = 32;
+    std::array<DevServerBinding*, MAX_RINGS> rings = {};
+    size_t ring_count = 0;
+
+    s_server_lock.lock();
     for (auto& b : g_bindings) {
         if (!b.active || !b.blk_rdma_active) {
             continue;
@@ -959,7 +1117,15 @@ void wki_dev_server_poll_rings() {
             continue;
         }
         b.blk_sq_notified = false;
-        blk_ring_server_poll(&b);
+        if (ring_count < MAX_RINGS) {
+            rings[ring_count++] = &b;
+        }
+    }
+    s_server_lock.unlock();
+
+    // blk_ring_server_poll may do block I/O — call outside the lock
+    for (size_t i = 0; i < ring_count; i++) {
+        blk_ring_server_poll(rings[i]);
     }
 }
 

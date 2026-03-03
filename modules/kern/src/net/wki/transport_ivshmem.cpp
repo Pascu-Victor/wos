@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/pci.hpp>
+#include <net/packet.hpp>
 #include <net/wki/irq_fwd.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -247,6 +248,22 @@ auto ivshmem_wki_tx(WkiTransport* self, uint16_t /*neighbor_id*/, const void* da
         uint32_t peer_id = (priv->my_vm_id == 0) ? 1U : 0U;
         priv->regs[IVSHMEM_REG_DOORBELL / 4] = peer_id;
     }
+    return ret;
+}
+
+auto ivshmem_wki_tx_pkt(WkiTransport* self, uint16_t /*neighbor_id*/, net::PacketBuffer* pkt) -> int {
+    auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
+    if (priv == nullptr) {
+        net::pkt_free(pkt);
+        return -1;
+    }
+
+    int ret = ring_write(&priv->tx_ring, pkt->data, static_cast<uint16_t>(pkt->len));
+    if (ret == 0) {
+        uint32_t peer_id = (priv->my_vm_id == 0) ? 1U : 0U;
+        priv->regs[IVSHMEM_REG_DOORBELL / 4] = peer_id;
+    }
+    net::pkt_free(pkt);
     return ret;
 }
 
@@ -552,6 +569,7 @@ void wki_ivshmem_transport_init() {
     s_ivshmem_transport.rdma_capable = true;
     s_ivshmem_transport.private_data = &s_ivshmem_priv;
     s_ivshmem_transport.tx = ivshmem_wki_tx;
+    s_ivshmem_transport.tx_pkt = ivshmem_wki_tx_pkt;
     s_ivshmem_transport.set_rx_handler = ivshmem_wki_set_rx_handler;
     s_ivshmem_transport.rdma_register_region = ivshmem_wki_rdma_register_region;
     s_ivshmem_transport.rdma_read = ivshmem_wki_rdma_read;

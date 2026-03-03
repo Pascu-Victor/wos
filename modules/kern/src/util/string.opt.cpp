@@ -139,12 +139,12 @@ int u64toh(uint64_t n, char s[]) {
 
 namespace std = _std;
 
-char* snprintf(char* str, size_t size, const char* format, ...) {
+int snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    _std::vsnprintf(str, size, format, args);
+    int ret = _std::vsnprintf(str, size, format, args);
     va_end(args);
-    return str;
+    return ret;
 }
 
 char* strcat(char* dest, const char* src) {
@@ -219,12 +219,12 @@ int u64toa(uint64_t n, std::span<char> s, int base) { return _std::u64toa(n, s, 
 
 int u64toh(uint64_t n, std::span<char> s) { return _std::u64toh(n, s); }
 
-char* snprintf(char* str, size_t size, const char* format, ...) {
+int snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    char* result = _std::snprintf(str, size, format, args);
+    int ret = _std::vsnprintf(str, size, format, args);
     va_end(args);
-    return result;
+    return ret;
 }
 
 char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }

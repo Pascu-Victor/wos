@@ -17,7 +17,6 @@ struct PerCpuGdt {
     Tss_t tss_data;
 } __attribute__((packed, aligned(64)));
 
-static constexpr size_t MAX_CPUS = 256;
 static PerCpuGdt perCpuGdt[MAX_CPUS];
 
 void setTssEntry(TssDescriptor* tssDesc, uint64_t base, uint8_t flags, uint8_t access) {
@@ -71,60 +70,60 @@ void initGdt(uint64_t* stackPointer, uint64_t cpuId) {
         user Data   -  (present, ring 3, type: data, expand-down)
         */
         sharedGdtEntries[GDT_ENTRY_NULL] = makeGdtEntry(0, 0,
-                                                         {
-                                                             .segmentType = 0,
-                                                             .descriptorType = 0,
-                                                             .dpl = 0,
-                                                             .present = 0,
-                                                             .avl = 0,
-                                                             .longMode = 0,
-                                                             .defaultSize = 0,
-                                                             .granularity = 0,
-                                                         });  // null
+                                                        {
+                                                            .segmentType = 0,
+                                                            .descriptorType = 0,
+                                                            .dpl = 0,
+                                                            .present = 0,
+                                                            .avl = 0,
+                                                            .longMode = 0,
+                                                            .defaultSize = 0,
+                                                            .granularity = 0,
+                                                        });  // null
         sharedGdtEntries[GDT_ENTRY_KERNEL_CODE] = makeGdtEntry(0, 0,
-                                                                {
-                                                                    .segmentType = 0xA,
-                                                                    .descriptorType = 1,
-                                                                    .dpl = 0,
-                                                                    .present = 1,
-                                                                    .avl = 0,
-                                                                    .longMode = 1,
-                                                                    .defaultSize = 0,
-                                                                    .granularity = 1,
-                                                                });  // kernel Code
+                                                               {
+                                                                   .segmentType = 0xA,
+                                                                   .descriptorType = 1,
+                                                                   .dpl = 0,
+                                                                   .present = 1,
+                                                                   .avl = 0,
+                                                                   .longMode = 1,
+                                                                   .defaultSize = 0,
+                                                                   .granularity = 1,
+                                                               });  // kernel Code
         sharedGdtEntries[GDT_ENTRY_KERNEL_DATA] = makeGdtEntry(0, 0,
-                                                                {
-                                                                    .segmentType = 0x3,
-                                                                    .descriptorType = 1,
-                                                                    .dpl = 0,
-                                                                    .present = 1,
-                                                                    .avl = 0,
-                                                                    .longMode = 1,
-                                                                    .defaultSize = 0,
-                                                                    .granularity = 1,
-                                                                });  // kernel Data
+                                                               {
+                                                                   .segmentType = 0x3,
+                                                                   .descriptorType = 1,
+                                                                   .dpl = 0,
+                                                                   .present = 1,
+                                                                   .avl = 0,
+                                                                   .longMode = 1,
+                                                                   .defaultSize = 0,
+                                                                   .granularity = 1,
+                                                               });  // kernel Data
         sharedGdtEntries[GDT_ENTRY_USER_CODE] = makeGdtEntry(0, 0,
-                                                              {
-                                                                  .segmentType = 0xA,
-                                                                  .descriptorType = 1,
-                                                                  .dpl = 3,
-                                                                  .present = 1,
-                                                                  .avl = 0,
-                                                                  .longMode = 1,
-                                                                  .defaultSize = 0,
-                                                                  .granularity = 1,
-                                                              });  // user Code
+                                                             {
+                                                                 .segmentType = 0xA,
+                                                                 .descriptorType = 1,
+                                                                 .dpl = 3,
+                                                                 .present = 1,
+                                                                 .avl = 0,
+                                                                 .longMode = 1,
+                                                                 .defaultSize = 0,
+                                                                 .granularity = 1,
+                                                             });  // user Code
         sharedGdtEntries[GDT_ENTRY_USER_DATA] = makeGdtEntry(0, 0,
-                                                              {
-                                                                  .segmentType = 0x3,  // Data: writable, expand-up
-                                                                  .descriptorType = 1,
-                                                                  .dpl = 3,
-                                                                  .present = 1,
-                                                                  .avl = 0,
-                                                                  .longMode = 1,
-                                                                  .defaultSize = 0,
-                                                                  .granularity = 1,
-                                                              });  // user Data
+                                                             {
+                                                                 .segmentType = 0x3,  // Data: writable, expand-up
+                                                                 .descriptorType = 1,
+                                                                 .dpl = 3,
+                                                                 .present = 1,
+                                                                 .avl = 0,
+                                                                 .longMode = 1,
+                                                                 .defaultSize = 0,
+                                                                 .granularity = 1,
+                                                             });  // user Data
 
         gdtEntriesInitialized = true;
     }

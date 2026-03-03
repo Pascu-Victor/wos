@@ -29,7 +29,9 @@ namespace ker::net::wki {
 namespace {
 std::deque<std::unique_ptr<ProxyBlockState>> g_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_dev_proxy_initialized = false;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_proxy_lock;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+// Caller must hold s_proxy_lock.
 auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
         if (p->active && &p->bdev == bdev) {
@@ -39,6 +41,7 @@ auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
     return nullptr;
 }
 
+// Caller must hold s_proxy_lock.
 auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
         if ((p->active || p->op_pending) && p->owner_node == owner_node && p->assigned_channel == channel_id) {
@@ -48,6 +51,7 @@ auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlo
     return nullptr;
 }
 
+// Caller must hold s_proxy_lock.
 auto find_proxy_by_attach(uint16_t owner_node) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
         if (p->attach_pending && p->owner_node == owner_node) {
@@ -320,8 +324,10 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
         memcpy(req_data + sizeof(uint64_t), &chunk, sizeof(uint32_t));
 
         // Set up blocking state
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = dest;
         state->op_resp_max = chunk_bytes;
@@ -332,23 +338,17 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
         int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(),
                                 static_cast<uint16_t>(sizeof(DevOpReqPayload) + REQ_DATA_LEN));
         if (send_ret != WKI_OK) {
-            state->op_pending = false;
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             return -1;
         }
 
-        // Spin-wait for response — targeted single-channel tick
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                state->op_pending = false;
-                return -1;
-            }
-            wki_spin_yield_channel(ch);
+        // Async wait for response
+        int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            return -1;
         }
 
         if (state->op_status != 0) {
@@ -504,7 +504,9 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
 
 // Dispatcher: uses RDMA ring if available, falls back to message-based
 auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -563,8 +565,10 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
         memcpy(req_data + 12, src, chunk_bytes);
 
         // Set up blocking state
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = nullptr;
         state->op_resp_max = 0;
@@ -576,23 +580,17 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
         ker::mod::mm::dyn::kmalloc::free(req_buf);
 
         if (send_ret != WKI_OK) {
-            state->op_pending = false;
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             return -1;
         }
 
-        // Spin-wait for response — targeted single-channel tick
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                state->op_pending = false;
-                return -1;
-            }
-            wki_spin_yield_channel(ch);
+        // Async wait for response
+        int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            return -1;
         }
 
         if (state->op_status != 0) {
@@ -708,7 +706,9 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
 
 // Dispatcher: uses RDMA ring if available, falls back to message-based
 auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -737,8 +737,10 @@ auto remote_block_flush_msg(ProxyBlockState* state) -> int {
     req.op_id = OP_BLOCK_FLUSH;
     req.data_len = 0;
 
+    WkiWaitEntry wait = {};
     state->lock.lock();
-    state->op_pending = true;
+    state->op_wait_entry = &wait;
+    state->op_pending.store(true, std::memory_order_release);
     state->op_status = 0;
     state->op_resp_buf = nullptr;
     state->op_resp_max = 0;
@@ -747,22 +749,16 @@ auto remote_block_flush_msg(ProxyBlockState* state) -> int {
 
     int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
     if (send_ret != WKI_OK) {
-        state->op_pending = false;
+        state->op_wait_entry = nullptr;
+        state->op_pending.store(false, std::memory_order_relaxed);
         return -1;
     }
 
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-    while (state->op_pending) {
-        asm volatile("pause" ::: "memory");
-        if (!state->op_pending) {
-            break;
-        }
-        if (wki_now_us() >= deadline) {
-            state->op_pending = false;
-            return -1;
-        }
-        wki_spin_yield_channel(ch);
+    int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    state->op_wait_entry = nullptr;
+    if (wait_rc == WKI_ERR_TIMEOUT) {
+        state->op_pending.store(false, std::memory_order_relaxed);
+        return -1;
     }
 
     return static_cast<int>(state->op_status);
@@ -823,7 +819,9 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
 
 // Dispatcher
 auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -865,8 +863,11 @@ void wki_dev_proxy_init() {
 
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::dev::BlockDevice* {
     // Allocate a new proxy state via unique_ptr (deque stores pointers, not objects)
+    s_proxy_lock.lock();
     g_proxies.push_back(std::make_unique<ProxyBlockState>());
     auto* state = g_proxies.back().get();
+    s_proxy_lock.unlock();
+    // Proxy pointer is stable (std::deque + unique_ptr); safe to use after unlock.
 
     state->owner_node = owner_node;
     state->resource_id = resource_id;
@@ -879,7 +880,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
     attach_req.requested_channel = 0;  // auto-assign
 
-    state->attach_pending = true;
+    state->attach_pending.store(true, std::memory_order_release);
     state->attach_status = 0;
     state->attach_channel = 0;
 
@@ -890,10 +891,12 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 
     constexpr int MAX_ATTACH_RETRIES = 3;
     for (int retry = 0; retry < MAX_ATTACH_RETRIES; retry++) {
+        WkiWaitEntry wait = {};
+        state->attach_wait_entry = &wait;
         if (retry > 0) {
             ker::mod::dbg::log("[WKI] Dev proxy attach retry %d: node=0x%04x res_id=%u pending=%d", retry, owner_node, resource_id,
-                               state->attach_pending ? 1 : 0);
-            state->attach_pending = true;
+                               state->attach_pending.load(std::memory_order_relaxed) ? 1 : 0);
+            state->attach_pending.store(true, std::memory_order_release);
         }
 
         int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
@@ -901,21 +904,15 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 #ifdef DEBUG_WKI_TRANSPORT
             ker::mod::dbg::log("[WKI-DBG] attach_block: send failed err=%d retry=%d", send_ret, retry);
 #endif
+            state->attach_wait_entry = nullptr;
             continue;  // Retry on send failure
         }
 
-        // Spin-wait for attach ACK — targeted single-channel tick
-        WkiChannel* res_ch = wki_channel_get(owner_node, WKI_CHAN_RESOURCE);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->attach_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->attach_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                break;  // Timeout, try again
-            }
-            wki_spin_yield_channel(res_ch);
+        // Async wait for attach ACK
+        int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->attach_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            continue;  // Timeout, try again
         }
 
         if (!state->attach_pending) {
@@ -930,8 +927,10 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 #ifdef DEBUG_WKI_TRANSPORT
         ker::mod::dbg::log("[WKI-DBG] attach_block: TIMEOUT - setting attach_pending=false, popping proxy");
 #endif
-        state->attach_pending = false;
+        state->attach_pending.store(false, std::memory_order_relaxed);
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         ker::mod::dbg::log("[WKI] Dev proxy attach timeout after %d retries: node=0x%04x res_id=%u proxies_left=%u", MAX_ATTACH_RETRIES,
                            owner_node, resource_id, static_cast<unsigned>(g_proxies.size()));
         return nullptr;
@@ -941,7 +940,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
         ker::mod::dbg::log("[WKI] Dev proxy attach rejected: node=0x%04x res_id=%u status=%u", owner_node, resource_id,
                            state->attach_status);
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         return nullptr;
     }
 
@@ -1081,8 +1082,10 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         info_req.data_len = 0;
 
         std::array<uint8_t, 16> info_buf = {};
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = static_cast<void*>(info_buf.data());
         state->op_resp_max = info_buf.size();
@@ -1091,6 +1094,8 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 
         int send_ret = wki_send(owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &info_req, sizeof(info_req));
         if (send_ret != WKI_OK) {
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             mod::dbg::log("[WKI] Dev proxy block info request send failed: node=0x%04x res_id=%u err=%d", owner_node, resource_id,
                           send_ret);
             DevDetachPayload det = {};
@@ -1098,28 +1103,27 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
             det.resource_id = resource_id;
             wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            s_proxy_lock.lock();
             g_proxies.pop_back();
+            s_proxy_lock.unlock();
             return nullptr;
         }
 
-        WkiChannel* info_ch = wki_channel_get(owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                mod::dbg::log("[WKI] Dev proxy block info request timeout: node=0x%04x res_id=%u", owner_node, resource_id);
-                state->op_pending = false;
-                g_proxies.pop_back();
-                return nullptr;
-            }
-            wki_spin_yield_channel(info_ch);
+        int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (wait_rc == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            mod::dbg::log("[WKI] Dev proxy block info request timeout: node=0x%04x res_id=%u", owner_node, resource_id);
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
         }
 
         if (state->op_status != 0 || state->op_resp_len < 16) {
+            s_proxy_lock.lock();
             g_proxies.pop_back();
+            s_proxy_lock.unlock();
             return nullptr;
         }
 
@@ -1155,7 +1159,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
         det.resource_id = resource_id;
         wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         return nullptr;
     }
 
@@ -1169,21 +1175,27 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 }
 
 void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
+    // Lock to find proxy and copy info needed for cleanup outside the lock.
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(proxy_bdev);
     if (state == nullptr) {
+        s_proxy_lock.unlock();
         return;
     }
 
-    // Free read-ahead cache
-    if (state->ra_buffer != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(state->ra_buffer);
-        state->ra_buffer = nullptr;
-    }
-    ra_invalidate(state);
+    // Copy info for cleanup outside the lock
+    uint16_t owner_node = state->owner_node;
+    uint32_t resource_id = state->resource_id;
+    uint16_t assigned_channel = state->assigned_channel;
+    bool had_rdma = state->rdma_attached;
+    uint32_t rdma_zone_id = state->rdma_zone_id;
+    uint8_t* ra_buf = state->ra_buffer;
 
-    // Destroy RDMA zone before sending detach
-    if (state->rdma_attached && state->rdma_zone_id != 0) {
-        wki_zone_destroy(state->rdma_zone_id);
+    // Neutralise proxy under lock so no other thread picks it up
+    state->ra_buffer = nullptr;
+    ra_invalidate(state);
+    state->active = false;
+    if (had_rdma) {
         state->rdma_attached = false;
         state->rdma_zone_ptr = nullptr;
         state->rdma_zone_id = 0;
@@ -1191,28 +1203,40 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
         state->rdma_transport = nullptr;
         state->rdma_remote_rkey = 0;
     }
+    s_proxy_lock.unlock();
+
+    // --- Cleanup outside lock (no blocking operations while holding spinlock) ---
+
+    // Free read-ahead cache
+    if (ra_buf != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free(ra_buf);
+    }
+
+    // Destroy RDMA zone before sending detach
+    if (had_rdma && rdma_zone_id != 0) {
+        wki_zone_destroy(rdma_zone_id);
+    }
 
     // Unregister from block device subsystem
-    ker::dev::block_device_unregister(&state->bdev);
+    ker::dev::block_device_unregister(proxy_bdev);
 
     // Send DEV_DETACH to owner
     DevDetachPayload det = {};
-    det.target_node = state->owner_node;
+    det.target_node = owner_node;
     det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
-    det.resource_id = state->resource_id;
-    wki_send(state->owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+    det.resource_id = resource_id;
+    wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
 
     // Close the dynamic channel
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    WkiChannel* ch = wki_channel_get(owner_node, assigned_channel);
     if (ch != nullptr) {
         wki_channel_close(ch);
     }
 
-    ker::mod::dbg::log("[WKI] Dev proxy detached: %s", state->bdev.name.data());
+    ker::mod::dbg::log("[WKI] Dev proxy detached: node=0x%04x res=%u ch=%u", owner_node, resource_id, assigned_channel);
 
-    state->active = false;
-
-    // Remove inactive entries
+    // Remove inactive entries under lock
+    s_proxy_lock.lock();
     for (auto it = g_proxies.begin(); it != g_proxies.end();) {
         if (!(*it)->active) {
             it = g_proxies.erase(it);
@@ -1220,6 +1244,7 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
             ++it;
         }
     }
+    s_proxy_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -1228,24 +1253,45 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
 
 void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
     uint64_t now = wki_now_us();
+
+    // Info collected under lock for cleanup outside
+    struct PendingCleanup {
+        uint16_t owner_node;
+        uint16_t channel;
+        uint8_t* ra_buf;
+    };
+    PendingCleanup cleanup[64];  // NOLINT
+    int cleanup_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || p->owner_node != node_id) {
             continue;
         }
 
-        // Fail any in-flight operation so the spin-wait unblocks,
+        // Fail any in-flight operation so the waiter unblocks,
         // but keep the proxy registered — callers will see fenced==true
         // on retry and block in wait_for_fence_lift().
         if (p->op_pending) {
             p->op_status = -1;
-            p->op_pending = false;
+            p->op_pending.store(false, std::memory_order_release);
+            if (p->op_wait_entry != nullptr) {
+                wki_wake_op(p->op_wait_entry, -1);
+            }
+            if (p->attach_wait_entry != nullptr) {
+                wki_wake_op(p->attach_wait_entry, -1);
+            }
         }
 
-        // Free read-ahead cache
-        if (p->ra_buffer != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->ra_buffer);
-            p->ra_buffer = nullptr;
+        // Save RA buffer + channel info for cleanup outside lock
+        if (cleanup_count < 64) {
+            cleanup[cleanup_count].owner_node = p->owner_node;
+            cleanup[cleanup_count].channel = p->assigned_channel;
+            cleanup[cleanup_count].ra_buf = p->ra_buffer;
+            cleanup_count++;
         }
+
+        p->ra_buffer = nullptr;
         ra_invalidate(p.get());
 
         // Clear RDMA state — zone will be destroyed by wki_zones_destroy_for_peer()
@@ -1259,23 +1305,46 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
             p->rdma_remote_rkey = 0;
         }
 
-        // Close the dynamic channel (stale seq/ack state)
-        WkiChannel* ch = wki_channel_get(p->owner_node, p->assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
-        }
-
         p->fenced = true;
         p->fence_time_us = now;
 
         ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x — I/O will block until reconnect or %llu s timeout",
                            p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
     }
+    s_proxy_lock.unlock();
+
+    // Free RA buffers and close channels outside lock
+    for (int i = 0; i < cleanup_count; i++) {
+        if (cleanup[i].ra_buf != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(cleanup[i].ra_buf);
+        }
+        WkiChannel* ch = wki_channel_get(cleanup[i].owner_node, cleanup[i].channel);
+        if (ch != nullptr) {
+            wki_channel_close(ch);
+        }
+    }
 }
 
 void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
+    // Collect matching proxies under lock (deque pointer stability guarantees
+    // the raw pointers remain valid after unlock as long as no erase occurs;
+    // erases only happen in detach/cleanup paths which mark active=false first).
+    ProxyBlockState* to_resume[64];  // NOLINT
+    size_t resume_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
-        if (!p->active || !p->fenced || p->owner_node != node_id) {
+        if (p->active && p->fenced && p->owner_node == node_id && resume_count < 64) {
+            to_resume[resume_count++] = p.get();
+        }
+    }
+    s_proxy_lock.unlock();
+
+    for (size_t ri = 0; ri < resume_count; ri++) {
+        auto* p = to_resume[ri];
+
+        // Re-check validity (another thread may have detached this proxy)
+        if (!p->active || !p->fenced) {
             continue;
         }
 
@@ -1287,33 +1356,29 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
         attach_req.requested_channel = 0;  // auto-assign
 
-        p->attach_pending = true;
+        p->attach_pending.store(true, std::memory_order_release);
         p->attach_status = 0;
         p->attach_channel = 0;
 
         constexpr int MAX_RESUME_RETRIES = 5;
         bool attached = false;
         for (int retry = 0; retry < MAX_RESUME_RETRIES; retry++) {
+            WkiWaitEntry wait = {};
+            p->attach_wait_entry = &wait;
             if (retry > 0) {
-                p->attach_pending = true;
+                p->attach_pending.store(true, std::memory_order_release);
             }
 
             int send_ret = wki_send(node_id, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
             if (send_ret != WKI_OK) {
+                p->attach_wait_entry = nullptr;
                 continue;
             }
 
-            WkiChannel* res_ch = wki_channel_get(node_id, WKI_CHAN_RESOURCE);
-            uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-            while (p->attach_pending) {
-                asm volatile("pause" ::: "memory");
-                if (!p->attach_pending) {
-                    break;
-                }
-                if (wki_now_us() >= deadline) {
-                    break;
-                }
-                wki_spin_yield_channel(res_ch);
+            int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+            p->attach_wait_entry = nullptr;
+            if (wait_rc == WKI_ERR_TIMEOUT) {
+                continue;
             }
 
             if (!p->attach_pending && p->attach_status == static_cast<uint8_t>(DevAttachStatus::OK)) {
@@ -1325,15 +1390,18 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         if (!attached) {
             ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x — will hard-detach", p->bdev.name.data(),
                                node_id);
-            p->attach_pending = false;
+            p->attach_pending.store(false, std::memory_order_relaxed);
             // Leave fenced=true; the fence_timeout_tick will clean it up
             continue;
         }
 
+        // Lock briefly to set channel / fenced fields
+        s_proxy_lock.lock();
         p->assigned_channel = p->attach_channel;
         p->max_op_size = p->attach_max_op_size;
+        s_proxy_lock.unlock();
 
-        // Re-attach RDMA zone if the new attach ACK provided one
+        // Re-attach RDMA zone if the new attach ACK provided one (RDMA ops outside lock)
         if (p->rdma_zone_id != 0 && !p->rdma_attached) {
             WkiZone* zone = wki_zone_find(p->rdma_zone_id);
             if (zone != nullptr && zone->state == ZoneState::ACTIVE) {
@@ -1364,7 +1432,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                             p->ra_capacity = ring_hdr->data_slot_size / ring_hdr->block_size;
                         }
                     }
-                    ra_invalidate(p.get());
+                    ra_invalidate(p);
 
                     ker::mod::dbg::log("[WKI] Dev proxy RDMA ring re-attached on resume: zone=0x%08x roce=%d", p->rdma_zone_id,
                                        p->rdma_roce ? 1 : 0);
@@ -1372,8 +1440,10 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
             }
         }
 
+        s_proxy_lock.lock();
         p->fenced = false;
         p->fence_time_us = 0;
+        s_proxy_lock.unlock();
 
         ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u — blocked I/O will now proceed", p->bdev.name.data(), node_id,
                            p->assigned_channel);
@@ -1381,6 +1451,19 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
 }
 
 void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
+    // Info collected under lock for cleanup outside
+    struct DetachInfo {
+        uint8_t* ra_buf;
+        uint32_t rdma_zone_id;
+        uint16_t owner_node;
+        uint16_t channel;
+        ker::dev::BlockDevice* bdev;
+    };
+    DetachInfo info[64];  // NOLINT
+    int info_count = 0;
+
+    // Lock to iterate, collect info, and mark inactive
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || p->owner_node != node_id) {
             continue;
@@ -1389,19 +1472,29 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
         // Fail any pending operation
         if (p->op_pending) {
             p->op_status = -1;
-            p->op_pending = false;
+            p->op_pending.store(false, std::memory_order_release);
+            if (p->op_wait_entry != nullptr) {
+                wki_wake_op(p->op_wait_entry, -1);
+            }
+            if (p->attach_wait_entry != nullptr) {
+                wki_wake_op(p->attach_wait_entry, -1);
+            }
         }
 
-        // Free read-ahead cache
-        if (p->ra_buffer != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->ra_buffer);
-            p->ra_buffer = nullptr;
+        // Collect info for cleanup outside lock
+        if (info_count < 64) {
+            info[info_count].ra_buf = p->ra_buffer;
+            info[info_count].rdma_zone_id = p->rdma_zone_id;
+            info[info_count].owner_node = p->owner_node;
+            info[info_count].channel = p->assigned_channel;
+            info[info_count].bdev = &p->bdev;
+            info_count++;
         }
+
+        // Neutralise fields under lock
+        p->ra_buffer = nullptr;
         ra_invalidate(p.get());
-
-        // Destroy RDMA zone
         if (p->rdma_zone_id != 0) {
-            wki_zone_destroy(p->rdma_zone_id);
             p->rdma_attached = false;
             p->rdma_zone_ptr = nullptr;
             p->rdma_zone_id = 0;
@@ -1410,22 +1503,29 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
             p->rdma_remote_rkey = 0;
         }
 
-        // Close the dynamic channel
-        WkiChannel* ch = wki_channel_get(p->owner_node, p->assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
-        }
-
-        // Unregister from block device subsystem
-        ker::dev::block_device_unregister(&p->bdev);
-
-        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: %s node=0x%04x", p->bdev.name.data(), node_id);
-
         p->fenced = false;
         p->active = false;
     }
+    s_proxy_lock.unlock();
 
-    // Remove inactive entries
+    // Cleanup outside lock: unregister + close channels + free RA + destroy zones
+    for (int i = 0; i < info_count; i++) {
+        if (info[i].ra_buf != nullptr) {
+            ker::mod::mm::dyn::kmalloc::free(info[i].ra_buf);
+        }
+        if (info[i].rdma_zone_id != 0) {
+            wki_zone_destroy(info[i].rdma_zone_id);
+        }
+        WkiChannel* ch = wki_channel_get(info[i].owner_node, info[i].channel);
+        if (ch != nullptr) {
+            wki_channel_close(ch);
+        }
+        ker::dev::block_device_unregister(info[i].bdev);
+        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: node=0x%04x ch=%u", info[i].owner_node, info[i].channel);
+    }
+
+    // Remove inactive entries under lock
+    s_proxy_lock.lock();
     for (auto it = g_proxies.begin(); it != g_proxies.end();) {
         if (!(*it)->active) {
             it = g_proxies.erase(it);
@@ -1433,9 +1533,19 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
             ++it;
         }
     }
+    s_proxy_lock.unlock();
 }
 
 void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
+    // Collect timed-out proxies under lock, mark inactive, then unregister outside.
+    struct TimedOutInfo {
+        ProxyBlockState* state;
+        uint64_t elapsed;
+    };
+    TimedOutInfo timed_out[64];  // NOLINT
+    int to_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || !p->fenced) {
             continue;
@@ -1450,27 +1560,35 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
 
         uint64_t elapsed = now_us - p->fence_time_us;
         if (elapsed >= WKI_DEV_PROXY_FENCE_WAIT_US) {
-            ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x — tearing down", elapsed / 1000000ULL,
-                               p->bdev.name.data(), p->owner_node);
-
-            // 1. Unregister from block device subsystem — prevents new I/O
-            ker::dev::block_device_unregister(&p->bdev);
-
-            // 2. Mark inactive FIRST so that wait_for_fence_lift() returns
-            //    false.  Leave fenced=true so spinning I/O threads stay in
-            //    the wait loop until they check active and bail out.
-            //    Memory barrier ensures the active=false store is visible to
-            //    other CPUs before we continue.
+            // Mark inactive FIRST so that wait_for_fence_lift() returns
+            // false.  Leave fenced=true so spinning I/O threads stay in
+            // the wait loop until they check active and bail out.
+            // Memory barrier ensures the active=false store is visible to
+            // other CPUs before we continue.
             p->active = false;
             asm volatile("mfence" ::: "memory");
 
-            // Do NOT erase the proxy from g_proxies here — I/O threads on
-            // other CPUs may still hold a raw ProxyBlockState* pointer from
-            // find_proxy_by_bdev().  Freeing the memory would cause a
-            // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
-            // checks active, and all other g_proxies iterators skip inactive
-            // entries.
+            if (to_count < 64) {
+                timed_out[to_count].state = p.get();
+                timed_out[to_count].elapsed = elapsed;
+                to_count++;
+            }
         }
+    }
+    s_proxy_lock.unlock();
+
+    // Unregister block devices outside lock (pointer still valid — no erase).
+    // Do NOT erase the proxy from g_proxies here — I/O threads on
+    // other CPUs may still hold a raw ProxyBlockState* pointer from
+    // find_proxy_by_bdev().  Freeing the memory would cause a
+    // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
+    // checks active, and all other g_proxies iterators skip inactive
+    // entries.
+    for (int i = 0; i < to_count; i++) {
+        auto* st = timed_out[i].state;
+        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x — tearing down", timed_out[i].elapsed / 1000000ULL,
+                           st->bdev.name.data(), st->owner_node);
+        ker::dev::block_device_unregister(&st->bdev);
     }
 }
 
@@ -1532,9 +1650,11 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 #endif
     }
 
-    // Release the spin-wait
-    asm volatile("" ::: "memory");
-    state->attach_pending = false;
+    // Release the waiter
+    state->attach_pending.store(false, std::memory_order_release);
+    if (state->attach_wait_entry != nullptr) {
+        wki_wake_op(state->attach_wait_entry, 0);
+    }
 }
 
 void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1571,9 +1691,11 @@ void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     state->lock.unlock();
 
-    // Release the spin-wait
-    asm volatile("" ::: "memory");
-    state->op_pending = false;
+    // Release the waiter
+    state->op_pending.store(false, std::memory_order_release);
+    if (state->op_wait_entry != nullptr) {
+        wki_wake_op(state->op_wait_entry, 0);
+    }
 }
 
 }  // namespace detail

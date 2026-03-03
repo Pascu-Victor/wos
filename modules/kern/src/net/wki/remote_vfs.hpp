@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -18,6 +19,9 @@ namespace ker::net::wki {
 constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 
+// Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
+constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
+
 // -----------------------------------------------------------------------------
 // VfsExport (server side) — explicitly registered export paths
 // -----------------------------------------------------------------------------
@@ -25,8 +29,8 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 struct VfsExport {
     bool active = false;
     uint32_t resource_id = 0;
-    char export_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
-    char name[VFS_EXPORT_NAME_LEN] = {};         // NOLINT(modernize-avoid-c-arrays)
+    char export_path[VFS_EXPORT_PATH_LEN] = {};
+    char name[VFS_EXPORT_NAME_LEN] = {};
 };
 
 // -----------------------------------------------------------------------------
@@ -53,18 +57,29 @@ struct ProxyVfsState {
     uint32_t resource_id = 0;
     uint16_t max_op_size = 0;
 
-    volatile bool op_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> op_pending{false};
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
+    WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
 
-    volatile bool attach_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> attach_pending{false};
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
-    char local_mount_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
+    char local_mount_path[VFS_EXPORT_PATH_LEN] = {};
+
+    // RDMA-backed I/O — populated at mount time when peer has RDMA transport.
+    // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).
+    // For writes, consumer rdma_writes into server's pre-registered receive region.
+    bool rdma_capable = false;
+    WkiTransport* rdma_transport = nullptr;
+    uint32_t rdma_read_rkey = 0;          // our bounce buffer's rkey (server writes file data here)
+    uint8_t* rdma_bounce_buf = nullptr;   // 64 KB bounce buffer for reads and write staging
+    uint32_t rdma_server_write_rkey = 0;  // server's receive region rkey (consumer writes here for writes)
 
     ker::mod::sys::Spinlock lock;
 };
@@ -73,7 +88,7 @@ struct ProxyVfsState {
 // D6: Read-ahead cache and write-behind buffer (consumer side)
 // -----------------------------------------------------------------------------
 
-constexpr size_t VFS_CACHE_SIZE = 4096;
+constexpr size_t VFS_CACHE_SIZE = 8192;
 
 struct ReadAheadCache {
     int64_t cached_offset = -1;  // Start offset of cached region (-1 = empty)
@@ -130,6 +145,18 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
 
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
+
+// Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2§A9]
+auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int;
+
+// Consumer side: called from vfs_rmdir() for FSType::REMOTE mounts [V2§A9]
+auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int;
+
+// Consumer side: called from vfs_rename() for FSType::REMOTE mounts [V2§A9]
+auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int;
+
+// Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
+auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize) -> ssize_t;
 
 // Consumer side: get the FileOperations for remote VFS files
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;

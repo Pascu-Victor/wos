@@ -147,6 +147,9 @@ static_assert(sizeof(WkiHeader) == 32, "WkiHeader must be 32 bytes");
 constexpr uint16_t WKI_CAP_RDMA_SUPPORT = 0x0001;
 constexpr uint16_t WKI_CAP_ZONE_SUPPORT = 0x0002;
 
+// Hostname constants
+constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
+
 struct HelloPayload {
     uint32_t magic;  // WKI_HELLO_MAGIC
     uint16_t protocol_version;
@@ -157,9 +160,11 @@ struct HelloPayload {
     uint16_t max_channels;
     uint32_t rdma_zone_bitmap;  // RDMA zone membership (32 zones max)
     std::array<uint8_t, 8> reserved;
+    // --- V2 extension (offset 32) ---
+    char hostname[WKI_HOSTNAME_MAX];  // NUL-terminated hostname string [V2§A1.3]
 } __attribute__((packed));
 
-static_assert(sizeof(HelloPayload) == 32, "HelloPayload must be 32 bytes");
+static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
 
 // -----------------------------------------------------------------------------
 // HEARTBEAT Payload — 16 bytes
@@ -465,15 +470,34 @@ struct DevAttachAckPayload {
     uint8_t status;  // DevAttachStatus
     uint8_t reserved;
     uint16_t assigned_channel;
-    uint16_t max_op_size;       // max payload size for DEV_OP_REQ
-    uint16_t rdma_flags;        // bit 0: RDMA block ring zone available
-    uint32_t blk_zone_id;       // RDMA zone ID for block ring (0 = not available)
+    uint16_t max_op_size;  // max payload size for DEV_OP_REQ
+    uint16_t rdma_flags;   // bit 0: RDMA block ring zone available
+    uint32_t blk_zone_id;  // RDMA zone ID for block ring (0 = not available)
 } __attribute__((packed));
 
 static_assert(sizeof(DevAttachAckPayload) == 12, "DevAttachAckPayload must be 12 bytes");
 
+// V2: Extended attach ACK for NET resources — includes owner NIC info [V2§A5.3]
+struct DevAttachAckNetPayload {
+    // V1 base fields (identical layout to DevAttachAckPayload)
+    uint8_t status;
+    uint8_t reserved;
+    uint16_t assigned_channel;
+    uint16_t max_op_size;
+    uint16_t rdma_flags;
+    uint32_t blk_zone_id;  // unused for NET, kept for layout compatibility
+    // V2 NET extension fields
+    uint32_t ipv4_addr;               // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask;               // Owner NIC's IPv4 subnet mask
+    std::array<uint8_t, 6> real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state;              // 0=DOWN, 1=UP
+} __attribute__((packed));
+
+static_assert(sizeof(DevAttachAckNetPayload) == 28, "DevAttachAckNetPayload must be 28 bytes");
+
 // RDMA flags for DevAttachAckPayload
 constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
+constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;       // VFS RDMA available; blk_zone_id carries server write-recv rkey
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload — 8 bytes
@@ -517,6 +541,9 @@ constexpr uint16_t OP_NET_XMIT = 0x0300;
 constexpr uint16_t OP_NET_SET_MAC = 0x0301;
 constexpr uint16_t OP_NET_RX_NOTIFY = 0x0302;
 constexpr uint16_t OP_NET_GET_STATS = 0x0303;
+constexpr uint16_t OP_NET_OPEN = 0x0304;       // V2: bring up remote NIC [V2§A5.5]
+constexpr uint16_t OP_NET_CLOSE = 0x0305;      // V2: shut down remote NIC [V2§A5.5]
+constexpr uint16_t OP_NET_RX_CREDIT = 0x0306;  // V2: replenish RX credits [V2§A5.6]
 
 constexpr uint16_t OP_VFS_OPEN = 0x0400;
 constexpr uint16_t OP_VFS_READ = 0x0401;
@@ -527,6 +554,18 @@ constexpr uint16_t OP_VFS_STAT = 0x0405;
 constexpr uint16_t OP_VFS_MKDIR = 0x0406;
 constexpr uint16_t OP_VFS_READLINK = 0x0407;  // D8: symlink target resolution
 constexpr uint16_t OP_VFS_SYMLINK = 0x0408;   // D8: symlink creation
+constexpr uint16_t OP_VFS_UNLINK = 0x0409;    // V2: file deletion [V2§A9.1]
+constexpr uint16_t OP_VFS_RMDIR = 0x040A;     // V2: directory removal [V2§A9.1]
+constexpr uint16_t OP_VFS_RENAME = 0x040B;    // V2: rename/move [V2§A9.1]
+constexpr uint16_t OP_VFS_FSYNC = 0x040C;     // V2: flush to disk [V2§A9.1]
+constexpr uint16_t OP_VFS_TRUNCATE = 0x040D;  // V2: truncate file [V2§A9.1]
+constexpr uint16_t OP_VFS_SEEK_END = 0x040E;  // V2: seek from end [V2§A9.1]
+constexpr uint16_t OP_VFS_READ_RDMA =
+    0x0410;  // RDMA read:  req={fd:i32,len:u32,off:i64,rkey:u32}(20B) resp={bytes:u32}(4B), data pushed via rdma_write
+constexpr uint16_t OP_VFS_WRITE_RDMA =
+    0x0411;  // RDMA write: consumer rdma_write to server buf first, req={fd:i32,off:i64,len:u32}(16B) resp={bytes:u32}(4B)
+constexpr uint16_t OP_VFS_READDIR_BATCH =
+    0x0412;  // Batch readdir: req={fd:i32,start:u32,max:u32}(12B) resp={count:u32,entries:DirEntry[count]}
 
 // -----------------------------------------------------------------------------
 // DEV_IRQ_FWD Payload — 8 bytes
@@ -585,14 +624,23 @@ enum class TaskDeliveryMode : uint8_t {
 struct TaskSubmitPayload {
     uint32_t task_id;
     uint8_t delivery_mode;  // TaskDeliveryMode
-    uint8_t reserved;
+    uint8_t prefer_inline;  // V2: 0=prefer VFS_REF, 1=prefer INLINE
     uint16_t args_len;
-    // Variable portion depends on delivery_mode:
-    //   INLINE:       uint32_t binary_len, binary[binary_len], args[args_len]
-    //   VFS_REF:      uint16_t path_len, path[path_len], args[args_len]
+    // --- V2 extended environment (offset 8) ---
+    uint16_t argc;     // Number of NUL-separated argument strings
+    uint16_t envc;     // Number of NUL-separated env strings (KEY=VALUE)
+    uint16_t cwd_len;  // Length of CWD string (0 = use default "/")
+    uint16_t reserved;
+    // Variable portion follows at offset 16, depends on delivery_mode:
+    //   INLINE:       uint32_t binary_len, binary[binary_len]
+    //   VFS_REF:      uint16_t path_len, path[path_len]
     //   RESOURCE_REF: uint16_t ref_node_id, uint32_t ref_resource_id,
-    //                 uint16_t path_len, path[path_len], args[args_len]
+    //                 uint16_t path_len, path[path_len]
+    // Then: argc NUL-terminated arg strings, envc NUL-terminated env strings,
+    //       cwd string (cwd_len bytes including NUL)
 } __attribute__((packed));
+
+static_assert(sizeof(TaskSubmitPayload) == 16, "TaskSubmitPayload V2 must be 16 bytes");
 
 // -----------------------------------------------------------------------------
 // TASK_ACCEPT / TASK_REJECT Payload — 16 bytes

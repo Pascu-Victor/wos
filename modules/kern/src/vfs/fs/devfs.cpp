@@ -1,6 +1,7 @@
 #include "devfs.hpp"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
@@ -12,6 +13,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <string_view>
 
 #include "vfs/file_operations.hpp"
 #include "vfs/vfs.hpp"
@@ -1022,16 +1024,18 @@ auto wki_ensure_dirs() -> bool {
 }
 
 // Add a symlink named `name` under `parent_dir`, pointing to `target`.
-void wki_add_symlink(DevFSNode* parent_dir, const char* name, const char* target) {
-    auto* link = create_node(name, DevFSNodeType::SYMLINK);
+void wki_add_symlink(DevFSNode* parent_dir, std::string_view name, std::string_view target) {
+    std::array<char, DEVFS_NAME_MAX> name_buf{};
+    size_t nlen = (name.size() < DEVFS_NAME_MAX - 1) ? name.size() : DEVFS_NAME_MAX - 1;
+    std::memcpy(name_buf.data(), name.data(), nlen);
+    name_buf[nlen] = '\0';
+
+    auto* link = create_node(name_buf.data(), DevFSNodeType::SYMLINK);
     if (link == nullptr) {
         return;
     }
-    size_t tlen = std::strlen(target);
-    if (tlen >= DEVFS_SYMLINK_MAX) {
-        tlen = DEVFS_SYMLINK_MAX - 1;
-    }
-    std::memcpy(link->symlink_target.data(), target, tlen);
+    size_t tlen = (target.size() < DEVFS_SYMLINK_MAX - 1) ? target.size() : DEVFS_SYMLINK_MAX - 1;
+    std::memcpy(link->symlink_target.data(), target.data(), tlen);
     link->symlink_target[tlen] = '\0';
     add_child(parent_dir, link);
 }
@@ -1203,31 +1207,34 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     add_child(type_dir, node);
 
     // Build symlink target: /dev/wki/{type_dir}/{dev_name}
-    char target[128] = {};  // NOLINT(modernize-avoid-c-arrays)
+    std::array<char, DEVFS_SYMLINK_MAX> target = {};
     {
         size_t p = 0;
-        auto app = [&](const char* s) {
-            while (*s != '\0' && p < sizeof(target) - 1) {
-                target[p++] = *s++;
-            }
+        auto app = [&](std::string_view sv) {
+            size_t n = (sv.size() < target.size() - 1 - p) ? sv.size() : target.size() - 1 - p;
+            std::memcpy(target.data() + p, sv.data(), n);
+            p += n;
         };
         app("/dev/wki/");
         app(type_dir_name);
         app("/");
-        app(rctx->dev_name);
+        app(static_cast<const char*>(rctx->dev_name));
         target[p] = '\0';
     }
+
+    std::string_view dev_name_sv{static_cast<const char*>(rctx->dev_name)};
+    std::string_view target_sv{target.data()};
 
     // Symlink in by-zone/{zone_id}/
     DevFSNode* zone_sub = wki_ensure_hex_subdir(g_wki_by_zone, zone_id);
     if (zone_sub != nullptr) {
-        wki_add_symlink(zone_sub, rctx->dev_name, target);
+        wki_add_symlink(zone_sub, dev_name_sv, target_sv);
     }
 
     // Symlink in by-peer/{peer_id}/
     DevFSNode* peer_sub = wki_ensure_hex_subdir(g_wki_by_peer, node_id);
     if (peer_sub != nullptr) {
-        wki_add_symlink(peer_sub, rctx->dev_name, target);
+        wki_add_symlink(peer_sub, dev_name_sv, target_sv);
     }
 
     g_wki_total++;
@@ -1275,7 +1282,7 @@ void devfs_wki_remove_peer_resources(uint16_t node_id) {
         }
 
         // Collect matching nodes first (removal modifies children array)
-        DevFSNode* to_remove[64] = {};  // NOLINT(modernize-avoid-c-arrays)
+        std::array<DevFSNode*, 64> to_remove = {};  // NOLINT(modernize-avoid-c-arrays)
         size_t remove_count = 0;
 
         for (size_t i = 0; i < type_dir->children_count && remove_count < 64; i++) {
@@ -1338,6 +1345,239 @@ auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
     }
 
     return nullptr;
+}
+
+// =============================================================================
+// V2: /dev/nodes/ hierarchy — Node identity
+// =============================================================================
+
+namespace {
+
+// Context for each devfs file under /dev/nodes/<hostname>/
+struct NodeDevfsCtx {
+    uint16_t node_id;   // WKI node ID (0 = self)
+    uint8_t file_type;  // 0 = id, 1 = state, 2 = load
+    char hostname[64];  // Copy of hostname for lookup
+};
+
+// Separate CharDeviceOps for id, state, and load files
+static ker::dev::CharDeviceOps s_node_id_ops = {
+    .open = nullptr,
+    .close = nullptr,
+    .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
+        auto* df = static_cast<DevFSFile*>(f->private_data);
+        if (df == nullptr || df->device == nullptr || df->device->private_data == nullptr) {
+            return 0;
+        }
+        auto* ctx = static_cast<NodeDevfsCtx*>(df->device->private_data);
+
+        std::array<char, 16> data = {};
+        int len = snprintf(data.data(), data.size(), "0x%04x\n", ctx->node_id);
+
+        auto offset = static_cast<size_t>(f->pos);
+        if (offset >= static_cast<size_t>(len)) {
+            return 0;
+        }
+        size_t avail = static_cast<size_t>(len) - offset;
+        size_t to_copy = (count < avail) ? count : avail;
+        std::memcpy(buf, data.data() + offset, to_copy);
+        f->pos += static_cast<off_t>(to_copy);
+        return static_cast<ssize_t>(to_copy);
+    },
+    .write = nullptr,
+    .isatty = nullptr,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+};
+
+static ker::dev::CharDeviceOps s_node_state_ops = {
+    .open = nullptr,
+    .close = nullptr,
+    .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
+        auto* df = static_cast<DevFSFile*>(f->private_data);
+        if (df == nullptr || df->device == nullptr || df->device->private_data == nullptr) {
+            return 0;
+        }
+        auto* ctx = static_cast<NodeDevfsCtx*>(df->device->private_data);
+
+        const char* state_str = "UNKNOWN\n";
+
+        if (ctx->node_id == ker::net::wki::g_wki.my_node_id) {
+            state_str = "SELF\n";
+        } else {
+            auto* peer = ker::net::wki::wki_peer_find(ctx->node_id);
+            if (peer != nullptr) {
+                switch (peer->state) {
+                    case ker::net::wki::PeerState::CONNECTED:
+                        state_str = "CONNECTED\n";
+                        break;
+                    case ker::net::wki::PeerState::FENCED:
+                        state_str = "FENCED\n";
+                        break;
+                    case ker::net::wki::PeerState::HELLO_SENT:
+                        state_str = "HELLO_SENT\n";
+                        break;
+                    case ker::net::wki::PeerState::RECONNECTING:
+                        state_str = "RECONNECTING\n";
+                        break;
+                    default:
+                        state_str = "UNKNOWN\n";
+                        break;
+                }
+            }
+        }
+
+        size_t len = std::strlen(state_str);
+        auto offset = static_cast<size_t>(f->pos);
+        if (offset >= len) {
+            return 0;
+        }
+        size_t avail = len - offset;
+        size_t to_copy = (count < avail) ? count : avail;
+        std::memcpy(buf, state_str + offset, to_copy);
+        f->pos += static_cast<off_t>(to_copy);
+        return static_cast<ssize_t>(to_copy);
+    },
+    .write = nullptr,
+    .isatty = nullptr,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+};
+
+static ker::dev::CharDeviceOps s_node_load_ops = {
+    .open = nullptr,
+    .close = nullptr,
+    .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
+        auto* df = static_cast<DevFSFile*>(f->private_data);
+        if (df == nullptr || df->device == nullptr || df->device->private_data == nullptr) {
+            return 0;
+        }
+        auto* ctx = static_cast<NodeDevfsCtx*>(df->device->private_data);
+
+        std::array<char, 128> data = {};
+        int len = 0;
+
+        if (ctx->node_id == ker::net::wki::g_wki.my_node_id) {
+            len = snprintf(data.data(), data.size(), "cpu=0 mem=0 tasks=0\n");
+        } else {
+            auto* peer = ker::net::wki::wki_peer_find(ctx->node_id);
+            if (peer != nullptr) {
+                len = snprintf(data.data(), data.size(), "rtt=%u\n", peer->rtt_us);
+            } else {
+                len = snprintf(data.data(), data.size(), "unavailable\n");
+            }
+        }
+
+        auto offset = static_cast<size_t>(f->pos);
+        if (offset >= static_cast<size_t>(len)) {
+            return 0;
+        }
+        size_t avail = static_cast<size_t>(len) - offset;
+        size_t to_copy = (count < avail) ? count : avail;
+        std::memcpy(buf, data.data() + offset, to_copy);
+        f->pos += static_cast<off_t>(to_copy);
+        return static_cast<ssize_t>(to_copy);
+    },
+    .write = nullptr,
+    .isatty = nullptr,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+};
+
+static unsigned s_node_minor_counter = 0;
+
+auto make_node_device(const char* hostname, uint16_t node_id, uint8_t file_type, ker::dev::CharDeviceOps* ops) -> ker::dev::Device* {
+    auto* dev = new ker::dev::Device();
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    auto* ctx = static_cast<NodeDevfsCtx*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(NodeDevfsCtx)));
+    if (ctx == nullptr) {
+        delete dev;
+        return nullptr;
+    }
+
+    ctx->node_id = node_id;
+    ctx->file_type = file_type;
+    std::strncpy(static_cast<char*>(ctx->hostname), hostname, sizeof(ctx->hostname) - 1);
+
+    dev->major = 10;
+    dev->minor = 300 + s_node_minor_counter++;
+    dev->name = static_cast<char*>(ctx->hostname);  // devfs doesn't use this for path
+    dev->type = ker::dev::DeviceType::CHAR;
+    dev->private_data = ctx;
+    dev->char_ops = ops;
+
+    return dev;
+}
+
+}  // namespace
+
+void devfs_nodes_init() {
+    walk_path("nodes", true);  // creates /dev/nodes/
+}
+
+void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
+    if (hostname == nullptr || hostname[0] == '\0') {
+        return;
+    }
+
+    // Build directory path: "nodes/<hostname>"
+    std::array<char, 128> dir_path = {};
+    snprintf(dir_path.data(), dir_path.size(), "nodes/%s", hostname);
+    walk_path(dir_path.data(), true);  // creates /dev/nodes/<hostname>/
+
+    // Create id file
+    std::array<char, 160> path = {};
+    snprintf(path.data(), path.size(), "nodes/%s/id", hostname);
+    auto* id_dev = make_node_device(hostname, node_id, 0, &s_node_id_ops);
+    if (id_dev != nullptr) {
+        devfs_add_device_node(path.data(), id_dev);
+    }
+
+    // Create state file
+    snprintf(path.data(), path.size(), "nodes/%s/state", hostname);
+    auto* state_dev = make_node_device(hostname, node_id, 1, &s_node_state_ops);
+    if (state_dev != nullptr) {
+        devfs_add_device_node(path.data(), state_dev);
+    }
+
+    // Create load file
+    snprintf(path.data(), path.size(), "nodes/%s/load", hostname);
+    auto* load_dev = make_node_device(hostname, node_id, 2, &s_node_load_ops);
+    if (load_dev != nullptr) {
+        devfs_add_device_node(path.data(), load_dev);
+    }
+}
+
+void devfs_nodes_update_state(const char* /*hostname*/, const char* /*state_str*/) {
+    // State is read live from WkiPeer::state via the s_node_state_ops read handler.
+    // No cached state to update — this function exists for future use if caching is added.
+}
+
+void devfs_nodes_remove_peer(const char* hostname) {
+    if (hostname == nullptr || hostname[0] == '\0') {
+        return;
+    }
+
+    std::array<char, 128> dir_path = {};
+    snprintf(dir_path.data(), dir_path.size(), "nodes/%s", hostname);
+    auto* dir = walk_path(dir_path.data());
+    if (dir == nullptr) {
+        return;
+    }
+
+    // Remove all children (id, state, load files)
+    while (dir->children_count > 0) {
+        remove_child(dir, dir->children[0]);
+    }
+
+    // Remove the directory itself from /dev/nodes/
+    auto* nodes_dir = walk_path("nodes");
+    if (nodes_dir != nullptr) {
+        remove_child(nodes_dir, dir);
+    }
 }
 
 }  // namespace ker::vfs::devfs

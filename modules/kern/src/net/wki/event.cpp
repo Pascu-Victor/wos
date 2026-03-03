@@ -51,6 +51,8 @@ struct PendingReliableEvent {
 
 std::deque<PendingReliableEvent> g_pending_reliable;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+static ker::mod::sys::Spinlock s_event_lock;
+
 // -----------------------------------------------------------------------------
 // D2: Event log ring buffer — replay matching events to new subscribers
 // -----------------------------------------------------------------------------
@@ -196,6 +198,8 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
         memcpy(buf.data() + sizeof(EventPublishPayload), data, data_len);
     }
 
+    s_event_lock.lock();
+
     // D2: Store in event log ring buffer for future replay
     event_log_push(event_class, event_id, g_wki.my_node_id, data, data_len);
 
@@ -237,6 +241,8 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
 
         h.handler(g_wki.my_node_id, event_class, event_id, data, data_len);
     }
+
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -254,11 +260,15 @@ void wki_event_register_handler(uint16_t event_class, uint16_t event_id, EventHa
     h.event_id = event_id;
     h.handler = handler;
 
+    s_event_lock.lock();
     g_local_handlers.push_back(h);
+    s_event_lock.unlock();
 }
 
 void wki_event_unregister_handler(EventHandlerFn handler) {
+    s_event_lock.lock();
     std::erase_if(g_local_handlers, [handler](const WkiEventHandler& h) { return h.handler == handler; });
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -266,7 +276,14 @@ void wki_event_unregister_handler(EventHandlerFn handler) {
 // -----------------------------------------------------------------------------
 
 void wki_event_timer_tick(uint64_t now_us) {
-    if (!g_event_initialized || g_pending_reliable.empty()) {
+    if (!g_event_initialized) {
+        return;
+    }
+
+    s_event_lock.lock();
+
+    if (g_pending_reliable.empty()) {
+        s_event_lock.unlock();
         return;
     }
 
@@ -293,6 +310,8 @@ void wki_event_timer_tick(uint64_t now_us) {
     if (any_removed) {
         std::erase_if(g_pending_reliable, [](const PendingReliableEvent& p) { return p.subscriber_node == WKI_NODE_INVALID; });
     }
+
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -300,8 +319,10 @@ void wki_event_timer_tick(uint64_t now_us) {
 // -----------------------------------------------------------------------------
 
 void wki_event_cleanup_for_peer(uint16_t node_id) {
+    s_event_lock.lock();
     std::erase_if(g_subscriptions, [node_id](const WkiEventSubscription& sub) { return sub.subscriber_node == node_id; });
     std::erase_if(g_pending_reliable, [node_id](const PendingReliableEvent& p) { return p.subscriber_node == node_id; });
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -317,12 +338,15 @@ void handle_event_subscribe(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     const auto* sub = reinterpret_cast<const EventSubscribePayload*>(payload);
 
+    s_event_lock.lock();
+
     // Check if this subscription already exists (upsert)
     for (auto& existing : g_subscriptions) {
         if (existing.active && existing.subscriber_node == hdr->src_node && existing.event_class == sub->event_class &&
             existing.event_id == sub->event_id) {
             // Update delivery mode
             existing.delivery_mode = sub->delivery_mode;
+            s_event_lock.unlock();
             return;
         }
     }
@@ -337,11 +361,13 @@ void handle_event_subscribe(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     g_subscriptions.push_back(entry);
 
-    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node, sub->event_class,
-                       sub->event_id, (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
-
     // D2: Replay matching events from log to the new subscriber
     event_log_replay_to(hdr->src_node, sub->event_class, sub->event_id);
+
+    s_event_lock.unlock();
+
+    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node, sub->event_class,
+                       sub->event_id, (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
 }
 
 void handle_event_unsubscribe(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -351,9 +377,11 @@ void handle_event_unsubscribe(const WkiHeader* hdr, const uint8_t* payload, uint
 
     const auto* unsub = reinterpret_cast<const EventSubscribePayload*>(payload);
 
+    s_event_lock.lock();
     std::erase_if(g_subscriptions, [&](const WkiEventSubscription& s) {
         return s.subscriber_node == hdr->src_node && s.event_class == unsub->event_class && s.event_id == unsub->event_id;
     });
+    s_event_lock.unlock();
 
     ker::mod::dbg::log("[WKI] Event unsubscription: node=0x%04x class=0x%04x id=0x%04x", hdr->src_node, unsub->event_class,
                        unsub->event_id);
@@ -376,6 +404,8 @@ void handle_event_publish(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         event_data = payload + sizeof(EventPublishPayload);
     }
 
+    s_event_lock.lock();
+
     // Invoke matching local handlers
     for (const auto& h : g_local_handlers) {
         if (!h.active || h.handler == nullptr) {
@@ -387,6 +417,8 @@ void handle_event_publish(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
         h.handler(pub->origin_node, pub->event_class, pub->event_id, event_data, pub->data_len);
     }
+
+    s_event_lock.unlock();
 
     // D1: Always send an ACK back to the publisher. We don't track our own
     // outgoing subscriptions locally, so we can't check delivery mode here.
@@ -409,10 +441,12 @@ void handle_event_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
     const auto* ack = reinterpret_cast<const EventAckPayload*>(payload);
 
     // D1: Remove the matching pending reliable event for this subscriber
+    s_event_lock.lock();
     std::erase_if(g_pending_reliable, [&](const PendingReliableEvent& p) {
         return p.subscriber_node == hdr->src_node && p.event_class == ack->event_class && p.event_id == ack->event_id &&
                p.origin_node == ack->origin_node;
     });
+    s_event_lock.unlock();
 }
 
 }  // namespace detail

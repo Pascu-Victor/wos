@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <dev/block_device.hpp>
 #include <net/wki/blk_ring.hpp>
@@ -32,17 +33,19 @@ struct ProxyBlockState {
     uint16_t max_op_size = 0;
 
     // Synchronous blocking for DEV_OP_RESP
-    volatile bool op_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> op_pending{false};
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
+    WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
 
     // Attach handshake (DEV_ATTACH_ACK)
-    volatile bool attach_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> attach_pending{false};
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
     // RDMA block ring state (Phase 3: shared memory SQ/CQ for block I/O)
     bool rdma_attached = false;
@@ -74,9 +77,9 @@ struct ProxyBlockState {
     bool ra_valid = false;         // true when cache contains valid data
 
     // Registered block device (callers use this transparently)
-    ker::dev::BlockDevice bdev;
+    dev::BlockDevice bdev;
 
-    ker::mod::sys::Spinlock lock;
+    mod::sys::Spinlock lock;
 };
 
 // -----------------------------------------------------------------------------
@@ -89,10 +92,10 @@ void wki_dev_proxy_init();
 // Attach to a remote block device. Sends DEV_ATTACH_REQ and blocks until ACK.
 // On success, registers a proxy BlockDevice and returns a pointer to it.
 // On failure, returns nullptr.
-auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::dev::BlockDevice*;
+auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> dev::BlockDevice*;
 
 // Detach a proxy block device. Sends DEV_DETACH to the owner.
-void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev);
+void wki_dev_proxy_detach_block(dev::BlockDevice* proxy_bdev);
 
 // Suspend all proxies for a fenced peer — block device stays registered but
 // I/O operations will block until the fence is lifted or a timeout expires.

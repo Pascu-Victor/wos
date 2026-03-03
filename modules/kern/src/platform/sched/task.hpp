@@ -90,6 +90,13 @@ struct Task {
     static constexpr unsigned EXE_PATH_MAX = 256;
     char exe_path[EXE_PATH_MAX] = "";
 
+    // WKI: prefer inline delivery for remote compute placement (V2§A6.4)
+    bool wki_prefer_inline = false;
+
+    // WKI: when non-zero, this task is a proxy for a remote task.
+    // The proxy stays in WAITING state until the remote task completes.
+    uint32_t wki_proxy_task_id = 0;
+
     // POSIX credential model
     uint32_t uid = 0;      // Real user ID
     uint32_t gid = 0;      // Real group ID

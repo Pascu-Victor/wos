@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
@@ -21,6 +22,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
+#include <vfs/fs/devfs.hpp>
 
 #include "platform/mm/phys.hpp"
 
@@ -40,6 +42,8 @@ void wki_peer_send_hello_broadcast() {
     hello.heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
     hello.max_channels = g_wki.max_channels;
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
+    // V2: include local hostname
+    memcpy(hello.hostname, g_wki.local_hostname, WKI_HOSTNAME_MAX);
 
     wki_send_raw(WKI_NODE_BROADCAST, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY);
 }
@@ -54,6 +58,8 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
     hello.heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
     hello.max_channels = g_wki.max_channels;
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
+    // V2: include local hostname
+    memcpy(hello.hostname, g_wki.local_hostname, WKI_HOSTNAME_MAX);
 
     // Build frame manually to use specific transport
     uint16_t frame_len = WKI_HEADER_SIZE + sizeof(HelloPayload);
@@ -90,6 +96,8 @@ void wki_peer_send_hello_ack(WkiPeer* peer) {
     ack.heartbeat_interval_ms = peer->heartbeat_interval_ms;
     ack.max_channels = g_wki.max_channels;
     ack.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
+    // V2: include local hostname
+    memcpy(ack.hostname, g_wki.local_hostname, WKI_HOSTNAME_MAX);
 
     wki_send_raw(peer->node_id, MsgType::HELLO_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
 }
@@ -124,12 +132,12 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         int cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
         if (cmp < 0) {
             // Remote has lower MAC → remote keeps, we regenerate
-            uint64_t seed = ker::mod::time::getTicks();
+            uint64_t seed = mod::time::getTicks();
             auto new_id = static_cast<uint16_t>((seed ^ (seed >> 16)) & 0xFFFF);
             if (new_id == WKI_NODE_INVALID || new_id == WKI_NODE_BROADCAST) {
                 new_id = 0x0001;
             }
-            ker::mod::dbg::log("[WKI] Node ID collision with 0x%04x, regenerating to 0x%04x", hello->node_id, new_id);
+            mod::dbg::log("[WKI] Node ID collision with 0x%04x, regenerating to 0x%04x", hello->node_id, new_id);
             g_wki.my_node_id = new_id;
             // Re-broadcast HELLO with new ID
             wki_peer_send_hello_broadcast();
@@ -147,7 +155,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         peer = wki_peer_alloc(peer_node);
         if (peer == nullptr) {
             g_wki.peer_lock.unlock();
-            ker::mod::dbg::log("[WKI] Peer table full, ignoring HELLO from 0x%04x", peer_node);
+            mod::dbg::log("[WKI] Peer table full, ignoring HELLO from 0x%04x", peer_node);
             return;
         }
     }
@@ -156,7 +164,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
 
     // Update peer info
     memcpy(&peer->mac, &hello->mac_addr, 6);
-    peer->transport = transport;
+    //   ivshmem > RoCE > Ethernet.  Only upgrade, never downgrade.
+    if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
+        peer->transport = transport;
+    }
     peer->capabilities = hello->capabilities;
     peer->max_channels = hello->max_channels;
     peer->rdma_zone_bitmap = hello->rdma_zone_bitmap;
@@ -165,6 +176,30 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     peer->link_cost = 1;
     peer->last_heartbeat = wki_now_us();
     peer->missed_beats = 0;
+
+    // V2: Copy hostname from HELLO payload
+    memcpy(peer->hostname, hello->hostname, WKI_HOSTNAME_MAX);
+    peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';  // ensure NUL-terminated
+
+    // V2: Hostname collision detection
+    // If the peer has the same hostname as us, the node with the lower MAC keeps it
+    if (peer->hostname[0] != '\0' && strcmp(peer->hostname, g_wki.local_hostname) == 0) {
+        int mac_cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
+        if (mac_cmp < 0) {
+            // Remote has lower MAC → remote keeps hostname, we fall back
+            snprintf(g_wki.local_hostname, WKI_HOSTNAME_MAX, "node-%04x", g_wki.my_node_id);
+            mod::dbg::log("[WKI] Hostname collision with 0x%04x, falling back to '%s'", peer_node, g_wki.local_hostname);
+        } else if (mac_cmp > 0) {
+            // We have lower MAC → we keep hostname, remote will fall back on their end
+            // Clear peer's hostname so it gets the fallback on our records
+            snprintf(peer->hostname, WKI_HOSTNAME_MAX, "node-%04x", peer_node);
+        }
+    }
+
+    // If peer sent empty hostname, generate a fallback
+    if (peer->hostname[0] == '\0') {
+        snprintf(peer->hostname, WKI_HOSTNAME_MAX, "node-%04x", peer_node);
+    }
 
     // Select RDMA transport: prefer ivshmem (native doorbell), fall back to RoCE
     if (transport->rdma_capable) {
@@ -199,12 +234,13 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
 
     if (was_fenced) {
         peer->state = PeerState::RECONNECTING;
-        ker::mod::dbg::log("[WKI] Peer 0x%04x reconnecting (was fenced)", peer_node);
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnecting (was fenced)", peer_node, peer->hostname);
     } else if (peer->state == PeerState::UNKNOWN || peer->state == PeerState::HELLO_SENT) {
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         newly_connected = true;
-        ker::mod::dbg::log("[WKI] Peer 0x%04x connected (direct)", peer_node);
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (direct, transport=%s)", peer_node, peer->hostname,
+                      peer->transport != nullptr ? peer->transport->name : "?");
     }
 
     g_wki.peer_lock.unlock();
@@ -221,7 +257,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         g_wki.peer_lock.unlock();
-        ker::mod::dbg::log("[WKI] Peer 0x%04x reconnected, reconciling", peer_node);
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnected, reconciling", peer_node, peer->hostname);
         newly_connected = true;
 
         // Resume any suspended block device proxies — re-attach channels
@@ -239,6 +275,9 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
 
         // D9: Auto-discover and advertise exportable local mount points as VFS resources
         wki_remote_vfs_auto_discover();
+
+        // V2: Register peer in /dev/nodes/ hierarchy
+        vfs::devfs::devfs_nodes_add_peer(peer->hostname, peer_node);
 
         // Emit NODE_JOIN event
         wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
@@ -272,12 +311,24 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     }
 
     memcpy(&peer->mac, &ack->mac_addr, 6);
-    peer->transport = transport;
+    // Prefer RDMA-capable (ivshmem) transport over Ethernet per spec
+    //   ivshmem > RoCE > Ethernet.  Only upgrade, never downgrade.
+    if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
+        peer->transport = transport;
+    }
     peer->capabilities = ack->capabilities;
     peer->max_channels = ack->max_channels;
     peer->rdma_zone_bitmap = ack->rdma_zone_bitmap;
     peer->is_direct = true;
     peer->hop_count = 1;
+
+    // V2: Copy hostname from HELLO_ACK payload
+    memcpy(peer->hostname, ack->hostname, WKI_HOSTNAME_MAX);
+    peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';
+    // If peer sent empty hostname, generate a fallback
+    if (peer->hostname[0] == '\0') {
+        snprintf(peer->hostname, WKI_HOSTNAME_MAX, "node-%04x", peer_node);
+    }
 
     // Select RDMA transport: prefer ivshmem, fall back to RoCE
     if (transport->rdma_capable) {
@@ -313,7 +364,8 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         newly_connected = true;
-        ker::mod::dbg::log("[WKI] Peer 0x%04x connected (HELLO_ACK received)", peer_node);
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, peer->hostname,
+                      peer->transport != nullptr ? peer->transport->name : "?");
     }
 
     g_wki.peer_lock.unlock();
@@ -327,6 +379,9 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
         // D9: Auto-discover and advertise exportable local mount points as VFS resources
         wki_remote_vfs_auto_discover();
+
+        // V2: Register peer in /dev/nodes/ hierarchy
+        vfs::devfs::devfs_nodes_add_peer(peer->hostname, peer_node);
 
         // Emit NODE_JOIN event
         wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
@@ -342,16 +397,16 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 void wki_peer_send_heartbeats() {
     // Gather real CPU load from scheduler run queues
     uint16_t total_runnable = 0;
-    uint64_t cpu_count = ker::mod::smt::getCoreCount();
+    uint64_t cpu_count = mod::smt::getCoreCount();
     for (uint64_t c = 0; c < cpu_count; c++) {
-        auto stats = ker::mod::sched::get_run_queue_stats(c);
+        auto stats = mod::sched::get_run_queue_stats(c);
         total_runnable += static_cast<uint16_t>(stats.active_task_count);
     }
 
     HeartbeatPayload hb = {};
-    hb.send_timestamp = ker::mod::time::getUs() * 1000;  // convert to nanoseconds
+    hb.send_timestamp = mod::time::getUs() * 1000;  // convert to nanoseconds
     hb.sender_load = total_runnable;
-    hb.sender_mem_free = ker::mod::mm::phys::get_free_mem_bytes();
+    hb.sender_mem_free = mod::mm::phys::get_free_mem_bytes();
     hb.reserved = 0;
 
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
@@ -394,9 +449,9 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 
     // Send HEARTBEAT_ACK echoing the timestamp for RTT calculation
     uint16_t ack_runnable = 0;
-    uint64_t ack_cpu_count = ker::mod::smt::getCoreCount();
+    uint64_t ack_cpu_count = mod::smt::getCoreCount();
     for (uint64_t c = 0; c < ack_cpu_count; c++) {
-        auto stats = ker::mod::sched::get_run_queue_stats(c);
+        auto stats = mod::sched::get_run_queue_stats(c);
         ack_runnable += static_cast<uint16_t>(stats.active_task_count);
     }
 
@@ -465,7 +520,7 @@ void wki_peer_fence(WkiPeer* peer) {
     peer->state = PeerState::FENCED;
     peer->lock.unlock();
 
-    ker::mod::dbg::log("[WKI] FENCED peer 0x%04x", fenced_id);
+    mod::dbg::log("[WKI] FENCED peer 0x%04x", fenced_id);
 
     // Emit NODE_LEAVE event before cleanup
     wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_LEAVE, &fenced_id, sizeof(fenced_id));
@@ -520,6 +575,9 @@ void wki_peer_fence(WkiPeer* peer) {
         wki_send(p->node_id, WKI_CHAN_CONTROL, MsgType::FENCE_NOTIFY, &fn, sizeof(fn));
     }
 
+    // V2: Remove fenced peer from /dev/nodes/
+    vfs::devfs::devfs_nodes_remove_peer(peer->hostname);
+
     // Invalidate discovered resources from fenced peer
     wki_resources_invalidate_for_peer(fenced_id);
 
@@ -537,7 +595,7 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 
     const auto* fn = reinterpret_cast<const FenceNotifyPayload*>(payload);
 
-    ker::mod::dbg::log("[WKI] Received FENCE_NOTIFY: node 0x%04x fenced by 0x%04x", fn->fenced_node, fn->fencing_node);
+    mod::dbg::log("[WKI] Received FENCE_NOTIFY: node 0x%04x fenced by 0x%04x", fn->fenced_node, fn->fencing_node);
 
     // Invalidate the fenced node's LSDB entry and recompute routes.
     // The fencing node will also flood an updated LSA without the fenced peer,
@@ -663,8 +721,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
 
         if (elapsed >= timeout_us) {
-            ker::mod::dbg::log("[WKI] Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer->node_id, elapsed,
-                               timeout_us);
+            mod::dbg::log("[WKI] Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer->node_id, elapsed, timeout_us);
             wki_peer_fence(peer);
         }
     }
@@ -699,6 +756,50 @@ void wki_peer_timer_tick(uint64_t now_us) {
 
     // Also run the channel-level retransmit/ACK timer
     wki_timer_tick(now_us);
+
+    // V2: Scan pending async wait entries for timeouts
+    wki_wait_timeout_scan(now_us);
+}
+
+// -----------------------------------------------------------------------------
+// V2: Hostname lookup API
+// -----------------------------------------------------------------------------
+
+auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t {
+    if (hostname == nullptr || hostname[0] == '\0') {
+        return WKI_NODE_INVALID;
+    }
+
+    // Check if it's our own hostname
+    if (strcmp(hostname, g_wki.local_hostname) == 0) {
+        return g_wki.my_node_id;
+    }
+
+    g_wki.peer_lock.lock();
+    for (uint16_t i = 0; i < g_wki.peer_count; i++) {
+        auto& peer = g_wki.peers[i];
+        if (peer.node_id != WKI_NODE_INVALID && peer.state == PeerState::CONNECTED) {
+            if (strcmp(peer.hostname, hostname) == 0) {
+                uint16_t result = peer.node_id;
+                g_wki.peer_lock.unlock();
+                return result;
+            }
+        }
+    }
+    g_wki.peer_lock.unlock();
+    return WKI_NODE_INVALID;
+}
+
+auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
+    if (node_id == g_wki.my_node_id) {
+        return g_wki.local_hostname;
+    }
+
+    WkiPeer* peer = wki_peer_find(node_id);
+    if (peer == nullptr || peer->hostname[0] == '\0') {
+        return nullptr;
+    }
+    return peer->hostname;
 }
 
 // -----------------------------------------------------------------------------
@@ -707,22 +808,22 @@ void wki_peer_timer_tick(uint64_t now_us) {
 
 [[noreturn]] void wki_timer_thread() {
     for (;;) {
-        uint64_t now_us = ker::mod::time::getUs();
+        uint64_t now_us = mod::time::getUs();
         wki_peer_timer_tick(now_us);
         // Sleep until next interrupt (~10ms scheduler tick).
         // The scheduler will preempt this thread if other tasks need CPU time.
-        ker::mod::sched::kern_yield();
+        mod::sched::kern_yield();
     }
 }
 
 void wki_timer_thread_start() {
-    auto* task = ker::mod::sched::task::Task::createKernelThread("wki_timer", wki_timer_thread);
+    auto* task = mod::sched::task::Task::createKernelThread("wki_timer", wki_timer_thread);
     if (task == nullptr) {
-        ker::mod::dbg::log("[WKI] Failed to create WKI timer kernel thread");
+        mod::dbg::log("[WKI] Failed to create WKI timer kernel thread");
         return;
     }
-    ker::mod::sched::post_task_balanced(task);
-    ker::mod::dbg::log("[WKI] Timer kernel thread started (PID %d)", task->pid);
+    mod::sched::post_task_balanced(task);
+    mod::dbg::log("[WKI] Timer kernel thread started (PID %d)", task->pid);
 }
 
 }  // namespace ker::net::wki

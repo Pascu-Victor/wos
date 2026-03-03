@@ -7,6 +7,8 @@
 #include <platform/mm/addr.hpp>
 
 namespace ker::mod::desc::gdt {
+static constexpr size_t MAX_CPUS = 256;
+
 // GDT Setup
 constexpr static uint64_t GDT_ENTRY_NULL = 0;
 constexpr static uint64_t GDT_ENTRY_KERNEL_CODE = 1;

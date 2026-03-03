@@ -32,8 +32,6 @@
 #include "sys/multiproc.h"
 
 namespace {
-constexpr size_t buffer_size = 64;
-constexpr int NUM_SUB_INITS = 20;
 constexpr size_t FSTAB_BUF_SIZE = 4096;
 constexpr size_t FIELD_MAX = 256;
 
@@ -41,30 +39,10 @@ constexpr size_t FIELD_MAX = 256;
 int simple_atoi(const char* str) {
     int result = 0;
     while (*str >= '0' && *str <= '9') {
-        result = result * 10 + (*str - '0');
+        result = (result * 10) + (*str - '0');
         str++;
     }
     return result;
-}
-
-// Simple itoa for small numbers (0-99)
-void int_to_str(int val, char* buf) {
-    if (val == 0) {
-        buf[0] = '0';
-        buf[1] = '\0';
-        return;
-    }
-    int i = 0;
-    char tmp[16];
-    while (val > 0) {
-        tmp[i++] = '0' + (val % 10);
-        val /= 10;
-    }
-    int j = 0;
-    while (i > 0) {
-        buf[j++] = tmp[--i];
-    }
-    buf[j] = '\0';
 }
 
 }  // namespace

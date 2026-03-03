@@ -5,7 +5,9 @@
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -223,6 +225,52 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
                 memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
             }
             continue;  // re-resolve after substitution
+        }
+
+        // Remote mounts: ask the server to resolve symlinks
+        if (mount->fs_type == FSType::REMOTE) {
+            size_t mount_len = 0;
+            while (mount->path[mount_len] != '\0') mount_len++;
+            const char* fs_path = resolved_buf;
+            if (mount_len == 1 && mount->path[0] == '/')
+                fs_path = resolved_buf + 1;
+            else if (resolved_buf[mount_len] == '/')
+                fs_path = resolved_buf + mount_len + 1;
+            else if (resolved_buf[mount_len] == '\0')
+                fs_path = "";
+            else
+                fs_path = resolved_buf + mount_len;
+
+            char linkbuf[MAX_PATH_LEN];
+            ssize_t link_len = ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, linkbuf, MAX_PATH_LEN - 1);
+            if (link_len <= 0) {
+                return 0;  // Not a symlink or readlink failed — resolution complete
+            }
+            linkbuf[link_len] = '\0';
+
+            if (linkbuf[0] == '/') {
+                // Absolute symlink target — replace entire path
+                if (static_cast<size_t>(link_len) >= bufsize) return -1;
+                memcpy(resolved_buf, linkbuf, link_len + 1);
+            } else {
+                // Relative symlink target — replace last component
+                size_t last_slash = 0;
+                bool found_slash = false;
+                for (size_t i = 0; resolved_buf[i] != '\0'; ++i) {
+                    if (resolved_buf[i] == '/') {
+                        last_slash = i;
+                        found_slash = true;
+                    }
+                }
+                size_t prefix_len = found_slash ? last_slash + 1 : 0;
+                if (prefix_len + static_cast<size_t>(link_len) >= bufsize) return -1;
+                char new_path[MAX_PATH_LEN];
+                memcpy(new_path, resolved_buf, prefix_len);
+                memcpy(new_path + prefix_len, linkbuf, link_len);
+                new_path[prefix_len + link_len] = '\0';
+                memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
+            }
+            continue;  // Re-resolve after substitution
         }
 
         // Only tmpfs supports symlinks currently
@@ -933,6 +981,20 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return ret;
     }
 
+    if (mount->fs_type == FSType::REMOTE) {
+        // Strip mount prefix
+        size_t mount_len = 0;
+        while (mount->path[mount_len] != '\0') mount_len++;
+        const char* fs_path = absPath;
+        if (mount_len == 1 && mount->path[0] == '/')
+            fs_path = absPath + 1;
+        else if (absPath[mount_len] == '/')
+            fs_path = absPath + mount_len + 1;
+        else
+            fs_path = absPath + mount_len;
+        return ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, buf, bufsize);
+    }
+
     if (mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
@@ -1322,6 +1384,14 @@ auto vfs_chdir(const char* path) -> int {
 
     canonicalize_path(resolved, MAX_PATH_LEN);
 
+    // Resolve symlinks (e.g. /proc/self -> /proc/<pid>)
+    char sym_resolved[MAX_PATH_LEN];
+    int resolve_ret = resolve_symlinks(resolved, sym_resolved, MAX_PATH_LEN);
+    if (resolve_ret == -ELOOP) return -ELOOP;
+    if (resolve_ret == 0) {
+        std::memcpy(resolved, sym_resolved, MAX_PATH_LEN);
+    }
+
     // Verify the directory exists via stat
     ker::vfs::stat st{};
     int ret = vfs_stat(resolved, &st);
@@ -1431,6 +1501,18 @@ auto vfs_unlink(const char* path) -> int {
         return ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
+    if (mount->fs_type == FSType::REMOTE) {
+        size_t mount_len = std::strlen(mount->path);
+        const char* fs_path = pathBuf;
+        if (mount_len == 1 && mount->path[0] == '/')
+            fs_path = pathBuf + 1;
+        else if (pathBuf[mount_len] == '/')
+            fs_path = pathBuf + mount_len + 1;
+        else
+            fs_path = pathBuf + mount_len;
+        return ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
+    }
+
     if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
 
     // Strip mount prefix
@@ -1515,6 +1597,18 @@ auto vfs_rmdir(const char* path) -> int {
         return ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
+    if (mount->fs_type == FSType::REMOTE) {
+        size_t mount_len = std::strlen(mount->path);
+        const char* fs_path = pathBuf;
+        if (mount_len == 1 && mount->path[0] == '/')
+            fs_path = pathBuf + 1;
+        else if (pathBuf[mount_len] == '/')
+            fs_path = pathBuf + mount_len + 1;
+        else
+            fs_path = pathBuf + mount_len;
+        return ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
+    }
+
     if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
 
     size_t mount_len = std::strlen(mount->path);
@@ -1594,6 +1688,17 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         };
         return ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(oldMount->private_data),
                                                   strip_mount_fat(oldBuf, oldMount), strip_mount_fat(newBuf, newMount));
+    }
+
+    if (oldMount->fs_type == FSType::REMOTE && newMount->fs_type == FSType::REMOTE && oldMount == newMount) {
+        auto strip_mount_remote = [](const char* buf, MountPoint* m) -> const char* {
+            size_t ml = std::strlen(m->path);
+            if (ml == 1 && m->path[0] == '/') return buf + 1;
+            if (buf[ml] == '/') return buf + ml + 1;
+            return buf + ml;
+        };
+        return ker::net::wki::wki_remote_vfs_rename(oldMount->private_data, strip_mount_remote(oldBuf, oldMount),
+                                                    strip_mount_remote(newBuf, newMount));
     }
 
     if (oldMount->fs_type != FSType::TMPFS || newMount->fs_type != FSType::TMPFS) return -ENOSYS;
@@ -2256,6 +2361,65 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
     ker::dev::BlockDevice* bdev = nullptr;
 
     if (source != nullptr) {
+        // V2: Handle wki://<hostname>/<export> URIs
+        if (source[0] == 'w' && source[1] == 'k' && source[2] == 'i' && source[3] == ':' && source[4] == '/' && source[5] == '/') {
+            const char* host_start = source + 6;
+            const char* slash = host_start;
+            while (*slash != '\0' && *slash != '/') {
+                slash++;
+            }
+            size_t host_len = static_cast<size_t>(slash - host_start);
+            if (host_len == 0 || host_len >= 64) {
+                return -EINVAL;
+            }
+
+            char hostname[64] = {};  // NOLINT(modernize-avoid-c-arrays)
+            memcpy(hostname, host_start, host_len);
+            hostname[host_len] = '\0';
+
+            const char* export_name = (*slash == '/') ? slash + 1 : "";
+            if (export_name[0] == '\0') {
+                return -EINVAL;
+            }
+
+            // Resolve hostname to node_id
+            uint16_t node_id = ker::net::wki::wki_peer_find_by_hostname(hostname);
+            if (node_id == 0) {
+                return -ENODEV;
+            }
+            auto* peer = ker::net::wki::wki_peer_find(node_id);
+            if (peer == nullptr || peer->state != ker::net::wki::PeerState::CONNECTED) {
+                return -EHOSTUNREACH;
+            }
+
+            // Find matching VFS resource from discovered table
+            struct VfsFindCtx {
+                uint16_t node_id;
+                const char* export_name;
+                ker::net::wki::DiscoveredResource* result;
+            };
+            VfsFindCtx find_ctx = {node_id, export_name, nullptr};
+            ker::net::wki::wki_resource_foreach(
+                [](const ker::net::wki::DiscoveredResource& r, void* ctx_ptr) {
+                    auto* fc = static_cast<VfsFindCtx*>(ctx_ptr);
+                    if (fc->result != nullptr) return;
+                    if (r.node_id == fc->node_id && r.resource_type == ker::net::wki::ResourceType::VFS &&
+                        strncmp(static_cast<const char*>(r.name), fc->export_name, ker::net::wki::DISCOVERED_RESOURCE_NAME_LEN) == 0) {
+                        fc->result = const_cast<ker::net::wki::DiscoveredResource*>(&r);
+                    }
+                },
+                &find_ctx);
+
+            if (find_ctx.result == nullptr) {
+                return -ENXIO;
+            }
+
+            // Create mount target directory
+            vfs_mkdir(target, 0755);
+
+            return ker::net::wki::wki_remote_vfs_mount(node_id, find_ctx.result->resource_id, target);
+        }
+
         // Check for PARTUUID= prefix
         constexpr size_t PARTUUID_PREFIX_LEN = 9;  // "PARTUUID="
         bool is_partuuid = (source[0] == 'P' && source[1] == 'A' && source[2] == 'R' && source[3] == 'T' && source[4] == 'U' &&
