@@ -7,7 +7,7 @@ set -e
 # WOS_WKI_TAP   — TAP device for dedicated WKI NIC (e1000e). Omit to skip.
 # WOS_IVSHMEM   — Shared memory path for ivshmem (e.g. /dev/shm/wos-ivshmem). Omit to skip.
 # WOS_DISK0     — Path to primary disk image.  Default: disk.qcow2
-# WOS_DISK1     — Path to secondary disk image. Default: test_fat32.qcow2
+# WOS_DISK1     — Path to secondary disk image. Default: mountfs.qcow2
 # WOS_MEM       — Guest RAM size. Default: 4G (single VM), cluster script overrides to 4G.
 # WOS_ENABLE_GFX — Set to enable graphical display. Default: display none.
 # ----------------------------------------------------------------------------
@@ -15,7 +15,7 @@ set -e
 VM_ID="${WOS_VM_ID:-0}"
 MEM="${WOS_MEM:-4G}"
 DISK0="${WOS_DISK0:-disk.qcow2}"
-DISK1="${WOS_DISK1:-test_fat32.qcow2}"
+DISK1="${WOS_DISK1:-mountfs.qcow2}"
 
 # Derive a per-VM hex byte for MAC uniqueness (0x56 + VM_ID, matching legacy default)
 MAC_BYTE=$(printf '%02x' $((0x56 + VM_ID)))
@@ -45,21 +45,22 @@ for arg in "$@"
 do
     if [ "$arg" == "--debug" ]; then
         IS_DEBUG=1
-        # Create debug-specific overlays independent of cluster overlays
+        # Create debug-specific disk copies independent of cluster
         OVERLAY_DIR="cluster-overlays"
         mkdir -p "$OVERLAY_DIR"
 
         DEBUG_DISK0="${OVERLAY_DIR}/debug-disk-vm${VM_ID}.qcow2"
-        DEBUG_DISK1="${OVERLAY_DIR}/debug-fat32-vm${VM_ID}.qcow2"
+        DEBUG_DISK1="${OVERLAY_DIR}/debug-mountfs-vm${VM_ID}.qcow2"
 
-        # Remove old debug overlays for clean state
+        # Remove old debug disks for clean state
         rm -f "$DEBUG_DISK0" "$DEBUG_DISK1"
 
-        # Create fresh debug overlays
+        # Create fresh debug disks
         qemu-img create -f qcow2 -b "$(pwd)/disk.qcow2" -F qcow2 "$DEBUG_DISK0" >/dev/null
-        qemu-img create -f qcow2 -b "$(pwd)/test_fat32.qcow2" -F qcow2 "$DEBUG_DISK1" >/dev/null
+        # Full copy — qcow2 overlays don't play well with XFS
+        cp --reflink=auto "$(pwd)/mountfs.qcow2" "$DEBUG_DISK1"
 
-        # Override disk paths to use debug overlays
+        # Override disk paths to use debug disks
         DISK0="$DEBUG_DISK0"
         DISK1="$DEBUG_DISK1"
 

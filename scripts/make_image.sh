@@ -19,7 +19,7 @@ mkfs fat /dev/sda1
 _EOF_
 
 # Phase 2: Build the CPIO initramfs now that all disk images exist
-# with their final PARTUUIDs (disk.qcow2 + test_fat32.qcow2).
+# with their final PARTUUIDs (disk.qcow2 + mountfs.qcow2).
 sh "$CWD/scripts/make_initramfs.sh"
 
 # Phase 3: Populate the boot partition with kernel, bootloader, and initramfs.

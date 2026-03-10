@@ -30,3 +30,6 @@ coredumps
 
 #cluster data (persistent SSH keys, etc.)
 cluster-data
+
+
+reference/

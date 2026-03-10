@@ -12,10 +12,12 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <string_view>
+#include <vfs/buffer_cache.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/procfs.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 
@@ -273,9 +275,61 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
             continue;  // Re-resolve after substitution
         }
 
-        // Only tmpfs supports symlinks currently
-        if (mount->fs_type != FSType::TMPFS) {
+        // Only tmpfs and XFS support symlinks currently
+        if (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS) {
             return 0;
+        }
+
+        // XFS: resolve symlinks via xfs_readlink
+        if (mount->fs_type == FSType::XFS) {
+            size_t mount_len = 0;
+            while (mount->path[mount_len] != '\0') mount_len++;
+            const char* fs_path = resolved_buf;
+            if (mount_len == 1 && mount->path[0] == '/')
+                fs_path = resolved_buf + 1;
+            else if (resolved_buf[mount_len] == '/')
+                fs_path = resolved_buf + mount_len + 1;
+            else if (resolved_buf[mount_len] == '\0')
+                fs_path = "";
+            else
+                fs_path = resolved_buf + mount_len;
+
+            // Open the path to check if it's a symlink
+            auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
+            auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
+            if (f == nullptr) return 0;
+            if (f->fops == nullptr || f->fops->vfs_readlink == nullptr) {
+                ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
+                ker::mod::mm::dyn::kmalloc::free(f);
+                return 0;
+            }
+            char linkbuf[MAX_PATH_LEN];
+            ssize_t link_len = f->fops->vfs_readlink(f, linkbuf, MAX_PATH_LEN - 1);
+            ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
+            ker::mod::mm::dyn::kmalloc::free(f);
+            if (link_len <= 0) return 0;  // Not a symlink or error
+            linkbuf[link_len] = '\0';
+            if (linkbuf[0] == '/') {
+                if (static_cast<size_t>(link_len) >= bufsize) return -1;
+                memcpy(resolved_buf, linkbuf, link_len + 1);
+            } else {
+                size_t last_slash = 0;
+                bool found_slash = false;
+                for (size_t i = 0; resolved_buf[i] != '\0'; ++i) {
+                    if (resolved_buf[i] == '/') {
+                        last_slash = i;
+                        found_slash = true;
+                    }
+                }
+                size_t prefix_len = found_slash ? last_slash + 1 : 0;
+                if (prefix_len + static_cast<size_t>(link_len) >= bufsize) return -1;
+                char new_path[MAX_PATH_LEN];
+                memcpy(new_path, resolved_buf, prefix_len);
+                memcpy(new_path + prefix_len, linkbuf, link_len);
+                new_path[prefix_len + link_len] = '\0';
+                memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
+            }
+            continue;
         }
 
         // Strip mount prefix to get fs-relative path
@@ -468,6 +522,14 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             if (f != nullptr) {
                 f->fops = ker::vfs::procfs::get_procfs_fops();
                 f->fs_type = FSType::PROCFS;
+            }
+            break;
+        case FSType::XFS:
+            f = ker::vfs::xfs::xfs_open_path(fs_relative_path, flags, mode,
+                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            if (f != nullptr) {
+                f->fops = ker::vfs::xfs::get_xfs_fops();
+                f->fs_type = FSType::XFS;
             }
             break;
         default:
@@ -995,6 +1057,25 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, buf, bufsize);
     }
 
+    if (mount->fs_type == FSType::XFS) {
+        size_t mount_len = 0;
+        while (mount->path[mount_len] != '\0') mount_len++;
+        const char* fs_path = absPath;
+        if (mount_len == 1 && mount->path[0] == '/')
+            fs_path = absPath + 1;
+        else if (absPath[mount_len] == '/')
+            fs_path = absPath + mount_len + 1;
+        else
+            fs_path = absPath + mount_len;
+        auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
+        auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
+        if (f == nullptr) return -ENOENT;
+        ssize_t ret = ker::vfs::xfs::get_xfs_fops()->vfs_readlink(f, buf, bufsize);
+        ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
+        ker::mod::mm::dyn::kmalloc::free(f);
+        return ret;
+    }
+
     if (mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
@@ -1209,6 +1290,9 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             delete f;
             return 0;
         }
+        case FSType::XFS: {
+            return ker::vfs::xfs::xfs_stat(fs_path, statbuf, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        }
         default:
             return -ENOSYS;
     }
@@ -1309,6 +1393,9 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
             return 0;
+        }
+        case FSType::XFS: {
+            return ker::vfs::xfs::xfs_fstat(file, statbuf);
         }
         default:
             return -ENOSYS;
@@ -1839,7 +1926,8 @@ auto vfs_chmod(const char* path, int mode) -> int {
             return 0;
         }
         case FSType::FAT32:
-            // FAT32 has no on-disk permission model; accept silently
+        case FSType::XFS:
+            // FAT32/XFS have no on-disk permission model or are read-only; accept silently
             return 0;
         default:
             return -ENOSYS;
@@ -1861,6 +1949,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
         }
         case FSType::DEVFS:
         case FSType::FAT32:
+        case FSType::XFS:
             return 0;  // Accept silently
         default:
             return -ENOSYS;
@@ -1906,6 +1995,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             return 0;
         }
         case FSType::FAT32:
+        case FSType::XFS:
             return 0;  // Accept silently
         default:
             return -ENOSYS;
@@ -1928,6 +2018,7 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
         }
         case FSType::DEVFS:
         case FSType::FAT32:
+        case FSType::XFS:
             return 0;  // Accept silently
         default:
             return -ENOSYS;
@@ -2450,6 +2541,27 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
         }
     }
 
+    // Auto-detect filesystem type when a block device is present and the
+    // caller did NOT supply an explicit fstype (i.e. fstype was NULL or
+    // empty, which we defaulted to "fat32" above).  Probe the first sector
+    // for known superblock magic so the correct driver is selected.
+    if (bdev != nullptr && (fstype == nullptr || fstype[0] == '\0')) {
+        ker::vfs::buffer_cache_init();
+        auto* probe_buf = ker::vfs::bread(bdev, 0);
+        if (probe_buf != nullptr) {
+            // XFS superblock magic at offset 0: 0x58465342 ('XFSB') big-endian
+            if (probe_buf->size >= 4) {
+                uint32_t magic = (static_cast<uint32_t>(probe_buf->data[0]) << 24) | (static_cast<uint32_t>(probe_buf->data[1]) << 16) |
+                                 (static_cast<uint32_t>(probe_buf->data[2]) << 8) | (static_cast<uint32_t>(probe_buf->data[3]));
+                if (magic == 0x58465342) {  // XFS_SB_MAGIC
+                    effective_fstype = "xfs";
+                    ker::mod::io::serial::write("vfs_mount: auto-detected XFS filesystem\n");
+                }
+            }
+            ker::vfs::brelse(probe_buf);
+        }
+    }
+
     // Create mount point directory in tmpfs if needed
     vfs_mkdir(target, 0755);
 
@@ -2465,6 +2577,9 @@ void init() {
 
     // Register FAT32 driver (will be mounted when a disk is available)
     ker::vfs::fat32::register_fat32();
+
+    // Register XFS driver
+    ker::vfs::xfs::register_xfs();
 
     // Register and mount devfs for device files
     ker::vfs::devfs::devfs_init();
@@ -2540,6 +2655,14 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File* {
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
+            }
+            break;
+        case FSType::XFS:
+            f = ker::vfs::xfs::xfs_open_path(fs_relative_path, flags, mode,
+                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            if (f != nullptr) {
+                f->fops = ker::vfs::xfs::get_xfs_fops();
+                f->fs_type = FSType::XFS;
             }
             break;
         default:
@@ -2649,10 +2772,11 @@ auto vfs_fsync(int fd) -> int {
     switch (file->fs_type) {
         case FSType::FAT32:
             return ker::vfs::fat32::fat32_fsync(file);
+        case FSType::XFS:
         case FSType::TMPFS:
         case FSType::DEVFS:
         case FSType::PROCFS:
-            return 0;  // No-op for in-memory filesystems
+            return 0;  // No-op for in-memory or read-only filesystems
         default:
             return 0;
     }

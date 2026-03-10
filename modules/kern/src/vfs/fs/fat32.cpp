@@ -220,9 +220,15 @@ auto extract_lfn_name(const FAT32LongNameEntry* lfn_entries, size_t lfn_count, c
         };
 
         bool cont = true;
-        for (int j = 0; j < 5 && cont; ++j) cont = extract_char(lfn->name1[j]);
-        for (int j = 0; j < 6 && cont; ++j) cont = extract_char(lfn->name2[j]);
-        for (int j = 0; j < 2 && cont; ++j) cont = extract_char(lfn->name3[j]);
+        for (int j = 0; j < 5 && cont; ++j) {
+            cont = extract_char(lfn->name1[j]);
+        }
+        for (int j = 0; j < 6 && cont; ++j) {
+            cont = extract_char(lfn->name2[j]);
+        }
+        for (int j = 0; j < 2 && cont; ++j) {
+            cont = extract_char(lfn->name3[j]);
+        }
     }
 
     out_name[out_pos] = '\0';
@@ -1012,7 +1018,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     bool bulk_capable = (ctx->device != nullptr) && ((ctx->device->capabilities & ker::dev::BDEV_CAP_BULK_RDMA) != 0);
 
     while (bytes_read < to_read && current_cluster >= 2 && current_cluster < FAT32_EOC) {
-        // ── Contiguous extent detection ─────────────────────────────────────
+        // -- Contiguous extent detection -------------------------------------
         // Walk the FAT chain to find the longest run of physically contiguous
         // clusters starting at current_cluster.
         uint32_t extent_start = current_cluster;
@@ -1033,7 +1039,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         size_t extent_bytes = static_cast<size_t>(extent_len) * cluster_size;
         size_t remaining = to_read - bytes_read;
 
-        // ── Bulk path: contiguous extent exceeds threshold ──────────────────
+        // -- Bulk path: contiguous extent exceeds threshold ------------------
         if (bulk_capable && byte_offset == 0 && extent_bytes >= ker::net::wki::BLK_RING_BULK_THRESHOLD && remaining >= extent_bytes) {
             // Compute the LBA range for the contiguous cluster run
             uint64_t extent_lba =
@@ -1060,7 +1066,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
             // Bulk read failed — fall through to per-cluster path
         }
 
-        // ── Standard per-cluster path ───────────────────────────────────────
+        // -- Standard per-cluster path ---------------------------------------
         // Read the cluster from disk
         if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
             fat32_log("fat32_read: failed to read cluster\n");
@@ -1921,12 +1927,16 @@ auto fat32_truncate(File* f, off_t length) -> int {
 // Walk a path to find the parent directory node and final component name.
 // Returns nullptr if parent not found. Sets *out_name to final component.
 auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char** out_name) -> FAT32Node* {
-    if (path == nullptr || *path == '\0') return nullptr;
+    if (path == nullptr || *path == '\0') {
+        return nullptr;
+    }
 
     // Find last '/'
     const char* last_slash = nullptr;
     for (const char* p = path; *p; ++p) {
-        if (*p == '/') last_slash = p;
+        if (*p == '/') {
+            last_slash = p;
+        }
     }
 
     const char* final_name;
@@ -1938,18 +1948,24 @@ auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char**
         parent_cluster = ctx->root_cluster;
     } else {
         final_name = last_slash + 1;
-        if (*final_name == '\0') return nullptr;  // path ends with /
+        if (*final_name == '\0') {
+            return nullptr;  // path ends with /
+        }
 
         // Walk to the parent directory by opening the parent path
         char parent_path[512];
-        size_t plen = static_cast<size_t>(last_slash - path);
-        if (plen >= sizeof(parent_path)) return nullptr;
+        auto plen = static_cast<size_t>(last_slash - path);
+        if (plen >= sizeof(parent_path)) {
+            return nullptr;
+        }
         memcpy(parent_path, path, plen);
         parent_path[plen] = '\0';
 
         // Use fat32_open_path to find parent dir
         auto* pf = fat32_open_path(parent_path, 0, 0, ctx);
-        if (pf == nullptr) return nullptr;
+        if (pf == nullptr) {
+            return nullptr;
+        }
         auto* pnode = static_cast<FAT32Node*>(pf->private_data);
         if (pnode == nullptr || !pnode->is_directory) {
             // Clean up

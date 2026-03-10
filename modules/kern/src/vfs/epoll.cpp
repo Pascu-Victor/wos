@@ -8,7 +8,7 @@
 
 namespace ker::vfs {
 
-// ── FileOperations for epoll fds ─────────────────────────────────────────────
+// -- FileOperations for epoll fds ---------------------------------------------
 
 static auto epoll_close(File* f) -> int {
     if (f && f->private_data) {
@@ -32,7 +32,7 @@ static FileOperations epoll_fops = {
     .vfs_poll_check = nullptr,
 };
 
-// ── Helper: poll a single fd and return its ready mask ───────────────────────
+// -- Helper: poll a single fd and return its ready mask -----------------------
 
 static auto poll_fd(File* file, uint32_t events) -> uint32_t {
     if (file == nullptr) return 0;
@@ -58,7 +58,7 @@ static auto poll_fd(File* file, uint32_t events) -> uint32_t {
     return events & (EPOLLIN | EPOLLOUT);
 }
 
-// ── epoll_create ─────────────────────────────────────────────────────────────
+// -- epoll_create -------------------------------------------------------------
 
 auto epoll_create(int flags) -> int {
     (void)flags;  // EPOLL_CLOEXEC handled below
@@ -96,7 +96,7 @@ auto epoll_create(int flags) -> int {
     return fd;
 }
 
-// ── epoll_ctl ────────────────────────────────────────────────────────────────
+// -- epoll_ctl ----------------------------------------------------------------
 
 auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
     auto* task = ker::mod::sched::get_current_task();
@@ -163,7 +163,7 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
     }
 }
 
-// ── epoll_pwait ──────────────────────────────────────────────────────────────
+// -- epoll_pwait --------------------------------------------------------------
 
 auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) -> int {
     if (maxevents <= 0 || events == nullptr) return -EINVAL;

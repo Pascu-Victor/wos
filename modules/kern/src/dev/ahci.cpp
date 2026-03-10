@@ -529,6 +529,140 @@ auto ahci_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const vo
     return result ? 0 : -1;
 }
 
+// Send ATA IDENTIFY command and return the actual total number of LBA sectors.
+// Returns 0 on failure, in which case the caller should fall back to a default.
+auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
+    uint32_t slot = UINT32_MAX;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].lock();
+    }
+
+    port->is = static_cast<uint32_t>(-1);
+    slot = find_cmdslot(port, portno);
+    if (slot == UINT32_MAX) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_locks[portno].unlock();
+        }
+        return 0;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
+    }
+
+    // Allocate a 512-byte buffer for the IDENTIFY response
+    auto* id_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(512));
+    if (id_buf == nullptr) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
+        return 0;
+    }
+    std::memset(id_buf, 0, 512);
+
+    auto* kernel_pt =
+        (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer((uint64_t)ker::mod::mm::virt::getKernelPageTable());
+    uint64_t buf_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(id_buf));
+
+    HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
+    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmdheader->w = 0;
+    cmdheader->prdtl = 1;
+
+    auto* cmdtbl = reinterpret_cast<HBA_CMD_TBL*>(port_memory[portno].ctb_virt[slot]);
+    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL));
+
+    // Single PRDT entry for 512 bytes
+    cmdtbl->prdt_entry[0].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
+    cmdtbl->prdt_entry[0].dbau = static_cast<uint32_t>((buf_phys >> 32) & UINT32_MAX);
+    cmdtbl->prdt_entry[0].dbc = 512 - 1;  // 512 bytes
+    cmdtbl->prdt_entry[0].i = 1;
+
+    auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
+    cmdfis->fis_type = FIS_TYPE_REG_H2D;
+    cmdfis->c = 1;
+    cmdfis->command = ATA_CMD_IDENTIFY;
+    cmdfis->device = 0;
+
+    // Wait for port to be ready
+    int spin = 0;
+    constexpr int MAX_SPIN = 1000000;
+    while (((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
+        spin++;
+    }
+    if (spin == MAX_SPIN) {
+        ahci_log("identify_disk: port is hung\n");
+        ker::mod::mm::dyn::kmalloc::free(id_buf);
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
+        return 0;
+    }
+
+    port->ci = 1 << slot;
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_locks[portno].unlock();
+    }
+
+    // Wait for completion
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) {
+            break;
+        }
+        if ((port->is & HBA_PxIS_TFES) != 0U) {
+            ahci_log("identify_disk: error\n");
+            ker::mod::mm::dyn::kmalloc::free(id_buf);
+            if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+                port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            }
+            return 0;
+        }
+        asm volatile("pause");
+    }
+
+    if ((port->is & HBA_PxIS_TFES) != 0U) {
+        ahci_log("identify_disk: error after completion\n");
+        ker::mod::mm::dyn::kmalloc::free(id_buf);
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+        }
+        return 0;
+    }
+
+    if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+        port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+    }
+
+    // Parse IDENTIFY response (array of 256 uint16_t words)
+    auto* id_words = reinterpret_cast<uint16_t*>(id_buf);
+
+    uint64_t total = 0;
+
+    // Check if 48-bit LBA is supported (word 83, bit 10)
+    if ((id_words[83] & (1 << 10)) != 0) {
+        // Words 100-103: 48-bit total user addressable LBA sectors
+        total = static_cast<uint64_t>(id_words[100]) | (static_cast<uint64_t>(id_words[101]) << 16) |
+                (static_cast<uint64_t>(id_words[102]) << 32) | (static_cast<uint64_t>(id_words[103]) << 48);
+    }
+
+    // Fall back to 28-bit LBA (words 60-61) if 48-bit returned 0
+    if (total == 0) {
+        total = static_cast<uint64_t>(id_words[60]) | (static_cast<uint64_t>(id_words[61]) << 16);
+    }
+
+    ker::mod::mm::dyn::kmalloc::free(id_buf);
+
+    ahci_log("identify_disk: total sectors = 0x");
+    ahci_log_hex(total);
+    ahci_log("\n");
+
+    return total;
+}
+
 // Probe all ports for devices
 void probe_port(volatile HBA_MEM* abar) {
     uint32_t port_implemented = abar->pi;
@@ -545,7 +679,10 @@ void probe_port(volatile HBA_MEM* abar) {
                 if (device_count < MAX_PORTS) {
                     AHCIDevice* dev = &devices[device_count];
                     dev->port_num = i;
-                    dev->total_sectors = 131072;  // Default 64MB
+
+                    // Issue ATA IDENTIFY to get real disk capacity
+                    uint64_t sectors = identify_disk(&abar->ports[i], i);
+                    dev->total_sectors = (sectors > 0) ? sectors : 131072;  // Fallback 64MB
 
                     // Set up block device
                     dev->bdev.major = 8;

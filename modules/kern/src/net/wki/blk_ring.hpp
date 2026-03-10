@@ -4,7 +4,7 @@
 
 namespace ker::net::wki {
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Block RDMA Ring — Shared Memory Layout
 //
 // This header defines data structures that live in an RDMA zone shared between
@@ -22,20 +22,20 @@ namespace ker::net::wki {
 //   - CQ: server writes at cq_head, consumer reads at cq_tail (SPSC)
 //   - Data slots: consumer fills (for writes) or server fills (for reads)
 //   - Signaling: doorbell (ivshmem/RoCE) or ZONE_NOTIFY_POST (fallback)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Configuration defaults (can be overridden at zone creation time)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 constexpr uint32_t BLK_RING_DEFAULT_SQ_DEPTH = 64;
 constexpr uint32_t BLK_RING_DEFAULT_CQ_DEPTH = 64;
 constexpr uint32_t BLK_RING_DEFAULT_DATA_SLOTS = 64;
 constexpr uint32_t BLK_RING_DEFAULT_DATA_SLOT_SIZE = 65536;  // 64KB per slot
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Submission Queue Entry — consumer writes, server reads
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 enum class BlkOpcode : uint8_t {
     READ = 0,
@@ -63,12 +63,12 @@ struct BlkSqEntry {
 
 static_assert(sizeof(BlkSqEntry) == 24, "BlkSqEntry must be 24 bytes");
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Bulk Transfer SQ Entry — same size as BlkSqEntry, union-compatible.
 // Used with BULK_READ / BULK_WRITE opcodes.  Instead of a data_slot index the
 // consumer passes its RDMA rkey so the server can RDMA-write/read the entire
 // block range directly into/from the consumer's registered buffer.
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 struct BlkBulkSqEntry {
     uint32_t tag;    // unique request ID (consumer-assigned)
@@ -81,9 +81,9 @@ struct BlkBulkSqEntry {
 
 static_assert(sizeof(BlkBulkSqEntry) == 24, "BlkBulkSqEntry must be 24 bytes (union-compatible with BlkSqEntry)");
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Completion Queue Entry — server writes, consumer reads
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 struct BlkCqEntry {
     uint32_t tag;                // echoed from SQE
@@ -94,9 +94,9 @@ struct BlkCqEntry {
 
 static_assert(sizeof(BlkCqEntry) == 16, "BlkCqEntry must be 16 bytes");
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Ring Header — first 64 bytes of the zone (cache-line aligned)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 struct BlkRingHeader {
     // SQ pointers: consumer produces at sq_head, server consumes at sq_tail
@@ -121,9 +121,9 @@ struct BlkRingHeader {
 
 static_assert(sizeof(BlkRingHeader) == 64, "BlkRingHeader must be exactly 64 bytes");
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Offset calculations — compute layout within a zone
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 // Header is at offset 0, padded to 64 bytes (cache line)
 constexpr uint32_t BLK_RING_HEADER_SIZE = 64;
@@ -154,9 +154,9 @@ inline constexpr auto blk_ring_default_zone_size() -> uint32_t {
                               BLK_RING_DEFAULT_DATA_SLOT_SIZE);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Inline accessors — cast into the zone's shared memory
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 inline auto blk_ring_header(void* zone_base) -> BlkRingHeader* { return reinterpret_cast<BlkRingHeader*>(zone_base); }
 
@@ -183,9 +183,9 @@ inline auto blk_data_slot(void* zone_base, const BlkRingHeader* hdr, uint32_t sl
     return blk_data_slot(zone_base, hdr->sq_depth, hdr->cq_depth, slot_idx, hdr->data_slot_size);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Ring state queries — SPSC lock-free
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 // SQ full: consumer cannot post (one slot wasted as sentinel)
 inline auto blk_sq_full(const BlkRingHeader* hdr) -> bool { return ((hdr->sq_head + 1) % hdr->sq_depth) == hdr->sq_tail; }

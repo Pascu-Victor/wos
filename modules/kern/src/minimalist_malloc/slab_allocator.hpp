@@ -1,6 +1,8 @@
 #pragma once
-#include <assert.h>
-
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/phys.hpp>
@@ -28,7 +30,7 @@ struct SlabHeader {
 template <size_t size>
 struct MemoryBlock {
     uintptr_t slab_ptr;
-    char data[size];
+    std::array<char, size> data;
 };
 
 template <size_t slab_size, size_t memory_size>
@@ -40,10 +42,10 @@ class Slab {
     static_assert((sizeof(MemoryBlock<slab_size>) + MAX_HEADER_SIZE) <= memory_size);
 
     SlabHeader<slab_size, memory_size, MAX_BLOCKS> header;
-    MemoryBlock<slab_size> blocks[MAX_BLOCKS];
+    std::array<MemoryBlock<slab_size>, MAX_BLOCKS> blocks;
 
     // Static spinlock shared across all slabs of the same size for thread safety
-    static inline ker::mod::sys::Spinlock slabLock;
+    static inline ker::mod::sys::Spinlock slab_lock;
 
     bool is_address_in_slab(void* address);
     void* alloc_in_current_slab(size_t block_index);
@@ -64,7 +66,7 @@ class Slab {
     // Collect statistics about the slab chain starting at this slab.
     // Outputs (by reference): number of slab pages, total blocks across all slabs,
     // and total free blocks across all slabs. This function does not allocate.
-    void collectStats(uint64_t& outSlabCount, uint64_t& outTotalBlocks, uint64_t& outFreeBlocks) const;
+    void collect_stats(uint64_t& out_slab_count, uint64_t& out_total_blocks, uint64_t& out_free_blocks) const;
 };
 
 template <size_t slab_size, size_t memory_size>
@@ -89,20 +91,23 @@ void* Slab<slab_size, memory_size>::alloc_unlocked() {
     assert(header.size == slab_size);
 
     size_t block_index = -1;
-    if (header.free_blocks && ((block_index = header.mem_map.find_unused(header.next_fit_block)) != BITMAP_NO_BITS_LEFT)) {
-        return alloc_in_current_slab(block_index);
-    } else if (header.next) {
-        return header.next->alloc_unlocked();
-    } else {
-        return alloc_in_new_slab();
+    if (header.free_blocks) {
+        block_index = header.mem_map.find_unused(header.next_fit_block);
+        if (BITMAP_NO_BITS_LEFT != block_index) {
+            return alloc_in_current_slab(block_index);
+        }
     }
+    if (header.next) {
+        return header.next->alloc_unlocked();
+    }
+    return alloc_in_new_slab();
 }
 
 template <size_t slab_size, size_t memory_size>
 void* Slab<slab_size, memory_size>::alloc() {
-    slabLock.lock();
+    slab_lock.lock();
     void* result = alloc_unlocked();
-    slabLock.unlock();
+    slab_lock.unlock();
     return result;
 }
 
@@ -112,7 +117,7 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
     assert(header.size == slab_size);
     assert(is_address_in_slab(address));
 
-    size_t block_index = (uintptr_t(address) - uintptr_t(blocks)) / sizeof(MemoryBlock<slab_size>);
+    size_t block_index = (uintptr_t(address) - uintptr_t(blocks.data())) / sizeof(MemoryBlock<slab_size>);
 
     // Defensive checks: ensure computed index is in range and belongs to this slab.
     if (block_index >= MAX_BLOCKS || blocks[block_index].slab_ptr != uintptr_t(this) || !header.mem_map.check_used(block_index)) {
@@ -120,7 +125,7 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
         size_t found = BITMAP_NO_BITS_LEFT;
         for (size_t i = 0; i < MAX_BLOCKS; ++i) {
             if (header.mem_map.check_used(i)) {
-                if (static_cast<void*>(blocks[i].data) == address) {
+                if (static_cast<void*>(blocks[i].data.data()) == address) {
                     found = i;
                     break;
                 }
@@ -134,8 +139,8 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
                                (unsigned long)header.size, (unsigned long)header.free_blocks, (unsigned long)header.next_fit_block,
                                header.prev, header.next);
             // Dump block table summary (only first 64 entries to avoid huge logs)
-            unsigned limit = (unsigned)MAX_BLOCKS;
-            if (limit > 64) limit = 64;
+            auto limit = MAX_BLOCKS;
+            limit = std::min<unsigned int>(limit, 64);
             for (unsigned i = 0; i < limit; ++i) {
                 // Read a prefix of the data to help diagnose buffer overrun corruption
                 uint64_t prefix = 0;
@@ -174,28 +179,24 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
 
 template <size_t slab_size, size_t memory_size>
 void Slab<slab_size, memory_size>::free(void* address) {
-    slabLock.lock();
+    slab_lock.lock();
     free_unlocked(address);
-    slabLock.unlock();
+    slab_lock.unlock();
 }
 
 template <size_t slab_size, size_t memory_size>
 bool Slab<slab_size, memory_size>::is_address_in_slab(void* address) {
-    if ((address >= blocks) && (address <= &blocks[MAX_BLOCKS - 1].data[slab_size - 1])) {
-        return true;
-    } else {
-        return false;
-    }
+    return static_cast<bool>((address >= blocks.data()) && (address <= &blocks[MAX_BLOCKS - 1].data[slab_size - 1]));
     return true;
 }
 
 template <size_t slab_size, size_t memory_size>
-void Slab<slab_size, memory_size>::collectStats(uint64_t& outSlabCount, uint64_t& outTotalBlocks, uint64_t& outFreeBlocks) const {
+void Slab<slab_size, memory_size>::collect_stats(uint64_t& out_slab_count, uint64_t& out_total_blocks, uint64_t& out_free_blocks) const {
     const Slab* s = this;
     while (s != nullptr) {
-        outSlabCount++;
-        outTotalBlocks += MAX_BLOCKS;
-        outFreeBlocks += s->header.free_blocks;
+        out_slab_count++;
+        out_total_blocks += MAX_BLOCKS;
+        out_free_blocks += s->header.free_blocks;
         s = s->header.next;
     }
 }
@@ -203,7 +204,7 @@ void Slab<slab_size, memory_size>::collectStats(uint64_t& outSlabCount, uint64_t
 template <size_t slab_size, size_t memory_size>
 void* Slab<slab_size, memory_size>::alloc_in_new_slab() {
     Slab* new_slab = static_cast<Slab*>(request_memory_from_os(sizeof(Slab)));
-    if (!new_slab) {
+    if (new_slab == nullptr) {
         return nullptr;
     }
     new_slab->init(this);
@@ -218,7 +219,7 @@ void* Slab<slab_size, memory_size>::alloc_in_current_slab(size_t block_index) {
     header.next_fit_block = (block_index + 1) % MAX_BLOCKS;
     header.free_blocks--;
     blocks[block_index].slab_ptr = uintptr_t(this);
-    return static_cast<void*>(blocks[block_index].data);
+    return static_cast<void*>(blocks[block_index].data.data());
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -227,15 +228,22 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
     // lazily allocate diagnostic arrays if not present
     if (!header.last_free_caller) {
         header.last_free_caller = static_cast<uintptr_t*>(request_memory_from_os(sizeof(uintptr_t) * MAX_BLOCKS));
-        if (header.last_free_caller) memset(header.last_free_caller, 0, sizeof(uintptr_t) * MAX_BLOCKS);
+        if (header.last_free_caller) {
+            memset(header.last_free_caller, 0, sizeof(uintptr_t) * MAX_BLOCKS);
+        }
     }
     if (!header.free_count) {
         header.free_count = static_cast<unsigned int*>(request_memory_from_os(sizeof(unsigned int) * MAX_BLOCKS));
-        if (header.free_count) memset(header.free_count, 0, sizeof(unsigned int) * MAX_BLOCKS);
+        if (header.free_count) {
+            memset(header.free_count, 0, sizeof(unsigned int) * MAX_BLOCKS);
+        }
     }
     if (header.last_free_caller && header.free_count) {
         // Record the external caller (skip one more frame) so we can see who invoked free()
-        header.last_free_caller[block_index] = (uintptr_t)__builtin_return_address(2);  // NOLINT
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wframe-address"
+        header.last_free_caller[block_index] = reinterpret_cast<uintptr_t>(__builtin_return_address(2));
+#pragma clang diagnostic pop
     }
 
     header.next_fit_block = block_index;
@@ -273,7 +281,7 @@ template <size_t slab_size, size_t memory_size>
 void* Slab<slab_size, memory_size>::request_memory_from_os(size_t size) {
     // system dependent function, returns aligned memory region.
     void* address = ker::mod::mm::phys::pageAlloc(size);
-    if (!address) {
+    if (address == nullptr) {
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
         assert(false);
     }

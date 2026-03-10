@@ -9,6 +9,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/fs/fat32.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 
 #include "vfs/fs/devfs.hpp"
 #include "vfs/fs/procfs.hpp"
@@ -37,6 +38,9 @@ auto fstype_to_enum(const char* fstype) -> FSType {
     }
     if (std::strcmp(fstype, "procfs") == 0) {
         return FSType::PROCFS;
+    }
+    if (std::strcmp(fstype, "xfs") == 0) {
+        return FSType::XFS;
     }
     return FSType::TMPFS;
 }
@@ -127,6 +131,21 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         mount->fops = nullptr;
     } else if (std::strcmp(fstype, "procfs") == 0) {
         mount->fops = ker::vfs::procfs::get_procfs_fops();
+    } else if (std::strcmp(fstype, "xfs") == 0) {
+        // XFS filesystem
+        if (device == nullptr) {
+            vfs_debug_log("mount_filesystem: XFS requires a block device\n");
+            delete mount;
+            return -1;
+        }
+        auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device);
+        if (xfs_ctx == nullptr) {
+            vfs_debug_log("mount_filesystem: XFS initialization failed\n");
+            delete mount;
+            return -1;
+        }
+        mount->private_data = xfs_ctx;
+        mount->fops = ker::vfs::xfs::get_xfs_fops();
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         delete mount;

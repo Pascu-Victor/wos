@@ -8,13 +8,13 @@ set -e
 # Launches N QEMU VMs (default 2) configured for WKI inter-kernel communication.
 # --skip N    Start VM IDs from N instead of 0 (useful for adding to existing cluster)
 # Each VM gets:
-#   - A CoW overlay disk (preserves base images)
+#   - Per-VM disk copies (preserves base images)
 #   - Unique VM ID, MAC addresses, serial/QEMU logs
 #   - A dedicated WKI NIC (e1000e) on wos-wki-tap<N>
 #   - Shared ivshmem region for RDMA transport
 #
 # Prerequisites:
-#   - Base disk images: disk.qcow2, test_fat32.qcow2
+#   - Base disk images: disk.qcow2, mountfs.qcow2
 #   - WKI bridge + taps created: ./scripts/setup_wki_bridge.sh <N>
 #   - (Optional) Regular networking bridge wos-br0 + wos-wki-tap<N> for each VM
 #
@@ -48,8 +48,8 @@ if [ ! -f disk.qcow2 ]; then
   echo "ERROR: disk.qcow2 not found in $(pwd). Run from the project root." >&2
   exit 1
 fi
-if [ ! -f test_fat32.qcow2 ]; then
-  echo "ERROR: test_fat32.qcow2 not found in $(pwd). Run from the project root." >&2
+if [ ! -f mountfs.qcow2 ]; then
+  echo "ERROR: mountfs.qcow2 not found in $(pwd). Run from the project root." >&2
   exit 1
 fi
 
@@ -89,11 +89,12 @@ trap cleanup EXIT INT TERM
 for ((i = SKIP; i < NUM_VMS; i++)); do
   echo "--- Preparing VM${i} ---"
 
-  # Create CoW overlay disks (recreate each run for clean state)
+  # Create per-VM disk images (recreate each run for clean state)
   OVERLAY0="${OVERLAY_DIR}/disk-vm${i}.qcow2"
-  OVERLAY1="${OVERLAY_DIR}/fat32-vm${i}.qcow2"
+  OVERLAY1="${OVERLAY_DIR}/mountfs-vm${i}.qcow2"
   qemu-img create -f qcow2 -b "$(pwd)/disk.qcow2" -F qcow2 "$OVERLAY0" >/dev/null
-  qemu-img create -f qcow2 -b "$(pwd)/test_fat32.qcow2" -F qcow2 "$OVERLAY1" >/dev/null
+  # Full copy — qcow2 overlays don't play well with XFS
+  cp --reflink=auto "$(pwd)/mountfs.qcow2" "$OVERLAY1"
 
   # Verify WKI tap device exists
   WKI_TAP="wos-wki-tap${i}"
@@ -121,7 +122,7 @@ done
 echo ""
 echo "=== All ${SPAWNED} VMs launched (IDs ${SKIP}-$((NUM_VMS - 1))) ==="
 echo "    Serial logs: serial-vm{$SKIP..$(($NUM_VMS - 1))}.log"
-echo "    Overlays:    ${OVERLAY_DIR}/"
+echo "    Per-VM disks: ${OVERLAY_DIR}/"
 echo "    ivshmem:     ${IVSHMEM_PATH}"
 echo ""
 echo "Press Ctrl+C to stop all VMs."

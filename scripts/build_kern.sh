@@ -17,13 +17,13 @@ check_headers "modules/init"
 cmake -B build -GNinja .
 cmake --build build
 
-# run scripts/create_fat32_test_disk.sh
-result=$(sh scripts/create_fat32_test_disk.sh)
+# run scripts/create_mountfs_disk.sh
+result=$(sh scripts/create_mountfs_disk.sh)
 if [ "$?" != "0" ]; then
-    echo "Error: create_fat32_test_disk.sh failed"
+    echo "Error: create_mountfs_disk.sh failed"
     exit 1
 else
-    echo "fat32 image created successfully"
+    echo "mountfs image created successfully"
 fi
 
 # run scripts/make_image.sh (creates boot disk, builds initramfs, populates boot partition)

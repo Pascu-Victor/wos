@@ -26,18 +26,18 @@ void init() {
 void enableTime() {
     if (isTimeAvailable) {
         // Panic! should only be called once when ktime is initialized
-        panicHandler("Kernel time was already initialized");
+        panic_handler("Kernel time was already initialized");
     }
     isTimeAvailable = true;
     log("Kernel time is now available");
 }
 
-void breakIntoDebugger() { __asm__ volatile("int $3"); }
+void break_into_debugger() { __asm__ volatile("int $3"); }
 
 void enableKmalloc() {
     if (isKmallocAvailable) {
         // Panic! should only be called once when kmalloc is initialized
-        panicHandler("Kernel kmalloc already initialized");
+        panic_handler("Kernel kmalloc already initialized");
     }
     isKmallocAvailable = true;
     log("Kernel memory allocator is now available");
@@ -189,7 +189,7 @@ void error(const char* str) {
     logLock.unlock();
 }
 
-void panicHandler(const char* msg) {
+void panic_handler(const char* msg) {
     // Log the panic message
     log("KERNEL PANIC: %s", msg);
 

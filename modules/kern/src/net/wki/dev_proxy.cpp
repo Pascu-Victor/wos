@@ -403,14 +403,14 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         return -1;
     }
 
-    // ── 1. Serve from read-ahead cache if the request is fully covered ──────
+    // -- 1. Serve from read-ahead cache if the request is fully covered ------
     if (ra_cache_hit(state, block, count)) {
         uint64_t off = (block - state->ra_base_lba) * blk_sz;
         memcpy(buffer, state->ra_buffer + off, static_cast<size_t>(count) * blk_sz);
         return 0;
     }
 
-    // ── 2. Cache miss — fetch a full slot starting at the requested LBA ─────
+    // -- 2. Cache miss — fetch a full slot starting at the requested LBA -----
     //    Cap at device boundary.
     uint32_t fetch_count = blocks_per_slot;
     if (block + fetch_count > ring_hdr->total_blocks) {
@@ -461,7 +461,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     // Signal server
     rdma_signal_server(state);
 
-    // ── 3. Wait for completion ──────────────────────────────────────────────
+    // -- 3. Wait for completion ----------------------------------------------
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
     uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     BlkCqEntry cqe = {};
@@ -508,7 +508,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         return cqe.status;
     }
 
-    // ── 4. Populate read-ahead cache from the data slot ─────────────────────
+    // -- 4. Populate read-ahead cache from the data slot ---------------------
     // For RoCE the server already pushed data into our local zone — no pull needed.
     if (!state->rdma_roce) {
         roce_pull_data_slot(state, static_cast<uint32_t>(slot), fetch_bytes);
@@ -526,7 +526,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     rdma_free_slot(state, static_cast<uint32_t>(slot));
     rdma_free_tag(state, tag);
 
-    // ── 5. Copy the originally-requested data to the caller's buffer ────────
+    // -- 5. Copy the originally-requested data to the caller's buffer --------
     memcpy(buffer, state->ra_buffer != nullptr ? state->ra_buffer : slot_data, static_cast<size_t>(count) * blk_sz);
 
     return 0;
@@ -1274,7 +1274,7 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
                 return -1;
             }
         }
-        uint32_t tag = static_cast<uint32_t>(tag_id);
+        auto tag = static_cast<uint32_t>(tag_id);
 
         // Post Bulk SQE (same binary layout as BlkSqEntry, data_slot = roce_rkey)
         uint32_t sq_idx = ring_hdr->sq_head % ring_hdr->sq_depth;
@@ -1294,14 +1294,16 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
 
         // Wait for completion — server RDMA-writes data into our staging buffer
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US * 4;  // larger timeout for bulk
+        uint64_t deadline = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);  // larger timeout for bulk
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
         if (state->rdma_roce) {
             while (!got_cqe) {
                 got_cqe = rdma_wait_cqe_push(state, tag, &cqe);
-                if (got_cqe) break;
+                if (got_cqe) {
+                    break;
+                }
                 if (wki_now_us() >= deadline) {
                     rdma_free_tag(state, tag);
                     return -1;
@@ -1312,7 +1314,9 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
         } else {
             while (!got_cqe) {
                 got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
-                if (got_cqe) break;
+                if (got_cqe) {
+                    break;
+                }
                 if (wki_now_us() >= deadline) {
                     rdma_free_tag(state, tag);
                     return -1;
@@ -1414,13 +1418,15 @@ auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t
 
         // Wait for completion
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US * 4;
+        uint64_t deadline = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
         while (!got_cqe) {
             got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
-            if (got_cqe) break;
+            if (got_cqe) {
+                break;
+            }
             if (wki_now_us() >= deadline) {
                 rdma_free_tag(state, tag);
                 return -1;

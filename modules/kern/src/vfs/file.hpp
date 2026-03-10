@@ -22,6 +22,7 @@ enum class FSType : uint8_t {
     SOCKET,
     REMOTE,
     PROCFS,
+    XFS,
 };
 
 struct File {

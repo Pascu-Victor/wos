@@ -713,7 +713,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
     memory = vm_cfg.get("memory", "4G")
     cpus = vm_cfg.get("cpus", 2)
     disk0 = vm_cfg.get("disk0", "disk.qcow2")
-    disk1 = vm_cfg.get("disk1", "test_fat32.qcow2")
+    disk1 = vm_cfg.get("disk1", "mountfs.qcow2")
     is_debug = eff.get("debug", False)
 
     # Create overlay disks
@@ -721,7 +721,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
     os.makedirs(overlay_dir, exist_ok=True)
 
     overlay0 = os.path.join(overlay_dir, f"disk-vm{node_id}.qcow2")
-    overlay1 = os.path.join(overlay_dir, f"fat32-vm{node_id}.qcow2")
+    overlay1 = os.path.join(overlay_dir, f"mountfs-vm{node_id}.qcow2")
 
     # Remove old overlays for clean state (may be root-owned from previous sudo run)
     for f in [overlay0, overlay1]:

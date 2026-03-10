@@ -15,6 +15,7 @@ Diagnostics:
             - cppcoreguidelines-pro-bounds-pointer-arithmetic
             - cppcoreguidelines-avoid-non-const-global-variables
             - cppcoreguidelines-pro-type-cstyle-cast
+            - cppcoreguidelines-pro-type-union-access
             - bugprone-easily-swappable-parameters
             - bugprone-reserved-identifier
             - misc-non-private-member-variables-in-classes

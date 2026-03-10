@@ -18,7 +18,7 @@
                 "memory": "4G",
                 "cpus": 2,
                 "disk0": "disk.qcow2",
-                "disk1": "test_fat32.qcow2"
+                "disk1": "mountfs.qcow2"
             }
         },
         {

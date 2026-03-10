@@ -356,7 +356,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     auto cur_offset = static_cast<int64_t>(offset);
     ssize_t total_read = 0;
 
-    // ── Bulk RDMA path ────────────────────────────────────────────────────
+    // -- Bulk RDMA path ----------------------------------------------------
     // Two modes:
     //  (a) Direct bulk — request > 64 KB: issue OP_VFS_READ_BULK for each chunk.
     //  (b) Prefetch   — request ≤ 64 KB (typical cp/cat): on the first small read
@@ -368,7 +368,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     // filled it.  When ownership changes the old prefetch is implicitly stale.
     if (ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_bulk_rkey != 0 &&
         ctx->proxy->rdma_bulk_buf != nullptr) {
-        // ── (b) Prefetch path: try to satisfy from the existing bulk cache ──
+        // -- (b) Prefetch path: try to satisfy from the existing bulk cache --
         if (remaining <= VFS_RDMA_BOUNCE_SIZE && ctx->proxy->bulk_owner_fd == ctx->remote_fd && ctx->bulk_cached_len > 0 &&
             cur_offset >= ctx->bulk_cached_offset && cur_offset < ctx->bulk_cached_offset + static_cast<int64_t>(ctx->bulk_cached_len)) {
             auto off_in_buf = static_cast<uint32_t>(cur_offset - ctx->bulk_cached_offset);
@@ -387,7 +387,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             // Partial hit — fall through to refill below
         }
 
-        // ── Bulk fetch: either (a) direct or (b) prefetch refill ──────────
+        // -- Bulk fetch: either (a) direct or (b) prefetch refill ----------
         while (remaining > 0) {
             // For small reads, prefetch the full bulk buffer size; for large
             // reads, transfer exactly what is needed.

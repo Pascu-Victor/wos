@@ -429,7 +429,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
 
         ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s rdma=%s", hdr->src_node, req->resource_id, ch->channel_id,
-                           static_cast<const char*>(exp->export_path), (ack.rdma_flags & DEV_ATTACH_RDMA_VFS) ? "yes" : "no");
+                           static_cast<const char*>(exp->export_path), ((ack.rdma_flags & DEV_ATTACH_RDMA_VFS) != 0) ? "yes" : "no");
 
         // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
         // the piggybacked ACK properly drains the client's retransmit queue for channel 3.

@@ -117,7 +117,7 @@
         },
         {
             "label": "Create Test Disk",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/create_fat32_test_disk.sh",
+            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/create_mountfs_disk.sh",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",

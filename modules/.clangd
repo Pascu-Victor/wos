@@ -26,3 +26,5 @@ Diagnostics:
             - readability-function-cognitive-complexity
             - cppcoreguidelines-pro-bounds-constant-array-index
             - misc-non-private-member-variables-in-classes
+            - cppcoreguidelines-pro-type-union-access
+            - cppcoreguidelines-avoid-goto

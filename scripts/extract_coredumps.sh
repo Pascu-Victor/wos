@@ -31,17 +31,17 @@ if [ "$CLUSTER_MODE" -eq 1 ]; then
         echo "Cluster overlays directory not found: $OVERLAY_DIR"
         exit 1
     fi
-    for img in "$OVERLAY_DIR"/fat32-vm*.qcow2; do
+    for img in "$OVERLAY_DIR"/mountfs-vm*.qcow2; do
         if [ -f "$img" ]; then
             DISK_IMAGES+=("$img")
         fi
     done
     if [ ${#DISK_IMAGES[@]} -eq 0 ]; then
-        echo "No fat32 overlay images found in $OVERLAY_DIR"
+        echo "No mountfs overlay images found in $OVERLAY_DIR"
         exit 1
     fi
 else
-    DISK_IMAGE="$PROJECT_ROOT/test_fat32.qcow2"
+    DISK_IMAGE="$PROJECT_ROOT/mountfs.qcow2"
     if [ ! -f "$DISK_IMAGE" ]; then
         echo "Disk image not found: $DISK_IMAGE"
         exit 1

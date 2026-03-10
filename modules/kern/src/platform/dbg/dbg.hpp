@@ -28,6 +28,6 @@ void enableKmalloc(void);
 void breakIntoDebugger(void);
 
 // Panic handler which halts other CPUs and stops the system.
-void panicHandler(const char* msg);
+void panic_handler(const char* msg);
 
 }  // namespace ker::mod::dbg
