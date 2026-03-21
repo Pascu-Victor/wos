@@ -16,7 +16,6 @@ namespace {
 // ---------------------------------------------------------------------------
 // Global pool (fallback)
 // ---------------------------------------------------------------------------
-PacketBuffer* pool = nullptr;
 size_t pool_capacity = 0;
 PacketBuffer* free_list = nullptr;
 ker::mod::sys::Spinlock pool_lock;
@@ -27,21 +26,6 @@ bool initialized = false;
 // to cheaply check whether we should reserve buffers for RX.
 std::atomic<size_t> free_count{0};
 
-// ---------------------------------------------------------------------------
-// Per-CPU packet cache — avoids global pool_lock contention on the hot path.
-// The NAPI worker and the spin-waiting caller are typically on the same CPU,
-// so recently-freed RX buffers are cache-hot when reused for the next TX.
-// ---------------------------------------------------------------------------
-constexpr size_t PKT_PERCPU_CACHE_SIZE = 8;  // entries per CPU
-constexpr size_t PKT_PERCPU_MAX_CPUS = 256;
-
-struct PktPerCpuCache {
-    PacketBuffer* head = nullptr;
-    uint32_t count = 0;
-};
-
-PktPerCpuCache s_percpu_cache[PKT_PERCPU_MAX_CPUS];
-std::atomic<bool> s_percpu_ready{false};
 
 void add_buffers_to_pool(size_t count) {
     // Allocate new buffers
@@ -65,25 +49,25 @@ void add_buffers_to_pool(size_t count) {
     ker::mod::dbg::log("net: Added %zu packet buffers (total: %zu)", count, pool_capacity);
 }
 
-// Allocate from global pool (locked)
+// Allocate from global pool
 auto pkt_global_alloc() -> PacketBuffer* {
-    pool_lock.lock();
+    uint64_t flags = pool_lock.lock_irqsave();
     if (free_list == nullptr) {
-        pool_lock.unlock();
+        pool_lock.unlock_irqrestore(flags);
         return nullptr;
     }
     auto* pkt = free_list;
     free_list = pkt->next;
-    pool_lock.unlock();
+    pool_lock.unlock_irqrestore(flags);
     return pkt;
 }
 
-// Return to global pool (locked)
+// Return to global pool (IRQ-safe — see pkt_global_alloc comment).
 void pkt_global_free(PacketBuffer* pkt) {
-    pool_lock.lock();
+    uint64_t flags = pool_lock.lock_irqsave();
     pkt->next = free_list;
     free_list = pkt;
-    pool_lock.unlock();
+    pool_lock.unlock_irqrestore(flags);
 }
 
 }  // namespace
@@ -110,8 +94,6 @@ void pkt_pool_expand_for_nics() {
         add_buffers_to_pool(to_add);
     }
 
-    // Per-CPU cache is safe once SMP + NAPI workers are up
-    s_percpu_ready.store(true, std::memory_order_release);
 }
 
 auto pkt_pool_size() -> size_t { return pool_capacity; }
@@ -119,24 +101,9 @@ auto pkt_pool_size() -> size_t { return pool_capacity; }
 auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_relaxed); }
 
 auto pkt_alloc() -> PacketBuffer* {
-    PacketBuffer* pkt = nullptr;
-
-    // Fast path: try per-CPU cache (no lock, no cache-line bounce)
-    if (s_percpu_ready.load(std::memory_order_acquire)) {
-        auto& cache = s_percpu_cache[ker::mod::cpu::currentCpu()];
-        if (cache.head != nullptr) {
-            pkt = cache.head;
-            cache.head = pkt->next;
-            cache.count--;
-        }
-    }
-
-    // Slow path: global pool
+    PacketBuffer* pkt = pkt_global_alloc();
     if (pkt == nullptr) {
-        pkt = pkt_global_alloc();
-        if (pkt == nullptr) {
-            return nullptr;
-        }
+        return nullptr;
     }
 
     // Initialize the packet buffer
@@ -171,21 +138,8 @@ void pkt_free(PacketBuffer* pkt) {
         return;
     }
 
-    free_count.fetch_add(1, std::memory_order_relaxed);
-
-    // Fast path: return to per-CPU cache if not full
-    if (s_percpu_ready.load(std::memory_order_acquire)) {
-        auto& cache = s_percpu_cache[ker::mod::cpu::currentCpu()];
-        if (cache.count < PKT_PERCPU_CACHE_SIZE) {
-            pkt->next = cache.head;
-            cache.head = pkt;
-            cache.count++;
-            return;
-        }
-    }
-
-    // Slow path: return to global pool
     pkt_global_free(pkt);
+    free_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace ker::net

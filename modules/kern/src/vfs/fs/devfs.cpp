@@ -245,7 +245,7 @@ auto devfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> s
 }
 
 auto devfs_lseek(File* /*f*/, off_t /*offset*/, int /*whence*/) -> off_t {
-    return ESPIPE;  // devfs does not support seeking
+    return -ESPIPE;  // devfs does not support seeking
 }
 
 auto devfs_isatty(File* f) -> bool {

@@ -253,13 +253,9 @@ int e1000_poll(ker::net::NapiStruct* napi, int budget) {
     auto* dev = reinterpret_cast<E1000Device*>(napi->dev);
     int processed = 0;
 
-    // Process RX packets up to budget
+    // TX reclamation is done lazily in start_xmit when the ring is full.
+    // NAPI poll is the sole consumer of RX (mutual exclusion via NAPI CAS).
     processed = process_rx_budget(dev, budget);
-
-    // Process TX completions (with lock since start_xmit also accesses)
-    dev->tx_lock.lock();
-    process_tx(dev);
-    dev->tx_lock.unlock();
 
     // If we processed less than budget, we're done - re-enable IRQs
     if (processed < budget) {
@@ -312,8 +308,10 @@ void e1000_close(ker::net::NetDevice* /*ndev*/) {}
 int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     auto* dev = reinterpret_cast<E1000Device*>(ndev);
 
-    // Use regular lock (we're in thread context, not IRQ)
-    dev->tx_lock.lock();
+    // Use lock_irqsave to prevent preemption while holding the lock.
+    // Without this, a DAEMON task holding the plain lock can be preempted,
+    // and a non-preemptible PROCESS task on the same CPU will spin forever.
+    uint64_t txflags = dev->tx_lock.lock_irqsave();
 
     uint16_t idx = dev->tx_tail;
     auto* desc = &dev->tx_descs[idx];
@@ -323,7 +321,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
         // TX ring full — try to reclaim
         process_tx(dev);
         if (dev->tx_bufs[idx] != nullptr) {
-            dev->tx_lock.unlock();
+            dev->tx_lock.unlock_irqrestore(txflags);
             ker::net::pkt_free(pkt);
             return -1;  // Drop packet
         }
@@ -347,7 +345,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     ndev->tx_packets++;
     ndev->tx_bytes += pkt->len;
 
-    dev->tx_lock.unlock();
+    dev->tx_lock.unlock_irqrestore(txflags);
     return 0;
 }
 
@@ -412,6 +410,13 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     reg_write(dev, REG_IMC, 0xFFFFFFFF);
     // Clear pending interrupts
     (void)reg_read(dev, REG_ICR);
+
+    // Disable interrupt moderation/coalescing for low-latency VM-to-VM traffic.
+    reg_write(dev, REG_ITR, 0);
+    reg_write(dev, REG_RDTR, 0);
+    reg_write(dev, REG_RADV, 0);
+    reg_write(dev, REG_TIDV, 0);
+    reg_write(dev, REG_TADV, 0);
 
     // Set link up
     uint32_t ctrl = reg_read(dev, REG_CTRL);

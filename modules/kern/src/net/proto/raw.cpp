@@ -96,40 +96,21 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
         return -EINVAL;
     }
 
-    // Try to read from socket receive buffer
-    sock->rcvbuf.lock.lock();
-
-    if (sock->rcvbuf.used == 0) {
-        sock->rcvbuf.lock.unlock();
-        // No data available - would need to block or return EAGAIN
-        // For now, just return would block
+    if (sock->rcvbuf.available() == 0) {
         return -EAGAIN;
     }
 
 #ifdef DEBUG_RAW
-    ker::mod::dbg::log("raw_recvfrom: pid=%zu has %zu bytes available\n", sock->owner_pid, sock->rcvbuf.used);
+    ker::mod::dbg::log("raw_recvfrom: pid=%zu has %zu bytes available\n", sock->owner_pid, sock->rcvbuf.available());
 #endif
 
-    // Read available data
-    size_t to_read = (len < sock->rcvbuf.used) ? len : sock->rcvbuf.used;
+    ssize_t n = sock->rcvbuf.read(buf, len);
 
-    auto* dst = static_cast<uint8_t*>(buf);
-    for (size_t i = 0; i < to_read; i++) {
-        dst[i] = sock->rcvbuf.data[sock->rcvbuf.read_pos];
-        sock->rcvbuf.read_pos = (sock->rcvbuf.read_pos + 1) % sock->rcvbuf.capacity;
-    }
-    sock->rcvbuf.used -= to_read;
-
-    sock->rcvbuf.lock.unlock();
-
-    // For raw sockets, we don't have the source address stored in the buffer
-    // Would need more sophisticated buffering to include source address
     if (addr_out != nullptr && addr_len != nullptr) {
-        // Zero out for now
         std::memset(addr_out, 0, *addr_len);
     }
 
-    return static_cast<ssize_t>(to_read);
+    return n;
 }
 
 auto raw_bind(Socket* sock, const void*, size_t) -> int {
@@ -186,23 +167,16 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
                 }
             }
 
-            // Copy packet data to socket receive buffer
-            sock->rcvbuf.lock.lock();
-
-            size_t space = sock->rcvbuf.capacity - sock->rcvbuf.used;
-            size_t to_copy = (pkt->len < space) ? pkt->len : space;
-
+            if (sock->rcvbuf.available() + pkt->len > sock->rcvbuf.capacity) {
 #ifdef DEBUG_RAW
-            ker::mod::dbg::log("raw_deliver: MATCH socket: copying %zu bytes (space=%zu used=%zu)\n", to_copy, space, sock->rcvbuf.used);
+                ker::mod::dbg::log("raw_deliver: SKIP socket: not enough buffer space (available=%zu, pkt_len=%zu, capacity=%zu)\n",
+                                   sock->rcvbuf.available(), pkt->len, sock->rcvbuf.capacity);
 #endif
-
-            for (size_t j = 0; j < to_copy; j++) {
-                sock->rcvbuf.data[sock->rcvbuf.write_pos] = pkt->data[j];
-                sock->rcvbuf.write_pos = (sock->rcvbuf.write_pos + 1) % sock->rcvbuf.capacity;
+                continue;  // Not enough space in receive buffer
             }
-            sock->rcvbuf.used += to_copy;
 
-            sock->rcvbuf.lock.unlock();
+            // Copy packet data to socket receive buffer
+            sock->rcvbuf.write(pkt->data, pkt->len);
 
 #ifdef DEBUG_RAW
             ker::mod::dbg::log("raw_deliver: delivered to socket, now used=%zu\n", sock->rcvbuf.used);
@@ -216,6 +190,21 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
 
 namespace {
 
+int raw_setsockopt(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+    if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
+        socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+    }
+    return 0;
+}
+
+int raw_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
+    if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
+        *static_cast<int*>(optval) = static_cast<int>(sock->rcvbuf.capacity);
+        *optlen = sizeof(int);
+    }
+    return 0;
+}
+
 SocketProtoOps raw_proto_ops = {
     .bind = raw_bind,
     .listen = nullptr,
@@ -227,8 +216,8 @@ SocketProtoOps raw_proto_ops = {
     .recvfrom = raw_recvfrom,
     .close = raw_close,
     .shutdown = nullptr,
-    .setsockopt = nullptr,
-    .getsockopt = nullptr,
+    .setsockopt = raw_setsockopt,
+    .getsockopt = raw_getsockopt,
     .poll_check = nullptr,
 };
 

@@ -1,5 +1,8 @@
 #include "ktime.hpp"
 
+#include <platform/rtc/rtc.hpp>
+#include <platform/tsc/tsc.hpp>
+
 namespace ker::mod::time {
 bool isInit = false;
 
@@ -25,8 +28,14 @@ void init() {
         return;
     }
 
-    // HPET
+    // HPET must be first — it is the calibration reference for TSC.
     hpet::init();
+
+    // Calibrate the invariant TSC against the now-ready HPET.
+    tsc::init();
+
+    // Read the CMOS real-time clock for wall-clock initialisation.
+    rtc::init();
 
     isInit = true;
 }

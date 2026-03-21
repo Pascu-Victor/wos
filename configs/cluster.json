@@ -2,6 +2,7 @@
     "zones": [
         {
             "id": "GLOBAL",
+            "debug": false,
             "mtu": 9000,
             "nic_model": "virtio-net-pci",
             "ivshmem": {
@@ -15,8 +16,8 @@
                 "ip": null
             },
             "vm": {
-                "memory": "4G",
-                "cpus": 2,
+                "memory": "16G",
+                "cpus": 8,
                 "disk0": "disk.qcow2",
                 "disk1": "mountfs.qcow2"
             }

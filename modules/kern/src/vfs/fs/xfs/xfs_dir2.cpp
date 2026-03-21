@@ -732,10 +732,10 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
     if (!xfs_inode_isdir(dp)) {
         return -ENOTDIR;
     }
-
+#ifdef XFS_DEBUG
     mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s\n", (unsigned long)dp->ino, dp->data_fork.format,
                   (unsigned long)dp->size, (int)namelen, name);
-
+#endif
     switch (dp->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
             return dir2_sf_lookup(dp, name, namelen, entry);

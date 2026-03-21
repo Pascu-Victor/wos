@@ -2,10 +2,14 @@
 
 #include <array>
 #include <cstring>
+#include <net/backlog.hpp>
+#include <net/net_trace.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/smt/smt.hpp>
 #include <string_view>
 
 namespace ker::net {
@@ -78,6 +82,7 @@ auto netdev_at(size_t i) -> NetDevice* {
 
 // Forward declaration - will be implemented in ethernet.cpp
 void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
+    NET_TRACE_SPAN(SPAN_NETDEV_RX);
     if (dev == nullptr || pkt == nullptr) {
         return;
     }
@@ -122,7 +127,19 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    // Hand off to ethernet layer for demuxing
+    // Steer to per-CPU handler thread for parallel protocol processing.
+    // Loopback is already handled above; only real NICs go through backlog.
+    if (backlog_ready()) {
+        uint64_t target = backlog_flow_hash(pkt, ker::mod::smt::getCoreCount());
+        // If the flow hashes to THIS CPU, process inline to avoid expensive reschedule
+        if (target != ker::mod::cpu::currentCpu()) {
+            backlog_enqueue(target, pkt);
+            return;
+        }
+    }
+
+    // Inline processing: same-CPU fast path, early boot, or single CPU.
+    NET_TRACE_TICK();
     proto::eth_rx(dev, pkt);
 }
 

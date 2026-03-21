@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/sys/spinlock.hpp>
 
 #include "device.hpp"
 
@@ -80,7 +81,7 @@ static constexpr uint32_t TIOS_IEXTEN = 0100000;
 KTermios default_termios();
 
 // Ring buffer for PTY data flow
-static constexpr size_t PTY_BUF_SIZE = 4096;
+static constexpr size_t PTY_BUF_SIZE = 65536;
 
 struct PtyRingBuf {
     uint8_t data[PTY_BUF_SIZE]{};
@@ -108,7 +109,8 @@ struct PtyPair {
     Winsize winsize;          // Terminal dimensions
     int foreground_pgrp = 0;  // Foreground process group (TIOCGPGRP/TIOCSPGRP)
 
-    KTermios termios;  // Terminal attributes (line discipline settings)
+    KTermios termios;         // Terminal attributes (line discipline settings)
+    mod::sys::Spinlock lock;  // Protects termios, canonical state, and ring buffers
 
     PtyRingBuf m2s;  // master → slave (master write → slave read)
     PtyRingBuf s2m;  // slave → master (slave write → master read)

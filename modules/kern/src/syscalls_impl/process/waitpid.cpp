@@ -1,12 +1,24 @@
 #include "waitpid.hpp"
 
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 
 namespace ker::syscall::process {
+
+// Fill POSIX struct rusage with the child's timing data (ru_utime and ru_stime only).
+// rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
+static void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
+    if (rusage_phys_addr == 0) return;
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::getVirtPointer(rusage_phys_addr));
+    ru->ru_utime_sec  = (int64_t)(child->user_time_us / 1000000ULL);
+    ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
+    ru->ru_stime_sec  = (int64_t)(child->system_time_us / 1000000ULL);
+    ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+}
 
 // Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child"
 static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
@@ -31,7 +43,7 @@ static auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::
     return nullptr;
 }
 
-auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t rusage_vaddr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto* currentTask = ker::mod::sched::get_current_task();
     if (currentTask == nullptr) {
 #ifdef WAITPID_DEBUG
@@ -51,6 +63,10 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
             if (status != nullptr) {
                 *status = exited->exitStatus;
             }
+            if (rusage_vaddr != 0) {
+                uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
+                fill_rusage(phys, exited);
+            }
             exited->waitedOn = true;
             return exited->pid;
         }
@@ -67,6 +83,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
         } else {
             currentTask->waitStatusPhysAddr = 0;
         }
+        currentTask->waitRusagePhysAddr = (rusage_vaddr != 0)
+            ? ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr)
+            : 0;
 
         currentTask->deferredTaskSwitch = true;
         return 0;
@@ -95,6 +114,10 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
         if (status != nullptr) {
             *status = target_task->exitStatus;
         }
+        if (rusage_vaddr != 0) {
+            uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
+            fill_rusage(phys, target_task);
+        }
         // Mark that the parent has retrieved the exit status (zombie can now be reaped)
         target_task->waitedOn = true;
         return pid;  // Return the PID of the exited process
@@ -121,6 +144,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, ker::mod::c
     } else {
         currentTask->waitStatusPhysAddr = 0;
     }
+    currentTask->waitRusagePhysAddr = (rusage_vaddr != 0)
+        ? ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr)
+        : 0;
 
     // Set the deferred task switch flag - the task will be moved to wait queue after syscall returns
     currentTask->deferredTaskSwitch = true;

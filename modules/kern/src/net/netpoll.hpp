@@ -27,18 +27,18 @@ using NapiPollFn = int (*)(NapiStruct* napi, int budget);
 
 // Per-device NAPI context - embedded in driver device struct
 struct NapiStruct {
-    NetDevice* dev;                       // Parent network device
-    NapiPollFn poll;                      // Driver poll function
-    std::atomic<NapiState> state;         // Current NAPI state (lock-free)
-    int weight;                           // Max packets per poll (default: 64)
+    NetDevice* dev;                // Parent network device
+    NapiPollFn poll;               // Driver poll function
+    std::atomic<NapiState> state;  // Current NAPI state (lock-free)
+    int weight;                    // Max packets per poll (default: 64)
 
     // Per-device worker thread
     ker::mod::sched::task::Task* worker;  // Dedicated kernel thread
     std::atomic<bool> has_work;           // Signal to wake worker (set by IRQ)
 
     // Statistics
-    uint64_t poll_count;                  // Number of poll calls
-    uint64_t complete_count;              // Number of napi_complete calls
+    uint64_t poll_count;      // Number of poll calls
+    uint64_t complete_count;  // Number of napi_complete calls
 };
 
 constexpr int NAPI_DEFAULT_WEIGHT = 64;
@@ -66,5 +66,15 @@ void napi_complete(NapiStruct* napi);
 // relying on the NAPI worker thread.  Returns number of packets processed (0 if
 // the device was already being polled or no work was pending).
 int napi_poll_inline(NetDevice* dev);
+
+// Bounded inline poll for IRQ fast paths: same semantics as napi_poll_inline(),
+// but caps the work done in interrupt/spin-wait context.
+int napi_poll_inline_budget(NetDevice* dev, int budget);
+
+// Drain all registered NAPI devices inline.  Call this after kern_yield() in
+// blocking kernel paths (tcp_send, tcp_recv) so incoming ACKs/data are
+// processed immediately instead of waiting for the next timer tick.
+// Returns total number of packets processed across all devices.
+int napi_poll_all_pending();
 
 }  // namespace ker::net

@@ -1,3 +1,4 @@
+#include "abi-bits/route.h"
 #define _DEFAULT_SOURCE 1
 
 #include <arpa/inet.h>
@@ -282,15 +283,22 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         ioctl(sock, SIOCSIFNETMASK, &ifr);
     }
 
+    // Add local subnet route (direct, no gateway) so on-subnet traffic is
+    // not sent through the default gateway.
+    if (lease.subnet_mask != 0) {
+        struct rtentry rt{};
+        rt.rt_flags = RTF_UP;
+        *reinterpret_cast<uint32_t*>(&rt.rt_dst) = htonl(lease.your_ip & lease.subnet_mask);
+        *reinterpret_cast<uint32_t*>(&rt.rt_genmask) = htonl(lease.subnet_mask);
+        ioctl(sock, SIOCADDRT, &rt);
+    }
+
     // Add default route via router
     if (lease.router != 0) {
-        // rtentry layout: offsets 12=dst(sin_addr), 28=gateway(sin_addr), 44=genmask(sin_addr)
-        uint8_t rt[64]{};
-        // dst = 0.0.0.0 (default route) -- already zeroed
-        // gateway at offset 28
-        *reinterpret_cast<uint32_t*>(rt + 28) = htonl(lease.router);
-        // genmask = 0.0.0.0 -- already zeroed
-        ioctl(sock, SIOCADDRT, rt);
+        rtentry rt{};
+        rt.rt_flags = RTF_UP | RTF_GATEWAY;
+        *reinterpret_cast<uint32_t*>(&rt.rt_gateway) = htonl(lease.router);
+        ioctl(sock, SIOCADDRT, &rt);
     }
 
     close(sock);
@@ -368,8 +376,8 @@ auto main(int argc, char** argv) -> int {
     dst_addr.sin_addr.s_addr = htonl(0xFFFFFFFF);
 
     // Derive xid from MAC address to ensure uniqueness across VMs
-    uint32_t xid = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) |
-                   (static_cast<uint32_t>(mac[4]) << 8) | static_cast<uint32_t>(mac[5]);
+    uint32_t xid = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) | (static_cast<uint32_t>(mac[4]) << 8) |
+                   static_cast<uint32_t>(mac[5]);
     DhcpPacket pkt{};
     std::array<uint8_t, 1500> recv_buf{};
     DhcpLease lease{};

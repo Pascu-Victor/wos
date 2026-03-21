@@ -2665,6 +2665,13 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File* {
                 f->fs_type = FSType::XFS;
             }
             break;
+        case FSType::PROCFS:
+            f = ker::vfs::procfs::procfs_open_path(fs_relative_path, flags, mode);
+            if (f != nullptr) {
+                f->fops = ker::vfs::procfs::get_procfs_fops();
+                f->fs_type = FSType::PROCFS;
+            }
+            break;
         default:
             return nullptr;
     }

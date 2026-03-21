@@ -1,4 +1,5 @@
 #include "exit.hpp"
+#include "waitpid.hpp"
 
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -15,16 +16,29 @@
 
 namespace ker::syscall::process {
 
+// Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
+static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
+    if (waiter->waitRusagePhysAddr == 0) {
+        return;
+    }
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::getVirtPointer(waiter->waitRusagePhysAddr));
+    ru->ru_utime_sec  = (int64_t)(child->user_time_us / 1000000ULL);
+    ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
+    ru->ru_stime_sec  = (int64_t)(child->system_time_us / 1000000ULL);
+    ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+    waiter->waitRusagePhysAddr = 0;
+}
+
 void wos_proc_exit(int status) {
-    auto* currentTask = ker::mod::sched::get_current_task();
-    if (currentTask == nullptr) {
+    auto* current_task = ker::mod::sched::get_current_task();
+    if (current_task == nullptr) {
         return;
     }
 
     // CRITICAL: Atomically transition to EXITING state.
     // This prevents other CPUs from scheduling this task while we're cleaning up.
     // If this fails, another CPU already started our exit (shouldn't happen).
-    if (!currentTask->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
+    if (!current_task->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
         // Already exiting - this shouldn't happen but handle it gracefully
         for (;;) {
             asm volatile("hlt");
@@ -38,13 +52,13 @@ void wos_proc_exit(int status) {
     ker::mod::dbg::log("wos_proc_exit: Task PID %x exiting with status %d", currentTask->pid, status);
 #endif
 
-    // Store exit status for waiting processes
-    currentTask->exitStatus = status;
-    currentTask->hasExited = true;
+    // Store exit status in POSIX waitpid format
+    current_task->exitStatus = (status & 0xff) << 8;
+    current_task->hasExited = true;
 
     // Send SIGCHLD to parent process
-    if (currentTask->parentPid != 0) {
-        auto* parent = ker::mod::sched::find_task_by_pid_safe(currentTask->parentPid);
+    if (current_task->parentPid != 0) {
+        auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parentPid);
         if (parent != nullptr) {
             // Set SIGCHLD (signal 17) pending on parent
             parent->sigPending |= (1ULL << (17 - 1));
@@ -54,15 +68,16 @@ void wos_proc_exit(int status) {
             // Only safe when deferredTaskSwitch is false (parent is in wait queue,
             // its context is stable). If deferredTaskSwitch is still true,
             // the deferred_task_switch race check will handle it.
-            static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+            static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
             if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
-                parent->context.regs.rax = currentTask->pid;
+                parent->context.regs.rax = current_task->pid;
                 if (parent->waitStatusPhysAddr != 0) {
-                    auto* statusPtr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(parent->waitStatusPhysAddr));
-                    *statusPtr = status;
+                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(parent->waitStatusPhysAddr));
+                    *status_ptr = current_task->exitStatus;
                 }
+                fill_rusage_for_waiter(parent, current_task);
                 parent->waitingForPid = 0;
-                currentTask->waitedOn = true;
+                current_task->waitedOn = true;
                 // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) —
                 // we must explicitly reschedule it so it actually wakes up.
                 uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
@@ -79,51 +94,52 @@ void wos_proc_exit(int status) {
     }
 
     // Reschedule all tasks waiting for this process to exit
-    for (uint64_t i = 0; i < currentTask->awaitee_on_exit_count; ++i) {
-        uint64_t waitingPid = currentTask->awaitee_on_exit[i];
+    for (uint64_t i = 0; i < current_task->awaitee_on_exit_count; ++i) {
+        uint64_t waiting_pid = current_task->awaitee_on_exit[i];
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waitingPid);
 #endif
 
         // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
-        auto* waitingTask = ker::mod::sched::find_task_by_pid_safe(waitingPid);
-        if (waitingTask != nullptr) {
+        auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(waiting_pid);
+        if (waiting_task != nullptr) {
             // Only modify the waiting task's saved context when it's safely in waitQueue
             // (deferredTaskSwitch is false). When deferredTaskSwitch is true, the task is
             // still running on another CPU - writing to context.regs is a data race and the
             // values would be overwritten by deferredTaskSwitch's context save anyway.
             // In that case, deferredTaskSwitch() will detect hasExited==true and set rax
             // correctly before re-scheduling the task (see scheduler.cpp deferredTaskSwitch).
-            if (!waitingTask->deferredTaskSwitch) {
-                waitingTask->context.regs.rax = currentTask->pid;
+            if (!waiting_task->deferredTaskSwitch) {
+                waiting_task->context.regs.rax = current_task->pid;
 
-                if (waitingTask->waitStatusPhysAddr != 0) {
-                    auto* statusPtr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waitingTask->waitStatusPhysAddr));
-                    *statusPtr = status;
+                if (waiting_task->waitStatusPhysAddr != 0) {
+                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waiting_task->waitStatusPhysAddr));
+                    *status_ptr = status;
 #ifdef EXIT_DEBUG
                     ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", status, waitingPid);
 #endif
                 }
+                fill_rusage_for_waiter(waiting_task, current_task);
             }
 
             // Mark that this waiter has consumed the exit status (zombie can now be reaped)
             // Note: If multiple processes wait for the same child (not typical but possible),
             // only the first one marks waitedOn. In Linux, only one waiter succeeds anyway.
             if (i == 0) {  // First waiter marks the process as waited-on
-                currentTask->waitedOn = true;
+                current_task->waitedOn = true;
             }
 
             // Reschedule the waiting task on the least loaded CPU.
-            // rescheduleTaskForCpu validates state and removes from all queues before
+            // reschedule_task_for_cpu validates state and removes from all queues before
             // adding, preventing double-queuing even if the task is still currentTask.
-            uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
-            ker::mod::sched::reschedule_task_for_cpu(targetCpu, waitingTask);
+            uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
+            ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);
 #endif
 
             // Release the reference we acquired from findTaskByPidSafe
-            waitingTask->release();
+            waiting_task->release();
         } else {
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Could not find waiting task PID %x", waitingPid);
@@ -137,7 +153,7 @@ void wos_proc_exit(int status) {
         uint32_t count = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < count; i++) {
             auto* child = ker::mod::sched::get_active_task_at(i);
-            if (child != nullptr && child->parentPid == currentTask->pid && child != currentTask) {
+            if (child != nullptr && child->parentPid == current_task->pid && child != current_task) {
                 child->parentPid = 1;  // Reparent to init
             }
         }
@@ -147,19 +163,19 @@ void wos_proc_exit(int status) {
 
     // Close all open file descriptors
     for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (currentTask->fds[i] != nullptr) {
+        if (current_task->fds[i] != nullptr) {
             ker::vfs::vfs_close(static_cast<int>(i));
         }
     }
 
     // Free ELF buffer
-    if (currentTask->elfBuffer != nullptr) {
+    if (current_task->elfBuffer != nullptr) {
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Freeing ELF buffer of size %d", currentTask->elfBufferSize);
 #endif
-        delete[] currentTask->elfBuffer;
-        currentTask->elfBuffer = nullptr;
-        currentTask->elfBufferSize = 0;
+        delete[] current_task->elfBuffer;
+        current_task->elfBuffer = nullptr;
+        current_task->elfBufferSize = 0;
     }
 
     // CRITICAL: Do NOT modify or destroy pagemap/thread here!
@@ -175,7 +191,7 @@ void wos_proc_exit(int status) {
     //
     // The downside is user pages remain allocated ~1 second longer, but this is
     // necessary for correctness in the face of concurrent scheduling.
-    if (currentTask->pagemap != nullptr) {
+    if (current_task->pagemap != nullptr) {
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Deferring pagemap destruction for PID %x to GC", currentTask->pid);
 #endif
@@ -197,8 +213,8 @@ void wos_proc_exit(int status) {
 
     // Transition to DEAD state and record death epoch for garbage collection.
     // The task will be reclaimed once all CPUs have passed through the grace period.
-    currentTask->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
-    currentTask->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
+    current_task->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+    current_task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
 
 #ifdef EXIT_DEBUG
     ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");

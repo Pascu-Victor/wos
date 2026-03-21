@@ -19,17 +19,22 @@
 
 namespace ker::mod::mm::dyn::kmalloc {
 
-// Per-CPU mini_malloc instances for reduced contention
-struct PerCpuAllocator {
-    sys::Spinlock lock;
-    bool initialized;
+static constexpr int NUM_SLAB_CLASSES = 9;
+static constexpr int MAGAZINE_CAPACITY = 32;
 
-    PerCpuAllocator() : initialized(false) {}
+// Per-CPU magazine cache — Linux SLUB pattern.
+// Fast path: pop/push from per-CPU magazine with IRQs disabled (no lock).
+// Slow path: fall through to mini_malloc/mini_free which hold per-size-class slab_lock.
+struct PerCpuAllocator {
+    bool initialized{false};
+    void* magazine[NUM_SLAB_CLASSES][MAGAZINE_CAPACITY]{};
+    uint8_t mag_count[NUM_SLAB_CLASSES]{};
+
+    PerCpuAllocator() = default;
 };
 
 static PerCpuAllocator* perCpuAllocators = nullptr;
 static size_t numCpus = 0;
-static sys::Spinlock globalAllocLock;         // Fallback lock
 static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures are initialized
 
 // Safe CPU ID getter - falls back to APIC ID during early boot
@@ -170,28 +175,56 @@ void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
     largeAllocLock.unlock();
 }
 
+static int size_to_slab_idx(uint64_t size) {
+    if (size <= 0x10)  return 0;
+    if (size <= 0x20)  return 1;
+    if (size <= 0x40)  return 2;
+    if (size <= 0x80)  return 3;
+    if (size <= 0x100) return 4;
+    if (size <= 0x200) return 5;
+    if (size <= 0x300) return 6;
+    if (size <= 0x400) return 7;
+    if (size <= 0x800) return 8;
+    return -1;
+}
+
+static int slab_size_to_idx(size_t slab_size) {
+    switch (slab_size) {
+        case 0x10:  return 0;
+        case 0x20:  return 1;
+        case 0x40:  return 2;
+        case 0x80:  return 3;
+        case 0x100: return 4;
+        case 0x200: return 5;
+        case 0x300: return 6;
+        case 0x400: return 7;
+        case 0x800: return 8;
+        default:    return -1;
+    }
+}
+
 void* malloc(uint64_t size) {
     if (size == 0) {
         return nullptr;
     }
 
-    // Tier 1: Small allocations (0x1 - 0x800) - use mini_malloc slab allocator
+    // Tier 1: Small allocations (0x1 - 0x800) - magazine fast path, slab slow path
     if (size <= SLAB_MAX_SIZE) {
-        if (perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+        int idx = size_to_slab_idx(size);
+        if (idx >= 0 && perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+            uint64_t flags;
+            asm volatile("pushfq; popq %0; cli" : "=r"(flags));
             uint64_t cpuId = getCurrentCpuId();
-            if (cpuId < numCpus && perCpuAllocators[cpuId].initialized) {
-                perCpuAllocators[cpuId].lock.lock();
-                void* ptr = mini_malloc(size);
-                perCpuAllocators[cpuId].lock.unlock();
+            auto& cpu = perCpuAllocators[cpuId];
+            if (cpu.initialized && cpu.mag_count[idx] > 0) {
+                void* ptr = cpu.magazine[idx][--cpu.mag_count[idx]];
+                if (flags & 0x200) asm volatile("sti");
                 return ptr;
             }
+            if (flags & 0x200) asm volatile("sti");
         }
-
-        // Fallback to global lock if per-CPU not available
-        globalAllocLock.lock();
-        void* ptr = mini_malloc(size);
-        globalAllocLock.unlock();
-        return ptr;
+        // Slow path: mini_malloc acquires per-size-class slab_lock internally
+        return mini_malloc(size);
     }
 
     // Tier 2: Medium allocations (0x801 - 0xFFFF) - use regular pageAlloc with tracking
@@ -458,34 +491,12 @@ auto realloc(void* ptr, int sz) -> void* {
 
     // Staying in small range?
     if (newSize <= SLAB_MAX_SIZE) {
-        // Try mini_malloc realloc (it might give same pointer if it fits)
-        uint64_t cpuId = getCurrentCpuId();
-        if (perCpuAllocators != nullptr && cpuId < numCpus && perCpuAllocators[cpuId].initialized &&
-            perCpuReady.load(std::memory_order_acquire)) {
-            perCpuAllocators[cpuId].lock.lock();
-            void* newPtr = mini_malloc(newSize);
-            if (newPtr != nullptr) {
-                // Copy old data - we don't know exact old size, so copy up to newSize
-                // This is safe because mini_malloc slabs are at least the requested size
-                if (newPtr != ptr) {
-                    memcpy(newPtr, ptr, newSize);
-                    mini_free(ptr);
-                }
-            }
-            perCpuAllocators[cpuId].lock.unlock();
-            return newPtr;
-        } else {
-            globalAllocLock.lock();
-            void* newPtr = mini_malloc(newSize);
-            if (newPtr != nullptr) {
-                if (newPtr != ptr) {
-                    memcpy(newPtr, ptr, newSize);
-                    mini_free(ptr);
-                }
-            }
-            globalAllocLock.unlock();
-            return newPtr;
+        void* newPtr = malloc(newSize);
+        if (newPtr != nullptr && newPtr != ptr) {
+            memcpy(newPtr, ptr, newSize);
+            free(ptr);
         }
+        return newPtr;
     }
 
     // Transitioning from small to medium or large
@@ -578,20 +589,40 @@ void free(void* ptr) {
         }
     }
 
-    // Otherwise, it's a small allocation (<= 0x800) - free via mini_malloc
-    if (perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+    // Otherwise, it's a small allocation (<= 0x800) - magazine fast path, slab slow path
+    size_t slab_sz = mini_get_slab_size(ptr);
+    int idx = (slab_sz > 0) ? slab_size_to_idx(slab_sz) : -1;
+
+    if (idx >= 0 && perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
+        uint64_t flags;
+        asm volatile("pushfq; popq %0; cli" : "=r"(flags));
         uint64_t cpuId = getCurrentCpuId();
-        if (cpuId < numCpus && perCpuAllocators[cpuId].initialized) {
-            perCpuAllocators[cpuId].lock.lock();
-            mini_free(ptr);
-            perCpuAllocators[cpuId].lock.unlock();
+        auto& cpu = perCpuAllocators[cpuId];
+        if (cpu.initialized) {
+            if (cpu.mag_count[idx] < MAGAZINE_CAPACITY) {
+                cpu.magazine[idx][cpu.mag_count[idx]++] = ptr;
+                if (flags & 0x200) asm volatile("sti");
+                return;
+            }
+            // Magazine full: flush all entries to slab, push new ptr, then drain
+            uint8_t cnt = cpu.mag_count[idx];
+            void* batch[MAGAZINE_CAPACITY];
+            for (uint8_t i = 0; i < cnt; i++) {
+                batch[i] = cpu.magazine[idx][i];
+            }
+            cpu.mag_count[idx] = 0;
+            cpu.magazine[idx][cpu.mag_count[idx]++] = ptr;
+            if (flags & 0x200) asm volatile("sti");
+            for (uint8_t i = 0; i < cnt; i++) {
+                mini_free(batch[i]);
+            }
             return;
         }
+        if (flags & 0x200) asm volatile("sti");
     }
 
-    globalAllocLock.lock();
+    // Slow path: mini_free acquires per-size-class slab_lock internally
     mini_free(ptr);
-    globalAllocLock.unlock();
 }
 
 }  // namespace ker::mod::mm::dyn::kmalloc

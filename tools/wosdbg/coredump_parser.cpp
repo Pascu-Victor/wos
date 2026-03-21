@@ -133,7 +133,7 @@ static GPRegs parseGPRegs(const char* data, size_t& off) {
 }
 
 std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
-    // Minimum size: header (16) + 7×8 fields + 2×(7×8 + 15×8) frames/regs + 8×8 task metadata = 488 bytes
+    // Minimum size: header (16) + 7x8 fields + 2x(7x8 + 15x8) frames/regs + 8x8 task metadata = 488 bytes
     static constexpr size_t MIN_HEADER_SIZE = 488;
     if (static_cast<size_t>(data.size()) < MIN_HEADER_SIZE) {
         qWarning() << "Coredump too small:" << data.size() << "bytes (minimum" << MIN_HEADER_SIZE << ")";
@@ -159,7 +159,7 @@ std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
         return std::nullopt;
     }
 
-    // 7 × uint64: timestamp, pid, cpu, intNum, errCode, cr2, cr3
+    // 7 x uint64: timestamp, pid, cpu, intNum, errCode, cr2, cr3
     dump.timestamp = readLE<uint64_t>(d + off);
     off += 8;
     dump.pid = readLE<uint64_t>(d + off);
@@ -183,7 +183,7 @@ std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
     dump.savedFrame = parseInterruptFrame(d, off);
     dump.savedRegs = parseGPRegs(d, off);
 
-    // Task metadata: 8 × uint64
+    // Task metadata: 8 x uint64
     dump.taskEntry = readLE<uint64_t>(d + off);
     off += 8;
     dump.taskPagemap = readLE<uint64_t>(d + off);

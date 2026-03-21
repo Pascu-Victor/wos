@@ -138,6 +138,18 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             __builtin_unreachable();
         }
 
+        if (frame.intNum == 1) {
+            // Debug exception (hardware breakpoint or TF single-step).
+            uint64_t dr7_clear = 0x400;       // bit 10 reserved=1, all enable bits=0
+            uint64_t dr6_clear = 0xFFFF0FF0;  // reserved bits set, all status bits cleared
+            asm volatile("mov %0, %%dr7" ::"r"(dr7_clear));
+            asm volatile("mov %0, %%dr6" ::"r"(dr6_clear));
+            dbg::log("Userspace debug trap (INT 1): rip=0x%x pid=%x", frame.rip,
+                     ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+            ker::syscall::process::wos_proc_exit(128 + 5);  // 133 = SIGTRAP
+            __builtin_unreachable();
+        }
+
         dbg::log("Userspace exception: int=%d err=%d rip=0x%x pid=%x", frame.intNum, frame.errCode, frame.rip,
                  ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
         ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
@@ -441,22 +453,16 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
 
     if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
-    } else {
-        // No handler registered - log and handle appropriately
-        ker::mod::io::serial::write("UNHANDLED INT: vector=");
+    } else if (isIrq(frame.intNum)) {
+        // Unexpected hardware IRQ with no handler — log and ignore.
+        ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
         ker::mod::io::serial::writeHex(static_cast<uint8_t>(frame.intNum));
-        ker::mod::io::serial::write(" rip=");
-        ker::mod::io::serial::writeHex(frame.rip);
         ker::mod::io::serial::write("\n");
-
-        if (!isIrq(frame.intNum)) {
-            exception_handler(gpr, frame);
-            ker::mod::apic::eoi();
-            ker::mod::io::serial::write("No handler for interrupt ");
-            ker::mod::io::serial::write(frame.intNum);
-            ker::mod::io::serial::write("\n");
-            hcf();
-        }
+    } else {
+        // CPU exception with no registered handler — route to exception_handler
+        // which kills the userspace process or panics for kernel-mode faults.
+        exception_handler(gpr, frame);
+        __builtin_unreachable();
     }
     ker::mod::apic::eoi();
 }

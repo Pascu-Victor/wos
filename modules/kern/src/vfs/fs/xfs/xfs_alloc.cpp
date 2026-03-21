@@ -159,9 +159,9 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     result->agno = agno;
     result->agbno = alloc_start;
     result->len = alloc_len;
-
+#ifdef XFS_DEBUG
     mod::dbg::log("[xfs alloc] allocated AG %u block %u len %u\n", agno, alloc_start, alloc_len);
-
+#endif
     return 0;
 }
 

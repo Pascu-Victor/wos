@@ -74,7 +74,7 @@ auto main(int argc, char** argv) -> int {
             } else {
                 std::println("sub-init[{}]: Spawned '{}' as PID {} (instance {}/{})", cpuno, prog_path, child_pid, i + 1, spawn_count);
                 int exit_code = 0;
-                ker::process::waitpid((int64_t)child_pid, &exit_code, 0);
+                ker::process::waitpid((int64_t)child_pid, &exit_code, 0, nullptr);
                 std::println("sub-init[{}]: Child PID {} exited with code {}", cpuno, child_pid, exit_code);
             }
         }
@@ -261,7 +261,7 @@ auto main(int argc, char** argv) -> int {
                 std::println("init[{}]: FAILED to spawn dropbearkey", cpuno);
             } else {
                 int exit_code = 0;
-                ker::process::waitpid((int64_t)keygen_pid, &exit_code, 0);
+                ker::process::waitpid((int64_t)keygen_pid, &exit_code, 0, nullptr);
                 std::println("init[{}]: dropbearkey exited with code {}", cpuno, exit_code);
             }
         }
@@ -395,7 +395,7 @@ auto main(int argc, char** argv) -> int {
     // otherwise zombie processes accumulate in the process table.
     for (;;) {
         int32_t reap_status = 0;
-        auto reap_pid = ker::process::waitpid(-1, &reap_status, 1 /* WNOHANG */);
+        auto reap_pid = ker::process::waitpid(-1, &reap_status, 1 /* WNOHANG */, nullptr);
         if (reap_pid == 0 || reap_pid == static_cast<uint64_t>(-1)) {
             // No zombie children to reap right now — sleep briefly
             asm volatile("pause");

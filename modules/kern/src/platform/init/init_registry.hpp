@@ -55,6 +55,7 @@ void cdc_ether_init();
 void xhci_init();
 void ivshmem_init();
 void pkt_pool_expand();
+void backlog_init();
 void ndp_init();
 void wki_init();
 void devfs_populate_net();
@@ -64,6 +65,7 @@ void wki_eth_transport_init();
 void wki_ivshmem_transport_init();
 void ipv6_linklocal_init();
 void sse_init();
+void ntp_init();
 
 // PHASE 7: Kernel Start
 void kernel_start();
@@ -124,13 +126,14 @@ inline constexpr std::array<ModuleDesc, 2> PHASE_4_MODULES = {{
 }};
 
 // PHASE 5: Drivers
-inline constexpr std::array<ModuleDesc, 10> PHASE_5_MODULES = {{
+inline constexpr std::array<ModuleDesc, 11> PHASE_5_MODULES = {{
     {.name = "virtio_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::virtio_net_init},       // depends: pci, net, smt
     {.name = "e1000e", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::e1000e_init},               // depends: pci, net, smt
     {.name = "cdc_ether", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::cdc_ether_init},         // depends: pci, net, smt
     {.name = "xhci", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::xhci_init},                   // depends: pci, cdc_ether, smt
     {.name = "ivshmem", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ivshmem_init},             // depends: pci, net, smt
     {.name = "pkt_pool_expand", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::pkt_pool_expand},  // depends: virtio, e1000e, ivshmem
+    {.name = "backlog", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::backlog_init},              // depends: pkt_pool_expand, smt
     {.name = "ndp", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ndp_init},                     // depends: net
     {.name = "wki", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::wki_init},                     // depends: ndp
     {.name = "devfs_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::devfs_populate_net},     // depends: vfs, virtio, e1000e
@@ -140,7 +143,7 @@ inline constexpr std::array<ModuleDesc, 10> PHASE_5_MODULES = {{
 // This is the key phase that MUST come after all drivers!
 // WKI transport and IPv6 linklocal send packets, which requires EpochManager
 // smt and epoch_manager are now initialized in PHASE_3, so sched can use them here
-inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
+inline constexpr std::array<ModuleDesc, 5> PHASE_6_MODULES = {{
     {.name = "wki_eth_transport",
      .phase = BootPhase::PHASE_6_POST_SCHEDULER,
      .init_fn = fns::wki_eth_transport_init},  // depends: sched, wki
@@ -149,6 +152,7 @@ inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
      .init_fn = fns::wki_ivshmem_transport_init},                                                                 // depends: sched, wki
     {.name = "ipv6_linklocal", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ipv6_linklocal_init},  // depends: sched, net
     {.name = "sse", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::sse_init},                        // depends: sched
+    {.name = "ntp", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ntp_init},                        // depends: sched, net, rtc, tsc
 }};
 
 // PHASE 7: Kernel Start (never returns)

@@ -3,7 +3,7 @@
     "tasks": [
         {
             "label": "Check Headers",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && sh scripts/check_headers.sh modules/kern && sh scripts/check_headers.sh modules/init",
+            "command": "sh scripts/check_headers.sh modules/kern && sh scripts/check_headers.sh modules/init",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -12,6 +12,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -22,7 +39,7 @@
         },
         {
             "label": "Build mlibc",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build install 2>&1) || { echo \"$_out\"; false; }",
+            "command": "_out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/mlibc-build install 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -31,6 +48,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -41,7 +75,7 @@
         },
         {
             "label": "Build libcxx",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install 2>&1) || { echo \"$_out\"; false; }",
+            "command": "_out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full 2>&1) || { echo \"$_out\"; false; } && _out=$(ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -50,6 +84,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -60,7 +111,7 @@
         },
         {
             "label": "Build busybox",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(${workspaceFolder}/scripts/build_busybox.sh 2>&1) || { echo \"$_out\"; false; }",
+            "command": "_out=$(${workspaceFolder}/scripts/build_busybox.sh 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -69,6 +120,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -79,7 +147,7 @@
         },
         {
             "label": "Build dropbear",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && _out=$(${workspaceFolder}/scripts/build_dropbear.sh 2>&1) || { echo \"$_out\"; false; }",
+            "command": "_out=$(${workspaceFolder}/scripts/build_dropbear.sh 2>&1) || { echo \"$_out\"; false; }",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -88,6 +156,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -98,7 +183,7 @@
         },
         {
             "label": "CMake Build",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && cmake -B build -GNinja . && cmake --build build",
+            "command": "cmake -B build -GNinja . && cmake --build build",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -107,6 +192,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -117,7 +219,7 @@
         },
         {
             "label": "Create Test Disk",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/create_mountfs_disk.sh",
+            "command": "${workspaceFolder}/scripts/create_mountfs_disk.sh",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -126,6 +228,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -136,7 +255,7 @@
         },
         {
             "label": "Make Boot Image",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/make_image.sh",
+            "command": "${workspaceFolder}/scripts/make_image.sh",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -145,6 +264,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": false,
@@ -223,7 +359,7 @@
         },
         {
             "label": "Start QEMU Debug",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_kern.sh --debug",
+            "command": "${workspaceFolder}/scripts/run_kern.sh --debug",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -232,6 +368,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": true,
@@ -259,7 +412,7 @@
         },
         {
             "label": "Start Cluster Background",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
+            "command": "${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -268,6 +421,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/target1",
+                    "WOS_CLANG_VERSION": "21",
+                    "CC": "${workspaceFolder}/toolchain/target1/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/target1/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/target1/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1 -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/target1",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/target1/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/target1/lib"
                 }
             },
             "isBackground": true,

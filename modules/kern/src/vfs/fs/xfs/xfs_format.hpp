@@ -198,7 +198,7 @@ struct XfsDinode {
     __be32 di_extsize;              // extent size hint
     __be32 di_nextents;             // number of data extents
     __be16 di_anextents;            // number of attr extents
-    uint8_t di_forkoff;             // attr fork offset (×8)
+    uint8_t di_forkoff;             // attr fork offset (x8)
     int8_t di_aformat;              // format of attr fork (xfs_dinode_fmt)
     __be32 di_dmevmask;             // DMIG event mask
     __be16 di_dmstate;              // DMIG state info

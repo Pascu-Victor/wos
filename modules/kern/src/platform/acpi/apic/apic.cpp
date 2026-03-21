@@ -1,6 +1,7 @@
 #include "apic.hpp"
 
 #include <cstdint>
+#include <platform/acpi/hpet/hpet.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -67,8 +68,7 @@ void initApicMP() {
 auto calibrateTimer(uint64_t us) -> uint32_t {
     writeReg((uint32_t)X2APICMSRs::TIMER_DIVIDE_CONFIG, 0x3);
     writeReg((uint32_t)X2APICMSRs::TIMER_INIT_COUNT, 0xFFFFFFFF);
-    uint64_t start = rdtsc();
-    while (rdtsc() - start < us * 1000);
+    hpet::sleepUs(us);
     writeReg((uint32_t)X2APICMSRs::LVT_TIMER, (0 << 16) | (0 << 17) | 32);
     return 0xFFFFFFFF - readReg((uint32_t)X2APICMSRs::TIMER_CURRENT_COUNT);
 }

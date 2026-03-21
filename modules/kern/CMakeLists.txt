@@ -20,9 +20,10 @@ add_executable(${KERNEL} ${CFILES} ${ASFILES} ${NASMFILES} ${CXXFILES})
 
 # Kernel-specific compile options: freestanding, no exceptions, no RTTI.
 target_compile_options(${KERNEL} PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-fno-exceptions;-mcmodel=kernel>
-    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel>
+    $<$<COMPILE_LANGUAGE:C>:-fno-exceptions;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
 )
+target_link_options(${KERNEL} PRIVATE -fno-lto)
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)
 target_include_directories(${KERNEL} PRIVATE
@@ -43,6 +44,10 @@ target_include_directories(${KERNEL} PRIVATE
 target_include_directories(${KERNEL} SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../extern/limine
 )
+
+# Network hot-path instrumentation (prints cycle-count stats every 1000 pkts)
+# Remove this line to disable tracing.
+# target_compile_definitions(${KERNEL} PRIVATE NET_TRACE)
 
 target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 

@@ -144,10 +144,9 @@ inline void fbLog(const char* str) {
 }
 
 void logString(const char* str) {
-    logLock.lock();
-    // Write atomically to serial (includes newline)
     serialLogLine(str);
-    // Framebuffer logging
+    // logLock only protects the framebuffer state and linesLogged counter.
+    logLock.lock();
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
         fbLog(str);
     }
@@ -183,10 +182,8 @@ void logFbAdvance(void) {
 }
 
 void error(const char* str) {
-    logLock.lock();
-    log(str);
     // TODO: pretty print error
-    logLock.unlock();
+    log(str);
 }
 
 void panic_handler(const char* msg) {

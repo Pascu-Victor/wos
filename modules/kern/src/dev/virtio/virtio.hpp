@@ -127,6 +127,11 @@ inline bool virtq_has_pending(const Virtqueue* vq) {
     return vq->last_used_idx != vq->used->idx;
 }
 
+inline uint16_t virtq_pending_count(const Virtqueue* vq) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return static_cast<uint16_t>(vq->used->idx - vq->last_used_idx);
+}
+
 // Calculate virtqueue memory layout sizes
 auto virtq_desc_size(uint16_t qsz) -> size_t;
 auto virtq_avail_size(uint16_t qsz) -> size_t;

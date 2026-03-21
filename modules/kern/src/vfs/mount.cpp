@@ -8,6 +8,7 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 
@@ -21,6 +22,7 @@ namespace ker::vfs {
 namespace {
 MountPoint* mounts[MAX_MOUNTS] = {};
 size_t mount_count = 0;
+mod::sys::Spinlock mount_lock;  // Protects mounts[] and mount_count
 }  // namespace
 
 auto fstype_to_enum(const char* fstype) -> FSType {
@@ -48,11 +50,6 @@ auto fstype_to_enum(const char* fstype) -> FSType {
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
-        return -1;
-    }
-
-    if (mount_count >= MAX_MOUNTS) {
-        vfs_debug_log("mount_filesystem: mount table full\n");
         return -1;
     }
 
@@ -152,8 +149,16 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         return -1;
     }
 
+    mount_lock.lock();
+    if (mount_count >= MAX_MOUNTS) {
+        mount_lock.unlock();
+        vfs_debug_log("mount_filesystem: mount table full\n");
+        delete mount;
+        return -1;
+    }
     mounts[mount_count] = mount;
     mount_count++;
+    mount_lock.unlock();
 
     vfs_debug_log("mount_filesystem: mounted ");
     vfs_debug_log(fstype);
@@ -175,6 +180,7 @@ auto unmount_filesystem(const char* path) -> int {
         return -EINVAL;
     }
 
+    mount_lock.lock();
     for (size_t i = 0; i < mount_count; ++i) {
         if (mounts[i] != nullptr && mounts[i]->path != nullptr && std::strcmp(path, mounts[i]->path) == 0) {
             delete mounts[i];
@@ -185,6 +191,7 @@ auto unmount_filesystem(const char* path) -> int {
             }
             mount_count--;
             mounts[mount_count] = nullptr;
+            mount_lock.unlock();
 
             vfs_debug_log("unmount_filesystem: unmounted ");
             vfs_debug_log(path);
@@ -199,6 +206,7 @@ auto unmount_filesystem(const char* path) -> int {
             return 0;
         }
     }
+    mount_lock.unlock();
     return -ENOENT;
 }
 
@@ -209,6 +217,7 @@ auto find_mount_point(const char* path) -> MountPoint* {
     MountPoint* best_match = nullptr;
     size_t best_length = 0;
 
+    mount_lock.lock();
     for (size_t i = 0; i < mount_count; ++i) {
         if (mounts[i] == nullptr || mounts[i]->path == nullptr) continue;
 
@@ -233,17 +242,27 @@ auto find_mount_point(const char* path) -> MountPoint* {
             }
         }
     }
+    mount_lock.unlock();
 
     return best_match;
 }
 
-auto get_mount_count() -> size_t { return mount_count; }
+auto get_mount_count() -> size_t {
+    mount_lock.lock();
+    size_t count = mount_count;
+    mount_lock.unlock();
+    return count;
+}
 
 auto get_mount_at(size_t index) -> MountPoint* {
+    mount_lock.lock();
     if (index >= mount_count) {
+        mount_lock.unlock();
         return nullptr;
     }
-    return mounts[index];
+    MountPoint* mp = mounts[index];
+    mount_lock.unlock();
+    return mp;
 }
 
 }  // namespace ker::vfs

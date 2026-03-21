@@ -73,7 +73,7 @@ if [ -f "$BUSYBOX_BINARY" ]; then
     echo "  initramfs: added /bin/busybox ($(du -h "$BUSYBOX_BINARY" | cut -f1))"
 
     # Create symlinks for enabled applets
-    BUSYBOX_APPLETS="mount umount ls cat echo mkdir cp mv rm grep find ps df ifconfig sh"
+    BUSYBOX_APPLETS="mount umount ls cat echo mkdir cp mv rm grep find ps df ifconfig sh clear time"
     for applet in $BUSYBOX_APPLETS; do
         ln -sf busybox "$INITRAMFS_DIR/bin/$applet"
         echo "  initramfs: symlinked /bin/$applet -> busybox"

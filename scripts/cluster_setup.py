@@ -21,6 +21,7 @@ import argparse
 import base64
 import json
 import os
+import pwd
 import shutil
 import signal
 import struct
@@ -201,6 +202,23 @@ def parse_size(s: str) -> int:
     elif s.endswith("K"):
         return int(s[:-1]) * 1024
     return int(s)
+
+
+def tap_owner_uid(name: str) -> int | None:
+    result = subprocess.run(
+        f"ip tuntap show dev {name}", shell=True, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+
+    parts = result.stdout.strip().split()
+    for idx, part in enumerate(parts):
+        if part == "user" and idx + 1 < len(parts):
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
 
 
 def reattach_libvirt_vms(bridge: str):
@@ -549,9 +567,18 @@ def setup(config: dict):
             print(f"  Bridge IP: {ip_addr}")
 
         # Create TAP devices
-        real_user = os.environ.get("USER", "nobody")
+        real_user = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+        real_uid = pwd.getpwnam(real_user).pw_uid
         for node_id in range(num_nodes):
             tap = tap_name(zone_cfg, node_id)
+            existing_owner = tap_owner_uid(tap) if link_exists(tap) else None
+            if existing_owner is not None and existing_owner != real_uid:
+                print(
+                    f"  TAP {tap} owned by uid {existing_owner}, recreating for {real_user}"
+                )
+                run(f"ip link set {tap} down", check=False, quiet=True, privileged=True)
+                run(f"ip tuntap del dev {tap} mode tap", check=False, privileged=True)
+
             if not link_exists(tap):
                 run(
                     f"ip tuntap add dev {tap} mode tap user {real_user}",

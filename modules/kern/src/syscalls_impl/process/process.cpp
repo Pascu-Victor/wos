@@ -382,16 +382,8 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     // Set the signal pending bit (signal N is bit N-1)
     target->sigPending |= (1ULL << (sig - 1));
 
-    // If the target is blocked (waiting), wake it up so it can handle the signal
-    auto state = target->state.load(std::memory_order_acquire);
-    if (state == sched::task::TaskState::ACTIVE) {
-        // Task may be in a wait queue — try to reschedule it
-        // Only reschedule if it's actually blocked (not currently running)
-        if (target->deferredTaskSwitch || target->voluntaryBlock) {
-            uint64_t cpu = sched::get_least_loaded_cpu();
-            sched::reschedule_task_for_cpu(cpu, target);
-        }
-    }
+    // Ensure blocked tasks become runnable so pending signals are delivered promptly.
+    sched::wake_task_for_signal(target);
 
     target->release();
     return 0;
@@ -407,7 +399,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                                  reinterpret_cast<const char* const*>(a4));
         }
         case abi::process::procmgmt_ops::waitpid: {
-            return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), gpr);
+            return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), a5, gpr);
         }
         case abi::process::procmgmt_ops::getpid: {
             return wos_proc_getpid();

@@ -129,7 +129,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     std::array<RxTarget, MAX_RX_TARGETS> targets = {};
     size_t target_count = 0;
 
-    s_server_lock.lock();
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
     for (auto& b : g_bindings) {
         if (!b.active || b.resource_type != ResourceType::NET || b.net_dev != dev) {
             continue;
@@ -152,7 +152,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
             targets[target_count++] = {b.consumer_node, b.assigned_channel};
         }
     }
-    s_server_lock.unlock();
+    s_server_lock.unlock_irqrestore(srv_flags);
 
     // Build and send OP_NET_RX_NOTIFY outside the lock (fire-and-forget)
     auto pkt_data_len = static_cast<uint16_t>(pkt->len);
@@ -197,7 +197,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
     std::array<ker::net::NetDevice*, MAX_NET_DEVS> uninstall_devs = {};
     size_t uninstall_count = 0;
 
-    s_server_lock.lock();
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
     for (auto& b : g_bindings) {
         if (!b.active || b.consumer_node != node_id) {
             continue;
@@ -240,7 +240,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
             uninstall_devs[uninstall_count++] = work[i].net_dev;
         }
     }
-    s_server_lock.unlock();
+    s_server_lock.unlock_irqrestore(srv_flags);
 
     // Perform cleanup outside the lock
     for (size_t i = 0; i < work_count; i++) {
@@ -338,9 +338,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.blk_zone_pending = true;  // processed by wki_dev_server_process_pending_zones()
         binding.blk_rdma_active = false;  // not yet — set when deferred creation succeeds
 
-        s_server_lock.lock();
-        g_bindings.push_back(std::move(binding));
-        s_server_lock.unlock();
+        {
+            uint64_t srv_flags = s_server_lock.lock_irqsave();
+            g_bindings.push_back(std::move(binding));
+            s_server_lock.unlock_irqrestore(srv_flags);
+        }
 
         // Send success ACK with the proposed RDMA zone info.
         // The consumer will wait for the zone to appear + server_ready.
@@ -420,9 +422,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             }
         }
 
-        s_server_lock.lock();
-        g_bindings.push_back(std::move(binding));
-        s_server_lock.unlock();
+        {
+            uint64_t srv_flags = s_server_lock.lock_irqsave();
+            g_bindings.push_back(std::move(binding));
+            s_server_lock.unlock_irqrestore(srv_flags);
+        }
 
         ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
         ack.assigned_channel = ch->channel_id;
@@ -480,9 +484,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_id = req->resource_id;
         binding.net_dev = ndev;
 
-        s_server_lock.lock();
-        g_bindings.push_back(std::move(binding));
-        s_server_lock.unlock();
+        {
+            uint64_t srv_flags = s_server_lock.lock_irqsave();
+            g_bindings.push_back(std::move(binding));
+            s_server_lock.unlock_irqrestore(srv_flags);
+        }
 
         // D11: Install RX forward hook on the NIC so received packets are forwarded
         ndev->wki_rx_forward = wki_dev_server_forward_net_rx;
@@ -535,25 +541,27 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     };
     DetachInfo info = {};
 
-    s_server_lock.lock();
-    for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
-        if (!it->active || it->consumer_node != hdr->src_node || it->resource_id != det->resource_id) {
-            continue;
+    {
+        uint64_t srv_flags = s_server_lock.lock_irqsave();
+        for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
+            if (!it->active || it->consumer_node != hdr->src_node || it->resource_id != det->resource_id) {
+                continue;
+            }
+            info.found = true;
+            info.blk_zone_id = it->blk_zone_id;
+            info.blk_rdma_active = it->blk_rdma_active;
+            info.block_dev = it->block_dev;
+            info.net_dev = it->net_dev;
+            info.consumer_node = it->consumer_node;
+            info.assigned_channel = it->assigned_channel;
+            g_bindings.erase(it);
+            if (info.net_dev != nullptr) {
+                info.uninstall_rx_forward = !has_net_binding_for_dev(info.net_dev);
+            }
+            break;
         }
-        info.found = true;
-        info.blk_zone_id = it->blk_zone_id;
-        info.blk_rdma_active = it->blk_rdma_active;
-        info.block_dev = it->block_dev;
-        info.net_dev = it->net_dev;
-        info.consumer_node = it->consumer_node;
-        info.assigned_channel = it->assigned_channel;
-        g_bindings.erase(it);
-        if (info.net_dev != nullptr) {
-            info.uninstall_rx_forward = !has_net_binding_for_dev(info.net_dev);
-        }
-        break;
+        s_server_lock.unlock_irqrestore(srv_flags);
     }
-    s_server_lock.unlock();
 
     if (!info.found) {
         return;
@@ -594,9 +602,12 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     // Find binding by (src_node, channel_id) — pointer is stable (std::deque reference stability)
-    s_server_lock.lock();
-    DevServerBinding* binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
-    s_server_lock.unlock();
+    DevServerBinding* binding = nullptr;
+    {
+        uint64_t srv_flags = s_server_lock.lock_irqsave();
+        binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
+        s_server_lock.unlock_irqrestore(srv_flags);
+    }
 
     if (binding == nullptr) {
         // D11: OP_NET_RX_NOTIFY is sent server→consumer on the dynamic channel.
@@ -1098,12 +1109,15 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 namespace {
 
 void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*length*/, uint8_t /*op_type*/) {
-    s_server_lock.lock();
-    auto* binding = find_binding_by_zone_id(zone_id);
-    if (binding != nullptr) {
-        binding->blk_sq_notified = true;
+    DevServerBinding* binding = nullptr;
+    {
+        uint64_t srv_flags = s_server_lock.lock_irqsave();
+        binding = find_binding_by_zone_id(zone_id);
+        if (binding != nullptr) {
+            binding->blk_sq_notified = true;
+        }
+        s_server_lock.unlock_irqrestore(srv_flags);
     }
-    s_server_lock.unlock();
 
     // blk_ring_server_poll may do block I/O — call outside the lock
     if (binding != nullptr) {
@@ -1123,17 +1137,19 @@ void wki_dev_server_process_pending_zones() {
     std::array<DevServerBinding*, MAX_PENDING> pending = {};
     size_t pending_count = 0;
 
-    s_server_lock.lock();
-    for (auto& b : g_bindings) {
-        if (!b.active || !b.blk_zone_pending) {
-            continue;
+    {
+        uint64_t srv_flags = s_server_lock.lock_irqsave();
+        for (auto& b : g_bindings) {
+            if (!b.active || !b.blk_zone_pending) {
+                continue;
+            }
+            b.blk_zone_pending = false;  // only attempt once
+            if (pending_count < MAX_PENDING) {
+                pending[pending_count++] = &b;
+            }
         }
-        b.blk_zone_pending = false;  // only attempt once
-        if (pending_count < MAX_PENDING) {
-            pending[pending_count++] = &b;
-        }
+        s_server_lock.unlock_irqrestore(srv_flags);
     }
-    s_server_lock.unlock();
 
     // Process each pending binding outside the lock (wki_zone_create may block)
     for (size_t pi = 0; pi < pending_count; pi++) {
@@ -1203,15 +1219,15 @@ void wki_dev_server_process_pending_zones() {
 // -----------------------------------------------------------------------------
 
 auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
-    s_server_lock.lock();
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
     for (auto& b : g_bindings) {
         if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
             uint8_t* buf = b.vfs_rdma_write_buf;
-            s_server_lock.unlock();
+            s_server_lock.unlock_irqrestore(srv_flags);
             return buf;
         }
     }
-    s_server_lock.unlock();
+    s_server_lock.unlock_irqrestore(srv_flags);
     return nullptr;
 }
 
@@ -1221,24 +1237,26 @@ void wki_dev_server_poll_rings() {
     std::array<DevServerBinding*, MAX_RINGS> rings = {};
     size_t ring_count = 0;
 
-    s_server_lock.lock();
-    for (auto& b : g_bindings) {
-        if (!b.active || !b.blk_rdma_active) {
-            continue;
+    {
+        uint64_t srv_flags = s_server_lock.lock_irqsave();
+        for (auto& b : g_bindings) {
+            if (!b.active || !b.blk_rdma_active) {
+                continue;
+            }
+            // For RoCE bindings, only poll when the consumer has signalled new work.
+            // The consumer pushes the SQ via RDMA_WRITE then sends a doorbell;
+            // there is nothing to do until that notification arrives.
+            // Non-RoCE (ivshmem) bindings use shared memory — polling is cheap.
+            if (b.blk_roce && !b.blk_sq_notified) {
+                continue;
+            }
+            b.blk_sq_notified = false;
+            if (ring_count < MAX_RINGS) {
+                rings[ring_count++] = &b;
+            }
         }
-        // For RoCE bindings, only poll when the consumer has signalled new work.
-        // The consumer pushes the SQ via RDMA_WRITE then sends a doorbell;
-        // there is nothing to do until that notification arrives.
-        // Non-RoCE (ivshmem) bindings use shared memory — polling is cheap.
-        if (b.blk_roce && !b.blk_sq_notified) {
-            continue;
-        }
-        b.blk_sq_notified = false;
-        if (ring_count < MAX_RINGS) {
-            rings[ring_count++] = &b;
-        }
+        s_server_lock.unlock_irqrestore(srv_flags);
     }
-    s_server_lock.unlock();
 
     // blk_ring_server_poll may do block I/O — call outside the lock
     for (size_t i = 0; i < ring_count; i++) {

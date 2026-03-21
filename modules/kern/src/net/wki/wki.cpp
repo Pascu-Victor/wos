@@ -37,6 +37,13 @@ namespace ker::net::wki {
 
 WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+// Re-entrancy guard for deferred work processed inside wki_timer_tick().
+// wki_remote_vfs_mount() spin-waits via wki_spin_yield() which calls
+// wki_timer_tick() recursively.  The guard prevents the deferred mount/
+// attach processing from re-entering itself while the outer call is
+// still blocked inside wki_wait_for_op().
+static std::atomic<bool> s_timer_deferred_running{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
 // -----------------------------------------------------------------------------
 // Time source
 // -----------------------------------------------------------------------------
@@ -139,14 +146,18 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Link into pending list (for timeout scan)
     wait_list_link(entry);
 
-    // Poll until completed or deadline
+    // Poll until completed or deadline.  Use wki_spin_yield() instead of
+    // plain kern_yield() so that channel-level delayed ACKs and retransmits
+    // continue to be processed.  Without this, a credit-starved remote peer
+    // can never send the reply because our delayed ACK is stuck in the
+    // timer tick that will never run (the timer thread is us, blocked here).
     while (!entry->completed.load(std::memory_order_acquire)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
             // Timed out — unlink and return error
             wait_list_unlink(entry);
             return WKI_ERR_TIMEOUT;
         }
-        mod::sched::kern_yield();
+        wki_spin_yield();
     }
 
     // Completed — unlink and return result
@@ -1345,6 +1356,15 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             }
 #endif
 
+            // Reconnect resync: if this channel was just recreated locally (all-zero RX state)
+            // but the peer continued its sequence space, adopt the peer's current seq baseline.
+            // This avoids getting stuck buffering every frame as permanently out-of-order.
+            if (ch->rx_seq == 0 && ch->bytes_received == 0 && ch->reorder_head == nullptr && hdr->seq_num != 0) {
+                ker::mod::dbg::log("[WKI] Resyncing channel seq: src=0x%04x ch=%u local_rx_seq=0 remote_seq=%u", hdr->src_node,
+                                   hdr->channel_id, hdr->seq_num);
+                ch->rx_seq = hdr->seq_num;
+            }
+
             if (hdr->seq_num == ch->rx_seq) {
                 // In-order: advance rx_seq, mark ACK pending
                 ch->rx_seq++;
@@ -1660,17 +1680,26 @@ void wki_timer_tick(uint64_t now_us) {
 
     // Heartbeat checks are done in peer.cpp's wki_peer_timer_tick()
 
-    // Process deferred RDMA zone creations (must run outside NAPI poll context)
-    wki_dev_server_process_pending_zones();
+    // Process deferred blocking work (mounts, attaches, zone creates).
+    // These operations can call wki_wait_for_op() which re-enters
+    // wki_spin_yield() → wki_timer_tick().  The guard prevents the
+    // deferred work section from running recursively.
+    bool expected = false;
+    if (s_timer_deferred_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        // Process deferred RDMA zone creations (must run outside NAPI poll context)
+        wki_dev_server_process_pending_zones();
 
-    // Process deferred VFS auto-mounts (must run outside NAPI poll context)
-    wki_remotable_process_pending_mounts();
+        // Process deferred VFS auto-mounts (must run outside NAPI poll context)
+        wki_remotable_process_pending_mounts();
 
-    // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
-    wki_remotable_process_pending_net_attaches();
+        // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
+        wki_remotable_process_pending_net_attaches();
 
-    // Poll RDMA block ring SQ entries on server bindings
-    wki_dev_server_poll_rings();
+        // Poll RDMA block ring SQ entries on server bindings
+        wki_dev_server_poll_rings();
+
+        s_timer_deferred_running.store(false, std::memory_order_release);
+    }
 }
 
 }  // namespace ker::net::wki

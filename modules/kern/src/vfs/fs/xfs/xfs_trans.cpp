@@ -157,8 +157,10 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     for (int i = 0; i < tp->item_count; i++) {
         XfsTransItem& item = tp->items[i];
         if (item.type == XfsLogItemType::Buffer && item.buf.dirty && item.buf.bp != nullptr) {
+#ifdef XFS_DEBUG
             mod::dbg::log("[xfs trans] commit: write buf blk=%lu off=%u len=%u size=%lu\\n", (unsigned long)item.buf.bp->block_no,
                           item.buf.offset, item.buf.len, (unsigned long)item.buf.bp->size);
+#endif
             bdirty(item.buf.bp);
             int wrc = bwrite(item.buf.bp);
             if (wrc != 0 && rc == 0) {

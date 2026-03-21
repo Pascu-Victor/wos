@@ -135,8 +135,9 @@ struct Task {
     volatile bool voluntaryBlock = false;
 
     // Waitpid state: when this task is waiting for another task to exit
-    uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
-    uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
+    uint64_t waitingForPid;        // PID we're waiting for (for waitpid return value)
+    uint64_t waitStatusPhysAddr;   // Physical address of status variable (for waitpid)
+    uint64_t waitRusagePhysAddr;   // Physical address of rusage struct (for wait3/wait4, 0 if unused)
 
     // --- Signal infrastructure ---
     // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)

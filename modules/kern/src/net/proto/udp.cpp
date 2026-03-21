@@ -177,7 +177,13 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
     udp->checksum = 0;
 
     uint32_t src = sock->local_v4.addr;
-    return ipv4_tx(pkt, src, ip, IPPROTO_UDP, 64) == 0 ? static_cast<ssize_t>(len) : static_cast<ssize_t>(-1);
+    int tx_ret = -1;
+    if (src == 0) {
+        tx_ret = ipv4_tx_auto(pkt, ip, IPPROTO_UDP);
+    } else {
+        tx_ret = ipv4_tx(pkt, src, ip, IPPROTO_UDP, 64);
+    }
+    return tx_ret == 0 ? static_cast<ssize_t>(len) : static_cast<ssize_t>(-1);
 }
 
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_raw, size_t* addr_len) -> ssize_t {
@@ -209,15 +215,25 @@ int udp_setsockopt(Socket* sock, int, int optname, const void* optval, size_t op
     if (optname == 15 && optlen >= sizeof(int)) {  // SO_REUSEPORT
         sock->reuse_port = *static_cast<const int*>(optval) != 0;
     }
+    if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
+        socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+    }
+    // SO_SNDBUF (7): UDP has no kernel send buffer - accept silently
     return 0;
 }
-int udp_getsockopt(Socket*, int, int, void*, size_t*) { return 0; }
+int udp_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
+    if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
+        *static_cast<int*>(optval) = static_cast<int>(sock->rcvbuf.capacity);
+        *optlen = sizeof(int);
+    }
+    return 0;
+}
 int udp_poll_check(Socket* sock, int events) {
     int ready = 0;
     if ((events & 1) != 0 && sock->rcvbuf.available() > 0) {  // POLLIN
         ready |= 1;
     }
-    if ((events & 4) != 0 && sock->sndbuf.free_space() > 0) {  // POLLOUT
+    if ((events & 4) != 0) {  // POLLOUT - UDP sends are always immediate
         ready |= 4;
     }
     return ready;

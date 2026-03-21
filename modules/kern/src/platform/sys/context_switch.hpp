@@ -10,4 +10,5 @@ namespace ker::mod::sys::context_switch {
 // and caller should fall back to idle loop
 bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask);
 void startSchedTimer();
+void request_reschedule();
 }  // namespace ker::mod::sys::context_switch

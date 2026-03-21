@@ -5,11 +5,16 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
+#include "syscalls_impl/process/exit.hpp"
 
 // Signal constants (matching Linux ABI)
 static constexpr uint64_t WOS_SIG_DFL = 0;
 static constexpr uint64_t WOS_SIG_IGN = 1;
 static constexpr int WOS_SIGKILL = 9;
+static constexpr int WOS_SIGHUP = 1;
+static constexpr int WOS_SIGINT = 2;
+static constexpr int WOS_SIGQUIT = 3;
+static constexpr int WOS_SIGTERM = 15;
 static constexpr int WOS_SIGSTOP = 19;
 static constexpr int WOS_SIGCHLD = 17;
 static constexpr int WOS_SIGURG = 23;
@@ -109,9 +114,14 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
         // Default action depends on signal:
         // SIGCHLD, SIGURG, SIGWINCH, SIGCONT: ignore
         // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
-        // SIGKILL, SIGTERM, SIGINT, etc: terminate (TODO)
+        // SIGKILL, SIGTERM, SIGINT, etc: terminate
         if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
             return;  // Ignore
+        }
+        // Uncatchable stop signal
+        if (signo == WOS_SIGSTOP) {
+            task->voluntaryBlock = true;
+            return;
         }
         // Job control stop signals: default action is to stop the process
         if (signo == 20 || signo == 21 || signo == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
@@ -119,9 +129,17 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
             task->voluntaryBlock = true;
             return;
         }
-        // Default terminate — for now, just ignore to be safe during development
-        // TODO: implement default signal actions (terminate, core dump, stop)
-        return;
+        // Default terminate semantics for normal fatal signals.
+        // Shells expect status 128 + signo for signal-terminated tasks.
+        if (signo == WOS_SIGHUP || signo == WOS_SIGINT || signo == WOS_SIGQUIT || signo == WOS_SIGTERM || signo == WOS_SIGKILL ||
+            signo == 13 || signo == 11 || signo == 6 || signo == 8 || signo == 4 || signo == 7) {
+            ker::syscall::process::wos_proc_exit(128 + signo);
+            __builtin_unreachable();
+        }
+
+        // Conservative fallback: terminate by signal number if action is unknown.
+        ker::syscall::process::wos_proc_exit(128 + signo);
+        __builtin_unreachable();
     }
 
     // Handle SIG_IGN

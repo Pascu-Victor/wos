@@ -95,6 +95,15 @@ void build_full_path(char* out, size_t out_size, const char* export_path, const 
     out[pos] = '\0';
 }
 
+// Check if the resolved server-side path would cross into a REMOTE (WKI proxy) mount.
+// This prevents recursive proxying: e.g. a client reads /wki/nodeA/wki/nodeB/... which
+// would cause the server to proxy through its own WKI mounts, creating a chain that
+// times out or loops.
+bool path_crosses_remote_mount(const char* path) {
+    auto* mp = ker::vfs::find_mount_point(path);
+    return mp != nullptr && mp->fs_type == ker::vfs::FSType::REMOTE;
+}
+
 // -----------------------------------------------------------------------------
 // Consumer side
 // -----------------------------------------------------------------------------
@@ -1052,6 +1061,16 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};  // NOLINT(modernize-avoid-c-arrays)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 10), path_len);
 
+            // Block recursive proxying: don't let a remote client traverse into our WKI mounts
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_OPEN;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             // Open the file using vfs_open_file (no task/FD context required)
             ker::vfs::File* file = ker::vfs::vfs_open_file(full_path.data(), static_cast<int>(flags), static_cast<int>(mode));
             if (file == nullptr) {
@@ -1405,6 +1424,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_STAT;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             ker::vfs::stat statbuf = {};
             int ret = ker::vfs::vfs_stat(full_path.data(), &statbuf);
 
@@ -1466,6 +1494,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 6), path_len);
 
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_MKDIR;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             int ret = ker::vfs::vfs_mkdir(full_path.data(), static_cast<int>(mode));
 
             DevOpRespPayload resp = {};
@@ -1501,6 +1538,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
+
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_READLINK;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
 
             // Read the symlink target
             std::array<char, 512> target_buf{};
@@ -1587,6 +1633,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             build_full_path(full_link.data(), full_link.size(), export_path, reinterpret_cast<const char*>(data + 4 + target_len),
                             link_len);
 
+            if (path_crosses_remote_mount(full_link.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_SYMLINK;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             int ret = ker::vfs::vfs_symlink(target_str.data(), full_link.data());
 
             DevOpRespPayload resp = {};
@@ -1626,6 +1681,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_UNLINK;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             int ret = ker::vfs::vfs_unlink(full_path.data());
 
             DevOpRespPayload resp = {};
@@ -1660,6 +1724,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
+
+            if (path_crosses_remote_mount(full_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_RMDIR;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
 
             int ret = ker::vfs::vfs_rmdir(full_path.data());
 
@@ -1709,6 +1782,15 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             std::array<char, 512> new_full{};
             build_full_path(new_full.data(), new_full.size(), export_path, reinterpret_cast<const char*>(data + 4 + old_len), new_len);
+
+            if (path_crosses_remote_mount(old_full.data()) || path_crosses_remote_mount(new_full.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_RENAME;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
 
             int ret = ker::vfs::vfs_rename(old_full.data(), new_full.data());
 
@@ -2640,7 +2722,8 @@ void wki_remote_vfs_auto_discover() {
 
         // Skip REMOTE mounts (don't re-export remote filesystems)
         // Skip DEVFS mounts (not meaningful to export)
-        if (mp->fs_type == ker::vfs::FSType::REMOTE || mp->fs_type == ker::vfs::FSType::DEVFS) {
+        // Skip PROCFS mounts (remote /proc shows server processes, not client's)
+        if (mp->fs_type == ker::vfs::FSType::REMOTE || mp->fs_type == ker::vfs::FSType::DEVFS || mp->fs_type == ker::vfs::FSType::PROCFS) {
             continue;
         }
 

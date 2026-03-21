@@ -13,17 +13,17 @@
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
+#include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
+#include <vfs/fs/xfs/xfs_ialloc.hpp>
 #include <vfs/fs/xfs/xfs_inode.hpp>
 #include <vfs/fs/xfs/xfs_log.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_symlink.hpp>
-#include <vfs/fs/xfs/xfs_vfs.hpp>
-#include <vfs/fs/xfs/xfs_alloc.hpp>
-#include <vfs/fs/xfs/xfs_ialloc.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/stat.hpp>
 
 #include "platform/dbg/dbg.hpp"
@@ -328,9 +328,10 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
     // Update file size if we wrote past the end
     if (offset + total_written > ip->size) {
-        mod::dbg::log("[xfs] write: updating size ino=%lu %lu -> %lu\n",
-                      (unsigned long)ip->ino, (unsigned long)ip->size,
+#ifdef XFS_DEBUG
+        mod::dbg::log("[xfs] write: updating size ino=%lu %lu -> %lu\n", (unsigned long)ip->ino, (unsigned long)ip->size,
                       (unsigned long)(offset + total_written));
+#endif
         ip->size = offset + total_written;
         ip->dirty = true;
 
@@ -685,8 +686,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
     // Handle O_TRUNC on regular files
     if ((flags & O_TRUNC_FLAG) != 0 && xfs_inode_isreg(ip) && !ctx->read_only) {
-        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0\n",
-                      (unsigned long)ip->ino, (unsigned long)ip->size);
+        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0\n", (unsigned long)ip->ino, (unsigned long)ip->size);
         ip->size = 0;
         ip->dirty = true;
         XfsTransaction* tp = xfs_trans_alloc(ctx);

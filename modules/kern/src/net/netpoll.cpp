@@ -2,9 +2,11 @@
 
 #include <cstring>
 #include <net/netdevice.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net {
@@ -55,29 +57,39 @@ void unregister_napi(NapiStruct* napi) {
 
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
+    // Counts consecutive idle wakeups to trigger fallback polling if needed.
+    uint32_t idle_wakeups = 0;
+
     for (;;) {
-        // Disable interrupts BEFORE checking the work flag so that no
-        // IRQ can sneak in between the check and the sti;hlt below.
-        // The sti;hlt pair is architecturally atomic on x86: if an
-        // interrupt is already pending when sti executes, the CPU
-        // enters hlt and immediately wakes, so no wakeup is lost.
+        // Disable interrupts before checking work flag.
         asm volatile("cli" ::: "memory");
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
-            // No work - atomically enable interrupts and halt
+            // No work: yield and increment idle counter.
             ker::mod::sched::kern_yield();
+            idle_wakeups++;
+
+            // Fallback: after ~10 idle wakeups, force a poll in case of missed IRQs.
+            constexpr uint32_t IDLE_POLL_THRESHOLD = 10;
+            if (idle_wakeups >= IDLE_POLL_THRESHOLD) {
+                idle_wakeups = 0;
+                NapiState idle = NapiState::IDLE;
+                if (napi->state.compare_exchange_strong(idle, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    napi->has_work.store(true, std::memory_order_release);
+                }
+            }
             continue;
         }
+        idle_wakeups = 0;
 
-        // Work available - re-enable interrupts before polling
+        // Work available: re-enable interrupts before polling.
         asm volatile("sti" ::: "memory");
 
-        // Transition SCHEDULED -> POLLING
+        // SCHEDULED -> POLLING
         NapiState expected = NapiState::SCHEDULED;
         if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            // State changed unexpectedly (disabled?), retry
             if (expected == NapiState::DISABLED) {
-                // Device going down, halt
+                // Device down: halt.
                 for (;;) {
                     asm volatile("hlt");
                 }
@@ -85,24 +97,21 @@ void unregister_napi(NapiStruct* napi) {
             continue;
         }
 
-        // Inner polling loop - stay here while processing full budget
+        // Poll while work remains.
         for (;;) {
             int processed = napi->poll(napi, napi->weight);
             napi->poll_count++;
 
             if (processed < napi->weight) {
-                // Processed less than budget - driver called napi_complete()
+                // Driver called napi_complete().
                 break;
             }
-            // processed >= weight: more work available, continue polling
         }
 
-        // Clear the work flag so we sleep on next iteration
+        // Clear work flag.
         napi->has_work.store(false, std::memory_order_release);
 
-        // Check for race: if an IRQ arrived between napi_complete() and clearing
-        // has_work, state will be SCHEDULED but has_work is now false.
-        // Re-set has_work to prevent deadlock.
+        // If IRQ arrived during poll, re-arm work flag.
         if (napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED) {
             napi->has_work.store(true, std::memory_order_release);
         }
@@ -211,14 +220,16 @@ bool napi_schedule(NapiStruct* napi) {
     // Set work flag for interface worker thread
     napi->has_work.store(true, std::memory_order_release);
 
-    // Wake the worker thread if it is sleeping (via sti;hlt) on another CPU.
-    // The NIC IRQ may have been delivered to a different CPU than the one
-    // the worker is halted on.  We send a lightweight IPI to break it out
-    // of hlt.  Note: rescheduleTaskForCpu does NOT work here because the
-    // worker is the currentTask on its CPU (just halted), so the scheduler
-    // sees it as "already running" and aborts.
+    // Wake the worker thread.
     if (napi->worker != nullptr) {
-        ker::mod::sched::wake_cpu(napi->worker->cpu);
+        if (napi->worker->cpu == ker::mod::cpu::currentCpu()) {
+            // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
+            // immediate scheduling pass instead of waiting up to 1ms for the
+            // next quantum tick.
+            ker::mod::sys::context_switch::request_reschedule();
+        } else {
+            ker::mod::sched::wake_cpu(napi->worker->cpu);
+        }
     }
 
     return true;
@@ -234,7 +245,7 @@ void napi_complete(NapiStruct* napi) {
     // Driver should re-enable device interrupts after calling this
 }
 
-int napi_poll_inline(NetDevice* dev) {
+int napi_poll_inline_budget(NetDevice* dev, int budget) {
     if (dev == nullptr) {
         return 0;
     }
@@ -263,10 +274,11 @@ int napi_poll_inline(NetDevice* dev) {
     // napi_complete() and ours could schedule the worker (IDLE→SCHEDULED→
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.
-    int processed = napi->poll(napi, napi->weight);
+    int effective_budget = budget > 0 ? budget : napi->weight;
+    int processed = napi->poll(napi, effective_budget);
     napi->poll_count++;
 
-    if (processed >= napi->weight) {
+    if (processed >= effective_budget) {
         // Driver did NOT call napi_complete() (more work pending).
         // Transition back to SCHEDULED so the worker can pick up the
         // remaining work and re-enable IRQs when it's done.
@@ -288,6 +300,28 @@ int napi_poll_inline(NetDevice* dev) {
     }
 
     return processed;
+}
+
+int napi_poll_inline(NetDevice* dev) { return napi_poll_inline_budget(dev, 0); }
+
+int napi_poll_all_pending() {
+    int total = 0;
+    // Snapshot count under lock to avoid tearing, then poll without the lock
+    // (napi_poll_inline_budget is safe to call without the registry lock).
+    g_registry_lock.lock();
+    size_t count = g_napi_count;
+    NapiStruct* snapshot[MAX_NAPI_DEVICES];
+    for (size_t i = 0; i < count; ++i) {
+        snapshot[i] = g_napi_registry[i];
+    }
+    g_registry_lock.unlock();
+
+    for (size_t i = 0; i < count; ++i) {
+        if (snapshot[i] != nullptr && snapshot[i]->dev != nullptr) {
+            total += napi_poll_inline_budget(snapshot[i]->dev, NAPI_DEFAULT_WEIGHT);
+        }
+    }
+    return total;
 }
 
 }  // namespace ker::net

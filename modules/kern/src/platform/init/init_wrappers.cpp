@@ -16,6 +16,7 @@
 #include <dev/virtio/virtio_net.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/backlog.hpp>
 #include <net/loopback.hpp>
 #include <net/net.hpp>
 #include <net/netdevice.hpp>
@@ -27,6 +28,7 @@
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/ntp/ntp.hpp>
 #include <platform/acpi/acpi.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/ioapic/ioapic.hpp>
@@ -142,6 +144,8 @@ void ivshmem_init() { dev::ivshmem::ivshmem_net_init(); }
 
 void pkt_pool_expand() { net::pkt_pool_expand_for_nics(); }
 
+void backlog_init() { net::backlog_init(); }
+
 void ndp_init() { net::proto::ndp_init(); }
 
 void wki_init() { net::wki::wki_init(); }
@@ -188,6 +192,8 @@ void sse_init() {
     mod::cpu::enableSSE();
     mod::io::serial::markCpuIdAvailable();
 }
+
+void ntp_init() { mod::ntp::init(); }
 
 void initramfs_init() {
     // Unpack CPIO initramfs from Limine modules into tmpfs root

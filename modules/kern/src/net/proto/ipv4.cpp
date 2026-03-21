@@ -159,18 +159,11 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
         return -1;
     }
 
-    // Determine next hop (guard against null route)
+    // Determine next hop: if the matched route has a gateway, use it.
+    // Direct routes (on-link) have gateway=0, so next_hop stays as dst.
     uint32_t next_hop = dst;
     if (route != nullptr && route->gateway != 0) {
-        // Check if destination is on the same subnet as the route
-        // If so, send directly to the destination (don't use gateway)
-        uint32_t dst_net = dst & route->netmask;
-        uint32_t route_net = route->dest & route->netmask;
-        if (dst_net != route_net) {
-            // Different subnet - use gateway as next hop
-            next_hop = route->gateway;
-        }
-        // else: same subnet - keep next_hop = dst
+        next_hop = route->gateway;
     }
 
     // If the device is loopback, bypass ARP

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <platform/asm/segment.hpp>
@@ -24,6 +25,9 @@
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
 #include "platform/sys/context_switch.hpp"
+#include "platform/sys/signal.hpp"
+#include "syscalls_impl/process/exit.hpp"
+#include "syscalls_impl/process/waitpid.hpp"
 #include "util/hcf.hpp"
 
 // Kernel idle loop - defined in context_switch.asm
@@ -265,12 +269,14 @@ void wake_idle_cpu(uint64_t cpu_no) {
 }
 
 // IPI handler for scheduler wake-up.
-// NOTE: Do NOT call apic::eoi() here — the generic iterrupt_handler already
+// NOTE: Do NOT call apic::eoi() here — the generic interrupt_handler already
 // sends EOI after dispatching interruptHandlers[].
 void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::interruptFrame frame) {
     auto* rq = run_queues->thisCpu();
     if (rq->runnableHeap.size > 0) {
         rq->isIdle.store(false, std::memory_order_release);
+        // Trigger an immediate scheduling pass via the timer path.
+        sys::context_switch::request_reschedule();
     }
 }
 
@@ -888,6 +894,86 @@ void start_scheduler() {
 // deferredTaskSwitch — called from syscall path for yield/block
 // ============================================================================
 
+// Check pending signals before restoring a task on the deferred-resume path.
+// _wOS_deferredTaskSwitchReturn bypasses syscall.asm's check_pending_signals,
+// so we must handle signals here for tasks woken from the wait queue.
+// Called with GS and pagemap already switched to `task`.
+static void check_pending_signals_deferred(task::Task* task) {
+    if (task->type != task::TaskType::PROCESS) {
+        return;
+    }
+
+    uint64_t deliverable = task->sigPending & ~task->sigMask;
+    if (deliverable == 0) {
+        return;
+    }
+
+    int signo = __builtin_ctzll(deliverable) + 1;
+    unsigned idx = static_cast<unsigned>(signo - 1);
+    task->sigPending &= ~(1ULL << idx);
+
+    auto& handler = task->sigHandlers[idx];
+
+    if (handler.handler == 0 /*SIG_DFL*/) {
+        // Signals with default-ignore action: SIGCHLD, SIGURG, SIGWINCH, SIGCONT
+        if (signo == 17 || signo == 23 || signo == 28 || signo == 18) {
+            return;
+        }
+        // Stop signals
+        if (signo == 19 || signo == 20 || signo == 21 || signo == 22) {
+            task->voluntaryBlock = true;
+            return;
+        }
+        // All other SIG_DFL: fatal terminate.
+        // GS/pagemap/rq->currentTask are all set to `task` at this call site.
+        ker::syscall::process::wos_proc_exit(128 + signo);
+        __builtin_unreachable();
+    }
+
+    if (handler.handler == 1 /*SIG_IGN*/) {
+        return;
+    }
+
+    // User signal handler: set up signal frame on the user stack and redirect context.
+    uint64_t userRsp = task->context.frame.rsp;
+    uint64_t userRip = task->context.frame.rip;
+    uint64_t userRflags = task->context.frame.flags;
+
+    uint64_t frameAddr = (userRsp - sizeof(sys::signal::SignalFrame)) & ~0xFULL;
+    auto* sigframe = reinterpret_cast<sys::signal::SignalFrame*>(frameAddr);
+
+    sigframe->pretcode = handler.restorer;
+    sigframe->signo = static_cast<uint64_t>(signo);
+    sigframe->saved_mask = task->sigMask;
+    sigframe->saved_rip = userRip;
+    sigframe->saved_rsp = userRsp;
+    sigframe->saved_rflags = userRflags;
+    sigframe->saved_retval = task->context.regs.rax;
+
+    // GPRs in GPRegs struct are r15..rax (15 fields, same order as saved_regs)
+    const uint64_t* regs_arr = reinterpret_cast<const uint64_t*>(&task->context.regs);
+    for (int i = 0; i < 15; i++) {
+        sigframe->saved_regs[i] = regs_arr[i];
+    }
+
+    // Redirect task context to signal handler
+    task->context.regs.rdi = static_cast<uint64_t>(signo);  // arg1
+    task->context.frame.rip = handler.handler;
+    task->context.frame.rsp = frameAddr;
+
+    // Update PerCpu scratch area (GS already points to task's PerCpu)
+    auto* perCpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscallScratchArea);
+    perCpu->userRsp = frameAddr;
+    perCpu->syscallRetRip = handler.handler;
+
+    // Block additional signals for duration of handler
+    task->sigMask |= handler.mask;
+    if (!(handler.flags & 0x40000000ULL)) {  // !SA_NODEFER
+        task->sigMask |= (1ULL << idx);
+    }
+    task->inSignalHandler = true;
+}
+
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unused]] ker::mod::gates::interruptFrame* frame_ptr) {
     if (gpr_ptr == nullptr) {
         return;
@@ -935,9 +1021,19 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     current_task->yieldSwitch = false;
     current_task->deferredTaskSwitch = false;
 
+    // Signal race check: if a deliverable signal is already pending, do not
+    // move this task to wait queue; resume userspace with EINTR.
+    bool skip_wait_queue = false;
+    if (!is_yield) {
+        uint64_t deliverable = current_task->sigPending & ~current_task->sigMask;
+        if (deliverable != 0) {
+            skip_wait_queue = true;
+            current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+        }
+    }
+
     // Race check: for blocking waits, verify target hasn't already exited
     static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-    bool skip_wait_queue = false;
     if (!is_yield && current_task->waitingForPid != 0) {
         if (current_task->waitingForPid == WAIT_ANY_CHILD) {
             // Wait-for-any-child: scan for an exited child of this task
@@ -950,6 +1046,15 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     if (current_task->waitStatusPhysAddr != 0) {
                         auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(current_task->waitStatusPhysAddr));
                         *status_ptr = child->exitStatus;
+                    }
+                    if (current_task->waitRusagePhysAddr != 0) {
+                        auto* ru =
+                            reinterpret_cast<syscall::process::KernRusage*>(mm::addr::getVirtPointer(current_task->waitRusagePhysAddr));
+                        ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
+                        ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
+                        ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
+                        ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+                        current_task->waitRusagePhysAddr = 0;
                     }
                     current_task->waitingForPid = 0;
                     child->waitedOn = true;
@@ -965,6 +1070,14 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 if (current_task->waitStatusPhysAddr != 0) {
                     auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::getVirtPointer(current_task->waitStatusPhysAddr));
                     *status_ptr = target->exitStatus;
+                }
+                if (current_task->waitRusagePhysAddr != 0) {
+                    auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::getVirtPointer(current_task->waitRusagePhysAddr));
+                    ru->ru_utime_sec = (int64_t)(target->user_time_us / 1000000ULL);
+                    ru->ru_utime_usec = (int64_t)(target->user_time_us % 1000000ULL);
+                    ru->ru_stime_sec = (int64_t)(target->system_time_us / 1000000ULL);
+                    ru->ru_stime_usec = (int64_t)(target->system_time_us % 1000000ULL);
+                    current_task->waitRusagePhysAddr = 0;
                 }
                 current_task->waitingForPid = 0;
                 // Mark that parent has retrieved exit status (zombie can now be reaped)
@@ -1103,6 +1216,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     debug_task_ptrs[cpu::currentCpu()] = next_task;
 
+    check_pending_signals_deferred(next_task);
     _wOS_deferredTaskSwitchReturn(&next_task->context.regs, &next_task->context.frame);
     __builtin_unreachable();
 }
@@ -1200,15 +1314,12 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // CRITICAL: If the task is currentTask on some CPU, that CPU is actively running
     // it (possibly in a syscall). Don't move it — let the timer preempt it naturally.
     bool is_current_on_some_cpu = false;
+    uint64_t current_cpu_of_task = UINT64_MAX;
     for (uint64_t search_cpu = 0; search_cpu < smt::getCoreCount(); ++search_cpu) {
-        run_queues->withLockVoid(search_cpu, [task, &is_current_on_some_cpu
-#ifdef SCHED_DEBUG
-                                              ,
-                                              search_cpu
-#endif
-        ](RunQueue* rq) {
+        run_queues->withLockVoid(search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, search_cpu](RunQueue* rq) {
             if (rq->currentTask == task) {
                 is_current_on_some_cpu = true;
+                current_cpu_of_task = search_cpu;
 #ifdef SCHED_DEBUG
                 dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, (int)search_cpu);
 #endif
@@ -1240,6 +1351,17 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
         dbg::log("RESCHED: PID %x ABORT - is currentTask somewhere", task->pid);
 #endif
+        // If the task is at a voluntary yield point (hlt), wake its CPU so it
+        // can check its condition promptly rather than waiting for the next
+        // timer tick (up to 1ms).  Use request_reschedule() for same-CPU since
+        // wake_cpu() is a no-op for the current CPU.
+        if (task->voluntaryBlock && current_cpu_of_task != UINT64_MAX) {
+            if (current_cpu_of_task == cpu::currentCpu()) {
+                sys::context_switch::request_reschedule();
+            } else {
+                wake_cpu(current_cpu_of_task);
+            }
+        }
         return;
     }
 
@@ -1260,8 +1382,15 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         add_to_sums(rq, task);
     });
 
-    // Wake the target CPU if it's idle
-    wake_idle_cpu(cpu_no);
+    // Poke the target CPU so the newly-rescheduled task runs promptly.
+    // wake_cpu() is a no-op for the current CPU (can't self-IPI), so use
+    // request_reschedule() to arm the APIC timer with count=1 instead.
+    // This avoids up to 1ms of scheduling latency on same-CPU wakes.
+    if (cpu_no == cpu::currentCpu()) {
+        sys::context_switch::request_reschedule();
+    } else {
+        wake_cpu(cpu_no);
+    }
 #ifdef SCHED_DEBUG
     dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, (int)cpuNo, task->heapIndex);
 #endif
@@ -1290,6 +1419,30 @@ auto get_active_task_at(uint32_t index) -> task::Task* {
     return active_task_list[index];
 }
 
+void wake_task_for_signal(task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || task->hasExited) {
+        return;
+    }
+
+    // Nudge the task's current CPU immediately so hlt/deferred paths react fast.
+    // This is cheap and avoids latency when signal delivery races scheduler state.
+    wake_cpu(task->cpu);
+
+    // If the task is blocked or sleeping in a syscall path, put it back on
+    // a runnable queue so it can process pending signals promptly.
+    if (task->schedQueue == task::Task::SchedQueue::WAITING || task->deferredTaskSwitch || task->voluntaryBlock) {
+        // Prefer its existing CPU to avoid migration latency for short wakeups.
+        uint64_t cpu = task->cpu;
+        if (cpu >= smt::getCoreCount()) {
+            cpu = get_least_loaded_cpu();
+        }
+        reschedule_task_for_cpu(cpu, task);
+    }
+}
+
 void signal_process_group(uint64_t pgid, int sig) {
     if (pgid == 0 || sig <= 0 || sig > static_cast<int>(task::Task::MAX_SIGNALS)) {
         return;
@@ -1299,6 +1452,7 @@ void signal_process_group(uint64_t pgid, int sig) {
         auto* t = active_task_list[i];
         if (t != nullptr && t->pgid == pgid && !t->hasExited) {
             t->sigPending |= mask;
+            wake_task_for_signal(t);
         }
     }
 }

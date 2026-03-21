@@ -209,6 +209,33 @@ auto mini_malloc(size_t size) -> void* {
     return nullptr;
 }
 
+size_t mini_get_slab_size(void* ptr) {
+    if (ptr == nullptr) {
+        return 0;
+    }
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    bool valid = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL) ||
+                 (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    if (!valid) {
+        return 0;
+    }
+    auto* block = reinterpret_cast<MemoryBlock<0>*>(addr - sizeof(MemoryBlock<0>::slab_ptr));
+    if (block->slab_ptr == 0) {
+        return 0;
+    }
+    uintptr_t sp = block->slab_ptr;
+    bool sp_valid = (sp >= 0xffff800000000000ULL && sp < 0xffff900000000000ULL) ||
+                    (sp >= 0xffffffff80000000ULL && sp < 0xffffffffc0000000ULL);
+    if (!sp_valid) {
+        return 0;
+    }
+    auto* hdr = reinterpret_cast<SlabHeader<1, 1>*>(sp);
+    if (hdr->magic != MAGIC) {
+        return 0;
+    }
+    return hdr->size;
+}
+
 void mini_free(void* address) {
     if (address == nullptr) {
         return;

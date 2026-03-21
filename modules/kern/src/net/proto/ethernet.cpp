@@ -7,6 +7,7 @@
 #include <net/proto/ipv6.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_roce.hpp>
+#include <net/net_trace.hpp>
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::net::proto {
@@ -14,6 +15,7 @@ namespace ker::net::proto {
 const std::array<uint8_t, ETH_ALEN> ETH_BROADCAST = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
+    NET_TRACE_SPAN(SPAN_ETH_RX);
     if (pkt->len < ETH_HLEN) {
         pkt_free(pkt);
         return;

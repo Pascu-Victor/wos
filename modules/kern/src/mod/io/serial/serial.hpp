@@ -7,12 +7,11 @@
 
 extern "C" __attribute__((noreturn)) void hcf() noexcept;
 
-namespace ker::mod::io {
-namespace serial {
-void init(void);
+namespace ker::mod::io::serial {
+void init();
 void write(const char* str);
 void write(const char* str, uint64_t len);
-void write(const char c);
+void write(char c);
 void write(uint64_t num);
 void writeHex(uint64_t num);
 void writeBin(uint64_t num);
@@ -31,7 +30,7 @@ void enterPanicMode();
 // Unlocked write variants - caller must hold lock via acquireLock()/releaseLock()
 void writeUnlocked(const char* str);
 void writeUnlocked(const char* str, uint64_t len);
-void writeUnlocked(const char c);
+void writeUnlocked(char c);
 void writeUnlocked(uint64_t num);
 void writeHexUnlocked(uint64_t num);
 void writeBinUnlocked(uint64_t num);
@@ -44,5 +43,4 @@ class ScopedLock {
     ScopedLock(const ScopedLock&) = delete;
     ScopedLock& operator=(const ScopedLock&) = delete;
 };
-}  // namespace serial
-}  // namespace ker::mod::io
+}  // namespace ker::mod::io::serial

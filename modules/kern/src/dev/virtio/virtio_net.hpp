@@ -18,11 +18,12 @@ struct VirtIONetDevice {
     uint32_t negotiated_features{};
     bool msix_enabled{};
 
-    // NAPI state for deferred packet processing
+    // Serializes QUEUE_SELECT + MSI_QUEUE_VECTOR programming.
+    ker::mod::sys::Spinlock irq_lock;
+
     ker::net::NapiStruct napi{};
 };
 
-// Probe for VirtIO-Net PCI devices and initialize them
 auto virtio_net_init() -> int;
 
 }  // namespace ker::dev::virtio

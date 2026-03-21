@@ -739,7 +739,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     // 1. Compute the base of the pushq-saved register block on the kernel stack.
     //    gs:0x0 = kernel stack top (K).  After `sub rsp,8` (retval slot) +
-    //    `pushq` (15 regs × 8 = 120 bytes), RSP = K-128.
+    //    `pushq` (15 regs x 8 = 120 bytes), RSP = K-128.
     //    The GPRegs struct maps directly to K-128 (r15 at offset 0, rax at 0x70).
     //    The compiler accesses this as a stack-passed MEMORY-class parameter at
     //    the callee's rbp+0x10 = K-128.

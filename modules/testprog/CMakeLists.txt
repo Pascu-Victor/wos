@@ -19,7 +19,13 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/fsbench.cpp
     src/main.cpp
+    src/netbench.cpp
+    src/mandelbench/lodepng.c
+    src/mandelbench/mandelbench.cpp
+    src/mandelbench/util.cpp
+    src/mandelbench/tinycthread.c
 )
 
 # Create executable

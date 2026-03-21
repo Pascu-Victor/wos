@@ -21,6 +21,9 @@
 #include <cstring>
 #include <print>
 
+#include "fsbench.hpp"
+#include "netbench.hpp"
+
 // ICMP Echo Request structure
 struct icmp_header {
     uint8_t type;
@@ -186,8 +189,23 @@ auto get_interface_info(const char* ifname) -> bool {
 auto main(int argc, char** argv, char** envp) -> int {
     int pid = ker::process::getpid();
     (void)envp;
-    (void)argv;
     int tid = ker::multiproc::currentThreadId();
+
+    const char* command = nullptr;
+    if (argc > 1) {
+        command = argv[1];
+        if (command[0] == '-' && command[1] == '-') {
+            command += 2;
+        }
+    }
+
+    if (command != nullptr && (std::strcmp(command, "vfsbench-read") == 0 || std::strcmp(command, "vfsbench-stat") == 0)) {
+        return run_fsbench(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
+        return run_netbench(argc - 1, argv + 1);
+    }
 
     std::println("testprog[t:{},p:{}]: argc = {}", tid, pid, argc);
 
@@ -201,5 +219,5 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     std::println("testprog[t:{},p:{}]: Network tests complete", tid, pid);
 
-    return pid;
+    return 0;
 }

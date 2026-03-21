@@ -154,6 +154,7 @@ int master_close(ker::vfs::File* file) {
     auto* pair = static_cast<PtyPair*>(dff->device->private_data);
     if (pair == nullptr) return 0;
 
+    uint64_t irqf = pair->lock.lock_irqsave();
     pair->master_opened--;
 
     // If slave is also closed, free the pair
@@ -163,6 +164,7 @@ int master_close(ker::vfs::File* file) {
         pair->m2s = PtyRingBuf{};
         pair->s2m = PtyRingBuf{};
     }
+    pair->lock.unlock_irqrestore(irqf);
 
     return 0;
 }
@@ -185,10 +187,13 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     if (pair == nullptr) return -EBADF;
 
     // Master reads from slave→master buffer
+    uint64_t irqf = pair->lock.lock_irqsave();
     size_t rd = pair->s2m.read(buf, count);
+    bool slave_opened = pair->slave_opened > 0;
+    pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
         // If slave is closed, return EOF
-        if (!pair->slave_opened) return 0;
+        if (!slave_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately (propagates to application)
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
         // Blocking fd: return WOS_ERESTARTSYS so the mlibc sysdep layer retries
@@ -233,7 +238,9 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         uint8_t ch = bytes[i];
 
         // Input processing (c_iflag)
+        uint64_t irqf = pair->lock.lock_irqsave();
         if ((pair->termios.c_iflag & TIOS_IGNCR) && ch == '\r') {
+            pair->lock.unlock_irqrestore(irqf);
             processed++;
             continue;  // Discard CR
         }
@@ -259,6 +266,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->m2s.flush();
                     pair->canon_len = 0;
                 }
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -272,6 +280,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->m2s.flush();
                     pair->canon_len = 0;
                 }
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -281,6 +290,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -303,6 +313,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                         pair->s2m.write(erase, 3);
                     }
                 }
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -316,6 +327,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
                 pair->canon_len = 0;
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -326,6 +338,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 // Don't put VEOF in the buffer; an empty read signals EOF to slave
+                pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
@@ -351,17 +364,36 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 pair->canon_len = 0;
             }
 
+            pair->lock.unlock_irqrestore(irqf);
+
             processed++;
         } else {
             // Non-canonical (raw) mode — pass through directly
             if (pair->termios.c_lflag & TIOS_ECHO) {
                 pty_echo_byte(pair, ch);
             }
+            pair->lock.unlock_irqrestore(irqf);
 
-            size_t wr = pair->m2s.write(&ch, 1);
-            if (wr == 0) {
-                if (processed == 0) return -EAGAIN;
-                break;
+            if (file->open_flags & 04000) {
+                // Non-blocking: fail immediately if no space
+                uint64_t wr_irqf = pair->lock.lock_irqsave();
+                size_t wr = pair->m2s.write(&ch, 1);
+                pair->lock.unlock_irqrestore(wr_irqf);
+                if (wr == 0) {
+                    if (processed == 0) return -EAGAIN;
+                    break;
+                }
+            } else {
+                // Blocking: yield until space is available
+                while (true) {
+                    uint64_t wr_irqf = pair->lock.lock_irqsave();
+                    size_t wr = pair->m2s.write(&ch, 1);
+                    pair->lock.unlock_irqrestore(wr_irqf);
+                    if (wr != 0) {
+                        break;
+                    }
+                    ker::mod::sched::kern_yield();
+                }
             }
             processed++;
         }
@@ -381,31 +413,41 @@ int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         case TIOCGPTN: {
             if (arg == 0) return -EFAULT;
             auto* out = reinterpret_cast<int*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *out = pair->index;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCSPTLCK: {
             if (arg == 0) return -EFAULT;
             auto* lock_val = reinterpret_cast<const int*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             pair->slave_locked = (*lock_val != 0);
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCGWINSZ: {
             if (arg == 0) return -EFAULT;
             auto* ws = reinterpret_cast<Winsize*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *ws = pair->winsize;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCSWINSZ: {
             if (arg == 0) return -EFAULT;
             auto* ws = reinterpret_cast<const Winsize*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             pair->winsize = *ws;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCGETS: {
             if (arg == 0) return -EFAULT;
             auto* out = reinterpret_cast<KTermios*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *out = pair->termios;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCSETS:
@@ -413,15 +455,18 @@ int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         case TCSETSF: {
             if (arg == 0) return -EFAULT;
             auto* in = reinterpret_cast<const KTermios*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             if (cmd == TCSETSF) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
             pair->termios = *in;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCFLSH: {
             int queue = static_cast<int>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             if (queue == 0 || queue == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
@@ -429,6 +474,7 @@ int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             if (queue == 1 || queue == 2) {
                 pair->s2m.flush();
             }
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         default:
@@ -441,6 +487,7 @@ int master_poll_check(ker::vfs::File* file, int events) {
     if (pair == nullptr) return 0;
 
     int ready = 0;
+    uint64_t irqf = pair->lock.lock_irqsave();
     if ((events & POLLIN) && pair->s2m.available() > 0) {
         ready |= POLLIN;
     }
@@ -452,6 +499,7 @@ int master_poll_check(ker::vfs::File* file, int events) {
     if (pair->slave_opened <= 0) {
         ready |= POLLHUP;
     }
+    pair->lock.unlock_irqrestore(irqf);
     return ready;
 }
 
@@ -471,10 +519,14 @@ int slave_open(ker::vfs::File* file) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -ENODEV;
 
-    if (pair->slave_locked) {
+    uint64_t irqf = pair->lock.lock_irqsave();
+    bool slave_locked = pair->slave_locked;
+    pair->lock.unlock_irqrestore(irqf);
+    if (slave_locked) {
         return -EIO;  // Slave is locked, cannot open
     }
 
+    irqf = pair->lock.lock_irqsave();
     pair->slave_opened++;
 
     // Set initial foreground process group to the opener's pgid (only on first open)
@@ -484,6 +536,7 @@ int slave_open(ker::vfs::File* file) {
             pair->foreground_pgrp = static_cast<int>((task->pgid != 0) ? task->pgid : task->pid);
         }
     }
+    pair->lock.unlock_irqrestore(irqf);
 
     return 0;
 }
@@ -492,6 +545,7 @@ int slave_close(ker::vfs::File* file) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return 0;
 
+    uint64_t irqf = pair->lock.lock_irqsave();
     pair->slave_opened--;
 
     // If master is also closed, free the pair
@@ -500,6 +554,7 @@ int slave_close(ker::vfs::File* file) {
         pair->m2s = PtyRingBuf{};
         pair->s2m = PtyRingBuf{};
     }
+    pair->lock.unlock_irqrestore(irqf);
 
     return 0;
 }
@@ -509,10 +564,13 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     if (pair == nullptr) return -EBADF;
 
     // Slave reads from master→slave buffer
+    uint64_t irqf = pair->lock.lock_irqsave();
     size_t rd = pair->m2s.read(buf, count);
+    bool master_opened = pair->master_opened > 0;
+    pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
         // If master is closed, return EOF
-        if (!pair->master_opened) return 0;
+        if (!master_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
         // Blocking fd: return WOS_ERESTARTSYS so mlibc retries internally.
@@ -525,6 +583,14 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
 
+    // If master is closed, writes should fail (Linux returns EIO)
+    {
+        uint64_t irqf = pair->lock.lock_irqsave();
+        bool master_opened = pair->master_opened > 0;
+        pair->lock.unlock_irqrestore(irqf);
+        if (!master_opened) return -EIO;
+    }
+
     auto* bytes = static_cast<const uint8_t*>(buf);
     size_t written = 0;
 
@@ -533,18 +599,54 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
 
         // Output post-processing (OPOST)
         if ((pair->termios.c_oflag & TIOS_OPOST) && (pair->termios.c_oflag & TIOS_ONLCR) && ch == '\n') {
-            if (pair->s2m.space() < 2) {
+            if (file->open_flags & 04000) {
+                uint64_t irqf = pair->lock.lock_irqsave();
+                bool has_space = pair->s2m.space() >= 2;
+                pair->lock.unlock_irqrestore(irqf);
+                if (!has_space) {
+                    if (written == 0) return -EAGAIN;
+                    break;
+                }
+            } else {
+                while (true) {
+                    uint64_t irqf = pair->lock.lock_irqsave();
+                    bool has_space = pair->s2m.space() >= 2;
+                    bool master_opened = pair->master_opened > 0;
+                    if (has_space) {
+                        pair->lock.unlock_irqrestore(irqf);
+                        break;
+                    }
+                    pair->lock.unlock_irqrestore(irqf);
+                    if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
+                    ker::mod::sched::kern_yield();
+                }
+            }
+            uint8_t cr = '\r';
+            uint64_t irqf = pair->lock.lock_irqsave();
+            pair->s2m.write(&cr, 1);
+            pair->lock.unlock_irqrestore(irqf);
+        }
+
+        if (file->open_flags & 04000) {
+            uint64_t irqf = pair->lock.lock_irqsave();
+            size_t wr = pair->s2m.write(&ch, 1);
+            pair->lock.unlock_irqrestore(irqf);
+            if (wr == 0) {
                 if (written == 0) return -EAGAIN;
                 break;
             }
-            uint8_t cr = '\r';
-            pair->s2m.write(&cr, 1);
-        }
-
-        size_t wr = pair->s2m.write(&ch, 1);
-        if (wr == 0) {
-            if (written == 0) return -EAGAIN;
-            break;
+        } else {
+            while (true) {
+                uint64_t irqf = pair->lock.lock_irqsave();
+                size_t wr = pair->s2m.write(&ch, 1);
+                bool master_opened = pair->master_opened > 0;
+                pair->lock.unlock_irqrestore(irqf);
+                if (wr != 0) {
+                    break;
+                }
+                if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
+                ker::mod::sched::kern_yield();
+            }
         }
         written++;
     }
@@ -565,19 +667,25 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         case TIOCGPTN: {
             if (arg == 0) return -EFAULT;
             auto* out = reinterpret_cast<int*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *out = pair->index;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCGWINSZ: {
             if (arg == 0) return -EFAULT;
             auto* ws = reinterpret_cast<Winsize*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *ws = pair->winsize;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCSWINSZ: {
             if (arg == 0) return -EFAULT;
             const auto* ws = reinterpret_cast<const Winsize*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             pair->winsize = *ws;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCSCTTY: {
@@ -598,19 +706,25 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         case TIOCGPGRP: {
             if (arg == 0) return -EFAULT;
             auto* out = reinterpret_cast<int*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *out = static_cast<int>(pair->foreground_pgrp);
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TIOCSPGRP: {
             if (arg == 0) return -EFAULT;
             auto* in = reinterpret_cast<const int*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             pair->foreground_pgrp = *in;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCGETS: {
             if (arg == 0) return -EFAULT;
             auto* out = reinterpret_cast<KTermios*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             *out = pair->termios;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCSETS:
@@ -618,15 +732,18 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         case TCSETSF: {
             if (arg == 0) return -EFAULT;
             auto* in = reinterpret_cast<const KTermios*>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             if (cmd == TCSETSF) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
             pair->termios = *in;
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         case TCFLSH: {
             int queue = static_cast<int>(arg);
+            uint64_t irqf = pair->lock.lock_irqsave();
             if (queue == 0 || queue == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
@@ -634,6 +751,7 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             if (queue == 1 || queue == 2) {
                 pair->s2m.flush();
             }
+            pair->lock.unlock_irqrestore(irqf);
             return 0;
         }
         default:
@@ -648,6 +766,7 @@ int slave_poll_check(ker::vfs::File* file, int events) {
     }
 
     int ready = 0;
+    uint64_t irqf = pair->lock.lock_irqsave();
     if (((events & POLLIN) != 0) && pair->m2s.available() > 0) {
         ready |= POLLIN;
     }
@@ -658,6 +777,7 @@ int slave_poll_check(ker::vfs::File* file, int events) {
     if (pair->master_opened <= 0) {
         ready |= POLLHUP;
     }
+    pair->lock.unlock_irqrestore(irqf);
     return ready;
 }
 

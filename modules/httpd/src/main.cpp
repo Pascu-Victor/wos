@@ -652,7 +652,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
         // Parent: wait for mount to complete
         int32_t exit_code = 0;
-        ker::process::waitpid(exec_res, &exit_code, 0);
+        ker::process::waitpid(exec_res, &exit_code, 0, nullptr);
 
         if (exit_code == 0) {
             log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);

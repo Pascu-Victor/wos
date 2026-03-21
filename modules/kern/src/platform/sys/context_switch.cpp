@@ -194,7 +194,12 @@ extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
 }
 
 void startSchedTimer() {
-    timerQuantum = apic::calibrateTimer(10000);  // 10ms
+    timerQuantum = apic::calibrateTimer(1000);  // 1ms
     apic::oneShotTimer(timerQuantum);
+}
+
+void request_reschedule() {
+    // Fires the scheduler timer on the next CPU cycle
+    apic::oneShotTimer(1);
 }
 }  // namespace ker::mod::sys::context_switch
