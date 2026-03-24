@@ -22,7 +22,11 @@
 #include <print>
 
 #include "fsbench.hpp"
+#include "mandelbench/config.hpp"
+#include "mandelbench/mandelbench.hpp"
+#include "mandelbench/util.hpp"
 #include "netbench.hpp"
+#include "perfbench.hpp"
 
 // ICMP Echo Request structure
 struct icmp_header {
@@ -205,6 +209,40 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
         return run_netbench(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "perf") == 0) {
+        return run_perf(argc - 2, argv + 2);
+    }
+
+    if (command != nullptr && std::strcmp(command, "mandelbench") == 0) {
+        int width = WIDTH;
+        int height = HEIGHT;
+        int max_iter = MAX_ITERATION;
+        int threads = THREADS;
+        int repeat = REPEAT;
+
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
+                width = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
+                height = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--max-iter") == 0 && i + 1 < argc) {
+                max_iter = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+                threads = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
+                repeat = std::atoi(argv[++i]);
+            }
+        }
+        std::println("testprog[t:{},p:{}]: Running mandelbench with width={}, height={}, max_iter={}, threads={}, repeat={}", tid, pid,
+                     width, height, max_iter, threads, repeat);
+
+        std::vector<unsigned char> image(static_cast<size_t>(width * height * 4));
+        std::vector<unsigned char> colormap(static_cast<size_t>((max_iter + 1) * 3));
+        init_colormap(max_iter + 1, colormap.data());
+
+        return mandelbench(width, height, max_iter, threads, repeat, image.data(), colormap.data());
     }
 
     std::println("testprog[t:{},p:{}]: argc = {}", tid, pid, argc);

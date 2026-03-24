@@ -1,7 +1,7 @@
 // WOS Kernel Entry Point
 // The main function is minimal - all initialization is handled by the init system.
 
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <platform/init/init_executor.hpp>
 
@@ -37,12 +37,12 @@ void callGlobalDestructors() {  // NOLINT
 }
 
 }  // namespace
-__attribute__((used, section(".requests"))) volatile LIMINE_BASE_REVISION(3);  // NOLINT
+__attribute__((used, section(".requests"))) volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);  // NOLINT
 
 // Kernel entry point.
 extern "C" [[noreturn]] void _start(void) {  // NOLINT
     // Check limine protocol support
-    if (LIMINE_BASE_REVISION_SUPPORTED == 0) {
+    if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == 0) {
         while (true) {
             asm volatile("hlt");
         }

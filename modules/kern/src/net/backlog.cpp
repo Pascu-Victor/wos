@@ -27,9 +27,16 @@ uint64_t num_cpus = 0;
 
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
-    auto& q = queues[cpu_idx];
-
     for (;;) {
+        // Re-read current CPU each iteration: the scheduler may migrate this
+        // handler thread, so we must always drain the queue for whichever CPU
+        // we're actually running on right now.
+        cpu_idx = ker::mod::cpu::currentCpu();
+        if (cpu_idx >= MAX_CPUS) {
+            cpu_idx = 0;
+        }
+        auto& q = queues[cpu_idx];
+
         // Atomic drain: grab entire list in one shot (MPSC consumer).
         PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
 
@@ -42,7 +49,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
                 continue;
             }
 
-            ker::mod::sched::kern_yield();
+            ker::mod::sched::kern_block();
             q.handler_active.store(true, std::memory_order_relaxed);
             continue;
         }
@@ -68,7 +75,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 }
 
 [[noreturn]] void backlog_handler_entry() {
-    // Handler task pinned via post_task_for_cpu, currentCpu() is the queue index.
+    // Starting CPU — passed as initial hint but re-read each iteration in the loop.
     uint64_t my_cpu = ker::mod::cpu::currentCpu();
     backlog_handler_loop(my_cpu);
     __builtin_unreachable();
@@ -92,7 +99,7 @@ void backlog_init() {
         }
         queues[i].handler = task;
         queues[i].handler_active.store(false, std::memory_order_relaxed);
-        ker::mod::sched::post_task_for_cpu(i, task);
+        ker::mod::sched::post_task_pinned_cpu(i, task);
     }
 
     ready.store(true, std::memory_order_release);
@@ -111,7 +118,7 @@ void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
         pkt->next = old_head;
     } while (!q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed));
 
-    ker::mod::sched::wake_cpu(target_cpu);
+    ker::mod::sched::kern_wake(q.handler);
 }
 
 auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {

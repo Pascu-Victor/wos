@@ -9,8 +9,8 @@ PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags) {
     entry.present = (flags & PAGE_PRESENT) > 0;
     entry.writable = (flags & PAGE_WRITE) > 0;
     entry.user = (flags & PAGE_USER) > 0;
-    entry.writeThrough = 0;
-    entry.cacheDisabled = 0;
+    entry.writeThrough = ((flags & PAGE_PWT) != 0U) ? 1 : 0;
+    entry.cacheDisabled = ((flags & PAGE_PCD) != 0U) ? 1 : 0;
     entry.accessed = 0;
     entry.dirty = 0;
     entry.pagesize = 0;  // 4KB pages, not large pages

@@ -28,6 +28,8 @@ std::atomic<uint64_t> timer_earliest{UINT64_MAX};
 
 constexpr uint8_t MAX_RETRIES = 8;
 constexpr size_t MAX_DEFERRED_RETRANSMITS = 16;
+constexpr uint64_t TCP_TIMER_IDLE_SLEEP_US = 10000;
+constexpr uint64_t TCP_TIMER_MS_TO_US = 1000;
 
 struct DeferredRetransmit {
     PacketBuffer* pkt;
@@ -399,16 +401,20 @@ void tcp_timer_tick(uint64_t now_ms) {
 
 [[noreturn]] void tcp_timer_thread() {
     for (;;) {
-        uint64_t now_ms = ker::mod::time::getUs() / 1000;
+        uint64_t now_ms = ker::mod::time::getUs() / TCP_TIMER_MS_TO_US;
         uint64_t earliest = timer_earliest.load(std::memory_order_relaxed);
+        uint64_t sleep_us = TCP_TIMER_IDLE_SLEEP_US;
 
         if (now_ms >= earliest) {
             tcp_timer_tick(now_ms);
+        } else if (earliest != UINT64_MAX) {
+            uint64_t delta_ms = earliest - now_ms;
+            sleep_us = std::min(delta_ms * TCP_TIMER_MS_TO_US, sleep_us);
         }
 #ifdef NET_TRACE
         ker::net::trace::flush();
 #endif
-        ker::mod::sched::kern_yield();
+        ker::mod::sched::kern_sleep_us(sleep_us);
     }
 }
 

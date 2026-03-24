@@ -384,9 +384,10 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     hdr.h_fs_uuid = mount->uuid;
     hdr.h_size = __be32::from_cpu(block_size);
 
-    // Write header block
+    // Write header block — use xfs_buf_get (not xfs_buf_read) since we
+    // immediately zero and overwrite the entire block; no need to read from disk.
     uint64_t hdr_disk_block = log->log_start + head;
-    BufHead* hdr_bh = xfs_buf_read(mount, hdr_disk_block);
+    BufHead* hdr_bh = xfs_buf_get(mount, hdr_disk_block);
     if (hdr_bh == nullptr) {
         return -EIO;
     }
@@ -405,10 +406,8 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t hdr_crc = util::crc32c_compute(hdr_bh->data, write_len);
     on_disk_hdr->h_crc = hdr_crc;  // little-endian on disk
 
-    int wrc = bwrite(hdr_bh);
-    if (wrc != 0) {
-        return wrc;
-    }
+    bdirty(hdr_bh);
+    brelse(hdr_bh);
 
     // Write body data blocks
     uint32_t cur_block = (head + 1) % log->log_blocks;
@@ -445,7 +444,8 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     // Write body data block by block
     while (body_offset < body_size) {
         uint64_t data_disk_block = log->log_start + cur_block;
-        BufHead* data_bh = xfs_buf_read(mount, data_disk_block);
+        // Use xfs_buf_get — we zero+overwrite the full block, no read needed.
+        BufHead* data_bh = xfs_buf_get(mount, data_disk_block);
         if (data_bh == nullptr) {
             mod::mm::dyn::kmalloc::free(body_buf);
             return -EIO;
@@ -456,11 +456,8 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         __builtin_memset(data_bh->data, 0, block_size);
         __builtin_memcpy(data_bh->data, body_buf + body_offset, chunk);
 
-        wrc = bwrite(data_bh);
-        if (wrc != 0) {
-            mod::mm::dyn::kmalloc::free(body_buf);
-            return wrc;
-        }
+        bdirty(data_bh);
+        brelse(data_bh);
 
         body_offset += chunk;
         cur_block = (cur_block + 1) % log->log_blocks;

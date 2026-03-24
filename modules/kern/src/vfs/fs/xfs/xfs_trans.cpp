@@ -152,22 +152,14 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
         mod::dbg::log("[xfs trans] log write failed: %d\n", log_rc);
     }
 
-    // Phase 3: Flush all dirty buffers synchronously to disk.
+    // Phase 3: Mark all dirty metadata buffers as dirty in the cache.
+    // The journal (written above) ensures recoverability; the buffers will
+    // be flushed to disk by LRU writeback, avoiding per-transaction I/O.
     int rc = 0;
     for (int i = 0; i < tp->item_count; i++) {
         XfsTransItem& item = tp->items[i];
         if (item.type == XfsLogItemType::Buffer && item.buf.dirty && item.buf.bp != nullptr) {
-#ifdef XFS_DEBUG
-            mod::dbg::log("[xfs trans] commit: write buf blk=%lu off=%u len=%u size=%lu\\n", (unsigned long)item.buf.bp->block_no,
-                          item.buf.offset, item.buf.len, (unsigned long)item.buf.bp->size);
-#endif
             bdirty(item.buf.bp);
-            int wrc = bwrite(item.buf.bp);
-            if (wrc != 0 && rc == 0) {
-                rc = wrc;
-            }
-            // Release the buffer reference to prevent memory leaks
-            // (especially for multi-block buffers not in the cache).
             brelse(item.buf.bp);
             item.buf.bp = nullptr;
         }

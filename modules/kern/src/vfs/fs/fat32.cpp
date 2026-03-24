@@ -105,6 +105,11 @@ auto hash32_djb2(const char* s) -> uint32_t {
     return h;
 }
 
+inline auto decode_dirent_cluster(const FAT32DirectoryEntry& e) -> uint32_t {
+    uint32_t raw = (static_cast<uint32_t>(e.cluster_high) << 16) | e.cluster_low;
+    return raw & FAT32_CLUSTER_MASK;
+}
+
 auto make_short_alias_83(const char* longName, char out11[11]) -> void {
     // Deterministic alias: "CD" + 6 hex digits, extension "BIN".
     // This is sufficient for our coredump use-case and avoids needing full collision handling.
@@ -363,18 +368,24 @@ auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> uint32_
         fat32_log("get_next_cluster: context or fat_table is null\n");
         return 0;
     }
-    if (cluster >= FAT32_EOC) {
+    if (cluster < 2) {
+        return 0;
+    }
+    if (cluster >= FAT32_EOC_MIN) {
         return 0;
     }
 
-    // Sanity check: make sure we're not accessing beyond reasonable bounds
-    if (cluster > FAT32_EOC) {
+    uint32_t fat_entries = (ctx->sectors_per_fat * ctx->bytes_per_sector) / sizeof(uint32_t);
+    if (cluster >= fat_entries) {
         return 0;
     }
 
-    uint32_t next = ctx->fat_table[cluster] & FAT32_EOC;
+    uint32_t next = ctx->fat_table[cluster] & FAT32_CLUSTER_MASK;
 
-    if (next >= FAT32_EOC) {
+    if (next < 2 || next >= FAT32_EOC_MIN) {
+        return 0;
+    }
+    if (next >= fat_entries) {
         return 0;
     }
     return next;
@@ -382,12 +393,33 @@ auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> uint32_
 
 // Helper function to read a cluster from the block device
 auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* buffer) -> int {
-    if (ctx == nullptr || ctx->device == nullptr || cluster < 2) {
+    if (ctx == nullptr || ctx->device == nullptr || buffer == nullptr) {
+        return -1;
+    }
+
+    cluster &= FAT32_CLUSTER_MASK;
+    if (cluster < 2 || cluster >= FAT32_EOC_MIN) {
+        return -1;
+    }
+
+    uint32_t data_clusters = 0;
+    if (ctx->sectors_per_cluster != 0 && ctx->total_sectors > ctx->data_start_sector) {
+        data_clusters = (ctx->total_sectors - ctx->data_start_sector) / ctx->sectors_per_cluster;
+    }
+    if (data_clusters == 0) {
+        return -1;
+    }
+    if (cluster - 2 >= data_clusters) {
         return -1;
     }
 
     // Calculate the LBA of the cluster
-    uint64_t cluster_lba = ctx->partition_offset + ctx->data_start_sector + ((cluster - 2) * ctx->sectors_per_cluster);
+    uint64_t cluster_lba =
+        ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(cluster) - 2) * ctx->sectors_per_cluster);
+    uint64_t partition_end_lba = ctx->partition_offset + ctx->total_sectors;
+    if (cluster_lba + ctx->sectors_per_cluster > partition_end_lba) {
+        return -1;
+    }
 
     // Read the cluster
     return ker::dev::block_read(ctx->device, cluster_lba, ctx->sectors_per_cluster, buffer);
@@ -729,7 +761,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         ker::mod::io::serial::write("'\n");
 #endif
 
-        while (search_cluster >= 2 && search_cluster < FAT32_EOC) {
+        while (search_cluster >= 2 && search_cluster < FAT32_EOC_MIN) {
             if (read_cluster(ctx, search_cluster, cluster_buf) != 0) {
                 fat32_log("fat32_open_path: failed to read cluster\n");
                 delete[] cluster_buf;
@@ -857,7 +889,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
                 return nullptr;
             }
             // Move to this directory
-            current_cluster = (static_cast<uint32_t>(found_entry.cluster_high) << 16) | found_entry.cluster_low;
+            current_cluster = decode_dirent_cluster(found_entry);
         } else {
             // This is the final component
             final_entry = found_entry;
@@ -876,7 +908,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 
     // Create file node
     auto* node = new FAT32Node;
-    node->start_cluster = (static_cast<uint32_t>(final_entry.cluster_high) << 16) | final_entry.cluster_low;
+    node->start_cluster = decode_dirent_cluster(final_entry);
     node->file_size = final_entry.file_size;
     node->attributes = final_entry.attributes;
     node->name = nullptr;
@@ -1467,7 +1499,7 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     FAT32LongNameEntry lfn_entries[MAX_LFN];  // NOLINT(modernize-avoid-c-arrays)
     int lfn_count = 0;
 
-    while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
+    while (current_cluster >= 2 && current_cluster < FAT32_EOC_MIN) {
         // Read the cluster
         if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
             delete[] cluster_buf;
@@ -1624,7 +1656,11 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
         uint32_t found_size = 0;
         uint8_t found_attr = 0;
 
-        while (current_cluster < FAT32_EOC && current_cluster >= 2) {
+        constexpr size_t MAX_LFN = 20;
+        std::array<FAT32LongNameEntry, MAX_LFN> lfn_entries{};
+        size_t lfn_count = 0;
+
+        while (current_cluster < FAT32_EOC_MIN && current_cluster >= 2) {
             if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
                 delete[] cluster_buf;
                 ctx->lock.unlock();
@@ -1634,14 +1670,12 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
             auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
             size_t entries_count = bytes_per_cluster / sizeof(FAT32DirectoryEntry);
 
-            char long_name[256] = {0};  // NOLINT
-            size_t lfn_index = 0;
-
             for (size_t i = 0; i < entries_count; ++i) {
                 if (entries[i].name[0] == 0x00) {
                     break;  // End of directory
                 }
                 if (static_cast<uint8_t>(entries[i].name[0]) == 0xE5) {
+                    lfn_count = 0;
                     continue;  // Deleted entry
                 }
 
@@ -1649,37 +1683,28 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
                 if ((entries[i].attributes & FAT32_ATTR_LONG_NAME) == FAT32_ATTR_LONG_NAME) {
                     auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(&entries[i]);
                     if ((lfn->order & 0x40) != 0) {
-                        memset(long_name, 0, sizeof(long_name));
-                        lfn_index = 0;
+                        lfn_count = 0;
                     }
-                    // Extract LFN characters
-                    for (int j = 0; j < 5 && lfn->name1[j] != 0xFFFF && lfn->name1[j] != 0; ++j) {
-                        if (lfn_index < 255) {
-                            long_name[lfn_index++] = static_cast<char>(lfn->name1[j]);
-                        }
-                    }
-                    for (int j = 0; j < 6 && lfn->name2[j] != 0xFFFF && lfn->name2[j] != 0; ++j) {
-                        if (lfn_index < 255) {
-                            long_name[lfn_index++] = static_cast<char>(lfn->name2[j]);
-                        }
-                    }
-                    for (int j = 0; j < 2 && lfn->name3[j] != 0xFFFF && lfn->name3[j] != 0; ++j) {
-                        if (lfn_index < 255) {
-                            long_name[lfn_index++] = static_cast<char>(lfn->name3[j]);
-                        }
+                    if (lfn_count < MAX_LFN) {
+                        lfn_entries[lfn_count++] = *lfn;
                     }
                     continue;
                 }
 
                 // Regular entry - compare names
                 if (entries[i].attributes == FAT32_ATTR_VOLUME_ID) {
+                    lfn_count = 0;
                     continue;
                 }
 
                 // Try LFN first, then SFN
                 bool name_match = false;
-                if (long_name[0] != '\0') {
-                    name_match = (strcasecmp_local(component, long_name) == 0);
+                if (lfn_count > 0) {
+                    std::array<char, 256> long_name{};
+                    extract_lfn_name(lfn_entries.data(), lfn_count, long_name.data(), long_name.size());
+                    if (long_name[0] != '\0') {
+                        name_match = (strcasecmp_local(component, long_name.data()) == 0);
+                    }
                 }
                 if (!name_match) {
                     // Compare with short name
@@ -1698,17 +1723,15 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
                     name_match = (strcasecmp_local(component, short_name) == 0);
                 }
 
+                lfn_count = 0;
+
                 if (name_match) {
                     found = true;
-                    found_cluster = (static_cast<uint32_t>(entries[i].cluster_high) << 16) | entries[i].cluster_low;
+                    found_cluster = decode_dirent_cluster(entries[i]);
                     found_size = entries[i].file_size;
                     found_attr = entries[i].attributes;
                     break;
                 }
-
-                // Clear LFN for next entry
-                memset(long_name, 0, sizeof(long_name));
-                lfn_index = 0;
             }
 
             if (found) {

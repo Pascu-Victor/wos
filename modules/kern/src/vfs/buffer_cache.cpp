@@ -288,22 +288,38 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     size_t blk_size = bdev->block_size;
     size_t total_size = blk_size * count;
 
-    // Allocate a single large BufHead with a contiguous data buffer
-    auto* bh = static_cast<BufHead*>(mod::mm::dyn::kmalloc::malloc(sizeof(BufHead)));
+    // Multi-block buffers are cached by (bdev, block_no) like single-block
+    // buffers.  This is critical for correctness: within a transaction,
+    // multiple reads of the same XFS block (e.g. AG block 0) must return
+    // the same buffer so that in-transaction writes are visible to subsequent
+    // reads and the transaction system can merge dirty regions correctly.
+    uint64_t irqflags = cache_lock.lock_irqsave();
+
+    BufHead* bh = hash_lookup(bdev, block_no);
+    if (bh != nullptr) {
+        // Verify size matches (should always match for fixed XFS block size)
+        if (bh->size == total_size) {
+            bh->refcount.fetch_add(1, std::memory_order_relaxed);
+            lru_touch(bh);
+            stat_hits++;
+            cache_lock.unlock_irqrestore(irqflags);
+            return bh;
+        }
+        // Size mismatch — fall through to allocate fresh (shouldn't happen)
+    }
+
+    stat_misses++;
+    evict_lru();
+
+    bh = static_cast<BufHead*>(mod::mm::dyn::kmalloc::malloc(sizeof(BufHead)));
     if (bh == nullptr) {
+        cache_lock.unlock_irqrestore(irqflags);
         return nullptr;
     }
     auto* data = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(total_size));
     if (data == nullptr) {
         mod::mm::dyn::kmalloc::free(bh);
-        return nullptr;
-    }
-
-    // Read all blocks contiguously
-    int rc = dev::block_read(bdev, block_no, count, data);
-    if (rc != 0) {
-        mod::mm::dyn::kmalloc::free(data);
-        mod::mm::dyn::kmalloc::free(bh);
+        cache_lock.unlock_irqrestore(irqflags);
         return nullptr;
     }
 
@@ -311,14 +327,30 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     bh->block_no = block_no;
     bh->bdev = bdev;
     bh->refcount.store(1, std::memory_order_relaxed);
-    bh->flags = BH_VALID;
+    bh->flags = 0;
     bh->size = total_size;
     bh->lru_prev = nullptr;
     bh->lru_next = nullptr;
     bh->hash_next = nullptr;
 
-    // NOTE: multi-block buffers are NOT inserted into the hash table or LRU.
-    // They are temporary read buffers that must be released with brelse().
+    cache_total_bytes += total_size;
+    cache_total_buffers++;
+
+    hash_insert(bh);
+    lru_touch(bh);
+
+    cache_lock.unlock_irqrestore(irqflags);
+
+    // Read from disk outside the lock
+    int rc = dev::block_read(bdev, block_no, count, data);
+    if (rc != 0) {
+        irqflags = cache_lock.lock_irqsave();
+        free_buffer(bh);
+        cache_lock.unlock_irqrestore(irqflags);
+        return nullptr;
+    }
+    bh->flags |= BH_VALID;
+
     return bh;
 }
 
@@ -375,6 +407,95 @@ void bdirty(BufHead* bh) {
         cache_dirty_buffers++;
     }
     cache_lock.unlock_irqrestore(irqflags);
+}
+
+auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+    if (bdev == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t irqflags = cache_lock.lock_irqsave();
+
+    // If the block is already cached, return it (caller will overwrite).
+    BufHead* bh = hash_lookup(bdev, block_no);
+    if (bh != nullptr) {
+        bh->refcount.fetch_add(1, std::memory_order_relaxed);
+        lru_touch(bh);
+        cache_lock.unlock_irqrestore(irqflags);
+        return bh;
+    }
+
+    // Not cached — allocate a new buffer and insert without reading.
+    evict_lru();
+    bh = alloc_buffer(bdev, block_no);
+    if (bh == nullptr) {
+        cache_lock.unlock_irqrestore(irqflags);
+        return nullptr;
+    }
+    bh->flags = BH_VALID;  // Mark valid without disk read
+    hash_insert(bh);
+    lru_touch(bh);
+    cache_lock.unlock_irqrestore(irqflags);
+    return bh;
+}
+
+auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+    if (bdev == nullptr || count == 0) {
+        return nullptr;
+    }
+    if (count == 1) {
+        return bget(bdev, block_no);
+    }
+
+    size_t blk_size = bdev->block_size;
+    size_t total_size = blk_size * count;
+
+    uint64_t irqflags = cache_lock.lock_irqsave();
+
+    // If already cached, return it (caller will overwrite contents).
+    BufHead* bh = hash_lookup(bdev, block_no);
+    if (bh != nullptr) {
+        if (bh->size == total_size) {
+            bh->refcount.fetch_add(1, std::memory_order_relaxed);
+            lru_touch(bh);
+            cache_lock.unlock_irqrestore(irqflags);
+            return bh;
+        }
+        // Size mismatch — fall through to allocate fresh (shouldn't happen)
+    }
+
+    evict_lru();
+
+    bh = static_cast<BufHead*>(mod::mm::dyn::kmalloc::malloc(sizeof(BufHead)));
+    if (bh == nullptr) {
+        cache_lock.unlock_irqrestore(irqflags);
+        return nullptr;
+    }
+    auto* data = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(total_size));
+    if (data == nullptr) {
+        mod::mm::dyn::kmalloc::free(bh);
+        cache_lock.unlock_irqrestore(irqflags);
+        return nullptr;
+    }
+
+    bh->data = data;
+    bh->block_no = block_no;
+    bh->bdev = bdev;
+    bh->refcount.store(1, std::memory_order_relaxed);
+    bh->flags = BH_VALID;
+    bh->size = total_size;
+    bh->lru_prev = nullptr;
+    bh->lru_next = nullptr;
+    bh->hash_next = nullptr;
+
+    cache_total_bytes += total_size;
+    cache_total_buffers++;
+
+    hash_insert(bh);
+    lru_touch(bh);
+    cache_lock.unlock_irqrestore(irqflags);
+
+    return bh;
 }
 
 auto sync_blockdev(dev::BlockDevice* bdev) -> int {

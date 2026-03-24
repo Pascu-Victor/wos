@@ -320,6 +320,8 @@ struct XfsAgfl {
     // Followed by __be32 agfl_bno[] filling the rest of the sector
 } __attribute__((packed));
 
+constexpr size_t XFS_AGFL_CRC_OFF = offsetof(XfsAgfl, agfl_crc);
+
 // ============================================================================
 // B+Tree Block Headers
 // ============================================================================

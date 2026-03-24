@@ -35,4 +35,18 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
 // Returns 0 on success.
 auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t len) -> int;
 
+// Number of block slots in the AGFL bno array for this filesystem.
+inline auto xfs_agfl_size(const XfsMountContext* ctx) -> uint32_t {
+    return static_cast<uint32_t>((ctx->sect_size - sizeof(XfsAgfl)) / sizeof(uint32_t));
+}
+
+// Take one block from the AGFL for use as a btree node.
+// Returns 0 and sets *out_bno on success, -ENOSPC if the AGFL is empty.
+auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t* out_bno) -> int;
+
+// Return one block to the AGFL (e.g. an emptied btree leaf).
+// Falls back to xfs_free_extent if the AGFL is already full.
+// Returns 0 on success.
+auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t bno) -> int;
+
 }  // namespace ker::vfs::xfs

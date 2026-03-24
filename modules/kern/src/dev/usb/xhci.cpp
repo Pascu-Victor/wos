@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
@@ -28,7 +29,12 @@ void write64(volatile uint8_t* base, uint32_t offset, uint64_t val) { *reinterpr
 auto virt_to_phys(void* v) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(v);
     if (addr >= 0xffffffff80000000ULL) {
-        return mod::mm::virt::translate(mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = mod::mm::virt::translate(mod::mm::virt::getKernelPagemap(), addr);
+        if (phys == mod::mm::virt::PADDR_INVALID) {
+            mod::dbg::log("xhci: virt_to_phys failed for kernel address 0x%lx", addr);
+            hcf();
+        }
+        return phys;
     }
     return reinterpret_cast<uint64_t>(mod::mm::addr::getPhysPointer(addr));
 }

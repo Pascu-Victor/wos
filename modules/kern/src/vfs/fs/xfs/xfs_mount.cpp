@@ -78,6 +78,20 @@ auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) 
     return bread_multi(ctx->device, dev_block, dev_count);
 }
 
+auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
+    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
+    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
+    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+
+    size_t dev_blk_size = ctx->device->block_size;
+    size_t ratio = ctx->block_size / dev_blk_size;
+    uint64_t dev_block = linear_block * ratio;
+    if (ratio <= 1) {
+        return bget(ctx->device, dev_block);
+    }
+    return bget_multi(ctx->device, dev_block, ratio);
+}
+
 namespace {
 
 // Read the AGF for a given AG and populate per_ag fields.
@@ -126,6 +140,12 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     pag->agf_freeblks = agf->agf_freeblks.to_cpu();
     pag->agf_longest = agf->agf_longest.to_cpu();
     pag->agf_flcount = agf->agf_flcount.to_cpu();
+    pag->agf_flfirst = agf->agf_flfirst.to_cpu();
+    pag->agf_fllast  = agf->agf_fllast.to_cpu();
+
+    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u\n",
+                  agno, pag->agf_flfirst, pag->agf_fllast, pag->agf_flcount,
+                  pag->agf_bno_root, pag->agf_cnt_root);
 
     brelse(bh);
     return 0;

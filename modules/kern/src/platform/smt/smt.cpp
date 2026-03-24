@@ -23,8 +23,8 @@
 #include "vfs/fs/devfs.hpp"
 #include "vfs/fs/tmpfs.hpp"
 
-__attribute__((used, section(".requests"))) const static volatile limine_smp_request smp_request = {
-    .id = LIMINE_SMP_REQUEST,
+__attribute__((used, section(".requests"))) const static volatile limine_mp_request smp_request = {
+    .id = LIMINE_MP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
     .flags = 1,
@@ -50,6 +50,7 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     // FSGSBASE must be enabled before using wrgsbase instruction
     cpu::enableFSGSBASE();
     cpu::enableSSE();
+    cpu::enableXSave();
 
     // Set up per-CPU data
     // Allocate a dedicated PerCpu structure for this CPU (don't reuse stack bottom
@@ -120,7 +121,7 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     sched::start_scheduler();
 }
 
-void nonPrimaryCpuInit(limine_smp_info* smpInfo) {
+void nonPrimaryCpuInit(limine_mp_info* smpInfo) {
     // FIRST: Switch to kernel page table before accessing any kernel data
     mm::virt::switchToKernelPagemap();
 
@@ -211,9 +212,9 @@ void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
             uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
 
             uint64_t pagePhys = mm::virt::translate(newTask->pagemap, pageVirt);
-            if (pagePhys == 0) {
-                dbg::log("ERROR: Failed to translate page virt=0x%x for stack data", pageVirt);
-                return 0;
+            if (pagePhys == mm::virt::PADDR_INVALID) {
+                dbg::log("PANIC: Failed to translate page virt=0x%x for stack data — stack page not mapped", pageVirt);
+                hcf();
             }
 
             auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
@@ -237,9 +238,9 @@ void createInitTasks(boot::HandoverModules& modStruct, uint64_t kernelRsp) {
             uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
 
             uint64_t pagePhys = mm::virt::translate(newTask->pagemap, pageVirt);
-            if (pagePhys == 0) {
-                dbg::log("ERROR: Failed to translate page virt=0x%x for string '%s'", pageVirt, str);
-                return 0;
+            if (pagePhys == mm::virt::PADDR_INVALID) {
+                dbg::log("PANIC: Failed to translate page virt=0x%x for string '%s' — stack page not mapped", pageVirt, str);
+                hcf();
             }
 
             auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
@@ -394,6 +395,9 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     // Write cpuId directly to the memory location
     bsp_per_cpu->cpuId = 0;
     cpu::setCurrentCpuid(0);
+
+    // GS base is now valid — cpu::currentCpu() works, safe to enable CPU ID in serial logs
+    io::serial::markCpuIdAvailable();
 
     // Store the BSP's PerCpu pointer for later retrieval
     if (kernelPerCpuPtrs != nullptr) {

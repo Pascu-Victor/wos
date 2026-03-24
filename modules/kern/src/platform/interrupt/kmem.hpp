@@ -1,5 +1,5 @@
 #pragma once
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>

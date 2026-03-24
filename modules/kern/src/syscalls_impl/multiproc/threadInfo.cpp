@@ -1,4 +1,5 @@
 #include "threadInfo.hpp"
+#include <platform/asm/cpu.hpp>
 
 namespace ker::syscall::multiproc {
 uint64_t threadInfo(abi::multiproc::threadInfoOps op) {
@@ -8,6 +9,9 @@ uint64_t threadInfo(abi::multiproc::threadInfoOps op) {
 
         case abi::multiproc::threadInfoOps::nativeThreadCount:
             return mod::smt::cpuCount();
+
+        case abi::multiproc::threadInfoOps::currentCpu:
+            return mod::cpu::currentCpu();
 
         default:
             mod::dbg::error("Invalid op in syscall thread info");

@@ -76,10 +76,11 @@ void kernel_start();
 // Dependencies are documented in comments and enforced by phase structure
 
 // PHASE 0: Early boot (no heap, no interrupts)
-inline constexpr std::array<ModuleDesc, 7> PHASE_0_MODULES = {{
+inline constexpr std::array<ModuleDesc, 8> PHASE_0_MODULES = {{
     {.name = "fb", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fb_init},
     {.name = "serial", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::serial_init},
     {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},            // depends: serial
+    {.name = "sse", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::sse_init},            // must be before any VEX/BMI2 code runs (march=native)
     {.name = "mm", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::mm_init},              // depends: dbg
     {.name = "fsgsbase", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fsgsbase_init},  // depends: stack_capture
     {.name = "gdt", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::gdt_init},            // depends: fsgsbase
@@ -93,11 +94,11 @@ inline constexpr std::array<ModuleDesc, 1> PHASE_1_MODULES = {{
 // PHASE 2: Post-Interrupt (flattened from interrupt::init)
 inline constexpr std::array<ModuleDesc, 8> PHASE_2_MODULES = {{
     {.name = "pic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::pic_remap},         // depends: kmalloc
-    {.name = "acpi", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::acpi_init},        // depends: pic
+    {.name = "idt", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::idt_init},          // depends: pic — must be before acpi so faults are handled
+    {.name = "acpi", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::acpi_init},        // depends: idt
     {.name = "apic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_init},        // depends: acpi
     {.name = "apic_mp", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_mp_init},  // depends: apic
     {.name = "time", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::time_init},        // depends: apic_mp
-    {.name = "idt", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::idt_init},          // depends: time
     {.name = "sys", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::sys_init},          // depends: idt
     {.name = "ioapic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::ioapic_init},    // depends: idt
 }};
@@ -143,7 +144,7 @@ inline constexpr std::array<ModuleDesc, 11> PHASE_5_MODULES = {{
 // This is the key phase that MUST come after all drivers!
 // WKI transport and IPv6 linklocal send packets, which requires EpochManager
 // smt and epoch_manager are now initialized in PHASE_3, so sched can use them here
-inline constexpr std::array<ModuleDesc, 5> PHASE_6_MODULES = {{
+inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
     {.name = "wki_eth_transport",
      .phase = BootPhase::PHASE_6_POST_SCHEDULER,
      .init_fn = fns::wki_eth_transport_init},  // depends: sched, wki
@@ -151,7 +152,6 @@ inline constexpr std::array<ModuleDesc, 5> PHASE_6_MODULES = {{
      .phase = BootPhase::PHASE_6_POST_SCHEDULER,
      .init_fn = fns::wki_ivshmem_transport_init},                                                                 // depends: sched, wki
     {.name = "ipv6_linklocal", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ipv6_linklocal_init},  // depends: sched, net
-    {.name = "sse", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::sse_init},                        // depends: sched
     {.name = "ntp", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ntp_init},                        // depends: sched, net, rtc, tsc
 }};
 

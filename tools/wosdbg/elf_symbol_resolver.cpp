@@ -391,4 +391,49 @@ QString formatAddress(uint64_t addr, const std::vector<SymbolTable*>& sym_tables
     return base;
 }
 
+// -------------------- elfBytesAtVA --------------------
+
+std::vector<uint8_t> elfBytesAtVA(const QByteArray& elf, uint64_t va, size_t len) {
+    const auto* data = reinterpret_cast<const uint8_t*>(elf.constData());
+    const size_t elf_len = static_cast<size_t>(elf.size());
+
+    if (elf_len < 64 || std::memcmp(data, ELF_MAGIC, 4) != 0 || data[4] != 2 /* ELF64 */) {
+        return {};
+    }
+
+    // e_phoff, e_phentsize, e_phnum
+    uint64_t phoff    = read_le<uint64_t>(data + 32);
+    uint16_t phentsize = read_le<uint16_t>(data + 54);
+    uint16_t phnum    = read_le<uint16_t>(data + 56);
+
+    static constexpr uint32_t PT_LOAD = 1;
+
+    for (uint16_t i = 0; i < phnum; ++i) {
+        size_t ph_off = static_cast<size_t>(phoff) + i * phentsize;
+        if (ph_off + 56 > elf_len) break;
+
+        uint32_t p_type   = read_le<uint32_t>(data + ph_off);
+        if (p_type != PT_LOAD) continue;
+
+        uint64_t p_offset = read_le<uint64_t>(data + ph_off + 8);
+        uint64_t p_vaddr  = read_le<uint64_t>(data + ph_off + 16);
+        uint64_t p_filesz = read_le<uint64_t>(data + ph_off + 32);
+
+        if (va < p_vaddr || va >= p_vaddr + p_filesz) continue;
+
+        uint64_t seg_off = va - p_vaddr;
+        uint64_t file_off = p_offset + seg_off;
+        uint64_t avail = p_filesz - seg_off;
+        size_t to_read = static_cast<size_t>(std::min<uint64_t>(avail, static_cast<uint64_t>(len)));
+
+        if (file_off + to_read > elf_len) {
+            to_read = elf_len - static_cast<size_t>(file_off);
+        }
+        if (to_read == 0) return {};
+
+        return std::vector<uint8_t>(data + file_off, data + file_off + to_read);
+    }
+    return {};
+}
+
 }  // namespace wosdbg

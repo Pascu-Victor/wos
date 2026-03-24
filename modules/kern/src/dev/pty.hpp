@@ -98,6 +98,7 @@ struct PtyRingBuf {
 
 // Canonical line buffer size
 static constexpr size_t CANON_BUF_SIZE = 256;
+static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
 
 // A single PTY pair (master + slave)
 struct PtyPair {
@@ -118,6 +119,13 @@ struct PtyPair {
     // Canonical mode line editing buffer
     uint8_t canon_buf[CANON_BUF_SIZE]{};
     size_t canon_len = 0;
+
+    // Tracks potential terminal cursor-position reports (ESC[row;colR)
+    // across fragmented master writes so stale ASK_TERMINAL replies can be
+    // consumed in-kernel without leaking into userspace input.
+    uint8_t cpr_filter_buf[CPR_FILTER_BUF_SIZE]{};
+    size_t cpr_filter_len = 0;
+    bool cpr_filter_active = false;
 
     // Device structs for master and slave
     Device master_dev;

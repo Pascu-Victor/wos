@@ -17,6 +17,8 @@
 namespace ker::mod::gates {
 namespace {
 interruptHandler_t interruptHandlers[256] = {nullptr};
+std::atomic<bool> panicLock{false};
+std::atomic<int64_t> panicLockOwner{-1};
 
 // Context-based IRQ handlers (parallel array)
 struct IrqContext {
@@ -48,39 +50,6 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         }
     }
 
-    // CRITICAL: Prevent nested panics by detecting recursion
-    // Use atomic int to track which CPU owns the panic handler (-1 = none)
-    static std::atomic<int64_t> panicOwnerCpu{-1};
-
-    int64_t myApicId = apic::getApicId();
-    int64_t expectedOwner = -1;
-
-    // Try to claim ownership of the panic handler
-    if (!panicOwnerCpu.compare_exchange_strong(expectedOwner, myApicId, std::memory_order_acq_rel)) {
-        // Another CPU already owns the panic handler
-        if (expectedOwner == myApicId) {
-            // We already own it - this is a nested panic on the same CPU
-            io::serial::enterPanicMode();
-            dbg::log(
-                "CPU %d: NESTED PANIC DETECTED! Halting immediately. Frame info: intNum=%d, errCode=%d, rip=0x%x, cs=0x%x, flags=0x%x, "
-                "rsp=0x%x, ss=0x%x. GPRegs: rax=0x%x, rbx=0x%x, rcx=0x%x, rdx=0x%x, rdi=0x%x, rsi=0x%x, rbp=0x%x, r8=0x%x, r9=0x%x, "
-                "r10=0x%x, r11=0x%x, r12=0x%x, r13=0x%x, r14=0x%x, r15=0x%x",
-                myApicId, frame.intNum, frame.errCode, frame.rip, frame.cs, frame.flags, frame.rsp, frame.ss, gpr.rax, gpr.rbx, gpr.rcx,
-                gpr.rdx, gpr.rdi, gpr.rsi, gpr.rbp, gpr.r8, gpr.r9, gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
-        } else {
-            // Different CPU owns it - just print minimal info and halt
-            io::serial::enterPanicMode();
-            dbg::log(
-                "CPU %d: FAULT while CPU %d is handling panic. Halting. Frame info: intNum=%d, errCode=%d, rip=0x%x, cs=0x%x, flags=0x%x, "
-                "rsp=0x%x, ss=0x%x. GPRegs: rax=0x%x, rbx=0x%x, rcx=0x%x, rdx=0x%x, rdi=0x%x, rsi=0x%x, rbp=0x%x, r8=0x%x, r9=0x%x, "
-                "r10=0x%x, r11=0x%x, r12=0x%x, r13=0x%x, r14=0x%x, r15=0x%x",
-                myApicId, expectedOwner, frame.intNum, frame.errCode, frame.rip, frame.cs, frame.flags, frame.rsp, frame.ss, gpr.rax,
-                gpr.rbx, gpr.rcx, gpr.rdx, gpr.rdi, gpr.rsi, gpr.rbp, gpr.r8, gpr.r9, gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
-        }
-        asm volatile("cli; hlt");
-        __builtin_unreachable();
-    }
-
     uint64_t cr0{};
     uint64_t cr2{};
     uint64_t cr3{};
@@ -94,6 +63,9 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // If an exception occurs while returning to or running in userspace,
     // it must not take down the whole kernel. Treat it as a process crash.
+    // NOTE: userspace faults are handled BEFORE the panic-ownership CAS below
+    // because they are normal concurrent events (multiple threads can crash
+    // simultaneously) and must never be mistaken for nested kernel panics.
     uint64_t cpl = frame.cs & 0x3;
     if (cpl == 3) {
         auto* currentTaskForDump = ker::mod::sched::get_current_task();
@@ -161,17 +133,31 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // faulted while holding a spinlock (e.g., in pageAlloc).
     // Coredumps are only for userspace crashes, handled above.
 
-    // We already claimed ownership via CAS at the top of this function.
+    // Serialize all panicking CPUs: spin-acquire a TAS lock, dump, release, halt.
+    // Every CPU gets to print before halting — one at a time, no interleaving.
+    // If this CPU already owns the lock (nested fault during dump), release and halt immediately.
+    {
+        int64_t myApicId = static_cast<int64_t>(apic::getApicId());
+        if (panicLockOwner.load(std::memory_order_acquire) == myApicId) {
+            panicLock.store(false, std::memory_order_release);
+            panicLockOwner.store(-1, std::memory_order_release);
+            hcf();
+        }
+        while (panicLock.exchange(true, std::memory_order_acquire)) {
+            asm volatile("pause");
+        }
+        panicLockOwner.store(myApicId, std::memory_order_release);
+    }
 
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
-    // or its fields while we're printing panic info. We do this BEFORE acquiring
-    // the serial lock to minimize the window where GC can corrupt task data.
-    // If epoch management is broken, this is a no-op (safe).
+    // or its fields while we're printing panic info.
     ker::mod::sched::EpochManager::enterCriticalAPIC();
 
-    // Enter panic mode for serial output. This disables the serial lock entirely
-    // to prevent deadlocks when CPU ID detection is unreliable during panic.
-    // All subsequent serial writes (including from dbg::log) will proceed without locking.
+    // Acquire the serial lock BEFORE entering panic mode so other CPUs still
+    // respect it. Once enterPanicMode() is called, all serial locking becomes
+    // a no-op for other CPUs — they cannot deadlock waiting for our lock.
+    // We hold this lock for the entire dump (never released, ends in hcf()).
+    io::serial::acquireLock();
     io::serial::enterPanicMode();
 
     dbg::log("PANIC!");
@@ -435,6 +421,8 @@ skip_task_dump:
     }
 
     dbg::log("Halting");
+    panicLockOwner.store(-1, std::memory_order_release);
+    panicLock.store(false, std::memory_order_release);
     hcf();
 }
 

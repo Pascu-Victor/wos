@@ -217,9 +217,22 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         }
     }
 
-    // No events and no signals: return -ERESTARTSYS (512) so the mlibc
-    // sysdep layer retries internally.  Distinct from -EAGAIN (11) which
-    // propagates to the application for non-blocking I/O.
+    // No events and no signals: update owner_pid on all watched sockets so
+    // wake_socket() wakes this task (not the parent that accepted the fd).
+    for (size_t i = 0; i < EPOLL_MAX_INTEREST; i++) {
+        if (!inst->interests[i].active) continue;
+        auto* f = vfs_get_file(task, inst->interests[i].fd);
+        if (f == nullptr) continue;
+        if (f->fs_type == FSType::SOCKET) {
+            auto* sock = static_cast<ker::net::Socket*>(f->private_data);
+            if (sock != nullptr) {
+                sock->owner_pid = task->pid;
+            }
+        }
+    }
+
+    // Yield CPU before returning so mlibc's retry loop doesn't spin at 100%.
+    ker::mod::sched::kern_yield();
     return -512;  // WOS_ERESTARTSYS
 }
 

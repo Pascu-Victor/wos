@@ -2,7 +2,7 @@
 
 __attribute__((used, section(".requests")))
 static volatile limine_rsdp_request rsdpRequest = {
-    .id = LIMINE_RSDP_REQUEST,
+    .id = LIMINE_RSDP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };

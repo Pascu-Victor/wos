@@ -806,13 +806,13 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 // WKI timer kernel thread — runs wki_peer_timer_tick() at ~10ms cadence
 // -----------------------------------------------------------------------------
 
+constexpr uint64_t WKI_TIMER_SLEEP_US = 10000;
+
 [[noreturn]] void wki_timer_thread() {
     for (;;) {
         uint64_t now_us = mod::time::getUs();
         wki_peer_timer_tick(now_us);
-        // Sleep until next interrupt (~10ms scheduler tick).
-        // The scheduler will preempt this thread if other tasks need CPU time.
-        mod::sched::kern_yield();
+        mod::sched::kern_sleep_us(WKI_TIMER_SLEEP_US);
     }
 }
 

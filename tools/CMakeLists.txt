@@ -9,13 +9,35 @@ unset(ENV{CFLAGS})
 unset(ENV{CXXFLAGS})
 unset(ENV{LDFLAGS})
 
-# If the WOS environment saved the original PATH in WOS_ORIGINAL_PATH, restore it
-# so this CMake run uses the user's original PATH rather than the WOS toolchain overlay.
-if(DEFINED ENV{WOS_ORIGINAL_PATH})
-    set(ENV{PATH} "$ENV{WOS_ORIGINAL_PATH}")
+# Resolve workspace root and path entries to remove from host compiler discovery.
+get_filename_component(WOS_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/target1/bin")
+set(WOS_HOST_TOOLS_BIN "${WOS_WORKSPACE_ROOT}/tools/build/bin")
+
+# Reconstruct a clean host PATH so find_program() does not pick the target compiler
+# from nearby overlaid paths.
+if(DEFINED ENV{WOS_ORIGINAL_PATH} AND NOT "$ENV{WOS_ORIGINAL_PATH}" STREQUAL "")
+    set(_wos_path_source "$ENV{WOS_ORIGINAL_PATH}")
+else()
+    set(_wos_path_source "$ENV{PATH}")
 endif()
 
-# Find clang/clang++ in system PATH only
+string(REPLACE ":" ";" _wos_path_entries "${_wos_path_source}")
+set(_wos_clean_path_entries "")
+foreach(_entry IN LISTS _wos_path_entries)
+    if(NOT _entry STREQUAL ""
+       AND NOT _entry STREQUAL "${WOS_TARGET_TOOLCHAIN_BIN}"
+       AND NOT _entry STREQUAL "${WOS_HOST_TOOLS_BIN}")
+        list(APPEND _wos_clean_path_entries "${_entry}")
+    endif()
+endforeach()
+
+if(_wos_clean_path_entries)
+    list(JOIN _wos_clean_path_entries ":" _wos_clean_path)
+    set(ENV{PATH} "${_wos_clean_path}")
+endif()
+
+# Find host clang/clang++ from the cleaned PATH.
 find_program(CLANG_C_COMPILER clang)
 find_program(CLANG_CXX_COMPILER clang++)
 

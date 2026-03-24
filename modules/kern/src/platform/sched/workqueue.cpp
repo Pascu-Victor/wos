@@ -72,8 +72,8 @@ void Workqueue::drain_loop() {
             item->fn(item->arg);
             completed_count_.fetch_add(1, std::memory_order_release);
         } else {
-            // Nothing to do — sleep until next wakeup
-            kern_yield();
+            // Nothing to do — truly block until enqueue() wakes us.
+            kern_block();
         }
     }
 
@@ -150,9 +150,8 @@ void Workqueue::enqueue(WorkItem* item) {
     pending_count_.fetch_add(1, std::memory_order_relaxed);
     lock_.unlock_irqrestore(irqf);
 
-    // Wake the worker thread's CPU to break its hlt if it's sleeping.
     if (thread_ != nullptr) {
-        wake_cpu(thread_->cpu);
+        kern_wake(thread_);
     }
 }
 
@@ -171,7 +170,7 @@ void Workqueue::destroy() {
 
     // Wake the worker so it notices the stop flag
     if (thread_ != nullptr) {
-        wake_cpu(thread_->cpu);
+        kern_wake(thread_);
     }
 
     // Wait for the worker to finish draining (best effort — we busy-wait

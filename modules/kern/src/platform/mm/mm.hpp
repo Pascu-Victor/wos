@@ -1,5 +1,5 @@
 #pragma once
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>

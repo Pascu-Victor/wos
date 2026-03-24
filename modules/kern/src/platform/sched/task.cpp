@@ -8,6 +8,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <vfs/file.hpp>
 
 #include "platform/asm/msr.hpp"
 
@@ -54,6 +55,8 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->heapIndex = -1;
     this->schedQueue = SchedQueue::NONE;
     this->schedNext = nullptr;
+    this->wakeAtUs = 0;
+    this->wantsBlock = false;
 
     // Signal infrastructure
     this->sigPending = 0;
@@ -97,6 +100,11 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         this->pagemap = mm::virt::getKernelPagemap();
         this->type = type;
         this->cpu = cpu::currentCpu();
+        // Daemons are mostly background service work. Give them a much smaller
+        // fair-share budget than user compute threads so periodic wakeups do not
+        // dominate a CPU and stretch long-running PROCESS benchmarks by 2-4x.
+        this->schedWeight = 128;
+        this->sliceNs = 2'000'000;
         this->context.syscallKernelStack = kernelRsp;
         this->thread = nullptr;
 
@@ -206,7 +214,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     if (ssym && ssym->isTlsOffset) {
         uint64_t destVaddr = this->thread->tlsBaseVirt + ssym->rawValue;  // rawValue stores st_value (TLS offset)
         uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
-        if (destPaddr != 0) {
+        if (destPaddr != mm::virt::PADDR_INVALID) {
             auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
             *destPtr = this->thread->safestackPtrValue;
             dbg::log("Wrote SafeStack ptr for PID %x at vaddr=%x (phys=%x) value=%x", this->pid, destVaddr, destPaddr,
@@ -215,6 +223,150 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
             dbg::log("Failed to translate SafeStack TLS vaddr %x for PID %x", destVaddr, this->pid);
         }
     }
+}
+
+Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa) {
+    uint64_t kstackBase = (uint64_t)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    if (kstackBase == 0) {
+        dbg::log("createUserThread: OOM allocating kernel stack");
+        return nullptr;
+    }
+    uint64_t kRsp = kstackBase + KERNEL_STACK_SIZE;
+
+    auto* t = new Task{};  // default-constructed; all fields set explicitly below
+
+    // Copy name from parent
+    if (parent->name != nullptr) {
+        size_t nameLen = strlen(parent->name);
+        char* nameCopy = new char[nameLen + 1];
+        memcpy(nameCopy, parent->name, nameLen + 1);
+        t->name = nameCopy;
+    } else {
+        t->name = nullptr;
+    }
+
+    // Identity
+    t->pid = sched::task::getNextPid();
+    t->parentPid = parent->parentPid ? parent->parentPid : parent->pid;
+    t->type = TaskType::PROCESS;
+    t->isThread = true;
+    t->ownerPid = parent->pid;
+    t->cpu = cpu::currentCpu();
+
+    // Share the parent's pagemap — do NOT create a new one
+    t->pagemap = parent->pagemap;
+
+    // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
+    auto* thr = new threading::Thread{};
+    thr->magic = 0xDEADBEEF;
+    thr->fsbase = tcbVaddr;
+    thr->gsbase = 0;
+    thr->stack = userSp;
+    thr->stackSize = 0;
+    thr->tlsSize = 0;
+    thr->tlsBaseVirt = 0;
+    thr->tlsPhysPtr = 0;
+    thr->stackPhysPtr = 0;
+    t->thread = thr;
+
+    // Kernel-space PerCpu scratch area for syscall entry.
+    // gsbase must also point here: after swapgs on syscall entry, GS_BASE becomes
+    // gsbase, so it must be the PerCpu scratch area — not 0.
+    auto* perCpu = new cpu::PerCpu();
+    perCpu->syscallStack = kRsp;
+    perCpu->cpuId = cpu::currentCpu();
+    t->context.syscallKernelStack = kRsp;
+    t->context.syscallScratchArea = (uint64_t)perCpu;
+    thr->gsbase = (uint64_t)perCpu;
+
+    // User-mode interrupt frame: jump straight into __mlibc_enter_thread.
+    // sys_prepare_stack pushed [ user_arg, entry ] below userSp (i.e. at userSp and userSp+8).
+    // Read them out now so the kernel can set RDI/RSI directly, and advance RSP past them.
+    uint64_t entry_va = 0;
+    uint64_t user_arg_va = 0;
+    {
+        // Translate the two words on the prepared stack via the parent pagemap
+        uint64_t pa_entry = mm::virt::translate(parent->pagemap, userSp);
+        if (pa_entry != mm::virt::PADDR_INVALID) {
+            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::getVirtPointer(pa_entry));
+        }
+        uint64_t pa_arg = mm::virt::translate(parent->pagemap, userSp + 8);
+        if (pa_arg != mm::virt::PADDR_INVALID) {
+            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::getVirtPointer(pa_arg));
+        }
+    }
+
+    t->context.frame.rip = enterThreadVa;  // __mlibc_enter_thread
+    t->context.frame.rsp = userSp + 16;    // skip the two pushed words
+    t->context.frame.cs = 0x23;            // user code segment
+    t->context.frame.ss = 0x1b;            // user stack segment
+    t->context.frame.flags = 0x202;        // IF=1, reserved=1
+    t->context.regs = cpu::GPRegs{};
+    t->context.regs.rdi = entry_va;     // arg1: entry function
+    t->context.regs.rsi = user_arg_va;  // arg2: user_arg
+
+    // Inherit FDs: share the same File* pointers and bump each refcount
+    for (unsigned i = 0; i < FD_TABLE_SIZE; i++) {
+        if (parent->fds[i] != nullptr) {
+            reinterpret_cast<ker::vfs::File*>(parent->fds[i])->refcount++;
+        }
+        t->fds[i] = parent->fds[i];
+    }
+    memcpy(t->cwd, parent->cwd, sizeof(t->cwd));
+    memcpy(t->exe_path, parent->exe_path, sizeof(t->exe_path));
+    t->uid = parent->uid;
+    t->gid = parent->gid;
+    t->euid = parent->euid;
+    t->egid = parent->egid;
+    t->suid = parent->suid;
+    t->sgid = parent->sgid;
+    t->umask = parent->umask;
+    t->session_id = parent->session_id;
+    t->pgid = parent->pgid;
+    t->controlling_tty = parent->controlling_tty;
+
+    // ELF buffer: threads have no separate ELF
+    t->elfBuffer = nullptr;
+    t->elfBufferSize = 0;
+
+    // Scheduling defaults
+    t->hasRun = false;
+    t->hasExited = false;
+    t->exitStatus = 0;
+    t->waitedOn = false;
+    t->awaitee_on_exit_count = 0;
+    t->deferredTaskSwitch = false;
+    t->yieldSwitch = false;
+    t->voluntaryBlock = false;
+    t->waitingForPid = 0;
+    t->waitStatusPhysAddr = 0;
+    t->waitRusagePhysAddr = 0;
+    t->vruntime = 0;
+    t->vdeadline = 0;
+    t->schedWeight = 1024;
+    t->sliceNs = 10'000'000;
+    t->sliceUsedNs = 0;
+    t->heapIndex = -1;
+    t->schedQueue = SchedQueue::NONE;
+    t->schedNext = nullptr;
+
+    // Signals: inherit mask and handlers from parent (POSIX §2.4)
+    t->sigPending = 0;
+    t->sigMask = parent->sigMask;
+    t->inSignalHandler = false;
+    t->doSigreturn = false;
+    for (unsigned i = 0; i < MAX_SIGNALS; i++) {
+        t->sigHandlers[i] = parent->sigHandlers[i];
+    }
+
+    // Time accounting
+    t->start_time_us = 0;
+    t->user_time_us = 0;
+    t->system_time_us = 0;
+    t->itimer_real_expire_us = 0;
+    t->itimer_real_interval_us = 0;
+
+    return t;
 }
 
 Task* Task::createKernelThread(const char* name, void (*entryFunc)()) {

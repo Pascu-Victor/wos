@@ -87,6 +87,11 @@ std::unique_ptr<SectionMap> loadSectionsFromFile(const QString& path);
 std::unique_ptr<SymbolTable> loadSymbolsFromCoreDump(const CoreDump& dump);
 std::unique_ptr<SectionMap> loadSectionsFromCoreDump(const CoreDump& dump);
 
+/// Extract up to `len` bytes from `elf` at virtual address `va` by walking
+/// the ELF64 program headers (PT_LOAD segments).  Returns an empty vector if
+/// the address is not covered.
+std::vector<uint8_t> elfBytesAtVA(const QByteArray& elf, uint64_t va, size_t len);
+
 // Try to resolve an address using multiple symbol tables and section maps.
 // Returns e.g. "func_name+0x1a" or empty string.
 std::optional<std::string> resolveAddress(uint64_t addr, const std::vector<SymbolTable*>& symTables,

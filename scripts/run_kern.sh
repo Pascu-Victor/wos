@@ -125,4 +125,4 @@ qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m ${MEM} \
   -device ide-hd,drive=drive1,bus=ahci.1 \
   $NET_ARGS \
   $IVSHMEM_ARGS \
-  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $GFX_ARGS $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 2
+  -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 2

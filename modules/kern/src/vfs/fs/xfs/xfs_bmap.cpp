@@ -35,7 +35,9 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
     if (ext.count == 0) {
         result->is_hole = true;
         result->startblock = NULLFSBLOCK;
-        result->blockcount = 1;
+        // No extents at all — the entire address space is a hole.  Return a
+        // large blockcount so the caller can allocate in large batches.
+        result->blockcount = ~static_cast<xfs_filblks_t>(0);
         result->unwritten = false;
         return 0;
     }
@@ -78,7 +80,9 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
         if (lo < static_cast<int>(ext.count)) {
             result->blockcount = ext.list[lo].br_startoff - file_block;
         } else {
-            result->blockcount = 1;  // past the last extent
+            // Past the last extent — unbounded hole to EOF.  Return a large
+            // blockcount so callers can allocate in large batches.
+            result->blockcount = ~static_cast<xfs_filblks_t>(0);
         }
     }
 
@@ -107,7 +111,7 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     if (numrecs == 0) {
         result->is_hole = true;
         result->startblock = NULLFSBLOCK;
-        result->blockcount = 1;
+        result->blockcount = ~static_cast<xfs_filblks_t>(0);
         result->unwritten = false;
         return 0;
     }
@@ -409,27 +413,25 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         }
     }
 
-    // No merge — insert new extent
+    // No merge — insert new extent.
+    // Grow the list with capacity doubling to avoid O(N²) reallocations.
     uint32_t new_count = ext.count + 1;
-    auto* new_list = new XfsBmbtIrec[new_count];
-    if (new_list == nullptr) {
-        return -ENOMEM;
+    if (new_count > ext.capacity) {
+        uint32_t new_cap = ext.capacity == 0 ? 4 : ext.capacity * 2;
+        if (new_cap < new_count) { new_cap = new_count; }
+        auto* new_list = new XfsBmbtIrec[new_cap];
+        if (new_list == nullptr) { return -ENOMEM; }
+        for (uint32_t i = 0; i < ext.count; i++) { new_list[i] = ext.list[i]; }
+        delete[] ext.list;
+        ext.list = new_list;
+        ext.capacity = new_cap;
     }
 
-    // Copy entries before insertion point
-    for (uint32_t i = 0; i < insert_at; i++) {
-        new_list[i] = ext.list[i];
+    // Shift entries after insertion point right by one
+    for (uint32_t i = ext.count; i > insert_at; i--) {
+        ext.list[i] = ext.list[i - 1];
     }
-    // Insert new extent
-    new_list[insert_at] = new_ext;
-    // Copy entries after insertion point
-    for (uint32_t i = insert_at; i < ext.count; i++) {
-        new_list[i + 1] = ext.list[i];
-    }
-
-    // Replace the old list
-    delete[] ext.list;
-    ext.list = new_list;
+    ext.list[insert_at] = new_ext;
     ext.count = new_count;
     ip->nextents = new_count;
     ip->dirty = true;

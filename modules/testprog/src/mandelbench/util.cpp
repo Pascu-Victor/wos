@@ -4,7 +4,8 @@
 #include <cmath>
 #include <print>
 
-#include "lodepng.h"
+#include "config.hpp"
+#include "lodepng.hpp"
 
 unsigned char color2byte(float v) {
     float c = v * 255;
@@ -103,45 +104,45 @@ void save_image(const char* filename, const unsigned char* image, unsigned width
     free(png);
 }
 
-void description(const char* name, char* desc) {
+void description(const char* name, int width, int height, int max_iteration, int threads, char* desc) {
     if (strcmp("cpu", name) == 0) {
-        sprintf(desc, "width=%d height=%d iterations=%d threads=%d", WIDTH, HEIGHT, MAX_ITERATION, THREADS);
+        sprintf(desc, "width=%d height=%d iterations=%d threads=%d", width, height, max_iteration, threads);
     } else {
         sprintf(desc, "-");
     }
 }
 
-void progress(const char* name, int r, double time) {
+void progress(const char* name, int width, int height, int max_iteration, int threads, int repeat, int r, double time) {
     char desc[100];
-    description(name, desc);
-    std::println(stderr, "name={} {} repeat={}/{} duration={:.2f}", name, desc, r + 1, REPEAT, time);
+    description(name, width, height, max_iteration, threads, desc);
+    std::println(stderr, "name={} {} repeat={}/{} duration={:.2f}", name, desc, r + 1, repeat, time);
 }
 
-void report(const char* name, std::vector<double> times) {
+void report(const char* name, int width, int height, int max_iteration, int threads, int repeat, const std::vector<double>& times) {
     int r;
     double avg, stdev, min, max, mean;
     char desc[100];
     FILE* f = nullptr;
 
-    description(name, desc);
+    description(name, width, height, max_iteration, threads, desc);
 
     avg = 0;
     min = times[0];
     max = times[0];
-    for (r = 0; r < REPEAT; r++) {
+    for (r = 0; r < repeat; r++) {
         avg += times[r];
         min = std::min(min, times[r]);
         max = std::max(max, times[r]);
     }
-    avg /= REPEAT;
+    avg /= repeat;
 
     stdev = 0;
-    for (r = 0; r < REPEAT; r++) {
+    for (r = 0; r < repeat; r++) {
         stdev += (times[r] - avg) * (times[r] - avg);
     }
-    stdev = sqrt(stdev / REPEAT);
+    stdev = sqrt(stdev / repeat);
 
-    mean = times[REPEAT / 2];
+    mean = times[repeat / 2];
 
     std::string rep =
         std::format("name={} {} min={:.2f} max={:.2f} mean={:.2f} avg={:.2f} stdev={:.2f}", name, desc, min, max, mean, avg, stdev);

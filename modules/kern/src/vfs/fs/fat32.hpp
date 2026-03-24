@@ -111,6 +111,8 @@ constexpr uint8_t FAT32_ATTR_DEVICE = 0x40;
 constexpr uint8_t FAT32_ATTR_LONG_NAME = 0x0F;
 
 // FAT32 specific end-of-chain marker
+constexpr uint32_t FAT32_CLUSTER_MASK = 0x0FFFFFFF;
+constexpr uint32_t FAT32_EOC_MIN = 0x0FFFFFF8;
 constexpr uint32_t FAT32_EOC = 0x0FFFFFFF;
 constexpr uint32_t FAT32_BAD_CLUSTER = 0x0FFFFFF7;
 

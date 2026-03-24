@@ -75,5 +75,12 @@ void enablePSE(void);
 void enableSSE(void);
 void enableFSGSBASE(void);
 
+// Enable XSAVE/XRSTOR and configure XCR0 for x87+SSE+AVX.
+// Must be called after enableSSE(). Called on each CPU.
+void enableXSave(void);
+
+// Size in bytes of the xsave area (set after enableXSave). 0 = XSAVE not supported, use fxsave.
+extern uint64_t xsaveAreaSize;
+
 #define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

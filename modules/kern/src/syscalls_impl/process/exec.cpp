@@ -262,8 +262,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         uint64_t pageOffset = virtAddr & (mod::mm::paging::PAGE_SIZE - 1);
 
         uint64_t pagePhys = mod::mm::virt::translate(newTask->pagemap, pageVirt);
-        if (pagePhys == 0) {
-            return 0;
+        if (pagePhys == mod::mm::virt::PADDR_INVALID) {
+            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x — stack page not mapped", pageVirt);
+            hcf();
         }
 
         auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::getVirtPointer(pagePhys)) + pageOffset;
@@ -284,8 +285,9 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         uint64_t pageOffset = virtAddr & (mod::mm::paging::PAGE_SIZE - 1);
 
         uint64_t pagePhys = mod::mm::virt::translate(newTask->pagemap, pageVirt);
-        if (pagePhys == 0) {
-            return 0;
+        if (pagePhys == mod::mm::virt::PADDR_INVALID) {
+            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x — stack page not mapped", pageVirt);
+            hcf();
         }
 
         auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::getVirtPointer(pagePhys)) + pageOffset;
@@ -576,6 +578,22 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         task->exe_path[pathLen] = '\0';
     }
 
+    // Update task name to the new executable's basename
+    {
+        std::string_view path_str(path, std::strlen(path));
+        const char* base_name = path_str.data();
+        for (size_t i = 0; i < path_str.size(); i++) {
+            if (path_str[i] == '/') {
+                base_name = path_str.data() + i + 1;
+            }
+        }
+        size_t base_len = std::strlen(base_name);
+        char* name_buf = new char[base_len + 1];
+        std::memcpy(name_buf, base_name, base_len + 1);
+        delete[] task->name;
+        task->name = name_buf;
+    }
+
     // Handle setuid/setgid from executable
     {
         vfs::stat exec_st{};
@@ -623,7 +641,10 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
         uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
         uint64_t pagePhys = mm::virt::translate(newPagemap, pageVirt);
-        if (pagePhys == 0) return 0;
+        if (pagePhys == mm::virt::PADDR_INVALID) {
+            dbg::log("exec pushData: translate failed for stack vaddr 0x%x", pageVirt);
+            hcf();
+        }
         auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, data, size);
         return virtAddr;
@@ -637,7 +658,10 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         uint64_t pageVirt = virtAddr & ~(mm::paging::PAGE_SIZE - 1);
         uint64_t pageOffset = virtAddr & (mm::paging::PAGE_SIZE - 1);
         uint64_t pagePhys = mm::virt::translate(newPagemap, pageVirt);
-        if (pagePhys == 0) return 0;
+        if (pagePhys == mm::virt::PADDR_INVALID) {
+            dbg::log("exec pushString: translate failed for stack vaddr 0x%x", pageVirt);
+            hcf();
+        }
         auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, str, len);
         return virtAddr;
@@ -717,7 +741,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     if (ssym && ssym->isTlsOffset) {
         uint64_t destVaddr = task->thread->tlsBaseVirt + ssym->rawValue;
         uint64_t destPaddr = mm::virt::translate(newPagemap, destVaddr);
-        if (destPaddr != 0) {
+        if (destPaddr != mm::virt::PADDR_INVALID) {
             auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
             *destPtr = task->thread->safestackPtrValue;
         }

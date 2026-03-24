@@ -1,29 +1,49 @@
 #include "serial.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <platform/asm/cpu.hpp>
 
 namespace ker::mod::io::serial {
 bool isInit = false;
 
+namespace {
 // Reentrant spinlock: tracks owner CPU and recursion depth
-// Use UINT64_MAX-1 for early boot (before per-CPU is set up)
-static constexpr uint64_t NO_OWNER = UINT64_MAX;
-static std::atomic<uint64_t> lock_owner{NO_OWNER};
-static std::atomic<uint64_t> lock_depth{0};
-static std::atomic<bool> cpu_id_available{false};
-static std::atomic<bool> in_panic_mode{false};
+// Use UINT64_MAX for "no owner"
+constexpr uint64_t NO_OWNER = UINT64_MAX;
+std::atomic<uint64_t> lock_owner{NO_OWNER};
+std::atomic<uint64_t> lock_depth{0};
+std::atomic<bool> cpu_id_available{false};
+
+// Set to true once any CPU enters panic mode.
+std::atomic<bool> in_panic_mode{false};
+// CPU index of the first CPU to call enterPanicMode().
+constexpr uint64_t NO_PANIC_OWNER = UINT64_MAX;
+std::atomic<uint64_t> panic_owner_cpu{NO_PANIC_OWNER};
+}  // namespace
 
 void markCpuIdAvailable() { cpu_id_available.store(true, std::memory_order_release); }
 
-void enterPanicMode() {
-    // Once in panic mode, all lock operations become no-ops.
-    // This prevents deadlocks when CPU ID detection is unreliable during panic.
+// Returns true if this CPU is the first to enter panic mode (becomes the panic owner).
+// Returns false for every subsequent caller.
+bool enterPanicMode() {
     in_panic_mode.store(true, std::memory_order_release);
+    uint64_t expected = NO_PANIC_OWNER;
+    constexpr uint64_t ADDR_MASK = 0xFFFFU;
+    auto fallback = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&expected) & ADDR_MASK);
+    uint64_t cpu_id = cpu_id_available.load(std::memory_order_acquire) ? cpu::currentCpu() : fallback;
+    return panic_owner_cpu.compare_exchange_strong(expected, cpu_id,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire);
+}
+
+bool isPanicMode() {
+    return in_panic_mode.load(std::memory_order_acquire);
 }
 
 void acquireLock() {
-    // In panic mode, skip all locking to avoid deadlocks from unreliable CPU ID
+    // In panic mode all locking is a no-op: the panic owner holds the normal
+    // lock before calling enterPanicMode(), so other CPUs must not spin on it.
     if (in_panic_mode.load(std::memory_order_acquire)) {
         return;
     }
@@ -32,7 +52,7 @@ void acquireLock() {
                        ? cpu::currentCpu()
                        : 0;
 
-    // If we already own the lock, just increment depth
+    // If we already own the lock, just increment depth (reentrant)
     if (lock_owner.load(std::memory_order_relaxed) == cpu) {
         lock_depth.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -48,14 +68,13 @@ void acquireLock() {
 }
 
 void releaseLock() {
-    // In panic mode, skip all locking
+    // In panic mode all locking is a no-op.
     if (in_panic_mode.load(std::memory_order_acquire)) {
         return;
     }
 
     uint64_t depth = lock_depth.fetch_sub(1, std::memory_order_relaxed);
     if (depth == 1) {
-        // Last release - actually unlock
         lock_owner.store(NO_OWNER, std::memory_order_release);
     }
 }

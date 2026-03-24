@@ -31,6 +31,8 @@ struct XfsPerAG {
     uint32_t agf_freeblks;       // total free blocks
     uint32_t agf_longest;        // longest free extent
     uint32_t agf_flcount;        // freelist block count
+    uint32_t agf_flfirst;        // head index into AGFL circular array
+    uint32_t agf_fllast;         // tail index into AGFL circular array
 
     // From AGI
     uint32_t agi_count;           // allocated inodes
@@ -109,6 +111,10 @@ auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
 // Read `count` contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead*;
+
+// Get a buffer for one XFS filesystem block without reading from disk.
+// Use for newly allocated blocks that will be fully overwritten.
+auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
 // Unmount — flush dirty buffers, close journal, free mount context.
 void xfs_unmount(XfsMountContext* ctx);

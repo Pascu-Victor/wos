@@ -32,6 +32,11 @@ auto xfs_stat(const char* fs_path, ker::vfs::stat* statbuf, XfsMountContext* ctx
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::stat* statbuf) -> int;
 
+// Remove a file by filesystem-relative path.
+// Returns 0 on success, negative errno on failure.
+// Cannot be used to remove directories (use xfs_rmdir_path for that).
+auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int;
+
 // Return the global XFS FileOperations vtable.
 auto get_xfs_fops() -> FileOperations*;
 

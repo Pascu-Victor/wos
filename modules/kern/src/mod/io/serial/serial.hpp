@@ -1,6 +1,6 @@
 #pragma once
 
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <cstddef>
 #include <mod/io/port/port.hpp>
@@ -23,9 +23,16 @@ void releaseLock();
 // Call this after per-CPU data is initialized to enable proper CPU ID tracking
 void markCpuIdAvailable();
 
-// Enter panic mode - disables all locking to prevent deadlocks during panic.
-// Call this early in the panic handler before any dbg::log() calls.
-void enterPanicMode();
+// Enter panic mode - switches to a simple non-reentrant raw spinlock that
+// cannot deadlock on CPU-ID logic. Must be called before panic log output.
+// Safe to call from multiple CPUs; only the first caller wins the panic lock.
+// Enter panic mode — makes acquireLock()/releaseLock() no-ops so that the panic
+// owner CPU (which already holds acquireLock()) is never deadlocked by other CPUs.
+// Returns true if this CPU is the first caller (the panic owner).
+bool enterPanicMode();
+
+// Returns true if panic mode is active.
+bool isPanicMode();
 
 // Unlocked write variants - caller must hold lock via acquireLock()/releaseLock()
 void writeUnlocked(const char* str);

@@ -42,6 +42,26 @@ struct Context {
     gates::interruptFrame frame;
 } __attribute__((packed));
 
+// FPU/SSE/AVX state saved by xsave or fxsave (must be 64-byte aligned for xsave).
+// We over-allocate by 63 bytes so we can always find a 64-byte-aligned region
+// inside the buffer, regardless of the Task allocation's alignment.
+struct FxState {
+    uint8_t raw[1024 + 63] = {};
+    bool saved = false;  // true after first saveFpuState — guards xrstor on zeroed buffer
+
+    // Return a pointer to the 64-byte-aligned region within raw[].
+    uint8_t* aligned() {
+        auto addr = reinterpret_cast<uintptr_t>(raw);
+        addr = (addr + 63) & ~uintptr_t(63);
+        return reinterpret_cast<uint8_t*>(addr);
+    }
+    const uint8_t* aligned() const {
+        auto addr = reinterpret_cast<uintptr_t>(raw);
+        addr = (addr + 63) & ~uintptr_t(63);
+        return reinterpret_cast<const uint8_t*>(addr);
+    }
+};
+
 struct Task {
     Task(Task&&) = delete;
     auto operator=(const Task&) -> Task& = delete;
@@ -52,16 +72,28 @@ struct Task {
     // entryFunc: [[noreturn]] void func() — the kernel thread body.
     static Task* createKernelThread(const char* name, void (*entryFunc)());
 
+    // Factory for userspace threads (PROCESS tasks that share the parent's pagemap).
+    // tcbVaddr: virtual address of the mlibc TCB (becomes FS base / fsbase).
+    // userSp:   prepared stack pointer (sys_prepare_stack pushed entry+user_arg below it).
+    // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
+    static Task* createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa);
+
     Task(const Task& task) = delete;
+
+    // Default constructor — leaves all fields zero/default-initialized.
+    // Used only by createUserThread; callers must fill in all required fields.
+    Task() = default;
 
     mm::paging::PageTable* pagemap;
     Context context;
+    FxState fxState;  // FPU/SSE register state (fxsave/fxrstor on context switch)
     uint64_t entry;
     void (*kthreadEntry)();  // Kernel thread entry (DAEMON only), nullptr otherwise
 
     const char* name;
     TaskType type;
     uint64_t cpu;
+    bool cpu_pinned = false;  // When true, scheduler will not migrate this task to another CPU
     threading::Thread* thread;
     uint64_t pid;
     uint64_t parentPid;  // Parent process ID (0 for orphaned/init processes)
@@ -89,6 +121,14 @@ struct Task {
     // Executable path (set by exec, used by procfs /proc/self/exe)
     static constexpr unsigned EXE_PATH_MAX = 256;
     char exe_path[EXE_PATH_MAX] = "";
+
+    // True when this Task is a userspace thread (shares pagemap with owning process).
+    // Thread exits must NOT free the pagemap or close shared FDs.
+    bool isThread = false;
+
+    // PID of the process that owns this thread (set by createUserThread).
+    // 0 for regular processes.
+    uint64_t ownerPid = 0;
 
     // WKI: prefer inline delivery for remote compute placement (V2§A6.4)
     bool wki_prefer_inline = false;
@@ -166,6 +206,10 @@ struct Task {
     uint64_t user_time_us;    // Cumulative user-mode CPU time (microseconds)
     uint64_t system_time_us;  // Cumulative kernel-mode CPU time (microseconds)
 
+    // === ITIMER_REAL (SIGALRM) state (microseconds, 0 = not armed) ===
+    uint64_t itimer_real_expire_us;    // Absolute HPET time when SIGALRM fires (0 = disarmed)
+    uint64_t itimer_real_interval_us;  // Reload interval after expiry (0 = one-shot)
+
     // === EEVDF scheduling fields ===
     // Virtual runtime: cumulative weighted CPU time consumed.
     // Advances by (actual_ns * 1024 / weight) each tick. Signed for wrap-safe comparison.
@@ -190,6 +234,14 @@ struct Task {
     // Which scheduling queue the task is logically in.
     enum class SchedQueue : uint8_t { NONE = 0, RUNNABLE = 1, WAITING = 2, DEAD_GC = 3 };
     SchedQueue schedQueue;
+
+    // Non-zero: task is in wait list sleeping until this absolute time (microseconds).
+    // Set by nanosleep; cleared by the timer tick when the deadline is reached.
+    uint64_t wakeAtUs;
+
+    // Set by kern_block() to ask the timer interrupt to move this task to the
+    // wait list on the next tick (under the run queue lock). Cleared by scheduler.
+    bool wantsBlock;
 
     // Intrusive list pointer for wait queue and dead list (zero allocations).
     Task* schedNext;

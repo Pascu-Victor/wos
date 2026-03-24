@@ -7,5 +7,5 @@
 #include <platform/smt/smt.hpp>
 
 namespace ker::syscall::multiproc {
-uint64_t threadControl(ker::abi::multiproc::threadControlOps op, void* arg1);
+uint64_t threadControl(ker::abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3);
 }  // namespace ker::syscall::multiproc

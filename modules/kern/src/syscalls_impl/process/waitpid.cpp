@@ -12,7 +12,7 @@ namespace ker::syscall::process {
 // Fill POSIX struct rusage with the child's timing data (ru_utime and ru_stime only).
 // rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
 static void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
-    if (rusage_phys_addr == 0) return;
+    if (rusage_phys_addr == 0 || rusage_phys_addr == ker::mod::mm::virt::PADDR_INVALID) return;
     auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::getVirtPointer(rusage_phys_addr));
     ru->ru_utime_sec  = (int64_t)(child->user_time_us / 1000000ULL);
     ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
@@ -79,13 +79,17 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         // No exited child yet — block until SIGCHLD wakes us
         currentTask->waitingForPid = WAIT_ANY_CHILD;
         if (status != nullptr) {
-            currentTask->waitStatusPhysAddr = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
+            uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
+            currentTask->waitStatusPhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
         } else {
             currentTask->waitStatusPhysAddr = 0;
         }
-        currentTask->waitRusagePhysAddr = (rusage_vaddr != 0)
-            ? ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr)
-            : 0;
+        if (rusage_vaddr != 0) {
+            uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
+            currentTask->waitRusagePhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+        } else {
+            currentTask->waitRusagePhysAddr = 0;
+        }
 
         currentTask->deferredTaskSwitch = true;
         return 0;
@@ -140,13 +144,17 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     currentTask->waitingForPid = pid;
     // May be different pagemap so store physical address
     if (status != nullptr) {
-        currentTask->waitStatusPhysAddr = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
+        uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
+        currentTask->waitStatusPhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
     } else {
         currentTask->waitStatusPhysAddr = 0;
     }
-    currentTask->waitRusagePhysAddr = (rusage_vaddr != 0)
-        ? ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr)
-        : 0;
+    if (rusage_vaddr != 0) {
+        uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
+        currentTask->waitRusagePhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+    } else {
+        currentTask->waitRusagePhysAddr = 0;
+    }
 
     // Set the deferred task switch flag - the task will be moved to wait queue after syscall returns
     currentTask->deferredTaskSwitch = true;

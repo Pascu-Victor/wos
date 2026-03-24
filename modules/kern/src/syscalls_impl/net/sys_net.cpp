@@ -584,8 +584,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
             }
 
-            // No events and no signals: return WOS_ERESTARTSYS (512) so the
-            // mlibc sysdep layer retries.  Distinct from EAGAIN (11).
+            // No events and no signals: yield CPU before returning so mlibc's
+            // retry loop doesn't spin at 100% doing millions of syscalls/second.
+            ker::mod::sched::kern_yield();
             return static_cast<uint64_t>(-512);
         }
 

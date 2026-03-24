@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -1076,6 +1077,42 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return ret;
     }
 
+    if (mount->fs_type == FSType::DEVFS) {
+        size_t mount_len = 0;
+        while (mount->path[mount_len] != '\0') {
+            mount_len++;
+        }
+
+        const char* fs_path = absPath;
+        if (mount_len == 1 && mount->path[0] == '/') {
+            fs_path = absPath + 1;
+        } else if (absPath[mount_len] == '/') {
+            fs_path = absPath + mount_len + 1;
+        } else {
+            fs_path = absPath + mount_len;
+        }
+
+        auto* f = ker::vfs::devfs::devfs_open_path(fs_path, 0, 0);
+        if (f == nullptr) {
+            return -ENOENT;
+        }
+
+        if (f->fops == nullptr || f->fops->vfs_readlink == nullptr) {
+            if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
+                f->fops->vfs_close(f);
+            }
+            ker::mod::mm::dyn::kmalloc::free(f);
+            return -ENOSYS;
+        }
+
+        ssize_t ret = f->fops->vfs_readlink(f, buf, bufsize);
+        if (f->fops->vfs_close != nullptr) {
+            f->fops->vfs_close(f);
+        }
+        ker::mod::mm::dyn::kmalloc::free(f);
+        return ret;
+    }
+
     if (mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
@@ -1568,35 +1605,49 @@ auto vfs_unlink(const char* path) -> int {
     if (path == nullptr) return -EINVAL;
 
     // Resolve relative path and canonicalize
-    char pathBuf[MAX_PATH_LEN];
-    if (make_absolute(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(pathBuf, MAX_PATH_LEN);
+    char path_buf[MAX_PATH_LEN];
+    if (make_absolute(path, path_buf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    canonicalize_path(path_buf, MAX_PATH_LEN);
 
-    MountPoint* mount = find_mount_point(pathBuf);
+    MountPoint* mount = find_mount_point(path_buf);
     if (mount == nullptr) return -ENOENT;
+
+    if (mount->fs_type == FSType::XFS) {
+        // Strip mount prefix for XFS
+        size_t mount_len = std::strlen(mount->path);
+        const char* fs_path = path_buf;
+        if (mount_len == 1 && mount->path[0] == '/') {
+            fs_path = path_buf + 1;
+        } else if (path_buf[mount_len] == '/') {
+            fs_path = path_buf + mount_len + 1;
+        } else {
+            fs_path = path_buf + mount_len;
+        }
+        return ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+    }
 
     if (mount->fs_type == FSType::FAT32) {
         // Strip mount prefix for FAT32
         size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = pathBuf;
+        const char* fs_path = path_buf;
         if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = pathBuf + 1;
-        else if (pathBuf[mount_len] == '/')
-            fs_path = pathBuf + mount_len + 1;
+            fs_path = path_buf + 1;
+        else if (path_buf[mount_len] == '/')
+            fs_path = path_buf + mount_len + 1;
         else
-            fs_path = pathBuf + mount_len;
+            fs_path = path_buf + mount_len;
         return ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
     if (mount->fs_type == FSType::REMOTE) {
         size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = pathBuf;
+        const char* fs_path = path_buf;
         if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = pathBuf + 1;
-        else if (pathBuf[mount_len] == '/')
-            fs_path = pathBuf + mount_len + 1;
+            fs_path = path_buf + 1;
+        else if (path_buf[mount_len] == '/')
+            fs_path = path_buf + mount_len + 1;
         else
-            fs_path = pathBuf + mount_len;
+            fs_path = path_buf + mount_len;
         return ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
     }
 
@@ -1604,13 +1655,13 @@ auto vfs_unlink(const char* path) -> int {
 
     // Strip mount prefix
     size_t mount_len = std::strlen(mount->path);
-    const char* fs_path = pathBuf;
+    const char* fs_path = path_buf;
     if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = pathBuf + 1;
-    } else if (pathBuf[mount_len] == '/') {
-        fs_path = pathBuf + mount_len + 1;
+        fs_path = path_buf + 1;
+    } else if (path_buf[mount_len] == '/') {
+        fs_path = path_buf + mount_len + 1;
     } else {
-        fs_path = pathBuf + mount_len;
+        fs_path = path_buf + mount_len;
     }
 
     // Walk to parent, then find child
@@ -2125,7 +2176,7 @@ static void pipe_wake_readers(PipeState* st) {
         size_t to_read = st->reader_info[i].requested;
         if (to_read > st->count) to_read = st->count;
 
-        if (to_read > 0 && st->reader_info[i].bufPhysAddr != 0) {
+        if (to_read > 0 && st->reader_info[i].bufPhysAddr != 0 && st->reader_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
             auto* dst = reinterpret_cast<char*>(ker::mod::mm::addr::getVirtPointer(st->reader_info[i].bufPhysAddr));
             for (size_t j = 0; j < to_read; j++) {
                 dst[j] = st->buf[st->tail];
@@ -2148,14 +2199,16 @@ static void pipe_wake_readers(PipeState* st) {
 static void pipe_wake_writers(PipeState* st) {
     for (uint64_t i = 0; i < st->writers_count; i++) {
         auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->writers_waiting[i]);
-        if (waiter == nullptr) continue;
+        if (waiter == nullptr) {
+            continue;
+        }
 
         size_t avail = st->capacity - st->count;
         size_t to_write = st->writer_info[i].requested;
-        if (to_write > avail) to_write = avail;
+        to_write = std::min(to_write, avail);
 
-        if (to_write > 0 && st->writer_info[i].bufPhysAddr != 0) {
-            auto* src = reinterpret_cast<const char*>(ker::mod::mm::addr::getVirtPointer(st->writer_info[i].bufPhysAddr));
+        if (to_write > 0 && st->writer_info[i].bufPhysAddr != 0 && st->writer_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
+            const auto* src = reinterpret_cast<const char*>(ker::mod::mm::addr::getVirtPointer(st->writer_info[i].bufPhysAddr));
             for (size_t j = 0; j < to_write; j++) {
                 st->buf[st->head] = src[j];
                 st->head = (st->head + 1) % st->capacity;
@@ -2165,8 +2218,8 @@ static void pipe_wake_writers(PipeState* st) {
 
         waiter->context.regs.rax = to_write;
 
-        uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
-        ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
+        uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
         waiter->release();
     }
     st->writers_count = 0;
@@ -2712,7 +2765,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     }
 
     // Allocate buffer for reading/writing
-    constexpr size_t BUF_SIZE = 65536;  // 64KB buffer
+    constexpr size_t BUF_SIZE = 4UL * 1024UL * 1024UL;  // 4MB buffer — large enough for AHCI max DMA (32MB cap)
     auto* buffer = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
     if (buffer == nullptr) {
         return -ENOMEM;

@@ -1,5 +1,7 @@
 #include "phys.hpp"
 
+#include <extern/limine.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -12,7 +14,6 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 
-#include "limine.h"
 #include "page_alloc.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
@@ -43,6 +44,14 @@ struct PerCpuPageCache {
 };
 
 // Debug spinlock for memlock — records holder CR3, CPU, and caller RIP
+__attribute__((section(".data"))) paging::PageZone* zones = nullptr;
+__attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // Dedicated zone for huge allocations
+
+// Per-CPU caches (initialized in init())
+static PerCpuPageCache* perCpuCaches = nullptr;
+static size_t numCpus = 0;
+static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures are initialized
+
 struct TrackedSpinlock {
     std::atomic<bool> locked{false};
     volatile uint64_t holder_cr3 = 0;
@@ -65,7 +74,7 @@ struct TrackedSpinlock {
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
         holder_cr3 = cr3;
         holder_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-        holder_cpu = apic::getApicId();
+        holder_cpu = perCpuReady.load(std::memory_order_acquire) ? cpu::currentCpu() : apic::getApicId();
         return flags;
     }
 
@@ -83,13 +92,6 @@ struct TrackedSpinlock {
 };
 
 TrackedSpinlock memlock;  // Global lock for zone list and large allocations
-__attribute__((section(".data"))) paging::PageZone* zones = nullptr;
-__attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // Dedicated zone for huge allocations
-
-// Per-CPU caches (initialized in init())
-static PerCpuPageCache* perCpuCaches = nullptr;
-static size_t numCpus = 0;
-static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures are initialized
 
 // Per-CPU cache deferred initialization info
 static uint64_t perCpuCachesPhysBase = 0;

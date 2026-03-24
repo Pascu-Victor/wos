@@ -6,6 +6,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
@@ -51,7 +52,12 @@ size_t cdc_count = 0;
 auto virt_to_phys(void* v) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(v);
     if (addr >= 0xffffffff80000000ULL) {
-        return ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+            ker::mod::dbg::log("cdc_ether: virt_to_phys failed for kernel address 0x%lx", addr);
+            hcf();
+        }
+        return phys;
     }
     return reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(addr));
 }

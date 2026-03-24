@@ -40,7 +40,7 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
             } else {
                 if (!currentPagemap) return false;
                 phys = ker::mod::mm::virt::translate(currentPagemap, (ker::mod::mm::addr::vaddr_t)(src_addr + copied));
-                if (phys == 0) break;  // unmapped - stop copying
+                if (phys == ker::mod::mm::virt::PADDR_INVALID) break;  // unmapped - stop copying
                 dest[copied] = *(const char*)ker::mod::mm::addr::getVirtPointer(phys);
             }
             if (dest[copied] == '\0') {

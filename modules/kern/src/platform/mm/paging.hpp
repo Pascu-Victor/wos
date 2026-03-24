@@ -58,6 +58,8 @@ struct PageFault {
 const static uint64_t PAGE_PRESENT = 0x1;
 const static uint64_t PAGE_WRITE = 0x2;
 const static uint64_t PAGE_USER = 0x4;
+const static uint64_t PAGE_PWT = 0x8;   // Page Write-Through
+const static uint64_t PAGE_PCD = 0x10;  // Page Cache Disable (uncacheable)
 const static uint64_t PAGE_NX = (1ULL << 63);
 
 // COW (Copy-on-Write) flag: stored in PTE bit 9 (first "available" OS bit).
@@ -69,6 +71,10 @@ const static uint64_t READONLY = PAGE_PRESENT;
 const static uint64_t KERNEL = PAGE_PRESENT | PAGE_WRITE;
 const static uint64_t USER = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
 const static uint64_t USER_READONLY = PAGE_PRESENT | PAGE_USER;
+// Uncacheable MMIO mapping: PWT+PCD force strong uncacheable ordering so
+// KVM/EPT handles accesses natively instead of routing through the software
+// emulator (which cannot decode VEX/BMI2 instructions).
+const static uint64_t MMIO = PAGE_PRESENT | PAGE_WRITE | PAGE_PWT | PAGE_PCD;
 }  // namespace pageTypes
 
 namespace errorFlags {

@@ -2,12 +2,24 @@
 
 #include <sys/times.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <ctime>
 #include <platform/ktime/ktime.hpp>
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/tsc/tsc.hpp>
 
+#include "abi/callnums/time.h"
 #include "bits/posix/timeval.h"
+#include "platform/dbg/dbg.hpp"
+
+struct itimerval {
+    struct timeval it_interval;
+    struct timeval it_value;
+};
+
+static constexpr int ITIMER_REAL = 0;
 
 // CLK_TCK for times() return values — must match userspace sysconf(_SC_CLK_TCK)
 static constexpr uint64_t WOS_CLK_TCK = 100;
@@ -67,10 +79,21 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             }
             const auto* req = reinterpret_cast<const struct timespec*>(arg1);
             uint64_t sleep_us = ((uint64_t)req->tv_sec * 1000000ULL) + ((uint64_t)req->tv_nsec / 1000ULL);
-            uint64_t start = ker::mod::time::getUs();
-            // Yield-based sleep loop
-            while (ker::mod::time::getUs() - start < sleep_us) {
-                ker::mod::sched::kern_yield();
+            if (sleep_us > 0) {
+                auto* task = ker::mod::sched::get_current_task();
+                if (task != nullptr) {
+                    // Set wake deadline and use deferredTaskSwitch to properly block
+                    // (move to wait list). The timer tick wakeup scan will reschedule us
+                    // once wakeAtUs is reached.
+                    task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
+                    task->deferredTaskSwitch = true;
+                    // Return 0 now — syscall exit path sees deferredTaskSwitch=true,
+                    // moves task to wait list, switches to next task.
+                } else {
+                    // Pre-scheduler fallback: spin-wait
+                    uint64_t start = ker::mod::time::getUs();
+                    while (ker::mod::time::getUs() - start < sleep_us) {}
+                }
             }
             // Set remaining to zero
             if (arg2 != nullptr) {
@@ -100,6 +123,68 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 auto* out = (long*)arg2;
                 *out = (long)us_to_ticks(ker::mod::time::getUs());
             }
+            return 0;
+        }
+
+        case ker::abi::sys_time_ops::setitimer: {
+            // arg1 = which (as uintptr_t), arg2 = const itimerval* new_value
+            // old_value is not passed through this 2-arg path; mlibc reads it
+            // via getitimer before calling setitimer if it needs the old value.
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return (uint64_t)-ESRCH;
+            }
+
+            int which = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            if (which != 0 /* ITIMER_REAL */) {
+                return (uint64_t)-EINVAL;
+            }
+
+            const auto* nv = reinterpret_cast<const itimerval*>(arg2);
+            if (nv == nullptr) {
+                return (uint64_t)-EFAULT;
+            }
+
+            uint64_t new_val_us = ((uint64_t)nv->it_value.tv_sec * 1000000ULL) + (uint64_t)nv->it_value.tv_usec;
+            uint64_t new_interval_us = ((uint64_t)nv->it_interval.tv_sec * 1000000ULL) + (uint64_t)nv->it_interval.tv_usec;
+
+            if (new_val_us == 0) {
+                task->itimer_real_expire_us = 0;
+                task->itimer_real_interval_us = 0;
+            } else {
+                task->itimer_real_expire_us = ker::mod::time::getUs() + new_val_us;
+                task->itimer_real_interval_us = new_interval_us;
+            }
+            return 0;
+        }
+
+        case ker::abi::sys_time_ops::getitimer: {
+            // arg1 = which (as uintptr_t), arg2 = itimerval* curr_value
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return (uint64_t)-ESRCH;
+            }
+
+            int which = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            if (which != 0 /* ITIMER_REAL */) {
+                return (uint64_t)-EINVAL;
+            }
+
+            auto* cv = reinterpret_cast<itimerval*>(arg2);
+            if (cv == nullptr) {
+                return (uint64_t)-EFAULT;
+            }
+
+            uint64_t now_us = ker::mod::time::getUs();
+            uint64_t remain_us = 0;
+            if (task->itimer_real_expire_us != 0 && task->itimer_real_expire_us > now_us) {
+                remain_us = task->itimer_real_expire_us - now_us;
+            }
+
+            cv->it_value.tv_sec = (long)(remain_us / 1000000ULL);
+            cv->it_value.tv_usec = (long)(remain_us % 1000000ULL);
+            cv->it_interval.tv_sec = (long)(task->itimer_real_interval_us / 1000000ULL);
+            cv->it_interval.tv_usec = (long)(task->itimer_real_interval_us % 1000000ULL);
             return 0;
         }
 

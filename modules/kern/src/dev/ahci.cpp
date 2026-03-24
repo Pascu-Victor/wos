@@ -5,6 +5,7 @@
 
 #include "ahci.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -18,9 +19,11 @@
 
 #include "block_device.hpp"
 #include "pci.hpp"
-#include "platform/mm/addr.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sys/spinlock.hpp"
+#ifdef AHCI_BENCH
+#include "platform/tsc/tsc.hpp"
+#endif
 
 namespace ker::dev::ahci {
 
@@ -163,8 +166,7 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     stop_cmd(port);  // Stop command engine
 
     // Get kernel page table for physical address translation
-    auto* kernel_pt =
-        (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer((uint64_t)ker::mod::mm::virt::getKernelPageTable());
+    auto* kernel_pt = ker::mod::mm::virt::getKernelPagemap();
 
     // Command list offset: 1K*portno
     // Command list entry size = 32 bytes
@@ -173,6 +175,10 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     auto* clb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(1024));
     std::memset(clb_virt, 0, 1024);
     uint64_t clb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(clb_virt));
+    if (clb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+        ker::mod::dbg::log("ahci: failed to translate CLB kernel allocation");
+        hcf();
+    }
     port->clb = static_cast<uint32_t>(clb_phys & UINT32_MAX);
     port->clbu = static_cast<uint32_t>((clb_phys >> 32) & UINT32_MAX);
 
@@ -184,6 +190,10 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     auto* fb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(256));
     std::memset(fb_virt, 0, 256);
     uint64_t fb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(fb_virt));
+    if (fb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+        ker::mod::dbg::log("ahci: failed to translate FIS buffer kernel allocation");
+        hcf();
+    }
     port->fb = static_cast<uint32_t>(fb_phys & UINT32_MAX);
     port->fbu = static_cast<uint32_t>((fb_phys >> 32) & UINT32_MAX);
 
@@ -194,12 +204,17 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     // Command table size = 256*32 = 8K per port
     auto* cmdheader = reinterpret_cast<HBA_CMD_HEADER*>(clb_virt);
     for (int i = 0; i < 32; i++) {
-        cmdheader[i].prdtl = 8;  // 8 prdt entries per command table
-                                 // 256 bytes per command table, 64+16+48+16*8
-        // Command table offset: 40K + 8K*portno + cmdheader_index*256
-        auto* ctb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(256));
-        std::memset(ctb_virt, 0, 256);
+        // Command table: 128B fixed header + 8192 × 16B PRDT entries = 131200 bytes.
+        // 8192 entries × 4KB/page = 32MB per command (ATA sector count is 16-bit = 32MB max).
+        constexpr size_t CTB_SIZE = 128 + (8192 * sizeof(HBA_PRDT_ENTRY));
+        cmdheader[i].prdtl = 8192;
+        auto* ctb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(CTB_SIZE));
+        std::memset(ctb_virt, 0, CTB_SIZE);
         uint64_t ctb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(ctb_virt));
+        if (ctb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+            ker::mod::dbg::log("ahci: failed to translate CTB kernel allocation");
+            hcf();
+        }
         cmdheader[i].ctba = static_cast<uint32_t>(ctb_phys & UINT32_MAX);
         cmdheader[i].ctbau = static_cast<uint32_t>((ctb_phys >> 32) & UINT32_MAX);
 
@@ -255,41 +270,63 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
     }
 
-    // Get kernel page table for physical address translation
-    auto* kernel_pt =
-        (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer((uint64_t)ker::mod::mm::virt::getKernelPageTable());
+    // Use the current task's page table for buffer translation so that both
+    // kernel and userspace buffer pointers are resolved correctly.
+    // If no task is running (early boot / kernel thread), fall back to the kernel page table.
+    ker::mod::mm::paging::PageTable* active_pt = nullptr;
+    {
+        ker::mod::sched::task::Task* cur_task = nullptr;
+        if (ker::mod::sched::has_run_queues()) {
+            cur_task = ker::mod::sched::get_current_task();
+        }
+        if (cur_task != nullptr && cur_task->pagemap != nullptr) {
+            active_pt = cur_task->pagemap;
+        } else {
+            active_pt = ker::mod::mm::virt::getKernelPagemap();
+        }
+    }
 
     // Get command header using stored virtual address
     HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
 
-    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);         // Command FIS size
-    cmdheader->w = write_op ? 1 : 0;                                 // Write flag
-    cmdheader->prdtl = static_cast<uint16_t>((count - 1) >> 4) + 1;  // PRDT entries count
+    // Each PRDT entry covers one 4K page (physically translated individually).
+    // Command table: 128B header + 8192 × 16B PRDT entries.
+    constexpr uint32_t SECTORS_PER_PAGE = 4096 / 512;  // 8 sectors per 4K page
+    constexpr size_t MAX_PRDT = 8192;
 
-    // Get command table using stored virtual address
+    // count is in 512-byte sectors; pages needed (round up), capped to PRDT capacity
+    uint32_t pages = (count + SECTORS_PER_PAGE - 1) / SECTORS_PER_PAGE;
+    pages = std::min(pages, static_cast<uint32_t>(MAX_PRDT));
+
     auto* cmdtbl = reinterpret_cast<HBA_CMD_TBL*>(port_memory[portno].ctb_virt[slot]);
-    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + ((cmdheader->prdtl - 1) * sizeof(HBA_PRDT_ENTRY)));
+    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + ((pages - 1) * sizeof(HBA_PRDT_ENTRY)));
 
-    // Get physical address of buffer
-    uint64_t buf_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(buf));
-
-    // 8K bytes (16 sectors) per PRDT
     uint32_t remaining_sectors = count;
-    size_t i = 0;
-    for (; i < cmdheader->prdtl - 1; i++) {
-        cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
-        cmdtbl->prdt_entry[i].dbau = static_cast<uint32_t>((buf_phys >> 32) & UINT32_MAX);
-        cmdtbl->prdt_entry[i].dbc = (8 * 1024) - 1;  // 8K bytes
+    auto buf_virt = reinterpret_cast<uint64_t>(buf);
+    for (size_t i = 0; i < pages; i++) {
+        uint32_t secs = (remaining_sectors < SECTORS_PER_PAGE) ? remaining_sectors : SECTORS_PER_PAGE;
+        uint64_t phys = ker::mod::mm::virt::translate(active_pt, buf_virt);
+        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+            // Page not mapped — refuse to DMA into unmapped memory
+            if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+                port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+                port_locks[portno].unlock();
+            }
+            return false;
+        }
+        cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(phys & UINT32_MAX);
+        cmdtbl->prdt_entry[i].dbau = static_cast<uint32_t>((phys >> 32) & UINT32_MAX);
+        cmdtbl->prdt_entry[i].dbc = (secs * 512) - 1;
         cmdtbl->prdt_entry[i].i = 1;
-        buf_phys += 4 * 1024 * 2;  // 4K words = 8K bytes
-        remaining_sectors -= 16;   // 16 sectors
+        buf_virt += 4096;
+        remaining_sectors -= secs;
     }
 
-    // Last entry
-    cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
-    cmdtbl->prdt_entry[i].dbau = static_cast<uint32_t>((buf_phys >> 32) & UINT32_MAX);
-    cmdtbl->prdt_entry[i].dbc = (remaining_sectors << 9) - 1;  // 512 bytes per sector
-    cmdtbl->prdt_entry[i].i = 1;
+    uint32_t actual_count = count - remaining_sectors;  // sectors actually covered by PRDT
+    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmdheader->w = write_op ? 1 : 0;
+    cmdheader->prdtl = static_cast<uint16_t>(pages);
+    (void)actual_count;  // FIS count fields use 'count' — caller must ensure count <= MAX_PRDT*8
 
     // Setup command FIS
     auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
@@ -325,6 +362,9 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     }
 
     // Issue command
+#ifdef AHCI_BENCH
+    uint64_t t_issue = ker::mod::tsc::getNs();
+#endif
     port->ci = 1 << slot;
 
     // Release lock after issuing command - the slot is now ours and we just need to wait
@@ -368,6 +408,26 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         return false;
     }
 
+#ifdef AHCI_BENCH
+    {
+        uint64_t t_done = ker::mod::tsc::getNs();
+        static std::atomic<uint64_t> s_cmd_count{0};
+        static std::atomic<uint64_t> s_total_ns{0};
+        static std::atomic<uint64_t> s_total_sectors{0};
+        uint64_t n = s_cmd_count.fetch_add(1, std::memory_order_relaxed);
+        s_total_ns.fetch_add(t_done - t_issue, std::memory_order_relaxed);
+        s_total_sectors.fetch_add(count, std::memory_order_relaxed);
+        if ((n & 63) == 63) {
+            uint64_t total_ns = s_total_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t total_sec = s_total_sectors.exchange(0, std::memory_order_relaxed);
+            uint64_t avg_us = total_ns / (64ULL * 1000ULL);
+            uint64_t mbps = total_sec == 0 ? 0 : (total_sec * 512 * 1000) / (total_ns == 0 ? 1 : total_ns);
+            ker::mod::dbg::log("[AHCI bench] cmd#%lu: avg_latency=%luus throughput~%luMB/s (last 64 cmds, %lu sectors)\n",
+                               (unsigned long)n, (unsigned long)avg_us, (unsigned long)mbps, (unsigned long)total_sec);
+        }
+    }
+#endif
+
     // Clear the software slot tracking on success
     if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
         port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
@@ -376,14 +436,42 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     return true;
 }
 
-// Read sectors from disk
+// Max sectors per AHCI command: 512 PRDT entries × 8 sectors/page = 4096 sectors (2 MB)
+// 8192 PRDT entries × 8 sectors/page = 65536, capped at 65535 (ATA 16-bit sector count)
+constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 65535;
+
+// Read sectors from disk — splits large requests into per-command chunks
 auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
-    return read_write_disk(port, portno, startl, starth, count, buf, false);
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t chunk = count - done;
+        chunk = std::min(chunk, AHCI_MAX_SECTORS_PER_CMD);
+        uint64_t lba = (static_cast<uint64_t>(starth) << 32) | startl;
+        lba += done;
+        if (!read_write_disk(port, portno, static_cast<uint32_t>(lba & 0xFFFFFFFFU), static_cast<uint32_t>(lba >> 32), chunk,
+                             buf + (done * 512UL), false)) {
+            return false;
+        }
+        done += chunk;
+    }
+    return true;
 }
 
-// Write sectors to disk
+// Write sectors to disk — splits large requests into per-command chunks
 auto write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
-    return read_write_disk(port, portno, startl, starth, count, buf, true);
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t chunk = count - done;
+        chunk = std::min(chunk, AHCI_MAX_SECTORS_PER_CMD);
+        uint64_t lba = (static_cast<uint64_t>(starth) << 32) | startl;
+        lba += done;
+        if (!read_write_disk(port, portno, static_cast<uint32_t>(lba & 0xFFFFFFFFU), static_cast<uint32_t>(lba >> 32), chunk,
+                             buf + (done * 512UL), true)) {
+            return false;
+        }
+        done += chunk;
+    }
+    return true;
 }
 
 // Flush volatile write cache to non-volatile storage
@@ -562,9 +650,12 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
     }
     std::memset(id_buf, 0, 512);
 
-    auto* kernel_pt =
-        (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::getVirtPointer((uint64_t)ker::mod::mm::virt::getKernelPageTable());
+    auto* kernel_pt = ker::mod::mm::virt::getKernelPagemap();
     uint64_t buf_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(id_buf));
+    if (buf_phys == ker::mod::mm::virt::PADDR_INVALID) {
+        ker::mod::dbg::log("ahci: failed to translate identify buffer");
+        hcf();
+    }
 
     HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
     cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);

@@ -1,21 +1,29 @@
 #include "virt.hpp"
 
+#include <extern/limine.h>
+
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 
+#include "mod/io/serial/serial.hpp"
+#include "platform/asm/cpu.hpp"
+#include "platform/asm/tlb.hpp"
 #include "platform/dbg/coredump.hpp"
+#include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
+#include "platform/mm/phys.hpp"
+#include "util/hcf.hpp"
 namespace ker::mod::mm::virt {
 static paging::PageTable* kernelPagemap;
 
 static limine_memmap_response* memmapResponse;
-static limine_kernel_file_response* kernelFileResponse;
-static limine_kernel_address_response* kernelAddressResponse;
+static limine_executable_file_response* kernelFileResponse;
+static limine_executable_address_response* kernelAddressResponse;
 
-void init(limine_memmap_response* _memmapResponse, limine_kernel_file_response* _kernelFileResponse,
-          limine_kernel_address_response* _kernelAddressResponse) {
+void init(limine_memmap_response* _memmapResponse, limine_executable_file_response* _kernelFileResponse,
+          limine_executable_address_response* _kernelAddressResponse) {
     memmapResponse = _memmapResponse;
     kernelFileResponse = _kernelFileResponse;
     kernelAddressResponse = _kernelAddressResponse;
@@ -55,7 +63,12 @@ void switchPagemap(sched::task::Task* t) {
     dbg::log("switchPagemap: task=%s pid=%d virt=0x%x phys=0x%x", (t->name != nullptr) ? t->name : "unknown", t->pid,
              (unsigned int)(uintptr_t)t->pagemap, (unsigned int)phys_pagemap);
 #endif
-    wrcr3(phys_pagemap);
+    // Skip CR3 write if the pagemap hasn't changed (e.g. switching between threads
+    // of the same process). Writing CR3 flushes the entire TLB which is very
+    // expensive for large working sets.
+    if (rdcr3() != phys_pagemap) {
+        wrcr3(phys_pagemap);
+    }
 }
 
 // Helper: get the raw uint64_t value of a PTE
@@ -178,14 +191,19 @@ paddr_t translate(PageTable* pageTable, vaddr_t vaddr) {
 
     PageTable* table = pageTable;
     for (int i = 4; i > 1; i--) {
-        uint64_t phys = table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT;
-        table = (PageTable*)(phys + 0xffff800000000000ULL);  // Use HHDM for page table walk
-        if ((uint64_t)table == 0xffff800000000000ULL) {
-            return 0;
+        const auto& entry = table->entries[index_of(vaddr, i)];
+        if (!entry.present) {
+            return PADDR_INVALID;
         }
+        uint64_t phys = entry.frame << paging::PAGE_SHIFT;
+        table = (PageTable*)(phys + 0xffff800000000000ULL);  // Use HHDM for page table walk
     }
 
-    uint64_t phys = (table->entries[index_of(vaddr, 1)].frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
+    const auto& pte = table->entries[index_of(vaddr, 1)];
+    if (!pte.present) {
+        return PADDR_INVALID;
+    }
+    uint64_t phys = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
     return phys;  // Return physical address only
 }
 void initPagemap() {
@@ -231,7 +249,7 @@ void initPagemap() {
                 std::strncpy(typeBuf, bootloaderReclaimableStr, sizeof(bootloaderReclaimableStr));
                 break;
             }
-            case LIMINE_MEMMAP_KERNEL_AND_MODULES: {
+            case LIMINE_MEMMAP_EXECUTABLE_AND_MODULES: {
                 constexpr char kernelAndModulesStr[] = "KERNEL_AND_MODULES";
                 std::strncpy(typeBuf, kernelAndModulesStr, sizeof(kernelAndModulesStr));
                 break;
@@ -277,7 +295,7 @@ void initPagemap() {
                     entry->base + j * paging::PAGE_SIZE,                        // physical address
                     entry->type == LIMINE_MEMMAP_RESERVED                       // reserved memory
                             || entry->type == LIMINE_MEMMAP_BAD_MEMORY          // bad memory
-                            || entry->type == LIMINE_MEMMAP_KERNEL_AND_MODULES  // kernel and modules
+                            || entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES  // kernel and modules
                         ? paging::pageTypes::READONLY                           // becomes read-only
                         : paging::pageTypes::KERNEL                             // otherwise kernel memory
             );
@@ -294,7 +312,7 @@ void initPagemap() {
     io::serial::writeHex(totalPagesMapped);
     io::serial::write("\n");
 
-    for (size_t i = 0; i <= kernelFileResponse->kernel_file->size; i++) {
+    for (size_t i = 0; i <= kernelFileResponse->executable_file->size; i++) {
         vaddr_t vaddr = kernelAddressResponse->virtual_base + i * paging::PAGE_SIZE;
         mapPage(kernelPagemap,
                 vaddr,                                                         // virtual address

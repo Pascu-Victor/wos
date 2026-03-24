@@ -1,12 +1,14 @@
 #include "rsdp.hpp"
 
+#include <cstdint>
+
 namespace ker::mod::acpi::rsdp {
 static bool hasXsdt = false;
 static Rsdp rsdp;
 
-void validateChecksum(const Rsdp *rsdp) {
+void validateChecksum(const Rsdp* rsdp) {
     uint8_t sum = 0;
-    uint8_t *ptr = (uint8_t *)rsdp;
+    uint8_t* ptr = (uint8_t*)rsdp;
 
     for (size_t i = 0; i < 20; i++) {
         sum += *ptr++;
@@ -21,8 +23,8 @@ void validateChecksum(const Rsdp *rsdp) {
 bool useXsdt(void) { return hasXsdt; }
 
 void init(uint64_t rsdpAddr) {
+    rsdp = *(Rsdp*)rsdpAddr;
     validateChecksum(&rsdp);
-    rsdp = *(Rsdp *)mm::addr::getVirtPointer(rsdpAddr);
     rsdp.oem_id[5] = 0;
     // TODO: log stuff
 

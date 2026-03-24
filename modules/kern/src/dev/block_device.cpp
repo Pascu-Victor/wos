@@ -115,7 +115,9 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
     }
 
     if (block + count > bdev->total_blocks) {
-        mod::io::serial::write("block_read: read past end of device\n");
+        mod::dbg::log("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p\n",
+                      (unsigned long)block, (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0),
+                      __builtin_return_address(1));
         return -1;
     }
 
@@ -133,7 +135,9 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
     }
 
     if (block + count > bdev->total_blocks) {
-        mod::io::serial::write("block_write: write past end of device\n");
+        mod::dbg::log("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p\n",
+                      (unsigned long)block, (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0),
+                      __builtin_return_address(1));
         return -1;
     }
 

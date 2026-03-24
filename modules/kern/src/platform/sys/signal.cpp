@@ -26,22 +26,22 @@ static constexpr int WOS_SIGCONT = 18;
 //   0x00=r15, 0x08=r14, 0x10=r13, 0x18=r12, 0x20=r11, 0x28=r10,
 //   0x30=r9,  0x38=r8,  0x40=rbp, 0x48=rdi, 0x50=rsi, 0x58=rdx,
 //   0x60=rcx, 0x68=rbx, 0x70=rax, 0x78=return_value
-#define STACK_OFF_R15 0x00
-#define STACK_OFF_R14 0x08
-#define STACK_OFF_R13 0x10
-#define STACK_OFF_R12 0x18
-#define STACK_OFF_R11 0x20
-#define STACK_OFF_R10 0x28
-#define STACK_OFF_R9 0x30
-#define STACK_OFF_R8 0x38
-#define STACK_OFF_RBP 0x40
-#define STACK_OFF_RDI 0x48
-#define STACK_OFF_RSI 0x50
-#define STACK_OFF_RDX 0x58
-#define STACK_OFF_RCX 0x60
-#define STACK_OFF_RBX 0x68
-#define STACK_OFF_RAX 0x70
-#define STACK_OFF_RETVAL 0x78
+constexpr auto STACK_OFF_R15 = 0x00;
+constexpr auto STACK_OFF_R14 = 0x08;
+constexpr auto STACK_OFF_R13 = 0x10;
+constexpr auto STACK_OFF_R12 = 0x18;
+constexpr auto STACK_OFF_R11 = 0x20;
+constexpr auto STACK_OFF_R10 = 0x28;
+constexpr auto STACK_OFF_R9 = 0x30;
+constexpr auto STACK_OFF_R8 = 0x38;
+constexpr auto STACK_OFF_RBP = 0x40;
+constexpr auto STACK_OFF_RDI = 0x48;
+constexpr auto STACK_OFF_RSI = 0x50;
+constexpr auto STACK_OFF_RDX = 0x58;
+constexpr auto STACK_OFF_RCX = 0x60;
+constexpr auto STACK_OFF_RBX = 0x68;
+constexpr auto STACK_OFF_RAX = 0x70;
+constexpr auto STACK_OFF_RETVAL = 0x78;
 
 namespace ker::mod::sys::signal {
 
@@ -148,22 +148,23 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     }
 
     // --- Deliver the signal: set up signal frame on user stack ---
-    uint64_t userRsp = perCpu->userRsp;
-    uint64_t userRip = perCpu->syscallRetRip;
-    uint64_t userRflags = perCpu->syscallRetFlags;
+    uint64_t user_rsp = perCpu->userRsp;
+    uint64_t user_rip = perCpu->syscallRetRip;
+    uint64_t user_rflags = perCpu->syscallRetFlags;
 
-    // Compute frame location on user stack (16-byte aligned)
-    uint64_t frameAddr = (userRsp - sizeof(SignalFrame)) & ~0xFULL;
-    auto* frame = reinterpret_cast<SignalFrame*>(frameAddr);
+    // Compute frame location on user stack. make sure it is 16 byte aligned
+    // for system V compat
+    uint64_t frame_addr = ((user_rsp - sizeof(SignalFrame)) & ~0xFULL) - 8;
+    auto* frame = reinterpret_cast<SignalFrame*>(frame_addr);
 
     // Write the signal frame to user-space stack
     // (We're still in the task's pagemap during syscall, so direct writes work)
     frame->pretcode = handler.restorer;  // sa_restorer trampoline
     frame->signo = static_cast<uint64_t>(signo);
     frame->saved_mask = task->sigMask;
-    frame->saved_rip = userRip;
-    frame->saved_rsp = userRsp;
-    frame->saved_rflags = userRflags;
+    frame->saved_rip = user_rip;
+    frame->saved_rsp = user_rsp;
+    frame->saved_rflags = user_rflags;
     frame->saved_retval = stack_read(stack_base, STACK_OFF_RETVAL);
 
     // Save all 15 GP registers from the stack
@@ -176,7 +177,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     stack_write(stack_base, STACK_OFF_RDI, static_cast<uint64_t>(signo));  // arg1 = signo
 
     // Update PerCpu for the modified return path
-    perCpu->userRsp = frameAddr;              // new user stack (with frame)
+    perCpu->userRsp = frame_addr;             // new user stack (with frame)
     perCpu->syscallRetRip = handler.handler;  // update diagnostic check value
 
     // Block additional signals during handler execution

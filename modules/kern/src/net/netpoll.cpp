@@ -15,6 +15,7 @@ namespace {
 
 // Registry of all NAPI structures for worker thread lookup
 constexpr size_t MAX_NAPI_DEVICES = 16;
+constexpr uint64_t NAPI_IDLE_SLEEP_US = 1000;
 NapiStruct* g_napi_registry[MAX_NAPI_DEVICES] = {};
 size_t g_napi_count = 0;
 ker::mod::sys::Spinlock g_registry_lock;
@@ -65,8 +66,8 @@ void unregister_napi(NapiStruct* napi) {
         asm volatile("cli" ::: "memory");
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
-            // No work: yield and increment idle counter.
-            ker::mod::sched::kern_yield();
+            // No work: truly sleep until the next poll interval or explicit wake.
+            ker::mod::sched::kern_sleep_us(NAPI_IDLE_SLEEP_US);
             idle_wakeups++;
 
             // Fallback: after ~10 idle wakeups, force a poll in case of missed IRQs.
@@ -222,6 +223,7 @@ bool napi_schedule(NapiStruct* napi) {
 
     // Wake the worker thread.
     if (napi->worker != nullptr) {
+        ker::mod::sched::kern_wake(napi->worker);
         if (napi->worker->cpu == ker::mod::cpu::currentCpu()) {
             // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
             // immediate scheduling pass instead of waiting up to 1ms for the

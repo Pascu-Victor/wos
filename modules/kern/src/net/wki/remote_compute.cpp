@@ -1158,8 +1158,9 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
             uint64_t page_off = vaddr & (paging::PAGE_SIZE - 1);
 
             uint64_t page_phys = virt::translate(new_task->pagemap, page_virt);
-            if (page_phys == 0) {
-                return 0;
+            if (page_phys == virt::PADDR_INVALID) {
+                mod::dbg::log("remote_compute: translate failed for stack vaddr 0x%x", page_virt);
+                hcf();
             }
             auto* dest = reinterpret_cast<uint8_t*>(addr::getVirtPointer(page_phys)) + page_off;
             std::memcpy(dest, data, size);
@@ -1178,8 +1179,9 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
             uint64_t page_off = vaddr & (paging::PAGE_SIZE - 1);
 
             uint64_t page_phys = virt::translate(new_task->pagemap, page_virt);
-            if (page_phys == 0) {
-                return 0;
+            if (page_phys == virt::PADDR_INVALID) {
+                mod::dbg::log("remote_compute push_string: translate failed for stack vaddr 0x%x", page_virt);
+                hcf();
             }
             auto* dest = reinterpret_cast<uint8_t*>(addr::getVirtPointer(page_phys)) + page_off;
             std::memcpy(dest, str, len);

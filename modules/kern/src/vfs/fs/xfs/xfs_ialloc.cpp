@@ -153,8 +153,9 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                 }
 
                 // 6. On-disk inode initialization happens via xfs_inode_write() at commit
-
+#ifdef XFS_DEBUG
                 mod::dbg::log("[xfs ialloc] allocated inode %lu (AG %u agino %u)\n", (unsigned long)ino, agno, agino);
+#endif
                 return ino;
             }
         }

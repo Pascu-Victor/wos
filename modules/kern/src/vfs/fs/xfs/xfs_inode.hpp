@@ -24,6 +24,7 @@ namespace ker::vfs::xfs {
 struct XfsIforkExtents {
     XfsBmbtIrec* list;  // decoded extent records (heap-allocated)
     uint32_t count;     // number of extents
+    uint32_t capacity;  // allocated capacity (for amortised growth)
 };
 
 // B+tree root in inode fork (for BTREE format)

@@ -1,5 +1,5 @@
 #pragma once
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <atomic>
 #include <cstdint>
@@ -15,7 +15,7 @@
 
 namespace ker::mod::smt {
 
-using CpuGotoAddr = void (*)(struct limine_smp_info*);
+using CpuGotoAddr = void (*)(struct limine_mp_info*);
 
 struct CpuInfo {
     uint32_t processor_id;
@@ -174,7 +174,7 @@ inline void startCpuTask(uint64_t cpuNo, CpuGotoAddr task, mm::Stack<4096> stack
     __atomic_store_n(cpuData.goto_address, task, __ATOMIC_SEQ_CST);
 }
 
-// Overload accepting a CpuGotoAddr-compatible function (takes limine_smp_info*).
+// Overload accepting a CpuGotoAddr-compatible function (takes limine_mp_info*).
 constexpr void execOnAllCpus(CpuGotoAddr func) {
     auto* initStacks = new mm::Stack<4096>[getCoreCount()];
     for (uint64_t i = 0; i < getCoreCount(); i++) {

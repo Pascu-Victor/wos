@@ -28,7 +28,6 @@
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wki.hpp>
-#include <platform/ntp/ntp.hpp>
 #include <platform/acpi/acpi.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/ioapic/ioapic.hpp>
@@ -40,6 +39,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/ntp/ntp.hpp>
 #include <platform/pic/pic.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -188,9 +188,8 @@ void ipv6_linklocal_init() {
 }
 
 void sse_init() {
-    // Enable SSE instructions and mark CPU ID available for serial output
     mod::cpu::enableSSE();
-    mod::io::serial::markCpuIdAvailable();
+    mod::cpu::enableXSave();
 }
 
 void ntp_init() { mod::ntp::init(); }

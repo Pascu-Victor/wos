@@ -59,6 +59,7 @@ class CoredumpRegisterPanel;
 class CoredumpSegmentPanel;
 class CoredumpMemoryPanel;
 class CoredumpElfPanel;
+class CoredumpDisasmPanel;
 
 namespace wosdbg {
 struct CoreDump;
@@ -236,6 +237,7 @@ class QemuLogViewer : public QMainWindow {
     CoredumpSegmentPanel* segmentPanel_ = nullptr;
     CoredumpMemoryPanel* memoryPanel_ = nullptr;
     CoredumpElfPanel* elfPanel_ = nullptr;
+    CoredumpDisasmPanel* disasmPanel_ = nullptr;
 
     // Coredump state
     std::unique_ptr<wosdbg::CoreDump> currentCoreDump_;

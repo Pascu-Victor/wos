@@ -2336,6 +2336,7 @@ void QemuLogViewer::onTableCellClicked(int row, int column) {
 #include "coredump_memory_panel.h"
 #include "coredump_parser.h"
 #include "coredump_register_panel.h"
+#include "coredump_disasm_panel.h"
 #include "coredump_segment_panel.h"
 #include "elf_symbol_resolver.h"
 
@@ -2389,6 +2390,13 @@ void QemuLogViewer::setupCoredumpPanels() {
     tabifyDockWidget(segmentPanel_, elfPanel_);
     elfPanel_->hide();
 
+    // --- Disassembly panel (right dock, tabified with ELF panel) ---
+    disasmPanel_ = new CoredumpDisasmPanel(this);
+    addDockWidget(Qt::RightDockWidgetArea, disasmPanel_);
+    tabifyDockWidget(elfPanel_, disasmPanel_);
+    disasmPanel_->hide();
+    connect(disasmPanel_, &CoredumpDisasmPanel::addressClicked, this, &QemuLogViewer::onCoredumpAddressClicked);
+
     // --- Memory/Stack panel (bottom dock, tabbed with hex bytes) ---
     memoryPanel_ = new CoredumpMemoryPanel(this);
     addDockWidget(Qt::BottomDockWidgetArea, memoryPanel_);
@@ -2439,6 +2447,10 @@ void QemuLogViewer::openCoredump(const QString& filePath) {
     memoryPanel_->setCoreDump(currentCoreDump_.get(), symTables, sectionMaps);
     memoryPanel_->show();
 
+    disasmPanel_->loadCoreDump(currentCoreDump_.get(), symTables, sectionMaps);
+    disasmPanel_->show();
+    disasmPanel_->raise();
+
     // Auto-dump the stack around RSP
     memoryPanel_->dumpStackAroundRsp();
 
@@ -2460,6 +2472,8 @@ void QemuLogViewer::closeCoredump() {
     elfPanel_->hide();
     memoryPanel_->clear();
     memoryPanel_->hide();
+    disasmPanel_->clear();
+    disasmPanel_->hide();
 
     currentCoreDump_.reset();
     coreDumpSymtab_.reset();

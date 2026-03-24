@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe-stack")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -flto -Wall -Wextra -Werror -fno-sanitize=safe-stack")
 
 # Include paths
 include_directories(
@@ -22,10 +22,11 @@ set(SOURCES
     src/fsbench.cpp
     src/main.cpp
     src/netbench.cpp
-    src/mandelbench/lodepng.c
+    src/perfbench.cpp
+    src/mandelbench/lodepng.cpp
     src/mandelbench/mandelbench.cpp
     src/mandelbench/util.cpp
-    src/mandelbench/tinycthread.c
+    src/mandelbench/tinycthread.cpp
 )
 
 # Create executable

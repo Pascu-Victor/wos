@@ -178,6 +178,8 @@ uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global
 // Internal helpers
 // ============================================================================
 
+void request_local_reschedule();
+
 // Restore kernel GS_BASE before entering idle loop.
 // Ensures cpu::currentCpu() returns the correct CPU index when
 // timer interrupts wake us from idle and call processTasks.
@@ -215,36 +217,150 @@ inline void remove_from_sums(RunQueue* rq, task::Task* t) {
     rq->totalWeightedVruntime -= (t->vruntime - rq->minVruntime) * (int64_t)t->schedWeight;
 }
 
-// Send a scheduler wake IPI to a specific CPU if it's currently idle.
-// This ensures idle CPUs don't sleep up to 10ms before noticing new work.
-void wake_idle_cpu(uint64_t cpu_no) {
-    if (wake_ipi_vector == 0) {
-        return;  // No vector allocated
-    }
-    if (cpu_no == cpu::currentCpu()) {
-        return;  // Don't IPI ourselves
-    }
-    auto* rq = run_queues->thatCpu(cpu_no);
-    if (!rq->isIdle.load(std::memory_order_acquire)) {
-        return;  // Already running
+inline uint32_t compute_effective_load_locked(RunQueue* rq, task::TaskType incoming_type = task::TaskType::DAEMON) {
+    constexpr uint32_t full_load = 8;
+    constexpr uint32_t daemon_load = 1;
+
+    uint32_t load = rq->runnableHeap.size * full_load;
+    auto* cur = rq->currentTask;
+    bool cur_in_heap = cur != nullptr && rq->runnableHeap.contains(cur);
+
+    if (cur != nullptr && cur->voluntaryBlock && cur_in_heap && load >= full_load) {
+        load -= full_load;
     }
 
-    apic::IPIConfig ipi{
-        .vector = wake_ipi_vector,
-        .deliveryMode = apic::IPIDeliveryMode::FIXED,
-        .destinationMode = apic::IPIDestinationMode::PHYSICAL,
-        .level = apic::IPILevel::ASSERT,
-        .triggerMode = apic::IPITriggerMode::EDGE,
-        .destinationShorthand = apic::IPIDestinationShorthand::NONE,
-    };
-    uint32_t lapic_id = smt::getCpu(cpu_no).lapic_id;
-    apic::sendIpi(ipi, lapic_id);
+    bool has_active = (cur != nullptr && cur->type != task::TaskType::IDLE && !cur->voluntaryBlock);
+    if (has_active && !cur_in_heap) {
+        bool daemon_is_background = (incoming_type == task::TaskType::PROCESS && cur->type == task::TaskType::DAEMON);
+        load += daemon_is_background ? daemon_load : full_load;
+    }
+
+    load += rq->placementReservations.load(std::memory_order_relaxed) * full_load;
+    return load;
+}
+
+uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
+    if (run_queues == nullptr) {
+        return 0;
+    }
+
+    uint64_t cpu_count = smt::getCoreCount();
+    if (cpu_count <= 1) {
+        return 0;
+    }
+
+    task::TaskType incoming_type = incoming_task != nullptr ? incoming_task->type : task::TaskType::DAEMON;
+
+    static std::atomic<uint64_t> rr_seed{0};
+    uint64_t start = rr_seed.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+
+    uint64_t best_cpu = start;
+    uint32_t best_load = UINT32_MAX;
+
+    for (uint64_t off = 0; off < cpu_count; ++off) {
+        uint64_t cpu_no = (start + off) % cpu_count;
+        uint32_t load = run_queues->withLock(
+            cpu_no, [incoming_type](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq, incoming_type); });
+
+        if (load < best_load) {
+            best_load = load;
+            best_cpu = cpu_no;
+        }
+        if (best_load == 0) {
+            return best_cpu;
+        }
+    }
+
+    return best_cpu;
+}
+
+uint64_t reserve_least_loaded_cpu(task::Task* incoming_task) {
+    uint64_t best_cpu = get_least_loaded_cpu_for_task(incoming_task);
+    auto* rq = run_queues != nullptr ? run_queues->thatCpu(best_cpu) : nullptr;
+    if (rq != nullptr) {
+        rq->placementReservations.fetch_add(1, std::memory_order_relaxed);
+    }
+    return best_cpu;
+}
+
+void release_cpu_reservation(uint64_t cpu_no) {
+    auto* rq = run_queues != nullptr ? run_queues->thatCpu(cpu_no) : nullptr;
+    if (rq != nullptr) {
+        rq->placementReservations.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_reservation) {
+#ifdef SCHED_DEBUG
+    dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?", (int)cpu_no,
+             task->heapIndex, (int)cpu::currentCpu());
+#endif
+    task->cpu = cpu_no;
+
+    if (task->start_time_us == 0) {
+        task->start_time_us = time::getUs();
+    }
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    if (task->type == task::TaskType::IDLE) {
+        run_queues->withLockVoid(cpu_no, [task](RunQueue* rq) {
+            rq->idleTask = task;
+            task->schedQueue = task::Task::SchedQueue::NONE;
+        });
+        if (release_reservation) {
+            release_cpu_reservation(cpu_no);
+        }
+        return true;
+    }
+
+    if (task->pid > 0) {
+        pid_table_insert(task);
+        active_list_insert(task);
+    }
+
+    run_queues->withLockVoid(cpu_no, [task](RunQueue* rq) {
+        task->vruntime = (rq->minVruntime > 0) ? rq->minVruntime : 0;
+        task->vdeadline = task->vruntime + (((int64_t)task->sliceNs * 1024) / (int64_t)task->schedWeight);
+        task->sliceUsedNs = 0;
+        task->schedQueue = task::Task::SchedQueue::RUNNABLE;
+
+        rq->runnableHeap.insert(task);
+        add_to_sums(rq, task);
+    });
+
+    if (release_reservation) {
+        release_cpu_reservation(cpu_no);
+    }
+
+    if (cpu_no == cpu::currentCpu()) {
+        request_local_reschedule();
+    } else {
+        wake_cpu(cpu_no);
+    }
+
+    return true;
+}
+
+// Send a scheduler wake IPI to a specific CPU if it's currently idle.
+// This ensures idle CPUs don't sleep up to 10ms before noticing new work.
+static void request_local_reschedule() {
+    auto* rq = run_queues->thisCpu();
+    if (rq != nullptr) {
+        rq->localRescheduleRequests.fetch_add(1, std::memory_order_relaxed);
+    }
+    sys::context_switch::request_reschedule();
+}
+
+static void arm_idle_timer_locked(RunQueue* rq) {
+    rq->idleTimerArms.fetch_add(1, std::memory_order_relaxed);
+    apic::oneShotTimer(apic::calibrateTimer(10000));
 }
 
 // Enter the kernel idle loop on the idle task's stack. Does NOT return.
 [[noreturn]] void enter_idle_loop(RunQueue* rq) {
     rq->isIdle.store(true, std::memory_order_release);
-    apic::oneShotTimer(apic::calibrateTimer(10000));  // 10ms timer
+    arm_idle_timer_for_this_cpu();
 
     uint64_t idle_stack =
         (rq->idleTask != nullptr) ? rq->idleTask->context.syscallKernelStack : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
@@ -276,7 +392,7 @@ void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] g
     if (rq->runnableHeap.size > 0) {
         rq->isIdle.store(false, std::memory_order_release);
         // Trigger an immediate scheduling pass via the timer path.
-        sys::context_switch::request_reschedule();
+        request_local_reschedule();
     }
 }
 
@@ -300,6 +416,11 @@ void wake_cpu(uint64_t cpu_no) {
         .triggerMode = apic::IPITriggerMode::EDGE,
         .destinationShorthand = apic::IPIDestinationShorthand::NONE,
     };
+
+    auto* rq = run_queues != nullptr ? run_queues->thatCpu(cpu_no) : nullptr;
+    if (rq != nullptr) {
+        rq->wakeIpisSent.fetch_add(1, std::memory_order_relaxed);
+    }
 
     uint32_t lapic_id = smt::getCpu(cpu_no).lapic_id;
     apic::sendIpi(ipi, lapic_id);
@@ -356,55 +477,13 @@ void percpu_init() {
 // Task posting
 // ============================================================================
 
-auto post_task(task::Task* task) -> bool { return post_task_for_cpu(cpu::currentCpu(), task); }
+auto post_task(task::Task* task) -> bool { return post_task_for_cpu_impl(cpu::currentCpu(), task, false); }
 
-bool post_task_for_cpu(uint64_t cpu_no, task::Task* task) {
-#ifdef SCHED_DEBUG
-    dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?", (int)cpu_no,
-             task->heapIndex, (int)cpu::currentCpu());
-#endif
-    task->cpu = cpu_no;
+bool post_task_for_cpu(uint64_t cpu_no, task::Task* task) { return post_task_for_cpu_impl(cpu_no, task, false); }
 
-    // Set start time if not already set
-    if (task->start_time_us == 0) {
-        task->start_time_us = time::getUs();
-    }
-
-    // Memory barrier to ensure all task fields are visible to other CPUs
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-
-    // Idle tasks are stored separately — never in the heap
-    if (task->type == task::TaskType::IDLE) {
-        run_queues->withLockVoid(cpu_no, [task](RunQueue* rq) {
-            rq->idleTask = task;
-            task->schedQueue = task::Task::SchedQueue::NONE;
-        });
-        return true;
-    }
-
-    // Register in PID hash table for O(1) lookups
-    if (task->pid > 0) {
-        pid_table_insert(task);
-        active_list_insert(task);
-    }
-
-    // Insert into target CPU's runnable heap with EEVDF initialization
-    run_queues->withLockVoid(cpu_no, [task](RunQueue* rq) {
-        // New task starts at minVruntime — fair position relative to existing tasks.
-        // This ensures it doesn't get a huge head start (starting at 0) or penalty.
-        task->vruntime = (rq->minVruntime > 0) ? rq->minVruntime : 0;
-        task->vdeadline = task->vruntime + (((int64_t)task->sliceNs * 1024) / (int64_t)task->schedWeight);
-        task->sliceUsedNs = 0;
-        task->schedQueue = task::Task::SchedQueue::RUNNABLE;
-
-        rq->runnableHeap.insert(task);
-        add_to_sums(rq, task);
-    });
-
-    // Wake the target CPU if it's idle so it picks up the new task immediately
-    wake_idle_cpu(cpu_no);
-
-    return true;
+auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
+    task->cpu_pinned = true;
+    return post_task_for_cpu(cpu_no, task);
 }
 
 auto post_task_balanced(task::Task* task) -> bool {
@@ -415,9 +494,9 @@ auto post_task_balanced(task::Task* task) -> bool {
         }
     }
 
-    uint64_t target_cpu = get_least_loaded_cpu();
+    uint64_t target_cpu = reserve_least_loaded_cpu(task);
     task->cpu = target_cpu;
-    return post_task_for_cpu(target_cpu, task);
+    return post_task_for_cpu_impl(target_cpu, task, true);
 }
 
 // ============================================================================
@@ -452,9 +531,58 @@ void remove_current_task() {
 // processTasks — timer interrupt hot path (EEVDF)
 // ============================================================================
 
+void kern_wake(task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    // Always go through reschedule_task_for_cpu — it handles all cases safely
+    // under locks: task RUNNABLE (no-op if currentTask), task WAITING (move to heap),
+    // or task migrated to another CPU.
+    // The fast path inside reschedule_task_for_cpu checks task->cpu first (O(1) common case).
+    uint64_t preferred_cpu = task->cpu;
+    uint64_t ncpus = smt::getCoreCount();
+    if (preferred_cpu >= ncpus) {
+        preferred_cpu = get_least_loaded_cpu();
+    }
+    reschedule_task_for_cpu(preferred_cpu, task);
+}
+
 void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
     // Enter epoch critical section — protects task pointers from GC
     EpochGuard epoch_guard;
+
+    // Wake any tasks sleeping via nanosleep whose deadline has passed.
+    // Scan this CPU's wait list; tasks with wakeAtUs != 0 are timer sleeps.
+    {
+        uint64_t now_us = time::getUs();
+        run_queues->thisCpuLockedVoid([now_us](RunQueue* rq) {
+            // Collect tasks to wake (can't modify list while iterating)
+            task::Task* to_wake[16];
+            uint32_t wake_count = 0;
+            task::Task* t = rq->waitList.head;
+            while (t != nullptr && wake_count < 16) {
+                if (t->wakeAtUs != 0 && now_us >= t->wakeAtUs) {
+                    to_wake[wake_count++] = t;
+                }
+                t = t->schedNext;
+            }
+            for (uint32_t i = 0; i < wake_count; i++) {
+                task::Task* w = to_wake[i];
+                rq->waitList.remove(w);
+                int64_t avg = compute_avg_vruntime(rq);
+                int64_t fair = avg > rq->minVruntime ? avg : (int64_t)rq->minVruntime;
+                w->wakeAtUs = 0;
+                w->wantsBlock = false;  // Clear any pending block from kern_block()
+                w->vruntime = w->vruntime > fair ? w->vruntime : fair;
+                w->vdeadline = w->vruntime + (((int64_t)w->sliceNs * 1024) / (int64_t)w->schedWeight);
+                w->sliceUsedNs = 0;
+                w->schedQueue = task::Task::SchedQueue::RUNNABLE;
+                rq->runnableHeap.insert(w);
+                add_to_sums(rq, w);
+            }
+        });
+    }
 
     auto* rq = run_queues->thisCpu();
     auto* current_task = rq->currentTask;
@@ -485,6 +613,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             // without this, there's a window where the task can be moved to
             // another CPU's heap between pickBestEligible and the assignment.
             rq->currentTask = t;
+            // (runnableHeap.size already decremented by remove above)
             return t;
         });
 
@@ -506,6 +635,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             rq->currentTask = rq->idleTask;
             debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
             rq->isIdle.store(true, std::memory_order_release);
+            arm_idle_timer_for_this_cpu();
         }
         return;
     }
@@ -525,7 +655,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
     // context-save and preemption purposes.
     bool can_preempt_kernel = is_daemon || current_task->voluntaryBlock;
 
-    // Save context: user-mode PROCESS tasks, or DAEMON/voluntaryBlock tasks (always kernel mode but preemptible)
+    // Save GPR/frame context: user-mode PROCESS tasks, or DAEMON/voluntaryBlock tasks (always kernel mode but preemptible)
+    // NOTE: FPU save is deferred until we know a context switch is actually needed,
+    // to avoid the expensive xsave on every timer tick when no switch occurs.
     if (current_task->hasRun && current_task->type != task::TaskType::IDLE) {
         if (can_preempt_kernel || !in_kernel_mode) {
             current_task->context.regs = gpr;
@@ -533,91 +665,145 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         }
     }
 
-    task::Task* next_task = run_queues->thisCpuLocked([current_task, in_kernel_mode, can_preempt_kernel](RunQueue* rq) -> task::Task* {
-        // Compute time delta since last tick
-        uint64_t now_us = time::getUs();
-        auto delta_us = (int64_t)(now_us - rq->lastTickUs);
-        rq->lastTickUs = now_us;
-        if (delta_us <= 0) {
-            delta_us = 1;
-        }
-        int64_t delta_ns = delta_us * 1000;
-
-        // Process time accounting: attribute delta to user or system time
-        if (current_task->type != task::TaskType::IDLE) {
-            if (in_kernel_mode) {
-                current_task->system_time_us += (uint64_t)delta_us;
-            } else {
-                current_task->user_time_us += (uint64_t)delta_us;
+    bool blocked_current_task = false;
+    task::Task* next_task =
+        run_queues->thisCpuLocked([current_task, in_kernel_mode, can_preempt_kernel, &blocked_current_task](RunQueue* rq) -> task::Task* {
+            // Compute time delta since last tick
+            uint64_t now_us = time::getUs();
+            auto delta_us = (int64_t)(now_us - rq->lastTickUs);
+            rq->lastTickUs = now_us;
+            if (delta_us <= 0) {
+                delta_us = 1;
             }
-        }
+            int64_t delta_ns = delta_us * 1000;
 
-        // Update vruntime if task is in the heap
-        if (rq->runnableHeap.contains(current_task)) {
-            int64_t vruntime_delta = (delta_ns * 1024) / (int64_t)current_task->schedWeight;
-            current_task->vruntime += vruntime_delta;
-            current_task->sliceUsedNs += (uint32_t)delta_ns;
-
-            // Track weighted sum: delta_v * weight = deltaNs * 1024 always
-            rq->totalWeightedVruntime += vruntime_delta * (int64_t)current_task->schedWeight;
-
-            // Slice exhausted — reset and recalculate deadline
-            if (current_task->sliceUsedNs >= current_task->sliceNs) {
-                current_task->sliceUsedNs = 0;
-                current_task->vdeadline =
-                    current_task->vruntime + (((int64_t)current_task->sliceNs * 1024) / (int64_t)current_task->schedWeight);
+            // Process time accounting: attribute delta to user or system time
+            if (current_task->type != task::TaskType::IDLE) {
+                if (in_kernel_mode) {
+                    current_task->system_time_us += (uint64_t)delta_us;
+                } else {
+                    current_task->user_time_us += (uint64_t)delta_us;
+                }
             }
 
-            // Re-sift in heap after vruntime/vdeadline change
-            rq->runnableHeap.update(current_task);
-        }
+            // ITIMER_REAL expiry check — fire SIGALRM and reload or disarm
+            if (current_task->itimer_real_expire_us != 0 && now_us >= current_task->itimer_real_expire_us) {
+                current_task->sigPending |= (1ULL << (14 - 1));  // SIGALRM = 14
+                if (current_task->itimer_real_interval_us != 0) {
+                    current_task->itimer_real_expire_us = now_us + current_task->itimer_real_interval_us;
+                } else {
+                    current_task->itimer_real_expire_us = 0;
+                }
+            }
 
-        // Advance minVruntime to weighted average (prevents int64 overflow
-        // in totalWeightedVruntime by keeping relative keys small)
-        int64_t avg = compute_avg_vruntime(rq);
-        if (avg > rq->minVruntime) {
-            int64_t delta_min = avg - rq->minVruntime;
-            rq->minVruntime = avg;
-            rq->totalWeightedVruntime -= delta_min * rq->totalWeight;
-        }
+            // Update vruntime if task is in the heap
+            if (rq->runnableHeap.contains(current_task)) {
+                int64_t vruntime_delta = (delta_ns * 1024) / (int64_t)current_task->schedWeight;
+                current_task->vruntime += vruntime_delta;
+                current_task->sliceUsedNs += (uint32_t)delta_ns;
 
-        // Don't preempt PROCESS tasks in kernel mode (they're mid-syscall)
-        // unless they set voluntaryBlock (safe blocking point).
-        // DAEMON tasks are always in kernel mode but must be preemptible.
-        if (in_kernel_mode && !can_preempt_kernel) {
-            return nullptr;
-        }
+                // Track weighted sum: delta_v * weight = deltaNs * 1024 always
+                rq->totalWeightedVruntime += vruntime_delta * (int64_t)current_task->schedWeight;
 
-        // Pick best eligible task
-        if (rq->runnableHeap.size == 0) {
-            return nullptr;
-        }
-        auto* next = rq->runnableHeap.pickBestEligible(avg);
-        if (next == nullptr || next == current_task) {
-            return nullptr;
-        }
+                // Slice exhausted — reset and recalculate deadline
+                if (current_task->sliceUsedNs >= current_task->sliceNs) {
+                    current_task->sliceUsedNs = 0;
+                    current_task->vdeadline =
+                        current_task->vruntime + (((int64_t)current_task->sliceNs * 1024) / (int64_t)current_task->schedWeight);
+                }
 
-        // Validate next task state — it might have started exiting
-        if (next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
-            return nullptr;
-        }
-        if (next->type == task::TaskType::PROCESS && (next->thread == nullptr || next->pagemap == nullptr)) {
-            return nullptr;
-        }
-        if (next->type == task::TaskType::IDLE) {
-            return nullptr;
-        }
+                // Re-sift in heap after vruntime/vdeadline change
+                rq->runnableHeap.update(current_task);
+            }
 
-        // CRITICAL: Set currentTask inside lock to prevent double-scheduling.
-        // rescheduleTaskForCpu checks currentTask under this same lock;
-        // without this, there's a window where the picked task can be
-        // moved to another CPU between pickBestEligible and the assignment.
-        rq->currentTask = next;
-        return next;
-    });
+            // Advance minVruntime to weighted average (prevents int64 overflow
+            // in totalWeightedVruntime by keeping relative keys small)
+            int64_t avg = compute_avg_vruntime(rq);
+            if (avg > rq->minVruntime) {
+                int64_t delta_min = avg - rq->minVruntime;
+                rq->minVruntime = avg;
+                rq->totalWeightedVruntime -= delta_min * rq->totalWeight;
+            }
+
+            // Don't preempt PROCESS tasks in kernel mode (they're mid-syscall)
+            // unless they set voluntaryBlock (safe blocking point).
+            // DAEMON tasks are always in kernel mode but must be preemptible.
+            if (in_kernel_mode && !can_preempt_kernel) {
+                return nullptr;
+            }
+
+            // kern_block(): if the current task requested a true block (wantsBlock),
+            // move it from the runnable heap to the wait list now, under the lock.
+            // This is safe because we're in the timer interrupt with interrupts disabled.
+            if (current_task->wantsBlock && rq->runnableHeap.contains(current_task)) {
+                current_task->wantsBlock = false;
+                remove_from_sums(rq, current_task);
+                rq->runnableHeap.remove(current_task);
+                current_task->schedQueue = task::Task::SchedQueue::WAITING;
+                rq->waitList.push(current_task);
+                rq->currentTask = nullptr;
+                blocked_current_task = true;
+            }
+
+            // Pick best eligible task
+            if (rq->runnableHeap.size == 0) {
+                return nullptr;
+            }
+            auto* next = rq->runnableHeap.pickBestEligible(avg);
+            if (next == nullptr || next == current_task) {
+                return nullptr;
+            }
+
+            // EEVDF preemption guard: only preempt the current task if the candidate
+            // has a strictly earlier virtual deadline. This lets the current task run
+            // its full slice (~10ms) instead of being preempted every timer tick.
+            // Without this, equal-weight compute threads ping-pong on every 4ms tick.
+            //
+            // EXCEPTION: If the current task is at a voluntary block point (hlt in
+            // kern_yield), always allow preemption. The task isn't computing — it's
+            // sleeping. Without this, halted daemon threads waste their entire 10ms
+            // slice doing nothing, starving compute threads on the same CPU.
+            if (!current_task->voluntaryBlock && current_task->sliceUsedNs < current_task->sliceNs &&
+                rq->runnableHeap.contains(current_task) && next->vdeadline >= current_task->vdeadline) {
+                return nullptr;
+            }
+
+            // Validate next task state — it might have started exiting
+            if (next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+                return nullptr;
+            }
+            if (next->type == task::TaskType::PROCESS && (next->thread == nullptr || next->pagemap == nullptr)) {
+                return nullptr;
+            }
+            if (next->type == task::TaskType::IDLE) {
+                return nullptr;
+            }
+
+            // CRITICAL: Set currentTask inside lock to prevent double-scheduling.
+            // rescheduleTaskForCpu checks currentTask under this same lock;
+            // without this, there's a window where the picked task can be
+            // moved to another CPU between pickBestEligible and the assignment.
+            rq->currentTask = next;
+            return next;
+        });
 
     // No switch needed (same task, invalid, kernel mode, or no candidate)
     if (next_task == nullptr) {
+        if (blocked_current_task) {
+            auto* idle_rq = run_queues->thisCpu();
+            idle_rq->currentTask = idle_rq->idleTask;
+            idle_rq->isIdle.store(true, std::memory_order_release);
+            debug_task_ptrs[cpu::currentCpu()] = idle_rq->idleTask;
+            restore_kernel_gs_for_idle();
+
+            frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
+            frame.cs = 0x08;
+            frame.ss = 0x10;
+            frame.rsp = (idle_rq->idleTask != nullptr) ? idle_rq->idleTask->context.syscallKernelStack
+                                                       : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
+            frame.flags = 0x202;
+            gpr = cpu::GPRegs();
+        }
         return;
     }
 #ifdef SCHED_DEBUG
@@ -625,6 +811,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
              nextTask->heapIndex);
 #endif
     // Perform context switch — currentTask already set inside lock
+    // Save FPU state now that we know a switch is needed. This avoids the
+    // expensive xsave on every timer tick when the same task continues.
+    if (current_task->type == task::TaskType::PROCESS) {
+        sys::context_switch::saveFpuState(current_task);
+    }
+
     task::Task* original_task = current_task;
     debug_task_ptrs[cpu::currentCpu()] = next_task;
     rq->isIdle.store(false, std::memory_order_release);
@@ -724,7 +916,6 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         rq->currentTask = next_task;
         debug_task_ptrs[cpu::currentCpu()] = next_task;
         rq->isIdle.store(true, std::memory_order_release);
-        apic::oneShotTimer(apic::calibrateTimer(10000));
         EpochManager::exitCritical();
         enter_idle_loop(rq);
     }
@@ -780,14 +971,12 @@ void start_scheduler() {
     });
 
     if (first_task == nullptr || first_task->type == task::TaskType::IDLE) {
-        dbg::log("CPU %d: Only idle task, waiting for work...", cpu::currentCpu());
-
         // Set idle task as current while waiting
         rq->currentTask = rq->idleTask;
 
         for (;;) {
             rq->isIdle.store(true, std::memory_order_release);
-            apic::oneShotTimer(apic::calibrateTimer(1000));  // Wake every 1ms
+            arm_idle_timer_for_this_cpu();
             asm volatile("sti");
             asm volatile("hlt");
             asm volatile("cli");
@@ -830,8 +1019,7 @@ void start_scheduler() {
     rq->currentTask = first_task;
 
     // Set up GS/FS MSRs for the first task
-    uint32_t apic_id = apic::getApicId();
-    uint64_t real_cpu_id = smt::getCpuIndexFromApicId(apic_id);
+    uint64_t real_cpu_id = cpu::currentCpu();
     auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(first_task->context.syscallScratchArea);
     scratch_area->cpuId = real_cpu_id;
     if (first_task->thread != nullptr) {
@@ -858,6 +1046,11 @@ void start_scheduler() {
 
     // Start the scheduler timer
     sys::context_switch::startSchedTimer();
+
+    // Restore FPU/SSE/AVX state (PROCESS tasks only, and only if previously saved).
+    if (first_task->type == task::TaskType::PROCESS && first_task->fxState.saved) {
+        sys::context_switch::restoreFpuState(first_task);
+    }
 
     if (already_ran) {
 // Task was already running on another CPU and was migrated here.
@@ -1017,6 +1210,9 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     current_task->context.frame.rsp = user_rsp;
     current_task->context.frame.ss = desc::gdt::GDT_USER_DS;
 
+    // Save outgoing task's FPU/SSE/AVX state
+    sys::context_switch::saveFpuState(current_task);
+
     bool is_yield = current_task->yieldSwitch;
     current_task->yieldSwitch = false;
     current_task->deferredTaskSwitch = false;
@@ -1155,7 +1351,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         rq->currentTask = rq->idleTask;
         debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
         rq->isIdle.store(true, std::memory_order_release);
-        apic::oneShotTimer(apic::calibrateTimer(10000));
+        arm_idle_timer_for_this_cpu();
 
         uint64_t idle_stack = (rq->idleTask != nullptr) ? rq->idleTask->context.syscallKernelStack
                                                         : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
@@ -1175,8 +1371,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     next_task->hasRun = true;
 
     // Set up GS/FS for next task
-    uint32_t apic_id = apic::getApicId();
-    uint64_t real_cpu_id = smt::getCpuIndexFromApicId(apic_id);
+    uint64_t real_cpu_id = cpu::currentCpu();
     auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(next_task->context.syscallScratchArea);
     scratch_area->cpuId = real_cpu_id;
 
@@ -1217,6 +1412,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     debug_task_ptrs[cpu::currentCpu()] = next_task;
 
     check_pending_signals_deferred(next_task);
+
+    // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
+    if (next_task->type == task::TaskType::PROCESS && next_task->fxState.saved) {
+        sys::context_switch::restoreFpuState(next_task);
+    }
+
     _wOS_deferredTaskSwitchReturn(&next_task->context.regs, &next_task->context.frame);
     __builtin_unreachable();
 }
@@ -1234,6 +1435,9 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
     // Save context
     current_task->context.regs = gpr;
     current_task->context.frame = frame;
+    if (current_task->type == task::TaskType::PROCESS) {
+        sys::context_switch::saveFpuState(current_task);
+    }
 
     // Under lock: remove from heap, push to wait list, pick next
     task::Task* next_task = run_queues->thisCpuLocked([current_task](RunQueue* rq) -> task::Task* {
@@ -1279,7 +1483,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
         auto* rq = run_queues->thisCpu();
         rq->currentTask = rq->idleTask;
         rq->isIdle.store(true, std::memory_order_release);
-        apic::oneShotTimer(apic::calibrateTimer(10000));
+        arm_idle_timer_for_this_cpu();
         restore_kernel_gs_for_idle();
 
         frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
@@ -1309,39 +1513,74 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         return;
     }
 
-    // Remove from whatever queue the task is in on ALL CPUs.
-    // The task could be on any CPU's waitList (or even in a heap if there's a race).
+    // Remove from whatever queue the task is in.
+    // Optimization: check the task's last known CPU first (O(1) common case).
+    // Only fall back to scanning all CPUs if not found there (handles races).
     // CRITICAL: If the task is currentTask on some CPU, that CPU is actively running
     // it (possibly in a syscall). Don't move it — let the timer preempt it naturally.
     bool is_current_on_some_cpu = false;
     uint64_t current_cpu_of_task = UINT64_MAX;
-    for (uint64_t search_cpu = 0; search_cpu < smt::getCoreCount(); ++search_cpu) {
-        run_queues->withLockVoid(search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, search_cpu](RunQueue* rq) {
-            if (rq->currentTask == task) {
-                is_current_on_some_cpu = true;
-                current_cpu_of_task = search_cpu;
+    bool found_and_removed = false;
+
+    // Fast path: task's last CPU
+    uint64_t last_cpu = task->cpu;
+    uint64_t ncpus_resched = smt::getCoreCount();
+    if (last_cpu < ncpus_resched) {
+        run_queues->withLockVoid(last_cpu,
+                                 [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, last_cpu](RunQueue* rq) {
+                                     if (rq->currentTask == task) {
+                                         is_current_on_some_cpu = true;
+                                         current_cpu_of_task = last_cpu;
+                                         found_and_removed = true;
+                                         return;
+                                     }
+                                     if (task->schedQueue == task::Task::SchedQueue::WAITING) {
+                                         if (rq->waitList.remove(task)) {
+                                             found_and_removed = true;
+                                         }
+                                     }
+                                     if (rq->runnableHeap.contains(task)) {
+                                         remove_from_sums(rq, task);
+                                         rq->runnableHeap.remove(task);
+                                         found_and_removed = true;
+                                     }
+                                 });
+    }
+
+    // Slow path: scan all CPUs only if not found on last known CPU
+    if (!found_and_removed && !is_current_on_some_cpu) {
+        run_queues->thisCpu()->slowRescheduleScans.fetch_add(1, std::memory_order_relaxed);
+        for (uint64_t search_cpu = 0; search_cpu < ncpus_resched; ++search_cpu) {
+            if (search_cpu == last_cpu) continue;  // already checked
+            run_queues->withLockVoid(
+                search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, search_cpu](RunQueue* rq) {
+                    if (found_and_removed || is_current_on_some_cpu) return;
+                    if (rq->currentTask == task) {
+                        is_current_on_some_cpu = true;
+                        current_cpu_of_task = search_cpu;
 #ifdef SCHED_DEBUG
-                dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, (int)search_cpu);
+                        dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, (int)search_cpu);
 #endif
-                return;
-            }
-            // Remove from wait list
-            if (task->schedQueue == task::Task::SchedQueue::WAITING) {
-                if (rq->waitList.remove(task)) {
+                        return;
+                    }
+                    if (task->schedQueue == task::Task::SchedQueue::WAITING) {
+                        if (rq->waitList.remove(task)) {
+                            found_and_removed = true;
 #ifdef SCHED_DEBUG
-                    dbg::log("RESCHED: PID %x removed from CPU %d waitList", task->pid, (int)search_cpu);
+                            dbg::log("RESCHED: PID %x removed from CPU %d waitList", task->pid, (int)search_cpu);
 #endif
-                }
-            }
-            // Also try heap removal in case of races
-            if (rq->runnableHeap.contains(task)) {
+                        }
+                    }
+                    if (rq->runnableHeap.contains(task)) {
 #ifdef SCHED_DEBUG
-                dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, (int)search_cpu, task->heapIndex);
+                        dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, (int)search_cpu, task->heapIndex);
 #endif
-                remove_from_sums(rq, task);
-                rq->runnableHeap.remove(task);
-            }
-        });
+                        remove_from_sums(rq, task);
+                        rq->runnableHeap.remove(task);
+                        found_and_removed = true;
+                    }
+                });
+        }
     }
 
     // If the task is currently executing on a CPU, don't re-insert it.
@@ -1357,7 +1596,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         // wake_cpu() is a no-op for the current CPU.
         if (task->voluntaryBlock && current_cpu_of_task != UINT64_MAX) {
             if (current_cpu_of_task == cpu::currentCpu()) {
-                sys::context_switch::request_reschedule();
+                request_local_reschedule();
             } else {
                 wake_cpu(current_cpu_of_task);
             }
@@ -1365,18 +1604,32 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         return;
     }
 
-// Insert into target CPU's heap with updated vruntime
+// Insert into target CPU's heap with updated vruntime.
+// For pinned tasks, always re-insert on the task's own CPU, not the requested cpu_no.
 #ifdef SCHED_DEBUG
     dbg::log("RESCHED: PID %x INSERT -> CPU %d (heapIdx=%d before insert)", task->pid, (int)cpu_no, task->heapIndex);
 #endif
-    task->cpu = cpu_no;
+    if (task->cpu_pinned) {
+        cpu_no = task->cpu;  // Ignore requested CPU — keep on pinned CPU
+    } else {
+        task->cpu = cpu_no;
+    }
     run_queues->withLockVoid(cpu_no, [task](RunQueue* rq) {
-        // Boost vruntime to at least minVruntime so the task doesn't
-        // monopolize the CPU after waking from a long sleep
-        task->vruntime = std::max(task->vruntime, rq->minVruntime);
+        // Clamp vruntime to [minVruntime, avg_vruntime] on wakeup.
+        // Using minVruntime gives the task an artificially early vdeadline
+        // that immediately preempts active compute threads — causing thrashing
+        // when daemons wake up frequently (e.g. every 4ms for netd/httpd).
+        // Using avg_vruntime places the task at the current fair position,
+        // so it doesn't cut ahead of tasks that have been running continuously.
+        int64_t avg = compute_avg_vruntime(rq);
+        int64_t fair_vruntime = std::max((int64_t)rq->minVruntime, avg);
+        task->vruntime = std::max(task->vruntime, fair_vruntime);
         task->vdeadline = task->vruntime + ((((int64_t)task->sliceNs * 1024) / (int64_t)task->schedWeight));
         task->sliceUsedNs = 0;
         task->schedQueue = task::Task::SchedQueue::RUNNABLE;
+        // Clear any pending block request — we're explicitly waking this task.
+        // If wantsBlock is left true, the next timer tick would immediately re-block it.
+        task->wantsBlock = false;
 
         rq->runnableHeap.insert(task);
         add_to_sums(rq, task);
@@ -1387,7 +1640,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // request_reschedule() to arm the APIC timer with count=1 instead.
     // This avoids up to 1ms of scheduling latency on same-CPU wakes.
     if (cpu_no == cpu::currentCpu()) {
-        sys::context_switch::request_reschedule();
+        request_local_reschedule();
     } else {
         wake_cpu(cpu_no);
     }
@@ -1434,11 +1687,9 @@ void wake_task_for_signal(task::Task* task) {
     // If the task is blocked or sleeping in a syscall path, put it back on
     // a runnable queue so it can process pending signals promptly.
     if (task->schedQueue == task::Task::SchedQueue::WAITING || task->deferredTaskSwitch || task->voluntaryBlock) {
-        // Prefer its existing CPU to avoid migration latency for short wakeups.
-        uint64_t cpu = task->cpu;
-        if (cpu >= smt::getCoreCount()) {
-            cpu = get_least_loaded_cpu();
-        }
+        // Use the least-loaded CPU to avoid piling daemon wakeups onto CPUs
+        // that are busy running compute threads.
+        uint64_t cpu = get_least_loaded_cpu();
         reschedule_task_for_cpu(cpu, task);
     }
 }
@@ -1527,7 +1778,10 @@ void gc_expired_tasks() {
 
                     // LINUX-STYLE ZOMBIE BEHAVIOR: Don't reclaim until parent has called waitpid
                     // OR the parent is dead. This keeps the exit status available for waitpid.
-                    if (cur->hasExited && !cur->waitedOn) {
+                    // EXCEPTION: Threads (isThread) are joined via futex, not waitpid.
+                    // They never get waitedOn set, so without this exception they'd
+                    // accumulate as zombies forever, bloating the dead list.
+                    if (cur->hasExited && !cur->waitedOn && !cur->isThread) {
                         // Check if parent is still alive
                         if (cur->parentPid != 0) {
                             auto* parent = find_task_by_pid(cur->parentPid);
@@ -1588,10 +1842,40 @@ void gc_expired_tasks() {
                         active_list_remove(cur->pid);
                     }
 
-                    // Free pagemap (DAEMON tasks use the kernel pagemap — must NOT free it)
-                    if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON) {
-                        mm::virt::destroyUserSpace(cur->pagemap);
-                        mm::phys::pageFree(cur->pagemap);
+                    // Free pagemap.
+                    // - DAEMON tasks use the kernel pagemap — must NOT free it.
+                    // - Thread tasks (isThread == true) share the owner process's pagemap —
+                    //   must NOT free it here; we only free when the last user is gone.
+                    // - For process tasks (isThread == false): only free if no sibling
+                    //   threads sharing the same pagemap are still alive (not yet DEAD).
+                    if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON && !cur->isThread) {
+                        bool sibling_alive = false;
+                        for (uint32_t ai = 0; ai < active_task_count; ai++) {
+                            auto* other = active_task_list[ai];
+                            if (other != nullptr && other != cur && other->pagemap == cur->pagemap &&
+                                other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+                                sibling_alive = true;
+                                break;
+                            }
+                        }
+                        // Also scan the dead lists of all CPUs for threads sharing this
+                        // pagemap that haven't been reclaimed yet (still in grace period).
+                        if (!sibling_alive) {
+                            for (uint64_t scan_cpu = 0; scan_cpu < smt::getCoreCount() && !sibling_alive; scan_cpu++) {
+                                auto* dl = run_queues->thatCpu(scan_cpu)->deadList.head;
+                                while (dl != nullptr) {
+                                    if (dl != cur && dl->pagemap == cur->pagemap) {
+                                        sibling_alive = true;
+                                        break;
+                                    }
+                                    dl = dl->schedNext;
+                                }
+                            }
+                        }
+                        if (!sibling_alive) {
+                            mm::virt::destroyUserSpace(cur->pagemap);
+                            mm::phys::pageFree(cur->pagemap);
+                        }
                     }
 
                     // Free thread
@@ -1696,6 +1980,118 @@ auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats {
     });
 }
 
+void arm_idle_timer_for_this_cpu() {
+    if (run_queues == nullptr) {
+        return;
+    }
+    run_queues->thisCpuLockedVoid([](RunQueue* rq) { arm_idle_timer_locked(rq); });
+}
+
+void note_scheduler_timer_interrupt() {
+    if (run_queues == nullptr) {
+        return;
+    }
+    auto* rq = run_queues->thisCpu();
+    auto* current = rq != nullptr ? rq->currentTask : nullptr;
+    if (current == nullptr || current->type == task::TaskType::IDLE) {
+        rq->idleTimerWakeups.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
+    if (run_queues == nullptr) {
+        return SchedulerTraceStats{};
+    }
+
+    return run_queues->withLock(cpu_no, [](RunQueue* rq) -> SchedulerTraceStats {
+        if (rq == nullptr) {
+            return SchedulerTraceStats{};
+        }
+
+        return SchedulerTraceStats{
+            .idle_timer_arms = rq->idleTimerArms.load(std::memory_order_relaxed),
+            .idle_timer_disarms = rq->idleTimerDisarms.load(std::memory_order_relaxed),
+            .idle_timer_wakeups = rq->idleTimerWakeups.load(std::memory_order_relaxed),
+            .wake_ipis_sent = rq->wakeIpisSent.load(std::memory_order_relaxed),
+            .local_reschedule_requests = rq->localRescheduleRequests.load(std::memory_order_relaxed),
+            .slow_reschedule_scans = rq->slowRescheduleScans.load(std::memory_order_relaxed),
+            .load_balance_pushes = rq->loadBalancePushes.load(std::memory_order_relaxed),
+        };
+    });
+}
+
+auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
+    SchedulerCpuState state{};
+    state.cpu_no = cpu_no;
+    state.current_name = "?";
+
+    if (run_queues == nullptr) {
+        return state;
+    }
+
+    return run_queues->withLock(cpu_no, [cpu_no](RunQueue* rq) -> SchedulerCpuState {
+        SchedulerCpuState state{};
+        state.cpu_no = cpu_no;
+        state.current_name = "?";
+
+        if (rq == nullptr) {
+            return state;
+        }
+
+        state.is_idle = rq->isIdle.load(std::memory_order_acquire);
+        state.runnable_count = rq->runnableHeap.size;
+        state.wait_queue_count = rq->waitList.count;
+
+        auto* current = rq->currentTask;
+        if (current != nullptr) {
+            state.current_pid = current->pid;
+            state.current_name = current->name != nullptr ? current->name : "?";
+            state.current_type = static_cast<uint8_t>(current->type);
+            state.current_voluntary_block = current->voluntaryBlock;
+            state.current_wants_block = current->wantsBlock;
+            state.current_cpu_pinned = current->cpu_pinned;
+        }
+
+        return state;
+    });
+}
+
+void dump_scheduler_trace_stats() {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    uint64_t cpu_count = smt::getCoreCount();
+    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+        auto stats = get_scheduler_trace_stats(cpu_no);
+        if (stats.idle_timer_arms == 0 && stats.idle_timer_disarms == 0 && stats.idle_timer_wakeups == 0 && stats.wake_ipis_sent == 0 &&
+            stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 && stats.load_balance_pushes == 0) {
+            continue;
+        }
+
+        dbg::log("schedstats: cpu%lu idle_arm=%lu idle_disarm=%lu idle_wake=%lu wake_ipi=%lu local_resched=%lu slow_scan=%lu lb_push=%lu",
+                 (unsigned long)cpu_no, (unsigned long)stats.idle_timer_arms, (unsigned long)stats.idle_timer_disarms,
+                 (unsigned long)stats.idle_timer_wakeups, (unsigned long)stats.wake_ipis_sent,
+                 (unsigned long)stats.local_reschedule_requests, (unsigned long)stats.slow_reschedule_scans,
+                 (unsigned long)stats.load_balance_pushes);
+    }
+}
+
+void dump_scheduler_cpu_states() {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    uint64_t cpu_count = smt::getCoreCount();
+    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+        auto state = get_scheduler_cpu_state(cpu_no);
+        dbg::log("schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u", (unsigned long)state.cpu_no,
+                 state.is_idle ? 1U : 0U, (unsigned long)state.runnable_count, (unsigned long)state.wait_queue_count,
+                 (unsigned long)state.current_pid, state.current_name, (unsigned)state.current_type,
+                 state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U, state.current_cpu_pinned ? 1U : 0U);
+    }
+}
+
 auto get_least_loaded_cpu() -> uint64_t {
     if (run_queues == nullptr) {
         return 0;
@@ -1706,32 +2102,32 @@ auto get_least_loaded_cpu() -> uint64_t {
         return 0;
     }
 
-    // First pass: check for idle CPUs without taking locks (racy but cheap).
-    // Prefer spreading across idle cores before piling onto busy ones.
-    // Use a simple round-robin seed to avoid always picking the same idle CPU.
-    static uint64_t rr_seed = 0;
-    uint64_t start = rr_seed++ % cpu_count;
+    // Simple load metric: runnableHeap.size plus a running non-idle task.
+    // Discount a current task that is sitting at a voluntary blocking point,
+    // since it can be preempted immediately and should not make the CPU look
+    // busy for fresh thread placement. Also include in-flight placement
+    // reservations so burst thread creation does not keep choosing the same CPU
+    // before earlier insertions become visible in the steady-state load metric.
+    static std::atomic<uint64_t> rr_seed{0};
+    uint64_t start = rr_seed.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+
+    uint64_t best_cpu = start;
+    uint32_t best_load = UINT32_MAX;
+
     for (uint64_t off = 0; off < cpu_count; off++) {
         uint64_t i = (start + off) % cpu_count;
-        auto* rq = run_queues->thatCpu(i);
-        if (rq->isIdle.load(std::memory_order_acquire) && rq->runnableHeap.size == 0) {
-            return i;
+        uint32_t load = run_queues->withLock(i, [](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq); });
+
+        if (load < best_load) {
+            best_load = load;
+            best_cpu = i;
+        }
+        // Short-circuit: load=0 means truly empty CPU
+        if (best_load == 0) {
+            return best_cpu;
         }
     }
-
-    // No idle CPU — fall back to least total load (runnable + waiting)
-    uint64_t least_loaded_cpu = 0;
-    uint64_t min_load = UINT64_MAX;
-
-    for (uint64_t i = 0; i < cpu_count; i++) {
-        auto* rq = run_queues->thatCpu(i);
-        uint64_t load = rq->runnableHeap.size + rq->waitList.count;
-        if (load < min_load) {
-            min_load = load;
-            least_loaded_cpu = i;
-        }
-    }
-    return least_loaded_cpu;
+    return best_cpu;
 }
 
 size_t get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refcounts, size_t max_entries, size_t start_index) {

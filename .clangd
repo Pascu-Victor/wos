@@ -26,8 +26,6 @@ Diagnostics:
     MissingIncludes: Strict
 
 CompileFlags:
-    Add:
-        - -std=c++23
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword
@@ -37,6 +35,9 @@ CompileFlags:
         - -fPIE
         - -pie
         - -resource-dir=/usr/lib/clang/20
+        - -std=c++*
+        - -std=c1*
+        - -std=c2*
 
 Index:
     Background: Build
@@ -49,11 +50,32 @@ InlayHints:
 Hover:
     ShowAKA: true
 
-# Ignore .log files completely (no diagnostics, no background indexing)
+---
+
+# C-only third-party trees: no compile_commands.json so clangd defaults to
+# clang++, which rejects -std=c11. Force the C driver explicitly.
 If:
-    PathMatch: ".*\\.log$"
-    Then:
-        Index:
-            Background: false
-        Diagnostics:
-            Suppress: true
+    PathMatch: ".*/(busybox|dropbear)/.*\\.c$"
+CompileFlags:
+    Compiler: clang
+    Add:
+        - -std=c11
+    Remove:
+        - -std=c++*
+
+---
+
+If:
+    PathMatch: ".*\\.(cpp|cxx|cc|hpp|hxx|hh)$"
+CompileFlags:
+    Add:
+        - -std=c++23
+
+---
+
+If:
+    PathMatch: ".*\\.c$"
+    PathExclude: ".*/(busybox|dropbear)/.*"
+CompileFlags:
+    Add:
+        - -std=c11

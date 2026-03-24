@@ -800,13 +800,13 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         "-smp",
         str(cpus),
         "-drive",
-        f"file={overlay0},if=none,id=drive0,format=qcow2",
+        f"file={overlay0},if=none,id=drive0,format=qcow2,cache=unsafe",
         "-device",
         "ahci,id=ahci",
         "-device",
         "ide-hd,drive=drive0,bus=ahci.0",
         "-drive",
-        f"file={overlay1},if=none,id=drive1,format=qcow2",
+        f"file={overlay1},if=none,id=drive1,format=qcow2,cache=unsafe",
         "-device",
         "ide-hd,drive=drive1,bus=ahci.1",
         "-chardev",
@@ -936,18 +936,32 @@ def launch(config: dict):
     print(f"\n=== {len(pids)} VMs launched ===")
     print("Press Ctrl+C to stop all VMs.\n")
 
-    def shutdown(signum, frame):
-        print("\n=== Shutting down cluster ===")
-        for p in pids:
+    def stop_all_vms(processes: list, grace_seconds: float = 0.15):
+        """Stop all VMs with a short grace period, then force-kill survivors."""
+        running = [p for p in processes if p.poll() is None]
+        for p in running:
             try:
                 p.terminate()
             except OSError:
                 pass
-        for p in pids:
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
+
+        # Use a global deadline instead of per-process waits to keep Ctrl+C snappy.
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if all(p.poll() is not None for p in running):
+                return
+            time.sleep(0.01)
+
+        for p in running:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    def shutdown(signum, frame):
+        print("\n=== Shutting down cluster ===")
+        stop_all_vms(pids)
         print("=== Cluster stopped ===")
         sys.exit(0)
 

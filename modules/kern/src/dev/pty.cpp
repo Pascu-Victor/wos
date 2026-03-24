@@ -1,6 +1,7 @@
 #include "pty.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -40,6 +41,9 @@ static constexpr int POLLHUP = 0x010;
 // Returned by device reads that would block; the mlibc sysdep layer retries internally.
 // Distinct from EAGAIN (11) which is returned for non-blocking I/O.
 static constexpr int WOS_ERESTARTSYS = 512;
+// Fairness cadence for long PTY write bursts. Yielding periodically prevents
+// a single writer from monopolizing CPU and improves terminal interactivity.
+static constexpr size_t PTY_WRITE_FAIR_YIELD_INTERVAL = 4096;
 
 // Return a default termios (cooked mode: echo, canonical, signals)
 KTermios default_termios() {
@@ -95,6 +99,125 @@ auto PtyRingBuf::read(void* dst, size_t len) -> size_t {
 // --- PTY pair pool ---
 
 namespace {
+
+enum class CprPrefixMatch : uint8_t {
+    PREFIX,
+    COMPLETE,
+    INVALID,
+};
+
+enum class CprFeedAction : uint8_t {
+    PASS_THROUGH,
+    HOLD,
+    DROP,
+    REPLAY,
+};
+
+constexpr auto is_dec_digit(uint8_t ch) -> bool { return ch >= '0' && ch <= '9'; }
+
+auto classify_cpr_prefix(const uint8_t* seq, size_t len) -> CprPrefixMatch {
+    if (seq == nullptr || len == 0) {
+        return CprPrefixMatch::INVALID;
+    }
+
+    if (seq[0] != 0x1B) {
+        return CprPrefixMatch::INVALID;
+    }
+    if (len == 1) {
+        return CprPrefixMatch::PREFIX;
+    }
+
+    if (seq[1] != '[') {
+        return CprPrefixMatch::INVALID;
+    }
+    if (len == 2) {
+        return CprPrefixMatch::PREFIX;
+    }
+
+    size_t pos = 2;
+    size_t row_digits = 0;
+    while (pos < len && is_dec_digit(seq[pos])) {
+        row_digits++;
+        pos++;
+    }
+    if (row_digits == 0) {
+        return CprPrefixMatch::INVALID;
+    }
+    if (pos == len) {
+        return CprPrefixMatch::PREFIX;
+    }
+
+    if (seq[pos] != ';') {
+        return CprPrefixMatch::INVALID;
+    }
+    pos++;
+    if (pos == len) {
+        return CprPrefixMatch::PREFIX;
+    }
+
+    size_t col_digits = 0;
+    while (pos < len && is_dec_digit(seq[pos])) {
+        col_digits++;
+        pos++;
+    }
+    if (col_digits == 0) {
+        return CprPrefixMatch::INVALID;
+    }
+    if (pos == len) {
+        return CprPrefixMatch::PREFIX;
+    }
+
+    if (seq[pos] == 'R' && (pos + 1) == len) {
+        return CprPrefixMatch::COMPLETE;
+    }
+    return CprPrefixMatch::INVALID;
+}
+
+auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* replay_len_out) -> CprFeedAction {
+    if (pair == nullptr || replay_out == nullptr || replay_len_out == nullptr) {
+        return CprFeedAction::PASS_THROUGH;
+    }
+
+    *replay_len_out = 0;
+
+    if (!pair->cpr_filter_active) {
+        if (ch != 0x1B) {
+            return CprFeedAction::PASS_THROUGH;
+        }
+        pair->cpr_filter_active = true;
+        pair->cpr_filter_len = 0;
+    }
+
+    if (pair->cpr_filter_len < CPR_FILTER_BUF_SIZE) {
+        pair->cpr_filter_buf[pair->cpr_filter_len++] = ch;
+    } else {
+        for (size_t i = 0; i < pair->cpr_filter_len; i++) {
+            replay_out[i] = pair->cpr_filter_buf[i];
+        }
+        *replay_len_out = pair->cpr_filter_len;
+        pair->cpr_filter_active = false;
+        pair->cpr_filter_len = 0;
+        return CprFeedAction::REPLAY;
+    }
+
+    switch (classify_cpr_prefix(pair->cpr_filter_buf, pair->cpr_filter_len)) {
+        case CprPrefixMatch::PREFIX:
+            return CprFeedAction::HOLD;
+        case CprPrefixMatch::COMPLETE:
+            pair->cpr_filter_active = false;
+            pair->cpr_filter_len = 0;
+            return CprFeedAction::DROP;
+        case CprPrefixMatch::INVALID:
+        default:
+            for (size_t i = 0; i < pair->cpr_filter_len; i++) {
+                replay_out[i] = pair->cpr_filter_buf[i];
+            }
+            *replay_len_out = pair->cpr_filter_len;
+            pair->cpr_filter_active = false;
+            pair->cpr_filter_len = 0;
+            return CprFeedAction::REPLAY;
+    }
+}
 
 PtyPair pty_pool[PTY_MAX]{};
 bool pty_initialized = false;
@@ -196,7 +319,9 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
         if (!slave_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately (propagates to application)
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
-        // Blocking fd: return WOS_ERESTARTSYS so the mlibc sysdep layer retries
+        // Blocking fd: yield CPU before returning so mlibc's retry loop doesn't
+        // spin at 100% CPU doing millions of syscalls/second with no data.
+        ker::mod::sched::kern_yield();
         return -WOS_ERESTARTSYS;
     }
     return static_cast<ssize_t>(rd);
@@ -230,58 +355,106 @@ static void pty_echo_ctrl(PtyPair* pair, uint8_t ch) {
 ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
+    if (count == 0) return 0;
 
     auto* bytes = static_cast<const uint8_t*>(buf);
     size_t processed = 0;
 
-    for (size_t i = 0; i < count; i++) {
-        uint8_t ch = bytes[i];
+    uint8_t replay_buf[CPR_FILTER_BUF_SIZE]{};
+    size_t replay_pos = 0;
+    size_t replay_len = 0;
+
+    for (size_t i = 0; (i < count) || (replay_pos < replay_len);) {
+        bool from_replay = false;
+        uint8_t ch = 0;
+
+        if (replay_pos < replay_len) {
+            ch = replay_buf[replay_pos++];
+            from_replay = true;
+            if (replay_pos == replay_len) {
+                replay_pos = 0;
+                replay_len = 0;
+            }
+        } else {
+            ch = bytes[i++];
+        }
 
         // Input processing (c_iflag)
         uint64_t irqf = pair->lock.lock_irqsave();
-        if ((pair->termios.c_iflag & TIOS_IGNCR) && ch == '\r') {
-            pair->lock.unlock_irqrestore(irqf);
-            processed++;
-            continue;  // Discard CR
-        }
-        if ((pair->termios.c_iflag & TIOS_ICRNL) && ch == '\r') {
-            ch = '\n';  // CR → NL
-        }
-        if ((pair->termios.c_iflag & TIOS_INLCR) && ch == '\n') {
-            ch = '\r';  // NL → CR
-        }
-        if ((pair->termios.c_iflag & TIOS_ISTRIP)) {
-            ch &= 0x7F;  // Strip high bit
-        }
 
-        // Signal generation (c_lflag ISIG)
-        if (pair->termios.c_lflag & TIOS_ISIG) {
-            if (ch == pair->termios.c_cc[CC_VINTR] && pair->termios.c_cc[CC_VINTR] != 0) {
-                pty_signal_fg(pair, SIG_INT);
-                if (pair->termios.c_lflag & TIOS_ECHO) {
-                    pty_echo_ctrl(pair, ch);
-                    pty_echo_byte(pair, '\n');
-                }
-                if (!(pair->termios.c_lflag & TIOS_NOFLSH)) {
-                    pair->m2s.flush();
-                    pair->canon_len = 0;
-                }
+        if (!from_replay) {
+            uint8_t filter_replay[CPR_FILTER_BUF_SIZE]{};
+            size_t filter_replay_len = 0;
+            CprFeedAction filter_action = cpr_filter_feed(pair, ch, filter_replay, &filter_replay_len);
+
+            if (filter_action == CprFeedAction::HOLD || filter_action == CprFeedAction::DROP) {
                 pair->lock.unlock_irqrestore(irqf);
                 processed++;
                 continue;
             }
-            if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
-                pty_signal_fg(pair, SIG_QUIT);
-                if (pair->termios.c_lflag & TIOS_ECHO) {
+            if (filter_action == CprFeedAction::REPLAY) {
+                pair->lock.unlock_irqrestore(irqf);
+                processed++;
+                if (filter_replay_len > 0) {
+                    for (size_t j = 0; j < filter_replay_len; j++) {
+                        replay_buf[j] = filter_replay[j];
+                    }
+                    replay_pos = 0;
+                    replay_len = filter_replay_len;
+                }
+                continue;
+            }
+        }
+
+        if ((pair->termios.c_iflag & TIOS_IGNCR) && ch == '\r') {
+            pair->lock.unlock_irqrestore(irqf);
+            if (!from_replay) {
+                processed++;
+            }
+            continue;  // Discard CR
+        }
+        if (((pair->termios.c_iflag & TIOS_ICRNL) != 0U) && ch == '\r') {
+            ch = '\n';  // CR → NL
+        }
+        if (((pair->termios.c_iflag & TIOS_INLCR) != 0U) && ch == '\n') {
+            ch = '\r';  // NL → CR
+        }
+        if ((pair->termios.c_iflag & TIOS_ISTRIP) != 0U) {
+            ch &= 0x7F;  // Strip high bit
+        }
+
+        // Signal generation (c_lflag ISIG)
+        if ((pair->termios.c_lflag & TIOS_ISIG) != 0U) {
+            if (ch == pair->termios.c_cc[CC_VINTR] && pair->termios.c_cc[CC_VINTR] != 0) {
+                pty_signal_fg(pair, SIG_INT);
+                if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
-                if (!(pair->termios.c_lflag & TIOS_NOFLSH)) {
+                if ((pair->termios.c_lflag & TIOS_NOFLSH) == 0U) {
                     pair->m2s.flush();
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(irqf);
-                processed++;
+                if (!from_replay) {
+                    processed++;
+                }
+                continue;
+            }
+            if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
+                pty_signal_fg(pair, SIG_QUIT);
+                if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
+                    pty_echo_ctrl(pair, ch);
+                    pty_echo_byte(pair, '\n');
+                }
+                if ((pair->termios.c_lflag & TIOS_NOFLSH) == 0U) {
+                    pair->m2s.flush();
+                    pair->canon_len = 0;
+                }
+                pair->lock.unlock_irqrestore(irqf);
+                if (!from_replay) {
+                    processed++;
+                }
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
@@ -291,16 +464,13 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pty_echo_byte(pair, '\n');
                 }
                 pair->lock.unlock_irqrestore(irqf);
-                processed++;
+                if (!from_replay) processed++;
                 continue;
             }
         }
 
         // Canonical mode (ICANON)
         if (pair->termios.c_lflag & TIOS_ICANON) {
-            // VERASE - delete last character
-            // Accept both the configured VERASE char (default DEL/127) and BS (0x08)
-            // since SSH clients may send either for backspace
             bool is_erase = (ch == pair->termios.c_cc[CC_VERASE] && pair->termios.c_cc[CC_VERASE] != 0);
             if (!is_erase && (ch == '\b' || ch == 127)) {
                 is_erase = true;
@@ -314,10 +484,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
                 pair->lock.unlock_irqrestore(irqf);
-                processed++;
+                if (!from_replay) processed++;
                 continue;
             }
-            // VKILL - erase entire line
+
             if (ch == pair->termios.c_cc[CC_VKILL] && pair->termios.c_cc[CC_VKILL] != 0) {
                 if (pair->termios.c_lflag & (TIOS_ECHOK | TIOS_ECHOE)) {
                     while (pair->canon_len > 0) {
@@ -328,54 +498,46 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->canon_len = 0;
                 pair->lock.unlock_irqrestore(irqf);
-                processed++;
+                if (!from_replay) processed++;
                 continue;
             }
-            // VEOF - flush canonical buffer (EOF)
+
             if (ch == pair->termios.c_cc[CC_VEOF] && pair->termios.c_cc[CC_VEOF] != 0) {
                 if (pair->canon_len > 0) {
                     pair->m2s.write(pair->canon_buf, pair->canon_len);
                     pair->canon_len = 0;
                 }
-                // Don't put VEOF in the buffer; an empty read signals EOF to slave
                 pair->lock.unlock_irqrestore(irqf);
-                processed++;
+                if (!from_replay) processed++;
                 continue;
             }
 
-            // Accumulate in canonical buffer
             if (pair->canon_len < CANON_BUF_SIZE) {
                 pair->canon_buf[pair->canon_len++] = ch;
             }
 
-            // Echo
             if ((pair->termios.c_lflag & TIOS_ECHO) || ((pair->termios.c_lflag & TIOS_ECHONL) && ch == '\n')) {
                 if (ch < 32 && ch != '\n' && ch != '\t') {
-                    // Echo control characters as ^X to avoid cursor artifacts
                     pty_echo_ctrl(pair, ch);
                 } else {
                     pty_echo_byte(pair, ch);
                 }
             }
 
-            // If newline, flush canonical buffer to m2s
             if (ch == '\n') {
                 pair->m2s.write(pair->canon_buf, pair->canon_len);
                 pair->canon_len = 0;
             }
 
             pair->lock.unlock_irqrestore(irqf);
-
-            processed++;
+            if (!from_replay) processed++;
         } else {
-            // Non-canonical (raw) mode — pass through directly
             if (pair->termios.c_lflag & TIOS_ECHO) {
                 pty_echo_byte(pair, ch);
             }
             pair->lock.unlock_irqrestore(irqf);
 
             if (file->open_flags & 04000) {
-                // Non-blocking: fail immediately if no space
                 uint64_t wr_irqf = pair->lock.lock_irqsave();
                 size_t wr = pair->m2s.write(&ch, 1);
                 pair->lock.unlock_irqrestore(wr_irqf);
@@ -384,7 +546,6 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     break;
                 }
             } else {
-                // Blocking: yield until space is available
                 while (true) {
                     uint64_t wr_irqf = pair->lock.lock_irqsave();
                     size_t wr = pair->m2s.write(&ch, 1);
@@ -395,7 +556,11 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     ker::mod::sched::kern_yield();
                 }
             }
-            processed++;
+            if (!from_replay) processed++;
+        }
+
+        if ((processed != 0) && ((processed % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0)) {
+            ker::mod::sched::kern_yield();
         }
     }
 
@@ -573,7 +738,9 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
         if (!master_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
-        // Blocking fd: return WOS_ERESTARTSYS so mlibc retries internally.
+        // Blocking fd: yield CPU before returning so mlibc's retry loop doesn't
+        // spin at 100% CPU doing millions of syscalls/second with no data.
+        ker::mod::sched::kern_yield();
         return -WOS_ERESTARTSYS;
     }
     return static_cast<ssize_t>(rd);
@@ -582,6 +749,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
 ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
+    if (count == 0) return 0;
 
     // If master is closed, writes should fail (Linux returns EIO)
     {
@@ -649,6 +817,12 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
         }
         written++;
+
+        // Prevent long-running writers from starving the scheduler when output
+        // arrives faster than the SSH/network side can consume it.
+        if ((written % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0) {
+            ker::mod::sched::kern_yield();
+        }
     }
 
     if (written == 0) return -EAGAIN;
@@ -846,6 +1020,8 @@ auto pty_alloc() -> int {
             pair.winsize = {.ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
             pair.termios = default_termios();
             pair.canon_len = 0;
+            pair.cpr_filter_len = 0;
+            pair.cpr_filter_active = false;
             pair.foreground_pgrp = 0;
 
             // Build the slave device name: "pts/<N>"

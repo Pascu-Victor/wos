@@ -3,25 +3,25 @@
 #include <platform/dbg/dbg.hpp>
 
 __attribute__((used, section(".requests"))) static volatile limine_memmap_request memmapRequest = {
-    .id = LIMINE_MEMMAP_REQUEST,
+    .id = LIMINE_MEMMAP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-__attribute__((used, section(".requests"))) static volatile limine_kernel_file_request kernelFileRequest = {
-    .id = LIMINE_KERNEL_FILE_REQUEST,
+__attribute__((used, section(".requests"))) static volatile limine_executable_file_request kernelFileRequest = {
+    .id = LIMINE_EXECUTABLE_FILE_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-__attribute__((used, section(".requests"))) static volatile limine_kernel_address_request kernelAddressRequest = {
-    .id = LIMINE_KERNEL_ADDRESS_REQUEST,
+__attribute__((used, section(".requests"))) static volatile limine_executable_address_request kernelAddressRequest = {
+    .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
 __attribute__((used, section(".requests"))) static volatile limine_hhdm_request hhdmRequest = {
-    .id = LIMINE_HHDM_REQUEST,
+    .id = LIMINE_HHDM_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };

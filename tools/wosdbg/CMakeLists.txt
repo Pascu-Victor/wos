@@ -83,6 +83,8 @@ add_executable(wosdbg
     coredump_memory_panel.cpp
     coredump_elf_panel.h
     coredump_elf_panel.cpp
+    coredump_disasm_panel.h
+    coredump_disasm_panel.cpp
     capstone_disasm.h
     capstone_disasm.cpp
 )

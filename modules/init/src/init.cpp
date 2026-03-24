@@ -390,15 +390,17 @@ auto main(int argc, char** argv) -> int {
     // }
 
     // Keep init alive and reap orphaned zombie children.
-    // When a parent process exits, its children are reparented to init (PID 1).
-    // Init must call waitpid(-1, ..., WNOHANG) periodically to reap them,
-    // otherwise zombie processes accumulate in the process table.
+    // When children are still alive, block in waitpid() until one exits.
+    // If init temporarily has no children at all, sleep instead of spinning.
     for (;;) {
         int32_t reap_status = 0;
-        auto reap_pid = ker::process::waitpid(-1, &reap_status, 1 /* WNOHANG */, nullptr);
-        if (reap_pid == 0 || reap_pid == static_cast<uint64_t>(-1)) {
-            // No zombie children to reap right now — sleep briefly
-            asm volatile("pause");
+        auto reap_pid = ker::process::waitpid(-1, &reap_status, 0, nullptr);
+        if (reap_pid == static_cast<uint64_t>(-1)) {
+            struct timespec idle_sleep{
+                .tv_sec = 1,
+                .tv_nsec = 0,
+            };
+            nanosleep(&idle_sleep, nullptr);
         }
     }
 

@@ -1,5 +1,7 @@
 #include "cpu.hpp"
 
+#include <cstdint>
+
 namespace ker::mod::cpu {
 void cpuid(struct CpuidContext* cpuid_context) {
     asm volatile("cpuid"
@@ -43,7 +45,17 @@ void enableFSGSBASE(void) {
 }
 
 extern "C" void _wOS_enableSSE_asm(void);
+extern "C" uint64_t _wOS_enableXSave_asm(void);
 
 void enableSSE(void) { _wOS_enableSSE_asm(); }
+
+uint64_t xsaveAreaSize = 0;
+
+void enableXSave(void) {
+    uint64_t size = _wOS_enableXSave_asm();
+    if (size > 0 && (xsaveAreaSize == 0 || size == xsaveAreaSize)) {
+        xsaveAreaSize = size;
+    }
+}
 
 }  // namespace ker::mod::cpu

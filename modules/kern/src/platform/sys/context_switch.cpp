@@ -1,11 +1,14 @@
 #include "context_switch.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <platform/asm/msr.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/tsc/tsc.hpp>
 
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
@@ -22,6 +25,29 @@ namespace ker::mod::sys::context_switch {
 // This function is now a no-op since the scheduler tracks currentTask internally.
 static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpuId) {
     // No-op: scheduler's runQueues->thisCpu()->currentTask is the authoritative source
+}
+
+// Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
+// The memory operand must be 64-byte aligned for xsave, 16-byte for fxsave.
+// FxState::aligned() guarantees 64-byte alignment regardless of Task placement.
+void saveFpuState(sched::task::Task* task) {
+    auto* buf = task->fxState.aligned();
+    if (cpu::xsaveAreaSize > 0) {
+        asm volatile("xsave64 (%0)" : : "r"(buf), "a"(0x7), "d"(0) : "memory");
+    } else {
+        asm volatile("fxsave64 (%0)" : : "r"(buf) : "memory");
+    }
+    task->fxState.saved = true;
+}
+
+// Restore FPU/SSE/AVX state of a task. Uses xrstor if available, fxrstor otherwise.
+void restoreFpuState(sched::task::Task* task) {
+    auto* buf = task->fxState.aligned();
+    if (cpu::xsaveAreaSize > 0) {
+        asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(0x7), "d"(0) : "memory");
+    } else {
+        asm volatile("fxrstor64 (%0)" : : "r"(buf) : "memory");
+    }
 }
 
 bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask) {
@@ -85,9 +111,8 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
     // The epoch guard in processTasks ensures the task struct and its resources
     // (thread, pagemap) won't be freed until after we exit the critical section.
 
-    // Get real CPU ID from APIC
-    uint32_t apicId = apic::getApicId();
-    uint64_t realCpuId = smt::getCpuIndexFromApicId(apicId);
+    // Get real CPU ID from GS (no MSR / VM exit)
+    uint64_t realCpuId = cpu::currentCpu();
 
     // Update debug task pointer for panic inspection
     updateDebugTaskPtr(nextTask, realCpuId);
@@ -146,6 +171,11 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
         mm::virt::switchPagemap(nextTask);
     }
 
+    // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
+    if (nextTask->type == sched::task::TaskType::PROCESS && nextTask->fxState.saved) {
+        restoreFpuState(nextTask);
+    }
+
     return true;
 }
 
@@ -154,17 +184,61 @@ static long timerQuantum;
 // Tick counter for periodic epoch advancement and garbage collection
 static std::atomic<uint64_t> timerTickCount{0};
 
-extern "C" void _wOS_schedTimer(void* stack_ptr) {
-    // The stack layout at this point (from low to high address):
-    // [GPRegs] <- stack_ptr points here (15 registers)
-    // [intNum]
-    // [errCode]
-    // [RIP]
-    // [CS]
-    // [RFLAGS]
-    // [RSP]
-    // [SS]
+namespace {
+constexpr bool kEnableSchedHotLogging = false;
+constexpr bool kEnableSchedCpuDump = false;
 
+[[maybe_unused]]
+constexpr uint64_t HOT_TASK_STREAK_TICKS = 250;
+[[maybe_unused]]
+constexpr uint64_t SCHED_CPU_DUMP_PERIOD_TICKS = 1000;
+
+struct HotTaskTracker {
+    uint64_t last_pid{0};
+    uint64_t streak{0};
+};
+
+[[maybe_unused]]
+std::array<HotTaskTracker, 16> hotTaskTrackers;
+}  // namespace
+
+#ifdef SCHED_DEBUG
+// Per-CPU interrupt timing stats (indexed by CPU id, max 16 CPUs)
+struct IrqStats {
+    std::atomic<uint64_t> total_ns{0};      // total ns spent inside _wOS_schedTimer
+    std::atomic<uint64_t> count{0};         // number of timer interrupts
+    std::atomic<uint64_t> ctx_switches{0};  // number of context switches performed
+    std::atomic<uint64_t> xsave_ns{0};      // total ns spent in saveFpuState
+};
+static std::array<IrqStats, 16> irqStats;
+
+void dump_irq_stats() {
+    uint64_t grand_total_ns = 0;
+    uint64_t grand_count = 0;
+    uint64_t grand_switches = 0;
+    uint64_t grand_xsave_ns = 0;
+    for (uint64_t i = 0; i < 16; i++) {
+        uint64_t ns = irqStats[i].total_ns.load(std::memory_order_relaxed);
+        uint64_t cnt = irqStats[i].count.load(std::memory_order_relaxed);
+        uint64_t sw = irqStats[i].ctx_switches.load(std::memory_order_relaxed);
+        uint64_t xns = irqStats[i].xsave_ns.load(std::memory_order_relaxed);
+        if (cnt == 0) continue;
+        dbg::log("irqstats: cpu%lu ticks=%lu avg_ns=%lu switches=%lu xsave_ms=%lu", (unsigned long)i, (unsigned long)cnt,
+                 (unsigned long)(ns / cnt), (unsigned long)sw, (unsigned long)(xns / 1000000ULL));
+        grand_total_ns += ns;
+        grand_count += cnt;
+        grand_switches += sw;
+        grand_xsave_ns += xns;
+    }
+    if (grand_count > 0) {
+        dbg::log("irqstats: TOTAL ticks=%lu switches=%lu total_irq_ms=%lu xsave_ms=%lu avg_ns=%lu", (unsigned long)grand_count,
+                 (unsigned long)grand_switches, (unsigned long)(grand_total_ns / 1000000ULL), (unsigned long)(grand_xsave_ns / 1000000ULL),
+                 (unsigned long)(grand_total_ns / grand_count));
+    }
+}
+#endif  // SCHED_DEBUG
+
+extern "C" void _wOS_schedTimer(void* stack_ptr) {
     apic::eoi();
 
     // Advance epoch and run garbage collection periodically on CPU 0 only.
@@ -177,13 +251,76 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
-    // This may not return if we switch contexts
-    // Note: processTasks will arm the timer when appropriate
+#ifdef SCHED_DEBUG
+    uint64_t t0 = rdtsc();
+    auto* task_before = sched::get_current_task();
+#endif
+
     sched::process_tasks(*gpr_ptr, *frame_ptr);
 
-    // Re-arm timer for next quantum (only reached if processTasks returned,
-    // meaning we're continuing with idle task or same task)
     apic::oneShotTimer(timerQuantum);
+
+    auto* current_task = sched::get_current_task();
+    uint64_t cpu_no = cpu::currentCpu();
+    if constexpr (kEnableSchedHotLogging) {
+        if (cpu_no < hotTaskTrackers.size()) {
+            auto& tracker = hotTaskTrackers[cpu_no];
+            uint64_t current_pid = current_task != nullptr ? current_task->pid : 0;
+
+            if (current_pid != 0 && current_pid == tracker.last_pid) {
+                tracker.streak++;
+            } else {
+                tracker.last_pid = current_pid;
+                tracker.streak = current_pid != 0 ? 1 : 0;
+            }
+
+            if (current_task != nullptr && current_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
+                (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
+                auto stats = sched::get_run_queue_stats(cpu_no);
+                dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
+                         (unsigned long)cpu_no, (unsigned long)current_task->pid, current_task->name != nullptr ? current_task->name : "?",
+                         (unsigned long)tracker.streak, (unsigned)current_task->type, current_task->voluntaryBlock ? 1U : 0U,
+                         current_task->wantsBlock ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U, (unsigned long)stats.active_task_count,
+                         (unsigned long)stats.wait_queue_count, (unsigned)frame_ptr->cs);
+            }
+        }
+    }
+
+    if constexpr (kEnableSchedCpuDump) {
+        if (cpu_no == 0 && (ticks % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
+            sched::dump_scheduler_cpu_states();
+        }
+    }
+
+#ifdef SCHED_DEBUG
+    auto* task_after = sched::get_current_task();
+    uint64_t elapsed_ns = tsc::ticksToNs(rdtsc() - t0);
+    uint64_t cpu = cpu_no;
+    if (cpu < 16) {
+        irqStats[cpu].total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+        irqStats[cpu].count.fetch_add(1, std::memory_order_relaxed);
+        if (task_before != task_after) {
+            irqStats[cpu].ctx_switches.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    static std::atomic<uint64_t> switch_log_count{0};
+    if (cpu == 0 && task_before != task_after && ticks > 25000) {
+        uint64_t n = switch_log_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32) {
+            const char* name_before = (task_before != nullptr && task_before->name != nullptr) ? task_before->name : "?";
+            const char* name_after = (task_after != nullptr && task_after->name != nullptr) ? task_after->name : "?";
+            dbg::log("sw[%lu] t=%lu: %lu(%s)->%lu(%s) cs=0x%x", (unsigned long)n, (unsigned long)ticks,
+                     task_before != nullptr ? (unsigned long)task_before->pid : 0UL, name_before,
+                     task_after != nullptr ? (unsigned long)task_after->pid : 0UL, name_after, (unsigned)(frame_ptr->cs));
+        }
+    }
+
+    if (cpu == 0 && (ticks % 500) == 499) {
+        dump_irq_stats();
+        sched::dump_scheduler_trace_stats();
+    }
+#endif  // SCHED_DEBUG
 }
 
 extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
@@ -194,7 +331,7 @@ extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
 }
 
 void startSchedTimer() {
-    timerQuantum = apic::calibrateTimer(1000);  // 1ms
+    timerQuantum = apic::calibrateTimer(4000);  // 4ms (matches Linux CFS typical quantum)
     apic::oneShotTimer(timerQuantum);
 }
 

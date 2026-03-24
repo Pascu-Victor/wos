@@ -11,4 +11,8 @@ namespace ker::mod::sys::context_switch {
 bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask);
 void startSchedTimer();
 void request_reschedule();
+
+// Save/restore FPU/SSE/AVX state for a task (xsave if available, fxsave otherwise)
+void saveFpuState(sched::task::Task* task);
+void restoreFpuState(sched::task::Task* task);
 }  // namespace ker::mod::sys::context_switch

@@ -73,11 +73,17 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     // Kernel virtual address (static data, BSS, etc.): use page table walk
     if (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL) {
         auto* kernel_pt = ker::mod::mm::virt::getKernelPageTable();
-        return ker::mod::mm::virt::translate(kernel_pt, addr);
+        uint64_t phys = ker::mod::mm::virt::translate(kernel_pt, addr);
+        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+            ker::mod::dbg::log("e1000e: virt_to_phys failed for kernel address 0x%lx", addr);
+            hcf();
+        }
+        return phys;
     }
 
-    ker::mod::dbg::log("e1000e: ERROR - invalid virtual address 0x%lx for DMA", addr);
-    return 0;
+    ker::mod::dbg::log("e1000e: virt_to_phys called with unrecognized address 0x%lx", addr);
+    hcf();
+    __builtin_unreachable();
 }
 
 // -- EEPROM read ---------------------------------------------------------

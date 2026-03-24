@@ -12,18 +12,23 @@ if [ -e "$DISK" ]; then
     rm "$DISK"
 fi
 
-# Create 1GB disk
-DISK_SIZE="1G"
+# Create disk
+DISK_SIZE="4G"
 echo "Creating QCOW2 image ($DISK_SIZE)"
 qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
+
+PART_START_SECTOR=2048
+PART_SIZE_MIB=3500
+SECTOR_SIZE=512
+PART_END_SECTOR=$((PART_START_SECTOR + (PART_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE) - 1))
 
 echo "Creating GPT partition and XFS filesystem"
 # Use guestfish to create GPT and format as XFS
 guestfish --rw -a "$DISK" <<_EOF_
 run
 part-init /dev/sda gpt
-# Create 900MB partition starting at sector 2048
-part-add /dev/sda p 2048 1845247
+# Create partition starting at sector 2048
+part-add /dev/sda p $PART_START_SECTOR $PART_END_SECTOR
 
 mkfs xfs /dev/sda1
 mount /dev/sda1 /

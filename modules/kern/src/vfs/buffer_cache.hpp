@@ -66,6 +66,16 @@ auto bwrite(BufHead* bh) -> int;
 // Mark a buffer dirty for deferred writeback (async).
 void bdirty(BufHead* bh);
 
+// Get (or create) a buffer for a block WITHOUT reading from disk.
+// Use for blocks that are about to be fully overwritten (newly allocated).
+// The buffer data is uninitialized; the caller must write valid content before
+// calling bdirty() / bwrite(). Returns a referenced BufHead* on success.
+auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead*;
+
+// Like bget but for count contiguous device blocks (analogous to bread_multi).
+// Returns a single BufHead whose data covers count * block_size bytes.
+auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead*;
+
 // Write all dirty buffers for a given block device to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_blockdev(dev::BlockDevice* bdev) -> int;

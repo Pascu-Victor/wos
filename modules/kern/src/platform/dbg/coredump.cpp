@@ -216,7 +216,7 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
             phys = ker::mod::mm::virt::translate(task->pagemap, vaddrPage);
         }
 
-        if (phys != 0 && is_ram(phys)) {
+        if (phys != ker::mod::mm::virt::PADDR_INVALID && is_ram(phys)) {
             s.present = 1;
             s.fileOffset = nextOffset;
             nextOffset += PAGE;
@@ -275,7 +275,7 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
             continue;
         }
         uint64_t phys = ker::mod::mm::virt::translate(task->pagemap, segs[i].vaddr);
-        if (phys == 0 || !is_ram(phys)) {
+        if (phys == ker::mod::mm::virt::PADDR_INVALID || !is_ram(phys)) {
             continue;
         }
         void* pagePtr = ker::mod::mm::addr::getVirtPointer(phys);

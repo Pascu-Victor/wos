@@ -12,14 +12,15 @@ volatile uint32_t* ioapic_base = nullptr;
 uint32_t gsi_base = 0;
 uint32_t max_redirection_entries = 0;
 
-void ioapic_write(uint32_t reg, uint32_t value) {
-    ioapic_base[0] = reg;       // IOREGSEL
-    ioapic_base[4] = value;     // IOWIN (offset 0x10 in bytes = index 4 in uint32_t)
+// cannot inline these are MIMO
+[[gnu::noinline]] void ioapic_write(uint32_t reg, uint32_t value) {
+    ioapic_base[0] = reg;    // IOREGSEL
+    ioapic_base[4] = value;  // IOWIN (offset 0x10 in bytes = index 4 in uint32_t)
 }
-
-auto ioapic_read(uint32_t reg) -> uint32_t {
-    ioapic_base[0] = reg;       // IOREGSEL
-    return ioapic_base[4];      // IOWIN
+// cannot inline these are MIMO
+[[gnu::noinline]] auto ioapic_read(uint32_t reg) -> uint32_t {
+    ioapic_base[0] = reg;   // IOREGSEL
+    return ioapic_base[4];  // IOWIN
 }
 
 void write_redirection(uint8_t index, uint64_t value) {
@@ -54,7 +55,7 @@ void init() {
     // MMIO regions are not in the Limine memory map, so the HHDM has no
     // page table entry for them after the kernel switches to its own page tables.
     auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::getVirtPointer(phys_addr));
-    mm::virt::mapToKernelPageTable(virt_addr, phys_addr, mm::paging::pageTypes::KERNEL);
+    mm::virt::mapToKernelPageTable(virt_addr, phys_addr, mm::paging::pageTypes::MMIO);
 
     ioapic_base = reinterpret_cast<volatile uint32_t*>(virt_addr);
 
@@ -73,8 +74,7 @@ void init() {
     // These remap ISA IRQs (e.g., IRQ 0->GSI 2 for timer)
     for (uint32_t i = 0; i < apic_info.usableIOAPICISOs; i++) {
         const auto& iso = apic_info.ioapicISOs[i];
-        dbg::log("IOAPIC: ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x",
-                 iso.bus, iso.source, iso.globalSysInt, iso.flags);
+        dbg::log("IOAPIC: ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x", iso.bus, iso.source, iso.globalSysInt, iso.flags);
     }
 }
 

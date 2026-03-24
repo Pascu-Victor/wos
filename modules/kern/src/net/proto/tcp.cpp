@@ -122,10 +122,7 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     sock->lock.lock();
     if (sock->aq_count == 0) {
         sock->lock.unlock();
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr) {
-            task->deferredTaskSwitch = true;
-        }
+        ker::mod::sched::kern_yield();
         return -EAGAIN;
     }
 
@@ -253,6 +250,14 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
         return -1;
     }
 
+    // Update owner_pid so wake_socket() wakes the correct task after fork.
+    {
+        auto* cur = ker::mod::sched::get_current_task();
+        if (cur != nullptr) {
+            sock->owner_pid = cur->pid;
+        }
+    }
+
     const auto* data = static_cast<const uint8_t*>(buf);
     size_t sent = 0;
 
@@ -369,6 +374,15 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
 
     if (sock->nonblock) {
         return -EAGAIN;
+    }
+
+    // Update owner_pid so wake_socket() wakes the correct task (handles fork: child
+    // inherits the fd but owner_pid still points to the parent that accepted it).
+    {
+        auto* cur = ker::mod::sched::get_current_task();
+        if (cur != nullptr) {
+            sock->owner_pid = cur->pid;
+        }
     }
 
     for (;;) {

@@ -78,7 +78,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     // Translate user virtual address to physical address for cross-process uniqueness
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
     uint64_t phys_addr = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (phys_addr == 0) {
+    if (phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address
     }
 
@@ -146,7 +146,7 @@ int64_t futex_wake(int* addr) {  // NOLINT
     // Translate user virtual address to physical address
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
     uint64_t phys_addr = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (phys_addr == 0) {
+    if (phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address
     }
 

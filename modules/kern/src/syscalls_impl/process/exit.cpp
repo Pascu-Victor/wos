@@ -56,8 +56,9 @@ void wos_proc_exit(int status) {
     current_task->exitStatus = (status & 0xff) << 8;
     current_task->hasExited = true;
 
-    // Send SIGCHLD to parent process
-    if (current_task->parentPid != 0) {
+    // Send SIGCHLD to parent process.
+    // Threads do not send SIGCHLD — their exit is handled via futex (pthread_join).
+    if (!current_task->isThread && current_task->parentPid != 0) {
         auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parentPid);
         if (parent != nullptr) {
             // Set SIGCHLD (signal 17) pending on parent
@@ -80,13 +81,19 @@ void wos_proc_exit(int status) {
                 current_task->waitedOn = true;
                 // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) —
                 // we must explicitly reschedule it so it actually wakes up.
-                uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
+                uint64_t cpu = parent->cpu;
+                if (cpu >= ker::mod::smt::getCoreCount()) {
+                    cpu = ker::mod::sched::get_least_loaded_cpu();
+                }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
             } else if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
                 // Parent is blocked for another reason (or WAIT_ANY_CHILD with
                 // deferredTaskSwitch still true — race check will handle RAX).
                 // Wake it so it can handle the signal / race check.
-                uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
+                uint64_t cpu = parent->cpu;
+                if (cpu >= ker::mod::smt::getCoreCount()) {
+                    cpu = ker::mod::sched::get_least_loaded_cpu();
+                }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
             }
             parent->release();
@@ -114,9 +121,9 @@ void wos_proc_exit(int status) {
 
                 if (waiting_task->waitStatusPhysAddr != 0) {
                     auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waiting_task->waitStatusPhysAddr));
-                    *status_ptr = status;
+                    *status_ptr = current_task->exitStatus;
 #ifdef EXIT_DEBUG
-                    ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", status, waitingPid);
+                    ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exitStatus, waitingPid);
 #endif
                 }
                 fill_rusage_for_waiter(waiting_task, current_task);
@@ -129,10 +136,13 @@ void wos_proc_exit(int status) {
                 current_task->waitedOn = true;
             }
 
-            // Reschedule the waiting task on the least loaded CPU.
-            // reschedule_task_for_cpu validates state and removes from all queues before
-            // adding, preventing double-queuing even if the task is still currentTask.
-            uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
+            // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration
+            // latency and the risk of landing on a non-preemptible CPU.  Fall back to the
+            // least-loaded CPU only if the stored cpu index is out of range.
+            uint64_t target_cpu = waiting_task->cpu;
+            if (target_cpu >= ker::mod::smt::getCoreCount()) {
+                target_cpu = ker::mod::sched::get_least_loaded_cpu();
+            }
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);
@@ -148,8 +158,8 @@ void wos_proc_exit(int status) {
     }
 
     // Reparent all children of this process to init (PID 1), so init can reap them.
-    // This prevents orphaned zombies from accumulating forever.
-    {
+    // Threads do not own children directly — skip reparenting for thread exits.
+    if (!current_task->isThread) {
         uint32_t count = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < count; i++) {
             auto* child = ker::mod::sched::get_active_task_at(i);
@@ -161,21 +171,23 @@ void wos_proc_exit(int status) {
 
     // CLEANUP TASK RESOURCES
 
-    // Close all open file descriptors
-    for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (current_task->fds[i] != nullptr) {
-            ker::vfs::vfs_close(static_cast<int>(i));
-        }
-    }
+    if (!current_task->isThread) {
+        // For a full process exit: close FDs and free ELF buffer.
+        // Threads share both with their owner process — do not touch them.
 
-    // Free ELF buffer
-    if (current_task->elfBuffer != nullptr) {
-#ifdef EXIT_DEBUG
-        ker::mod::dbg::log("wos_proc_exit: Freeing ELF buffer of size %d", currentTask->elfBufferSize);
-#endif
-        delete[] current_task->elfBuffer;
-        current_task->elfBuffer = nullptr;
-        current_task->elfBufferSize = 0;
+        // Close all open file descriptors
+        for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
+            if (current_task->fds[i] != nullptr) {
+                ker::vfs::vfs_close(static_cast<int>(i));
+            }
+        }
+
+        // Free ELF buffer
+        if (current_task->elfBuffer != nullptr) {
+            delete[] current_task->elfBuffer;
+            current_task->elfBuffer = nullptr;
+            current_task->elfBufferSize = 0;
+        }
     }
 
     // CRITICAL: Do NOT modify or destroy pagemap/thread here!
@@ -191,10 +203,10 @@ void wos_proc_exit(int status) {
     //
     // The downside is user pages remain allocated ~1 second longer, but this is
     // necessary for correctness in the face of concurrent scheduling.
-    if (current_task->pagemap != nullptr) {
-#ifdef EXIT_DEBUG
-        ker::mod::dbg::log("wos_proc_exit: Deferring pagemap destruction for PID %x to GC", currentTask->pid);
-#endif
+    //
+    // For threads (isThread == true): the pagemap is shared with the owning process
+    // and must NEVER be freed or even switched away from here; GC will skip it.
+    if (!current_task->isThread && current_task->pagemap != nullptr) {
         // Switch to kernel pagemap so we don't use our own pagemap anymore
         ker::mod::mm::virt::switchToKernelPagemap();
         // Pagemap destruction deferred to gcExpiredTasks()

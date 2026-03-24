@@ -4,7 +4,7 @@
 #include <cmath>
 #include <platform/mm/virt.hpp>
 __attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebufferRequest = {
-    .id = LIMINE_FRAMEBUFFER_REQUEST,
+    .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };

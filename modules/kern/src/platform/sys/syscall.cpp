@@ -41,7 +41,9 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
         case abi::callnums::threading:
             // Dispatch based on operation - threadControlOps start at 0x100
             if (a1 >= 0x100) {
-                return ker::syscall::multiproc::threadControl(static_cast<abi::multiproc::threadControlOps>(a1), (void*)a2);
+                return ker::syscall::multiproc::threadControl(
+                    static_cast<abi::multiproc::threadControlOps>(a1),
+                    (void*)a2, (void*)a3, (void*)a4);
             }
             return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
         case abi::callnums::time:
@@ -56,6 +58,15 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
             return ker::syscall::vmem::sys_vmem_map(a1, a2, a3, a4, a5, a6);
         case abi::callnums::process:
             return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(a1), a2, a3, a4, a5, regs);
+
+        case abi::callnums::debug:
+            // a1=0: disable interrupts on this CPU; a1=1: re-enable
+            if (a1 == 0) {
+                asm volatile("cli" ::: "memory");
+            } else {
+                asm volatile("sti" ::: "memory");
+            }
+            return 0;
 
         default:
             io::serial::write("Syscall undefined\n");

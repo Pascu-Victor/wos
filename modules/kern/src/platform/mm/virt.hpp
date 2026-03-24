@@ -1,6 +1,6 @@
 #pragma once
 
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <platform/acpi/acpi.hpp>
 #include <platform/asm/tlb.hpp>
@@ -20,8 +20,8 @@ struct Range {
     uint64_t end;
 };
 
-void init(limine_memmap_response* memmapResponse, limine_kernel_file_response* kernelFileResponse,
-          limine_kernel_address_response* kernelAddressResponse);
+void init(limine_memmap_response* memmapResponse, limine_executable_file_response* kernelFileResponse,
+          limine_executable_address_response* kernelAddressResponse);
 
 static inline auto getKernelPageTable() -> PageTable* { return (PageTable*)rdcr3(); }
 
@@ -42,6 +42,10 @@ void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void mapRangeToKernelPageTable(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset
 void mapRangeToKernelPageTable(Range range, uint64_t flags);
+// Sentinel returned by translate() when the virtual address is not mapped.
+// Using (paddr_t)-1 so physical address 0 remains valid.
+static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
+
 paddr_t translate(PageTable* pageTable, vaddr_t vaddr);
 
 // Free all user-space pages and page tables in a pagemap

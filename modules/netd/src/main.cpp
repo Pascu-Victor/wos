@@ -481,7 +481,10 @@ request_failed:
     if (lease.lease_time == 0) {
         std::println("netd: infinite lease, sleeping forever");
         for (;;) {
-            sched_yield();
+            // Sleep for a very long time instead of busy-spinning
+            struct timespec ts{};
+            ts.tv_sec = 86400;  // 24 hours
+            nanosleep(&ts, nullptr);
         }
     }
 
@@ -489,17 +492,10 @@ request_failed:
     std::println("netd: will renew in ~{} seconds (T1)", t1_seconds);
 
     for (;;) {
-        // Sleep until T1 using real clock
-        struct timespec sleep_start{};
-        clock_gettime(CLOCK_MONOTONIC, &sleep_start);
-        while (true) {
-            sched_yield();
-            struct timespec now{};
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (static_cast<uint32_t>(now.tv_sec - sleep_start.tv_sec) >= t1_seconds) {
-                break;
-            }
-        }
+        // Sleep until T1
+        struct timespec ts{};
+        ts.tv_sec = t1_seconds;
+        nanosleep(&ts, nullptr);
 
         std::println("netd: T1 reached, sending renewal REQUEST");
         ++xid;

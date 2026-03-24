@@ -9,6 +9,7 @@
 
 #include "xfs_dir2.hpp"
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
@@ -116,15 +117,21 @@ auto dir2_read_block(XfsInode* dp, xfs_dir2_db_t db, BufHead** bhp) -> int {
     XfsBmapResult bmap{};
     int rc = xfs_bmap_lookup(dp, file_block, &bmap);
     if (rc != 0) {
+#ifdef XFS_DEBUG
         mod::dbg::log("[xfs] dir2_read_block: bmap_lookup failed ino=%lu db=%u rc=%d\n", (unsigned long)dp->ino, db, rc);
+#endif
         return rc;
     }
     if (bmap.is_hole) {
+#ifdef XFS_DEBUG
         mod::dbg::log("[xfs] dir2_read_block: HOLE ino=%lu db=%u fmt=%d ext_count=%u\n", (unsigned long)dp->ino, db, dp->data_fork.format,
                       dp->data_fork.extents.count);
+#endif
         return -EINVAL;
     }
+#ifdef XFS_DEBUG
     mod::dbg::log("[xfs] dir2_read_block: ino=%lu db=%u blk=%lu\n", (unsigned long)dp->ino, db, (unsigned long)bmap.startblock);
+#endif
 
     uint32_t fbs = 1U << ctx->dir_blk_log;  // fs blocks per dir block
     if (fbs == 1) {
@@ -413,7 +420,9 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     BufHead* bh = nullptr;
     int rc = dir2_read_block(dp, 0, &bh);
     if (rc != 0) {
+#ifdef XFS_DEBUG
         mod::dbg::log("[xfs] dir2_block_iterate: read_block failed ino=%lu rc=%d\n", (unsigned long)dp->ino, rc);
+#endif
         return rc;
     }
 
@@ -424,10 +433,11 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     const auto* btp = reinterpret_cast<const XfsDir2BlockTail*>(block + blksize - sizeof(XfsDir2BlockTail));
     uint32_t leaf_count = btp->count.to_cpu();
 
+#ifdef XFS_DEBUG
     const auto* dbg_hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
     mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u\n", (unsigned long)dp->ino, dbg_hdr->hdr.magic.to_cpu(),
                   leaf_count);
-
+#endif
     // Data entries start after the v3 header
     size_t data_start = sizeof(XfsDir3DataHdr);
     // Data entries end before the leaf entries
@@ -1127,10 +1137,10 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     dp->size = blksize;
     dp->dirty = true;
     xfs_trans_log_inode(tp, dp);
-
+#ifdef XFS_DEBUG
     mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d\n", (unsigned long)dp->ino,
                   (unsigned long)disk_block, total_entries);
-
+#endif
     return 0;
 }
 
@@ -1382,6 +1392,334 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     return 0;
 }
 
+// ============================================================================
+// Directory remove-name — remove an entry from a directory
+// ============================================================================
+
+// Remove a name from a shortform directory (inline in inode data fork).
+// Finds the entry and removes it, compacting the remaining entries.
+auto dir2_sf_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp) -> int {
+    XfsMountContext* ctx = dp->mount;
+    bool has_ftype = xfs_has_ftype(ctx);
+
+    const uint8_t* old_data = dp->data_fork.local.data;
+    size_t old_size = dp->data_fork.local.size;
+
+    if (old_data == nullptr || old_size < sizeof(XfsDir2SfHdr)) {
+        return -EINVAL;
+    }
+
+    const auto* old_hdr = reinterpret_cast<const XfsDir2SfHdr*>(old_data);
+    size_t ino_size = xfs_dir2_sf_inumber_size(old_hdr);
+    size_t hdr_size = xfs_dir2_sf_hdr_size(old_hdr);
+
+    // Scan to find the entry to remove
+    const uint8_t* ptr = old_data + hdr_size;
+    uint8_t count = old_hdr->count;
+    size_t entry_offset_start = 0;
+    size_t entry_size = 0;
+    bool found = false;
+
+    for (uint8_t i = 0; i < count; i++) {
+        if (ptr >= old_data + old_size) {
+            break;
+        }
+
+        entry_offset_start = ptr - old_data;
+        const auto* sfep = reinterpret_cast<const XfsDir2SfEntry*>(ptr);
+        uint8_t entry_namelen = sfep->namelen;
+
+        if (entry_namelen == namelen && __builtin_memcmp(sfep->name, name, namelen) == 0) {
+            found = true;
+            entry_size = sizeof(uint8_t) + 2 + entry_namelen + (has_ftype ? 1 : 0) + ino_size;
+            break;
+        }
+
+        entry_size = sizeof(uint8_t) + 2 + entry_namelen + (has_ftype ? 1 : 0) + ino_size;
+        ptr += entry_size;
+    }
+
+    if (!found) {
+        return -ENOENT;
+    }
+
+    // Build new data fork without this entry
+    size_t new_size = old_size - entry_size;
+    auto* new_data = new uint8_t[new_size];
+    if (new_data == nullptr) {
+        return -ENOMEM;
+    }
+
+    // Copy header
+    __builtin_memcpy(new_data, old_data, hdr_size);
+
+    // Update header: decrement count
+    auto* new_hdr = reinterpret_cast<XfsDir2SfHdr*>(new_data);
+    new_hdr->count--;
+
+    // Copy entries before the removed entry
+    if (entry_offset_start > hdr_size) {
+        __builtin_memcpy(new_data + hdr_size, old_data + hdr_size, entry_offset_start - hdr_size);
+    }
+
+    // Copy entries after the removed entry
+    size_t after_offset = entry_offset_start + entry_size;
+    if (after_offset < old_size) {
+        __builtin_memcpy(new_data + entry_offset_start, old_data + after_offset, old_size - after_offset);
+    }
+
+    // Replace the data fork
+    delete[] dp->data_fork.local.data;
+    dp->data_fork.local.data = new_data;
+    dp->data_fork.local.size = new_size;
+    dp->size = new_size;
+    dp->dirty = true;
+    xfs_trans_log_inode(tp, dp);
+
+    return 0;
+}
+
+// Remove a name from a block-format directory (single directory block).
+auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp) -> int {
+    XfsMountContext* ctx = dp->mount;
+
+    // Read the single directory block
+    BufHead* bh = nullptr;
+    int rc = dir2_read_block(dp, 0, &bh);
+    if (rc != 0) return rc;
+
+    uint8_t* block = bh->data;
+    size_t blksize = ctx->dir_blk_size;
+
+    // Validate magic
+    auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
+    uint32_t magic = hdr->hdr.magic.to_cpu();
+    if (magic != XFS_DIR3_BLOCK_MAGIC) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
+    // Block tail is at the very end of the block
+    auto* btp = reinterpret_cast<XfsDir2BlockTail*>(block + blksize - sizeof(XfsDir2BlockTail));
+    uint32_t leaf_count = btp->count.to_cpu();
+
+    size_t leaf_bytes = static_cast<size_t>(leaf_count) * sizeof(XfsDir2LeafEntry);
+    if (leaf_bytes > blksize - sizeof(XfsDir3DataHdr) - sizeof(XfsDir2BlockTail)) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
+    size_t data_start = sizeof(XfsDir3DataHdr);
+    size_t data_end = blksize - sizeof(XfsDir2BlockTail) - leaf_bytes;
+    if (data_end <= data_start) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
+    // Leaf entries are just before the tail
+    auto* blp = reinterpret_cast<XfsDir2LeafEntry*>(block + data_end);
+
+    // Hash the name and find matching leaf entry
+    xfs_dahash_t hash = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+
+    int lo = 0;
+    int hi = static_cast<int>(leaf_count) - 1;
+    int mid = -1;
+    int match_idx = -1;
+    uint32_t entry_off = 0;
+    size_t entry_size = 0;
+
+    // Binary search for hash
+    while (lo <= hi) {
+        mid = (lo + hi) / 2;
+        uint32_t entry_hash = blp[mid].hashval.to_cpu();
+
+        if (hash < entry_hash) {
+            hi = mid - 1;
+        } else if (hash > entry_hash) {
+            lo = mid + 1;
+        } else {
+            // Back up to first with this hash
+            while (mid > 0 && blp[mid - 1].hashval.to_cpu() == hash) {
+                mid--;
+            }
+            break;
+        }
+    }
+
+    // Scan all entries with matching hash to find the name
+    if (lo <= hi || (mid >= 0 && mid < static_cast<int>(leaf_count) && blp[mid].hashval.to_cpu() == hash)) {
+        int start_idx = (mid >= 0) ? mid : lo;
+        for (int i = start_idx; i < static_cast<int>(leaf_count); i++) {
+            if (blp[i].hashval.to_cpu() != hash) {
+                break;
+            }
+
+            xfs_dir2_dataptr_t addr = blp[i].address.to_cpu();
+            if (addr == XFS_DIR2_NULL_DATAPTR) {
+                continue;  // stale
+            }
+
+            uint32_t off = dir2_dataptr_to_off(ctx, addr);
+            if (off < data_start || off + sizeof(XfsDir2DataEntry) > data_end) {
+                continue;
+            }
+
+            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
+            size_t dep_size = dir2_data_entsize(ctx, dep->namelen);
+            if (dep->namelen == 0 || dep_size == 0 || off + dep_size > data_end) {
+                continue;
+            }
+
+            if (dep->namelen == namelen && __builtin_memcmp(dep->name, name, namelen) == 0) {
+                match_idx = i;
+                entry_off = off;
+                entry_size = dep_size;
+                break;
+            }
+        }
+    }
+
+    if (match_idx < 0) {
+        brelse(bh);
+        return -ENOENT;
+    }
+
+    // Mark the leaf entry as stale (address = XFS_DIR2_NULL_DATAPTR)
+    blp[match_idx].address = __be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
+    uint32_t stale_count = btp->stale.to_cpu();
+    btp->stale = __be32::from_cpu(stale_count + 1);
+
+    // Convert the data entry to free space
+    auto* unused = reinterpret_cast<XfsDir2DataUnused*>(block + entry_off);
+    unused->freetag = __be16::from_cpu(XFS_DIR2_DATA_FREE_TAG);
+    unused->length = __be16::from_cpu(static_cast<uint16_t>(entry_size));
+
+    // Write tag at end of free space
+    auto* tag = reinterpret_cast<__be16*>(block + entry_off + entry_size - sizeof(__be16));
+    *tag = __be16::from_cpu(static_cast<uint16_t>(entry_off));
+
+    // Find immediate neighboring free regions by safely walking the data area.
+    size_t prev_free_off = 0;
+    size_t prev_free_len = 0;
+    bool prev_found = false;
+    size_t next_free_len = 0;
+    bool next_found = false;
+
+    {
+        size_t off = data_start;
+        while (off < data_end) {
+            if (off + sizeof(XfsDir2DataUnused) > data_end) {
+                break;
+            }
+
+            const auto* ent = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
+            if (ent->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
+                uint16_t free_len = ent->length.to_cpu();
+                if (free_len == 0 || off + free_len > data_end) {
+                    break;
+                }
+
+                if (off + free_len == entry_off) {
+                    prev_free_off = off;
+                    prev_free_len = free_len;
+                    prev_found = true;
+                } else if (off == entry_off + entry_size) {
+                    next_free_len = free_len;
+                    next_found = true;
+                }
+
+                off += free_len;
+                continue;
+            }
+
+            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
+            size_t dep_size = dir2_data_entsize(ctx, dep->namelen);
+            if (dep->namelen == 0 || dep_size == 0 || off + dep_size > data_end) {
+                break;
+            }
+            off += dep_size;
+        }
+    }
+
+    // Coalesce adjacent free regions into one contiguous record.
+    size_t merged_off = entry_off;
+    size_t merged_len = entry_size;
+    if (prev_found) {
+        merged_off = prev_free_off;
+        merged_len += prev_free_len;
+    }
+    if (next_found) {
+        merged_len += next_free_len;
+    }
+
+    auto* merged = reinterpret_cast<XfsDir2DataUnused*>(block + merged_off);
+    merged->freetag = __be16::from_cpu(XFS_DIR2_DATA_FREE_TAG);
+    merged->length = __be16::from_cpu(static_cast<uint16_t>(merged_len));
+    auto* merged_tag = reinterpret_cast<__be16*>(block + merged_off + merged_len - sizeof(__be16));
+    *merged_tag = __be16::from_cpu(static_cast<uint16_t>(merged_off));
+
+    // Rebuild top-3 best free regions from a validated linear walk.
+    struct BestFreeSlot {
+        uint16_t off;
+        uint16_t len;
+    };
+    std::array<BestFreeSlot, 3> best{{{0, 0}, {0, 0}, {0, 0}}};
+
+    {
+        size_t off = data_start;
+        while (off < data_end) {
+            if (off + sizeof(XfsDir2DataUnused) > data_end) {
+                break;
+            }
+
+            const auto* ent = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
+            if (ent->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
+                uint16_t free_len = ent->length.to_cpu();
+                if (free_len == 0 || off + free_len > data_end) {
+                    break;
+                }
+
+                BestFreeSlot cur{static_cast<uint16_t>(off), free_len};
+                for (int idx = 0; idx < 3; idx++) {
+                    if (cur.len > best[idx].len) {
+                        for (int j = 2; j > idx; j--) {
+                            best[j] = best[j - 1];
+                        }
+                        best[idx] = cur;
+                        break;
+                    }
+                }
+
+                off += free_len;
+                continue;
+            }
+
+            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
+            size_t dep_size = dir2_data_entsize(ctx, dep->namelen);
+            if (dep->namelen == 0 || dep_size == 0 || off + dep_size > data_end) {
+                break;
+            }
+            off += dep_size;
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        hdr->best_free[i].offset = __be16::from_cpu(best[i].off);
+        hdr->best_free[i].length = __be16::from_cpu(best[i].len);
+    }
+
+    // Update CRC over the block
+    hdr->hdr.crc = __be32{0};
+    uint32_t crc = util::crc32c_block_with_cksum(block, blksize, 4);
+    hdr->hdr.crc = __be32::from_cpu(crc);
+
+    xfs_trans_log_buf_full(tp, bh);
+    brelse(bh);
+
+    return 0;
+}
+
 }  // anonymous namespace
 
 auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp) -> int {
@@ -1403,11 +1741,15 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
         case XFS_DINODE_FMT_LOCAL: {
             rc = dir2_sf_addname(dp, name, namelen, ino, ftype, tp);
             if (rc == -E2BIG) {
-                // Shortform is full — convert to block format, then add there.
+// Shortform is full — convert to block format, then add there.
+#ifdef XFS_DEBUG
                 mod::dbg::log("[xfs] dir_addname: shortform dir full, converting to block format\n");
+#endif
                 rc = dir2_sf_to_block(dp, tp);
                 if (rc != 0) {
+#ifdef XFS_DEBUG
                     mod::dbg::log("[xfs] dir_addname: sf->block conversion failed: %d\n", rc);
+#endif
                     return rc;
                 }
                 // Now it's a block-format directory; add the new entry there.
@@ -1424,6 +1766,35 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
             // Leaf/node format add not yet implemented
             mod::dbg::log("[xfs] dir_addname: leaf/node dir add not yet supported\n");
             return -ENOSPC;
+        }
+
+        default:
+            return -EINVAL;
+    }
+}
+
+// Remove a name from a directory.  Dispatches to the appropriate format handler.
+auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp) -> int {
+    if (dp == nullptr || name == nullptr || namelen == 0 || tp == nullptr) {
+        return -EINVAL;
+    }
+    if (!xfs_inode_isdir(dp)) {
+        return -ENOTDIR;
+    }
+
+    switch (dp->data_fork.format) {
+        case XFS_DINODE_FMT_LOCAL: {
+            return dir2_sf_removename(dp, name, namelen, tp);
+        }
+
+        case XFS_DINODE_FMT_EXTENTS:
+        case XFS_DINODE_FMT_BTREE: {
+            if (dp->size <= dp->mount->dir_blk_size) {
+                return dir2_block_removename(dp, name, namelen, tp);
+            }
+            // Leaf/node format remove not yet implemented
+            mod::dbg::log("[xfs] dir_removename: leaf/node dir remove not yet supported\n");
+            return -ENOSYS;
         }
 
         default:

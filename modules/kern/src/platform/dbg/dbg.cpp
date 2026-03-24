@@ -43,48 +43,61 @@ void enableKmalloc() {
     log("Kernel memory allocator is now available");
 }
 
-// Write a complete log line atomically to serial (timestamp + message + newline)
+// Write timestamp + message + newline to serial.
+// In panic mode the panic-dump caller already holds panicAcquireLock() for its
+// entire dump, so we must NOT re-acquire (that would deadlock).  We write
+// directly with the unlocked variants instead.
+// Outside panic mode we take ScopedLock to prevent per-line interleaving.
 inline void serialLogLine(const char* str) {
-    // Hold the serial lock for the entire log line to prevent interleaving
-    io::serial::ScopedLock lock;
+    // Helper: write timestamp + str + newline using only unlocked writes.
+    // Called both in panic mode (no lock) and in normal mode (lock already held
+    // via ScopedLock below).
+    auto writeLineUnlocked = [&]() {
+        if (isTimeAvailable) [[likely]] {
+            char timeSec[10] = {0};
+            char timeMs[5] = {0};
+            int logTime = time::getMs();
+            int logTimeMsPart = logTime % 1000;
+            int logTimeSecPart = logTime / 1000;
+            auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
+                if (n == 0) {
+                    s[0] = '0';
+                    s[1] = '\0';
+                    return 1;
+                }
+                char buf[32];
+                int i = 0;
+                while (n > 0) {
+                    int digit = n % base;
+                    buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                    n /= base;
+                }
+                int j = 0;
+                while (i > 0) {
+                    s[j++] = buf[--i];
+                }
+                s[j] = '\0';
+                return j;
+            };
+            u64toa_local(static_cast<uint64_t>(logTimeMsPart), timeMs, 10);
+            u64toa_local(static_cast<uint64_t>(logTimeSecPart), timeSec, 10);
+            io::serial::writeUnlocked('[');
+            io::serial::writeUnlocked(timeSec);
+            io::serial::writeUnlocked('.');
+            io::serial::writeUnlocked(timeMs);
+            io::serial::writeUnlocked("]:");
+        }
+        io::serial::writeUnlocked(str);
+        io::serial::writeUnlocked('\n');
+    };
 
-    if (isTimeAvailable) [[likely]] {
-        char timeSec[10] = {0};
-        char timeMs[5] = {0};
-        int logTime = time::getMs();
-        int logTimeMsPart = logTime % 1000;
-        int logTimeSecPart = logTime / 1000;
-        // simple u64 to ascii helper (avoid depending on userspace std here)
-        auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
-            if (n == 0) {
-                s[0] = '0';
-                s[1] = '\0';
-                return 1;
-            }
-            char buf[32];
-            int i = 0;
-            while (n > 0) {
-                int digit = n % base;
-                buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
-                n /= base;
-            }
-            int j = 0;
-            while (i > 0) {
-                s[j++] = buf[--i];
-            }
-            s[j] = '\0';
-            return j;
-        };
-        u64toa_local(logTimeMsPart, timeMs, 10);
-        u64toa_local(logTimeSecPart, timeSec, 10);
-        io::serial::writeUnlocked('[');
-        io::serial::writeUnlocked(timeSec);
-        io::serial::writeUnlocked('.');
-        io::serial::writeUnlocked(timeMs);
-        io::serial::writeUnlocked("]:");
+    // In panic mode the caller already holds the panic lock for the whole dump.
+    if (io::serial::isPanicMode()) {
+        writeLineUnlocked();
+        return;
     }
-    io::serial::writeUnlocked(str);
-    io::serial::writeUnlocked('\n');
+    io::serial::ScopedLock lock;
+    writeLineUnlocked();
 }
 
 inline void fbLog(const char* str) {

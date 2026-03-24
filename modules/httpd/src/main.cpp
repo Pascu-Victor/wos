@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
-#include <iostream>
+#include <fstream>
 #include <print>
 #include <string>
 #include <string_view>
@@ -27,22 +27,20 @@
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-// constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
+constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
 constexpr const char* SERVE_ROOT = "/";
 
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
-    std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
-
-    // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
-    // if (log_stream.is_open()) {
-    //     log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
-    //     log_stream.close();
-    // }
+    std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
+    if (log_stream.is_open()) {
+        log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
+        log_stream.close();
+    }
 }
-constexpr size_t BUFFER_SIZE = 4096;
-constexpr size_t MAX_FILE_SIZE = static_cast<const size_t>(1024 * 1024);  // 1MB max file size
+constexpr size_t REQUEST_BUFFER_SIZE = 4096;
+constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
 constexpr int MAX_PENDING_CONNECTIONS = 128;
 
 // MIME type lookup based on file extension
@@ -174,7 +172,7 @@ auto url_decode(std::string_view encoded) -> std::string {
 // Check if path is safe (no directory traversal)
 auto is_safe_path(std::string_view path) -> bool {
     // Reject paths with ..
-    return path.find("..") == std::string_view::npos;
+    return !path.contains("..");
 }
 
 // Format file size for display
@@ -487,13 +485,6 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
         return false;
     }
 
-    // Check file size
-    if (static_cast<size_t>(st.st_size) > MAX_FILE_SIZE) {
-        log_message("httpd[t:{},p:{}]: File too large: {} ({} bytes)", tid, pid, fs_path, st.st_size);
-        send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
-        return false;
-    }
-
     // Read file
     int fd = open(fs_path.c_str(), O_RDONLY);
     if (fd < 0) {
@@ -502,20 +493,38 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
         return false;
     }
 
-    std::vector<char> file_buf(st.st_size);
-    ssize_t bytes_read = read(fd, file_buf.data(), st.st_size);
-    close(fd);
-
-    if (bytes_read < 0) {
-        log_message("httpd[t:{},p:{}]: Failed to read file: {}", tid, pid, fs_path);
-        send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
+    // Send response header first, then stream file body in chunks.
+    const char* mime_type = get_mime_type(fs_path);
+    ssize_t header_sent = send_response(client_fd, 200, "OK", mime_type, nullptr, static_cast<size_t>(st.st_size));
+    if (header_sent < 0) {
+        close(fd);
         return false;
     }
 
-    // Get MIME type and send response
-    const char* mime_type = get_mime_type(fs_path);
-    send_response(client_fd, 200, "OK", mime_type, file_buf.data(), bytes_read);
-    log_message("httpd[t:{},p:{}]: Served file: {} ({} bytes, {})", tid, pid, fs_path, bytes_read, mime_type);
+    std::vector<char> io_buf(FILE_STREAM_BUFFER_SIZE);
+    ssize_t total_sent = 0;
+    for (;;) {
+        ssize_t bytes_read = read(fd, io_buf.data(), io_buf.size());
+        if (bytes_read < 0) {
+            log_message("httpd[t:{},p:{}]: Failed to read file: {}", tid, pid, fs_path);
+            close(fd);
+            return false;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+
+        ssize_t bytes_sent = send_all(client_fd, io_buf.data(), static_cast<size_t>(bytes_read));
+        if (bytes_sent < 0) {
+            close(fd);
+            return false;
+        }
+        total_sent += bytes_sent;
+    }
+
+    close(fd);
+
+    log_message("httpd[t:{},p:{}]: Served file: {} ({} bytes, {})", tid, pid, fs_path, total_sent, mime_type);
     return true;
 }
 
@@ -790,7 +799,7 @@ auto main(int argc, char** argv) -> int {
     log_message("httpd[t:{},p:{}]: Listening for connections (backlog={})", tid, pid, MAX_PENDING_CONNECTIONS);
 
     // Main server loop
-    std::array<char, BUFFER_SIZE> buffer{};
+    std::array<char, REQUEST_BUFFER_SIZE> buffer{};
 
     for (;;) {
         struct sockaddr_in client_addr{};
@@ -811,7 +820,7 @@ auto main(int argc, char** argv) -> int {
         log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), client_port);
 
         // Read request
-        ssize_t received = recv(client_fd, buffer.data(), BUFFER_SIZE - 1, 0);
+        ssize_t received = recv(client_fd, buffer.data(), REQUEST_BUFFER_SIZE - 1, 0);
         if (received < 0) {
             log_message("httpd[t:{},p:{}]: Failed to read request: {}", tid, pid, received);
             close(client_fd);

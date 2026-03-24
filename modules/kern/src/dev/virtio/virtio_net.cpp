@@ -55,7 +55,12 @@ size_t device_count = 0;
 auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
     if (addr >= 0xffffffff80000000ULL) {
-        return ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+            ker::mod::dbg::log("virtio_net: virt_to_phys failed for kernel address 0x%lx", addr);
+            hcf();
+        }
+        return phys;
     }
     return reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(addr));
 }

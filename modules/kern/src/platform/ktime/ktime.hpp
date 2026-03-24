@@ -15,16 +15,17 @@ namespace ker::mod::time {
 
 void init(void);
 
-// HPET-backed helpers
+// HPET-backed helpers (use only where HPET precision is required, e.g. early boot calibration)
 inline uint64_t getTicks(void) { return hpet::getTicks(); }
-inline uint64_t getUs(void) { return hpet::getUs(); }
-inline uint64_t getMs(void) { return getUs() / 1000; }
+inline uint64_t getHpetUs(void) { return hpet::getUs(); }
 inline void sleepTicks(uint64_t ticks) { hpet::sleepTicks(ticks); }
 inline void sleepUs(uint64_t us) { hpet::sleepUs(us); }
 inline void sleep(uint64_t ms) { hpet::sleepUs(ms * 1000); }
 
-// TSC-backed monotonic nanoseconds
+// TSC-backed monotonic time — no VM-exits, use for hot paths like the scheduler
 inline uint64_t getMonotonicNs(void) { return tsc::getNs(); }
+inline uint64_t getUs(void) { return tsc::getNs() / 1000; }
+inline uint64_t getMs(void) { return tsc::getNs() / 1000000; }
 
 // RTC + TSC epoch nanoseconds
 inline uint64_t getEpochNs(void) { return rtc::getEpochNs(); }
