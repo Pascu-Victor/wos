@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <vector>
 
+#include "config.hpp"
+
 #ifndef _UTIL_H
 #define _UTIL_H
 
@@ -17,6 +19,7 @@ struct arg {
     int max;
     int id;
     int threads;
+#if MANDELBENCH_DEBUG
     // timing filled in by each thread
     uint64_t thread_start_ns;
     uint64_t thread_end_ns;
@@ -27,6 +30,13 @@ struct arg {
     int cpu_id;  // which CPU this thread ran on
     int cpu_end_id;
     uint32_t cpu_changes;
+    // Preemption accounting via inter-row gap sampling.
+    // A gap between consecutive rows that exceeds PREEMPT_THRESHOLD_NS is
+    // counted as a preemption event; the gap time is charged to preempt_ns.
+    uint64_t preempt_count;  // number of gaps that exceeded the threshold
+    uint64_t preempt_ns;     // total ns attributed to preemptions
+    uint64_t max_gap_ns;     // largest single preemption gap observed
+#endif
 };
 
 unsigned char color2byte(float v);

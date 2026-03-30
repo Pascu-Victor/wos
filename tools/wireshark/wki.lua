@@ -1236,10 +1236,10 @@ local roce_stats = {
     total_rdma_bytes = 0,
 }
 
--- Per-rkey transfer tracking: rkey → { writes, reads, bytes, first_frame, last_frame }
+-- Per-rkey transfer tracking: rkey => { writes, reads, bytes, first_frame, last_frame }
 local roce_rkey_stats = {}
 
--- Per-node stats: node_id → { tx_writes, tx_reads, tx_doorbells, bytes }
+-- Per-node stats: node_id => { tx_writes, tx_reads, tx_doorbells, bytes }
 local roce_node_stats = {}
 
 local function reset_roce_stats()

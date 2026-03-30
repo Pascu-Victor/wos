@@ -43,6 +43,38 @@ else
     echo "WARNING: httpd binary not found at $HTTPD_BINARY, skipping"
 fi
 
+# Copy perf binary (kernel performance tool)
+PERF_BINARY="build/modules/perf/perf"
+if [ -f "$PERF_BINARY" ]; then
+    mkdir -p "$INITRAMFS_DIR/bin"
+    cp "$PERF_BINARY" "$INITRAMFS_DIR/bin/perf"
+    echo "  initramfs: added /bin/perf ($(du -h "$PERF_BINARY" | cut -f1))"
+else
+    echo "WARNING: perf binary not found at $PERF_BINARY, skipping"
+fi
+
+# Generate /etc/hostname from system configuration
+if [ -f "configs/system.conf" ]; then
+    source "configs/system.conf"
+    echo -n "${WOS_HOSTNAME:-wos}" > "$INITRAMFS_DIR/etc/hostname"
+    echo "  initramfs: added /etc/hostname (${WOS_HOSTNAME:-wos})"
+else
+    echo -n "wos" > "$INITRAMFS_DIR/etc/hostname"
+    echo "  initramfs: added /etc/hostname (wos) [default, no system.conf]"
+fi
+
+# Generate /etc/profile for ash shell prompt
+cat > "$INITRAMFS_DIR/etc/profile" <<'PROFILE'
+export USER="${USER:-root}"
+HOSTNAME=$(uname -n 2>/dev/null) || { read -r HOSTNAME < /etc/hostname 2>/dev/null || HOSTNAME="wos"; }
+export HOSTNAME
+export HOME="${HOME:-/}"
+export PS1="$USER@$HOSTNAME:\w\$ "
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+export ENV="/etc/profile"
+PROFILE
+echo "  initramfs: added /etc/profile"
+
 # Generate /etc/fstab from disk configuration
 if [ -f "configs/disks.conf" ]; then
     # shellcheck source=configs/disks.conf
@@ -82,6 +114,17 @@ else
     echo "WARNING: busybox binary not found at $BUSYBOX_BINARY, skipping"
 fi
 
+# Create /etc/passwd and /etc/group (needed by whoami, id, login shells, etc.)
+cat > "$INITRAMFS_DIR/etc/passwd" <<'PASSWD'
+root:x:0:0:root:/:/bin/sh
+PASSWD
+echo "  initramfs: added /etc/passwd"
+
+cat > "$INITRAMFS_DIR/etc/group" <<'GROUP'
+root:x:0:root
+GROUP
+echo "  initramfs: added /etc/group"
+
 # Copy dropbearmulti binary and create symlinks
 DROPBEAR_BINARY="toolchain/target1/bin/dropbearmulti"
 if [ -f "$DROPBEAR_BINARY" ]; then
@@ -98,18 +141,6 @@ if [ -f "$DROPBEAR_BINARY" ]; then
         ln -sf dropbearmulti "$INITRAMFS_DIR/bin/$applet"
         echo "  initramfs: symlinked /bin/$applet -> dropbearmulti"
     done
-
-    # Create minimal /etc/passwd for SSH login (key-based auth only)
-    cat > "$INITRAMFS_DIR/etc/passwd" <<'PASSWD'
-root:x:0:0:root:/:/bin/sh
-PASSWD
-    echo "  initramfs: added /etc/passwd"
-
-    # Create minimal /etc/group
-    cat > "$INITRAMFS_DIR/etc/group" <<'GROUP'
-root:x:0:root
-GROUP
-    echo "  initramfs: added /etc/group"
 
     # Install SSH authorized_keys for root (home is /)
     # Try ed25519 first, then RSA

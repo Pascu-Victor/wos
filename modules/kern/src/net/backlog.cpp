@@ -84,7 +84,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 }  // namespace
 
 void backlog_init() {
-    num_cpus = ker::mod::smt::getCoreCount();
+    num_cpus = ker::mod::smt::get_core_count();
     num_cpus = std::min(num_cpus, MAX_CPUS);
     if (num_cpus <= 1) {
         ker::mod::dbg::log("backlog: single CPU, steering disabled");

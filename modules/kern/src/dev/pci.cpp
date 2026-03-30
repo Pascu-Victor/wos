@@ -7,6 +7,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/smt/smt.hpp>
 
 namespace ker::dev::pci {
 
@@ -228,7 +229,7 @@ auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t {
     return 0;
 }
 
-auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int {
+auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int {
     uint8_t msi_off = pci_find_capability(dev, PCI_CAP_ID_MSI);
     if (msi_off == 0) return -1;
 
@@ -241,9 +242,10 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int {
     uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, msi_off + 2);
     bool is_64bit = (msg_ctrl >> 7) & 1;
 
-    // Message Address: 0xFEE00000 | (dest APIC ID << 12)
-    // Use destination 0 (BSP) with physical destination mode
-    uint32_t msg_addr = 0xFEE00000;
+    // Message Address: 0xFEE00000 | (dest APIC ID << 12), physical destination mode.
+    // target_cpu is a logical CPU index; translate to APIC ID for the hardware.
+    uint32_t apic_id = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
+    uint32_t msg_addr = 0xFEE00000u | (apic_id << 12);
     pci_config_write32(dev->bus, dev->slot, dev->function, msi_off + 4, msg_addr);
 
     if (is_64bit) {
@@ -265,7 +267,7 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int {
     return 0;
 }
 
-auto pci_enable_msix(PCIDevice* dev, uint8_t vector) -> int {
+auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int {
     uint8_t msix_off = pci_find_capability(dev, PCI_CAP_ID_MSIX);
     if (msix_off == 0) return -1;
 
@@ -289,18 +291,19 @@ auto pci_enable_msix(PCIDevice* dev, uint8_t vector) -> int {
     auto* bar_base = pci_map_bar(dev, table_bir);
     if (bar_base == nullptr) return -1;
 
-    auto* table = reinterpret_cast<volatile uint32_t*>(
-        reinterpret_cast<volatile uint8_t*>(bar_base) + table_offset);
+    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<volatile uint8_t*>(bar_base) + table_offset);
 
     // Enable MSI-X with Function Mask set (mask all vectors while configuring)
     msg_ctrl |= (1u << 15) | (1u << 14);
     pci_config_write16(dev->bus, dev->slot, dev->function, msix_off + 2, msg_ctrl);
 
     // Configure entry 0 (each entry is 4 x 32-bit words = 16 bytes)
-    table[0] = 0xFEE00000;  // Message Address Lower (BSP, physical destination mode)
-    table[1] = 0;            // Message Address Upper
-    table[2] = vector;       // Message Data (interrupt vector)
-    table[3] = 0;            // Vector Control (0 = unmasked)
+    // target_cpu is a logical CPU index; translate to APIC ID for physical destination mode.
+    uint32_t apic_id = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
+    table[0] = 0xFEE00000u | (apic_id << 12);  // Message Address Lower
+    table[1] = 0;                              // Message Address Upper
+    table[2] = vector;                         // Message Data (interrupt vector)
+    table[3] = 0;                              // Vector Control (0 = unmasked)
 
     // Clear Function Mask to enable delivery
     msg_ctrl &= ~(1u << 14);
@@ -352,8 +355,7 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
     // to map intermediate bogus addresses (e.g. writing 0xFFFFFFFF to a
     // 64-bit BAR while the high half still holds the original value).
     uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND,
-                       cmd & ~PCI_COMMAND_MEM_SPACE);
+    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd & ~PCI_COMMAND_MEM_SPACE);
 
     // Write all 1s to determine size
     pci_config_write32(dev->bus, dev->slot, dev->function, reg, 0xFFFFFFFF);
@@ -407,10 +409,39 @@ auto pci_map_bar(PCIDevice* dev, int bar_idx) -> volatile void* {
     // Map the MMIO range into the kernel page table
     ker::mod::mm::virt::mapRangeToKernelPageTable(ker::mod::mm::virt::Range{phys_aligned, end}, ker::mod::mm::paging::pageTypes::KERNEL);
 
-    return reinterpret_cast<volatile void*>(ker::mod::mm::addr::getVirtPointer(phys));
+    return reinterpret_cast<volatile void*>(ker::mod::mm::addr::get_virt_pointer(phys));
 }
 
 // Legacy wrapper: find AHCI controller using full enumeration
+auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector, uint64_t target_cpu) -> int {
+    uint8_t msix_off = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+    if (msix_off == 0) return -1;
+
+    // Validate entry_idx against the table size in the capability header.
+    uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, msix_off + 2);
+    uint32_t table_size = (msg_ctrl & 0x07FFu) + 1u;
+    if (entry_idx >= table_size) return -1;
+
+    uint32_t table_off_bir = pci_config_read32(dev->bus, dev->slot, dev->function, msix_off + 4);
+    uint8_t table_bir = table_off_bir & 0x7;
+    uint32_t table_offset = table_off_bir & ~0x7u;
+
+    auto* bar_base = pci_map_bar(dev, table_bir);
+    if (bar_base == nullptr) return -1;
+
+    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<volatile uint8_t*>(bar_base) + table_offset);
+
+    // Each entry is 4 x 32-bit words = 16 bytes.
+    volatile uint32_t* entry = table + entry_idx * 4;
+    uint32_t apic_id = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
+    entry[0] = 0xFEE00000u | (apic_id << 12);  // Message Address Lower
+    entry[1] = 0;                              // Message Address Upper
+    entry[2] = vector;                         // Message Data
+    entry[3] = 0;                              // Vector Control (bit 0 = 0 -> unmasked)
+
+    return 0;
+}
+
 auto pci_find_ahci_controller() -> PCIDevice* {
     if (!enumerated) pci_enumerate_all();
 

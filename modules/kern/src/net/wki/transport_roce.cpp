@@ -1,6 +1,7 @@
 #include "transport_roce.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -41,7 +42,7 @@ constexpr uint8_t ROCE_VERSION = 1;
 constexpr uint32_t ROCE_MAX_PAYLOAD = 9000 - proto::ETH_HLEN - sizeof(RoceHeader);  // ~8962 bytes
 
 // -----------------------------------------------------------------------------
-// Memory region registry — maps rkey → (vaddr, size)
+// Memory region registry — maps rkey -> (vaddr, size)
 // -----------------------------------------------------------------------------
 
 constexpr size_t ROCE_MAX_REGIONS = 64;
@@ -212,7 +213,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
     volatile auto* reg = region_find(local_rkey);
     while (wki_now_us() < deadline) {
         if (reg == nullptr || !reg->active) {
-            break;  // region was deregistered by DOORBELL handler → data arrived
+            break;  // region was deregistered by DOORBELL handler -> data arrived
         }
         // Drive NIC RX so the RDMA_WRITE + DOORBELL response can be processed.
         NetDevice* net_dev = wki_eth_get_netdev();

@@ -113,6 +113,10 @@ void description(const char* name, int width, int height, int max_iteration, int
 }
 
 void progress(const char* name, int width, int height, int max_iteration, int threads, int repeat, int r, double time) {
+    if (!MANDELBENCH_DEBUG_ENABLED) {
+        return;
+    }
+
     char desc[100];
     description(name, width, height, max_iteration, threads, desc);
     std::println(stderr, "name={} {} repeat={}/{} duration={:.2f}", name, desc, r + 1, repeat, time);

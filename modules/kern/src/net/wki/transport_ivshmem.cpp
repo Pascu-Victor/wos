@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/pci.hpp>
@@ -14,6 +15,8 @@
 #include <platform/mm/addr.hpp>
 #include <platform/sched/scheduler.hpp>
 
+#include "platform/ktime/ktime.hpp"
+
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
@@ -21,8 +24,8 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 //
 // [0..63]                WKI ivshmem header
-// [64..64+64KB-1]        VM0→VM1 message ring
-// [64+64KB..64+128KB-1]  VM1→VM0 message ring
+// [64..64+64KB-1]        VM0->VM1 message ring
+// [64+64KB..64+128KB-1]  VM1->VM0 message ring
 // [64+128KB..end]        RDMA region pool (bitmap-allocated, 4KB granularity)
 //
 
@@ -67,7 +70,7 @@ static_assert(sizeof(WkiIvshmemHeader) == WKI_IVSHMEM_HEADER_SIZE, "WkiIvshmemHe
 
 // -----------------------------------------------------------------------------
 // D4: IRQ forwarding mailbox — overlaid on the 24-byte reserved area
-// Two 12-byte slots: [0]=VM0→VM1, [1]=VM1→VM0
+// Two 12-byte slots: [0]=VM0->VM1, [1]=VM1->VM0
 // -----------------------------------------------------------------------------
 
 struct IrqMailboxSlot {
@@ -336,8 +339,8 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
     priv->regs[IVSHMEM_REG_INTRSTATUS / 4] = priv->regs[IVSHMEM_REG_INTRSTATUS / 4];
 
     // D4: Check IRQ forwarding mailbox before draining the ring.
-    // Our RX mailbox: if we are VM0, the peer (VM1) writes to slot[1] (VM1→VM0).
-    //                 if we are VM1, the peer (VM0) writes to slot[0] (VM0→VM1).
+    // Our RX mailbox: if we are VM0, the peer (VM1) writes to slot[1] (VM1->VM0).
+    //                 if we are VM1, the peer (VM0) writes to slot[0] (VM0->VM1).
     auto* mailbox = reinterpret_cast<IrqMailboxSlot*>(priv->shmem + IRQ_MAILBOX_OFFSET);
     uint32_t rx_slot_idx = (priv->my_vm_id == 0) ? 1U : 0U;
     volatile auto* rx_slot = &mailbox[rx_slot_idx];
@@ -407,8 +410,8 @@ void wki_ivshmem_irq_mailbox_write(WkiTransport* transport, uint16_t device_id, 
     }
     auto* priv = static_cast<IvshmemTransportPrivate*>(transport->private_data);
 
-    // Our TX mailbox slot: if we are VM0, we write to slot[0] (VM0→VM1).
-    //                      if we are VM1, we write to slot[1] (VM1→VM0).
+    // Our TX mailbox slot: if we are VM0, we write to slot[0] (VM0->VM1).
+    //                      if we are VM1, we write to slot[1] (VM1->VM0).
     auto* mailbox = reinterpret_cast<IrqMailboxSlot*>(priv->shmem + IRQ_MAILBOX_OFFSET);
     volatile auto* tx_slot = &mailbox[priv->my_vm_id];
 

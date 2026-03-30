@@ -28,5 +28,8 @@ enum class procmgmt_ops : uint64_t {
     setpgid,      // 22
     getpgid,      // 23
     execve,       // 24 — POSIX replace-process execve
+    gethostname,  // 25
+    sethostname,  // 26
+    setpriority,  // 27
 };
 }  // namespace ker::abi::process

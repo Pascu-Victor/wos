@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <net/wki/event.hpp>
 #include <net/wki/transport_eth.hpp>
@@ -12,6 +14,10 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
 #include <vector>
+
+#include "platform/mm/addr.hpp"
+#include "platform/mm/phys.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -642,7 +648,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
                     use_rdma = true;
                     use_roce = true;
                     rkey = roce_rkey;
-                    phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+                    phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
                     zone_rdma_transport = roce;
                     memset(backing, 0, req->size);
                 }
@@ -662,7 +668,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
             return;
         }
         memset(backing, 0, req->size);
-        phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+        phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
     }
 
     // Populate zone entry
@@ -785,7 +791,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         if (use_rdma && !use_roce) {
             zone->local_phys_addr = static_cast<uint64_t>(rdma_offset);
         } else {
-            zone->local_phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+            zone->local_phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
         }
         zone->remote_phys_addr = ack->phys_addr;
         zone->remote_rkey = ack->rkey;
@@ -795,7 +801,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
 
         // For RoCE zones: tell the responder our local_rkey so it can RDMA
         // write/read our zone memory.  The ACK only carries the responder's
-        // rkey (responder → initiator); we send ours back via a ZONE_NOTIFY_POST
+        // rkey (responder -> initiator); we send ours back via a ZONE_NOTIFY_POST
         // with op_type=0xFE (rkey-exchange).  The rkey is encoded in the offset field.
         if (use_roce && local_rkey != 0) {
             ZoneNotifyPayload rkey_notify = {};

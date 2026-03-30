@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <net/netpoll.hpp>
@@ -25,10 +27,14 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <ranges>
+#include <util/hostname.hpp>
 #include <utility>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
+
+#include "net/packet.hpp"
+#include "platform/sys/spinlock.hpp"
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
@@ -145,6 +151,9 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
 
     // Link into pending list (for timeout scan)
     wait_list_link(entry);
+    if (entry->deadline_us != 0) {
+        wki_timer_notify();
+    }
 
     // Poll until completed or deadline.  Use wki_spin_yield() instead of
     // plain kern_yield() so that channel-level delayed ACKs and retransmits
@@ -204,50 +213,13 @@ void wki_wait_timeout_scan(uint64_t now_us) {
 // -----------------------------------------------------------------------------
 
 static void resolve_local_hostname() {
-    // Try reading /etc/hostname
-    vfs::File* f = vfs::vfs_open_file("/etc/hostname", 0 /*O_RDONLY*/, 0);
-    if (f != nullptr && f->fops != nullptr && f->fops->vfs_read != nullptr) {
-        char buf[WKI_HOSTNAME_MAX + 16] = {};  // extra for whitespace stripping
-        ssize_t n = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
-        if (f->fops->vfs_close != nullptr) {
-            f->fops->vfs_close(f);
-        }
-        if (n > 0) {
-            buf[n] = '\0';
-            // Strip leading/trailing whitespace and newlines
-            char* start = buf;
-            while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
-                start++;
-            }
-            char* end = start + strlen(start);
-            while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) {
-                end--;
-            }
-            *end = '\0';
-
-            // Validate: non-empty, 1-63 bytes, valid chars [a-zA-Z0-9-]
-            size_t len = static_cast<size_t>(end - start);
-            bool valid = (len > 0 && len < WKI_HOSTNAME_MAX);
-            if (valid && (start[0] == '-' || start[len - 1] == '-')) {
-                valid = false;  // no leading/trailing hyphens
-            }
-            for (size_t i = 0; valid && i < len; i++) {
-                char c = start[i];
-                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) {
-                    valid = false;
-                }
-            }
-            if (valid) {
-                memcpy(g_wki.local_hostname, start, len + 1);
-                return;
-            }
-        }
-    } else if (f != nullptr && f->fops != nullptr && f->fops->vfs_close != nullptr) {
-        f->fops->vfs_close(f);
+    // Use the kernel-wide hostname cache (populated from /etc/hostname at boot)
+    const char* cached = ker::util::hostname::get();
+    size_t len = strlen(cached);
+    if (len >= WKI_HOSTNAME_MAX) {
+        len = WKI_HOSTNAME_MAX - 1;
     }
-
-    // Fallback: "node-{id:04x}"
-    snprintf(g_wki.local_hostname, WKI_HOSTNAME_MAX, "node-%04x", g_wki.my_node_id);
+    memcpy(g_wki.local_hostname, cached, len + 1);
 }
 
 // -----------------------------------------------------------------------------
@@ -593,6 +565,37 @@ auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
 }
 
 }  // namespace
+
+auto wki_has_fast_timer_work() -> bool { return wki_next_fast_timer_deadline_us(wki_now_us()) != UINT64_MAX; }
+
+auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
+    uint64_t next_deadline = UINT64_MAX;
+
+    s_channel_pool_lock.lock();
+    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
+        WkiChannel* ch = &s_channel_pool[i];
+        if (!ch->active) {
+            continue;
+        }
+        if (ch->ack_pending) {
+            next_deadline = std::min(next_deadline, now_us + std::max<uint64_t>(WKI_ACK_DELAY_US, 1));
+        }
+        if (ch->retransmit_head != nullptr && ch->retransmit_deadline != 0) {
+            next_deadline = std::min(next_deadline, ch->retransmit_deadline);
+        }
+    }
+    s_channel_pool_lock.unlock();
+
+    s_wait_lock.lock();
+    for (WkiWaitEntry* cur = s_wait_head; cur != nullptr; cur = cur->next) {
+        if (cur->deadline_us != 0 && !cur->completed.load(std::memory_order_acquire)) {
+            next_deadline = std::min(next_deadline, cur->deadline_us);
+        }
+    }
+    s_wait_lock.unlock();
+
+    return next_deadline;
+}
 
 auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel* {
     channel_pool_init();
@@ -998,6 +1001,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         }
     }
 
+    bool notify_timer = false;
     if (rt_entry != nullptr) {
         memcpy(rt_data, frame, frame_len);
         rt_entry->data = rt_data;
@@ -1018,6 +1022,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         // Set retransmit deadline
         if (ch->retransmit_count == 1) {
             ch->retransmit_deadline = rt_entry->send_time_us + ch->rto_us;
+            notify_timer = true;
         }
     }
 
@@ -1041,6 +1046,10 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     // transport just prepends link header and sends.  Transport takes
     // ownership of pkt (frees on error).
     int ret = transport->tx_pkt(transport, next_hop, pkt);
+
+    if (notify_timer) {
+        wki_timer_notify();
+    }
 
     return ret < 0 ? WKI_ERR_TX_FAILED : WKI_OK;
 }
@@ -1402,6 +1411,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 // piggybacks an ACK, but the ACK of the *response itself* has
                 // no piggyback vehicle and would otherwise stall up to 10ms.
                 bool imm_ack = (ch->priority == PriorityClass::LATENCY && ch->ack_pending);
+                bool notify_timer = false;
                 WkiHeader imm_ack_hdr = {};
                 uint16_t imm_ack_peer = 0;
                 if (imm_ack) {
@@ -1420,9 +1430,15 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     imm_ack_peer = ch->peer_node_id;
                     ch->ack_pending = false;
                     ch->dup_ack_count = 0;
+                } else {
+                    notify_timer = ch->ack_pending;
                 }
 
                 ch->lock.unlock();
+
+                if (notify_timer) {
+                    wki_timer_notify();
+                }
 
                 // TX outside the lock to avoid deadlock with RX interrupt
                 if (imm_ack) {
@@ -1466,12 +1482,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->ack_pending = true;
 
                 ch->lock.unlock();
+                wki_timer_notify();
             } else {
                 // Old/duplicate: discard but re-arm ACK so the sender's retransmit
                 // queue gets drained.  Without this the sender never receives the
                 // ACK and keeps retransmitting the same stale packet.
                 ch->ack_pending = true;
                 ch->lock.unlock();
+                wki_timer_notify();
             }
             return;
         }
@@ -1682,7 +1700,7 @@ void wki_timer_tick(uint64_t now_us) {
 
     // Process deferred blocking work (mounts, attaches, zone creates).
     // These operations can call wki_wait_for_op() which re-enters
-    // wki_spin_yield() → wki_timer_tick().  The guard prevents the
+    // wki_spin_yield() -> wki_timer_tick().  The guard prevents the
     // deferred work section from running recursively.
     bool expected = false;
     if (s_timer_deferred_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {

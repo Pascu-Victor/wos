@@ -1,11 +1,11 @@
 #include "cdc_ether.hpp"
 
 #include <array>
-#include <net/wki/remotable.hpp>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
@@ -59,7 +59,7 @@ auto virt_to_phys(void* v) -> uint64_t {
         }
         return phys;
     }
-    return reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(addr));
+    return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(addr));
 }
 
 // NetDevice operations for CDC Ethernet

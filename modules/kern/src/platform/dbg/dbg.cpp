@@ -204,7 +204,7 @@ void panic_handler(const char* msg) {
     log("KERNEL PANIC: %s", msg);
 
     // Try to halt other CPUs to stabilize global state for any dump/inspection
-    ker::mod::smt::haltOtherCores();
+    ker::mod::smt::halt_other_cores();
 
     // If stacktrace printing is desired and available, it can be called here.
     // Finally, stop this CPU.

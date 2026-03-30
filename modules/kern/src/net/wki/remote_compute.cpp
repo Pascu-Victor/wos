@@ -3,6 +3,10 @@
 #include <extern/elf.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <net/wki/remotable.hpp>
@@ -19,9 +23,15 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/vfs.hpp>
+
+#include "platform/mm/paging.hpp"
+#include "platform/mm/virt.hpp"
+#include "platform/sys/spinlock.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::net::wki {
 
@@ -103,7 +113,7 @@ ker::vfs::FileOperations g_capture_fops = {
 // -----------------------------------------------------------------------------
 //  Check if this node has a VFS export covering the given path.
 // If so, build the remote-accessible VFS_REF path:
-//   local path /sbin/init  +  export "/"  → /wki/<our_hostname>/sbin/init
+//   local path /sbin/init  +  export "/"  => /wki/<our_hostname>/sbin/init
 // Returns true if a VFS_REF path was built.
 // -----------------------------------------------------------------------------
 
@@ -180,7 +190,7 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> bool {
 
     // Compute local load (0-1000 scale)
     uint16_t local_load = 0;
-    auto cpu_count = static_cast<uint16_t>(ker::mod::smt::getCoreCount());
+    auto cpu_count = static_cast<uint16_t>(ker::mod::smt::get_core_count());
     if (cpu_count > 0) {
         uint16_t total_runnable = 0;
         for (uint16_t c = 0; c < cpu_count; c++) {
@@ -576,7 +586,7 @@ void wki_load_report_send() {
     g_last_load_report_us = now;
 
     // Build LoadReportPayload with real scheduler metrics
-    auto cpu_count = static_cast<uint16_t>(ker::mod::smt::getCoreCount());
+    auto cpu_count = static_cast<uint16_t>(ker::mod::smt::get_core_count());
     if (cpu_count == 0) {
         cpu_count = 1;
     }
@@ -740,7 +750,8 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
                 if (!waiting_task->deferredTaskSwitch) {
                     waiting_task->context.regs.rax = proxy->pid;
                     if (waiting_task->waitStatusPhysAddr != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waiting_task->waitStatusPhysAddr));
+                        auto* status_ptr =
+                            reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
                         *status_ptr = -1;
                     }
                 }
@@ -1135,7 +1146,7 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     // Set CWD from submit payload (V2 extended field)
     if (submit->cwd_len > 0) {
         // CWD data is at the end of the variable portion (after args + env strings)
-        // For now: submitter sends cwd_len=0 → use default "/"
+        // For now: submitter sends cwd_len=0 => use default "/"
         // When cwd_len>0 the cwd string follows after argc+envc NUL-separated strings
     }
     // Default CWD is already "/" from task constructor
@@ -1162,7 +1173,7 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
                 mod::dbg::log("remote_compute: translate failed for stack vaddr 0x%x", page_virt);
                 hcf();
             }
-            auto* dest = reinterpret_cast<uint8_t*>(addr::getVirtPointer(page_phys)) + page_off;
+            auto* dest = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(page_phys)) + page_off;
             std::memcpy(dest, data, size);
             return vaddr;
         };
@@ -1183,7 +1194,7 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
                 mod::dbg::log("remote_compute push_string: translate failed for stack vaddr 0x%x", page_virt);
                 hcf();
             }
-            auto* dest = reinterpret_cast<uint8_t*>(addr::getVirtPointer(page_phys)) + page_off;
+            auto* dest = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(page_phys)) + page_off;
             std::memcpy(dest, str, len);
             return vaddr;
         };
@@ -1371,7 +1382,8 @@ void handle_task_complete(const WkiHeader* /*hdr*/, const uint8_t* payload, uint
                 if (!waiting_task->deferredTaskSwitch) {
                     waiting_task->context.regs.rax = proxy->pid;
                     if (waiting_task->waitStatusPhysAddr != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waiting_task->waitStatusPhysAddr));
+                        auto* status_ptr =
+                            reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
                         *status_ptr = comp->exit_status;
                     }
                 }

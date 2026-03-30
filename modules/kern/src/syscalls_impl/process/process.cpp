@@ -18,6 +18,7 @@
 #include "syscalls_impl/process/getpid.hpp"
 #include "syscalls_impl/process/getppid.hpp"
 #include "syscalls_impl/process/waitpid.hpp"
+#include "util/hostname.hpp"
 #include "vfs/file.hpp"
 #include "vfs/vfs.hpp"
 
@@ -27,6 +28,7 @@ static constexpr uint64_t WOS_SIG_IGN = 1;
 static constexpr int WOS_SIGKILL = 9;
 static constexpr int WOS_SIGSTOP = 19;
 static constexpr uint64_t WOS_SA_RESTORER = 0x04000000;
+static constexpr int WOS_PRIO_PROCESS = 0;
 
 namespace ker::syscall::process {
 
@@ -85,6 +87,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->vruntime = 0;
     child->vdeadline = 0;
     child->schedWeight = parent->schedWeight;
+    child->schedNice = parent->schedNice;
     child->sliceNs = parent->sliceNs;
     child->sliceUsedNs = 0;
     child->heapIndex = -1;
@@ -389,6 +392,28 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     return 0;
 }
 
+static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
+    if (which != WOS_PRIO_PROCESS) return static_cast<uint64_t>(-EINVAL);
+
+    auto* self = mod::sched::get_current_task();
+    if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+
+    if (who == 0) who = static_cast<int64_t>(self->pid);
+    if (who < 0) return static_cast<uint64_t>(-EINVAL);
+
+    auto* target = mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(who));
+    if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+
+    if (self->euid != 0 && target->pid != self->pid) {
+        target->release();
+        return static_cast<uint64_t>(-EPERM);
+    }
+
+    mod::sched::set_task_nice(target, prio);
+    target->release();
+    return 0;
+}
+
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     switch (op) {
         case abi::process::procmgmt_ops::exit:
@@ -422,30 +447,34 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::sigreturn: {
             // Signal the asm-level check_pending_signals to restore the saved context
             auto* task = ker::mod::sched::get_current_task();
-            if (task) task->doSigreturn = true;
+            if (task != nullptr) {
+                task->doSigreturn = true;
+            }
             return 0;
         }
 
         // --- POSIX credential syscalls ---
         case abi::process::procmgmt_ops::getuid: {
             auto* task = ker::mod::sched::get_current_task();
-            return task ? task->uid : 0;
+            return (task != nullptr) ? task->uid : 0;
         }
         case abi::process::procmgmt_ops::geteuid: {
             auto* task = ker::mod::sched::get_current_task();
-            return task ? task->euid : 0;
+            return (task != nullptr) ? task->euid : 0;
         }
         case abi::process::procmgmt_ops::getgid: {
             auto* task = ker::mod::sched::get_current_task();
-            return task ? task->gid : 0;
+            return (task != nullptr) ? task->gid : 0;
         }
         case abi::process::procmgmt_ops::getegid: {
             auto* task = ker::mod::sched::get_current_task();
-            return task ? task->egid : 0;
+            return (task != nullptr) ? task->egid : 0;
         }
         case abi::process::procmgmt_ops::setuid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto new_uid = static_cast<uint32_t>(a2);
             if (task->euid == 0) {
                 // Privileged: set all three
@@ -461,7 +490,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::setgid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto new_gid = static_cast<uint32_t>(a2);
             if (task->euid == 0) {
                 task->gid = new_gid;
@@ -476,7 +507,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::seteuid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto new_euid = static_cast<uint32_t>(a2);
             if (task->euid == 0 || new_euid == task->uid || new_euid == task->suid) {
                 task->euid = new_euid;
@@ -486,7 +519,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::setegid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto new_egid = static_cast<uint32_t>(a2);
             if (task->euid == 0 || new_egid == task->gid || new_egid == task->sgid) {
                 task->egid = new_egid;
@@ -496,11 +531,13 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::getumask: {
             auto* task = ker::mod::sched::get_current_task();
-            return task ? task->umask : 022;
+            return (task != nullptr) ? task->umask : 022;
         }
         case abi::process::procmgmt_ops::setumask: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto old_umask = task->umask;
             task->umask = static_cast<uint32_t>(a2) & 0777;
             return old_umask;
@@ -508,7 +545,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
 
         case abi::process::procmgmt_ops::setsid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             // POSIX: setsid fails if the caller is already a process group leader
             if (task->pgid == task->pid && task->session_id != 0) {
                 return static_cast<uint64_t>(-EPERM);
@@ -522,21 +561,27 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto pid = static_cast<int64_t>(a2);
             if (pid == 0) {
                 auto* task = ker::mod::sched::get_current_task();
-                if (!task) return static_cast<uint64_t>(-ESRCH);
+                if (task == nullptr) {
+                    return static_cast<uint64_t>(-ESRCH);
+                }
                 return task->session_id;
             }
             // Look up another task by pid
             auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
-            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if (target == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto sid = target->session_id;
             target->release();
             return sid;
         }
         case abi::process::procmgmt_ops::setpgid: {
             auto* task = ker::mod::sched::get_current_task();
-            if (!task) return static_cast<uint64_t>(-ESRCH);
-            auto pid = static_cast<uint64_t>(a2);
-            auto new_pgid = static_cast<uint64_t>(a3);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            auto pid = a2;
+            auto new_pgid = a3;
             // pid==0 means current process
             if (pid == 0) pid = task->pid;
             // pgid==0 means use pid as pgid
@@ -573,6 +618,26 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             // POSIX replace-process execve
             return wos_proc_execve(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
                                    reinterpret_cast<const char* const*>(a4), gpr);
+        }
+        case abi::process::procmgmt_ops::gethostname: {
+            auto* buf = reinterpret_cast<char*>(a2);
+            auto bufsize = static_cast<size_t>(a3);
+            if (buf == nullptr) return static_cast<uint64_t>(-EFAULT);
+            const char* name = ker::util::hostname::get();
+            size_t len = strlen(name);
+            if (len + 1 > bufsize) return static_cast<uint64_t>(-ENAMETOOLONG);
+            memcpy(buf, name, len + 1);
+            return 0;
+        }
+        case abi::process::procmgmt_ops::sethostname: {
+            auto* name = reinterpret_cast<const char*>(a2);
+            auto len = static_cast<size_t>(a3);
+            if (name == nullptr) return static_cast<uint64_t>(-EFAULT);
+            int r = ker::util::hostname::set(name, len);
+            return (r < 0) ? static_cast<uint64_t>(r) : 0;
+        }
+        case abi::process::procmgmt_ops::setpriority: {
+            return wos_proc_setpriority(static_cast<int>(a2), static_cast<int64_t>(a3), static_cast<int>(a4));
         }
 
         default:

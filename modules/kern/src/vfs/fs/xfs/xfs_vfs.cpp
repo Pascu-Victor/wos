@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -25,6 +26,8 @@
 #include <vfs/fs/xfs/xfs_trans.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/stat.hpp>
+
+#include "dev/block_device.hpp"
 
 #ifdef XFS_BENCH
 #include "platform/dbg/dbg.hpp"
@@ -59,7 +62,7 @@ auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
         return nullptr;
     }
 
-    // Empty path or "/" → root
+    // Empty path or "/" -> root
     if (path == nullptr || path[0] == '\0') {
         return ip;
     }

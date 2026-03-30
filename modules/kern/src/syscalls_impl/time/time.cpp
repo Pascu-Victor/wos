@@ -53,12 +53,24 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return (uint64_t)-1;
             }
             auto* ts = reinterpret_cast<struct timespec*>(arg1);
-            int clock_id = static_cast<int>(reinterpret_cast<uint64_t>(arg2));  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC
+            int clock_id =
+                static_cast<int>(reinterpret_cast<uint64_t>(arg2));  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC, 3=CLOCK_THREAD_CPUTIME_ID
             if (clock_id == 0) {
                 // CLOCK_REALTIME: RTC wall-clock epoch (includes NTP offset)
                 uint64_t epoch_ns = ker::mod::rtc::getEpochNs();
                 ts->tv_sec = (long)(epoch_ns / 1000000000ULL);
                 ts->tv_nsec = (long)(epoch_ns % 1000000000ULL);
+            } else if (clock_id == 3) {
+                // CLOCK_THREAD_CPUTIME_ID: kernel-tracked on-CPU time for this task.
+                // user_time_us + system_time_us are accumulated by the scheduler's
+                // timer tick handler (process_tasks) each time this task is current.
+                auto* task = ker::mod::sched::get_current_task();
+                uint64_t cpu_ns = 0;
+                if (task != nullptr) {
+                    cpu_ns = (task->user_time_us + task->system_time_us) * 1000ULL;
+                }
+                ts->tv_sec = (long)(cpu_ns / 1000000000ULL);
+                ts->tv_nsec = (long)(cpu_ns % 1000000000ULL);
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
@@ -92,7 +104,8 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 } else {
                     // Pre-scheduler fallback: spin-wait
                     uint64_t start = ker::mod::time::getUs();
-                    while (ker::mod::time::getUs() - start < sleep_us) {}
+                    while (ker::mod::time::getUs() - start < sleep_us) {
+                    }
                 }
             }
             // Set remaining to zero

@@ -100,6 +100,158 @@ auto PtyRingBuf::read(void* dst, size_t len) -> size_t {
 
 namespace {
 
+struct DevFSFileHack {
+    void* node;
+    ker::dev::Device* device;
+    uint32_t magic;
+};
+
+auto device_from_file(ker::vfs::File* f) -> ker::dev::Device* {
+    if (f == nullptr || f->private_data == nullptr) {
+        return nullptr;
+    }
+    auto* dff = static_cast<DevFSFileHack*>(f->private_data);
+    return dff->device;
+}
+
+auto pair_from_file(ker::vfs::File* f) -> PtyPair*;
+
+auto register_waiter(uint64_t* waiters, size_t& waiter_count, uint64_t pid) -> bool {
+    for (size_t i = 0; i < waiter_count; i++) {
+        if (waiters[i] == pid) {
+            return true;
+        }
+    }
+    if (waiter_count >= PTY_POLL_MAX_WAITERS) {
+        return false;
+    }
+    waiters[waiter_count++] = pid;
+    return true;
+}
+
+auto block_current_task(uint64_t* waiters, size_t& waiter_count) -> bool {
+    auto* current_task = ker::mod::sched::get_current_task();
+    if (current_task == nullptr) {
+        return false;
+    }
+    if (!register_waiter(waiters, waiter_count, current_task->pid)) {
+        return false;
+    }
+    current_task->deferredTaskSwitch = true;
+    return true;
+}
+
+void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
+    for (size_t i = 0; i < waiter_count; i++) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
+        if (waiter == nullptr) {
+            continue;
+        }
+        waiter->deferredTaskSwitch = false;
+        uint64_t target_cpu = waiter->cpu;
+        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+            target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        }
+        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        waiter->release();
+    }
+}
+
+void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, uint64_t* waiters, size_t& waiter_count) {
+    uint64_t pending[PTY_POLL_MAX_WAITERS]{};
+    uint64_t irqf = lock.lock_irqsave();
+    size_t pending_count = waiter_count;
+    for (size_t i = 0; i < pending_count; i++) {
+        pending[i] = waiters[i];
+    }
+    waiter_count = 0;
+    lock.unlock_irqrestore(irqf);
+    wake_waiters(pending, pending_count);
+}
+
+void wake_master_pollers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->master_poll_waiters, pair->master_poll_waiter_count);
+}
+
+void wake_slave_pollers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->slave_poll_waiters, pair->slave_poll_waiter_count);
+}
+
+void wake_master_readers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->master_read_waiters, pair->master_read_waiter_count);
+}
+
+void wake_master_writers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->master_write_waiters, pair->master_write_waiter_count);
+}
+
+void wake_slave_readers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->slave_read_waiters, pair->slave_read_waiter_count);
+}
+
+void wake_slave_writers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    drain_and_wake_waiters(pair->lock, pair->slave_write_waiters, pair->slave_write_waiter_count);
+}
+
+void wake_both_pollers(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+    uint64_t master_pending[PTY_POLL_MAX_WAITERS]{};
+    uint64_t slave_pending[PTY_POLL_MAX_WAITERS]{};
+    uint64_t irqf = pair->lock.lock_irqsave();
+    size_t master_pending_count = pair->master_poll_waiter_count;
+    for (size_t i = 0; i < master_pending_count; i++) {
+        master_pending[i] = pair->master_poll_waiters[i];
+    }
+    pair->master_poll_waiter_count = 0;
+
+    size_t slave_pending_count = pair->slave_poll_waiter_count;
+    for (size_t i = 0; i < slave_pending_count; i++) {
+        slave_pending[i] = pair->slave_poll_waiters[i];
+    }
+    pair->slave_poll_waiter_count = 0;
+    pair->lock.unlock_irqrestore(irqf);
+    wake_waiters(master_pending, master_pending_count);
+    wake_waiters(slave_pending, slave_pending_count);
+}
+
+auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
+    auto* pair = pair_from_file(file);
+    auto* device = device_from_file(file);
+    if (pair == nullptr || device == nullptr) {
+        return false;
+    }
+
+    uint64_t irqf = pair->lock.lock_irqsave();
+    bool ok = false;
+    if (device == &pair->master_dev) {
+        ok = register_waiter(pair->master_poll_waiters, pair->master_poll_waiter_count, pid);
+    } else if (device == &pair->slave_dev) {
+        ok = register_waiter(pair->slave_poll_waiters, pair->slave_poll_waiter_count, pid);
+    }
+    pair->lock.unlock_irqrestore(irqf);
+    return ok;
+}
+
 enum class CprPrefixMatch : uint8_t {
     PREFIX,
     COMPLETE,
@@ -247,11 +399,6 @@ int ptmx_open(ker::vfs::File* file) {
     // pair_from_file() on subsequent ioctl/read/write calls can locate the
     // correct PtyPair through device->private_data.
     if (file != nullptr && file->private_data != nullptr) {
-        struct DevFSFileHack {
-            void* node;
-            ker::dev::Device* device;
-            uint32_t magic;
-        };
         auto* dff = static_cast<DevFSFileHack*>(file->private_data);
         dff->device = &pair->master_dev;
     }
@@ -267,11 +414,6 @@ int master_close(ker::vfs::File* file) {
     if (file == nullptr || file->private_data == nullptr) return 0;
 
     // Walk through devfs wrapper to get device
-    struct DevFSFileHack {
-        void* node;
-        ker::dev::Device* device;
-        uint32_t magic;
-    };
     auto* dff = static_cast<DevFSFileHack*>(file->private_data);
     if (dff->device == nullptr) return 0;
     auto* pair = static_cast<PtyPair*>(dff->device->private_data);
@@ -289,19 +431,18 @@ int master_close(ker::vfs::File* file) {
     }
     pair->lock.unlock_irqrestore(irqf);
 
+    wake_slave_readers(pair);
+    wake_slave_writers(pair);
+    wake_slave_pollers(pair);
+
     return 0;
 }
 
 // Get PtyPair* from a devfs-wrapped File
-PtyPair* pair_from_file(ker::vfs::File* f) {
+auto pair_from_file(ker::vfs::File* f) -> PtyPair* {
     if (f == nullptr || f->private_data == nullptr) return nullptr;
-    struct DevFSFileHack {
-        void* node;
-        ker::dev::Device* device;
-        uint32_t magic;
-    };
     auto* dff = static_cast<DevFSFileHack*>(f->private_data);
-    if (dff->device == nullptr) return nullptr;
+    if (dff == nullptr || dff->device == nullptr) return nullptr;
     return static_cast<PtyPair*>(dff->device->private_data);
 }
 
@@ -309,20 +450,27 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
 
-    // Master reads from slave→master buffer
+    // Master reads from slave->master buffer
     uint64_t irqf = pair->lock.lock_irqsave();
     size_t rd = pair->s2m.read(buf, count);
     bool slave_opened = pair->slave_opened > 0;
+    bool should_block = false;
+    if (rd == 0 && slave_opened && (file->open_flags & 04000) == 0) {
+        should_block = block_current_task(pair->master_read_waiters, pair->master_read_waiter_count);
+    }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
         // If slave is closed, return EOF
         if (!slave_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately (propagates to application)
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
-        // Blocking fd: yield CPU before returning so mlibc's retry loop doesn't
-        // spin at 100% CPU doing millions of syscalls/second with no data.
+        if (should_block) return -WOS_ERESTARTSYS;
         ker::mod::sched::kern_yield();
         return -WOS_ERESTARTSYS;
+    }
+    if (rd > 0) {
+        wake_slave_writers(pair);
+        wake_slave_pollers(pair);
     }
     return static_cast<ssize_t>(rd);
 }
@@ -356,6 +504,13 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
     if (count == 0) return 0;
+
+    {
+        uint64_t irqf = pair->lock.lock_irqsave();
+        bool slave_opened = pair->slave_opened > 0;
+        pair->lock.unlock_irqrestore(irqf);
+        if (!slave_opened) return -EIO;
+    }
 
     auto* bytes = static_cast<const uint8_t*>(buf);
     size_t processed = 0;
@@ -414,10 +569,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             continue;  // Discard CR
         }
         if (((pair->termios.c_iflag & TIOS_ICRNL) != 0U) && ch == '\r') {
-            ch = '\n';  // CR → NL
+            ch = '\n';  // CR -> NL
         }
         if (((pair->termios.c_iflag & TIOS_INLCR) != 0U) && ch == '\n') {
-            ch = '\r';  // NL → CR
+            ch = '\r';  // NL -> CR
         }
         if ((pair->termios.c_iflag & TIOS_ISTRIP) != 0U) {
             ch &= 0x7F;  // Strip high bit
@@ -540,7 +695,11 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             if (file->open_flags & 04000) {
                 uint64_t wr_irqf = pair->lock.lock_irqsave();
                 size_t wr = pair->m2s.write(&ch, 1);
+                bool slave_opened = pair->slave_opened > 0;
                 pair->lock.unlock_irqrestore(wr_irqf);
+                if (!slave_opened) {
+                    return processed > 0 ? static_cast<ssize_t>(processed) : -EIO;
+                }
                 if (wr == 0) {
                     if (processed == 0) return -EAGAIN;
                     break;
@@ -549,9 +708,23 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 while (true) {
                     uint64_t wr_irqf = pair->lock.lock_irqsave();
                     size_t wr = pair->m2s.write(&ch, 1);
+                    bool slave_opened = pair->slave_opened > 0;
+                    bool should_block = false;
+                    if (wr == 0 && slave_opened && processed == 0) {
+                        should_block = block_current_task(pair->master_write_waiters, pair->master_write_waiter_count);
+                    }
                     pair->lock.unlock_irqrestore(wr_irqf);
                     if (wr != 0) {
                         break;
+                    }
+                    if (!slave_opened) {
+                        return processed > 0 ? static_cast<ssize_t>(processed) : -EIO;
+                    }
+                    if (processed != 0) {
+                        break;
+                    }
+                    if (should_block) {
+                        return -WOS_ERESTARTSYS;
                     }
                     ker::mod::sched::kern_yield();
                 }
@@ -565,6 +738,8 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     }
 
     if (processed == 0) return -EAGAIN;
+    wake_slave_readers(pair);
+    wake_both_pollers(pair);
     return static_cast<ssize_t>(processed);
 }
 
@@ -676,6 +851,7 @@ CharDeviceOps master_ops = {
     .isatty = master_isatty,
     .ioctl = master_ioctl,
     .poll_check = master_poll_check,
+    .poll_register_waiter = pty_poll_register_waiter,
 };
 
 // --- Slave-side device operations ---
@@ -703,6 +879,8 @@ int slave_open(ker::vfs::File* file) {
     }
     pair->lock.unlock_irqrestore(irqf);
 
+    wake_master_pollers(pair);
+
     return 0;
 }
 
@@ -721,6 +899,10 @@ int slave_close(ker::vfs::File* file) {
     }
     pair->lock.unlock_irqrestore(irqf);
 
+    wake_master_readers(pair);
+    wake_master_writers(pair);
+    wake_master_pollers(pair);
+
     return 0;
 }
 
@@ -728,20 +910,27 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) return -EBADF;
 
-    // Slave reads from master→slave buffer
+    // Slave reads from master->slave buffer
     uint64_t irqf = pair->lock.lock_irqsave();
     size_t rd = pair->m2s.read(buf, count);
     bool master_opened = pair->master_opened > 0;
+    bool should_block = false;
+    if (rd == 0 && master_opened && (file->open_flags & 04000) == 0) {
+        should_block = block_current_task(pair->slave_read_waiters, pair->slave_read_waiter_count);
+    }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
         // If master is closed, return EOF
         if (!master_opened) return 0;
         // Non-blocking fd: return EAGAIN immediately
         if (file->open_flags & 04000) return -EAGAIN;  // O_NONBLOCK = 04000
-        // Blocking fd: yield CPU before returning so mlibc's retry loop doesn't
-        // spin at 100% CPU doing millions of syscalls/second with no data.
+        if (should_block) return -WOS_ERESTARTSYS;
         ker::mod::sched::kern_yield();
         return -WOS_ERESTARTSYS;
+    }
+    if (rd > 0) {
+        wake_master_writers(pair);
+        wake_master_pollers(pair);
     }
     return static_cast<ssize_t>(rd);
 }
@@ -780,12 +969,18 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                     uint64_t irqf = pair->lock.lock_irqsave();
                     bool has_space = pair->s2m.space() >= 2;
                     bool master_opened = pair->master_opened > 0;
+                    bool should_block = false;
                     if (has_space) {
                         pair->lock.unlock_irqrestore(irqf);
                         break;
                     }
+                    if (master_opened && written == 0) {
+                        should_block = block_current_task(pair->slave_write_waiters, pair->slave_write_waiter_count);
+                    }
                     pair->lock.unlock_irqrestore(irqf);
                     if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
+                    if (written != 0) return static_cast<ssize_t>(written);
+                    if (should_block) return -WOS_ERESTARTSYS;
                     ker::mod::sched::kern_yield();
                 }
             }
@@ -808,11 +1003,17 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 uint64_t irqf = pair->lock.lock_irqsave();
                 size_t wr = pair->s2m.write(&ch, 1);
                 bool master_opened = pair->master_opened > 0;
+                bool should_block = false;
+                if (wr == 0 && master_opened && written == 0) {
+                    should_block = block_current_task(pair->slave_write_waiters, pair->slave_write_waiter_count);
+                }
                 pair->lock.unlock_irqrestore(irqf);
                 if (wr != 0) {
                     break;
                 }
                 if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
+                if (written != 0) return static_cast<ssize_t>(written);
+                if (should_block) return -WOS_ERESTARTSYS;
                 ker::mod::sched::kern_yield();
             }
         }
@@ -826,6 +1027,8 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     }
 
     if (written == 0) return -EAGAIN;
+    wake_master_readers(pair);
+    wake_both_pollers(pair);
     return static_cast<ssize_t>(written);
 }
 
@@ -963,6 +1166,7 @@ CharDeviceOps slave_ops = {
     .isatty = slave_isatty,
     .ioctl = slave_ioctl,
     .poll_check = slave_poll_check,
+    .poll_register_waiter = pty_poll_register_waiter,
 };
 
 // --- ptmx device (singleton — opening allocates a new PTY pair) ---

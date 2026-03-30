@@ -318,7 +318,7 @@ void scroll() {
 
 void mapFramebuffer(void) {
     if constexpr (WOS_HAS_GFX_FB) {
-        auto fbPhys = (uint64_t)mm::addr::getPhysPointer((mm::addr::paddr_t)(__framebuffer->address));
+        auto fbPhys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::paddr_t)(__framebuffer->address));
 
         ker::mod::io::serial::write("Mapping framebuffer\n");
         ker::mod::io::serial::write("\n");

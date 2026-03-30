@@ -176,7 +176,7 @@ uint64_t cachedHHDMOffset = 0;
 // Helper to safely check if a virtual address is in HHDM range
 auto isInHHDMRange(uint64_t addr) -> bool {
     if (cachedHHDMOffset == 0) {
-        cachedHHDMOffset = addr::getHHDMOffset();
+        cachedHHDMOffset = addr::get_hhdm_offset();
     }
     // HHDM typically covers up to 256TB of physical memory
     constexpr uint64_t MAX_HHDM_SIZE = 0x100000000000ULL;  // 1TB reasonable limit
@@ -201,7 +201,7 @@ auto isPhysAddrInZone(uint64_t physAddr) -> bool {
 // Returns 0 if address cannot be safely accessed
 auto physToVirtSafe(uint64_t physAddr) -> uint64_t {
     if (cachedHHDMOffset == 0) {
-        cachedHHDMOffset = addr::getHHDMOffset();
+        cachedHHDMOffset = addr::get_hhdm_offset();
     }
 
     // Basic sanity checks
@@ -239,7 +239,7 @@ auto countMappedPagesNoAlloc(paging::PageTable* pml4) -> PageCountResult {
 
     // Initialize HHDM offset cache if needed
     if (cachedHHDMOffset == 0) {
-        cachedHHDMOffset = addr::getHHDMOffset();
+        cachedHHDMOffset = addr::get_hhdm_offset();
         if (cachedHHDMOffset == 0) {
             return result;  // HHDM not initialized
         }
@@ -344,7 +344,7 @@ void analyzeMemoryRegions(paging::PageTable* pml4, MemoryRegionStats& stats) {
     stats = {};
 
     if (cachedHHDMOffset == 0) {
-        cachedHHDMOffset = addr::getHHDMOffset();
+        cachedHHDMOffset = addr::get_hhdm_offset();
         if (cachedHHDMOffset == 0) {
             return;
         }
@@ -612,7 +612,7 @@ void dumpPageAllocationsOOM() {
 
     // Halt all other CPUs immediately so they won't modify global state
     // while we perform a defensive OOM analysis on this core.
-    ker::mod::smt::haltOtherCores();
+    ker::mod::smt::halt_other_cores();
 
     io::serial::write("\n");
     io::serial::write("╔══════════════════════════════════════════════════════════════════════╗\n");
@@ -696,7 +696,7 @@ void dumpPageAllocationsOOM() {
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
     // Collect tasks from all CPUs
-    uint64_t core_count = smt::getCoreCount();
+    uint64_t core_count = smt::get_core_count();
     uint64_t total_task_pages = 0;
     uint64_t total_page_table_pages = 0;
     uint64_t exited_task_pages = 0;

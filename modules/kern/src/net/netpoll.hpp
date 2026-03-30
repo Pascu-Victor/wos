@@ -46,8 +46,10 @@ constexpr int NAPI_DEFAULT_WEIGHT = 64;
 // Initialize NAPI structure (called during driver init, before napi_enable)
 void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight);
 
-// Enable NAPI - creates and starts the per-device worker thread
-void napi_enable(NapiStruct* napi);
+// Enable NAPI - creates and starts the per-device worker thread.
+// If cpu_affinity is not UINT64_MAX the worker is pinned to that CPU
+// (same CPU that services the corresponding MSI-X vector).
+void napi_enable(NapiStruct* napi, uint64_t cpu_affinity = UINT64_MAX);
 
 // Disable NAPI - stops the worker thread (call before device shutdown)
 void napi_disable(NapiStruct* napi);
@@ -76,5 +78,9 @@ int napi_poll_inline_budget(NetDevice* dev, int budget);
 // processed immediately instead of waiting for the next timer tick.
 // Returns total number of packets processed across all devices.
 int napi_poll_all_pending();
+
+// Migrate the NAPI worker for this struct to `cpu` and pin it there.
+// Safe to call while the device is active; uses reschedule_task_for_cpu.
+void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu);
 
 }  // namespace ker::net

@@ -130,7 +130,7 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     // Steer to per-CPU handler thread for parallel protocol processing.
     // Loopback is already handled above; only real NICs go through backlog.
     if (backlog_ready()) {
-        uint64_t target = backlog_flow_hash(pkt, ker::mod::smt::getCoreCount());
+        uint64_t target = backlog_flow_hash(pkt, ker::mod::smt::get_core_count());
         // If the flow hashes to THIS CPU, process inline to avoid expensive reschedule
         if (target != ker::mod::cpu::currentCpu()) {
             backlog_enqueue(target, pkt);

@@ -31,4 +31,7 @@ void wki_peer_fence(WkiPeer* peer);
 [[noreturn]] void wki_timer_thread();
 void wki_timer_thread_start();
 
+// Wake the timer thread after arming earlier retransmit/ACK/timeout work.
+void wki_timer_notify();
+
 }  // namespace ker::net::wki

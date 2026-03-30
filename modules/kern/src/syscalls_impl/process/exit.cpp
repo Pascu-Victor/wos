@@ -1,5 +1,4 @@
 #include "exit.hpp"
-#include "waitpid.hpp"
 
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -14,6 +13,8 @@
 #include <platform/sys/context_switch.hpp>
 #include <vfs/vfs.hpp>
 
+#include "waitpid.hpp"
+
 namespace ker::syscall::process {
 
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
@@ -21,10 +22,10 @@ static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod
     if (waiter->waitRusagePhysAddr == 0) {
         return;
     }
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::getVirtPointer(waiter->waitRusagePhysAddr));
-    ru->ru_utime_sec  = (int64_t)(child->user_time_us / 1000000ULL);
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(waiter->waitRusagePhysAddr));
+    ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
     ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-    ru->ru_stime_sec  = (int64_t)(child->system_time_us / 1000000ULL);
+    ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
     ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
     waiter->waitRusagePhysAddr = 0;
 }
@@ -73,7 +74,7 @@ void wos_proc_exit(int status) {
             if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
                 parent->context.regs.rax = current_task->pid;
                 if (parent->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(parent->waitStatusPhysAddr));
+                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(parent->waitStatusPhysAddr));
                     *status_ptr = current_task->exitStatus;
                 }
                 fill_rusage_for_waiter(parent, current_task);
@@ -82,7 +83,7 @@ void wos_proc_exit(int status) {
                 // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) —
                 // we must explicitly reschedule it so it actually wakes up.
                 uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::getCoreCount()) {
+                if (cpu >= ker::mod::smt::get_core_count()) {
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
@@ -91,7 +92,7 @@ void wos_proc_exit(int status) {
                 // deferredTaskSwitch still true — race check will handle RAX).
                 // Wake it so it can handle the signal / race check.
                 uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::getCoreCount()) {
+                if (cpu >= ker::mod::smt::get_core_count()) {
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
@@ -120,7 +121,7 @@ void wos_proc_exit(int status) {
                 waiting_task->context.regs.rax = current_task->pid;
 
                 if (waiting_task->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::getVirtPointer(waiting_task->waitStatusPhysAddr));
+                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
                     *status_ptr = current_task->exitStatus;
 #ifdef EXIT_DEBUG
                     ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exitStatus, waitingPid);
@@ -140,7 +141,7 @@ void wos_proc_exit(int status) {
             // latency and the risk of landing on a non-preemptible CPU.  Fall back to the
             // least-loaded CPU only if the stored cpu index is out of range.
             uint64_t target_cpu = waiting_task->cpu;
-            if (target_cpu >= ker::mod::smt::getCoreCount()) {
+            if (target_cpu >= ker::mod::smt::get_core_count()) {
                 target_cpu = ker::mod::sched::get_least_loaded_cpu();
             }
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);

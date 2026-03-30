@@ -37,7 +37,7 @@ void init(void) {
     virt::initPagemap();
     dbg::log("Kernel page map initialized\n");
     // Set kernel CR3 for safe memset in pageAlloc when called from userspace context
-    phys::setKernelCr3((uint64_t)addr::getPhysPointer((uint64_t)virt::getKernelPagemap()));
+    phys::setKernelCr3((uint64_t)addr::get_phys_pointer((uint64_t)virt::getKernelPagemap()));
     // Now initialize huge page zone after page map is ready
     phys::initHugePageZoneDeferred();
     dbg::log("Huge page zone initialized\n");

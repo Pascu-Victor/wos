@@ -233,6 +233,7 @@ auto main(int argc, char** argv) -> int {
 
     // --- Spawn httpd (HTTP server on port 80) ---
     {
+        constexpr int BACKGROUND_SERVICE_NICE = 10;
         std::println("init[{}]: spawning httpd (HTTP server on port 80)", cpuno);
         std::array<const char*, 2> httpd_argv = {"/sbin/httpd", nullptr};
         std::array<const char*, 1> httpd_envp = {nullptr};
@@ -240,7 +241,11 @@ auto main(int argc, char** argv) -> int {
         if (httpd_pid == 0) {
             std::println("init[{}]: FAILED to spawn httpd", cpuno);
         } else {
+            int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(httpd_pid), BACKGROUND_SERVICE_NICE);
             std::println("init[{}]: httpd spawned as PID {}", cpuno, httpd_pid);
+            if (prio_rc < 0) {
+                std::println("init[{}]: WARNING: failed to lower httpd priority ({})", cpuno, prio_rc);
+            }
         }
     }
 
@@ -276,7 +281,12 @@ auto main(int argc, char** argv) -> int {
         if (dropbear_pid == 0) {
             std::println("init[{}]: FAILED to spawn dropbear", cpuno);
         } else {
+            constexpr int BACKGROUND_SERVICE_NICE = 10;
+            int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(dropbear_pid), BACKGROUND_SERVICE_NICE);
             std::println("init[{}]: dropbear spawned as PID {}", cpuno, dropbear_pid);
+            if (prio_rc < 0) {
+                std::println("init[{}]: WARNING: failed to lower dropbear priority ({})", cpuno, prio_rc);
+            }
         }
     }
 

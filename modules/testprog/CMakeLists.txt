@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.28)
 
 project(testprog LANGUAGES CXX)
 
+option(WOS_MANDELBENCH_DEBUG "Enable verbose mandelbench CPU instrumentation" OFF)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -31,6 +33,12 @@ set(SOURCES
 
 # Create executable
 add_executable(testprog ${SOURCES})
+
+if(WOS_MANDELBENCH_DEBUG)
+    target_compile_definitions(testprog PRIVATE MANDELBENCH_DEBUG=1)
+else()
+    target_compile_definitions(testprog PRIVATE MANDELBENCH_DEBUG=0)
+endif()
 
 # Linker settings
 set_target_properties(testprog PROPERTIES

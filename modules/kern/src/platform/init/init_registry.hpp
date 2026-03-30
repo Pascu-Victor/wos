@@ -47,6 +47,7 @@ void net_init();
 // PHASE 4: Scheduler Setup
 void sched_init();
 void initramfs_init();
+void hostname_init();
 
 // PHASE 5: Drivers
 void virtio_net_init();
@@ -121,8 +122,9 @@ inline constexpr std::array<ModuleDesc, 13> PHASE_3_MODULES = {{
 }};
 
 // PHASE 4: Scheduler Setup
-inline constexpr std::array<ModuleDesc, 2> PHASE_4_MODULES = {{
+inline constexpr std::array<ModuleDesc, 3> PHASE_4_MODULES = {{
     {.name = "initramfs", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::initramfs_init},  // depends: vfs
+    {.name = "hostname", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::hostname_init},    // depends: initramfs (reads /etc/hostname)
     {.name = "sched", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::sched_init},          // depends: epoch_manager, smt
 }};
 

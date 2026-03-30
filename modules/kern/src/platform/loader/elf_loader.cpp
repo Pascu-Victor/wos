@@ -148,7 +148,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     uint64_t P = base + elf.loadBase;
                     uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                     if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                        auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                        auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                         // RELR encodes RELATIVE relocations: add loadBase to the current value
                         *physPtr = *physPtr + elf.loadBase;
                     }
@@ -161,7 +161,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                             uint64_t P = base + offset + elf.loadBase;
                             uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                             if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                                auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                                auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                                 *physPtr = *physPtr + elf.loadBase;
                             }
                         }
@@ -189,7 +189,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                 uint64_t addend = 0;
                 uint64_t paddr = mod::mm::virt::translate(pagemap, P);
                 if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                    auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                    auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                     addend = *physPtr;
                 }
 
@@ -262,14 +262,14 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     case R_X86_64_TPOFF64: {
                         // TLS offset: S + A (symbol TLS offset plus addend)
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = S + addend;
                         }
                         break;
                     }
                     case R_X86_64_RELATIVE: {
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = addend + elf.loadBase;
                         }
                         break;
@@ -284,14 +284,14 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #endif
                             auto newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
                             if (newPaddr != 0) {
-                                auto physPtrPage = (uint64_t)mod::mm::addr::getPhysPointer(newPaddr);
+                                auto physPtrPage = (uint64_t)mod::mm::addr::get_phys_pointer(newPaddr);
                                 mod::mm::virt::mapPage(pagemap, targetPage, physPtrPage, mod::mm::paging::pageTypes::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
 
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             if (S == 0) {
                                 mod::dbg::log(
                                     "ERROR: Unresolved symbol '%s' (idx=%d) for relocation at P=0x%x (type=%d). Writing 0 to catch fault.",
@@ -314,7 +314,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     }
                     case R_X86_64_64: {
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = S + addend;
                         }
                         break;
@@ -323,7 +323,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     case R_X86_64_PLT32: {
                         // 32-bit PC-relative
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr32 = (uint32_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr32 = (uint32_t*)mod::mm::addr::get_virt_pointer(paddr);
                             uint64_t P64 = P;
                             auto value = (int64_t)(S + (int64_t)addend - (int64_t)P64);
                             *physPtr32 = (uint32_t)value;
@@ -434,14 +434,14 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     case R_X86_64_TPOFF64: {
                         int64_t tlsOffset = addend;  // use addend if present
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = (uint64_t)tlsOffset;
                         }
                         break;
                     }
                     case R_X86_64_RELATIVE: {
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = elf.loadBase + (uint64_t)addend;
                         }
                         break;
@@ -455,14 +455,14 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #endif
                             auto newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
                             if (newPaddr != 0) {
-                                auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(newPaddr);
+                                auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(newPaddr);
                                 mod::mm::virt::mapPage(pagemap, targetPage, physPtr, mod::mm::paging::pageTypes::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
 
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             if (S == 0) {
                                 mod::dbg::log(
                                     "ERROR: Unresolved symbol '%s' (idx=%d) for relocation at P=0x%x (type=%d). Writing 0 to catch fault.",
@@ -483,7 +483,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     }
                     case R_X86_64_64: {
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr = (uint64_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr = (uint64_t*)mod::mm::addr::get_virt_pointer(paddr);
                             *physPtr = S + (uint64_t)addend;
                         }
                         break;
@@ -491,7 +491,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                     case R_X86_64_PC32:
                     case R_X86_64_PLT32: {
                         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-                            auto* physPtr32 = (uint32_t*)mod::mm::addr::getVirtPointer(paddr);
+                            auto* physPtr32 = (uint32_t*)mod::mm::addr::get_virt_pointer(paddr);
                             uint64_t P64 = P;
                             auto value = (int64_t)(S + addend - (int64_t)P64);
                             *physPtr32 = (uint32_t)value;
@@ -571,13 +571,13 @@ void loadSegment(uint8_t* elfBase, ker::mod::mm::virt::PageTable* pagemap, Elf64
             mod::dbg::log("elf_loader: translate failed for already-mapped pageVA 0x%lx", pageVA);
             hcf();
         }
-        page_hhdm_ptr = (uint64_t)mod::mm::addr::getVirtPointer(paddr);
+        page_hhdm_ptr = (uint64_t)mod::mm::addr::get_virt_pointer(paddr);
     } else {
         // Allocate a new physical page; allocator returns an HHDM pointer to the page memory
         auto new_page_hhdm_ptr = (uint64_t)mod::mm::phys::pageAlloc();
         page_hhdm_ptr = new_page_hhdm_ptr;
         // Map using the physical address corresponding to that HHDM pointer
-        mod::mm::virt::mapPage(pagemap, pageVA, (mod::mm::addr::paddr_t)mod::mm::addr::getPhysPointer(new_page_hhdm_ptr),
+        mod::mm::virt::mapPage(pagemap, pageVA, (mod::mm::addr::paddr_t)mod::mm::addr::get_phys_pointer(new_page_hhdm_ptr),
                                mod::mm::paging::pageTypes::USER);
         // Zero freshly mapped page to handle bss/holes
         memset((void*)page_hhdm_ptr, 0, mod::mm::virt::PAGE_SIZE);
@@ -628,7 +628,7 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
     for (uint64_t i = 0; i < sectionHeadersPages; i++) {
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
+            auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
             mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                    mod::mm::paging::pageTypes::USER);
 
@@ -657,7 +657,7 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
     for (uint64_t i = 0; i < stringTablePages; i++) {
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(paddr);
+            auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
             mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr, mod::mm::paging::pageTypes::USER);
 
             // Zero the page
@@ -707,7 +707,7 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                 for (uint64_t i = 0; i < debugPages && remainingSize > 0; i++) {
                     auto debugPaddr = (uint64_t)mod::mm::phys::pageAlloc();
                     if (debugPaddr != 0) {
-                        auto physPtr = (uint64_t)mod::mm::addr::getPhysPointer(debugPaddr);
+                        auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(debugPaddr);
                         mod::mm::virt::mapPage(pagemap, debugVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
                                                mod::mm::paging::pageTypes::USER);
                         memset((void*)debugPaddr, 0, mod::mm::virt::PAGE_SIZE);
@@ -807,7 +807,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
             mod::dbg::log("ERROR: Failed to allocate physical page for headers");
             return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
         }
-        mod::mm::virt::mapPage(pagemap, elfHeaderVaddr + (i * mod::mm::virt::PAGE_SIZE), (uint64_t)mod::mm::addr::getPhysPointer(paddr),
+        mod::mm::virt::mapPage(pagemap, elfHeaderVaddr + (i * mod::mm::virt::PAGE_SIZE), (uint64_t)mod::mm::addr::get_phys_pointer(paddr),
                                mod::mm::paging::pageTypes::USER);
         headerPhysAddrs.push_back(paddr);
     }

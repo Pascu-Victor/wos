@@ -88,7 +88,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     uint64_t offset = phys_addr & 0xFFF;
 
     // Map physical page to read the value (using HHDM - Higher Half Direct Map)
-    int* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::getVirtPointer(phys_page) + offset);
+    int* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(phys_page) + offset);
 
     // Atomically check the value and add to wait queue
     futex_lock.lock();

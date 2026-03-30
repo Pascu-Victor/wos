@@ -13,8 +13,8 @@ namespace ker::net::wki {
 //
 // Layout within the RDMA zone:
 //   [0..63]                          BlkRingHeader (control, cache-line aligned)
-//   [64..64+SQ_SIZE-1]               Submission queue entries (consumer→server)
-//   [64+SQ_SIZE..64+SQ_SIZE+CQ_SIZE] Completion queue entries (server→consumer)
+//   [64..64+SQ_SIZE-1]               Submission queue entries (consumer->server)
+//   [64+SQ_SIZE..64+SQ_SIZE+CQ_SIZE] Completion queue entries (server->consumer)
 //   [DATA_OFFSET..end]               Data slots (block data transfer area)
 //
 // Ring protocol:
@@ -128,28 +128,28 @@ static_assert(sizeof(BlkRingHeader) == 64, "BlkRingHeader must be exactly 64 byt
 // Header is at offset 0, padded to 64 bytes (cache line)
 constexpr uint32_t BLK_RING_HEADER_SIZE = 64;
 
-inline constexpr auto blk_ring_sq_offset() -> uint32_t { return BLK_RING_HEADER_SIZE; }
+constexpr auto blk_ring_sq_offset() -> uint32_t { return BLK_RING_HEADER_SIZE; }
 
-inline constexpr auto blk_ring_sq_size(uint32_t depth) -> uint32_t { return depth * sizeof(BlkSqEntry); }
+constexpr auto blk_ring_sq_size(uint32_t depth) -> uint32_t { return depth * sizeof(BlkSqEntry); }
 
-inline constexpr auto blk_ring_cq_offset(uint32_t sq_depth) -> uint32_t { return blk_ring_sq_offset() + blk_ring_sq_size(sq_depth); }
+constexpr auto blk_ring_cq_offset(uint32_t sq_depth) -> uint32_t { return blk_ring_sq_offset() + blk_ring_sq_size(sq_depth); }
 
-inline constexpr auto blk_ring_cq_size(uint32_t depth) -> uint32_t { return depth * sizeof(BlkCqEntry); }
+constexpr auto blk_ring_cq_size(uint32_t depth) -> uint32_t { return depth * sizeof(BlkCqEntry); }
 
-inline constexpr auto blk_ring_data_offset(uint32_t sq_depth, uint32_t cq_depth) -> uint32_t {
+constexpr auto blk_ring_data_offset(uint32_t sq_depth, uint32_t cq_depth) -> uint32_t {
     return blk_ring_cq_offset(sq_depth) + blk_ring_cq_size(cq_depth);
 }
 
-inline constexpr auto blk_ring_data_size(uint32_t slot_count, uint32_t slot_size) -> uint32_t { return slot_count * slot_size; }
+constexpr auto blk_ring_data_size(uint32_t slot_count, uint32_t slot_size) -> uint32_t { return slot_count * slot_size; }
 
 // Total zone size (page-aligned upward, 4KB pages)
-inline constexpr auto blk_ring_zone_size(uint32_t sq_depth, uint32_t cq_depth, uint32_t slot_count, uint32_t slot_size) -> uint32_t {
+constexpr auto blk_ring_zone_size(uint32_t sq_depth, uint32_t cq_depth, uint32_t slot_count, uint32_t slot_size) -> uint32_t {
     uint32_t raw = blk_ring_data_offset(sq_depth, cq_depth) + blk_ring_data_size(slot_count, slot_size);
     return (raw + 0xFFFU) & ~0xFFFU;
 }
 
 // Default zone size with default parameters
-inline constexpr auto blk_ring_default_zone_size() -> uint32_t {
+constexpr auto blk_ring_default_zone_size() -> uint32_t {
     return blk_ring_zone_size(BLK_RING_DEFAULT_SQ_DEPTH, BLK_RING_DEFAULT_CQ_DEPTH, BLK_RING_DEFAULT_DATA_SLOTS,
                               BLK_RING_DEFAULT_DATA_SLOT_SIZE);
 }
@@ -175,7 +175,7 @@ inline auto blk_data_slot(void* zone_base, uint32_t sq_depth, uint32_t cq_depth,
 }
 
 // Convenience: use header's own depth/size fields
-inline auto blk_sq_entries(void* zone_base, const BlkRingHeader*) -> BlkSqEntry* { return blk_sq_entries(zone_base); }
+inline auto blk_sq_entries(void* zone_base, const BlkRingHeader* /*unused*/) -> BlkSqEntry* { return blk_sq_entries(zone_base); }
 
 inline auto blk_cq_entries(void* zone_base, const BlkRingHeader* hdr) -> BlkCqEntry* { return blk_cq_entries(zone_base, hdr->sq_depth); }
 

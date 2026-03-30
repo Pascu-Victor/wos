@@ -9,9 +9,9 @@
 #include "platform/dbg/dbg.hpp"
 
 namespace ker::syscall::log {
-#include <platform/sched/get_current_pagemap.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/get_current_pagemap.hpp>
 
 static constexpr size_t MAX_SYSLOG_COPY = 4096;
 
@@ -30,18 +30,18 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
             uint64_t phys = 0;
             if (src_is_kernel) {
                 // direct kernel virtual read
-                phys = (uint64_t)ker::mod::mm::addr::getPhysPointer((ker::mod::mm::addr::vaddr_t)src_addr + copied);
+                phys = (uint64_t)ker::mod::mm::addr::get_phys_pointer((ker::mod::mm::addr::vaddr_t)src_addr + copied);
                 // If getPhysPointer fails, fall back to virtual direct read
                 if (phys == 0) {
                     dest[copied] = *(const char*)(src_addr + copied);
                 } else {
-                    dest[copied] = *(const char*)ker::mod::mm::addr::getVirtPointer(phys + 0);
+                    dest[copied] = *(const char*)ker::mod::mm::addr::get_virt_pointer(phys + 0);
                 }
             } else {
                 if (!currentPagemap) return false;
                 phys = ker::mod::mm::virt::translate(currentPagemap, (ker::mod::mm::addr::vaddr_t)(src_addr + copied));
                 if (phys == ker::mod::mm::virt::PADDR_INVALID) break;  // unmapped - stop copying
-                dest[copied] = *(const char*)ker::mod::mm::addr::getVirtPointer(phys);
+                dest[copied] = *(const char*)ker::mod::mm::addr::get_virt_pointer(phys);
             }
             if (dest[copied] == '\0') {
                 copied++;

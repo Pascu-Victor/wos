@@ -99,6 +99,7 @@ struct PtyRingBuf {
 // Canonical line buffer size
 static constexpr size_t CANON_BUF_SIZE = 256;
 static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
+static constexpr size_t PTY_POLL_MAX_WAITERS = 8;
 
 // A single PTY pair (master + slave)
 struct PtyPair {
@@ -113,8 +114,8 @@ struct PtyPair {
     KTermios termios;         // Terminal attributes (line discipline settings)
     mod::sys::Spinlock lock;  // Protects termios, canonical state, and ring buffers
 
-    PtyRingBuf m2s;  // master → slave (master write → slave read)
-    PtyRingBuf s2m;  // slave → master (slave write → master read)
+    PtyRingBuf m2s;  // master -> slave (master write -> slave read)
+    PtyRingBuf s2m;  // slave -> master (slave write -> master read)
 
     // Canonical mode line editing buffer
     uint8_t canon_buf[CANON_BUF_SIZE]{};
@@ -126,6 +127,19 @@ struct PtyPair {
     uint8_t cpr_filter_buf[CPR_FILTER_BUF_SIZE]{};
     size_t cpr_filter_len = 0;
     bool cpr_filter_active = false;
+
+    uint64_t master_poll_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t master_poll_waiter_count = 0;
+    uint64_t slave_poll_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t slave_poll_waiter_count = 0;
+    uint64_t master_read_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t master_read_waiter_count = 0;
+    uint64_t master_write_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t master_write_waiter_count = 0;
+    uint64_t slave_read_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t slave_read_waiter_count = 0;
+    uint64_t slave_write_waiters[PTY_POLL_MAX_WAITERS]{};
+    size_t slave_write_waiter_count = 0;
 
     // Device structs for master and slave
     Device master_dev;

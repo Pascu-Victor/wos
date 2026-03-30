@@ -40,11 +40,13 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/ntp/ntp.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/pic/pic.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
+#include <util/hostname.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/initramfs.hpp>
 #include <vfs/vfs.hpp>
@@ -213,7 +215,13 @@ void initramfs_init() {
     }
 }
 
+void hostname_init() { ker::util::hostname::init(); }
+
 void sched_init() {
+    // Initialise kernel performance ring buffers before the scheduler starts
+    // recording events.
+    ker::mod::perf::init();
+
     mod::sched::setup_queues();
 
     // Build HandoverModules from limine module request

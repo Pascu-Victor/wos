@@ -25,6 +25,9 @@ struct NetDeviceOps {
     void (*close)(NetDevice* dev);
     int (*start_xmit)(NetDevice* dev, PacketBuffer* pkt);
     void (*set_mac)(NetDevice* dev, const uint8_t* mac);
+    // Optional: pin NAPI worker for queue pair `pair_idx` to `cpu` and steer its MSI-X entry.
+    // Returns 0 on success, -EINVAL if pair_idx is out of range, -ENOSYS if unsupported.
+    int (*set_queue_cpu)(NetDevice* dev, uint32_t pair_idx, uint64_t cpu);
 };
 
 struct NetDevice {

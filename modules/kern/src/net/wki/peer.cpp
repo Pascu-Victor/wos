@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <net/wki/dev_proxy.hpp>
@@ -25,6 +26,7 @@
 #include <vfs/fs/devfs.hpp>
 
 #include "platform/mm/phys.hpp"
+#include "platform/sched/task.hpp"
 
 namespace ker::net::wki {
 
@@ -131,7 +133,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         // The node with the lower MAC address keeps its ID; the other regenerates.
         int cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
         if (cmp < 0) {
-            // Remote has lower MAC → remote keeps, we regenerate
+            // Remote has lower MAC -> remote keeps, we regenerate
             uint64_t seed = mod::time::getTicks();
             auto new_id = static_cast<uint16_t>((seed ^ (seed >> 16)) & 0xFFFF);
             if (new_id == WKI_NODE_INVALID || new_id == WKI_NODE_BROADCAST) {
@@ -186,11 +188,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     if (peer->hostname[0] != '\0' && strcmp(peer->hostname, g_wki.local_hostname) == 0) {
         int mac_cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
         if (mac_cmp < 0) {
-            // Remote has lower MAC → remote keeps hostname, we fall back
+            // Remote has lower MAC -> remote keeps hostname, we fall back
             snprintf(g_wki.local_hostname, WKI_HOSTNAME_MAX, "node-%04x", g_wki.my_node_id);
             mod::dbg::log("[WKI] Hostname collision with 0x%04x, falling back to '%s'", peer_node, g_wki.local_hostname);
         } else if (mac_cmp > 0) {
-            // We have lower MAC → we keep hostname, remote will fall back on their end
+            // We have lower MAC -> we keep hostname, remote will fall back on their end
             // Clear peer's hostname so it gets the fallback on our records
             snprintf(peer->hostname, WKI_HOSTNAME_MAX, "node-%04x", peer_node);
         }
@@ -397,7 +399,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 void wki_peer_send_heartbeats() {
     // Gather real CPU load from scheduler run queues
     uint16_t total_runnable = 0;
-    uint64_t cpu_count = mod::smt::getCoreCount();
+    uint64_t cpu_count = mod::smt::get_core_count();
     for (uint64_t c = 0; c < cpu_count; c++) {
         auto stats = mod::sched::get_run_queue_stats(c);
         total_runnable += static_cast<uint16_t>(stats.active_task_count);
@@ -449,7 +451,7 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 
     // Send HEARTBEAT_ACK echoing the timestamp for RTT calculation
     uint16_t ack_runnable = 0;
-    uint64_t ack_cpu_count = mod::smt::getCoreCount();
+    uint64_t ack_cpu_count = mod::smt::get_core_count();
     for (uint64_t c = 0; c < ack_cpu_count; c++) {
         auto stats = mod::sched::get_run_queue_stats(c);
         ack_runnable += static_cast<uint16_t>(stats.active_task_count);
@@ -615,9 +617,10 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 // Track when we last sent heartbeats / HELLOs
 static uint64_t s_last_heartbeat_send = 0;
 static uint64_t s_last_hello_broadcast = 0;
-static uint64_t s_last_vfs_fd_gc = 0;                      // D10: stale FD GC
-static uint64_t s_last_net_stats_poll = 0;                 // D13: NIC stats polling
-static uint64_t s_jitter_state = 0;                        // Simple PRNG state for jitter
+static uint64_t s_last_vfs_fd_gc = 0;       // D10: stale FD GC
+static uint64_t s_last_net_stats_poll = 0;  // D13: NIC stats polling
+static uint64_t s_jitter_state = 0;         // Simple PRNG state for jitter
+static uint64_t s_next_heartbeat_send_deadline = 0;
 constexpr uint64_t HELLO_BROADCAST_INTERVAL_US = 1000000;  // 1 second
 constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;       // 10 seconds
 constexpr uint64_t NET_STATS_POLL_INTERVAL_US = 1000000;   // 1 second
@@ -647,6 +650,34 @@ static uint64_t wki_get_jitter_us(uint64_t base_interval_us) {
     return jitter;  // Will be subtracted by max_jitter by caller to center around 0
 }
 
+static auto wki_min_heartbeat_interval_us() -> uint64_t {
+    uint64_t min_interval_us = UINT64_MAX;
+    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
+        const WkiPeer* peer = &g_wki.peers[i];
+        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
+            continue;
+        }
+        uint64_t peer_interval_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000;
+        min_interval_us = std::min(min_interval_us, peer_interval_us);
+    }
+    return min_interval_us;
+}
+
+static auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_interval_us) -> uint64_t {
+    uint64_t max_jitter = (min_interval_us * WKI_HEARTBEAT_JITTER_PERCENT) / 100;
+    uint64_t jitter = wki_get_jitter_us(min_interval_us);
+    int64_t jitter_offset = static_cast<int64_t>(jitter) - static_cast<int64_t>(max_jitter);
+    uint64_t effective_interval = static_cast<uint64_t>(static_cast<int64_t>(min_interval_us) + jitter_offset);
+
+    if (effective_interval < min_interval_us / 2) {
+        effective_interval = min_interval_us / 2;
+    } else if (effective_interval > min_interval_us * 2) {
+        effective_interval = min_interval_us * 2;
+    }
+
+    return now_us + effective_interval;
+}
+
 void wki_peer_timer_tick(uint64_t now_us) {
     if (!g_wki.initialized) {
         return;
@@ -658,37 +689,19 @@ void wki_peer_timer_tick(uint64_t now_us) {
         s_last_hello_broadcast = now_us;
     }
 
-    // Send heartbeats at the configured interval
-    // Use the minimum interval among all peers (convert ms to us)
-    uint64_t min_interval_us = static_cast<uint64_t>(WKI_MAX_HEARTBEAT_INTERVAL_MS) * 1000;
-    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
-        WkiPeer* peer = &g_wki.peers[i];
-        if (peer->node_id == WKI_NODE_INVALID) {
-            continue;
+    // Send heartbeats at the configured interval.
+    uint64_t min_interval_us = wki_min_heartbeat_interval_us();
+    if (min_interval_us == UINT64_MAX) {
+        s_next_heartbeat_send_deadline = 0;
+    } else {
+        if (s_next_heartbeat_send_deadline == 0) {
+            s_next_heartbeat_send_deadline = wki_schedule_next_heartbeat_deadline(now_us, min_interval_us);
         }
-        if (peer->state != PeerState::CONNECTED) {
-            continue;
+        if (now_us >= s_next_heartbeat_send_deadline) {
+            wki_peer_send_heartbeats();
+            s_last_heartbeat_send = now_us;
+            s_next_heartbeat_send_deadline = wki_schedule_next_heartbeat_deadline(now_us, min_interval_us);
         }
-        uint64_t peer_interval_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000;
-        min_interval_us = std::min<uint64_t>(peer_interval_us, min_interval_us);
-    }
-
-    // Add jitter to prevent synchronized heartbeats across nodes
-    uint64_t max_jitter = (min_interval_us * WKI_HEARTBEAT_JITTER_PERCENT) / 100;
-    uint64_t jitter = wki_get_jitter_us(min_interval_us);
-    int64_t jitter_offset = static_cast<int64_t>(jitter) - static_cast<int64_t>(max_jitter);
-    uint64_t effective_interval = static_cast<uint64_t>(static_cast<int64_t>(min_interval_us) + jitter_offset);
-
-    // Clamp to reasonable bounds
-    if (effective_interval < min_interval_us / 2) {
-        effective_interval = min_interval_us / 2;
-    } else if (effective_interval > min_interval_us * 2) {
-        effective_interval = min_interval_us * 2;
-    }
-
-    if (now_us - s_last_heartbeat_send >= effective_interval) {
-        wki_peer_send_heartbeats();
-        s_last_heartbeat_send = now_us;
     }
 
     // Check for heartbeat timeouts and fence dead peers
@@ -803,16 +816,77 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 }
 
 // -----------------------------------------------------------------------------
-// WKI timer kernel thread — runs wki_peer_timer_tick() at ~10ms cadence
+// WKI timer kernel thread — runs wki_peer_timer_tick() with deadline-driven sleeps
 // -----------------------------------------------------------------------------
 
-constexpr uint64_t WKI_TIMER_SLEEP_US = 10000;
+constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 50000;
+constexpr uint64_t WKI_TIMER_IDLE_SLEEP_US = 1000000;
+static mod::sched::task::Task* s_wki_timer_task = nullptr;
+
+static auto wki_has_connected_peers() -> bool {
+    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
+        const WkiPeer* peer = &g_wki.peers[i];
+        if (peer->node_id != WKI_NODE_INVALID && peer->state == PeerState::CONNECTED) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void wki_timer_notify() {
+    if (s_wki_timer_task != nullptr) {
+        mod::sched::kern_wake(s_wki_timer_task);
+    }
+}
+
+static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
+    uint64_t next_deadline = s_last_hello_broadcast + HELLO_BROADCAST_INTERVAL_US;
+
+    if (s_next_heartbeat_send_deadline != 0) {
+        next_deadline = std::min(next_deadline, s_next_heartbeat_send_deadline);
+    }
+
+    next_deadline = std::min(next_deadline, s_last_vfs_fd_gc + VFS_FD_GC_INTERVAL_US);
+    next_deadline = std::min(next_deadline, s_last_net_stats_poll + NET_STATS_POLL_INTERVAL_US);
+
+    uint64_t grace_period_us = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
+    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
+        const WkiPeer* peer = &g_wki.peers[i];
+        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED || !peer->is_direct) {
+            continue;
+        }
+        if (now_us >= peer->connected_time && now_us - peer->connected_time < grace_period_us) {
+            next_deadline = std::min(next_deadline, peer->connected_time + grace_period_us);
+            continue;
+        }
+
+        uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
+        next_deadline = std::min(next_deadline, peer->last_heartbeat + timeout_us);
+    }
+
+    return next_deadline;
+}
 
 [[noreturn]] void wki_timer_thread() {
     for (;;) {
         uint64_t now_us = mod::time::getUs();
         wki_peer_timer_tick(now_us);
-        mod::sched::kern_sleep_us(WKI_TIMER_SLEEP_US);
+
+        now_us = mod::time::getUs();
+        uint64_t next_deadline = std::min(wki_next_fast_timer_deadline_us(now_us), wki_next_periodic_deadline_us(now_us));
+        uint64_t sleep_us = WKI_TIMER_IDLE_SLEEP_US;
+        if (next_deadline != UINT64_MAX) {
+            if (next_deadline <= now_us) {
+                continue;
+            }
+            sleep_us = next_deadline - now_us;
+        }
+
+        if (wki_has_connected_peers()) {
+            sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_POLL_US);
+        }
+
+        mod::sched::kern_sleep_us(std::max<uint64_t>(sleep_us, 1));
     }
 }
 
@@ -822,6 +896,7 @@ void wki_timer_thread_start() {
         mod::dbg::log("[WKI] Failed to create WKI timer kernel thread");
         return;
     }
+    s_wki_timer_task = task;
     mod::sched::post_task_balanced(task);
     mod::dbg::log("[WKI] Timer kernel thread started (PID %d)", task->pid);
 }

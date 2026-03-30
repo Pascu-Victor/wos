@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -8,14 +9,19 @@ namespace ker::vfs::procfs {
 
 // Procfs node types
 enum class ProcNodeType : uint8_t {
-    ROOT_DIR,      // /proc
-    PID_DIR,       // /proc/<pid>
-    SELF_LINK,     // /proc/self → /proc/<pid>
-    EXE_LINK,      // /proc/<pid>/exe → exe_path
-    STATUS_FILE,   // /proc/<pid>/status
-    MOUNTS_FILE,   // /proc/mounts
-    STAT_FILE,     // /proc/<pid>/stat
-    CMDLINE_FILE,  // /proc/<pid>/cmdline
+    ROOT_DIR,       // /proc
+    PID_DIR,        // /proc/<pid>
+    SELF_LINK,      // /proc/self -> /proc/<pid>
+    EXE_LINK,       // /proc/<pid>/exe -> exe_path
+    STATUS_FILE,    // /proc/<pid>/status
+    MOUNTS_FILE,    // /proc/mounts
+    STAT_FILE,      // /proc/<pid>/stat
+    CMDLINE_FILE,   // /proc/<pid>/cmdline
+    UPTIME_FILE,    // /proc/uptime
+    VERSION_FILE,   // /proc/version
+    KPERF_FILE,     // /proc/kperf    -> drain kernel perf ring buffer as text events
+    KCPUSTAT_FILE,  // /proc/kcpustat -> per-CPU aggregate scheduler statistics
+    KPERFCTL_FILE,  // /proc/kperfctl -> write "enable"/"disable" to control recording
 };
 
 struct ProcNode {

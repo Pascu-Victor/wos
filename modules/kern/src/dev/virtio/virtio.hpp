@@ -45,9 +45,16 @@ constexpr uint8_t VIRTIO_STATUS_FAILED = 128;
 // Feature bits
 constexpr uint32_t VIRTIO_NET_F_MAC = (1u << 5);
 constexpr uint32_t VIRTIO_NET_F_STATUS = (1u << 16);
+constexpr uint32_t VIRTIO_NET_F_CTRL_VQ = (1u << 17);  // Control queue present
 constexpr uint32_t VIRTIO_NET_F_MRG_RXBUF = (1u << 15);
 constexpr uint32_t VIRTIO_NET_F_CSUM = (1u << 0);
 constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1u << 1);
+constexpr uint32_t VIRTIO_NET_F_MQ = (1u << 22);  // Multi-queue (requires CTRL_VQ)
+
+// Control queue class/command for activating multi-queue pairs
+constexpr uint8_t VIRTIO_NET_CTRL_CLASS_MQ = 4;
+constexpr uint8_t VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET = 0;
+constexpr uint8_t VIRTIO_NET_OK = 0;
 
 // Virtqueue descriptor flags
 constexpr uint16_t VRING_DESC_F_NEXT = 1;

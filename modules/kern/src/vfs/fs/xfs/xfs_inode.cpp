@@ -8,7 +8,9 @@
 
 #include "xfs_inode.hpp"
 
+#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -16,6 +18,10 @@
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+
+#include "net/endian.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -431,10 +437,10 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
     // NREXT64: extent counts are stored in different fields (mirrors read path)
     if (xfs_has_nrext64(mount)) {
-        // Data extent count → di_pad[0..7] as __be64
+        // Data extent count => di_pad[0..7] as __be64
         __be64 big_nextents_be = __be64::from_cpu(static_cast<uint64_t>(ip->nextents));
         __builtin_memcpy(dip->di_pad.data(), &big_nextents_be, sizeof(__be64));
-        // Attr extent count → di_nextents as __be32
+        // Attr extent count => di_nextents as __be32
         dip->di_nextents = __be32::from_cpu(static_cast<uint32_t>(ip->anextents));
     } else {
         dip->di_nextents = __be32::from_cpu(ip->nextents);

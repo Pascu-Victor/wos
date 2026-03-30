@@ -22,10 +22,15 @@ void wake_socket(Socket* sock) {
     }
     uint64_t pid = sock->owner_pid;
     if (pid != 0) {
-        auto* task = ker::mod::sched::find_task_by_pid(pid);
+        auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
         if (task != nullptr) {
             task->deferredTaskSwitch = false;
-            ker::mod::sched::reschedule_task_for_cpu(task->cpu, task);
+            uint64_t target_cpu = task->cpu;
+            if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
+                target_cpu = ker::mod::sched::get_least_loaded_cpu();
+            }
+            ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
+            task->release();
         }
     }
 }

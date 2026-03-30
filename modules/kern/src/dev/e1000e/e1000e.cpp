@@ -62,7 +62,7 @@ inline void reg_write(E1000Device* dev, uint32_t offset, uint32_t value) { dev->
 // -- Physical address conversion -----------------------------------------
 auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
-    auto hhdm_offset = ker::mod::mm::addr::getHHDMOffset();
+    auto hhdm_offset = ker::mod::mm::addr::get_hhdm_offset();
 
     // Check if address is in HHDM range (physical memory direct mapped)
     if (addr >= hhdm_offset) {

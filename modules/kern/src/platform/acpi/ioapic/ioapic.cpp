@@ -54,7 +54,7 @@ void init() {
     // Map the IO APIC MMIO page into kernel page table.
     // MMIO regions are not in the Limine memory map, so the HHDM has no
     // page table entry for them after the kernel switches to its own page tables.
-    auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::getVirtPointer(phys_addr));
+    auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(phys_addr));
     mm::virt::mapToKernelPageTable(virt_addr, phys_addr, mm::paging::pageTypes::MMIO);
 
     ioapic_base = reinterpret_cast<volatile uint32_t*>(virt_addr);

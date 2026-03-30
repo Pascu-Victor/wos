@@ -267,7 +267,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
             hcf();
         }
 
-        auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, data, size);
 
         return virtAddr;
@@ -290,7 +290,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
             hcf();
         }
 
-        auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, str.data(), str.size());
         destPtr[str.size()] = '\0';
 
@@ -645,7 +645,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
             dbg::log("exec pushData: translate failed for stack vaddr 0x%x", pageVirt);
             hcf();
         }
-        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, data, size);
         return virtAddr;
     };
@@ -662,7 +662,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
             dbg::log("exec pushString: translate failed for stack vaddr 0x%x", pageVirt);
             hcf();
         }
-        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::getVirtPointer(pagePhys)) + pageOffset;
+        auto* destPtr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(pagePhys)) + pageOffset;
         std::memcpy(destPtr, str, len);
         return virtAddr;
     };
@@ -742,7 +742,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         uint64_t destVaddr = task->thread->tlsBaseVirt + ssym->rawValue;
         uint64_t destPaddr = mm::virt::translate(newPagemap, destVaddr);
         if (destPaddr != mm::virt::PADDR_INVALID) {
-            auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
+            auto* destPtr = (uint64_t*)mm::addr::get_virt_pointer(destPaddr);
             *destPtr = task->thread->safestackPtrValue;
         }
     }
@@ -784,7 +784,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path, elfResult.entryPoint, newRsp);
 #endif
     // Compute physical pagemap address before we enter the critical section
-    auto physPagemap = (uint64_t)mm::addr::getPhysPointer((uint64_t)newPagemap);
+    auto physPagemap = (uint64_t)mm::addr::get_phys_pointer((uint64_t)newPagemap);
 
     // === CRITICAL SECTION: No function calls below this point! ===
     // Any function call (including dbg::log) would use the kernel stack

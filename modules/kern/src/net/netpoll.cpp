@@ -1,5 +1,9 @@
 #include "netpoll.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <platform/asm/cpu.hpp>
@@ -8,6 +12,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <string_view>
 
 namespace ker::net {
 
@@ -15,7 +20,6 @@ namespace {
 
 // Registry of all NAPI structures for worker thread lookup
 constexpr size_t MAX_NAPI_DEVICES = 16;
-constexpr uint64_t NAPI_IDLE_SLEEP_US = 1000;
 NapiStruct* g_napi_registry[MAX_NAPI_DEVICES] = {};
 size_t g_napi_count = 0;
 ker::mod::sys::Spinlock g_registry_lock;
@@ -58,30 +62,15 @@ void unregister_napi(NapiStruct* napi) {
 
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
-    // Counts consecutive idle wakeups to trigger fallback polling if needed.
-    uint32_t idle_wakeups = 0;
-
     for (;;) {
         // Disable interrupts before checking work flag.
         asm volatile("cli" ::: "memory");
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
-            // No work: truly sleep until the next poll interval or explicit wake.
-            ker::mod::sched::kern_sleep_us(NAPI_IDLE_SLEEP_US);
-            idle_wakeups++;
-
-            // Fallback: after ~10 idle wakeups, force a poll in case of missed IRQs.
-            constexpr uint32_t IDLE_POLL_THRESHOLD = 10;
-            if (idle_wakeups >= IDLE_POLL_THRESHOLD) {
-                idle_wakeups = 0;
-                NapiState idle = NapiState::IDLE;
-                if (napi->state.compare_exchange_strong(idle, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    napi->has_work.store(true, std::memory_order_release);
-                }
-            }
+            // No work: block until napi_schedule() explicitly wakes us.
+            ker::mod::sched::kern_block();
             continue;
         }
-        idle_wakeups = 0;
 
         // Work available: re-enable interrupts before polling.
         asm volatile("sti" ::: "memory");
@@ -150,7 +139,7 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
     napi->complete_count = 0;
 }
 
-void napi_enable(NapiStruct* napi) {
+void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     // Set direct pointer for lock-free inline poll lookup
     napi->dev->napi = napi;
 
@@ -158,29 +147,43 @@ void napi_enable(NapiStruct* napi) {
     register_napi(napi);
 
     // Build thread name: "netpoll_eth0"
-    char name[32] = "netpoll_";
+    std::array<char, 32> name{};
     const char* dev_name = napi->dev->name.data();
-    size_t name_len = 8;  // strlen("netpoll_")
-    for (size_t i = 0; dev_name[i] != '\0' && name_len < 31; ++i) {
+    std::string_view prefix = "netpoll_";
+    size_t name_len = prefix.size();
+    std::ranges::copy(prefix, name.begin());
+    for (size_t i = 0; dev_name[i] != '\0' && name_len < name.size() - 1; ++i) {
         name[name_len++] = dev_name[i];
     }
     name[name_len] = '\0';
 
     // Create dedicated worker thread
-    napi->worker = ker::mod::sched::task::Task::createKernelThread(name, napi_worker_entry);
+    napi->worker = ker::mod::sched::task::Task::createKernelThread(name.data(), napi_worker_entry);
     if (napi->worker == nullptr) {
         ker::mod::dbg::log("netpoll: failed to create worker thread for %s", dev_name);
         unregister_napi(napi);
         return;
     }
 
-    // Schedule the worker thread
-    ker::mod::sched::post_task_balanced(napi->worker);
+    // Schedule the worker thread - place on the preferred CPU
+    if (cpu_affinity != UINT64_MAX) {
+        ker::mod::sched::post_task_for_cpu(cpu_affinity, napi->worker);
+    } else {
+        ker::mod::sched::post_task_balanced(napi->worker);
+    }
 
     // Transition to IDLE state (ready to receive IRQs)
     napi->state.store(NapiState::IDLE, std::memory_order_release);
 
     ker::mod::dbg::log("netpoll: enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
+}
+
+void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) {
+    if (napi == nullptr || napi->worker == nullptr) {
+        return;
+    }
+    napi->worker->cpu_pinned = true;
+    ker::mod::sched::reschedule_task_for_cpu(cpu, napi->worker);
 }
 
 void napi_disable(NapiStruct* napi) {
@@ -210,7 +213,7 @@ void napi_disable(NapiStruct* napi) {
     ker::mod::dbg::log("netpoll: disabled for %s", napi->dev->name.data());
 }
 
-bool napi_schedule(NapiStruct* napi) {
+auto napi_schedule(NapiStruct* napi) -> bool {
     // Try to transition from IDLE to SCHEDULED (atomic, no lock)
     NapiState expected = NapiState::IDLE;
     if (!napi->state.compare_exchange_strong(expected, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -247,7 +250,7 @@ void napi_complete(NapiStruct* napi) {
     // Driver should re-enable device interrupts after calling this
 }
 
-int napi_poll_inline_budget(NetDevice* dev, int budget) {
+auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
     if (dev == nullptr) {
         return 0;
     }
@@ -273,7 +276,7 @@ int napi_poll_inline_budget(NetDevice* dev, int budget) {
     // napi_complete() + re-enables IRQs internally when processed < budget.
     // We must NOT call napi_complete() again in that case, or we corrupt
     // the NAPI state machine — an IRQ arriving between the driver's
-    // napi_complete() and ours could schedule the worker (IDLE→SCHEDULED→
+    // napi_complete() and ours could schedule the worker (IDLE->SCHEDULED->
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.
     int effective_budget = budget > 0 ? budget : napi->weight;
@@ -304,15 +307,15 @@ int napi_poll_inline_budget(NetDevice* dev, int budget) {
     return processed;
 }
 
-int napi_poll_inline(NetDevice* dev) { return napi_poll_inline_budget(dev, 0); }
+auto napi_poll_inline(NetDevice* dev) -> int { return napi_poll_inline_budget(dev, 0); }
 
-int napi_poll_all_pending() {
+auto napi_poll_all_pending() -> int {
     int total = 0;
     // Snapshot count under lock to avoid tearing, then poll without the lock
     // (napi_poll_inline_budget is safe to call without the registry lock).
     g_registry_lock.lock();
     size_t count = g_napi_count;
-    NapiStruct* snapshot[MAX_NAPI_DEVICES];
+    std::array<NapiStruct*, MAX_NAPI_DEVICES> snapshot{};
     for (size_t i = 0; i < count; ++i) {
         snapshot[i] = g_napi_registry[i];
     }

@@ -12,7 +12,7 @@ std::atomic<uint64_t> EpochManager::globalEpoch{0};
 CpuEpoch* EpochManager::cpuEpochs = nullptr;
 
 void EpochManager::init() {
-    uint64_t coreCount = smt::getCoreCount();
+    uint64_t coreCount = smt::get_core_count();
 
     // Manually allocate aligned memory for CpuEpoch array.
     // Each CpuEpoch needs 64-byte alignment to avoid false sharing.
@@ -95,7 +95,7 @@ auto EpochManager::isSafeToReclaim(uint64_t deathEpoch) -> bool {
     // Check that all CPUs have moved past the death epoch.
     // A CPU that's in a critical section with a localEpoch <= deathEpoch
     // might still be holding references to memory freed at deathEpoch.
-    uint64_t coreCount = smt::getCoreCount();
+    uint64_t coreCount = smt::get_core_count();
     for (uint64_t i = 0; i < coreCount; ++i) {
         if (cpuEpochs[i].inCriticalSection.load(std::memory_order_acquire)) {
             uint64_t cpuEpoch = cpuEpochs[i].localEpoch.load(std::memory_order_acquire);

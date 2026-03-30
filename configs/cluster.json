@@ -27,6 +27,7 @@
             "name": "lan",
             "nodes": 2,
             "nic_model": "virtio-net-pci",
+            "nic_queues": 2,
             "bridge": {
                 "ip": "10.10.0.100/16"
             }

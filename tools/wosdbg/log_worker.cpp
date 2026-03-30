@@ -302,7 +302,7 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
             entry.hexBytes = hexStr.toStdString();
 
             QString asmStr = instrMatch.captured(3).trimmed();
-            entry.assembly = disassembler.convertToIntel(asmStr.toStdString());
+            entry.assembly = disassembler.convert_to_intel(asmStr.toStdString());
 
             // Debug logging for disassembly
             // qDebug() << "Parsed instruction:" << QString::fromStdString(entry.address) << QString::fromStdString(entry.assembly);

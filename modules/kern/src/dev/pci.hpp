@@ -111,8 +111,16 @@ void pci_enable_memory_space(PCIDevice* dev);
 
 // PCI Capability support
 auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t;  // config offset, 0 = not found
-auto pci_enable_msi(PCIDevice* dev, uint8_t vector) -> int;           // 0 = success
-auto pci_enable_msix(PCIDevice* dev, uint8_t vector) -> int;          // 0 = success, configures entry 0
+// target_cpu: logical CPU index (0 = BSP).  The MSI/MSI-X message address is
+// programmed to deliver to that CPU's APIC ID.  Defaults to 0 for backward
+// compatibility with callers that don't care about IRQ steering.
+auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu = 0) -> int;   // 0 = success
+auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu = 0) -> int;  // 0 = success, entry 0
+
+// Configure a single MSI-X table entry (0-based index) after pci_enable_msix has
+// enabled the capability.  entry_idx must be within the table size reported by the
+// device capability header.  Returns 0 on success, -1 on error.
+auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector, uint64_t target_cpu = 0) -> int;
 
 // BAR address resolution (handles 64-bit BARs)
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t;

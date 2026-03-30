@@ -38,6 +38,18 @@ ker::mod::sys::Spinlock tcp_bind_lock;
 
 uint16_t tcp_ephemeral_port = 49152;
 
+void defer_socket_wait(Socket* sock) {
+    auto* current_task = ker::mod::sched::get_current_task();
+    if (current_task == nullptr) {
+        return;
+    }
+
+    if (sock != nullptr) {
+        sock->owner_pid = current_task->pid;
+    }
+    current_task->deferredTaskSwitch = true;
+}
+
 // Simple ISS generator.
 uint32_t iss_counter = 0x12345678;
 auto generate_iss() -> uint32_t {
@@ -122,7 +134,7 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     sock->lock.lock();
     if (sock->aq_count == 0) {
         sock->lock.unlock();
-        ker::mod::sched::kern_yield();
+        defer_socket_wait(sock);
         return -EAGAIN;
     }
 
@@ -161,18 +173,15 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
         if (sock->nonblock) {
             return -EINPROGRESS;
         }
-        // Blocking connect
-        for (;;) {
-            if (cb->state == TcpState::ESTABLISHED) {
-                sock->state = SocketState::CONNECTED;
-                return 0;
-            }
-            if (cb->state == TcpState::CLOSED) {
-                return -ECONNREFUSED;
-            }
-            ker::mod::sched::kern_yield();
-            ker::net::napi_poll_all_pending();
+        if (cb->state == TcpState::ESTABLISHED) {
+            sock->state = SocketState::CONNECTED;
+            return 0;
         }
+        if (cb->state == TcpState::CLOSED) {
+            return -ECONNREFUSED;
+        }
+        defer_socket_wait(sock);
+        return -EINPROGRESS;
     }
 
     // Connection failed
@@ -230,18 +239,15 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
         return -EINPROGRESS;
     }
 
-    // Blocking connect: wait for SYN-ACK / RST
-    for (;;) {
-        if (cb->state == TcpState::ESTABLISHED) {
-            sock->state = SocketState::CONNECTED;
-            return 0;
-        }
-        if (cb->state == TcpState::CLOSED) {
-            return -ECONNREFUSED;
-        }
-        ker::mod::sched::kern_yield();
-        ker::net::napi_poll_all_pending();
+    if (cb->state == TcpState::ESTABLISHED) {
+        sock->state = SocketState::CONNECTED;
+        return 0;
     }
+    if (cb->state == TcpState::CLOSED) {
+        return -ECONNREFUSED;
+    }
+    defer_socket_wait(sock);
+    return -EINPROGRESS;
 }
 
 auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
@@ -281,14 +287,10 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
                 return static_cast<ssize_t>(sent);
             }
             if (sock->nonblock) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task != nullptr) {
-                    task->deferredTaskSwitch = true;
-                }
                 return -EAGAIN;
             }
-            ker::mod::sched::kern_yield();
-            continue;
+            defer_socket_wait(sock);
+            return -EAGAIN;
         }
 
         // Limit by send window
@@ -303,16 +305,10 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
                 return static_cast<ssize_t>(sent);
             }
             if (sock->nonblock) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task != nullptr) {
-                    task->deferredTaskSwitch = true;
-                }
                 return -EAGAIN;
             }
-            // Poll NAPI inline so incoming ACKs are processed promptly.
-            ker::mod::sched::kern_yield();
-            ker::net::napi_poll_all_pending();
-            continue;
+            defer_socket_wait(sock);
+            return -EAGAIN;
         }
         uint32_t available = window - in_flight;
         chunk = std::min<size_t>(chunk, available);
@@ -325,14 +321,10 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
                 return static_cast<ssize_t>(sent);
             }
             if (sock->nonblock) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task != nullptr) {
-                    task->deferredTaskSwitch = true;
-                }
                 return -EAGAIN;
             }
-            ker::mod::sched::kern_yield();
-            continue;
+            defer_socket_wait(sock);
+            return -EAGAIN;
         }
         sent += chunk;
     }

@@ -8,7 +8,7 @@ uint64_t threadInfo(abi::multiproc::threadInfoOps op) {
             return mod::apic::getApicId();
 
         case abi::multiproc::threadInfoOps::nativeThreadCount:
-            return mod::smt::cpuCount();
+            return mod::smt::cpu_count();
 
         case abi::multiproc::threadInfoOps::currentCpu:
             return mod::cpu::currentCpu();

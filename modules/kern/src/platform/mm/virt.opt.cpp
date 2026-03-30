@@ -29,7 +29,7 @@ void init(limine_memmap_response* _memmapResponse, limine_executable_file_respon
     kernelAddressResponse = _kernelAddressResponse;
 }
 
-void switchToKernelPagemap() { wrcr3((uint64_t)addr::getPhysPointer((paddr_t)kernelPagemap)); }
+void switchToKernelPagemap() { wrcr3((uint64_t)addr::get_phys_pointer((paddr_t)kernelPagemap)); }
 
 PageTable* getKernelPagemap() { return kernelPagemap; }
 
@@ -58,7 +58,7 @@ void switchPagemap(sched::task::Task* t) {
         hcf();
     }
 
-    auto phys_pagemap = (uint64_t)addr::getPhysPointer((vaddr_t)t->pagemap);
+    auto phys_pagemap = (uint64_t)addr::get_phys_pointer((vaddr_t)t->pagemap);
 #ifdef VERBOSE_PAGEMAP_SWITCH
     dbg::log("switchPagemap: task=%s pid=%d virt=0x%x phys=0x%x", (t->name != nullptr) ? t->name : "unknown", t->pid,
              (unsigned int)(uintptr_t)t->pagemap, (unsigned int)phys_pagemap);
@@ -115,15 +115,15 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             goto not_cow;
         }
         {
-            auto* pml3 = (paging::PageTable*)addr::getVirtPointer(pml4->entries[idx4].frame << paging::PAGE_SHIFT);
+            auto* pml3 = (paging::PageTable*)addr::get_virt_pointer(pml4->entries[idx4].frame << paging::PAGE_SHIFT);
             if (!pml3->entries[idx3].present) {
                 goto not_cow;
             }
-            auto* pml2 = (paging::PageTable*)addr::getVirtPointer(pml3->entries[idx3].frame << paging::PAGE_SHIFT);
+            auto* pml2 = (paging::PageTable*)addr::get_virt_pointer(pml3->entries[idx3].frame << paging::PAGE_SHIFT);
             if (!pml2->entries[idx2].present) {
                 goto not_cow;
             }
-            auto* pml1 = (paging::PageTable*)addr::getVirtPointer(pml2->entries[idx2].frame << paging::PAGE_SHIFT);
+            auto* pml1 = (paging::PageTable*)addr::get_virt_pointer(pml2->entries[idx2].frame << paging::PAGE_SHIFT);
 
             paging::PageTableEntry& pte = pml1->entries[idx1];
             if (!pte.present) {
@@ -137,7 +137,7 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
 
             // This is a COW page — handle it
             paddr_t oldPhys = pte.frame << paging::PAGE_SHIFT;
-            void* oldVirt = reinterpret_cast<void*>(addr::getVirtPointer(oldPhys));
+            void* oldVirt = reinterpret_cast<void*>(addr::get_virt_pointer(oldPhys));
 
             uint32_t refcount = phys::pageRefGet(oldVirt);
 
@@ -164,7 +164,7 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             phys::pageRefDec(oldVirt);
 
             // Map new page as writable, clear COW
-            auto new_phys = (paddr_t)addr::getPhysPointer((vaddr_t)newPage);
+            auto new_phys = (paddr_t)addr::get_phys_pointer((vaddr_t)newPage);
             raw &= ~paging::PAGE_COW;
             raw |= paging::PAGE_WRITE;
             // Replace frame bits
@@ -289,15 +289,15 @@ void initPagemap() {
         }
 
         for (size_t j = 0; j < numPages; j++) {
-            paddr_t vaddr = (paddr_t)addr::getVirtPointer(entry->base + j * paging::PAGE_SIZE);
+            paddr_t vaddr = (paddr_t)addr::get_virt_pointer(entry->base + j * paging::PAGE_SIZE);
             mapPage(kernelPagemap,
-                    vaddr,                                                      // virtual address
-                    entry->base + j * paging::PAGE_SIZE,                        // physical address
-                    entry->type == LIMINE_MEMMAP_RESERVED                       // reserved memory
-                            || entry->type == LIMINE_MEMMAP_BAD_MEMORY          // bad memory
+                    vaddr,                                                          // virtual address
+                    entry->base + j * paging::PAGE_SIZE,                            // physical address
+                    entry->type == LIMINE_MEMMAP_RESERVED                           // reserved memory
+                            || entry->type == LIMINE_MEMMAP_BAD_MEMORY              // bad memory
                             || entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES  // kernel and modules
-                        ? paging::pageTypes::READONLY                           // becomes read-only
-                        : paging::pageTypes::KERNEL                             // otherwise kernel memory
+                        ? paging::pageTypes::READONLY                               // becomes read-only
+                        : paging::pageTypes::KERNEL                                 // otherwise kernel memory
             );
             totalPagesMapped++;
         }
@@ -340,7 +340,7 @@ void initPagemap() {
             if (!pml4e.present) continue;
 
             paddr_t pml3Phys = pml4e.frame << paging::PAGE_SHIFT;
-            vaddr_t pml3Virt = (vaddr_t)addr::getVirtPointer(pml3Phys);
+            vaddr_t pml3Virt = (vaddr_t)addr::get_virt_pointer(pml3Phys);
             if (!isPageMapped(kernelPagemap, pml3Virt)) {
                 mapPage(kernelPagemap, pml3Virt, pml3Phys, paging::pageTypes::KERNEL);
                 ptPagesMappped++;
@@ -354,7 +354,7 @@ void initPagemap() {
                 if (!pml3e.present) continue;
 
                 paddr_t pml2Phys = pml3e.frame << paging::PAGE_SHIFT;
-                vaddr_t pml2Virt = (vaddr_t)addr::getVirtPointer(pml2Phys);
+                vaddr_t pml2Virt = (vaddr_t)addr::get_virt_pointer(pml2Phys);
                 if (!isPageMapped(kernelPagemap, pml2Virt)) {
                     mapPage(kernelPagemap, pml2Virt, pml2Phys, paging::pageTypes::KERNEL);
                     ptPagesMappped++;
@@ -368,7 +368,7 @@ void initPagemap() {
                     if (!pml2e.present) continue;
 
                     paddr_t pml1Phys = pml2e.frame << paging::PAGE_SHIFT;
-                    vaddr_t pml1Virt = (vaddr_t)addr::getVirtPointer(pml1Phys);
+                    vaddr_t pml1Virt = (vaddr_t)addr::get_virt_pointer(pml1Phys);
                     if (!isPageMapped(kernelPagemap, pml1Virt)) {
                         mapPage(kernelPagemap, pml1Virt, pml1Phys, paging::pageTypes::KERNEL);
                         ptPagesMappped++;
@@ -422,7 +422,7 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
             wrcr3(rdcr3());
         }
 
-        return (PageTable*)addr::getVirtPointer(entry.frame << paging::PAGE_SHIFT);
+        return (PageTable*)addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT);
     }
 
     void* pageVirt = phys::pageAlloc();
@@ -432,7 +432,7 @@ static paging::PageTable* advancePageTable(paging::PageTable* pageTable, size_t 
         hcf();
     }
 
-    paddr_t pagePhys = (paddr_t)addr::getPhysPointer((vaddr_t)pageVirt);
+    paddr_t pagePhys = (paddr_t)addr::get_phys_pointer((vaddr_t)pageVirt);
 
     memset(pageVirt, 0, paging::PAGE_SIZE);
 
@@ -481,7 +481,7 @@ bool isPageMapped(PageTable* pageTable, vaddr_t vaddr) {
         if (!table->entries[index_of(vaddr, i)].present) {
             return false;
         }
-        table = (PageTable*)addr::getVirtPointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
+        table = (PageTable*)addr::get_virt_pointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
     }
 
     return table->entries[index_of(vaddr, 1)].present;
@@ -552,7 +552,7 @@ void unmapPage(PageTable* pageTable, vaddr_t vaddr) {
     // Convert frame number to physical address, then to HHDM pointer for refcount-aware free
     if (frame != 0) {
         uint64_t physAddr = frame << paging::PAGE_SHIFT;
-        void* virtPtr = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
+        void* virtPtr = reinterpret_cast<void*>(addr::get_virt_pointer(physAddr));
         phys::pageRefDec(virtPtr);
     }
 }
@@ -577,7 +577,7 @@ void mapRangeToKernelPageTable(Range range, uint64_t flags, uint64_t offset) { m
 
 void mapRangeToKernelPageTable(Range range, uint64_t flags) {
     // no offset assume hhdm
-    mapRange(kernelPagemap, range, flags, addr::getHHDMOffset());
+    mapRange(kernelPagemap, range, flags, addr::get_hhdm_offset());
 }
 
 // Helper to free a page table level recursively
@@ -609,7 +609,7 @@ static void freePageTableLevel(PageTable* table, int level) {
                 // Don't recurse, just clear the entry
                 // Note: We don't free huge pages here as they may be specially allocated
             } else {
-                PageTable* nextLevel = reinterpret_cast<PageTable*>(addr::getVirtPointer(physAddr));
+                PageTable* nextLevel = reinterpret_cast<PageTable*>(addr::get_virt_pointer(physAddr));
                 freePageTableLevel(nextLevel, level - 1);
                 // Free the page table page itself (page tables are never COW-shared)
                 phys::pageFree(nextLevel);
@@ -617,7 +617,7 @@ static void freePageTableLevel(PageTable* table, int level) {
         } else {
             // Level 1 (PML1) - entries point to actual data pages
             // Use refcount-aware free: COW-shared pages won't be freed until all users unmap
-            void* pageVirt = reinterpret_cast<void*>(addr::getVirtPointer(physAddr));
+            void* pageVirt = reinterpret_cast<void*>(addr::get_virt_pointer(physAddr));
             phys::pageRefDec(pageVirt);
         }
 
@@ -652,7 +652,7 @@ bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
         if (!src->entries[i4].present) continue;
 
         paddr_t srcPml3Phys = src->entries[i4].frame << paging::PAGE_SHIFT;
-        auto* srcPml3 = (PageTable*)addr::getVirtPointer(srcPml3Phys);
+        auto* srcPml3 = (PageTable*)addr::get_virt_pointer(srcPml3Phys);
 
         // Allocate a new PML3 for dst
         auto* dstPml3 = (PageTable*)phys::pageAlloc();
@@ -661,20 +661,20 @@ bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
 
         // Set PML4 entry in dst (copy flags from src)
         dst->entries[i4] = src->entries[i4];
-        dst->entries[i4].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml3) >> paging::PAGE_SHIFT;
+        dst->entries[i4].frame = (paddr_t)addr::get_phys_pointer((vaddr_t)dstPml3) >> paging::PAGE_SHIFT;
 
         for (size_t i3 = 0; i3 < 512; i3++) {
             if (!srcPml3->entries[i3].present) continue;
 
             paddr_t srcPml2Phys = srcPml3->entries[i3].frame << paging::PAGE_SHIFT;
-            auto* srcPml2 = (PageTable*)addr::getVirtPointer(srcPml2Phys);
+            auto* srcPml2 = (PageTable*)addr::get_virt_pointer(srcPml2Phys);
 
             auto* dstPml2 = (PageTable*)phys::pageAlloc();
             if (!dstPml2) return false;
             memset(dstPml2, 0, paging::PAGE_SIZE);
 
             dstPml3->entries[i3] = srcPml3->entries[i3];
-            dstPml3->entries[i3].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml2) >> paging::PAGE_SHIFT;
+            dstPml3->entries[i3].frame = (paddr_t)addr::get_phys_pointer((vaddr_t)dstPml2) >> paging::PAGE_SHIFT;
 
             for (size_t i2 = 0; i2 < 512; i2++) {
                 if (!srcPml2->entries[i2].present) continue;
@@ -685,14 +685,14 @@ bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
                 }
 
                 paddr_t srcPml1Phys = srcPml2->entries[i2].frame << paging::PAGE_SHIFT;
-                auto* srcPml1 = (PageTable*)addr::getVirtPointer(srcPml1Phys);
+                auto* srcPml1 = (PageTable*)addr::get_virt_pointer(srcPml1Phys);
 
                 auto* dstPml1 = (PageTable*)phys::pageAlloc();
                 if (!dstPml1) return false;
                 memset(dstPml1, 0, paging::PAGE_SIZE);
 
                 dstPml2->entries[i2] = srcPml2->entries[i2];
-                dstPml2->entries[i2].frame = (paddr_t)addr::getPhysPointer((vaddr_t)dstPml1) >> paging::PAGE_SHIFT;
+                dstPml2->entries[i2].frame = (paddr_t)addr::get_phys_pointer((vaddr_t)dstPml1) >> paging::PAGE_SHIFT;
 
                 for (size_t i1 = 0; i1 < 512; i1++) {
                     if (!srcPml1->entries[i1].present) continue;
@@ -707,7 +707,7 @@ bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
 
                     // Increment refcount on the shared data page
                     paddr_t dataPhys = srcPml1->entries[i1].frame << paging::PAGE_SHIFT;
-                    void* dataVirt = reinterpret_cast<void*>(addr::getVirtPointer(dataPhys));
+                    void* dataVirt = reinterpret_cast<void*>(addr::get_virt_pointer(dataPhys));
                     phys::pageRefInc(dataVirt);
                 }
             }

@@ -45,7 +45,7 @@ static inline uint64_t getCurrentCpuId() {
     // Early boot: use APIC ID
     uint32_t apicId = apic::getApicId();
     if (numCpus > 0) {
-        uint64_t cpuIdx = smt::getCpuIndexFromApicId(apicId);
+        uint64_t cpuIdx = smt::get_cpu_index_from_apic_id(apicId);
         return cpuIdx;
     }
     return 0;  // BSP during very early init
@@ -86,7 +86,7 @@ static sys::Spinlock largeAllocLock;
 
 void init() {
     // Initialize per-CPU allocators
-    numCpus = smt::getEarlyCpuCount();
+    numCpus = smt::get_early_cpu_count();
 
     mini_malloc_init();
 

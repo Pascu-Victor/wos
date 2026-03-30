@@ -2164,7 +2164,44 @@ struct PipeState {
     };
     WaiterInfo reader_info[MAX_WAITERS];
     WaiterInfo writer_info[MAX_WAITERS];
+
+    uint64_t read_poll_waiting[MAX_WAITERS];
+    uint64_t read_poll_count;
+    uint64_t write_poll_waiting[MAX_WAITERS];
+    uint64_t write_poll_count;
 };
+
+static auto pipe_register_waiter(uint64_t* waiters, uint64_t& waiter_count, uint64_t pid) -> bool {
+    for (uint64_t i = 0; i < waiter_count; i++) {
+        if (waiters[i] == pid) {
+            return true;
+        }
+    }
+    if (waiter_count >= PipeState::MAX_WAITERS) {
+        return false;
+    }
+    waiters[waiter_count++] = pid;
+    return true;
+}
+
+static void pipe_wake_pollers(uint64_t* waiters, uint64_t& waiter_count) {
+    uint64_t pending[PipeState::MAX_WAITERS]{};
+    uint64_t pending_count = waiter_count;
+    for (uint64_t i = 0; i < pending_count; i++) {
+        pending[i] = waiters[i];
+    }
+    waiter_count = 0;
+
+    for (uint64_t i = 0; i < pending_count; i++) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(pending[i]);
+        if (waiter == nullptr) {
+            continue;
+        }
+        uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        waiter->release();
+    }
+}
 
 // Wake all waiting readers and let them read from the buffer
 static void pipe_wake_readers(PipeState* st) {
@@ -2177,7 +2214,7 @@ static void pipe_wake_readers(PipeState* st) {
         if (to_read > st->count) to_read = st->count;
 
         if (to_read > 0 && st->reader_info[i].bufPhysAddr != 0 && st->reader_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto* dst = reinterpret_cast<char*>(ker::mod::mm::addr::getVirtPointer(st->reader_info[i].bufPhysAddr));
+            auto* dst = reinterpret_cast<char*>(ker::mod::mm::addr::get_virt_pointer(st->reader_info[i].bufPhysAddr));
             for (size_t j = 0; j < to_read; j++) {
                 dst[j] = st->buf[st->tail];
                 st->tail = (st->tail + 1) % st->capacity;
@@ -2208,7 +2245,7 @@ static void pipe_wake_writers(PipeState* st) {
         to_write = std::min(to_write, avail);
 
         if (to_write > 0 && st->writer_info[i].bufPhysAddr != 0 && st->writer_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
-            const auto* src = reinterpret_cast<const char*>(ker::mod::mm::addr::getVirtPointer(st->writer_info[i].bufPhysAddr));
+            const auto* src = reinterpret_cast<const char*>(ker::mod::mm::addr::get_virt_pointer(st->writer_info[i].bufPhysAddr));
             for (size_t j = 0; j < to_write; j++) {
                 st->buf[st->head] = src[j];
                 st->head = (st->head + 1) % st->capacity;
@@ -2244,6 +2281,8 @@ auto vfs_pipe(int pipefd[2]) -> int {
     ps->read_closed = false;
     ps->readers_count = 0;
     ps->writers_count = 0;
+    ps->read_poll_count = 0;
+    ps->write_poll_count = 0;
 
     // Pipe fops — static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
@@ -2263,6 +2302,9 @@ auto vfs_pipe(int pipefd[2]) -> int {
             // Wake any blocked writers now that there's buffer space
             if (st->writers_count > 0) {
                 pipe_wake_writers(st);
+            }
+            if (st->write_poll_count > 0) {
+                pipe_wake_pollers(st->write_poll_waiting, st->write_poll_count);
             }
 
             return static_cast<ssize_t>(to_read);
@@ -2319,6 +2361,9 @@ auto vfs_pipe(int pipefd[2]) -> int {
             if (st->readers_count > 0) {
                 pipe_wake_readers(st);
             }
+            if (st->read_poll_count > 0) {
+                pipe_wake_pollers(st->read_poll_waiting, st->read_poll_count);
+            }
 
             return static_cast<ssize_t>(to_write);
         }
@@ -2364,6 +2409,9 @@ auto vfs_pipe(int pipefd[2]) -> int {
                 }
                 st->writers_count = 0;
             }
+            if (st->write_poll_count > 0) {
+                pipe_wake_pollers(st->write_poll_waiting, st->write_poll_count);
+            }
         }
         // Free if both ends closed
         if (st != nullptr && st->write_closed) {
@@ -2389,6 +2437,9 @@ auto vfs_pipe(int pipefd[2]) -> int {
                     }
                 }
                 st->readers_count = 0;
+            }
+            if (st->read_poll_count > 0) {
+                pipe_wake_pollers(st->read_poll_waiting, st->read_poll_count);
             }
         }
         if (st != nullptr && st->read_closed) {
@@ -2418,6 +2469,11 @@ auto vfs_pipe(int pipefd[2]) -> int {
                 ready |= 0x0010;
             return ready;
         },
+        .vfs_poll_register_waiter = [](File* f, uint64_t pid) -> bool {
+            auto* st = static_cast<PipeState*>(f->private_data);
+            if (st == nullptr) return false;
+            return pipe_register_waiter(st->read_poll_waiting, st->read_poll_count, pid);
+        },
     };
 
     static FileOperations pipe_write_fops = {
@@ -2439,6 +2495,11 @@ auto vfs_pipe(int pipefd[2]) -> int {
             if (st->read_closed)  // POLLERR (broken pipe)
                 ready |= 0x0008;
             return ready;
+        },
+        .vfs_poll_register_waiter = [](File* f, uint64_t pid) -> bool {
+            auto* st = static_cast<PipeState*>(f->private_data);
+            if (st == nullptr) return false;
+            return pipe_register_waiter(st->write_poll_waiting, st->write_poll_count, pid);
         },
     };
 

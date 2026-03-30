@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vfs/file.hpp>
 
@@ -44,7 +46,7 @@ constexpr size_t EPOLL_MAX_INTEREST = 64;
 
 // Per-epoll-instance state, stored as File::private_data
 struct EpollInstance {
-    EpollInterest interests[EPOLL_MAX_INTEREST];
+    std::array<EpollInterest, EPOLL_MAX_INTEREST> interests;
     size_t count;  // number of active entries
 };
 

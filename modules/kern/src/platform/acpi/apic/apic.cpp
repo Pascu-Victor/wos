@@ -45,7 +45,7 @@ void init() {
     acpi::ACPIResult madt = acpi::parseAcpiTables(ident);
     if (madt.success) {
         acpi::madt::ApicInfo apicInfo = acpi::madt::parseMadt(madt.data);
-        APIC_BASE = (uint64_t)mm::addr::getVirtPointer(apicInfo.lapicAddr);
+        APIC_BASE = (uint64_t)mm::addr::get_virt_pointer(apicInfo.lapicAddr);
     } else {
         io::serial::write("Failed to parse MADT table\n");
         hcf();

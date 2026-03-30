@@ -16,17 +16,17 @@ CapstoneDisassembler::~CapstoneDisassembler() {
     }
 }
 
-std::string CapstoneDisassembler::convertToIntel(const std::string& atntAssembly) const {
+std::string CapstoneDisassembler::convert_to_intel(const std::string& atntAssembly) const {
     if (!handle) {
         // If Capstone is not available, try manual conversion
-        return manualATTToIntelConversion(atntAssembly);
+        return manual_att_to_intel_conversion(atntAssembly);
     }
 
     // First try to extract hex bytes from the full line format
-    auto hexBytes = extractHexBytes(atntAssembly);
+    auto hexBytes = extract_hex_bytes(atntAssembly);
 
     if (!hexBytes.empty()) {
-        std::vector<uint8_t> bytes = hexStringToBytes(hexBytes);
+        std::vector<uint8_t> bytes = hex_string_to_bytes(hexBytes);
         if (!bytes.empty()) {
             cs_insn* insn;
             size_t count = cs_disasm(handle, bytes.data(), bytes.size(), 0x1000, 0, &insn);
@@ -40,10 +40,10 @@ std::string CapstoneDisassembler::convertToIntel(const std::string& atntAssembly
     }
 
     // If Capstone conversion failed, fall back to manual conversion
-    return manualATTToIntelConversion(atntAssembly);
+    return manual_att_to_intel_conversion(atntAssembly);
 }
 
-std::string CapstoneDisassembler::manualATTToIntelConversion(const std::string& atntAssembly) {
+std::string CapstoneDisassembler::manual_att_to_intel_conversion(const std::string& atntAssembly) {
     QString input = QString::fromStdString(atntAssembly);
     QString result = input;
 
@@ -136,7 +136,7 @@ std::string CapstoneDisassembler::manualATTToIntelConversion(const std::string& 
     return result.toStdString();
 }
 
-std::string CapstoneDisassembler::extractHexBytes(const std::string& line) {
+std::string CapstoneDisassembler::extract_hex_bytes(const std::string& line) {
     QRegularExpression hexRegex(R"(:\s*([0-9a-fA-F\s]{2,})\s+)");
     QString qline = QString::fromStdString(line);
     auto match = hexRegex.match(qline);
@@ -150,7 +150,7 @@ std::string CapstoneDisassembler::extractHexBytes(const std::string& line) {
     return "";
 }
 
-std::vector<uint8_t> CapstoneDisassembler::hexStringToBytes(const std::string& hex) {
+std::vector<uint8_t> CapstoneDisassembler::hex_string_to_bytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
 
     for (size_t i = 0; i < hex.length(); i += 2) {

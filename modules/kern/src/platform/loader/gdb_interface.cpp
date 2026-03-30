@@ -23,7 +23,7 @@ void addGdbDebugInfo(uint64_t pid, const char* name, uint64_t baseAddr, uint64_t
         return;
     }
 
-    GdbDebugInfo* debugInfo = (GdbDebugInfo*)ker::mod::mm::addr::getPhysPointer(debugInfoPaddr);
+    GdbDebugInfo* debugInfo = (GdbDebugInfo*)ker::mod::mm::addr::get_phys_pointer(debugInfoPaddr);
 
     // Initialize the debug info structure
     debugInfo->magic = 0x47444255;  // 'GDBU' in little endian

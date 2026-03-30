@@ -1,5 +1,6 @@
 #include "ntp.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <net/endian.hpp>
 #include <net/socket.hpp>
@@ -40,7 +41,7 @@ static constexpr size_t NTP_SERVER_COUNT = sizeof(NTP_SERVERS) / sizeof(NTP_SERV
 
 // Attempt to synchronise with a single NTP server.
 // Returns true if sync succeeded and the RTC offset has been updated.
-static bool try_sync(uint32_t server_ip) {
+static auto try_sync(uint32_t server_ip) -> bool {
     auto* sock = ker::net::socket_create(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
     if (sock == nullptr) {
         return false;
@@ -53,7 +54,7 @@ static bool try_sync(uint32_t server_ip) {
     *reinterpret_cast<uint32_t*>(remote + 4) = ker::net::htonl(server_ip);  // network byte order
 
     // Build SNTP client request (48 bytes, all zero except first byte).
-    // Byte 0: LI=0, VN=4, Mode=3 (client) → 0b 00 100 011 = 0x23
+    // Byte 0: LI=0, VN=4, Mode=3 (client) -> 0b 00 100 011 = 0x23
     uint8_t req[NTP_PACKET_LEN] = {};
     req[0] = 0x23;
 

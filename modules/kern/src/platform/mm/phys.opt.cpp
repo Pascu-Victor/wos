@@ -118,7 +118,7 @@ static inline uint64_t getCurrentCpuId() {
     // Early boot: use APIC ID
     uint32_t apicId = apic::getApicId();
     if (numCpus > 0) {
-        uint64_t cpuIdx = smt::getCpuIndexFromApicId(apicId);
+        uint64_t cpuIdx = smt::get_cpu_index_from_apic_id(apicId);
         return cpuIdx;
     }
     return 0;  // BSP during very early init
@@ -183,7 +183,7 @@ auto initHugePageZone(uint64_t base, uint64_t len) -> paging::PageZone* {
     }
 
     // Convert huge page region base to virtual address for initialization
-    auto virt_base = reinterpret_cast<uint64_t>(addr::getVirtPointer(base));
+    auto virt_base = reinterpret_cast<uint64_t>(addr::get_virt_pointer(base));
 
     zone->name = "Huge Pages";
     zone->zoneNum = 9999;  // Special zone number for huge pages
@@ -233,7 +233,7 @@ void init(limine_memmap_response* memmapResponse) {
     limine_memmap_response memmap = *(memmapResponse);
 
     // Initialize per-CPU caches
-    numCpus = smt::getCoreCount();
+    numCpus = smt::get_core_count();
     if (numCpus == 0) numCpus = 1;  // Fallback to single CPU
 
     // Reserve per-CPU caches region (will be mapped and initialized after virt::initPagemap)
@@ -292,7 +292,7 @@ void init(limine_memmap_response* memmapResponse) {
         mainHeapSize += memmap.entries[i]->length;
 
         paging::PageZone* zone =
-            initPageZone((uint64_t)addr::getVirtPointer(memmap.entries[i]->base), memmap.entries[i]->length, zoneNum++);
+            initPageZone((uint64_t)addr::get_virt_pointer(memmap.entries[i]->base), memmap.entries[i]->length, zoneNum++);
 
         if (zones_tail == nullptr) {
             zones = zone;  // set the head
@@ -331,14 +331,14 @@ void initHugePageZoneDeferred() {
 
         for (uint64_t offset = 0; offset < perCpuCachesSize; offset += paging::PAGE_SIZE) {
             uint64_t phys = perCpuCachesPhysBase + offset;
-            auto virt = (uint64_t)addr::getVirtPointer(phys);
+            auto virt = (uint64_t)addr::get_virt_pointer(phys);
             virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
         }
 
         io::serial::write("Per-CPU caches mapped, initializing structures\n");
 
         // Now we can safely access the memory
-        void* cacheMemory = addr::getVirtPointer(perCpuCachesPhysBase);
+        void* cacheMemory = addr::get_virt_pointer(perCpuCachesPhysBase);
         perCpuCaches = static_cast<PerCpuPageCache*>(cacheMemory);
         for (size_t i = 0; i < numCpus; i++) {
             new (&perCpuCaches[i]) PerCpuPageCache();  // Placement new
@@ -360,7 +360,7 @@ void initHugePageZoneDeferred() {
 
         for (uint64_t offset = 0; offset < hugePageSize; offset += paging::PAGE_SIZE) {
             uint64_t phys = hugePageBase + offset;
-            auto virt = (uint64_t)addr::getVirtPointer(phys);
+            auto virt = (uint64_t)addr::get_virt_pointer(phys);
             virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
         }
 

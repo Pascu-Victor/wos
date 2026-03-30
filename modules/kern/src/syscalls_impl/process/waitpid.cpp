@@ -13,10 +13,10 @@ namespace ker::syscall::process {
 // rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
 static void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
     if (rusage_phys_addr == 0 || rusage_phys_addr == ker::mod::mm::virt::PADDR_INVALID) return;
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::getVirtPointer(rusage_phys_addr));
-    ru->ru_utime_sec  = (int64_t)(child->user_time_us / 1000000ULL);
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(rusage_phys_addr));
+    ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
     ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-    ru->ru_stime_sec  = (int64_t)(child->system_time_us / 1000000ULL);
+    ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
     ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
 }
 

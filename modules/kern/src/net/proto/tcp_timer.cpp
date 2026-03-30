@@ -22,13 +22,14 @@ namespace {
 
 TcpCB* timer_head = nullptr;
 ker::mod::sys::Spinlock timer_lock;
+ker::mod::sched::task::Task* timer_task = nullptr;
 
 // Earliest deadline across timer-list entries.
 std::atomic<uint64_t> timer_earliest{UINT64_MAX};
 
 constexpr uint8_t MAX_RETRIES = 8;
 constexpr size_t MAX_DEFERRED_RETRANSMITS = 16;
-constexpr uint64_t TCP_TIMER_IDLE_SLEEP_US = 10000;
+constexpr uint64_t TCP_TIMER_IDLE_SLEEP_US = 100000;
 constexpr uint64_t TCP_TIMER_MS_TO_US = 1000;
 
 struct DeferredRetransmit {
@@ -74,10 +75,15 @@ void wake_socket_timer(Socket* sock) {
     }
     uint64_t pid = sock->owner_pid;
     if (pid != 0) {
-        auto* task = ker::mod::sched::find_task_by_pid(pid);
+        auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
         if (task != nullptr) {
             task->deferredTaskSwitch = false;
-            ker::mod::sched::reschedule_task_for_cpu(task->cpu, task);
+            uint64_t target_cpu = task->cpu;
+            if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
+                target_cpu = ker::mod::sched::get_least_loaded_cpu();
+            }
+            ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
+            task->release();
         }
     }
 }
@@ -108,6 +114,7 @@ void tcp_timer_arm(TcpCB* cb) {
         return;
     }
 
+    bool wake_timer = false;
     timer_lock.lock();
     if (!cb->on_timer_list) {
         tcp_cb_acquire(cb);
@@ -119,8 +126,13 @@ void tcp_timer_arm(TcpCB* cb) {
     uint64_t cur = timer_earliest.load(std::memory_order_relaxed);
     if (deadline < cur) {
         timer_earliest.store(deadline, std::memory_order_relaxed);
+        wake_timer = true;
     }
     timer_lock.unlock();
+
+    if (wake_timer && timer_task != nullptr) {
+        ker::mod::sched::kern_wake(timer_task);
+    }
 }
 
 void tcp_timer_disarm(TcpCB* cb) {
@@ -403,13 +415,19 @@ void tcp_timer_tick(uint64_t now_ms) {
     for (;;) {
         uint64_t now_ms = ker::mod::time::getUs() / TCP_TIMER_MS_TO_US;
         uint64_t earliest = timer_earliest.load(std::memory_order_relaxed);
-        uint64_t sleep_us = TCP_TIMER_IDLE_SLEEP_US;
 
         if (now_ms >= earliest) {
             tcp_timer_tick(now_ms);
-        } else if (earliest != UINT64_MAX) {
-            uint64_t delta_ms = earliest - now_ms;
-            sleep_us = std::min(delta_ms * TCP_TIMER_MS_TO_US, sleep_us);
+        }
+
+        uint64_t sleep_us = TCP_TIMER_IDLE_SLEEP_US;
+        now_ms = ker::mod::time::getUs() / TCP_TIMER_MS_TO_US;
+        earliest = timer_earliest.load(std::memory_order_relaxed);
+        if (earliest != UINT64_MAX) {
+            if (earliest <= now_ms) {
+                continue;
+            }
+            sleep_us = std::max<uint64_t>((earliest - now_ms) * TCP_TIMER_MS_TO_US, 1);
         }
 #ifdef NET_TRACE
         ker::net::trace::flush();
@@ -424,6 +442,7 @@ void tcp_timer_thread_start() {
         ker::mod::dbg::log("FATAL: Failed to create TCP timer kernel thread");
         return;
     }
+    timer_task = task;
     ker::mod::sched::post_task_balanced(task);
     ker::mod::dbg::log("TCP timer kernel thread created (PID %x)", task->pid);
 }

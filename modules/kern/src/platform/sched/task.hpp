@@ -94,6 +94,13 @@ struct Task {
     TaskType type;
     uint64_t cpu;
     bool cpu_pinned = false;  // When true, scheduler will not migrate this task to another CPU
+    // CPU domain affinity (Phase 1 — CPU domain infrastructure)
+    // domain_id: which domain this task belongs to (0 = ROOT, any CPU allowed)
+    // domain_mask: bitmask of allowed CPUs (all-ones = unrestricted)
+    // domain_hard: when true, task NEVER runs outside domain_mask
+    uint32_t domain_id = 0;
+    uint64_t domain_mask = ~0ULL;
+    bool domain_hard = false;
     threading::Thread* thread;
     uint64_t pid;
     uint64_t parentPid;  // Parent process ID (0 for orphaned/init processes)
@@ -175,9 +182,9 @@ struct Task {
     volatile bool voluntaryBlock = false;
 
     // Waitpid state: when this task is waiting for another task to exit
-    uint64_t waitingForPid;        // PID we're waiting for (for waitpid return value)
-    uint64_t waitStatusPhysAddr;   // Physical address of status variable (for waitpid)
-    uint64_t waitRusagePhysAddr;   // Physical address of rusage struct (for wait3/wait4, 0 if unused)
+    uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
+    uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
+    uint64_t waitRusagePhysAddr;  // Physical address of rusage struct (for wait3/wait4, 0 if unused)
 
     // --- Signal infrastructure ---
     // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)
@@ -222,6 +229,9 @@ struct Task {
     // Task weight (nice-level analog). 1024 = default (nice 0).
     uint32_t schedWeight;
 
+    // POSIX nice value backing schedWeight for PROCESS tasks. Range [-20, 19].
+    int8_t schedNice = 0;
+
     // Time slice in nanoseconds. Default 10ms.
     uint32_t sliceNs;
 
@@ -239,9 +249,43 @@ struct Task {
     // Set by nanosleep; cleared by the timer tick when the deadline is reached.
     uint64_t wakeAtUs;
 
+    // Absolute deadline for a restarted poll/epoll wait with a finite timeout.
+    // Unlike wakeAtUs, this persists across scheduler wakeup so the restarted
+    // syscall can return 0 once the original deadline has actually expired.
+    uint64_t pollWaitDeadlineUs = 0;
+
     // Set by kern_block() to ask the timer interrupt to move this task to the
     // wait list on the next tick (under the run queue lock). Cleared by scheduler.
     bool wantsBlock;
+
+    // Timestamp (us) when the task most recently entered the wait queue.
+    // Used to distinguish short-sleep bursty wakeups from long-idle interactive wakes.
+    uint64_t lastSleepStartUs = 0;
+
+    // Runtime (us) consumed in the most recent execution burst before blocking.
+    // Short-run + short-sleep tasks get a wakeup vruntime tax so they do not
+    // rigidly alternate 50/50 with CPU-bound compute threads under contention.
+    uint32_t lastRunUs = 0;
+
+    // Duration (us) of the most recent sleep before the task woke.
+    // Preserved across wakeup so preemption guards can distinguish bursty
+    // service wakeups from long-idle interactive or compute tasks.
+    uint32_t lastSleepUs = 0;
+
+    // Timestamp (us) when the task last moved from WAITING to RUNNABLE.
+    // Used with lastRunUs/lastSleepUs to suppress short-sleep wakeups from
+    // repeatedly cutting into a sustained compute slice.
+    uint64_t lastWakeUs = 0;
+
+    // Most recent block/yield callsite used for perf wait-churn attribution.
+    uint64_t perfWaitCallsite = 0;
+
+    // Set when a task transitions from the wait list to the runnable heap
+    // (timer expiry or kern_wake).  process_tasks uses this to enforce a
+    // minimum run-time granularity before a freshly-woken I/O task is allowed
+    // to preempt the currently running compute task (wakeup-preemption guard).
+    // Cleared on the first timer tick that fires while the task is running.
+    bool justWoke = false;
 
     // Intrusive list pointer for wait queue and dead list (zero allocations).
     Task* schedNext;

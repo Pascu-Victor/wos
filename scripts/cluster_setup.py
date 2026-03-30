@@ -217,8 +217,16 @@ def tap_owner_uid(name: str) -> int | None:
             try:
                 return int(parts[idx + 1])
             except ValueError:
-                return None
+                pass
     return None
+
+
+def tap_has_multiqueue(name: str) -> bool:
+    """Return True if the TAP device was created with IFF_MULTI_QUEUE."""
+    result = subprocess.run(
+        f"ip tuntap show dev {name}", shell=True, capture_output=True, text=True
+    )
+    return result.returncode == 0 and "multi_queue" in result.stdout
 
 
 def reattach_libvirt_vms(bridge: str):
@@ -412,19 +420,23 @@ def ensure_ssh_host_keys(node_ids: list):
             )
         else:
             _convert_pem_to_dropbear(openssh_key, dropbear_key)
-            print(f"  [VM{node_id}] Generated SSH host key (ssh-keygen + PEM→dropbear)")
+            print(
+                f"  [VM{node_id}] Generated SSH host key (ssh-keygen + PEM->dropbear)"
+            )
 
 
-def inject_host_key_into_overlay(overlay_path: str, dropbear_key_path: str) -> bool:
-    """Inject a pre-generated dropbear host key into an overlay's initramfs.
+def inject_into_overlay(
+    overlay_path: str, dropbear_key_path: str | None = None, hostname: str | None = None
+) -> bool:
+    """Inject per-node files into an overlay's initramfs.
 
     Extracts the base initramfs CPIO from build/initramfs.cpio, adds the
-    host key at /etc/dropbear/dropbear_rsa_host_key, re-packs the CPIO,
-    and writes it into the overlay's boot partition via guestfish.
+    host key and/or hostname, re-packs the CPIO, and writes it into the
+    overlay's boot partition via guestfish.
     """
     base_initramfs = os.path.abspath("build/initramfs.cpio")
     if not os.path.exists(base_initramfs):
-        print(f"  WARNING: {base_initramfs} not found, skipping host key injection")
+        print(f"  WARNING: {base_initramfs} not found, skipping overlay injection")
         return False
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -445,13 +457,21 @@ def inject_host_key_into_overlay(overlay_path: str, dropbear_key_path: str) -> b
             return False
 
         # Inject host key
-        dropbear_dir = os.path.join(extract_dir, "etc", "dropbear")
-        os.makedirs(dropbear_dir, exist_ok=True)
-        shutil.copy2(
-            dropbear_key_path,
-            os.path.join(dropbear_dir, "dropbear_rsa_host_key"),
-        )
-        os.chmod(os.path.join(dropbear_dir, "dropbear_rsa_host_key"), 0o600)
+        if dropbear_key_path:
+            dropbear_dir = os.path.join(extract_dir, "etc", "dropbear")
+            os.makedirs(dropbear_dir, exist_ok=True)
+            shutil.copy2(
+                dropbear_key_path,
+                os.path.join(dropbear_dir, "dropbear_rsa_host_key"),
+            )
+            os.chmod(os.path.join(dropbear_dir, "dropbear_rsa_host_key"), 0o600)
+
+        # Inject hostname
+        if hostname:
+            etc_dir = os.path.join(extract_dir, "etc")
+            os.makedirs(etc_dir, exist_ok=True)
+            with open(os.path.join(etc_dir, "hostname"), "w") as hf:
+                hf.write(hostname)
 
         # Re-create CPIO archive
         new_initramfs = os.path.join(tmpdir, "initramfs.cpio")
@@ -571,23 +591,34 @@ def setup(config: dict):
         real_uid = pwd.getpwnam(real_user).pw_uid
         for node_id in range(num_nodes):
             tap = tap_name(zone_cfg, node_id)
+            need_mq = effective.get("nic_queues", 1) > 1
             existing_owner = tap_owner_uid(tap) if link_exists(tap) else None
-            if existing_owner is not None and existing_owner != real_uid:
-                print(
-                    f"  TAP {tap} owned by uid {existing_owner}, recreating for {real_user}"
+
+            # Force-delete the TAP if the owner is wrong OR if multi_queue is needed
+            # but the existing TAP was created without it (QEMU will fail otherwise).
+            needs_recreate = (
+                existing_owner is not None and existing_owner != real_uid
+            ) or (need_mq and link_exists(tap) and not tap_has_multiqueue(tap))
+            if needs_recreate:
+                reason = (
+                    f"uid mismatch ({existing_owner} != {real_uid})"
+                    if existing_owner != real_uid
+                    else "multi_queue flag missing"
                 )
+                print(f"  TAP {tap}: recreating ({reason})")
                 run(f"ip link set {tap} down", check=False, quiet=True, privileged=True)
                 run(f"ip tuntap del dev {tap} mode tap", check=False, privileged=True)
 
             if not link_exists(tap):
+                mq_flag = " multi_queue" if need_mq else ""
                 run(
-                    f"ip tuntap add dev {tap} mode tap user {real_user}",
+                    f"ip tuntap add dev {tap} mode tap{mq_flag} user {real_user}",
                     privileged=True,
                 )
                 run(f"ip link set {tap} master {br}", privileged=True)
                 run(f"ip link set {tap} mtu {mtu}", privileged=True)
                 run(f"ip link set {tap} up", privileged=True)
-                print(f"  Created TAP: {tap}")
+                print(f"  Created TAP: {tap}" + (" (multi_queue)" if need_mq else ""))
             else:
                 print(f"  TAP {tap} already exists")
 
@@ -833,13 +864,16 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         nic_model = zone_eff.get("nic_model", "virtio-net-pci")
         tap = tap_name(zone_cfg, node_id)
         mac = mac_addr(zone_id, node_id, 0)
+        num_queues = zone_eff.get("nic_queues", 1)
+        netdev_extra = f",queues={num_queues}" if num_queues > 1 else ""
+        device_extra = f",mq=on,vectors={2 * num_queues + 2}" if num_queues > 1 else ""
 
         args.extend(
             [
                 "-netdev",
-                f"tap,id=net{nic_idx},ifname={tap},script=no,downscript=no",
+                f"tap,id=net{nic_idx},ifname={tap},script=no,downscript=no{netdev_extra}",
                 "-device",
-                f"{nic_model},netdev=net{nic_idx},mac={mac}",
+                f"{nic_model},netdev=net{nic_idx},mac={mac}{device_extra}",
             ]
         )
         nic_idx += 1
@@ -914,14 +948,18 @@ def launch(config: dict):
         print(f"  [VM{node_id}] zones={zone_names} debug={is_debug}")
         print(f"    cmd: {' '.join(args)}")
 
-        # Inject pre-generated SSH host key into the boot overlay's initramfs
+        # Inject per-node files (SSH host key, hostname) into the overlay's initramfs
         overlay0 = os.path.join("cluster-overlays", f"disk-vm{node_id}.qcow2")
         dropbear_key = os.path.join(
             SSH_KEYS_DIR, f"vm{node_id}", "dropbear_rsa_host_key"
         )
-        if os.path.exists(dropbear_key) and os.path.exists(overlay0):
-            if inject_host_key_into_overlay(overlay0, dropbear_key):
-                print(f"    Injected SSH host key into overlay")
+        node_hostname = f"wos-{node_id}"
+        key_path = dropbear_key if os.path.exists(dropbear_key) else None
+        if os.path.exists(overlay0):
+            if inject_into_overlay(
+                overlay0, dropbear_key_path=key_path, hostname=node_hostname
+            ):
+                print(f"    Injected per-node overlay (hostname={node_hostname})")
             else:
                 print(f"    WARNING: Failed to inject SSH host key")
 

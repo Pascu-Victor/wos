@@ -235,8 +235,10 @@ auto main(int argc, char** argv, char** envp) -> int {
                 repeat = std::atoi(argv[++i]);
             }
         }
-        std::println("testprog[t:{},p:{}]: Running mandelbench with width={}, height={}, max_iter={}, threads={}, repeat={}", tid, pid,
-                     width, height, max_iter, threads, repeat);
+        if (MANDELBENCH_DEBUG_ENABLED) {
+            std::println("testprog[t:{},p:{}]: Running mandelbench with width={}, height={}, max_iter={}, threads={}, repeat={}", tid, pid,
+                         width, height, max_iter, threads, repeat);
+        }
 
         std::vector<unsigned char> image(static_cast<size_t>(width * height * 4));
         std::vector<unsigned char> colormap(static_cast<size_t>((max_iter + 1) * 3));

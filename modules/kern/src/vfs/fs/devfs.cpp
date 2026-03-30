@@ -1,6 +1,8 @@
 #include "devfs.hpp"
 
+#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dev/block_device.hpp>
@@ -15,6 +17,8 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <string_view>
 
+#include "net/wki/wire.hpp"
+#include "vfs/file.hpp"
 #include "vfs/file_operations.hpp"
 #include "vfs/vfs.hpp"
 
@@ -361,6 +365,18 @@ auto devfs_poll_check(File* f, int events) -> int {
     return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT
 }
 
+auto devfs_poll_register_waiter(File* f, uint64_t pid) -> bool {
+    if (f == nullptr || f->private_data == nullptr) {
+        return false;
+    }
+    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    if (devfs_file->device == nullptr || devfs_file->device->char_ops == nullptr ||
+        devfs_file->device->char_ops->poll_register_waiter == nullptr) {
+        return false;
+    }
+    return devfs_file->device->char_ops->poll_register_waiter(f, pid);
+}
+
 FileOperations devfs_fops = {
     .vfs_open = nullptr,
     .vfs_close = devfs_close,
@@ -372,6 +388,7 @@ FileOperations devfs_fops = {
     .vfs_readlink = devfs_fops_readlink,
     .vfs_truncate = nullptr,
     .vfs_poll_check = devfs_poll_check,
+    .vfs_poll_register_waiter = devfs_poll_register_waiter,
 };
 
 }  // anonymous namespace
@@ -528,7 +545,7 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode* {
 
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode* {
     // If the name contains '/', walk to the parent directory first.
-    // e.g. "pts/0" → find (or create) the "pts" dir, then add node "0" there.
+    // e.g. "pts/0" => find (or create) the "pts" dir, then add node "0" there.
     const char* slash = nullptr;
     for (const char* p = name; *p != '\0'; p++) {
         if (*p == '/') {
@@ -808,7 +825,7 @@ DevFSNode* g_wki_by_peer = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-con
 uint32_t g_wki_type_counters[7] = {};  // indexed by ResourceType (1-6), slot 0 unused // NOLINT
 size_t g_wki_total = 0;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// ResourceType → directory name
+// ResourceType => directory name
 auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
     using RT = ker::net::wki::ResourceType;
     switch (type) {
@@ -828,7 +845,7 @@ auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
     return "unknown";
 }
 
-// ResourceType → device name prefix
+// ResourceType => device name prefix
 auto wki_type_prefix(ker::net::wki::ResourceType type) -> const char* {
     using RT = ker::net::wki::ResourceType;
     switch (type) {
@@ -895,7 +912,7 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         char stats[512];
         size_t pos = 0;
 
-        auto append_str = [&](const char* s) {
+        auto append_str = [&](const char* s) -> void {
             while (*s != '\0' && pos < sizeof(stats) - 1) {
                 stats[pos++] = *s++;
             }

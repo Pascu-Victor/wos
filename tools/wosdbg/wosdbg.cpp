@@ -2092,7 +2092,7 @@ QString QemuLogViewer::formatAssembly(const std::string& assembly) {
 
     // Try to convert to Intel syntax using improved Capstone disassembler
     if (disassembler) {
-        std::string intel = disassembler->convertToIntel(assembly);
+        std::string intel = disassembler->convert_to_intel(assembly);
         return QString::fromStdString(intel);
     }
 
@@ -2331,12 +2331,12 @@ void QemuLogViewer::onTableCellClicked(int row, int column) {
 
 #include "config.h"
 #include "coredump_browser.h"
+#include "coredump_disasm_panel.h"
 #include "coredump_elf_panel.h"
 #include "coredump_memory.h"
 #include "coredump_memory_panel.h"
 #include "coredump_parser.h"
 #include "coredump_register_panel.h"
-#include "coredump_disasm_panel.h"
 #include "coredump_segment_panel.h"
 #include "elf_symbol_resolver.h"
 
@@ -2491,7 +2491,7 @@ void QemuLogViewer::resolveSymbolsForCoredump() {
 
     const auto& cfg = ConfigService::instance().getConfig();
 
-    // 1. Try to resolve from the coredump filename → binaryName → config ELF path
+    // 1. Try to resolve from the coredump filename -> binaryName -> config ELF path
     QString binaryName = wosdbg::parseBinaryNameFromFilename(currentCoreDump_->sourceFilename);
     QString elfPath = cfg.findElfPathForBinary(binaryName);
 

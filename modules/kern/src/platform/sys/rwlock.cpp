@@ -15,6 +15,8 @@
 
 #include "rwlock.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <platform/sched/scheduler.hpp>
 
 namespace ker::mod::sys {
@@ -24,7 +26,7 @@ namespace ker::mod::sys {
 // ---------------------------------------------------------------------------
 
 void RwLock::read_lock() {
-    // Fast path: no writer active and no writers waiting → increment readers
+    // Fast path: no writer active and no writers waiting => increment readers
     constexpr int SPIN_LIMIT = 64;
 
     while (true) {
@@ -60,7 +62,7 @@ void RwLock::read_unlock() { state_.fetch_sub(1, std::memory_order_release); }
 // ---------------------------------------------------------------------------
 
 void RwLock::write_lock() {
-    // Signal readers that a writer is waiting → prevents new readers
+    // Signal readers that a writer is waiting => prevents new readers
     write_waiters_.fetch_add(1, std::memory_order_release);
 
     constexpr int SPIN_LIMIT = 64;

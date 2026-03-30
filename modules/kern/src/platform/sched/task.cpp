@@ -49,13 +49,15 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     // EEVDF scheduling fields
     this->vruntime = 0;
     this->vdeadline = 0;
-    this->schedWeight = 1024;    // nice-0 baseline
+    this->schedWeight = 1024;  // nice-0 baseline
+    this->schedNice = 0;
     this->sliceNs = 10'000'000;  // 10ms
     this->sliceUsedNs = 0;
     this->heapIndex = -1;
     this->schedQueue = SchedQueue::NONE;
     this->schedNext = nullptr;
     this->wakeAtUs = 0;
+    this->pollWaitDeadlineUs = 0;
     this->wantsBlock = false;
 
     // Signal infrastructure
@@ -104,6 +106,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         // fair-share budget than user compute threads so periodic wakeups do not
         // dominate a CPU and stretch long-running PROCESS benchmarks by 2-4x.
         this->schedWeight = 128;
+        this->schedNice = 10;
         this->sliceNs = 2'000'000;
         this->context.syscallKernelStack = kernelRsp;
         this->thread = nullptr;
@@ -215,7 +218,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         uint64_t destVaddr = this->thread->tlsBaseVirt + ssym->rawValue;  // rawValue stores st_value (TLS offset)
         uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
         if (destPaddr != mm::virt::PADDR_INVALID) {
-            auto* destPtr = (uint64_t*)mm::addr::getVirtPointer(destPaddr);
+            auto* destPtr = (uint64_t*)mm::addr::get_virt_pointer(destPaddr);
             *destPtr = this->thread->safestackPtrValue;
             dbg::log("Wrote SafeStack ptr for PID %x at vaddr=%x (phys=%x) value=%x", this->pid, destVaddr, destPaddr,
                      this->thread->safestackPtrValue);
@@ -288,11 +291,11 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
         // Translate the two words on the prepared stack via the parent pagemap
         uint64_t pa_entry = mm::virt::translate(parent->pagemap, userSp);
         if (pa_entry != mm::virt::PADDR_INVALID) {
-            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::getVirtPointer(pa_entry));
+            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(pa_entry));
         }
         uint64_t pa_arg = mm::virt::translate(parent->pagemap, userSp + 8);
         if (pa_arg != mm::virt::PADDR_INVALID) {
-            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::getVirtPointer(pa_arg));
+            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(pa_arg));
         }
     }
 
@@ -343,7 +346,8 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->waitRusagePhysAddr = 0;
     t->vruntime = 0;
     t->vdeadline = 0;
-    t->schedWeight = 1024;
+    t->schedWeight = parent->schedWeight;
+    t->schedNice = parent->schedNice;
     t->sliceNs = 10'000'000;
     t->sliceUsedNs = 0;
     t->heapIndex = -1;

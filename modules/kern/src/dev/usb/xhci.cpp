@@ -36,7 +36,7 @@ auto virt_to_phys(void* v) -> uint64_t {
         }
         return phys;
     }
-    return reinterpret_cast<uint64_t>(mod::mm::addr::getPhysPointer(addr));
+    return reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(addr));
 }
 
 // Allocate a page-aligned zeroed buffer, return {virt, phys}

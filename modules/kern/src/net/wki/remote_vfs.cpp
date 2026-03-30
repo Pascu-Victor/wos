@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -15,6 +19,11 @@
 #include <platform/sched/scheduler.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
+
+#include "platform/sys/spinlock.hpp"
+#include "vfs/file.hpp"
+#include "vfs/file_operations.hpp"
+#include "vfs/stat.hpp"
 
 namespace ker::net::wki {
 
@@ -826,11 +835,11 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
         if (cache != nullptr) {
             for (uint32_t i = 0; i < count && i < MAX_BATCH_ENTRIES; i++) {
                 ker::vfs::DirEntry fetched = {};
-                memcpy(&fetched, batch_buf + sizeof(uint32_t) + i * sizeof(ker::vfs::DirEntry), sizeof(ker::vfs::DirEntry));
+                memcpy(&fetched, batch_buf + sizeof(uint32_t) + (i * sizeof(ker::vfs::DirEntry)), sizeof(ker::vfs::DirEntry));
                 cache->entries.push_back(fetched);
             }
             if (count < MAX_BATCH_ENTRIES) {
-                cache->complete = true;  // Server returned fewer than asked → end of directory
+                cache->complete = true;  // Server returned fewer than asked -> end of directory
             }
         }
         s_vfs_lock.unlock();
@@ -896,6 +905,7 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
     .vfs_readlink = remote_vfs_readlink,
     .vfs_truncate = remote_vfs_truncate,
     .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
 };
 
 }  // namespace

@@ -45,6 +45,11 @@ target_include_directories(${KERNEL} SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../extern/limine
 )
 
+# Inject builder identity (user@hostname) into the kernel binary
+execute_process(COMMAND whoami OUTPUT_VARIABLE _WOS_USER OUTPUT_STRIP_TRAILING_WHITESPACE)
+cmake_host_system_information(RESULT _WOS_HOST QUERY HOSTNAME)
+target_compile_definitions(${KERNEL} PRIVATE "WOS_BUILDER=\"${_WOS_USER}@${_WOS_HOST}\"")
+
 # Network hot-path instrumentation (prints cycle-count stats every 1000 pkts)
 # Remove this line to disable tracing.
 # target_compile_definitions(${KERNEL} PRIVATE NET_TRACE)

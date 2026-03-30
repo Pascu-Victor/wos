@@ -12,11 +12,15 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
+
+#include "dev/block_device.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -47,7 +51,7 @@ auto verify_ag_crc(const void* buf, size_t len, size_t crc_off) -> bool {
 // xfs_block is an ENCODED xfs_fsblock_t: (agno << ag_blk_log) | agbno.
 // We decode it to a linear block number before multiplying by the ratio.
 auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
-    // Decode encoded FSB → linear block
+    // Decode encoded FSB -> linear block
     auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
     auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
     uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
@@ -63,7 +67,7 @@ auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
 
 // Read multiple contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
-    // Decode encoded FSB → linear block
+    // Decode encoded FSB -> linear block
     auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
     auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
     uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
@@ -141,11 +145,10 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     pag->agf_longest = agf->agf_longest.to_cpu();
     pag->agf_flcount = agf->agf_flcount.to_cpu();
     pag->agf_flfirst = agf->agf_flfirst.to_cpu();
-    pag->agf_fllast  = agf->agf_fllast.to_cpu();
+    pag->agf_fllast = agf->agf_fllast.to_cpu();
 
-    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u\n",
-                  agno, pag->agf_flfirst, pag->agf_fllast, pag->agf_flcount,
-                  pag->agf_bno_root, pag->agf_cnt_root);
+    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u\n", agno, pag->agf_flfirst,
+                  pag->agf_fllast, pag->agf_flcount, pag->agf_bno_root, pag->agf_cnt_root);
 
     brelse(bh);
     return 0;

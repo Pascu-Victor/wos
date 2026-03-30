@@ -20,6 +20,7 @@ struct CharDeviceOps {
     bool (*isatty)(ker::vfs::File* file);
     int (*ioctl)(ker::vfs::File* file, unsigned long cmd, unsigned long arg);  // nullptr = not supported
     int (*poll_check)(ker::vfs::File* file, int events);                       // nullptr = always ready
+    bool (*poll_register_waiter)(ker::vfs::File* file, uint64_t pid);          // nullptr = no explicit wake registration
 };
 
 enum class DeviceType : uint8_t {

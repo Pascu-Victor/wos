@@ -406,6 +406,14 @@ void wki_channels_close_for_peer(uint16_t node_id);
 // Process heartbeats, retransmit timers, ACK delays
 void wki_timer_tick(uint64_t now_us);
 
+// Returns true when channel retransmits/ACKs or async wait deadlines require
+// the WKI timer thread to stay on its fast cadence.
+auto wki_has_fast_timer_work() -> bool;
+
+// Earliest fast-path deadline from channel retransmits/ACKs and timed waits.
+// Returns UINT64_MAX when no fast timer work is armed.
+auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t;
+
 // -----------------------------------------------------------------------------
 // Public API — Time source (must be provided by platform)
 // -----------------------------------------------------------------------------

@@ -1,17 +1,24 @@
 #include "procfs.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/smt/smt.hpp>
 #include <vfs/file.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/sched/scheduler.hpp"
+#include "release.hpp"
 #include "vfs/file_operations.hpp"
 
 namespace ker::vfs::procfs {
@@ -87,8 +94,24 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "mounts", 7);
             return 0;
         }
+        if (count == 4) {
+            buf->d_ino = 4;
+            buf->d_off = 5;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "uptime", 7);
+            return 0;
+        }
+        if (count == 5) {
+            buf->d_ino = 5;
+            buf->d_off = 6;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "version", 8);
+            return 0;
+        }
         // PID directories from active task list
-        size_t pid_index = count - 4;
+        size_t pid_index = count - 6;
         uint32_t task_count = ker::mod::sched::get_active_task_count();
         if (pid_index >= task_count) {
             return -1;  // No more entries
@@ -350,6 +373,249 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
     return off;
 }
 
+// Generate content for /proc/uptime
+// Format: "<uptime_seconds> <idle_seconds>\n" with two decimal places
+auto generate_uptime(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+
+    uint64_t uptime_us = ker::mod::time::getUs();
+    uint64_t uptime_sec = uptime_us / 1000000ULL;
+    uint64_t uptime_frac = (uptime_us % 1000000ULL) / 10000ULL;  // two decimal places
+
+    append_int(uptime_sec);
+    append(".");
+    // Zero-pad the fractional part to two digits
+    if (uptime_frac < 10) {
+        append("0");
+    }
+    append_int(uptime_frac);
+
+    // Idle time: sum idle across all CPUs, divide by CPU count for average
+    // For now, report 0.00 as idle tracking is not yet implemented
+    append(" 0.00\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
+// Generate content for /proc/version
+auto generate_version(char* buf, size_t bufsz) -> size_t;
+
+// Generate a one-line status string for /proc/kperfctl
+auto generate_kperfctl(char* buf, size_t bufsz) -> size_t {
+    const char* state = ker::mod::perf::is_enabled() ? "enabled\n" : "disabled\n";
+    size_t len = strlen(state);
+    if (len >= bufsz) len = bufsz - 1;
+    memcpy(buf, state, len);
+    buf[len] = '\0';
+    return len;
+}
+
+// Hex helper
+static void append_hex64(char*& p, char* end, uint64_t v) {
+    static const char hx[] = "0123456789abcdef";
+    if (p + 18 >= end) return;
+    *p++ = '0';
+    *p++ = 'x';
+    for (int i = 60; i >= 0; i -= 4) *p++ = hx[(v >> i) & 0xf];
+}
+
+static void append_dec64(char*& p, char* end, uint64_t v) {
+    char tmp[22];
+    int n = 0;
+    if (v == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (v > 0 && n < 21) {
+            tmp[n++] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        }
+    }
+    // reverse into output
+    if (p + n >= end) return;
+    for (int i = n - 1; i >= 0; --i) *p++ = tmp[i];
+}
+
+static void append_sconst(char*& p, char* end, const char* s) {
+    while (*s && p + 1 < end) *p++ = *s++;
+}
+
+static void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
+    if (callsite == 0) {
+        append_sconst(p, end, "?");
+        return;
+    }
+
+    if (callsite >= 0xffff800000000000ULL) {
+        const auto* info = reinterpret_cast<const ker::mod::perf::PerfCallsiteInfo*>(callsite);
+        if (info->magic == ker::mod::perf::PERF_CALLSITE_MAGIC && info->file != nullptr && info->line != 0) {
+            const char* base = info->file;
+            for (const char* cur = info->file; *cur != '\0'; ++cur) {
+                if (*cur == '/') {
+                    base = cur + 1;
+                }
+            }
+            append_sconst(p, end, base);
+            if (p + 1 < end) {
+                *p++ = ':';
+            }
+            append_dec64(p, end, info->line);
+            return;
+        }
+    }
+
+    append_hex64(p, end, callsite);
+}
+
+// Generate content for /proc/kperf
+// Drains the kernel perf ring buffer and formats each event as one text line.
+// Format:
+//   S <ts_ns> <cpu> <pid> <rip_hex>   <lag_v>  <flags>    SAMPLE
+//   X <ts_ns> <cpu> <prev_pid> <next_pid> <lag_v> <flags> <run_us> <callsite>   SWITCH
+//   W <ts_ns> <cpu> <pid> <wake_at_us> <sleep_us> <flags> <callsite>            WAKE
+//   B <ts_ns> <cpu> <pid> <wake_at_us> <run_us>   <flags> <callsite>            SLEEP
+auto generate_kperf(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char* end = buf + bufsz - 1;
+
+    ker::mod::perf::PerfEvent batch[64];
+    size_t n;
+    while ((n = ker::mod::perf::drain_events(batch, 64, UINT32_MAX)) > 0) {
+        for (size_t i = 0; i < n; ++i) {
+            const auto& ev = batch[i];
+            // Determine event letter
+            char letter = '?';
+            switch (static_cast<ker::mod::perf::PerfEventType>(ev.type)) {
+                case ker::mod::perf::PerfEventType::SAMPLE:
+                    letter = 'S';
+                    break;
+                case ker::mod::perf::PerfEventType::SWITCH:
+                    letter = 'X';
+                    break;
+                case ker::mod::perf::PerfEventType::WAKE:
+                    letter = 'W';
+                    break;
+                case ker::mod::perf::PerfEventType::SLEEP:
+                    letter = 'B';
+                    break;
+            }
+            if (p + 2 >= end) break;
+            *p++ = letter;
+            *p++ = ' ';
+            append_dec64(p, end, ev.ts_ns);
+            *p++ = ' ';
+            append_dec64(p, end, ev.cpu);
+            *p++ = ' ';
+            // Type-specific fields
+            if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SAMPLE) {
+                append_dec64(p, end, ev.pid);
+                *p++ = ' ';
+                append_hex64(p, end, ev.data);  // RIP
+                *p++ = ' ';
+                if (ev.lag_v < 0 && p + 1 < end) {
+                    *p++ = '-';
+                }
+                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
+                *p++ = ' ';
+                append_dec64(p, end, ev.flags);
+            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SWITCH) {
+                append_dec64(p, end, ev.pid);  // prev
+                *p++ = ' ';
+                append_dec64(p, end, ev.data);  // next
+                *p++ = ' ';
+                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0u));
+                *p++ = ' ';
+                append_dec64(p, end, ev.flags);
+                *p++ = ' ';
+                append_dec64(p, end, ev.aux);
+                *p++ = ' ';
+                append_perf_callsite(p, end, ev.callsite);
+            } else {
+                // WAKE or SLEEP
+                append_dec64(p, end, ev.pid);
+                *p++ = ' ';
+                append_dec64(p, end, ev.data);  // wakeAtUs
+                *p++ = ' ';
+                append_dec64(p, end, ev.aux);
+                *p++ = ' ';
+                append_dec64(p, end, ev.flags);
+                *p++ = ' ';
+                append_perf_callsite(p, end, ev.callsite);
+            }
+            if (p + 1 < end) *p++ = '\n';
+        }
+        if (n < 64) break;  // ring drained
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+// Generate content for /proc/kcpustat
+// Shows per-CPU aggregate scheduler counters (non-destructive).
+auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char* end = buf + bufsz - 1;
+
+    uint64_t cpu_count = ker::mod::smt::get_core_count();
+    if (cpu_count == 0) cpu_count = 8;
+    if (cpu_count > ker::mod::perf::PERF_MAX_CPUS) cpu_count = ker::mod::perf::PERF_MAX_CPUS;
+
+    for (uint64_t c = 0; c < cpu_count; ++c) {
+        auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
+        append_sconst(p, end, "cpu=");
+        append_dec64(p, end, c);
+        append_sconst(p, end, " ctx=");
+        append_dec64(p, end, s.ctx_switches);
+        append_sconst(p, end, " preempt=");
+        append_dec64(p, end, s.preemptions);
+        append_sconst(p, end, " yield=");
+        append_dec64(p, end, s.yields);
+        append_sconst(p, end, " sleep=");
+        append_dec64(p, end, s.sleeps);
+        append_sconst(p, end, " wake=");
+        append_dec64(p, end, s.wakes);
+        append_sconst(p, end, " sample=");
+        append_dec64(p, end, s.samples);
+        if (p + 1 < end) *p++ = '\n';
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+// Generate content for /proc/version
+auto generate_version(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+
+    append(ker::release::NAME);
+    append(" version ");
+    append(ker::release::VERSION);
+    append(" (");
+    append(ker::release::BUILDER);
+    append(") (");
+    append(ker::release::COMPILER);
+    append(") #1 ");
+    append(ker::release::SMP);
+    append("\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
 // Procfs stores generated content in the File's private_data as ProcFileData.
 
 // --- FileOperations ---
@@ -363,7 +629,10 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     // Lazily generate content
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
-        pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(MAX_PROCFS_BUF));
+        constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
+        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KCPUSTAT_FILE);
+        size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
+        pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(alloc_sz));
         if (pfd->content == nullptr) {
             return -ENOMEM;
         }
@@ -380,6 +649,21 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::MOUNTS_FILE:
                 pfd->content_len = generate_mounts(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::UPTIME_FILE:
+                pfd->content_len = generate_uptime(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::VERSION_FILE:
+                pfd->content_len = generate_version(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::KPERF_FILE:
+                pfd->content_len = generate_kperf(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::KCPUSTAT_FILE:
+                pfd->content_len = generate_kcpustat(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::KPERFCTL_FILE:
+                pfd->content_len = generate_kperfctl(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
@@ -407,6 +691,26 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     size_t avail = pfd->content_len - offset;
     count = std::min(count, avail);
     memcpy(buf, pfd->content + offset, count);
+    return static_cast<ssize_t>(count);
+}
+
+auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
+    if (f == nullptr || f->private_data == nullptr || buf == nullptr) return -EINVAL;
+    auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) return -EPERM;
+    if (count == 0) return 0;
+
+    // Accept "enable" or "disable" (with optional newline)
+    const char* s = static_cast<const char*>(buf);
+    if (count >= 6 && memcmp(s, "enable", 6) == 0) {
+        // Reset ring buffers on fresh enable so report only sees the new session
+        ker::mod::perf::reset_rings();
+        ker::mod::perf::enable();
+    } else if (count >= 7 && memcmp(s, "disable", 7) == 0) {
+        ker::mod::perf::disable();
+    } else {
+        return -EINVAL;
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -495,7 +799,7 @@ FileOperations procfs_fops_instance = {
     .vfs_open = nullptr,
     .vfs_close = procfs_close,
     .vfs_read = procfs_read,
-    .vfs_write = nullptr,
+    .vfs_write = procfs_write,
     .vfs_lseek = procfs_lseek,
     .vfs_isatty = nullptr,
     .vfs_readdir = procfs_readdir,
@@ -554,7 +858,32 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         return make_file(ProcNodeType::MOUNTS_FILE, 0, false);
     }
 
-    // /proc/self → symlink to /proc/<pid>
+    // /proc/uptime
+    if (strcmp(path, "uptime") == 0) {
+        return make_file(ProcNodeType::UPTIME_FILE, 0, false);
+    }
+
+    // /proc/version
+    if (strcmp(path, "version") == 0) {
+        return make_file(ProcNodeType::VERSION_FILE, 0, false);
+    }
+
+    // /proc/kperf — drain kernel perf ring buffer as text events
+    if (strcmp(path, "kperf") == 0) {
+        return make_file(ProcNodeType::KPERF_FILE, 0, false);
+    }
+
+    // /proc/kcpustat — per-CPU aggregate scheduler statistics
+    if (strcmp(path, "kcpustat") == 0) {
+        return make_file(ProcNodeType::KCPUSTAT_FILE, 0, false);
+    }
+
+    // /proc/kperfctl — write "enable"/"disable" to start/stop perf recording
+    if (strcmp(path, "kperfctl") == 0) {
+        return make_file(ProcNodeType::KPERFCTL_FILE, 0, false);
+    }
+
+    // /proc/self -> symlink to /proc/<pid>
     if (strcmp(path, "self") == 0) {
         return make_file(ProcNodeType::SELF_LINK, self_pid, false);
     }

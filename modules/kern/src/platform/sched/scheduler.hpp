@@ -6,6 +6,7 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
@@ -34,6 +35,12 @@ struct RunQueue {
     // Last timer timestamp (microseconds from HPET) for computing delta
     uint64_t lastTickUs;
 
+    // Timestamp (µs) when currentTask most recently started running on this CPU.
+    // Used by the wakeup min-granularity guard in process_tasks: a justWoke task
+    // cannot preempt the running task until it has been running for at least
+    // SCHED_MIN_GRANULARITY_US continuously.  Set to 0 at init (means "no data").
+    uint64_t currentTaskStartUs = 0;
+
     // Lightweight per-CPU scheduler tracing counters.
     std::atomic<uint64_t> idleTimerArms;
     std::atomic<uint64_t> idleTimerDisarms;
@@ -43,6 +50,13 @@ struct RunQueue {
     std::atomic<uint64_t> slowRescheduleScans;
     std::atomic<uint64_t> loadBalancePushes;
     std::atomic<uint32_t> placementReservations;
+
+    // CPU domain fields (Phase 1)
+    // domain_id: which CpuDomain this RunQueue belongs to (0 = root)
+    // daemon_load_penalty: added to reported load when incoming task is PROCESS type.
+    // Set to 56 for soft-exclusive daemon CPUs (makes compute load appear as 64=full).
+    uint32_t domain_id = 0;
+    uint32_t daemon_load_penalty = 0;
 
     RunQueue()
         : currentTask(nullptr),
@@ -96,12 +110,17 @@ auto post_task_for_cpu(uint64_t cpu_no, task::Task* task) -> bool;
 // Like post_task_for_cpu but marks the task as CPU-pinned: the scheduler will
 // never migrate it to another CPU via load-balancing.
 auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool;
-auto post_task_balanced(task::Task* task) -> bool;  // Post to least loaded CPU
-auto get_least_loaded_cpu() -> uint64_t;            // Get CPU with least tasks
+auto post_task_balanced(task::Task* task) -> bool;               // Post to least loaded CPU
+auto get_least_loaded_cpu() -> uint64_t;                         // Get CPU with least tasks
+auto get_least_loaded_cpu_in_mask(uint64_t mask) -> uint64_t;    // Get least-loaded CPU within mask
+void set_cpu_daemon_penalty(uint64_t cpu_no, uint32_t penalty);  // Set daemon_load_penalty for a CPU
+void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_id on a CPU's RunQueue (Phase 8)
+auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
 void remove_current_task();                                       // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;               // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
+void set_task_nice(task::Task* task, int nice);                   // Update task weight safely on its run queue
 void signal_process_group(uint64_t pgid, int sig);                // Send signal to all tasks in a process group
 void wake_task_for_signal(task::Task* task);                      // Make a signaled blocked task runnable so signal delivery can occur
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task);  // Reschedule a specific task on a specific CPU
@@ -162,9 +181,10 @@ extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcore
 // Typical pattern:
 //   while (!condition) { kern_yield(); }
 //
-inline void kern_yield() {
+inline void kern_yield_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
+        task->perfWaitCallsite = perf_callsite;
         task->voluntaryBlock = true;
     }
     asm volatile("sti\n\thlt" ::: "memory");
@@ -179,9 +199,10 @@ inline void kern_yield() {
 // wait list before picking the next runnable task — safe because it runs
 // under the run queue lock with interrupts disabled.
 // Must only be called from DAEMON kernel threads.
-inline void kern_block() {
+inline void kern_block_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
+        task->perfWaitCallsite = perf_callsite;
         task->wantsBlock = true;
         task->voluntaryBlock = true;
     }
@@ -195,14 +216,15 @@ inline void kern_block() {
 // kern_sleep_us() -- block the current DAEMON task until the timer wake scan
 // reaches the requested deadline. This avoids keeping timer/worker threads as
 // the current task on otherwise idle CPUs.
-inline void kern_sleep_us(uint64_t sleep_us) {
+inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     if (sleep_us == 0) {
-        kern_yield();
+        kern_yield_impl(perf_callsite);
         return;
     }
 
     auto* task = get_current_task();
     if (task != nullptr) {
+        task->perfWaitCallsite = perf_callsite;
         task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
         task->wantsBlock = true;
         task->voluntaryBlock = true;
@@ -222,3 +244,13 @@ void kern_wake(task::Task* task);
 extern "C" auto _wOS_getCurrentTask() -> ker::mod::sched::task::Task*;
 extern "C" const uint64_t _wOS_DEFERRED_TASK_SWITCH_OFFSET;
 extern "C" void _wOS_deferredTaskSwitchReturn(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::interruptFrame* frame_ptr);
+
+#define WOS_SCHED_PERF_CALLSITE()                                                                                                 \
+    __extension__({                                                                                                               \
+        static const ::ker::mod::perf::PerfCallsiteInfo __wos_sched_perf_site = {::ker::mod::perf::PERF_CALLSITE_MAGIC, __FILE__, \
+                                                                                 __func__, static_cast<uint32_t>(__LINE__), 0U};  \
+        reinterpret_cast<uint64_t>(&__wos_sched_perf_site);                                                                       \
+    })
+#define kern_yield() kern_yield_impl(WOS_SCHED_PERF_CALLSITE())
+#define kern_block() kern_block_impl(WOS_SCHED_PERF_CALLSITE())
+#define kern_sleep_us(sleep_us) kern_sleep_us_impl((sleep_us), WOS_SCHED_PERF_CALLSITE())

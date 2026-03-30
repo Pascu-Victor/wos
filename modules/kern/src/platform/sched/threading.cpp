@@ -60,13 +60,13 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
 
     // Map all pages for TLS
     for (uint64_t offset = 0; offset < alignedTotalSize; offset += mm::paging::PAGE_SIZE) {
-        uint64_t tlsPhys = (uint64_t)mm::addr::getPhysPointer((uint64_t)tls + offset);
+        uint64_t tlsPhys = (uint64_t)mm::addr::get_phys_pointer((uint64_t)tls + offset);
         mm::virt::mapPage(pageTable, tlsVirtAddr + offset, tlsPhys, mm::paging::pageTypes::USER);
     }
 
     // Map all pages for stack
     for (uint64_t offset = 0; offset < stackSize; offset += mm::paging::PAGE_SIZE) {
-        uint64_t stackPhys = (uint64_t)mm::addr::getPhysPointer((uint64_t)stack + offset);
+        uint64_t stackPhys = (uint64_t)mm::addr::get_phys_pointer((uint64_t)stack + offset);
         mm::virt::mapPage(pageTable, stackVirtAddr + offset, stackPhys, mm::paging::pageTypes::USER);
     }
 
@@ -150,12 +150,12 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     thread->fsbase = reinterpret_cast<uint64_t>(tcbVirtAddr);
     // User GS_BASE points to TLS/stack base area (user-accessible)
     thread->gsbase = stackVirtAddr;  // Bottom of stack where scratch area lives
-    
+
     // Initialize the scratch area at the bottom of the stack
     auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(stack);
     memset(scratchArea, 0, sizeof(cpu::PerCpu));
     scratchArea->syscallStack = 0;  // Will be set by task initialization
-    scratchArea->cpuId = 0;          // Will be set by task initialization
+    scratchArea->cpuId = 0;         // Will be set by task initialization
 
     // Store the physical (HHDM) pointers for cleanup
     thread->tlsPhysPtr = reinterpret_cast<uint64_t>(tls);

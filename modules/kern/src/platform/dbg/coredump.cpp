@@ -27,7 +27,7 @@ bool is_ram(uint64_t phys) {
     for (auto* zone = ker::mod::mm::phys::getZones(); zone != nullptr; zone = zone->next) {
         // zone->start is virtual (HHDM)
         // zone->len is length in bytes
-        uint64_t zoneStartPhys = (uint64_t)ker::mod::mm::addr::getPhysPointer((ker::mod::mm::addr::vaddr_t)zone->start);
+        uint64_t zoneStartPhys = (uint64_t)ker::mod::mm::addr::get_phys_pointer((ker::mod::mm::addr::vaddr_t)zone->start);
         if (phys >= zoneStartPhys && phys < zoneStartPhys + zone->len) {
             return true;
         }
@@ -278,7 +278,7 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
         if (phys == ker::mod::mm::virt::PADDR_INVALID || !is_ram(phys)) {
             continue;
         }
-        void* pagePtr = ker::mod::mm::addr::getVirtPointer(phys);
+        void* pagePtr = ker::mod::mm::addr::get_virt_pointer(phys);
         ok = write_all(fd, pagePtr, PAGE);
     }
 

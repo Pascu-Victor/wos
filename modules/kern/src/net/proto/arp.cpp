@@ -1,6 +1,7 @@
 #include "arp.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/endian.hpp>
 #include <net/netif.hpp>
@@ -8,6 +9,9 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
@@ -131,7 +135,7 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt) {
     uint32_t target_ip = ntohl(arp->target_ip);
 
     // arp_lock must be irqsave: arp_resolve is called from the inline IRQ
-    // path (tcp_send_ack → ipv4_tx → arp_resolve).  If a non-irqsave holder
+    // path (tcp_send_ack -> ipv4_tx -> arp_resolve).  If a non-irqsave holder
     // is preempted on the same CPU by the NIC MSI-X interrupt, the IRQ handler
     // spins with IF=0, the holder can never resume, and the CPU freezes.
     uint64_t flags = arp_lock.lock_irqsave();
