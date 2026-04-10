@@ -1,6 +1,6 @@
 #pragma once
 
-// Workqueue — deferred work execution on dedicated kernel threads.
+// Workqueue - deferred work execution on dedicated kernel threads.
 //
 // Each Workqueue owns one kernel thread that drains a FIFO of work items.
 // XFS uses workqueues for: journal log writes, inode reclaim, extent
@@ -26,7 +26,7 @@ struct WorkItem {
     WorkItem* next;         // Intrusive FIFO link (used internally)
 };
 
-// Workqueue — a kernel thread that processes WorkItems in FIFO order.
+// Workqueue - a kernel thread that processes WorkItems in FIFO order.
 class Workqueue {
    public:
     // Create a workqueue with the given name.
@@ -39,7 +39,7 @@ class Workqueue {
     // function has been called (typically stack- or kmalloc-allocated).
     void enqueue(WorkItem* item);
 
-    // Flush — block the caller until all currently-queued work has completed.
+    // Flush - block the caller until all currently-queued work has completed.
     // New work submitted after the flush call returns is NOT waited on.
     void flush();
 
@@ -68,7 +68,7 @@ class Workqueue {
     WorkItem* tail_ = nullptr;
     std::atomic<uint32_t> pending_count_{0};
 
-    // Flush synchronization — incremented after completing each work item.
+    // Flush synchronization - incremented after completing each work item.
     // flush() snapshots pending_count_ and spins until completed >= snapshot.
     std::atomic<uint64_t> completed_count_{0};
 
@@ -77,7 +77,7 @@ class Workqueue {
 
     // Thread-local pointer to the Workqueue that owns the current worker
     // thread (set inside worker_entry so the static entry can find the wq).
-    static Workqueue* current_wq_;  // NOLINT — per-thread but only one worker per wq
+    static Workqueue* current_wq_;  // NOLINT - per-thread but only one worker per wq
 };
 
 }  // namespace ker::mod::sched

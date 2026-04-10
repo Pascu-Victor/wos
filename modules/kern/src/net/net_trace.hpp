@@ -3,7 +3,7 @@
 // Lightweight per-span cycle-count instrumentation for the network hot path.
 // Enable with -DNET_TRACE.  Accumulates min/avg/max every DUMP_INTERVAL
 // packets; actual serial output is deferred to net_trace_flush() which is
-// called from the TCP timer thread — never from the RX/TX hot path.
+// called from the TCP timer thread - never from the RX/TX hot path.
 
 #include <algorithm>
 #include <atomic>
@@ -32,7 +32,7 @@ struct Span {
     }
 };
 
-// Global spans — index with SpanId
+// Global spans - index with SpanId
 enum SpanId : uint32_t {
     SPAN_NAPI_POLL = 0,
     SPAN_TX_RECLAIM,
@@ -50,7 +50,7 @@ inline Span spans[SPAN_COUNT] = {
     {.name = "eth_rx"},    {.name = "tcp_find_cb"}, {.name = "tcp_process"}, {.name = "start_xmit"},
 };
 
-// Hot-path counter: just increments and sets a flag — no serial writes.
+// Hot-path counter: just increments and sets a flag - no serial writes.
 inline std::atomic<uint32_t> pkt_counter{0};
 inline std::atomic<bool> dump_pending{false};
 
@@ -63,7 +63,7 @@ inline void maybe_dump() {
 }
 
 // Called from a non-hot context (e.g. TCP timer thread) to do the actual print.
-// Safe to call frequently — no-op when nothing is pending.
+// Safe to call frequently - no-op when nothing is pending.
 inline void flush() {
     if (!dump_pending.load(std::memory_order_acquire)) {
         return;

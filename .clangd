@@ -21,11 +21,13 @@ Diagnostics:
             - misc-non-private-member-variables-in-classes
 
     Includes:
-        IgnoreHeader: ".*toolchain/target1/.*"
+        IgnoreHeader: ".*toolchain/sysroot/.*"
     UnusedIncludes: Strict
     MissingIncludes: Strict
 
 CompileFlags:
+    Add:
+        - -D_GLIBCXX_HOSTED
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword
@@ -51,7 +53,6 @@ Hover:
     ShowAKA: true
 
 ---
-
 # C-only third-party trees: no compile_commands.json so clangd defaults to
 # clang++, which rejects -std=c11. Force the C driver explicitly.
 If:
@@ -64,7 +65,6 @@ CompileFlags:
         - -std=c++*
 
 ---
-
 If:
     PathMatch: ".*\\.(cpp|cxx|cc|hpp|hxx|hh)$"
 CompileFlags:
@@ -72,7 +72,6 @@ CompileFlags:
         - -std=c++23
 
 ---
-
 If:
     PathMatch: ".*\\.c$"
     PathExclude: ".*/(busybox|dropbear)/.*"

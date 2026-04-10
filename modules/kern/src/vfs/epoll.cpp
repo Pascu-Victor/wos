@@ -93,7 +93,7 @@ auto poll_fd(File* file, uint32_t events) -> uint32_t {
         if ((sock != nullptr) && (sock->proto_ops != nullptr) && (sock->proto_ops->poll_check != nullptr)) {
             return static_cast<uint32_t>(sock->proto_ops->poll_check(sock, POLL_EVENTS));
         }
-        // Socket without poll_check — assume ready
+        // Socket without poll_check - assume ready
         return events & (EPOLLIN | EPOLLOUT);
     }
 
@@ -129,7 +129,7 @@ auto epoll_create(int flags) -> int {
     file->fops = &epoll_fops;
     file->pos = 0;
     file->is_directory = false;
-    file->fs_type = FSType::TMPFS;  // reuse TMPFS type — it's just an in-memory object
+    file->fs_type = FSType::TMPFS;  // reuse TMPFS type - it's just an in-memory object
     file->refcount = 1;
     file->open_flags = 0;
     file->fd_flags = ((flags & EPOLL_CLOEXEC_FLAG) != 0) ? FD_CLOEXEC : 0;  // EPOLL_CLOEXEC
@@ -254,7 +254,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
 
         auto* target = vfs_get_file(task, inst->interests[i].fd);
         if (target == nullptr) {
-            // fd was closed — auto-remove from interest list
+            // fd was closed - auto-remove from interest list
             inst->interests[i].active = false;
             inst->count--;
             continue;
@@ -283,7 +283,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return 0;
     }
 
-    // No events ready — check for deliverable signals before retrying.
+    // No events ready - check for deliverable signals before retrying.
     // This lets pselect/poll return -EINTR so signal handlers run promptly.
     // (task was already fetched at the top of this function)
     {

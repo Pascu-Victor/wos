@@ -92,7 +92,7 @@ _wOS_asm_syscallHandler:
     o64 sysret
 
 .sysret_rcx_corrupt:
-    ; RCX was corrupted — don't sysret or we'll execute at a wrong/kernel address.
+    ; RCX was corrupted - don't sysret or we'll execute at a wrong/kernel address.
     ; Call C diagnostic function. Stack is at kernel stack top, safe for calls.
     ; Save rax (syscall return value) so the panic handler can report it.
     push rax

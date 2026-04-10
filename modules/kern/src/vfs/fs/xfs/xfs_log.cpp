@@ -1,4 +1,4 @@
-// XFS Log implementation — journal recovery and basic log management.
+// XFS Log implementation - journal recovery and basic log management.
 //
 // On mount, the log is scanned to find the head and tail.  If they differ,
 // recovery is needed: log records are replayed to bring the filesystem back
@@ -40,7 +40,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
     const auto* hdr = reinterpret_cast<const XlogRecHeader*>(bh->data);
 
     if (hdr->h_magicno.to_cpu() != XLOG_HEADER_MAGIC_NUM) {
-        // No valid log record at position 0 — log is clean (never used or
+        // No valid log record at position 0 - log is clean (never used or
         // was cleanly unmounted with log cleared)
         log->head_cycle = 1;
         log->head_block = 0;
@@ -83,7 +83,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
         log->tail_block = tail_block;
         log->clean = (head_cycle == tail_cycle && tail_block == 0);
     } else {
-        // Head and last block have different cycles — log has wrapped
+        // Head and last block have different cycles - log has wrapped
         log->head_cycle = last_cycle;
         log->head_block = 0;
         log->tail_cycle = tail_cycle;
@@ -107,7 +107,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
     uint64_t disk_block = log->log_start + block;
     BufHead* hdr_bh = xfs_buf_read(ctx, disk_block);
     if (hdr_bh == nullptr) {
-        mod::dbg::log("[xfs log recover] failed to read log block %u\n", block);
+        mod::dbg::log("[xfs log recover] failed to read log block %u", block);
         return -1;
     }
 
@@ -122,7 +122,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
     brelse(hdr_bh);
 
     if (body_size == 0 || num_logops == 0) {
-        // Empty record — advance past header
+        // Empty record - advance past header
         return static_cast<int>((block + 1) % log->log_blocks);
     }
 
@@ -155,7 +155,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
 
     // Replay buffer modifications from the body
     // Format per buffer item: block_no(8B) + offset(4B) + len(4B) + data(lenB)
-    // Format per inode item: ino(8B) — we skip inode items during recovery
+    // Format per inode item: ino(8B) - we skip inode items during recovery
     uint32_t pos = 0;
     uint32_t replayed = 0;
 
@@ -202,14 +202,14 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
 
     mod::mm::dyn::kmalloc::free(body_buf);
 
-    mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u\n", replayed, num_logops, block);
+    mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u", replayed, num_logops, block);
 
     return static_cast<int>(cur_block);
 }
 
 // Recover the log by scanning from tail to head and replaying all records.
 auto xfs_log_recover(XfsLog* log) -> int {
-    mod::dbg::log("[xfs log recover] starting recovery: tail=%u.%u head=%u.%u\n", log->tail_cycle, log->tail_block, log->head_cycle,
+    mod::dbg::log("[xfs log recover] starting recovery: tail=%u.%u head=%u.%u", log->tail_cycle, log->tail_block, log->head_cycle,
                   log->head_block);
 
     uint32_t cur_block = log->tail_block;
@@ -219,7 +219,7 @@ auto xfs_log_recover(XfsLog* log) -> int {
     while (cur_cycle < log->head_cycle || (cur_cycle == log->head_cycle && cur_block < log->head_block)) {
         int next = replay_log_record(log, cur_block);
         if (next < 0) {
-            mod::dbg::log("[xfs log recover] failed at block %u, stopping\n", cur_block);
+            mod::dbg::log("[xfs log recover] failed at block %u, stopping", cur_block);
             break;
         }
         records++;
@@ -232,12 +232,12 @@ auto xfs_log_recover(XfsLog* log) -> int {
 
         // Safety: don't loop forever
         if (records > static_cast<int>(log->log_blocks)) {
-            mod::dbg::log("[xfs log recover] too many records, aborting\n");
+            mod::dbg::log("[xfs log recover] too many records, aborting");
             break;
         }
     }
 
-    mod::dbg::log("[xfs log recover] recovery complete: %d records replayed\n", records);
+    mod::dbg::log("[xfs log recover] recovery complete: %d records replayed", records);
 
     // Mark log as clean
     log->clean = true;
@@ -254,7 +254,7 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
         return -EINVAL;
     }
     if (mount->log_blocks == 0) {
-        mod::dbg::log("[xfs log] no log area configured\n");
+        mod::dbg::log("[xfs log] no log area configured");
         return -EINVAL;
     }
 
@@ -274,20 +274,18 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
 
     if (!log->clean) {
         if (mount->read_only) {
-            mod::dbg::log(
-                "[xfs log] log is dirty but mount is read-only — "
-                "recovery deferred\n");
+            mod::dbg::log("[xfs log] log is dirty but mount is read-only - recovery deferred");
         } else {
-            mod::dbg::log("[xfs log] log is dirty — recovery needed\n");
+            mod::dbg::log("[xfs log] log is dirty - recovery needed");
             int rrc = xfs_log_recover(log);
             if (rrc != 0) {
-                mod::dbg::log("[xfs log] recovery failed: %d\n", rrc);
+                mod::dbg::log("[xfs log] recovery failed: %d", rrc);
                 delete log;
                 return rrc;
             }
         }
     } else {
-        mod::dbg::log("[xfs log] log is clean\n");
+        mod::dbg::log("[xfs log] log is clean");
     }
 
     log->active = true;
@@ -301,7 +299,7 @@ void xfs_log_unmount(XfsMountContext* mount) {
     }
 
     active_log->active = false;
-    mod::dbg::log("[xfs log] log unmounted\n");
+    mod::dbg::log("[xfs log] log unmounted");
 
     delete active_log;
     active_log = nullptr;
@@ -348,7 +346,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t total_blocks = 1 + data_blocks;  // header block + data
 
     if (total_blocks > log->log_blocks) {
-        mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)\n", total_blocks, log->log_blocks);
+        mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)", total_blocks, log->log_blocks);
         return -ENOSPC;
     }
 
@@ -361,7 +359,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         avail = log->tail_block - head;
     }
     if (total_blocks >= avail) {
-        mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)\n", total_blocks, avail);
+        mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)", total_blocks, avail);
         return -ENOSPC;
     }
 
@@ -384,7 +382,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     hdr.h_fs_uuid = mount->uuid;
     hdr.h_size = __be32::from_cpu(block_size);
 
-    // Write header block — use xfs_buf_get (not xfs_buf_read) since we
+    // Write header block - use xfs_buf_get (not xfs_buf_read) since we
     // immediately zero and overwrite the entire block; no need to read from disk.
     uint64_t hdr_disk_block = log->log_start + head;
     BufHead* hdr_bh = xfs_buf_get(mount, hdr_disk_block);
@@ -444,7 +442,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     // Write body data block by block
     while (body_offset < body_size) {
         uint64_t data_disk_block = log->log_start + cur_block;
-        // Use xfs_buf_get — we zero+overwrite the full block, no read needed.
+        // Use xfs_buf_get - we zero+overwrite the full block, no read needed.
         BufHead* data_bh = xfs_buf_get(mount, data_disk_block);
         if (data_bh == nullptr) {
             mod::mm::dyn::kmalloc::free(body_buf);

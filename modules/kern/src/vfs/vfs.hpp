@@ -116,6 +116,12 @@ auto vfs_fsync(int fd) -> int;
 // Hard link
 auto vfs_link(const char* oldpath, const char* newpath) -> int;
 
+// WKI task-local VFS policy
+auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int;
+auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_rule_clear() -> int;
+void vfs_wki_load_default_rules();
+
 // File control
 auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
 

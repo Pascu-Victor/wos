@@ -49,7 +49,7 @@ auto lsdb_alloc(uint16_t origin_node) -> LsdbEntry* {
 }
 
 // -----------------------------------------------------------------------------
-// LSA flooding — send an LSA to all direct CONNECTED neighbors
+// LSA flooding - send an LSA to all direct CONNECTED neighbors
 // -----------------------------------------------------------------------------
 
 void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node) {
@@ -345,7 +345,7 @@ void wki_routing_recompute() {
         return 0xFFFF;
     };
 
-    // Main loop: O(V^2) — perfectly fine for V <= 256
+    // Main loop: O(V^2) - perfectly fine for V <= 256
     for (uint16_t iter = 0; iter < num_nodes; iter++) {
         // Pick unvisited node with smallest distance
         uint16_t u = 0xFFFF;
@@ -364,7 +364,7 @@ void wki_routing_recompute() {
         // Get u's LSDB entry (its advertised neighbors)
         LsdbEntry* u_lsdb = lsdb_find(nodes[u]);
         if (u_lsdb == nullptr) {
-            continue;  // leaf node — no outgoing edges
+            continue;  // leaf node - no outgoing edges
         }
 
         // Relax edges

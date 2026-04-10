@@ -16,17 +16,17 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 
 constexpr uint64_t WKI_DEV_PROXY_TIMEOUT_US = 100000;       // 100 ms per-operation timeout
-constexpr uint64_t WKI_DEV_PROXY_FENCE_WAIT_US = 30000000;  // 30 s — max time to wait for fence lift before teardown
-constexpr uint64_t WKI_DEV_PROXY_FENCE_POLL_US = 50000;     // 50 ms — poll interval while waiting for fence lift
+constexpr uint64_t WKI_DEV_PROXY_FENCE_WAIT_US = 30000000;  // 30 s - max time to wait for fence lift before teardown
+constexpr uint64_t WKI_DEV_PROXY_FENCE_POLL_US = 50000;     // 50 ms - poll interval while waiting for fence lift
 constexpr uint32_t WKI_DEV_PROXY_MAX_BATCH = 32;            // max SQEs per batch submission
 
 // -----------------------------------------------------------------------------
-// ProxyBlockState — one per remote block device attachment (consumer side)
+// ProxyBlockState - one per remote block device attachment (consumer side)
 // -----------------------------------------------------------------------------
 
 struct ProxyBlockState {
     bool active = false;
-    bool fenced = false;         // peer is fenced — ops should block and wait for reconnection
+    bool fenced = false;         // peer is fenced - ops should block and wait for reconnection
     uint64_t fence_time_us = 0;  // timestamp when fenced (for timeout-based teardown)
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
@@ -54,7 +54,7 @@ struct ProxyBlockState {
     void* rdma_zone_ptr = nullptr;
     uint64_t data_slot_bitmap = 0;  // 1 = slot in use (max 64 slots)
 
-    // RoCE RDMA state — RoCE zones have separate memory on each side, requiring
+    // RoCE RDMA state - RoCE zones have separate memory on each side, requiring
     // explicit rdma_write/read to sync ring state between proxy and server.
     bool rdma_roce = false;                  // true if zone is RoCE-backed
     uint32_t rdma_remote_rkey = 0;           // server's RDMA key for their zone copy
@@ -71,7 +71,7 @@ struct ProxyBlockState {
     uint64_t tag_bitmap = 0;                       // 1 = tag in use (bit index = tag value)
     std::array<TagCompletion, TAG_POOL_SIZE> tag_completions = {};
 
-    // Read-ahead cache — prefetches a full RDMA data slot worth of blocks
+    // Read-ahead cache - prefetches a full RDMA data slot worth of blocks
     // to amortize per-cluster RDMA round-trips for sequential FAT32 reads.
     uint64_t ra_base_lba = 0;      // starting LBA of cached data
     uint32_t ra_block_count = 0;   // number of blocks currently cached
@@ -79,7 +79,7 @@ struct ProxyBlockState {
     uint32_t ra_capacity = 0;      // max blocks that fit in ra_buffer
     bool ra_valid = false;         // true when cache contains valid data
 
-    // Streaming bulk transfer state — pre-registered staging buffer for large
+    // Streaming bulk transfer state - pre-registered staging buffer for large
     // sequential I/O that bypasses the per-slot SQ/CQ pipeline.
     bool bulk_capable = false;            // server advertised bulk support
     uint32_t bulk_max_transfer = 0;       // max bytes per bulk op (from server)
@@ -108,7 +108,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 // Detach a proxy block device. Sends DEV_DETACH to the owner.
 void wki_dev_proxy_detach_block(dev::BlockDevice* proxy_bdev);
 
-// Suspend all proxies for a fenced peer — block device stays registered but
+// Suspend all proxies for a fenced peer - block device stays registered but
 // I/O operations will block until the fence is lifted or a timeout expires.
 // Called from wki_peer_fence().
 void wki_dev_proxy_suspend_for_peer(uint16_t node_id);
@@ -155,7 +155,7 @@ auto wki_dev_proxy_bulk_read(dev::BlockDevice* bdev, uint64_t lba, uint32_t bloc
 auto wki_dev_proxy_bulk_write(dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, const void* buffer) -> int;
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

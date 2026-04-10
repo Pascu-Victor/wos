@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# -- run_cluster.sh — Launch an N-node WKI cluster --------------------------
+# -- run_cluster.sh - Launch an N-node WKI cluster --------------------------
 #
 # Usage:  ./scripts/run_cluster.sh [N] [--skip N]
 #
@@ -19,7 +19,7 @@ set -e
 #   - (Optional) Regular networking bridge wos-br0 + wos-wki-tap<N> for each VM
 #
 # Environment:
-#   WOS_NET=user   — Use QEMU user-mode networking instead of TAP for eth0
+#   WOS_NET=user   - Use QEMU user-mode networking instead of TAP for eth0
 # ----------------------------------------------------------------------------
 
 NUM_VMS=2
@@ -93,17 +93,17 @@ for ((i = SKIP; i < NUM_VMS; i++)); do
   OVERLAY0="${OVERLAY_DIR}/disk-vm${i}.qcow2"
   OVERLAY1="${OVERLAY_DIR}/mountfs-vm${i}.qcow2"
   qemu-img create -f qcow2 -b "$(pwd)/disk.qcow2" -F qcow2 "$OVERLAY0" >/dev/null
-  # Full copy — qcow2 overlays don't play well with XFS
+  # Full copy - qcow2 overlays don't play well with XFS
   cp --reflink=auto "$(pwd)/mountfs.qcow2" "$OVERLAY1"
 
   # Verify WKI tap device exists
   WKI_TAP="wos-wki-tap${i}"
   if ! ip link show "$WKI_TAP" &>/dev/null; then
-    echo "WARNING: ${WKI_TAP} not found — VM${i} will not have WKI NIC"
+    echo "WARNING: ${WKI_TAP} not found - VM${i} will not have WKI NIC"
     WKI_TAP=""
   fi
 
-  # Launch VM in background (no monitor stdio — use serial log)
+  # Launch VM in background (no monitor stdio - use serial log)
   # Default to user-mode networking for eth0 (WKI bridge handles inter-kernel on eth1)
   unset WOS_NET
   export WOS_MEM="${WOS_MEM:-4G}"

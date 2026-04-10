@@ -10,11 +10,11 @@
 namespace ker::net {
 
 // Per-type default receive buffer sizes
-constexpr size_t TCP_RCVBUF_SIZE    = 1048576;  // 1 MB — large window for streaming
-constexpr size_t UDP_RCVBUF_SIZE    = 65536;    // 64 KB — datagrams don't pipeline
-constexpr size_t RAW_RCVBUF_SIZE    = 65536;    // 64 KB
-constexpr size_t SOCKET_RCVBUF_MIN  = 8192;     // 8 KB floor for SO_RCVBUF
-constexpr size_t SOCKET_RCVBUF_MAX  = 10485760; // 10 MB ceiling for SO_RCVBUF
+constexpr size_t TCP_RCVBUF_SIZE = 1048576;     // 1 MB - large window for streaming
+constexpr size_t UDP_RCVBUF_SIZE = 65536;       // 64 KB - datagrams don't pipeline
+constexpr size_t RAW_RCVBUF_SIZE = 65536;       // 64 KB
+constexpr size_t SOCKET_RCVBUF_MIN = 8192;      // 8 KB floor for SO_RCVBUF
+constexpr size_t SOCKET_RCVBUF_MAX = 10485760;  // 10 MB ceiling for SO_RCVBUF
 constexpr size_t SOCKET_ACCEPT_QUEUE = 128;
 
 // Socket flags (Linux-compatible values for ease of userspace reuse)
@@ -24,15 +24,15 @@ constexpr int SOCK_TYPE_MASK = 0xF;   // low bits carry SOCK_STREAM/…
 // Lock-free SPSC ring buffer for socket data.
 // Single producer: NAPI worker (write).
 // Single consumer: application thread (read).
-// No spinlock needed — only 'used' is shared between the two sides.
+// No spinlock needed - only 'used' is shared between the two sides.
 // Producer writes data then increments used (release).
 // Consumer loads used (acquire) then reads data, guaranteeing it sees
 // exactly what the producer wrote before the release-store.
 struct RingBuffer {
     uint8_t* data = nullptr;
     size_t capacity = 0;
-    size_t read_pos = 0;   // only touched by consumer
-    size_t write_pos = 0;  // only touched by producer
+    size_t read_pos = 0;          // only touched by consumer
+    size_t write_pos = 0;         // only touched by producer
     std::atomic<size_t> used{0};  // shared; acquire/release ordered
 
     auto write(const void* buf, size_t len) -> ssize_t;

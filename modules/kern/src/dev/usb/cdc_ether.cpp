@@ -274,7 +274,7 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
         return -1;
     }
 
-    // Find controller — use the first one from the global list
+    // Find controller - use the first one from the global list
     if (controller_count == 0) {
         return -1;
     }

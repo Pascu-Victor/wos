@@ -88,6 +88,22 @@ else
     echo "# /etc/fstab - empty (no disks.conf found)" > "$INITRAMFS_DIR/etc/fstab"
 fi
 
+if [ -f "configs/vfstab" ]; then
+    cp "configs/vfstab" "$INITRAMFS_DIR/etc/vfstab"
+    echo "  initramfs: added /etc/vfstab from configs/vfstab"
+else
+    cat > "$INITRAMFS_DIR/etc/vfstab" <<'EOF'
+# prefix route
+/wki local
+/proc local
+/dev local
+/tmp local
+/run local
+/ host
+EOF
+    echo "  initramfs: added default /etc/vfstab"
+fi
+
 # Create /etc/filesystems for busybox mount auto-detection
 cat > "$INITRAMFS_DIR/etc/filesystems" <<'EOF'
 fat32
@@ -97,7 +113,7 @@ EOF
 echo "  initramfs: added /etc/filesystems"
 
 # Copy busybox binary and create applet symlinks
-BUSYBOX_BINARY="toolchain/target1/bin/busybox"
+BUSYBOX_BINARY="toolchain/sysroot/bin/busybox"
 if [ -f "$BUSYBOX_BINARY" ]; then
     mkdir -p "$INITRAMFS_DIR/bin"
     cp "$BUSYBOX_BINARY" "$INITRAMFS_DIR/bin/busybox"
@@ -126,7 +142,7 @@ GROUP
 echo "  initramfs: added /etc/group"
 
 # Copy dropbearmulti binary and create symlinks
-DROPBEAR_BINARY="toolchain/target1/bin/dropbearmulti"
+DROPBEAR_BINARY="toolchain/sysroot/bin/dropbearmulti"
 if [ -f "$DROPBEAR_BINARY" ]; then
     mkdir -p "$INITRAMFS_DIR/bin"
     mkdir -p "$INITRAMFS_DIR/etc/dropbear"

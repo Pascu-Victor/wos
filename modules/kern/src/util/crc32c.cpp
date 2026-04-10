@@ -15,7 +15,7 @@
 namespace ker::util {
 
 // ---------------------------------------------------------------------------
-// CPUID helper — detect SSE4.2 (bit 20 of ECX from CPUID leaf 1)
+// CPUID helper - detect SSE4.2 (bit 20 of ECX from CPUID leaf 1)
 // ---------------------------------------------------------------------------
 
 static bool hw_crc32_available = false;

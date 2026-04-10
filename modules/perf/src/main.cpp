@@ -1,4 +1,4 @@
-// perf — kernel performance measurement tool for WOS
+// perf - kernel performance measurement tool for WOS
 //
 // Usage:
 //   perf stat     [ms=1000]   CPU% per process over given sampling window
@@ -518,7 +518,7 @@ void save_perf_data() {
     ssize_t event_bytes = write_section_events(fd.get());
 
     if (event_bytes <= 0) {
-        std::println("perf: ring buffer empty — PROC_MAP saved, no events");
+        std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
         std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, event_bytes);
     }
@@ -1256,7 +1256,7 @@ void cmd_run(int argc, char** argv) {
         write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
         if (total_event_bytes <= 0) {
-            std::println("perf: ring buffer empty — PROC_MAP saved, no events");
+            std::println("perf: ring buffer empty - PROC_MAP saved, no events");
         } else {
             std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, total_event_bytes);
         }

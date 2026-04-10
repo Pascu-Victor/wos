@@ -22,7 +22,7 @@ class CoredumpSegmentPanel : public QDockWidget {
     void clear();
 
    signals:
-    // Emitted when a segment is double-clicked — requests memory dump
+    // Emitted when a segment is double-clicked - requests memory dump
     void dumpSegmentRequested(int segmentIndex, uint64_t vaStart, uint64_t vaEnd);
 
    private slots:

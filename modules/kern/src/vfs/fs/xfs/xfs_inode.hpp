@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Inode — in-memory representation and disk I/O.
+// XFS Inode - in-memory representation and disk I/O.
 //
 // XfsInode is the in-memory parsed form of xfs_dinode.  It is cached in a
 // hash table keyed by (mount, inode_number) with reference counting.
@@ -41,7 +41,7 @@ struct XfsIforkLocal {
     size_t size;
 };
 
-// Data fork representation — depends on di_format
+// Data fork representation - depends on di_format
 struct XfsIfork {
     xfs_dinode_fmt format;
     union {
@@ -74,7 +74,7 @@ struct XfsInode {
     uint16_t flags;    // XFS_DIFLAG_*
     uint64_t flags2;   // XFS_DIFLAG2_*
 
-    // Timestamps (raw on-disk format — decode later if needed)
+    // Timestamps (raw on-disk format - decode later if needed)
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
@@ -106,7 +106,7 @@ struct XfsInode {
 // ============================================================================
 
 // Read an inode from disk.  Returns a reference-counted XfsInode*, or nullptr
-// on error.  Uses an inode cache — repeated reads of the same inode return the
+// on error.  Uses an inode cache - repeated reads of the same inode return the
 // same pointer with incremented refcount.
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode*;
 

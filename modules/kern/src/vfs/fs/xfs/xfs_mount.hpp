@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Mount Context — in-memory representation of a mounted XFS filesystem.
+// XFS Mount Context - in-memory representation of a mounted XFS filesystem.
 //
 // Holds the parsed superblock geometry, per-AG state, buffer cache reference,
 // and journal state.  All XFS operations take an XfsMountContext* as their
@@ -45,7 +45,7 @@ struct XfsPerAG {
     mod::sys::Spinlock lock;  // Per-AG lock for concurrent access
 };
 
-// Mount context — one per mounted XFS filesystem
+// Mount context - one per mounted XFS filesystem
 struct XfsMountContext {
     dev::BlockDevice* device;  // Underlying block device
 
@@ -116,7 +116,7 @@ auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) 
 // Use for newly allocated blocks that will be fully overwritten.
 auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
-// Unmount — flush dirty buffers, close journal, free mount context.
+// Unmount - flush dirty buffers, close journal, free mount context.
 void xfs_unmount(XfsMountContext* ctx);
 
 // Check if a feature is enabled

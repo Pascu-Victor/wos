@@ -855,7 +855,7 @@ void dumpPageAllocationsOOM() {
     io::serial::write("│ KERNEL DYNAMIC BUFFERS                                              │\n");
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
-    io::serial::write("\nScheduler Run Queues (per-CPU, EEVDF — zero dynamic allocations):\n");
+    io::serial::write("\nScheduler Run Queues (per-CPU, EEVDF - zero dynamic allocations):\n");
 
     uint64_t totalRunnableCount = 0;
     uint64_t totalDeadCount = 0;

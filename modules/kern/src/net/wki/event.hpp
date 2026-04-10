@@ -31,7 +31,7 @@ constexpr uint16_t EVENT_ZONE_DESTROYED = 0x0002;
 constexpr uint16_t EVENT_WILDCARD = 0xFFFF;
 
 // -----------------------------------------------------------------------------
-// Subscription — tracks which remote nodes want events from us
+// Subscription - tracks which remote nodes want events from us
 // -----------------------------------------------------------------------------
 
 struct WkiEventSubscription {
@@ -43,7 +43,7 @@ struct WkiEventSubscription {
 };
 
 // -----------------------------------------------------------------------------
-// Local handler — kernel subsystem callbacks for incoming events
+// Local handler - kernel subsystem callbacks for incoming events
 // -----------------------------------------------------------------------------
 
 using EventHandlerFn = void (*)(uint16_t origin_node, uint16_t event_class, uint16_t event_id, const void* data, uint16_t data_len);
@@ -85,7 +85,7 @@ void wki_event_cleanup_for_peer(uint16_t node_id);
 void wki_event_timer_tick(uint64_t now_us);
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

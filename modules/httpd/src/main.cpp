@@ -1,4 +1,3 @@
-#define _DEFAULT_SOURCE 1
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -19,6 +18,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <print>
 #include <string>
 #include <string_view>
@@ -27,17 +27,17 @@
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
+// constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
 constexpr const char* SERVE_ROOT = "/";
 
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
-    std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
-    if (log_stream.is_open()) {
-        log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
-        log_stream.close();
-    }
+    // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
+    // if (log_stream.is_open()) {
+        std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
+        // log_stream.close();
+    // }
 }
 constexpr size_t REQUEST_BUFFER_SIZE = 4096;
 constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
@@ -395,7 +395,7 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
     while (remaining > 0) {
         ssize_t sent = send(fd, ptr, remaining, 0);
         if (sent < 0) {
-            // EAGAIN (-11): window full or buffer exhaustion — retry
+            // EAGAIN (-11): window full or buffer exhaustion - retry
             if (sent == -11 && retries < MAX_SEND_RETRIES) {
                 retries++;
                 sched_yield();

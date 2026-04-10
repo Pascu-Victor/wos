@@ -39,13 +39,13 @@ struct NetDevice {
     NetDeviceOps const* ops = nullptr;
     void* private_data = nullptr;
 
-    // WKI remotable trait — set by drivers that support remote access
+    // WKI remotable trait - set by drivers that support remote access
     wki::RemotableOps const* remotable = nullptr;
 
-    // NAPI context — set by napi_enable(), used for lock-free inline poll lookup
+    // NAPI context - set by napi_enable(), used for lock-free inline poll lookup
     NapiStruct* napi = nullptr;
 
-    // D11: WKI RX forward hook — set by dev_server when a remote consumer is attached.
+    // D11: WKI RX forward hook - set by dev_server when a remote consumer is attached.
     // Called from netdev_rx() to forward received packets to remote consumers.
     void (*wki_rx_forward)(NetDevice* dev, PacketBuffer* pkt) = nullptr;
 

@@ -1,10 +1,10 @@
 #pragma once
 
-// XFS Block Map (bmap) — extent mapping from logical file blocks to physical
+// XFS Block Map (bmap) - extent mapping from logical file blocks to physical
 // disk blocks.
 //
 // Handles all three inode data fork formats:
-//   - LOCAL (inline data — no block mapping needed)
+//   - LOCAL (inline data - no block mapping needed)
 //   - EXTENTS (flat extent list stored in inode)
 //   - BTREE (B+tree of extent records for large files)
 //

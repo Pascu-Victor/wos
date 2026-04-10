@@ -71,7 +71,7 @@ bool is_our_address(NetDevice* dev, const std::array<uint8_t, 16>& addr) {
 
     // Check solicited-node multicast for our link-local
     if (addr[0] == 0xFF && addr[1] == 0x02) {
-        // This is a multicast — check if it's our solicited-node
+        // This is a multicast - check if it's our solicited-node
         auto* iface = netif_get(dev);
         if (iface != nullptr) {
             for (size_t i = 0; i < iface->ipv6_addr_count; i++) {

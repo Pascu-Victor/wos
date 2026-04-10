@@ -868,17 +868,17 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         return make_file(ProcNodeType::VERSION_FILE, 0, false);
     }
 
-    // /proc/kperf — drain kernel perf ring buffer as text events
+    // /proc/kperf - drain kernel perf ring buffer as text events
     if (strcmp(path, "kperf") == 0) {
         return make_file(ProcNodeType::KPERF_FILE, 0, false);
     }
 
-    // /proc/kcpustat — per-CPU aggregate scheduler statistics
+    // /proc/kcpustat - per-CPU aggregate scheduler statistics
     if (strcmp(path, "kcpustat") == 0) {
         return make_file(ProcNodeType::KCPUSTAT_FILE, 0, false);
     }
 
-    // /proc/kperfctl — write "enable"/"disable" to start/stop perf recording
+    // /proc/kperfctl - write "enable"/"disable" to start/stop perf recording
     if (strcmp(path, "kperfctl") == 0) {
         return make_file(ProcNodeType::KPERFCTL_FILE, 0, false);
     }

@@ -1,0 +1,8 @@
+# prefix route
+
+/wki local
+/proc local
+/dev local
+/tmp local
+/run local
+/ host

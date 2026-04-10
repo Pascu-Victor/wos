@@ -1,12 +1,12 @@
 #pragma once
 
-// XFS Directory operations — lookup, iterate, add, remove.
+// XFS Directory operations - lookup, iterate, add, remove.
 //
 // Supports all four directory formats:
-//   1. Shortform  — inline in inode data fork (small directories)
-//   2. Block      — single directory block with data + leaf entries + tail
-//   3. Leaf       — multiple data blocks + a single leaf index block
-//   4. Node       — multiple data blocks + multi-level hash B+tree index
+//   1. Shortform  - inline in inode data fork (small directories)
+//   2. Block      - single directory block with data + leaf entries + tail
+//   3. Leaf       - multiple data blocks + a single leaf index block
+//   4. Node       - multiple data blocks + multi-level hash B+tree index
 //
 // Reference: reference/xfs/libxfs/xfs_dir2.h, reference/xfs/libxfs/xfs_dir2.c
 

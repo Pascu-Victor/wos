@@ -132,14 +132,14 @@ static void test_spawn_and_placement(int n) {
 // chance to run. The total wall time / (2 * iters) = one lock/unlock round
 // trip, which requires a context switch when both threads are competing.
 //
-// This avoids condvar entirely — no signal can be "lost", no way to deadlock.
+// This avoids condvar entirely - no signal can be "lost", no way to deadlock.
 // ---------------------------------------------------------------------------
 
 struct PingPongArg {
     mtx_t* mtx;
     volatile int* counter;
     int target;
-    int role;  // 0 or 1 — only used for identification
+    int role;  // 0 or 1 - only used for identification
 };
 
 static auto pingpong_thread(void* param) -> int {

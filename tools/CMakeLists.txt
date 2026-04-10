@@ -11,7 +11,7 @@ unset(ENV{LDFLAGS})
 
 # Resolve workspace root and path entries to remove from host compiler discovery.
 get_filename_component(WOS_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
-set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/target1/bin")
+set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/sysroot/bin")
 set(WOS_HOST_TOOLS_BIN "${WOS_WORKSPACE_ROOT}/tools/build/bin")
 
 # Reconstruct a clean host PATH so find_program() does not pick the target compiler

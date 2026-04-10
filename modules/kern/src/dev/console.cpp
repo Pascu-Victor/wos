@@ -114,7 +114,7 @@ Device console_device = {
     .char_ops = &serial_ops,  // Point to serial for now
 };
 
-// /dev/tty — controlling terminal (major 5, minor 0)
+// /dev/tty - controlling terminal (major 5, minor 0)
 // Opens the calling process's controlling PTY slave, or fails with ENXIO if none.
 
 int tty_open(ker::vfs::File* file) {

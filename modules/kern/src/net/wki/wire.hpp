@@ -118,7 +118,7 @@ inline bool seq_after(uint32_t a, uint32_t b) { return seq_before(b, a); }
 inline bool seq_between(uint32_t seq, uint32_t low, uint32_t high) { return !seq_before(seq, low) && seq_before(seq, high); }
 
 // -----------------------------------------------------------------------------
-// WKI Header — 32 bytes, fixed size, RDMA-aligned
+// WKI Header - 32 bytes, fixed size, RDMA-aligned
 // -----------------------------------------------------------------------------
 
 struct WkiHeader {
@@ -141,7 +141,7 @@ struct WkiHeader {
 static_assert(sizeof(WkiHeader) == 32, "WkiHeader must be 32 bytes");
 
 // -----------------------------------------------------------------------------
-// HELLO / HELLO_ACK Payload — 32 bytes
+// HELLO / HELLO_ACK Payload - 32 bytes
 // -----------------------------------------------------------------------------
 
 constexpr uint16_t WKI_CAP_RDMA_SUPPORT = 0x0001;
@@ -167,7 +167,7 @@ struct HelloPayload {
 static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
 
 // -----------------------------------------------------------------------------
-// HEARTBEAT Payload — 16 bytes
+// HEARTBEAT Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 struct HeartbeatPayload {
@@ -182,7 +182,7 @@ static_assert(sizeof(HeartbeatPayload) == 16, "HeartbeatPayload must be 16 bytes
 // HEARTBEAT_ACK echoes the same format (send_timestamp echoed for RTT calc)
 
 // -----------------------------------------------------------------------------
-// LSA (Link-State Advertisement) Payload — variable length
+// LSA (Link-State Advertisement) Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct LsaNeighborEntry {
@@ -211,7 +211,7 @@ inline auto lsa_neighbors(const LsaPayload* lsa) -> const LsaNeighborEntry* {
 inline size_t lsa_total_size(const LsaPayload* lsa) { return sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry)); }
 
 // -----------------------------------------------------------------------------
-// FENCE_NOTIFY Payload — 8 bytes
+// FENCE_NOTIFY Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct FenceNotifyPayload {
@@ -221,7 +221,7 @@ struct FenceNotifyPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// RECONCILE_REQ / RECONCILE_ACK Payload — 8 bytes
+// RECONCILE_REQ / RECONCILE_ACK Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct ReconcilePayload {
@@ -231,7 +231,7 @@ struct ReconcilePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// RESOURCE_ADVERT / RESOURCE_WITHDRAW Payload — variable length
+// RESOURCE_ADVERT / RESOURCE_WITHDRAW Payload - variable length
 // -----------------------------------------------------------------------------
 
 enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
@@ -264,7 +264,7 @@ inline auto resource_advert_name(const ResourceAdvertPayload* p) -> const char* 
 }
 
 // -----------------------------------------------------------------------------
-// ZONE_CREATE_REQ Payload — 16 bytes
+// ZONE_CREATE_REQ Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 // Access policy bits
@@ -302,7 +302,7 @@ struct ZoneCreateReqPayload {
 static_assert(sizeof(ZoneCreateReqPayload) == 16, "ZoneCreateReqPayload must be 16 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_CREATE_ACK Payload — 24 bytes
+// ZONE_CREATE_ACK Payload - 24 bytes
 // -----------------------------------------------------------------------------
 
 enum class ZoneCreateStatus : uint8_t {
@@ -323,7 +323,7 @@ struct ZoneCreateAckPayload {
 static_assert(sizeof(ZoneCreateAckPayload) == 24, "ZoneCreateAckPayload must be 24 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_DESTROY Payload — 8 bytes
+// ZONE_DESTROY Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneDestroyPayload {
@@ -332,7 +332,7 @@ struct ZoneDestroyPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST Payload — 16 bytes
+// ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneNotifyPayload {
@@ -345,7 +345,7 @@ struct ZoneNotifyPayload {
 
 static_assert(sizeof(ZoneNotifyPayload) == 16, "ZoneNotifyPayload must be 16 bytes");
 
-// ZONE_NOTIFY_PRE_ACK / ZONE_NOTIFY_POST_ACK Payload — 4 bytes
+// ZONE_NOTIFY_PRE_ACK / ZONE_NOTIFY_POST_ACK Payload - 4 bytes
 struct ZoneNotifyAckPayload {
     uint32_t zone_id;
 } __attribute__((packed));
@@ -353,7 +353,7 @@ struct ZoneNotifyAckPayload {
 static_assert(sizeof(ZoneNotifyAckPayload) == 4, "ZoneNotifyAckPayload must be 4 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_READ_REQ Payload — 12 bytes
+// ZONE_READ_REQ Payload - 12 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneReadReqPayload {
@@ -363,7 +363,7 @@ struct ZoneReadReqPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// ZONE_READ_RESP / ZONE_WRITE_REQ — variable length
+// ZONE_READ_RESP / ZONE_WRITE_REQ - variable length
 // Data follows immediately after the fixed portion
 // -----------------------------------------------------------------------------
 
@@ -388,7 +388,7 @@ struct ZoneWriteAckPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE Payload — 8 bytes
+// EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 constexpr uint8_t EVENT_DELIVERY_RELIABLE = 0;
@@ -404,7 +404,7 @@ struct EventSubscribePayload {
 static_assert(sizeof(EventSubscribePayload) == 8, "EventSubscribePayload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
-// EVENT_PUBLISH Payload — variable length
+// EVENT_PUBLISH Payload - variable length
 // -----------------------------------------------------------------------------
 
 // Well-known event classes
@@ -426,7 +426,7 @@ struct EventPublishPayload {
 
 static_assert(sizeof(EventPublishPayload) == 8, "EventPublishPayload must be 8 bytes");
 
-// EVENT_ACK — just echoes the event identity
+// EVENT_ACK - just echoes the event identity
 struct EventAckPayload {
     uint16_t event_class;
     uint16_t event_id;
@@ -435,7 +435,7 @@ struct EventAckPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// DEV_ATTACH_REQ Payload — 12 bytes
+// DEV_ATTACH_REQ Payload - 12 bytes
 // -----------------------------------------------------------------------------
 
 enum class AttachMode : uint8_t {
@@ -455,7 +455,7 @@ struct DevAttachReqPayload {
 static_assert(sizeof(DevAttachReqPayload) == 12, "DevAttachReqPayload must be 12 bytes");
 
 // -----------------------------------------------------------------------------
-// DEV_ATTACH_ACK Payload — 8 bytes
+// DEV_ATTACH_ACK Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 enum class DevAttachStatus : uint8_t {
@@ -477,7 +477,7 @@ struct DevAttachAckPayload {
 
 static_assert(sizeof(DevAttachAckPayload) == 12, "DevAttachAckPayload must be 12 bytes");
 
-// V2: Extended attach ACK for NET resources — includes owner NIC info [V2§A5.3]
+// V2: Extended attach ACK for NET resources - includes owner NIC info [V2§A5.3]
 struct DevAttachAckNetPayload {
     // V1 base fields (identical layout to DevAttachAckPayload)
     uint8_t status;
@@ -501,7 +501,7 @@ constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;       // VFS RDMA available; bl
 constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;      // bulk RDMA transfer supported (large sequential I/O)
 
 // -----------------------------------------------------------------------------
-// DEV_DETACH Payload — 8 bytes
+// DEV_DETACH Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct DevDetachPayload {
@@ -511,7 +511,7 @@ struct DevDetachPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// DEV_OP_REQ / DEV_OP_RESP Payload — variable length
+// DEV_OP_REQ / DEV_OP_RESP Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct DevOpReqPayload {
@@ -573,7 +573,7 @@ constexpr uint16_t OP_VFS_READ_BULK =
     0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
 
 // -----------------------------------------------------------------------------
-// DEV_IRQ_FWD Payload — 8 bytes
+// DEV_IRQ_FWD Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct DevIrqFwdPayload {
@@ -617,7 +617,7 @@ struct ChannelClosePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// TASK_SUBMIT Payload — variable length
+// TASK_SUBMIT Payload - variable length
 // -----------------------------------------------------------------------------
 
 enum class TaskDeliveryMode : uint8_t {
@@ -648,7 +648,7 @@ struct TaskSubmitPayload {
 static_assert(sizeof(TaskSubmitPayload) == 16, "TaskSubmitPayload V2 must be 16 bytes");
 
 // -----------------------------------------------------------------------------
-// TASK_ACCEPT / TASK_REJECT Payload — 16 bytes
+// TASK_ACCEPT / TASK_REJECT Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 enum class TaskRejectReason : uint8_t {
@@ -669,7 +669,7 @@ struct TaskResponsePayload {
 static_assert(sizeof(TaskResponsePayload) == 16, "TaskResponsePayload must be 16 bytes");
 
 // -----------------------------------------------------------------------------
-// TASK_COMPLETE Payload — variable length
+// TASK_COMPLETE Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct TaskCompletePayload {
@@ -681,7 +681,7 @@ struct TaskCompletePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// TASK_CANCEL Payload — 4 bytes
+// TASK_CANCEL Payload - 4 bytes
 // -----------------------------------------------------------------------------
 
 struct TaskCancelPayload {
@@ -689,7 +689,7 @@ struct TaskCancelPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// LOAD_REPORT Payload — variable length
+// LOAD_REPORT Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct LoadReportPayload {

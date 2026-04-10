@@ -16,6 +16,20 @@
 
 namespace ker::mod::sched::task {
 
+enum class WkiVfsRoute : uint8_t {
+    LOCAL = 0,
+    HOST = 1,
+};
+
+struct WkiVfsRule {
+    static constexpr unsigned PREFIX_MAX = 256;
+
+    char prefix[PREFIX_MAX] = {};
+    uint16_t prefix_len = 0;
+    uint8_t route = static_cast<uint8_t>(WkiVfsRoute::LOCAL);
+    uint8_t reserved = 0;
+};
+
 enum TaskType {
     DAEMON,
     PROCESS,
@@ -47,7 +61,7 @@ struct Context {
 // inside the buffer, regardless of the Task allocation's alignment.
 struct FxState {
     uint8_t raw[1024 + 63] = {};
-    bool saved = false;  // true after first saveFpuState — guards xrstor on zeroed buffer
+    bool saved = false;  // true after first saveFpuState - guards xrstor on zeroed buffer
 
     // Return a pointer to the 64-byte-aligned region within raw[].
     uint8_t* aligned() {
@@ -69,7 +83,7 @@ struct Task {
     Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
 
     // Factory for kernel threads (DAEMON tasks).
-    // entryFunc: [[noreturn]] void func() — the kernel thread body.
+    // entryFunc: [[noreturn]] void func() - the kernel thread body.
     static Task* createKernelThread(const char* name, void (*entryFunc)());
 
     // Factory for userspace threads (PROCESS tasks that share the parent's pagemap).
@@ -80,7 +94,7 @@ struct Task {
 
     Task(const Task& task) = delete;
 
-    // Default constructor — leaves all fields zero/default-initialized.
+    // Default constructor - leaves all fields zero/default-initialized.
     // Used only by createUserThread; callers must fill in all required fields.
     Task() = default;
 
@@ -94,7 +108,7 @@ struct Task {
     TaskType type;
     uint64_t cpu;
     bool cpu_pinned = false;  // When true, scheduler will not migrate this task to another CPU
-    // CPU domain affinity (Phase 1 — CPU domain infrastructure)
+    // CPU domain affinity (Phase 1 - CPU domain infrastructure)
     // domain_id: which domain this task belongs to (0 = ROOT, any CPU allowed)
     // domain_mask: bitmask of allowed CPUs (all-ones = unrestricted)
     // domain_hard: when true, task NEVER runs outside domain_mask
@@ -139,6 +153,26 @@ struct Task {
 
     // WKI: prefer inline delivery for remote compute placement (V2§A6.4)
     bool wki_prefer_inline = false;
+
+    // WKI: optional explicit remote target hostname for spawned processes.
+    // Empty means use automatic load-based placement.
+    static constexpr unsigned WKI_TARGET_HOSTNAME_MAX = 64;
+    static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
+    char wki_target_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
+    uint32_t wki_target_flags = 0;
+
+    // WKI: hostname of the logical submitter host whose filesystem should be
+    // treated as /wki/host for this task.
+    char wki_submitter_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
+
+    // WKI: explicit task-local VFS rules layered over defaults from /etc/vfstab.
+    static constexpr unsigned WKI_VFS_RULE_MAX = 16;
+    uint16_t wki_vfs_rule_count = 0;
+    std::array<WkiVfsRule, WKI_VFS_RULE_MAX> wki_vfs_rules = {};
+
+    // WKI: set by richer spawn paths after they already attempted remote placement.
+    // The legacy scheduler hook must skip those tasks to avoid losing exec context.
+    bool wki_skip_legacy_placement = false;
 
     // WKI: when non-zero, this task is a proxy for a remote task.
     // The proxy stays in WAITING state until the remote task completes.

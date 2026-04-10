@@ -126,10 +126,10 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     gpr = nextTask->context.regs;
 
-    // Validate context before restoring — catch corruption before it causes a crash
+    // Validate context before restoring - catch corruption before it causes a crash
     // in userspace where debugging is much harder.
     // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
-    // Skip validation when voluntaryBlock is set — the saved context is legitimately
+    // Skip validation when voluntaryBlock is set - the saved context is legitimately
     // kernel-mode (task was preempted at a safe blocking point like sti;hlt in a syscall).
     if (nextTask->type == sched::task::TaskType::PROCESS && !nextTask->voluntaryBlock) {
         if (frame.cs != desc::gdt::GDT_USER_CS) {

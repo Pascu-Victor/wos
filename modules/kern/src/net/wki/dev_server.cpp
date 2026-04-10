@@ -103,7 +103,7 @@ auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// D11: RX forward — called from netdev_rx() on the owner's NIC
+// D11: RX forward - called from netdev_rx() on the owner's NIC
 // -----------------------------------------------------------------------------
 
 void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) {
@@ -328,7 +328,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // Compute the RDMA zone ID for the block ring.  Zone creation is
         // deferred to the timer tick (wki_dev_server_process_pending_zones)
         // because wki_zone_create() blocks on a spin-wait for the zone ACK,
-        // and we are currently inside the NAPI poll handler — calling
+        // and we are currently inside the NAPI poll handler - calling
         // napi_poll_inline() re-entrantly returns 0, so the ACK can never
         // be received here.  Instead, send the ACK optimistically with the
         // zone_id; the consumer already has a timeout loop waiting for the
@@ -336,7 +336,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         uint32_t blk_zone_id = (static_cast<uint32_t>(hdr->src_node) << 16) | req->resource_id;
         binding.blk_zone_id = blk_zone_id;
         binding.blk_zone_pending = true;  // processed by wki_dev_server_process_pending_zones()
-        binding.blk_rdma_active = false;  // not yet — set when deferred creation succeeds
+        binding.blk_rdma_active = false;  // not yet - set when deferred creation succeeds
 
         {
             uint64_t srv_flags = s_server_lock.lock_irqsave();
@@ -400,7 +400,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
         // RDMA-backed VFS writes: pre-register a server-side receive buffer so the
         // consumer can rdma_write file data here, avoiding embedding data in messages.
-        // rdma_register_region is a local-only operation — safe to call in NAPI context.
+        // rdma_register_region is a local-only operation - safe to call in NAPI context.
         {
             WkiPeer* peer = wki_peer_find(hdr->src_node);
             if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
@@ -601,7 +601,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
-    // Find binding by (src_node, channel_id) — pointer is stable (std::deque reference stability)
+    // Find binding by (src_node, channel_id) - pointer is stable (std::deque reference stability)
     DevServerBinding* binding = nullptr;
     {
         uint64_t srv_flags = s_server_lock.lock_irqsave();
@@ -815,7 +815,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Block RDMA ring — tiered signaling (server → consumer)
+// Block RDMA ring - tiered signaling (server → consumer)
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -848,7 +848,7 @@ void blk_ring_signal_consumer(DevServerBinding* binding) {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Block RDMA ring — SQ poll (server side)
+// Block RDMA ring - SQ poll (server side)
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -889,14 +889,14 @@ struct BatchCqPush {
 
 // RoCE helper: push all accumulated completions in a single burst.
 // Data slots are pushed individually (each may be large), but CQ entries and
-// the header are pushed once at the end — amortizing per-completion frame overhead.
+// the header are pushed once at the end - amortizing per-completion frame overhead.
 void roce_push_completions_batch(DevServerBinding* binding, const BatchCqPush* entries, uint32_t count) {
     if (!binding->blk_roce || binding->blk_rdma_transport == nullptr || count == 0) {
         return;
     }
     auto* hdr = blk_ring_header(binding->blk_zone_ptr);
 
-    // 1. Push all data slots (each slot may be up to 64KB — individual writes)
+    // 1. Push all data slots (each slot may be up to 64KB - individual writes)
     for (uint32_t i = 0; i < count; i++) {
         if (entries[i].data_bytes > 0 && entries[i].data_slot < hdr->data_slot_count) {
             uint32_t slot_offset = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (entries[i].data_slot * hdr->data_slot_size);
@@ -938,7 +938,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 
     // For RoCE zones the consumer already pushes the SQ region into our local
     // copy via rdma_write (roce_push_sq) before sending the doorbell/notification.
-    // No need to do an RDMA_READ here — the data is already in blk_zone_ptr.
+    // No need to do an RDMA_READ here - the data is already in blk_zone_ptr.
 
     bool posted_cqe = false;
 
@@ -1024,7 +1024,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                 }
                 cqe.status = ret;
                 ker::mod::mm::dyn::kmalloc::free(staging);
-                // Bulk ops push data directly via RDMA — no ring data slot involved
+                // Bulk ops push data directly via RDMA - no ring data slot involved
                 data_bytes = 0;
                 break;
             }
@@ -1102,7 +1102,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Zone post_handler — called when the consumer sends ZONE_NOTIFY_POST
+// Zone post_handler - called when the consumer sends ZONE_NOTIFY_POST
 // Triggers immediate ring polling instead of waiting for the timer tick.
 // -----------------------------------------------------------------------------
 
@@ -1119,7 +1119,7 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
         s_server_lock.unlock_irqrestore(srv_flags);
     }
 
-    // blk_ring_server_poll may do block I/O — call outside the lock
+    // blk_ring_server_poll may do block I/O - call outside the lock
     if (binding != nullptr) {
         blk_ring_server_poll(binding);
     }
@@ -1128,7 +1128,7 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Deferred zone creation — runs from wki_timer_tick, outside NAPI poll context
+// Deferred zone creation - runs from wki_timer_tick, outside NAPI poll context
 // -----------------------------------------------------------------------------
 
 void wki_dev_server_process_pending_zones() {
@@ -1161,7 +1161,7 @@ void wki_dev_server_process_pending_zones() {
         int zone_ret =
             wki_zone_create(b.consumer_node, b.blk_zone_id, zone_sz, zone_access, ZoneNotifyMode::POST_ONLY, ZoneTypeHint::MSG_QUEUE);
         if (zone_ret != WKI_OK) {
-            ker::mod::dbg::log("[WKI] Deferred block RDMA ring creation failed (err=%d) for zone 0x%08x — consumer falls back to msg path",
+            ker::mod::dbg::log("[WKI] Deferred block RDMA ring creation failed (err=%d) for zone 0x%08x - consumer falls back to msg path",
                                zone_ret, b.blk_zone_id);
             b.blk_zone_id = 0;
             continue;
@@ -1215,7 +1215,7 @@ void wki_dev_server_process_pending_zones() {
 }
 
 // -----------------------------------------------------------------------------
-// Block RDMA ring — periodic poll (called from wki_timer_tick)
+// Block RDMA ring - periodic poll (called from wki_timer_tick)
 // -----------------------------------------------------------------------------
 
 auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
@@ -1246,7 +1246,7 @@ void wki_dev_server_poll_rings() {
             // For RoCE bindings, only poll when the consumer has signalled new work.
             // The consumer pushes the SQ via RDMA_WRITE then sends a doorbell;
             // there is nothing to do until that notification arrives.
-            // Non-RoCE (ivshmem) bindings use shared memory — polling is cheap.
+            // Non-RoCE (ivshmem) bindings use shared memory - polling is cheap.
             if (b.blk_roce && !b.blk_sq_notified) {
                 continue;
             }
@@ -1258,7 +1258,7 @@ void wki_dev_server_poll_rings() {
         s_server_lock.unlock_irqrestore(srv_flags);
     }
 
-    // blk_ring_server_poll may do block I/O — call outside the lock
+    // blk_ring_server_poll may do block I/O - call outside the lock
     for (size_t i = 0; i < ring_count; i++) {
         blk_ring_server_poll(rings[i]);
     }

@@ -2,14 +2,14 @@
 set -e
 
 # -- Multi-VM environment variables ------------------------------------------
-# WOS_VM_ID     — VM identifier (0, 1, 2, …). Default: 0. Derives unique MACs and log names.
-# WOS_NET       — "user" for QEMU user-mode networking, otherwise TAP (default).
-# WOS_WKI_TAP   — TAP device for dedicated WKI NIC (e1000e). Omit to skip.
-# WOS_IVSHMEM   — Shared memory path for ivshmem (e.g. /dev/shm/wos-ivshmem). Omit to skip.
-# WOS_DISK0     — Path to primary disk image.  Default: disk.qcow2
-# WOS_DISK1     — Path to secondary disk image. Default: mountfs.qcow2
-# WOS_MEM       — Guest RAM size. Default: 4G (single VM), cluster script overrides to 4G.
-# WOS_ENABLE_GFX — Set to enable graphical display. Default: display none.
+# WOS_VM_ID     - VM identifier (0, 1, 2, …). Default: 0. Derives unique MACs and log names.
+# WOS_NET       - "user" for QEMU user-mode networking, otherwise TAP (default).
+# WOS_WKI_TAP   - TAP device for dedicated WKI NIC (e1000e). Omit to skip.
+# WOS_IVSHMEM   - Shared memory path for ivshmem (e.g. /dev/shm/wos-ivshmem). Omit to skip.
+# WOS_DISK0     - Path to primary disk image.  Default: disk.qcow2
+# WOS_DISK1     - Path to secondary disk image. Default: mountfs.qcow2
+# WOS_MEM       - Guest RAM size. Default: 4G (single VM), cluster script overrides to 4G.
+# WOS_ENABLE_GFX - Set to enable graphical display. Default: display none.
 # ----------------------------------------------------------------------------
 
 VM_ID="${WOS_VM_ID:-0}"
@@ -57,7 +57,7 @@ do
 
         # Create fresh debug disks
         qemu-img create -f qcow2 -b "$(pwd)/disk.qcow2" -F qcow2 "$DEBUG_DISK0" >/dev/null
-        # Full copy — qcow2 overlays don't play well with XFS
+        # Full copy - qcow2 overlays don't play well with XFS
         cp --reflink=auto "$(pwd)/mountfs.qcow2" "$DEBUG_DISK1"
 
         # Override disk paths to use debug disks
@@ -76,7 +76,7 @@ do
     fi
 done
 
-# -- Primary NIC (eth0 — virtio-net, regular networking) ---------------------
+# -- Primary NIC (eth0 - virtio-net, regular networking) ---------------------
 # Set WOS_NET=user for QEMU user-mode networking (built-in DHCP server at 10.0.2.2)
 # Default: TAP device wos-tap<VM_ID> attached to bridge wos-br0
 if [ "$WOS_NET" = "user" ]; then
@@ -90,7 +90,7 @@ else
   echo "[VM${VM_ID}] eth0: TAP networking via ${TAP_DEV} MAC: 52:54:00:12:34:${MAC_BYTE} (set WOS_NET=user for built-in DHCP)"
 fi
 
-# -- WKI NIC (eth1 — virtio-net, dedicated inter-kernel bridge) --------------
+# -- WKI NIC (eth1 - virtio-net, dedicated inter-kernel bridge) --------------
 # Auto-detect: if WOS_WKI_TAP is not set but debug mode and bridge exists, use wos-wki-tap<VM_ID>
 if [ -z "$WOS_WKI_TAP" ] && [ "$IS_DEBUG" -eq 1 ]; then
   AUTO_WKI_TAP="wos-wki-tap${VM_ID}"

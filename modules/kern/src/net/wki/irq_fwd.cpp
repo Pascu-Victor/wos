@@ -42,7 +42,7 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
 
     s_irq_fwd_lock.lock();
 
-    // Allocate a local vector number (not a real hardware vector — just an ID
+    // Allocate a local vector number (not a real hardware vector - just an ID
     // for the binding table). Start from 1 and find the next unused.
     uint8_t local_vec = 1;
     for (const auto& b : g_irq_bindings) {
@@ -51,7 +51,7 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
         }
     }
     if (local_vec == 0) {
-        // Overflow (255 bindings — unlikely)
+        // Overflow (255 bindings - unlikely)
         s_irq_fwd_lock.unlock();
         return 0;
     }
@@ -88,7 +88,7 @@ void wki_irq_fwd_unregister(uint8_t local_vector) {
 }
 
 // -----------------------------------------------------------------------------
-// Send — fire-and-forget IRQ forward to a remote node
+// Send - fire-and-forget IRQ forward to a remote node
 // -----------------------------------------------------------------------------
 
 void wki_irq_fwd_send(uint16_t dst_node, uint16_t device_id, uint16_t irq_vector, uint32_t irq_status) {
@@ -122,7 +122,7 @@ void wki_irq_fwd_send(uint16_t dst_node, uint16_t device_id, uint16_t irq_vector
     fwd.irq_status = irq_status;
 
     // Send on RESOURCE channel with PRIORITY flag (via reliable send).
-    // The PRIORITY flag is set by the channel's priority class — RESOURCE channel
+    // The PRIORITY flag is set by the channel's priority class - RESOURCE channel
     // defaults to LATENCY which sets PRIORITY automatically.
     wki_send(dst_node, WKI_CHAN_RESOURCE, MsgType::DEV_IRQ_FWD, &fwd, sizeof(fwd));
 }
@@ -176,7 +176,7 @@ void handle_dev_irq_fwd(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     s_irq_fwd_lock.unlock();
-    // No matching binding — ignore silently
+    // No matching binding - ignore silently
 }
 
 }  // namespace detail
@@ -191,7 +191,7 @@ void wki_irq_fwd_doorbell_rx(uint16_t /*src_node*/, uint16_t device_id, uint16_t
 
     s_irq_fwd_lock.lock();
 
-    // Match by (device_id, irq_vector) — with ivshmem there's only one peer,
+    // Match by (device_id, irq_vector) - with ivshmem there's only one peer,
     // so src_node is redundant. All doorbell bindings are for direct ivshmem peers.
     for (const auto& b : g_irq_bindings) {
         if (!b.active || !b.use_doorbell) {

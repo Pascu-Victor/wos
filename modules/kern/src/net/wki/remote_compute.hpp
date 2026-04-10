@@ -49,8 +49,9 @@ struct SubmittedTask {
     WkiWaitEntry* complete_wait_entry = nullptr;  // V2 I-4: async wait for TASK_COMPLETE
     int32_t exit_status = 0;
 
-    // V2§A7: Proxy task pointer — kept alive in WAITING state until remote completes
+    // V2§A7: Proxy task pointer - kept alive in WAITING state until remote completes
     ker::mod::sched::task::Task* local_task = nullptr;
+    bool proxy_ready = false;
 
     SubmittedTask() = default;
     SubmittedTask(const SubmittedTask&) = delete;
@@ -66,7 +67,8 @@ struct SubmittedTask {
           complete_pending(o.complete_pending.load(std::memory_order_relaxed)),
           complete_wait_entry(o.complete_wait_entry),
           exit_status(o.exit_status),
-          local_task(o.local_task) {}
+          local_task(o.local_task),
+          proxy_ready(o.proxy_ready) {}
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
         if (this != &o) {
             active = o.active;
@@ -80,6 +82,7 @@ struct SubmittedTask {
             complete_wait_entry = o.complete_wait_entry;
             exit_status = o.exit_status;
             local_task = o.local_task;
+            proxy_ready = o.proxy_ready;
         }
         return *this;
     }
@@ -107,6 +110,18 @@ struct RunningRemoteTask {
     TaskOutputCapture* output = nullptr;
 };
 
+enum class WkiRemoteSpawnResult : uint8_t {
+    LOCAL = 0,
+    REMOTE = 1,
+    FAILED = 2,
+};
+
+struct WkiRemoteSpawnSpec {
+    const char* const* argv = nullptr;
+    const char* const* envp = nullptr;
+    const char* cwd = nullptr;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -116,12 +131,22 @@ void wki_remote_compute_init();
 
 // Submitter side: submit a task with inline binary.
 // Returns task_id on success, 0 on failure.
-auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len, const void* args, uint16_t args_len) -> uint32_t;
+auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len, const char* const argv[],
+                            const char* const envp[], const char* cwd, ker::mod::sched::task::Task* local_task) -> uint32_t;
 
 // Submitter side: submit a task via VFS_REF (path-based delivery).
 // The remote node loads the ELF from its VFS (typically via /wki/<hostname>/... mount).
 // Returns task_id on success, 0 on failure.
-auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const void* args, uint16_t args_len) -> uint32_t;
+auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const char* const argv[], const char* const envp[],
+                             const char* cwd, ker::mod::sched::task::Task* local_task) -> uint32_t;
+
+// Rich remote placement path used by spawn/exec code that already has the final
+// argv/envp/cwd context. On success, the task is converted into a proxy.
+auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpawnSpec& spec) -> WkiRemoteSpawnResult;
+
+// Mark a proxy task as fully parked in the wait queue.
+// Used by execve-style handoff after the current task has actually blocked.
+void wki_proxy_task_blocked(ker::mod::sched::task::Task* task);
 
 // Submitter side: wait for a submitted task to complete.
 // Returns 0 on success, -1 on timeout/error.
@@ -153,7 +178,7 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
 void wki_remote_compute_check_completions();
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers
+// Internal - RX message handlers
 // -----------------------------------------------------------------------------
 
 namespace detail {

@@ -58,7 +58,7 @@ void wos_proc_exit(int status) {
     current_task->hasExited = true;
 
     // Send SIGCHLD to parent process.
-    // Threads do not send SIGCHLD — their exit is handled via futex (pthread_join).
+    // Threads do not send SIGCHLD - their exit is handled via futex (pthread_join).
     if (!current_task->isThread && current_task->parentPid != 0) {
         auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parentPid);
         if (parent != nullptr) {
@@ -80,7 +80,7 @@ void wos_proc_exit(int status) {
                 fill_rusage_for_waiter(parent, current_task);
                 parent->waitingForPid = 0;
                 current_task->waitedOn = true;
-                // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) —
+                // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) -
                 // we must explicitly reschedule it so it actually wakes up.
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
@@ -89,7 +89,7 @@ void wos_proc_exit(int status) {
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
             } else if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
                 // Parent is blocked for another reason (or WAIT_ANY_CHILD with
-                // deferredTaskSwitch still true — race check will handle RAX).
+                // deferredTaskSwitch still true - race check will handle RAX).
                 // Wake it so it can handle the signal / race check.
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
@@ -159,7 +159,7 @@ void wos_proc_exit(int status) {
     }
 
     // Reparent all children of this process to init (PID 1), so init can reap them.
-    // Threads do not own children directly — skip reparenting for thread exits.
+    // Threads do not own children directly - skip reparenting for thread exits.
     if (!current_task->isThread) {
         uint32_t count = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < count; i++) {
@@ -174,7 +174,7 @@ void wos_proc_exit(int status) {
 
     if (!current_task->isThread) {
         // For a full process exit: close FDs and free ELF buffer.
-        // Threads share both with their owner process — do not touch them.
+        // Threads share both with their owner process - do not touch them.
 
         // Close all open file descriptors
         for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {

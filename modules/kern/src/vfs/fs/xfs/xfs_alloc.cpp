@@ -38,7 +38,7 @@ constexpr uint32_t XFS_AGFL_MIN = 4;
 // Top up the AGFL for the given AG to at least XFS_AGFL_MIN blocks.
 // Called at the start of alloc_ag_by_size when the AGFL is running low,
 // BEFORE any cursor is opened on the free space trees.  This is the only
-// safe point to do this — once a cursor is open and a split is in progress,
+// safe point to do this - once a cursor is open and a split is in progress,
 // calling xfs_alloc_extent would re-enter and corrupt the tree.
 void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) {
     XfsPerAG* pag = &mount->per_ag[agno];
@@ -64,7 +64,7 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             break;
         }
         // Note: btree_delete may shrink the root; pick up updated root after
-        // the delete via the cursor's updated nlevels/levels — but the pag
+        // the delete via the cursor's updated nlevels/levels - but the pag
         // fields are updated when we write the AGF below.
 
         // Delete from bnobt
@@ -81,7 +81,7 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
 
         xfs_extlen_t ext_len = found.blockcount;
         // Steal the LAST block of the extent so the remainder keeps its original
-        // startblock — this preserves large contiguous free runs for data allocation.
+        // startblock - this preserves large contiguous free runs for data allocation.
         xfs_agblock_t stolen = found.startblock + ext_len - 1;
 
         // Re-insert the remainder (all but the stolen last block)
@@ -405,7 +405,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
 }
 
 // ============================================================================
-// AGFL — AG Free List get/put
+// AGFL - AG Free List get/put
 // ============================================================================
 //
 // The AGFL is a circular array of pre-reserved blocks stored in sector 3 of
@@ -413,8 +413,8 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
 // single blocks without touching the free space btrees, breaking the recursion:
 //   xfs_btree_delete -> (old: xfs_free_extent -> xfs_btree_insert ->
 //                        btree_alloc_new_block -> xfs_alloc_extent -> recurse)
-//   xfs_btree_delete -> (new: xfs_alloc_put_freelist — no btree ops)
-//   btree_alloc_new_block -> (new: xfs_alloc_get_freelist — no btree ops)
+//   xfs_btree_delete -> (new: xfs_alloc_put_freelist - no btree ops)
+//   btree_alloc_new_block -> (new: xfs_alloc_get_freelist - no btree ops)
 
 namespace {
 

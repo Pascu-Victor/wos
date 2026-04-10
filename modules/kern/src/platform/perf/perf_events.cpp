@@ -6,13 +6,13 @@
 
 namespace ker::mod::perf {
 
-// Recording is OFF by default — enabled explicitly via perf record / /proc/kperfctl.
+// Recording is OFF by default - enabled explicitly via perf record / /proc/kperfctl.
 // Stats counters (ctx_switches etc.) always increment regardless of this flag so
 // /proc/kcpustat is always live and has zero overhead impact on the hot path.
 static std::atomic<bool> g_enabled{false};
 
-// Static ring buffers — no kernel allocator needed.
-// Total size: 16 × (sizeof(PerfCpuRing)) ≈ 16 × 97 KiB ≈ 1.5 MiB in BSS.
+// Static ring buffers - no kernel allocator needed.
+// Total size: 16 * (sizeof(PerfCpuRing)) ~= 16 * 97 KiB ~= 1.5 MiB in BSS.
 static PerfCpuRing g_rings[PERF_MAX_CPUS];
 
 // Sub-sampler: emit one SAMPLE per 10 timer ticks (~100 Hz at 1 kHz tick rate)
@@ -34,7 +34,7 @@ void disable() { g_enabled.store(false, std::memory_order_release); }
 
 void reset_rings() {
     // IRQ-safe reset of all ring head/drain pointers.
-    // Stats counters are NOT cleared — they accumulate across sessions for /proc/kcpustat.
+    // Stats counters are NOT cleared - they accumulate across sessions for /proc/kcpustat.
     for (size_t i = 0; i < PERF_MAX_CPUS; ++i) {
         auto& ring = g_rings[i];
         auto saved = ring.lock.lock_irqsave();
@@ -169,7 +169,7 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
 }
 
 // ---------------------------------------------------------------------------
-// drain_events — called from procfs read (process context, may sleep)
+// drain_events - called from procfs read (process context, may sleep)
 // ---------------------------------------------------------------------------
 size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter) {
     size_t total = 0;
@@ -188,7 +188,7 @@ size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter) {
 }
 
 // ---------------------------------------------------------------------------
-// get_cpu_stats — non-destructive snapshot
+// get_cpu_stats - non-destructive snapshot
 // ---------------------------------------------------------------------------
 PerfCpuStats get_cpu_stats(uint32_t cpu) {
     if (cpu >= PERF_MAX_CPUS) return {};

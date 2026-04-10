@@ -126,7 +126,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
                     if (urc == 0) {
                         if (rec.freecount == 0) {
-                            // No more free inodes in this chunk — remove from finobt
+                            // No more free inodes in this chunk - remove from finobt
                             xfs_btree_delete(&fi_cur, tp);
                         } else {
                             xfs_btree_update(&fi_cur, tp, rec);
@@ -249,7 +249,7 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         int frc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
 
         if (was_fully_allocated || frc != 0) {
-            // Chunk wasn't in finobt — insert it
+            // Chunk wasn't in finobt - insert it
             xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, nullptr, nullptr);
         } else {
             // Update existing finobt record

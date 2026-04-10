@@ -1,3 +1,5 @@
 *-build*
-target1
+sysroot
+host
 *-headers
+*-bootstrap

@@ -6,12 +6,10 @@
 namespace ker::mod::sched {
 
 // ============================================================================
-// RunHeap — array-backed binary min-heap keyed on Task::vdeadline
+// RunHeap - array-backed binary min-heap keyed on Task::vdeadline
 // ============================================================================
 
-void RunHeap::init() {
-    size = 0;
-}
+void RunHeap::init() { size = 0; }
 
 void RunHeap::swapEntries(uint32_t i, uint32_t j) {
     task::Task* tmp = entries[i];
@@ -59,10 +57,10 @@ bool RunHeap::insert(task::Task* t) {
     if (size >= PER_CPU_HEAP_CAP) {
         return false;
     }
-    // DIAGNOSTIC: Detect double-insertion — task already in some heap
+    // DIAGNOSTIC: Detect double-insertion - task already in some heap
     if (t->heapIndex >= 0) {
-        dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heapIndex=%d (size=%d, cpu=%d)! Refusing insert.",
-                 t->pid, t->heapIndex, size, (int)t->cpu);
+        dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heapIndex=%d (size=%d, cpu=%d)! Refusing insert.", t->pid, t->heapIndex, size,
+                 (int)t->cpu);
         // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
             if (entries[i] == t) {
@@ -141,7 +139,7 @@ task::Task* RunHeap::pickBestEligible(int64_t avgVruntime) {
     // Strategy: BFS-like bounded scan from the root. Since the heap root
     // has the smallest vdeadline, if it's eligible we're done. Otherwise
     // we check its children, etc. We cap the scan to avoid O(n) in
-    // pathological cases — if nothing is eligible in the first ~32 nodes,
+    // pathological cases - if nothing is eligible in the first ~32 nodes,
     // just return the root anyway (prevents starvation).
 
     task::Task* best = nullptr;
@@ -161,16 +159,16 @@ task::Task* RunHeap::pickBestEligible(int64_t avgVruntime) {
         int64_t lag = avgVruntime - t->vruntime;
 
         if (lag >= 0) {
-            // Eligible — check if it has the best (smallest) vdeadline
+            // Eligible - check if it has the best (smallest) vdeadline
             if (best == nullptr || t->vdeadline < bestDeadline) {
                 best = t;
                 bestDeadline = t->vdeadline;
             }
-            // Don't explore children of eligible nodes with larger deadlines —
+            // Don't explore children of eligible nodes with larger deadlines -
             // children have >= vdeadline so they can't beat this one.
             // But we still need to explore siblings.
         } else {
-            // Not eligible — its children might be (they can have smaller vruntime
+            // Not eligible - its children might be (they can have smaller vruntime
             // if they recently woke up, though they'd have larger vdeadline).
             // Only explore if we haven't found a candidate yet and haven't
             // exceeded our scan budget.
@@ -193,7 +191,7 @@ task::Task* RunHeap::pickBestEligible(int64_t avgVruntime) {
 }
 
 // ============================================================================
-// IntrusiveTaskList — singly-linked, zero-allocation
+// IntrusiveTaskList - singly-linked, zero-allocation
 // ============================================================================
 
 void IntrusiveTaskList::init() {

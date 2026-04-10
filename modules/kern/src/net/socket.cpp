@@ -74,7 +74,7 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
     // Assign protocol-specific ops
     // TODO: Extract me into enums
     size_t rcvbuf_size = UDP_RCVBUF_SIZE;  // default for unknown types
-    if (base_type == 1) {  // SOCK_STREAM
+    if (base_type == 1) {                  // SOCK_STREAM
         sock->proto_ops = proto::get_tcp_proto_ops();
         rcvbuf_size = TCP_RCVBUF_SIZE;
         // Allocate TCP control block
@@ -136,7 +136,7 @@ auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int {
     new_size = std::max(new_size, SOCKET_RCVBUF_MIN);
     new_size = std::min(new_size, SOCKET_RCVBUF_MAX);
 
-    // Can only resize when the buffer is drained — the SPSC ring has no
+    // Can only resize when the buffer is drained - the SPSC ring has no
     // synchronised resize path; resizing with live data would corrupt reads.
     if (sock->rcvbuf.available() > 0) {
         return -1;

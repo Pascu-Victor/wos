@@ -10,7 +10,7 @@ namespace ker::net::wki {
 // Called from main.cpp during boot after NIC drivers are probed.
 void wki_eth_transport_init(net::NetDevice* netdev);
 
-// RX entry point — called from ethernet.cpp's eth_rx() dispatch
+// RX entry point - called from ethernet.cpp's eth_rx() dispatch
 void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
 
 // Neighbor MAC table management (used by peer.cpp during HELLO handshake)

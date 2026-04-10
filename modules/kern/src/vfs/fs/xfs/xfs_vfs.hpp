@@ -1,14 +1,14 @@
 #pragma once
 
-// XFS VFS Integration — connects the XFS native implementation to the
+// XFS VFS Integration - connects the XFS native implementation to the
 // WOS Virtual Filesystem layer via FileOperations function pointers.
 //
 // Provides:
-//   - xfs_vfs_init_device()  — mount XFS on a block device, return context
-//   - xfs_open_path()        — open a file/directory by path
-//   - xfs_stat()             — stat by path
-//   - xfs_fstat()            — fstat on open file
-//   - get_xfs_fops()         — return the XFS FileOperations vtable
+//   - xfs_vfs_init_device()  - mount XFS on a block device, return context
+//   - xfs_open_path()        - open a file/directory by path
+//   - xfs_stat()             - stat by path
+//   - xfs_fstat()            - fstat on open file
+//   - get_xfs_fops()         - return the XFS FileOperations vtable
 
 #include <dev/block_device.hpp>
 #include <vfs/file.hpp>

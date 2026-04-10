@@ -81,7 +81,7 @@ struct TcpCB {
     bool ws_enabled = false;  // true once both sides have negotiated scaling
 
     // RTT estimation.
-    uint64_t rto_ms = 200;   // retransmit timeout (ms) — starts at 200 ms floor
+    uint64_t rto_ms = 200;   // retransmit timeout (ms) - starts at 200 ms floor
     uint64_t srtt_ms = 0;    // smoothed RTT
     uint64_t rttvar_ms = 0;  // RTT variance
 

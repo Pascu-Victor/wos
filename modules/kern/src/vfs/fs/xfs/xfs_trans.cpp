@@ -52,7 +52,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
         BufHead* existing = tp->items[i].buf.bp;
 
         if (existing == bp) {
-            // Same buffer pointer — extend the logged region.
+            // Same buffer pointer - extend the logged region.
             uint32_t old_end = tp->items[i].buf.offset + tp->items[i].buf.len;
             uint32_t new_end = offset + len;
             uint32_t start = (offset < tp->items[i].buf.offset) ? offset : tp->items[i].buf.offset;
@@ -64,7 +64,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
         }
 
         // Different buffer for the same disk block (e.g. two bread_multi
-        // calls for the same AG header block — one modifying the AGI, the
+        // calls for the same AG header block - one modifying the AGI, the
         // other the AGF).  Merge the dirty region from the new buffer into
         // the existing one so that a single write carries all changes.
         if (existing->bdev == bp->bdev && existing->block_no == bp->block_no && existing->size == bp->size) {
@@ -76,7 +76,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
             tp->items[i].buf.offset = start;
             tp->items[i].buf.len = end - start;
             tp->items[i].buf.dirty = true;
-            // No refcount bump — the caller will release their own reference
+            // No refcount bump - the caller will release their own reference
             // to bp normally (via brelse or cursor destructor).
             return;
         }
@@ -143,7 +143,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
         }
     }
 
-    // Phase 2: Write-ahead log — serialize all buffer modifications to the
+    // Phase 2: Write-ahead log - serialize all buffer modifications to the
     // journal before flushing any data.  This ensures recoverability.
     int log_rc = xfs_log_write(tp->mount, tp->items.data(), tp->item_count);
     if (log_rc != 0 && log_rc != -EINVAL) {

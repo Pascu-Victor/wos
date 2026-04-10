@@ -118,19 +118,19 @@ auto dir2_read_block(XfsInode* dp, xfs_dir2_db_t db, BufHead** bhp) -> int {
     int rc = xfs_bmap_lookup(dp, file_block, &bmap);
     if (rc != 0) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_read_block: bmap_lookup failed ino=%lu db=%u rc=%d\n", (unsigned long)dp->ino, db, rc);
+        mod::dbg::log("[xfs] dir2_read_block: bmap_lookup failed ino=%lu db=%u rc=%d", (unsigned long)dp->ino, db, rc);
 #endif
         return rc;
     }
     if (bmap.is_hole) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_read_block: HOLE ino=%lu db=%u fmt=%d ext_count=%u\n", (unsigned long)dp->ino, db, dp->data_fork.format,
+        mod::dbg::log("[xfs] dir2_read_block: HOLE ino=%lu db=%u fmt=%d ext_count=%u", (unsigned long)dp->ino, db, dp->data_fork.format,
                       dp->data_fork.extents.count);
 #endif
         return -EINVAL;
     }
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir2_read_block: ino=%lu db=%u blk=%lu\n", (unsigned long)dp->ino, db, (unsigned long)bmap.startblock);
+    mod::dbg::log("[xfs] dir2_read_block: ino=%lu db=%u blk=%lu", (unsigned long)dp->ino, db, (unsigned long)bmap.startblock);
 #endif
 
     uint32_t fbs = 1U << ctx->dir_blk_log;  // fs blocks per dir block
@@ -421,7 +421,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     int rc = dir2_read_block(dp, 0, &bh);
     if (rc != 0) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_block_iterate: read_block failed ino=%lu rc=%d\n", (unsigned long)dp->ino, rc);
+        mod::dbg::log("[xfs] dir2_block_iterate: read_block failed ino=%lu rc=%d", (unsigned long)dp->ino, rc);
 #endif
         return rc;
     }
@@ -435,7 +435,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 
 #ifdef XFS_DEBUG
     const auto* dbg_hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
-    mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u\n", (unsigned long)dp->ino, dbg_hdr->hdr.magic.to_cpu(),
+    mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u", (unsigned long)dp->ino, dbg_hdr->hdr.magic.to_cpu(),
                   leaf_count);
 #endif
     // Data entries start after the v3 header
@@ -476,7 +476,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 }
 
 // ============================================================================
-// Leaf/Node directory — data block scanning
+// Leaf/Node directory - data block scanning
 // ============================================================================
 
 // Iterate over a single data block calling fn for each entry
@@ -542,7 +542,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
     XfsBmapResult bmap{};
     int rc = xfs_bmap_lookup(dp, leaf_fsbno, &bmap);
     if (rc != 0 || bmap.is_hole) {
-        // No leaf block — might be single-block or corrupt
+        // No leaf block - might be single-block or corrupt
         // Fall back to linear scan of data blocks
         goto linear_scan;
     }
@@ -562,7 +562,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
         const uint8_t* leaf_data = leaf_bh->data;
 
-        // Check magic — leaf block starts with xfs_da3_blkinfo
+        // Check magic - leaf block starts with xfs_da3_blkinfo
         const auto* info = reinterpret_cast<const XfsDa3Blkinfo*>(leaf_data);
         uint16_t leaf_magic = info->hdr.magic.to_cpu();
 
@@ -743,7 +743,7 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
         return -ENOTDIR;
     }
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s\n", (unsigned long)dp->ino, dp->data_fork.format,
+    mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s", (unsigned long)dp->ino, dp->data_fork.format,
                   (unsigned long)dp->size, (int)namelen, name);
 #endif
     switch (dp->data_fork.format) {
@@ -791,7 +791,7 @@ auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int {
 }
 
 // ============================================================================
-// Directory add-name — add a new entry to a directory
+// Directory add-name - add a new entry to a directory
 // ============================================================================
 
 namespace {
@@ -824,7 +824,7 @@ auto dir2_sf_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
     // changes significantly.  For simplicity, just handle the common case
     // where the format stays the same.
     if (need_i8 && old_hdr->i8count == 0) {
-        // Would need format conversion — fall through to block format
+        // Would need format conversion - fall through to block format
         return -E2BIG;
     }
 
@@ -856,7 +856,7 @@ auto dir2_sf_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 
     // namelen
     entry_ptr[0] = static_cast<uint8_t>(namelen);
-    // offset — use a simple sequential offset (count * XFS_DIR2_DATA_ALIGN works as a tag)
+    // offset - use a simple sequential offset (count * XFS_DIR2_DATA_ALIGN works as a tag)
     uint16_t off_val = static_cast<uint16_t>(new_hdr->count);
     entry_ptr[1] = static_cast<uint8_t>(off_val >> 8);
     entry_ptr[2] = static_cast<uint8_t>(off_val & 0xFF);
@@ -1113,7 +1113,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     // Write the block to disk IMMEDIATELY.  dir2_block_addname (which runs
     // in the same transaction, before commit) will re-read this block from
     // disk.  Since multi-block buffers aren't cached, logging the buffer in
-    // the transaction is insufficient — we must ensure the data is on disk
+    // the transaction is insufficient - we must ensure the data is on disk
     // before the addname read.
     bwrite(bh);
     brelse(bh);
@@ -1138,7 +1138,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     dp->dirty = true;
     xfs_trans_log_inode(tp, dp);
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d\n", (unsigned long)dp->ino,
+    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", (unsigned long)dp->ino,
                   (unsigned long)disk_block, total_entries);
 #endif
     return 0;
@@ -1206,7 +1206,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
 
     if (!found_free) {
         brelse(bh);
-        return -ENOSPC;  // block full — would need conversion to leaf format
+        return -ENOSPC;  // block full - would need conversion to leaf format
     }
 
     // Write the new data entry at found_offset
@@ -1264,7 +1264,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     uint32_t stale_count = btp->stale.to_cpu();
 
     if (stale_count > 0) {
-        // Find a stale entry to reuse — find one nearest the correct sorted position
+        // Find a stale entry to reuse - find one nearest the correct sorted position
         int insert_pos = 0;
         for (int i = 0; i < static_cast<int>(leaf_count); i++) {
             if (blp[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && blp[i].hashval.to_cpu() <= hash) {
@@ -1303,7 +1303,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
             btp->stale = __be32::from_cpu(stale_count - 1);
         }
     } else {
-        // No stale entries — grow the leaf area by shifting it down one slot.
+        // No stale entries - grow the leaf area by shifting it down one slot.
         // This consumes sizeof(XfsDir2LeafEntry) bytes from the free space.
         size_t new_leaf_bytes = (static_cast<size_t>(leaf_count) + 1) * sizeof(XfsDir2LeafEntry);
         size_t new_leaf_start = blksize - sizeof(XfsDir2BlockTail) - new_leaf_bytes;
@@ -1393,7 +1393,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
 }
 
 // ============================================================================
-// Directory remove-name — remove an entry from a directory
+// Directory remove-name - remove an entry from a directory
 // ============================================================================
 
 // Remove a name from a shortform directory (inline in inode data fork).
@@ -1741,14 +1741,14 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
         case XFS_DINODE_FMT_LOCAL: {
             rc = dir2_sf_addname(dp, name, namelen, ino, ftype, tp);
             if (rc == -E2BIG) {
-// Shortform is full — convert to block format, then add there.
+// Shortform is full - convert to block format, then add there.
 #ifdef XFS_DEBUG
-                mod::dbg::log("[xfs] dir_addname: shortform dir full, converting to block format\n");
+                mod::dbg::log("[xfs] dir_addname: shortform dir full, converting to block format");
 #endif
                 rc = dir2_sf_to_block(dp, tp);
                 if (rc != 0) {
 #ifdef XFS_DEBUG
-                    mod::dbg::log("[xfs] dir_addname: sf->block conversion failed: %d\n", rc);
+                    mod::dbg::log("[xfs] dir_addname: sf->block conversion failed: %d", rc);
 #endif
                     return rc;
                 }
@@ -1764,7 +1764,7 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
                 return dir2_block_addname(dp, name, namelen, ino, ftype, tp);
             }
             // Leaf/node format add not yet implemented
-            mod::dbg::log("[xfs] dir_addname: leaf/node dir add not yet supported\n");
+            mod::dbg::log("[xfs] dir_addname: leaf/node dir add not yet supported");
             return -ENOSPC;
         }
 
@@ -1793,7 +1793,7 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
                 return dir2_block_removename(dp, name, namelen, tp);
             }
             // Leaf/node format remove not yet implemented
-            mod::dbg::log("[xfs] dir_removename: leaf/node dir remove not yet supported\n");
+            mod::dbg::log("[xfs] dir_removename: leaf/node dir remove not yet supported");
             return -ENOSYS;
         }
 

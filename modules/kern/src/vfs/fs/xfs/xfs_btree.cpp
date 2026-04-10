@@ -1,4 +1,4 @@
-// XFS B+Tree infrastructure — generic traversal and lookup engine.
+// XFS B+Tree infrastructure - generic traversal and lookup engine.
 //
 // Implements cursor-based B+tree operations for all XFS btree types.
 // The algorithm follows the Linux XFS implementation in
@@ -175,7 +175,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
     for (int level = nlevels - 1; level >= 0; level--) {
         int nr = cur->numrecs(level);
         if (nr == 0) {
-            // Empty block — tree is empty or corrupted
+            // Empty block - tree is empty or corrupted
             cur->levels[level].ptr = 0;
             return -ENOENT;
         }
@@ -310,7 +310,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
 }
 
 // ============================================================================
-// Increment — move to next record
+// Increment - move to next record
 // ============================================================================
 
 template <typename Traits>
@@ -351,7 +351,7 @@ auto xfs_btree_increment(XfsBtreeCursor<Traits>* cur) -> int {
 }
 
 // ============================================================================
-// Decrement — move to previous record
+// Decrement - move to previous record
 // ============================================================================
 
 template <typename Traits>
@@ -459,7 +459,7 @@ void XfsBtreeCursor<Traits>::set_numrecs(int level, int nrecs) {
 }
 
 // ============================================================================
-// B+tree update — overwrite record at current cursor position
+// B+tree update - overwrite record at current cursor position
 // ============================================================================
 
 template <typename Traits>
@@ -500,7 +500,7 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
 }
 
 // ============================================================================
-// B+tree insert — add a new record in sorted order
+// B+tree insert - add a new record in sorted order
 // ============================================================================
 
 namespace {
@@ -583,9 +583,9 @@ auto btree_alloc_new_block(XfsMountContext* mount, XfsTransaction* tp, xfs_agnum
     }
 
     if (agbno == NULLAGBLOCK || agbno >= mount->ag_blocks) {
-        mod::dbg::log("[xfs btree] btree_alloc_new_block: bad agbno=0x%x from AGFL (ag_blocks=%u agno=%u) — dropping\n", agbno,
+        mod::dbg::log("[xfs btree] btree_alloc_new_block: bad agbno=0x%x from AGFL (ag_blocks=%u agno=%u) - dropping\n", agbno,
                       mount->ag_blocks, agno);
-        // Do not put the bad block back — it would corrupt the free space trees.
+        // Do not put the bad block back - it would corrupt the free space trees.
         *out_bh = nullptr;
         if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
             return NULLAGBLOCK;
@@ -916,7 +916,7 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         return 0;
     }
 
-    // Parent is full — split it
+    // Parent is full - split it
     return btree_split_internal<Traits>(cur, tp, lev, insert_pos, new_key, new_ptr, root_block, nlevels, new_root, new_nlevels);
 }
 
@@ -964,13 +964,13 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
 
     if (new_nr == 0) {
         if (lev + 1 >= cur->nlevels) {
-            // This IS the root level — don't free it. Leave an empty root in place.
+            // This IS the root level - don't free it. Leave an empty root in place.
             // Freeing the root block would corrupt pag->agf_cnt_root / agf_bno_root.
             btree_update_crc<Traits>(parent_bp);
             xfs_trans_log_buf_full(tp, parent_bp);
             return 0;
         }
-        // Non-root internal node is empty — return it to the AGFL and recurse up.
+        // Non-root internal node is empty - return it to the AGFL and recurse up.
         // Use xfs_alloc_put_freelist (not xfs_free_extent) for the same
         // reason as the leaf case: avoids recursion through btree insert.
         uint64_t abs_block = parent_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
@@ -1025,10 +1025,10 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     int rc = xfs_btree_lookup(cur, root_block, nlevels, irec, XfsBtreeLookup::GE);
     int insert_ptr = 0;
     if (rc == -ENOENT) {
-        // All records are less than irec — insert at end
+        // All records are less than irec - insert at end
         insert_ptr = cur->numrecs(0) + 1;
     } else if (rc == 0) {
-        // Cursor is at GE position — insert before it
+        // Cursor is at GE position - insert before it
         insert_ptr = cur->levels[0].ptr;
     } else {
         return rc;
@@ -1042,7 +1042,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     int max_recs = btree_max_recs_leaf<Traits>(cur->mount->block_size);
 
     if (nr < max_recs) {
-        // Room in current leaf — shift records right and insert
+        // Room in current leaf - shift records right and insert
         uint8_t* base = cur->levels[0].bp->data + Traits::HDR_LEN;
         if (insert_ptr <= nr) {
             // Shift records from insert_ptr..nr to insert_ptr+1..nr+1
@@ -1075,7 +1075,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         return 0;
     }
 
-    // Leaf is full — split it.
+    // Leaf is full - split it.
     BufHead* left_bp = cur->levels[0].bp;
     int mid = nr / 2;  // left keeps [1..mid], right gets [mid+1..nr]
 
@@ -1180,7 +1180,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
 }
 
 // ============================================================================
-// B+tree delete — remove record at current cursor position
+// B+tree delete - remove record at current cursor position
 // ============================================================================
 
 template <typename Traits>
@@ -1225,7 +1225,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
         BufHead* leaf_bp = cur->levels[0].bp;
 
         if (cur->nlevels == 1) {
-            // Root leaf — don't free it, just leave it empty.
+            // Root leaf - don't free it, just leave it empty.
             // Freeing block 2 (cntbt root) or block 1 (bnobt root) would
             // catastrophically corrupt the free space trees.
             btree_update_crc<Traits>(leaf_bp);
@@ -1233,7 +1233,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
             return 0;
         }
 
-        // Non-root leaf — unlink it from the sibling chain and free it.
+        // Non-root leaf - unlink it from the sibling chain and free it.
         uint64_t left_sib = cur->left_sibling(0);
         uint64_t right_sib = cur->right_sibling(0);
 

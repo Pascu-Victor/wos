@@ -30,7 +30,7 @@ inline auto cpu_to_be64(uint64_t cpu) -> uint64_t { return __builtin_bswap64(cpu
 // Type-safe big-endian wrapper types for on-disk format definitions.
 //
 // These mirror the Linux __be16 / __be32 / __be64 types used in XFS on-disk
-// structures.  The wrapper types make endian conversions explicit — you must
+// structures.  The wrapper types make endian conversions explicit - you must
 // call .to_cpu() or the static ::from_cpu() to convert, which prevents
 // accidentally interpreting raw big-endian bytes as native values.
 //

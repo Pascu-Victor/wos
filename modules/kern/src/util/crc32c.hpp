@@ -1,6 +1,6 @@
 #pragma once
 
-// CRC32C (Castagnoli) — used by XFS v5 for metadata integrity verification.
+// CRC32C (Castagnoli) - used by XFS v5 for metadata integrity verification.
 // Hardware-accelerated via SSE4.2 crc32 instruction on x86_64, with a
 // software lookup-table fallback.
 //

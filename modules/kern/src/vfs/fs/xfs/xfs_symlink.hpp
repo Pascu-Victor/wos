@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Symlink support — read symlink targets.
+// XFS Symlink support - read symlink targets.
 //
 // Short symlinks are stored inline in the inode data fork (LOCAL format).
 // Long symlinks are stored in data blocks (EXTENTS/BTREE format).

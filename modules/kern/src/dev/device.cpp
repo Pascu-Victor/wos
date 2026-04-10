@@ -24,7 +24,7 @@ auto dev_register(Device* device) -> int {
 
     devices[device_count] = device;
     device_count++;
-
+#ifdef DEV_DEBUG
     mod::io::serial::write("dev_register: registered ");
     mod::io::serial::write(device->name);
     mod::io::serial::write(" (");
@@ -32,7 +32,7 @@ auto dev_register(Device* device) -> int {
     mod::io::serial::write(",");
     mod::io::serial::writeHex(device->minor);
     mod::io::serial::write(")\n");
-
+#endif
     return 0;
 }
 

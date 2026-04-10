@@ -31,7 +31,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// HELLO broadcast — discover neighbors on all transports
+// HELLO broadcast - discover neighbors on all transports
 // -----------------------------------------------------------------------------
 
 void wki_peer_send_hello_broadcast() {
@@ -129,7 +129,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
             return;  // ignore our own HELLO
         }
 
-        // Node ID collision — different node, same ID.
+        // Node ID collision - different node, same ID.
         // The node with the lower MAC address keeps its ID; the other regenerates.
         int cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
         if (cmp < 0) {
@@ -144,7 +144,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
             // Re-broadcast HELLO with new ID
             wki_peer_send_hello_broadcast();
         }
-        // If we have lower MAC (cmp > 0), we keep our ID — remote will regenerate
+        // If we have lower MAC (cmp > 0), we keep our ID - remote will regenerate
         return;
     }
 
@@ -205,9 +205,9 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
 
     // Select RDMA transport: prefer ivshmem (native doorbell), fall back to RoCE
     if (transport->rdma_capable) {
-        peer->rdma_transport = transport;  // ivshmem — preferred
+        peer->rdma_transport = transport;  // ivshmem - preferred
     } else {
-        peer->rdma_transport = wki_roce_transport_get();  // RoCE over Ethernet — fallback
+        peer->rdma_transport = wki_roce_transport_get();  // RoCE over Ethernet - fallback
     }
 
     // Negotiate heartbeat interval (use smaller of both proposals)
@@ -262,7 +262,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnected, reconciling", peer_node, peer->hostname);
         newly_connected = true;
 
-        // Resume any suspended block device proxies — re-attach channels
+        // Resume any suspended block device proxies - re-attach channels
         // so that blocked I/O can proceed.
         wki_dev_proxy_resume_for_peer(peer_node);
     }
@@ -393,7 +393,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Heartbeat — send and receive
+// Heartbeat - send and receive
 // -----------------------------------------------------------------------------
 
 void wki_peer_send_heartbeats() {
@@ -536,7 +536,7 @@ void wki_peer_fence(WkiPeer* peer) {
     // Detach all device server bindings for this peer
     wki_dev_server_detach_all_for_peer(fenced_id);
 
-    // Suspend device proxy attachments — block device stays registered but
+    // Suspend device proxy attachments - block device stays registered but
     // I/O operations will block until the peer reconnects or a 30s timeout
     // expires, at which point we do the hard teardown.
     wki_dev_proxy_suspend_for_peer(fenced_id);
@@ -611,7 +611,7 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Periodic timer tick — heartbeat checks and HELLO retries
+// Periodic timer tick - heartbeat checks and HELLO retries
 // -----------------------------------------------------------------------------
 
 // Track when we last sent heartbeats / HELLOs
@@ -743,7 +743,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
     wki_event_timer_tick(now_us);
 
     // Check for fenced block device proxies that have timed out waiting
-    // for reconnection — perform hard teardown after WKI_DEV_PROXY_FENCE_WAIT_US
+    // for reconnection - perform hard teardown after WKI_DEV_PROXY_FENCE_WAIT_US
     wki_dev_proxy_fence_timeout_tick(now_us);
 
     // Send periodic load reports to peers
@@ -816,7 +816,7 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 }
 
 // -----------------------------------------------------------------------------
-// WKI timer kernel thread — runs wki_peer_timer_tick() with deadline-driven sleeps
+// WKI timer kernel thread - runs wki_peer_timer_tick() with deadline-driven sleeps
 // -----------------------------------------------------------------------------
 
 constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 50000;

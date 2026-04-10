@@ -22,13 +22,13 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 // Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
 
-// Bulk RDMA transfer buffer — used for large sequential reads to reduce round-trips.
+// Bulk RDMA transfer buffer - used for large sequential reads to reduce round-trips.
 // Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
 // larger buffer instead of looping in 64 KB chunks.
 constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
 
 // -----------------------------------------------------------------------------
-// VfsExport (server side) — explicitly registered export paths
+// VfsExport (server side) - explicitly registered export paths
 // -----------------------------------------------------------------------------
 
 struct VfsExport {
@@ -39,7 +39,7 @@ struct VfsExport {
 };
 
 // -----------------------------------------------------------------------------
-// RemoteVfsFd (server side) — files opened on behalf of remote consumers
+// RemoteVfsFd (server side) - files opened on behalf of remote consumers
 // -----------------------------------------------------------------------------
 
 struct RemoteVfsFd {
@@ -52,7 +52,7 @@ struct RemoteVfsFd {
 };
 
 // -----------------------------------------------------------------------------
-// ProxyVfsState (consumer side) — per-mount proxy state
+// ProxyVfsState (consumer side) - per-mount proxy state
 // -----------------------------------------------------------------------------
 
 struct ProxyVfsState {
@@ -77,7 +77,7 @@ struct ProxyVfsState {
 
     char local_mount_path[VFS_EXPORT_PATH_LEN] = {};
 
-    // RDMA-backed I/O — populated at mount time when peer has RDMA transport.
+    // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
     // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).
     // For writes, consumer rdma_writes into server's pre-registered receive region.
     bool rdma_capable = false;
@@ -86,7 +86,7 @@ struct ProxyVfsState {
     uint8_t* rdma_bounce_buf = nullptr;   // 64 KB bounce buffer for reads and write staging
     uint32_t rdma_server_write_rkey = 0;  // server's receive region rkey (consumer writes here for writes)
 
-    // Bulk RDMA I/O — larger registered buffer for sequential reads > 64 KB.
+    // Bulk RDMA I/O - larger registered buffer for sequential reads > 64 KB.
     // Reduces round-trips from N (64 KB chunks) to 1 (up to 2 MB).
     bool bulk_rdma_capable = false;
     uint32_t rdma_bulk_rkey = 0;       // our bulk buffer's rkey (server writes large file data here)
@@ -116,18 +116,23 @@ struct WriteBehindBuffer {
 };
 
 // -----------------------------------------------------------------------------
-// RemoteFileContext (consumer side) — stored in File::private_data
+// RemoteFileContext (consumer side) - stored in File::private_data
 // -----------------------------------------------------------------------------
 
 struct RemoteFileContext {
     ProxyVfsState* proxy = nullptr;
     int32_t remote_fd = -1;
 
+    // When browsing a remote host's /wki directory through its root export,
+    // suppress entries that would recurse back into that same exported root.
+    bool hide_recursive_wki_entries = false;
+    char recursive_wki_hostname[WKI_HOSTNAME_MAX] = {};
+
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;
     WriteBehindBuffer* write_buf = nullptr;
 
-    // Bulk prefetch cache state — tracks which region of the shared
+    // Bulk prefetch cache state - tracks which region of the shared
     // proxy->rdma_bulk_buf belongs to this file.  Valid only when
     // proxy->bulk_owner_fd == remote_fd.
     int64_t bulk_cached_offset = -1;
@@ -183,7 +188,7 @@ auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
 // D9: Auto-discover and advertise exportable local mount points as VFS resources
 void wki_remote_vfs_auto_discover();
 
-// Fencing cleanup — remove all state for a fenced peer
+// Fencing cleanup - remove all state for a fenced peer
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);
 
 // D10: Garbage-collect server-side remote FDs that have been idle for too long
@@ -191,7 +196,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);
 void wki_remote_vfs_gc_stale_fds();
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp / dev_server.cpp)
+// Internal - RX message handlers (called from wki.cpp / dev_server.cpp)
 // -----------------------------------------------------------------------------
 
 namespace detail {

@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Inode Allocation — allocate and free inodes from the AG inode B+trees.
+// XFS Inode Allocation - allocate and free inodes from the AG inode B+trees.
 //
 // Reference: reference/xfs/libxfs/xfs_ialloc.h, reference/xfs/libxfs/xfs_ialloc.c
 

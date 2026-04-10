@@ -28,7 +28,7 @@ void init() {
         return;
     }
 
-    // HPET must be first — it is the calibration reference for TSC.
+    // HPET must be first - it is the calibration reference for TSC.
     hpet::init();
 
     // Calibrate the invariant TSC against the now-ready HPET.

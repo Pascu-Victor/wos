@@ -68,7 +68,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (ret < 0) {
                 return static_cast<int64_t>(ret);
             }
-            *new_offset = ret;
+            if (new_offset != nullptr) {
+                *new_offset = ret;
+            }
             return 0;
         }
         case ops::isatty: {
@@ -303,6 +305,21 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* oldpath = reinterpret_cast<const char*>(a1);
             auto* newpath = reinterpret_cast<const char*>(a2);
             return static_cast<int64_t>(ker::vfs::vfs_link(oldpath, newpath));
+        }
+        case ops::wki_rule_add: {
+            auto* prefix = reinterpret_cast<const char*>(a1);
+            auto route = static_cast<uint32_t>(a2);
+            return static_cast<int64_t>(ker::vfs::vfs_wki_rule_add(prefix, route));
+        }
+        case ops::wki_rule_get: {
+            auto index = static_cast<uint32_t>(a1);
+            auto* prefix_buf = reinterpret_cast<char*>(a2);
+            auto prefix_buf_size = static_cast<size_t>(a3);
+            auto* route_out = reinterpret_cast<uint32_t*>(a4);
+            return static_cast<int64_t>(ker::vfs::vfs_wki_rule_get(index, prefix_buf, prefix_buf_size, route_out));
+        }
+        case ops::wki_rule_clear: {
+            return static_cast<int64_t>(ker::vfs::vfs_wki_rule_clear());
         }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");

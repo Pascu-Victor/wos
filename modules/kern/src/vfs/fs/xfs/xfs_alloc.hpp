@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Free Space Allocation — allocate and free blocks from AG free space
+// XFS Free Space Allocation - allocate and free blocks from AG free space
 // B+trees (bnobt/cntbt).
 //
 // Reference: reference/xfs/libxfs/xfs_alloc.h, reference/xfs/libxfs/xfs_alloc.c
@@ -11,7 +11,7 @@
 
 namespace ker::vfs::xfs {
 
-// Allocation request — specifies what to allocate
+// Allocation request - specifies what to allocate
 struct XfsAllocReq {
     xfs_agnumber_t agno;     // preferred AG (or NULLAGNUMBER for any)
     xfs_agblock_t agbno;     // preferred starting block (hint)

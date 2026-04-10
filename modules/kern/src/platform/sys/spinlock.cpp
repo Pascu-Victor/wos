@@ -77,7 +77,7 @@ void print_stack(void** frames, int depth, const char* label) {
 }  // namespace
 
 void Spinlock::lock() {
-    // Take a ticket — this is our position in the FIFO queue.
+    // Take a ticket - this is our position in the FIFO queue.
     uint32_t my_ticket = next_ticket.fetch_add(1, std::memory_order_relaxed);
 
 #if SPINLOCK_DEBUG
@@ -121,9 +121,7 @@ void Spinlock::lock() {
 auto Spinlock::try_lock() -> bool {
     // Only succeed if no one else is waiting or holding the lock.
     uint32_t current = now_serving.load(std::memory_order_relaxed);
-    if (!next_ticket.compare_exchange_strong(current, current + 1,
-                                             std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
+    if (!next_ticket.compare_exchange_strong(current, current + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
         return false;
     }
 #if SPINLOCK_DEBUG

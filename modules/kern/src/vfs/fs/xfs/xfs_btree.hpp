@@ -1,12 +1,12 @@
 #pragma once
 
-// XFS B+Tree infrastructure — generic traversal and lookup engine.
+// XFS B+Tree infrastructure - generic traversal and lookup engine.
 //
 // XFS uses B+trees for:
-//   - Free space allocation (bnobt / cntbt) — short-form, AG-rooted
-//   - Inode allocation (inobt / finobt)   — short-form, AG-rooted
-//   - Extent mapping (bmbt)               — long-form, inode-rooted
-//   - Directory hash index (DA btree)     — handled separately in xfs_dir2.cpp
+//   - Free space allocation (bnobt / cntbt) - short-form, AG-rooted
+//   - Inode allocation (inobt / finobt)   - short-form, AG-rooted
+//   - Extent mapping (bmbt)               - long-form, inode-rooted
+//   - Directory hash index (DA btree)     - handled separately in xfs_dir2.cpp
 //
 // This implements a C++ template-based B+tree cursor with generic lookup,
 // increment, and decrement operations.  Type-specific traits structs provide
@@ -28,7 +28,7 @@
 namespace ker::vfs::xfs {
 
 // ============================================================================
-// Btree cursor — tracks position at each level during tree traversal
+// Btree cursor - tracks position at each level during tree traversal
 // ============================================================================
 
 constexpr int XFS_BTREE_MAXLEVELS = 9;  // sufficient for any XFS btree
@@ -46,14 +46,14 @@ enum class XfsBtreeLookup : uint8_t {
     GE = 2,  // greater than or equal
 };
 
-// B+tree type — determines pointer format
+// B+tree type - determines pointer format
 enum class XfsBtreeType : uint8_t {
-    SHORT = 0,  // AG btrees (bnobt, cntbt, inobt) — __be32 pointers
-    LONG = 1,   // inode btrees (bmbt) — __be64 pointers
+    SHORT = 0,  // AG btrees (bnobt, cntbt, inobt) - __be32 pointers
+    LONG = 1,   // inode btrees (bmbt) - __be64 pointers
 };
 
 // ============================================================================
-// Btree traits — type-specific operations as template parameter
+// Btree traits - type-specific operations as template parameter
 // ============================================================================
 
 // Each btree type provides a traits struct with these members:
@@ -220,7 +220,7 @@ struct XfsInobtTraits {
     }
 };
 
-// --- finobt (free inode btree) — same format, different magic ---
+// --- finobt (free inode btree) - same format, different magic ---
 struct XfsFinobtTraits : XfsInobtTraits {
     static constexpr uint32_t MAGIC = XFS_FIBT_CRC_MAGIC;
 };

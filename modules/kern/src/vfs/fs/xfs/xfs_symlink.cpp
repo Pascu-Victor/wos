@@ -1,4 +1,4 @@
-// XFS Symlink implementation — read symlink targets.
+// XFS Symlink implementation - read symlink targets.
 //
 // Short symlinks: target stored inline in inode data fork (LOCAL format).
 //   Just copy from fork data.
@@ -51,7 +51,7 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
     }
 
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
-        // Inline symlink — target is in the fork data
+        // Inline symlink - target is in the fork data
         if (ip->data_fork.local.data == nullptr) {
             return -EIO;
         }
@@ -62,7 +62,7 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
         return static_cast<int>(copy_len);
     }
 
-    // Remote symlink — target is in data blocks
+    // Remote symlink - target is in data blocks
     XfsMountContext* ctx = ip->mount;
     size_t copied = 0;
 

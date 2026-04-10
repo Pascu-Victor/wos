@@ -5,11 +5,11 @@
 namespace ker::mod::sched {
 
 namespace task {
-struct Task;  // Forward declaration — full definition in task.hpp
+struct Task;  // Forward declaration - full definition in task.hpp
 }
 
 // Fixed-capacity binary min-heap of Task*, keyed on Task::vdeadline.
-// Zero allocations — the array is inline in the struct.
+// Zero allocations - the array is inline in the struct.
 // Each Task stores its heapIndex for O(log n) removal without scanning.
 static constexpr uint32_t PER_CPU_HEAP_CAP = 8192;
 
@@ -49,7 +49,7 @@ struct RunHeap {
 };
 
 // Intrusive singly-linked list for wait queue and dead list.
-// Uses Task::schedNext pointer — zero allocations.
+// Uses Task::schedNext pointer - zero allocations.
 // No ordering, just a bag of parked tasks.
 struct IntrusiveTaskList {
     task::Task* head;

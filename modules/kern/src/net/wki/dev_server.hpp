@@ -15,7 +15,7 @@ struct PacketBuffer;
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// DevServerBinding — one per active remote consumer attachment
+// DevServerBinding - one per active remote consumer attachment
 // -----------------------------------------------------------------------------
 
 // D12: RX packet filter for remote NIC consumers
@@ -139,12 +139,12 @@ auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_i
 // blocks on a spin-wait that cannot make progress inside the NAPI poll handler.
 void wki_dev_server_process_pending_zones();
 
-// D11: RX forward callback — installed on NetDevice when remote consumer is attached.
+// D11: RX forward callback - installed on NetDevice when remote consumer is attached.
 // Forwards received packets to all NET bindings for this device.
 void wki_dev_server_forward_net_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

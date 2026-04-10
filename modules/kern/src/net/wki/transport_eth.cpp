@@ -14,7 +14,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// Neighbor MAC table — maps node_id to MAC address for Ethernet TX
+// Neighbor MAC table - maps node_id to MAC address for Ethernet TX
 // -----------------------------------------------------------------------------
 
 constexpr size_t ETH_NEIGHBOR_TABLE_SIZE = WKI_MAX_PEERS;
@@ -88,7 +88,7 @@ static EthTransportPrivate s_eth_priv;
 static bool s_eth_initialized = false;
 
 // -----------------------------------------------------------------------------
-// Secondary transport pool — auto-registered for non-primary NICs that
+// Secondary transport pool - auto-registered for non-primary NICs that
 // receive WKI frames (e.g. a debug VM whose only NIC is the data bridge).
 // -----------------------------------------------------------------------------
 
@@ -182,7 +182,7 @@ void eth_wki_set_rx_handler(WkiTransport* self, WkiRxHandler handler) {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// RX entry point — called from ethernet.cpp's eth_rx() switch
+// RX entry point - called from ethernet.cpp's eth_rx() switch
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -192,7 +192,7 @@ namespace {
 // Otherwise we allocate a lightweight secondary transport so that the
 // peer record stores the correct NIC for TX replies.
 auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
-    // Primary NIC — fast path
+    // Primary NIC - fast path
     if (dev == s_eth_priv.netdev) {
         return &s_eth_transport;
     }
@@ -229,7 +229,7 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
 
             s_secondary_lock.unlock();
 
-            // Register with WKI core — sets the RX handler on this transport
+            // Register with WKI core - sets the RX handler on this transport
             wki_transport_register(&slot.transport);
 
             ker::mod::dbg::log("[WKI] Secondary Ethernet transport auto-registered on %s", dev->name.data());
@@ -238,7 +238,7 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
     }
 
     s_secondary_lock.unlock();
-    // Pool exhausted — fall back to primary (best effort)
+    // Pool exhausted - fall back to primary (best effort)
     return &s_eth_transport;
 }
 
@@ -258,7 +258,7 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
         return;
     }
 
-    // Resolve the transport for the ingress NIC — auto-creates a secondary
+    // Resolve the transport for the ingress NIC - auto-creates a secondary
     // transport when the frame arrived on a NIC other than the primary WKI NIC.
     // This ensures that handle_hello() records the correct transport for the
     // peer, so HELLO_ACK and resource adverts go back on the right interface.

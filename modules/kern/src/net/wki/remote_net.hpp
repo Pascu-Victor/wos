@@ -10,7 +10,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// ProxyNetState (consumer side) — per-remote-NIC proxy state
+// ProxyNetState (consumer side) - per-remote-NIC proxy state
 // -----------------------------------------------------------------------------
 
 struct ProxyNetState {
@@ -59,14 +59,14 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 // Consumer side: detach from a remote NIC
 void wki_remote_net_detach(net::NetDevice* proxy_dev);
 
-// Fencing cleanup — remove all state for a fenced peer
+// Fencing cleanup - remove all state for a fenced peer
 void wki_remote_net_cleanup_for_peer(uint16_t node_id);
 
 // D13: Poll stats from real NIC and update proxy counters (called from timer tick)
 void wki_remote_net_poll_stats();
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers
+// Internal - RX message handlers
 // -----------------------------------------------------------------------------
 
 namespace detail {

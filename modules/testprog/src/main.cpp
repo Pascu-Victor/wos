@@ -11,6 +11,7 @@
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <print>
 
@@ -190,6 +192,228 @@ auto get_interface_info(const char* ifname) -> bool {
     return false;
 }
 
+auto print_wki_target_state() -> int {
+    char hostname[64] = {};
+    uint32_t flags = 0;
+    int64_t result = ker::process::getwkitarget(hostname, sizeof(hostname), &flags);
+    if (result < 0) {
+        std::println("wki-target: get failed: {}", result);
+        return 1;
+    }
+
+    if (result == 0) {
+        std::println("wki-target: <unset> flags=0x{:x}", flags);
+        return 0;
+    }
+
+    std::println("wki-target: host='{}' flags=0x{:x}", hostname, flags);
+    return 0;
+}
+
+auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
+    if (text == nullptr || flags_out == nullptr) {
+        return false;
+    }
+    if (std::strcmp(text, "strict") == 0) {
+        *flags_out = ker::process::WKI_TARGET_FLAG_STRICT;
+        return true;
+    }
+    if (std::strcmp(text, "fallback") == 0 || std::strcmp(text, "best-effort") == 0 || std::strcmp(text, "none") == 0) {
+        *flags_out = 0;
+        return true;
+    }
+    return false;
+}
+
+auto handle_wki_target_command(int argc, char** argv) -> int {
+    if (argc < 3) {
+        std::println("usage: testprog --wki-target <show|clear|set>");
+        return 1;
+    }
+
+    const char* action = argv[2];
+    if (std::strcmp(action, "show") == 0) {
+        return print_wki_target_state();
+    }
+
+    if (std::strcmp(action, "clear") == 0) {
+        int64_t result = ker::process::setwkitarget(nullptr, 0, 0);
+        if (result < 0) {
+            std::println("wki-target: clear failed: {}", result);
+            return 1;
+        }
+        return print_wki_target_state();
+    }
+
+    if (std::strcmp(action, "set") == 0) {
+        if (argc < 4) {
+            std::println("usage: testprog --wki-target set <hostname> [strict|fallback]");
+            return 1;
+        }
+
+        uint32_t flags = 0;
+        if (argc >= 5 && !parse_target_flags(argv[4], &flags)) {
+            std::println("wki-target: invalid mode '{}', expected strict or fallback", argv[4]);
+            return 1;
+        }
+
+        const char* hostname = argv[3];
+        int64_t result = ker::process::setwkitarget(hostname, std::strlen(hostname), flags);
+        if (result < 0) {
+            std::println("wki-target: set failed: {}", result);
+            return 1;
+        }
+        return print_wki_target_state();
+    }
+
+    std::println("wki-target: unknown action '{}'", action);
+    return 1;
+}
+
+auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
+    if (text == nullptr || route_out == nullptr) {
+        return false;
+    }
+    if (std::strcmp(text, "local") == 0) {
+        *route_out = ker::abi::vfs::WKI_VFS_ROUTE_LOCAL;
+        return true;
+    }
+    if (std::strcmp(text, "host") == 0) {
+        *route_out = ker::abi::vfs::WKI_VFS_ROUTE_HOST;
+        return true;
+    }
+    return false;
+}
+
+auto print_vfs_route(uint32_t route) -> const char* {
+    switch (route) {
+        case ker::abi::vfs::WKI_VFS_ROUTE_LOCAL:
+            return "local";
+        case ker::abi::vfs::WKI_VFS_ROUTE_HOST:
+            return "host";
+        default:
+            return "unknown";
+    }
+}
+
+auto list_wki_vfs_rules() -> int {
+    char prefix[128] = {};
+    uint32_t route = 0;
+    bool any = false;
+    for (uint32_t index = 0;; ++index) {
+        int rc = ker::abi::vfs::wki_rule_get_vfs(index, prefix, sizeof(prefix), &route);
+        if (rc == -2) {
+            break;
+        }
+        if (rc < 0) {
+            std::println("wki-vfs: get rule {} failed: {}", index, rc);
+            return 1;
+        }
+        std::println("wki-vfs[{}]: {} -> {}", index, prefix, print_vfs_route(route));
+        any = true;
+    }
+
+    if (!any) {
+        std::println("wki-vfs: no explicit task-local rules");
+    }
+    return 0;
+}
+
+auto probe_wki_path(const char* path) -> int {
+    char cwd_before[512] = {};
+    char cwd_after[512] = {};
+    if (getcwd(cwd_before, sizeof(cwd_before)) == nullptr) {
+        std::strcpy(cwd_before, "<getcwd failed>");
+    }
+
+    struct stat st{};
+    errno = 0;
+    int stat_rc = stat(path, &st);
+    std::println("wki-vfs-probe: path='{}' stat={} errno={}", path, stat_rc, errno);
+    if (stat_rc == 0) {
+        std::println("wki-vfs-probe: mode=0{:o} size={} ino={}", st.st_mode, (long long)st.st_size, (long long)st.st_ino);
+    }
+
+    errno = 0;
+    int access_rc = access(path, F_OK);
+    std::println("wki-vfs-probe: access(F_OK)={} errno={}", access_rc, errno);
+
+    errno = 0;
+    ssize_t link_len = readlink(path, cwd_after, sizeof(cwd_after) - 1);
+    if (link_len >= 0) {
+        cwd_after[link_len] = '\0';
+        std::println("wki-vfs-probe: readlink='{}'", cwd_after);
+    } else {
+        std::println("wki-vfs-probe: readlink={} errno={}", (int)link_len, errno);
+    }
+
+    errno = 0;
+    if (chdir(path) == 0) {
+        if (getcwd(cwd_after, sizeof(cwd_after)) == nullptr) {
+            std::strcpy(cwd_after, "<getcwd failed>");
+        }
+        std::println("wki-vfs-probe: chdir succeeded cwd='{}'", cwd_after);
+        chdir(cwd_before);
+    } else {
+        std::println("wki-vfs-probe: chdir failed errno={}", errno);
+    }
+
+    std::println("wki-vfs-probe: cwd-before='{}'", cwd_before);
+    return 0;
+}
+
+auto handle_wki_vfs_command(int argc, char** argv) -> int {
+    if (argc < 3) {
+        std::println("usage: testprog --wki-vfs <list|clear|add|probe>");
+        return 1;
+    }
+
+    const char* action = argv[2];
+    if (std::strcmp(action, "list") == 0) {
+        return list_wki_vfs_rules();
+    }
+
+    if (std::strcmp(action, "clear") == 0) {
+        int rc = ker::abi::vfs::wki_rule_clear_vfs();
+        if (rc < 0) {
+            std::println("wki-vfs: clear failed: {}", rc);
+            return 1;
+        }
+        return list_wki_vfs_rules();
+    }
+
+    if (std::strcmp(action, "add") == 0) {
+        if (argc < 5) {
+            std::println("usage: testprog --wki-vfs add <prefix> <local|host>");
+            return 1;
+        }
+
+        uint32_t route = 0;
+        if (!parse_vfs_route(argv[4], &route)) {
+            std::println("wki-vfs: invalid route '{}'", argv[4]);
+            return 1;
+        }
+
+        int rc = ker::abi::vfs::wki_rule_add_vfs(argv[3], route);
+        if (rc < 0) {
+            std::println("wki-vfs: add failed: {}", rc);
+            return 1;
+        }
+        return list_wki_vfs_rules();
+    }
+
+    if (std::strcmp(action, "probe") == 0) {
+        if (argc < 4) {
+            std::println("usage: testprog --wki-vfs probe <path>");
+            return 1;
+        }
+        return probe_wki_path(argv[3]);
+    }
+
+    std::println("wki-vfs: unknown action '{}'", action);
+    return 1;
+}
+
 auto main(int argc, char** argv, char** envp) -> int {
     int pid = ker::process::getpid();
     (void)envp;
@@ -209,6 +433,14 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
         return run_netbench(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "wki-target") == 0) {
+        return handle_wki_target_command(argc, argv);
+    }
+
+    if (command != nullptr && std::strcmp(command, "wki-vfs") == 0) {
+        return handle_wki_vfs_command(argc, argv);
     }
 
     if (command != nullptr && std::strcmp(command, "perf") == 0) {

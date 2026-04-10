@@ -43,7 +43,7 @@ struct PerCpuPageCache {
     }
 };
 
-// Debug spinlock for memlock — records holder CR3, CPU, and caller RIP
+// Debug spinlock for memlock - records holder CR3, CPU, and caller RIP
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
 __attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // Dedicated zone for huge allocations
 
@@ -451,7 +451,7 @@ auto pageAlloc(uint64_t size) -> void* {
         hcf();
     }
 
-    // Zero outside the lock — the block is exclusively ours now
+    // Zero outside the lock - the block is exclusively ours now
     uint64_t savedCr3 = 0;
     if (kernelCr3 != 0) {
         uint64_t currentCr3 = rdcr3();
@@ -486,7 +486,7 @@ auto pageAllocHuge(uint64_t size) -> void* {
     totalAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
     allocCount.fetch_add(1, std::memory_order_relaxed);
 
-    // Zero outside the lock — the block is exclusively ours now
+    // Zero outside the lock - the block is exclusively ours now
     uint64_t savedCr3 = 0;
     if (kernelCr3 != 0) {
         uint64_t currentCr3 = rdcr3();
@@ -607,7 +607,7 @@ uint32_t pageRefDec(void* page) {
         }
         uint32_t newRef = alloc->pageRefcounts[idx];
         if (newRef == 0) {
-            // Refcount reached zero — free the page
+            // Refcount reached zero - free the page
             alloc->free(page);
             freeCount.fetch_add(1, std::memory_order_relaxed);
             totalFreedBytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);

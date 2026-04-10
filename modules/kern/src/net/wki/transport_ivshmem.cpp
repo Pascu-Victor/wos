@@ -69,7 +69,7 @@ struct WkiIvshmemHeader {
 static_assert(sizeof(WkiIvshmemHeader) == WKI_IVSHMEM_HEADER_SIZE, "WkiIvshmemHeader must be 64 bytes");
 
 // -----------------------------------------------------------------------------
-// D4: IRQ forwarding mailbox — overlaid on the 24-byte reserved area
+// D4: IRQ forwarding mailbox - overlaid on the 24-byte reserved area
 // Two 12-byte slots: [0]=VM0->VM1, [1]=VM1->VM0
 // -----------------------------------------------------------------------------
 
@@ -326,7 +326,7 @@ auto ivshmem_wki_doorbell(WkiTransport* self, uint16_t /*neighbor_id*/, uint32_t
 }
 
 // -----------------------------------------------------------------------------
-// IRQ handler — poll RX ring and deliver to WKI
+// IRQ handler - poll RX ring and deliver to WKI
 // -----------------------------------------------------------------------------
 
 void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
@@ -376,7 +376,7 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Public API — RDMA allocator (used by zone.cpp for RDMA-backed zones)
+// Public API - RDMA allocator (used by zone.cpp for RDMA-backed zones)
 // -----------------------------------------------------------------------------
 
 auto wki_ivshmem_rdma_alloc(uint32_t size) -> int64_t {
@@ -514,7 +514,7 @@ void wki_ivshmem_transport_init() {
         uint64_t deadline = ker::mod::time::getUs() + PEER_READY_TIMEOUT_US;
         while (hdr->peer_ready == 0) {
             if (ker::mod::time::getUs() >= deadline) {
-                ker::mod::dbg::log("[WKI] ivshmem: peer_ready timeout — continuing without peer");
+                ker::mod::dbg::log("[WKI] ivshmem: peer_ready timeout - continuing without peer");
                 break;
             }
             asm volatile("pause" ::: "memory");

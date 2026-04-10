@@ -1,4 +1,4 @@
-// XFS Parent Pointer Operations — implementation.
+// XFS Parent Pointer Operations - implementation.
 //
 // Parent pointers are extended attributes with the XFS_ATTR_PARENT namespace
 // flag.  The xattr "name" is a 12-byte XfsParentRec (big-endian parent inode
@@ -20,7 +20,7 @@
 namespace ker::vfs::xfs {
 
 // ============================================================================
-// xfs_parent_get — retrieve the first parent pointer
+// xfs_parent_get - retrieve the first parent pointer
 // ============================================================================
 
 namespace {
@@ -60,7 +60,7 @@ int parent_get_cb(const XfsAttrEntry* entry, void* priv) {
 
     ctx->result = static_cast<int>(entry->valuelen);
     ctx->found = true;
-    return 1;  // stop iterating — we only want the first one
+    return 1;  // stop iterating - we only want the first one
 }
 
 }  // anonymous namespace
@@ -90,7 +90,7 @@ auto xfs_parent_get(XfsInode* ip, xfs_ino_t* parent_ino, uint32_t* parent_gen, u
 }
 
 // ============================================================================
-// xfs_parent_add — add a parent pointer
+// xfs_parent_add - add a parent pointer
 // ============================================================================
 
 auto xfs_parent_add(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino, uint32_t parent_gen, const uint8_t* name, uint16_t namelen)
@@ -107,7 +107,7 @@ auto xfs_parent_add(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino, u
 }
 
 // ============================================================================
-// xfs_parent_remove — remove a parent pointer
+// xfs_parent_remove - remove a parent pointer
 // ============================================================================
 
 auto xfs_parent_remove(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino, uint32_t parent_gen, const uint8_t* name,
@@ -127,7 +127,7 @@ auto xfs_parent_remove(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino
 }
 
 // ============================================================================
-// xfs_parent_replace — rename: remove old pointer, add new
+// xfs_parent_replace - rename: remove old pointer, add new
 // ============================================================================
 
 auto xfs_parent_replace(XfsInode* child, XfsTransaction* tp, xfs_ino_t old_pino, uint32_t old_pgen, const uint8_t* old_name,

@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Extended Attribute subsystem — read, write, list, and remove xattrs.
+// XFS Extended Attribute subsystem - read, write, list, and remove xattrs.
 //
 // Supports shortform (inline in inode attr fork), leaf (single block), and
 // node (multi-level DA btree) attribute formats.
@@ -19,7 +19,7 @@
 namespace ker::vfs::xfs {
 
 // ============================================================================
-// Attribute entry — in-memory representation returned by lookups/iterations
+// Attribute entry - in-memory representation returned by lookups/iterations
 // ============================================================================
 
 struct XfsAttrEntry {

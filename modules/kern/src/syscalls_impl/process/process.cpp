@@ -83,7 +83,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->waitingForPid = 0;
     child->waitStatusPhysAddr = 0;
 
-    // EEVDF scheduling fields — start fresh
+    // EEVDF scheduling fields - start fresh
     child->vruntime = 0;
     child->vdeadline = 0;
     child->schedWeight = parent->schedWeight;
@@ -104,6 +104,14 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // Copy executable path
     memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
+
+    // Copy WKI spawn configuration
+    memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
+    child->wki_target_flags = parent->wki_target_flags;
+    memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
+    child->wki_vfs_rule_count = parent->wki_vfs_rule_count;
+    memcpy(child->wki_vfs_rules.data(), parent->wki_vfs_rules.data(), sizeof(child->wki_vfs_rules));
+    child->wki_skip_legacy_placement = false;
 
     // Copy POSIX credentials
     child->uid = parent->uid;
@@ -161,10 +169,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             ::operator delete(child);
             return static_cast<uint64_t>(-ENOMEM);
         }
-        // Copy all fields — virtual addresses are the same (same address space layout via COW)
+        // Copy all fields - virtual addresses are the same (same address space layout via COW)
         *childThread = *parent->thread;
         // The physical pointers are now shared via COW so the child shouldn't free them
-        // on thread destroy — we zero them to prevent double-free
+        // on thread destroy - we zero them to prevent double-free
         childThread->tlsPhysPtr = 0;
         childThread->stackPhysPtr = 0;
         child->thread = childThread;
@@ -181,13 +189,13 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     perCpu->cpuId = cpu::currentCpu();
     child->context.syscallScratchArea = (uint64_t)perCpu;
 
-    // Copy parent's register context — child will resume at the same RIP
+    // Copy parent's register context - child will resume at the same RIP
     child->context.regs = parent->context.regs;
     child->context.intNo = 0;
     child->context.errorCode = 0;
 
     // Build the child's interrupt frame from the PerCpu scratch area.
-    // parent->context.frame is STALE — it was saved during the last timer
+    // parent->context.frame is STALE - it was saved during the last timer
     // preemption / context switch, NOT during this syscall.  The real
     // syscall return state lives in the scratch area populated by the
     // syscall entry path in syscall.asm:
@@ -414,6 +422,53 @@ static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
     return 0;
 }
 
+static auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    if ((flags & ~ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    if (hostname == nullptr || len == 0) {
+        task->wki_target_hostname[0] = '\0';
+        task->wki_target_flags = 0;
+        return 0;
+    }
+
+    if (len >= sizeof(task->wki_target_hostname)) {
+        return static_cast<uint64_t>(-ENAMETOOLONG);
+    }
+
+    memcpy(task->wki_target_hostname, hostname, len);
+    task->wki_target_hostname[len] = '\0';
+    task->wki_target_flags = flags;
+    return 0;
+}
+
+static auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_t* flags_out) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    size_t len = strnlen(task->wki_target_hostname, sizeof(task->wki_target_hostname));
+    if (hostname_out != nullptr) {
+        if (hostname_out_size == 0 || len + 1 > hostname_out_size) {
+            return static_cast<uint64_t>(-ENAMETOOLONG);
+        }
+        memcpy(hostname_out, task->wki_target_hostname, len + 1);
+    }
+
+    if (flags_out != nullptr) {
+        *flags_out = task->wki_target_flags;
+    }
+
+    return len;
+}
+
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     switch (op) {
         case abi::process::procmgmt_ops::exit:
@@ -638,6 +693,12 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::setpriority: {
             return wos_proc_setpriority(static_cast<int>(a2), static_cast<int64_t>(a3), static_cast<int>(a4));
+        }
+        case abi::process::procmgmt_ops::setwkitarget: {
+            return wos_proc_setwkitarget(reinterpret_cast<const char*>(a2), static_cast<size_t>(a3), static_cast<uint32_t>(a4));
+        }
+        case abi::process::procmgmt_ops::getwkitarget: {
+            return wos_proc_getwkitarget(reinterpret_cast<char*>(a2), static_cast<size_t>(a3), reinterpret_cast<uint32_t*>(a4));
         }
 
         default:

@@ -29,7 +29,7 @@ static constexpr uint16_t NTP_PORT = 123;
 // Seconds between NTP epoch (1900-01-01) and Unix epoch (1970-01-01).
 static constexpr uint64_t NTP_EPOCH_DELTA = 2208988800ULL;
 
-// NTP server — local router (10.10.0.1).
+// NTP server - local router (10.10.0.1).
 static constexpr uint32_t NTP_SERVERS[] = {
     (10U << 24) | (10U << 16) | (0U << 8) | 1U,  // 10.10.0.1 (local router)
 };
@@ -100,7 +100,7 @@ static auto try_sync(uint32_t server_ip) -> bool {
     int64_t delta = unix_sec - rtc_now;
 
     rtc::setOffset(delta);
-    dbg::log("ntp: synced to %lu.%lu.%lu.%lu — offset %ld s", (unsigned long)((server_ip >> 24) & 0xFF),
+    dbg::log("ntp: synced to %lu.%lu.%lu.%lu - offset %ld s", (unsigned long)((server_ip >> 24) & 0xFF),
              (unsigned long)((server_ip >> 16) & 0xFF), (unsigned long)((server_ip >> 8) & 0xFF), (unsigned long)(server_ip & 0xFF),
              (long)delta);
     return true;
@@ -127,7 +127,7 @@ static void ntp_sync_thread() {
             }
         }
 
-        dbg::log("ntp: sync attempt %d/%d failed — retrying", attempt + 1, MAX_ATTEMPTS);
+        dbg::log("ntp: sync attempt %d/%d failed - retrying", attempt + 1, MAX_ATTEMPTS);
     }
 
     dbg::log("ntp: all sync attempts exhausted; using RTC wall clock only");

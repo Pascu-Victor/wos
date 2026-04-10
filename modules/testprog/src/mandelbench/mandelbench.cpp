@@ -41,7 +41,7 @@ auto now_ns() -> uint64_t {
 #if MANDELBENCH_DEBUG
 auto thread_cpu_ns() -> uint64_t {
     // CLOCK_THREAD_CPUTIME_ID (id 3): kernel-tracked on-CPU time for this thread.
-    // user_time_us + system_time_us accumulated by the scheduler — measures actual
+    // user_time_us + system_time_us accumulated by the scheduler - measures actual
     // time the thread ran on a CPU, excluding any time it was preempted.
     timespec ts{};
     clock_gettime((clockid_t)3, &ts);

@@ -14,7 +14,7 @@ namespace ker::net::wki {
 constexpr uint16_t OP_BLOCK_INFO = 0x0103;
 
 // -----------------------------------------------------------------------------
-// Remotable Trait — attached to BlockDevice / NetDevice via .remotable field
+// Remotable Trait - attached to BlockDevice / NetDevice via .remotable field
 // -----------------------------------------------------------------------------
 
 struct RemotableOps {
@@ -27,7 +27,7 @@ struct RemotableOps {
 };
 
 // -----------------------------------------------------------------------------
-// Discovered Resource — advertised by remote peers
+// Discovered Resource - advertised by remote peers
 // -----------------------------------------------------------------------------
 
 constexpr size_t DISCOVERED_RESOURCE_NAME_LEN = 64;
@@ -74,7 +74,7 @@ void wki_remotable_process_pending_mounts();
 void wki_remotable_process_pending_net_attaches();
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

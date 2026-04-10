@@ -256,7 +256,7 @@ bool ndp_resolve(NetDevice* dev, const std::array<uint8_t, 16>& ip, std::array<u
         return true;
     }
 
-    // Not in cache or incomplete — send NS and queue packet
+    // Not in cache or incomplete - send NS and queue packet
     if (entry == nullptr) {
         entry = alloc_entry();
         if (entry == nullptr) {

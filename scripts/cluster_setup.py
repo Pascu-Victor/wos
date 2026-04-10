@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cluster_setup.py — Declarative WKI cluster topology manager.
+cluster_setup.py - Declarative WKI cluster topology manager.
 
 Reads configs/cluster.json and creates/tears down the entire host-side cluster
 topology: bridges, TAPs, ivshmem shared memory files. Replaces the ad-hoc
@@ -100,7 +100,7 @@ def get_node_config(zone_cfg: dict, node_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Naming conventions — deterministic from config, no state file
+# Naming conventions - deterministic from config, no state file
 # ---------------------------------------------------------------------------
 
 
@@ -128,7 +128,7 @@ def mac_addr(zone_id: int, node_id: int, seq: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ivshmem topology — compute link pairs
+# ivshmem topology - compute link pairs
 # ---------------------------------------------------------------------------
 
 
@@ -245,7 +245,7 @@ def reattach_libvirt_vms(bridge: str):
         text=True,
     )
     if result.returncode != 0:
-        return  # libvirt not available — nothing to do
+        return  # libvirt not available - nothing to do
 
     vms = [name.strip() for name in result.stdout.splitlines() if name.strip()]
     for vm in vms:
@@ -281,7 +281,7 @@ def reattach_libvirt_vms(bridge: str):
 
 
 # ---------------------------------------------------------------------------
-# SSH host key management — persistent per-node dropbear keys
+# SSH host key management - persistent per-node dropbear keys
 # ---------------------------------------------------------------------------
 
 CLUSTER_DATA_DIR = "cluster-data"
@@ -578,7 +578,7 @@ def setup(config: dict):
                 run(f"ip link set {uplink} up", privileged=True)
                 print(f"  Attached uplink: {uplink} -> {br}")
             else:
-                print(f"  WARNING: uplink {uplink} not found — skipping")
+                print(f"  WARNING: uplink {uplink} not found - skipping")
 
         # Assign IP to bridge if specified
         ip_addr = bridge_cfg.get("ip")
@@ -660,7 +660,7 @@ def setup(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# Teardown — stateless, derived from config
+# Teardown - stateless, derived from config
 # ---------------------------------------------------------------------------
 
 
@@ -729,7 +729,7 @@ def teardown(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# Launch — setup + start VMs
+# Launch - setup + start VMs
 # ---------------------------------------------------------------------------
 
 
@@ -855,7 +855,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         "-no-reboot",
     ]
 
-    # Add NICs — one per zone this node participates in
+    # Add NICs - one per zone this node participates in
     nic_idx = 0
     for zone_cfg in node_info["zones"]:
         zone_id = zone_cfg["id"]
@@ -878,7 +878,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         )
         nic_idx += 1
 
-    # Add ivshmem devices — one per ivshmem link involving this node.
+    # Add ivshmem devices - one per ivshmem link involving this node.
     # Pre-created /dev/shm files avoid BAR placement issues with hugepages
     # on hosts with above-4G decoding enabled.
     ivshmem_idx = 0

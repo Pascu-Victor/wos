@@ -30,7 +30,7 @@ struct RunQueue {
     // EEVDF bookkeeping (updated under per-CPU lock)
     int64_t totalWeightedVruntime;  // sum(vruntime_i * weight_i) for tasks in heap
     int64_t totalWeight;            // sum(weight_i) for tasks in heap
-    int64_t minVruntime;            // Monotonic floor — new/waking tasks start at least here
+    int64_t minVruntime;            // Monotonic floor - new/waking tasks start at least here
 
     // Last timer timestamp (microseconds from HPET) for computing delta
     uint64_t lastTickUs;
@@ -110,6 +110,7 @@ auto post_task_for_cpu(uint64_t cpu_no, task::Task* task) -> bool;
 // Like post_task_for_cpu but marks the task as CPU-pinned: the scheduler will
 // never migrate it to another CPU via load-balancing.
 auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool;
+auto post_task_waiting(task::Task* task) -> bool;                // Register a blocked task without making it runnable
 auto post_task_balanced(task::Task* task) -> bool;               // Post to least loaded CPU
 auto get_least_loaded_cpu() -> uint64_t;                         // Get CPU with least tasks
 auto get_least_loaded_cpu_in_mask(uint64_t mask) -> uint64_t;    // Get least-loaded CPU within mask
@@ -165,7 +166,7 @@ size_t get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* ref
 extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // ============================================================================
-// kern_yield() — voluntary preemption point for kernel blocking loops
+// kern_yield() - voluntary preemption point for kernel blocking loops
 // ============================================================================
 //
 // Use instead of bare `asm volatile("sti\nhlt")` in any kernel code that
@@ -193,10 +194,10 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     }
 }
 
-// kern_block() — request that the current DAEMON task be truly blocked
+// kern_block() - request that the current DAEMON task be truly blocked
 // (moved to wait list) on the next timer tick, then hlt to give up the CPU.
 // The timer interrupt handler sees wantsBlock=true and moves the task to the
-// wait list before picking the next runnable task — safe because it runs
+// wait list before picking the next runnable task - safe because it runs
 // under the run queue lock with interrupts disabled.
 // Must only be called from DAEMON kernel threads.
 inline void kern_block_impl(uint64_t perf_callsite) {
@@ -235,7 +236,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     }
 }
 
-// kern_wake() — move a blocked DAEMON task back to the runnable heap.
+// kern_wake() - move a blocked DAEMON task back to the runnable heap.
 // Safe to call from interrupt context or any CPU.
 // No-op if the task is already runnable.
 void kern_wake(task::Task* task);

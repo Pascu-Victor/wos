@@ -273,7 +273,7 @@ void wki_remote_net_init() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Server Side — NET Operation Handlers
+// Server Side - NET Operation Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {
@@ -392,7 +392,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
                 net_dev->ops->close(net_dev);
             }
 
-            // Mark the binding as closed — stop RX forwarding for this consumer
+            // Mark the binding as closed - stop RX forwarding for this consumer
             if (binding != nullptr) {
                 binding->net_nic_opened = false;
             }
@@ -412,7 +412,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
                 memcpy(&credits, data, sizeof(uint16_t));
                 binding->net_rx_credits += credits;
             }
-            // No response — fire-and-forget credit replenishment
+            // No response - fire-and-forget credit replenishment
             break;
         }
 
@@ -430,7 +430,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
 }  // namespace detail
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Side — Attach / Response Handlers
+// Consumer Side - Attach / Response Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::net::NetDevice* {
@@ -570,7 +570,7 @@ void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Side — RX Handlers
+// Consumer Side - RX Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {

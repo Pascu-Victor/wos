@@ -18,14 +18,14 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// Storage — discovered resources from remote peers
+// Storage - discovered resources from remote peers
 // -----------------------------------------------------------------------------
 
 namespace {
 std::deque<DiscoveredResource> g_discovered;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remotable_initialized = false;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// Deferred VFS mount queue — wki_remote_vfs_mount() spin-waits for an attach
+// Deferred VFS mount queue - wki_remote_vfs_mount() spin-waits for an attach
 // ACK, but handle_resource_advert() runs inside the NAPI poll handler where
 // napi_poll_inline() re-entrantly returns 0.  Queue the mount and process
 // it from the timer tick (outside NAPI context).
@@ -36,7 +36,7 @@ struct PendingVfsMount {
 };
 std::deque<PendingVfsMount> g_pending_vfs_mounts;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// V2: Deferred NET attach queue — same NAPI context issue as VFS mounts
+// V2: Deferred NET attach queue - same NAPI context issue as VFS mounts
 struct PendingNetAttach {
     uint16_t node_id;
     uint32_t resource_id;
@@ -47,7 +47,7 @@ std::deque<PendingNetAttach> g_pending_net_attaches;  // NOLINT(cppcoreguideline
 
 ker::mod::sys::Spinlock s_remotable_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// Unlocked helper — caller must hold s_remotable_lock
+// Unlocked helper - caller must hold s_remotable_lock
 auto find_resource_unlocked(uint16_t node_id, ResourceType type, uint32_t resource_id) -> DiscoveredResource* {
     for (auto& res : g_discovered) {
         if (res.valid && res.node_id == node_id && res.resource_type == type && res.resource_id == resource_id) {
@@ -61,7 +61,7 @@ auto find_resource_unlocked(uint16_t node_id, ResourceType type, uint32_t resour
 // Returns true if a local NIC already covers the same subnet as (remote_ip & remote_mask)
 auto has_local_subnet_overlap(uint32_t remote_ip, uint32_t remote_mask) -> bool {
     if (remote_ip == 0 && remote_mask == 0) {
-        return false;  // No IP info available — no overlap can be determined
+        return false;  // No IP info available - no overlap can be determined
     }
     uint32_t remote_subnet = remote_ip & remote_mask;
 
@@ -93,7 +93,7 @@ void build_vfs_mount_path(char* out, size_t out_size, const char* hostname, cons
     while (*stripped == '/') stripped++;
 
     if (*stripped == '\0') {
-        // Root export — mount directly at /wki/<hostname>
+        // Root export - mount directly at /wki/<hostname>
         snprintf(out, out_size, "/wki/%s", hostname);
     } else {
         snprintf(out, out_size, "/wki/%s/%s", hostname, stripped);
@@ -115,7 +115,7 @@ void wki_remotable_init() {
 }
 
 // -----------------------------------------------------------------------------
-// Local resource advertisement — iterate block devices with remotable != nullptr
+// Local resource advertisement - iterate block devices with remotable != nullptr
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -380,7 +380,7 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
 
     s_remotable_lock.unlock();
 
-    // Update devfs /dev/wki/ tree (outside lock — not a WKI container)
+    // Update devfs /dev/wki/ tree (outside lock - not a WKI container)
     ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type, adv->resource_id, adv->flags,
                                             static_cast<const char*>(res.name));
 
@@ -396,7 +396,7 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
     const auto* adv = reinterpret_cast<const ResourceAdvertPayload*>(payload);
     auto type = static_cast<ResourceType>(adv->resource_type);
 
-    // V2: Unmount VFS resources on withdraw — copy mount path under lock, unmount outside
+    // V2: Unmount VFS resources on withdraw - copy mount path under lock, unmount outside
     char mount_path[384] = {};  // NOLINT(modernize-avoid-c-arrays)
     bool do_vfs_unmount = false;
     if (type == ResourceType::VFS) {
@@ -412,7 +412,7 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
         }
     }
 
-    // Blocking VFS unmount — outside lock
+    // Blocking VFS unmount - outside lock
     if (do_vfs_unmount) {
         wki_remote_vfs_unmount(mount_path);
     }
@@ -422,7 +422,7 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
         // Find and detach the proxy NIC for this resource
         // The proxy is identified by owner_node + resource_id stored in ProxyNetState
         // wki_remote_net_cleanup_for_peer handles by node, but we need per-resource detach
-        // For now, log the withdrawal — full cleanup happens on fencing
+        // For now, log the withdrawal - full cleanup happens on fencing
         ker::mod::dbg::log("[WKI] NET resource withdrawn: node=0x%04x res_id=%u", adv->node_id, adv->resource_id);
     }
 
@@ -442,7 +442,7 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Deferred VFS mount processing — called from timer tick (outside NAPI context)
+// Deferred VFS mount processing - called from timer tick (outside NAPI context)
 // -----------------------------------------------------------------------------
 
 void wki_remotable_process_pending_mounts() {
@@ -481,7 +481,7 @@ void wki_remotable_process_pending_mounts() {
     }
 }
 
-// V2: Process deferred NET auto-attaches — called from timer tick
+// V2: Process deferred NET auto-attaches - called from timer tick
 void wki_remotable_process_pending_net_attaches() {
     while (true) {
         s_remotable_lock.lock();

@@ -1,4 +1,4 @@
-// XFS Extended Attribute subsystem — implementation.
+// XFS Extended Attribute subsystem - implementation.
 //
 // Handles shortform (inline in inode attr fork), leaf, and node attribute
 // formats for get, list, set, and remove operations.
@@ -23,7 +23,7 @@ namespace ker::vfs::xfs {
 using mod::dbg::log;
 
 // ============================================================================
-// ENOATTR — Linux uses ENODATA (61) for missing xattrs
+// ENOATTR - Linux uses ENODATA (61) for missing xattrs
 // ============================================================================
 constexpr int ENOATTR = 61;
 
@@ -192,7 +192,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
         ip->has_attr_fork = true;
         ip->anextents = 0;
 
-        // Set forkoff if not already set — place attr fork after data fork.
+        // Set forkoff if not already set - place attr fork after data fork.
         // Default: split inode literal area in half if data fork permits it.
         if (ip->forkoff == 0) {
             size_t inode_core = (ip->mount != nullptr) ? 176 : 176;  // v3 core
@@ -223,7 +223,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
     size_t total = hdr->totsize.to_cpu();
     size_t pos = sizeof(XfsAttrSfHdr);
 
-    // Check if the attribute already exists — replace it
+    // Check if the attribute already exists - replace it
     for (uint8_t i = 0; i < hdr->count; i++) {
         if (pos + sizeof(XfsAttrSfEntry) > total) {
             break;
@@ -242,7 +242,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
                 return 0;
             }
 
-            // Different size — remove old entry, then fall through to insert
+            // Different size - remove old entry, then fall through to insert
             size_t tail_start = pos + entry_size;
             size_t tail_len = total - tail_start;
             if (tail_len > 0) {
@@ -325,7 +325,7 @@ auto sf_remove(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t n
         }
 
         if (name_match(entry, name, namelen, flags)) {
-            // Found it — remove by shifting tail data
+            // Found it - remove by shifting tail data
             size_t tail_start = pos + entry_size;
             size_t tail_len = total - tail_start;
             if (tail_len > 0) {
@@ -370,7 +370,7 @@ auto leaf_block_iterate(XfsInode* ip, xfs_fsblock_t blkno, XfsAttrIterFn fn, voi
         }
 
         if ((eflags & XFS_ATTR_LOCAL) != 0) {
-            // Local attribute — name and value are in the leaf block
+            // Local attribute - name and value are in the leaf block
             const auto* local = reinterpret_cast<const XfsAttrLeafNameLocal*>(bh->data + nameidx);
             XfsAttrEntry ae{};
             ae.name = local->nameval;
@@ -385,7 +385,7 @@ auto leaf_block_iterate(XfsInode* ip, xfs_fsblock_t blkno, XfsAttrIterFn fn, voi
                 return rc;
             }
         } else {
-            // Remote attribute — only return name, value must be fetched separately
+            // Remote attribute - only return name, value must be fetched separately
             const auto* remote = reinterpret_cast<const XfsAttrLeafNameRemote*>(bh->data + nameidx);
             XfsAttrEntry ae{};
             ae.name = remote->name;

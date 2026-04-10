@@ -25,7 +25,7 @@ enum class SegmentType : uint32_t {
 
 QString segmentTypeName(uint32_t type);
 
-// x86-64 interrupt frame — matches WOS kernel InterruptFrame layout
+// x86-64 interrupt frame - matches WOS kernel InterruptFrame layout
 struct InterruptFrame {
     uint64_t intNum;
     uint64_t errCode;
@@ -36,7 +36,7 @@ struct InterruptFrame {
     uint64_t ss;
 };
 
-// x86-64 general purpose registers — matches WOS kernel GPRegs layout
+// x86-64 general purpose registers - matches WOS kernel GPRegs layout
 // Order: r15, r14, ..., r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
 struct GPRegs {
     uint64_t r15;

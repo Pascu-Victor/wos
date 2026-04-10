@@ -4,13 +4,8 @@ CompileFlags:
         - --target=x86_64-pc-wos
         - -DWOS=1
         - -D__x86_64__=1
-        - -resource-dir=toolchain/target1/lib/clang/21
-        - --sysroot=toolchain/target1
-        - -I../toolchain/target1/include/c++/v1
-        - -I../toolchain/target1/include
         - -I../modules/defines
         - -I../modules/extern
-        - -std=c++23
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword
@@ -18,7 +13,7 @@ CompileFlags:
         - -felf64
         - -fPIE
         - -pie
-        - -resource-dir=/usr/lib/clang/21
+        - -resource-dir=/usr/lib/clang/22
 Diagnostics:
     ClangTidy:
         Remove:

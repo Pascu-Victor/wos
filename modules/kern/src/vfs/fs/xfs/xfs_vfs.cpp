@@ -1,4 +1,4 @@
-// XFS VFS Integration — FileOperations implementation
+// XFS VFS Integration - FileOperations implementation
 //
 // This module bridges the WOS VFS layer (FileOperations function pointers)
 // to the XFS native implementation.  It implements open, read, write, seek,
@@ -170,7 +170,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         return static_cast<ssize_t>(to_copy);
     }
 
-    // EXTENTS or BTREE — block-based read
+    // EXTENTS or BTREE - block-based read
     if (offset >= ip->size) {
         return 0;
     }
@@ -205,7 +205,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         }
 
         if (bmap.is_hole || bmap.startblock == NULLFSBLOCK) {
-            // Hole — return zeros
+            // Hole - return zeros
             size_t hole_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - block_off;
             hole_bytes = std::min(hole_bytes, remaining);
             std::memset(dst + total_read, 0, hole_bytes);
@@ -225,7 +225,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         t0 = ker::mod::tsc::getNs();
 #endif
         if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-            // Aligned, full-block read — go direct to the block device.
+            // Aligned, full-block read - go direct to the block device.
             uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
             size_t dev_count = chunk / ctx->device->block_size;
             int rc = dev::block_read(ctx->device, dev_block, dev_count, dst + total_read);
@@ -236,7 +236,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
             }
         } else {
-            // Partial or unaligned — fall back to single cached block.
+            // Partial or unaligned - fall back to single cached block.
             chunk = std::min(ctx->block_size - block_off, remaining);
             BufHead* bp = xfs_buf_read(ctx, disk_block);
 #ifdef XFS_BENCH
@@ -397,7 +397,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             ip->dirty = true;
 
             // Log inode into this allocation transaction so the inode commit
-            // is piggybacked onto the alloc commit — avoids a second journal
+            // is piggybacked onto the alloc commit - avoids a second journal
             // write at the end of the write syscall.
             xfs_trans_log_inode(tp, ip);
 
@@ -431,13 +431,13 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 t0 = ker::mod::tsc::getNs();
 #endif
                 if (!leading_partial && !trailing_partial && slice_bytes == extent_bytes) {
-                    // Entire extent is fully covered — write directly, no buffer cache.
+                    // Entire extent is fully covered - write directly, no buffer cache.
                     uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
                     size_t dev_count = extent_bytes / ctx->device->block_size;
                     dev::block_write(ctx->device, dev_block, dev_count, src + (slice_start - offset));
                     total_written += slice_bytes;
                 } else {
-                    // Partial coverage — fall back to per-block buffer cache writes.
+                    // Partial coverage - fall back to per-block buffer cache writes.
                     for (xfs_extlen_t b = 0; b < alloc_result.len; b++) {
                         size_t blk_start = static_cast<size_t>(file_block + b) << ctx->block_log;
                         size_t blk_off = (b == 0) ? block_off : 0UL;
@@ -472,7 +472,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #ifdef XFS_BENCH
             loc_map++;
 #endif
-            // Block already mapped — write the contiguous extent in bulk.
+            // Block already mapped - write the contiguous extent in bulk.
             xfs_fsblock_t disk_block = bmap.startblock;
 
             size_t extent_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - block_off;
@@ -482,12 +482,12 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             t0 = ker::mod::tsc::getNs();
 #endif
             if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-                // Aligned full-block write — go direct to the block device.
+                // Aligned full-block write - go direct to the block device.
                 uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
                 size_t dev_count = chunk / ctx->device->block_size;
                 dev::block_write(ctx->device, dev_block, dev_count, src + total_written);
             } else {
-                // Partial — fall back to per-block buffer cache.
+                // Partial - fall back to per-block buffer cache.
                 chunk = std::min(ctx->block_size - block_off, count - total_written);
                 BufHead* bp = (block_off == 0 && chunk == ctx->block_size) ? xfs_buf_get(ctx, disk_block) : xfs_buf_read(ctx, disk_block);
                 if (bp == nullptr) {
@@ -596,7 +596,7 @@ auto xfs_vfs_lseek(File* f, off_t offset, int whence) -> off_t {
 auto xfs_vfs_isatty(File* /*f*/) -> bool { return false; }
 
 // ============================================================================
-// Readdir — uses xfs_dir_iterate
+// Readdir - uses xfs_dir_iterate
 // ============================================================================
 
 struct ReaddirCtx {
@@ -786,7 +786,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     auto* ip = walk_path(ctx, fs_path);
 
     if (ip == nullptr && (flags & O_CREAT_FLAG) != 0 && !ctx->read_only) {
-        // File doesn't exist and O_CREAT is set — create it.
+        // File doesn't exist and O_CREAT is set - create it.
         // Find the parent directory and the filename component.
         const char* last_slash = nullptr;
         for (const char* p = fs_path; *p != '\0'; p++) {
@@ -905,7 +905,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     // Handle O_TRUNC on regular files
     if ((flags & O_TRUNC_FLAG) != 0 && xfs_inode_isreg(ip) && !ctx->read_only) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0\n", (unsigned long)ip->ino, (unsigned long)ip->size);
+        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", (unsigned long)ip->ino, (unsigned long)ip->size);
 #endif
         ip->size = 0;
         ip->dirty = true;
@@ -914,7 +914,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             xfs_trans_log_inode(tp, ip);
             int trc = xfs_trans_commit(tp);
 #ifdef XFS_DEBUG
-            mod::dbg::log("[xfs] O_TRUNC: commit rc=%d\n", trc);
+            mod::dbg::log("[xfs] O_TRUNC: commit rc=%d", trc);
 #endif
             if (trc != 0) {
                 xfs_inode_release(ip);
@@ -968,7 +968,7 @@ void fill_stat(XfsInode* ip, ker::vfs::stat* st) {
     st->st_blksize = static_cast<blksize_t>(ip->mount->block_size);
     st->st_blocks = static_cast<blkcnt_t>(ip->nblocks * (ip->mount->block_size / 512));
 
-    // Timestamps — XFS stores seconds in the upper 32 bits, nanoseconds in
+    // Timestamps - XFS stores seconds in the upper 32 bits, nanoseconds in
     // the lower 32 bits (or for bigtime, a different encoding).  For now
     // just extract seconds.
     st->st_atim.tv_sec = static_cast<int64_t>(ip->atime >> 32);
@@ -1123,7 +1123,7 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
         // during filesystem check or when space is needed
         if (target_ip->nlink == 0) {
 #ifdef XFS_DEBUG
-            mod::dbg::log("[xfs] unlink: ino=%lu nlink->0 (inode marked for deletion)\n", (unsigned long)de.ino);
+            mod::dbg::log("[xfs] unlink: ino=%lu nlink->0 (inode marked for deletion)", (unsigned long)de.ino);
 #endif
             // TODO: Add inode to unlinked list  (di_next_unlinked chain)
             // For now, just mark dirty and let it be handled at a higher level
@@ -1190,7 +1190,7 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
     }
 
     if (xfs_log_needs_recovery(ctx)) {
-        ker::mod::io::serial::write("xfs: WARNING — journal is dirty, recovery not implemented\n");
+        ker::mod::io::serial::write("xfs: WARNING - journal is dirty, recovery not implemented\n");
     }
 
     ker::mod::io::serial::write(ctx->read_only ? "xfs: mounted successfully (read-only)\n" : "xfs: mounted successfully (read-write)\n");

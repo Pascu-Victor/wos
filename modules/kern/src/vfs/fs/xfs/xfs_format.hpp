@@ -7,11 +7,11 @@
 // conversions are explicit at every field access.
 //
 // Reference files:
-//   reference/xfs/libxfs/xfs_format.h   — superblock, AG headers, inode, extent records
-//   reference/xfs/libxfs/xfs_da_format.h — directory/attribute B+tree node format
-//   reference/xfs/libxfs/xfs_types.h     — type aliases
-//   reference/xfs/libxfs/xfs_sb.h        — superblock field definitions
-//   reference/xfs/libxfs/xfs_log_format.h — journal log record format
+//   reference/xfs/libxfs/xfs_format.h   - superblock, AG headers, inode, extent records
+//   reference/xfs/libxfs/xfs_da_format.h - directory/attribute B+tree node format
+//   reference/xfs/libxfs/xfs_types.h     - type aliases
+//   reference/xfs/libxfs/xfs_sb.h        - superblock field definitions
+//   reference/xfs/libxfs/xfs_log_format.h - journal log record format
 
 #include <array>
 #include <cstddef>
@@ -60,7 +60,7 @@ struct XfsUuidT {
 static_assert(sizeof(XfsUuidT) == 16);
 
 // ============================================================================
-// XFS Superblock — On-Disk (xfs_dsb)
+// XFS Superblock - On-Disk (xfs_dsb)
 // ============================================================================
 
 constexpr uint32_t XFS_SB_MAGIC = 0x58465342;  // 'XFSB'
@@ -172,10 +172,10 @@ constexpr uint16_t XFS_DIFLAG_SYNC = (1U << 5);
 constexpr uint16_t XFS_DIFLAG_NOATIME = (1U << 6);
 constexpr uint16_t XFS_DIFLAG_NODUMP = (1U << 7);
 
-// Inode flags2 (di_flags2) — v3 inodes only
+// Inode flags2 (di_flags2) - v3 inodes only
 constexpr uint64_t XFS_DIFLAG2_BIGTIME = (1ULL << 3);
 
-// XFS timestamp (on-disk) — packed into 8 bytes
+// XFS timestamp (on-disk) - packed into 8 bytes
 using xfs_timestamp_t = __be64;
 
 struct XfsDinode {
@@ -326,7 +326,7 @@ constexpr size_t XFS_AGFL_CRC_OFF = offsetof(XfsAgfl, agfl_crc);
 // B+Tree Block Headers
 // ============================================================================
 
-// Short-form B+tree header (AG-relative pointers) — used by bnobt, cntbt, inobt
+// Short-form B+tree header (AG-relative pointers) - used by bnobt, cntbt, inobt
 struct XfsBtreeSblock {
     __be32 bb_magic;
     __be16 bb_level;     // 0 = leaf
@@ -341,7 +341,7 @@ struct XfsBtreeSblock {
     uint32_t bb_crc;   // CRC (little-endian on disk)
 } __attribute__((packed));
 
-// Long-form B+tree header (filesystem-wide pointers) — used by bmbt
+// Long-form B+tree header (filesystem-wide pointers) - used by bmbt
 struct XfsBtreeLblock {
     __be32 bb_magic;
     __be16 bb_level;
@@ -362,28 +362,28 @@ constexpr size_t XFS_BTREE_SBLOCK_CRC_LEN = sizeof(XfsBtreeSblock);  // 56 bytes
 constexpr size_t XFS_BTREE_LBLOCK_CRC_LEN = sizeof(XfsBtreeLblock);  // 64 bytes
 
 // B+tree magic numbers
-constexpr uint32_t XFS_ABTB_CRC_MAGIC = 0x41423342;  // 'AB3B' — bnobt (free space by block)
-constexpr uint32_t XFS_ABTC_CRC_MAGIC = 0x41423343;  // 'AB3C' — cntbt (free space by count)
-constexpr uint32_t XFS_IBT_CRC_MAGIC = 0x49414233;   // 'IAB3' — inobt
-constexpr uint32_t XFS_FIBT_CRC_MAGIC = 0x46494233;  // 'FIB3' — free inobt
-constexpr uint32_t XFS_BMAP_CRC_MAGIC = 0x424D4133;  // 'BMA3' — bmbt (extent map)
+constexpr uint32_t XFS_ABTB_CRC_MAGIC = 0x41423342;  // 'AB3B' - bnobt (free space by block)
+constexpr uint32_t XFS_ABTC_CRC_MAGIC = 0x41423343;  // 'AB3C' - cntbt (free space by count)
+constexpr uint32_t XFS_IBT_CRC_MAGIC = 0x49414233;   // 'IAB3' - inobt
+constexpr uint32_t XFS_FIBT_CRC_MAGIC = 0x46494233;  // 'FIB3' - free inobt
+constexpr uint32_t XFS_BMAP_CRC_MAGIC = 0x424D4133;  // 'BMA3' - bmbt (extent map)
 
 // ============================================================================
 // Extent B+tree Records (bmbt)
 // ============================================================================
 
-// BMDR block — root of extent B+tree embedded in inode data fork
+// BMDR block - root of extent B+tree embedded in inode data fork
 struct XfsBmdrBlock {
     __be16 bb_level;    // 0 = leaf
     __be16 bb_numrecs;  // record count
 } __attribute__((packed));
 
-// Extent record — 16 bytes, packed as two big-endian 64-bit values
+// Extent record - 16 bytes, packed as two big-endian 64-bit values
 // Bit layout:
-//   l0[63]        — extent flag (1 = unwritten/preallocated)
-//   l0[62:9]      — startoff (54 bits, file block offset)
-//   l0[8:0]+l1[63:21] — startblock (52 bits, filesystem block)
-//   l1[20:0]      — blockcount (21 bits, max 2M-1 blocks)
+//   l0[63]        - extent flag (1 = unwritten/preallocated)
+//   l0[62:9]      - startoff (54 bits, file block offset)
+//   l0[8:0]+l1[63:21] - startblock (52 bits, filesystem block)
+//   l1[20:0]      - blockcount (21 bits, max 2M-1 blocks)
 struct XfsBmbtRec {
     __be64 l0;
     __be64 l1;
@@ -432,14 +432,14 @@ struct XfsBmbtKey {
     __be64 br_startoff;
 } __attribute__((packed));
 
-// Extent pointer (for B+tree interior nodes) — filesystem block number
+// Extent pointer (for B+tree interior nodes) - filesystem block number
 using xfs_bmbt_ptr_t = __be64;
 
 // ============================================================================
 // Free Space B+tree Records (bnobt / cntbt)
 // ============================================================================
 
-// Free space record — both bnobt and cntbt use the same record format
+// Free space record - both bnobt and cntbt use the same record format
 struct XfsAllocRec {
     __be32 ar_startblock;  // starting block number (AG-relative)
     __be32 ar_blockcount;  // count of free blocks
@@ -451,7 +451,7 @@ struct XfsAllocKey {
     __be32 ar_blockcount;
 } __attribute__((packed));
 
-// Pointer for AG btrees — AG-relative block number
+// Pointer for AG btrees - AG-relative block number
 using xfs_alloc_ptr_t = __be32;
 
 // ============================================================================
@@ -484,10 +484,10 @@ using XfsInobtPtr_t = __be32;
 // ============================================================================
 
 // --- Directory data block magic numbers ---
-constexpr uint32_t XFS_DIR3_BLOCK_MAGIC = 0x58444233;  // 'XDB3' — single-block dir
-constexpr uint32_t XFS_DIR3_DATA_MAGIC = 0x58444433;   // 'XDD3' — multi-block data
-constexpr uint32_t XFS_DIR3_FREE_MAGIC = 0x58444633;   // 'XDF3' — free space index
-constexpr uint32_t XFS_DIR3_LEAF_MAGIC = 0x3DF1;       // leaf (v3) — stored as __be16 in da_blkinfo
+constexpr uint32_t XFS_DIR3_BLOCK_MAGIC = 0x58444233;  // 'XDB3' - single-block dir
+constexpr uint32_t XFS_DIR3_DATA_MAGIC = 0x58444433;   // 'XDD3' - multi-block data
+constexpr uint32_t XFS_DIR3_FREE_MAGIC = 0x58444633;   // 'XDF3' - free space index
+constexpr uint32_t XFS_DIR3_LEAF_MAGIC = 0x3DF1;       // leaf (v3) - stored as __be16 in da_blkinfo
 constexpr uint32_t XFS_DIR3_LEAFN_MAGIC = 0x3FF1;      // leaf node (v3)
 constexpr uint32_t XFS_DA3_NODE_MAGIC = 0xFEBE;        // DA btree node (v3)
 
@@ -703,7 +703,7 @@ struct XfsAttrLeafNameRemote {
 // Parent Pointer Structures (XFS_SB_FEAT_INCOMPAT_PARENT)
 // ============================================================================
 
-// Parent pointer on-disk record — stored as the xattr name.
+// Parent pointer on-disk record - stored as the xattr name.
 // The xattr value is the directory entry name (filename).
 struct XfsParentRec {
     __be64 p_ino;  // parent inode number

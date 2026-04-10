@@ -33,7 +33,7 @@ uint8_t next_alloc_vector = 48;
 }  // namespace
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
-    // Page fault handler — handles COW faults and user-space segfaults.
+    // Page fault handler - handles COW faults and user-space segfaults.
     // This MUST run before the panic ownership CAS below, because page faults
     // (especially COW resolution) are normal concurrent events. If two CPUs
     // hit a COW fault at the same time the old code would make the second CPU
@@ -135,7 +135,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // Coredumps are only for userspace crashes, handled above.
 
     // Serialize all panicking CPUs: spin-acquire a TAS lock, dump, release, halt.
-    // Every CPU gets to print before halting — one at a time, no interleaving.
+    // Every CPU gets to print before halting - one at a time, no interleaving.
     // If this CPU already owns the lock (nested fault during dump), release and halt immediately.
     {
         int64_t myApicId = static_cast<int64_t>(apic::getApicId());
@@ -156,7 +156,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // Acquire the serial lock BEFORE entering panic mode so other CPUs still
     // respect it. Once enterPanicMode() is called, all serial locking becomes
-    // a no-op for other CPUs — they cannot deadlock waiting for our lock.
+    // a no-op for other CPUs - they cannot deadlock waiting for our lock.
     // We hold this lock for the entire dump (never released, ends in hcf()).
     io::serial::acquireLock();
     io::serial::enterPanicMode();
@@ -443,12 +443,12 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     if (interruptHandlers[frame.intNum] != nullptr) {
         interruptHandlers[frame.intNum](gpr, frame);
     } else if (isIrq(frame.intNum)) {
-        // Unexpected hardware IRQ with no handler — log and ignore.
+        // Unexpected hardware IRQ with no handler - log and ignore.
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
         ker::mod::io::serial::writeHex(static_cast<uint8_t>(frame.intNum));
         ker::mod::io::serial::write("\n");
     } else {
-        // CPU exception with no registered handler — route to exception_handler
+        // CPU exception with no registered handler - route to exception_handler
         // which kills the userspace process or panics for kernel-mode faults.
         exception_handler(gpr, frame);
         __builtin_unreachable();
@@ -505,7 +505,7 @@ void freeIrq(uint8_t vector) {
 auto allocateVector() -> uint8_t {
     // Find a free vector starting from 48 (above legacy IRQ range).
     // Vectors 0-31 are CPU exceptions.
-    // Vector 32 (0x20) is the timer interrupt — hardcoded in gates.asm
+    // Vector 32 (0x20) is the timer interrupt - hardcoded in gates.asm
     // (isr32 -> task_switch_handler). NEVER allocate it.
     // Vectors 33-47 are reserved for legacy ISA IRQs.
     // Vectors 48-255 are available for MSI/dynamic allocation.

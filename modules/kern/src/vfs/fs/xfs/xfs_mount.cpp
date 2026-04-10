@@ -106,7 +106,7 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
     BufHead* bh = xfs_buf_read(ctx, ag_start_block);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] failed to read AG %u block 0 for AGF\n", agno);
+        mod::dbg::log("[xfs] failed to read AG %u block 0 for AGF", agno);
         return -EIO;
     }
 
@@ -114,7 +114,7 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     size_t agf_offset = ctx->sect_size;  // sector 1
     if (agf_offset + sizeof(XfsAgf) > bh->size) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGF offset %lu exceeds block size %lu\n", agno, (unsigned long)agf_offset, (unsigned long)bh->size);
+        mod::dbg::log("[xfs] AG %u: AGF offset %lu exceeds block size %lu", agno, (unsigned long)agf_offset, (unsigned long)bh->size);
         return -EINVAL;
     }
 
@@ -123,14 +123,14 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     // Validate magic
     if (agf->agf_magicnum.to_cpu() != XFS_AGF_MAGIC) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: bad AGF magic 0x%x\n", agno, agf->agf_magicnum.to_cpu());
+        mod::dbg::log("[xfs] AG %u: bad AGF magic 0x%x", agno, agf->agf_magicnum.to_cpu());
         return -EINVAL;
     }
 
-    // Verify CRC — covers the full sector, not just the struct
+    // Verify CRC - covers the full sector, not just the struct
     if (!verify_ag_crc(bh->data + agf_offset, ctx->sect_size, XFS_AGF_CRC_OFF)) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGF CRC mismatch\n", agno);
+        mod::dbg::log("[xfs] AG %u: AGF CRC mismatch", agno);
         return -EINVAL;
     }
 
@@ -147,7 +147,7 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     pag->agf_flfirst = agf->agf_flfirst.to_cpu();
     pag->agf_fllast = agf->agf_fllast.to_cpu();
 
-    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u\n", agno, pag->agf_flfirst,
+    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u", agno, pag->agf_flfirst,
                   pag->agf_fllast, pag->agf_flcount, pag->agf_bno_root, pag->agf_cnt_root);
 
     brelse(bh);
@@ -159,7 +159,7 @@ auto read_agi(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
     BufHead* bh = xfs_buf_read(ctx, ag_start_block);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] failed to read AG %u block 0 for AGI\n", agno);
+        mod::dbg::log("[xfs] failed to read AG %u block 0 for AGI", agno);
         return -EIO;
     }
 
@@ -167,7 +167,7 @@ auto read_agi(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     auto agi_offset = static_cast<size_t>(ctx->sect_size * 2);
     if (agi_offset + sizeof(XfsAgi) > bh->size) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGI offset %lu exceeds block size %lu\n", agno, (unsigned long)agi_offset, (unsigned long)bh->size);
+        mod::dbg::log("[xfs] AG %u: AGI offset %lu exceeds block size %lu", agno, (unsigned long)agi_offset, (unsigned long)bh->size);
         return -EINVAL;
     }
 
@@ -176,14 +176,14 @@ auto read_agi(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     // Validate magic
     if (agi->agi_magicnum.to_cpu() != XFS_AGI_MAGIC) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: bad AGI magic 0x%x\n", agno, agi->agi_magicnum.to_cpu());
+        mod::dbg::log("[xfs] AG %u: bad AGI magic 0x%x", agno, agi->agi_magicnum.to_cpu());
         return -EINVAL;
     }
 
-    // Verify CRC — covers the full sector, not just the struct
+    // Verify CRC - covers the full sector, not just the struct
     if (!verify_ag_crc(bh->data + agi_offset, ctx->sect_size, XFS_AGI_CRC_OFF)) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGI CRC mismatch\n", agno);
+        mod::dbg::log("[xfs] AG %u: AGI CRC mismatch", agno);
         return -EINVAL;
     }
 
@@ -212,7 +212,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     // Read block 0 which contains the primary superblock
     BufHead* bh = bread(device, 0);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] failed to read superblock (block 0)\n");
+        mod::dbg::log("[xfs] failed to read superblock (block 0)");
         return -EIO;
     }
 
@@ -222,7 +222,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 
     // Magic
     if (dsb->sb_magicnum.to_cpu() != XFS_SB_MAGIC) {
-        mod::dbg::log("[xfs] bad superblock magic: 0x%x (expected 0x%x)\n", dsb->sb_magicnum.to_cpu(), XFS_SB_MAGIC);
+        mod::dbg::log("[xfs] bad superblock magic: 0x%x (expected 0x%x)", dsb->sb_magicnum.to_cpu(), XFS_SB_MAGIC);
         brelse(bh);
         return -EINVAL;
     }
@@ -230,7 +230,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     // Version: we only support v5
     uint16_t version = dsb->sb_versionnum.to_cpu();
     if ((version & 0xF) != XFS_SB_VERSION_5) {
-        mod::dbg::log("[xfs] unsupported version %u (only v5 supported)\n", version);
+        mod::dbg::log("[xfs] unsupported version %u (only v5 supported)", version);
         brelse(bh);
         return -EINVAL;
     }
@@ -240,7 +240,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     // not just the defined structure fields.  Use the buffer size from bread()
     // which matches the device sector size.
     if (!verify_sb_crc(dsb, bh->size)) {
-        mod::dbg::log("[xfs] superblock CRC mismatch\n");
+        mod::dbg::log("[xfs] superblock CRC mismatch");
         brelse(bh);
         return -EINVAL;
     }
@@ -287,24 +287,24 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 
     brelse(bh);
 
-    mod::dbg::log("[xfs] superblock: blocksize=%u agcount=%u agblocks=%u rootino=%lu\n", ctx->block_size, ctx->ag_count, ctx->ag_blocks,
+    mod::dbg::log("[xfs] superblock: blocksize=%u agcount=%u agblocks=%u rootino=%lu", ctx->block_size, ctx->ag_count, ctx->ag_blocks,
                   static_cast<unsigned long>(ctx->root_ino));
-    mod::dbg::log("[xfs]   inodesize=%u sect=%u log_start=%lu log_blocks=%u\n", ctx->inode_size, ctx->sect_size,
+    mod::dbg::log("[xfs]   inodesize=%u sect=%u log_start=%lu log_blocks=%u", ctx->inode_size, ctx->sect_size,
                   static_cast<unsigned long>(ctx->log_start), ctx->log_blocks);
 
     // --- Sanity checks ---
     if (ctx->block_size < 512 || ctx->block_size > 65536) {
-        mod::dbg::log("[xfs] invalid block size %u\n", ctx->block_size);
+        mod::dbg::log("[xfs] invalid block size %u", ctx->block_size);
         delete ctx;
         return -EINVAL;
     }
     if (ctx->ag_count == 0 || ctx->ag_blocks == 0) {
-        mod::dbg::log("[xfs] invalid AG geometry\n");
+        mod::dbg::log("[xfs] invalid AG geometry");
         delete ctx;
         return -EINVAL;
     }
     if (ctx->inode_size < 256) {
-        mod::dbg::log("[xfs] inode size %u too small\n", ctx->inode_size);
+        mod::dbg::log("[xfs] inode size %u too small", ctx->inode_size);
         delete ctx;
         return -EINVAL;
     }
@@ -314,19 +314,19 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
                                             XFS_SB_FEAT_INCOMPAT_NREXT64 | XFS_SB_FEAT_INCOMPAT_EXCHRANGE | XFS_SB_FEAT_INCOMPAT_PARENT;
     uint32_t unsupported = ctx->feat_incompat & ~SUPPORTED_INCOMPAT;
     if (unsupported != 0) {
-        mod::dbg::log("[xfs] unsupported incompat features: 0x%x\n", unsupported);
+        mod::dbg::log("[xfs] unsupported incompat features: 0x%x", unsupported);
         if (!read_only) {
             delete ctx;
             return -EINVAL;
         }
-        mod::dbg::log("[xfs]   mounting read-only anyway\n");
+        mod::dbg::log("[xfs]   mounting read-only anyway");
     }
 
     // --- Allocate per-AG state and read AGF/AGI headers ---
     size_t pag_size = sizeof(XfsPerAG) * ctx->ag_count;
     ctx->per_ag = static_cast<XfsPerAG*>(mod::mm::dyn::kmalloc::malloc(pag_size));
     if (ctx->per_ag == nullptr) {
-        mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)\n", ctx->ag_count);
+        mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)", ctx->ag_count);
         delete ctx;
         return -ENOMEM;
     }
@@ -335,7 +335,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     for (xfs_agnumber_t ag = 0; ag < ctx->ag_count; ag++) {
         int rc = read_agf(ctx, ag);
         if (rc != 0) {
-            mod::dbg::log("[xfs] failed to read AGF for AG %u\n", ag);
+            mod::dbg::log("[xfs] failed to read AGF for AG %u", ag);
             mod::mm::dyn::kmalloc::free(ctx->per_ag);
             delete ctx;
             return rc;
@@ -343,7 +343,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 
         rc = read_agi(ctx, ag);
         if (rc != 0) {
-            mod::dbg::log("[xfs] failed to read AGI for AG %u\n", ag);
+            mod::dbg::log("[xfs] failed to read AGI for AG %u", ag);
             mod::mm::dyn::kmalloc::free(ctx->per_ag);
             delete ctx;
             return rc;
@@ -362,7 +362,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         total_inodes += ctx->per_ag[ag].agi_count;
         free_inodes += ctx->per_ag[ag].agi_freecount;
     }
-    mod::dbg::log("[xfs] mounted: %lu free blocks, %lu/%lu inodes free\n", (unsigned long)total_free, (unsigned long)free_inodes,
+    mod::dbg::log("[xfs] mounted: %lu free blocks, %lu/%lu inodes free", (unsigned long)total_free, (unsigned long)free_inodes,
                   (unsigned long)total_inodes);
 
     return 0;
@@ -388,7 +388,7 @@ void xfs_unmount(XfsMountContext* ctx) {
     }
 
     ctx->mounted = false;
-    mod::dbg::log("[xfs] unmounted\n");
+    mod::dbg::log("[xfs] unmounted");
 
     delete ctx;
 }

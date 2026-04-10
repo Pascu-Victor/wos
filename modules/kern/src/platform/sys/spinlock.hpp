@@ -12,7 +12,7 @@
 
 namespace ker::mod::sys {
 
-// Ticket spinlock — FIFO fair, prevents starvation.
+// Ticket spinlock - FIFO fair, prevents starvation.
 // Each waiter atomically grabs a ticket; it spins only until its ticket
 // is the "now serving" value.  The owner advances "now_serving" on unlock,
 // guaranteeing that every waiter eventually wins in arrival order.

@@ -233,7 +233,7 @@ void process_event(XhciController* hc, Trb* evt) {
             }
         }
     } else if (type == TRB_TRANSFER_EVENT) {
-        // Transfer completion — wake blocked task
+        // Transfer completion - wake blocked task
         // For now, just mark the command as done
         // (used for synchronous control/bulk transfers)
         hc->cmd_result = evt->status;

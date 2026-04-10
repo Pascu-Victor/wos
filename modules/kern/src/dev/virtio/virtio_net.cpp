@@ -289,7 +289,7 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev) -> bool {
     buf[1] = VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET;
     buf[2] = 2;     // num_pairs = 2, little-endian low byte
     buf[3] = 0;     // num_pairs high byte
-    buf[4] = 0xFF;  // ack placeholder — device writes VIRTIO_NET_OK (0) on success
+    buf[4] = 0xFF;  // ack placeholder - device writes VIRTIO_NET_OK (0) on success
 
     uint64_t phys = virt_to_phys(buf);
 
@@ -519,7 +519,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint64_t txq_phys = virt_to_phys(dev->txq->desc);
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(txq_phys / 4096));
 
-    // Queue pair 1 (queues 2/3) + control queue (queue 4) — set up only when MQ desired.
+    // Queue pair 1 (queues 2/3) + control queue (queue 4) - set up only when MQ desired.
     if (want_mq) {
         ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 2);
         uint16_t rxq2_size = std::min(::inw(io_base + VIRTIO_REG_QUEUE_SIZE), VIRTQ_MAX_SIZE);

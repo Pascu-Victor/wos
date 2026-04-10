@@ -1,6 +1,6 @@
 #pragma once
 
-// Sleeping Mutex — blocks the caller when contended instead of spinning.
+// Sleeping Mutex - blocks the caller when contended instead of spinning.
 //
 // Uses an atomic flag for the fast uncontended path and falls back to
 // kern_yield() to sleep when the lock is held by another task.  A simple

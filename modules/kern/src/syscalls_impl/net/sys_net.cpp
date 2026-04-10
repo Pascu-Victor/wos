@@ -650,7 +650,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return 0;
             }
 
-            // No events — check for deliverable signals before retrying.
+            // No events - check for deliverable signals before retrying.
             {
                 uint64_t deliverable = task->sigPending & ~task->sigMask;
                 if (deliverable != 0) {

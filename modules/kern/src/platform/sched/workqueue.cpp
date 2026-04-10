@@ -31,7 +31,7 @@ Workqueue* pending_launch_wq = nullptr;  // NOLINT
 sys::Spinlock launch_lock;
 }  // namespace
 
-// Static worker entry point — called by the scheduler as a kernel thread.
+// Static worker entry point - called by the scheduler as a kernel thread.
 void Workqueue::worker_entry() {
     // Grab the Workqueue that launched this thread.
     uint64_t irqf = launch_lock.lock_irqsave();
@@ -72,7 +72,7 @@ void Workqueue::drain_loop() {
             item->fn(item->arg);
             completed_count_.fetch_add(1, std::memory_order_release);
         } else {
-            // Nothing to do — truly block until enqueue() wakes us.
+            // Nothing to do - truly block until enqueue() wakes us.
             kern_block();
         }
     }
@@ -98,7 +98,7 @@ void Workqueue::drain_loop() {
         completed_count_.fetch_add(1, std::memory_order_release);
     }
 
-    // Worker thread done — loop forever in yield (the scheduler will GC it
+    // Worker thread done - loop forever in yield (the scheduler will GC it
     // when the task eventually exits).
     while (true) {
         kern_yield();
@@ -173,7 +173,7 @@ void Workqueue::destroy() {
         kern_wake(thread_);
     }
 
-    // Wait for the worker to finish draining (best effort — we busy-wait
+    // Wait for the worker to finish draining (best effort - we busy-wait
     // a bounded number of times).
     for (int i = 0; i < 1000; i++) {
         if (pending_count_.load(std::memory_order_acquire) == 0) {

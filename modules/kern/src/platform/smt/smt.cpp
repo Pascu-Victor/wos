@@ -126,7 +126,7 @@ void init_cpu_domains() {
     root.hard = false;
     __builtin_memcpy(root.name, "root", 5);
 
-    // Domain 1: single GROUP_0 (flat topology — one socket)
+    // Domain 1: single GROUP_0 (flat topology - one socket)
     // Future NUMA support: parse MADT/SRAT to create one group per proximity domain
     CpuDomain& grp = domain_table[domain_count++];
     grp.id = 1;
@@ -146,11 +146,11 @@ namespace {
 // Array to store kernel PerCpu structure addresses for each CPU
 // These are the PerCpu structures allocated during boot that have correct cpuId
 // Used to restore GS_BASE when entering idle loop (no task context)
-static cpu::PerCpu** kernelPerCpuPtrs = nullptr;
+cpu::PerCpu** kernelPerCpuPtrs = nullptr;
 
 // Atomic counter to track how many CPUs have completed GS_BASE initialization
 // The last CPU to reach cpu_count enables per-CPU allocations globally
-static std::atomic<uint64_t> cpusInitialized{0};
+std::atomic<uint64_t> cpusInitialized{0};
 
 void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     // Enable CPU features FIRST (must be done on each CPU)
@@ -222,7 +222,7 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
         mm::dyn::kmalloc::enablePerCpuAllocations();
     }
 
-    dbg::log("CPU %d initialized and ready (%d/%d CPUs ready)", cpuNo, initialized_count, cpu_count);
+    dbg::log("CPU %d initialized and ready (%d/%d CPUs ready)", cpuNo, initialized_count, g_cpu_count);
 
     // Start the scheduler on this CPU
     sched::start_scheduler();
@@ -320,7 +320,7 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
             uint64_t page_phys = mm::virt::translate(new_task->pagemap, page_virt);
             if (page_phys == mm::virt::PADDR_INVALID) {
-                dbg::log("PANIC: Failed to translate page virt=0x%x for stack data — stack page not mapped", page_virt);
+                dbg::log("PANIC: Failed to translate page virt=0x%x for stack data - stack page not mapped", page_virt);
                 hcf();
             }
 
@@ -346,7 +346,7 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
             uint64_t page_phys = mm::virt::translate(new_task->pagemap, page_virt);
             if (page_phys == mm::virt::PADDR_INVALID) {
-                dbg::log("PANIC: Failed to translate page virt=0x%x for string '%s' — stack page not mapped", page_virt, str);
+                dbg::log("PANIC: Failed to translate page virt=0x%x for string '%s' - stack page not mapped", page_virt, str);
                 hcf();
             }
 
@@ -510,7 +510,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     bsp_per_cpu->cpuId = 0;
     cpu::setCurrentCpuid(0);
 
-    // GS base is now valid — cpu::currentCpu() works, safe to enable CPU ID in serial logs
+    // GS base is now valid - cpu::currentCpu() works, safe to enable CPU ID in serial logs
     io::serial::markCpuIdAvailable();
 
     // Store the BSP's PerCpu pointer for later retrieval

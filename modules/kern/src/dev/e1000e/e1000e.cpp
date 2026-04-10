@@ -227,7 +227,7 @@ int process_rx_budget(E1000Device* dev, int budget) {
                     dev->rx_bufs[idx] = new_pkt;
                     desc->addr = virt_to_phys(new_pkt->storage.data());
                 } else {
-                    // No buffer available — mark slot as empty
+                    // No buffer available - mark slot as empty
                     dev->rx_bufs[idx] = nullptr;
                     desc->addr = 0;
                 }
@@ -324,7 +324,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
 
     // Check if descriptor is available
     if (dev->tx_bufs[idx] != nullptr) {
-        // TX ring full — try to reclaim
+        // TX ring full - try to reclaim
         process_tx(dev);
         if (dev->tx_bufs[idx] != nullptr) {
             dev->tx_lock.unlock_irqrestore(txflags);
@@ -356,7 +356,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
 }
 
 void e1000_set_mac(ker::net::NetDevice* /*ndev*/, const uint8_t* /*mac*/) {
-    // Not implemented — MAC is read from hardware
+    // Not implemented - MAC is read from hardware
 }
 
 ker::net::NetDeviceOps e1000_netdev_ops = {

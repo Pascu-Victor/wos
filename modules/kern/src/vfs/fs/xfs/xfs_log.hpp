@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Log (Write-Ahead Log) — journal management.
+// XFS Log (Write-Ahead Log) - journal management.
 //
 // The XFS log is a circular buffer on disk used to ensure metadata consistency.
 // On mount, the log is scanned for uncommitted records and replayed.

@@ -155,7 +155,7 @@ void evict_lru() {
                 cur = cur->lru_prev;
             }
             if (!found) {
-                break;  // All buffers are referenced or dirty — cannot evict
+                break;  // All buffers are referenced or dirty - cannot evict
             }
         }
         free_buffer(victim);
@@ -246,7 +246,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         return bh;
     }
 
-    // 2. Cache miss — allocate and read from disk
+    // 2. Cache miss - allocate and read from disk
     stat_misses++;
 
     // Evict if necessary before allocating
@@ -267,7 +267,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
 
     int rc = read_block_from_disk(bh);
     if (rc != 0) {
-        // Read failed — remove from cache
+        // Read failed - remove from cache
         irqflags = cache_lock.lock_irqsave();
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
@@ -305,7 +305,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
             cache_lock.unlock_irqrestore(irqflags);
             return bh;
         }
-        // Size mismatch — fall through to allocate fresh (shouldn't happen)
+        // Size mismatch - fall through to allocate fresh (shouldn't happen)
     }
 
     stat_misses++;
@@ -364,7 +364,7 @@ void brelse(BufHead* bh) {
         // Refcount hit zero. If the buffer is not in the hash (multi-block),
         // free it immediately.
         if (bh->lru_prev == nullptr && bh->lru_next == nullptr && bh->hash_next == nullptr) {
-            // Not in cache (multi-block temporary buffer) — check if it's also
+            // Not in cache (multi-block temporary buffer) - check if it's also
             // not the sole entry in any hash bucket. For multi-block buffers
             // (which are never inserted into the hash), just free.
             // Simple heuristic: if size > block_size, it's a multi-block buffer.
@@ -425,7 +425,7 @@ auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         return bh;
     }
 
-    // Not cached — allocate a new buffer and insert without reading.
+    // Not cached - allocate a new buffer and insert without reading.
     evict_lru();
     bh = alloc_buffer(bdev, block_no);
     if (bh == nullptr) {
@@ -461,7 +461,7 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
             cache_lock.unlock_irqrestore(irqflags);
             return bh;
         }
-        // Size mismatch — fall through to allocate fresh (shouldn't happen)
+        // Size mismatch - fall through to allocate fresh (shouldn't happen)
     }
 
     evict_lru();

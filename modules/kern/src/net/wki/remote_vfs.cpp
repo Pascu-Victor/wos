@@ -113,11 +113,44 @@ bool path_crosses_remote_mount(const char* path) {
     return mp != nullptr && mp->fs_type == ker::vfs::FSType::REMOTE;
 }
 
+bool path_crosses_recursive_self_alias(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+
+    constexpr char host_prefix[] = "/wki/host";
+    constexpr size_t host_prefix_len = sizeof(host_prefix) - 1;
+    if (std::strncmp(path, host_prefix, host_prefix_len) == 0 && (path[host_prefix_len] == '\0' || path[host_prefix_len] == '/')) {
+        return true;
+    }
+
+    char self_prefix[WKI_HOSTNAME_MAX + 6] = {};
+    std::snprintf(self_prefix, sizeof(self_prefix), "/wki/%s", g_wki.local_hostname);
+    size_t self_prefix_len = std::strlen(self_prefix);
+    return std::strncmp(path, self_prefix, self_prefix_len) == 0 && (path[self_prefix_len] == '\0' || path[self_prefix_len] == '/');
+}
+
+bool path_crosses_recursive_wki_boundary(const char* path) {
+    return path_crosses_remote_mount(path) || path_crosses_recursive_self_alias(path);
+}
+
+bool should_hide_recursive_wki_entry(const RemoteFileContext* ctx, const ker::vfs::DirEntry& entry) {
+    if (ctx == nullptr || !ctx->hide_recursive_wki_entries) {
+        return false;
+    }
+
+    if (std::strcmp(entry.d_name.data(), "host") == 0) {
+        return true;
+    }
+
+    return ctx->recursive_wki_hostname[0] != '\0' && std::strcmp(entry.d_name.data(), ctx->recursive_wki_hostname) == 0;
+}
+
 // -----------------------------------------------------------------------------
 // Consumer side
 // -----------------------------------------------------------------------------
 
-// D7: Directory listing cache — avoids repeated round-trips for readdir()
+// D7: Directory listing cache - avoids repeated round-trips for readdir()
 struct DirCacheEntry {
     ProxyVfsState* proxy = nullptr;
     int32_t remote_fd = -1;
@@ -127,6 +160,28 @@ struct DirCacheEntry {
 
     static constexpr uint64_t STALE_US = 5000000;  // 5 seconds
 };
+
+bool try_get_visible_cached_dirent(const DirCacheEntry* cache, const RemoteFileContext* ctx, size_t visible_index,
+                                   ker::vfs::DirEntry* out) {
+    if (cache == nullptr || out == nullptr) {
+        return false;
+    }
+
+    size_t current_visible = 0;
+    for (const auto& candidate : cache->entries) {
+        if (should_hide_recursive_wki_entry(ctx, candidate)) {
+            continue;
+        }
+        if (current_visible == visible_index) {
+            *out = candidate;
+            return true;
+        }
+        current_visible++;
+    }
+
+    return false;
+}
+
 std::deque<DirCacheEntry> g_dir_cache;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto find_dir_cache(ProxyVfsState* proxy, int32_t remote_fd) -> DirCacheEntry* {
@@ -211,7 +266,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         state->lock.unlock();
         asm volatile("pause" ::: "memory");
     }
-    // Lock held, op_pending still false — set up wait entry and response fields
+    // Lock held, op_pending still false - set up wait entry and response fields
     WkiWaitEntry wait = {};
     state->op_wait_entry = &wait;
     state->op_pending.store(true, std::memory_order_release);
@@ -376,8 +431,8 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
 
     // -- Bulk RDMA path ----------------------------------------------------
     // Two modes:
-    //  (a) Direct bulk — request > 64 KB: issue OP_VFS_READ_BULK for each chunk.
-    //  (b) Prefetch   — request ≤ 64 KB (typical cp/cat): on the first small read
+    //  (a) Direct bulk - request > 64 KB: issue OP_VFS_READ_BULK for each chunk.
+    //  (b) Prefetch   - request ≤ 64 KB (typical cp/cat): on the first small read
     //      (or cache miss), pre-fetch up to 2 MB from the server into the bulk
     //      buffer and serve subsequent sequential reads from it.  This turns
     //      hundreds of 4 KB RPCs into one bulk RDMA write.
@@ -402,7 +457,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             if (remaining == 0) {
                 return total_read;
             }
-            // Partial hit — fall through to refill below
+            // Partial hit - fall through to refill below
         }
 
         // -- Bulk fetch: either (a) direct or (b) prefetch refill ----------
@@ -444,7 +499,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                 break;  // Short read: EOF
             }
 
-            // For prefetch path, one fetch is enough — subsequent small reads
+            // For prefetch path, one fetch is enough - subsequent small reads
             // will hit the cache at the top of this function.
             if (remaining <= VFS_RDMA_BOUNCE_SIZE) {
                 break;
@@ -454,7 +509,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     }
 
     // RDMA path: server rdma_writes file data to our bounce buffer, sends tiny
-    // completion — bulk data never touches ethernet. 64 KB per round-trip vs ~1400 B.
+    // completion - bulk data never touches ethernet. 64 KB per round-trip vs ~1400 B.
     if (ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
         ctx->proxy->rdma_bounce_buf != nullptr) {
         while (remaining > 0) {
@@ -668,7 +723,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
                 break;  // Short write
             }
         }
-        // Loop back — remaining data will be buffered on next iteration
+        // Loop back - remaining data will be buffered on next iteration
     }
 
     return total_written;
@@ -686,7 +741,7 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
         case 1:  // SEEK_CUR
             f->pos += offset;
             break;
-        case 2: {  // SEEK_END — V2: server roundtrip to get file size
+        case 2: {  // SEEK_END - V2: server roundtrip to get file size
             if (f->private_data == nullptr) {
                 ker::mod::dbg::log("remote_vfs_lseek: SEEK_END private_data is null");
                 return -1;
@@ -750,14 +805,13 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
     }
 
     // Cache hit: entry already fetched
-    if (cache != nullptr && index < cache->entries.size()) {
-        *entry = cache->entries[index];
+    if (cache != nullptr && try_get_visible_cached_dirent(cache, ctx, index, entry)) {
         s_vfs_lock.unlock();
         return 0;
     }
 
     // Cache hit but we already know directory is exhausted
-    if (cache != nullptr && cache->complete && index >= cache->entries.size()) {
+    if (cache != nullptr && cache->complete) {
         s_vfs_lock.unlock();
         return -1;
     }
@@ -775,7 +829,7 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
 
     // Fetch entries from server in batches.
     // One OP_VFS_READDIR_BATCH request returns up to MAX_BATCH_ENTRIES entries,
-    // filling the full jumbo frame — typically the entire directory in one round-trip.
+    // filling the full jumbo frame - typically the entire directory in one round-trip.
     constexpr uint32_t MAX_BATCH_ENTRIES =
         static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
     constexpr size_t BATCH_RESP_SIZE = sizeof(uint32_t) + MAX_BATCH_ENTRIES * sizeof(ker::vfs::DirEntry);
@@ -793,8 +847,7 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
             ker::mod::mm::dyn::kmalloc::free(batch_buf);
             return -1;
         }
-        if (index < cache->entries.size()) {
-            *entry = cache->entries[index];
+        if (try_get_visible_cached_dirent(cache, ctx, index, entry)) {
             s_vfs_lock.unlock();
             ker::mod::mm::dyn::kmalloc::free(batch_buf);
             return 0;
@@ -857,7 +910,7 @@ auto remote_vfs_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
     }
 
     // We don't have a path available from the File. readlink on an already-opened
-    // remote file is not meaningful — readlink operates on paths, not FDs.
+    // remote file is not meaningful - readlink operates on paths, not FDs.
     // Return -1 as unsupported on open files.
     (void)bufsize;
     return -1;
@@ -923,7 +976,7 @@ void wki_remote_vfs_init() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Server Side — VFS Export Management
+// Server Side - VFS Export Management
 // ═══════════════════════════════════════════════════════════════════════════════
 
 auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t {
@@ -1032,7 +1085,7 @@ void wki_remote_vfs_advertise_exports() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Server Side — VFS Operation Handlers
+// Server Side - VFS Operation Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {
@@ -1072,7 +1125,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 10), path_len);
 
             // Block recursive proxying: don't let a remote client traverse into our WKI mounts
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_OPEN;
                 resp.status = -EPERM;
@@ -1334,7 +1387,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
         case OP_VFS_READDIR_BATCH: {
             // Request: {fd:i32, start_idx:u32, max_count:u32} = 12 bytes
-            // Response: {count:u32} + count×DirEntry — packs as many entries as
+            // Response: {count:u32} + count×DirEntry - packs as many entries as
             // fit in one jumbo frame, typically the whole directory in one shot.
             if (data_len < 12) {
                 DevOpRespPayload resp = {};
@@ -1434,7 +1487,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_STAT;
                 resp.status = -EPERM;
@@ -1504,7 +1557,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 6), path_len);
 
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_MKDIR;
                 resp.status = -EPERM;
@@ -1549,7 +1602,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_READLINK;
                 resp.status = -EPERM;
@@ -1643,7 +1696,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             build_full_path(full_link.data(), full_link.size(), export_path, reinterpret_cast<const char*>(data + 4 + target_len),
                             link_len);
 
-            if (path_crosses_remote_mount(full_link.data())) {
+            if (path_crosses_recursive_wki_boundary(full_link.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -EPERM;
@@ -1691,7 +1744,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_UNLINK;
                 resp.status = -EPERM;
@@ -1735,7 +1788,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> full_path{};
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
 
-            if (path_crosses_remote_mount(full_path.data())) {
+            if (path_crosses_recursive_wki_boundary(full_path.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_RMDIR;
                 resp.status = -EPERM;
@@ -1793,7 +1846,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             std::array<char, 512> new_full{};
             build_full_path(new_full.data(), new_full.size(), export_path, reinterpret_cast<const char*>(data + 4 + old_len), new_len);
 
-            if (path_crosses_remote_mount(old_full.data()) || path_crosses_remote_mount(new_full.data())) {
+            if (path_crosses_recursive_wki_boundary(old_full.data()) || path_crosses_recursive_wki_boundary(new_full.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_RENAME;
                 resp.status = -EPERM;
@@ -2015,7 +2068,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
         }
 
         case OP_VFS_READ_BULK: {
-            // Bulk RDMA read — identical request layout to OP_VFS_READ_RDMA but len
+            // Bulk RDMA read - identical request layout to OP_VFS_READ_RDMA but len
             // is not capped to 64 KB.  The consumer provides an rkey to a large
             // (up to 2 MB) registered buffer.  We read from the local file, then
             // push the entire result in one rdma_write.
@@ -2156,7 +2209,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 }  // namespace detail
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Side — Mount / Open / Response Handlers
+// Consumer Side - Mount / Open / Response Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int {
@@ -2416,6 +2469,19 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     ctx->proxy = state;
     ctx->remote_fd = open_resp.fd;
 
+    const char* path = fs_relative_path;
+    while (path != nullptr && *path == '/') {
+        path++;
+    }
+    if (path != nullptr && std::strcmp(path, "wki") == 0) {
+        ctx->hide_recursive_wki_entries = true;
+        const char* owner_hostname = wki_peer_get_hostname(state->owner_node);
+        if (owner_hostname != nullptr) {
+            std::strncpy(ctx->recursive_wki_hostname, owner_hostname, sizeof(ctx->recursive_wki_hostname) - 1);
+            ctx->recursive_wki_hostname[sizeof(ctx->recursive_wki_hostname) - 1] = '\0';
+        }
+    }
+
     file->fd = -1;  // Will be assigned by vfs_alloc_fd
     file->private_data = ctx;
     file->fops = &g_remote_vfs_fops;
@@ -2591,7 +2657,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations* { return &g_remote_vfs_fops; }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Side — RX Handlers
+// Consumer Side - RX Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {
@@ -2639,7 +2705,7 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         return;
     }
 
-    // Find VFS proxy by (src_node, channel_id) — hold s_vfs_lock across lookup +
+    // Find VFS proxy by (src_node, channel_id) - hold s_vfs_lock across lookup +
     // response copy to prevent proxy teardown between lookup and use.
     s_vfs_lock.lock();
     ProxyVfsState* state = find_vfs_proxy_by_channel(hdr->src_node, hdr->channel_id);

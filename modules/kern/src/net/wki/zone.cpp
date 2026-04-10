@@ -22,7 +22,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// Zone table — static storage for all zones on this node
+// Zone table - static storage for all zones on this node
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -175,7 +175,7 @@ void wki_zone_init() {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone creation
+// Public API - Zone creation
 // -----------------------------------------------------------------------------
 
 auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify, ZoneTypeHint hint)
@@ -260,7 +260,7 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     int wait_rc = wki_wait_for_op(&create_wait, WKI_OP_TIMEOUT_US);
     zone->read_wait_entry = nullptr;
     if (wait_rc == WKI_ERR_TIMEOUT) {
-        // Timeout — clean up
+        // Timeout - clean up
         s_zone_table_lock.lock();
         zone->state = ZoneState::NONE;
         zone->zone_id = 0;
@@ -272,12 +272,12 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
         return WKI_OK;
     }
 
-    // Zone was rejected — slot already cleaned up by ACK handler
+    // Zone was rejected - slot already cleaned up by ACK handler
     return WKI_ERR_ZONE_REJECTED;
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone destruction
+// Public API - Zone destruction
 // -----------------------------------------------------------------------------
 
 auto wki_zone_destroy(uint32_t zone_id) -> int {
@@ -311,7 +311,7 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone lookup
+// Public API - Zone lookup
 // -----------------------------------------------------------------------------
 
 auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
@@ -322,7 +322,7 @@ auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone read (message-based, blocking)
+// Public API - Zone read (message-based, blocking)
 // -----------------------------------------------------------------------------
 
 auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int {
@@ -334,7 +334,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         return WKI_ERR_ZONE_INACTIVE;
     }
 
-    // Check access policy — we need REMOTE_READ on the peer's zone
+    // Check access policy - we need REMOTE_READ on the peer's zone
     // (The remote side validates this too, but checking early avoids network round-trip)
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         return WKI_ERR_ZONE_ACCESS;
@@ -405,7 +405,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone write (message-based, blocking)
+// Public API - Zone write (message-based, blocking)
 // -----------------------------------------------------------------------------
 
 auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int {
@@ -493,13 +493,13 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 }
 
 // -----------------------------------------------------------------------------
-// Public API — RDMA direct access
+// Public API - RDMA direct access
 // -----------------------------------------------------------------------------
 
 // Returns a raw pointer to the zone's local backing memory for RDMA direct access.
 // The caller is responsible for respecting the zone's access_policy bits
 // (ZONE_ACCESS_LOCAL_READ/WRITE, ZONE_ACCESS_REMOTE_READ/WRITE from wire.hpp).
-// No enforcement is done here — policy checks are performed at the message-based
+// No enforcement is done here - policy checks are performed at the message-based
 // read/write paths (wki_zone_read / wki_zone_write).
 auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
     WkiZone* zone = wki_zone_find(zone_id);
@@ -510,7 +510,7 @@ auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Notification handlers
+// Public API - Notification handlers
 // -----------------------------------------------------------------------------
 
 void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHandler post) {
@@ -525,7 +525,7 @@ void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHa
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Fencing cleanup
+// Public API - Fencing cleanup
 // -----------------------------------------------------------------------------
 
 void wki_zones_destroy_for_peer(uint16_t node_id) {
@@ -558,7 +558,7 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone listing
+// Public API - Zone listing
 // -----------------------------------------------------------------------------
 
 auto wki_zones_list() -> auto {
@@ -574,7 +574,7 @@ auto wki_zones_list() -> auto {
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone negotiation
+// RX Handlers - Zone negotiation
 // -----------------------------------------------------------------------------
 
 namespace detail {
@@ -876,7 +876,7 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone notifications
+// RX Handlers - Zone notifications
 // -----------------------------------------------------------------------------
 
 void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -920,11 +920,11 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
         return;
     }
 
-    // op_type=0xFE: rkey-exchange — the initiator is telling us its RDMA rkey
+    // op_type=0xFE: rkey-exchange - the initiator is telling us its RDMA rkey
     // so we can write/read its zone memory.  Store it in remote_rkey.
     if (notify->op_type == 0xFE) {
         zone->remote_rkey = notify->offset;  // rkey encoded in offset field
-        // No ACK needed for rkey-exchange — the initiator doesn't wait.
+        // No ACK needed for rkey-exchange - the initiator doesn't wait.
         return;
     }
 
@@ -940,7 +940,7 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone read (message-based)
+// RX Handlers - Zone read (message-based)
 // -----------------------------------------------------------------------------
 
 void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -961,7 +961,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         return;
     }
 
-    // Check access policy — peer wants to read our local data
+    // Check access policy - peer wants to read our local data
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         return;
     }
@@ -1030,7 +1030,7 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone write (message-based)
+// RX Handlers - Zone write (message-based)
 // -----------------------------------------------------------------------------
 
 void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1051,7 +1051,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
-    // Check access policy — peer wants to write to our local data
+    // Check access policy - peer wants to write to our local data
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
         ZoneWriteAckPayload ack = {};
         ack.zone_id = req->zone_id;

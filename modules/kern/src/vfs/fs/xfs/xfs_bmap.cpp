@@ -24,7 +24,7 @@
 namespace ker::vfs::xfs {
 
 // ============================================================================
-// EXTENTS format — binary search in decoded extent list
+// EXTENTS format - binary search in decoded extent list
 // ============================================================================
 
 namespace {
@@ -35,7 +35,7 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
     if (ext.count == 0) {
         result->is_hole = true;
         result->startblock = NULLFSBLOCK;
-        // No extents at all — the entire address space is a hole.  Return a
+        // No extents at all - the entire address space is a hole.  Return a
         // large blockcount so the caller can allocate in large batches.
         result->blockcount = ~static_cast<xfs_filblks_t>(0);
         result->unwritten = false;
@@ -80,7 +80,7 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
         if (lo < static_cast<int>(ext.count)) {
             result->blockcount = ext.list[lo].br_startoff - file_block;
         } else {
-            // Past the last extent — unbounded hole to EOF.  Return a large
+            // Past the last extent - unbounded hole to EOF.  Return a large
             // blockcount so callers can allocate in large batches.
             result->blockcount = ~static_cast<xfs_filblks_t>(0);
         }
@@ -90,7 +90,7 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
 }
 
 // ============================================================================
-// BTREE format — use bmbt cursor
+// BTREE format - use bmbt cursor
 // ============================================================================
 
 auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* result) -> int {
@@ -145,7 +145,7 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     uint64_t child_block = ptr_val.to_cpu();
 
     if (level == 1) {
-        // Child is a leaf — we can read it directly and do the lookup
+        // Child is a leaf - we can read it directly and do the lookup
         // Set up a btree cursor positioned at the child block
         XfsBtreeCursor<XfsBmbtTraits> cur;
         cur.mount = mount;
@@ -255,7 +255,7 @@ auto xfs_bmap_lookup(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* resu
 
     switch (ip->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
-            // Inline data — no block mapping.  The caller should read data
+            // Inline data - no block mapping.  The caller should read data
             // directly from the inode fork.
             result->is_hole = false;
             result->startblock = NULLFSBLOCK;
@@ -270,7 +270,7 @@ auto xfs_bmap_lookup(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* resu
             return bmap_lookup_btree(ip, file_block, result);
 
         default:
-            mod::dbg::log("[xfs] bmap: unsupported fork format %d for inode %lu\n", ip->data_fork.format, (unsigned long)ip->ino);
+            mod::dbg::log("[xfs] bmap: unsupported fork format %d for inode %lu", ip->data_fork.format, (unsigned long)ip->ino);
             return -EINVAL;
     }
 }
@@ -339,14 +339,14 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
     }
 
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
-        return 0;  // inline — no extents
+        return 0;  // inline - no extents
     }
 
     return -EINVAL;
 }
 
 // ============================================================================
-// Add extent — insert a new extent mapping into the inode's data fork
+// Add extent - insert a new extent mapping into the inode's data fork
 // ============================================================================
 
 auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& new_ext) -> int {
@@ -357,7 +357,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     // Only support EXTENTS format for now (most common for small/medium files).
     // An empty file (LOCAL format with 0 extents) can be promoted to EXTENTS.
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
-        // Promote to EXTENTS format — free inline data if any
+        // Promote to EXTENTS format - free inline data if any
         if (ip->data_fork.local.data != nullptr) {
             delete[] ip->data_fork.local.data;
             ip->data_fork.local.data = nullptr;
@@ -369,7 +369,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     }
 
     if (ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
-        mod::dbg::log("[xfs] bmap_add_extent: unsupported fork format %d for inode %lu\n", ip->data_fork.format,
+        mod::dbg::log("[xfs] bmap_add_extent: unsupported fork format %d for inode %lu", ip->data_fork.format,
                       static_cast<unsigned long>(ip->ino));
         return -EOPNOTSUPP;
     }
@@ -413,15 +413,21 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         }
     }
 
-    // No merge — insert new extent.
+    // No merge - insert new extent.
     // Grow the list with capacity doubling to avoid O(N²) reallocations.
     uint32_t new_count = ext.count + 1;
     if (new_count > ext.capacity) {
         uint32_t new_cap = ext.capacity == 0 ? 4 : ext.capacity * 2;
-        if (new_cap < new_count) { new_cap = new_count; }
+        if (new_cap < new_count) {
+            new_cap = new_count;
+        }
         auto* new_list = new XfsBmbtIrec[new_cap];
-        if (new_list == nullptr) { return -ENOMEM; }
-        for (uint32_t i = 0; i < ext.count; i++) { new_list[i] = ext.list[i]; }
+        if (new_list == nullptr) {
+            return -ENOMEM;
+        }
+        for (uint32_t i = 0; i < ext.count; i++) {
+            new_list[i] = ext.list[i];
+        }
         delete[] ext.list;
         ext.list = new_list;
         ext.capacity = new_cap;

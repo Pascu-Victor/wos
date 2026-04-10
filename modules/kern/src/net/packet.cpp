@@ -26,7 +26,6 @@ bool initialized = false;
 // to cheaply check whether we should reserve buffers for RX.
 std::atomic<size_t> free_count{0};
 
-
 void add_buffers_to_pool(size_t count) {
     // Allocate new buffers
     auto* new_buffers = static_cast<PacketBuffer*>(ker::mod::mm::dyn::kmalloc::calloc(count, sizeof(PacketBuffer)));
@@ -62,7 +61,7 @@ auto pkt_global_alloc() -> PacketBuffer* {
     return pkt;
 }
 
-// Return to global pool (IRQ-safe — see pkt_global_alloc comment).
+// Return to global pool (IRQ-safe - see pkt_global_alloc comment).
 void pkt_global_free(PacketBuffer* pkt) {
     uint64_t flags = pool_lock.lock_irqsave();
     pkt->next = free_list;
@@ -93,7 +92,6 @@ void pkt_pool_expand_for_nics() {
         size_t to_add = required - pool_capacity;
         add_buffers_to_pool(to_add);
     }
-
 }
 
 auto pkt_pool_size() -> size_t { return pool_capacity; }

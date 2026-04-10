@@ -45,7 +45,7 @@ void CoredumpRegisterPanel::setupUI() {
     mainLayout->setContentsMargins(4, 4, 4, 4);
     mainLayout->setSpacing(2);
 
-    // Header info table (PID, CPU, interrupt, etc.) — compact
+    // Header info table (PID, CPU, interrupt, etc.) - compact
     headerTable_ = new QTableWidget(container);
     headerTable_->setColumnCount(8);
     headerTable_->setRowCount(1);

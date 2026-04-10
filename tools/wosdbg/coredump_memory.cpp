@@ -149,11 +149,11 @@ std::vector<AnnotatedQword> dumpRange(const CoreDump& dump, uint64_t va_start, u
 
         // Stack direction gutter
         if (va < trap_rsp) {
-            aq.gutter = " v ";  // below RSP — stack growth direction
+            aq.gutter = " v ";  // below RSP - stack growth direction
         } else if (va == trap_rsp) {
             aq.gutter = ">>>";  // current stack pointer
         } else {
-            aq.gutter = " ^ ";  // above RSP — toward caller frames
+            aq.gutter = " ^ ";  // above RSP - toward caller frames
         }
 
         result.push_back(std::move(aq));

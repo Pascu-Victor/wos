@@ -76,7 +76,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             return 0;
         }
 
-        // No exited child yet — block until SIGCHLD wakes us
+        // No exited child yet - block until SIGCHLD wakes us
         currentTask->waitingForPid = WAIT_ANY_CHILD;
         if (status != nullptr) {
             uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));

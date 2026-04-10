@@ -1169,7 +1169,7 @@ CharDeviceOps slave_ops = {
     .poll_register_waiter = pty_poll_register_waiter,
 };
 
-// --- ptmx device (singleton — opening allocates a new PTY pair) ---
+// --- ptmx device (singleton - opening allocates a new PTY pair) ---
 
 Device ptmx_dev = {
     .major = 5,
@@ -1229,7 +1229,7 @@ auto pty_alloc() -> int {
             pair.foreground_pgrp = 0;
 
             // Build the slave device name: "pts/<N>"
-            // We need a persistent name string — use the Device name field
+            // We need a persistent name string - use the Device name field
             // Build "N" as a string (0-63, max 2 digits)
             static char slave_names[PTY_MAX][8]{};
             int n = pair.index;
@@ -1272,8 +1272,9 @@ auto pty_alloc() -> int {
             // Register the slave device, then add to devfs
             dev_register(&pair.slave_dev);
             vfs::devfs::devfs_add_device_node(pts_path, &pair.slave_dev);
-
-            ker::mod::dbg::log("pty: allocated pair %d\n", n);
+#ifdef DEBUG_PTY
+            ker::mod::dbg::log("pty: allocated pair %d", n);
+#endif
             return n;
         }
     }

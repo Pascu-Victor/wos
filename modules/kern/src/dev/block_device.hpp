@@ -45,10 +45,10 @@ struct BlockDevice {
     // Private driver data
     void* private_data = nullptr;
 
-    // Capability flags (BDEV_CAP_* bits) — set during remote attach negotiation
+    // Capability flags (BDEV_CAP_* bits) - set during remote attach negotiation
     uint32_t capabilities = 0;
 
-    // WKI remotable trait — set by drivers that support remote access
+    // WKI remotable trait - set by drivers that support remote access
     ker::net::wki::RemotableOps const* remotable = nullptr;
 
     // Partition info (set for partition block devices, not whole disks)

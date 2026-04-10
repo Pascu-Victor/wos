@@ -75,7 +75,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 }
 
 [[noreturn]] void backlog_handler_entry() {
-    // Starting CPU — passed as initial hint but re-read each iteration in the loop.
+    // Starting CPU - passed as initial hint but re-read each iteration in the loop.
     uint64_t my_cpu = ker::mod::cpu::currentCpu();
     backlog_handler_loop(my_cpu);
     __builtin_unreachable();

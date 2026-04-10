@@ -89,7 +89,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                 case 'l': {
                     i++;
                     if (format[i] == 'u') {
-                        // %lu — unsigned long (64-bit on x86_64)
+                        // %lu - unsigned long (64-bit on x86_64)
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
@@ -122,7 +122,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         strncpy(str + j, buf.data(), size - j);
                         j += len;
                     } else if (format[i] == 'x') {
-                        // %lx — unsigned long hex (64-bit on x86_64)
+                        // %lx - unsigned long hex (64-bit on x86_64)
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
@@ -139,7 +139,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         strncpy(str + j, buf.data(), size - j);
                         j += len;
                     } else if (format[i] == 'd') {
-                        // %ld — signed long (64-bit on x86_64)
+                        // %ld - signed long (64-bit on x86_64)
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }

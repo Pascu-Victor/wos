@@ -64,7 +64,7 @@ bool napi_schedule(NapiStruct* napi);
 // Driver should re-enable device interrupts after calling this
 void napi_complete(NapiStruct* napi);
 
-// Inline poll — called from spin-wait context to drain pending packets without
+// Inline poll - called from spin-wait context to drain pending packets without
 // relying on the NAPI worker thread.  Returns number of packets processed (0 if
 // the device was already being polled or no work was pending).
 int napi_poll_inline(NetDevice* dev);

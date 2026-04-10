@@ -14,7 +14,7 @@ int null_open(ker::vfs::File* /*file*/) { return 0; }
 int null_close(ker::vfs::File* /*file*/) { return 0; }
 
 ssize_t null_read(ker::vfs::File* /*file*/, void* /*buf*/, size_t /*count*/) {
-    return 0;  // EOF — always returns 0 bytes
+    return 0;  // EOF - always returns 0 bytes
 }
 
 ssize_t null_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) {

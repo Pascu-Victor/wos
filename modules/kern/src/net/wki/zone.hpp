@@ -36,13 +36,13 @@ enum class ZoneState : uint8_t {
 };
 
 // -----------------------------------------------------------------------------
-// Zone Notify Handler — callback for PRE/POST notifications
+// Zone Notify Handler - callback for PRE/POST notifications
 // -----------------------------------------------------------------------------
 
 using ZoneNotifyHandler = void (*)(uint32_t zone_id, uint32_t offset, uint32_t length, uint8_t op_type);
 
 // -----------------------------------------------------------------------------
-// WkiZone — per-zone state
+// WkiZone - per-zone state
 // -----------------------------------------------------------------------------
 
 struct WkiZone {
@@ -129,7 +129,7 @@ void wki_zones_destroy_for_peer(uint16_t node_id);
 auto wki_zones_list() -> auto;
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

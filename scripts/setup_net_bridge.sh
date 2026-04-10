@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-# -- setup_net_bridge.sh — Create network bridge and TAP devices ------------
+# -- setup_net_bridge.sh - Create network bridge and TAP devices ------------
 #
 # Usage:  sudo ./scripts/setup_net_bridge.sh [N]
 #         sudo ./scripts/setup_net_bridge.sh --no-lan [N]
 #         sudo ./scripts/setup_net_bridge.sh --vm [N]
 #
 # Creates:
-#   - wos-br0             — Linux bridge for VM network traffic
-#   - wos-tap0..tapN-1    — TAP devices attached to the bridge (one per VM)
+#   - wos-br0             - Linux bridge for VM network traffic
+#   - wos-tap0..tapN-1    - TAP devices attached to the bridge (one per VM)
 #
 # By default, moves the IP configuration from NET_LAN to the bridge so that
 # both the host and VMs share the same network segment with internet access.
@@ -151,7 +151,7 @@ if ! ip link show "$BRIDGE" &>/dev/null; then
   echo "  Creating bridge: ${BRIDGE}"
   ip link add "$BRIDGE" type bridge
   ip link set "$BRIDGE" mtu 9000
-  # Disable STP — small isolated segment, no loops
+  # Disable STP - small isolated segment, no loops
   echo 0 > /sys/class/net/${BRIDGE}/bridge/stp_state 2>/dev/null || true
 else
   echo "  Bridge ${BRIDGE} already exists"
@@ -159,7 +159,7 @@ else
   echo 0 > /sys/class/net/${BRIDGE}/bridge/stp_state 2>/dev/null || true
 fi
 
-# Disable bridge netfilter — prevents iptables from filtering bridged traffic (including ICMP)
+# Disable bridge netfilter - prevents iptables from filtering bridged traffic (including ICMP)
 if modprobe br_netfilter 2>/dev/null; then
   echo "  Disabling bridge netfilter (allows ICMP through bridge)"
   sysctl -q -w net.bridge.bridge-nf-call-iptables=0
@@ -247,7 +247,7 @@ for ((i = 0; i < NUM_VMS; i++)); do
   TAP="wos-tap${i}"
 
   if ip link show "$TAP" &>/dev/null; then
-    echo "  TAP ${TAP} already exists — skipping"
+    echo "  TAP ${TAP} already exists - skipping"
     continue
   fi
 

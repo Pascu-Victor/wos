@@ -44,6 +44,9 @@ enum class ops : uint64_t {
     ioctl,             // 38
     fsync,             // 39
     link,              // 40
+    wki_rule_add,      // 41
+    wki_rule_get,      // 42
+    wki_rule_clear,    // 43
 };
 
 }  // namespace ker::abi::vfs

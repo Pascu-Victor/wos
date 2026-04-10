@@ -3,6 +3,8 @@
 #include <abi/callnums/futex.h>
 #include <errno.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
@@ -167,6 +169,7 @@ int64_t futex_wake(int* addr) {  // NOLINT
             // Find the task and reschedule it
             auto* waiter_task = mod::sched::find_task_by_pid(waiter_pid);
             if (waiter_task != nullptr) {
+                waiter_task->deferredTaskSwitch = false;
                 mod::sched::reschedule_task_for_cpu(waiter_cpu, waiter_task);
                 woken_count++;
             }

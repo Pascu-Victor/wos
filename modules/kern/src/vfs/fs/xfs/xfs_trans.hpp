@@ -1,6 +1,6 @@
 #pragma once
 
-// XFS Transaction API — accumulate metadata modifications and commit them
+// XFS Transaction API - accumulate metadata modifications and commit them
 // atomically to the write-ahead log.
 //
 // Reference: reference/xfs/xfs_trans.h, reference/xfs/xfs_trans.c
@@ -27,7 +27,7 @@ enum class XfsLogItemType : uint8_t {
     Inode = 2,
 };
 
-// A logged buffer region — records which part of a buffer was modified
+// A logged buffer region - records which part of a buffer was modified
 struct XfsTransBufItem {
     BufHead* bp;
     uint32_t offset;  // byte offset of modified region within buffer
@@ -75,11 +75,11 @@ void xfs_trans_log_buf_full(XfsTransaction* tp, BufHead* bp);
 // Log a modified inode within a transaction.
 void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip);
 
-// Commit the transaction — write log entries and mark buffers dirty.
+// Commit the transaction - write log entries and mark buffers dirty.
 // Returns 0 on success.
 auto xfs_trans_commit(XfsTransaction* tp) -> int;
 
-// Cancel a transaction — discard all changes.
+// Cancel a transaction - discard all changes.
 void xfs_trans_cancel(XfsTransaction* tp);
 
 }  // namespace ker::vfs::xfs

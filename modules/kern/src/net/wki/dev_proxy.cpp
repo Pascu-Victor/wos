@@ -112,7 +112,7 @@ void roce_push_sq(ProxyBlockState* state) {
                                       sq_region_size);
 }
 
-// RoCE helper: push a data slot to the server (for WRITE ops — data must be visible before SQE).
+// RoCE helper: push a data slot to the server (for WRITE ops - data must be visible before SQE).
 void roce_push_data_slot(ProxyBlockState* state, uint32_t slot, uint32_t bytes) {
     if (!state->rdma_roce || state->rdma_transport == nullptr || bytes == 0) {
         return;
@@ -145,13 +145,13 @@ void roce_pull_cq(ProxyBlockState* state) {
     state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
                                      BLK_RING_HEADER_SIZE);
 
-    // Restore consumer-owned fields — the server's copy of sq_head/cq_tail may
+    // Restore consumer-owned fields - the server's copy of sq_head/cq_tail may
     // be stale (lagging behind the consumer's latest values)
     hdr->sq_head = saved_sq_head;
     hdr->cq_tail = saved_cq_tail;
 }
 
-// RoCE helper: pull a data slot from server (for READ ops — data filled by server).
+// RoCE helper: pull a data slot from server (for READ ops - data filled by server).
 void roce_pull_data_slot(ProxyBlockState* state, uint32_t slot, uint32_t bytes) {
     if (!state->rdma_roce || state->rdma_transport == nullptr || bytes == 0) {
         return;
@@ -236,7 +236,7 @@ void rdma_drain_cq(ProxyBlockState* state) {
             state->tag_completions[tag].completed = true;
             state->tag_completions[tag].pending = false;
         }
-        // Tags not in the bitmap are stale/orphaned — safe to drop
+        // Tags not in the bitmap are stale/orphaned - safe to drop
 
         asm volatile("" ::: "memory");  // write barrier before advancing tail
         hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
@@ -274,7 +274,7 @@ void rdma_signal_server(ProxyBlockState* state) {
 
     // Tier 1: ivshmem doorbell (near-zero latency)
     if (peer->transport != nullptr && peer->transport->rdma_capable) {
-        // ivshmem transport has native doorbell — zone post handler will fire
+        // ivshmem transport has native doorbell - zone post handler will fire
         ZoneNotifyPayload notify = {};
         notify.zone_id = state->rdma_zone_id;
         notify.op_type = 1;  // WRITE (new SQ entries available)
@@ -384,7 +384,7 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
     return 0;
 }
 
-// RDMA ring-based block read — with read-ahead cache and server-push optimisation.
+// RDMA ring-based block read - with read-ahead cache and server-push optimisation.
 //
 // Prefetches a full data-slot worth of blocks (typically 64 KB) on each RDMA
 // round-trip and caches the excess for subsequent reads.  For RoCE zones the
@@ -410,7 +410,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         return 0;
     }
 
-    // -- 2. Cache miss — fetch a full slot starting at the requested LBA -----
+    // -- 2. Cache miss - fetch a full slot starting at the requested LBA -----
     //    Cap at device boundary.
     uint32_t fetch_count = blocks_per_slot;
     if (block + fetch_count > ring_hdr->total_blocks) {
@@ -437,7 +437,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         rdma_drain_cq(state);
     }
 
-    // Post SQE — request the full prefetch range
+    // Post SQE - request the full prefetch range
     int tag_id = rdma_alloc_tag(state);
     if (tag_id < 0) {
         rdma_free_slot(state, static_cast<uint32_t>(slot));
@@ -509,7 +509,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     }
 
     // -- 4. Populate read-ahead cache from the data slot ---------------------
-    // For RoCE the server already pushed data into our local zone — no pull needed.
+    // For RoCE the server already pushed data into our local zone - no pull needed.
     if (!state->rdma_roce) {
         roce_pull_data_slot(state, static_cast<uint32_t>(slot), fetch_bytes);
     }
@@ -635,12 +635,12 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
     return 0;
 }
 
-// RDMA ring-based block write — consumer copies data into slot, server reads from it
+// RDMA ring-based block write - consumer copies data into slot, server reads from it
 auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, const void* buffer) -> int {
     if (!state->active || state->rdma_zone_ptr == nullptr) {
         return -1;
     }
-    // Invalidate read-ahead cache — written data may overlap cached range
+    // Invalidate read-ahead cache - written data may overlap cached range
     ra_invalidate(state);
 
     auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
@@ -815,7 +815,7 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
         rdma_drain_cq(state);
     }
 
-    // Post SQE — flush uses no data slot
+    // Post SQE - flush uses no data slot
     int tag_id = rdma_alloc_tag(state);
     if (tag_id < 0) {
         return -1;
@@ -887,7 +887,7 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
 }
 
 // -----------------------------------------------------------------------------
-// Batch I/O — async SQ pipeline (submits multiple SQEs, single doorbell)
+// Batch I/O - async SQ pipeline (submits multiple SQEs, single doorbell)
 // -----------------------------------------------------------------------------
 
 // Per-batch tracking entry (tag + data slot allocated for one SQE)
@@ -1043,7 +1043,7 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
 
     auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
 
-    // Invalidate RA cache — batch reads bypass the single-block read-ahead
+    // Invalidate RA cache - batch reads bypass the single-block read-ahead
     ra_invalidate(state);
 
     // Clamp batch to max depth
@@ -1060,7 +1060,7 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
 
     int collected = rdma_batch_collect(state, entries.data(), static_cast<uint32_t>(posted), true);
     if (collected != posted) {
-        // Timeout — free resources for all posted entries
+        // Timeout - free resources for all posted entries
         for (int i = 0; i < posted; i++) {
             rdma_free_slot(state, entries[i].slot);
             rdma_free_tag(state, entries[i].tag);
@@ -1104,7 +1104,7 @@ auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ran
         return -1;
     }
 
-    // Invalidate read-ahead cache — written data may overlap cached range
+    // Invalidate read-ahead cache - written data may overlap cached range
     ra_invalidate(state);
 
     // Clamp batch to max depth
@@ -1121,7 +1121,7 @@ auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ran
 
     int collected = rdma_batch_collect(state, entries.data(), static_cast<uint32_t>(posted), true);
     if (collected != posted) {
-        // Timeout — free resources
+        // Timeout - free resources
         for (int i = 0; i < posted; i++) {
             rdma_free_slot(state, entries[i].slot);
             rdma_free_tag(state, entries[i].tag);
@@ -1219,7 +1219,7 @@ auto remote_block_write_batch(ker::dev::BlockDevice* dev, const BlockRange* rang
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Streaming Bulk Transfer — large contiguous I/O via direct RDMA to/from
+// Streaming Bulk Transfer - large contiguous I/O via direct RDMA to/from
 // a pre-registered consumer staging buffer.  Bypasses the normal per-slot
 // SQ/CQ pipeline for transfers exceeding BLK_RING_BULK_THRESHOLD bytes.
 // -----------------------------------------------------------------------------
@@ -1292,7 +1292,7 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
         roce_push_sq(state);
         rdma_signal_server(state);
 
-        // Wait for completion — server RDMA-writes data into our staging buffer
+        // Wait for completion - server RDMA-writes data into our staging buffer
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
         uint64_t deadline = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);  // larger timeout for bulk
         BlkCqEntry cqe = {};
@@ -1357,7 +1357,7 @@ auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t
     auto* sq = blk_sq_entries(state->rdma_zone_ptr);
     uint32_t blk_sz = ring_hdr->block_size;
 
-    // Invalidate RA cache — written data may overlap cached range
+    // Invalidate RA cache - written data may overlap cached range
     ra_invalidate(state);
 
     const auto* src = static_cast<const uint8_t*>(buffer);
@@ -1665,7 +1665,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                     net::napi_poll_inline(net_dev);
                 }
 
-                // Also re-check rkey — the 0xFE notification may arrive
+                // Also re-check rkey - the 0xFE notification may arrive
                 // during the NIC poll above.
                 if (state->rdma_remote_rkey == 0 && zone->remote_rkey != 0) {
                     state->rdma_remote_rkey = zone->remote_rkey;
@@ -1679,7 +1679,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             }
 
             if (ring_hdr->server_ready != 0) {
-                // Read device info directly from the ring header — no OP_BLOCK_INFO needed
+                // Read device info directly from the ring header - no OP_BLOCK_INFO needed
                 block_size = ring_hdr->block_size;
                 total_blocks = ring_hdr->total_blocks;
                 state->rdma_attached = true;
@@ -1703,7 +1703,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                                    state->rdma_zone_id, ring_hdr->block_size, ring_hdr->total_blocks, ring_hdr->data_slot_count,
                                    state->rdma_roce ? 1 : 0, state->ra_buffer != nullptr ? "yes" : "no");
             } else {
-                ker::mod::dbg::log("[WKI] Dev proxy RDMA ring server_ready timeout — falling back to msg path");
+                ker::mod::dbg::log("[WKI] Dev proxy RDMA ring server_ready timeout - falling back to msg path");
                 state->rdma_zone_id = 0;
                 state->rdma_zone_ptr = nullptr;
                 state->rdma_roce = false;
@@ -1711,7 +1711,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 state->rdma_remote_rkey = 0;
             }
         } else {
-            ker::mod::dbg::log("[WKI] Dev proxy RDMA zone not found (0x%08x) — falling back to msg path", state->rdma_zone_id);
+            ker::mod::dbg::log("[WKI] Dev proxy RDMA zone not found (0x%08x) - falling back to msg path", state->rdma_zone_id);
             state->rdma_zone_id = 0;
             state->rdma_roce = false;
             state->rdma_transport = nullptr;
@@ -1932,7 +1932,7 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
 }
 
 // -----------------------------------------------------------------------------
-// Fencing — suspend / resume / hard teardown
+// Fencing - suspend / resume / hard teardown
 // -----------------------------------------------------------------------------
 
 void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
@@ -1954,7 +1954,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         }
 
         // Fail any in-flight operation so the waiter unblocks,
-        // but keep the proxy registered — callers will see fenced==true
+        // but keep the proxy registered - callers will see fenced==true
         // on retry and block in wait_for_fence_lift().
         if (p->op_pending) {
             p->op_status = -1;
@@ -1978,7 +1978,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         p->ra_buffer = nullptr;
         ra_invalidate(p.get());
 
-        // Clear RDMA state — zone will be destroyed by wki_zones_destroy_for_peer()
+        // Clear RDMA state - zone will be destroyed by wki_zones_destroy_for_peer()
         if (p->rdma_attached) {
             p->rdma_attached = false;
             p->rdma_zone_ptr = nullptr;
@@ -1992,7 +1992,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         p->fenced = true;
         p->fence_time_us = now;
 
-        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x — I/O will block until reconnect or %llu s timeout",
+        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x - I/O will block until reconnect or %llu s timeout",
                            p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
     }
     s_proxy_lock.unlock();
@@ -2072,7 +2072,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         }
 
         if (!attached) {
-            ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x — will hard-detach", p->bdev.name.data(),
+            ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x - will hard-detach", p->bdev.name.data(),
                                node_id);
             p->attach_pending.store(false, std::memory_order_relaxed);
             // Leave fenced=true; the fence_timeout_tick will clean it up
@@ -2129,7 +2129,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         p->fence_time_us = 0;
         s_proxy_lock.unlock();
 
-        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u — blocked I/O will now proceed", p->bdev.name.data(), node_id,
+        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u - blocked I/O will now proceed", p->bdev.name.data(), node_id,
                            p->assigned_channel);
     }
 }
@@ -2235,7 +2235,7 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
             continue;
         }
 
-        // Guard against unsigned underflow from TSC skew between CPUs —
+        // Guard against unsigned underflow from TSC skew between CPUs -
         // fence_time_us may have been stamped on a different core whose
         // TSC is slightly ahead of ours.
         if (p->fence_time_us == 0 || now_us < p->fence_time_us) {
@@ -2261,8 +2261,8 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
     }
     s_proxy_lock.unlock();
 
-    // Unregister block devices outside lock (pointer still valid — no erase).
-    // Do NOT erase the proxy from g_proxies here — I/O threads on
+    // Unregister block devices outside lock (pointer still valid - no erase).
+    // Do NOT erase the proxy from g_proxies here - I/O threads on
     // other CPUs may still hold a raw ProxyBlockState* pointer from
     // find_proxy_by_bdev().  Freeing the memory would cause a
     // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
@@ -2270,14 +2270,14 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
     // entries.
     for (int i = 0; i < to_count; i++) {
         auto* st = timed_out[i].state;
-        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x — tearing down", timed_out[i].elapsed / 1000000ULL,
+        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x - tearing down", timed_out[i].elapsed / 1000000ULL,
                            st->bdev.name.data(), st->owner_node);
         ker::dev::block_device_unregister(&st->bdev);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Batch I/O — public API
+// Batch I/O - public API
 // -----------------------------------------------------------------------------
 
 auto wki_dev_proxy_batch_read(ker::dev::BlockDevice* bdev, const BlockRange* ranges, uint32_t count) -> int {
@@ -2295,7 +2295,7 @@ auto wki_dev_proxy_batch_write(ker::dev::BlockDevice* bdev, const BlockRange* ra
 }
 
 // -----------------------------------------------------------------------------
-// Streaming Bulk Transfer — public API
+// Streaming Bulk Transfer - public API
 // -----------------------------------------------------------------------------
 
 auto wki_dev_proxy_bulk_read(ker::dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, void* buffer) -> int {

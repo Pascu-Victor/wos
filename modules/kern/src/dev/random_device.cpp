@@ -52,7 +52,7 @@ ssize_t urandom_read(ker::vfs::File* /*file*/, void* buf, size_t count) {
     if (count == 0) return 0;
 
     if (!rdrand_fill(static_cast<uint8_t*>(buf), count)) {
-        // RDRAND failed — should not normally happen on modern CPUs
+        // RDRAND failed - should not normally happen on modern CPUs
         return -1;
     }
 

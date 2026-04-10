@@ -1,6 +1,6 @@
 #!/bin/bash
 # WOS Development Environment Profile
-# Extracted from tools/build-llvm.sh
+# Extracted from tools/bootstrap.sh
 # This script sets up the environment variables needed for WOS development
 #
 # Usage:
@@ -40,21 +40,21 @@ wos_strip_path_entry() {
 }
 
 # Check if toolchain exists
-if [ ! -d "$WOS_TOOLCHAIN_ROOT/target1" ]; then
-    echo "Warning: WOS toolchain not found at $WOS_TOOLCHAIN_ROOT/target1"
-    echo "Please run tools/build-llvm.sh to build the toolchain first."
+if [ ! -d "$WOS_TOOLCHAIN_ROOT/host" ]; then
+    echo "Warning: WOS host toolchain not found at $WOS_TOOLCHAIN_ROOT/host"
+    echo "Please run tools/bootstrap.sh to build the toolchain first."
     return 1
 fi
 
 # Save original environment if not already saved
 if [ -z "$WOS_ORIGINAL_PATH" ]; then
-    _wos_clean_path="$(wos_strip_path_entry "$PATH" "$WOS_TOOLCHAIN_ROOT/target1/bin")"
+    _wos_clean_path="$(wos_strip_path_entry "$PATH" "$WOS_TOOLCHAIN_ROOT/host/bin")"
     _wos_clean_path="$(wos_strip_path_entry "$_wos_clean_path" "$WOS_HOST_TOOLS")"
     export WOS_ORIGINAL_PATH="$_wos_clean_path"
     unset _wos_clean_path
 fi
 if [ -z "$WOS_ORIGINAL_LD_LIBRARY_PATH" ]; then
-    _wos_clean_ld="$(wos_strip_path_entry "$LD_LIBRARY_PATH" "$WOS_TOOLCHAIN_ROOT/target1/lib")"
+    _wos_clean_ld="$(wos_strip_path_entry "$LD_LIBRARY_PATH" "$WOS_TOOLCHAIN_ROOT/host/lib")"
     export WOS_ORIGINAL_LD_LIBRARY_PATH="$_wos_clean_ld"
     unset _wos_clean_ld
 fi
@@ -68,29 +68,29 @@ export WOS_TARGET_ARCH
 export NINJA_STATUS="[%f/%t %e] "
 
 # Compiler and linker paths
-export CC="$WOS_TOOLCHAIN_ROOT/target1/bin/clang"
-export CXX="$WOS_TOOLCHAIN_ROOT/target1/bin/clang++"
-export LD="$WOS_TOOLCHAIN_ROOT/target1/bin/ld.lld"
+export CC="$WOS_TOOLCHAIN_ROOT/host/bin/clang"
+export CXX="$WOS_TOOLCHAIN_ROOT/host/bin/clang++"
+export LD="$WOS_TOOLCHAIN_ROOT/host/bin/ld.lld"
 
-# Update PATH so toolchain and host tools are first, but preserve a clean host path tail.
-export PATH="$WOS_TOOLCHAIN_ROOT/target1/bin:$WOS_HOST_TOOLS:$WOS_ORIGINAL_PATH"
+# Update PATH so host tools and build tools are first, but preserve a clean host path tail.
+export PATH="$WOS_TOOLCHAIN_ROOT/host/bin:$WOS_HOST_TOOLS:$WOS_ORIGINAL_PATH"
 
 # Library paths (overlay on existing LD_LIBRARY_PATH)
 if [ -n "$WOS_ORIGINAL_LD_LIBRARY_PATH" ]; then
-    export LD_LIBRARY_PATH="$WOS_TOOLCHAIN_ROOT/target1/lib:$WOS_ORIGINAL_LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="$WOS_TOOLCHAIN_ROOT/host/lib:$WOS_ORIGINAL_LD_LIBRARY_PATH"
 else
-    export LD_LIBRARY_PATH="$WOS_TOOLCHAIN_ROOT/target1/lib"
+    export LD_LIBRARY_PATH="$WOS_TOOLCHAIN_ROOT/host/lib"
 fi
 
 # Compiler flags for WOS development
-export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -std=c23"
-export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1 -std=c++23"
-export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/target1"
+export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot -std=c23"
+export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot -std=c++23"
+export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot"
 
 # Additional useful variables
-export WOS_SYSROOT="$WOS_TOOLCHAIN_ROOT/target1"
-export WOS_CLANG_VERSION="21"
-export WOS_CLANG_LIB_DIR="$WOS_TOOLCHAIN_ROOT/target1/lib/clang/$WOS_CLANG_VERSION/lib/$WOS_TARGET_ARCH"
+export WOS_SYSROOT="$WOS_TOOLCHAIN_ROOT/sysroot"
+export WOS_CLANG_VERSION="22"
+export WOS_CLANG_LIB_DIR="$WOS_TOOLCHAIN_ROOT/host/lib/clang/$WOS_CLANG_VERSION/lib/$WOS_TARGET_ARCH"
 
 # Mark environment as loaded
 export WOS_ENV_LOADED="1"

@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
 
     parser.process(*app);
 
-    // Initialize config service — search CWD and upward for wosdbg.json
+    // Initialize config service - search CWD and upward for wosdbg.json
     {
         QString configPath = "wosdbg.json";
         QDir dir = QDir::current();

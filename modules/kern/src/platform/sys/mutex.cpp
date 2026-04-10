@@ -1,12 +1,12 @@
 // Sleeping Mutex implementation.
 //
-// Fast path: atomic CAS on the `held_` flag — if uncontested, lock/unlock
+// Fast path: atomic CAS on the `held_` flag - if uncontested, lock/unlock
 // are a single atomic operation with no scheduler involvement.
 //
 // Slow path: when the lock is held, the caller increments `waiters_` and
 // enters a kern_yield() loop.  kern_yield() gives up the CPU (sti;hlt)
 // so the task sleeps until the next timer interrupt or IPI wakes it.
-// On unlock, the holder simply clears `held_` — the next scheduler tick
+// On unlock, the holder simply clears `held_` - the next scheduler tick
 // will wake sleeping waiters.
 //
 // This design is deliberately simple and matches the existing WOS blocking
@@ -20,13 +20,13 @@
 namespace ker::mod::sys {
 
 void Mutex::lock() {
-    // Fast path — try to acquire immediately
+    // Fast path - try to acquire immediately
     bool expected = false;
     if (held_.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
         return;
     }
 
-    // Slow path — contended
+    // Slow path - contended
     waiters_.fetch_add(1, std::memory_order_relaxed);
 
     // Brief spin before yielding (avoids a full context switch for very short
@@ -41,7 +41,7 @@ void Mutex::lock() {
         asm volatile("pause");
     }
 
-    // Yield loop — surrender the CPU and retry after wakeup
+    // Yield loop - surrender the CPU and retry after wakeup
     while (true) {
         sched::kern_yield();
 

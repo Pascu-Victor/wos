@@ -135,14 +135,14 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
                 goto not_cow;
             }
 
-            // This is a COW page — handle it
+            // This is a COW page - handle it
             paddr_t oldPhys = pte.frame << paging::PAGE_SHIFT;
             void* oldVirt = reinterpret_cast<void*>(addr::get_virt_pointer(oldPhys));
 
             uint32_t refcount = phys::pageRefGet(oldVirt);
 
             if (refcount <= 1) {
-                // We're the sole owner — just make it writable and clear COW
+                // We're the sole owner - just make it writable and clear COW
                 raw &= ~paging::PAGE_COW;
                 raw |= paging::PAGE_WRITE;
                 pte = pteFromRaw(raw);
@@ -150,7 +150,7 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
                 return true;
             }
 
-            // Multiple owners — allocate a new page and copy
+            // Multiple owners - allocate a new page and copy
             void* newPage = phys::pageAlloc(paging::PAGE_SIZE);
             if (newPage == nullptr) {
                 dbg::log("COW fault: OOM allocating new page for vaddr 0x%x", vaddr);
@@ -177,7 +177,7 @@ bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
     }
 
 not_cow:
-    // Not a COW fault — let the caller handle it (userspace crash / kernel panic).
+    // Not a COW fault - let the caller handle it (userspace crash / kernel panic).
     return false;
 }
 
@@ -679,7 +679,7 @@ bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst) {
             for (size_t i2 = 0; i2 < 512; i2++) {
                 if (!srcPml2->entries[i2].present) continue;
                 if (srcPml2->entries[i2].pagesize) {
-                    // 2MB huge page — just copy the entry (no COW for huge pages)
+                    // 2MB huge page - just copy the entry (no COW for huge pages)
                     dstPml2->entries[i2] = srcPml2->entries[i2];
                     continue;
                 }

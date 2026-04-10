@@ -22,7 +22,7 @@ namespace ker::mod::mm::dyn::kmalloc {
 static constexpr int NUM_SLAB_CLASSES = 9;
 static constexpr int MAGAZINE_CAPACITY = 32;
 
-// Per-CPU magazine cache — Linux SLUB pattern.
+// Per-CPU magazine cache - Linux SLUB pattern.
 // Fast path: pop/push from per-CPU magazine with IRQs disabled (no lock).
 // Slow path: fall through to mini_malloc/mini_free which hold per-size-class slab_lock.
 struct PerCpuAllocator {
@@ -176,10 +176,10 @@ void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
 }
 
 static int size_to_slab_idx(uint64_t size) {
-    if (size <= 0x10)  return 0;
-    if (size <= 0x20)  return 1;
-    if (size <= 0x40)  return 2;
-    if (size <= 0x80)  return 3;
+    if (size <= 0x10) return 0;
+    if (size <= 0x20) return 1;
+    if (size <= 0x40) return 2;
+    if (size <= 0x80) return 3;
     if (size <= 0x100) return 4;
     if (size <= 0x200) return 5;
     if (size <= 0x300) return 6;
@@ -190,16 +190,26 @@ static int size_to_slab_idx(uint64_t size) {
 
 static int slab_size_to_idx(size_t slab_size) {
     switch (slab_size) {
-        case 0x10:  return 0;
-        case 0x20:  return 1;
-        case 0x40:  return 2;
-        case 0x80:  return 3;
-        case 0x100: return 4;
-        case 0x200: return 5;
-        case 0x300: return 6;
-        case 0x400: return 7;
-        case 0x800: return 8;
-        default:    return -1;
+        case 0x10:
+            return 0;
+        case 0x20:
+            return 1;
+        case 0x40:
+            return 2;
+        case 0x80:
+            return 3;
+        case 0x100:
+            return 4;
+        case 0x200:
+            return 5;
+        case 0x300:
+            return 6;
+        case 0x400:
+            return 7;
+        case 0x800:
+            return 8;
+        default:
+            return -1;
     }
 }
 

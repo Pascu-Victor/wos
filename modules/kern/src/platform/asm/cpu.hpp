@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/asm/msr.hpp>

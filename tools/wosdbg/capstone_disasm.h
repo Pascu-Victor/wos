@@ -1,5 +1,5 @@
 #pragma once
-// Shared CapstoneDisassembler — AT&T->Intel x86-64 disassembly conversion.
+// Shared CapstoneDisassembler - AT&T->Intel x86-64 disassembly conversion.
 // Used by both wosdbg (GUI) and wosdbg_worker (headless).
 
 #include <capstone/capstone.h>

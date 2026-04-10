@@ -307,7 +307,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         uint32_t secs = (remaining_sectors < SECTORS_PER_PAGE) ? remaining_sectors : SECTORS_PER_PAGE;
         uint64_t phys = ker::mod::mm::virt::translate(active_pt, buf_virt);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
-            // Page not mapped — refuse to DMA into unmapped memory
+            // Page not mapped - refuse to DMA into unmapped memory
             if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
                 port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
                 port_locks[portno].unlock();
@@ -326,7 +326,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
     cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
     cmdheader->w = write_op ? 1 : 0;
     cmdheader->prdtl = static_cast<uint16_t>(pages);
-    (void)actual_count;  // FIS count fields use 'count' — caller must ensure count <= MAX_PRDT*8
+    (void)actual_count;  // FIS count fields use 'count' - caller must ensure count <= MAX_PRDT*8
 
     // Setup command FIS
     auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);
@@ -422,8 +422,8 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
             uint64_t total_sec = s_total_sectors.exchange(0, std::memory_order_relaxed);
             uint64_t avg_us = total_ns / (64ULL * 1000ULL);
             uint64_t mbps = total_sec == 0 ? 0 : (total_sec * 512 * 1000) / (total_ns == 0 ? 1 : total_ns);
-            ker::mod::dbg::log("[AHCI bench] cmd#%lu: avg_latency=%luus throughput~%luMB/s (last 64 cmds, %lu sectors)\n",
-                               (unsigned long)n, (unsigned long)avg_us, (unsigned long)mbps, (unsigned long)total_sec);
+            ker::mod::dbg::log("[AHCI bench] cmd#%lu: avg_latency=%luus throughput~%luMB/s (last 64 cmds, %lu sectors)\n", (unsigned long)n,
+                               (unsigned long)avg_us, (unsigned long)mbps, (unsigned long)total_sec);
         }
     }
 #endif
@@ -440,7 +440,7 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
 // 8192 PRDT entries × 8 sectors/page = 65536, capped at 65535 (ATA 16-bit sector count)
 constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 65535;
 
-// Read sectors from disk — splits large requests into per-command chunks
+// Read sectors from disk - splits large requests into per-command chunks
 auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
     uint32_t done = 0;
     while (done < count) {
@@ -457,7 +457,7 @@ auto read_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t st
     return true;
 }
 
-// Write sectors to disk — splits large requests into per-command chunks
+// Write sectors to disk - splits large requests into per-command chunks
 auto write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
     uint32_t done = 0;
     while (done < count) {

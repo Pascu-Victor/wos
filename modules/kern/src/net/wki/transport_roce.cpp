@@ -16,7 +16,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// RoCE wire format — raw L2 Ethernet (EtherType 0x88B8), no IP/UDP
+// RoCE wire format - raw L2 Ethernet (EtherType 0x88B8), no IP/UDP
 // -----------------------------------------------------------------------------
 
 enum class RoceOpcode : uint8_t {
@@ -42,7 +42,7 @@ constexpr uint8_t ROCE_VERSION = 1;
 constexpr uint32_t ROCE_MAX_PAYLOAD = 9000 - proto::ETH_HLEN - sizeof(RoceHeader);  // ~8962 bytes
 
 // -----------------------------------------------------------------------------
-// Memory region registry — maps rkey -> (vaddr, size)
+// Memory region registry - maps rkey -> (vaddr, size)
 // -----------------------------------------------------------------------------
 
 constexpr size_t ROCE_MAX_REGIONS = 64;
@@ -78,7 +78,7 @@ static auto region_find(uint32_t rkey) -> RoceRegion* {
 }
 
 // -----------------------------------------------------------------------------
-// Raw Ethernet TX helper — sends a RoCE frame (EtherType 0x88B8)
+// Raw Ethernet TX helper - sends a RoCE frame (EtherType 0x88B8)
 // -----------------------------------------------------------------------------
 
 static auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
@@ -118,7 +118,7 @@ static auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void*
 }
 
 // -----------------------------------------------------------------------------
-// RDMA operations — WkiTransport function pointers
+// RDMA operations - WkiTransport function pointers
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -176,7 +176,7 @@ int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey,
 }
 
 int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, void* local_buf, uint32_t len) {
-    // Send RDMA_READ_REQ — responder sends back data as RDMA_WRITE frames
+    // Send RDMA_READ_REQ - responder sends back data as RDMA_WRITE frames
     // into a temporary registered region, then a DOORBELL to signal completion.
     // For now, use a simple synchronous approach with a completion flag.
 
@@ -249,7 +249,7 @@ int roce_doorbell(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t value) 
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// RX entry point — called from ethernet.cpp for EtherType 0x88B8
+// RX entry point - called from ethernet.cpp for EtherType 0x88B8
 // -----------------------------------------------------------------------------
 
 void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
@@ -286,7 +286,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
         }
 
         case RoceOpcode::RDMA_READ_REQ: {
-            // Peer wants to read from our registered region — send data back as RDMA_WRITE
+            // Peer wants to read from our registered region - send data back as RDMA_WRITE
             auto* region = region_find(hdr->rkey);
             if (region == nullptr) {
                 break;
@@ -321,7 +321,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
                 remaining -= chunk;
             }
 
-            // Send a DOORBELL to signal read completion — deregister the temp region
+            // Send a DOORBELL to signal read completion - deregister the temp region
             RoceHeader db_hdr = {};
             db_hdr.opcode = static_cast<uint8_t>(RoceOpcode::DOORBELL);
             db_hdr.version = ROCE_VERSION;
@@ -336,12 +336,12 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
         }
 
         case RoceOpcode::RDMA_READ_RESP:
-            // Handled same as RDMA_WRITE — data arrives into our local region
+            // Handled same as RDMA_WRITE - data arrives into our local region
             // (shouldn't normally be sent separately; requestor uses RDMA_WRITE)
             break;
 
         case RoceOpcode::DOORBELL: {
-            // Doorbell received — determine if it's a read-completion (deregister
+            // Doorbell received - determine if it's a read-completion (deregister
             // a temp region) or a zone notification (invoke post_handler).
             //
             // The namespaces are disjoint: temp rkeys are small sequential values
@@ -352,13 +352,13 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 
             auto* region = region_find(val);
             if (region != nullptr) {
-                // Read-completion doorbell — deregister temp region to unblock
+                // Read-completion doorbell - deregister temp region to unblock
                 // the roce_rdma_read spin-wait.
                 region->active = false;
                 break;
             }
 
-            // Zone doorbell — dispatch to zone post handler
+            // Zone doorbell - dispatch to zone post handler
             WkiZone* zone = wki_zone_find(val);
             if (zone != nullptr && zone->post_handler != nullptr) {
                 zone->post_handler(val, 0, 0, 0);
@@ -386,7 +386,7 @@ void wki_roce_transport_init() {
         r.active = false;
     }
 
-    // RoCE is an RDMA-only overlay transport — no WKI message TX (tx/tx_pkt are null)
+    // RoCE is an RDMA-only overlay transport - no WKI message TX (tx/tx_pkt are null)
     s_roce_transport.name = "wki-roce";
     s_roce_transport.mtu = static_cast<uint16_t>(ROCE_MAX_PAYLOAD);
     s_roce_transport.rdma_capable = true;
@@ -400,7 +400,7 @@ void wki_roce_transport_init() {
     s_roce_transport.doorbell = roce_doorbell;
     s_roce_transport.next = nullptr;
 
-    // Do NOT register with wki_transport_register — RoCE is not a message transport.
+    // Do NOT register with wki_transport_register - RoCE is not a message transport.
     // Peers discover it via wki_roce_transport_get() during HELLO completion.
 
     s_roce_initialized = true;

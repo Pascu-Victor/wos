@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <net/wki/remote_compute.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
@@ -184,6 +185,26 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
     newTask->parentPid = parentPid;
 
+    // Inherit process execution context from the parent before applying
+    // executable-specific overrides such as setuid/setgid.
+    memcpy(newTask->cwd, parentTask->cwd, sizeof(newTask->cwd));
+    newTask->uid = parentTask->uid;
+    newTask->gid = parentTask->gid;
+    newTask->euid = parentTask->euid;
+    newTask->egid = parentTask->egid;
+    newTask->suid = parentTask->suid;
+    newTask->sgid = parentTask->sgid;
+    newTask->umask = parentTask->umask;
+    newTask->session_id = parentTask->session_id;
+    newTask->pgid = (parentTask->pgid != 0) ? parentTask->pgid : parentTask->pid;
+    newTask->controlling_tty = parentTask->controlling_tty;
+    newTask->wki_prefer_inline = parentTask->wki_prefer_inline;
+    memcpy(newTask->wki_target_hostname, parentTask->wki_target_hostname, sizeof(newTask->wki_target_hostname));
+    newTask->wki_target_flags = parentTask->wki_target_flags;
+    memcpy(newTask->wki_submitter_hostname, parentTask->wki_submitter_hostname, sizeof(newTask->wki_submitter_hostname));
+    newTask->wki_vfs_rule_count = parentTask->wki_vfs_rule_count;
+    memcpy(newTask->wki_vfs_rules.data(), parentTask->wki_vfs_rules.data(), sizeof(newTask->wki_vfs_rules));
+
     // Inherit file descriptors from parent, respecting O_CLOEXEC / FD_CLOEXEC.
     // FDs with FD_CLOEXEC set are NOT inherited (closed on exec).
     // FDs without FD_CLOEXEC are inherited by incrementing refcount.
@@ -193,7 +214,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         auto* parentFile = static_cast<vfs::File*>(parentTask->fds[i]);
 
         if (parentFile->fd_flags & vfs::FD_CLOEXEC) {
-            // FD_CLOEXEC is set — do NOT inherit
+            // FD_CLOEXEC is set - do NOT inherit
             continue;
         }
 
@@ -263,7 +284,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
         uint64_t pagePhys = mod::mm::virt::translate(newTask->pagemap, pageVirt);
         if (pagePhys == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x — stack page not mapped", pageVirt);
+            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x - stack page not mapped", pageVirt);
             hcf();
         }
 
@@ -286,7 +307,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 
         uint64_t pagePhys = mod::mm::virt::translate(newTask->pagemap, pageVirt);
         if (pagePhys == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x — stack page not mapped", pageVirt);
+            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x - stack page not mapped", pageVirt);
             hcf();
         }
 
@@ -381,6 +402,21 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     newTask->context.regs.rdi = argc;
     newTask->context.regs.rsi = argvPtr;
     newTask->context.regs.rdx = envpPtr;
+
+    ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
+        .argv = argv,
+        .envp = envp,
+        .cwd = parentTask->cwd,
+    };
+    auto remote_result = ker::net::wki::wki_try_remote_spawn(newTask, remote_spawn);
+    if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
+        return newTask->pid;
+    }
+    if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
+        delete newTask;
+        delete[] elfBuffer;
+        return 0;
+    }
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Setup stack - argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", argc, argvPtr, envpPtr, newTask->context.frame.rsp);
@@ -498,6 +534,107 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     }
     kEnvp[envpCount] = nullptr;
 
+    auto freeKernelArgEnv = [&]() {
+        for (size_t i = 0; i < argvCount; i++) {
+            delete[] kArgv[i];
+        }
+        delete[] kArgv;
+        for (size_t i = 0; i < envpCount; i++) {
+            delete[] kEnvp[i];
+        }
+        delete[] kEnvp;
+    };
+
+    uint8_t* oldElfBuffer = task->elfBuffer;
+    size_t oldElfBufferSize = task->elfBufferSize;
+    bool oldSkipLegacyPlacement = task->wki_skip_legacy_placement;
+    std::array<char, sched::task::Task::EXE_PATH_MAX> oldExePath = {};
+    std::memcpy(oldExePath.data(), task->exe_path, oldExePath.size());
+
+    task->elfBuffer = elfBuffer;
+    task->elfBufferSize = static_cast<size_t>(fileSize);
+    {
+        size_t pathLen = std::strlen(path);
+        if (pathLen >= sched::task::Task::EXE_PATH_MAX) {
+            pathLen = sched::task::Task::EXE_PATH_MAX - 1;
+        }
+        std::memcpy(task->exe_path, path, pathLen);
+        task->exe_path[pathLen] = '\0';
+    }
+
+    ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
+        .argv = kArgv,
+        .envp = kEnvp,
+        .cwd = task->cwd,
+    };
+    auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);
+    if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
+        for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
+            if (task->fds[i] == nullptr) continue;
+            auto* file = static_cast<vfs::File*>(task->fds[i]);
+            if (file->fd_flags & vfs::FD_CLOEXEC) {
+                vfs::vfs_close(static_cast<int>(i));
+                task->fds[i] = nullptr;
+            }
+        }
+
+        if (oldElfBuffer != nullptr) {
+            delete[] oldElfBuffer;
+        }
+
+        {
+            std::string_view path_str(path, std::strlen(path));
+            const char* base_name = path_str.data();
+            for (size_t i = 0; i < path_str.size(); i++) {
+                if (path_str[i] == '/') {
+                    base_name = path_str.data() + i + 1;
+                }
+            }
+            size_t base_len = std::strlen(base_name);
+            char* name_buf = new char[base_len + 1];
+            std::memcpy(name_buf, base_name, base_len + 1);
+            delete[] task->name;
+            task->name = name_buf;
+        }
+
+        {
+            vfs::stat exec_st{};
+            if (vfs::vfs_stat(path, &exec_st) == 0) {
+                if (exec_st.st_mode & 04000) {
+                    task->euid = exec_st.st_uid;
+                    task->suid = exec_st.st_uid;
+                }
+                if (exec_st.st_mode & 02000) {
+                    task->egid = exec_st.st_gid;
+                    task->sgid = exec_st.st_gid;
+                }
+            }
+        }
+
+        task->sigPending = 0;
+        task->inSignalHandler = false;
+        task->doSigreturn = false;
+        for (auto& sh : task->sigHandlers) {
+            sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
+        }
+
+        freeKernelArgEnv();
+        task->deferredTaskSwitch = true;
+        task->yieldSwitch = false;
+        return 0;
+    }
+
+    task->elfBuffer = oldElfBuffer;
+    task->elfBufferSize = oldElfBufferSize;
+    task->wki_skip_legacy_placement = oldSkipLegacyPlacement;
+    std::memcpy(task->exe_path, oldExePath.data(), oldExePath.size());
+
+    if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
+        delete[] elfBuffer;
+        freeKernelArgEnv();
+        return static_cast<uint64_t>(-EHOSTUNREACH);
+    }
+
     // --- Close FD_CLOEXEC file descriptors ---
     for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
         if (task->fds[i] == nullptr) continue;
@@ -530,7 +667,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     mm::virt::copyKernelMappings(task);
 
     // TODO: Properly tear down old pagemap user pages. For now we just leak
-    // them — a full implementation would walk and free old user-space frames.
+    // them - a full implementation would walk and free old user-space frames.
     (void)oldPagemap;
 
     // --- Create new thread (user stack + TLS) ---
@@ -680,10 +817,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     envpAddrs[envpCount] = 0;
 
     // Free kernel copies of argv/envp strings
-    for (size_t i = 0; i < argvCount; i++) delete[] kArgv[i];
-    delete[] kArgv;
-    for (size_t i = 0; i < envpCount; i++) delete[] kEnvp[i];
-    delete[] kEnvp;
+    freeKernelArgEnv();
 
     // Alignment
     {
@@ -779,7 +913,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     uint64_t newRsp = userStackVirt - currentVirtOffset;
 #ifdef EXEC_DEBUG
-    // Log BEFORE patching the stack — dbg::log uses the stack and would
+    // Log BEFORE patching the stack - dbg::log uses the stack and would
     // clobber the patched register slots if called after.
     dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path, elfResult.entryPoint, newRsp);
 #endif

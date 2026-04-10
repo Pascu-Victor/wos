@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -31,6 +32,8 @@
 
 namespace ker::vfs {
 
+auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+
 // Keep in sync with userspace fcntl.h (Linux-compatible octal values)
 constexpr int O_NONBLOCK = 04000;
 
@@ -38,6 +41,524 @@ namespace {
 constexpr size_t MAX_PATH_LEN = 512;
 constexpr int MAX_SYMLINK_DEPTH = 8;
 constexpr size_t MAX_COMPONENTS = 64;
+constexpr size_t MAX_DEFAULT_VFS_RULES = 32;
+constexpr size_t MAX_VFSTAB_BYTES = 4096;
+constexpr size_t WKI_PATH_PREFIX_LEN = 5;
+
+auto make_absolute(const char* path, char* out, size_t outsize) -> int;
+auto canonicalize_path(char* path, size_t bufsize) -> int;
+auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
+
+std::array<ker::mod::sched::task::WkiVfsRule, MAX_DEFAULT_VFS_RULES> g_default_vfs_rules = {};
+size_t g_default_vfs_rule_count = 0;
+
+struct VfsRouteDecision {
+    uint8_t route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
+    size_t prefix_len = 0;
+};
+
+auto copy_path_string(const char* src, char* dst, size_t dst_size) -> int {
+    if (src == nullptr || dst == nullptr || dst_size == 0) {
+        return -EINVAL;
+    }
+
+    size_t len = std::strlen(src);
+    if (len + 1 > dst_size) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(dst, src, len + 1);
+    return 0;
+}
+
+auto task_submitter_hostname(const ker::mod::sched::task::Task* task) -> const char* {
+    if (task != nullptr && task->wki_submitter_hostname[0] != '\0') {
+        return task->wki_submitter_hostname;
+    }
+    return ker::net::wki::g_wki.local_hostname;
+}
+
+auto path_prefix_matches(const char* path, const char* prefix, size_t prefix_len) -> bool {
+    if (path == nullptr || prefix == nullptr || prefix_len == 0) {
+        return false;
+    }
+
+    if (prefix_len == 1 && prefix[0] == '/') {
+        return path[0] == '/';
+    }
+
+    if (std::strncmp(path, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    return path[prefix_len] == '\0' || path[prefix_len] == '/';
+}
+
+auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char* {
+    if (mount == nullptr || path == nullptr) {
+        return path;
+    }
+
+    size_t mount_len = 0;
+    while (mount->path[mount_len] != '\0') {
+        mount_len++;
+    }
+
+    if (mount_len == 1 && mount->path[0] == '/') {
+        return path + 1;
+    }
+    if (path[mount_len] == '/') {
+        return path + mount_len + 1;
+    }
+    if (path[mount_len] == '\0') {
+        return "";
+    }
+    return path + mount_len;
+}
+
+auto build_wki_host_path(const char* hostname, const char* suffix, char* out, size_t out_size) -> int {
+    if (hostname == nullptr || hostname[0] == '\0') {
+        return -ENOENT;
+    }
+
+    const char* trimmed_suffix = suffix;
+    while (trimmed_suffix != nullptr && *trimmed_suffix == '/') {
+        trimmed_suffix++;
+    }
+
+    size_t host_len = std::strlen(hostname);
+    size_t suffix_len = (trimmed_suffix != nullptr) ? std::strlen(trimmed_suffix) : 0;
+    size_t total = WKI_PATH_PREFIX_LEN + host_len + (suffix_len > 0 ? 1 + suffix_len : 0) + 1;
+    if (total > out_size) {
+        return -ENAMETOOLONG;
+    }
+
+    size_t pos = 0;
+    std::memcpy(out + pos, "/wki/", WKI_PATH_PREFIX_LEN);
+    pos += WKI_PATH_PREFIX_LEN;
+    std::memcpy(out + pos, hostname, host_len);
+    pos += host_len;
+    if (suffix_len > 0) {
+        out[pos++] = '/';
+        std::memcpy(out + pos, trimmed_suffix, suffix_len);
+        pos += suffix_len;
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char* path, char* out, size_t out_size) -> int {
+    constexpr char host_prefix[] = "/wki/host";
+    constexpr size_t host_prefix_len = sizeof(host_prefix) - 1;
+
+    if (path == nullptr) {
+        return copy_path_string(path, out, out_size);
+    }
+
+    if (task == nullptr) {
+        return copy_path_string(path, out, out_size);
+    }
+
+    char current[MAX_PATH_LEN] = {};
+    int copy_result = copy_path_string(path, current, sizeof(current));
+    if (copy_result < 0) {
+        return copy_result;
+    }
+
+    for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
+        if (std::strncmp(current, host_prefix, host_prefix_len) != 0 ||
+            (current[host_prefix_len] != '\0' && current[host_prefix_len] != '/')) {
+            break;
+        }
+
+        const char* submitter = task_submitter_hostname(task);
+        if (submitter != nullptr && submitter[0] != '\0' && std::strcmp(submitter, ker::net::wki::g_wki.local_hostname) == 0) {
+            const char* suffix = current + host_prefix_len;
+            while (*suffix == '/') {
+                suffix++;
+            }
+
+            if (*suffix == '\0') {
+                copy_result = copy_path_string("/", current, sizeof(current));
+            } else {
+                size_t suffix_len = std::strlen(suffix);
+                if (suffix_len + 2 > sizeof(current)) {
+                    return -ENAMETOOLONG;
+                }
+
+                current[0] = '/';
+                std::memcpy(current + 1, suffix, suffix_len + 1);
+                copy_result = 0;
+            }
+        } else {
+            copy_result = build_wki_host_path(submitter, current + host_prefix_len, current, sizeof(current));
+        }
+
+        if (copy_result < 0) {
+            return copy_result;
+        }
+    }
+
+    return copy_path_string(current, out, out_size);
+}
+
+auto splice_symlink_target(const char* original_path, size_t prefix_len, const char* target, char* out, size_t out_size) -> int {
+    if (original_path == nullptr || target == nullptr || out == nullptr || out_size == 0) {
+        return -EINVAL;
+    }
+
+    const char* remainder = original_path + prefix_len;
+    while (*remainder == '/') {
+        remainder++;
+    }
+
+    size_t remainder_len = std::strlen(remainder);
+    size_t target_len = std::strlen(target);
+    size_t pos = 0;
+
+    if (target[0] == '/') {
+        if (target_len + 1 > out_size) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out, target, target_len);
+        pos = target_len;
+    } else {
+        size_t parent_len = 1;
+        for (size_t i = 1; i < prefix_len; ++i) {
+            if (original_path[i] == '/') {
+                parent_len = i;
+            }
+        }
+
+        if (parent_len + 1 > out_size) {
+            return -ENAMETOOLONG;
+        }
+
+        std::memcpy(out, original_path, parent_len);
+        pos = parent_len;
+        if (pos == 0 || out[pos - 1] != '/') {
+            out[pos++] = '/';
+        }
+
+        if (pos + target_len + 1 > out_size) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out + pos, target, target_len);
+        pos += target_len;
+    }
+
+    if (remainder_len > 0) {
+        if (pos == 0 || out[pos - 1] != '/') {
+            if (pos + 1 >= out_size) {
+                return -ENAMETOOLONG;
+            }
+            out[pos++] = '/';
+        }
+        if (pos + remainder_len + 1 > out_size) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out + pos, remainder, remainder_len + 1);
+    } else {
+        if (pos >= out_size) {
+            return -ENAMETOOLONG;
+        }
+        out[pos] = '\0';
+    }
+
+    return canonicalize_path(out, out_size);
+}
+
+auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy) -> int {
+    if (path == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+
+    for (size_t end = 1;; ++end) {
+        char ch = path[end];
+        if (ch != '/' && ch != '\0') {
+            continue;
+        }
+        if (end == 1) {
+            if (ch == '\0') {
+                break;
+            }
+            continue;
+        }
+
+        char prefix[MAX_PATH_LEN] = {};
+        if (end + 1 > sizeof(prefix)) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(prefix, path, end);
+        prefix[end] = '\0';
+
+        char linkbuf[MAX_PATH_LEN] = {};
+        ssize_t link_len = vfs_readlink(prefix, linkbuf, sizeof(linkbuf) - 1);
+        if (link_len > 0) {
+            linkbuf[link_len] = '\0';
+
+            char substituted[MAX_PATH_LEN] = {};
+            int splice_result = splice_symlink_target(path, end, linkbuf, substituted, sizeof(substituted));
+            if (splice_result < 0) {
+                return splice_result;
+            }
+
+            int copy_result = copy_path_string(substituted, path, bufsize);
+            if (copy_result < 0) {
+                return copy_result;
+            }
+
+            if (apply_task_policy) {
+                int normalize = normalize_task_path_inplace(path, bufsize);
+                if (normalize < 0) {
+                    return normalize;
+                }
+            }
+
+            return 1;
+        }
+
+        if (ch == '\0') {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+auto choose_task_route(const ker::mod::sched::task::Task* task, const char* path) -> VfsRouteDecision {
+    VfsRouteDecision best = {};
+
+    if (task != nullptr) {
+        auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
+        for (uint16_t i = 0; i < explicit_count; ++i) {
+            const auto& rule = task->wki_vfs_rules[i];
+            if (rule.prefix_len == 0 || !path_prefix_matches(path, rule.prefix, rule.prefix_len)) {
+                continue;
+            }
+            if (rule.prefix_len > best.prefix_len) {
+                best.route = rule.route;
+                best.prefix_len = rule.prefix_len;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g_default_vfs_rule_count; ++i) {
+        const auto& rule = g_default_vfs_rules[i];
+        if (rule.prefix_len == 0 || !path_prefix_matches(path, rule.prefix, rule.prefix_len)) {
+            continue;
+        }
+        if (rule.prefix_len > best.prefix_len) {
+            best.route = rule.route;
+            best.prefix_len = rule.prefix_len;
+        }
+    }
+
+    return best;
+}
+
+auto apply_task_vfs_route(const ker::mod::sched::task::Task* task, const char* path, char* out, size_t out_size) -> int {
+    if (path == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+
+    if (task == nullptr) {
+        return copy_path_string(path, out, out_size);
+    }
+
+    char aliased[MAX_PATH_LEN] = {};
+    int alias_result = rewrite_wki_host_alias(task, path, aliased, sizeof(aliased));
+    if (alias_result < 0) {
+        return alias_result;
+    }
+
+    VfsRouteDecision decision = choose_task_route(task, aliased);
+    if (decision.route != static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::HOST)) {
+        return copy_path_string(aliased, out, out_size);
+    }
+
+    const char* submitter = task_submitter_hostname(task);
+    if (submitter == nullptr || submitter[0] == '\0' || std::strcmp(submitter, ker::net::wki::g_wki.local_hostname) == 0) {
+        return copy_path_string(aliased, out, out_size);
+    }
+
+    return build_wki_host_path(submitter, aliased, out, out_size);
+}
+
+auto normalize_task_path_inplace(char* path, size_t bufsize) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+
+    int canonical = canonicalize_path(path, bufsize);
+    if (canonical < 0) {
+        return canonical;
+    }
+
+    char routed[MAX_PATH_LEN] = {};
+    ker::mod::sched::task::Task* current_task = nullptr;
+    if (ker::mod::sched::has_run_queues()) {
+        current_task = ker::mod::sched::get_current_task();
+    }
+
+    int route_result = apply_task_vfs_route(current_task, path, routed, sizeof(routed));
+    if (route_result < 0) {
+        return route_result;
+    }
+
+    return copy_path_string(routed, path, bufsize);
+}
+
+auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
+    int absolute = make_absolute(path, out, outsize);
+    if (absolute < 0) {
+        return absolute;
+    }
+
+    return normalize_task_path_inplace(out, outsize);
+}
+
+auto add_default_vfs_rule(const char* prefix, uint8_t route) -> int {
+    if (prefix == nullptr || prefix[0] != '/') {
+        return -EINVAL;
+    }
+    if (route != static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL) &&
+        route != static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::HOST)) {
+        return -EINVAL;
+    }
+
+    char canonical[MAX_PATH_LEN] = {};
+    int copy_result = copy_path_string(prefix, canonical, sizeof(canonical));
+    if (copy_result < 0) {
+        return copy_result;
+    }
+
+    int canonical_result = canonicalize_path(canonical, sizeof(canonical));
+    if (canonical_result < 0) {
+        return canonical_result;
+    }
+
+    size_t prefix_len = std::strlen(canonical);
+    if (prefix_len == 0 || prefix_len >= ker::mod::sched::task::WkiVfsRule::PREFIX_MAX) {
+        return -ENAMETOOLONG;
+    }
+
+    for (size_t i = 0; i < g_default_vfs_rule_count; ++i) {
+        auto& rule = g_default_vfs_rules[i];
+        if (rule.prefix_len == prefix_len && std::strncmp(rule.prefix, canonical, prefix_len) == 0) {
+            std::memcpy(rule.prefix, canonical, prefix_len + 1);
+            rule.prefix_len = static_cast<uint16_t>(prefix_len);
+            rule.route = route;
+            rule.reserved = 0;
+            return 0;
+        }
+    }
+
+    if (g_default_vfs_rule_count >= g_default_vfs_rules.size()) {
+        return -ENOSPC;
+    }
+
+    auto& rule = g_default_vfs_rules[g_default_vfs_rule_count++];
+    std::memcpy(rule.prefix, canonical, prefix_len + 1);
+    rule.prefix_len = static_cast<uint16_t>(prefix_len);
+    rule.route = route;
+    rule.reserved = 0;
+    return 0;
+}
+
+void install_builtin_vfs_rules() {
+    g_default_vfs_rule_count = 0;
+    add_default_vfs_rule("/wki", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
+    add_default_vfs_rule("/proc", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
+    add_default_vfs_rule("/dev", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
+    add_default_vfs_rule("/tmp", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
+    add_default_vfs_rule("/run", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
+    add_default_vfs_rule("/", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::HOST));
+}
+
+auto parse_vfs_route(const char* route_text, uint8_t* route_out) -> bool {
+    if (route_text == nullptr || route_out == nullptr) {
+        return false;
+    }
+
+    if (std::strcmp(route_text, "local") == 0) {
+        *route_out = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
+        return true;
+    }
+    if (std::strcmp(route_text, "host") == 0) {
+        *route_out = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::HOST);
+        return true;
+    }
+    return false;
+}
+
+void release_open_file(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+
+    if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
+        file->fops->vfs_close(file);
+    }
+    if (file->vfs_path != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free((void*)file->vfs_path);
+    }
+    delete file;
+}
+
+void load_vfs_rules_from_buffer(char* buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+
+    char* line = buffer;
+    while (*line != '\0') {
+        char* line_end = line;
+        while (*line_end != '\0' && *line_end != '\n' && *line_end != '\r') {
+            line_end++;
+        }
+
+        char* next_line = line_end;
+        while (*next_line == '\n' || *next_line == '\r') {
+            *next_line = '\0';
+            next_line++;
+        }
+        if (*line_end != '\0') {
+            *line_end = '\0';
+        }
+
+        while (*line == ' ' || *line == '\t') {
+            line++;
+        }
+
+        if (*line != '\0' && *line != '#') {
+            char* prefix = line;
+            while (*line != '\0' && *line != ' ' && *line != '\t') {
+                line++;
+            }
+
+            if (*line != '\0') {
+                *line++ = '\0';
+                while (*line == ' ' || *line == '\t') {
+                    line++;
+                }
+
+                char* route_text = line;
+                while (*line != '\0' && *line != ' ' && *line != '\t') {
+                    line++;
+                }
+                *line = '\0';
+
+                uint8_t route = 0;
+                if (parse_vfs_route(route_text, &route)) {
+                    add_default_vfs_rule(prefix, route);
+                }
+            }
+        }
+
+        line = next_line;
+    }
+}
 
 // Convert a possibly-relative path to an absolute path by prepending CWD.
 // If the path is already absolute, copies it as-is.
@@ -53,7 +574,7 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
         return 0;
     }
 
-    // Relative path — prepend task CWD
+    // Relative path - prepend task CWD
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
 
@@ -119,7 +640,7 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
             components[num_components++] = comp_start;
         }
 
-        // Keep the null terminator in place — the component pointers
+        // Keep the null terminator in place - the component pointers
         // stored in components[] depend on it for correct strlen/memcpy
         // during reconstruction.  Parsing still works because we advance
         // p past the '\0' below.
@@ -158,7 +679,7 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 
 // Resolve symlinks in a path. The resolved path is written to resolved_buf.
 // Returns 0 on success, -ELOOP on too many symlinks, -1 on other errors.
-auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> int {
+auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false) -> int {
     if (path == nullptr || resolved_buf == nullptr || bufsize == 0) {
         return -1;
     }
@@ -171,7 +692,22 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
     }
     resolved_buf[path_len] = '\0';
 
+    if (apply_task_policy) {
+        int normalize = normalize_task_path_inplace(resolved_buf, bufsize);
+        if (normalize < 0) {
+            return normalize;
+        }
+    }
+
     for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
+        int prefix_result = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy);
+        if (prefix_result < 0) {
+            return prefix_result;
+        }
+        if (prefix_result > 0) {
+            continue;
+        }
+
         MountPoint* mount = find_mount_point(resolved_buf);
         if (mount == nullptr) {
             return 0;
@@ -227,6 +763,12 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
                 new_path[prefix_len + link_len] = '\0';
                 memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
             }
+            if (apply_task_policy) {
+                int normalize = normalize_task_path_inplace(resolved_buf, bufsize);
+                if (normalize < 0) {
+                    return normalize;
+                }
+            }
             continue;  // re-resolve after substitution
         }
 
@@ -247,16 +789,16 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
             char linkbuf[MAX_PATH_LEN];
             ssize_t link_len = ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, linkbuf, MAX_PATH_LEN - 1);
             if (link_len <= 0) {
-                return 0;  // Not a symlink or readlink failed — resolution complete
+                return 0;  // Not a symlink or readlink failed - resolution complete
             }
             linkbuf[link_len] = '\0';
 
             if (linkbuf[0] == '/') {
-                // Absolute symlink target — replace entire path
+                // Absolute symlink target - replace entire path
                 if (static_cast<size_t>(link_len) >= bufsize) return -1;
                 memcpy(resolved_buf, linkbuf, link_len + 1);
             } else {
-                // Relative symlink target — replace last component
+                // Relative symlink target - replace last component
                 size_t last_slash = 0;
                 bool found_slash = false;
                 for (size_t i = 0; resolved_buf[i] != '\0'; ++i) {
@@ -272,6 +814,12 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
                 memcpy(new_path + prefix_len, linkbuf, link_len);
                 new_path[prefix_len + link_len] = '\0';
                 memcpy(resolved_buf, new_path, prefix_len + link_len + 1);
+            }
+            if (apply_task_policy) {
+                int normalize = normalize_task_path_inplace(resolved_buf, bufsize);
+                if (normalize < 0) {
+                    return normalize;
+                }
             }
             continue;  // Re-resolve after substitution
         }
@@ -397,6 +945,13 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize) -> i
             new_path[prefix_len + target_len] = '\0';                         // NOLINT
             memcpy(resolved_buf, new_path, prefix_len + target_len + 1);
         }
+
+        if (apply_task_policy) {
+            int normalize = normalize_task_path_inplace(resolved_buf, bufsize);
+            if (normalize < 0) {
+                return normalize;
+            }
+        }
     }
 
     return -ELOOP;
@@ -422,21 +977,17 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     std::memcpy(rawPath, path.data(), path.size());
     rawPath[path.size()] = '\0';
 
-    // Resolve relative paths to absolute using CWD
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    if (make_absolute(rawPath, pathBuffer, MAX_PATH_LEN) < 0) {
+    if (resolve_task_path_raw(rawPath, pathBuffer, MAX_PATH_LEN) < 0) {
         return -ENOENT;
     }
 
-    // Canonicalize path (resolve ".", "..", collapse "//")
-    canonicalize_path(static_cast<char*>(pathBuffer), MAX_PATH_LEN);
-
     // Resolve symlinks in the path
     char resolved[MAX_PATH_LEN];  // NOLINT
-    int resolve_ret = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN);
+    int resolve_ret = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true);
     if (resolve_ret == -ELOOP) {
         ker::mod::io::serial::write("vfs_open: too many symlink levels\n");
-        return -1;
+        return -ELOOP;
     }
     if (resolve_ret == 0) {
         // Use the resolved path
@@ -459,27 +1010,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return -1;
     }
 
-    // Strip the mount point prefix to get the filesystem-relative path
-    const char* fs_relative_path = pathBuffer;
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    // Skip past the mount point prefix
-    if (mount_len > 0 && pathBuffer[mount_len - 1] == '/' && mount_len == 1) {
-        // Root mount "/" - skip the leading /
-        fs_relative_path = pathBuffer + 1;
-    } else if (pathBuffer[mount_len] == '/') {
-        // Path continues after mount point with /
-        fs_relative_path = pathBuffer + mount_len + 1;
-    } else if (pathBuffer[mount_len] == '\0') {
-        // Path exactly matches mount point - opening mount root
-        fs_relative_path = "";
-    } else {
-        // Path doesn't match mount point properly (shouldn't happen)
-        fs_relative_path = pathBuffer + mount_len;
-    }
+    const char* fs_relative_path = strip_mount_prefix(mount, pathBuffer);
 
     ker::vfs::File* f = nullptr;
 
@@ -569,7 +1100,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         if (node != nullptr) {
             int perm_ret = vfs_check_permission(node->mode, node->uid, node->gid, required_access);
             if (perm_ret < 0) {
-                // Permission denied — clean up and return
+                // Permission denied - clean up and return
                 if (f->vfs_path != nullptr) ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(f->vfs_path));
                 ker::mod::mm::dyn::kmalloc::free(f);
                 return perm_ret;
@@ -795,7 +1326,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
         return -EINVAL;
     }
 
-    // We allow vfs_readdir to be null — the directory may contain only mount children
+    // We allow vfs_readdir to be null - the directory may contain only mount children
     bool has_fs_readdir = (f->fops != nullptr) && (f->fops->vfs_readdir != nullptr);
 
     auto* entries = static_cast<DirEntry*>(buffer);
@@ -819,7 +1350,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
             f->dir_fs_count = actual_index;
         }
 
-        // Phase 2: inject mount-point children as synthetic directory entries.
+        // Phase 2: inject synthetic task-aware aliases and mount-point children.
         // For each mount whose path starts with vfs_path, extract the first
         // path component after vfs_path as a child directory name.
         // Deduplicate against FS entries and against earlier mounts that
@@ -827,14 +1358,46 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
         bool found_mount_child = false;
         if (f->vfs_path != nullptr) {
             size_t fs_count = has_fs_readdir ? f->dir_fs_count : 0;
-            size_t mount_idx = actual_index - fs_count;
+            size_t synthetic_index = actual_index - fs_count;
+
+            bool inject_host_alias = std::strcmp(f->vfs_path, "/wki") == 0;
+            if (inject_host_alias && has_fs_readdir && fs_count > 0) {
+                DirEntry probe = {};
+                for (size_t pi = 0; pi < fs_count; ++pi) {
+                    int pret = f->fops->vfs_readdir(f, &probe, pi);
+                    if (pret != 0) {
+                        break;
+                    }
+                    if (std::strcmp(probe.d_name.data(), "host") == 0) {
+                        inject_host_alias = false;
+                        break;
+                    }
+                }
+            }
+
+            if (inject_host_alias) {
+                if (synthetic_index == 0) {
+                    entries[entries_read].d_ino = 0x574b49486f7374ULL;
+                    entries[entries_read].d_off = actual_index + 1;
+                    entries[entries_read].d_reclen = sizeof(DirEntry);
+                    entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
+                    std::memcpy(entries[entries_read].d_name.data(), "host", 5);
+                    entries_read++;
+                    continue;
+                }
+                synthetic_index--;
+            }
+
+            size_t mount_idx = synthetic_index;
 
             size_t dir_len = std::strlen(f->vfs_path);
             size_t child_count = 0;
 
             for (size_t mi = 0; mi < get_mount_count(); ++mi) {
                 MountPoint* mp = get_mount_at(mi);
-                if (mp == nullptr || mp->path == nullptr) continue;
+                if (mp == nullptr || mp->path == nullptr) {
+                    continue;
+                }
 
                 size_t mp_len = std::strlen(mp->path);
                 const char* child_start = nullptr;
@@ -909,7 +1472,16 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     entries[entries_read].d_ino = reinterpret_cast<uint64_t>(mp);
                     entries[entries_read].d_off = actual_index + 1;
                     entries[entries_read].d_reclen = sizeof(DirEntry);
-                    entries[entries_read].d_type = DT_DIR;
+
+                    // Mark WKI entries with WOSLINK flag for recursion prevention:
+                    // - listing /wki: all mount children (wos-0, wos-1, ...) are WOSLINK
+                    // - listing /: the "wki" mount child is WOSLINK
+                    if (std::strcmp(f->vfs_path, "/wki") == 0 ||
+                        (dir_len == 1 && f->vfs_path[0] == '/' && child_len == 3 && std::memcmp(child_start, "wki", 3) == 0)) {
+                        entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
+                    } else {
+                        entries[entries_read].d_type = DT_DIR;
+                    }
 
                     size_t copy_len = child_len < DIRENT_NAME_MAX - 1 ? child_len : DIRENT_NAME_MAX - 1;
                     std::memcpy(entries[entries_read].d_name.data(), child_start, copy_len);
@@ -944,10 +1516,8 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -EINVAL;
     }
 
-    // Resolve relative linkpath to absolute
     char absLinkpath[MAX_PATH_LEN];
-    if (make_absolute(linkpath, absLinkpath, MAX_PATH_LEN) < 0) return -ENOENT;
-    canonicalize_path(absLinkpath, MAX_PATH_LEN);
+    if (resolve_task_path_raw(linkpath, absLinkpath, MAX_PATH_LEN) < 0) return -ENOENT;
 
     // Find mount point for the linkpath
     MountPoint* mount = find_mount_point(absLinkpath);
@@ -960,20 +1530,7 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -ENOSYS;
     }
 
-    // Strip mount prefix
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    const char* fs_path = absLinkpath;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = absLinkpath + 1;
-    } else if (absLinkpath[mount_len] == '/') {
-        fs_path = absLinkpath + mount_len + 1;
-    } else {
-        fs_path = absLinkpath + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, absLinkpath);
 
     // Split into parent path and link name
     const char* last_slash = nullptr;
@@ -1014,10 +1571,8 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
-    // Resolve relative path to absolute
     char absPath[MAX_PATH_LEN];
-    if (make_absolute(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
-    canonicalize_path(absPath, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
 
     MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
@@ -1025,16 +1580,7 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     }
 
     if (mount->fs_type == FSType::PROCFS) {
-        // Strip mount prefix for procfs readlink
-        size_t ml = 0;
-        while (mount->path[ml] != '\0') ml++;
-        const char* fsp = absPath;
-        if (ml == 1 && mount->path[0] == '/')
-            fsp = absPath + 1;
-        else if (absPath[ml] == '/')
-            fsp = absPath + ml + 1;
-        else
-            fsp = absPath + ml;
+        const char* fsp = strip_mount_prefix(mount, absPath);
 
         auto* f = ker::vfs::procfs::procfs_open_path(fsp, 0, 0);
         if (f == nullptr) return -ENOENT;
@@ -1045,29 +1591,12 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        // Strip mount prefix
-        size_t mount_len = 0;
-        while (mount->path[mount_len] != '\0') mount_len++;
-        const char* fs_path = absPath;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = absPath + 1;
-        else if (absPath[mount_len] == '/')
-            fs_path = absPath + mount_len + 1;
-        else
-            fs_path = absPath + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, absPath);
         return ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, buf, bufsize);
     }
 
     if (mount->fs_type == FSType::XFS) {
-        size_t mount_len = 0;
-        while (mount->path[mount_len] != '\0') mount_len++;
-        const char* fs_path = absPath;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = absPath + 1;
-        else if (absPath[mount_len] == '/')
-            fs_path = absPath + mount_len + 1;
-        else
-            fs_path = absPath + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, absPath);
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
         if (f == nullptr) return -ENOENT;
@@ -1078,19 +1607,7 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     }
 
     if (mount->fs_type == FSType::DEVFS) {
-        size_t mount_len = 0;
-        while (mount->path[mount_len] != '\0') {
-            mount_len++;
-        }
-
-        const char* fs_path = absPath;
-        if (mount_len == 1 && mount->path[0] == '/') {
-            fs_path = absPath + 1;
-        } else if (absPath[mount_len] == '/') {
-            fs_path = absPath + mount_len + 1;
-        } else {
-            fs_path = absPath + mount_len;
-        }
+        const char* fs_path = strip_mount_prefix(mount, absPath);
 
         auto* f = ker::vfs::devfs::devfs_open_path(fs_path, 0, 0);
         if (f == nullptr) {
@@ -1117,20 +1634,7 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -ENOSYS;
     }
 
-    // Strip mount prefix
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    const char* fs_path = absPath;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = absPath + 1;
-    } else if (absPath[mount_len] == '/') {
-        fs_path = absPath + mount_len + 1;
-    } else {
-        fs_path = absPath + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, absPath);
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
     if (node == nullptr) {
@@ -1156,10 +1660,8 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return -EINVAL;
     }
 
-    // Resolve relative path to absolute
     char absPath[MAX_PATH_LEN];
-    if (make_absolute(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
-    canonicalize_path(absPath, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
 
     MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
@@ -1170,20 +1672,7 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return -ENOSYS;  // Only tmpfs supports mkdir for now
     }
 
-    // Strip mount prefix
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    const char* fs_path = absPath;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = absPath + 1;
-    } else if (absPath[mount_len] == '/') {
-        fs_path = absPath + mount_len + 1;
-    } else {
-        fs_path = absPath + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, absPath);
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, true);
     return (node != nullptr) ? 0 : -1;
@@ -1194,13 +1683,60 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
         return -EINVAL;
     }
 
-    // Resolve relative paths and canonicalize
+    // WOSLINK detection: compute canonical pre-rewrite path to detect /wki
+    // entries before resolve_task_path_raw rewrites them (e.g., /wki/host → /).
+    bool is_wki_entry = false;
+    {
+        char pre_rewrite[MAX_PATH_LEN] = {};
+        if (make_absolute(path, pre_rewrite, MAX_PATH_LEN) == 0 && canonicalize_path(pre_rewrite, MAX_PATH_LEN) == 0) {
+            if (std::strcmp(pre_rewrite, "/wki") == 0) {
+                is_wki_entry = true;
+            } else if (std::strncmp(pre_rewrite, "/wki/", 5) == 0) {
+                // Direct child of /wki (one component, no further slashes)
+                const char* child = pre_rewrite + 5;
+                bool has_slash = false;
+                for (const char* p = child; *p != '\0'; ++p) {
+                    if (*p == '/') { has_slash = true; break; }
+                }
+                if (*child != '\0' && !has_slash) {
+                    is_wki_entry = true;
+                }
+            }
+        }
+    }
+
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) {
+    if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) {
         return -ENOENT;
     }
 
-    canonicalize_path(pathBuffer, MAX_PATH_LEN);
+    char resolved[MAX_PATH_LEN];  // NOLINT
+    int resolve_ret = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true);
+    if (resolve_ret == -ELOOP) {
+        return -ELOOP;
+    }
+    if (resolve_ret < 0) {
+        return resolve_ret;
+    }
+    std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+
+    // Post-rewrite WOSLINK check: after host alias rewriting, deeper paths
+    // like /wki/host/wki resolve to /wki, and /wki/host/wki/wos-1 resolves
+    // to /wki/wos-1.  Catch these by examining the resolved pathBuffer.
+    if (!is_wki_entry) {
+        if (std::strcmp(pathBuffer, "/wki") == 0) {
+            is_wki_entry = true;
+        } else if (std::strncmp(pathBuffer, "/wki/", 5) == 0) {
+            const char* child = pathBuffer + 5;
+            bool has_slash = false;
+            for (const char* p = child; *p != '\0'; ++p) {
+                if (*p == '/') { has_slash = true; break; }
+            }
+            if (*child != '\0' && !has_slash) {
+                is_wki_entry = true;
+            }
+        }
+    }
 
     // Find mount point
     MountPoint* mount = find_mount_point(pathBuffer);
@@ -1208,25 +1744,12 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
         return -ENOENT;
     }
 
-    // Strip mount prefix
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    const char* fs_path = pathBuffer;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = pathBuffer + 1;
-    } else if (pathBuffer[mount_len] == '/') {
-        fs_path = pathBuffer + mount_len + 1;
-    } else if (pathBuffer[mount_len] == '\0') {
-        fs_path = "";
-    } else {
-        fs_path = pathBuffer + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, pathBuffer);
 
     // Initialize stat buffer
     memset(statbuf, 0, sizeof(stat));
+
+    int result = -ENOSYS;
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
@@ -1254,10 +1777,12 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
-            return 0;
+            result = 0;
+            break;
         }
         case FSType::FAT32: {
-            return ker::vfs::fat32::fat32_stat(fs_path, statbuf, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            result = ker::vfs::fat32::fat32_stat(fs_path, statbuf, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            break;
         }
         case FSType::DEVFS: {
             // Walk devfs tree to determine if directory or device
@@ -1285,10 +1810,12 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             } else {
                 statbuf->st_mode = S_IFCHR | node->mode;
             }
-            return 0;
+            result = 0;
+            break;
         }
         case FSType::REMOTE: {
-            return ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
+            result = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
+            break;
         }
         case FSType::PROCFS: {
             // procfs: open the path, check if it exists
@@ -1325,14 +1852,25 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             // Clean up temporary file (allocated with new in procfs_open_path)
             ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
             delete f;
-            return 0;
+            result = 0;
+            break;
         }
         case FSType::XFS: {
-            return ker::vfs::xfs::xfs_stat(fs_path, statbuf, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            result = ker::vfs::xfs::xfs_stat(fs_path, statbuf, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            break;
         }
         default:
             return -ENOSYS;
     }
+
+    // WOSLINK post-processing: mark WKI entry directories with S_WOSLINK
+    // so userspace tools (e.g., ls -R) can avoid infinite recursion through
+    // /wki/host/wki/host/... or /wki/node-1/wki/node-0/wki/node-1/...
+    if (result == 0 && is_wki_entry && (statbuf->st_mode & S_IFMT) == S_IFDIR) {
+        statbuf->st_mode |= S_WOSLINK;
+    }
+
+    return result;
 }
 
 auto vfs_fstat(int fd, stat* statbuf) -> int {
@@ -1418,17 +1956,22 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             return 0;
         }
         case FSType::REMOTE: {
-            // Remote files — report basic file info from position
+            // Remote files/directories - report basic info
             statbuf->st_dev = 0;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
-            statbuf->st_mode = S_IFREG | 0644;
             statbuf->st_uid = 0;
             statbuf->st_gid = 0;
             statbuf->st_rdev = 0;
-            statbuf->st_size = file->pos;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
+            if (file->is_directory) {
+                statbuf->st_mode = S_IFDIR | S_WOSLINK | 0755;
+                statbuf->st_size = 0;
+            } else {
+                statbuf->st_mode = S_IFREG | 0644;
+                statbuf->st_size = file->pos;
+            }
             return 0;
         }
         case FSType::XFS: {
@@ -1490,49 +2033,46 @@ auto vfs_chdir(const char* path) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
 
-    // Canonicalize the path
-    char resolved[MAX_PATH_LEN];
-    size_t plen = std::strlen(path);
-
-    if (path[0] != '/') {
-        // Relative path — prepend cwd
-        size_t cwdlen = std::strlen(task->cwd);
-        if (cwdlen + 1 + plen + 1 > MAX_PATH_LEN) return -ENAMETOOLONG;
-        std::memcpy(resolved, task->cwd, cwdlen);
-        if (cwdlen > 1) resolved[cwdlen++] = '/';  // don't double-/ after root
-        std::memcpy(resolved + cwdlen, path, plen + 1);
-    } else {
-        if (plen + 1 > MAX_PATH_LEN) return -ENAMETOOLONG;
-        std::memcpy(resolved, path, plen + 1);
+    char logical[MAX_PATH_LEN] = {};
+    int absolute = make_absolute(path, logical, MAX_PATH_LEN);
+    if (absolute < 0) {
+        return absolute;
     }
 
-    canonicalize_path(resolved, MAX_PATH_LEN);
-
-    // Resolve symlinks (e.g. /proc/self -> /proc/<pid>)
-    char sym_resolved[MAX_PATH_LEN];
-    int resolve_ret = resolve_symlinks(resolved, sym_resolved, MAX_PATH_LEN);
-    if (resolve_ret == -ELOOP) return -ELOOP;
-    if (resolve_ret == 0) {
-        std::memcpy(resolved, sym_resolved, MAX_PATH_LEN);
+    int canonical = canonicalize_path(logical, MAX_PATH_LEN);
+    if (canonical < 0) {
+        return canonical;
     }
 
-    // Verify the directory exists via stat
+    char resolved[MAX_PATH_LEN] = {};
+    int routed = resolve_task_path_raw(logical, resolved, MAX_PATH_LEN);
+    if (routed < 0) {
+        return routed;
+    }
+
+    char final_path[MAX_PATH_LEN] = {};
+    int resolve_ret = resolve_symlinks(resolved, final_path, MAX_PATH_LEN, true);
+    if (resolve_ret < 0) {
+        return resolve_ret;
+    }
+
+    // Verify the resolved backing path is a directory, but keep cwd logical.
     ker::vfs::stat st{};
-    int ret = vfs_stat(resolved, &st);
-    if (ret < 0) return -ENOENT;
+    int ret = vfs_stat(final_path, &st);
+    if (ret < 0) return ret;
     if ((st.st_mode & S_IFDIR) == 0) return -ENOTDIR;
 
     // Copy to task cwd
-    size_t rlen = std::strlen(resolved);
+    size_t rlen = std::strlen(logical);
     if (rlen + 1 > ker::mod::sched::task::Task::CWD_MAX) return -ENAMETOOLONG;
-    std::memcpy(task->cwd, resolved, rlen + 1);
+    std::memcpy(task->cwd, logical, rlen + 1);
     return 0;
 }
 
 // --- access ---
 // R_OK=4, W_OK=2, X_OK=1, F_OK=0
 auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_gid, int access_bits) -> int {
-    if (access_bits == 0) return 0;  // F_OK — existence only
+    if (access_bits == 0) return 0;  // F_OK - existence only
 
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
@@ -1573,7 +2113,7 @@ auto vfs_access(const char* path, int mode) -> int {
     }
 
     if (mode == 0) {
-        return 0;  // F_OK — just existence check
+        return 0;  // F_OK - just existence check
     }
 
     // st_mode already has the full mode bits from stat
@@ -1604,65 +2144,30 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
 auto vfs_unlink(const char* path) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Resolve relative path and canonicalize
     char path_buf[MAX_PATH_LEN];
-    if (make_absolute(path, path_buf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(path_buf, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, path_buf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     MountPoint* mount = find_mount_point(path_buf);
     if (mount == nullptr) return -ENOENT;
 
     if (mount->fs_type == FSType::XFS) {
-        // Strip mount prefix for XFS
-        size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = path_buf;
-        if (mount_len == 1 && mount->path[0] == '/') {
-            fs_path = path_buf + 1;
-        } else if (path_buf[mount_len] == '/') {
-            fs_path = path_buf + mount_len + 1;
-        } else {
-            fs_path = path_buf + mount_len;
-        }
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
         return ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
     }
 
     if (mount->fs_type == FSType::FAT32) {
-        // Strip mount prefix for FAT32
-        size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = path_buf;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = path_buf + 1;
-        else if (path_buf[mount_len] == '/')
-            fs_path = path_buf + mount_len + 1;
-        else
-            fs_path = path_buf + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
         return ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = path_buf;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = path_buf + 1;
-        else if (path_buf[mount_len] == '/')
-            fs_path = path_buf + mount_len + 1;
-        else
-            fs_path = path_buf + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
         return ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
     }
 
     if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
 
-    // Strip mount prefix
-    size_t mount_len = std::strlen(mount->path);
-    const char* fs_path = path_buf;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = path_buf + 1;
-    } else if (path_buf[mount_len] == '/') {
-        fs_path = path_buf + mount_len + 1;
-    } else {
-        fs_path = path_buf + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, path_buf);
 
     // Walk to parent, then find child
     const char* last_slash = nullptr;
@@ -1715,49 +2220,25 @@ auto vfs_unlink(const char* path) -> int {
 auto vfs_rmdir(const char* path) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Resolve relative path and canonicalize
     char pathBuf[MAX_PATH_LEN];
-    if (make_absolute(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(pathBuf, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     MountPoint* mount = find_mount_point(pathBuf);
     if (mount == nullptr) return -ENOENT;
 
     if (mount->fs_type == FSType::FAT32) {
-        size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = pathBuf;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = pathBuf + 1;
-        else if (pathBuf[mount_len] == '/')
-            fs_path = pathBuf + mount_len + 1;
-        else
-            fs_path = pathBuf + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, pathBuf);
         return ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        size_t mount_len = std::strlen(mount->path);
-        const char* fs_path = pathBuf;
-        if (mount_len == 1 && mount->path[0] == '/')
-            fs_path = pathBuf + 1;
-        else if (pathBuf[mount_len] == '/')
-            fs_path = pathBuf + mount_len + 1;
-        else
-            fs_path = pathBuf + mount_len;
+        const char* fs_path = strip_mount_prefix(mount, pathBuf);
         return ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
     }
 
     if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
 
-    size_t mount_len = std::strlen(mount->path);
-    const char* fs_path = pathBuf;
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = pathBuf + 1;
-    } else if (pathBuf[mount_len] == '/') {
-        fs_path = pathBuf + mount_len + 1;
-    } else {
-        fs_path = pathBuf + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, pathBuf);
 
     const char* last_slash = nullptr;
     for (const char* p = fs_path; *p; ++p) {
@@ -1806,37 +2287,22 @@ auto vfs_rmdir(const char* path) -> int {
 auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) return -EINVAL;
 
-    // Resolve relative paths and canonicalize
     char oldBuf[MAX_PATH_LEN], newBuf[MAX_PATH_LEN];
-    if (make_absolute(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    if (make_absolute(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(oldBuf, MAX_PATH_LEN);
-    canonicalize_path(newBuf, MAX_PATH_LEN);
+    if (resolve_task_path_raw(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    if (resolve_task_path_raw(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     MountPoint* oldMount = find_mount_point(oldBuf);
     MountPoint* newMount = find_mount_point(newBuf);
     if (!oldMount || !newMount) return -ENOENT;
 
     if (oldMount->fs_type == FSType::FAT32 && newMount->fs_type == FSType::FAT32 && oldMount == newMount) {
-        auto strip_mount_fat = [](const char* buf, MountPoint* m) -> const char* {
-            size_t ml = std::strlen(m->path);
-            if (ml == 1 && m->path[0] == '/') return buf + 1;
-            if (buf[ml] == '/') return buf + ml + 1;
-            return buf + ml;
-        };
         return ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(oldMount->private_data),
-                                                  strip_mount_fat(oldBuf, oldMount), strip_mount_fat(newBuf, newMount));
+                                                  strip_mount_prefix(oldMount, oldBuf), strip_mount_prefix(newMount, newBuf));
     }
 
     if (oldMount->fs_type == FSType::REMOTE && newMount->fs_type == FSType::REMOTE && oldMount == newMount) {
-        auto strip_mount_remote = [](const char* buf, MountPoint* m) -> const char* {
-            size_t ml = std::strlen(m->path);
-            if (ml == 1 && m->path[0] == '/') return buf + 1;
-            if (buf[ml] == '/') return buf + ml + 1;
-            return buf + ml;
-        };
-        return ker::net::wki::wki_remote_vfs_rename(oldMount->private_data, strip_mount_remote(oldBuf, oldMount),
-                                                    strip_mount_remote(newBuf, newMount));
+        return ker::net::wki::wki_remote_vfs_rename(oldMount->private_data, strip_mount_prefix(oldMount, oldBuf),
+                                                    strip_mount_prefix(newMount, newBuf));
     }
 
     if (oldMount->fs_type != FSType::TMPFS || newMount->fs_type != FSType::TMPFS) return -ENOSYS;
@@ -1922,7 +2388,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     std::memcpy(oldNode->name.data(), newName, copy_len);
     oldNode->name[copy_len] = '\0';
 
-    // Add to new parent (inline — avoid circular include of tmpfs internal helpers)
+    // Add to new parent (inline - avoid circular include of tmpfs internal helpers)
     // Grow children array if needed
     if (newParent->children_count >= newParent->children_capacity) {
         size_t new_cap = (newParent->children_capacity == 0) ? 8 : newParent->children_capacity * 2;
@@ -1943,25 +2409,13 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 auto vfs_chmod(const char* path, int mode) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Resolve relative path and canonicalize
     char pathBuffer[MAX_PATH_LEN];
-    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(pathBuffer, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     auto* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) return -ENOENT;
 
-    size_t mount_len = strlen(mount->path);
-    const char* fs_path = "";
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = pathBuffer + 1;
-    } else if (pathBuffer[mount_len] == '/') {
-        fs_path = pathBuffer + mount_len + 1;
-    } else if (pathBuffer[mount_len] == '\0') {
-        fs_path = "";
-    } else {
-        fs_path = pathBuffer + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, pathBuffer);
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
@@ -2010,25 +2464,13 @@ auto vfs_fchmod(int fd, int mode) -> int {
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
     if (path == nullptr) return -EINVAL;
 
-    // Resolve relative path and canonicalize
     char pathBuffer[MAX_PATH_LEN];
-    if (make_absolute(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(pathBuffer, MAX_PATH_LEN);
+    if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     auto* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) return -ENOENT;
 
-    size_t mount_len = strlen(mount->path);
-    const char* fs_path = "";
-    if (mount_len == 1 && mount->path[0] == '/') {
-        fs_path = pathBuffer + 1;
-    } else if (pathBuffer[mount_len] == '/') {
-        fs_path = pathBuffer + mount_len + 1;
-    } else if (pathBuffer[mount_len] == '\0') {
-        fs_path = "";
-    } else {
-        fs_path = pathBuffer + mount_len;
-    }
+    const char* fs_path = strip_mount_prefix(mount, pathBuffer);
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
@@ -2095,7 +2537,7 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
 
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)
     switch (cmd) {
-        case 0: {  // F_DUPFD — dup to fd >= arg
+        case 0: {  // F_DUPFD - dup to fd >= arg
             f->refcount++;
             for (unsigned i = static_cast<unsigned>(arg); i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
                 if (task->fds[i] == nullptr) {
@@ -2116,7 +2558,7 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
         case 4:  // F_SETFL
             f->open_flags = static_cast<int>(arg);
             return 0;
-        case 1030: {  // F_DUPFD_CLOEXEC — dup to fd >= arg, set close-on-exec
+        case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
             f->refcount++;
             for (unsigned i = static_cast<unsigned>(arg); i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
                 if (task->fds[i] == nullptr) {
@@ -2197,6 +2639,7 @@ static void pipe_wake_pollers(uint64_t* waiters, uint64_t& waiter_count) {
         if (waiter == nullptr) {
             continue;
         }
+        waiter->deferredTaskSwitch = false;
         uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
         waiter->release();
@@ -2224,6 +2667,7 @@ static void pipe_wake_readers(PipeState* st) {
 
         // Set return value: bytes read (or 0 for EOF)
         waiter->context.regs.rax = to_read;
+        waiter->deferredTaskSwitch = false;
 
         uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
         ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
@@ -2254,6 +2698,7 @@ static void pipe_wake_writers(PipeState* st) {
         }
 
         waiter->context.regs.rax = to_write;
+        waiter->deferredTaskSwitch = false;
 
         uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
@@ -2284,13 +2729,13 @@ auto vfs_pipe(int pipefd[2]) -> int {
     ps->read_poll_count = 0;
     ps->write_poll_count = 0;
 
-    // Pipe fops — static lambdas converted to function pointers
+    // Pipe fops - static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) return -EBADF;
 
         if (st->count > 0) {
-            // Data available — read immediately
+            // Data available - read immediately
             size_t to_read = count < st->count ? count : st->count;
             auto* dst = static_cast<char*>(buf);
             for (size_t i = 0; i < to_read; ++i) {
@@ -2311,7 +2756,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
         }
 
         // Buffer empty
-        if (st->write_closed) return 0;  // EOF — write end closed
+        if (st->write_closed) return 0;  // EOF - write end closed
 
         // Non-blocking: return EAGAIN immediately instead of blocking
         if (f->open_flags & O_NONBLOCK) {
@@ -2333,7 +2778,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
             return 0;  // Will be overwritten when woken
         }
 
-        // Wait queue full — return EAGAIN
+        // Wait queue full - return EAGAIN
         return -EAGAIN;
     };
 
@@ -2394,12 +2839,13 @@ auto vfs_pipe(int pipefd[2]) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st != nullptr) {
             st->read_closed = true;
-            // Wake blocked writers — they'll get EPIPE on next attempt
+            // Wake blocked writers - they'll get EPIPE on next attempt
             if (st->writers_count > 0) {
                 for (uint64_t i = 0; i < st->writers_count; i++) {
                     auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->writers_waiting[i]);
                     if (waiter != nullptr) {
                         waiter->context.regs.rax = static_cast<uint64_t>(-EPIPE);
+                        waiter->deferredTaskSwitch = false;
                         // Send SIGPIPE to the blocked writer
                         waiter->sigPending |= (1ULL << (13 - 1));
                         uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
@@ -2425,12 +2871,13 @@ auto vfs_pipe(int pipefd[2]) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st != nullptr) {
             st->write_closed = true;
-            // Wake blocked readers — they'll get EOF (0)
+            // Wake blocked readers - they'll get EOF (0)
             if (st->readers_count > 0) {
                 for (uint64_t i = 0; i < st->readers_count; i++) {
                     auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->readers_waiting[i]);
                     if (waiter != nullptr) {
                         waiter->context.regs.rax = 0;  // EOF
+                        waiter->deferredTaskSwitch = false;
                         uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
                         ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
                         waiter->release();
@@ -2642,7 +3089,7 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
             // /dev/XXX - lookup by device name
             bdev = ker::dev::block_device_find_by_name(source + 5);
             if (bdev == nullptr) {
-                // Walk devfs tree — handles subdirectory paths like wki/block/<name>
+                // Walk devfs tree - handles subdirectory paths like wki/block/<name>
                 // and triggers WKI proxy attach for remote block devices
                 bdev = ker::vfs::devfs::devfs_resolve_block_device(source + 5);
             }
@@ -2701,6 +3148,132 @@ void init() {
 
     // Register and mount procfs for process information
     ker::vfs::procfs::procfs_init();
+
+    install_builtin_vfs_rules();
+}
+
+void vfs_wki_load_default_rules() {
+    install_builtin_vfs_rules();
+
+    ker::vfs::stat st{};
+    if (vfs_stat("/etc/vfstab", &st) < 0 || st.st_size <= 0) {
+        return;
+    }
+
+    size_t bytes_to_read = std::min<size_t>(static_cast<size_t>(st.st_size), MAX_VFSTAB_BYTES);
+    auto* file = vfs_open_file("/etc/vfstab", 0, 0);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr) {
+        release_open_file(file);
+        return;
+    }
+
+    auto* buffer = new char[bytes_to_read + 1];
+    if (buffer == nullptr) {
+        release_open_file(file);
+        return;
+    }
+
+    ssize_t bytes_read = file->fops->vfs_read(file, buffer, bytes_to_read, 0);
+    release_open_file(file);
+    if (bytes_read <= 0) {
+        delete[] buffer;
+        return;
+    }
+
+    buffer[static_cast<size_t>(bytes_read)] = '\0';
+    load_vfs_rules_from_buffer(buffer);
+    delete[] buffer;
+}
+
+auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || prefix == nullptr) {
+        return -EINVAL;
+    }
+    if (route != static_cast<uint32_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL) &&
+        route != static_cast<uint32_t>(ker::mod::sched::task::WkiVfsRoute::HOST)) {
+        return -EINVAL;
+    }
+
+    char canonical[MAX_PATH_LEN] = {};
+    int absolute = make_absolute(prefix, canonical, sizeof(canonical));
+    if (absolute < 0) {
+        return absolute;
+    }
+
+    int canonical_result = canonicalize_path(canonical, sizeof(canonical));
+    if (canonical_result < 0) {
+        return canonical_result;
+    }
+
+    size_t prefix_len = std::strlen(canonical);
+    if (prefix_len == 0 || prefix_len >= ker::mod::sched::task::WkiVfsRule::PREFIX_MAX) {
+        return -ENAMETOOLONG;
+    }
+
+    auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
+    for (uint16_t i = 0; i < explicit_count; ++i) {
+        auto& rule = task->wki_vfs_rules[i];
+        if (rule.prefix_len == prefix_len && std::strncmp(rule.prefix, canonical, prefix_len) == 0) {
+            std::memcpy(rule.prefix, canonical, prefix_len + 1);
+            rule.prefix_len = static_cast<uint16_t>(prefix_len);
+            rule.route = static_cast<uint8_t>(route);
+            rule.reserved = 0;
+            return 0;
+        }
+    }
+
+    if (explicit_count >= ker::mod::sched::task::Task::WKI_VFS_RULE_MAX) {
+        return -ENOSPC;
+    }
+
+    auto& rule = task->wki_vfs_rules[explicit_count];
+    std::memcpy(rule.prefix, canonical, prefix_len + 1);
+    rule.prefix_len = static_cast<uint16_t>(prefix_len);
+    rule.route = static_cast<uint8_t>(route);
+    rule.reserved = 0;
+    task->wki_vfs_rule_count = static_cast<uint16_t>(explicit_count + 1);
+    return 0;
+}
+
+auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -EINVAL;
+    }
+
+    auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
+    if (index >= explicit_count) {
+        return -ENOENT;
+    }
+
+    const auto& rule = task->wki_vfs_rules[index];
+    if (prefix_buf != nullptr) {
+        if (rule.prefix_len + 1 > prefix_buf_size) {
+            return -ERANGE;
+        }
+        std::memcpy(prefix_buf, rule.prefix, rule.prefix_len + 1);
+    }
+    if (route_out != nullptr) {
+        *route_out = rule.route;
+    }
+    return static_cast<int>(rule.prefix_len);
+}
+
+auto vfs_wki_rule_clear() -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -EINVAL;
+    }
+
+    task->wki_vfs_rule_count = 0;
+    for (auto& rule : task->wki_vfs_rules) {
+        rule.prefix[0] = '\0';
+        rule.prefix_len = 0;
+        rule.route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
+        rule.reserved = 0;
+    }
+    return 0;
 }
 
 auto vfs_open_file(const char* path, int flags, int mode) -> File* {
@@ -2826,7 +3399,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     }
 
     // Allocate buffer for reading/writing
-    constexpr size_t BUF_SIZE = 4UL * 1024UL * 1024UL;  // 4MB buffer — large enough for AHCI max DMA (32MB cap)
+    constexpr size_t BUF_SIZE = 4UL * 1024UL * 1024UL;  // 4MB buffer - large enough for AHCI max DMA (32MB cap)
     auto* buffer = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
     if (buffer == nullptr) {
         return -ENOMEM;
@@ -2906,12 +3479,9 @@ auto vfs_fsync(int fd) -> int {
 auto vfs_link(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) return -EINVAL;
 
-    // Resolve relative paths and canonicalize
     char oldBuf[MAX_PATH_LEN], newBuf[MAX_PATH_LEN];
-    if (make_absolute(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    if (make_absolute(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    canonicalize_path(oldBuf, MAX_PATH_LEN);
-    canonicalize_path(newBuf, MAX_PATH_LEN);
+    if (resolve_task_path_raw(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    if (resolve_task_path_raw(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
 
     MountPoint* oldMount = find_mount_point(oldBuf);
     MountPoint* newMount = find_mount_point(newBuf);
@@ -2926,15 +3496,8 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
     if (oldMount->fs_type != FSType::TMPFS) return -ENOSYS;
 
     // --- tmpfs hard link (data-copy) ---
-    auto strip_mount = [](const char* buf, MountPoint* m) -> const char* {
-        size_t ml = std::strlen(m->path);
-        if (ml == 1 && m->path[0] == '/') return buf + 1;
-        if (buf[ml] == '/') return buf + ml + 1;
-        return buf + ml;
-    };
-
-    const char* oldFs = strip_mount(oldBuf, oldMount);
-    const char* newFs = strip_mount(newBuf, newMount);
+    const char* oldFs = strip_mount_prefix(oldMount, oldBuf);
+    const char* newFs = strip_mount_prefix(newMount, newBuf);
 
     // Look up the source node
     auto* srcNode = ker::vfs::tmpfs::tmpfs_walk_path(oldFs, false);
@@ -2976,7 +3539,7 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         // Copy symlink
         ker::vfs::tmpfs::tmpfs_create_symlink(newParent, newName, srcNode->symlink_target);
     } else {
-        // Regular file — copy data
+        // Regular file - copy data
         auto* dst = ker::vfs::tmpfs::tmpfs_create_file(newParent, newName, srcNode->mode);
         if (dst == nullptr) return -ENOMEM;
         if (srcNode->data != nullptr && srcNode->size > 0) {

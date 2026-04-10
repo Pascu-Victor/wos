@@ -31,6 +31,7 @@ part-init /dev/sda gpt
 part-add /dev/sda p $PART_START_SECTOR $PART_END_SECTOR
 
 mkfs xfs /dev/sda1
+sync
 mount /dev/sda1 /
 mkdir /testdata
 copy-in $CWD/build/modules/testprog/testprog /

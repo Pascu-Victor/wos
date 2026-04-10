@@ -54,7 +54,7 @@ struct PageAllocator {
     void* alloc(uint64_t sizeBytes);
 
     // Free a previous allocation.  The allocation order is recovered from the
-    // per-page flags — callers do not need to supply the size.
+    // per-page flags - callers do not need to supply the size.
     void free(void* ptr);
 
     uint32_t getFreePages() const { return freeCount; }

@@ -10,6 +10,7 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/userspace.hpp>
 // Debug helpers
+#include <net/wki/remote_compute.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/addr.hpp>
@@ -188,7 +189,7 @@ void active_list_remove(uint64_t pid) {
 }
 
 inline uint32_t pid_hash(uint64_t pid) {
-    // Knuth multiplicative hash — spreads sequential PIDs well
+    // Knuth multiplicative hash - spreads sequential PIDs well
     return (uint32_t)((pid * 11400714819323198485ULL) >> 40) & (MAX_PIDS - 1);
 }
 
@@ -202,12 +203,12 @@ bool pid_table_insert(task::Task* t) {
             return true;
         }
         if (pid_table[idx].pid == t->pid) {
-            // Slot already taken by same PID — update pointer (shouldn't happen)
+            // Slot already taken by same PID - update pointer (shouldn't happen)
             pid_table[idx].task = t;
             return true;
         }
     }
-    return false;  // Table full — MAX_PIDS concurrent processes exceeded
+    return false;  // Table full - MAX_PIDS concurrent processes exceeded
 }
 
 task::Task* pid_table_find(uint64_t pid) {
@@ -218,7 +219,7 @@ task::Task* pid_table_find(uint64_t pid) {
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t idx = (slot + i) & (MAX_PIDS - 1);
         if (pid_table[idx].pid == 0) {
-            return nullptr;  // Empty slot — not found
+            return nullptr;  // Empty slot - not found
         }
         if (pid_table[idx].pid == pid) {
             return pid_table[idx].task;
@@ -440,10 +441,10 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             continue;
         }
 
-        // Quick racy load peek (no lock needed — heuristic, not authoritative)
+        // Quick racy load peek (no lock needed - heuristic, not authoritative)
         auto* victim_rq_raw = run_queues->that_cpu(victim_cpu);
 
-        // Phase 8a: hard-domain boundary — never steal from a CPU in a hard leaf domain
+        // Phase 8a: hard-domain boundary - never steal from a CPU in a hard leaf domain
         // into a CPU outside that domain. Racy read is intentional (heuristic guard).
         {
             uint32_t victim_dom_id = victim_rq_raw->domain_id;
@@ -490,7 +491,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 if (t == victim_current) continue;  // Never steal currently-executing task
                 if (t->cpu_pinned || t->domain_hard) continue;
                 if (t->type == task::TaskType::IDLE) continue;
-                // Never steal PROCESS tasks — they have large working sets and
+                // Never steal PROCESS tasks - they have large working sets and
                 // cross-CPU migration causes severe cache thrashing (mandelbench
                 // regression: >2x slowdown when compute threads are stolen).
                 // Only DAEMON tasks are lightweight enough to migrate safely.
@@ -502,7 +503,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             }
             if (best == nullptr) return;
 
-            // Claim ownership BEFORE removing from heap — closes the window
+            // Claim ownership BEFORE removing from heap - closes the window
             // where reschedule_task_for_cpu could re-insert into victim queue.
             best->cpu = stealing_cpu;
 
@@ -514,7 +515,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
 
         if (stolen != nullptr) {
             // Phase 2: insert into our heap. Victim lock is now released.
-            // Our lock is already held by the outer thisCpuLocked — safe to write.
+            // Our lock is already held by the outer thisCpuLocked - safe to write.
             if (stolen->vruntime < our_rq->minVruntime) {
                 int64_t diff = our_rq->minVruntime - stolen->vruntime;
                 stolen->vruntime = our_rq->minVruntime;
@@ -522,7 +523,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             }
             stolen->schedQueue = task::Task::SchedQueue::RUNNABLE;
             if (!our_rq->runnableHeap.insert(stolen)) {
-                // Insert refused (double-insert guard fired) — task is already
+                // Insert refused (double-insert guard fired) - task is already
                 // in some heap due to a concurrent reschedule.  Don't count
                 // this as a successful steal; let the normal scheduler pick it.
                 return false;
@@ -717,7 +718,7 @@ static void arm_idle_timer_locked(RunQueue* rq) {
 }
 
 // IPI handler for scheduler wake-up.
-// NOTE: Do NOT call apic::eoi() here — the generic interrupt_handler already
+// NOTE: Do NOT call apic::eoi() here - the generic interrupt_handler already
 // sends EOI after dispatching interruptHandlers[].
 void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::interruptFrame frame) {
     auto* rq = run_queues->this_cpu();
@@ -732,7 +733,7 @@ void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] g
 
 void set_task_nice(task::Task* task, int nice) { set_task_nice_impl(task, nice); }
 
-// Unconditional wake IPI — breaks a CPU out of hlt regardless of scheduler
+// Unconditional wake IPI - breaks a CPU out of hlt regardless of scheduler
 // idle state.  Used by NAPI to wake worker threads that sleep via sti;hlt
 // as the currentTask (so isIdle is false, and wake_idle_cpu would skip them).
 void wake_cpu(uint64_t cpu_no) {
@@ -821,6 +822,37 @@ auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
     return post_task_for_cpu(cpu_no, task);
 }
 
+auto post_task_waiting(task::Task* task) -> bool {
+    if (task == nullptr || task->schedQueue != task::Task::SchedQueue::NONE) {
+        return false;
+    }
+
+    uint64_t target_cpu = task->cpu;
+    if (target_cpu >= smt::get_core_count()) {
+        target_cpu = cpu::currentCpu();
+    }
+    task->cpu = target_cpu;
+
+    if (task->start_time_us == 0) {
+        task->start_time_us = time::getUs();
+    }
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    if (task->pid > 0) {
+        pid_table_insert(task);
+        active_list_insert(task);
+    }
+
+    run_queues->with_lock_void(target_cpu, [task](RunQueue* rq) {
+        task->lastSleepStartUs = time::getUs();
+        task->schedQueue = task::Task::SchedQueue::WAITING;
+        rq->waitList.push(task);
+    });
+
+    return true;
+}
+
 auto post_task_balanced(task::Task* task) -> bool {
     // D17: Try remote placement if WKI is active and task is a user process
     if (wki_try_remote_placement_fn != nullptr && task->type == task::TaskType::PROCESS) {
@@ -863,7 +895,7 @@ void remove_current_task() {
 }
 
 // ============================================================================
-// processTasks — timer interrupt hot path (EEVDF)
+// processTasks - timer interrupt hot path (EEVDF)
 // ============================================================================
 
 void kern_wake(task::Task* task) {
@@ -871,7 +903,7 @@ void kern_wake(task::Task* task) {
         return;
     }
 
-    // Always go through reschedule_task_for_cpu — it handles all cases safely
+    // Always go through reschedule_task_for_cpu - it handles all cases safely
     // under locks: task RUNNABLE (no-op if currentTask), task WAITING (move to heap),
     // or task migrated to another CPU.
     // The fast path inside reschedule_task_for_cpu checks task->cpu first (O(1) common case).
@@ -884,7 +916,7 @@ void kern_wake(task::Task* task) {
 }
 
 void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
-    // Enter epoch critical section — protects task pointers from GC
+    // Enter epoch critical section - protects task pointers from GC
     EpochGuard epoch_guard;
 
     // Wake any tasks sleeping via nanosleep whose deadline has passed.
@@ -934,7 +966,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             if (rq->runnableHeap.size == 0) {
                 // Phase 2: attempt work stealing from a peer CPU before going idle.
                 // try_steal_from_peers is called with our lock held; it uses
-                // tryWithLock (non-blocking) for victim CPUs — no deadlock risk.
+                // tryWithLock (non-blocking) for victim CPUs - no deadlock risk.
                 try_steal_from_peers(cpu::currentCpu(), rq);
                 if (rq->runnableHeap.size == 0) {
                     return nullptr;
@@ -994,7 +1026,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
     // CRITICAL: If the timer fired while a PROCESS task was in kernel mode (e.g.
     // during a syscall), the interrupt frame and GPRegs contain kernel-mode values.
     // We must NOT save these as the task's user-mode context, and we must NOT
-    // preempt — the kernel is non-preemptive for PROCESS tasks.
+    // preempt - the kernel is non-preemptive for PROCESS tasks.
     // DAEMON (kernel thread) tasks are always in kernel mode but MUST be preemptible.
     bool in_kernel_mode = (frame.cs != desc::gdt::GDT_USER_CS);
     bool is_daemon = (current_task->type == task::TaskType::DAEMON);
@@ -1059,7 +1091,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         perf::record_sample(static_cast<uint32_t>(cpu::currentCpu()), current_task->pid, current_task->context.frame.rip, !in_kernel_mode,
                             compute_avg_vruntime(rq) - current_task->vruntime);
 
-        // ITIMER_REAL expiry check — fire SIGALRM and reload or disarm
+        // ITIMER_REAL expiry check - fire SIGALRM and reload or disarm
         if (current_task->itimer_real_expire_us != 0 && now_us >= current_task->itimer_real_expire_us) {
             current_task->sigPending |= (1ULL << (14 - 1));  // SIGALRM = 14
             if (current_task->itimer_real_interval_us != 0) {
@@ -1078,7 +1110,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             // Track weighted sum: delta_v * weight = deltaNs * 1024 always
             rq->totalWeightedVruntime += vruntime_delta * (int64_t)current_task->schedWeight;
 
-            // Slice exhausted — reset and recalculate deadline
+            // Slice exhausted - reset and recalculate deadline
             if (current_task->sliceUsedNs >= current_task->sliceNs) {
                 current_task->sliceUsedNs = 0;
                 current_task->vdeadline =
@@ -1140,7 +1172,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         // Without this, equal-weight compute threads ping-pong on every 4ms tick.
         //
         // EXCEPTION: If the current task is at a voluntary block point (hlt in
-        // kern_yield), always allow preemption. The task isn't computing — it's
+        // kern_yield), always allow preemption. The task isn't computing - it's
         // sleeping. Without this, halted daemon threads waste their entire 10ms
         // slice doing nothing, starving compute threads on the same CPU.
         //
@@ -1188,7 +1220,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             return nullptr;
         }
 
-        // Validate next task state — it might have started exiting
+        // Validate next task state - it might have started exiting
         if (next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
             return nullptr;
         }
@@ -1239,7 +1271,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         perf::record_switch(static_cast<uint32_t>(cpu::currentCpu()), current_task->pid, next_task->pid, sw_flags, perf_lag_out,
                             current_task->sliceUsedNs / 1000U, current_task->voluntaryBlock ? perf_wait_callsite(current_task) : 0);
     }
-    // Perform context switch — currentTask already set inside lock
+    // Perform context switch - currentTask already set inside lock
     // Save FPU state now that we know a switch is needed. This avoids the
     // expensive xsave on every timer tick when the same task continues.
     if (current_task->type == task::TaskType::PROCESS) {
@@ -1258,7 +1290,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
 }
 
 // ============================================================================
-// jumpToNextTask — called after task exit to switch to next task
+// jumpToNextTask - called after task exit to switch to next task
 // ============================================================================
 
 void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
@@ -1308,7 +1340,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
     });
 
     if (next_task == nullptr) {
-        // No runnable tasks — enter idle loop
+        // No runnable tasks - enter idle loop
 #ifdef SCHED_DEBUG
         dbg::log("jumpToNextTask: CPU %d: No ready tasks, entering idle", cpu::currentCpu());
 #endif
@@ -1375,7 +1407,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
 }
 
 // ============================================================================
-// startScheduler — initial task entry on each CPU
+// startScheduler - initial task entry on each CPU
 // ============================================================================
 
 void start_scheduler() {
@@ -1441,7 +1473,7 @@ void start_scheduler() {
         }
     }
 
-    // Check if task already ran before marking it — we need to know whether
+    // Check if task already ran before marking it - we need to know whether
     // to resume from saved context or start fresh at the entry point.
     bool already_ran = first_task->hasRun;
     first_task->hasRun = true;
@@ -1492,7 +1524,7 @@ void start_scheduler() {
         __builtin_unreachable();
     }
 
-    // DAEMON kernel thread — enter at kthreadEntry in ring 0 via iretq
+    // DAEMON kernel thread - enter at kthreadEntry in ring 0 via iretq
     if (first_task->type == task::TaskType::DAEMON) {
 #ifdef SCHED_DEBUG
         dbg::log("CPU %d: Starting kernel thread PID %x '%s' (rip=0x%x)", cpu::currentCpu(), first_task->pid,
@@ -1502,7 +1534,7 @@ void start_scheduler() {
         __builtin_unreachable();
     }
 
-    // Brand new user task — write TLS self-pointer and enter at ELF entry point
+    // Brand new user task - write TLS self-pointer and enter at ELF entry point
     if (first_task->thread != nullptr) {
         *(reinterpret_cast<uint64_t*>(first_task->thread->fsbase)) = first_task->thread->fsbase;
     }
@@ -1513,7 +1545,7 @@ void start_scheduler() {
 }
 
 // ============================================================================
-// deferredTaskSwitch — called from syscall path for yield/block
+// deferredTaskSwitch - called from syscall path for yield/block
 // ============================================================================
 
 // Check pending signals before restoring a task on the deferred-resume path.
@@ -1649,7 +1681,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     // Signal race check: if a deliverable signal is already pending, do not
     // move this task to wait queue; resume userspace with EINTR.
     bool skip_wait_queue = false;
-    if (!is_yield) {
+    if (!is_yield && current_task->wki_proxy_task_id == 0) {
         uint64_t deliverable = current_task->sigPending & ~current_task->sigMask;
         if (deliverable != 0) {
             skip_wait_queue = true;
@@ -1723,7 +1755,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         }
         int64_t delta_ns = delta_us * 1000;
 
-        // Deferred switch is always from syscall context (kernel mode) — attribute to system time
+        // Deferred switch is always from syscall context (kernel mode) - attribute to system time
         if (current_task->type != task::TaskType::IDLE) {
             current_task->system_time_us += (uint64_t)delta_us;
         }
@@ -1813,6 +1845,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         __builtin_unreachable();
     }
 
+    if (!is_yield && !skip_wait_queue && current_task->wki_proxy_task_id != 0) {
+        ker::net::wki::wki_proxy_task_blocked(current_task);
+    }
+
     next_task->hasRun = true;
 
     // Set up GS/FS for next task
@@ -1831,8 +1867,8 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     mm::virt::switchPagemap(next_task);
 
-    // Validate context before restoring (only for PROCESS tasks — DAEMON uses kernel addresses)
-    // Skip validation when voluntaryBlock is set — kernel-mode context is legitimate.
+    // Validate context before restoring (only for PROCESS tasks - DAEMON uses kernel addresses)
+    // Skip validation when voluntaryBlock is set - kernel-mode context is legitimate.
     if (next_task->type == task::TaskType::PROCESS && !next_task->voluntaryBlock) {
         if (next_task->context.frame.cs != desc::gdt::GDT_USER_CS) {
             dbg::log("deferredTaskSwitch: CORRUPT cs=0x%x (expected 0x%x) PID %x", next_task->context.frame.cs, desc::gdt::GDT_USER_CS,
@@ -1868,7 +1904,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 }
 
 // ============================================================================
-// placeTaskInWaitQueue — block current task on I/O
+// placeTaskInWaitQueue - block current task on I/O
 // ============================================================================
 
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame) {
@@ -1928,7 +1964,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
             gpr = cpu::GPRegs();
         }
     } else {
-        // Only idle or no tasks — enter idle via iretq
+        // Only idle or no tasks - enter idle via iretq
         auto* rq = run_queues->this_cpu();
         rq->currentTask = rq->idleTask;
         rq->isIdle.store(true, std::memory_order_release);
@@ -1946,7 +1982,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
 }
 
 // ============================================================================
-// rescheduleTaskForCpu — wake task from wait queue onto target CPU
+// rescheduleTaskForCpu - wake task from wait queue onto target CPU
 // ============================================================================
 
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
@@ -1966,7 +2002,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // Optimization: check the task's last known CPU first (O(1) common case).
     // Only fall back to scanning all CPUs if not found there (handles races).
     // CRITICAL: If the task is currentTask on some CPU, that CPU is actively running
-    // it (possibly in a syscall). Don't move it — let the timer preempt it naturally.
+    // it (possibly in a syscall). Don't move it - let the timer preempt it naturally.
     bool is_current_on_some_cpu = false;
     uint64_t current_cpu_of_task = UINT64_MAX;
     bool found_and_removed = false;
@@ -2072,12 +2108,34 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
     dbg::log("RESCHED: PID %x INSERT -> CPU %d (heapIdx=%d before insert)", task->pid, (int)cpu_no, task->heapIndex);
 #endif
+
+    // Guard against concurrent wakers: if another reschedule_task_for_cpu() already
+    // inserted this task into a heap between our remove phase and now, don't
+    // double-insert. Just poke the CPU it landed on.
+    if (task->heapIndex >= 0) {
+        uint64_t landed_cpu = task->cpu;
+        if (landed_cpu < smt::get_core_count()) {
+            if (landed_cpu == cpu::currentCpu()) {
+                request_local_reschedule();
+            } else {
+                wake_cpu(landed_cpu);
+            }
+        }
+        return;
+    }
+
     if (task->cpu_pinned) {
-        cpu_no = task->cpu;  // Ignore requested CPU — keep on pinned CPU
+        cpu_no = task->cpu;  // Ignore requested CPU - keep on pinned CPU
     } else {
         task->cpu = cpu_no;
     }
     run_queues->with_lock_void(cpu_no, [task, cpu_no](RunQueue* rq) {
+        // Double-check under lock: another waker may have inserted between
+        // the unlocked heapIndex check and acquiring this lock.
+        if (task->heapIndex >= 0) {
+            return;
+        }
+
         uint64_t now_us = time::getUs();
         bool was_waiting = (task->schedQueue == task::Task::SchedQueue::WAITING);
         uint64_t wake_at_us = task->wakeAtUs;
@@ -2086,7 +2144,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         task->justWoke = was_waiting;
         // Clamp vruntime to [minVruntime, avg_vruntime] on wakeup.
         // Using minVruntime gives the task an artificially early vdeadline
-        // that immediately preempts active compute threads — causing thrashing
+        // that immediately preempts active compute threads - causing thrashing
         // when daemons wake up frequently (e.g. every 4ms for netd/httpd).
         // Using avg_vruntime places the task at the current fair position,
         // so it doesn't cut ahead of tasks that have been running continuously.
@@ -2101,7 +2159,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         task->vdeadline = task->vruntime + ((((int64_t)task->sliceNs * 1024) / (int64_t)task->schedWeight));
         task->sliceUsedNs = 0;
         task->schedQueue = task::Task::SchedQueue::RUNNABLE;
-        // Clear any pending block request — we're explicitly waking this task.
+        // Clear any pending block request - we're explicitly waking this task.
         // If wantsBlock is left true, the next timer tick would immediately re-block it.
         task->wantsBlock = false;
 
@@ -2190,6 +2248,48 @@ void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
         return;
     }
+
+    bool found_current = false;
+    bool removed_from_queue = false;
+    uint64_t last_cpu = task->cpu;
+    uint64_t cpu_count = smt::get_core_count();
+
+    auto detach_from_cpu = [task, &found_current, &removed_from_queue](RunQueue* rq) {
+        if (rq->currentTask == task) {
+            found_current = true;
+            return;
+        }
+        if (task->schedQueue == task::Task::SchedQueue::WAITING && rq->waitList.remove(task)) {
+            removed_from_queue = true;
+            return;
+        }
+        if (rq->runnableHeap.contains(task)) {
+            remove_from_sums(rq, task);
+            rq->runnableHeap.remove(task);
+            removed_from_queue = true;
+        }
+    };
+
+    if (last_cpu < cpu_count) {
+        run_queues->with_lock_void(last_cpu, detach_from_cpu);
+    }
+
+    if (!found_current && !removed_from_queue) {
+        for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+            if (cpu_no == last_cpu) {
+                continue;
+            }
+            run_queues->with_lock_void(cpu_no, detach_from_cpu);
+            if (found_current || removed_from_queue) {
+                break;
+            }
+        }
+    }
+
+    if (found_current) {
+        return;
+    }
+
     task->schedQueue = task::Task::SchedQueue::DEAD_GC;
     run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->deadList.push(task); });
 }
@@ -2317,8 +2417,8 @@ void gc_expired_tasks() {
                     }
 
                     // Free pagemap.
-                    // - DAEMON tasks use the kernel pagemap — must NOT free it.
-                    // - Thread tasks (isThread == true) share the owner process's pagemap —
+                    // - DAEMON tasks use the kernel pagemap - must NOT free it.
+                    // - Thread tasks (isThread == true) share the owner process's pagemap -
                     //   must NOT free it here; we only free when the last user is gone.
                     // - For process tasks (isThread == false): only free if no sibling
                     //   threads sharing the same pagemap are still alive (not yet DEAD).

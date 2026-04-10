@@ -416,7 +416,7 @@ void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std:
         }
 
         // STEP 2: Try to get source file/line info for the exact address.
-        // Use bfd_find_nearest_line first — it resolves to the actual source line
+        // Use bfd_find_nearest_line first - it resolves to the actual source line
         // for the instruction address (via DWARF line tables).
         // Fall back to bfd_find_line which only gives the symbol's declaration line.
         const char* filename = nullptr;

@@ -32,7 +32,7 @@ bool event_matches(uint16_t sub_class, uint16_t sub_id, uint16_t pub_class, uint
 }
 
 // -----------------------------------------------------------------------------
-// D1: Pending reliable events — awaiting ACK from remote subscribers
+// D1: Pending reliable events - awaiting ACK from remote subscribers
 // -----------------------------------------------------------------------------
 
 constexpr uint8_t RELIABLE_MAX_RETRIES = 5;
@@ -54,7 +54,7 @@ std::deque<PendingReliableEvent> g_pending_reliable;  // NOLINT(cppcoreguideline
 static ker::mod::sys::Spinlock s_event_lock;
 
 // -----------------------------------------------------------------------------
-// D2: Event log ring buffer — replay matching events to new subscribers
+// D2: Event log ring buffer - replay matching events to new subscribers
 // -----------------------------------------------------------------------------
 
 constexpr size_t EVENT_LOG_MAX = 128;
@@ -141,7 +141,7 @@ void wki_event_init() {
 }
 
 // -----------------------------------------------------------------------------
-// Subscribe / Unsubscribe — outgoing requests to a remote node
+// Subscribe / Unsubscribe - outgoing requests to a remote node
 // -----------------------------------------------------------------------------
 
 void wki_event_subscribe(uint16_t peer_node, uint16_t event_class, uint16_t event_id, uint8_t delivery_mode) {
@@ -170,7 +170,7 @@ void wki_event_unsubscribe(uint16_t peer_node, uint16_t event_class, uint16_t ev
 }
 
 // -----------------------------------------------------------------------------
-// Publish — send event to matching remote subscribers + invoke local handlers
+// Publish - send event to matching remote subscribers + invoke local handlers
 // -----------------------------------------------------------------------------
 
 void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data, uint16_t data_len) {
@@ -272,7 +272,7 @@ void wki_event_unregister_handler(EventHandlerFn handler) {
 }
 
 // -----------------------------------------------------------------------------
-// D1: Timer tick — retransmit reliable events that haven't been ACKed
+// D1: Timer tick - retransmit reliable events that haven't been ACKed
 // -----------------------------------------------------------------------------
 
 void wki_event_timer_tick(uint64_t now_us) {
@@ -295,7 +295,7 @@ void wki_event_timer_tick(uint64_t now_us) {
         }
 
         if (pending.retries >= RELIABLE_MAX_RETRIES) {
-            // Give up — mark for removal
+            // Give up - mark for removal
             pending.subscriber_node = WKI_NODE_INVALID;
             any_removed = true;
             continue;
@@ -315,7 +315,7 @@ void wki_event_timer_tick(uint64_t now_us) {
 }
 
 // -----------------------------------------------------------------------------
-// Fencing cleanup — remove all subscriptions and pending events for a fenced peer
+// Fencing cleanup - remove all subscriptions and pending events for a fenced peer
 // -----------------------------------------------------------------------------
 
 void wki_event_cleanup_for_peer(uint16_t node_id) {

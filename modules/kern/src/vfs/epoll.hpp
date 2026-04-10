@@ -22,7 +22,7 @@ constexpr uint32_t EPOLLRDHUP = 0x2000;
 constexpr uint32_t EPOLLONESHOT = (1U << 30);
 constexpr uint32_t EPOLLET = (1U << 31);
 
-// User-kernel ABI struct — must match mlibc's struct epoll_event layout
+// User-kernel ABI struct - must match mlibc's struct epoll_event layout
 struct __attribute__((__packed__)) EpollEvent {
     uint32_t events;
     union {
@@ -50,7 +50,7 @@ struct EpollInstance {
     size_t count;  // number of active entries
 };
 
-// Kernel epoll API — called from sys_vfs dispatcher
+// Kernel epoll API - called from sys_vfs dispatcher
 auto epoll_create(int flags) -> int;  // returns fd, or negative errno
 auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int;
 auto epoll_pwait(int epfd, EpollEvent* events, int maxevents,

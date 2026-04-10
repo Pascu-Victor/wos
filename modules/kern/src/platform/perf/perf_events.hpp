@@ -36,7 +36,7 @@ constexpr uint8_t PERF_FLAG_EXPLICIT_WAKE = 0x20;  // (WAKE) wake came from kern
 constexpr uint8_t PERF_FLAG_WAKE_CURRENT = 0x40;   // (WAKE) wake raced a task still current on some CPU
 
 // ===========================================================================
-// Event record — 48 bytes
+// Event record - 48 bytes
 // ===========================================================================
 
 struct PerfEvent {
@@ -71,7 +71,7 @@ struct PerfCpuStats {
 };
 
 // ===========================================================================
-// Per-CPU ring buffer  (2 048 events × 48 bytes = 96 KiB per CPU)
+// Per-CPU ring buffer  (2 048 events * 48 bytes = 96 KiB per CPU)
 // ===========================================================================
 
 constexpr size_t PERF_RING_SHIFT = 11;

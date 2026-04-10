@@ -47,7 +47,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             // arg1 = tcb vaddr (mlibc Tcb*, becomes fsbase / FS register)
             // arg2 = prepared stack pointer (entry + user_arg pushed below it)
             // arg3 = virtual address of __mlibc_enter_thread in the process image
-            // arg4 (tid_out) is passed via the a4 register (r8); not yet exposed here —
+            // arg4 (tid_out) is passed via the a4 register (r8); not yet exposed here -
             // the TID is returned as the syscall return value and mlibc writes it to tid_out.
             auto* parent = mod::sched::get_current_task();
             auto tcb_va = (uint64_t)arg1;
@@ -79,7 +79,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
 
         case abi::multiproc::threadControlOps::threadExit: {
             // Exit the current thread without tearing down the process.
-            // The pagemap, FDs, and ELF are shared — do NOT free them.
+            // The pagemap, FDs, and ELF are shared - do NOT free them.
             auto* task = mod::sched::get_current_task();
             if (task == nullptr) {
                 return 0;
@@ -98,7 +98,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
                     waiter->release();
                 }
             }
-            // Transfer to dead list and pick next task — never returns
+            // Transfer to dead list and pick next task - never returns
             jump_to_next_task_no_save();
             __builtin_unreachable();
         }

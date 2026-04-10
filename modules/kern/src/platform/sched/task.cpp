@@ -256,7 +256,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->ownerPid = parent->pid;
     t->cpu = cpu::currentCpu();
 
-    // Share the parent's pagemap — do NOT create a new one
+    // Share the parent's pagemap - do NOT create a new one
     t->pagemap = parent->pagemap;
 
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
@@ -274,7 +274,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
 
     // Kernel-space PerCpu scratch area for syscall entry.
     // gsbase must also point here: after swapgs on syscall entry, GS_BASE becomes
-    // gsbase, so it must be the PerCpu scratch area — not 0.
+    // gsbase, so it must be the PerCpu scratch area - not 0.
     auto* perCpu = new cpu::PerCpu();
     perCpu->syscallStack = kRsp;
     perCpu->cpuId = cpu::currentCpu();
@@ -327,6 +327,12 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->session_id = parent->session_id;
     t->pgid = parent->pgid;
     t->controlling_tty = parent->controlling_tty;
+    memcpy(t->wki_target_hostname, parent->wki_target_hostname, sizeof(t->wki_target_hostname));
+    t->wki_target_flags = parent->wki_target_flags;
+    memcpy(t->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(t->wki_submitter_hostname));
+    t->wki_vfs_rule_count = parent->wki_vfs_rule_count;
+    memcpy(t->wki_vfs_rules.data(), parent->wki_vfs_rules.data(), sizeof(t->wki_vfs_rules));
+    t->wki_skip_legacy_placement = false;
 
     // ELF buffer: threads have no separate ELF
     t->elfBuffer = nullptr;

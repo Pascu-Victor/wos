@@ -1,5 +1,6 @@
 #include "time.hpp"
 
+#include <bits/timeval.h>
 #include <sys/times.h>
 
 #include <cerrno>
@@ -11,7 +12,6 @@
 #include <platform/tsc/tsc.hpp>
 
 #include "abi/callnums/time.h"
-#include "bits/posix/timeval.h"
 #include "platform/dbg/dbg.hpp"
 
 struct itimerval {
@@ -21,7 +21,7 @@ struct itimerval {
 
 static constexpr int ITIMER_REAL = 0;
 
-// CLK_TCK for times() return values — must match userspace sysconf(_SC_CLK_TCK)
+// CLK_TCK for times() return values - must match userspace sysconf(_SC_CLK_TCK)
 static constexpr uint64_t WOS_CLK_TCK = 100;
 
 namespace ker::syscall::time {
@@ -99,7 +99,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                     // once wakeAtUs is reached.
                     task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
                     task->deferredTaskSwitch = true;
-                    // Return 0 now — syscall exit path sees deferredTaskSwitch=true,
+                    // Return 0 now - syscall exit path sees deferredTaskSwitch=true,
                     // moves task to wait list, switches to next task.
                 } else {
                     // Pre-scheduler fallback: spin-wait

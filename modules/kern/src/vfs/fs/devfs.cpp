@@ -355,7 +355,7 @@ auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
 
 auto devfs_poll_check(File* f, int events) -> int {
     if (f == nullptr || f->private_data == nullptr) {
-        return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT — always ready fallback
+        return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT - always ready fallback
     }
     auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->poll_check != nullptr) {
@@ -813,7 +813,7 @@ void devfs_populate_net_nodes() {
 }
 
 // -----------------------------------------------------------------------------
-// WKI remotable resource nodes — /dev/wki/
+// WKI remotable resource nodes - /dev/wki/
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -892,7 +892,7 @@ struct WkiDevfsCtx {
     uint32_t resource_id;
     uint8_t flags;
     char remote_name[64];  // NOLINT(modernize-avoid-c-arrays)
-    char dev_name[64];     // NOLINT(modernize-avoid-c-arrays) — persistent name for Device::name
+    char dev_name[64];     // NOLINT(modernize-avoid-c-arrays) - persistent name for Device::name
 };
 
 // Read handler for WKI device nodes
@@ -1353,7 +1353,7 @@ auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
         return existing;
     }
 
-    // WKI block resource — trigger proxy attach
+    // WKI block resource - trigger proxy attach
     if (node->device->major == 11 && node->device->private_data != nullptr) {
         auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
         if (ctx->resource_type == ker::net::wki::ResourceType::BLOCK) {
@@ -1365,7 +1365,7 @@ auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
 }
 
 // =============================================================================
-// V2: /dev/nodes/ hierarchy — Node identity
+// V2: /dev/nodes/ hierarchy - Node identity
 // =============================================================================
 
 namespace {
@@ -1570,7 +1570,7 @@ void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
 
 void devfs_nodes_update_state(const char* /*hostname*/, const char* /*state_str*/) {
     // State is read live from WkiPeer::state via the s_node_state_ops read handler.
-    // No cached state to update — this function exists for future use if caching is added.
+    // No cached state to update - this function exists for future use if caching is added.
 }
 
 void devfs_nodes_remove_peer(const char* hostname) {

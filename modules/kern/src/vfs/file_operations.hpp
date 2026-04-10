@@ -30,6 +30,10 @@ constexpr uint8_t DT_FIFO = 5;  // FIFO
 constexpr uint8_t DT_SOCK = 6;  // Socket
 constexpr uint8_t DT_LNK = 7;   // Symbolic link
 
+// WOS extension: WOSLINK flag — OR'd with DT_DIR to mark transparent VFS
+// directories that tools should not recurse into (recursion prevention).
+constexpr uint8_t DT_WOSLINK = 0x80;
+
 // Function pointer types for filesystem operations
 using vfs_open_fn = int (*)(std::string_view, int, int);
 using vfs_close_fn = int (*)(struct File*);

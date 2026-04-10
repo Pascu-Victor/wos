@@ -1,24 +1,25 @@
 #!/bin/bash
 # Incrementally rebuild Dropbear SSH for WOS and install into the sysroot.
-# Expects the toolchain to already be bootstrapped (build-llvm.sh step 9).
+# Expects the toolchain to already be bootstrapped (tools/bootstrap.sh).
 set -e
 
 B=$(pwd)/toolchain
-TARGET_SYSROOT="$B/target1"
+HOST="$B/host"
+TARGET_SYSROOT="$B/sysroot"
 DB_SRC="$B/src/dropbear"
 DB_BUILD="$B/dropbear-build"
 
 if [ ! -d "$DB_SRC" ]; then
     echo "ERROR: dropbear source directory not found at $DB_SRC"
-    echo "Run tools/build-llvm.sh first to bootstrap the toolchain."
+    echo "Run tools/bootstrap.sh first to bootstrap the toolchain."
     exit 1
 fi
 
-# Cross-compilation environment
-export CC="$TARGET_SYSROOT/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
-export AR="$TARGET_SYSROOT/bin/llvm-ar"
-export RANLIB="$TARGET_SYSROOT/bin/llvm-ranlib"
-export STRIP="$TARGET_SYSROOT/bin/llvm-strip"
+# Cross-compilation environment - host tools, target sysroot
+export CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+export AR="$HOST/bin/llvm-ar"
+export RANLIB="$HOST/bin/llvm-ranlib"
+export STRIP="$HOST/bin/llvm-strip"
 export CFLAGS="--sysroot=$TARGET_SYSROOT -static -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
 export LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--whole-archive,-lc,--no-whole-archive"
 
@@ -64,7 +65,7 @@ if [ -f "$DB_BUILD/dropbearmulti" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.a "$TARGET_SYSROOT"/lib/libc++.a \
                "$TARGET_SYSROOT"/lib/libc++abi.a "$TARGET_SYSROOT"/lib/libm.a; do
         if [ -f "$lib" ] && [ "$lib" -nt "$DB_BUILD/dropbearmulti" ]; then
-            echo "Sysroot library $(basename "$lib") changed — forcing relink"
+            echo "Sysroot library $(basename "$lib") changed - forcing relink"
             rm -f "$DB_BUILD/dropbearmulti"
             break
         fi

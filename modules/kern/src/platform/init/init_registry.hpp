@@ -80,8 +80,10 @@ void kernel_start();
 inline constexpr std::array<ModuleDesc, 8> PHASE_0_MODULES = {{
     {.name = "fb", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fb_init},
     {.name = "serial", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::serial_init},
-    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},            // depends: serial
-    {.name = "sse", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::sse_init},            // must be before any VEX/BMI2 code runs (march=native)
+    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},  // depends: serial
+    {.name = "sse",
+     .phase = BootPhase::PHASE_0_EARLY_BOOT,
+     .init_fn = fns::sse_init},  // must be before any VEX/BMI2 code runs (march=native)
     {.name = "mm", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::mm_init},              // depends: dbg
     {.name = "fsgsbase", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fsgsbase_init},  // depends: stack_capture
     {.name = "gdt", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::gdt_init},            // depends: fsgsbase
@@ -94,8 +96,10 @@ inline constexpr std::array<ModuleDesc, 1> PHASE_1_MODULES = {{
 
 // PHASE 2: Post-Interrupt (flattened from interrupt::init)
 inline constexpr std::array<ModuleDesc, 8> PHASE_2_MODULES = {{
-    {.name = "pic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::pic_remap},         // depends: kmalloc
-    {.name = "idt", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::idt_init},          // depends: pic — must be before acpi so faults are handled
+    {.name = "pic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::pic_remap},  // depends: kmalloc
+    {.name = "idt",
+     .phase = BootPhase::PHASE_2_POST_INTERRUPT,
+     .init_fn = fns::idt_init},  // depends: pic - must be before acpi so faults are handled
     {.name = "acpi", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::acpi_init},        // depends: idt
     {.name = "apic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_init},        // depends: acpi
     {.name = "apic_mp", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_mp_init},  // depends: apic
@@ -124,8 +128,10 @@ inline constexpr std::array<ModuleDesc, 13> PHASE_3_MODULES = {{
 // PHASE 4: Scheduler Setup
 inline constexpr std::array<ModuleDesc, 3> PHASE_4_MODULES = {{
     {.name = "initramfs", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::initramfs_init},  // depends: vfs
-    {.name = "hostname", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::hostname_init},    // depends: initramfs (reads /etc/hostname)
-    {.name = "sched", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::sched_init},          // depends: epoch_manager, smt
+    {.name = "hostname",
+     .phase = BootPhase::PHASE_4_SCHEDULER_SETUP,
+     .init_fn = fns::hostname_init},                                                             // depends: initramfs (reads /etc/hostname)
+    {.name = "sched", .phase = BootPhase::PHASE_4_SCHEDULER_SETUP, .init_fn = fns::sched_init},  // depends: epoch_manager, smt
 }};
 
 // PHASE 5: Drivers
@@ -136,7 +142,7 @@ inline constexpr std::array<ModuleDesc, 11> PHASE_5_MODULES = {{
     {.name = "xhci", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::xhci_init},                   // depends: pci, cdc_ether, smt
     {.name = "ivshmem", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ivshmem_init},             // depends: pci, net, smt
     {.name = "pkt_pool_expand", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::pkt_pool_expand},  // depends: virtio, e1000e, ivshmem
-    {.name = "backlog", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::backlog_init},              // depends: pkt_pool_expand, smt
+    {.name = "backlog", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::backlog_init},             // depends: pkt_pool_expand, smt
     {.name = "ndp", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ndp_init},                     // depends: net
     {.name = "wki", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::wki_init},                     // depends: ndp
     {.name = "devfs_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::devfs_populate_net},     // depends: vfs, virtio, e1000e
@@ -154,7 +160,7 @@ inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
      .phase = BootPhase::PHASE_6_POST_SCHEDULER,
      .init_fn = fns::wki_ivshmem_transport_init},                                                                 // depends: sched, wki
     {.name = "ipv6_linklocal", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ipv6_linklocal_init},  // depends: sched, net
-    {.name = "ntp", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ntp_init},                        // depends: sched, net, rtc, tsc
+    {.name = "ntp", .phase = BootPhase::PHASE_6_POST_SCHEDULER, .init_fn = fns::ntp_init},  // depends: sched, net, rtc, tsc
 }};
 
 // PHASE 7: Kernel Start (never returns)

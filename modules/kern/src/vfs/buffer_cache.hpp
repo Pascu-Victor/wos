@@ -18,7 +18,7 @@ constexpr uint32_t BH_VALID = (1u << 1);      // Buffer contains valid data from
 constexpr uint32_t BH_LOCKED = (1u << 2);     // Buffer is locked for I/O
 constexpr uint32_t BH_WRITEBACK = (1u << 3);  // Buffer is being written back
 
-// Buffer head — represents a single cached block from a block device.
+// Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
 struct BufHead {
     uint8_t* data;                  // Pointer to cached block data
@@ -55,7 +55,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead*;
 // Returns nullptr on I/O error.
 auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead*;
 
-// Release a buffer — decrements refcount. If refcount reaches 0 the buffer
+// Release a buffer - decrements refcount. If refcount reaches 0 the buffer
 // becomes eligible for LRU eviction but is NOT freed immediately.
 void brelse(BufHead* bh);
 

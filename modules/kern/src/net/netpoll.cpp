@@ -275,7 +275,7 @@ auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
     // NOTE: The driver's poll function (e.g. virtio_net_poll) calls
     // napi_complete() + re-enables IRQs internally when processed < budget.
     // We must NOT call napi_complete() again in that case, or we corrupt
-    // the NAPI state machine — an IRQ arriving between the driver's
+    // the NAPI state machine - an IRQ arriving between the driver's
     // napi_complete() and ours could schedule the worker (IDLE->SCHEDULED->
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.

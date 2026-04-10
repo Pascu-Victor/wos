@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-# -- setup_wki_bridge.sh — Create WKI bridge and TAP devices ----------------
+# -- setup_wki_bridge.sh - Create WKI bridge and TAP devices ----------------
 #
 # Usage:  sudo ./scripts/setup_wki_bridge.sh [N]
 #
 # Creates:
-#   - wos-wki-br0         — Isolated Linux bridge for WKI inter-kernel traffic
-#   - wos-wki-tap0..tapN-1 — TAP devices attached to the bridge (one per VM)
+#   - wos-wki-br0         - Isolated Linux bridge for WKI inter-kernel traffic
+#   - wos-wki-tap0..tapN-1 - TAP devices attached to the bridge (one per VM)
 #
-# The bridge is intentionally NOT assigned an IP address — it is an isolated
+# The bridge is intentionally NOT assigned an IP address - it is an isolated
 # L2 segment that only WKI kernels communicate over.
 #
 # To tear down:  sudo ./scripts/setup_wki_bridge.sh --teardown
@@ -56,7 +56,7 @@ if ! ip link show "$BRIDGE" &>/dev/null; then
   ip link add "$BRIDGE" type bridge
   ip link set "$BRIDGE" mtu 9000
   ip link set "$BRIDGE" up
-  # Disable STP — small isolated segment, no loops
+  # Disable STP - small isolated segment, no loops
   echo 0 > /sys/class/net/${BRIDGE}/bridge/stp_state 2>/dev/null || true
 else
   echo "  Bridge ${BRIDGE} already exists"
@@ -67,7 +67,7 @@ for ((i = 0; i < NUM_VMS; i++)); do
   TAP="wos-wki-tap${i}"
 
   if ip link show "$TAP" &>/dev/null; then
-    echo "  TAP ${TAP} already exists — skipping"
+    echo "  TAP ${TAP} already exists - skipping"
     continue
   fi
 

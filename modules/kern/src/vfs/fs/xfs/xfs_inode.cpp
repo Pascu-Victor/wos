@@ -26,7 +26,7 @@
 namespace ker::vfs::xfs {
 
 // ============================================================================
-// Inode cache — simple hash table
+// Inode cache - simple hash table
 // ============================================================================
 
 namespace {
@@ -181,7 +181,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
             break;
 
         default:
-            mod::dbg::log("[xfs] unknown fork format %d\n", fmt);
+            mod::dbg::log("[xfs] unknown fork format %d", fmt);
             return -EINVAL;
     }
 
@@ -240,18 +240,18 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     }
     icache[bucket].lock.unlock_irqrestore(flags);
 
-    // Not in cache — read from disk
+    // Not in cache - read from disk
     xfs_fsblock_t block = xfs_inode_block(mount, ino);
     size_t offset = xfs_inode_offset(mount, ino);
 
     BufHead* bh = xfs_buf_read(mount, block);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] failed to read inode %lu block %lu\n", (unsigned long)ino, (unsigned long)block);
+        mod::dbg::log("[xfs] failed to read inode %lu block %lu", (unsigned long)ino, (unsigned long)block);
         return nullptr;
     }
 
     if (offset + mount->inode_size > bh->size) {
-        mod::dbg::log("[xfs] inode %lu: offset %lu + size %u exceeds block size %lu\n", (unsigned long)ino, (unsigned long)offset,
+        mod::dbg::log("[xfs] inode %lu: offset %lu + size %u exceeds block size %lu", (unsigned long)ino, (unsigned long)offset,
                       mount->inode_size, (unsigned long)bh->size);
         brelse(bh);
         return nullptr;
@@ -261,14 +261,14 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
 
     // Validate magic
     if (dip->di_magic.to_cpu() != XFS_DINODE_MAGIC) {
-        mod::dbg::log("[xfs] inode %lu: bad magic 0x%x\n", (unsigned long)ino, dip->di_magic.to_cpu());
+        mod::dbg::log("[xfs] inode %lu: bad magic 0x%x", (unsigned long)ino, dip->di_magic.to_cpu());
         brelse(bh);
         return nullptr;
     }
 
     // Verify version
     if (dip->di_version != 3) {
-        mod::dbg::log("[xfs] inode %lu: unsupported version %u\n", (unsigned long)ino, dip->di_version);
+        mod::dbg::log("[xfs] inode %lu: unsupported version %u", (unsigned long)ino, dip->di_version);
         brelse(bh);
         return nullptr;
     }
@@ -276,7 +276,7 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     // Verify CRC
     uint32_t computed = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
     if (computed != dip->di_crc) {
-        mod::dbg::log("[xfs] inode %lu: CRC mismatch (computed 0x%x, on-disk 0x%x)\n", (unsigned long)ino, computed, dip->di_crc);
+        mod::dbg::log("[xfs] inode %lu: CRC mismatch (computed 0x%x, on-disk 0x%x)", (unsigned long)ino, computed, dip->di_crc);
         brelse(bh);
         return nullptr;
     }
@@ -331,7 +331,7 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     // Parse data fork
     int rc = parse_ifork(&ip->data_fork, dip->di_format, inode_data + data_fork_start, data_fork_size, ip->nextents);
     if (rc != 0) {
-        mod::dbg::log("[xfs] inode %lu: failed to parse data fork (%d)\n", (unsigned long)ino, rc);
+        mod::dbg::log("[xfs] inode %lu: failed to parse data fork (%d)", (unsigned long)ino, rc);
         brelse(bh);
         delete ip;
         return nullptr;
@@ -343,7 +343,7 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
         rc =
             parse_ifork(&ip->attr_fork, static_cast<uint8_t>(dip->di_aformat), inode_data + attr_fork_start, attr_fork_size, ip->anextents);
         if (rc != 0) {
-            mod::dbg::log("[xfs] inode %lu: failed to parse attr fork (%d)\n", (unsigned long)ino, rc);
+            mod::dbg::log("[xfs] inode %lu: failed to parse attr fork (%d)", (unsigned long)ino, rc);
             free_ifork(&ip->data_fork);
             brelse(bh);
             delete ip;
@@ -363,7 +363,7 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     ip->dirty = false;
 
     flags = icache[bucket].lock.lock_irqsave();
-    // Check for a race — another thread might have loaded the same inode
+    // Check for a race - another thread might have loaded the same inode
     XfsInode* existing = icache_lookup_locked(ino, bucket);
     if (existing != nullptr) {
         // Another thread beat us; free our copy and use theirs
@@ -387,7 +387,7 @@ void xfs_inode_release(XfsInode* ip) {
 
     ip->refcount--;
     if (ip->refcount <= 0) {
-        // Inode is no longer referenced — remove from cache and free
+        // Inode is no longer referenced - remove from cache and free
         icache_remove_locked(ip, bucket);
         icache[bucket].lock.unlock_irqrestore(flags);
         free_inode(ip);
@@ -408,7 +408,7 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
     BufHead* bh = xfs_buf_read(mount, block);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] inode write: failed to read block %lu\n", (unsigned long)block);
+        mod::dbg::log("[xfs] inode write: failed to read block %lu", (unsigned long)block);
         return -EIO;
     }
 

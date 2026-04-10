@@ -108,7 +108,7 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
 
 // -----------------------------------------------------------------------------
 // V2: Async Wait Queue
-// Lock-free polling via kern_yield() — matches existing WKI blocking patterns.
+// Lock-free polling via kern_yield() - matches existing WKI blocking patterns.
 // The pending list is protected by a spinlock for link/unlink only; the hot
 // path (completed flag check) is a plain volatile read with no lock.
 // -----------------------------------------------------------------------------
@@ -162,21 +162,21 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // timer tick that will never run (the timer thread is us, blocked here).
     while (!entry->completed.load(std::memory_order_acquire)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
-            // Timed out — unlink and return error
+            // Timed out - unlink and return error
             wait_list_unlink(entry);
             return WKI_ERR_TIMEOUT;
         }
         wki_spin_yield();
     }
 
-    // Completed — unlink and return result
+    // Completed - unlink and return result
     wait_list_unlink(entry);
     return entry->result;
 }
 
 void wki_wake_op(WkiWaitEntry* entry, int result) {
     entry->result = result;
-    entry->completed.store(true, std::memory_order_release);  // atomic release — visible to polling loop
+    entry->completed.store(true, std::memory_order_release);  // atomic release - visible to polling loop
 
     // Send wake IPI to break the hlt in kern_yield() for immediate response
     if (entry->task != nullptr) {
@@ -185,7 +185,7 @@ void wki_wake_op(WkiWaitEntry* entry, int result) {
 }
 
 void wki_wait_timeout_scan(uint64_t now_us) {
-    // Called from timer tick context — scan for expired waiters.
+    // Called from timer tick context - scan for expired waiters.
     // We only set deadline_us entries to timed-out; the polling loop in
     // wki_wait_for_op detects this and does the actual unlink + return.
     // This provides a backstop if the polling task hasn't run yet.
@@ -304,6 +304,8 @@ void wki_init() {
         ker::vfs::vfs_symlink("/", self_link);
     }
 
+    ker::vfs::vfs_wki_load_default_rules();
+
     // V2: Create /dev/nodes/ hierarchy and register self
     ker::vfs::devfs::devfs_nodes_init();
     ker::vfs::devfs::devfs_nodes_add_peer(g_wki.local_hostname, g_wki.my_node_id);
@@ -379,7 +381,7 @@ void wki_transport_unregister(WkiTransport* transport) {
 }
 
 // -----------------------------------------------------------------------------
-// Peer management — compact hash with multiplicative hashing + linear probing
+// Peer management - compact hash with multiplicative hashing + linear probing
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -468,7 +470,7 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer* {
 auto wki_peer_count() -> uint16_t { return g_wki.peer_count; }
 
 // -----------------------------------------------------------------------------
-// Channel management — per-peer O(1) lookup via peer->channels[channel_id]
+// Channel management - per-peer O(1) lookup via peer->channels[channel_id]
 // -----------------------------------------------------------------------------
 
 // Channels are allocated from a contiguous flat pool (cache-friendly) but
@@ -490,7 +492,7 @@ void channel_pool_init() {
     s_channel_pool_init = true;
 }
 
-// Free a retransmit entry — checks whether it's the inline pre-allocated entry
+// Free a retransmit entry - checks whether it's the inline pre-allocated entry
 // (part of the channel struct) or a heap-allocated fallback, and acts accordingly.
 void rt_entry_free(WkiChannel* ch, WkiRetransmitEntry* rt) {
     if (rt == &ch->tx_rt_entry) {
@@ -745,7 +747,7 @@ void wki_channels_close_for_peer(uint16_t node_id) {
 }
 
 // -----------------------------------------------------------------------------
-// Sending — raw (unreliable, for HELLO/HEARTBEAT)
+// Sending - raw (unreliable, for HELLO/HEARTBEAT)
 // -----------------------------------------------------------------------------
 namespace {
 
@@ -890,7 +892,7 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
 }
 
 // -----------------------------------------------------------------------------
-// Sending — reliable (via channel)
+// Sending - reliable (via channel)
 // -----------------------------------------------------------------------------
 
 auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int {
@@ -980,7 +982,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         hdr->checksum = wki_crc32(frame, frame_len);
     }
 
-    // Queue for retransmit — use inline entry if available, else kmalloc
+    // Queue for retransmit - use inline entry if available, else kmalloc
     WkiRetransmitEntry* rt_entry = nullptr;
     uint8_t* rt_data = nullptr;
 
@@ -1085,7 +1087,7 @@ static void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const 
             break;
         case MsgType::ZONE_NOTIFY_PRE_ACK:
         case MsgType::ZONE_NOTIFY_POST_ACK:
-            // ACKs for zone notifications — currently informational only
+            // ACKs for zone notifications - currently informational only
             break;
         case MsgType::ZONE_READ_REQ:
             detail::handle_zone_read_req(hdr, payload, payload_len);
@@ -1240,7 +1242,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         if (ch != nullptr) {
             ch->lock.lock();
 
-            // Advance tx_ack — release ACKed retransmit entries
+            // Advance tx_ack - release ACKed retransmit entries
             if (seq_after(hdr->ack_num + 1, ch->tx_ack)) {
                 ch->tx_ack = hdr->ack_num + 1;
 
@@ -1291,7 +1293,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
     auto msg = static_cast<MsgType>(hdr->msg_type);
 
     switch (msg) {
-        // Unreliable control messages — handled directly
+        // Unreliable control messages - handled directly
         case MsgType::HELLO:
             detail::handle_hello(transport, hdr, payload, payload_len);
             return;
@@ -1305,7 +1307,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             detail::handle_heartbeat_ack(hdr, payload, payload_len);
             return;
 
-        // Reliable control messages — check seq ordering
+        // Reliable control messages - check seq ordering
         case MsgType::LSA:
         case MsgType::LSA_ACK:
         case MsgType::FENCE_NOTIFY:
@@ -1595,7 +1597,7 @@ void wki_spin_yield_channel(WkiChannel* ch) {
 }
 
 // -----------------------------------------------------------------------------
-// Timer tick — heartbeats, retransmit, ACK delays
+// Timer tick - heartbeats, retransmit, ACK delays
 // -----------------------------------------------------------------------------
 
 void wki_timer_tick(uint64_t now_us) {
@@ -1647,7 +1649,7 @@ void wki_timer_tick(uint64_t now_us) {
             ch->retransmit_deadline = now_us + ch->rto_us;
         }
 
-        // Delayed ACK — send standalone ACK if pending
+        // Delayed ACK - send standalone ACK if pending
         // Timer runs at ~10ms cadence which exceeds WKI_ACK_DELAY_US (1ms),
         // so always send when ack_pending is set.
         if (ch->ack_pending) {

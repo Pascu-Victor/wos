@@ -1,6 +1,6 @@
 #pragma once
 
-// Read-Write Lock — multiple concurrent readers, exclusive writer.
+// Read-Write Lock - multiple concurrent readers, exclusive writer.
 //
 // XFS uses these for inode i_lock (concurrent reads on the same file)
 // and per-allocation-group locks.
@@ -51,8 +51,8 @@ class RwLock {
 
    private:
     // State encoding (single 32-bit atomic):
-    //   bits [30:0]  — active reader count
-    //   bit  31      — writer-active flag
+    //   bits [30:0]  - active reader count
+    //   bit  31      - writer-active flag
     // A separate `write_waiters_` counter prevents reader starvation of writers:
     // when a writer is waiting, new readers block until the writer is served.
     static constexpr uint32_t WRITER_BIT = 1u << 31;

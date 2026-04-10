@@ -55,7 +55,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
     auto* mount = new MountPoint;
 
-    // Copy path and fstype into kernel heap — the caller may have passed
+    // Copy path and fstype into kernel heap - the caller may have passed
     // pointers into userspace memory (e.g. from a mount syscall) that become
     // invalid after the syscall returns.
     size_t path_len = std::strlen(path);
@@ -124,7 +124,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         // devfs filesystem
         mount->fops = ker::vfs::devfs::get_devfs_fops();
     } else if (std::strcmp(fstype, "remote") == 0) {
-        // Remote VFS — fops and private_data set by caller after mount_filesystem returns
+        // Remote VFS - fops and private_data set by caller after mount_filesystem returns
         mount->fops = nullptr;
     } else if (std::strcmp(fstype, "procfs") == 0) {
         mount->fops = ker::vfs::procfs::get_procfs_fops();

@@ -1,24 +1,25 @@
 #!/bin/bash
 # Incrementally rebuild busybox for WOS and install into the sysroot.
-# Expects the toolchain to already be bootstrapped (build-llvm.sh step 8).
+# Expects the toolchain to already be bootstrapped (tools/bootstrap.sh).
 set -e
 
 B=$(pwd)/toolchain
-TARGET_SYSROOT="$B/target1"
+HOST="$B/host"
+TARGET_SYSROOT="$B/sysroot"
 
 if [ ! -d "$B/busybox-build" ]; then
     echo "ERROR: busybox build directory not found at $B/busybox-build"
-    echo "Run tools/build-llvm.sh first to bootstrap the toolchain."
+    echo "Run tools/bootstrap.sh first to bootstrap the toolchain."
     exit 1
 fi
 
-# Cross-compilation variables
-BB_CC="$TARGET_SYSROOT/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
-BB_AR="$TARGET_SYSROOT/bin/llvm-ar"
-BB_STRIP="$TARGET_SYSROOT/bin/llvm-strip"
-BB_RANLIB="$TARGET_SYSROOT/bin/llvm-ranlib"
-BB_OBJCOPY="$TARGET_SYSROOT/bin/llvm-objcopy"
-BB_NM="$TARGET_SYSROOT/bin/llvm-nm"
+# Cross-compilation variables - host tools, target sysroot
+BB_CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+BB_AR="$HOST/bin/llvm-ar"
+BB_STRIP="$HOST/bin/llvm-strip"
+BB_RANLIB="$HOST/bin/llvm-ranlib"
+BB_OBJCOPY="$HOST/bin/llvm-objcopy"
+BB_NM="$HOST/bin/llvm-nm"
 BB_HOSTCC="gcc"
 BB_CFLAGS="--sysroot=$TARGET_SYSROOT -static -fno-sanitize=safe-stack -fno-stack-protector"
 BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld"
@@ -29,7 +30,7 @@ BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld"
 #    available, otherwise use sed-based approach.
 BB_SRC="$B/src/busybox"
 if [ -f "$BB_SRC/configs/wos_defconfig" ]; then
-    # Step 1: allnoconfig — everything off
+    # Step 1: allnoconfig - everything off
     make -C "$BB_SRC" O="$B/busybox-build" \
         CC="$BB_CC" \
         AR="$BB_AR" \
@@ -76,7 +77,7 @@ if [ -f "$B/busybox-build/busybox" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.a "$TARGET_SYSROOT"/lib/libc++.a \
                "$TARGET_SYSROOT"/lib/libc++abi.a "$TARGET_SYSROOT"/lib/libm.a; do
         if [ -f "$lib" ] && [ "$lib" -nt "$B/busybox-build/busybox" ]; then
-            echo "Sysroot library $(basename "$lib") changed — forcing relink"
+            echo "Sysroot library $(basename "$lib") changed - forcing relink"
             rm -f "$B/busybox-build/busybox"
             break
         fi
@@ -97,5 +98,6 @@ make -C "$B/busybox-build" -j"$(nproc)" \
     busybox
 
 # Install into sysroot
+mkdir -p "$TARGET_SYSROOT/bin"
 cp "$B/busybox-build/busybox" "$TARGET_SYSROOT/bin/busybox"
 echo "busybox installed to $TARGET_SYSROOT/bin/busybox"
