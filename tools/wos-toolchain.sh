@@ -344,7 +344,7 @@ echo "Busybox installed to $SYSROOT/bin/busybox"
 
 # 7. Build Dropbear SSH for WOS userspace
 cd $B/src
-[ ! -d dropbear ] && git clone --depth=1 https://github.com/Pascu-Victor/dropbear.git
+[ ! -d dropbear ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/dropbear.git
 
 mkdir -p $B/dropbear-build
 cd $B/dropbear-build
