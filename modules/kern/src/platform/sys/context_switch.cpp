@@ -33,7 +33,7 @@ static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, 
 void saveFpuState(sched::task::Task* task) {
     auto* buf = task->fxState.aligned();
     if (cpu::xsaveAreaSize > 0) {
-        asm volatile("xsave64 (%0)" : : "r"(buf), "a"(0x7), "d"(0) : "memory");
+        asm volatile("xsave64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
     } else {
         asm volatile("fxsave64 (%0)" : : "r"(buf) : "memory");
     }
@@ -44,7 +44,7 @@ void saveFpuState(sched::task::Task* task) {
 void restoreFpuState(sched::task::Task* task) {
     auto* buf = task->fxState.aligned();
     if (cpu::xsaveAreaSize > 0) {
-        asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(0x7), "d"(0) : "memory");
+        asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
     } else {
         asm volatile("fxrstor64 (%0)" : : "r"(buf) : "memory");
     }

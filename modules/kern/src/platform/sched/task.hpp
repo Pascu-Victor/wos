@@ -62,7 +62,7 @@ struct Context {
 // We over-allocate by 63 bytes so we can always find a 64-byte-aligned region
 // inside the buffer, regardless of the Task allocation's alignment.
 struct FxState {
-    uint8_t raw[1024 + 63] = {};
+    uint8_t raw[2688 + 63] = {};
     bool saved = false;  // true after first saveFpuState - guards xrstor on zeroed buffer
 
     // Return a pointer to the 64-byte-aligned region within raw[].

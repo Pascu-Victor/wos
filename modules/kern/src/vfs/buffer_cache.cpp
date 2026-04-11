@@ -11,9 +11,14 @@
 
 #include "buffer_cache.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+
+#include "dev/block_device.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::vfs {
 
@@ -226,7 +231,7 @@ void buffer_cache_init() {
     stat_hits = 0;
     stat_misses = 0;
     cache_initialized = true;
-    mod::dbg::log("[buffer_cache] initialized (max %lu bytes)\n", static_cast<uint64_t>(cache_max_bytes));
+    mod::dbg::log("[buffer_cache] initialized (max %lu bytes)", static_cast<uint64_t>(cache_max_bytes));
 }
 
 auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
@@ -255,7 +260,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     bh = alloc_buffer(bdev, block_no);
     if (bh == nullptr) {
         cache_lock.unlock_irqrestore(irqflags);
-        mod::dbg::log("[buffer_cache] OOM allocating buffer for block %lu\n", block_no);
+        mod::dbg::log("[buffer_cache] OOM allocating buffer for block %lu", block_no);
         return nullptr;
     }
 
