@@ -2007,8 +2007,7 @@ auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char**
             ker::mod::mm::dyn::kmalloc::free(pf);
             return nullptr;
         }
-        // We need the node to persist, so don't free pf yet - copy needed data
-        // Actually, we need a standalone node. Let's create one.
+
         auto* parent_node = new FAT32Node;
         parent_node->context = ctx;
         parent_node->start_cluster = pnode->start_cluster;
@@ -2019,12 +2018,7 @@ auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char**
         parent_node->dir_entry_offset = pnode->dir_entry_offset;
         parent_node->mode = pnode->mode;
 
-        // Free the temporary file struct (but NOT its private_data - that's allocated with new)
-        // Actually fat32_open_path allocates both - we need to be careful
-        // Let's just return the node from pf and let the caller manage cleanup
         *out_name = final_name;
-        // Free the File wrapper but keep node alive - actually pf->private_data IS the node
-        // We can't free pnode separately. Let's just free pf and return parent_node.
         delete static_cast<FAT32Node*>(pf->private_data);
         ker::mod::mm::dyn::kmalloc::free(pf);
         *out_name = final_name;

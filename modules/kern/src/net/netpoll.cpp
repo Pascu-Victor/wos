@@ -1,33 +1,32 @@
 #include "netpoll.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
+#include <util/smallvec.hpp>
 
 namespace ker::net {
 
 namespace {
 
 // Registry of all NAPI structures for worker thread lookup
-constexpr size_t MAX_NAPI_DEVICES = 16;
-NapiStruct* g_napi_registry[MAX_NAPI_DEVICES] = {};
-size_t g_napi_count = 0;
+ker::util::SmallVec<NapiStruct*, 4> g_napi_registry;
 ker::mod::sys::Spinlock g_registry_lock;
 
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
     auto* current = ker::mod::sched::get_current_task();
-    for (size_t i = 0; i < g_napi_count; ++i) {
+    for (size_t i = 0; i < g_napi_registry.size(); ++i) {
         if (g_napi_registry[i] != nullptr && g_napi_registry[i]->worker == current) {
             return g_napi_registry[i];
         }
@@ -38,23 +37,22 @@ auto find_napi_for_current_task() -> NapiStruct* {
 // Register a NapiStruct in the global registry
 void register_napi(NapiStruct* napi) {
     g_registry_lock.lock();
-    if (g_napi_count < MAX_NAPI_DEVICES) {
-        g_napi_registry[g_napi_count++] = napi;
-    }
+    g_napi_registry.push_back(napi);
     g_registry_lock.unlock();
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
+                                          static_cast<int64_t>(g_napi_registry.size()), 0, 0);
 }
 
 // Unregister a NapiStruct from the global registry
 void unregister_napi(NapiStruct* napi) {
     g_registry_lock.lock();
-    for (size_t i = 0; i < g_napi_count; ++i) {
+    for (size_t i = 0; i < g_napi_registry.size(); ++i) {
         if (g_napi_registry[i] == napi) {
-            // Shift remaining entries down
-            for (size_t j = i; j < g_napi_count - 1; ++j) {
-                g_napi_registry[j] = g_napi_registry[j + 1];
-            }
-            g_napi_registry[--g_napi_count] = nullptr;
-            break;
+            g_napi_registry.remove_at(i);
+            g_registry_lock.unlock();
+            ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                                  static_cast<int64_t>(g_napi_registry.size()), 0, 0);
+            return;
         }
     }
     g_registry_lock.unlock();
@@ -314,8 +312,9 @@ auto napi_poll_all_pending() -> int {
     // Snapshot count under lock to avoid tearing, then poll without the lock
     // (napi_poll_inline_budget is safe to call without the registry lock).
     g_registry_lock.lock();
-    size_t count = g_napi_count;
-    std::array<NapiStruct*, MAX_NAPI_DEVICES> snapshot{};
+    size_t count = g_napi_registry.size();
+    NapiStruct* snapshot[16];
+    if (count > 16) count = 16;
     for (size_t i = 0; i < count; ++i) {
         snapshot[i] = g_napi_registry[i];
     }

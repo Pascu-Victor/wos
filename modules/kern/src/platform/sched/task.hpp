@@ -12,6 +12,8 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/threading.hpp>
 #include <util/list.hpp>
+#include <util/radix_tree.hpp>
+#include <util/smallvec.hpp>
 // Avoid pulling in in-tree std headers into kernel translation units from here.
 
 namespace ker::mod::sched::task {
@@ -130,10 +132,11 @@ struct Task {
     uint64_t programHeaderAddr;  // Virtual address of program headers (AT_PHDR)
     uint64_t elfHeaderAddr;      // Virtual address of ELF header (AT_EHDR)
 
-    // File descriptor table for the task (per-process model planned).
-    // Small fixed-size table for now; will be moved/made dynamic when process struct is available.
+    // File descriptor table for the task (per-process model).
+    // Dynamic radix tree: no fixed upper bound on FD count.
+    // FD_TABLE_SIZE retained as a soft limit for dup2/fcntl bounds checking.
     static constexpr unsigned FD_TABLE_SIZE = 256;
-    void* fds[FD_TABLE_SIZE];  // opaque pointers to kernel file descriptor objects (ker::vfs::File)
+    ker::util::RadixTree<void*> fd_table;
 
     // Current working directory (absolute path, "/" by default)
     static constexpr unsigned CWD_MAX = 256;
@@ -166,9 +169,7 @@ struct Task {
     char wki_submitter_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
 
     // WKI: explicit task-local VFS rules layered over defaults from /etc/vfstab.
-    static constexpr unsigned WKI_VFS_RULE_MAX = 16;
-    uint16_t wki_vfs_rule_count = 0;
-    std::array<WkiVfsRule, WKI_VFS_RULE_MAX> wki_vfs_rules = {};
+    ker::util::SmallVec<WkiVfsRule, 4> wki_vfs_rules;
 
     // WKI: set by richer spawn paths after they already attempted remote placement.
     // The legacy scheduler hook must skip those tasks to avoid losing exec context.
@@ -201,9 +202,7 @@ struct Task {
 
     // List of task IDs waiting for this task to exit
     // When this task exits, all tasks in this list will be rescheduled on their respective CPUs
-    static constexpr unsigned MAX_AWAITEE_COUNT = 512;
-    uint64_t awaitee_on_exit[MAX_AWAITEE_COUNT];
-    uint64_t awaitee_on_exit_count;
+    ker::util::SmallVec<uint64_t, 4> awaitee_on_exit;
 
     // Flag indicating that this task should be moved to wait queue after syscall returns
     bool deferredTaskSwitch;

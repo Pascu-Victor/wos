@@ -11,9 +11,12 @@
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <string_view>
+#include <util/smallvec.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/fs/fat32.hpp>
@@ -41,7 +44,6 @@ namespace {
 constexpr size_t MAX_PATH_LEN = 512;
 constexpr int MAX_SYMLINK_DEPTH = 8;
 constexpr size_t MAX_COMPONENTS = 64;
-constexpr size_t MAX_DEFAULT_VFS_RULES = 32;
 constexpr size_t MAX_VFSTAB_BYTES = 4096;
 constexpr size_t WKI_PATH_PREFIX_LEN = 5;
 
@@ -49,8 +51,7 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int;
 auto canonicalize_path(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
 
-std::array<ker::mod::sched::task::WkiVfsRule, MAX_DEFAULT_VFS_RULES> g_default_vfs_rules = {};
-size_t g_default_vfs_rule_count = 0;
+ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
 
 struct VfsRouteDecision {
     uint8_t route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
@@ -330,8 +331,7 @@ auto choose_task_route(const ker::mod::sched::task::Task* task, const char* path
     VfsRouteDecision best = {};
 
     if (task != nullptr) {
-        auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
-        for (uint16_t i = 0; i < explicit_count; ++i) {
+        for (size_t i = 0; i < task->wki_vfs_rules.size(); ++i) {
             const auto& rule = task->wki_vfs_rules[i];
             if (rule.prefix_len == 0 || !path_prefix_matches(path, rule.prefix, rule.prefix_len)) {
                 continue;
@@ -343,7 +343,7 @@ auto choose_task_route(const ker::mod::sched::task::Task* task, const char* path
         }
     }
 
-    for (size_t i = 0; i < g_default_vfs_rule_count; ++i) {
+    for (size_t i = 0; i < g_default_vfs_rules.size(); ++i) {
         const auto& rule = g_default_vfs_rules[i];
         if (rule.prefix_len == 0 || !path_prefix_matches(path, rule.prefix, rule.prefix_len)) {
             continue;
@@ -443,7 +443,7 @@ auto add_default_vfs_rule(const char* prefix, uint8_t route) -> int {
         return -ENAMETOOLONG;
     }
 
-    for (size_t i = 0; i < g_default_vfs_rule_count; ++i) {
+    for (size_t i = 0; i < g_default_vfs_rules.size(); ++i) {
         auto& rule = g_default_vfs_rules[i];
         if (rule.prefix_len == prefix_len && std::strncmp(rule.prefix, canonical, prefix_len) == 0) {
             std::memcpy(rule.prefix, canonical, prefix_len + 1);
@@ -454,20 +454,19 @@ auto add_default_vfs_rule(const char* prefix, uint8_t route) -> int {
         }
     }
 
-    if (g_default_vfs_rule_count >= g_default_vfs_rules.size()) {
-        return -ENOSPC;
+    ker::mod::sched::task::WkiVfsRule new_rule{};
+    std::memcpy(new_rule.prefix, canonical, prefix_len + 1);
+    new_rule.prefix_len = static_cast<uint16_t>(prefix_len);
+    new_rule.route = route;
+    new_rule.reserved = 0;
+    if (!g_default_vfs_rules.push_back(new_rule)) {
+        return -ENOMEM;
     }
-
-    auto& rule = g_default_vfs_rules[g_default_vfs_rule_count++];
-    std::memcpy(rule.prefix, canonical, prefix_len + 1);
-    rule.prefix_len = static_cast<uint16_t>(prefix_len);
-    rule.route = route;
-    rule.reserved = 0;
     return 0;
 }
 
 void install_builtin_vfs_rules() {
-    g_default_vfs_rule_count = 0;
+    g_default_vfs_rules.clear();
     add_default_vfs_rule("/wki", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
     add_default_vfs_rule("/proc", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
     add_default_vfs_rule("/dev", static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL));
@@ -1215,34 +1214,34 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     if ((task == nullptr) || (file == nullptr)) {
         return -1;
     }
-    for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (task->fds[i] == nullptr) {
-            task->fds[i] = file;
-            file->fd = (int)i;
-            return (int)i;
-        }
+    uint64_t slot = task->fd_table.find_first_unset(0);
+    if (slot == UINT64_MAX || !task->fd_table.insert(slot, file)) {
+        return -1;  // EMFILE (too many open files) or OOM
     }
-    return -1;  // EMFILE (too many open files)
+    file->fd = static_cast<int>(slot);
+    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_INSERT,
+                                          static_cast<int64_t>(task->fd_table.size()), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    return static_cast<int>(slot);
 }
 
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
-    if (task == nullptr) {
+    if (task == nullptr || fd < 0) {
         return nullptr;
     }
-    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-        return nullptr;
-    }
-    return reinterpret_cast<struct File*>(task->fds[fd]);
+    return reinterpret_cast<struct File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
 }
 
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
-    if (task == nullptr) {
+    if (task == nullptr || fd < 0) {
         return -1;
     }
-    if (fd < 0 || (unsigned)fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-        return -1;
-    }
-    task->fds[fd] = nullptr;
+    task->fd_table.remove(static_cast<uint64_t>(fd));
+    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                          static_cast<int64_t>(task->fd_table.size()), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return 0;
 }
 
@@ -1956,7 +1955,18 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             return 0;
         }
         case FSType::REMOTE: {
-            // Remote files/directories - report basic info
+            if (file->vfs_path != nullptr) {
+                MountPoint* mount = find_mount_point(file->vfs_path);
+                if (mount != nullptr && mount->fs_type == FSType::REMOTE) {
+                    const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
+                    int ret = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
+                    if (ret == 0) {
+                        return 0;
+                    }
+                }
+            }
+
+            // Fall back to a synthetic stat if path-based remote metadata lookup fails.
             statbuf->st_dev = 0;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
@@ -1970,7 +1980,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                 statbuf->st_size = 0;
             } else {
                 statbuf->st_mode = S_IFREG | 0644;
-                statbuf->st_size = file->pos;
+                statbuf->st_size = 0;
             }
             return 0;
         }
@@ -2013,7 +2023,7 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
         vfs_close(newfd);
     }
     f->refcount++;
-    task->fds[newfd] = f;
+    task->fd_table.insert(static_cast<uint64_t>(newfd), f);
     return newfd;
 }
 
@@ -2539,14 +2549,12 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
     switch (cmd) {
         case 0: {  // F_DUPFD - dup to fd >= arg
             f->refcount++;
-            for (unsigned i = static_cast<unsigned>(arg); i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-                if (task->fds[i] == nullptr) {
-                    task->fds[i] = f;
-                    return static_cast<int>(i);
-                }
+            uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
+            if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
+                f->refcount--;
+                return -EMFILE;
             }
-            f->refcount--;
-            return -EMFILE;
+            return static_cast<int>(slot);
         }
         case 1:  // F_GETFD
             return f->fd_flags;
@@ -2560,20 +2568,18 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             return 0;
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
             f->refcount++;
-            for (unsigned i = static_cast<unsigned>(arg); i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-                if (task->fds[i] == nullptr) {
-                    task->fds[i] = f;
-                    // Note: fd_flags is stored per-File, not per-fd-slot.
-                    // Only set CLOEXEC if refcount==1 (no other fds share this File).
-                    // TODO: implement proper per-fd flags separate from File object.
-                    if (f->refcount <= 1) {
-                        f->fd_flags = 1;  // FD_CLOEXEC
-                    }
-                    return static_cast<int>(i);
-                }
+            uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
+            if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
+                f->refcount--;
+                return -EMFILE;
             }
-            f->refcount--;
-            return -EMFILE;
+            // Note: fd_flags is stored per-File, not per-fd-slot.
+            // Only set CLOEXEC if refcount==1 (no other fds share this File).
+            // TODO: implement proper per-fd flags separate from File object.
+            if (f->refcount <= 1) {
+                f->fd_flags = 1;  // FD_CLOEXEC
+            }
+            return static_cast<int>(slot);
         }
         default:
             return -EINVAL;
@@ -2583,6 +2589,8 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
 // --- pipe ---
 
 // PipeState is shared between both ends. It includes wait queues for blocking.
+static constexpr ssize_t PIPE_WOS_ERESTARTSYS = 512;
+
 struct PipeState {
     char* buf;
     size_t capacity;
@@ -2591,120 +2599,56 @@ struct PipeState {
     size_t count;  // bytes in buffer
     bool write_closed;
     bool read_closed;
+    ker::mod::sys::Spinlock lock;
 
     // Wait queues for blocking pipe I/O
-    static constexpr unsigned MAX_WAITERS = 16;
-    uint64_t readers_waiting[MAX_WAITERS];  // PIDs of tasks blocked on read
-    uint64_t readers_count;
-    uint64_t writers_waiting[MAX_WAITERS];  // PIDs of tasks blocked on write
-    uint64_t writers_count;
+    ker::util::SmallVec<uint64_t, 2> readers_waiting;
+    ker::util::SmallVec<uint64_t, 2> writers_waiting;
 
-    // Physical addresses of user buffers + counts for deferred completion
-    struct WaiterInfo {
-        uint64_t bufPhysAddr;  // Physical address of user buffer
-        size_t requested;      // Bytes the user requested
-    };
-    WaiterInfo reader_info[MAX_WAITERS];
-    WaiterInfo writer_info[MAX_WAITERS];
-
-    uint64_t read_poll_waiting[MAX_WAITERS];
-    uint64_t read_poll_count;
-    uint64_t write_poll_waiting[MAX_WAITERS];
-    uint64_t write_poll_count;
+    ker::util::SmallVec<uint64_t, 2> read_poll_waiting;
+    ker::util::SmallVec<uint64_t, 2> write_poll_waiting;
 };
 
-static auto pipe_register_waiter(uint64_t* waiters, uint64_t& waiter_count, uint64_t pid) -> bool {
-    for (uint64_t i = 0; i < waiter_count; i++) {
+static auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+    for (size_t i = 0; i < waiters.size(); i++) {
         if (waiters[i] == pid) {
             return true;
         }
     }
-    if (waiter_count >= PipeState::MAX_WAITERS) {
-        return false;
-    }
-    waiters[waiter_count++] = pid;
-    return true;
+    return waiters.push_back(pid);
 }
 
-static void pipe_wake_pollers(uint64_t* waiters, uint64_t& waiter_count) {
-    uint64_t pending[PipeState::MAX_WAITERS]{};
-    uint64_t pending_count = waiter_count;
-    for (uint64_t i = 0; i < pending_count; i++) {
+static auto pipe_register_poll_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+    return pipe_register_waiter(waiters, pid);
+}
+
+static void pipe_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t* pending, size_t* pending_count) {
+    *pending_count = std::min(waiters.size(), size_t{32});
+    for (size_t i = 0; i < *pending_count; i++) {
         pending[i] = waiters[i];
     }
-    waiter_count = 0;
-
-    for (uint64_t i = 0; i < pending_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(pending[i]);
-        if (waiter == nullptr) {
-            continue;
-        }
-        waiter->deferredTaskSwitch = false;
-        uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
-        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
-        waiter->release();
-    }
+    waiters.clear();
 }
 
-// Wake all waiting readers and let them read from the buffer
-static void pipe_wake_readers(PipeState* st) {
-    for (uint64_t i = 0; i < st->readers_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->readers_waiting[i]);
-        if (waiter == nullptr) continue;
-
-        // Copy data into the waiter's buffer
-        size_t to_read = st->reader_info[i].requested;
-        if (to_read > st->count) to_read = st->count;
-
-        if (to_read > 0 && st->reader_info[i].bufPhysAddr != 0 && st->reader_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto* dst = reinterpret_cast<char*>(ker::mod::mm::addr::get_virt_pointer(st->reader_info[i].bufPhysAddr));
-            for (size_t j = 0; j < to_read; j++) {
-                dst[j] = st->buf[st->tail];
-                st->tail = (st->tail + 1) % st->capacity;
-            }
-            st->count -= to_read;
-        }
-
-        // Set return value: bytes read (or 0 for EOF)
-        waiter->context.regs.rax = to_read;
-        waiter->deferredTaskSwitch = false;
-
-        uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
-        ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
-        waiter->release();
-    }
-    st->readers_count = 0;
-}
-
-// Wake all waiting writers and let them write into the buffer
-static void pipe_wake_writers(PipeState* st) {
-    for (uint64_t i = 0; i < st->writers_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->writers_waiting[i]);
+static void pipe_reschedule_waiters(const uint64_t* waiters, size_t waiter_count, bool sigpipe = false) {
+    for (size_t i = 0; i < waiter_count; i++) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
         if (waiter == nullptr) {
             continue;
         }
 
-        size_t avail = st->capacity - st->count;
-        size_t to_write = st->writer_info[i].requested;
-        to_write = std::min(to_write, avail);
-
-        if (to_write > 0 && st->writer_info[i].bufPhysAddr != 0 && st->writer_info[i].bufPhysAddr != ker::mod::mm::virt::PADDR_INVALID) {
-            const auto* src = reinterpret_cast<const char*>(ker::mod::mm::addr::get_virt_pointer(st->writer_info[i].bufPhysAddr));
-            for (size_t j = 0; j < to_write; j++) {
-                st->buf[st->head] = src[j];
-                st->head = (st->head + 1) % st->capacity;
-            }
-            st->count += to_write;
+        if (sigpipe) {
+            waiter->sigPending |= (1ULL << (13 - 1));
         }
 
-        waiter->context.regs.rax = to_write;
         waiter->deferredTaskSwitch = false;
-
-        uint64_t target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        uint64_t target_cpu = waiter->cpu;
+        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+            target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        }
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
         waiter->release();
     }
-    st->writers_count = 0;
 }
 
 auto vfs_pipe(int pipefd[2]) -> int {
@@ -2712,8 +2656,9 @@ auto vfs_pipe(int pipefd[2]) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
 
-    // Allocate pipe buffer
-    constexpr size_t PIPE_BUF_SIZE = 4096;
+    // Keep a moderate default capacity so simple producer/consumer pipelines do
+    // not bounce through the scheduler every 4 KiB.
+    constexpr size_t PIPE_BUF_SIZE = 64UL * 1024UL;
     auto* pipe_buf = new char[PIPE_BUF_SIZE];
 
     auto* ps = new PipeState{};
@@ -2724,18 +2669,21 @@ auto vfs_pipe(int pipefd[2]) -> int {
     ps->count = 0;
     ps->write_closed = false;
     ps->read_closed = false;
-    ps->readers_count = 0;
-    ps->writers_count = 0;
-    ps->read_poll_count = 0;
-    ps->write_poll_count = 0;
 
     // Pipe fops - static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) return -EBADF;
 
+        uint64_t pending_writers[32]{};
+        size_t pending_writers_count = 0;
+        uint64_t pending_write_pollers[32]{};
+        size_t pending_write_pollers_count = 0;
+        ssize_t result = 0;
+
+        uint64_t irqf = st->lock.lock_irqsave();
+
         if (st->count > 0) {
-            // Data available - read immediately
             size_t to_read = count < st->count ? count : st->count;
             auto* dst = static_cast<char*>(buf);
             for (size_t i = 0; i < to_read; ++i) {
@@ -2744,48 +2692,58 @@ auto vfs_pipe(int pipefd[2]) -> int {
             }
             st->count -= to_read;
 
-            // Wake any blocked writers now that there's buffer space
-            if (st->writers_count > 0) {
-                pipe_wake_writers(st);
+            if (st->writers_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
             }
-            if (st->write_poll_count > 0) {
-                pipe_wake_pollers(st->write_poll_waiting, st->write_poll_count);
+            if (st->write_poll_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
             }
 
-            return static_cast<ssize_t>(to_read);
+            result = static_cast<ssize_t>(to_read);
+            st->lock.unlock_irqrestore(irqf);
+            pipe_reschedule_waiters(pending_writers, pending_writers_count);
+            pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+            return result;
         }
 
-        // Buffer empty
-        if (st->write_closed) return 0;  // EOF - write end closed
+        if (st->write_closed) {
+            st->lock.unlock_irqrestore(irqf);
+            return 0;
+        }
 
-        // Non-blocking: return EAGAIN immediately instead of blocking
         if (f->open_flags & O_NONBLOCK) {
+            st->lock.unlock_irqrestore(irqf);
             return -EAGAIN;
         }
 
-        // Block: add current task to readers wait queue
         auto* currentTask = ker::mod::sched::get_current_task();
-        if (currentTask == nullptr) return -ESRCH;
-
-        if (st->readers_count < PipeState::MAX_WAITERS) {
-            uint64_t idx = st->readers_count++;
-            st->readers_waiting[idx] = currentTask->pid;
-            // Translate user buffer to physical address for deferred copy
-            st->reader_info[idx].bufPhysAddr = ker::mod::mm::virt::translate(currentTask->pagemap, (uint64_t)buf);
-            st->reader_info[idx].requested = count;
-
-            currentTask->deferredTaskSwitch = true;
-            return 0;  // Will be overwritten when woken
+        if (currentTask == nullptr) {
+            st->lock.unlock_irqrestore(irqf);
+            return -ESRCH;
         }
 
-        // Wait queue full - return EAGAIN
+        if (pipe_register_waiter(st->readers_waiting, currentTask->pid)) {
+            currentTask->deferredTaskSwitch = true;
+            st->lock.unlock_irqrestore(irqf);
+            return -PIPE_WOS_ERESTARTSYS;
+        }
+
+        st->lock.unlock_irqrestore(irqf);
         return -EAGAIN;
     };
 
     static auto pipe_write = [](File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) return -EBADF;
+
+        uint64_t pending_readers[32]{};
+        size_t pending_readers_count = 0;
+        uint64_t pending_read_pollers[32]{};
+        size_t pending_read_pollers_count = 0;
+
+        uint64_t irqf = st->lock.lock_irqsave();
         if (st->read_closed) {
+            st->lock.unlock_irqrestore(irqf);
             // Send SIGPIPE to the writing process (signal 13)
             auto* task = ker::mod::sched::get_current_task();
             if (task) task->sigPending |= (1ULL << (13 - 1));
@@ -2802,65 +2760,62 @@ auto vfs_pipe(int pipefd[2]) -> int {
             }
             st->count += to_write;
 
-            // Wake any blocked readers now that there's data
-            if (st->readers_count > 0) {
-                pipe_wake_readers(st);
+            if (st->readers_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
             }
-            if (st->read_poll_count > 0) {
-                pipe_wake_pollers(st->read_poll_waiting, st->read_poll_count);
+            if (st->read_poll_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
             }
 
+            st->lock.unlock_irqrestore(irqf);
+            pipe_reschedule_waiters(pending_readers, pending_readers_count);
+            pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
             return static_cast<ssize_t>(to_write);
         }
 
-        // Buffer full
         if (f->open_flags & O_NONBLOCK) {
+            st->lock.unlock_irqrestore(irqf);
             return -EAGAIN;
         }
 
-        // Block: add current task to writers wait queue
         auto* currentTask = ker::mod::sched::get_current_task();
-        if (currentTask == nullptr) return -ESRCH;
-
-        if (st->writers_count < PipeState::MAX_WAITERS) {
-            uint64_t idx = st->writers_count++;
-            st->writers_waiting[idx] = currentTask->pid;
-            st->writer_info[idx].bufPhysAddr = ker::mod::mm::virt::translate(currentTask->pagemap, (uint64_t)buf);
-            st->writer_info[idx].requested = count;
-
-            currentTask->deferredTaskSwitch = true;
-            return 0;
+        if (currentTask == nullptr) {
+            st->lock.unlock_irqrestore(irqf);
+            return -ESRCH;
         }
 
+        if (pipe_register_waiter(st->writers_waiting, currentTask->pid)) {
+            currentTask->deferredTaskSwitch = true;
+            st->lock.unlock_irqrestore(irqf);
+            return -PIPE_WOS_ERESTARTSYS;
+        }
+
+        st->lock.unlock_irqrestore(irqf);
         return -EAGAIN;
     };
 
     static auto pipe_close_read = [](File* f) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
+        uint64_t pending_writers[32]{};
+        size_t pending_writers_count = 0;
+        uint64_t pending_write_pollers[32]{};
+        size_t pending_write_pollers_count = 0;
+        bool should_free = false;
         if (st != nullptr) {
+            uint64_t irqf = st->lock.lock_irqsave();
             st->read_closed = true;
-            // Wake blocked writers - they'll get EPIPE on next attempt
-            if (st->writers_count > 0) {
-                for (uint64_t i = 0; i < st->writers_count; i++) {
-                    auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->writers_waiting[i]);
-                    if (waiter != nullptr) {
-                        waiter->context.regs.rax = static_cast<uint64_t>(-EPIPE);
-                        waiter->deferredTaskSwitch = false;
-                        // Send SIGPIPE to the blocked writer
-                        waiter->sigPending |= (1ULL << (13 - 1));
-                        uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
-                        ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
-                        waiter->release();
-                    }
-                }
-                st->writers_count = 0;
+            if (st->writers_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
             }
-            if (st->write_poll_count > 0) {
-                pipe_wake_pollers(st->write_poll_waiting, st->write_poll_count);
+            if (st->write_poll_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
             }
+            should_free = st->write_closed;
+            st->lock.unlock_irqrestore(irqf);
         }
-        // Free if both ends closed
-        if (st != nullptr && st->write_closed) {
+        pipe_reschedule_waiters(pending_writers, pending_writers_count, true);
+        pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+        if (st != nullptr && should_free) {
             delete[] st->buf;
             delete st;
         }
@@ -2869,27 +2824,26 @@ auto vfs_pipe(int pipefd[2]) -> int {
 
     static auto pipe_close_write = [](File* f) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
+        uint64_t pending_readers[32]{};
+        size_t pending_readers_count = 0;
+        uint64_t pending_read_pollers[32]{};
+        size_t pending_read_pollers_count = 0;
+        bool should_free = false;
         if (st != nullptr) {
+            uint64_t irqf = st->lock.lock_irqsave();
             st->write_closed = true;
-            // Wake blocked readers - they'll get EOF (0)
-            if (st->readers_count > 0) {
-                for (uint64_t i = 0; i < st->readers_count; i++) {
-                    auto* waiter = ker::mod::sched::find_task_by_pid_safe(st->readers_waiting[i]);
-                    if (waiter != nullptr) {
-                        waiter->context.regs.rax = 0;  // EOF
-                        waiter->deferredTaskSwitch = false;
-                        uint64_t targetCpu = ker::mod::sched::get_least_loaded_cpu();
-                        ker::mod::sched::reschedule_task_for_cpu(targetCpu, waiter);
-                        waiter->release();
-                    }
-                }
-                st->readers_count = 0;
+            if (st->readers_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
             }
-            if (st->read_poll_count > 0) {
-                pipe_wake_pollers(st->read_poll_waiting, st->read_poll_count);
+            if (st->read_poll_waiting.size() > 0) {
+                pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
             }
+            should_free = st->read_closed;
+            st->lock.unlock_irqrestore(irqf);
         }
-        if (st != nullptr && st->read_closed) {
+        pipe_reschedule_waiters(pending_readers, pending_readers_count);
+        pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
+        if (st != nullptr && should_free) {
             delete[] st->buf;
             delete st;
         }
@@ -2910,16 +2864,21 @@ auto vfs_pipe(int pipefd[2]) -> int {
             auto* st = static_cast<PipeState*>(f->private_data);
             if (st == nullptr) return 0;
             int ready = 0;
+            uint64_t irqf = st->lock.lock_irqsave();
             if ((events & 0x0001) && (st->count > 0 || st->write_closed))  // POLLIN
                 ready |= 0x0001;
             if (st->write_closed && st->count == 0)  // POLLHUP
                 ready |= 0x0010;
+            st->lock.unlock_irqrestore(irqf);
             return ready;
         },
         .vfs_poll_register_waiter = [](File* f, uint64_t pid) -> bool {
             auto* st = static_cast<PipeState*>(f->private_data);
             if (st == nullptr) return false;
-            return pipe_register_waiter(st->read_poll_waiting, st->read_poll_count, pid);
+            uint64_t irqf = st->lock.lock_irqsave();
+            bool ok = pipe_register_poll_waiter(st->read_poll_waiting, pid);
+            st->lock.unlock_irqrestore(irqf);
+            return ok;
         },
     };
 
@@ -2937,16 +2896,21 @@ auto vfs_pipe(int pipefd[2]) -> int {
             auto* st = static_cast<PipeState*>(f->private_data);
             if (st == nullptr) return 0;
             int ready = 0;
+            uint64_t irqf = st->lock.lock_irqsave();
             if ((events & 0x0004) && (st->count < st->capacity || st->read_closed))  // POLLOUT
                 ready |= 0x0004;
             if (st->read_closed)  // POLLERR (broken pipe)
                 ready |= 0x0008;
+            st->lock.unlock_irqrestore(irqf);
             return ready;
         },
         .vfs_poll_register_waiter = [](File* f, uint64_t pid) -> bool {
             auto* st = static_cast<PipeState*>(f->private_data);
             if (st == nullptr) return false;
-            return pipe_register_waiter(st->write_poll_waiting, st->write_poll_count, pid);
+            uint64_t irqf = st->lock.lock_irqsave();
+            bool ok = pipe_register_poll_waiter(st->write_poll_waiting, pid);
+            st->lock.unlock_irqrestore(irqf);
+            return ok;
         },
     };
 
@@ -3211,8 +3175,7 @@ auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
         return -ENAMETOOLONG;
     }
 
-    auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
-    for (uint16_t i = 0; i < explicit_count; ++i) {
+    for (size_t i = 0; i < task->wki_vfs_rules.size(); ++i) {
         auto& rule = task->wki_vfs_rules[i];
         if (rule.prefix_len == prefix_len && std::strncmp(rule.prefix, canonical, prefix_len) == 0) {
             std::memcpy(rule.prefix, canonical, prefix_len + 1);
@@ -3223,16 +3186,14 @@ auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
         }
     }
 
-    if (explicit_count >= ker::mod::sched::task::Task::WKI_VFS_RULE_MAX) {
-        return -ENOSPC;
+    mod::sched::task::WkiVfsRule new_rule{};
+    std::memcpy(new_rule.prefix, canonical, prefix_len + 1);
+    new_rule.prefix_len = static_cast<uint16_t>(prefix_len);
+    new_rule.route = static_cast<uint8_t>(route);
+    new_rule.reserved = 0;
+    if (!task->wki_vfs_rules.push_back(new_rule)) {
+        return -ENOMEM;
     }
-
-    auto& rule = task->wki_vfs_rules[explicit_count];
-    std::memcpy(rule.prefix, canonical, prefix_len + 1);
-    rule.prefix_len = static_cast<uint16_t>(prefix_len);
-    rule.route = static_cast<uint8_t>(route);
-    rule.reserved = 0;
-    task->wki_vfs_rule_count = static_cast<uint16_t>(explicit_count + 1);
     return 0;
 }
 
@@ -3242,8 +3203,7 @@ auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, 
         return -EINVAL;
     }
 
-    auto explicit_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
-    if (index >= explicit_count) {
+    if (index >= task->wki_vfs_rules.size()) {
         return -ENOENT;
     }
 
@@ -3266,13 +3226,7 @@ auto vfs_wki_rule_clear() -> int {
         return -EINVAL;
     }
 
-    task->wki_vfs_rule_count = 0;
-    for (auto& rule : task->wki_vfs_rules) {
-        rule.prefix[0] = '\0';
-        rule.prefix_len = 0;
-        rule.route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
-        rule.reserved = 0;
-    }
+    task->wki_vfs_rules.clear();
     return 0;
 }
 
@@ -3398,59 +3352,64 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         return -EBADF;
     }
 
-    // Allocate buffer for reading/writing
-    constexpr size_t BUF_SIZE = 4UL * 1024UL * 1024UL;  // 4MB buffer - large enough for AHCI max DMA (32MB cap)
+    // Keep the staging buffer modest so blocking outputs do not cause sendfile()
+    // to pre-read large chunks that cannot be written in the same call.
+    constexpr size_t BUF_SIZE = 64UL * 1024UL;
     auto* buffer = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
     if (buffer == nullptr) {
         return -ENOMEM;
     }
 
     ssize_t total_sent = 0;
+    off_t source_offset = offset != nullptr ? *offset : infile->pos;
+    size_t remaining = count;
 
-    while (total_sent < static_cast<ssize_t>(count)) {
-        size_t to_read = (count - total_sent) > BUF_SIZE ? BUF_SIZE : (count - total_sent);
-
-        // If offset is provided, seek to that position first
-        if (offset != nullptr) {
-            off_t seek_result = vfs_lseek(infd, *offset, SEEK_SET);
-            if (seek_result < 0) {
-                ker::mod::mm::dyn::kmalloc::free(buffer);
-                return seek_result;
-            }
-        }
-
-        // Read from input file
-        size_t bytes_read = 0;
-        ssize_t read_result = vfs_read(infd, buffer, to_read, &bytes_read);
+    while (remaining > 0) {
+        size_t to_read = remaining > BUF_SIZE ? BUF_SIZE : remaining;
+        ssize_t read_result = vfs_pread(infd, buffer, to_read, source_offset);
         if (read_result < 0) {
-            ker::mod::mm::dyn::kmalloc::free(buffer);
-            return read_result;
-        }
-
-        // If we read 0 bytes, we're at EOF
-        if (bytes_read == 0) {
+            if (total_sent == 0) {
+                ker::mod::mm::dyn::kmalloc::free(buffer);
+                return read_result;
+            }
             break;
         }
 
-        // Write to output file
-        size_t bytes_written = 0;
-        ssize_t write_result = vfs_write(outfd, buffer, bytes_read, &bytes_written);
-        if (write_result < 0) {
-            ker::mod::mm::dyn::kmalloc::free(buffer);
-            return write_result;
-        }
-
-        // Update offset if provided
-        if (offset != nullptr) {
-            *offset += bytes_written;
-        }
-
-        total_sent += bytes_written;
-
-        // If we wrote less than we read, the output device might be full
-        if (bytes_written < bytes_read) {
+        if (read_result == 0) {
             break;
         }
+
+        size_t chunk_size = static_cast<size_t>(read_result);
+        size_t chunk_offset = 0;
+        while (chunk_offset < chunk_size) {
+            size_t bytes_written = 0;
+            ssize_t write_result = vfs_write(outfd, buffer + chunk_offset, chunk_size - chunk_offset, &bytes_written);
+            if (write_result < 0) {
+                if (total_sent == 0) {
+                    ker::mod::mm::dyn::kmalloc::free(buffer);
+                    return write_result;
+                }
+                chunk_offset = chunk_size;
+                break;
+            }
+
+            if (bytes_written == 0) {
+                chunk_offset = chunk_size;
+                remaining = 0;
+                break;
+            }
+
+            chunk_offset += bytes_written;
+            total_sent += static_cast<ssize_t>(bytes_written);
+            source_offset += static_cast<off_t>(bytes_written);
+            remaining -= bytes_written;
+        }
+    }
+
+    if (offset != nullptr) {
+        *offset = source_offset;
+    } else {
+        infile->pos = source_offset;
     }
 
     ker::mod::mm::dyn::kmalloc::free(buffer);

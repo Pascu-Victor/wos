@@ -15,7 +15,6 @@ constexpr size_t UDP_RCVBUF_SIZE = 65536;       // 64 KB - datagrams don't pipel
 constexpr size_t RAW_RCVBUF_SIZE = 65536;       // 64 KB
 constexpr size_t SOCKET_RCVBUF_MIN = 8192;      // 8 KB floor for SO_RCVBUF
 constexpr size_t SOCKET_RCVBUF_MAX = 10485760;  // 10 MB ceiling for SO_RCVBUF
-constexpr size_t SOCKET_ACCEPT_QUEUE = 128;
 
 // Socket flags (Linux-compatible values for ease of userspace reuse)
 constexpr int SOCK_NONBLOCK = 0x800;  // matches Linux SOCK_NONBLOCK
@@ -94,12 +93,14 @@ struct Socket {
     void* proto_data = nullptr;  // TCP: TcpCB*
     SocketProtoOps* proto_ops = nullptr;
 
-    // Accept queue (for listening sockets)
-    Socket* accept_queue[SOCKET_ACCEPT_QUEUE] = {};
-    size_t aq_head = 0;
-    size_t aq_tail = 0;
+    // Accept queue (intrusive singly-linked list for listening sockets)
+    Socket* aq_head = nullptr;
+    Socket* aq_tail = nullptr;
     size_t aq_count = 0;
     int backlog = 0;
+
+    // Intrusive link for accept queue membership
+    Socket* accept_next = nullptr;
 
     uint64_t owner_pid = 0;
     bool reuse_addr = false;

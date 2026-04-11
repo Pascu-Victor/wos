@@ -51,7 +51,7 @@ constexpr mode_t S_IFDIR = 0x04000;
 constexpr mode_t S_IFLNK = 0x0A000;
 constexpr mode_t S_IFSOCK = 0x0C000;
 
-// WOS extension: WOSLINK flag (bit 16) — marks transparent VFS directories
+// WOS extension: WOSLINK flag (bit 16) - marks transparent VFS directories
 // that should not be recursed into (e.g., WKI mount points that would cause
 // infinite traversal loops like /wki/host/wki/host/...).
 // OR'd with S_IFDIR in st_mode; S_ISDIR() still returns true.

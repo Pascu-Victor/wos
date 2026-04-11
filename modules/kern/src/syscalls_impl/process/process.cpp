@@ -73,7 +73,6 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->exitStatus = 0;
     child->hasExited = false;
     child->waitedOn = false;
-    child->awaitee_on_exit_count = 0;
     child->deferredTaskSwitch = false;
     child->yieldSwitch = false;
     child->voluntaryBlock = false;
@@ -109,8 +108,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
     child->wki_target_flags = parent->wki_target_flags;
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
-    child->wki_vfs_rule_count = parent->wki_vfs_rule_count;
-    memcpy(child->wki_vfs_rules.data(), parent->wki_vfs_rules.data(), sizeof(child->wki_vfs_rules));
+    child->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
     child->wki_skip_legacy_placement = false;
 
     // Copy POSIX credentials
@@ -226,24 +224,22 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->elfHeaderAddr = parent->elfHeaderAddr;
 
     // --- Clone file descriptors ---
-    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (parent->fds[i] != nullptr) {
-            auto* file = static_cast<ker::vfs::File*>(parent->fds[i]);
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val != nullptr) {
+            auto* file = static_cast<ker::vfs::File*>(val);
             file->refcount++;
-            child->fds[i] = file;
+            child->fd_table.insert(key, file);
         }
-    }
+    });
 
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
         // Undo FD refcount increments
-        for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
-            if (child->fds[i] != nullptr) {
-                auto* file = static_cast<ker::vfs::File*>(child->fds[i]);
-                file->refcount--;
-                child->fds[i] = nullptr;
+        child->fd_table.for_each([](uint64_t /*key*/, void* val) {
+            if (val != nullptr) {
+                static_cast<ker::vfs::File*>(val)->refcount--;
             }
-        }
+        });
         if (child->thread) delete child->thread;
         delete (cpu::PerCpu*)child->context.syscallScratchArea;
         mm::virt::destroyUserSpace(child->pagemap);

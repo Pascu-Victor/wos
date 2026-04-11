@@ -6,17 +6,17 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
+#include <util/smallvec.hpp>
 
 #include "device.hpp"
 
 namespace ker::dev {
 
 // Block device registry
-// TODO: make dynamic
 namespace {
-constexpr size_t MAX_BLOCK_DEVICES = 16;
-BlockDevice* block_devices[MAX_BLOCK_DEVICES] = {};  // NOLINT
-size_t device_count = 0;
+ker::util::SmallVec<BlockDevice*, 8> block_devices;
+ker::util::SmallVec<Device, 8> block_dev_nodes;
 }  // namespace
 
 auto block_device_register(BlockDevice* bdev) -> int {
@@ -25,13 +25,10 @@ auto block_device_register(BlockDevice* bdev) -> int {
         return -1;
     }
 
-    if (device_count >= MAX_BLOCK_DEVICES) {
-        mod::io::serial::write("block_device_register: device table full\n");
+    if (!block_devices.push_back(bdev)) {
+        mod::io::serial::write("block_device_register: device table full (OOM)\n");
         return -1;
     }
-
-    block_devices[device_count] = bdev;
-    device_count++;
 
     mod::io::serial::write("block_device_register: registered ");
     mod::io::serial::write(bdev->name.data());
@@ -39,17 +36,25 @@ auto block_device_register(BlockDevice* bdev) -> int {
 
     // Also register as a device node in /dev
     // Create a Device wrapper for this block device
-    static Device block_dev_nodes[MAX_BLOCK_DEVICES];  // NOLINT
-    Device* dev_node = &block_dev_nodes[device_count - 1];
+    Device dev_node{};
+    dev_node.major = bdev->major;
+    dev_node.minor = bdev->minor;
+    dev_node.name = bdev->name.data();
+    dev_node.type = DeviceType::BLOCK;
+    dev_node.private_data = bdev;
+    dev_node.char_ops = nullptr;  // Block devices don't use char ops
 
-    dev_node->major = bdev->major;
-    dev_node->minor = bdev->minor;
-    dev_node->name = bdev->name.data();
-    dev_node->type = DeviceType::BLOCK;
-    dev_node->private_data = bdev;
-    dev_node->char_ops = nullptr;  // Block devices don't use char ops
+    if (!block_dev_nodes.push_back(dev_node)) {
+        // Undo block_devices push
+        block_devices.remove_at(block_devices.size() - 1);
+        mod::io::serial::write("block_device_register: dev node alloc failed (OOM)\n");
+        return -1;
+    }
 
-    dev_register(dev_node);
+    dev_register(&block_dev_nodes[block_dev_nodes.size() - 1]);
+
+    mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_INSERT,
+                                     static_cast<int64_t>(block_devices.size()), 0, 0);
 
     return 0;
 }
@@ -58,15 +63,18 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
         return -1;
     }
-    for (size_t i = 0; i < device_count; i++) {
+    for (size_t i = 0; i < block_devices.size(); i++) {
         if (block_devices[i] == bdev) {
-            block_devices[i] = nullptr;
+            block_devices.remove_at(i);
 
             // Also remove the corresponding /dev node
             Device* dev_node = dev_find_by_name(bdev->name.data());
             if (dev_node != nullptr && dev_node->private_data == bdev) {
                 dev_unregister(dev_node);
             }
+
+            mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_REMOVE,
+                                             static_cast<int64_t>(block_devices.size()), 0, 0);
 
             mod::io::serial::write("block_device_unregister: removed ");
             mod::io::serial::write(bdev->name.data());
@@ -78,7 +86,7 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
 }
 
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice* {
-    for (size_t i = 0; i < device_count; i++) {
+    for (size_t i = 0; i < block_devices.size(); i++) {
         if (block_devices[i] != nullptr && block_devices[i]->major == major && block_devices[i]->minor == minor) {
             return block_devices[i];
         }
@@ -91,7 +99,7 @@ auto block_device_find_by_name(const char* name) -> BlockDevice* {
         return nullptr;
     }
 
-    for (size_t i = 0; i < device_count; i++) {
+    for (size_t i = 0; i < block_devices.size(); i++) {
         if (block_devices[i] != nullptr && !block_devices[i]->name.empty()) {
             // Simple string comparison
             size_t j = 0;
@@ -161,10 +169,10 @@ auto block_flush(BlockDevice* bdev) -> int {
     return bdev->flush(bdev);
 }
 
-auto block_device_count() -> size_t { return device_count; }
+auto block_device_count() -> size_t { return block_devices.size(); }
 
 auto block_device_at(size_t index) -> BlockDevice* {
-    if (index >= device_count) {
+    if (index >= block_devices.size()) {
         return nullptr;
     }
     return block_devices[index];
@@ -174,7 +182,7 @@ auto block_device_find_by_partuuid(const char* uuid_str) -> BlockDevice* {
     if (uuid_str == nullptr) {
         return nullptr;
     }
-    for (size_t i = 0; i < device_count; i++) {
+    for (size_t i = 0; i < block_devices.size(); i++) {
         if (block_devices[i] != nullptr && block_devices[i]->is_partition) {
             // Compare PARTUUID strings
             bool match = true;
@@ -282,7 +290,7 @@ auto block_device_init() -> void {
 
     // Enumerate GPT partitions on all registered whole-disk block devices
     // We snapshot the current count since enumeration will register new partition devices
-    size_t disk_count = device_count;
+    size_t disk_count = block_devices.size();
     for (size_t i = 0; i < disk_count; ++i) {
         BlockDevice* disk = block_devices[i];
         if (disk == nullptr || disk->is_partition) {
@@ -303,7 +311,7 @@ auto block_device_init() -> void {
         }
     }
 
-    ker::mod::dbg::log("Block device init complete: %d devices registered", static_cast<unsigned>(device_count));
+    ker::mod::dbg::log("Block device init complete: %d devices registered", static_cast<unsigned>(block_devices.size()));
 }
 
 }  // namespace ker::dev

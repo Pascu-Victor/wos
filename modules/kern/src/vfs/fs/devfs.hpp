@@ -55,6 +55,9 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode*;
 // Add a device node to the devfs root
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode*;
 
+// Remove a node at path (relative to /dev root). Returns true if removed.
+auto devfs_remove_node(const char* path) -> bool;
+
 // Walk a path and return the DevFSNode (for stat operations)
 auto devfs_walk_path(const char* path) -> DevFSNode*;
 

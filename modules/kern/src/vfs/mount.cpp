@@ -8,7 +8,9 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <util/smallvec.hpp>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 
@@ -20,9 +22,8 @@ namespace ker::vfs {
 
 // Mount point registry
 namespace {
-MountPoint* mounts[MAX_MOUNTS] = {};
-size_t mount_count = 0;
-mod::sys::Spinlock mount_lock;  // Protects mounts[] and mount_count
+ker::util::SmallVec<MountPoint*, 8> mounts;
+mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
 }  // namespace
 
 auto fstype_to_enum(const char* fstype) -> FSType {
@@ -150,14 +151,12 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     }
 
     mount_lock.lock();
-    if (mount_count >= MAX_MOUNTS) {
+    if (!mounts.push_back(mount)) {
         mount_lock.unlock();
-        vfs_debug_log("mount_filesystem: mount table full\n");
+        vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
         delete mount;
         return -1;
     }
-    mounts[mount_count] = mount;
-    mount_count++;
     mount_lock.unlock();
 
     vfs_debug_log("mount_filesystem: mounted ");
@@ -165,6 +164,9 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     vfs_debug_log(" at ");
     vfs_debug_log(path);
     vfs_debug_log("\n");
+
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
+                                          static_cast<int64_t>(mounts.size()), 0, 0);
 
     // Emit WKI storage mount event (if WKI is active)
     if (ker::net::wki::g_wki.initialized) {
@@ -181,17 +183,14 @@ auto unmount_filesystem(const char* path) -> int {
     }
 
     mount_lock.lock();
-    for (size_t i = 0; i < mount_count; ++i) {
+    for (size_t i = 0; i < mounts.size(); ++i) {
         if (mounts[i] != nullptr && mounts[i]->path != nullptr && std::strcmp(path, mounts[i]->path) == 0) {
             delete mounts[i];
-
-            // Compact: shift remaining entries down
-            for (size_t j = i; j + 1 < mount_count; ++j) {
-                mounts[j] = mounts[j + 1];
-            }
-            mount_count--;
-            mounts[mount_count] = nullptr;
+            mounts.remove_at(i);
             mount_lock.unlock();
+
+            ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                                  static_cast<int64_t>(mounts.size()), 0, 0);
 
             vfs_debug_log("unmount_filesystem: unmounted ");
             vfs_debug_log(path);
@@ -218,7 +217,7 @@ auto find_mount_point(const char* path) -> MountPoint* {
     size_t best_length = 0;
 
     mount_lock.lock();
-    for (size_t i = 0; i < mount_count; ++i) {
+    for (size_t i = 0; i < mounts.size(); ++i) {
         if (mounts[i] == nullptr || mounts[i]->path == nullptr) continue;
 
         // Check if path starts with this mount point
@@ -249,14 +248,14 @@ auto find_mount_point(const char* path) -> MountPoint* {
 
 auto get_mount_count() -> size_t {
     mount_lock.lock();
-    size_t count = mount_count;
+    size_t count = mounts.size();
     mount_lock.unlock();
     return count;
 }
 
 auto get_mount_at(size_t index) -> MountPoint* {
     mount_lock.lock();
-    if (index >= mount_count) {
+    if (index >= mounts.size()) {
         mount_lock.unlock();
         return nullptr;
     }

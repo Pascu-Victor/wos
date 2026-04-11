@@ -421,6 +421,48 @@ auto generate_kperfctl(char* buf, size_t bufsz) -> size_t {
     return len;
 }
 
+// Forward declarations for helpers defined below
+static void append_dec64(char*& p, char* end, uint64_t v);
+static void append_sconst(char*& p, char* end, const char* s);
+
+// Generate content for /proc/kcontstat
+// Shows per-subsystem container aggregate statistics (non-destructive).
+auto generate_kcontstat(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char* end = buf + bufsz - 1;
+
+    for (size_t i = 1; i < ker::mod::perf::PERF_SUBSYSTEM_COUNT; ++i) {
+        auto s = ker::mod::perf::get_subsystem_stats(static_cast<ker::mod::perf::PerfSubsystem>(i));
+        uint64_t ins = s.inserts;
+        uint64_t rem = s.removes;
+        uint64_t res = s.resizes;
+        uint64_t oom = s.oom_failures;
+        uint64_t peak = s.peak_count;
+        uint64_t cur = s.current_count;
+
+        // Skip subsystems with no activity
+        if (ins == 0 && rem == 0 && res == 0 && oom == 0) continue;
+
+        append_sconst(p, end, "subsys=");
+        append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(i)));
+        append_sconst(p, end, " inserts=");
+        append_dec64(p, end, ins);
+        append_sconst(p, end, " removes=");
+        append_dec64(p, end, rem);
+        append_sconst(p, end, " resizes=");
+        append_dec64(p, end, res);
+        append_sconst(p, end, " oom=");
+        append_dec64(p, end, oom);
+        append_sconst(p, end, " peak=");
+        append_dec64(p, end, peak);
+        append_sconst(p, end, " current=");
+        append_dec64(p, end, cur);
+        if (p + 1 < end) *p++ = '\n';
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 // Hex helper
 static void append_hex64(char*& p, char* end, uint64_t v) {
     static const char hx[] = "0123456789abcdef";
@@ -508,6 +550,9 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 case ker::mod::perf::PerfEventType::SLEEP:
                     letter = 'B';
                     break;
+                case ker::mod::perf::PerfEventType::CONTAINER_STAT:
+                    letter = 'C';
+                    break;
             }
             if (p + 2 >= end) break;
             *p++ = letter;
@@ -540,6 +585,21 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 append_dec64(p, end, ev.aux);
                 *p++ = ' ';
                 append_perf_callsite(p, end, ev.callsite);
+            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::CONTAINER_STAT) {
+                // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
+                uint8_t subsys_id = static_cast<uint8_t>(ev.data >> 32);
+                append_dec64(p, end, ev.pid);
+                *p++ = ' ';
+                append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(subsys_id)));
+                *p++ = ' ';
+                append_dec64(p, end, ev.flags);
+                *p++ = ' ';
+                if (ev.lag_v < 0 && p + 1 < end) *p++ = '-';
+                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
+                *p++ = ' ';
+                append_dec64(p, end, ev.aux);
+                *p++ = ' ';
+                append_perf_callsite(p, end, ev.callsite);
             } else {
                 // WAKE or SLEEP
                 append_dec64(p, end, ev.pid);
@@ -568,7 +628,7 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
 
     uint64_t cpu_count = ker::mod::smt::get_core_count();
     if (cpu_count == 0) cpu_count = 8;
-    if (cpu_count > ker::mod::perf::PERF_MAX_CPUS) cpu_count = ker::mod::perf::PERF_MAX_CPUS;
+    if (cpu_count > ker::mod::perf::get_num_perf_cpus()) cpu_count = ker::mod::perf::get_num_perf_cpus();
 
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
@@ -630,7 +690,8 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
-        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KCPUSTAT_FILE);
+        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KCPUSTAT_FILE ||
+                         pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
         size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
         pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(alloc_sz));
         if (pfd->content == nullptr) {
@@ -664,6 +725,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::KPERFCTL_FILE:
                 pfd->content_len = generate_kperfctl(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::KCONTSTAT_FILE:
+                pfd->content_len = generate_kcontstat(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
@@ -700,12 +764,29 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
     if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) return -EPERM;
     if (count == 0) return 0;
 
-    // Accept "enable" or "disable" (with optional newline)
+    // Accept "enable", "enable <filter>", "mask <filter>", or "disable"
     const char* s = static_cast<const char*>(buf);
     if (count >= 6 && memcmp(s, "enable", 6) == 0) {
+        // Check for optional filter: "enable switch,wake,container"
+        if (count > 7 && s[6] == ' ') {
+            uint8_t mask = ker::mod::perf::parse_event_mask(s + 7, count - 7);
+            if (mask == 0) return -EINVAL;
+            ker::mod::perf::set_event_mask(mask);
+        } else {
+            ker::mod::perf::set_event_mask(ker::mod::perf::PERF_MASK_ALL);
+        }
         // Reset ring buffers on fresh enable so report only sees the new session
         ker::mod::perf::reset_rings();
         ker::mod::perf::enable();
+    } else if (count >= 4 && memcmp(s, "mask", 4) == 0) {
+        // Change mask without resetting rings or toggling enable: "mask switch,container"
+        if (count > 5 && s[4] == ' ') {
+            uint8_t mask = ker::mod::perf::parse_event_mask(s + 5, count - 5);
+            if (mask == 0) return -EINVAL;
+            ker::mod::perf::set_event_mask(mask);
+        } else {
+            return -EINVAL;
+        }
     } else if (count >= 7 && memcmp(s, "disable", 7) == 0) {
         ker::mod::perf::disable();
     } else {
@@ -881,6 +962,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/kperfctl - write "enable"/"disable" to start/stop perf recording
     if (strcmp(path, "kperfctl") == 0) {
         return make_file(ProcNodeType::KPERFCTL_FILE, 0, false);
+    }
+
+    // /proc/kcontstat - per-subsystem container statistics
+    if (strcmp(path, "kcontstat") == 0) {
+        return make_file(ProcNodeType::KCONTSTAT_FILE, 0, false);
     }
 
     // /proc/self -> symlink to /proc/<pid>

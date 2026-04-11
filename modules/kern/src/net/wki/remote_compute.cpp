@@ -173,8 +173,8 @@ void write_proxy_output(ker::mod::sched::task::Task* proxy, const uint8_t* outpu
     }
 
     ker::mod::dbg::log("[WKI] Task %u remote output (%u bytes):", task_id, output_len);
-    if (proxy->fds[1] != nullptr) {
-        auto* file = static_cast<ker::vfs::File*>(proxy->fds[1]);
+    if (proxy->fd_table.lookup(1) != nullptr) {
+        auto* file = static_cast<ker::vfs::File*>(proxy->fd_table.lookup(1));
         if (file->fops != nullptr && file->fops->vfs_write != nullptr) {
             file->fops->vfs_write(file, output_data, output_len, 0);
         }
@@ -186,7 +186,7 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
         return;
     }
 
-    for (uint64_t i = 0; i < proxy->awaitee_on_exit_count; ++i) {
+    for (size_t i = 0; i < proxy->awaitee_on_exit.size(); ++i) {
         uint64_t waiting_pid = proxy->awaitee_on_exit[i];
         auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(waiting_pid);
         if (waiting_task != nullptr) {
@@ -202,7 +202,7 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
             waiting_task->release();
         }
     }
-    proxy->awaitee_on_exit_count = 0;
+    proxy->awaitee_on_exit.clear();
 }
 
 void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status, const uint8_t* output_data, uint16_t output_len,
@@ -235,13 +235,12 @@ struct SubmitContextInfo {
 };
 
 auto serialized_task_vfs_rules_size(const ker::mod::sched::task::Task* task) -> uint16_t {
-    if (task == nullptr || task->wki_vfs_rule_count == 0) {
+    if (task == nullptr || task->wki_vfs_rules.size() == 0) {
         return 0;
     }
 
     uint32_t total = sizeof(uint16_t);
-    auto rule_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
-    for (uint16_t i = 0; i < rule_count; ++i) {
+    for (size_t i = 0; i < task->wki_vfs_rules.size(); ++i) {
         const auto& rule = task->wki_vfs_rules[i];
         if (rule.prefix_len == 0 || rule.prefix_len >= ker::mod::sched::task::WkiVfsRule::PREFIX_MAX || rule.prefix[0] != '/' ||
             rule.prefix[rule.prefix_len] != '\0') {
@@ -265,8 +264,7 @@ void serialize_task_vfs_rules(uint8_t* dest, const ker::mod::sched::task::Task* 
     *count_ptr = 0;
     dest += sizeof(uint16_t);
 
-    auto rule_count = std::min<uint16_t>(task->wki_vfs_rule_count, ker::mod::sched::task::Task::WKI_VFS_RULE_MAX);
-    for (uint16_t i = 0; i < rule_count; ++i) {
+    for (size_t i = 0; i < task->wki_vfs_rules.size(); ++i) {
         const auto& rule = task->wki_vfs_rules[i];
         if (rule.prefix_len == 0 || rule.prefix_len >= ker::mod::sched::task::WkiVfsRule::PREFIX_MAX || rule.prefix[0] != '/' ||
             rule.prefix[rule.prefix_len] != '\0') {
@@ -288,7 +286,7 @@ auto deserialize_task_vfs_rules(ker::mod::sched::task::Task* task, const uint8_t
         return false;
     }
 
-    task->wki_vfs_rule_count = 0;
+    task->wki_vfs_rules.clear();
     if (data == nullptr || data_len == 0) {
         return true;
     }
@@ -302,7 +300,7 @@ auto deserialize_task_vfs_rules(ker::mod::sched::task::Task* task, const uint8_t
     data += sizeof(uint16_t);
     data_len = static_cast<uint16_t>(data_len - sizeof(uint16_t));
 
-    if (encoded_count > ker::mod::sched::task::Task::WKI_VFS_RULE_MAX) {
+    if (encoded_count > 256) {
         return false;
     }
 
@@ -323,12 +321,15 @@ auto deserialize_task_vfs_rules(ker::mod::sched::task::Task* task, const uint8_t
             return false;
         }
 
-        auto& rule = task->wki_vfs_rules[task->wki_vfs_rule_count++];
-        memcpy(rule.prefix, data, prefix_len);
-        rule.prefix[prefix_len] = '\0';
-        rule.prefix_len = prefix_len;
-        rule.route = route;
-        rule.reserved = 0;
+        ker::mod::sched::task::WkiVfsRule new_rule{};
+        memcpy(new_rule.prefix, data, prefix_len);
+        new_rule.prefix[prefix_len] = '\0';
+        new_rule.prefix_len = prefix_len;
+        new_rule.route = route;
+        new_rule.reserved = 0;
+        if (!task->wki_vfs_rules.push_back(new_rule)) {
+            return false;
+        }
 
         data += prefix_len;
         data_len = static_cast<uint16_t>(data_len - prefix_len);
@@ -441,25 +442,8 @@ auto build_vfs_ref_path(uint16_t /*target_node*/, const char* local_path, char* 
         return false;
     }
 
-    // Check that a VFS export on this node covers the requested path.
-    // The simplest check: if we export "/" (root), any local path is coverable.
-    // For more specific exports, the local_path must start with the export path.
+    // Check that the file exists and is accessible via VFS (implying a covering export).
     bool covered = false;
-    wki_resource_foreach(
-        [](const DiscoveredResource& /*res*/, void* /*ctx*/) {
-            // We actually need to check our LOCAL exports, not discovered remote ones.
-            // This visitor iterates discovered (remote) resources. We need a different approach.
-        },
-        nullptr);
-
-    // Instead, directly check our local VFS exports.
-    // Iterate VFS exports: if any export_path is a prefix of local_path, it's covered.
-    // We can't iterate g_vfs_exports directly (it's in remote_vfs.cpp), but we can
-    // check if we have a root "/" export by checking if local_path is accessible via VFS.
-    // Simplification: if local_path starts with "/" and the file exists, we likely export
-    // a VFS covering it. The remote node will resolve /wki/<hostname>/<relative_path>.
-
-    // Check that the file actually exists
     int fd = ker::vfs::vfs_open(local_path, 0, 0);
     if (fd < 0) {
         return false;
@@ -1288,7 +1272,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len) -> ExecResult {
         capture_file->is_directory = false;
         capture_file->fs_type = ker::vfs::FSType::DEVFS;
         capture_file->refcount = 1;
-        new_task->fds[fd_idx] = capture_file;
+        new_task->fd_table.insert(fd_idx, capture_file);
     }
 
     // Note: Caller is responsible for calling post_task_balanced() after

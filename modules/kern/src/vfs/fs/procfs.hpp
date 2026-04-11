@@ -22,6 +22,7 @@ enum class ProcNodeType : uint8_t {
     KPERF_FILE,     // /proc/kperf    -> drain kernel perf ring buffer as text events
     KCPUSTAT_FILE,  // /proc/kcpustat -> per-CPU aggregate scheduler statistics
     KPERFCTL_FILE,  // /proc/kperfctl -> write "enable"/"disable" to control recording
+    KCONTSTAT_FILE, // /proc/kcontstat -> per-subsystem container statistics
 };
 
 struct ProcNode {

@@ -6,7 +6,9 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <util/radix_tree.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 
@@ -116,25 +118,33 @@ auto device_from_file(ker::vfs::File* f) -> ker::dev::Device* {
 
 auto pair_from_file(ker::vfs::File* f) -> PtyPair*;
 
-auto register_waiter(uint64_t* waiters, size_t& waiter_count, uint64_t pid) -> bool {
-    for (size_t i = 0; i < waiter_count; i++) {
+void pty_unregister_slave(PtyPair* pair) {
+    if (pair == nullptr) {
+        return;
+    }
+
+    char pts_path[16]{};
+    std::memcpy(pts_path, "pts/", 4);
+    std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
+    ker::vfs::devfs::devfs_remove_node(pts_path);
+    ker::dev::dev_unregister(&pair->slave_dev);
+}
+
+auto register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+    for (size_t i = 0; i < waiters.size(); i++) {
         if (waiters[i] == pid) {
             return true;
         }
     }
-    if (waiter_count >= PTY_POLL_MAX_WAITERS) {
-        return false;
-    }
-    waiters[waiter_count++] = pid;
-    return true;
+    return waiters.push_back(pid);
 }
 
-auto block_current_task(uint64_t* waiters, size_t& waiter_count) -> bool {
+auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters) -> bool {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
         return false;
     }
-    if (!register_waiter(waiters, waiter_count, current_task->pid)) {
+    if (!register_waiter(waiters, current_task->pid)) {
         return false;
     }
     current_task->deferredTaskSwitch = true;
@@ -157,14 +167,14 @@ void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
     }
 }
 
-void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, uint64_t* waiters, size_t& waiter_count) {
-    uint64_t pending[PTY_POLL_MAX_WAITERS]{};
+void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, ker::util::SmallVec<uint64_t, 2>& waiters) {
+    uint64_t pending[32]{};
     uint64_t irqf = lock.lock_irqsave();
-    size_t pending_count = waiter_count;
+    size_t pending_count = std::min(waiters.size(), size_t{32});
     for (size_t i = 0; i < pending_count; i++) {
         pending[i] = waiters[i];
     }
-    waiter_count = 0;
+    waiters.clear();
     lock.unlock_irqrestore(irqf);
     wake_waiters(pending, pending_count);
 }
@@ -173,62 +183,62 @@ void wake_master_pollers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->master_poll_waiters, pair->master_poll_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->master_poll_waiters);
 }
 
 void wake_slave_pollers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->slave_poll_waiters, pair->slave_poll_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->slave_poll_waiters);
 }
 
 void wake_master_readers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->master_read_waiters, pair->master_read_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->master_read_waiters);
 }
 
 void wake_master_writers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->master_write_waiters, pair->master_write_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->master_write_waiters);
 }
 
 void wake_slave_readers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->slave_read_waiters, pair->slave_read_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->slave_read_waiters);
 }
 
 void wake_slave_writers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    drain_and_wake_waiters(pair->lock, pair->slave_write_waiters, pair->slave_write_waiter_count);
+    drain_and_wake_waiters(pair->lock, pair->slave_write_waiters);
 }
 
 void wake_both_pollers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    uint64_t master_pending[PTY_POLL_MAX_WAITERS]{};
-    uint64_t slave_pending[PTY_POLL_MAX_WAITERS]{};
+    uint64_t master_pending[32]{};
+    uint64_t slave_pending[32]{};
     uint64_t irqf = pair->lock.lock_irqsave();
-    size_t master_pending_count = pair->master_poll_waiter_count;
+    size_t master_pending_count = std::min(pair->master_poll_waiters.size(), size_t{32});
     for (size_t i = 0; i < master_pending_count; i++) {
         master_pending[i] = pair->master_poll_waiters[i];
     }
-    pair->master_poll_waiter_count = 0;
+    pair->master_poll_waiters.clear();
 
-    size_t slave_pending_count = pair->slave_poll_waiter_count;
+    size_t slave_pending_count = std::min(pair->slave_poll_waiters.size(), size_t{32});
     for (size_t i = 0; i < slave_pending_count; i++) {
         slave_pending[i] = pair->slave_poll_waiters[i];
     }
-    pair->slave_poll_waiter_count = 0;
+    pair->slave_poll_waiters.clear();
     pair->lock.unlock_irqrestore(irqf);
     wake_waiters(master_pending, master_pending_count);
     wake_waiters(slave_pending, slave_pending_count);
@@ -244,9 +254,9 @@ auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
     uint64_t irqf = pair->lock.lock_irqsave();
     bool ok = false;
     if (device == &pair->master_dev) {
-        ok = register_waiter(pair->master_poll_waiters, pair->master_poll_waiter_count, pid);
+        ok = register_waiter(pair->master_poll_waiters, pid);
     } else if (device == &pair->slave_dev) {
-        ok = register_waiter(pair->slave_poll_waiters, pair->slave_poll_waiter_count, pid);
+        ok = register_waiter(pair->slave_poll_waiters, pid);
     }
     pair->lock.unlock_irqrestore(irqf);
     return ok;
@@ -371,7 +381,8 @@ auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* rep
     }
 }
 
-PtyPair pty_pool[PTY_MAX]{};
+ker::util::RadixTree<PtyPair*> pty_tree;
+size_t pty_next_index = 0;
 bool pty_initialized = false;
 
 // --- Master-side device operations ---
@@ -422,18 +433,25 @@ int master_close(ker::vfs::File* file) {
     uint64_t irqf = pair->lock.lock_irqsave();
     pair->master_opened--;
 
+    bool should_free = false;
     // If slave is also closed, free the pair
     if (pair->slave_opened <= 0) {
         pair->allocated = false;
-        // Zero out buffers
-        pair->m2s = PtyRingBuf{};
-        pair->s2m = PtyRingBuf{};
+        should_free = true;
     }
     pair->lock.unlock_irqrestore(irqf);
 
     wake_slave_readers(pair);
     wake_slave_writers(pair);
     wake_slave_pollers(pair);
+
+    if (should_free) {
+        pty_unregister_slave(pair);
+        pty_tree.remove(static_cast<uint64_t>(pair->index));
+        ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(pair->index),
+                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(pty_tree.size()), 0, 0);
+        delete pair;
+    }
 
     return 0;
 }
@@ -456,7 +474,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     bool slave_opened = pair->slave_opened > 0;
     bool should_block = false;
     if (rd == 0 && slave_opened && (file->open_flags & 04000) == 0) {
-        should_block = block_current_task(pair->master_read_waiters, pair->master_read_waiter_count);
+        should_block = block_current_task(pair->master_read_waiters);
     }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
@@ -711,7 +729,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     bool slave_opened = pair->slave_opened > 0;
                     bool should_block = false;
                     if (wr == 0 && slave_opened && processed == 0) {
-                        should_block = block_current_task(pair->master_write_waiters, pair->master_write_waiter_count);
+                        should_block = block_current_task(pair->master_write_waiters);
                     }
                     pair->lock.unlock_irqrestore(wr_irqf);
                     if (wr != 0) {
@@ -891,17 +909,25 @@ int slave_close(ker::vfs::File* file) {
     uint64_t irqf = pair->lock.lock_irqsave();
     pair->slave_opened--;
 
+    bool should_free = false;
     // If master is also closed, free the pair
     if (pair->master_opened <= 0) {
         pair->allocated = false;
-        pair->m2s = PtyRingBuf{};
-        pair->s2m = PtyRingBuf{};
+        should_free = true;
     }
     pair->lock.unlock_irqrestore(irqf);
 
     wake_master_readers(pair);
     wake_master_writers(pair);
     wake_master_pollers(pair);
+
+    if (should_free) {
+        pty_unregister_slave(pair);
+        pty_tree.remove(static_cast<uint64_t>(pair->index));
+        ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(pair->index),
+                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(pty_tree.size()), 0, 0);
+        delete pair;
+    }
 
     return 0;
 }
@@ -916,7 +942,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     bool master_opened = pair->master_opened > 0;
     bool should_block = false;
     if (rd == 0 && master_opened && (file->open_flags & 04000) == 0) {
-        should_block = block_current_task(pair->slave_read_waiters, pair->slave_read_waiter_count);
+        should_block = block_current_task(pair->slave_read_waiters);
     }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
@@ -975,7 +1001,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                         break;
                     }
                     if (master_opened && written == 0) {
-                        should_block = block_current_task(pair->slave_write_waiters, pair->slave_write_waiter_count);
+                        should_block = block_current_task(pair->slave_write_waiters);
                     }
                     pair->lock.unlock_irqrestore(irqf);
                     if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
@@ -1005,7 +1031,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 bool master_opened = pair->master_opened > 0;
                 bool should_block = false;
                 if (wr == 0 && master_opened && written == 0) {
-                    should_block = block_current_task(pair->slave_write_waiters, pair->slave_write_waiter_count);
+                    should_block = block_current_task(pair->slave_write_waiters);
                 }
                 pair->lock.unlock_irqrestore(irqf);
                 if (wr != 0) {
@@ -1187,16 +1213,6 @@ Device ptmx_dev = {
 void pty_init() {
     ker::mod::io::serial::write("pty: initializing PTY subsystem\n");
 
-    // Zero out the pool
-    for (size_t i = 0; i < PTY_MAX; i++) {
-        pty_pool[i].index = static_cast<int>(i);
-        pty_pool[i].allocated = false;
-        pty_pool[i].slave_locked = true;  // Locked by default (must unlock before slave open)
-        pty_pool[i].slave_opened = 0;
-        pty_pool[i].master_opened = 0;
-        pty_pool[i].winsize = {.ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
-    }
-
     // Register /dev/ptmx
     dev_register(&ptmx_dev);
 
@@ -1208,83 +1224,103 @@ void pty_init() {
     vfs::devfs::devfs_create_directory("pts");
 
     pty_initialized = true;
-    ker::mod::io::serial::write("pty: initialized (max 64 pairs)\n");
+    ker::mod::io::serial::write("pty: initialized (dynamic allocation)\n");
 }
 
 auto pty_alloc() -> int {
-    for (auto& i : pty_pool) {
-        if (!i.allocated) {
-            auto& pair = i;
-            pair.allocated = true;
-            pair.slave_locked = true;
-            pair.slave_opened = 0;
-            pair.master_opened = 0;
-            pair.m2s = PtyRingBuf{};
-            pair.s2m = PtyRingBuf{};
-            pair.winsize = {.ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
-            pair.termios = default_termios();
-            pair.canon_len = 0;
-            pair.cpr_filter_len = 0;
-            pair.cpr_filter_active = false;
-            pair.foreground_pgrp = 0;
-
-            // Build the slave device name: "pts/<N>"
-            // We need a persistent name string - use the Device name field
-            // Build "N" as a string (0-63, max 2 digits)
-            static char slave_names[PTY_MAX][8]{};
-            int n = pair.index;
-            if (n < 10) {
-                slave_names[n][0] = '0' + static_cast<char>(n);
-                slave_names[n][1] = '\0';
-            } else {
-                slave_names[n][0] = '0' + static_cast<char>(n / 10);
-                slave_names[n][1] = '0' + static_cast<char>(n % 10);
-                slave_names[n][2] = '\0';
-            }
-
-            // Set up the slave Device struct
-            pair.slave_dev = Device{
-                .major = 136,
-                .minor = static_cast<unsigned>(n),
-                .name = slave_names[n],
-                .type = DeviceType::CHAR,
-                .private_data = &pair,
-                .char_ops = &slave_ops,
-            };
-
-            // Set up the master Device struct (already allocated in ptmx open,
-            // but we need per-pair master for devfs wrapping)
-            pair.master_dev = Device{
-                .major = 5,
-                .minor = static_cast<unsigned>(2 + n),  // Each master gets unique minor
-                .name = "ptmx",                         // Master is always accessed via /dev/ptmx
-                .type = DeviceType::CHAR,
-                .private_data = &pair,
-                .char_ops = &master_ops,
-            };
-
-            // Register slave device into devfs as /dev/pts/<N>
-            // Build path "pts/<N>"
-            char pts_path[16]{};
-            std::memcpy(pts_path, "pts/", 4);
-            std::memcpy(pts_path + 4, slave_names[n], std::strlen(slave_names[n]) + 1);
-
-            // Register the slave device, then add to devfs
-            dev_register(&pair.slave_dev);
-            vfs::devfs::devfs_add_device_node(pts_path, &pair.slave_dev);
-#ifdef DEBUG_PTY
-            ker::mod::dbg::log("pty: allocated pair %d", n);
-#endif
-            return n;
-        }
+    // Find next available PTY index
+    uint64_t slot = pty_tree.find_first_unset(0);
+    if (slot == UINT64_MAX || slot >= PTY_MAX) {
+        return -1;  // No free PTY pairs
     }
-    return -1;  // No free PTY pairs
+
+    int n = static_cast<int>(slot);
+
+    auto* pair = new PtyPair{};
+    if (pair == nullptr) {
+        return -1;
+    }
+
+    pair->index = n;
+    pair->allocated = true;
+    pair->slave_locked = true;
+    pair->slave_opened = 0;
+    pair->master_opened = 0;
+    pair->m2s = PtyRingBuf{};
+    pair->s2m = PtyRingBuf{};
+    pair->winsize = {.ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
+    pair->termios = default_termios();
+    pair->canon_len = 0;
+    pair->cpr_filter_len = 0;
+    pair->cpr_filter_active = false;
+    pair->foreground_pgrp = 0;
+
+    // Build the slave name: "N" (e.g., "0", "12")
+    if (n < 10) {
+        pair->slave_name[0] = '0' + static_cast<char>(n);
+        pair->slave_name[1] = '\0';
+    } else if (n < 100) {
+        pair->slave_name[0] = '0' + static_cast<char>(n / 10);
+        pair->slave_name[1] = '0' + static_cast<char>(n % 10);
+        pair->slave_name[2] = '\0';
+    } else {
+        pair->slave_name[0] = '0' + static_cast<char>(n / 100);
+        pair->slave_name[1] = '0' + static_cast<char>((n / 10) % 10);
+        pair->slave_name[2] = '0' + static_cast<char>(n % 10);
+        pair->slave_name[3] = '\0';
+    }
+
+    // Set up the slave Device struct
+    pair->slave_dev = Device{
+        .major = 136,
+        .minor = static_cast<unsigned>(n),
+        .name = pair->slave_name,
+        .type = DeviceType::CHAR,
+        .private_data = pair,
+        .char_ops = &slave_ops,
+    };
+
+    // Set up the master Device struct
+    pair->master_dev = Device{
+        .major = 5,
+        .minor = static_cast<unsigned>(2 + n),
+        .name = "ptmx",
+        .type = DeviceType::CHAR,
+        .private_data = pair,
+        .char_ops = &master_ops,
+    };
+
+    // Insert into radix tree
+    if (!pty_tree.insert(slot, pair)) {
+        delete pair;
+        return -1;
+    }
+
+    // Register slave device into devfs as /dev/pts/<N>
+    char pts_path[16]{};
+    std::memcpy(pts_path, "pts/", 4);
+    std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
+
+    dev_register(&pair->slave_dev);
+    if (vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev) == nullptr) {
+        dev_unregister(&pair->slave_dev);
+        pty_tree.remove(slot);
+        delete pair;
+        return -1;
+    }
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(n),
+                                          ker::mod::perf::PERF_FLAG_CT_INSERT, static_cast<int64_t>(pty_tree.size()), 0, 0);
+#ifdef DEBUG_PTY
+    ker::mod::dbg::log("pty: allocated pair %d", n);
+#endif
+    return n;
 }
 
 auto pty_get(int index) -> PtyPair* {
     if (index < 0 || index >= static_cast<int>(PTY_MAX)) return nullptr;
-    if (!pty_pool[index].allocated) return nullptr;
-    return &pty_pool[index];
+    auto ptr = pty_tree.lookup(static_cast<uint64_t>(index));
+    if (ptr == nullptr) return nullptr;
+    return ptr;
 }
 
 auto get_ptmx_device() -> Device* { return &ptmx_dev; }

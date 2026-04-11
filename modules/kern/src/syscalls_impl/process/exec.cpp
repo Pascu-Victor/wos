@@ -202,36 +202,31 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     memcpy(newTask->wki_target_hostname, parentTask->wki_target_hostname, sizeof(newTask->wki_target_hostname));
     newTask->wki_target_flags = parentTask->wki_target_flags;
     memcpy(newTask->wki_submitter_hostname, parentTask->wki_submitter_hostname, sizeof(newTask->wki_submitter_hostname));
-    newTask->wki_vfs_rule_count = parentTask->wki_vfs_rule_count;
-    memcpy(newTask->wki_vfs_rules.data(), parentTask->wki_vfs_rules.data(), sizeof(newTask->wki_vfs_rules));
+    newTask->wki_vfs_rules.clone_from(parentTask->wki_vfs_rules);
 
     // Inherit file descriptors from parent, respecting O_CLOEXEC / FD_CLOEXEC.
     // FDs with FD_CLOEXEC set are NOT inherited (closed on exec).
     // FDs without FD_CLOEXEC are inherited by incrementing refcount.
     // For fds 0/1/2 (stdin/stdout/stderr), if not inherited, re-open /dev/console.
-    for (unsigned i = 0; i < mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (parentTask->fds[i] == nullptr) continue;
-        auto* parentFile = static_cast<vfs::File*>(parentTask->fds[i]);
-
+    parentTask->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val == nullptr) return;
+        auto* parentFile = static_cast<vfs::File*>(val);
         if (parentFile->fd_flags & vfs::FD_CLOEXEC) {
-            // FD_CLOEXEC is set - do NOT inherit
-            continue;
+            return;  // FD_CLOEXEC is set - do NOT inherit
         }
-
-        // Inherit: increment refcount and share the File object
         parentFile->refcount++;
-        newTask->fds[i] = parentFile;
-    }
+        newTask->fd_table.insert(key, parentFile);
+    });
 
     // Ensure fds 0/1/2 are always set (open /dev/console if not inherited)
     for (unsigned i = 0; i < 3; ++i) {
-        if (newTask->fds[i] == nullptr) {
+        if (newTask->fd_table.lookup(i) == nullptr) {
             vfs::File* newFile = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
             if (newFile != nullptr) {
                 newFile->fops = vfs::devfs::get_devfs_fops();
                 newFile->fd = static_cast<int>(i);
                 newFile->refcount = 1;
-                newTask->fds[i] = newFile;
+                newTask->fd_table.insert(i, newFile);
             }
         }
     }
@@ -570,11 +565,10 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
         for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
-            if (task->fds[i] == nullptr) continue;
-            auto* file = static_cast<vfs::File*>(task->fds[i]);
-            if (file->fd_flags & vfs::FD_CLOEXEC) {
+            auto* fval = static_cast<vfs::File*>(task->fd_table.lookup(i));
+            if (fval == nullptr) continue;
+            if (fval->fd_flags & vfs::FD_CLOEXEC) {
                 vfs::vfs_close(static_cast<int>(i));
-                task->fds[i] = nullptr;
             }
         }
 
@@ -636,14 +630,13 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     }
 
     // --- Close FD_CLOEXEC file descriptors ---
-    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
-        if (task->fds[i] == nullptr) continue;
-        auto* file = static_cast<vfs::File*>(task->fds[i]);
+    task->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val == nullptr) return;
+        auto* file = static_cast<vfs::File*>(val);
         if (file->fd_flags & vfs::FD_CLOEXEC) {
-            vfs::vfs_close(static_cast<int>(i));
-            task->fds[i] = nullptr;
+            vfs::vfs_close(static_cast<int>(key));
         }
-    }
+    });
 
     // --- Free old ELF buffer ---
     if (task->elfBuffer != nullptr) {
@@ -756,13 +749,13 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     // Ensure fds 0/1/2 exist
     for (unsigned i = 0; i < 3; ++i) {
-        if (task->fds[i] == nullptr) {
+        if (task->fd_table.lookup(i) == nullptr) {
             vfs::File* newFile = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
             if (newFile != nullptr) {
                 newFile->fops = vfs::devfs::get_devfs_fops();
                 newFile->fd = static_cast<int>(i);
                 newFile->refcount = 1;
-                task->fds[i] = newFile;
+                task->fd_table.insert(i, newFile);
             }
         }
     }

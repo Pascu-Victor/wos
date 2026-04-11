@@ -31,7 +31,6 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->hasRun = false;              // Task hasn't run yet, context.frame contains initial setup
     this->exitStatus = 0;              // Initialize exit status
     this->hasExited = false;           // Task hasn't exited yet
-    this->awaitee_on_exit_count = 0;   // Initialize awaitee counter
     this->deferredTaskSwitch = false;  // No deferred switch by default
     this->yieldSwitch = false;
     this->kthreadEntry = nullptr;
@@ -69,10 +68,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         sig_handler = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};  // SIG_DFL for all
     }
 
-    // Initialize file descriptor table to null
-    for (auto& fd : this->fds) {
-        fd = nullptr;
-    }
+    // fd_table is initialized by RadixTree default constructor (empty)
 
     if (type == TaskType::IDLE) {
         // Idle tasks use the kernel pagemap
@@ -309,12 +305,12 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->context.regs.rsi = user_arg_va;  // arg2: user_arg
 
     // Inherit FDs: share the same File* pointers and bump each refcount
-    for (unsigned i = 0; i < FD_TABLE_SIZE; i++) {
-        if (parent->fds[i] != nullptr) {
-            reinterpret_cast<ker::vfs::File*>(parent->fds[i])->refcount++;
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val != nullptr) {
+            reinterpret_cast<ker::vfs::File*>(val)->refcount++;
         }
-        t->fds[i] = parent->fds[i];
-    }
+        t->fd_table.insert(key, val);
+    });
     memcpy(t->cwd, parent->cwd, sizeof(t->cwd));
     memcpy(t->exe_path, parent->exe_path, sizeof(t->exe_path));
     t->uid = parent->uid;
@@ -330,8 +326,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     memcpy(t->wki_target_hostname, parent->wki_target_hostname, sizeof(t->wki_target_hostname));
     t->wki_target_flags = parent->wki_target_flags;
     memcpy(t->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(t->wki_submitter_hostname));
-    t->wki_vfs_rule_count = parent->wki_vfs_rule_count;
-    memcpy(t->wki_vfs_rules.data(), parent->wki_vfs_rules.data(), sizeof(t->wki_vfs_rules));
+    t->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
     t->wki_skip_legacy_placement = false;
 
     // ELF buffer: threads have no separate ELF
@@ -343,7 +338,6 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->hasExited = false;
     t->exitStatus = 0;
     t->waitedOn = false;
-    t->awaitee_on_exit_count = 0;
     t->deferredTaskSwitch = false;
     t->yieldSwitch = false;
     t->voluntaryBlock = false;

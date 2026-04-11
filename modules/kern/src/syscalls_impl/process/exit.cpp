@@ -102,7 +102,7 @@ void wos_proc_exit(int status) {
     }
 
     // Reschedule all tasks waiting for this process to exit
-    for (uint64_t i = 0; i < current_task->awaitee_on_exit_count; ++i) {
+    for (size_t i = 0; i < current_task->awaitee_on_exit.size(); ++i) {
         uint64_t waiting_pid = current_task->awaitee_on_exit[i];
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waitingPid);
@@ -177,11 +177,7 @@ void wos_proc_exit(int status) {
         // Threads share both with their owner process - do not touch them.
 
         // Close all open file descriptors
-        for (unsigned i = 0; i < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++i) {
-            if (current_task->fds[i] != nullptr) {
-                ker::vfs::vfs_close(static_cast<int>(i));
-            }
-        }
+        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) { ker::vfs::vfs_close(static_cast<int>(key)); });
 
         // Free ELF buffer
         if (current_task->elfBuffer != nullptr) {

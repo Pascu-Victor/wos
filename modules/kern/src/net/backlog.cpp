@@ -19,9 +19,7 @@ namespace ker::net {
 
 namespace {
 
-constexpr size_t MAX_CPUS = 64;
-
-BacklogQueue queues[MAX_CPUS];
+BacklogQueue* queues = nullptr;
 std::atomic<bool> ready{false};
 uint64_t num_cpus = 0;
 
@@ -32,7 +30,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         // handler thread, so we must always drain the queue for whichever CPU
         // we're actually running on right now.
         cpu_idx = ker::mod::cpu::currentCpu();
-        if (cpu_idx >= MAX_CPUS) {
+        if (cpu_idx >= num_cpus) {
             cpu_idx = 0;
         }
         auto& q = queues[cpu_idx];
@@ -85,9 +83,14 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 
 void backlog_init() {
     num_cpus = ker::mod::smt::get_core_count();
-    num_cpus = std::min(num_cpus, MAX_CPUS);
     if (num_cpus <= 1) {
         ker::mod::dbg::log("backlog: single CPU, steering disabled");
+        return;
+    }
+
+    queues = new BacklogQueue[num_cpus]{};
+    if (queues == nullptr) {
+        ker::mod::dbg::log("backlog: failed to allocate queues");
         return;
     }
 

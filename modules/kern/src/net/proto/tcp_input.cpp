@@ -267,9 +267,14 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         if (listener != nullptr && listener->socket != nullptr) {
                             Socket* lsock = listener->socket;
                             uint64_t lsock_flags = lsock->lock.lock_irqsave();
-                            if (lsock->aq_count < SOCKET_ACCEPT_QUEUE) {
-                                lsock->accept_queue[lsock->aq_tail] = child_sock;
-                                lsock->aq_tail = (lsock->aq_tail + 1) % SOCKET_ACCEPT_QUEUE;
+                            if (lsock->aq_count < static_cast<size_t>(lsock->backlog)) {
+                                child_sock->accept_next = nullptr;
+                                if (lsock->aq_tail != nullptr) {
+                                    lsock->aq_tail->accept_next = child_sock;
+                                } else {
+                                    lsock->aq_head = child_sock;
+                                }
+                                lsock->aq_tail = child_sock;
                                 lsock->aq_count++;
                             }
                             lsock->lock.unlock_irqrestore(lsock_flags);

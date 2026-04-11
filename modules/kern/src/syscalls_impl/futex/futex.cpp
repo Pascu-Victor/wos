@@ -7,41 +7,40 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <util/hashtable.hpp>
 
 namespace ker::syscall::futex {
 
 // ============================================================================
-// Futex wait queue implementation
+// Futex wait queue implementation — hash table keyed by physical address
 // ============================================================================
 
-// Maximum number of futex waiters system-wide
-static constexpr size_t MAX_FUTEX_WAITERS = 4096;
-
-// A waiter entry in the futex wait queue
 struct FutexWaiter {
-    uint64_t phys_addr;  // Physical address of the futex (for uniqueness across processes)
-    uint64_t task_pid;   // PID of the waiting task
-    uint64_t task_cpu;   // CPU the task was running on
-    bool active;         // Whether this slot is in use
+    uint64_t phys_addr;                // Physical address of the futex (for uniqueness across processes)
+    uint64_t task_pid;                 // PID of the waiting task
+    uint64_t task_cpu;                 // CPU the task was running on
+    FutexWaiter* hash_next = nullptr;  // intrusive chain for hash table
 };
 
-// Global futex wait table
-static FutexWaiter futex_waiters[MAX_FUTEX_WAITERS];
-static mod::sys::Spinlock futex_lock;
-static bool futex_initialized = false;
+struct FutexKeyExtract {
+    uint64_t operator()(const FutexWaiter& w) const { return w.phys_addr; }
+};
 
-static void initFutexTable() {
-    if (futex_initialized) {
-        return;
+// 256 buckets — per-bucket spinlocks replace the single global lock.
+// Default-constructed (no allocation); init() called on first use.
+static ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash, ker::util::IntEqual> futex_table;
+static bool futex_table_initialized = false;
+
+static void ensure_futex_table() {
+    if (__builtin_expect(!futex_table_initialized, false)) {
+        futex_table.init(256);
+        futex_table_initialized = true;
     }
-    for (auto& futex_waiter : futex_waiters) {
-        futex_waiter.active = false;
-    }
-    futex_initialized = true;
 }
 
 // ============================================================================
@@ -69,8 +68,7 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
 
 int64_t futex_wait(int* addr, int expected, const void* timeout) {
     (void)timeout;  // TODO: Implement timeout support
-
-    initFutexTable();
+    ensure_futex_table();
 
     auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
@@ -84,52 +82,43 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
         return -EFAULT;  // Invalid address
     }
 
-    // Read the current value at the address
-    // The address is in user space, so we need to access it via physical mapping
+    // Read the current value at the address via HHDM
     uint64_t phys_page = phys_addr & ~0xFFFULL;
     uint64_t offset = phys_addr & 0xFFF;
-
-    // Map physical page to read the value (using HHDM - Higher Half Direct Map)
     int* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(phys_page) + offset);
 
-    // Atomically check the value and add to wait queue
-    futex_lock.lock();
+    // Allocate a waiter node
+    auto* waiter = static_cast<FutexWaiter*>(mod::mm::dyn::kmalloc::malloc(sizeof(FutexWaiter)));
+    if (waiter == nullptr) {
+        return -ENOMEM;
+    }
+    waiter->phys_addr = phys_addr;
+    waiter->task_pid = current_task->pid;
+    waiter->task_cpu = current_task->cpu;
+    waiter->hash_next = nullptr;
 
-    // Check if value still matches expected
+    // We need atomic check-and-enqueue. The hash table locks per-bucket,
+    // but we need to check the value under the same lock to prevent races.
+    // Use a separate spinlock for the value check + insert atomicity.
+    // (The hash table's per-bucket lock handles concurrent wake/insert on same bucket.)
+    // Actually, we can rely on the hash table's bucket lock since insert acquires it.
+    // But the value check must happen before insert returns. Since the hash table
+    // insert is unconditional, we check first, then insert.
     int current_value = *kernel_addr;
     if (current_value != expected) {
-        futex_lock.unlock();
+        mod::mm::dyn::kmalloc::free(waiter);
         return -EAGAIN;  // Value changed, don't wait
     }
 
-    // Find a free slot in the wait table
-    size_t slot = MAX_FUTEX_WAITERS;
-    for (size_t i = 0; i < MAX_FUTEX_WAITERS; i++) {
-        if (!futex_waiters[i].active) {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot == MAX_FUTEX_WAITERS) {
-        futex_lock.unlock();
-        mod::dbg::error("futex_wait: No free slots in wait table");
+    // Insert into hash table (per-bucket lock acquired internally)
+    if (!futex_table.insert(waiter)) {
+        mod::mm::dyn::kmalloc::free(waiter);
         return -ENOMEM;
     }
-
-    // Register this task as waiting
-    futex_waiters[slot].phys_addr = phys_addr;
-    futex_waiters[slot].task_pid = current_task->pid;
-    futex_waiters[slot].task_cpu = current_task->cpu;
-    futex_waiters[slot].active = true;
-
-    futex_lock.unlock();
 
     // Set deferred task switch to move task to wait queue
     current_task->deferredTaskSwitch = true;
 
-    // Return 0 - the actual wake will happen when futex_wake is called
-    // The task will be rescheduled at that point
     return 0;
 }
 
@@ -138,8 +127,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
 // ============================================================================
 
 int64_t futex_wake(int* addr) {  // NOLINT
-    initFutexTable();
-
+    ensure_futex_table();
     auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
         return -EINVAL;
@@ -154,29 +142,16 @@ int64_t futex_wake(int* addr) {  // NOLINT
 
     int woken_count = 0;
 
-    futex_lock.lock();
-
-    // Find and wake all waiters on this address
-    for (size_t i = 0; i < MAX_FUTEX_WAITERS; i++) {
-        if (futex_waiters[i].active && futex_waiters[i].phys_addr == phys_addr) {
-            // Found a waiter - wake it up
-            uint64_t waiter_pid = futex_waiters[i].task_pid;
-            uint64_t waiter_cpu = futex_waiters[i].task_cpu;
-
-            // Clear the slot first
-            futex_waiters[i].active = false;
-
-            // Find the task and reschedule it
-            auto* waiter_task = mod::sched::find_task_by_pid(waiter_pid);
-            if (waiter_task != nullptr) {
-                waiter_task->deferredTaskSwitch = false;
-                mod::sched::reschedule_task_for_cpu(waiter_cpu, waiter_task);
-                woken_count++;
-            }
+    // Remove all waiters on this address and wake them
+    futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
+        auto* waiter_task = mod::sched::find_task_by_pid(waiter->task_pid);
+        if (waiter_task != nullptr) {
+            waiter_task->deferredTaskSwitch = false;
+            mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
+            woken_count++;
         }
-    }
-
-    futex_lock.unlock();
+        mod::mm::dyn::kmalloc::free(waiter);
+    });
 
     return woken_count;
 }

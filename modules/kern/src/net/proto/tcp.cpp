@@ -138,9 +138,12 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
         return -EAGAIN;
     }
 
-    Socket* child = sock->accept_queue[sock->aq_head];
-    sock->accept_queue[sock->aq_head] = nullptr;
-    sock->aq_head = (sock->aq_head + 1) % SOCKET_ACCEPT_QUEUE;
+    Socket* child = sock->aq_head;
+    sock->aq_head = child->accept_next;
+    child->accept_next = nullptr;
+    if (sock->aq_head == nullptr) {
+        sock->aq_tail = nullptr;
+    }
     sock->aq_count--;
     sock->lock.unlock();
 

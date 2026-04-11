@@ -1249,6 +1249,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             idle_rq->currentTask = idle_rq->idleTask;
             idle_rq->isIdle.store(true, std::memory_order_release);
             debug_task_ptrs[cpu::currentCpu()] = idle_rq->idleTask;
+            mm::virt::switchToKernelPagemap();
             restore_kernel_gs_for_idle();
 
             frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
@@ -1394,6 +1395,8 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
 #endif
         rq->currentTask = rq->idleTask;
         rq->isIdle.store(true, std::memory_order_release);
+        debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
+        mm::virt::switchToKernelPagemap();
         restore_kernel_gs_for_idle();
 
         frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
@@ -1833,6 +1836,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         uint64_t idle_stack = (rq->idleTask != nullptr) ? rq->idleTask->context.syscallKernelStack
                                                         : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
 
+        mm::virt::switchToKernelPagemap();
         restore_kernel_gs_for_idle();
 
         asm volatile(
@@ -1951,13 +1955,16 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
         next_task->hasRun = true;
         if (!sys::context_switch::switchTo(gpr, frame, next_task)) {
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
-            run_queues->this_cpu()->isIdle.store(true, std::memory_order_release);
+            auto* rq = run_queues->this_cpu();
+            rq->currentTask = rq->idleTask;
+            rq->isIdle.store(true, std::memory_order_release);
+            debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
+            mm::virt::switchToKernelPagemap();
             restore_kernel_gs_for_idle();
 
             frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
             frame.cs = 0x08;
             frame.ss = 0x10;
-            auto* rq = run_queues->this_cpu();
             frame.rsp = (rq->idleTask != nullptr) ? rq->idleTask->context.syscallKernelStack
                                                   : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
             frame.flags = 0x202;
@@ -1968,7 +1975,9 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
         auto* rq = run_queues->this_cpu();
         rq->currentTask = rq->idleTask;
         rq->isIdle.store(true, std::memory_order_release);
+        debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
         arm_idle_timer_for_this_cpu();
+        mm::virt::switchToKernelPagemap();
         restore_kernel_gs_for_idle();
 
         frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
@@ -2084,7 +2093,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         // event already arrived, effectively losing the wake.
         task->wantsBlock = false;
         task->wakeAtUs = 0;
-        if (wake_current && current_cpu_of_task < perf::PERF_MAX_CPUS) {
+        if (wake_current && current_cpu_of_task < perf::get_num_perf_cpus()) {
             perf::record_wake(static_cast<uint32_t>(current_cpu_of_task), task->pid, wake_at_us, perf_wake_flags(wake_at_us, true, true),
                               observed_sleep_us(task, now_us), perf_wait_callsite(task));
         }

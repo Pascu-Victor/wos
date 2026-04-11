@@ -128,15 +128,12 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     }
 
     // Add the current task's PID to the target task's awaitee list
-    if (target_task->awaitee_on_exit_count >= ker::mod::sched::task::Task::MAX_AWAITEE_COUNT) {
+    if (!target_task->awaitee_on_exit.push_back(currentTask->pid)) {
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Awaitee list full for PID %x", pid);
 #endif
-        return static_cast<uint64_t>(-1);  // Awaitee list is full
+        return static_cast<uint64_t>(-1);  // OOM
     }
-
-    target_task->awaitee_on_exit[target_task->awaitee_on_exit_count] = currentTask->pid;
-    target_task->awaitee_on_exit_count++;
 #ifdef WAITPID_DEBUG
     ker::mod::dbg::log("wos_proc_waitpid: Added PID %x to awaitee list of PID %x", currentTask->pid, pid);
 #endif

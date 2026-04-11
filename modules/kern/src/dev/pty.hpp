@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/sys/spinlock.hpp>
+#include <util/smallvec.hpp>
 
 #include "device.hpp"
 
@@ -99,7 +100,6 @@ struct PtyRingBuf {
 // Canonical line buffer size
 static constexpr size_t CANON_BUF_SIZE = 256;
 static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
-static constexpr size_t PTY_POLL_MAX_WAITERS = 8;
 
 // A single PTY pair (master + slave)
 struct PtyPair {
@@ -128,26 +128,23 @@ struct PtyPair {
     size_t cpr_filter_len = 0;
     bool cpr_filter_active = false;
 
-    uint64_t master_poll_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t master_poll_waiter_count = 0;
-    uint64_t slave_poll_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t slave_poll_waiter_count = 0;
-    uint64_t master_read_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t master_read_waiter_count = 0;
-    uint64_t master_write_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t master_write_waiter_count = 0;
-    uint64_t slave_read_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t slave_read_waiter_count = 0;
-    uint64_t slave_write_waiters[PTY_POLL_MAX_WAITERS]{};
-    size_t slave_write_waiter_count = 0;
+    ker::util::SmallVec<uint64_t, 2> master_poll_waiters;
+    ker::util::SmallVec<uint64_t, 2> slave_poll_waiters;
+    ker::util::SmallVec<uint64_t, 2> master_read_waiters;
+    ker::util::SmallVec<uint64_t, 2> master_write_waiters;
+    ker::util::SmallVec<uint64_t, 2> slave_read_waiters;
+    ker::util::SmallVec<uint64_t, 2> slave_write_waiters;
+
+    // Persistent slave name buffer (e.g., "0", "12")
+    char slave_name[8]{};
 
     // Device structs for master and slave
     Device master_dev;
     Device slave_dev;
 };
 
-// Maximum concurrent PTY pairs
-static constexpr size_t PTY_MAX = 64;
+// Maximum concurrent PTY pairs (soft limit for PTY number assignment)
+static constexpr size_t PTY_MAX = 256;
 
 // Initialize PTY subsystem: registers /dev/ptmx, creates /dev/pts/ directory
 void pty_init();

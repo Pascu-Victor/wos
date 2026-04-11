@@ -287,16 +287,17 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
             console_stderr->fops = ker::vfs::devfs::get_devfs_fops();
 
             // Assign file descriptors 0, 1, 2
-            new_task->fds[0] = console_stdin;
+            new_task->fd_table.insert(0, console_stdin);
             console_stdin->fd = 0;
             dbg::log("Setup fd 0 (stdin): %p", console_stdin);
-            new_task->fds[1] = console_stdout;
+            new_task->fd_table.insert(1, console_stdout);
             console_stdout->fd = 1;
             dbg::log("Setup fd 1 (stdout): %p", console_stdout);
-            new_task->fds[2] = console_stderr;
+            new_task->fd_table.insert(2, console_stderr);
             console_stderr->fd = 2;
             dbg::log("Setup fd 2 (stderr): %p", console_stderr);
-            dbg::log("Verifying: fds[0]=%p, fds[1]=%p, fds[2]=%p", new_task->fds[0], new_task->fds[1], new_task->fds[2]);
+            dbg::log("Verifying: fds[0]=%p, fds[1]=%p, fds[2]=%p", new_task->fd_table.lookup(0), new_task->fd_table.lookup(1),
+                     new_task->fd_table.lookup(2));
 
             dbg::log("Setup stdin/stdout/stderr for task %s", module.name);
         } else {
@@ -543,7 +544,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     // CRITICAL: Initialize scheduler and create init task BEFORE starting secondary CPUs
     // This ensures init gets PID 1, regardless of how many CPUs exist
     sched::percpu_init();
-    dbg::log("Creating init task(s) on BSP BEFORE starting secondary CPUs to ensure PID 1");
+    dbg::log("Creating init task(s) from handover modules");
     create_init_tasks(modules, kernel_rsp);
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context

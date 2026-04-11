@@ -71,7 +71,7 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (new_offset != nullptr) {
                 *new_offset = ret;
             }
-            return 0;
+            return static_cast<int64_t>(ret);
         }
         case ops::isatty: {
             int fd = static_cast<int>(a1);
@@ -289,8 +289,8 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // Get the file for the fd
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) return -ESRCH;
-            if (fd < 0 || fd >= static_cast<int>(ker::mod::sched::task::Task::FD_TABLE_SIZE)) return -EBADF;
-            auto* file = static_cast<ker::vfs::File*>(task->fds[fd]);
+            if (fd < 0) return -EBADF;
+            auto* file = static_cast<ker::vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
             if (file == nullptr) return -EBADF;
             if (file->fs_type == ker::vfs::FSType::DEVFS) {
                 return static_cast<int64_t>(ker::vfs::devfs::devfs_ioctl(file, cmd, arg));

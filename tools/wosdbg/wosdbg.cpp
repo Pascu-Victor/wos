@@ -2029,10 +2029,7 @@ void QemuLogViewer::onDetailsPaneLinkClicked(const QUrl& url) {
     } else if (url.scheme() == "wos-remote") {
         // Format: wos-remote://path:line
         QString path = url.path();  // /path/to/file:line
-        // Remove leading slash if present (Qt adds it for host-less URLs sometimes)
-        // But here we used wos-remote://path:line, so host is empty, path is /path:line
 
-        // Actually, let's parse it manually from string to be safe
         QString urlStr = url.toString();
         QString prefix = "wos-remote://";
         if (urlStr.startsWith(prefix)) {

@@ -80,6 +80,7 @@ constexpr std::string_view PROC_CMDLINE_SUFFIX = "/cmdline";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
 constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
+constexpr std::string_view KCONTSTAT_PATH = "/proc/kcontstat";
 constexpr std::string_view SECTION_HEADER = "--- SECTION";
 constexpr std::string_view SECTION_EVENTS = "--- SECTION EVENTS ---\n";
 constexpr std::string_view SECTION_EVENTS_END = "--- END EVENTS ---\n";
@@ -178,6 +179,7 @@ struct EventInfo {
     uint64_t other_pid{};
     uint64_t data{};
     std::string callsite;
+    std::string subsys_name;
     int64_t lag{};
     uint8_t flags{};
     uint32_t aux{};
@@ -582,7 +584,7 @@ void cmd_stat(int ms) {
     }
 }
 
-void cmd_record(int ms) {
+void cmd_record(int ms, const char* filter = nullptr) {
     if (ms < 1) {
         ms = DEFAULT_SAMPLE_MS;
     }
@@ -593,8 +595,14 @@ void cmd_record(int ms) {
         return;
     }
 
-    write_all(control_fd.get(), "enable");
-    std::println("perf: recording for {} ms...", ms);
+    if (filter != nullptr) {
+        std::string cmd = std::string("enable ") + filter;
+        write_all(control_fd.get(), cmd.c_str());
+        std::println("perf: recording with filter '{}' for {} ms...", filter, ms);
+    } else {
+        write_all(control_fd.get(), "enable");
+        std::println("perf: recording for {} ms...", ms);
+    }
     wall_sleep_ms(ms);
     write_all(control_fd.get(), "disable");
     std::println("perf: recording stopped.");
@@ -715,6 +723,23 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
                 }
             } else {
                 out.flags = static_cast<uint8_t>((out.type == 'B' ? FLAG_BLOCK : 0U) | (out.data != 0 ? FLAG_TIMED : 0U));
+            }
+            return true;
+
+        case 'C':
+            // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
+            if (token_count < EVENT_EXTENDED_TOKEN_COUNT) {
+                return false;
+            }
+            out.pid = parse_u64(tokens[TOK_PID]);
+            out.subsys_name = std::string(tokens[TOK_DATA]);  // tok 3 = subsys_name
+            out.flags = parse_u8(tokens[TOK_LAG]);            // tok 4 = flags
+            out.lag = parse_i64(tokens[TOK_FLAGS]);           // tok 5 = element count
+            if (token_count >= TOK_AUX + 1) {
+                out.aux = parse_u32(tokens[TOK_AUX]);  // tok 6 = capacity
+            }
+            if (token_count >= TOK_CALLSITE + 1) {
+                out.callsite = std::string(tokens[TOK_CALLSITE]);
             }
             return true;
 
@@ -1017,6 +1042,10 @@ void cmd_sched(int max_events) {
                        format_pid_name(event.pid, proc_map), event.data, event.aux, display_callsite(event.callsite));
             print_wait_flags(event.flags);
             std::println("");
+        } else if (event.type == 'C') {
+            std::println("CNT  {:>18}  {:>3}  {:<24} subsys={} count={} cap={} flags={} site={}", event.ts_ns, event.cpu,
+                         format_pid_name(event.pid, proc_map), event.subsys_name, event.lag, event.aux, static_cast<unsigned>(event.flags),
+                         display_callsite(event.callsite));
         }
 
         ++count;
@@ -1054,6 +1083,50 @@ void cmd_cpustat() {
 
         std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("ctx="), get_val("preempt="),
                      get_val("yield="), get_val("sleep="), get_val("wake="), get_val("sample="));
+    }
+}
+
+void cmd_contstat() {
+    auto buffer = read_file(KCONTSTAT_PATH, CPUSTAT_READ_CAPACITY);
+    if (!buffer.has_value() || buffer->empty()) {
+        std::println("perf: cannot read /proc/kcontstat (no activity yet?)");
+        return;
+    }
+
+    std::println("=== perf contstat ==================================================");
+    std::println("{:<14}  {:>10}  {:>10}  {:>10}  {:>6}  {:>10}  {:>10}", "subsystem", "inserts", "removes", "resizes", "oom", "peak",
+                 "current");
+    std::println("{:->14}  {:->10}  {:->10}  {:->10}  {:->6}  {:->10}  {:->10}", "", "", "", "", "", "", "");
+
+    std::size_t pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) -> uint64_t {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return 0;
+            }
+            key_pos += key.size();
+            std::size_t end = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos));
+        };
+
+        auto get_str = [&](std::string_view key) -> std::string_view {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return "?";
+            }
+            key_pos += key.size();
+            std::size_t end = line.find(' ', key_pos);
+            return line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos);
+        };
+
+        std::println("{:<14}  {:>10}  {:>10}  {:>10}  {:>6}  {:>10}  {:>10}", get_str("subsys="), get_val("inserts="), get_val("removes="),
+                     get_val("resizes="), get_val("oom="), get_val("peak="), get_val("current="));
     }
 }
 
@@ -1336,10 +1409,11 @@ void usage() {
     std::println("Usage: perf <command> [args]");
     std::println("Commands:");
     std::println("  stat     [ms=1000]    CPU% per process (sampling window in ms)");
-    std::println("  record   [ms=1000]    Record kernel events for N ms, save to perf.data");
+    std::println("  record   [ms=1000] [--filter=switch,container]  Record events");
     std::println("  report   [n=2000]     Display events from perf.data (or live ring buffer)");
     std::println("  sched    [n=2000]     Alias for report");
     std::println("  cpustat               Per-CPU aggregate scheduler statistics");
+    std::println("  contstat              Per-subsystem container statistics");
     std::println("  top      [ms=1000]    Continuous CPU% snapshots");
     std::println("  run      <cmd> [args] Trace cmd+descendants, save to perf.data");
     std::println("  show-map              Show PID->name/cmdline map from perf.data");
@@ -1358,13 +1432,24 @@ int main(int argc, char* argv[]) {
         int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
         cmd_stat(ms);
     } else if (cmd == "record") {
-        int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-        cmd_record(ms);
+        int ms = DEFAULT_SAMPLE_MS;
+        const char* filter = nullptr;
+        for (int i = 2; i < argc; ++i) {
+            std::string_view arg(argv[i]);
+            if (arg.starts_with("--filter=")) {
+                filter = argv[i] + 9;
+            } else {
+                ms = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+            }
+        }
+        cmd_record(ms, filter);
     } else if (cmd == "report" || cmd == "sched") {
         int max_events = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_MAX_EVENTS;
         cmd_sched(max_events);
     } else if (cmd == "cpustat") {
         cmd_cpustat();
+    } else if (cmd == "contstat") {
+        cmd_contstat();
     } else if (cmd == "top") {
         int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
         cmd_top(ms);

@@ -571,6 +571,13 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
         leaf_name = slash + 1;
     }
 
+    if (auto* existing = find_child(parent, leaf_name); existing != nullptr) {
+        existing->type = DevFSNodeType::DEVICE;
+        existing->device = dev;
+        existing->mode = 0666;
+        return existing;
+    }
+
     auto* node = create_node(leaf_name, DevFSNodeType::DEVICE);
     if (node == nullptr) {
         return nullptr;
@@ -578,6 +585,20 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
     node->device = dev;
     add_child(parent, node);
     return node;
+}
+
+auto devfs_remove_node(const char* path) -> bool {
+    auto* node = walk_path(path, false);
+    if (node == nullptr || node == &root_node || node->parent == nullptr) {
+        return false;
+    }
+    if (node->type == DevFSNodeType::DIRECTORY && node->children_count != 0) {
+        return false;
+    }
+
+    remove_child(node->parent, node);
+    delete node;
+    return true;
 }
 
 void devfs_populate_partition_symlinks() {
