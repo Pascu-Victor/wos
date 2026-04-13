@@ -44,22 +44,34 @@ add_custom_target(check_headers
 )
 
 # --- mlibc: build and install the C library ---------------------------------
-add_custom_target(mlibc
+# Use a stamp file so mlibc only rebuilds when the stamp is missing or stale.
+# Delete build/stamps/mlibc.stamp to force a rebuild.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stamps)
+set(MLIBC_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc.stamp)
+add_custom_command(
+    OUTPUT ${MLIBC_STAMP}
     COMMAND ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh ${CMAKE_BUILD_TYPE}
+    COMMAND ${CMAKE_COMMAND} -E touch ${MLIBC_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building mlibc..."
+    DEPENDS ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh
     USES_TERMINAL
 )
+add_custom_target(mlibc DEPENDS ${MLIBC_STAMP})
 
 # --- libcxx: build and install libc++ ---------------------------------------
-add_custom_target(libcxx
+set(LIBCXX_STAMP ${CMAKE_BINARY_DIR}/stamps/libcxx.stamp)
+add_custom_command(
+    OUTPUT ${LIBCXX_STAMP}
     COMMAND ninja -C ${LIBCXX_BUILD_DIR}
     COMMAND ninja -C ${LIBCXX_BUILD_DIR} install
+    COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building libc++..."
+    DEPENDS ${MLIBC_STAMP}
     USES_TERMINAL
 )
-add_dependencies(libcxx mlibc)
+add_custom_target(libcxx DEPENDS ${LIBCXX_STAMP})
 
 # --- busybox: cross-compile busybox for WOS ---------------------------------
 add_custom_target(busybox
@@ -98,8 +110,11 @@ add_custom_target(boot_image
 )
 add_dependencies(boot_image wos_modules mountfs_disk)
 
-# --- wos_modules must build after all toolchain/external projects ----------
-add_dependencies(wos_modules mlibc libcxx busybox dropbear)
+foreach(mod wos init testprog netd httpd perf)
+    add_dependencies(${mod} mlibc libcxx)
+endforeach()
+# busybox and dropbear are only needed for image creation, not compilation.
+add_dependencies(boot_image busybox dropbear)
 
 # --- wos_full: top-level target that builds everything ---------------------
 add_custom_target(wos_full

@@ -68,3 +68,4 @@ fi
 
 ninja -C "$MLIBC_BUILD"
 ninja -C "$MLIBC_BUILD" install
+sync
