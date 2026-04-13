@@ -1,5 +1,3 @@
-#define _DEFAULT_SOURCE 1
-
 #include "netbench.hpp"
 
 #include <arpa/inet.h>

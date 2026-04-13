@@ -1,5 +1,3 @@
-#define _DEFAULT_SOURCE 1
-
 #include "fsbench.hpp"
 
 #include <fcntl.h>

@@ -1,4 +1,3 @@
-#define _DEFAULT_SOURCE 1
 #include <sys/multiproc.h>
 #include <time.h>
 

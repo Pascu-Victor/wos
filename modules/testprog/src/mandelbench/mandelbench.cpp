@@ -12,7 +12,6 @@
 #include <print>
 
 #include "config.hpp"
-#define _DEFAULT_SOURCE 1
 #ifdef WOS
 #include <sys/multiproc.h>
 #endif

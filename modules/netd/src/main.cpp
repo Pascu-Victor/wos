@@ -1,6 +1,3 @@
-#include "abi-bits/route.h"
-#define _DEFAULT_SOURCE 1
-
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -15,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <print>
+
+#include "abi-bits/route.h"
 
 namespace {
 

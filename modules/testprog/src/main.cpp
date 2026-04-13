@@ -1,4 +1,3 @@
-#define _DEFAULT_SOURCE 1
 #include <abi/callnums/sys_log.h>
 #include <arpa/inet.h>
 #include <dirent.h>
