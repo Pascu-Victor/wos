@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -10,6 +11,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 
+#include "net/socket.hpp"
 #include "tcp.hpp"
 
 namespace ker::net::proto {
@@ -430,6 +432,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 if (cb->socket != nullptr) {
                     cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                 }
+            } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(seg_seq, cb->rcv_nxt)) {
+                // Keepalive probe
+                build_deferred_ack();
             }
 
             // FIN: ACK immediately and cancel delayed ACK.
