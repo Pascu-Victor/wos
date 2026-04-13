@@ -480,9 +480,10 @@ int master_close(ker::vfs::File* file) {
     pair->master_opened--;
 
     bool should_free = false;
-    // If slave is also closed, free the pair
-    if (pair->slave_opened <= 0) {
+    // If slave is also closed AND no one else is already freeing, free the pair
+    if (pair->slave_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
+        pair->freeing = true;
         should_free = true;
     }
     pair->lock.unlock_irqrestore(irqf);
@@ -957,9 +958,10 @@ int slave_close(ker::vfs::File* file) {
     pair->slave_opened--;
 
     bool should_free = false;
-    // If master is also closed, free the pair
-    if (pair->master_opened <= 0) {
+    // If master is also closed AND no one else is already freeing, free the pair
+    if (pair->master_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
+        pair->freeing = true;
         should_free = true;
     }
     pair->lock.unlock_irqrestore(irqf);

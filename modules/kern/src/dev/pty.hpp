@@ -106,6 +106,7 @@ struct PtyPair {
     int index;                // PTY number (for /dev/pts/N)
     bool allocated;           // In use
     bool slave_locked;        // TIOCSPTLCK lock (must be unlocked before slave can be opened)
+    bool freeing = false;     // Set under lock by first closer to prevent double-free
     int slave_opened;         // Slave open refcount (0 = closed)
     int master_opened;        // Master open refcount (0 = closed)
     Winsize winsize;          // Terminal dimensions
