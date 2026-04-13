@@ -1084,7 +1084,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
     f->dir_fs_count = static_cast<size_t>(-1);
     f->open_flags = flags;
-    f->fd_flags = (flags & ker::vfs::O_CLOEXEC) ? ker::vfs::FD_CLOEXEC : 0;
+    f->fd_flags = 0;  // fd_flags on File is legacy; CLOEXEC is per-fd in task bitmap
 
     // Permission check: verify R/W access based on open flags
     // Build required access bits from open flags
@@ -1111,6 +1111,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     if (fd < 0) {
         return -1;
     }
+    if (flags & ker::vfs::O_CLOEXEC) {
+        current->set_fd_cloexec(static_cast<unsigned>(fd));
+    }
     return fd;
 }
 
@@ -1130,6 +1133,7 @@ auto vfs_close(int fd) -> int {
 
     // Release the FD from the task's file descriptor table
     vfs_release_fd(t, fd);
+    t->clear_fd_cloexec(static_cast<unsigned>(fd));
 
     // Only call close and free if no more references
     if (f->refcount <= 0) {
@@ -1205,7 +1209,7 @@ auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_lseek == nullptr)) {
-        return -EINVAL;
+        return -ESPIPE;
     }
     return f->fops->vfs_lseek(f, offset, whence);
 }
@@ -1219,8 +1223,7 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
         return -1;  // EMFILE (too many open files) or OOM
     }
     file->fd = static_cast<int>(slot);
-    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
-                                          ker::mod::perf::PERF_FLAG_CT_INSERT,
+    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
                                           static_cast<int64_t>(task->fd_table.size()), 0,
                                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return static_cast<int>(slot);
@@ -1238,8 +1241,7 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
         return -1;
     }
     task->fd_table.remove(static_cast<uint64_t>(fd));
-    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
-                                          ker::mod::perf::PERF_FLAG_CT_REMOVE,
+    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
                                           static_cast<int64_t>(task->fd_table.size()), 0,
                                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return 0;
@@ -1695,7 +1697,10 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                 const char* child = pre_rewrite + 5;
                 bool has_slash = false;
                 for (const char* p = child; *p != '\0'; ++p) {
-                    if (*p == '/') { has_slash = true; break; }
+                    if (*p == '/') {
+                        has_slash = true;
+                        break;
+                    }
                 }
                 if (*child != '\0' && !has_slash) {
                     is_wki_entry = true;
@@ -1729,7 +1734,10 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
             const char* child = pathBuffer + 5;
             bool has_slash = false;
             for (const char* p = child; *p != '\0'; ++p) {
-                if (*p == '/') { has_slash = true; break; }
+                if (*p == '/') {
+                    has_slash = true;
+                    break;
+                }
             }
             if (*child != '\0' && !has_slash) {
                 is_wki_entry = true;
@@ -2024,6 +2032,8 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     }
     f->refcount++;
     task->fd_table.insert(static_cast<uint64_t>(newfd), f);
+    // POSIX: dup2 does NOT inherit close-on-exec from the source fd
+    task->clear_fd_cloexec(static_cast<unsigned>(newfd));
     return newfd;
 }
 
@@ -2554,12 +2564,17 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
                 f->refcount--;
                 return -EMFILE;
             }
+            task->clear_fd_cloexec(static_cast<unsigned>(slot));
             return static_cast<int>(slot);
         }
         case 1:  // F_GETFD
-            return f->fd_flags;
+            return task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
         case 2:  // F_SETFD
-            f->fd_flags = static_cast<int>(arg);
+            if (arg & 1) {
+                task->set_fd_cloexec(static_cast<unsigned>(fd));
+            } else {
+                task->clear_fd_cloexec(static_cast<unsigned>(fd));
+            }
             return 0;
         case 3:  // F_GETFL
             return f->open_flags;
@@ -2573,12 +2588,7 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
                 f->refcount--;
                 return -EMFILE;
             }
-            // Note: fd_flags is stored per-File, not per-fd-slot.
-            // Only set CLOEXEC if refcount==1 (no other fds share this File).
-            // TODO: implement proper per-fd flags separate from File object.
-            if (f->refcount <= 1) {
-                f->fd_flags = 1;  // FD_CLOEXEC
-            }
+            task->set_fd_cloexec(static_cast<unsigned>(slot));
             return static_cast<int>(slot);
         }
         default:
@@ -2686,10 +2696,14 @@ auto vfs_pipe(int pipefd[2]) -> int {
         if (st->count > 0) {
             size_t to_read = count < st->count ? count : st->count;
             auto* dst = static_cast<char*>(buf);
-            for (size_t i = 0; i < to_read; ++i) {
-                dst[i] = st->buf[st->tail];
-                st->tail = (st->tail + 1) % st->capacity;
+            size_t first = st->capacity - st->tail;
+            if (first >= to_read) {
+                std::memcpy(dst, st->buf + st->tail, to_read);
+            } else {
+                std::memcpy(dst, st->buf + st->tail, first);
+                std::memcpy(dst + first, st->buf, to_read - first);
             }
+            st->tail = (st->tail + to_read) % st->capacity;
             st->count -= to_read;
 
             if (st->writers_waiting.size() > 0) {
@@ -2723,6 +2737,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
         }
 
         if (pipe_register_waiter(st->readers_waiting, currentTask->pid)) {
+            currentTask->wait_channel = "pipe_read";
             currentTask->deferredTaskSwitch = true;
             st->lock.unlock_irqrestore(irqf);
             return -PIPE_WOS_ERESTARTSYS;
@@ -2754,10 +2769,15 @@ auto vfs_pipe(int pipefd[2]) -> int {
         if (avail > 0) {
             size_t to_write = count < avail ? count : avail;
             auto* src = static_cast<const char*>(buf);
-            for (size_t i = 0; i < to_write; ++i) {
-                st->buf[st->head] = src[i];
-                st->head = (st->head + 1) % st->capacity;
+            // Bulk copy into ring buffer (at most 2 memcpy segments for wraparound)
+            size_t first = st->capacity - st->head;
+            if (first >= to_write) {
+                std::memcpy(st->buf + st->head, src, to_write);
+            } else {
+                std::memcpy(st->buf + st->head, src, first);
+                std::memcpy(st->buf, src + first, to_write - first);
             }
+            st->head = (st->head + to_write) % st->capacity;
             st->count += to_write;
 
             if (st->readers_waiting.size() > 0) {
@@ -2785,6 +2805,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
         }
 
         if (pipe_register_waiter(st->writers_waiting, currentTask->pid)) {
+            currentTask->wait_channel = "pipe_write";
             currentTask->deferredTaskSwitch = true;
             st->lock.unlock_irqrestore(irqf);
             return -PIPE_WOS_ERESTARTSYS;
@@ -3385,11 +3406,22 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
             size_t bytes_written = 0;
             ssize_t write_result = vfs_write(outfd, buffer + chunk_offset, chunk_size - chunk_offset, &bytes_written);
             if (write_result < 0) {
+                auto* current = mod::sched::get_current_task();
+                if (current != nullptr && current->deferredTaskSwitch) {
+                    ker::mod::mm::dyn::kmalloc::free(buffer);
+                    if (offset != nullptr) {
+                        *offset = source_offset;
+                    } else {
+                        infile->pos = source_offset;
+                    }
+                    return total_sent > 0 ? total_sent : write_result;
+                }
                 if (total_sent == 0) {
                     ker::mod::mm::dyn::kmalloc::free(buffer);
                     return write_result;
                 }
                 chunk_offset = chunk_size;
+                remaining = 0;
                 break;
             }
 

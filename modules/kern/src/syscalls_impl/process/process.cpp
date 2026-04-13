@@ -232,6 +232,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         }
     });
 
+    // Copy per-fd close-on-exec bitmap
+    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE / 64; i++) {
+        child->fd_cloexec[i] = parent->fd_cloexec[i];
+    }
+
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
         // Undo FD refcount increments

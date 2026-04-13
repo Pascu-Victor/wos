@@ -98,6 +98,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                     // (move to wait list). The timer tick wakeup scan will reschedule us
                     // once wakeAtUs is reached.
                     task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
+                    task->wait_channel = "nanosleep";
                     task->deferredTaskSwitch = true;
                     // Return 0 now - syscall exit path sees deferredTaskSwitch=true,
                     // moves task to wait list, switches to next task.

@@ -138,6 +138,20 @@ struct Task {
     static constexpr unsigned FD_TABLE_SIZE = 256;
     ker::util::RadixTree<void*> fd_table;
 
+    // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
+    uint64_t fd_cloexec[FD_TABLE_SIZE / 64] = {};
+
+    inline void set_fd_cloexec(unsigned fd) {
+        if (fd < FD_TABLE_SIZE) fd_cloexec[fd / 64] |= (1ULL << (fd % 64));
+    }
+    inline void clear_fd_cloexec(unsigned fd) {
+        if (fd < FD_TABLE_SIZE) fd_cloexec[fd / 64] &= ~(1ULL << (fd % 64));
+    }
+    [[nodiscard]] inline bool get_fd_cloexec(unsigned fd) const {
+        if (fd >= FD_TABLE_SIZE) return false;
+        return (fd_cloexec[fd / 64] & (1ULL << (fd % 64))) != 0;
+    }
+
     // Current working directory (absolute path, "/" by default)
     static constexpr unsigned CWD_MAX = 256;
     char cwd[CWD_MAX] = "/";
@@ -161,6 +175,9 @@ struct Task {
     // Empty means use automatic load-based placement.
     static constexpr unsigned WKI_TARGET_HOSTNAME_MAX = 64;
     static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
+    static constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1;      // pin task to local node (skip remote placement)
+    static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to children on exec
+    static constexpr uint32_t WKI_TARGET_FLAGS_ALL = WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT;
     char wki_target_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
     uint32_t wki_target_flags = 0;
 
@@ -208,6 +225,11 @@ struct Task {
     bool deferredTaskSwitch;
     // When true, deferredTaskSwitch puts task in expired queue (yield) instead of wait queue (block)
     bool yieldSwitch;
+
+    // Set by reschedule_task_for_cpu when a wakeup fires while this task is
+    // still currentTask (about to block via deferred_task_switch).  Checked
+    // under the RQ lock in deferred_task_switch to avoid lost wakeups.
+    std::atomic<bool> wakeupPending{false};
 
     // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
     // in a syscall wait loop).  The scheduler may preempt it as if it were a DAEMON,
@@ -312,6 +334,11 @@ struct Task {
 
     // Most recent block/yield callsite used for perf wait-churn attribution.
     uint64_t perfWaitCallsite = 0;
+
+    // Wait channel: human-readable string describing why the task is blocked.
+    // Set at every block site (deferredTaskSwitch, kern_block, kern_sleep_us).
+    // Cleared when the task is rescheduled. Visible via /proc/<pid>/stat (wchan).
+    const char* wait_channel = nullptr;
 
     // Set when a task transitions from the wait list to the runnable heap
     // (timer expiry or kern_wake).  process_tasks uses this to enforce a

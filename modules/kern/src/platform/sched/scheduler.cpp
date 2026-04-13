@@ -286,6 +286,9 @@ std::array<task::Task*, desc::gdt::MAX_CPUS> debug_task_ptrs = {nullptr};  // NO
 // Must not conflict with device driver IRQ allocations.
 uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+// Cached APIC timer tick count for the idle timer.
+uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
@@ -658,8 +661,9 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
         task->sliceUsedNs = 0;
         task->schedQueue = task::Task::SchedQueue::RUNNABLE;
 
-        rq->runnableHeap.insert(task);
-        add_to_sums(rq, task);
+        if (rq->runnableHeap.insert(task)) {
+            add_to_sums(rq, task);
+        }
     });
 
     if (release_reservation) {
@@ -687,7 +691,10 @@ static void request_local_reschedule() {
 
 static void arm_idle_timer_locked(RunQueue* rq) {
     rq->idleTimerArms.fetch_add(1, std::memory_order_relaxed);
-    apic::oneShotTimer(apic::calibrateTimer(10000));
+    if (idle_timer_ticks == 0) {
+        idle_timer_ticks = apic::calibrateTimer(10000);
+    }
+    apic::oneShotTimer(idle_timer_ticks);
 }
 
 // Enter the kernel idle loop on the idle task's stack. Does NOT return.
@@ -951,8 +958,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
                 w->vdeadline = w->vruntime + (((int64_t)w->sliceNs * 1024) / (int64_t)w->schedWeight);
                 w->sliceUsedNs = 0;
                 w->schedQueue = task::Task::SchedQueue::RUNNABLE;
-                rq->runnableHeap.insert(w);
-                add_to_sums(rq, w);
+                if (rq->runnableHeap.insert(w)) {
+                    add_to_sums(rq, w);
+                }
             }
         });
     }
@@ -1184,7 +1192,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         // netpoll, etc.) win vdeadline comparisons on every 4ms tick purely
         // because they slept and were placed at avg_vruntime while the compute
         // task accumulated vruntime above avg.
-        static constexpr uint64_t SCHED_MIN_GRANULARITY_US = 6000ULL;  // 6ms
+        static constexpr uint64_t SCHED_MIN_GRANULARITY_US = 1000ULL;  // 1ms
         static constexpr uint64_t SCHED_BACKGROUND_PREEMPT_BASE_US = 12000ULL;
         static constexpr uint64_t SCHED_BACKGROUND_PREEMPT_PER_NICE_US = 2500ULL;
         static constexpr uint64_t SCHED_BACKGROUND_PREEMPT_MAX_US = 48000ULL;
@@ -1560,13 +1568,18 @@ static void check_pending_signals_deferred(task::Task* task) {
         return;
     }
 
+    // Do not deliver a new signal if we are already inside a signal handler.
+    if (task->inSignalHandler) {
+        return;
+    }
+
     uint64_t deliverable = task->sigPending & ~task->sigMask;
     if (deliverable == 0) {
         return;
     }
 
     int signo = __builtin_ctzll(deliverable) + 1;
-    unsigned idx = static_cast<unsigned>(signo - 1);
+    auto idx = static_cast<unsigned>(signo - 1);
     task->sigPending &= ~(1ULL << idx);
 
     auto& handler = task->sigHandlers[idx];
@@ -1769,8 +1782,13 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             rq->totalWeightedVruntime += vruntime_delta * (int64_t)current_task->schedWeight;
         }
 
-        if (is_yield || skip_wait_queue) {
-            // Yield / target already exited: task stays in heap with fresh deadline
+        // A concurrent wakeup may have seen this task as rq->currentTask and
+        // set wakeupPending instead of moving it. Blocking now would lose that
+        // wake and leave the task stuck, so treat it as a yield instead.
+        bool woke = current_task->wakeupPending.exchange(false, std::memory_order_acquire);
+
+        if (is_yield || skip_wait_queue || woke) {
+            // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
             if (rq->runnableHeap.contains(current_task)) {
                 note_perf_wait_callsite(current_task, current_task->context.frame.rip);
                 current_task->sliceUsedNs = 0;
@@ -1825,6 +1843,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                             current_task->sliceUsedNs / 1000U, (is_yield || !skip_wait_queue) ? perf_wait_callsite(current_task) : 0);
     }
 
+    // Notify WKI proxy only when the task actually transitioned to WAITING.
+    if (!is_yield && !skip_wait_queue && current_task->schedQueue == task::Task::SchedQueue::WAITING &&
+        current_task->wki_proxy_task_id != 0) {
+        ker::net::wki::wki_proxy_task_blocked(current_task);
+    }
+
     if (next_task == nullptr || next_task->type == task::TaskType::IDLE) {
         // Enter idle loop
         auto* rq = run_queues->this_cpu();
@@ -1847,10 +1871,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             : "r"(idle_stack)
             : "memory");
         __builtin_unreachable();
-    }
-
-    if (!is_yield && !skip_wait_queue && current_task->wki_proxy_task_id != 0) {
-        ker::net::wki::wki_proxy_task_blocked(current_task);
     }
 
     next_task->hasRun = true;
@@ -2084,6 +2104,10 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
         dbg::log("RESCHED: PID %x ABORT - is currentTask somewhere", task->pid);
 #endif
+        // Signal to deferred_task_switch that a wakeup was attempted while
+        // the task is still currentTask.
+        task->wakeupPending.store(true, std::memory_order_release);
+
         uint64_t now_us = time::getUs();
         uint64_t wake_at_us = task->wakeAtUs;
         bool wake_current = task->voluntaryBlock || task->wantsBlock || task->lastSleepStartUs != 0;
@@ -2148,6 +2172,8 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         uint64_t now_us = time::getUs();
         bool was_waiting = (task->schedQueue == task::Task::SchedQueue::WAITING);
         uint64_t wake_at_us = task->wakeAtUs;
+        // Clear wait channel on wakeup
+        task->wait_channel = nullptr;
         // Mark justWoke if this is a sleep->run transition (task was in WAITING state).
         // justWoke inhibits wakeup-preemption for SCHED_MIN_GRANULARITY_US; see process_tasks.
         task->justWoke = was_waiting;
@@ -2172,8 +2198,9 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         // If wantsBlock is left true, the next timer tick would immediately re-block it.
         task->wantsBlock = false;
 
-        rq->runnableHeap.insert(task);
-        add_to_sums(rq, task);
+        if (rq->runnableHeap.insert(task)) {
+            add_to_sums(rq, task);
+        }
     });
 
     // Poke the target CPU so the newly-rescheduled task runs promptly.

@@ -47,6 +47,7 @@ void defer_socket_wait(Socket* sock) {
     if (sock != nullptr) {
         sock->owner_pid = current_task->pid;
     }
+    current_task->wait_channel = "tcp_wait";
     current_task->deferredTaskSwitch = true;
 }
 
@@ -429,9 +430,11 @@ void tcp_close_op(Socket* sock) {
         rtx_drained++;
     }
     cb->retransmit_tail = nullptr;
+#ifdef TCP_DEBUG
     if (rtx_drained > 0) {
         ker::mod::dbg::log("tcp_close: drained %zu rtx entries, pool_free=%zu", rtx_drained, ker::net::pkt_pool_free_count());
     }
+#endif
     switch (cb->state) {
         case TcpState::CLOSED:
         case TcpState::LISTEN:

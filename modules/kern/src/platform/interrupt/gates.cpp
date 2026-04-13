@@ -12,6 +12,9 @@
 #include <syscalls_impl/process/exit.hpp>
 
 #include "mod/io/serial/serial.hpp"
+#include "platform/acpi/apic/apic.hpp"
+#include "platform/asm/msr.hpp"
+#include "platform/mm/paging.hpp"
 #include "platform/sched/scheduler.hpp"
 
 namespace ker::mod::gates {
@@ -138,8 +141,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // Every CPU gets to print before halting - one at a time, no interleaving.
     // If this CPU already owns the lock (nested fault during dump), release and halt immediately.
     {
-        int64_t myApicId = static_cast<int64_t>(apic::getApicId());
-        if (panicLockOwner.load(std::memory_order_acquire) == myApicId) {
+        auto my_apic_id = static_cast<int64_t>(apic::getApicId());
+        if (panicLockOwner.load(std::memory_order_acquire) == my_apic_id) {
             panicLock.store(false, std::memory_order_release);
             panicLockOwner.store(-1, std::memory_order_release);
             hcf();
@@ -147,7 +150,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         while (panicLock.exchange(true, std::memory_order_acquire)) {
             asm volatile("pause");
         }
-        panicLockOwner.store(myApicId, std::memory_order_release);
+        panicLockOwner.store(my_apic_id, std::memory_order_release);
     }
 
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
@@ -166,17 +169,17 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // stack trace - validate RSP before dereferencing
     dbg::log("Stack trace:");
     auto* rsp = (uint64_t*)frame.rsp;
-    uintptr_t rspAddr = reinterpret_cast<uintptr_t>(rsp);
-    bool rspValid = (rspAddr >= 0xffff800000000000ULL && rspAddr < 0xffff900000000000ULL) ||
-                    (rspAddr >= 0xffffffff80000000ULL && rspAddr < 0xffffffffc0000000ULL);
+    auto rsp_addr = reinterpret_cast<uintptr_t>(rsp);
+    bool rsp_valid = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
+                     (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
 
-    if (rspValid) {
+    if (rsp_valid) {
         constexpr uint64_t MAX_STACK_TRACE = 64;
         for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
             dbg::log("%d: 0x%lx", i, rsp[i]);
         }
     } else {
-        dbg::log("Invalid RSP: 0x%lx - skipping stack trace", rspAddr);
+        dbg::log("Invalid RSP: 0x%lx - skipping stack trace", rsp_addr);
     }
 
     // Dump current task information - use getCurrentTask() instead of hardcoded address

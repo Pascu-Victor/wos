@@ -311,6 +311,10 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
         }
         t->fd_table.insert(key, val);
     });
+    // Copy per-fd close-on-exec bitmap
+    for (unsigned i = 0; i < Task::FD_TABLE_SIZE / 64; i++) {
+        t->fd_cloexec[i] = parent->fd_cloexec[i];
+    }
     memcpy(t->cwd, parent->cwd, sizeof(t->cwd));
     memcpy(t->exe_path, parent->exe_path, sizeof(t->exe_path));
     t->uid = parent->uid;

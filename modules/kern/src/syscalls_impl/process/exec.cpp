@@ -199,19 +199,21 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     newTask->pgid = (parentTask->pgid != 0) ? parentTask->pgid : parentTask->pid;
     newTask->controlling_tty = parentTask->controlling_tty;
     newTask->wki_prefer_inline = parentTask->wki_prefer_inline;
-    memcpy(newTask->wki_target_hostname, parentTask->wki_target_hostname, sizeof(newTask->wki_target_hostname));
-    newTask->wki_target_flags = parentTask->wki_target_flags;
+    if ((parentTask->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) == 0) {
+        memcpy(newTask->wki_target_hostname, parentTask->wki_target_hostname, sizeof(newTask->wki_target_hostname));
+        newTask->wki_target_flags = parentTask->wki_target_flags;
+    }
     memcpy(newTask->wki_submitter_hostname, parentTask->wki_submitter_hostname, sizeof(newTask->wki_submitter_hostname));
     newTask->wki_vfs_rules.clone_from(parentTask->wki_vfs_rules);
 
-    // Inherit file descriptors from parent, respecting O_CLOEXEC / FD_CLOEXEC.
+    // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
     // FDs with FD_CLOEXEC set are NOT inherited (closed on exec).
     // FDs without FD_CLOEXEC are inherited by incrementing refcount.
     // For fds 0/1/2 (stdin/stdout/stderr), if not inherited, re-open /dev/console.
     parentTask->fd_table.for_each([&](uint64_t key, void* val) {
         if (val == nullptr) return;
         auto* parentFile = static_cast<vfs::File*>(val);
-        if (parentFile->fd_flags & vfs::FD_CLOEXEC) {
+        if (parentTask->get_fd_cloexec(static_cast<unsigned>(key))) {
             return;  // FD_CLOEXEC is set - do NOT inherit
         }
         parentFile->refcount++;
@@ -567,7 +569,7 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE; ++i) {
             auto* fval = static_cast<vfs::File*>(task->fd_table.lookup(i));
             if (fval == nullptr) continue;
-            if (fval->fd_flags & vfs::FD_CLOEXEC) {
+            if (task->get_fd_cloexec(i)) {
                 vfs::vfs_close(static_cast<int>(i));
             }
         }
@@ -629,11 +631,10 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         return static_cast<uint64_t>(-EHOSTUNREACH);
     }
 
-    // --- Close FD_CLOEXEC file descriptors ---
+    // --- Close FD_CLOEXEC file descriptors (per-fd bitmap) ---
     task->fd_table.for_each([&](uint64_t key, void* val) {
         if (val == nullptr) return;
-        auto* file = static_cast<vfs::File*>(val);
-        if (file->fd_flags & vfs::FD_CLOEXEC) {
+        if (task->get_fd_cloexec(static_cast<unsigned>(key))) {
             vfs::vfs_close(static_cast<int>(key));
         }
     });

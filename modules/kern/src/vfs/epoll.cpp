@@ -132,7 +132,7 @@ auto epoll_create(int flags) -> int {
     file->fs_type = FSType::TMPFS;  // reuse TMPFS type - it's just an in-memory object
     file->refcount = 1;
     file->open_flags = 0;
-    file->fd_flags = ((flags & EPOLL_CLOEXEC_FLAG) != 0) ? FD_CLOEXEC : 0;  // EPOLL_CLOEXEC
+    file->fd_flags = 0;  // CLOEXEC is per-fd in task bitmap
     file->vfs_path = nullptr;
     file->dir_fs_count = 0;
 
@@ -143,6 +143,9 @@ auto epoll_create(int flags) -> int {
         return fd;
     }
     file->fd = fd;
+    if ((flags & EPOLL_CLOEXEC_FLAG) != 0) {
+        task->set_fd_cloexec(static_cast<unsigned>(fd));
+    }
     return fd;
 }
 
@@ -310,7 +313,36 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
 
     if (can_block) {
         task->wakeAtUs = deadline_us;
+        task->wait_channel = "epoll_wait";
         task->deferredTaskSwitch = true;
+
+        // Re-check interests after registration + deferred mark to close
+        // the race window where an event fires between the initial scan
+        // and waiter registration.  With deferredTaskSwitch already set,
+        // any concurrent wake_waiters will clear it, preventing a block.
+        int recheck = 0;
+        for (size_t i = 0; i < EPOLL_MAX_INTEREST && recheck < maxevents; i++) {
+            if (!inst->interests[i].active) continue;
+            auto* target = vfs_get_file(task, inst->interests[i].fd);
+            if (target == nullptr) continue;
+            uint32_t revents = poll_fd(target, inst->interests[i].events);
+            if (revents != 0) {
+                events[recheck].events = revents;
+                events[recheck].data.u64 = inst->interests[i].data;
+                recheck++;
+                if ((inst->interests[i].events & EPOLLONESHOT) != 0U) {
+                    inst->interests[i].events = 0;
+                }
+            }
+        }
+        if (recheck > 0) {
+            task->deferredTaskSwitch = false;
+            task->wakeAtUs = 0;
+            task->wait_channel = nullptr;
+            clear_poll_timeout(task);
+            return recheck;
+        }
+
         return -WOS_ERESTARTSYS;
     }
 

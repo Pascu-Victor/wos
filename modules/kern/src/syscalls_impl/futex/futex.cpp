@@ -117,6 +117,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     }
 
     // Set deferred task switch to move task to wait queue
+    current_task->wait_channel = "futex_wait";
     current_task->deferredTaskSwitch = true;
 
     return 0;

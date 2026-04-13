@@ -27,7 +27,7 @@ struct RunHeap {
     // Eligible = (avgVruntime - task.vruntime) >= 0.
     // Does NOT remove it from the heap.
     // Returns nullptr if heap is empty.
-    task::Task* pickBestEligible(int64_t avgVruntime);
+    auto pickBestEligible(int64_t avgVruntime) -> task::Task*;
 
     // Remove a specific task using its heapIndex. O(log n).
     // Returns false if task is not in this heap.

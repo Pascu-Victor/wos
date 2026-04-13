@@ -186,11 +186,13 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
+        task->wait_channel = "kern_yield";
         task->voluntaryBlock = true;
     }
     asm volatile("sti\n\thlt" ::: "memory");
     if (task != nullptr) {
         task->voluntaryBlock = false;
+        task->wait_channel = nullptr;
     }
 }
 
@@ -204,13 +206,14 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
+        task->wait_channel = "kern_block";
         task->wantsBlock = true;
         task->voluntaryBlock = true;
     }
     asm volatile("sti\n\thlt" ::: "memory");
     if (task != nullptr) {
         task->voluntaryBlock = false;
-        // wantsBlock is cleared by the scheduler when it does the block
+        task->wait_channel = nullptr;
     }
 }
 
@@ -226,6 +229,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
+        task->wait_channel = "kern_sleep";
         task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
         task->wantsBlock = true;
         task->voluntaryBlock = true;
@@ -233,6 +237,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     asm volatile("sti\n\thlt" ::: "memory");
     if (task != nullptr) {
         task->voluntaryBlock = false;
+        task->wait_channel = nullptr;
     }
 }
 

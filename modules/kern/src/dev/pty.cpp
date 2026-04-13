@@ -102,17 +102,62 @@ auto PtyRingBuf::read(void* dst, size_t len) -> size_t {
 
 namespace {
 
+constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
+
+auto is_valid_kernel_pointer(const void* ptr) -> bool {
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    bool in_hhdm = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
+    bool in_kernel_static = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    return in_hhdm || in_kernel_static;
+}
+
 struct DevFSFileHack {
     void* node;
     ker::dev::Device* device;
     uint32_t magic;
 };
 
-auto device_from_file(ker::vfs::File* f) -> ker::dev::Device* {
+auto devfs_file_from_file(ker::vfs::File* f, const char* op) -> DevFSFileHack* {
     if (f == nullptr || f->private_data == nullptr) {
         return nullptr;
     }
     auto* dff = static_cast<DevFSFileHack*>(f->private_data);
+    if (!is_valid_kernel_pointer(dff)) {
+        ker::mod::dbg::log("pty_%s: invalid devfs wrapper %p", op, dff);
+        return nullptr;
+    }
+    if (dff->magic != DEVFS_FILE_MAGIC) {
+        ker::mod::dbg::log("pty_%s: bad devfs wrapper magic 0x%x at %p", op, dff->magic, dff);
+        return nullptr;
+    }
+    if (dff->device != nullptr && !is_valid_kernel_pointer(dff->device)) {
+        ker::mod::dbg::log("pty_%s: invalid device pointer %p in wrapper %p", op, dff->device, dff);
+        return nullptr;
+    }
+    return dff;
+}
+
+auto pair_from_device(ker::dev::Device* device, const char* op) -> PtyPair* {
+    if (device == nullptr) {
+        return nullptr;
+    }
+    auto* pair = static_cast<PtyPair*>(device->private_data);
+    if (pair == nullptr || !is_valid_kernel_pointer(pair)) {
+        ker::mod::dbg::log("pty_%s: invalid pair pointer %p from device %p", op, pair, device);
+        return nullptr;
+    }
+    if (device != &pair->master_dev && device != &pair->slave_dev) {
+        ker::mod::dbg::log("pty_%s: device %p does not belong to pair %p", op, device, pair);
+        return nullptr;
+    }
+    return pair;
+}
+
+auto device_from_file(ker::vfs::File* f) -> ker::dev::Device* {
+    auto* dff = devfs_file_from_file(f, "device_from_file");
+    if (dff == nullptr) {
+        return nullptr;
+    }
     return dff->device;
 }
 
@@ -139,7 +184,7 @@ auto register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) ->
     return waiters.push_back(pid);
 }
 
-auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters) -> bool {
+auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* wchan = nullptr) -> bool {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
         return false;
@@ -147,6 +192,7 @@ auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters) -> bool {
     if (!register_waiter(waiters, current_task->pid)) {
         return false;
     }
+    current_task->wait_channel = wchan;
     current_task->deferredTaskSwitch = true;
     return true;
 }
@@ -458,10 +504,11 @@ int master_close(ker::vfs::File* file) {
 
 // Get PtyPair* from a devfs-wrapped File
 auto pair_from_file(ker::vfs::File* f) -> PtyPair* {
-    if (f == nullptr || f->private_data == nullptr) return nullptr;
-    auto* dff = static_cast<DevFSFileHack*>(f->private_data);
-    if (dff == nullptr || dff->device == nullptr) return nullptr;
-    return static_cast<PtyPair*>(dff->device->private_data);
+    auto* dff = devfs_file_from_file(f, "pair_from_file");
+    if (dff == nullptr || dff->device == nullptr) {
+        return nullptr;
+    }
+    return pair_from_device(dff->device, "pair_from_file");
 }
 
 ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
@@ -474,7 +521,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     bool slave_opened = pair->slave_opened > 0;
     bool should_block = false;
     if (rd == 0 && slave_opened && (file->open_flags & 04000) == 0) {
-        should_block = block_current_task(pair->master_read_waiters);
+        should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
     }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
@@ -729,7 +776,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     bool slave_opened = pair->slave_opened > 0;
                     bool should_block = false;
                     if (wr == 0 && slave_opened && processed == 0) {
-                        should_block = block_current_task(pair->master_write_waiters);
+                        should_block = block_current_task(pair->master_write_waiters, "pty_master_write");
                     }
                     pair->lock.unlock_irqrestore(wr_irqf);
                     if (wr != 0) {
@@ -942,7 +989,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     bool master_opened = pair->master_opened > 0;
     bool should_block = false;
     if (rd == 0 && master_opened && (file->open_flags & 04000) == 0) {
-        should_block = block_current_task(pair->slave_read_waiters);
+        should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
     }
     pair->lock.unlock_irqrestore(irqf);
     if (rd == 0) {
@@ -1001,12 +1048,21 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                         break;
                     }
                     if (master_opened && written == 0) {
-                        should_block = block_current_task(pair->slave_write_waiters);
+                        should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
                     }
                     pair->lock.unlock_irqrestore(irqf);
-                    if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
-                    if (written != 0) return static_cast<ssize_t>(written);
-                    if (should_block) return -WOS_ERESTARTSYS;
+                    if (!master_opened) {
+                        if (written > 0) goto wake_and_return;
+                        return -EIO;
+                    }
+                    if (written != 0) {
+                        goto wake_and_return;
+                    }
+                    if (should_block) {
+                        wake_master_readers(pair);
+                        wake_both_pollers(pair);
+                        return -WOS_ERESTARTSYS;
+                    }
                     ker::mod::sched::kern_yield();
                 }
             }
@@ -1031,15 +1087,24 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 bool master_opened = pair->master_opened > 0;
                 bool should_block = false;
                 if (wr == 0 && master_opened && written == 0) {
-                    should_block = block_current_task(pair->slave_write_waiters);
+                    should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
                 }
                 pair->lock.unlock_irqrestore(irqf);
                 if (wr != 0) {
                     break;
                 }
-                if (!master_opened) return written > 0 ? (ssize_t)written : -EIO;
-                if (written != 0) return static_cast<ssize_t>(written);
-                if (should_block) return -WOS_ERESTARTSYS;
+                if (!master_opened) {
+                    if (written > 0) goto wake_and_return;
+                    return -EIO;
+                }
+                if (written != 0) {
+                    goto wake_and_return;
+                }
+                if (should_block) {
+                    wake_master_readers(pair);
+                    wake_both_pollers(pair);
+                    return -WOS_ERESTARTSYS;
+                }
                 ker::mod::sched::kern_yield();
             }
         }
@@ -1053,6 +1118,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     }
 
     if (written == 0) return -EAGAIN;
+wake_and_return:
     wake_master_readers(pair);
     wake_both_pollers(pair);
     return static_cast<ssize_t>(written);

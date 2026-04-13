@@ -224,6 +224,78 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append_int(task->sgid);
     append("\t");
     append_int(task->gid);
+
+    // State
+    append("\nState:\t");
+    auto ts_st = task->state.load(std::memory_order_acquire);
+    if (ts_st == ker::mod::sched::task::TaskState::DEAD || ts_st == ker::mod::sched::task::TaskState::EXITING || task->hasExited) {
+        append("Z (zombie)");
+    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::RUNNABLE) {
+        append("R (running)");
+    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING) {
+        append(task->wait_channel != nullptr ? "D (blocked)" : "S (sleeping)");
+    } else {
+        append("S (sleeping)");
+    }
+
+    // Scheduling info
+    append("\nCpu:\t");
+    append_int(task->cpu);
+    append("\nSchedQueue:\t");
+    switch (task->schedQueue) {
+        case ker::mod::sched::task::Task::SchedQueue::NONE: append("NONE"); break;
+        case ker::mod::sched::task::Task::SchedQueue::RUNNABLE: append("RUNNABLE"); break;
+        case ker::mod::sched::task::Task::SchedQueue::WAITING: append("WAITING"); break;
+        case ker::mod::sched::task::Task::SchedQueue::DEAD_GC: append("DEAD_GC"); break;
+    }
+
+    // Wait channel
+    append("\nWchan:\t");
+    if (task->wait_channel != nullptr) {
+        append(task->wait_channel);
+    } else {
+        append("-");
+    }
+
+    // Blocking state flags
+    append("\nDeferredSwitch:\t");
+    append(task->deferredTaskSwitch ? "1" : "0");
+    append("\nVoluntaryBlock:\t");
+    append(task->voluntaryBlock ? "1" : "0");
+    append("\nWaitingForPid:\t");
+    append_int(task->waitingForPid);
+
+    // Signals
+    append("\nSigPnd:\t");
+    append_int(task->sigPending);
+    append("\nSigBlk:\t");
+    append_int(task->sigMask);
+    append("\nInSigHandler:\t");
+    append(task->inSignalHandler ? "1" : "0");
+
+    // Terminal
+    append("\nTTY:\t");
+    if (task->controlling_tty >= 0) {
+        append_int(static_cast<uint64_t>(task->controlling_tty));
+    } else {
+        append("-1");
+    }
+    append("\nPGID:\t");
+    append_int(task->pgid != 0 ? task->pgid : task->pid);
+    append("\nSID:\t");
+    append_int(task->session_id != 0 ? task->session_id : task->pid);
+
+    // Time accounting
+    append("\nUserTime:\t");
+    append_int(task->user_time_us);
+    append(" us");
+    append("\nSysTime:\t");
+    append_int(task->system_time_us);
+    append(" us");
+    append("\nStartTime:\t");
+    append_int(task->start_time_us);
+    append(" us");
+
     append("\n");
 
     buf[off] = '\0';
@@ -271,8 +343,11 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     auto ts = task->state.load(std::memory_order_acquire);
     if (ts == ker::mod::sched::task::TaskState::DEAD || ts == ker::mod::sched::task::TaskState::EXITING || task->hasExited) {
         state = 'Z';
+    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::RUNNABLE) {
+        state = 'R';
+    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING) {
+        state = task->wait_channel != nullptr ? 'D' : 'S';
     }
-    // Could refine: R for running, but S is a safe default
 
     // pid (comm) state ppid pgid sid tty_nr tpgid flags
     append_int(task->pid);
@@ -318,7 +393,27 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     // vsize rss
     append("0 ");  // vsize
-    append("0");   // rss
+    append("0 ");  // rss
+
+    // rlim signal blocked sigignore sigcatch wchan nswap cnswap exit_signal processor
+    append("0 ");  // rlim
+    append_int(task->sigPending);  // signal (pending)
+    append(" ");
+    append_int(task->sigMask);  // blocked
+    append(" ");
+    append("0 ");  // sigignore
+    append("0 ");  // sigcatch
+    // wchan: kernel wait channel name (0 if not blocked)
+    if (task->wait_channel != nullptr) {
+        append(task->wait_channel);
+    } else {
+        append("0");
+    }
+    append(" ");
+    append("0 ");  // nswap
+    append("0 ");  // cnswap
+    append("0 ");  // exit_signal
+    append_int(task->cpu);  // processor
 
     append("\n");
     buf[off] = '\0';

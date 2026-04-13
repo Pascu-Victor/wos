@@ -91,6 +91,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             currentTask->waitRusagePhysAddr = 0;
         }
 
+        currentTask->wait_channel = "waitpid";
         currentTask->deferredTaskSwitch = true;
         return 0;
     }
@@ -154,6 +155,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     }
 
     // Set the deferred task switch flag - the task will be moved to wait queue after syscall returns
+    currentTask->wait_channel = "waitpid";
     currentTask->deferredTaskSwitch = true;
 #ifdef WAITPID_DEBUG
     ker::mod::dbg::log("wos_proc_waitpid: Setting deferred task switch for PID %x, flag at %p = %d", currentTask->pid,

@@ -675,7 +675,40 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
             if (can_block) {
                 task->wakeAtUs = deadline_us;
+                task->wait_channel = "poll";
                 task->deferredTaskSwitch = true;
+
+                // Re-check fds after registration + deferred mark to close
+                // the race window where an event fires between the initial
+                // poll_check and waiter registration.  With deferredTaskSwitch
+                // already set, any concurrent wake_waiters will clear it, so
+                // syscall.asm will skip the block and retry the syscall.
+                int recheck = 0;
+                for (size_t i = 0; i < nfds; i++) {
+                    fds[i].revents = 0;
+                    if (fds[i].fd < 0) continue;
+                    auto* rf = ker::vfs::vfs_get_file(task, fds[i].fd);
+                    if (rf == nullptr) continue;
+                    if (rf->fs_type == ker::vfs::FSType::SOCKET) {
+                        auto* sock = static_cast<ker::net::Socket*>(rf->private_data);
+                        if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
+                            fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
+                        }
+                    } else if (rf->fops != nullptr && rf->fops->vfs_poll_check != nullptr) {
+                        fds[i].revents = static_cast<int16_t>(rf->fops->vfs_poll_check(rf, fds[i].events));
+                    } else {
+                        fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));
+                    }
+                    if (fds[i].revents != 0) recheck++;
+                }
+                if (recheck > 0) {
+                    task->deferredTaskSwitch = false;
+                    task->wakeAtUs = 0;
+                    task->wait_channel = nullptr;
+                    clear_poll_timeout(task);
+                    return static_cast<uint64_t>(recheck);
+                }
+
                 return static_cast<uint64_t>(-WOS_ERESTARTSYS);
             }
 
