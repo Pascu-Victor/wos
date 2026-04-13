@@ -47,6 +47,7 @@ enum class ops : uint64_t {
     wki_rule_add,      // 41
     wki_rule_get,      // 42
     wki_rule_clear,    // 43
+    pivot_root,        // 44
 };
 
 }  // namespace ker::abi::vfs

@@ -968,15 +968,29 @@ void fill_stat(XfsInode* ip, ker::vfs::stat* st) {
     st->st_blksize = static_cast<blksize_t>(ip->mount->block_size);
     st->st_blocks = static_cast<blkcnt_t>(ip->nblocks * (ip->mount->block_size / 512));
 
-    // Timestamps - XFS stores seconds in the upper 32 bits, nanoseconds in
-    // the lower 32 bits (or for bigtime, a different encoding).  For now
-    // just extract seconds.
-    st->st_atim.tv_sec = static_cast<int64_t>(ip->atime >> 32);
-    st->st_atim.tv_nsec = static_cast<int64_t>(ip->atime & 0xFFFFFFFF);
-    st->st_mtim.tv_sec = static_cast<int64_t>(ip->mtime >> 32);
-    st->st_mtim.tv_nsec = static_cast<int64_t>(ip->mtime & 0xFFFFFFFF);
-    st->st_ctim.tv_sec = static_cast<int64_t>(ip->ctime >> 32);
-    st->st_ctim.tv_nsec = static_cast<int64_t>(ip->ctime & 0xFFFFFFFF);
+    // Timestamps: bigtime uses nanoseconds since Dec 13, 1901 packed into
+    // a uint64; legacy uses upper-32 = seconds, lower-32 = nanoseconds.
+    bool bigtime = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    if (bigtime) {
+        // XFS bigtime epoch: nanoseconds offset from the legacy min timestamp.
+        // Linux: XFS_BIGTIME_EPOCH_OFFSET = -(int64_t)S32_MIN = 2^31 = 2147483648
+        constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
+        constexpr uint64_t NSEC_PER_SEC = 1000000000ULL;
+        auto decode = [&](uint64_t raw, struct timespec& ts) {
+            ts.tv_sec = static_cast<int64_t>(raw / NSEC_PER_SEC) - XFS_BIGTIME_EPOCH_OFFSET;
+            ts.tv_nsec = static_cast<int64_t>(raw % NSEC_PER_SEC);
+        };
+        decode(ip->atime, st->st_atim);
+        decode(ip->mtime, st->st_mtim);
+        decode(ip->ctime, st->st_ctim);
+    } else {
+        st->st_atim.tv_sec = static_cast<int64_t>(ip->atime >> 32);
+        st->st_atim.tv_nsec = static_cast<int64_t>(ip->atime & 0xFFFFFFFF);
+        st->st_mtim.tv_sec = static_cast<int64_t>(ip->mtime >> 32);
+        st->st_mtim.tv_nsec = static_cast<int64_t>(ip->mtime & 0xFFFFFFFF);
+        st->st_ctim.tv_sec = static_cast<int64_t>(ip->ctime >> 32);
+        st->st_ctim.tv_nsec = static_cast<int64_t>(ip->ctime & 0xFFFFFFFF);
+    }
 }
 
 }  // anonymous namespace

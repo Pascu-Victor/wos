@@ -72,6 +72,7 @@ auto vfs_mkdir(const char* path, int mode) -> int;
 // Mount operations (called from userspace via syscall)
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int;
 auto vfs_umount(const char* target) -> int;
+auto vfs_pivot_root(const char* new_root, const char* put_old) -> int;
 
 // FD duplication
 auto vfs_dup(int oldfd) -> int;

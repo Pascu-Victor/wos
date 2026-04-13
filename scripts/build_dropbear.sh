@@ -20,8 +20,8 @@ export CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
-export CFLAGS="--sysroot=$TARGET_SYSROOT -static -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
-export LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--whole-archive,-lc,--no-whole-archive"
+export CFLAGS="--sysroot=$TARGET_SYSROOT -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
+export LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib"
 
 mkdir -p "$DB_BUILD"
 
@@ -45,7 +45,6 @@ if [ ! -f "$DB_BUILD/Makefile" ]; then
     "$DB_SRC/configure" \
         --host=x86_64-pc-wos \
         --prefix="$TARGET_SYSROOT" \
-        --enable-static \
         --enable-bundled-libtom \
         --disable-zlib \
         --disable-pam \
@@ -62,8 +61,8 @@ fi
 # make only tracks dropbear's own .o files and misses external changes
 # (e.g. libc.a rebuilt with new sysdeps).
 if [ -f "$DB_BUILD/dropbearmulti" ]; then
-    for lib in "$TARGET_SYSROOT"/lib/libc.a "$TARGET_SYSROOT"/lib/libc++.a \
-               "$TARGET_SYSROOT"/lib/libc++abi.a "$TARGET_SYSROOT"/lib/libm.a; do
+    for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libc++.so \
+               "$TARGET_SYSROOT"/lib/libc++abi.so "$TARGET_SYSROOT"/lib/libm.so; do
         if [ -f "$lib" ] && [ "$lib" -nt "$DB_BUILD/dropbearmulti" ]; then
             echo "Sysroot library $(basename "$lib") changed - forcing relink"
             rm -f "$DB_BUILD/dropbearmulti"
@@ -73,7 +72,7 @@ if [ -f "$DB_BUILD/dropbearmulti" ]; then
 fi
 
 # Build dropbearmulti (combined binary like busybox)
-make -C "$DB_BUILD" -j"$(nproc)" PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+make -C "$DB_BUILD" -j"$(nproc)" STATIC=0 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
 
 # Install into sysroot
 cp "$DB_BUILD/dropbearmulti" "$TARGET_SYSROOT/bin/dropbearmulti"

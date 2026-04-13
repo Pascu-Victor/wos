@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build CPIO newc initramfs archive containing /sbin/init and /etc/fstab.
+# Build CPIO newc initramfs archive containing only /sbin/init and boot config.
+# Everything else lives on the rootfs (mountfs.qcow2).
 # PARTUUIDs are auto-extracted from disk images defined in configs/disks.conf.
 set -e
 
@@ -21,37 +22,9 @@ trap 'rm -rf "$INITRAMFS_DIR"' EXIT
 mkdir -p "$INITRAMFS_DIR/sbin"
 mkdir -p "$INITRAMFS_DIR/etc"
 
-# Copy init binary
+# Copy init binary (statically linked — the only binary in initramfs)
 cp "$INIT_BINARY" "$INITRAMFS_DIR/sbin/init"
 echo "  initramfs: added /sbin/init ($(du -h "$INIT_BINARY" | cut -f1))"
-
-# Copy netd binary (DHCP network daemon)
-NETD_BINARY="build/modules/netd/netd"
-if [ -f "$NETD_BINARY" ]; then
-    cp "$NETD_BINARY" "$INITRAMFS_DIR/sbin/netd"
-    echo "  initramfs: added /sbin/netd ($(du -h "$NETD_BINARY" | cut -f1))"
-else
-    echo "WARNING: netd binary not found at $NETD_BINARY, skipping"
-fi
-
-# Copy httpd binary (HTTP server)
-HTTPD_BINARY="build/modules/httpd/httpd"
-if [ -f "$HTTPD_BINARY" ]; then
-    cp "$HTTPD_BINARY" "$INITRAMFS_DIR/sbin/httpd"
-    echo "  initramfs: added /sbin/httpd ($(du -h "$HTTPD_BINARY" | cut -f1))"
-else
-    echo "WARNING: httpd binary not found at $HTTPD_BINARY, skipping"
-fi
-
-# Copy perf binary (kernel performance tool)
-PERF_BINARY="build/modules/perf/perf"
-if [ -f "$PERF_BINARY" ]; then
-    mkdir -p "$INITRAMFS_DIR/bin"
-    cp "$PERF_BINARY" "$INITRAMFS_DIR/bin/perf"
-    echo "  initramfs: added /bin/perf ($(du -h "$PERF_BINARY" | cut -f1))"
-else
-    echo "WARNING: perf binary not found at $PERF_BINARY, skipping"
-fi
 
 # Generate /etc/hostname from system configuration
 if [ -f "configs/system.conf" ]; then
@@ -63,21 +36,8 @@ else
     echo "  initramfs: added /etc/hostname (wos) [default, no system.conf]"
 fi
 
-# Generate /etc/profile for ash shell prompt
-cat > "$INITRAMFS_DIR/etc/profile" <<'PROFILE'
-export USER="${USER:-root}"
-HOSTNAME=$(uname -n 2>/dev/null) || { read -r HOSTNAME < /etc/hostname 2>/dev/null || HOSTNAME="wos"; }
-export HOSTNAME
-export HOME="${HOME:-/}"
-export PS1="$USER@$HOSTNAME:\w\$ "
-export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
-export ENV="/etc/profile"
-PROFILE
-echo "  initramfs: added /etc/profile"
-
 # Generate /etc/fstab from disk configuration
 if [ -f "configs/disks.conf" ]; then
-    # shellcheck source=configs/disks.conf
     source "configs/disks.conf"
     echo "  initramfs: generating /etc/fstab from configs/disks.conf"
     generate_fstab "$INITRAMFS_DIR/etc/fstab"
@@ -102,82 +62,6 @@ else
 / host
 EOF
     echo "  initramfs: added default /etc/vfstab"
-fi
-
-# Create /etc/filesystems for busybox mount auto-detection
-cat > "$INITRAMFS_DIR/etc/filesystems" <<'EOF'
-fat32
-vfat
-tmpfs
-EOF
-echo "  initramfs: added /etc/filesystems"
-
-# Copy busybox binary and create applet symlinks
-BUSYBOX_BINARY="toolchain/sysroot/bin/busybox"
-if [ -f "$BUSYBOX_BINARY" ]; then
-    mkdir -p "$INITRAMFS_DIR/bin"
-    cp "$BUSYBOX_BINARY" "$INITRAMFS_DIR/bin/busybox"
-    chmod +x "$INITRAMFS_DIR/bin/busybox"
-    echo "  initramfs: added /bin/busybox ($(du -h "$BUSYBOX_BINARY" | cut -f1))"
-
-    # Create symlinks for enabled applets
-    BUSYBOX_APPLETS="yes whoami wc uniq uname umount true tr touch time test tee tail stat sort sleep sha256sum sh seq rmdir rm realpath readlink pwd ps printf mv mount mkdir md5sum ls ln ifconfig id head grep find false env echo du dirname df dd date cut cp clear chown chmod cat basename"
-    for applet in $BUSYBOX_APPLETS; do
-        ln -sf busybox "$INITRAMFS_DIR/bin/$applet"
-        echo "  initramfs: symlinked /bin/$applet -> busybox"
-    done
-else
-    echo "WARNING: busybox binary not found at $BUSYBOX_BINARY, skipping"
-fi
-
-# Create /etc/passwd and /etc/group (needed by whoami, id, login shells, etc.)
-cat > "$INITRAMFS_DIR/etc/passwd" <<'PASSWD'
-root:x:0:0:root:/:/bin/sh
-PASSWD
-echo "  initramfs: added /etc/passwd"
-
-cat > "$INITRAMFS_DIR/etc/group" <<'GROUP'
-root:x:0:root
-GROUP
-echo "  initramfs: added /etc/group"
-
-# Copy dropbearmulti binary and create symlinks
-DROPBEAR_BINARY="toolchain/sysroot/bin/dropbearmulti"
-if [ -f "$DROPBEAR_BINARY" ]; then
-    mkdir -p "$INITRAMFS_DIR/bin"
-    mkdir -p "$INITRAMFS_DIR/etc/dropbear"
-    mkdir -p "$INITRAMFS_DIR/dev/pts"
-    cp "$DROPBEAR_BINARY" "$INITRAMFS_DIR/bin/dropbearmulti"
-    chmod +x "$INITRAMFS_DIR/bin/dropbearmulti"
-    echo "  initramfs: added /bin/dropbearmulti ($(du -h "$DROPBEAR_BINARY" | cut -f1))"
-
-    # Create symlinks for dropbear applets
-    DROPBEAR_APPLETS="dropbear dbclient dropbearkey scp"
-    for applet in $DROPBEAR_APPLETS; do
-        ln -sf dropbearmulti "$INITRAMFS_DIR/bin/$applet"
-        echo "  initramfs: symlinked /bin/$applet -> dropbearmulti"
-    done
-
-    # Install SSH authorized_keys for root (home is /)
-    # Try ed25519 first, then RSA
-    SSH_PUBKEY=""
-    for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
-        if [ -f "$keyfile" ]; then
-            SSH_PUBKEY="$keyfile"
-            break
-        fi
-    done
-    if [ -n "$SSH_PUBKEY" ]; then
-        mkdir -p "$INITRAMFS_DIR/.ssh"
-        chmod 700 "$INITRAMFS_DIR/.ssh"
-        cp "$SSH_PUBKEY" "$INITRAMFS_DIR/.ssh/authorized_keys"
-        chmod 600 "$INITRAMFS_DIR/.ssh/authorized_keys"
-        echo "  initramfs: added /.ssh/authorized_keys from $SSH_PUBKEY"
-    else
-        echo "WARNING: no SSH public key found, skipping authorized_keys"
-    fi
-else
-    echo "WARNING: dropbearmulti binary not found at $DROPBEAR_BINARY, skipping"
 fi
 
 # Create CPIO newc archive

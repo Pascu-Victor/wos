@@ -754,8 +754,8 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 }
 }  // namespace
 
-auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName, bool registerSpecialSymbols)
-    -> ElfLoadResult {
+auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName, bool registerSpecialSymbols,
+             uint64_t baseAddress) -> ElfLoadResult {
     // Validate input pointer
     if (elf == nullptr) {
         mod::dbg::log("ERROR: loadElf called with null ELF pointer (pid=%d)", pid);
@@ -763,6 +763,11 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     }
 
     ElfFile elfFile = parseElf((uint8_t*)elf);
+
+    // Apply explicit base address (used when loading ld.so at a non-zero base)
+    if (baseAddress != 0) {
+        elfFile.loadBase = baseAddress;
+    }
 
     if (!headerIsValid(elfFile.elfHead)) {
         mod::dbg::log("ERROR: Invalid ELF header (pid=%d)", pid);
@@ -779,72 +784,93 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     // Register this process for debugging
     debug::registerProcess(pid, processName, (uint64_t)elfFile.base, elfFile.elfHead.e_entry + elfFile.loadBase);
 
-    // Filter program headers: only include PT_PHDR, PT_DYNAMIC, PT_TLS, PT_INTERP
-    // PT_DYNAMIC is CRITICAL for the dynamic linker to find .dynamic section
+    // Collect all program headers for the executable — ld.so needs the full set
+    // (PT_LOAD, PT_DYNAMIC, PT_TLS, PT_PHDR, PT_GNU_RELRO, etc.)
     std::vector<Elf64_Phdr> filteredHeaders;
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
         auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
-        if (ph->p_type == PT_PHDR || ph->p_type == PT_DYNAMIC || ph->p_type == PT_TLS || ph->p_type == PT_INTERP) {
-            filteredHeaders.push_back(*ph);
+        filteredHeaders.push_back(*ph);
+    }
+
+    // Set up AT_PHDR for the main executable (baseAddress == 0).
+    // For PIE (ET_DYN): PHDRs are already mapped by the first PT_LOAD segment at their
+    // original file offsets (e_phoff). Copying them to a fixed address like 0x1000 would
+    // conflict with PT_LOAD segments that cover that range, and the subsequent PT_LOAD
+    // mapping would overwrite the copied headers. Just point AT_PHDR at the originals.
+    // For non-PIE (ET_EXEC): PT_LOAD segments start at high addresses (e.g. 0x400000),
+    // so we can safely copy headers to 0x1000 without conflicts.
+    uint64_t elfHeaderVaddr = 0;
+    uint64_t programHeadersVaddr = 0;
+
+    if (baseAddress == 0 && elfFile.elfHead.e_type == ET_DYN) {
+        // PIE executable: PHDRs already at loadBase + e_phoff via PT_LOAD mapping.
+        // PT_PHDR.p_vaddr matches e_phoff, so ld.so computes baseAddress = AT_PHDR - p_vaddr = 0.
+        elfHeaderVaddr = elfFile.loadBase;
+        programHeadersVaddr = elfFile.loadBase + elfFile.elfHead.e_phoff;
+        debug::setProgramHeaders(pid, (Elf64_Phdr*)programHeadersVaddr, programHeadersVaddr, elfFile.elfHead.e_phnum);
+    } else if (baseAddress == 0) {
+        // Non-PIE (ET_EXEC): copy headers to 0x1000 (no PT_LOAD overlap at low addresses)
+        constexpr uint64_t headerCopyVaddr = 0x1000;
+        constexpr uint64_t programHeadersOffsetInHeader = sizeof(Elf64_Ehdr);
+        elfHeaderVaddr = headerCopyVaddr;
+        programHeadersVaddr = headerCopyVaddr + programHeadersOffsetInHeader;
+
+        auto programHeadersSize = static_cast<uint64_t>(filteredHeaders.size() * elfFile.elfHead.e_phentsize);
+        uint64_t totalHeadersSize = sizeof(Elf64_Ehdr) + programHeadersSize;
+        uint64_t totalHeadersPages = PAGE_ALIGN_UP(totalHeadersSize) / mod::mm::virt::PAGE_SIZE;
+
+        // Allocate physical pages for both ELF and program headers
+        std::vector<uint64_t> headerPhysAddrs;
+        for (uint64_t i = 0; i < totalHeadersPages; i++) {
+            auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
+            if (paddr == ker::mod::mm::virt::PADDR_INVALID) {
+                mod::dbg::log("ERROR: Failed to allocate physical page for headers");
+                return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
+            }
+            mod::mm::virt::mapPage(pagemap, headerCopyVaddr + (i * mod::mm::virt::PAGE_SIZE),
+                                   (uint64_t)mod::mm::addr::get_phys_pointer(paddr), mod::mm::paging::pageTypes::USER);
+            headerPhysAddrs.push_back(paddr);
         }
-    }
 
-    // Allocate and load ELF header and program headers at address 0x1000
-    // ELF header at 0x1000, program headers right after
-    constexpr uint64_t elfHeaderVaddr = 0x1000;  // Address 0x1000 in process space
-    constexpr uint64_t programHeadersOffsetInHeader = sizeof(Elf64_Ehdr);
-    uint64_t programHeadersVaddr = elfHeaderVaddr + programHeadersOffsetInHeader;
-
-    auto programHeadersSize = static_cast<uint64_t>(filteredHeaders.size() * elfFile.elfHead.e_phentsize);
-    uint64_t totalHeadersSize = sizeof(Elf64_Ehdr) + programHeadersSize;
-    uint64_t totalHeadersPages = PAGE_ALIGN_UP(totalHeadersSize) / mod::mm::virt::PAGE_SIZE;
-
-    // Allocate physical pages for both ELF and program headers
-    std::vector<uint64_t> headerPhysAddrs;
-    for (uint64_t i = 0; i < totalHeadersPages; i++) {
-        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
-        if (paddr == ker::mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("ERROR: Failed to allocate physical page for headers");
-            return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
+        // Copy ELF header
+        {
+            auto* headerPtr = (Elf64_Ehdr*)headerPhysAddrs[0];
+            memcpy(headerPtr, &elfFile.elfHead, sizeof(Elf64_Ehdr));
+            headerPtr->e_phoff = programHeadersOffsetInHeader;
+            headerPtr->e_phnum = static_cast<Elf64_Half>(filteredHeaders.size());
         }
-        mod::mm::virt::mapPage(pagemap, elfHeaderVaddr + (i * mod::mm::virt::PAGE_SIZE), (uint64_t)mod::mm::addr::get_phys_pointer(paddr),
-                               mod::mm::paging::pageTypes::USER);
-        headerPhysAddrs.push_back(paddr);
-    }
 
-    // Copy ELF header to the first page and update e_phnum to reflect filtered headers
-    {
-        auto* headerPtr = (Elf64_Ehdr*)headerPhysAddrs[0];
-        memcpy(headerPtr, &elfFile.elfHead, sizeof(Elf64_Ehdr));
-        // Update e_phoff to point to where we actually placed the program headers
-        headerPtr->e_phoff = programHeadersOffsetInHeader;
-        // Update e_phnum to reflect only the filtered headers
-        headerPtr->e_phnum = static_cast<Elf64_Half>(filteredHeaders.size());
-    }
-
-    // Copy filtered program headers right after ELF header
-    {
-        uint64_t destOffset = programHeadersOffsetInHeader;
-        for (auto& filteredHeader : filteredHeaders) {
-            uint64_t headerSize = elfFile.elfHead.e_phentsize;
-            for (uint64_t i = 0; i < headerSize; i++) {
-                uint64_t pageIdx = destOffset / mod::mm::virt::PAGE_SIZE;
-                uint64_t offsetInPage = destOffset % mod::mm::virt::PAGE_SIZE;
-
-                if (pageIdx >= headerPhysAddrs.size()) {
-                    mod::dbg::log("ERROR: Program header offset exceeds allocated pages");
-                    return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
+        // Copy program headers, fixing up PT_PHDR.p_vaddr to match placement
+        {
+            for (auto& filteredHeader : filteredHeaders) {
+                if (filteredHeader.p_type == PT_PHDR) {
+                    filteredHeader.p_vaddr = programHeadersVaddr;
+                    filteredHeader.p_paddr = programHeadersVaddr;
                 }
+            }
 
-                uint8_t* destPtr = (uint8_t*)headerPhysAddrs[pageIdx] + offsetInPage;
-                uint8_t* srcPtr = (uint8_t*)&filteredHeader + i;
-                *destPtr = *srcPtr;
-                destOffset++;
+            uint64_t destOffset = programHeadersOffsetInHeader;
+            for (auto& filteredHeader : filteredHeaders) {
+                uint64_t headerSize = elfFile.elfHead.e_phentsize;
+                for (uint64_t i = 0; i < headerSize; i++) {
+                    uint64_t pageIdx = destOffset / mod::mm::virt::PAGE_SIZE;
+                    uint64_t offsetInPage = destOffset % mod::mm::virt::PAGE_SIZE;
+
+                    if (pageIdx >= headerPhysAddrs.size()) {
+                        mod::dbg::log("ERROR: Program header offset exceeds allocated pages");
+                        return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
+                    }
+
+                    uint8_t* destPtr = (uint8_t*)headerPhysAddrs[pageIdx] + offsetInPage;
+                    uint8_t* srcPtr = (uint8_t*)&filteredHeader + i;
+                    *destPtr = *srcPtr;
+                    destOffset++;
+                }
             }
         }
-    }
 
-    debug::setProgramHeaders(pid, (Elf64_Phdr*)programHeadersVaddr, programHeadersVaddr, static_cast<uint16_t>(filteredHeaders.size()));
+        debug::setProgramHeaders(pid, (Elf64_Phdr*)programHeadersVaddr, programHeadersVaddr, static_cast<uint16_t>(filteredHeaders.size()));
+    }
     for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
         auto* currentHeader = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
 
@@ -913,7 +939,9 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                 break;
 
             case PT_INTERP:
-                mod::dbg::log("WARN: PT_INTERP skipped FIXME!");
+                // Extract the dynamic linker path from the segment data.
+                // The path is a null-terminated string at p_offset within the ELF.
+                // We don't load the interpreter here — the caller (exec) handles it.
                 break;
 
             case PT_DYNAMIC:
@@ -966,8 +994,22 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     // Load section headers with debug info
     loadSectionHeaders(elfFile, pagemap, pid);
 
-    // Process relocations AFTER loading all segments
-    processRelocations(elfFile, pagemap);
+    // Only process relocations for statically-linked binaries.
+    // Dynamically-linked ones (PT_INTERP present) have their relocations
+    // handled by the dynamic linker (ld.so).
+    // ld.so itself (loaded with non-zero loadBase) handles its own via relocateSelf().
+    bool hasDynamicInterp = false;
+    for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
+        auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
+        if (ph->p_type == PT_INTERP) {
+            hasDynamicInterp = true;
+            break;
+        }
+    }
+    bool skipRelocations = hasDynamicInterp || elfFile.loadBase != 0;
+    if (!skipRelocations) {
+        processRelocations(elfFile, pagemap);
+    }
 
     // Apply final permissions to PT_LOAD segments based on p_flags (after relocations complete).
     // With NX available:
@@ -1016,7 +1058,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                                 }
                             }
                             if (skipPage) {
-#ifdef ELF_DEBUG
+#ifdef ELF_DEBUG_EXTRA
                                 mod::dbg::log("Skipping page 0x%x (overlaps with writable segment)", va);
 #endif
                                 continue;
@@ -1024,13 +1066,13 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                         }
                     }
 
-#ifdef ELF_DEBUG
+#ifdef ELF_DEBUG_EXTRA
                     mod::dbg::log("Setting page 0x%x to flags=0x%x (%s %s)", va, baseFlags, writable ? "WRITE" : "READONLY",
                                   executable ? "EXEC" : "NOEXEC");
 #endif
                     mod::mm::virt::unifyPageFlags(pagemap, va, baseFlags);
                 }
-#ifdef ELF_DEBUG
+#ifdef ELF_DEBUG_EXTRA
                 mod::dbg::log("PT_LOAD perms applied: vaddr=[0x%x, 0x%x) flags=0x%x -> %s%s", start, end, ph->p_flags,
                               writable ? "USER" : "USER_READONLY", executable ? "" : "+NX");
 #endif
@@ -1038,60 +1080,63 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
         }
     }
 
-    // Enforce RELRO after relocations: PT_GNU_RELRO pages become read-only
-    for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
-        auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
-        if (ph->p_type == PT_GNU_RELRO) {
+    // Enforce RELRO after relocations: PT_GNU_RELRO pages become read-only.
+    // Skip for dynamically-linked binaries and ld.so — ld.so handles RELRO after its own relocations.
+    if (!skipRelocations) {
+        for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
+            auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
+            if (ph->p_type == PT_GNU_RELRO) {
 #ifdef ELF_DEBUG
-            mod::dbg::log("Found PT_GNU_RELRO at vaddr=0x%x, memsz=0x%x", ph->p_vaddr, ph->p_memsz);
+                mod::dbg::log("Found PT_GNU_RELRO at vaddr=0x%x, memsz=0x%x", ph->p_vaddr, ph->p_memsz);
 #endif
-            uint64_t start = ph->p_vaddr + elfFile.loadBase;
-            uint64_t end = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
+                uint64_t start = ph->p_vaddr + elfFile.loadBase;
+                uint64_t end = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
 
-            // Find .got.plt sections to exclude from RELRO
-            const char* sectionNames =
-                (const char*)((uint64_t)elfFile.seHead + (static_cast<uint64_t>(elfFile.elfHead.e_shstrndx * elfFile.elfHead.e_shentsize)));
-            auto* shstrtabHdr =
-                (Elf64_Shdr*)((uint64_t)elfFile.seHead + (static_cast<uint64_t>(elfFile.elfHead.e_shstrndx * elfFile.elfHead.e_shentsize)));
-            sectionNames = (const char*)((uint64_t)elfFile.base + shstrtabHdr->sh_offset);
+                // Find .got.plt sections to exclude from RELRO
+                const char* sectionNames = (const char*)((uint64_t)elfFile.seHead +
+                                                         (static_cast<uint64_t>(elfFile.elfHead.e_shstrndx * elfFile.elfHead.e_shentsize)));
+                auto* shstrtabHdr = (Elf64_Shdr*)((uint64_t)elfFile.seHead +
+                                                  (static_cast<uint64_t>(elfFile.elfHead.e_shstrndx * elfFile.elfHead.e_shentsize)));
+                sectionNames = (const char*)((uint64_t)elfFile.base + shstrtabHdr->sh_offset);
 
-            // Check each page to see if it overlaps with any GOT.PLT sections
-            for (uint64_t va = start; va < end; va += mod::mm::virt::PAGE_SIZE) {
-                if (!mod::mm::virt::isPageMapped(pagemap, va)) {
-                    continue;
-                }
+                // Check each page to see if it overlaps with any GOT.PLT sections
+                for (uint64_t va = start; va < end; va += mod::mm::virt::PAGE_SIZE) {
+                    if (!mod::mm::virt::isPageMapped(pagemap, va)) {
+                        continue;
+                    }
 
-                // Check if this page contains any .got.plt section
-                bool hasGotPlt = false;
-                for (size_t sectionIndex = 0; sectionIndex < elfFile.elfHead.e_shnum; sectionIndex++) {
-                    auto* sectionHeader = (Elf64_Shdr*)((uint64_t)elfFile.seHead + (sectionIndex * elfFile.elfHead.e_shentsize));
-                    const char* sectionName = &sectionNames[sectionHeader->sh_name];
+                    // Check if this page contains any .got.plt section
+                    bool hasGotPlt = false;
+                    for (size_t sectionIndex = 0; sectionIndex < elfFile.elfHead.e_shnum; sectionIndex++) {
+                        auto* sectionHeader = (Elf64_Shdr*)((uint64_t)elfFile.seHead + (sectionIndex * elfFile.elfHead.e_shentsize));
+                        const char* sectionName = &sectionNames[sectionHeader->sh_name];
 
-                    if (std::strncmp(sectionName, ".got.plt", 8) == 0 && sectionHeader->sh_addr != 0) {
-                        uint64_t gotStart = sectionHeader->sh_addr + elfFile.loadBase;
-                        uint64_t gotEnd = gotStart + sectionHeader->sh_size;
-                        uint64_t pageEnd = va + mod::mm::virt::PAGE_SIZE;
+                        if (std::strncmp(sectionName, ".got.plt", 8) == 0 && sectionHeader->sh_addr != 0) {
+                            uint64_t gotStart = sectionHeader->sh_addr + elfFile.loadBase;
+                            uint64_t gotEnd = gotStart + sectionHeader->sh_size;
+                            uint64_t pageEnd = va + mod::mm::virt::PAGE_SIZE;
 
-                        // Check if GOT.PLT overlaps with this page
-                        if (gotStart < pageEnd && gotEnd > va) {
-                            hasGotPlt = true;
+                            // Check if GOT.PLT overlaps with this page
+                            if (gotStart < pageEnd && gotEnd > va) {
+                                hasGotPlt = true;
 #ifdef ELF_DEBUG
-                            mod::dbg::log("RELRO: Skipping page 0x%x because it contains .got.plt [0x%x-0x%x)", va, gotStart, gotEnd);
+                                mod::dbg::log("RELRO: Skipping page 0x%x because it contains .got.plt [0x%x-0x%x)", va, gotStart, gotEnd);
 #endif
-                            break;
+                                break;
+                            }
                         }
                     }
-                }
 
-                if (!hasGotPlt) {
-                    mod::mm::virt::unifyPageFlags(pagemap, va, mod::mm::paging::pageTypes::USER_READONLY);
+                    if (!hasGotPlt) {
+                        mod::mm::virt::unifyPageFlags(pagemap, va, mod::mm::paging::pageTypes::USER_READONLY);
+                    }
                 }
-            }
 #ifdef ELF_DEBUG
-            mod::dbg::log("RELRO enforced for vaddr=[0x%x, 0x%x) (excluding .got.plt pages)", start, end);
+                mod::dbg::log("RELRO enforced for vaddr=[0x%x, 0x%x) (excluding .got.plt pages)", start, end);
 #endif
+            }
         }
-    }
+    }  // !skipRelocations
 
     if (registerSpecialSymbols) {
         // Iterate section headers to find symbol tables
@@ -1124,7 +1169,25 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
     // Return entry point, program header address, and ELF header address for auxv setup
     ElfLoadResult result = {.entryPoint = elfFile.elfHead.e_entry + elfFile.loadBase,
                             .programHeaderAddr = programHeadersVaddr,
-                            .elfHeaderAddr = elfHeaderVaddr};
+                            .elfHeaderAddr = elfHeaderVaddr,
+                            .programHeaderCount = elfFile.elfHead.e_phnum,
+                            .programHeaderEntSize = elfFile.elfHead.e_phentsize};
+
+    // Extract PT_INTERP path if present
+    for (Elf64_Half i = 0; i < elfFile.elfHead.e_phnum; i++) {
+        auto* ph = (Elf64_Phdr*)((uint64_t)elfFile.pgHead + (static_cast<uint64_t>(i * elfFile.elfHead.e_phentsize)));
+        if (ph->p_type == PT_INTERP && ph->p_filesz > 0 && ph->p_filesz < ElfLoadResult::INTERP_PATH_MAX) {
+            const char* interpStr = (const char*)(elfFile.base + ph->p_offset);
+            std::memcpy(result.interpPath, interpStr, ph->p_filesz);
+            result.interpPath[ph->p_filesz] = '\0';
+            result.hasInterp = true;
+#ifdef ELF_DEBUG
+            mod::dbg::log("PT_INTERP: dynamic linker path = '%s'", result.interpPath);
+#endif
+            break;
+        }
+    }
+
     return result;
 }
 

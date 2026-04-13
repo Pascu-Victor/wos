@@ -42,7 +42,7 @@ endif()
 
 # Linker settings
 set_target_properties(testprog PROPERTIES
-    LINK_FLAGS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/linker.ld -static -Wl,-z,now"
+    LINK_FLAGS "-Wl,-z,now"
 )
 
 target_link_libraries(testprog c++abi c++ c unwind)

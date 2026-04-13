@@ -12,6 +12,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/rtc/rtc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -36,6 +37,7 @@
 namespace ker::vfs {
 
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_t;
 
 // Keep in sync with userspace fcntl.h (Linux-compatible octal values)
 constexpr int O_NONBLOCK = 04000;
@@ -203,6 +205,22 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
     return copy_path_string(current, out, out_size);
 }
 
+// Re-apply the calling task's root prefix after following an absolute symlink.
+// Without this, absolute symlink targets (e.g. /usr/sbin) escape the pivoted
+// root and resolve against the global root instead of the task's root.
+auto reapply_root_prefix(char* path, size_t bufsize) -> int {
+    if (!ker::mod::sched::has_run_queues()) return 0;
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) return 0;
+    size_t root_len = std::strlen(task->root);
+    if (root_len <= 1) return 0;  // root == "/"
+    size_t path_len = std::strlen(path);
+    if (root_len + path_len + 1 > bufsize) return -ENAMETOOLONG;
+    std::memmove(path + root_len, path, path_len + 1);
+    std::memcpy(path, task->root, root_len);
+    return 0;
+}
+
 auto splice_symlink_target(const char* original_path, size_t prefix_len, const char* target, char* out, size_t out_size) -> int {
     if (original_path == nullptr || target == nullptr || out == nullptr || out_size == 0) {
         return -EINVAL;
@@ -294,7 +312,7 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
         prefix[end] = '\0';
 
         char linkbuf[MAX_PATH_LEN] = {};
-        ssize_t link_len = vfs_readlink(prefix, linkbuf, sizeof(linkbuf) - 1);
+        ssize_t link_len = readlink_resolved(prefix, linkbuf, sizeof(linkbuf) - 1);
         if (link_len > 0) {
             linkbuf[link_len] = '\0';
 
@@ -307,6 +325,12 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
             int copy_result = copy_path_string(substituted, path, bufsize);
             if (copy_result < 0) {
                 return copy_result;
+            }
+
+            // Absolute symlink targets must stay within the task's root.
+            if (linkbuf[0] == '/') {
+                int rr = reapply_root_prefix(path, bufsize);
+                if (rr < 0) return rr;
             }
 
             if (apply_task_policy) {
@@ -395,6 +419,21 @@ auto normalize_task_path_inplace(char* path, size_t bufsize) -> int {
         return canonical;
     }
 
+    // Clamp: if ".." escaped above task->root, force path back to root.
+    if (ker::mod::sched::has_run_queues()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr) {
+            size_t root_len = std::strlen(task->root);
+            if (root_len > 1) {
+                if (std::strncmp(path, task->root, root_len) != 0) {
+                    std::memcpy(path, task->root, root_len);
+                    path[root_len] = '/';
+                    path[root_len + 1] = '\0';
+                }
+            }
+        }
+    }
+
     char routed[MAX_PATH_LEN] = {};
     ker::mod::sched::task::Task* current_task = nullptr;
     if (ker::mod::sched::has_run_queues()) {
@@ -413,6 +452,25 @@ auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
     int absolute = make_absolute(path, out, outsize);
     if (absolute < 0) {
         return absolute;
+    }
+
+    // Prepend per-process root prefix when it differs from "/".
+    // This makes pivot_root transparent: after pivot_root("/rootfs", ...),
+    // task->root becomes "/rootfs" and all absolute paths get prefixed.
+    if (ker::mod::sched::has_run_queues()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr) {
+            size_t root_len = std::strlen(task->root);
+            if (root_len > 1) {  // root != "/"
+                size_t path_len = std::strlen(out);
+                if (root_len + path_len + 1 > outsize) {
+                    return -ENAMETOOLONG;
+                }
+                // Shift existing path right to make room for root prefix
+                std::memmove(out + root_len, out, path_len + 1);
+                std::memcpy(out, task->root, root_len);
+            }
+        }
     }
 
     return normalize_task_path_inplace(out, outsize);
@@ -745,6 +803,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (linkbuf[0] == '/') {
                 if (static_cast<size_t>(link_len) >= bufsize) return -1;
                 memcpy(resolved_buf, linkbuf, link_len + 1);
+                int rr = reapply_root_prefix(resolved_buf, bufsize);
+                if (rr < 0) return rr;
             } else {
                 size_t last_slash = 0;
                 bool found_slash = false;
@@ -796,6 +856,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 // Absolute symlink target - replace entire path
                 if (static_cast<size_t>(link_len) >= bufsize) return -1;
                 memcpy(resolved_buf, linkbuf, link_len + 1);
+                int rr = reapply_root_prefix(resolved_buf, bufsize);
+                if (rr < 0) return rr;
             } else {
                 // Relative symlink target - replace last component
                 size_t last_slash = 0;
@@ -860,6 +922,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (linkbuf[0] == '/') {
                 if (static_cast<size_t>(link_len) >= bufsize) return -1;
                 memcpy(resolved_buf, linkbuf, link_len + 1);
+                int rr = reapply_root_prefix(resolved_buf, bufsize);
+                if (rr < 0) return rr;
             } else {
                 size_t last_slash = 0;
                 bool found_slash = false;
@@ -924,6 +988,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 return -1;
             }
             memcpy(resolved_buf, node->symlink_target, target_len + 1);
+            int rr = reapply_root_prefix(resolved_buf, bufsize);
+            if (rr < 0) return rr;
         } else {
             // Relative symlink target - replace last component
             size_t last_slash = 0;
@@ -1567,13 +1633,13 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
     return (node != nullptr) ? 0 : -1;
 }
 
-auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
-    if (path == nullptr || buf == nullptr || bufsize == 0) {
+// Internal readlink operating on an already-resolved absolute path (no root
+// prefix applied).  Used by resolve_prefix_symlink_once which works on paths
+// that already include the task root.
+auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_t {
+    if (absPath == nullptr || buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
-
-    char absPath[MAX_PATH_LEN];
-    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
 
     MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
@@ -1653,6 +1719,17 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     size_t to_copy = (len < bufsize) ? len : bufsize;
     memcpy(buf, node->symlink_target, to_copy);
     return static_cast<ssize_t>(to_copy);
+}
+
+auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
+    if (path == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+
+    char absPath[MAX_PATH_LEN];
+    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
+
+    return readlink_resolved(absPath, buf, bufsize);
 }
 
 auto vfs_mkdir(const char* path, int mode) -> int {
@@ -1784,6 +1861,13 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            {
+                uint64_t now_ns = ker::mod::rtc::getEpochNs();
+                statbuf->st_atim.tv_sec = static_cast<int64_t>(now_ns / 1000000000ULL);
+                statbuf->st_atim.tv_nsec = static_cast<int64_t>(now_ns % 1000000000ULL);
+                statbuf->st_mtim = statbuf->st_atim;
+                statbuf->st_ctim = statbuf->st_atim;
+            }
             result = 0;
             break;
         }
@@ -1816,6 +1900,13 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                 statbuf->st_mode = S_IFBLK | node->mode;
             } else {
                 statbuf->st_mode = S_IFCHR | node->mode;
+            }
+            {
+                uint64_t now_ns = ker::mod::rtc::getEpochNs();
+                statbuf->st_atim.tv_sec = static_cast<int64_t>(now_ns / 1000000000ULL);
+                statbuf->st_atim.tv_nsec = static_cast<int64_t>(now_ns % 1000000000ULL);
+                statbuf->st_mtim = statbuf->st_atim;
+                statbuf->st_ctim = statbuf->st_atim;
             }
             result = 0;
             break;
@@ -1855,6 +1946,13 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
                 } else {
                     statbuf->st_mode = S_IFREG | 0444;
                 }
+            }
+            {
+                uint64_t now_ns = ker::mod::rtc::getEpochNs();
+                statbuf->st_atim.tv_sec = static_cast<int64_t>(now_ns / 1000000000ULL);
+                statbuf->st_atim.tv_nsec = static_cast<int64_t>(now_ns % 1000000000ULL);
+                statbuf->st_mtim = statbuf->st_atim;
+                statbuf->st_ctim = statbuf->st_atim;
             }
             // Clean up temporary file (allocated with new in procfs_open_path)
             ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
@@ -1924,6 +2022,13 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            {
+                uint64_t now_ns = ker::mod::rtc::getEpochNs();
+                statbuf->st_atim.tv_sec = static_cast<int64_t>(now_ns / 1000000000ULL);
+                statbuf->st_atim.tv_nsec = static_cast<int64_t>(now_ns % 1000000000ULL);
+                statbuf->st_mtim = statbuf->st_atim;
+                statbuf->st_ctim = statbuf->st_atim;
+            }
             return 0;
         }
         case FSType::FAT32: {
@@ -1946,6 +2051,13 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                 statbuf->st_mode = S_IFDIR | (node ? node->mode : 0755);
             } else {
                 statbuf->st_mode = S_IFCHR | (node ? node->mode : 0666);
+            }
+            {
+                uint64_t now_ns = ker::mod::rtc::getEpochNs();
+                statbuf->st_atim.tv_sec = static_cast<int64_t>(now_ns / 1000000000ULL);
+                statbuf->st_atim.tv_nsec = static_cast<int64_t>(now_ns % 1000000000ULL);
+                statbuf->st_mtim = statbuf->st_atim;
+                statbuf->st_ctim = statbuf->st_atim;
             }
             return 0;
         }
@@ -2001,7 +2113,93 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
 }
 
 // --- umount ---
-auto vfs_umount(const char* target) -> int { return unmount_filesystem(target); }
+auto vfs_umount(const char* target) -> int {
+    // Resolve path through the task's root prefix.
+    char resolved[MAX_PATH_LEN];
+    if (resolve_task_path_raw(target, resolved, MAX_PATH_LEN) < 0) {
+        return -ENAMETOOLONG;
+    }
+    return unmount_filesystem(resolved);
+}
+
+// --- pivot_root ---
+auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
+    if (new_root == nullptr || put_old == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    // Validate that new_root is an existing mount point
+    MountPoint* new_mount = find_mount_point(new_root);
+    if (new_mount == nullptr) {
+        ker::mod::dbg::log("pivot_root: new_root '%s' is not a mount point", new_root);
+        return -EINVAL;
+    }
+
+    // Check that new_root path matches the mount point exactly
+    if (std::strcmp(new_mount->path, new_root) != 0) {
+        ker::mod::dbg::log("pivot_root: new_root '%s' is not an exact mount point (found '%s')", new_root, new_mount->path);
+        return -EINVAL;
+    }
+
+    // Rename the old root mount from "/" to put_old so it can be accessed
+    // (and unmounted) under the new root.
+    MountPoint* old_root_mount = find_mount_point("/");
+    if (old_root_mount != nullptr && std::strcmp(old_root_mount->path, "/") == 0) {
+        size_t put_old_len = std::strlen(put_old);
+        auto* new_path = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(put_old_len + 1));
+        if (new_path != nullptr) {
+            std::memcpy(new_path, put_old, put_old_len + 1);
+            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(old_root_mount->path));
+            old_root_mount->path = new_path;
+        }
+    }
+
+    // Remap child mounts of the old root so they remain accessible under
+    // the new root.  After pivot_root("/rootfs", ...), a devfs at "/dev"
+    // must become "/rootfs/dev" because task path resolution will prepend
+    // the root prefix, turning user "/dev/urandom" into "/rootfs/dev/urandom".
+    size_t new_root_len = std::strlen(new_root);
+    size_t mount_count = get_mount_count();
+    for (size_t i = 0; i < mount_count; ++i) {
+        MountPoint* mp = get_mount_at(i);
+        if (mp == nullptr || mp->path == nullptr) continue;
+
+        // Skip the new root mount itself
+        if (std::strcmp(mp->path, new_root) == 0) continue;
+
+        // Skip mounts already under the new root (including the just-renamed old root)
+        if (std::strncmp(mp->path, new_root, new_root_len) == 0 && (mp->path[new_root_len] == '/' || mp->path[new_root_len] == '\0'))
+            continue;
+
+        // This mount is under the old root — prefix it with new_root
+        size_t mp_len = std::strlen(mp->path);
+        auto* remapped = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(new_root_len + mp_len + 1));
+        if (remapped != nullptr) {
+            std::memcpy(remapped, new_root, new_root_len);
+            std::memcpy(remapped + new_root_len, mp->path, mp_len + 1);
+            ker::mod::dbg::log("pivot_root: remapped mount '%s' -> '%s'", mp->path, remapped);
+            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(mp->path));
+            mp->path = remapped;
+        }
+    }
+
+    // Set the calling task's root to new_root.
+    // After this, all absolute path resolution for this task (and its children)
+    // will prepend this prefix, effectively making new_root the apparent "/".
+    if (new_root_len >= ker::mod::sched::task::Task::CWD_MAX) {
+        return -ENAMETOOLONG;
+    }
+    std::memcpy(task->root, new_root, new_root_len + 1);
+
+    ker::mod::dbg::log("pivot_root: task '%s' (pid %x) root set to '%s'", task->name, task->pid, new_root);
+
+    return 0;
+}
 
 // --- dup / dup2 ---
 auto vfs_dup(int oldfd) -> int {
@@ -2064,21 +2262,10 @@ auto vfs_chdir(const char* path) -> int {
         return canonical;
     }
 
-    char resolved[MAX_PATH_LEN] = {};
-    int routed = resolve_task_path_raw(logical, resolved, MAX_PATH_LEN);
-    if (routed < 0) {
-        return routed;
-    }
-
-    char final_path[MAX_PATH_LEN] = {};
-    int resolve_ret = resolve_symlinks(resolved, final_path, MAX_PATH_LEN, true);
-    if (resolve_ret < 0) {
-        return resolve_ret;
-    }
-
-    // Verify the resolved backing path is a directory, but keep cwd logical.
+    // Verify the path is a directory.  vfs_stat handles root-prefix
+    // resolution internally, so pass the logical (user-visible) path.
     ker::vfs::stat st{};
-    int ret = vfs_stat(final_path, &st);
+    int ret = vfs_stat(logical, &st);
     if (ret < 0) return ret;
     if ((st.st_mode & S_IFDIR) == 0) return -ENOTDIR;
 

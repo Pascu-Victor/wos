@@ -20,9 +20,16 @@ struct TlsModule {
 using Elf64Entry = uint64_t;
 
 struct ElfLoadResult {
-    uint64_t entryPoint;         // Program entry point
-    uint64_t programHeaderAddr;  // Virtual address of program headers (for AT_PHDR)
-    uint64_t elfHeaderAddr;      // Virtual address of ELF header (for AT_EHDR)
+    uint64_t entryPoint;            // Program entry point
+    uint64_t programHeaderAddr;     // Virtual address of program headers (for AT_PHDR)
+    uint64_t elfHeaderAddr;         // Virtual address of ELF header (for AT_EHDR)
+    uint16_t programHeaderCount;    // Number of program headers (for AT_PHNUM)
+    uint16_t programHeaderEntSize;  // Size of each program header entry (for AT_PHENT)
+
+    // PT_INTERP fields — set when the ELF requests a dynamic linker
+    static constexpr unsigned INTERP_PATH_MAX = 256;
+    char interpPath[INTERP_PATH_MAX] = {};  // e.g. "/lib/ld.so"
+    bool hasInterp = false;                 // true if PT_INTERP was found
 };
 
 struct ElfFile {
@@ -36,7 +43,7 @@ struct ElfFile {
 };
 
 auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName,
-             bool registerSpecialSymbols = true) -> ElfLoadResult;
+             bool registerSpecialSymbols = true, uint64_t baseAddress = 0) -> ElfLoadResult;
 
 // Extract TLS information from ELF without fully loading it
 auto extractTlsInfo(void* elfData) -> TlsModule;

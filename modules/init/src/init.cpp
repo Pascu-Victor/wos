@@ -1,4 +1,5 @@
 #include <sys/process.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -70,6 +71,24 @@ auto main(int argc, char** argv) -> int {
     ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT);
 
     mount_filesystems();
+
+    // Pivot root from initramfs to the real rootfs.
+    // After mount_filesystems(), the XFS rootfs is mounted at /rootfs.
+    // pivot_root makes it appear as "/" for this task and all children.
+    int pivot_ret = ker::abi::vfs::pivot_root_vfs("/rootfs", "/rootfs/oldroot");
+    if (pivot_ret < 0) {
+        std::println("init[{}]: pivot_root failed (ret={}), continuing with initramfs root", cpuno, pivot_ret);
+    } else {
+        std::println("init[{}]: pivot_root succeeded, root is now /rootfs", cpuno);
+        // Unmount the old initramfs root to free its RAM.
+        int umount_ret = ker::abi::vfs::umount("/oldroot");
+        if (umount_ret < 0) {
+            std::println("init[{}]: umount /oldroot failed (ret={})", cpuno, umount_ret);
+        } else {
+            std::println("init[{}]: unmounted old initramfs root", cpuno);
+        }
+    }
+
     start_network();
     start_httpd();
     start_dropbear();

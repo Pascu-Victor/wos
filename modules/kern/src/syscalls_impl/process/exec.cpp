@@ -20,6 +20,7 @@
 #include <platform/sched/task.hpp>
 #include <span>
 #include <string_view>
+#include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
@@ -188,6 +189,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
     memcpy(newTask->cwd, parentTask->cwd, sizeof(newTask->cwd));
+    memcpy(newTask->root, parentTask->root, sizeof(newTask->root));
     newTask->uid = parentTask->uid;
     newTask->gid = parentTask->gid;
     newTask->euid = parentTask->euid;
@@ -345,16 +347,16 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     envpAddrs[envpCount] = 0;
 
     // Align to 16 bytes after string data, accounting for structured data parity.
-    // Structured data: auxv (10 qwords) + envp array + argv array + argc.
-    // Total structured qwords = 10 + (envpCount+1) + (argvCount+1) + 1 = envpCount + argvCount + 13.
-    // If that count is odd, we need 8 extra bytes of padding so rsp ends 16-byte aligned.
+    // Structured data: auxv (variable) + envp array + argv array + argc.
+    // auxv: 4 core pairs (8 qwords) + optional AT_BASE pair (2 qwords) + AT_NULL pair (2 qwords)
     {
         constexpr uint64_t alignment = 16;
         uint64_t currentAddr = userStackVirt - currentVirtOffset;
         uint64_t aligned = currentAddr & ~(alignment - 1);
         currentVirtOffset += (currentAddr - aligned);
 
-        size_t structuredQwords = 10 + (envpCount + 1) + (argvCount + 1) + 1;
+        size_t auxvQwords = 14 + (newTask->interpBase != 0 ? 2 : 0);
+        size_t structuredQwords = auxvQwords + (envpCount + 1) + (argvCount + 1) + 1;
         if (structuredQwords % 2 != 0) {
             // Add 8 bytes padding so final rsp is 16-byte aligned
             uint64_t pad = 0;
@@ -365,19 +367,37 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     // Push auxv (System V ABI: auxv sits between envp NULL terminator and string data)
     {
         constexpr uint64_t AT_NULL = 0;
-        constexpr uint64_t AT_PAGESZ = 6;
-        constexpr uint64_t AT_ENTRY = 9;
         constexpr uint64_t AT_PHDR = 3;
+        constexpr uint64_t AT_PHENT = 4;
+        constexpr uint64_t AT_PHNUM = 5;
+        constexpr uint64_t AT_PAGESZ = 6;
+        constexpr uint64_t AT_BASE = 7;
+        constexpr uint64_t AT_ENTRY = 9;
         constexpr uint64_t AT_EHDR = 33;
 
-        std::array<uint64_t, 10> auxvEntries = {AT_PAGESZ, (uint64_t)mod::mm::paging::PAGE_SIZE,
-                                                AT_ENTRY,  newTask->entry,
-                                                AT_PHDR,   newTask->programHeaderAddr,
-                                                AT_EHDR,   newTask->elfHeaderAddr,
-                                                AT_NULL,   0};
+        // Build auxv dynamically: always include core entries, conditionally add AT_BASE
+        ker::util::SmallVec<uint64_t, 16> auxv;
+        auxv.push_back(AT_PAGESZ);
+        auxv.push_back((uint64_t)mod::mm::paging::PAGE_SIZE);
+        auxv.push_back(AT_ENTRY);
+        auxv.push_back(newTask->entry);
+        auxv.push_back(AT_PHDR);
+        auxv.push_back(newTask->programHeaderAddr);
+        auxv.push_back(AT_PHENT);
+        auxv.push_back(newTask->programHeaderEntSize);
+        auxv.push_back(AT_PHNUM);
+        auxv.push_back(newTask->programHeaderCount);
+        auxv.push_back(AT_EHDR);
+        auxv.push_back(newTask->elfHeaderAddr);
+        if (newTask->interpBase != 0) {
+            auxv.push_back(AT_BASE);
+            auxv.push_back(newTask->interpBase);
+        }
+        auxv.push_back(AT_NULL);
+        auxv.push_back(0);
 
-        for (int j = static_cast<int>(auxvEntries.size()) - 1; j >= 0; j--) {
-            uint64_t val = auxvEntries[static_cast<size_t>(j)];
+        for (int j = static_cast<int>(auxv.size()) - 1; j >= 0; j--) {
+            uint64_t val = auxv[static_cast<size_t>(j)];
             pushToStack(&val, sizeof(uint64_t));
         }
     }
@@ -743,8 +763,61 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     task->entry = elfResult.entryPoint;
     task->programHeaderAddr = elfResult.programHeaderAddr;
     task->elfHeaderAddr = elfResult.elfHeaderAddr;
+    task->programHeaderCount = elfResult.programHeaderCount;
+    task->programHeaderEntSize = elfResult.programHeaderEntSize;
     task->elfBuffer = elfBuffer;
     task->elfBufferSize = fileSize;
+    task->interpBase = 0;
+
+    // If the binary requests a dynamic linker (PT_INTERP), load it.
+    if (elfResult.hasInterp) {
+        constexpr uint64_t INTERP_BASE = 0x40000000ULL;
+
+        int interpFd = vfs::vfs_open(std::string_view(elfResult.interpPath, std::strlen(elfResult.interpPath)), 0, 0);
+        if (interpFd < 0) {
+            dbg::log("wos_proc_execve: Failed to open interpreter '%s'", elfResult.interpPath);
+            delete[] elfBuffer;
+            freeKernelArgEnv();
+            return static_cast<uint64_t>(-ENOEXEC);
+        }
+
+        ssize_t interpSize = vfs::vfs_lseek(interpFd, 0, 2);
+        vfs::vfs_lseek(interpFd, 0, 0);
+        if (interpSize <= 0) {
+            vfs::vfs_close(interpFd);
+            delete[] elfBuffer;
+            freeKernelArgEnv();
+            return static_cast<uint64_t>(-ENOEXEC);
+        }
+
+        auto* interpBuf = new uint8_t[interpSize];
+        ssize_t interpRead = 0;
+        vfs::vfs_read(interpFd, interpBuf, interpSize, (size_t*)&interpRead);
+        vfs::vfs_close(interpFd);
+
+        if (interpRead != interpSize) {
+            delete[] interpBuf;
+            delete[] elfBuffer;
+            freeKernelArgEnv();
+            return static_cast<uint64_t>(-EIO);
+        }
+
+        loader::elf::ElfLoadResult interpResult =
+            loader::elf::loadElf((loader::elf::ElfFile*)(uint64_t)interpBuf, newPagemap, task->pid, "ld.so", false, INTERP_BASE);
+
+        if (interpResult.entryPoint == 0) {
+            delete[] interpBuf;
+            delete[] elfBuffer;
+            freeKernelArgEnv();
+            return static_cast<uint64_t>(-ENOEXEC);
+        }
+
+        // Override entry point to the interpreter — ld.so reads AT_ENTRY from auxv
+        elfResult.entryPoint = interpResult.entryPoint;
+        task->interpBase = INTERP_BASE;
+
+        delete[] interpBuf;
+    }
 
     // Update executable path
     {
@@ -865,7 +938,8 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         uint64_t aligned = currentAddr & ~(alignment - 1);
         currentVirtOffset += (currentAddr - aligned);
 
-        size_t structuredQwords = 10 + (envpCount + 1) + (argvCount + 1) + 1;
+        size_t auxvQwords = 14 + (task->interpBase != 0 ? 2 : 0);
+        size_t structuredQwords = auxvQwords + (envpCount + 1) + (argvCount + 1) + 1;
         if (structuredQwords % 2 != 0) {
             uint64_t pad = 0;
             pushToStack(&pad, sizeof(uint64_t));
@@ -874,14 +948,30 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     // auxv
     {
-        constexpr uint64_t AT_NULL = 0, AT_PAGESZ = 6, AT_ENTRY = 9, AT_PHDR = 3, AT_EHDR = 33;
-        std::array<uint64_t, 10> auxvEntries = {AT_PAGESZ, (uint64_t)mm::paging::PAGE_SIZE,
-                                                AT_ENTRY,  task->entry,
-                                                AT_PHDR,   task->programHeaderAddr,
-                                                AT_EHDR,   task->elfHeaderAddr,
-                                                AT_NULL,   0};
-        for (int j = static_cast<int>(auxvEntries.size()) - 1; j >= 0; j--) {
-            uint64_t val = auxvEntries[static_cast<size_t>(j)];
+        constexpr uint64_t AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9, AT_EHDR = 33;
+
+        ker::util::SmallVec<uint64_t, 16> auxv;
+        auxv.push_back(AT_PAGESZ);
+        auxv.push_back((uint64_t)mm::paging::PAGE_SIZE);
+        auxv.push_back(AT_ENTRY);
+        auxv.push_back(task->entry);
+        auxv.push_back(AT_PHDR);
+        auxv.push_back(task->programHeaderAddr);
+        auxv.push_back(AT_PHENT);
+        auxv.push_back(task->programHeaderEntSize);
+        auxv.push_back(AT_PHNUM);
+        auxv.push_back(task->programHeaderCount);
+        auxv.push_back(AT_EHDR);
+        auxv.push_back(task->elfHeaderAddr);
+        if (task->interpBase != 0) {
+            auxv.push_back(AT_BASE);
+            auxv.push_back(task->interpBase);
+        }
+        auxv.push_back(AT_NULL);
+        auxv.push_back(0);
+
+        for (int j = static_cast<int>(auxv.size()) - 1; j >= 0; j--) {
+            uint64_t val = auxv[static_cast<size_t>(j)];
             pushToStack(&val, sizeof(uint64_t));
         }
     }

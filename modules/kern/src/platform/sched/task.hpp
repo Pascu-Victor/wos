@@ -129,8 +129,11 @@ struct Task {
     size_t elfBufferSize;
 
     // ELF metadata for auxv setup
-    uint64_t programHeaderAddr;  // Virtual address of program headers (AT_PHDR)
-    uint64_t elfHeaderAddr;      // Virtual address of ELF header (AT_EHDR)
+    uint64_t programHeaderAddr;         // Virtual address of program headers (AT_PHDR)
+    uint64_t elfHeaderAddr;             // Virtual address of ELF header (AT_EHDR)
+    uint16_t programHeaderCount = 0;    // Number of program headers (AT_PHNUM)
+    uint16_t programHeaderEntSize = 0;  // Size of each program header entry (AT_PHENT)
+    uint64_t interpBase = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
 
     // File descriptor table for the task (per-process model).
     // Dynamic radix tree: no fixed upper bound on FD count.
@@ -155,6 +158,10 @@ struct Task {
     // Current working directory (absolute path, "/" by default)
     static constexpr unsigned CWD_MAX = 256;
     char cwd[CWD_MAX] = "/";
+
+    // Per-process root directory (for pivot_root / chroot).
+    // Path resolution prepends this to absolute paths when it differs from "/".
+    char root[CWD_MAX] = "/";
 
     // Executable path (set by exec, used by procfs /proc/self/exe)
     static constexpr unsigned EXE_PATH_MAX = 256;

@@ -101,6 +101,9 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy CWD
     memcpy(child->cwd, parent->cwd, sched::task::Task::CWD_MAX);
 
+    // Copy root directory (pivot_root / chroot)
+    memcpy(child->root, parent->root, sched::task::Task::CWD_MAX);
+
     // Copy executable path
     memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
 
@@ -224,6 +227,8 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->entry = parent->entry;
     child->programHeaderAddr = parent->programHeaderAddr;
     child->elfHeaderAddr = parent->elfHeaderAddr;
+    child->programHeaderCount = parent->programHeaderCount;
+    child->programHeaderEntSize = parent->programHeaderEntSize;
 
     // --- Clone file descriptors ---
     parent->fd_table.for_each([&](uint64_t key, void* val) {

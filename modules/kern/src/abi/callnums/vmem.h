@@ -5,6 +5,7 @@ namespace ker::abi::vmem {
 enum class ops : uint64_t {
     anon_allocate,
     anon_free,
+    protect,
 };
 
 // Protection flags (matching Linux mmap)

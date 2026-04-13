@@ -428,84 +428,48 @@ def ensure_ssh_host_keys(node_ids: list):
 def inject_into_overlay(
     overlay_path: str, dropbear_key_path: str | None = None, hostname: str | None = None
 ) -> bool:
-    """Inject per-node files into an overlay's initramfs.
+    """Inject per-node files directly into a mountfs overlay's XFS rootfs.
 
-    Extracts the base initramfs CPIO from build/initramfs.cpio, adds the
-    host key and/or hostname, re-packs the CPIO, and writes it into the
-    overlay's boot partition via guestfish.
+    Uses guestfish to write the SSH host key and hostname into the overlay
+    without any CPIO extract/repack cycle.
     """
-    base_initramfs = os.path.abspath("build/initramfs.cpio")
-    if not os.path.exists(base_initramfs):
-        print(f"  WARNING: {base_initramfs} not found, skipping overlay injection")
+    abs_overlay = os.path.abspath(overlay_path)
+    if not os.path.exists(abs_overlay):
+        print(f"  WARNING: {abs_overlay} not found, skipping overlay injection")
         return False
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        extract_dir = os.path.join(tmpdir, "rootfs")
-        os.makedirs(extract_dir)
+    gf_cmds = "run\nmount /dev/sda1 /\n"
 
-        # Extract base initramfs
-        with open(base_initramfs, "rb") as f:
-            result = subprocess.run(
-                ["cpio", "-idm", "--quiet"],
-                cwd=extract_dir,
-                stdin=f,
-                capture_output=True,
-                text=True,
-            )
-        if result.returncode != 0:
-            print(f"  WARNING: cpio extract failed: {result.stderr}")
-            return False
+    if dropbear_key_path and os.path.exists(dropbear_key_path):
+        abs_key = os.path.abspath(dropbear_key_path)
+        gf_cmds += "mkdir-p /etc/dropbear\n"
+        gf_cmds += f"upload {abs_key} /etc/dropbear/dropbear_rsa_host_key\n"
+        gf_cmds += "chmod 0600 /etc/dropbear/dropbear_rsa_host_key\n"
 
-        # Inject host key
-        if dropbear_key_path:
-            dropbear_dir = os.path.join(extract_dir, "etc", "dropbear")
-            os.makedirs(dropbear_dir, exist_ok=True)
-            shutil.copy2(
-                dropbear_key_path,
-                os.path.join(dropbear_dir, "dropbear_rsa_host_key"),
-            )
-            os.chmod(os.path.join(dropbear_dir, "dropbear_rsa_host_key"), 0o600)
+    if hostname:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".hostname", delete=False) as hf:
+            hf.write(hostname)
+            hostname_file = hf.name
+        gf_cmds += f"upload {hostname_file} /etc/hostname\n"
 
-        # Inject hostname
-        if hostname:
-            etc_dir = os.path.join(extract_dir, "etc")
-            os.makedirs(etc_dir, exist_ok=True)
-            with open(os.path.join(etc_dir, "hostname"), "w") as hf:
-                hf.write(hostname)
+    gf_cmds += "umount /\n"
 
-        # Re-create CPIO archive
-        new_initramfs = os.path.join(tmpdir, "initramfs.cpio")
-        find_result = subprocess.run(
-            ["find", "."],
-            cwd=extract_dir,
-            capture_output=True,
-        )
-        with open(new_initramfs, "wb") as f:
-            result = subprocess.run(
-                ["cpio", "-o", "-H", "newc", "--quiet"],
-                cwd=extract_dir,
-                input=find_result.stdout,
-                stdout=f,
-                stderr=subprocess.PIPE,
-            )
-        if result.returncode != 0:
-            print(f"  WARNING: cpio create failed: {result.stderr}")
-            return False
+    result = subprocess.run(
+        ["guestfish", "--rw", "-a", abs_overlay],
+        input=gf_cmds,
+        capture_output=True,
+        text=True,
+    )
 
-        # Upload into overlay's boot partition via guestfish
-        abs_overlay = os.path.abspath(overlay_path)
-        gf_cmds = f"run\nmount /dev/sda1 /\nupload {new_initramfs} /boot/initramfs.cpio\numount /\n"
-        result = subprocess.run(
-            ["guestfish", "--rw", "-a", abs_overlay],
-            input=gf_cmds,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            print(f"  WARNING: guestfish failed: {result.stderr}")
-            return False
+    # Clean up temp hostname file
+    if hostname:
+        os.unlink(hostname_file)
 
-        return True
+    if result.returncode != 0:
+        print(f"  WARNING: guestfish failed: {result.stderr}")
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -968,16 +932,16 @@ def launch(config: dict, tcg_level: str | None = None):
         print(f"  [VM{node_id}] zones={zone_names} debug={is_debug}")
         print(f"    cmd: {' '.join(args)}")
 
-        # Inject per-node files (SSH host key, hostname) into the overlay's initramfs
-        overlay0 = os.path.join("cluster-overlays", f"disk-vm{node_id}.qcow2")
+        # Inject per-node files (SSH host key, hostname) into the mountfs overlay
+        mountfs_overlay = os.path.join("cluster-overlays", f"mountfs-vm{node_id}.qcow2")
         dropbear_key = os.path.join(
             SSH_KEYS_DIR, f"vm{node_id}", "dropbear_rsa_host_key"
         )
         node_hostname = f"wos-{node_id}"
         key_path = dropbear_key if os.path.exists(dropbear_key) else None
-        if os.path.exists(overlay0):
+        if os.path.exists(mountfs_overlay):
             if inject_into_overlay(
-                overlay0, dropbear_key_path=key_path, hostname=node_hostname
+                mountfs_overlay, dropbear_key_path=key_path, hostname=node_hostname
             ):
                 print(f"    Injected per-node overlay (hostname={node_hostname})")
             else:

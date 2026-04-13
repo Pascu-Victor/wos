@@ -37,8 +37,8 @@ mkdir -p $SYSROOT/bin $SYSROOT/lib $SYSROOT/include/abi-bits
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << 'EOF'
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos',  '-fno-PIC', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos',  '-fno-PIC', '-mcmodel=small']
+c = ['clang', '--target=x86_64-pc-wos', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 [host_machine]
@@ -184,7 +184,7 @@ mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
 c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$SYSROOT/include/c++/v1', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-fno-PIC', '-mcmodel=small']
+cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$SYSROOT/include/c++/v1', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 
@@ -275,6 +275,14 @@ cmake -G Ninja \
 
 ninja && ninja install
 
+# Generate Clang config file for WOS target triple
+# Must be after all library builds (mlibc, libc++) but before userspace binaries
+cat > $HOST/bin/x86_64-pc-wos.cfg << 'CFGEOF'
+-fPIE
+-pie
+-Wl,--dynamic-linker=/lib/ld.so
+CFGEOF
+
 # 6. Build busybox for WOS userspace
 cd $B/src
 [ ! -d busybox ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/busybox.git
@@ -291,8 +299,8 @@ BB_RANLIB="$HOST/bin/llvm-ranlib"
 BB_OBJCOPY="$HOST/bin/llvm-objcopy"
 BB_NM="$HOST/bin/llvm-nm"
 BB_HOSTCC="gcc"
-BB_CFLAGS="--sysroot=$TARGET_SYSROOT -static -fno-sanitize=safe-stack -fno-stack-protector"
-BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld"
+BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector"
+BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld"
 
 if [ -f $B/src/busybox/configs/wos_defconfig ]; then
     make -C $B/src/busybox O=$B/busybox-build \
@@ -354,8 +362,8 @@ export CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
-export CFLAGS="--sysroot=$TARGET_SYSROOT -static -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
-export LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld -L$TARGET_SYSROOT/lib"
+export CFLAGS="--sysroot=$TARGET_SYSROOT -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
+export LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib"
 
 if [ ! -f "$B/src/dropbear/configure" ]; then
     (cd $B/src/dropbear && autoconf && autoheader)
@@ -369,7 +377,6 @@ fi
 $B/src/dropbear/configure \
     --host=x86_64-pc-wos \
     --prefix="$TARGET_SYSROOT" \
-    --enable-static \
     --enable-bundled-libtom \
     --disable-zlib \
     --disable-pam \

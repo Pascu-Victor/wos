@@ -125,5 +125,6 @@ inline bool xfs_has_finobt(const XfsMountContext* ctx) { return (ctx->feat_ro_co
 inline bool xfs_has_nrext64(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_NREXT64) != 0; }
 inline bool xfs_has_parent(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_PARENT) != 0; }
 inline bool xfs_has_exchrange(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_EXCHRANGE) != 0; }
+inline bool xfs_has_bigtime(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_BIGTIME) != 0; }
 
 }  // namespace ker::vfs::xfs

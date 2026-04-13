@@ -321,6 +321,11 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         case ops::wki_rule_clear: {
             return static_cast<int64_t>(ker::vfs::vfs_wki_rule_clear());
         }
+        case ops::pivot_root: {
+            const auto* new_root = reinterpret_cast<const char*>(a1);
+            const auto* put_old = reinterpret_cast<const char*>(a2);
+            return static_cast<int64_t>(ker::vfs::vfs_pivot_root(new_root, put_old));
+        }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");
             return static_cast<int64_t>(ENOSYS);

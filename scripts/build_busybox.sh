@@ -21,8 +21,8 @@ BB_RANLIB="$HOST/bin/llvm-ranlib"
 BB_OBJCOPY="$HOST/bin/llvm-objcopy"
 BB_NM="$HOST/bin/llvm-nm"
 BB_HOSTCC="gcc"
-BB_CFLAGS="--sysroot=$TARGET_SYSROOT -static -fno-sanitize=safe-stack -fno-stack-protector"
-BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -static -fuse-ld=lld"
+BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector"
+BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -Wl,--no-dynamic-linker"
 
 # Re-apply config from wos_defconfig to stay in sync.
 # 1) Run allnoconfig to set everything to 'n'.
@@ -74,8 +74,8 @@ fi
 
 # Force relink if any sysroot library is newer than the binary
 if [ -f "$B/busybox-build/busybox" ]; then
-    for lib in "$TARGET_SYSROOT"/lib/libc.a "$TARGET_SYSROOT"/lib/libc++.a \
-               "$TARGET_SYSROOT"/lib/libc++abi.a "$TARGET_SYSROOT"/lib/libm.a; do
+    for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libc++.so \
+               "$TARGET_SYSROOT"/lib/libc++abi.so "$TARGET_SYSROOT"/lib/libm.so; do
         if [ -f "$lib" ] && [ "$lib" -nt "$B/busybox-build/busybox" ]; then
             echo "Sysroot library $(basename "$lib") changed - forcing relink"
             rm -f "$B/busybox-build/busybox"

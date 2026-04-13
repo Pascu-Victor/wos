@@ -25,19 +25,20 @@ include_directories(src ../extern ../ ../extern/limine)
 # Do not include kernel source headers; rely exclusively on toolchain/sysroot headers
 
 set_target_properties(${TARGET} PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
+    POSITION_INDEPENDENT_CODE OFF
     INTERPROCEDURAL_OPTIMIZATION OFF
 )
 
 # Clear the global link options and set our own
 set_target_properties(${TARGET} PROPERTIES LINK_OPTIONS "")
 
-# Use static linking with custom linker script
+# Use static linking with custom linker script (overrides .cfg PIE defaults)
 target_link_options(${TARGET} PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
     "-L${CMAKE_SYSROOT}/lib"
     "-static"
+    "-no-pie"
     "-mcmodel=small"
     "-Wl,-z,now"        # bind-now: resolve all PLT entries at load time
     "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"

@@ -27,7 +27,7 @@ add_executable(perf ${SOURCES})
 
 # Linker settings
 set_target_properties(perf PROPERTIES
-    LINK_FLAGS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/linker.ld -static -Wl,-z,now"
+    LINK_FLAGS "-Wl,-z,now"
 )
 
 target_link_libraries(perf c++abi c++ c unwind)

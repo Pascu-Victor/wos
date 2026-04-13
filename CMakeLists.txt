@@ -44,8 +44,16 @@ add_custom_target(check_headers
 )
 
 # --- mlibc: build and install the C library ---------------------------------
-# Use a stamp file so mlibc only rebuilds when the stamp is missing or stale.
-# Delete build/stamps/mlibc.stamp to force a rebuild.
+# Glob all mlibc sources so the stamp invalidates when any file changes.
+# New files require a CMake reconfigure (cmake -B build).
+file(GLOB_RECURSE MLIBC_SOURCES
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.cpp
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.c
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.hpp
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.h
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.S
+    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/meson.build
+)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stamps)
 set(MLIBC_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc.stamp)
 add_custom_command(
@@ -54,7 +62,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E touch ${MLIBC_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building mlibc..."
-    DEPENDS ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh
+    DEPENDS ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh ${MLIBC_SOURCES}
     USES_TERMINAL
 )
 add_custom_target(mlibc DEPENDS ${MLIBC_STAMP})
@@ -91,11 +99,13 @@ add_custom_target(dropbear
 )
 add_dependencies(dropbear mlibc libcxx)
 
-# --- mountfs_disk: create the XFS test disk image ---------------------------
+# --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
+# If mountfs.qcow2 doesn't exist, create it from scratch.
+# If it already exists, delta-sync changed binaries and libraries.
 add_custom_target(mountfs_disk
-    COMMAND ${CMAKE_SOURCE_DIR}/scripts/create_mountfs_disk.sh
+    COMMAND bash -c "if [ -f '${CMAKE_SOURCE_DIR}/mountfs.qcow2' ]\; then '${CMAKE_SOURCE_DIR}/scripts/sync_rootfs.sh'\; else '${CMAKE_SOURCE_DIR}/scripts/create_mountfs_disk.sh'\; fi"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Creating mountfs test disk..."
+    COMMENT "Syncing rootfs disk..."
     USES_TERMINAL
 )
 # Needs testprog and init binaries from the modules build

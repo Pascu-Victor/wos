@@ -26,10 +26,8 @@ target_link_options(${TARGET} PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
     "-L${CMAKE_SYSROOT}/lib"
-    "-static"
     "-mcmodel=small"
     "-Wl,-z,now"
-    "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/netd/linker.ld"
 )
 
 target_link_libraries(${TARGET} PRIVATE

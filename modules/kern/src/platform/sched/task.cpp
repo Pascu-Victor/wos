@@ -9,6 +9,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <vfs/file.hpp>
+#include <vfs/vfs.hpp>
 
 #include "platform/asm/msr.hpp"
 
@@ -200,6 +201,58 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->context.frame.rip = elfResult.entryPoint;
     this->programHeaderAddr = elfResult.programHeaderAddr;
     this->elfHeaderAddr = elfResult.elfHeaderAddr;
+    this->programHeaderCount = elfResult.programHeaderCount;
+    this->programHeaderEntSize = elfResult.programHeaderEntSize;
+
+    // If the binary requests a dynamic linker (PT_INTERP), load it now.
+    // The interpreter (ld.so) is loaded at a high base address to avoid
+    // conflicting with the main binary's address space.
+    if (elfResult.hasInterp) {
+        constexpr uint64_t INTERP_BASE = 0x40000000ULL;
+
+        int interpFd = ker::vfs::vfs_open(std::string_view(elfResult.interpPath, __builtin_strlen(elfResult.interpPath)), 0, 0);
+        if (interpFd < 0) {
+            dbg::log("Failed to open interpreter '%s' for task %s", elfResult.interpPath, name);
+            hcf();
+        }
+
+        ssize_t interpSize = ker::vfs::vfs_lseek(interpFd, 0, 2);
+        ker::vfs::vfs_lseek(interpFd, 0, 0);
+        if (interpSize <= 0) {
+            ker::vfs::vfs_close(interpFd);
+            dbg::log("Invalid interpreter file size for '%s'", elfResult.interpPath);
+            hcf();
+        }
+
+        auto* interpBuf = new uint8_t[interpSize];
+        ssize_t interpRead = 0;
+        ker::vfs::vfs_read(interpFd, interpBuf, interpSize, (size_t*)&interpRead);
+        ker::vfs::vfs_close(interpFd);
+
+        if (interpRead != interpSize) {
+            delete[] interpBuf;
+            dbg::log("Short read loading interpreter '%s'", elfResult.interpPath);
+            hcf();
+        }
+
+        loader::elf::ElfLoadResult interpResult =
+            loader::elf::loadElf((loader::elf::ElfFile*)(uint64_t)interpBuf, this->pagemap, this->pid, "ld.so",
+                                 false /* don't register debug symbols for interp */, INTERP_BASE);
+
+        if (interpResult.entryPoint == 0) {
+            delete[] interpBuf;
+            dbg::log("Failed to load interpreter ELF '%s'", elfResult.interpPath);
+            hcf();
+        }
+
+        // Entry point becomes the interpreter's entry (ld.so _start).
+        // ld.so reads AT_ENTRY and AT_PHDR from auxv to find the real binary.
+        this->context.frame.rip = interpResult.entryPoint;
+        // Store interpBase for AT_BASE in auxv (set by exec.cpp)
+        this->interpBase = INTERP_BASE;
+
+        delete[] interpBuf;
+    }
 
     // Initialize interrupt frame fields for usermode
     this->context.frame.intNum = 0;     // Not from a real interrupt

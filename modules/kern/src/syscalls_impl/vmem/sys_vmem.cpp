@@ -259,6 +259,45 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             return anonFree(a1, a2);
         }
 
+        case ker::abi::vmem::ops::protect: {
+            // a1: address
+            // a2: size
+            // a3: new protection flags
+            auto* task = getCurrentTask();
+            if (task == nullptr || task->pagemap == nullptr) {
+                return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+            }
+
+            uint64_t addr = a1;
+            uint64_t size = a2;
+            uint64_t prot = a3;
+
+            if (size == 0) {
+                return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+            }
+            if (addr % ker::mod::mm::paging::PAGE_SIZE != 0) {
+                return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+            }
+
+            size = PAGE_ALIGN_UP(size);
+
+            if (addr + size > USER_SPACE_END || addr + size < addr) {
+                return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+            }
+
+            auto page_flags = protToPageFlags(prot);
+            uint64_t numPages = size / ker::mod::mm::paging::PAGE_SIZE;
+
+            for (uint64_t i = 0; i < numPages; i++) {
+                uint64_t currentVaddr = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
+                if (ker::mod::mm::virt::isPageMapped(task->pagemap, currentVaddr)) {
+                    ker::mod::mm::virt::unifyPageFlags(task->pagemap, currentVaddr, page_flags);
+                }
+            }
+
+            return 0;
+        }
+
         default:
             ker::mod::dbg::log("vmem: invalid operation %llu", op);
             return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);

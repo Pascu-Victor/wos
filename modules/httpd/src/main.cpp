@@ -248,7 +248,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     html += "</h1>\r\n";
 
     html += "<table>\r\n";
-    html += "<tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
+    html += "<tr><th>Name</th><th>Mode</th><th>Owner</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
 
     // Parent directory link (if not root)
     if (url_path != "/" && url_path.size() > 1) {
@@ -264,7 +264,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
         }
         html += "<tr><td><span class='icon'>📁</span><a href=\"";
         html += parent;
-        html += "\">..</a></td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
+        html += "\">..</a></td><td>-</td><td>-</td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
     }
 
     // Read directory entries
@@ -276,6 +276,9 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             std::string name;
             bool is_dir;
             bool is_blk;
+            uint32_t mode;
+            uint32_t uid;
+            uint32_t gid;
         };
         std::vector<DirEntry> entries;
 
@@ -301,7 +304,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 is_blk = S_ISBLK(st.st_mode);
             }
 
-            entries.push_back({name, is_dir, is_blk});
+            entries.push_back({name, is_dir, is_blk, static_cast<uint32_t>(st.st_mode), static_cast<uint32_t>(st.st_uid), static_cast<uint32_t>(st.st_gid)});
         }
         closedir(dir);
 
@@ -350,7 +353,30 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             if (ent.is_dir) {
                 html += "/";
             }
-            html += "</a></td><td class='size'>";
+            html += "</a></td><td>";
+            // Format mode as octal
+            {
+                char mode_str[32];
+                // rwx string
+                const char *rwx = "rwxrwxrwx";
+                char perms[11];
+                perms[0] = ent.is_dir ? 'd' : (ent.is_blk ? 'b' : '-');
+                for (int b = 0; b < 9; b++) {
+                    perms[1 + b] = (ent.mode & (1 << (8 - b))) ? rwx[b] : '-';
+                }
+                perms[10] = '\0';
+                int n = snprintf(mode_str, sizeof(mode_str), "%s (%04o)", perms, ent.mode & 07777);
+                if (n > 0 && n < static_cast<int>(sizeof(mode_str))) {
+                    html.append(mode_str, n);
+                }
+            }
+            html += "</td><td>";
+            {
+                char owner_str[32];
+                int n = snprintf(owner_str, sizeof(owner_str), "%u:%u", ent.uid, ent.gid);
+                html.append(owner_str, n);
+            }
+            html += "</td><td class='size'>";
             html += ent.is_dir ? "-" : format_size(size);
             html += "</td><td class='type'>";
             if (ent.is_blk) {
