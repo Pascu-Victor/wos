@@ -26,6 +26,15 @@ namespace ker::vfs::devfs {
 
 namespace {
 
+constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
+
+auto is_valid_kernel_pointer(const void* ptr) -> bool {
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    bool in_hhdm = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
+    bool in_kernel_static = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    return in_hhdm || in_kernel_static;
+}
+
 // -- DevFSNode tree root ----------------------------------------------
 
 DevFSNode root_node;
@@ -176,8 +185,44 @@ auto walk_path(const char* path, bool create_intermediate = false) -> DevFSNode*
 struct DevFSFile {
     DevFSNode* node = nullptr;
     ker::dev::Device* device = nullptr;
-    uint32_t magic = 0xDEADBEEF;
+    uint32_t magic = DEVFS_FILE_MAGIC;
 };
+
+auto validate_devfs_file(File* f, const char* op) -> DevFSFile* {
+    if (f == nullptr || f->private_data == nullptr) {
+        return nullptr;
+    }
+
+    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    if (!is_valid_kernel_pointer(devfs_file)) {
+        ker::mod::dbg::log("devfs_%s: private_data %p outside valid kernel range", op, devfs_file);
+        return nullptr;
+    }
+
+    if (devfs_file->magic != DEVFS_FILE_MAGIC) {
+        ker::mod::dbg::log("devfs_%s: private_data %p has invalid magic 0x%x", op, devfs_file, devfs_file->magic);
+        return nullptr;
+    }
+
+    if (devfs_file->node != nullptr && !is_valid_kernel_pointer(devfs_file->node)) {
+        ker::mod::dbg::log("devfs_%s: node pointer %p invalid (df=%p)", op, devfs_file->node, devfs_file);
+        return nullptr;
+    }
+
+    if (devfs_file->device != nullptr && !is_valid_kernel_pointer(devfs_file->device)) {
+        ker::mod::dbg::log("devfs_%s: device pointer %p invalid (df=%p)", op, devfs_file->device, devfs_file);
+        return nullptr;
+    }
+
+    if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr &&
+        !is_valid_kernel_pointer(devfs_file->device->char_ops)) {
+        ker::mod::dbg::log("devfs_%s: char_ops pointer %p invalid (device=%p df=%p)", op, devfs_file->device->char_ops, devfs_file->device,
+                           devfs_file);
+        return nullptr;
+    }
+
+    return devfs_file;
+}
 
 // -- File operations --------------------------------------------------
 
@@ -206,7 +251,7 @@ auto devfs_close(File* f) -> int {
         return 0;
     }
 
-    if (devfs_file->magic != 0xDEADBEEF) {
+    if (devfs_file->magic != DEVFS_FILE_MAGIC) {
         ker::mod::dbg::log(
             "devfs_close: devfs_file %p has invalid magic 0x%x; "
             "skipping delete\n",
@@ -216,7 +261,8 @@ auto devfs_close(File* f) -> int {
     }
 
     // Call device close if available
-    if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->close != nullptr) {
+    if (devfs_file->device != nullptr && is_valid_kernel_pointer(devfs_file->device) && devfs_file->device->char_ops != nullptr &&
+        is_valid_kernel_pointer(devfs_file->device->char_ops) && devfs_file->device->char_ops->close != nullptr) {
         devfs_file->device->char_ops->close(f);
     }
 
@@ -227,10 +273,10 @@ auto devfs_close(File* f) -> int {
 }
 
 auto devfs_read(File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "read");
+    if (devfs_file == nullptr) {
         return -1;
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->read != nullptr) {
         return devfs_file->device->char_ops->read(f, buf, count);
     }
@@ -238,10 +284,10 @@ auto devfs_read(File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t 
 }
 
 auto devfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "write");
+    if (devfs_file == nullptr) {
         return -1;
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->write != nullptr) {
         return devfs_file->device->char_ops->write(f, buf, count);
     }
@@ -253,10 +299,10 @@ auto devfs_lseek(File* /*f*/, off_t /*offset*/, int /*whence*/) -> off_t {
 }
 
 auto devfs_isatty(File* f) -> bool {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "isatty");
+    if (devfs_file == nullptr) {
         return false;
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->isatty != nullptr) {
         return devfs_file->device->char_ops->isatty(f);
     }
@@ -267,11 +313,10 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (f == nullptr || entry == nullptr || !f->is_directory) {
         return -1;
     }
-    if (f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "readdir");
+    if (devfs_file == nullptr) {
         return -1;
     }
-
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     auto* dir_node = devfs_file->node;
     if (dir_node == nullptr || dir_node->type != DevFSNodeType::DIRECTORY) {
         return -1;
@@ -337,11 +382,14 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
 }
 
 auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr || buf == nullptr || bufsize == 0) {
+    if (buf == nullptr || bufsize == 0) {
         return -1;
     }
 
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
+    auto* devfs_file = validate_devfs_file(f, "readlink");
+    if (devfs_file == nullptr) {
+        return -1;
+    }
     auto* node = devfs_file->node;
     if (node == nullptr || node->type != DevFSNodeType::SYMLINK) {
         return -EINVAL;
@@ -354,10 +402,10 @@ auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
 }
 
 auto devfs_poll_check(File* f, int events) -> int {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "poll_check");
+    if (devfs_file == nullptr) {
         return events & (0x001 | 0x004);  // EPOLLIN | EPOLLOUT - always ready fallback
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->poll_check != nullptr) {
         return devfs_file->device->char_ops->poll_check(f, events);
     }
@@ -366,10 +414,10 @@ auto devfs_poll_check(File* f, int events) -> int {
 }
 
 auto devfs_poll_register_waiter(File* f, uint64_t pid) -> bool {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "poll_register_waiter");
+    if (devfs_file == nullptr) {
         return false;
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device == nullptr || devfs_file->device->char_ops == nullptr ||
         devfs_file->device->char_ops->poll_register_waiter == nullptr) {
         return false;
@@ -398,10 +446,10 @@ FileOperations devfs_fops = {
 auto get_devfs_fops() -> FileOperations* { return &devfs_fops; }
 
 auto devfs_ioctl(File* f, unsigned long cmd, unsigned long arg) -> int {
-    if (f == nullptr || f->private_data == nullptr) {
+    auto* devfs_file = validate_devfs_file(f, "ioctl");
+    if (devfs_file == nullptr) {
         return -EBADF;
     }
-    auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->ioctl != nullptr) {
         return devfs_file->device->char_ops->ioctl(f, cmd, arg);
     }
