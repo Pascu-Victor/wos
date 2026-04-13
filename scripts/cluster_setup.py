@@ -762,8 +762,19 @@ def collect_unique_nodes(config: dict) -> dict:
     return nodes
 
 
-def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
-    """Build QEMU command line for a single node."""
+# TCG log-level presets (only useful with software emulation, no-ops under KVM)
+TCG_LOG_LEVELS = {
+    "": "cpu_reset,int,in_asm,nochain,guest_errors,page",
+    "int": "cpu_reset,int,pcall,in_asm,nochain,guest_errors,page",
+    "full": "cpu_reset,int,exec,cpu,fpu,pcall,in_asm,nochain,guest_errors,page,mmu",
+}
+
+
+def build_qemu_args(node_id: int, node_info: dict, config: dict, tcg_level: str | None = None) -> list:
+    """Build QEMU command line for a single node.
+
+    tcg_level: None = KVM (default), "" = basic TCG, "int" = TCG+interrupts, "full" = TCG+cpu state
+    """
     eff = node_info["effective"]
     vm_cfg = eff.get("vm", {})
     global_cfg = find_global(config["zones"])
@@ -819,13 +830,22 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
     if os.path.exists(serial_log):
         os.remove(serial_log)
 
+    # Acceleration: KVM (default) or TCG (software emulation for full tracing)
+    if tcg_level is not None:
+        accel_args = ["-accel", "tcg"]
+        log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
+        print(f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}")
+    else:
+        accel_args = ["-cpu", "host", "--enable-kvm"]
+        # Under KVM only trace events and guest_errors produce output;
+        # in_asm/nochain/page/exec/cpu are TCG-only and silently ignored.
+        log_flags = "cpu_reset,guest_errors"
+
     args = [
         "qemu-system-x86_64",
         "-M",
         "q35",
-        "-cpu",
-        "host",
-        "--enable-kvm",
+        *accel_args,
         "-m",
         memory,
         "-smp",
@@ -849,7 +869,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
         "-bios",
         "/usr/share/OVMF/x64/OVMF.4m.fd",
         "-d",
-        "cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation",
+        log_flags,
         "-D",
         qemu_log,
         "-no-reboot",
@@ -928,7 +948,7 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict) -> list:
     return args
 
 
-def launch(config: dict):
+def launch(config: dict, tcg_level: str | None = None):
     """Setup topology, then launch VMs."""
     setup(config)
     print()
@@ -940,7 +960,7 @@ def launch(config: dict):
 
     for node_id in sorted(nodes.keys()):
         node_info = nodes[node_id]
-        args = build_qemu_args(node_id, node_info, config)
+        args = build_qemu_args(node_id, node_info, config, tcg_level=tcg_level)
 
         zone_names = [zone_name(z) for z in node_info["zones"]]
         is_debug = node_info["effective"].get("debug", False)
@@ -1027,6 +1047,14 @@ def main():
     parser.add_argument("--launch", action="store_true", help="Setup + launch VMs")
     parser.add_argument("--teardown", action="store_true", help="Destroy topology")
     parser.add_argument(
+        "--tcg",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="LEVEL",
+        help="Use TCG instead of KVM. Optional level: int, full (default: basic)",
+    )
+    parser.add_argument(
         "--config", default="configs/cluster.json", help="Config file path"
     )
     args = parser.parse_args()
@@ -1039,7 +1067,7 @@ def main():
     if args.teardown:
         teardown(config)
     elif args.launch:
-        launch(config)
+        launch(config, tcg_level=args.tcg)
     else:
         setup(config)
 
