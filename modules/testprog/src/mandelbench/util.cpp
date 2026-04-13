@@ -124,21 +124,21 @@ void progress(const char* name, int width, int height, int max_iteration, int th
 
 void report(const char* name, int width, int height, int max_iteration, int threads, int repeat, const std::vector<double>& times) {
     int r;
-    double avg, stdev, min, max, mean;
+    double avg, stdev, min, max, median, total;
     char desc[100];
     FILE* f = nullptr;
 
     description(name, width, height, max_iteration, threads, desc);
 
-    avg = 0;
+    total = 0;
     min = times[0];
     max = times[0];
     for (r = 0; r < repeat; r++) {
-        avg += times[r];
+        total += times[r];
         min = std::min(min, times[r]);
         max = std::max(max, times[r]);
     }
-    avg /= repeat;
+    avg = total / repeat;
 
     stdev = 0;
     for (r = 0; r < repeat; r++) {
@@ -146,10 +146,16 @@ void report(const char* name, int width, int height, int max_iteration, int thre
     }
     stdev = sqrt(stdev / repeat);
 
-    mean = times[repeat / 2];
+    std::vector<double> sorted_times = times;
+    std::sort(sorted_times.begin(), sorted_times.end());
+    if ((repeat & 1) != 0) {
+        median = sorted_times[repeat / 2];
+    } else {
+        median = (sorted_times[(repeat / 2) - 1] + sorted_times[repeat / 2]) / 2.0;
+    }
 
-    std::string rep =
-        std::format("name={} {} min={:.2f} max={:.2f} mean={:.2f} avg={:.2f} stdev={:.2f}", name, desc, min, max, mean, avg, stdev);
+    std::string rep = std::format("name={} {} repeat={} total_compute={:.2f} min={:.2f} max={:.2f} median={:.2f} avg={:.2f} stdev={:.2f}",
+                                  name, desc, repeat, total, min, max, median, avg, stdev);
 
     f = fopen(REPORT, "a");
     fputs(rep.c_str(), f);

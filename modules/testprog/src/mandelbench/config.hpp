@@ -14,5 +14,5 @@ inline constexpr int MAX_ITERATION = 5000;
 inline constexpr int THREADS = 8;
 inline constexpr int REPEAT = 5;
 
-inline constexpr const char* IMAGE = "./%s_%02d.png";
+inline constexpr const char* IMAGE = "./{:s}_{:02d}.png";
 inline constexpr const char* REPORT = "./report.txt";
