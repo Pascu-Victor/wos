@@ -526,12 +526,17 @@ void save_perf_data() {
     }
 }
 
-void set_recording_enabled(bool enabled) {
+void set_recording_enabled(bool enabled, const char* filter = nullptr) {
     ScopedFd fd = open_writeonly(KPERFCTL_PATH);
     if (!fd.valid()) {
         return;
     }
-    write_all(fd.get(), enabled ? "enable" : "disable");
+    if (enabled && filter != nullptr) {
+        std::string cmd = std::string("enable ") + filter;
+        write_all(fd.get(), cmd);
+    } else {
+        write_all(fd.get(), enabled ? "enable" : "disable");
+    }
 }
 
 void cmd_stat(int ms) {
@@ -1130,23 +1135,138 @@ void cmd_contstat() {
     }
 }
 
+// Resolve a command name to a full path by searching PATH.
+// If cmd already contains '/', returns it as-is (if accessible).
+// Returns empty string if not found.
+auto resolve_command(const char* cmd) -> std::string {
+    if (cmd == nullptr || cmd[0] == '\0') return {};
+
+    // If cmd contains '/', treat as a path (absolute or relative)
+    if (std::strchr(cmd, '/') != nullptr) {
+        if (access(cmd, X_OK) == 0) return std::string(cmd);
+        return {};
+    }
+
+    // Search PATH
+    const char* path_env = getenv("PATH");
+    if (path_env == nullptr) path_env = "/bin";
+
+    std::string_view path_sv(path_env);
+    std::size_t start = 0;
+    while (start <= path_sv.size()) {
+        auto colon = path_sv.find(':', start);
+        auto dir = path_sv.substr(start, colon == std::string_view::npos ? std::string_view::npos : colon - start);
+        if (dir.empty()) dir = ".";
+
+        std::string candidate;
+        candidate.reserve(dir.size() + 1 + std::strlen(cmd));
+        candidate.append(dir);
+        candidate.push_back('/');
+        candidate.append(cmd);
+
+        if (access(candidate.c_str(), X_OK) == 0) return candidate;
+
+        if (colon == std::string_view::npos) break;
+        start = colon + 1;
+    }
+    return {};
+}
+
+// Read the shebang line from a script file. Returns the interpreter path,
+// or empty string if the file is not a script.
+auto read_shebang(const char* path) -> std::string {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return {};
+    char hdr[256];
+    ssize_t n = read(fd, hdr, sizeof(hdr) - 1);
+    close(fd);
+    if (n < 3 || hdr[0] != '#' || hdr[1] != '!') return {};
+    hdr[n] = '\0';
+    // Find end of first line
+    char* nl = std::strchr(hdr + 2, '\n');
+    if (nl != nullptr) *nl = '\0';
+    // Skip whitespace after #!
+    const char* p = hdr + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return {};
+    // Take only the interpreter path (stop at first space for args)
+    const char* end = p;
+    while (*end != '\0' && *end != ' ' && *end != '\t') end++;
+    return std::string(p, end);
+}
+
 void cmd_run(int argc, char** argv) {
     if (argc < 1) {
         std::println("perf run: no command specified");
         return;
     }
 
+    // Parse --filter=... option (strip from argv before exec)
+    const char* filter = "switch,wake,sleep";  // default: no container spam
+    std::vector<char*> cmd_argv;
+    for (int i = 0; i < argc; i++) {
+        std::string_view arg(argv[i]);
+        if (arg.starts_with("--filter=")) {
+            filter = argv[i] + 9;
+        } else {
+            cmd_argv.push_back(argv[i]);
+        }
+    }
+    argc = static_cast<int>(cmd_argv.size());
+    argv = cmd_argv.data();
+
+    if (argc < 1) {
+        std::println("perf run: no command specified");
+        return;
+    }
+
+    // Resolve the command to a full path (PATH search)
+    std::string resolved = resolve_command(argv[0]);
+    if (resolved.empty()) {
+        std::println("perf run: command not found: {}", argv[0]);
+        return;
+    }
+
+    // Check if this is a script with a shebang - if so, wrap with the interpreter
+    std::string interp = read_shebang(resolved.c_str());
+    std::vector<char*> new_argv;
+    if (!interp.empty()) {
+        // Resolve the interpreter too
+        std::string interp_resolved = resolve_command(interp.c_str());
+        if (interp_resolved.empty()) {
+            std::println("perf run: interpreter not found: {} (from shebang in {})", interp, resolved);
+            return;
+        }
+        interp = std::move(interp_resolved);
+
+        // Build new argv: [interpreter, script_path, original_args[1:]]
+        new_argv.push_back(interp.data());
+        new_argv.push_back(resolved.data());
+        for (int i = 1; i < argc; i++) new_argv.push_back(argv[i]);
+        new_argv.push_back(nullptr);
+    } else {
+        // ELF binary - use resolved path as argv[0], keep rest
+        new_argv.push_back(resolved.data());
+        for (int i = 1; i < argc; i++) new_argv.push_back(argv[i]);
+        new_argv.push_back(nullptr);
+    }
+
+    char** exec_argv = new_argv.data();
+    const char* exec_path = exec_argv[0];
+
     auto before = collect_stats();
     int64_t start_ms = now_ms();
-    set_recording_enabled(true);
+    set_recording_enabled(true, filter);
 
     int64_t child_pid = ker::process::fork();
     if (child_pid == 0) {
         ker::process::setpgid(0, 0);
-        const auto* exec_argv = const_cast<const char* const*>(argv);
+        const auto* ea = const_cast<const char* const*>(exec_argv);
         const auto* exec_envp = const_cast<const char* const*>(environ);
-        ker::process::execve(argv[0], exec_argv, exec_envp);
-        exit(EXEC_FAILURE_EXIT_CODE);
+        ker::process::execve(exec_path, ea, exec_envp);
+        // If we get here, exec failed
+        std::println("perf run: exec failed for '{}'", exec_path);
+        _exit(EXEC_FAILURE_EXIT_CODE);
     }
 
     if (child_pid < 0) {
@@ -1156,7 +1276,7 @@ void cmd_run(int argc, char** argv) {
     }
 
     int64_t target_pgid = child_pid;
-    std::println("perf run: tracing pgid={} cmd={}", target_pgid, argv[0]);
+    std::println("perf run: tracing pgid={} cmd={}", target_pgid, exec_path);
 
     std::vector<TrackedProc> tracked;
     auto upsert_tracked = [&](const StatInfo& stat) {
@@ -1415,7 +1535,7 @@ void usage() {
     std::println("  cpustat               Per-CPU aggregate scheduler statistics");
     std::println("  contstat              Per-subsystem container statistics");
     std::println("  top      [ms=1000]    Continuous CPU% snapshots");
-    std::println("  run      <cmd> [args] Trace cmd+descendants, save to perf.data");
+    std::println("  run      [--filter=switch,wake,sleep] <cmd> [args]  Trace cmd (default: no container)");
     std::println("  show-map              Show PID->name/cmdline map from perf.data");
 }
 }  // namespace
