@@ -1,0 +1,65 @@
+#include "network.h"
+
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/process.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <array>
+#include <cstring>
+#include <print>
+
+#include "sys/multiproc.h"
+
+void start_network() {
+    int cpuno = ker::multiproc::currentThreadId();
+
+    std::println("init[{}]: spawning netd (DHCP daemon)", cpuno);
+    std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
+    std::array<const char*, 1> netd_envp = {nullptr};
+    uint64_t netd_pid = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
+    if (netd_pid == 0) {
+        std::println("init[{}]: FAILED to spawn netd", cpuno);
+    } else {
+        std::println("init[{}]: netd spawned as PID {}", cpuno, netd_pid);
+    }
+
+    // Poll eth0 for IP address readiness (wait for DHCP to complete)
+    int poll_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (poll_sock >= 0) {
+        struct ifreq ifr{};
+        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+
+        constexpr long POLL_TIMEOUT_SECS = 10;
+        struct timespec poll_start{};
+        clock_gettime(CLOCK_MONOTONIC, &poll_start);
+        bool net_ready = false;
+        for (;;) {
+            if (ioctl(poll_sock, SIOCGIFADDR, &ifr) == 0) {
+                auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
+                if (addr->sin_addr.s_addr != 0) {
+                    std::array<char, INET_ADDRSTRLEN> ip_str{};
+                    inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
+                    std::println("init[{}]: eth0 configured with IP {}", cpuno, ip_str.data());
+                    net_ready = true;
+                    break;
+                }
+            }
+            struct timespec now{};
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - poll_start.tv_sec >= POLL_TIMEOUT_SECS) {
+                break;
+            }
+            sched_yield();
+        }
+        close(poll_sock);
+        if (!net_ready) {
+            std::println("init[{}]: WARNING: eth0 not configured after polling, continuing anyway", cpuno);
+        }
+    }
+}

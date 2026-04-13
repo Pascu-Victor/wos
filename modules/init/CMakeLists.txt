@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.10)
 project(init_service CXX)
 
 set(TARGET init)
-# Build only the entry source; exclude any local ABI shims
-set(CXXFILES src/init.cpp)
+set(CXXFILES
+    src/init.cpp
+    src/fstab.cpp
+    src/network.cpp
+    src/services.cpp
+)
 
 add_executable(${TARGET} ${CXXFILES})
 
