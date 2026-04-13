@@ -218,7 +218,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         if (parentTask->get_fd_cloexec(static_cast<unsigned>(key))) {
             return;  // FD_CLOEXEC is set - do NOT inherit
         }
-        parentFile->refcount++;
+        __atomic_add_fetch(&parentFile->refcount, 1, __ATOMIC_ACQ_REL);
         newTask->fd_table.insert(key, parentFile);
     });
 

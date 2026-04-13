@@ -234,7 +234,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     parent->fd_table.for_each([&](uint64_t key, void* val) {
         if (val != nullptr) {
             auto* file = static_cast<ker::vfs::File*>(val);
-            file->refcount++;
+            __atomic_add_fetch(&file->refcount, 1, __ATOMIC_ACQ_REL);
             child->fd_table.insert(key, file);
         }
     });
@@ -249,7 +249,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // Undo FD refcount increments
         child->fd_table.for_each([](uint64_t /*key*/, void* val) {
             if (val != nullptr) {
-                static_cast<ker::vfs::File*>(val)->refcount--;
+                __atomic_sub_fetch(&static_cast<ker::vfs::File*>(val)->refcount, 1, __ATOMIC_ACQ_REL);
             }
         });
         if (child->thread) delete child->thread;

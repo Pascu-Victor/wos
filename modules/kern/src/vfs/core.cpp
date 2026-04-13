@@ -1194,15 +1194,15 @@ auto vfs_close(int fd) -> int {
         return -EBADF;
     }
 
-    // Decrement reference count
-    f->refcount--;
+    // Decrement reference count and check if we need to free the file
+    int new_rc = __atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
 
     // Release the FD from the task's file descriptor table
     vfs_release_fd(t, fd);
     t->clear_fd_cloexec(static_cast<unsigned>(fd));
 
     // Only call close and free if no more references
-    if (f->refcount <= 0) {
+    if (new_rc <= 0) {
         if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
             f->fops->vfs_close(f);
         }
@@ -2207,10 +2207,10 @@ auto vfs_dup(int oldfd) -> int {
     if (task == nullptr) return -ESRCH;
     auto* f = vfs_get_file(task, oldfd);
     if (f == nullptr) return -EBADF;
-    f->refcount++;
+    __atomic_add_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
     int newfd = vfs_alloc_fd(task, f);
     if (newfd < 0) {
-        f->refcount--;
+        __atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
         return -EMFILE;
     }
     return newfd;
@@ -2228,7 +2228,7 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     if (existing != nullptr) {
         vfs_close(newfd);
     }
-    f->refcount++;
+    __atomic_add_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
     task->fd_table.insert(static_cast<uint64_t>(newfd), f);
     // POSIX: dup2 does NOT inherit close-on-exec from the source fd
     task->clear_fd_cloexec(static_cast<unsigned>(newfd));
@@ -2745,10 +2745,10 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)
     switch (cmd) {
         case 0: {  // F_DUPFD - dup to fd >= arg
-            f->refcount++;
+            __atomic_add_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
             if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount--;
+                __atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
                 return -EMFILE;
             }
             task->clear_fd_cloexec(static_cast<unsigned>(slot));
@@ -2769,10 +2769,10 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             f->open_flags = static_cast<int>(arg);
             return 0;
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
-            f->refcount++;
+            __atomic_add_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
             if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount--;
+                __atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
                 return -EMFILE;
             }
             task->set_fd_cloexec(static_cast<unsigned>(slot));
