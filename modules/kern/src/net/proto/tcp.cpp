@@ -1,7 +1,9 @@
 #include "tcp.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -17,6 +19,8 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#include "net/socket.hpp"
 
 namespace ker::net::proto {
 
@@ -526,6 +530,21 @@ int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t
     }
     if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
         socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+    }
+    if (optname == 9 && optlen >= sizeof(int)) {  // SO_KEEPALIVE
+        auto* cb = static_cast<TcpCB*>(sock->proto_data);
+        if (cb != nullptr) {
+            uint64_t flags = cb->lock.lock_irqsave();
+            cb->keepalive_enabled = *static_cast<const int*>(optval) != 0;
+            if (cb->keepalive_enabled && cb->state == TcpState::ESTABLISHED) {
+                cb->keepalive_count = 0;
+                cb->keepalive_deadline = tcp_now_ms() + cb->keepalive_idle_ms;
+                tcp_timer_arm(cb);
+            } else {
+                cb->keepalive_deadline = 0;
+            }
+            cb->lock.unlock_irqrestore(flags);
+        }
     }
     return 0;
 }

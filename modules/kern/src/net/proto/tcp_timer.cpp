@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
@@ -9,6 +11,8 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 
+#include "net/socket.hpp"
+#include "platform/sys/spinlock.hpp"
 #include "tcp.hpp"
 
 namespace ker::net::proto {
@@ -108,6 +112,9 @@ void tcp_timer_arm(TcpCB* cb) {
     }
     if (cb->delayed_ack_deadline != 0) {
         deadline = std::min(deadline, cb->delayed_ack_deadline);
+    }
+    if (cb->keepalive_deadline != 0) {
+        deadline = std::min(deadline, cb->keepalive_deadline);
     }
 
     if (deadline == UINT64_MAX) {
@@ -237,6 +244,9 @@ void tcp_timer_tick(uint64_t now_ms) {
         if (cb->delayed_ack_deadline != 0 && now_ms >= cb->delayed_ack_deadline && cb->state == TcpState::ESTABLISHED) {
             needs_work = true;
         }
+        if (cb->keepalive_deadline != 0 && now_ms >= cb->keepalive_deadline && cb->state == TcpState::ESTABLISHED) {
+            needs_work = true;
+        }
 
         if (needs_work) {
             tcp_cb_acquire(cb);
@@ -251,6 +261,9 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
         if (cb->delayed_ack_deadline != 0) {
             next_earliest = std::min(next_earliest, cb->delayed_ack_deadline);
+        }
+        if (cb->keepalive_deadline != 0) {
+            next_earliest = std::min(next_earliest, cb->keepalive_deadline);
         }
         if (cb->state == TcpState::TIME_WAIT) {
             next_earliest = std::min(next_earliest, cb->time_wait_deadline);
@@ -330,6 +343,44 @@ void tcp_timer_tick(uint64_t now_ms) {
             }
         }
 
+        // Keepalive probe.
+        if (rcb->keepalive_deadline != 0 && now_ms >= rcb->keepalive_deadline && rcb->state == TcpState::ESTABLISHED &&
+            deferred_count < MAX_DEFERRED_RETRANSMITS) {
+            if (rcb->keepalive_count >= rcb->keepalive_probes_max) {
+                // Peer is unreachable; kill the connection.
+                rcb->keepalive_deadline = 0;
+                rcb->state = TcpState::CLOSED;
+                while (rcb->retransmit_head != nullptr) {
+                    auto* e = rcb->retransmit_head;
+                    rcb->retransmit_head = e->next;
+                    if (e->pkt != nullptr) {
+                        pkt_free(e->pkt);
+                    }
+                    ker::mod::mm::dyn::kmalloc::free(e);
+                }
+                rcb->retransmit_tail = nullptr;
+                if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
+                    sockets_to_wake[wake_count++] = rcb->socket;
+                }
+            } else {
+                uint32_t ka_local = 0;
+                uint32_t ka_remote = 0;
+                auto* ka_pkt = tcp_build_keepalive_probe(rcb, &ka_local, &ka_remote);
+                if (ka_pkt != nullptr) {
+                    deferred[deferred_count++] = {
+                        .pkt = ka_pkt,
+                        .local_ip = ka_local,
+                        .remote_ip = ka_remote,
+                        .seq_end = 0,
+                        .cb = nullptr,
+                        .ack_cb = nullptr,
+                    };
+                }
+                rcb->keepalive_count++;
+                rcb->keepalive_deadline = now_ms + rcb->keepalive_intvl_ms;
+            }
+        }
+
         if (rcb->retransmit_head != nullptr && rcb->state != TcpState::CLOSED && rcb->state != TcpState::TIME_WAIT &&
             rcb->state != TcpState::LISTEN) {
             if (now_ms >= rcb->retransmit_deadline) {
@@ -368,7 +419,8 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         bool still_active = rcb->retransmit_head != nullptr || rcb->ack_pending || rcb->delayed_ack_deadline != 0 ||
-                            rcb->state == TcpState::TIME_WAIT || (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
+                            rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
+                            (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
         if (!still_active) {
             tcp_timer_disarm(rcb);
         }

@@ -331,8 +331,16 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 }
                 cb->retransmit_tail = nullptr;
                 cb->state = TcpState::CLOSED;
+                cb->keepalive_deadline = 0;
                 deferred_wake = true;
                 break;
+            }
+
+            // Any valid segment resets the keepalive idle timer.
+            if (cb->keepalive_enabled) {
+                cb->keepalive_count = 0;
+                cb->keepalive_deadline = tcp_now_ms() + cb->keepalive_idle_ms;
+                tcp_timer_arm(cb);
             }
 
             if ((flags & TCP_ACK) != 0) {
@@ -442,6 +450,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 cb->rcv_nxt = seg_seq + static_cast<uint32_t>(payload_len) + 1;
                 cb->segs_pending_ack = 0;
                 cb->delayed_ack_deadline = 0;
+                cb->keepalive_deadline = 0;
                 build_deferred_ack();
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::CLOSE_WAIT;

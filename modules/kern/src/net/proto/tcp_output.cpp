@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -200,6 +201,32 @@ bool tcp_send_ack(TcpCB* cb) {
     hdr->checksum = pseudo_header_checksum(cb->local_ip, cb->remote_ip, 6, pkt->data, pkt->len);
 
     return ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64) >= 0;
+}
+
+// Build a keepalive probe: ACK with seq = snd_una - 1
+auto tcp_build_keepalive_probe(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer* {
+    auto* pkt = pkt_alloc();
+    if (pkt == nullptr) {
+        return nullptr;
+    }
+
+    auto* payload = pkt->put(sizeof(TcpHeader));
+    auto* hdr = reinterpret_cast<TcpHeader*>(payload);
+    hdr->src_port = htons(cb->local_port);
+    hdr->dst_port = htons(cb->remote_port);
+    hdr->seq = htonl(cb->snd_una - 1);
+    hdr->ack = htonl(cb->rcv_nxt);
+    hdr->data_offset = (sizeof(TcpHeader) / 4) << 4;
+    hdr->flags = TCP_ACK;
+    hdr->window = cb->ws_enabled ? htons(static_cast<uint16_t>(cb->rcv_wnd >> cb->rcv_wscale))
+                                 : htons(static_cast<uint16_t>(cb->rcv_wnd > 65535 ? 65535 : cb->rcv_wnd));
+    hdr->checksum = 0;
+    hdr->urgent_ptr = 0;
+    hdr->checksum = pseudo_header_checksum(cb->local_ip, cb->remote_ip, 6, pkt->data, pkt->len);
+
+    *out_local = cb->local_ip;
+    *out_remote = cb->remote_ip;
+    return pkt;
 }
 
 }  // namespace ker::net::proto

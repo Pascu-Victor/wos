@@ -52,6 +52,10 @@ struct RetransmitEntry {
     RetransmitEntry* next;
 };
 
+constexpr uint8_t TCP_KEEPALIVE_PROBES_DEFAULT = 9;
+constexpr uint64_t TCP_KEEPALIVE_IDLE_MS_DEFAULT = 7200000;  // 2 hours
+constexpr uint64_t TCP_KEEPALIVE_INTVL_MS_DEFAULT = 75000;   // 75 seconds
+
 struct TcpCB {
     TcpState state = TcpState::CLOSED;
 
@@ -97,6 +101,14 @@ struct TcpCB {
     // Delayed ACK state.
     uint8_t segs_pending_ack = 0;       // data segments received since last ACK
     uint64_t delayed_ack_deadline = 0;  // ms timestamp; 0 = no pending delayed ACK
+
+    // Keepalive state.
+    bool keepalive_enabled = false;
+    uint8_t keepalive_count = 0;  // probes sent without reply
+    uint8_t keepalive_probes_max = TCP_KEEPALIVE_PROBES_DEFAULT;
+    uint64_t keepalive_idle_ms = TCP_KEEPALIVE_IDLE_MS_DEFAULT;
+    uint64_t keepalive_intvl_ms = TCP_KEEPALIVE_INTVL_MS_DEFAULT;
+    uint64_t keepalive_deadline = 0;  // next probe time; 0 = not armed
 
     Socket* socket = nullptr;
 
@@ -149,6 +161,8 @@ bool tcp_send_ack(TcpCB* cb);
 
 // Build ACK without sending; caller holds cb->lock.
 auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
+// Build a keepalive probe (ACK with seq = snd_una - 1); caller holds cb->lock.
+auto tcp_build_keepalive_probe(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
 
 void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, uint32_t src_ip, uint32_t dst_ip);
 
