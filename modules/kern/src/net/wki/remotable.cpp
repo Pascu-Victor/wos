@@ -33,8 +33,14 @@ struct PendingVfsMount {
     uint16_t node_id;
     uint32_t resource_id;
     char mount_path[384];
+    uint8_t retry_count = 0;
+    uint64_t next_attempt_us = 0;
 };
 std::deque<PendingVfsMount> g_pending_vfs_mounts;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr uint8_t VFS_AUTO_MOUNT_MAX_RETRIES = 8;
+constexpr uint64_t VFS_AUTO_MOUNT_RETRY_BASE_US = 250000;
+constexpr uint64_t VFS_AUTO_MOUNT_RETRY_MAX_US = 2000000;
 
 // V2: Deferred NET attach queue - same NAPI context issue as VFS mounts
 struct PendingNetAttach {
@@ -282,6 +288,8 @@ void wki_resources_invalidate_for_peer(uint16_t node_id) {
     s_remotable_lock.lock();
     // Use erase-remove idiom to remove all entries from the fenced peer
     std::erase_if(g_discovered, [node_id](const DiscoveredResource& res) { return res.node_id == node_id; });
+    std::erase_if(g_pending_vfs_mounts, [node_id](const PendingVfsMount& pending) { return pending.node_id == node_id; });
+    std::erase_if(g_pending_net_attaches, [node_id](const PendingNetAttach& pending) { return pending.node_id == node_id; });
     s_remotable_lock.unlock();
 }
 
@@ -447,36 +455,84 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
 
 void wki_remotable_process_pending_mounts() {
     while (true) {
+        uint64_t now_us = wki_now_us();
+
         s_remotable_lock.lock();
-        if (g_pending_vfs_mounts.empty()) {
+        size_t pending_count = g_pending_vfs_mounts.size();
+        if (pending_count == 0) {
             s_remotable_lock.unlock();
             break;
         }
-        PendingVfsMount pending = g_pending_vfs_mounts.front();
-        g_pending_vfs_mounts.pop_front();
         s_remotable_lock.unlock();
 
-        // Create intermediate directories (/wki/<hostname>)
-        // Find the second '/' after "/wki/" to get host dir
-        char host_dir[256] = {};                 // NOLINT(modernize-avoid-c-arrays)
-        const char* p = pending.mount_path + 5;  // skip "/wki/"
-        const char* slash = p;
-        while (*slash != '\0' && *slash != '/') slash++;
-        auto host_dir_len = static_cast<size_t>(slash - pending.mount_path);
-        if (host_dir_len < sizeof(host_dir)) {
-            memcpy(host_dir, pending.mount_path, host_dir_len);
-            host_dir[host_dir_len] = '\0';
-            ker::vfs::vfs_mkdir(host_dir, 0755);
+        bool processed_any = false;
+        for (size_t i = 0; i < pending_count; i++) {
+            s_remotable_lock.lock();
+            if (g_pending_vfs_mounts.empty()) {
+                s_remotable_lock.unlock();
+                break;
+            }
+            PendingVfsMount pending = g_pending_vfs_mounts.front();
+            g_pending_vfs_mounts.pop_front();
+            s_remotable_lock.unlock();
+
+            if (pending.next_attempt_us != 0 && now_us < pending.next_attempt_us) {
+                s_remotable_lock.lock();
+                g_pending_vfs_mounts.push_back(pending);
+                s_remotable_lock.unlock();
+                continue;
+            }
+
+            processed_any = true;
+
+            WkiPeer* peer = wki_peer_find(pending.node_id);
+            if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+                continue;
+            }
+
+            // Create intermediate directories (/wki/<hostname>)
+            // Find the second '/' after "/wki/" to get host dir
+            char host_dir[256] = {};                 // NOLINT(modernize-avoid-c-arrays)
+            const char* p = pending.mount_path + 5;  // skip "/wki/"
+            const char* slash = p;
+            while (*slash != '\0' && *slash != '/') slash++;
+            auto host_dir_len = static_cast<size_t>(slash - pending.mount_path);
+            if (host_dir_len < sizeof(host_dir)) {
+                memcpy(host_dir, pending.mount_path, host_dir_len);
+                host_dir[host_dir_len] = '\0';
+                ker::vfs::vfs_mkdir(host_dir, 0755);
+            }
+
+            // Create the full mount path directory
+            ker::vfs::vfs_mkdir(pending.mount_path, 0755);
+
+            int ret = wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path);
+            if (ret == 0) {
+                ker::mod::dbg::log("[WKI] Auto-mounted VFS: %s -> node=0x%04x", pending.mount_path, pending.node_id);
+                continue;
+            }
+
+            if (pending.retry_count + 1 < VFS_AUTO_MOUNT_MAX_RETRIES) {
+                pending.retry_count++;
+                uint64_t delay_us = VFS_AUTO_MOUNT_RETRY_BASE_US << (pending.retry_count - 1);
+                if (delay_us > VFS_AUTO_MOUNT_RETRY_MAX_US) {
+                    delay_us = VFS_AUTO_MOUNT_RETRY_MAX_US;
+                }
+                pending.next_attempt_us = now_us + delay_us;
+
+                s_remotable_lock.lock();
+                g_pending_vfs_mounts.push_back(pending);
+                s_remotable_lock.unlock();
+
+                ker::mod::dbg::log("[WKI] VFS auto-mount retry %u/%u queued: %s (ret=%d)", pending.retry_count,
+                                   VFS_AUTO_MOUNT_MAX_RETRIES - 1, pending.mount_path, ret);
+            } else {
+                ker::mod::dbg::log("[WKI] VFS auto-mount failed: %s (ret=%d)", pending.mount_path, ret);
+            }
         }
 
-        // Create the full mount path directory
-        ker::vfs::vfs_mkdir(pending.mount_path, 0755);
-
-        int ret = wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path);
-        if (ret == 0) {
-            ker::mod::dbg::log("[WKI] Auto-mounted VFS: %s -> node=0x%04x", pending.mount_path, pending.node_id);
-        } else {
-            ker::mod::dbg::log("[WKI] VFS auto-mount failed: %s (ret=%d)", pending.mount_path, ret);
+        if (!processed_any) {
+            break;
         }
     }
 }

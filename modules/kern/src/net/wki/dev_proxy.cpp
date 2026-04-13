@@ -1,6 +1,8 @@
 #include "dev_proxy.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
@@ -18,7 +20,7 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 
-#define DEBUG_WKI_TRANSPORT
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 

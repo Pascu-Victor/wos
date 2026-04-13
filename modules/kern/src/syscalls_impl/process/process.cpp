@@ -105,8 +105,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
 
     // Copy WKI spawn configuration
-    memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
-    child->wki_target_flags = parent->wki_target_flags;
+    if ((parent->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) == 0) {
+        memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
+        child->wki_target_flags = parent->wki_target_flags;
+    }
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
     child->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
     child->wki_skip_legacy_placement = false;
@@ -429,13 +431,13 @@ static auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t fla
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    if ((flags & ~ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0) {
+    if ((flags & ~ker::mod::sched::task::Task::WKI_TARGET_FLAGS_ALL) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
 
     if (hostname == nullptr || len == 0) {
         task->wki_target_hostname[0] = '\0';
-        task->wki_target_flags = 0;
+        task->wki_target_flags = flags;
         return 0;
     }
 
