@@ -61,8 +61,11 @@ struct ProxyVfsState {
     uint16_t assigned_channel = 0;
     uint32_t resource_id = 0;
     uint16_t max_op_size = 0;
+    std::atomic<bool> readlink_unsupported{false};
 
     std::atomic<bool> op_pending{false};
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
@@ -187,6 +190,10 @@ auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
 
 // D9: Auto-discover and advertise exportable local mount points as VFS resources
 void wki_remote_vfs_auto_discover();
+
+// Rebuild and re-advertise VFS exports after mount topology changes such as
+// pivot_root(). Sends withdraws for stale exports before advertising the new set.
+void wki_remote_vfs_rebuild_exports();
 
 // Fencing cleanup - remove all state for a fenced peer
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);

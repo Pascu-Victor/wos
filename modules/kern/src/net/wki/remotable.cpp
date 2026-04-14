@@ -348,9 +348,15 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     // Check if we already have this resource (upsert)
     DiscoveredResource* existing = find_resource_unlocked(adv->node_id, type, adv->resource_id);
     if (existing != nullptr) {
-        // Update flags
+        // Refresh mutable fields so reconnect/re-advertisement can correct a
+        // stale visible name without requiring a reboot.
         existing->flags = adv->flags;
+        memcpy(static_cast<void*>(existing->name), static_cast<const void*>(res.name), sizeof(existing->name));
         s_remotable_lock.unlock();
+
+        ker::vfs::devfs::devfs_wki_remove_resource(adv->node_id, adv->resource_type, adv->resource_id);
+        ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type, adv->resource_id, adv->flags,
+                                                static_cast<const char*>(res.name));
         return;
     }
 
@@ -580,9 +586,14 @@ void wki_remotable_process_pending_net_attaches() {
 
         ker::mod::dbg::log("[WKI] NET auto-attached: %s -> node=0x%04x", pending.nic_name, pending.node_id);
 
-        // V2: Install route for the remote subnet through the proxy NIC
+        // In sparse mode we intentionally avoid auto-installing routes.
+        // Remote NIC discovery happens before local DHCP/static configuration
+        // is necessarily complete, so eagerly adding a same-subnet route can
+        // steal local traffic (e.g. SSH/NTP) until the real NIC is configured.
+        // ATTACH_ALL keeps the old behavior and auto-routes every remote NIC.
         auto* proxy_state = static_cast<ProxyNetState*>(proxy_dev->private_data);
-        if (proxy_state != nullptr && proxy_state->owner_ipv4_addr != 0 && proxy_state->owner_ipv4_mask != 0) {
+        if (g_wki.nic_policy == WkiNicPolicy::ATTACH_ALL && proxy_state != nullptr && proxy_state->owner_ipv4_addr != 0 &&
+            proxy_state->owner_ipv4_mask != 0) {
             uint32_t remote_subnet = proxy_state->owner_ipv4_addr & proxy_state->owner_ipv4_mask;
             int route_ret = ker::net::route_add(remote_subnet, proxy_state->owner_ipv4_mask, 0 /*gateway*/, 100 /*metric*/, proxy_dev);
             if (route_ret == 0) {

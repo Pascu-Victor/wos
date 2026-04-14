@@ -2284,6 +2284,9 @@ void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
         return;
     }
+    if (task->schedQueue == task::Task::SchedQueue::DEAD_GC) {
+        return;
+    }
 
     bool found_current = false;
     bool removed_from_queue = false;
@@ -2338,8 +2341,9 @@ void gc_expired_tasks() {
 #endif
         ](RunQueue* rq) {
             // Walk dead list, reclaiming tasks whose epoch grace period has elapsed.
-            // Because IntrusiveTaskList::remove() only removes one node (not all
-            // occurrences), we can safely walk with a restart-on-remove pattern.
+            // Duplicate insertion used to leave the same Task* reachable multiple
+            // times; remove all local occurrences before freeing so GC never visits
+            // a stale duplicate after the object is destroyed.
             bool made_progress = true;
             while (made_progress) {
                 made_progress = false;
@@ -2437,14 +2441,18 @@ void gc_expired_tasks() {
                     }
 
                     if (!task_looks_valid) {
-                        rq->deadList.remove(cur);
+                        while (rq->deadList.remove(cur)) {
+                        }
                         dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
                         made_progress = true;
                         break;
                     }
 
                     // Remove from dead list
-                    rq->deadList.remove(cur);
+                    while (rq->deadList.remove(cur)) {
+                    }
+
+                    cur->schedQueue = task::Task::SchedQueue::NONE;
 
                     // Clear PID hash table entry
                     if (cur->pid > 0) {
@@ -2486,6 +2494,7 @@ void gc_expired_tasks() {
                             mm::virt::destroyUserSpace(cur->pagemap);
                             mm::phys::pageFree(cur->pagemap);
                         }
+                        cur->pagemap = nullptr;
                     }
 
                     // Free thread
@@ -2506,6 +2515,7 @@ void gc_expired_tasks() {
                                 thread_ptr->stackPhysPtr = 0;
                                 threading::destroyThread(thread_ptr);
                             }
+                            cur->thread = nullptr;
                         }
                     }
 

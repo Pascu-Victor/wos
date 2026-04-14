@@ -83,8 +83,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
         if (frame.intNum == 14) {
-            dbg::log("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx pid=%x", cr2, frame.errCode, frame.rip,
-                     ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+            dbg::log("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%x", cr2, frame.errCode, frame.rip,
+                     frame.rsp, ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
 
             auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF);
             uint64_t idx4 = (cr2 >> 39) & 0x1FF;

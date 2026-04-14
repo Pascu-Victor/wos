@@ -26,6 +26,11 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 auto unmount_filesystem(const char* path) -> int;
 auto find_mount_point(const char* path) -> MountPoint*;
 
+// Resolve path through the current task's root prefix (same as mount_filesystem
+// stores internally).  Callers that need to find_mount_point a raw path AFTER
+// mount_filesystem should resolve first.
+auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int;
+
 // Helper to convert fstype string to FSType enum
 auto fstype_to_enum(const char* fstype) -> FSType;
 

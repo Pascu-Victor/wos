@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <net/wki/peer.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wire.hpp>
@@ -48,6 +49,28 @@ uint32_t g_next_task_id = 1;                           // NOLINT(cppcoreguidelin
 bool g_remote_compute_initialized = false;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_last_load_report_us = 0;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_compute_lock;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// Pending queue for VFS_REF/RESOURCE_REF task submits.
+// These delivery modes call load_elf_from_vfs_path() which does blocking
+// remote VFS reads.  Running those from NAPI poll context causes
+// re-entrance deadlocks, so they are queued here and processed in
+// wki_timer_tick()'s deferred-work section.
+struct PendingTaskSubmit {
+    uint16_t src_node;
+    uint8_t* payload;
+    uint16_t payload_len;
+};
+std::deque<PendingTaskSubmit> g_pending_task_submits;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_pending_submit_lock;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
+constexpr size_t WKI_VFS_LOAD_CHUNK = 65536;
+constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
+constexpr int32_t WKI_SIGKILL_NUM = 9;
+constexpr int32_t WKI_SIGTERM_NUM = 15;
+constexpr uint64_t WKI_SIGCHLD_NUM = 17;
+constexpr int32_t WKI_WAIT_STATUS_EXIT_SHIFT = 8;
+constexpr int32_t WKI_WAIT_STATUS_FAILURE_CODE = 255;
 
 // s_compute_lock must be held by caller
 auto find_submitted_task(uint32_t task_id) -> SubmittedTask* {
@@ -170,6 +193,21 @@ void close_proxy_fd_table(ker::mod::sched::task::Task* task) {
     }
 }
 
+auto encode_remote_wait_status(int32_t exit_status) -> int32_t {
+    if (exit_status >= 0) {
+        return exit_status;
+    }
+
+    switch (exit_status) {
+        case -WKI_SIGKILL_NUM:
+            return WKI_SIGKILL_NUM;
+        case -WKI_SIGTERM_NUM:
+            return WKI_SIGTERM_NUM;
+        default:
+            return WKI_WAIT_STATUS_FAILURE_CODE << WKI_WAIT_STATUS_EXIT_SHIFT;
+    }
+}
+
 void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->isThread) {
         return;
@@ -187,8 +225,9 @@ void write_proxy_output(ker::mod::sched::task::Task* proxy, const uint8_t* outpu
     if (proxy == nullptr || output_data == nullptr || output_len == 0) {
         return;
     }
-
+#ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Task %u remote output (%u bytes):", task_id, output_len);
+#endif
     if (proxy->fd_table.lookup(1) != nullptr) {
         auto* file = static_cast<ker::vfs::File*>(proxy->fd_table.lookup(1));
         if (file->fops != nullptr && file->fops->vfs_write != nullptr) {
@@ -202,6 +241,8 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
         return;
     }
 
+    int32_t wait_status = encode_remote_wait_status(exit_status);
+
     for (size_t i = 0; i < proxy->awaitee_on_exit.size(); ++i) {
         uint64_t waiting_pid = proxy->awaitee_on_exit[i];
         auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(waiting_pid);
@@ -210,7 +251,7 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
                 waiting_task->context.regs.rax = proxy->pid;
                 if (waiting_task->waitStatusPhysAddr != 0) {
                     auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
-                    *status_ptr = exit_status;
+                    *status_ptr = wait_status;
                 }
             }
             uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
@@ -227,9 +268,20 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
         return;
     }
 
+    if (!proxy->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
+        auto state = proxy->state.load(std::memory_order_acquire);
+        if (state == ker::mod::sched::task::TaskState::DEAD || state == ker::mod::sched::task::TaskState::EXITING ||
+            proxy->schedQueue == ker::mod::sched::task::Task::SchedQueue::DEAD_GC) {
+            return;
+        }
+        return;
+    }
+
+    int32_t wait_status = encode_remote_wait_status(exit_status);
+
     write_proxy_output(proxy, output_data, output_len, task_id);
 
-    proxy->exitStatus = exit_status;
+    proxy->exitStatus = wait_status;
     proxy->hasExited = true;
     proxy->wki_proxy_task_id = 0;
 
@@ -242,14 +294,14 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
     if (!proxy->isThread && proxy->parentPid != 0) {
         auto* parent = ker::mod::sched::find_task_by_pid_safe(proxy->parentPid);
         if (parent != nullptr) {
-            parent->sigPending |= (1ULL << (17 - 1));  // SIGCHLD
+            parent->sigPending |= (1ULL << (WKI_SIGCHLD_NUM - 1));
 
             static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
             if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
                 parent->context.regs.rax = proxy->pid;
                 if (parent->waitStatusPhysAddr != 0) {
                     auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(parent->waitStatusPhysAddr));
-                    *status_ptr = exit_status;
+                    *status_ptr = wait_status;
                 }
                 parent->waitingForPid = 0;
                 proxy->waitedOn = true;
@@ -746,9 +798,11 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         std::array<char, VFS_REF_PATH_MAX> vfs_ref_path = {};
         if (build_vfs_ref_path(best_node, local_path, vfs_ref_path.data(), vfs_ref_path.size())) {
             tid = wki_task_submit_vfs_ref(best_node, vfs_ref_path.data(), spec.argv, spec.envp, spec.cwd, task);
+#ifdef WKI_DEBUG
             if (tid != 0) {
                 ker::mod::dbg::log("[WKI] Remote spawn using VFS_REF '%s' -> '%s'", task->exe_path, vfs_ref_path.data());
             }
+#endif
         }
     }
 
@@ -790,8 +844,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     if (completed_immediately) {
         finalize_proxy_task(task, completed_exit_status, nullptr, 0, tid);
     }
-
+#ifdef WKI_DEBUG
     ker::mod::dbg::log("[WKI] Task '%s' (pid=0x%lx) placed as proxy on node 0x%04x (task_id=%u)", task->name, task->pid, best_node, tid);
+#endif
     return WkiRemoteSpawnResult::REMOTE;
 }
 
@@ -1001,12 +1056,13 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
         return 0;
     }
 
-    int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    int wait_rc = wki_wait_for_op(&wait, WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
     task_ptr->response_wait_entry = nullptr;
     if (wait_rc != 0) {
         task_ptr->response_pending.store(false, std::memory_order_relaxed);
         task_ptr->active = false;
-        ker::mod::dbg::log("[WKI] VFS_REF submit wait failed: task_id=%u rc=%d", task_id, wait_rc);
+        ker::mod::dbg::log("[WKI] VFS_REF submit wait failed: task_id=%u rc=%d timeout_us=%llu", task_id, wait_rc,
+                           WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
         return 0;
     }
 
@@ -1015,8 +1071,9 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
         task_ptr->active = false;
         return 0;
     }
-
+#ifdef WKI_DEBUG
     ker::mod::dbg::log("[WKI] VFS_REF task accepted: task_id=%u remote_pid=%lu", task_id, task_ptr->remote_pid);
+#endif
     return task_id;
 }
 
@@ -1114,8 +1171,8 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
         return false;
     }
 
-    // Only forward SIGKILL(9) and SIGTERM(15) - other signals have no meaning on remote
-    if (signum != 9 && signum != 15) {
+    // Only forward SIGKILL and SIGTERM - other signals have no meaning on remote.
+    if (signum != WKI_SIGKILL_NUM && signum != WKI_SIGTERM_NUM) {
         return false;
     }
 
@@ -1191,7 +1248,7 @@ void wki_load_report_send() {
             continue;
         }
 
-        wki_send(peer->node_id, WKI_CHAN_RESOURCE, MsgType::LOAD_REPORT, &buf[0],
+        wki_send(peer->node_id, WKI_CHAN_EVENT_BUS, MsgType::LOAD_REPORT, &buf[0],
                  total_len);  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     }
 }
@@ -1352,7 +1409,11 @@ void wki_remote_compute_check_completions() {
         }
 
         if (num_completions < MAX_COMPLETIONS) {
-            completions[num_completions++] = {rt.task_id, rt.submitter_node, rt.local_pid, exit_status, rt.output};
+            completions[num_completions++] = {.task_id = rt.task_id,
+                                              .submitter_node = rt.submitter_node,
+                                              .local_pid = rt.local_pid,
+                                              .exit_status = exit_status,
+                                              .output = rt.output};
         } else {
             delete rt.output;
         }
@@ -1386,10 +1447,10 @@ void wki_remote_compute_check_completions() {
             wki_send(info.submitter_node, WKI_CHAN_RESOURCE, MsgType::TASK_COMPLETE, buf, msg_len);
             ker::mod::mm::dyn::kmalloc::free(buf);
         }
-
+#if WKI_DEBUG
         ker::mod::dbg::log("[WKI] Remote task completed: task_id=%u pid=0x%lx exit=%d output=%u bytes", info.task_id, info.local_pid,
                            info.exit_status, out_len);
-
+#endif
         delete info.output;
     }
 }
@@ -1426,6 +1487,9 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len) -> ExecResult {
     const auto* elf_hdr = reinterpret_cast<const Elf64_Ehdr*>(elf_buffer);
     if (elf_hdr->e_ident[EI_MAG0] != ELFMAG0 || elf_hdr->e_ident[EI_MAG1] != ELFMAG1 || elf_hdr->e_ident[EI_MAG2] != ELFMAG2 ||
         elf_hdr->e_ident[EI_MAG3] != ELFMAG3) {
+        ker::mod::dbg::log("[WKI] exec_elf_buffer: bad ELF magic at %p len=%u bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]", elf_buffer,
+                           binary_len, elf_buffer[0], elf_buffer[1], elf_buffer[2], elf_buffer[3], elf_buffer[4], elf_buffer[5],
+                           elf_buffer[6], elf_buffer[7]);
         delete[] elf_buffer;
         result.reject_reason = TaskRejectReason::FETCH_FAILED;
         return result;
@@ -1523,15 +1587,38 @@ auto load_elf_from_vfs_path(const char* path) -> VfsLoadResult {
     ker::vfs::vfs_lseek(fd, 0, 0);  // SEEK_SET
 
     auto* buf = new uint8_t[static_cast<size_t>(file_size)];  // NOLINT(cppcoreguidelines-owning-memory)
-    size_t actual = 0;
-    ker::vfs::vfs_read(fd, buf, static_cast<size_t>(file_size), &actual);
+    size_t total_read = 0;
+    uint32_t idle_retries = 0;
+
+    while (total_read < static_cast<size_t>(file_size)) {
+        size_t chunk = std::min(WKI_VFS_LOAD_CHUNK, static_cast<size_t>(file_size) - total_read);
+        size_t actual = 0;
+        ssize_t read_ret = ker::vfs::vfs_read(fd, buf + total_read, chunk, &actual);
+
+        if (read_ret < 0 || actual == 0) {
+            if (++idle_retries >= WKI_VFS_LOAD_IDLE_RETRIES) {
+                break;
+            }
+            continue;
+        }
+
+        total_read += actual;
+        idle_retries = 0;
+    }
+
     ker::vfs::vfs_close(fd);
 
-    if (static_cast<ssize_t>(actual) != file_size) {
+    if (total_read != static_cast<size_t>(file_size)) {
+        ker::mod::dbg::log("[WKI] VFS_REF: short read for '%s' (%zu/%ld bytes)", resolved_path, total_read, static_cast<long>(file_size));
         delete[] buf;
         result.reject_reason = TaskRejectReason::FETCH_FAILED;
         return result;
     }
+
+#ifdef DEBUG_WKI_COMPUTE
+    ker::mod::dbg::log("[WKI] VFS_REF: loaded '%s' %zu bytes hdr=[%02x %02x %02x %02x]", resolved_path, total_read, buf[0], buf[1], buf[2],
+                       buf[3]);
+#endif
 
     result.buffer = buf;
     result.size = static_cast<uint32_t>(file_size);
@@ -1544,12 +1631,19 @@ auto load_elf_from_vfs_path(const char* path) -> VfsLoadResult {
 // Receiver Side - RX Handlers
 // ===============================================================================
 
-namespace detail {
-
-void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+// Internal implementation: runs the full TASK_SUBMIT handler including
+// any blocking VFS reads.  Must only be called from a context where
+// wki_spin_yield() / napi_poll_inline() are safe (i.e. NOT from inside
+// the NAPI poll dispatch path).
+static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(TaskSubmitPayload)) {
         return;
     }
+
+    // Build a minimal header for the internal helpers that need src_node.
+    WkiHeader synth_hdr = {};
+    synth_hdr.src_node = src_node;
+    const WkiHeader* hdr = &synth_hdr;
 
     const auto* submit = reinterpret_cast<const TaskSubmitPayload*>(payload);
     const uint8_t* var_data = payload + sizeof(TaskSubmitPayload);
@@ -1832,6 +1926,15 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     memcpy(new_task->cwd, task_cwd, cwd_copy_len);
     new_task->cwd[cwd_copy_len] = '\0';
 
+    // Inherit per-process root from the current (kernel) task so that
+    // path resolution after pivot_root works identically to local tasks.
+    {
+        auto* cur = ker::mod::sched::get_current_task();
+        if (cur != nullptr) {
+            memcpy(new_task->root, cur->root, sizeof(new_task->root));
+        }
+    }
+
     // Remote-receiver tasks and their descendants should execute locally on
     // the receiver unless they opt into a different policy explicitly later.
     new_task->wki_target_hostname[0] = '\0';
@@ -1937,7 +2040,8 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         uint64_t aligned = cur & ~(ALIGN - 1);
         stack_offset += (cur - aligned);
 
-        size_t structured_qwords = 10 + (static_cast<size_t>(submit->envc) + 1) + (static_cast<size_t>(submit->argc) + 1) + 1;
+        size_t auxv_qwords = 14 + (new_task->interpBase != 0 ? 2 : 0);
+        size_t structured_qwords = auxv_qwords + (static_cast<size_t>(submit->envc) + 1) + (static_cast<size_t>(submit->argc) + 1) + 1;
         if (structured_qwords % 2 != 0) {
             uint64_t pad = 0;
             if (push_to_stack(&pad, sizeof(uint64_t)) == 0) {
@@ -1947,19 +2051,36 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
             }
         }
 
-        // Auxiliary vector (minimal: AT_PAGESZ, AT_ENTRY, AT_NULL)
+        // Mirror the normal execve() auxv contract so PT_INTERP binaries
+        // (for example dropbearmulti) can bootstrap through ld.so.
         constexpr uint64_t AT_NULL = 0;
-        constexpr uint64_t AT_PAGESZ = 6;
-        constexpr uint64_t AT_ENTRY = 9;
         constexpr uint64_t AT_PHDR = 3;
+        constexpr uint64_t AT_PHENT = 4;
+        constexpr uint64_t AT_PHNUM = 5;
+        constexpr uint64_t AT_PAGESZ = 6;
+        constexpr uint64_t AT_BASE = 7;
+        constexpr uint64_t AT_ENTRY = 9;
         constexpr uint64_t AT_EHDR = 33;
 
-        std::array<uint64_t, 10> auxv = {AT_PAGESZ, paging::PAGE_SIZE,
-                                         AT_ENTRY,  new_task->entry,
-                                         AT_PHDR,   new_task->programHeaderAddr,
-                                         AT_EHDR,   new_task->elfHeaderAddr,
-                                         AT_NULL,   0};
-        for (int j = static_cast<int>(auxv.size()) - 1; j >= 0; --j) {
+        std::array<uint64_t, 16> auxv = {};
+        size_t auxv_count = 0;
+        auto append_auxv = [&](uint64_t key, uint64_t value) {
+            auxv[auxv_count++] = key;
+            auxv[auxv_count++] = value;
+        };
+
+        append_auxv(AT_PAGESZ, paging::PAGE_SIZE);
+        append_auxv(AT_ENTRY, new_task->entry);
+        append_auxv(AT_PHDR, new_task->programHeaderAddr);
+        append_auxv(AT_PHENT, new_task->programHeaderEntSize);
+        append_auxv(AT_PHNUM, new_task->programHeaderCount);
+        append_auxv(AT_EHDR, new_task->elfHeaderAddr);
+        if (new_task->interpBase != 0) {
+            append_auxv(AT_BASE, new_task->interpBase);
+        }
+        append_auxv(AT_NULL, 0);
+
+        for (int j = static_cast<int>(auxv_count) - 1; j >= 0; --j) {
             uint64_t val = auxv[static_cast<size_t>(j)];
             if (push_to_stack(&val, sizeof(uint64_t)) == 0) {
                 delete[] argv_addrs;
@@ -2010,7 +2131,16 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     // Save PID before posting to scheduler.  Once posted, the task can
     // complete and be epoch-reclaimed before we touch exec.task again.
     uint64_t launched_pid = exec.task->pid;
-    int launched_cpu = exec.task->cpu;
+#ifdef DEBUG_WKI_COMPUTE
+    int launched_cpu = -1;
+    ker::mod::dbg::log("[WKI-DBG] task_id=%u pid=0x%lx pre-post: rsp=0x%lx rip=0x%lx entry=0x%lx stack_top=0x%lx cs=0x%x ss=0x%x",
+                       submit->task_id, launched_pid, new_task->context.frame.rsp, new_task->context.frame.rip, new_task->entry,
+                       new_task->thread ? new_task->thread->stack : 0, (uint32_t)new_task->context.frame.cs,
+                       (uint32_t)new_task->context.frame.ss);
+    ker::mod::dbg::log("[WKI-DBG] task_id=%u fsbase=0x%lx gsbase=0x%lx tlsBaseVirt=0x%lx safestackPtr=0x%lx", submit->task_id,
+                       new_task->thread ? new_task->thread->fsbase : 0, new_task->thread ? new_task->thread->gsbase : 0,
+                       new_task->thread ? new_task->thread->tlsBaseVirt : 0, new_task->thread ? new_task->thread->safestackPtrValue : 0);
+#endif
 
     // Post to scheduler
     if (!ker::mod::sched::post_task_balanced(new_task)) {
@@ -2024,6 +2154,11 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
         return;
     }
+#ifdef DEBUG_WKI_COMPUTE
+    // post_task_balanced sets task->cpu before returning; capture it here
+    // before the task can complete and be reclaimed.
+    launched_cpu = static_cast<int>(new_task->cpu);
+#endif
 
     // Track for completion monitoring (use saved PID, not exec.task->pid)
     RunningRemoteTask rt;
@@ -2042,9 +2177,78 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     accept.status = static_cast<uint8_t>(TaskRejectReason::ACCEPTED);
     accept.remote_pid = launched_pid;
     wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_ACCEPT, &accept, sizeof(accept));
-
+#ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Remote task launched: task_id=%u pid=0x%lx on CPU %d mode=%u", submit->task_id, launched_pid, launched_cpu,
                        submit->delivery_mode);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+void wki_remote_compute_process_pending_submits() {
+    while (true) {
+        s_pending_submit_lock.lock();
+        if (g_pending_task_submits.empty()) {
+            s_pending_submit_lock.unlock();
+            return;
+        }
+        auto pending = g_pending_task_submits.front();
+        g_pending_task_submits.pop_front();
+        s_pending_submit_lock.unlock();
+
+        handle_task_submit_work(pending.src_node, pending.payload, pending.payload_len);
+        ker::mod::mm::dyn::kmalloc::free(pending.payload);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// detail:: RX handlers (called from NAPI dispatch in wki_rx)
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+    if (payload_len < sizeof(TaskSubmitPayload)) {
+        return;
+    }
+
+    const auto* submit = reinterpret_cast<const TaskSubmitPayload*>(payload);
+    auto mode = static_cast<TaskDeliveryMode>(submit->delivery_mode);
+
+    // VFS_REF and RESOURCE_REF delivery modes call load_elf_from_vfs_path()
+    // which does blocking remote VFS reads through vfs_proxy_send_and_wait().
+    // Those waits call wki_spin_yield() -> napi_poll_inline(), causing NAPI
+    // re-entrance when dispatched from wki_rx().  Defer to the timer tick's
+    // deferred-work section where napi_poll_inline() is safe.
+    if (mode == TaskDeliveryMode::VFS_REF || mode == TaskDeliveryMode::RESOURCE_REF) {
+        auto* copy = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(payload_len));
+        if (copy == nullptr) {
+            TaskResponsePayload reject = {};
+            reject.task_id = submit->task_id;
+            reject.status = static_cast<uint8_t>(TaskRejectReason::NO_MEM);
+            reject.remote_pid = 0;
+            wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+            return;
+        }
+        std::memcpy(copy, payload, payload_len);
+
+        PendingTaskSubmit pending;
+        pending.src_node = hdr->src_node;
+        pending.payload = copy;
+        pending.payload_len = payload_len;
+
+        s_pending_submit_lock.lock();
+        g_pending_task_submits.push_back(pending);
+        s_pending_submit_lock.unlock();
+
+        wki_timer_notify();
+        return;
+    }
+
+    // INLINE delivery has no blocking VFS I/O — safe to handle directly.
+    handle_task_submit_work(hdr->src_node, payload, payload_len);
 }
 
 void handle_task_accept(const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
@@ -2105,6 +2309,7 @@ void handle_task_complete(const WkiHeader* /*hdr*/, const uint8_t* payload, uint
     }
 
     const auto* comp = reinterpret_cast<const TaskCompletePayload*>(payload);
+    WkiWaitEntry* complete_waiter = nullptr;
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(comp->task_id);
@@ -2120,6 +2325,11 @@ void handle_task_complete(const WkiHeader* /*hdr*/, const uint8_t* payload, uint
     if (proxy != nullptr) {
         task->local_task = nullptr;
     }
+
+    task->complete_pending.store(false, std::memory_order_release);
+    complete_waiter = task->complete_wait_entry;
+    task->complete_wait_entry = nullptr;
+    task->active = false;
     s_compute_lock.unlock();
 
     if (proxy != nullptr) {
@@ -2127,43 +2337,40 @@ void handle_task_complete(const WkiHeader* /*hdr*/, const uint8_t* payload, uint
         uint16_t out_len = comp->output_len;
         if (out_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
             auto avail = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
-            if (out_len > avail) {
-                out_len = avail;
-            }
+            out_len = std::min(out_len, avail);
             finalize_proxy_task(proxy, comp->exit_status, output_data, out_len, comp->task_id);
         } else {
             finalize_proxy_task(proxy, comp->exit_status, nullptr, 0, comp->task_id);
         }
-
+#ifdef DEBUG_WKI_COMPUTE
         ker::mod::dbg::log("[WKI] Proxy task pid=0x%lx completed: exit=%d (remote task_id=%u)", proxy->pid, comp->exit_status,
                            comp->task_id);
+#endif
     } else {
         // proxy_ready=false: the proxy task hasn't blocked yet (it's still
         // in exec return / deferred-switch setup).  Record exit_status so
-        // that wki_proxy_task_blocked() can finalize when it runs.  If
-        // local_task is set, also forward any captured output.
+        // that the submit path or wki_proxy_task_blocked() can finalize when
+        // it observes task->active became false. If local_task is set, also
+        // forward any captured output.
+#ifdef DEBUG_WKI_COMPUTE
         ker::mod::dbg::log("[WKI] TASK_COMPLETE early (proxy not ready): task_id=%u exit=%d local_task=%p", comp->task_id,
                            comp->exit_status, task->local_task);
+#endif
         if (task->local_task != nullptr) {
             const uint8_t* output_data = payload + sizeof(TaskCompletePayload);
             uint16_t out_len = comp->output_len;
             if (out_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
                 auto avail = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
-                if (out_len > avail) {
-                    out_len = avail;
-                }
+                out_len = std::min(out_len, avail);
                 write_proxy_output(task->local_task, output_data, out_len, comp->task_id);
             }
-        } else if (comp->output_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
+        }
+#ifdef DEBUG_WKI_COMPUTE
+        else if (comp->output_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
             ker::mod::dbg::log("[WKI] Task %u output (%u bytes)", comp->task_id, comp->output_len);
         }
+#endif
     }
-
-    s_compute_lock.lock();
-    task->complete_pending.store(false, std::memory_order_release);
-    WkiWaitEntry* complete_waiter = task->complete_wait_entry;
-    task->active = false;
-    s_compute_lock.unlock();
 
     if (complete_waiter != nullptr) {
         wki_wake_op(complete_waiter, 0);

@@ -177,6 +177,11 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
 // When a task exits, sends TASK_COMPLETE back to the submitter.
 void wki_remote_compute_check_completions();
 
+// Process deferred VFS_REF/RESOURCE_REF task submits (called from timer tick
+// deferred-work section).  These cannot run from NAPI poll context because
+// the remote VFS reads cause napi_poll_inline() re-entrance.
+void wki_remote_compute_process_pending_submits();
+
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers
 // -----------------------------------------------------------------------------

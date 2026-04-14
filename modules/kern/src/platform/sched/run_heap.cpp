@@ -200,6 +200,16 @@ void IntrusiveTaskList::init() {
 }
 
 void IntrusiveTaskList::push(task::Task* t) {
+    if (t == nullptr) {
+        return;
+    }
+
+    for (task::Task* cur = head; cur != nullptr; cur = cur->schedNext) {
+        if (cur == t) {
+            return;
+        }
+    }
+
     t->schedNext = head;
     head = t;
     count++;

@@ -280,6 +280,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     // Prepare response
     DevAttachAckPayload ack = {};
+    ack.resource_id = req->resource_id;
 
     auto res_type = static_cast<ResourceType>(req->resource_type);
 
@@ -497,6 +498,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         DevAttachAckNetPayload net_ack = {};
         net_ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
         net_ack.assigned_channel = ch->channel_id;
+        net_ack.resource_id = req->resource_id;
         net_ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
         net_ack.real_mac = ndev->mac;
         net_ack.link_state = ndev->state;

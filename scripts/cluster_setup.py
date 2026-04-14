@@ -888,6 +888,10 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict, tcg_level: str 
                 )
                 ivshmem_idx += 1
 
+    # Per-node hostname via QEMU fw_cfg (read by kernel before VFS is up)
+    node_hostname = f"wos-{node_id}"
+    args.extend(["-fw_cfg", f"name=opt/wos/hostname,string={node_hostname}"])
+
     # Debug mode
     if is_debug:
         gdb_port = 1234 + node_id

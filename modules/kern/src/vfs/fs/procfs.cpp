@@ -17,6 +17,7 @@
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
+#include "net/wki/wki.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "release.hpp"
 #include "vfs/file_operations.hpp"
@@ -503,6 +504,43 @@ auto generate_uptime(char* buf, size_t bufsz) -> size_t {
     return off;
 }
 
+// Generate content for /proc/<pid>/wki_launcher
+// Returns the hostname of the node that submitted/launched this process,
+// or the local hostname if the process was launched locally.
+auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    const char* hostname = nullptr;
+    if (task != nullptr && task->wki_submitter_hostname[0] != '\0') {
+        hostname = static_cast<const char*>(task->wki_submitter_hostname);
+    } else {
+        hostname = ker::net::wki::g_wki.local_hostname;
+    }
+    if (hostname == nullptr || hostname[0] == '\0') {
+        hostname = "local";
+    }
+    size_t len = strlen(hostname);
+    if (len + 2 > bufsz) len = bufsz - 2;
+    memcpy(buf, hostname, len);
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    return len + 1;
+}
+
+// Generate content for /proc/<pid>/wki_runner
+// Returns the hostname of the node currently executing this process.
+auto generate_wki_runner(char* buf, size_t bufsz) -> size_t {
+    const char* hostname = ker::net::wki::g_wki.local_hostname;
+    if (hostname == nullptr || hostname[0] == '\0') {
+        hostname = "local";
+    }
+    size_t len = strlen(hostname);
+    if (len + 2 > bufsz) len = bufsz - 2;
+    memcpy(buf, hostname, len);
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    return len + 1;
+}
+
 // Generate content for /proc/version
 auto generate_version(char* buf, size_t bufsz) -> size_t;
 
@@ -824,6 +862,12 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::KCONTSTAT_FILE:
                 pfd->content_len = generate_kcontstat(pfd->content, MAX_KPERF_BUF);
                 break;
+            case ProcNodeType::WKI_LAUNCHER_FILE:
+                pfd->content_len = generate_wki_launcher(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::WKI_RUNNER_FILE:
+                pfd->content_len = generate_wki_runner(pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
@@ -1084,6 +1128,14 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/cmdline") == 0) {
         return make_file(ProcNodeType::CMDLINE_FILE, self_pid, false);
     }
+    // /proc/self/wki_launcher
+    if (strcmp(path, "self/wki_launcher") == 0) {
+        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, self_pid, false);
+    }
+    // /proc/self/wki_runner
+    if (strcmp(path, "self/wki_runner") == 0) {
+        return make_file(ProcNodeType::WKI_RUNNER_FILE, self_pid, false);
+    }
 
     // /proc/<pid>
     // Find first / in path
@@ -1136,6 +1188,12 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "cmdline") == 0) {
         return make_file(ProcNodeType::CMDLINE_FILE, static_cast<uint64_t>(pid), false);
+    }
+    if (strcmp(sub, "wki_launcher") == 0) {
+        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, static_cast<uint64_t>(pid), false);
+    }
+    if (strcmp(sub, "wki_runner") == 0) {
+        return make_file(ProcNodeType::WKI_RUNNER_FILE, static_cast<uint64_t>(pid), false);
     }
 
     return nullptr;  // Unknown procfs path

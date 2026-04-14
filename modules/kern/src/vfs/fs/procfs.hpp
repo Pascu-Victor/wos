@@ -22,7 +22,9 @@ enum class ProcNodeType : uint8_t {
     KPERF_FILE,     // /proc/kperf    -> drain kernel perf ring buffer as text events
     KCPUSTAT_FILE,  // /proc/kcpustat -> per-CPU aggregate scheduler statistics
     KPERFCTL_FILE,  // /proc/kperfctl -> write "enable"/"disable" to control recording
-    KCONTSTAT_FILE, // /proc/kcontstat -> per-subsystem container statistics
+    KCONTSTAT_FILE,      // /proc/kcontstat -> per-subsystem container statistics
+    WKI_LAUNCHER_FILE,   // /proc/<pid>/wki_launcher -> hostname of the node that launched the process
+    WKI_RUNNER_FILE,     // /proc/<pid>/wki_runner   -> hostname of the node currently running the process
 };
 
 struct ProcNode {

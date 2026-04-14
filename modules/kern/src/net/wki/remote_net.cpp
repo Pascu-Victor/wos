@@ -42,9 +42,9 @@ auto find_net_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> Prox
 }
 
 // s_net_proxy_lock must be held by caller
-auto find_net_proxy_by_attach(uint16_t owner_node) -> ProxyNetState* {
+auto find_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyNetState* {
     for (auto& p : g_net_proxies) {
-        if (p->attach_pending && p->owner_node == owner_node) {
+        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id) {
             return p.get();
         }
     }
@@ -583,7 +583,7 @@ void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     const auto* ack = reinterpret_cast<const DevAttachAckPayload*>(payload);
 
     s_net_proxy_lock.lock();
-    ProxyNetState* state = find_net_proxy_by_attach(hdr->src_node);
+    ProxyNetState* state = find_net_proxy_by_attach(hdr->src_node, ack->resource_id);
     s_net_proxy_lock.unlock();
     if (state == nullptr) {
         return;

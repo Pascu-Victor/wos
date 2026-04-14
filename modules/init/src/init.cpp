@@ -80,6 +80,11 @@ auto main(int argc, char** argv) -> int {
         std::println("init[{}]: pivot_root failed (ret={}), continuing with initramfs root", cpuno, pivot_ret);
     } else {
         std::println("init[{}]: pivot_root succeeded, root is now /rootfs", cpuno);
+
+        // Recreate /wki on the new root filesystem so WKI remote VFS mounts
+        // survive the old initramfs root being unmounted.
+        ker::abi::vfs::mkdir("/wki", 0755);
+
         // Unmount the old initramfs root to free its RAM.
         int umount_ret = ker::abi::vfs::umount("/oldroot");
         if (umount_ret < 0) {

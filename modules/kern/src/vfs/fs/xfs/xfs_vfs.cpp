@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/mm/paging.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -28,9 +29,8 @@
 #include <vfs/stat.hpp>
 
 #include "dev/block_device.hpp"
-
-#ifdef XFS_BENCH
 #include "platform/dbg/dbg.hpp"
+#ifdef XFS_BENCH
 #include "platform/tsc/tsc.hpp"
 #endif
 
@@ -224,7 +224,8 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 #ifdef XFS_BENCH
         t0 = ker::mod::tsc::getNs();
 #endif
-        if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0) {
+        bool dma_safe_dst = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
+        if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0 && dma_safe_dst) {
             // Aligned, full-block read - go direct to the block device.
             uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
             size_t dev_count = chunk / ctx->device->block_size;
@@ -267,6 +268,27 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                            (unsigned long)(nb / 1000ULL), (unsigned long)(ni / 1000ULL), (unsigned long)by, (unsigned long)mbps);
     }
 #endif
+
+    // Diagnostic: detect all-zero reads and dump bmap details
+    if (total_read > 0 && offset == 0) {
+        auto* dbg_dst = static_cast<const uint8_t*>(buf);
+        bool all_zero = true;
+        for (size_t i = 0; i < std::min(total_read, static_cast<size_t>(64)); i++) {
+            if (dbg_dst[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            XfsBmapResult dbg_bmap{};
+            int dbg_rc = xfs_bmap_lookup(ip, 0, &dbg_bmap);
+            ker::mod::dbg::log(
+                "[XFS-DIAG] ZERO READ: ino=%lu size=%lu nextents=%u fmt=%d nblocks=%lu"
+                " bmap_rc=%d hole=%d startblk=%lu blkcnt=%lu unwritten=%d",
+                (unsigned long)ip->ino, (unsigned long)ip->size, ip->nextents, ip->data_fork.format, (unsigned long)ip->nblocks, dbg_rc,
+                dbg_bmap.is_hole, (unsigned long)dbg_bmap.startblock, (unsigned long)dbg_bmap.blockcount, dbg_bmap.unwritten);
+        }
+    }
 
     return static_cast<ssize_t>(total_read);
 }

@@ -566,6 +566,12 @@ auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
     return (channel_id <= WKI_CHAN_RESOURCE) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
 }
 
+void refresh_rx_credits(WkiChannel* ch) {
+    uint16_t max_credits = default_credits_for_channel(ch->channel_id);
+    uint32_t used = std::min<uint32_t>(ch->reorder_count, max_credits);
+    ch->rx_credits = static_cast<uint16_t>(max_credits - used);
+}
+
 }  // namespace
 
 auto wki_has_fast_timer_work() -> bool { return wki_next_fast_timer_deadline_us(wki_now_us()) != UINT64_MAX; }
@@ -1236,15 +1242,31 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         return;
     }
 
+    // Update last_rx_activity for traffic-based liveness detection.
+    // Any valid packet from a peer proves it is alive, so the heartbeat
+    // timeout check can use this alongside the explicit heartbeat timestamp.
+    {
+        WkiPeer* rx_peer = wki_peer_find(hdr->src_node);
+        if (rx_peer != nullptr) {
+            rx_peer->last_rx_activity = wki_now_us();
+        }
+    }
+
     // Process piggybacked ACK
     if ((wki_flags(hdr->version_flags) & WKI_FLAG_ACK_PRESENT) != 0) {
         WkiChannel* ch = wki_channel_get(hdr->src_node, hdr->channel_id);
         if (ch != nullptr) {
+            auto* fast_retransmit_data = static_cast<uint8_t*>(nullptr);
+            uint16_t fast_retransmit_len = 0;
+            uint16_t fast_retransmit_peer = 0;
+
             ch->lock.lock();
 
             // Advance tx_ack - release ACKed retransmit entries
             if (seq_after(hdr->ack_num + 1, ch->tx_ack)) {
                 ch->tx_ack = hdr->ack_num + 1;
+                ch->last_dup_ack = hdr->ack_num;
+                ch->dup_ack_count = 0;
 
                 // Remove ACKed entries from retransmit queue
                 while ((ch->retransmit_head != nullptr) && !seq_after(ch->retransmit_head->seq + 1, ch->tx_ack)) {
@@ -1278,14 +1300,55 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                     rt_entry_free(ch, rt);
                 }
+            } else if (hdr->ack_num + 1 == ch->tx_ack && ch->retransmit_head != nullptr) {
+                // Duplicate ACK for the current head-of-line gap.
+                // If we see enough of these, immediately retransmit the oldest
+                // unacked frame instead of waiting for the RTO to expire.
+                if (ch->last_dup_ack == hdr->ack_num) {
+                    ch->dup_ack_count++;
+                } else {
+                    ch->last_dup_ack = hdr->ack_num;
+                    ch->dup_ack_count = 1;
+                }
+
+                if (ch->dup_ack_count >= WKI_FAST_RETRANSMIT_THRESH) {
+                    WkiRetransmitEntry* rt = ch->retransmit_head;
+                    fast_retransmit_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rt->len));
+                    if (fast_retransmit_data != nullptr) {
+                        memcpy(fast_retransmit_data, rt->data, rt->len);
+                        fast_retransmit_len = rt->len;
+                        fast_retransmit_peer = ch->peer_node_id;
+
+                        uint64_t now = wki_now_us();
+                        rt->retries++;
+                        rt->send_time_us = now;
+                        ch->retransmits++;
+                        ch->retransmit_deadline = now + ch->rto_us;
+                    }
+                    ch->dup_ack_count = 0;
+                }
+            } else {
+                ch->last_dup_ack = hdr->ack_num;
+                ch->dup_ack_count = 0;
             }
 
-            // Replenish credits from header
-            if (hdr->credits > 0) {
-                ch->tx_credits += hdr->credits;
-            }
+            // The wire field advertises the peer's current receive budget for
+            // this channel. Treat it as an absolute window, not a delta.
+            uint16_t max_credits = default_credits_for_channel(ch->channel_id);
+            ch->tx_credits = static_cast<uint16_t>(std::min<uint16_t>(hdr->credits, max_credits));
 
             ch->lock.unlock();
+
+            if (fast_retransmit_data != nullptr) {
+                WkiTransport* transport = find_transport_for_peer(fast_retransmit_peer);
+                if (transport != nullptr) {
+                    uint16_t next_hop = resolve_next_hop(fast_retransmit_peer);
+                    if (next_hop != WKI_NODE_INVALID) {
+                        transport->tx(transport, next_hop, fast_retransmit_data, fast_retransmit_len);
+                    }
+                }
+                ker::mod::mm::dyn::kmalloc::free(fast_retransmit_data);
+            }
         }
     }
 
@@ -1382,7 +1445,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->rx_ack_pending = hdr->seq_num;
                 ch->ack_pending = true;
                 ch->bytes_received += payload_len;
-                ch->dup_ack_count = 0;
 
                 ch->lock.unlock();
 
@@ -1395,6 +1457,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     WkiReorderEntry* ro = ch->reorder_head;
                     ch->reorder_head = ro->next;
                     ch->reorder_count--;
+                    refresh_rx_credits(ch);
                     ch->rx_seq++;
                     ch->rx_ack_pending = ro->seq;
                     ch->bytes_received += ro->len;
@@ -1431,7 +1494,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     imm_ack_hdr.reserved = 0;
                     imm_ack_peer = ch->peer_node_id;
                     ch->ack_pending = false;
-                    ch->dup_ack_count = 0;
                 } else {
                     notify_timer = ch->ack_pending;
                 }
@@ -1455,32 +1517,45 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
             } else if (seq_after(hdr->seq_num, ch->rx_seq)) {
                 // Out-of-order: buffer in reorder queue, send dup ACK
-                ker::mod::dbg::log("[WKI] Out-of-order msg: src=0x%04x ch=%u seq=%u expected=%u type=%u", hdr->src_node, hdr->channel_id,
-                                   hdr->seq_num, ch->rx_seq, hdr->msg_type);
-                auto* ro = static_cast<WkiReorderEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiReorderEntry)));
-                if (ro != nullptr) {
-                    ro->data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(payload_len));
-                    if (ro->data != nullptr) {
-                        memcpy(ro->data, payload, payload_len);
-                        ro->len = payload_len;
-                        ro->msg_type = hdr->msg_type;
-                        ro->seq = hdr->seq_num;
-
-                        // Insert sorted by seq
-                        WkiReorderEntry** pp = &ch->reorder_head;
-                        while ((*pp != nullptr) && seq_before((*pp)->seq, ro->seq)) {
-                            pp = &(*pp)->next;
-                        }
-                        ro->next = *pp;
-                        *pp = ro;
-                        ch->reorder_count++;
-                    } else {
-                        ker::mod::mm::dyn::kmalloc::free(ro);
+                bool already_buffered = false;
+                for (WkiReorderEntry* cur = ch->reorder_head; cur != nullptr; cur = cur->next) {
+                    if (cur->seq == hdr->seq_num) {
+                        already_buffered = true;
+                        break;
                     }
                 }
 
-                // Track dup ACKs for fast retransmit
-                ch->dup_ack_count++;
+                if (!already_buffered) {
+                    ker::mod::dbg::log("[WKI] Out-of-order msg: src=0x%04x ch=%u seq=%u expected=%u type=%u", hdr->src_node,
+                                       hdr->channel_id, hdr->seq_num, ch->rx_seq, hdr->msg_type);
+
+                    uint16_t max_reorder = default_credits_for_channel(ch->channel_id);
+                    if (ch->reorder_count < max_reorder) {
+                        auto* ro = static_cast<WkiReorderEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiReorderEntry)));
+                        if (ro != nullptr) {
+                            ro->data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(payload_len));
+                            if (ro->data != nullptr) {
+                                memcpy(ro->data, payload, payload_len);
+                                ro->len = payload_len;
+                                ro->msg_type = hdr->msg_type;
+                                ro->seq = hdr->seq_num;
+
+                                // Insert sorted by seq.
+                                WkiReorderEntry** pp = &ch->reorder_head;
+                                while ((*pp != nullptr) && seq_before((*pp)->seq, ro->seq)) {
+                                    pp = &(*pp)->next;
+                                }
+                                ro->next = *pp;
+                                *pp = ro;
+                                ch->reorder_count++;
+                                refresh_rx_credits(ch);
+                            } else {
+                                ker::mod::mm::dyn::kmalloc::free(ro);
+                            }
+                        }
+                    }
+                }
+
                 ch->ack_pending = true;
 
                 ch->lock.unlock();
@@ -1558,7 +1633,6 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         do_ack = true;
 
         ch->ack_pending = false;
-        ch->dup_ack_count = 0;
     }
 
     ch->lock.unlock();
@@ -1670,7 +1744,6 @@ void wki_timer_tick(uint64_t now_us) {
             do_ack = true;
 
             ch->ack_pending = false;
-            ch->dup_ack_count = 0;
         }
 
         ch->lock.unlock();
@@ -1711,6 +1784,9 @@ void wki_timer_tick(uint64_t now_us) {
 
         // Process deferred VFS auto-mounts (must run outside NAPI poll context)
         wki_remotable_process_pending_mounts();
+
+        // Process deferred VFS_REF/RESOURCE_REF task submits (must run outside NAPI poll context)
+        wki_remote_compute_process_pending_submits();
 
         // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
         wki_remotable_process_pending_net_attaches();

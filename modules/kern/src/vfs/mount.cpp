@@ -9,6 +9,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
 #include <vfs/fs/fat32.hpp>
@@ -24,7 +25,32 @@ namespace ker::vfs {
 namespace {
 ker::util::SmallVec<MountPoint*, 8> mounts;
 mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
+
+constexpr size_t MAX_MOUNT_PATH = 512;
+
 }  // namespace
+
+// Resolve path through current task's root prefix so mount paths are stored
+// in the same namespace that find_mount_point receives from resolve_task_path_raw.
+// After pivot_root("/rootfs", ...), "/wki/node-xxx" → "/rootfs/wki/node-xxx".
+auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
+    size_t path_len = std::strlen(path);
+    if (path_len + 1 > outsize) return -1;
+    std::memcpy(out, path, path_len + 1);
+
+    if (ker::mod::sched::has_run_queues()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr) {
+            size_t root_len = std::strlen(task->root);
+            if (root_len > 1) {  // root != "/"
+                if (root_len + path_len + 1 > outsize) return -1;
+                std::memmove(out + root_len, out, path_len + 1);
+                std::memcpy(out, task->root, root_len);
+            }
+        }
+    }
+    return 0;
+}
 
 auto fstype_to_enum(const char* fstype) -> FSType {
     if (fstype == nullptr) {
@@ -54,18 +80,24 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         return -1;
     }
 
+    // Resolve through task root prefix so the stored path matches what
+    // find_mount_point receives after resolve_task_path_raw.
+    char resolved[MAX_MOUNT_PATH] = {};
+    if (resolve_mount_path(path, resolved, MAX_MOUNT_PATH) < 0) {
+        vfs_debug_log("mount_filesystem: path too long\n");
+        return -1;
+    }
+
     auto* mount = new MountPoint;
 
-    // Copy path and fstype into kernel heap - the caller may have passed
-    // pointers into userspace memory (e.g. from a mount syscall) that become
-    // invalid after the syscall returns.
-    size_t path_len = std::strlen(path);
+    // Copy resolved path and fstype into kernel heap.
+    size_t path_len = std::strlen(resolved);
     auto* path_copy = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
     if (path_copy == nullptr) {
         delete mount;
         return -1;
     }
-    std::memcpy(path_copy, path, path_len + 1);
+    std::memcpy(path_copy, resolved, path_len + 1);
     mount->path = path_copy;
 
     size_t fstype_len = std::strlen(fstype);
@@ -182,9 +214,15 @@ auto unmount_filesystem(const char* path) -> int {
         return -EINVAL;
     }
 
+    // Resolve through task root prefix to match stored mount paths.
+    char resolved[MAX_MOUNT_PATH] = {};
+    if (resolve_mount_path(path, resolved, MAX_MOUNT_PATH) < 0) {
+        return -ENAMETOOLONG;
+    }
+
     mount_lock.lock();
     for (size_t i = 0; i < mounts.size(); ++i) {
-        if (mounts[i] != nullptr && mounts[i]->path != nullptr && std::strcmp(path, mounts[i]->path) == 0) {
+        if (mounts[i] != nullptr && mounts[i]->path != nullptr && std::strcmp(resolved, mounts[i]->path) == 0) {
             delete mounts[i];
             mounts.remove_at(i);
             mount_lock.unlock();

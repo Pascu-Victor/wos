@@ -153,6 +153,7 @@ struct WkiPeer {
     WkiTransport* rdma_transport = nullptr;  // RDMA-capable overlay (ivshmem or RoCE)
     PeerState state = PeerState::UNKNOWN;
     uint64_t last_heartbeat = 0;                                         // timestamp of last recv'd heartbeat (microseconds)
+    uint64_t last_rx_activity = 0;                                       // timestamp of last received packet (any type) from this peer
     uint64_t connected_time = 0;                                         // timestamp when peer transitioned to CONNECTED
     uint32_t rtt_us = 0;                                                 // smoothed RTT (microseconds)
     uint32_t rtt_var_us = 0;                                             // RTT variance

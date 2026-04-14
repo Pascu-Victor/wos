@@ -418,6 +418,11 @@ auto main(int argc, char** argv, char** envp) -> int {
     (void)envp;
     int tid = ker::multiproc::currentThreadId();
 
+    char launcher[64] = {};
+    char runner[64] = {};
+    ker::process::wki_launcher_node(launcher, sizeof(launcher));
+    ker::process::wki_runner_node(runner, sizeof(runner));
+
     const char* command = nullptr;
     if (argc > 1) {
         command = argv[1];
@@ -478,7 +483,7 @@ auto main(int argc, char** argv, char** envp) -> int {
         return mandelbench(width, height, max_iter, threads, repeat, image.data(), colormap.data());
     }
 
-    std::println("testprog[t:{},p:{}]: argc = {}", tid, pid, argc);
+    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: argc = {}", tid, pid, launcher, runner, argc);
 
     // Test 1: Ping loopback
     // std::println("testprog[t:{},p:{}]: === Test 1: Ping loopback ===", tid, pid);
@@ -488,7 +493,7 @@ auto main(int argc, char** argv, char** envp) -> int {
     // std::println("testprog[t:{},p:{}]: === Test 2: Get eth0 info ===", tid, pid);
     // get_interface_info("eth0");
 
-    std::println("testprog[t:{},p:{}]: Network tests complete", tid, pid);
+    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: Network tests complete", tid, pid, launcher, runner);
 
     return 0;
 }

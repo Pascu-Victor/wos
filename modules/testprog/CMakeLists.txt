@@ -42,7 +42,7 @@ endif()
 
 # Linker settings
 set_target_properties(testprog PROPERTIES
-    LINK_FLAGS "-Wl,-z,now"
+    LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
 )
 
 target_link_libraries(testprog c++abi c++ c unwind)

@@ -435,8 +435,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 mask = ker::net::ntohl(mask);
 
                 if (request == SIOC_ADDRT) {
-                    // Find device for the route: prefer non-loopback UP device
-                    // that has an IP on the same subnet as the gateway
+                    // Find device for the route.
+                    // For gateway routes, prefer a non-loopback UP device that
+                    // has an IP on the same subnet as the gateway.
+                    // For direct routes (gw == 0), prefer a non-loopback UP
+                    // device whose configured IPv4 subnet matches the route's
+                    // destination/mask. Falling back to an arbitrary UP device
+                    // can bind the route to a proxy NIC and hijack local
+                    // traffic on overlapping subnets.
                     ker::net::NetDevice* rdev = nullptr;
                     if (gw != 0) {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
@@ -454,16 +460,43 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                                 }
                             }
                         }
-                    }
-                    // Fallback: first non-loopback UP device
-                    if (rdev == nullptr) {
+                    } else {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                             auto* d = ker::net::netdev_at(i);
-                            if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
-                                rdev = d;
+                            if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
+                                continue;
+                            }
+                            auto* nif = ker::net::netif_get(d);
+                            if (nif == nullptr || nif->ipv4_addr_count == 0) {
+                                continue;
+                            }
+                            for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
+                                uint32_t dev_ip = nif->ipv4_addrs[j].addr;
+                                if ((dev_ip & mask) == (dst & mask)) {
+                                    rdev = d;
+                                    break;
+                                }
+                            }
+                            if (rdev != nullptr) {
                                 break;
                             }
                         }
+                    }
+                    // Gateway routes can still fall back to the first
+                    // non-loopback UP device if there is only one usable path.
+                    if (rdev == nullptr) {
+                        if (gw != 0) {
+                            for (size_t i = 0; i < ker::net::netdev_count(); i++) {
+                                auto* d = ker::net::netdev_at(i);
+                                if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
+                                    rdev = d;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (rdev == nullptr) {
+                        return static_cast<uint64_t>(-ENODEV);
                     }
                     int ret = ker::net::route_add(dst, mask, gw, 0, rdev);
                     return static_cast<uint64_t>(ret);

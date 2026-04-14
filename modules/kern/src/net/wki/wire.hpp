@@ -455,7 +455,7 @@ struct DevAttachReqPayload {
 static_assert(sizeof(DevAttachReqPayload) == 12, "DevAttachReqPayload must be 12 bytes");
 
 // -----------------------------------------------------------------------------
-// DEV_ATTACH_ACK Payload - 8 bytes
+// DEV_ATTACH_ACK Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 enum class DevAttachStatus : uint8_t {
@@ -470,12 +470,13 @@ struct DevAttachAckPayload {
     uint8_t status;  // DevAttachStatus
     uint8_t reserved;
     uint16_t assigned_channel;
+    uint32_t resource_id;  // echoed from DEV_ATTACH_REQ for consumer-side matching
     uint16_t max_op_size;  // max payload size for DEV_OP_REQ
     uint16_t rdma_flags;   // bit 0: RDMA block ring zone available
     uint32_t blk_zone_id;  // RDMA zone ID for block ring (0 = not available)
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckPayload) == 12, "DevAttachAckPayload must be 12 bytes");
+static_assert(sizeof(DevAttachAckPayload) == 16, "DevAttachAckPayload must be 16 bytes");
 
 // V2: Extended attach ACK for NET resources - includes owner NIC info [V2§A5.3]
 struct DevAttachAckNetPayload {
@@ -483,6 +484,7 @@ struct DevAttachAckNetPayload {
     uint8_t status;
     uint8_t reserved;
     uint16_t assigned_channel;
+    uint32_t resource_id;
     uint16_t max_op_size;
     uint16_t rdma_flags;
     uint32_t blk_zone_id;  // unused for NET, kept for layout compatibility
@@ -493,7 +495,7 @@ struct DevAttachAckNetPayload {
     uint16_t link_state;              // 0=DOWN, 1=UP
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckNetPayload) == 28, "DevAttachAckNetPayload must be 28 bytes");
+static_assert(sizeof(DevAttachAckNetPayload) == 32, "DevAttachAckNetPayload must be 32 bytes");
 
 // RDMA flags for DevAttachAckPayload
 constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available

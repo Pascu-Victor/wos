@@ -54,9 +54,9 @@ auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlo
 }
 
 // Caller must hold s_proxy_lock.
-auto find_proxy_by_attach(uint16_t owner_node) -> ProxyBlockState* {
+auto find_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
-        if (p->attach_pending && p->owner_node == owner_node) {
+        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id) {
             return p.get();
         }
     }
@@ -2348,10 +2348,10 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
                            p->attach_pending ? 1 : 0, p->active ? 1 : 0);
     }
 #endif
-    ProxyBlockState* state = find_proxy_by_attach(hdr->src_node);
+    ProxyBlockState* state = find_proxy_by_attach(hdr->src_node, ack->resource_id);
     if (state == nullptr) {
 #ifdef DEBUG_WKI_TRANSPORT
-        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: NO proxy found for node 0x%04x", hdr->src_node);
+        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: NO proxy found for node 0x%04x res_id=%u", hdr->src_node, ack->resource_id);
 #endif
         return;
     }

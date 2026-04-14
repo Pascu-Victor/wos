@@ -13,6 +13,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -270,63 +271,85 @@ auto read_write_disk(volatile HBA_PORT* port, int portno, uint32_t startl, uint3
         port_slots_in_use[portno].fetch_or(1U << slot, std::memory_order_release);
     }
 
-    // Use the current task's page table for buffer translation so that both
-    // kernel and userspace buffer pointers are resolved correctly.
-    // If no task is running (early boot / kernel thread), fall back to the kernel page table.
+    // Choose the right page table for buffer virtual→physical translation.
+    // Kernel-space buffers (HHDM addresses) must always use the kernel pagemap
+    // because kernel threads may have a stale or unrelated task pagemap.
+    // Userspace buffers (below HHDM) need the current task's pagemap.
     ker::mod::mm::paging::PageTable* active_pt = nullptr;
     {
-        ker::mod::sched::task::Task* cur_task = nullptr;
-        if (ker::mod::sched::has_run_queues()) {
-            cur_task = ker::mod::sched::get_current_task();
-        }
-        if (cur_task != nullptr && cur_task->pagemap != nullptr) {
-            active_pt = cur_task->pagemap;
-        } else {
+        uint64_t hhdm = ker::mod::mm::addr::get_hhdm_offset();
+        bool is_kernel_buf = (reinterpret_cast<uint64_t>(buf) >= hhdm);
+
+        if (is_kernel_buf) {
             active_pt = ker::mod::mm::virt::getKernelPagemap();
+        } else {
+            ker::mod::sched::task::Task* cur_task = nullptr;
+            if (ker::mod::sched::has_run_queues()) {
+                cur_task = ker::mod::sched::get_current_task();
+            }
+            if (cur_task != nullptr && cur_task->pagemap != nullptr) {
+                active_pt = cur_task->pagemap;
+            } else {
+                active_pt = ker::mod::mm::virt::getKernelPagemap();
+            }
         }
     }
 
     // Get command header using stored virtual address
     HBA_CMD_HEADER* cmdheader = &port_memory[portno].clb_virt[slot];
 
-    // Each PRDT entry covers one 4K page (physically translated individually).
-    // Command table: 128B header + 8192 × 16B PRDT entries.
-    constexpr uint32_t SECTORS_PER_PAGE = 4096 / 512;  // 8 sectors per 4K page
+    // Each PRDT entry must stay within a single mapped page span. The old code
+    // assumed page-aligned buffers and advanced in fixed 4 KiB steps, which
+    // breaks for callers like remote VFS that DMA into resp_buf + header.
+    constexpr uint32_t SECTOR_SIZE = 512;
     constexpr size_t MAX_PRDT = 8192;
 
-    // count is in 512-byte sectors; pages needed (round up), capped to PRDT capacity
-    uint32_t pages = (count + SECTORS_PER_PAGE - 1) / SECTORS_PER_PAGE;
-    pages = std::min(pages, static_cast<uint32_t>(MAX_PRDT));
+    uint64_t total_bytes = static_cast<uint64_t>(count) * SECTOR_SIZE;
+    uint64_t buf_virt = reinterpret_cast<uint64_t>(buf);
+    uint64_t first_page_off = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
+    size_t prdt_entries =
+        static_cast<size_t>((first_page_off + total_bytes + ker::mod::mm::paging::PAGE_SIZE - 1) / ker::mod::mm::paging::PAGE_SIZE);
+    prdt_entries = std::min(prdt_entries, MAX_PRDT);
 
     auto* cmdtbl = reinterpret_cast<HBA_CMD_TBL*>(port_memory[portno].ctb_virt[slot]);
-    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + ((pages - 1) * sizeof(HBA_PRDT_ENTRY)));
+    std::memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + ((prdt_entries - 1) * sizeof(HBA_PRDT_ENTRY)));
 
-    uint32_t remaining_sectors = count;
-    auto buf_virt = reinterpret_cast<uint64_t>(buf);
-    for (size_t i = 0; i < pages; i++) {
-        uint32_t secs = (remaining_sectors < SECTORS_PER_PAGE) ? remaining_sectors : SECTORS_PER_PAGE;
+    uint64_t remaining_bytes = total_bytes;
+    size_t actual_prdt_entries = 0;
+    while (remaining_bytes > 0 && actual_prdt_entries < prdt_entries) {
         uint64_t phys = ker::mod::mm::virt::translate(active_pt, buf_virt);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
-            // Page not mapped - refuse to DMA into unmapped memory
             if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
                 port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
                 port_locks[portno].unlock();
             }
             return false;
         }
-        cmdtbl->prdt_entry[i].dba = static_cast<uint32_t>(phys & UINT32_MAX);
-        cmdtbl->prdt_entry[i].dbau = static_cast<uint32_t>((phys >> 32) & UINT32_MAX);
-        cmdtbl->prdt_entry[i].dbc = (secs * 512) - 1;
-        cmdtbl->prdt_entry[i].i = 1;
-        buf_virt += 4096;
-        remaining_sectors -= secs;
+
+        uint64_t page_off = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t bytes_this_entry = std::min<uint64_t>(remaining_bytes, ker::mod::mm::paging::PAGE_SIZE - page_off);
+
+        cmdtbl->prdt_entry[actual_prdt_entries].dba = static_cast<uint32_t>(phys & UINT32_MAX);
+        cmdtbl->prdt_entry[actual_prdt_entries].dbau = static_cast<uint32_t>((phys >> 32) & UINT32_MAX);
+        cmdtbl->prdt_entry[actual_prdt_entries].dbc = static_cast<uint32_t>(bytes_this_entry - 1);
+        cmdtbl->prdt_entry[actual_prdt_entries].i = 1;
+
+        buf_virt += bytes_this_entry;
+        remaining_bytes -= bytes_this_entry;
+        actual_prdt_entries++;
     }
 
-    uint32_t actual_count = count - remaining_sectors;  // sectors actually covered by PRDT
+    if (remaining_bytes != 0) {
+        if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
+            port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
+            port_locks[portno].unlock();
+        }
+        return false;
+    }
+
     cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
     cmdheader->w = write_op ? 1 : 0;
-    cmdheader->prdtl = static_cast<uint16_t>(pages);
-    (void)actual_count;  // FIS count fields use 'count' - caller must ensure count <= MAX_PRDT*8
+    cmdheader->prdtl = static_cast<uint16_t>(actual_prdt_entries);
 
     // Setup command FIS
     auto* cmdfis = reinterpret_cast<FIS_REG_H2D*>(&cmdtbl->cfis);

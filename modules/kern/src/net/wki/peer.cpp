@@ -177,6 +177,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     peer->hop_count = 1;
     peer->link_cost = 1;
     peer->last_heartbeat = wki_now_us();
+    peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
 
     // V2: Copy hostname from HELLO payload
@@ -340,6 +341,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     }
     peer->link_cost = 1;
     peer->last_heartbeat = wki_now_us();
+    peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
 
     // Negotiate heartbeat interval
@@ -420,6 +422,14 @@ void wki_peer_send_heartbeats() {
             continue;
         }
         if (!peer->is_direct) {
+            continue;
+        }
+
+        // Suppress heartbeat if we recently received traffic from this
+        // peer — active RX proves liveness, so an explicit ping is redundant.
+        uint64_t suppress_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000;
+        uint64_t now_hb = wki_now_us();
+        if (peer->last_rx_activity != 0 && (now_hb - peer->last_rx_activity) < suppress_us) {
             continue;
         }
 
@@ -725,12 +735,18 @@ void wki_peer_timer_tick(uint64_t now_us) {
             continue;
         }
 
+        // Use the most recent of heartbeat and any-traffic timestamps
+        // as proof of liveness — active data traffic from a peer is just
+        // as good as an explicit heartbeat.
         uint64_t last_hb = peer->last_heartbeat;
-        // Handle race: heartbeat arrived after we captured now_us
-        if (last_hb >= now_us) {
-            continue;  // Just received a heartbeat, no timeout
+        uint64_t last_rx = peer->last_rx_activity;
+        uint64_t last_seen = (last_rx > last_hb) ? last_rx : last_hb;
+
+        // Handle race: activity arrived after we captured now_us
+        if (last_seen >= now_us) {
+            continue;
         }
-        uint64_t elapsed = now_us - last_hb;
+        uint64_t elapsed = now_us - last_seen;
         uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
 
         if (elapsed >= timeout_us) {

@@ -171,7 +171,7 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
     // Format: /mnt/disk/[PROGRAM]_[TIMESTAMP]_coredump.bin
     const char suffix[] = "_coredump.bin";
     size_t pos = 0;
-    const char prefix[] = "/mnt/disk/";
+    const char prefix[] = "/root/";
     for (size_t i = 0; prefix[i] != '\0' && pos + 1 < sizeof(path); ++i) {
         path[pos++] = prefix[i];
     }

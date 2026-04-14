@@ -1,0 +1,95 @@
+#include "qemu_fw_cfg.hpp"
+
+#include <cstring>
+#include <mod/io/port/port.hpp>
+
+// QEMU fw_cfg I/O-port interface (x86)
+// Selector register: 0x510 (16-bit write)
+// Data register:     0x511 (8-bit read, auto-increments)
+// File directory:    selector 0x0019
+
+namespace ker::platform::fw {
+
+namespace {
+
+constexpr uint16_t FW_CFG_PORT_SEL = 0x510;
+constexpr uint16_t FW_CFG_PORT_DATA = 0x511;
+constexpr uint16_t FW_CFG_FILE_DIR = 0x0019;
+constexpr uint16_t FW_CFG_SIGNATURE = 0x0000;
+constexpr size_t FW_CFG_MAX_NAME = 56;
+
+struct FwCfgFile {
+    uint32_t size;
+    uint16_t select;
+    uint16_t reserved;
+    char name[FW_CFG_MAX_NAME];
+} __attribute__((packed));
+
+auto read_be16() -> uint16_t {
+    uint8_t hi = inb(FW_CFG_PORT_DATA);
+    uint8_t lo = inb(FW_CFG_PORT_DATA);
+    return static_cast<uint16_t>((hi << 8) | lo);
+}
+
+auto read_be32() -> uint32_t {
+    uint8_t b3 = inb(FW_CFG_PORT_DATA);
+    uint8_t b2 = inb(FW_CFG_PORT_DATA);
+    uint8_t b1 = inb(FW_CFG_PORT_DATA);
+    uint8_t b0 = inb(FW_CFG_PORT_DATA);
+    return (static_cast<uint32_t>(b3) << 24) | (static_cast<uint32_t>(b2) << 16) | (static_cast<uint32_t>(b1) << 8) |
+           static_cast<uint32_t>(b0);
+}
+
+void read_bytes(void* buf, size_t n) {
+    auto* p = static_cast<uint8_t*>(buf);
+    for (size_t i = 0; i < n; i++) {
+        p[i] = inb(FW_CFG_PORT_DATA);
+    }
+}
+
+void skip_bytes(size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        inb(FW_CFG_PORT_DATA);
+    }
+}
+
+}  // namespace
+
+auto fw_cfg_read_file(const char* name, void* buf, size_t buf_size) -> int {
+    if (name == nullptr || buf == nullptr || buf_size == 0) {
+        return -1;
+    }
+
+    // Verify fw_cfg is present by reading signature
+    outw(FW_CFG_PORT_SEL, FW_CFG_SIGNATURE);
+    char sig[4];
+    read_bytes(sig, 4);
+    if (sig[0] != 'Q' || sig[1] != 'E' || sig[2] != 'M' || sig[3] != 'U') {
+        return -1;  // No QEMU fw_cfg device
+    }
+
+    // Read file directory
+    outw(FW_CFG_PORT_SEL, FW_CFG_FILE_DIR);
+    uint32_t count = read_be32();
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t file_size = read_be32();
+        uint16_t file_sel = read_be16();
+        skip_bytes(2);  // reserved
+
+        char file_name[FW_CFG_MAX_NAME] = {};
+        read_bytes(file_name, FW_CFG_MAX_NAME);
+
+        if (std::strcmp(file_name, name) == 0) {
+            // Found it — select and read
+            outw(FW_CFG_PORT_SEL, file_sel);
+            size_t to_read = (file_size < buf_size) ? file_size : buf_size;
+            read_bytes(buf, to_read);
+            return static_cast<int>(to_read);
+        }
+    }
+
+    return -1;  // Not found
+}
+
+}  // namespace ker::platform::fw

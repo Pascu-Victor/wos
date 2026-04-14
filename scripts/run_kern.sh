@@ -113,6 +113,11 @@ fi
 #   echo "[VM${VM_ID}] ivshmem: ${WOS_IVSHMEM}"
 # fi
 
+# -- Per-VM hostname via QEMU fw_cfg -----------------------------------------
+WOS_VM_HOSTNAME="${WOS_HOSTNAME:-wos-${VM_ID}}"
+FW_CFG_ARGS="-fw_cfg name=opt/wos/hostname,string=${WOS_VM_HOSTNAME}"
+echo "[VM${VM_ID}] hostname: ${WOS_VM_HOSTNAME}"
+
 echo "[VM${VM_ID}] STARTING BOOT:"
 
 LOG_ARGS="-d cpu_reset,int,tid,in_asm,nochain,guest_errors,page,trace:ps2_keyboard_set_translation -D ${QEMU_LOG}"
@@ -125,4 +130,5 @@ qemu-system-x86_64 -M q35 -cpu host -enable-kvm -m ${MEM} \
   -device ide-hd,drive=drive1,bus=ahci.1 \
   $NET_ARGS \
   $IVSHMEM_ARGS \
+  $FW_CFG_ARGS \
   -bios /usr/share/OVMF/x64/OVMF.4m.fd $CHARDEV $DEBUG_ARGS $LOG_ARGS -no-reboot -smp 2
