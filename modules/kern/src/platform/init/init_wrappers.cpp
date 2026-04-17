@@ -39,6 +39,9 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
 #include <platform/ntp/ntp.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/pic/pic.hpp>
@@ -88,6 +91,9 @@ void gdt_init() {
 void kmalloc_init() {
     mod::mm::dyn::kmalloc::init();
     mod::dbg::enableKmalloc();
+#ifdef WOS_KASAN
+    ker::mod::kasan::init();
+#endif
 }
 
 void pic_remap() { mod::pic::remap(); }
@@ -103,7 +109,13 @@ void time_init() {
     mod::dbg::enableTime();
 }
 
-void idt_init() { mod::desc::idt::idtInit(); }
+void idt_init() {
+    mod::desc::idt::idtInit();
+#ifdef WOS_KASAN
+    // IDT is live — shadow demand-faulting now works.
+    ker::mod::kasan::enable();
+#endif
+}
 
 void sys_init() { mod::sys::init(); }
 

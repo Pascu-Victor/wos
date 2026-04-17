@@ -10,12 +10,13 @@ _wOS_enableSSE_asm:
     or ax, 0x2			;set coprocessor monitoring  CR0.MP
     mov cr0, rax
     mov rax, cr4
-    or ax, 3 << 9		;set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
+    or rax, (3 << 9)               ;OSFXSR | OSXMMEXCPT
     mov cr4, rax
     ret
 
 ; Enable XSAVE and set XCR0 to save x87 + SSE + AVX (if supported).
 ; Returns: rax = required xsave area size (bytes), 0 if XSAVE not supported.
+; Note: CR4.OSXSAVE is set here after verifying XSAVE support via CPUID.
 _wOS_enableXSave_asm:
     push rbx             ; RBX is callee-saved; cpuid clobbers it
 
@@ -25,11 +26,12 @@ _wOS_enableXSave_asm:
     bt ecx, 26
     jnc .no_xsave
 
-    ; Enable CR4.OSXSAVE (bit 18)
+    ; Set CR4.OSXSAVE (bit 18) now that we know it's supported
     mov rax, cr4
-    or eax, 1 << 18
+    or rax, (1 << 18)
     mov cr4, rax
 
+    ; Configure XCR0.
     ; Build XCR0 mask: bit 0 = x87, bit 1 = SSE (mandatory)
     mov ecx, 0          ; XCR0
     xgetbv               ; current XCR0 -> edx:eax

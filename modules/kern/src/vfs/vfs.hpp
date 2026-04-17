@@ -126,6 +126,11 @@ void vfs_wki_load_default_rules();
 // File control
 auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
 
+// IPC file identity helpers (used by WKI remote IPC proxy)
+auto vfs_is_pipe_file(const File* f) -> bool;
+auto vfs_is_epoll_file(const File* f) -> bool;
+auto vfs_is_socket_file(const File* f) -> bool;
+
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;
@@ -139,5 +144,8 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
 
 // Initialize VFS (register tmpfs, devfs, etc.)
 void init();
+
+// Stream-cache teardown helper for REMOTE mounts.
+void vfs_stream_cache_invalidate_remote_scope(const void* remote_scope);
 
 }  // namespace ker::vfs

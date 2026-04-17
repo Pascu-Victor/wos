@@ -40,7 +40,7 @@ constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
 constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
 constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 300;       // 300 ms
 constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
-constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 5;             // 5 misses = 5 second timeout
+constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 10;            // 10 misses = 10 second timeout
 
 // Grace period for newly connected peers
 constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = 5000;  // 5 seconds after connection
@@ -459,8 +459,8 @@ struct WkiWaitEntry {
     WkiWaitEntry* prev = nullptr;
 };
 
-// Default operation timeout: 5 seconds
-constexpr uint64_t WKI_OP_TIMEOUT_US = 5'000'000;
+// Default operation timeout: 15 seconds (allows for CPU-loaded VFS servers)
+constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
 
 // Put the calling task to sleep until woken or timeout.
 // Returns: 0 on success, WKI_ERR_TIMEOUT on timeout, WKI_ERR_PEER_FENCED on fencing.
@@ -472,6 +472,9 @@ void wki_wake_op(WkiWaitEntry* entry, int result);
 
 // Scan pending waits for timeouts. Called from timer thread.
 void wki_wait_timeout_scan(uint64_t now_us);
+
+// Unlink all pending wait entries belonging to task. Called on task exit.
+void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (implemented in peer.cpp, channel.cpp, etc.)

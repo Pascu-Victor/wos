@@ -1,5 +1,6 @@
 #include "run_heap.hpp"
 
+#include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/task.hpp>
 
@@ -12,6 +13,10 @@ namespace ker::mod::sched {
 void RunHeap::init() { size = 0; }
 
 void RunHeap::swapEntries(uint32_t i, uint32_t j) {
+    if (i >= PER_CPU_HEAP_CAP || j >= PER_CPU_HEAP_CAP) [[unlikely]] {
+        dbg::log("RunHeap::swapEntries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
+        dbg::panic_handler("RunHeap: swapEntries index out of bounds (size field corrupted?)");
+    }
     task::Task* tmp = entries[i];
     entries[i] = entries[j];
     entries[j] = tmp;
@@ -20,6 +25,10 @@ void RunHeap::swapEntries(uint32_t i, uint32_t j) {
 }
 
 void RunHeap::siftUp(uint32_t idx) {
+    if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
+        dbg::log("RunHeap::siftUp: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        dbg::panic_handler("RunHeap: size field corrupted in siftUp");
+    }
     while (idx > 0) {
         uint32_t parent = (idx - 1) / 2;
         if (entries[idx]->vdeadline < entries[parent]->vdeadline) {
@@ -32,16 +41,32 @@ void RunHeap::siftUp(uint32_t idx) {
 }
 
 void RunHeap::siftDown(uint32_t idx) {
+    if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
+        dbg::log("RunHeap::siftDown: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        dbg::panic_handler("RunHeap: size field corrupted in siftDown");
+    }
     while (true) {
         uint32_t smallest = idx;
         uint32_t left = 2 * idx + 1;
         uint32_t right = 2 * idx + 2;
 
-        if (left < size && entries[left]->vdeadline < entries[smallest]->vdeadline) {
-            smallest = left;
+        if (left < size) {
+            if (left >= PER_CPU_HEAP_CAP) [[unlikely]] {
+                dbg::log("RunHeap::siftDown: left=%u >= cap=%u, size=%u corrupted", left, PER_CPU_HEAP_CAP, size);
+                dbg::panic_handler("RunHeap: siftDown OOB (size corrupted)");
+            }
+            if (entries[left]->vdeadline < entries[smallest]->vdeadline) {
+                smallest = left;
+            }
         }
-        if (right < size && entries[right]->vdeadline < entries[smallest]->vdeadline) {
-            smallest = right;
+        if (right < size) {
+            if (right >= PER_CPU_HEAP_CAP) [[unlikely]] {
+                dbg::log("RunHeap::siftDown: right=%u >= cap=%u, size=%u corrupted", right, PER_CPU_HEAP_CAP, size);
+                dbg::panic_handler("RunHeap: siftDown OOB (size corrupted)");
+            }
+            if (entries[right]->vdeadline < entries[smallest]->vdeadline) {
+                smallest = right;
+            }
         }
 
         if (smallest != idx) {

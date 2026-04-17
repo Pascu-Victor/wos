@@ -16,6 +16,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
@@ -43,6 +44,88 @@ auto transport_supports_vfs_push_rdma(const WkiTransport* transport) -> bool {
     // ivshmem transport's memcpy-based writes, but not for RoCE's fragmented
     // Ethernet writes, which need an explicit completion signal.
     return std::strcmp(transport->name, "wki-ivshmem") == 0;
+}
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+auto perf_vfs_op(uint16_t op_id) -> uint8_t {
+    switch (op_id) {
+        case OP_VFS_OPEN:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::OPEN);
+        case OP_VFS_STAT:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::STAT);
+        case OP_VFS_CLOSE:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::CLOSE);
+        case OP_VFS_MKDIR:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::MKDIR);
+        case OP_VFS_WRITE:
+        case OP_VFS_WRITE_RDMA:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::WRITE);
+        case OP_VFS_READ_RDMA:
+        case OP_VFS_READ_BULK:
+        case OP_VFS_READ:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::READ);
+        case OP_VFS_READDIR_BATCH:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::READDIR);
+        case OP_VFS_SEEK_END:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::SEEK);
+        case OP_VFS_TRUNCATE:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::TRUNCATE);
+        case OP_VFS_UNLINK:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::UNLINK);
+        case OP_VFS_RMDIR:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RMDIR);
+        case OP_VFS_RENAME:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RENAME);
+        case OP_VFS_READLINK:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::READLINK);
+        default:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RETRY);
+    }
+}
+
+auto perf_vfs_bytes(uint16_t op_id, uint16_t req_len, uint16_t resp_len) -> uint64_t {
+    switch (op_id) {
+        case OP_VFS_READ:
+        case OP_VFS_READ_RDMA:
+        case OP_VFS_READ_BULK:
+        case OP_VFS_READDIR_BATCH:
+        case OP_VFS_READLINK:
+        case OP_VFS_STAT:
+            return resp_len;
+        case OP_VFS_WRITE:
+        case OP_VFS_WRITE_RDMA:
+            return req_len;
+        default:
+            return std::max<uint16_t>(req_len, resp_len);
+    }
+}
+
+void perf_record_vfs_point(uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t aux, uint64_t callsite) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    uint32_t correlation = ker::mod::perf::next_wki_trace_correlation();
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, op,
+                                     ker::mod::perf::WkiPerfPhase::POINT, peer, channel, correlation, status, aux, callsite);
+    uint32_t latency_us = (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT) ||
+                           op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT))
+                              ? aux
+                              : 0U;
+    bool has_latency = op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT) ||
+                       op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT);
+    uint32_t retries = (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RETRY)) ? 1U : 0U;
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, op, peer, channel, status, latency_us, has_latency,
+                                       retries, 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -242,7 +325,6 @@ void invalidate_dir_cache(ProxyVfsState* proxy, int32_t remote_fd) {
     std::erase_if(g_dir_cache, [&](const DirCacheEntry& dc) { return dc.proxy == proxy && dc.remote_fd == remote_fd; });
 }
 
-// unique_ptr indirection: ProxyVfsState contains Spinlock which has deleted move-assignment
 std::deque<std::unique_ptr<ProxyVfsState>> g_vfs_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_vfs_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -300,9 +382,154 @@ auto peek_channel_tx_seq16(uint16_t owner_node, uint16_t channel_id, uint16_t* s
     return true;
 }
 
+constexpr uint64_t VFS_READLINK_CACHE_RETENTION_US = 100000;
+
+void reset_readlink_cache_entry(ProxyVfsState::ReadlinkCacheEntry& entry) {
+    entry.valid = false;
+    entry.status = 0;
+    entry.target_len = 0;
+    entry.cached_at_us = 0;
+    entry.path[0] = '\0';
+    entry.target[0] = '\0';
+}
+
+void invalidate_readlink_cache_locked(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    for (auto& entry : state->readlink_cache) {
+        reset_readlink_cache_entry(entry);
+    }
+}
+
+void invalidate_readlink_cache(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->lock.lock();
+    invalidate_readlink_cache_locked(state);
+    state->lock.unlock();
+}
+
+auto readlink_status_is_cacheable(int status) -> bool {
+    return status == 0 || status == -EINVAL || status == -ENOENT || status == -ENOTDIR;
+}
+
+auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_path, char* buf, size_t bufsize, ssize_t* result_out) -> bool {
+    if (state == nullptr || fs_relative_path == nullptr || result_out == nullptr) {
+        return false;
+    }
+
+    if (std::strlen(fs_relative_path) >= VFS_READLINK_CACHE_TEXT_MAX) {
+        return false;
+    }
+
+    bool found = false;
+    uint64_t now = wki_now_us();
+    state->lock.lock();
+    for (auto& entry : state->readlink_cache) {
+        if (!entry.valid) {
+            continue;
+        }
+
+        if (now - entry.cached_at_us > VFS_READLINK_CACHE_RETENTION_US) {
+            reset_readlink_cache_entry(entry);
+            continue;
+        }
+
+        if (std::strncmp(entry.path.data(), fs_relative_path, VFS_READLINK_CACHE_TEXT_MAX) != 0) {
+            continue;
+        }
+
+        if (entry.status != 0) {
+            *result_out = entry.status;
+            found = true;
+            break;
+        }
+
+        size_t to_copy = std::min(bufsize, static_cast<size_t>(entry.target_len));
+        memcpy(buf, entry.target.data(), to_copy);
+        *result_out = static_cast<ssize_t>(to_copy);
+        found = true;
+        break;
+    }
+    state->lock.unlock();
+
+    return found;
+}
+
+void cache_readlink_result(ProxyVfsState* state, const char* fs_relative_path, int status, const char* target, uint16_t target_len) {
+    if (state == nullptr || fs_relative_path == nullptr || !readlink_status_is_cacheable(status)) {
+        return;
+    }
+
+    size_t path_len = std::strlen(fs_relative_path);
+    if (path_len >= VFS_READLINK_CACHE_TEXT_MAX) {
+        return;
+    }
+
+    if (status == 0 && (target == nullptr || target_len == 0 || target_len >= VFS_READLINK_CACHE_TEXT_MAX)) {
+        return;
+    }
+
+    uint64_t now = wki_now_us();
+    state->lock.lock();
+
+    ProxyVfsState::ReadlinkCacheEntry* selected = nullptr;
+    ProxyVfsState::ReadlinkCacheEntry* oldest = nullptr;
+    for (auto& entry : state->readlink_cache) {
+        if (entry.valid && now - entry.cached_at_us > VFS_READLINK_CACHE_RETENTION_US) {
+            reset_readlink_cache_entry(entry);
+        }
+
+        if (!entry.valid) {
+            if (selected == nullptr) {
+                selected = &entry;
+            }
+            continue;
+        }
+
+        if (std::strncmp(entry.path.data(), fs_relative_path, VFS_READLINK_CACHE_TEXT_MAX) == 0) {
+            selected = &entry;
+            break;
+        }
+
+        if (oldest == nullptr || entry.cached_at_us < oldest->cached_at_us) {
+            oldest = &entry;
+        }
+    }
+
+    if (selected == nullptr) {
+        selected = oldest;
+    }
+    if (selected != nullptr) {
+        reset_readlink_cache_entry(*selected);
+        selected->valid = true;
+        selected->status = static_cast<int16_t>(status);
+        selected->cached_at_us = now;
+        memcpy(selected->path.data(), fs_relative_path, path_len + 1);
+        if (status == 0) {
+            selected->target_len = target_len;
+            memcpy(selected->target.data(), target, target_len);
+        }
+    }
+
+    state->lock.unlock();
+}
+
 // Helper: send DEV_OP_REQ and spin-wait for response
 auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
-                             uint16_t resp_buf_max) -> int {
+                             uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr) -> int {
+    uint32_t correlation = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t callsite = WOS_PERF_CALLSITE();
+    uint64_t proxy_wait_start = wki_now_us();
+
+    if (resp_len_out != nullptr) {
+        *resp_len_out = 0;
+    }
+
     auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + req_data_len);
     auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
     if (req_buf == nullptr) {
@@ -319,13 +546,40 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     // Serialize: spin until we can claim the proxy for this operation.
     // Another thread may be using the same proxy (e.g., concurrent stat+open).
+    // A draining channel (timed-out request waiting for late response) is
+    // force-released once its drain deadline expires.
     while (true) {
         state->lock.lock();
         if (!state->op_pending.load(std::memory_order_acquire)) {
+            // Clean up stale drain flag left by a delivered-during-race response
+            if (state->op_draining.load(std::memory_order_relaxed)) {
+                state->op_draining.store(false, std::memory_order_relaxed);
+            }
+            break;
+        }
+        // Force-release a draining channel whose deadline has passed
+        if (state->op_draining.load(std::memory_order_acquire) && wki_now_us() >= state->op_drain_deadline_us) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            state->op_draining.store(false, std::memory_order_relaxed);
+            state->op_expected_id = 0;
+            state->op_expected_seq = 0;
+            state->op_resp_buf = nullptr;
+            state->op_resp_max = 0;
+            state->op_resp_len = 0;
             break;
         }
         state->lock.unlock();
         wki_spin_yield();
+        if (!state->op_pending.load(std::memory_order_acquire)) {
+            continue;
+        }
+        ker::mod::sched::kern_yield();
+    }
+
+    uint32_t proxy_wait_us = static_cast<uint32_t>(wki_now_us() - proxy_wait_start);
+    if (proxy_wait_us > 0) {
+        perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT), state->owner_node, state->assigned_channel, 0,
+                              proxy_wait_us, callsite);
     }
 
     uint16_t expected_seq = 0;
@@ -347,6 +601,11 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     state->op_resp_len = 0;
     state->lock.unlock();
 
+    uint64_t started_us = wki_now_us();
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
+                                     ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, correlation, 0,
+                                     req_data_len, callsite);
+
     int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
     ker::mod::mm::dyn::kmalloc::free(req_buf);
 
@@ -360,6 +619,12 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         state->op_resp_max = 0;
         state->op_resp_len = 0;
         state->lock.unlock();
+        uint32_t elapsed_us = static_cast<uint32_t>(wki_now_us() - started_us);
+        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
+                                         perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
+                                         correlation, send_ret, elapsed_us, callsite);
+        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
+                                           state->assigned_channel, send_ret, elapsed_us, true, 0, req_data_len);
         ker::mod::dbg::log("[WKI] vfs_proxy_send_and_wait send failed: node=0x%04x ch=%u op=%u rc=%d", state->owner_node,
                            state->assigned_channel, op_id, send_ret);
         return send_ret;
@@ -369,13 +634,25 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     state->op_wait_entry = nullptr;
     if (wait_rc != 0) {
         state->lock.lock();
-        state->op_pending.store(false, std::memory_order_relaxed);
-        state->op_expected_id = 0;
-        state->op_expected_seq = 0;
+        // Only enter drain mode if op_pending is still true.  Between
+        // wki_wait_for_op returning and acquiring this lock, the response
+        // handler may have delivered the response (clearing op_pending).
+        // Setting drain on an already-cleared channel would incorrectly
+        // absorb the NEXT request's response.
+        if (state->op_pending.load(std::memory_order_acquire)) {
+            state->op_draining.store(true, std::memory_order_release);
+            state->op_drain_deadline_us = wki_now_us() + WKI_OP_TIMEOUT_US;
+        }
         state->op_resp_buf = nullptr;
         state->op_resp_max = 0;
         state->op_resp_len = 0;
         state->lock.unlock();
+        uint32_t elapsed_us = static_cast<uint32_t>(wki_now_us() - started_us);
+        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
+                                         perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
+                                         correlation, wait_rc, elapsed_us, callsite);
+        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
+                                           state->assigned_channel, wait_rc, elapsed_us, true, 0, req_data_len);
         if (wait_rc == WKI_ERR_TIMEOUT) {
             ker::mod::dbg::log("[WKI] vfs_proxy_send_and_wait timeout: node=0x%04x ch=%u op=%u", state->owner_node, state->assigned_channel,
                                op_id);
@@ -388,11 +665,23 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     state->lock.lock();
     int status = static_cast<int>(state->op_status);
+    uint16_t resp_len = state->op_resp_len;
     state->op_expected_id = 0;
     state->op_expected_seq = 0;
     state->op_resp_buf = nullptr;
     state->op_resp_max = 0;
     state->lock.unlock();
+
+    uint32_t elapsed_us = static_cast<uint32_t>(wki_now_us() - started_us);
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
+                                     ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel, correlation, status,
+                                     elapsed_us, callsite);
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
+                                       state->assigned_channel, status, elapsed_us, true, 0, perf_vfs_bytes(op_id, req_data_len, resp_len));
+
+    if (resp_len_out != nullptr) {
+        *resp_len_out = resp_len;
+    }
 
     return status;
 }
@@ -404,12 +693,15 @@ auto vfs_read_status_is_retryable(int status) -> bool {
 }
 
 auto vfs_proxy_read_with_retry(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
-                               uint16_t resp_buf_max) -> int {
+                               uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr) -> int {
     for (uint32_t attempt = 0;; ++attempt) {
-        int status = vfs_proxy_send_and_wait(state, op_id, req_data, req_data_len, resp_buf, resp_buf_max);
+        int status = vfs_proxy_send_and_wait(state, op_id, req_data, req_data_len, resp_buf, resp_buf_max, resp_len_out);
         if (!vfs_read_status_is_retryable(status) || attempt >= VFS_READ_RETRIES) {
             return status;
         }
+
+        perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RETRY), state->owner_node, state->assigned_channel, status,
+                              attempt + 1, WOS_PERF_CALLSITE());
 
         ker::mod::dbg::log("[WKI] retrying VFS read after transient failure: node=0x%04x ch=%u op=%u rc=%d attempt=%u", state->owner_node,
                            state->assigned_channel, op_id, status, attempt + 1);
@@ -2465,8 +2757,11 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         return -1;
     }
 
+    uint64_t attach_started_us = wki_now_us();
     int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     state->attach_wait_entry = nullptr;
+    perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT), owner_node, state->attach_channel, wait_rc,
+                          static_cast<uint32_t>(wki_now_us() - attach_started_us), WOS_PERF_CALLSITE());
     if (wait_rc != 0) {
         state->attach_pending.store(false, std::memory_order_relaxed);
         s_vfs_lock.lock();
@@ -2594,27 +2889,7 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
     uint32_t resource_id = state->resource_id;
     state->active = false;
 
-    // Free RDMA bounce buffer before erasing the proxy
-    if (state->rdma_bounce_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(state->rdma_bounce_buf);
-        state->rdma_bounce_buf = nullptr;
-    }
-
-    // Free bulk RDMA buffer
-    if (state->rdma_bulk_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(state->rdma_bulk_buf);
-        state->rdma_bulk_buf = nullptr;
-        state->bulk_rdma_capable = false;
-    }
-
-    // Remove inactive
-    for (auto it = g_vfs_proxies.begin(); it != g_vfs_proxies.end();) {
-        if (!(*it)->active) {
-            it = g_vfs_proxies.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    ker::vfs::vfs_stream_cache_invalidate_remote_scope(state);
     s_vfs_lock.unlock();
 
     // Send DEV_DETACH
@@ -2762,6 +3037,9 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
     }
 
     int status = vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len, nullptr, 0);
+    if (status == 0) {
+        invalidate_readlink_cache(state);
+    }
     return status;
 }
 
@@ -2780,7 +3058,11 @@ auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_pat
         strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
     }
 
-    return vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len, nullptr, 0);
+    int status = vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len, nullptr, 0);
+    if (status == 0) {
+        invalidate_readlink_cache(state);
+    }
+    return status;
 }
 
 // Consumer side: remove a directory on the remote server
@@ -2798,7 +3080,11 @@ auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path
         strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
     }
 
-    return vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len, nullptr, 0);
+    int status = vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len, nullptr, 0);
+    if (status == 0) {
+        invalidate_readlink_cache(state);
+    }
+    return status;
 }
 
 // Consumer side: rename a file/directory on the remote server
@@ -2823,7 +3109,11 @@ auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, co
         strcpy(reinterpret_cast<char*>(req_data + 4 + old_len), new_fs_path);
     }
 
-    return vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len, nullptr, 0);
+    int status = vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len, nullptr, 0);
+    if (status == 0) {
+        invalidate_readlink_cache(state);
+    }
+    return status;
 }
 
 // Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
@@ -2835,6 +3125,11 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
 
     if (state->readlink_unsupported.load(std::memory_order_acquire)) {
         return -ENOSYS;
+    }
+
+    ssize_t cached_result = 0;
+    if (try_readlink_cache_lookup(state, fs_relative_path, buf, bufsize, &cached_result)) {
+        return cached_result;
     }
 
     // Build request: {path_len:u16, path[N]}
@@ -2850,8 +3145,9 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
 
     // Response: {target_len:u16, target[]}
     std::array<uint8_t, 514> resp_buf{};
-    int status =
-        vfs_proxy_send_and_wait(state, OP_VFS_READLINK, req_data, req_data_len, resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
+    uint16_t resp_len = 0;
+    int status = vfs_proxy_read_with_retry(state, OP_VFS_READLINK, req_data, req_data_len, resp_buf.data(),
+                                           static_cast<uint16_t>(resp_buf.size()), &resp_len);
     if (status != 0) {
         if (status == -ENOSYS) {
             state->readlink_unsupported.store(true, std::memory_order_release);
@@ -2859,6 +3155,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
         }
 
         if (status == -EINVAL || status == -ENOENT) {
+            cache_readlink_result(state, fs_relative_path, status, nullptr, 0);
             return status;
         }
 
@@ -2867,7 +3164,6 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
         return status;
     }
 
-    uint16_t resp_len = state->op_resp_len;
     if (resp_len < 2) {
         return -1;
     }
@@ -2883,6 +3179,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
         to_copy = bufsize;
     }
     memcpy(buf, resp_buf.data() + 2, to_copy);
+    cache_readlink_result(state, fs_relative_path, 0, reinterpret_cast<const char*>(resp_buf.data() + 2), target_len);
     return static_cast<ssize_t>(to_copy);
 }
 
@@ -2947,6 +3244,30 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     state->lock.lock();
+
+    // Re-check op_pending under lock: between the lockless check above and
+    // acquiring state->lock, a drain force-release may have cleared op_pending.
+    if (!state->op_pending.load(std::memory_order_acquire)) {
+        state->lock.unlock();
+        s_vfs_lock.unlock();
+        return;
+    }
+
+    // If the channel is draining (previous request timed out), absorb the late
+    // response and release the channel so the next request can proceed cleanly.
+    if (state->op_draining.load(std::memory_order_acquire)) {
+        state->op_pending.store(false, std::memory_order_release);
+        state->op_draining.store(false, std::memory_order_relaxed);
+        state->op_expected_id = 0;
+        state->op_expected_seq = 0;
+        state->op_resp_buf = nullptr;
+        state->op_resp_max = 0;
+        state->op_resp_len = 0;
+        state->lock.unlock();
+        s_vfs_lock.unlock();
+        return;
+    }
+
     bool op_mismatch = resp->op_id != state->op_expected_id;
     bool seq_mismatch = resp->reserved != 0 && resp->reserved != state->op_expected_seq;
     if (op_mismatch || seq_mismatch) {
@@ -3144,6 +3465,9 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             continue;
         }
 
+        ker::vfs::vfs_stream_cache_invalidate_remote_scope(p.get());
+        invalidate_readlink_cache(p.get());
+
         if (p->op_pending.load(std::memory_order_acquire)) {
             p->op_status = -1;
             p->op_pending.store(false, std::memory_order_release);
@@ -3163,32 +3487,8 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             wki_channel_close(ch);
         }
 
-        // V2: Unmount the remote VFS from the local filesystem
-        if (p->local_mount_path[0] != '\0') {
-            ker::vfs::unmount_filesystem(p->local_mount_path);
-        }
-
-        // Free RDMA buffers
-        if (p->rdma_bounce_buf != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->rdma_bounce_buf);
-            p->rdma_bounce_buf = nullptr;
-        }
-        if (p->rdma_bulk_buf != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->rdma_bulk_buf);
-            p->rdma_bulk_buf = nullptr;
-            p->bulk_rdma_capable = false;
-        }
-
         ker::mod::dbg::log("[WKI] Remote VFS proxy fenced: %s node=0x%04x", static_cast<const char*>(p->local_mount_path), node_id);
         p->active = false;
-    }
-
-    for (auto it = g_vfs_proxies.begin(); it != g_vfs_proxies.end();) {
-        if (!(*it)->active) {
-            it = g_vfs_proxies.erase(it);
-        } else {
-            ++it;
-        }
     }
 }
 

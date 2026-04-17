@@ -17,6 +17,10 @@
 #include "platform/mm/phys.hpp"
 #include "platform/sys/spinlock.hpp"
 
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
+
 namespace ker::mod::mm::dyn::kmalloc {
 
 static constexpr int NUM_SLAB_CLASSES = 9;
@@ -59,20 +63,22 @@ constexpr uint64_t SLAB_MAX_SIZE = 0x800;     // 2KB - maximum size mini_malloc 
 constexpr uint64_t MEDIUM_MAX_SIZE = 0xFFFF;  // ~64KB - maximum size for medium allocations
 
 // Medium allocation header for sizes 0x801 - 0xFFFF
-struct MediumAllocationHeader {
+struct alignas(16) MediumAllocationHeader {
     MediumAllocationHeader* next;
     uint64_t size;   // Total allocation size including header
     uint64_t magic;  // For validation
+    uint64_t _pad;   // Pad to 32 bytes so (header + 1) is 16-byte aligned
     // Data follows immediately after this header
 };
 
 constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
 
 // Large allocation header for sizes >= 0x10000
-struct LargeAllocationHeader {
+struct alignas(16) LargeAllocationHeader {
     LargeAllocationHeader* next;
     uint64_t size;
     uint64_t magic;  // For validation
+    uint64_t _pad;   // Pad to 32 bytes so (header + 1) is 16-byte aligned
     // Data follows immediately after this header
 };
 
@@ -221,20 +227,29 @@ void* malloc(uint64_t size) {
     // Tier 1: Small allocations (0x1 - 0x800) - magazine fast path, slab slow path
     if (size <= SLAB_MAX_SIZE) {
         int idx = size_to_slab_idx(size);
+        void* ptr = nullptr;
         if (idx >= 0 && perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
             uint64_t flags;
             asm volatile("pushfq; popq %0; cli" : "=r"(flags));
             uint64_t cpuId = getCurrentCpuId();
             auto& cpu = perCpuAllocators[cpuId];
             if (cpu.initialized && cpu.mag_count[idx] > 0) {
-                void* ptr = cpu.magazine[idx][--cpu.mag_count[idx]];
+                ptr = cpu.magazine[idx][--cpu.mag_count[idx]];
                 if (flags & 0x200) asm volatile("sti");
-                return ptr;
+            } else {
+                if (flags & 0x200) asm volatile("sti");
             }
-            if (flags & 0x200) asm volatile("sti");
         }
         // Slow path: mini_malloc acquires per-size-class slab_lock internally
-        return mini_malloc(size);
+        if (ptr == nullptr) {
+            ptr = mini_malloc(size);
+        }
+#ifdef WOS_KASAN
+        if (ptr != nullptr) {
+            kasan::unpoison_range(ptr, size);
+        }
+#endif
+        return ptr;
     }
 
     // Tier 2: Medium allocations (0x801 - 0xFFFF) - use regular pageAlloc with tracking
@@ -271,7 +286,13 @@ void* malloc(uint64_t size) {
         mediumAllocLock.unlock();
 
         // Return pointer to data (after header)
-        return static_cast<void*>(header + 1);
+        void* data = static_cast<void*>(header + 1);
+#ifdef WOS_KASAN
+        // Mark the header as poisoned (internal), user data as accessible.
+        kasan::poison_range(static_cast<void*>(header), sizeof(MediumAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
+        kasan::unpoison_range(data, size);
+#endif
+        return data;
     }
 
     // Tier 3: Large allocations (>= 0x10000) - use pageAllocHuge with tracking
@@ -312,7 +333,12 @@ void* malloc(uint64_t size) {
     largeAllocLock.unlock();
 
     // Return pointer to data (after header)
-    return static_cast<void*>(header + 1);
+    void* data = static_cast<void*>(header + 1);
+#ifdef WOS_KASAN
+    kasan::poison_range(static_cast<void*>(header), sizeof(LargeAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
+    kasan::unpoison_range(data, size);
+#endif
+    return data;
 }
 
 // Helper to find and remove from medium alloc list
@@ -577,6 +603,10 @@ void free(void* ptr) {
             ker::mod::io::serial::writeHex(size);
             ker::mod::io::serial::write(" bytes)\n");
 #endif
+#ifdef WOS_KASAN
+            // Poison entire allocation (header + user data) as freed.
+            kasan::poison_range(static_cast<void*>(potentialLargeHeader), size, kasan::SHADOW_HEAP_FREED);
+#endif
             phys::pageFree(potentialLargeHeader);  // Free from header, not data ptr
             return;
         }
@@ -594,6 +624,9 @@ void free(void* ptr) {
             ker::mod::io::serial::writeHex(size);
             ker::mod::io::serial::write(" bytes)\n");
 #endif
+#ifdef WOS_KASAN
+            kasan::poison_range(static_cast<void*>(potentialMediumHeader), size, kasan::SHADOW_HEAP_FREED);
+#endif
             phys::pageFree(potentialMediumHeader);  // Free from header, not data ptr
             return;
         }
@@ -602,6 +635,13 @@ void free(void* ptr) {
     // Otherwise, it's a small allocation (<= 0x800) - magazine fast path, slab slow path
     size_t slab_sz = mini_get_slab_size(ptr);
     int idx = (slab_sz > 0) ? slab_size_to_idx(slab_sz) : -1;
+
+#ifdef WOS_KASAN
+    // Poison the slab chunk as freed before returning it to the magazine/slab.
+    if (slab_sz > 0) {
+        kasan::poison_range(ptr, slab_sz, kasan::SHADOW_HEAP_FREED);
+    }
+#endif
 
     if (idx >= 0 && perCpuAllocators != nullptr && perCpuReady.load(std::memory_order_acquire)) {
         uint64_t flags;

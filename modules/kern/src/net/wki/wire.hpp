@@ -241,6 +241,12 @@ enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
     VFS = 4,
     COMPUTE = 5,
     CUSTOM = 6,
+    IPC_PIPE = 7,
+    IPC_EVENTFD = 8,
+    IPC_PTY = 9,
+    IPC_FUTEX = 10,
+    IPC_EPOLL = 11,
+    IPC_SOCKET = 12,
 };
 
 constexpr uint8_t RESOURCE_FLAG_SHAREABLE = 0x01;
@@ -574,6 +580,34 @@ constexpr uint16_t OP_VFS_READDIR_BATCH =
 constexpr uint16_t OP_VFS_READ_BULK =
     0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
 
+// IPC Pipe (0x0700–0x070F) — data moves via wire messages
+constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;
+constexpr uint16_t OP_PIPE_CLOSE_WRITE = 0x0701;
+constexpr uint16_t OP_PIPE_DATA = 0x0702;  // req={resource_id:u32, data[]}
+constexpr uint16_t OP_PIPE_POLL_STATE = 0x0703;
+
+// IPC Eventfd (0x0710–0x071F)
+constexpr uint16_t OP_EVENTFD_CLOSE = 0x0710;
+
+// IPC PTY (0x0720–0x072F) — control only; data via RDMA
+constexpr uint16_t OP_PTY_IOCTL = 0x0720;
+constexpr uint16_t OP_PTY_CLOSE = 0x0721;
+
+// IPC Futex (0x0730–0x073F)
+constexpr uint16_t OP_FUTEX_WAKE = 0x0730;
+
+// IPC Epoll (0x0740–0x074F)
+constexpr uint16_t OP_EPOLL_CTL = 0x0740;
+constexpr uint16_t OP_EPOLL_READY_NOTIFY = 0x0741;
+
+// IPC Socket (0x0750–0x075F)
+constexpr uint16_t OP_SOCK_ACCEPT = 0x0750;
+constexpr uint16_t OP_SOCK_CLOSE = 0x0751;
+constexpr uint16_t OP_SOCK_SHUTDOWN = 0x0752;
+constexpr uint16_t OP_SOCK_GETPEERNAME = 0x0753;
+constexpr uint16_t OP_SOCK_GETSOCKOPT = 0x0754;
+constexpr uint16_t OP_SOCK_SETSOCKOPT = 0x0755;
+
 // -----------------------------------------------------------------------------
 // DEV_IRQ_FWD Payload - 8 bytes
 // -----------------------------------------------------------------------------
@@ -628,16 +662,29 @@ enum class TaskDeliveryMode : uint8_t {
     RESOURCE_REF = 2,
 };
 
+// IPC fd entry for cross-node task submission — appended to TASK_SUBMIT payload
+struct WkiIpcFdEntry {
+    uint16_t local_fd;
+    uint16_t res_type;  // ResourceType enum
+    uint32_t resource_id;
+    uint16_t home_node;
+    uint16_t reserved1;    // submitter-side access mode / open_flags low bits
+    uint32_t rdma_rkey;    // home node's RDMA rkey for shared region
+    uint64_t rdma_offset;  // offset within RDMA space
+} __attribute__((packed));
+
+static_assert(sizeof(WkiIpcFdEntry) == 24, "WkiIpcFdEntry must be 24 bytes");
+
 struct TaskSubmitPayload {
     uint32_t task_id;
     uint8_t delivery_mode;  // TaskDeliveryMode
     uint8_t prefer_inline;  // V2: 0=prefer VFS_REF, 1=prefer INLINE
     uint16_t args_len;
     // --- V2 extended environment (offset 8) ---
-    uint16_t argc;     // Number of NUL-separated argument strings
-    uint16_t envc;     // Number of NUL-separated env strings (KEY=VALUE)
-    uint16_t cwd_len;  // Length of CWD string (0 = use default "/")
-    uint16_t reserved;
+    uint16_t argc;          // Number of NUL-separated argument strings
+    uint16_t envc;          // Number of NUL-separated env strings (KEY=VALUE)
+    uint16_t cwd_len;       // Length of CWD string (0 = use default "/")
+    uint16_t ipc_fd_count;  // Number of WkiIpcFdEntry following argv/envp/cwd
     // Variable portion follows at offset 16, depends on delivery_mode:
     //   INLINE:       uint32_t binary_len, binary[binary_len]
     //   VFS_REF:      uint16_t path_len, path[path_len]

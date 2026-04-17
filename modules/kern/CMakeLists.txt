@@ -4,6 +4,14 @@ project(wos C CXX ASM_NASM)
 # Set the output name for the final kernel executable
 set(KERNEL wos)
 
+# ---------------------------------------------------------------------------
+# Sanitizer / instrumentation options (all default OFF for release builds)
+# ---------------------------------------------------------------------------
+option(WOS_KCFI   "Enable Clang Kernel Control-Flow Integrity"            OFF)
+option(WOS_KUBSAN "Enable Kernel UndefinedBehaviorSanitizer"              OFF)
+option(WOS_KASAN  "Enable Kernel AddressSanitizer (requires shadow map)"  OFF)
+option(WOS_KCOV   "Enable kernel coverage instrumentation (for Syzkaller)" OFF)
+
 # Internal flags
 set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
 
@@ -24,6 +32,115 @@ target_compile_options(${KERNEL} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
 )
 target_link_options(${KERNEL} PRIVATE -fno-lto)
+
+# ---------------------------------------------------------------------------
+# Sanitizer flags (applied on top of the base kernel options)
+# ---------------------------------------------------------------------------
+if(WOS_KCFI)
+    target_compile_options(${KERNEL} PRIVATE
+        $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=kcfi>
+    )
+    target_link_options(${KERNEL} PRIVATE -fsanitize=kcfi)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KCFI=1)
+    message(STATUS "[WOS] KCFI enabled")
+endif()
+
+if(WOS_KUBSAN)
+    # Use trap mode: UBSan calls __ubsan_handle_* which we implement in sanitizer/ubsan.cpp
+    target_compile_options(${KERNEL} PRIVATE
+        $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=undefined;-fno-sanitize-recover=all;-fno-sanitize=function,vptr>
+    )
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KUBSAN=1)
+    message(STATUS "[WOS] KUBSan enabled")
+endif()
+
+if(WOS_KASAN)
+    # -fsanitize=kernel-address applies to C/CXX only (not NASM/ASM).
+    target_compile_options(${KERNEL} PRIVATE
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=kernel-address>
+    )
+    # -mllvm flags must be passed as SHELL: pairs so CMake doesn't strip the
+    # repeated -mllvm tokens (deduplication). They also must be language-gated
+    # so NASM doesn't see them.
+    target_compile_options(${KERNEL} PRIVATE
+        "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -asan-mapping-offset=0xdffffc0000000000>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -asan-globals=0>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -asan-instrumentation-with-call-threshold=0>"
+    )
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KASAN=1)
+
+    # ---------------------------------------------------------------------------
+    # Files that must NOT be KASan-instrumented because they execute before the
+    # shadow memory is mapped (PHASE_0 early boot, MM init, interrupt/fault
+    # infrastructure, and the KASan runtime itself).
+    #
+    # Instrumenting these causes the compiler-inserted shadow checks to fault on
+    # unmapped shadow pages before the page-fault handler is ready — instant
+    # triple fault or infinite recursion.
+    # ---------------------------------------------------------------------------
+    set(KASAN_EXCLUDED_SRCS
+        # Early boot / logging (runs before any shadow pages exist)
+        src/platform/dbg/dbg.cpp
+        src/platform/dbg/coredump.cpp
+        src/mod/io/serial/serial.cpp
+        src/mod/gfx/fb.cpp
+        src/mod/gfx/fb_font.cpp
+        # Memory management init (sets up the very heap KASan annotates)
+        src/platform/mm/phys.opt.cpp
+        src/platform/mm/virt.opt.cpp
+        src/platform/mm/mm.opt.cpp
+        src/platform/mm/addr.opt.cpp
+        src/platform/mm/paging.opt.cpp
+        src/platform/mm/page_alloc.cpp
+        src/platform/mm/dyn/kmalloc.opt.cpp
+        src/platform/mm/dyn/slab.opt.cpp
+        src/minimalist_malloc/mini_malloc.cpp
+        # Interrupt/exception infrastructure (fault handler runs before kasan::init)
+        src/platform/interrupt/gates.cpp
+        src/platform/interrupt/gdt.cpp
+        src/platform/interrupt/idt.cpp
+        src/platform/interrupt/interrupt.cpp
+        src/platform/interrupt/kmem.cpp
+        # KASan/UBSan/KCOV runtimes (must not instrument themselves)
+        src/sanitizer/kasan.cpp
+        src/sanitizer/ubsan.cpp
+        src/sanitizer/kcov.cpp
+        # Init infrastructure itself
+        src/main.cpp
+        src/platform/init/init_wrappers.cpp
+        src/platform/init/init_validation.cpp
+        src/platform/init/limine_requests.cpp
+        # Low-level CPU/ASM helpers called from exception paths
+        src/platform/asm/cpu.cpp
+        src/platform/asm/tlb.cpp
+        src/util/hcf.hpp
+        # Synchronization primitives — called from excluded early-boot code
+        # (dbg::log -> logLock.lock() runs before IDT; shadow fault = triple fault)
+        src/platform/sys/spinlock.cpp
+        src/platform/sys/mutex.cpp
+        src/platform/sys/rwlock.cpp
+        # String/memory primitives — called transitively from excluded files
+        src/util/string.opt.cpp
+        src/util/mem.opt.cpp
+        src/util/abi_stubs.opt.cpp
+    )
+    foreach(src IN LISTS KASAN_EXCLUDED_SRCS)
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+            PROPERTIES COMPILE_OPTIONS "-fno-sanitize=kernel-address"
+        )
+    endforeach()
+
+    message(STATUS "[WOS] KASan enabled (requires shadow memory setup)")
+endif()
+
+if(WOS_KCOV)
+    target_compile_options(${KERNEL} PRIVATE
+        $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize-coverage=trace-pc>
+    )
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV=1)
+    message(STATUS "[WOS] KCOV enabled (for Syzkaller coverage)")
+endif()
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)
 target_include_directories(${KERNEL} PRIVATE

@@ -14,6 +14,7 @@
 #include <net/wki/peer.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_compute.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
@@ -25,6 +26,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <ranges>
 #include <util/hostname.hpp>
@@ -49,6 +51,83 @@ WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 // attach processing from re-entering itself while the outer call is
 // still blocked inside wki_wait_for_op().
 static std::atomic<bool> s_timer_deferred_running{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// RAII guard: ensures s_timer_deferred_running is reset even if a deferred
+// work function panics or asserts.  Without this, a crash inside the
+// deferred section would leave the flag permanently true, silently blocking
+// all future deferred work (mounts, net attaches, zone creates, etc.).
+struct DeferredGuard {
+    bool entered = false;
+    bool try_enter() {
+        bool expected = false;
+        entered = s_timer_deferred_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+        return entered;
+    }
+    ~DeferredGuard() {
+        if (entered) {
+            s_timer_deferred_running.store(false, std::memory_order_release);
+        }
+    }
+};
+
+namespace {
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+void perf_record_transport_point(mod::perf::WkiPerfTransportOp op, uint16_t peer, uint16_t channel, int32_t status, uint32_t aux,
+                                 uint32_t correlation, uint64_t callsite) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), mod::perf::WkiPerfScope::TRANSPORT, static_cast<uint8_t>(op),
+                                mod::perf::WkiPerfPhase::POINT, peer, channel, correlation, status, aux, callsite);
+    mod::perf::record_wki_summary(mod::perf::WkiPerfScope::TRANSPORT, static_cast<uint8_t>(op), peer, channel, status, 0, false, 0, 0);
+}
+
+void perf_record_transport_begin(uint16_t peer, uint16_t channel, uint32_t correlation, uint32_t bytes, uint64_t callsite) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), mod::perf::WkiPerfScope::TRANSPORT,
+                                static_cast<uint8_t>(mod::perf::WkiPerfTransportOp::SEND), mod::perf::WkiPerfPhase::BEGIN, peer, channel,
+                                correlation, 0, bytes, callsite);
+}
+
+void perf_record_transport_end(uint16_t peer, uint16_t channel, uint32_t correlation, int32_t status, uint32_t bytes, uint64_t callsite) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), mod::perf::WkiPerfScope::TRANSPORT,
+                                static_cast<uint8_t>(mod::perf::WkiPerfTransportOp::SEND), mod::perf::WkiPerfPhase::END, peer, channel,
+                                correlation, status, bytes, callsite);
+    mod::perf::record_wki_summary(mod::perf::WkiPerfScope::TRANSPORT, static_cast<uint8_t>(mod::perf::WkiPerfTransportOp::SEND), peer,
+                                  channel, status, 0, false, 0, bytes);
+}
+
+void perf_record_transport_rtt(uint16_t peer, uint16_t channel, uint32_t correlation, uint32_t rtt_us, uint32_t retries) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), mod::perf::WkiPerfScope::TRANSPORT,
+                                static_cast<uint8_t>(mod::perf::WkiPerfTransportOp::ACK_RTT), mod::perf::WkiPerfPhase::END, peer, channel,
+                                correlation, 0, rtt_us, 0);
+    mod::perf::record_wki_summary(mod::perf::WkiPerfScope::TRANSPORT, static_cast<uint8_t>(mod::perf::WkiPerfTransportOp::ACK_RTT), peer,
+                                  channel, 0, rtt_us, true, retries, 0);
+}
+
+}  // namespace
 
 // -----------------------------------------------------------------------------
 // Time source
@@ -155,11 +234,9 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
         wki_timer_notify();
     }
 
-    // Poll until completed or deadline.  Use wki_spin_yield() instead of
-    // plain kern_yield() so that channel-level delayed ACKs and retransmits
-    // continue to be processed.  Without this, a credit-starved remote peer
-    // can never send the reply because our delayed ACK is stuck in the
-    // timer tick that will never run (the timer thread is us, blocked here).
+    // Poll until completed or deadline. Each loop explicitly pumps delayed
+    // ACKs/retransmits before yielding the CPU so the waiter does not busy-spin
+    // for long accept/completion paths under load.
     while (!entry->completed.load(std::memory_order_acquire)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
             // Timed out - unlink and return error
@@ -167,6 +244,10 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
             return WKI_ERR_TIMEOUT;
         }
         wki_spin_yield();
+        if (entry->completed.load(std::memory_order_acquire)) {
+            break;
+        }
+        mod::sched::kern_yield();
     }
 
     // Completed - unlink and return result
@@ -176,7 +257,10 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
 
 void wki_wake_op(WkiWaitEntry* entry, int result) {
     entry->result = result;
-    entry->completed.store(true, std::memory_order_release);  // atomic release - visible to polling loop
+    bool expected = false;
+    if (!entry->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;  // already completed - stale wake
+    }
 
     // Send wake IPI to break the hlt in kern_yield() for immediate response
     if (entry->task != nullptr) {
@@ -186,20 +270,77 @@ void wki_wake_op(WkiWaitEntry* entry, int result) {
 
 void wki_wait_timeout_scan(uint64_t now_us) {
     // Called from timer tick context - scan for expired waiters.
-    // We only set deadline_us entries to timed-out; the polling loop in
-    // wki_wait_for_op detects this and does the actual unlink + return.
-    // This provides a backstop if the polling task hasn't run yet.
+    // We unlink completed/timed-out entries directly (we already hold the lock)
+    // so that stale entries cannot linger if the owning task is killed or its
+    // stack is reclaimed before the polling loop runs wait_list_unlink().
+    s_wait_lock.lock();
+    WkiWaitEntry* cur = s_wait_head;
+    while (cur != nullptr) {
+        // guard against corrupted lists
+        if (reinterpret_cast<uintptr_t>(cur) % alignof(WkiWaitEntry) != 0) {
+            ker::mod::dbg::log("[WKI] wait_timeout_scan: misaligned entry %p, truncating list", cur);
+            s_wait_head = nullptr;
+            break;
+        }
+        WkiWaitEntry* next = cur->next;
+
+        bool should_unlink = false;
+
+        // Check for timeout
+        if (cur->deadline_us != 0 && now_us >= cur->deadline_us) {
+            cur->result = WKI_ERR_TIMEOUT;
+            bool expected = false;
+            if (cur->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                should_unlink = true;
+                if (cur->task != nullptr) {
+                    ker::mod::sched::wake_cpu(cur->task->cpu);
+                }
+            }
+        }
+
+        // Also reap entries that were already completed (e.g. by wki_wake_op
+        // or peer cleanup) but whose owning task died before it could unlink.
+        if (!should_unlink && cur->completed.load(std::memory_order_acquire)) {
+            should_unlink = true;
+        }
+
+        if (should_unlink) {
+            if (cur->prev != nullptr) {
+                cur->prev->next = cur->next;
+            } else if (s_wait_head == cur) {
+                s_wait_head = cur->next;
+            }
+            if (cur->next != nullptr) {
+                cur->next->prev = cur->prev;
+            }
+            cur->next = nullptr;
+            cur->prev = nullptr;
+        }
+
+        cur = next;
+    }
+    s_wait_lock.unlock();
+}
+
+void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task) {
     s_wait_lock.lock();
     WkiWaitEntry* cur = s_wait_head;
     while (cur != nullptr) {
         WkiWaitEntry* next = cur->next;
-        if (cur->deadline_us != 0 && now_us >= cur->deadline_us && !cur->completed.load(std::memory_order_acquire)) {
-            cur->result = WKI_ERR_TIMEOUT;
-            cur->completed.store(true, std::memory_order_release);
-            // Wake the CPU so the polling loop exits immediately
-            if (cur->task != nullptr) {
-                ker::mod::sched::wake_cpu(cur->task->cpu);
+        if (cur->task == task) {
+            // Unlink this entry - the task is dying and won't clean up itself.
+            if (cur->prev != nullptr) {
+                cur->prev->next = cur->next;
+            } else if (s_wait_head == cur) {
+                s_wait_head = cur->next;
             }
+            if (cur->next != nullptr) {
+                cur->next->prev = cur->prev;
+            }
+            cur->next = nullptr;
+            cur->prev = nullptr;
+            // Mark completed so any stale pointer holders won't re-link it.
+            cur->completed.store(true, std::memory_order_release);
         }
         cur = next;
     }
@@ -288,6 +429,9 @@ void wki_init() {
 
     // Init remote compute subsystem
     wki_remote_compute_init();
+
+    // Init IPC proxy subsystem (cross-node pipe, socket, epoll forwarding)
+    wki_ipc_subsystem_init();
 
     // V2: Create /wki/ base directory for remote VFS mounts
     ker::vfs::vfs_mkdir("/wki", 0755);
@@ -944,12 +1088,19 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
     ch->lock.lock();
 
+    uint64_t trace_callsite = WOS_PERF_CALLSITE();
+    uint32_t trace_correlation = ch->tx_seq;
+
     // Check credits
     if (ch->tx_credits == 0) {
         ch->lock.unlock();
         net::pkt_free(pkt);
+        perf_record_transport_point(mod::perf::WkiPerfTransportOp::NO_CREDITS, dst_node, channel_id, WKI_ERR_NO_CREDITS, 0,
+                                    trace_correlation, trace_callsite);
         return WKI_ERR_NO_CREDITS;
     }
+
+    perf_record_transport_begin(dst_node, channel_id, trace_correlation, payload_len, trace_callsite);
 
     uint8_t flags = 0;
     if (ch->priority == PriorityClass::LATENCY) {
@@ -1059,7 +1210,12 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         wki_timer_notify();
     }
 
-    return ret < 0 ? WKI_ERR_TX_FAILED : WKI_OK;
+    if (ret < 0) {
+        perf_record_transport_end(dst_node, channel_id, trace_correlation, WKI_ERR_TX_FAILED, payload_len, trace_callsite);
+        return WKI_ERR_TX_FAILED;
+    }
+
+    return WKI_OK;
 }
 
 // -----------------------------------------------------------------------------
@@ -1288,14 +1444,17 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         ch->rto_us = ch->srtt_us + (4 * ch->rttvar_us);
                         ch->rto_us = std::max(ch->rto_us, WKI_MIN_RTO_US);
                         ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
+                        perf_record_transport_rtt(ch->peer_node_id, ch->channel_id, rt->seq, sample, rt->retries);
                     } else if (rt->retries == 0) {
                         // First RTT sample
                         uint64_t now = wki_now_us();
-                        ch->srtt_us = static_cast<uint32_t>(now - rt->send_time_us);
+                        auto sample = static_cast<uint32_t>(now - rt->send_time_us);
+                        ch->srtt_us = sample;
                         ch->rttvar_us = ch->srtt_us / 2;
                         ch->rto_us = ch->srtt_us + (4 * ch->rttvar_us);
                         ch->rto_us = std::max(ch->rto_us, WKI_MIN_RTO_US);
                         ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
+                        perf_record_transport_rtt(ch->peer_node_id, ch->channel_id, rt->seq, sample, rt->retries);
                     }
 
                     rt_entry_free(ch, rt);
@@ -1324,6 +1483,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         rt->send_time_us = now;
                         ch->retransmits++;
                         ch->retransmit_deadline = now + ch->rto_us;
+                        perf_record_transport_point(mod::perf::WkiPerfTransportOp::FAST_RETRANSMIT, ch->peer_node_id, ch->channel_id, 0,
+                                                    rt->len, rt->seq, 0);
                     }
                     ch->dup_ack_count = 0;
                 }
@@ -1608,6 +1769,8 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
             rt->retries++;
             rt->send_time_us = now_us;
             ch->retransmits++;
+            perf_record_transport_point(mod::perf::WkiPerfTransportOp::RETRANSMIT, ch->peer_node_id, ch->channel_id, 0, rt->len, rt->seq,
+                                        0);
 
             ch->rto_us *= 2;
             ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
@@ -1714,6 +1877,8 @@ void wki_timer_tick(uint64_t now_us) {
                 rt->retries++;
                 rt->send_time_us = now_us;
                 ch->retransmits++;
+                perf_record_transport_point(mod::perf::WkiPerfTransportOp::RETRANSMIT, ch->peer_node_id, ch->channel_id, 0, rt->len,
+                                            rt->seq, 0);
 
                 // Exponential backoff
                 ch->rto_us *= 2;
@@ -1775,26 +1940,22 @@ void wki_timer_tick(uint64_t now_us) {
 
     // Process deferred blocking work (mounts, attaches, zone creates).
     // These operations can call wki_wait_for_op() which re-enters
-    // wki_spin_yield() -> wki_timer_tick().  The guard prevents the
-    // deferred work section from running recursively.
-    bool expected = false;
-    if (s_timer_deferred_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    // wki_spin_yield() -> wki_timer_tick().  The RAII guard prevents the
+    // deferred work section from running recursively and ensures the flag
+    // is reset even if a deferred function crashes.
+    DeferredGuard deferred;
+    if (deferred.try_enter()) {
         // Process deferred RDMA zone creations (must run outside NAPI poll context)
         wki_dev_server_process_pending_zones();
 
         // Process deferred VFS auto-mounts (must run outside NAPI poll context)
         wki_remotable_process_pending_mounts();
 
-        // Process deferred VFS_REF/RESOURCE_REF task submits (must run outside NAPI poll context)
-        wki_remote_compute_process_pending_submits();
-
         // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
         wki_remotable_process_pending_net_attaches();
 
         // Poll RDMA block ring SQ entries on server bindings
         wki_dev_server_poll_rings();
-
-        s_timer_deferred_running.store(false, std::memory_order_release);
     }
 }
 

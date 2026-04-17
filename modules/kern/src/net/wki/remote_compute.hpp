@@ -48,6 +48,8 @@ struct SubmittedTask {
     std::atomic<bool> complete_pending{false};
     WkiWaitEntry* complete_wait_entry = nullptr;  // V2 I-4: async wait for TASK_COMPLETE
     int32_t exit_status = 0;
+    uint64_t accepted_at_us = 0;
+    uint64_t complete_received_at_us = 0;
 
     // V2§A7: Proxy task pointer - kept alive in WAITING state until remote completes
     ker::mod::sched::task::Task* local_task = nullptr;
@@ -67,6 +69,8 @@ struct SubmittedTask {
           complete_pending(o.complete_pending.load(std::memory_order_relaxed)),
           complete_wait_entry(o.complete_wait_entry),
           exit_status(o.exit_status),
+          accepted_at_us(o.accepted_at_us),
+          complete_received_at_us(o.complete_received_at_us),
           local_task(o.local_task),
           proxy_ready(o.proxy_ready) {}
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
@@ -81,6 +85,8 @@ struct SubmittedTask {
             complete_pending.store(o.complete_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             complete_wait_entry = o.complete_wait_entry;
             exit_status = o.exit_status;
+            accepted_at_us = o.accepted_at_us;
+            complete_received_at_us = o.complete_received_at_us;
             local_task = o.local_task;
             proxy_ready = o.proxy_ready;
         }
@@ -132,13 +138,15 @@ void wki_remote_compute_init();
 // Submitter side: submit a task with inline binary.
 // Returns task_id on success, 0 on failure.
 auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len, const char* const argv[],
-                            const char* const envp[], const char* cwd, ker::mod::sched::task::Task* local_task) -> uint32_t;
+                            const char* const envp[], const char* cwd, ker::mod::sched::task::Task* local_task,
+                            const WkiIpcFdEntry* ipc_fd_map = nullptr, uint16_t ipc_fd_count = 0) -> uint32_t;
 
 // Submitter side: submit a task via VFS_REF (path-based delivery).
 // The remote node loads the ELF from its VFS (typically via /wki/<hostname>/... mount).
 // Returns task_id on success, 0 on failure.
 auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const char* const argv[], const char* const envp[],
-                             const char* cwd, ker::mod::sched::task::Task* local_task) -> uint32_t;
+                             const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
+                             uint16_t ipc_fd_count = 0) -> uint32_t;
 
 // Rich remote placement path used by spawn/exec code that already has the final
 // argv/envp/cwd context. On success, the task is converted into a proxy.
@@ -169,6 +177,11 @@ auto wki_least_loaded_node(uint16_t local_load) -> uint16_t;
 // Fencing cleanup
 void wki_remote_compute_cleanup_for_peer(uint16_t node_id);
 
+// Release a shared cached ELF buffer acquired for remote execution.
+// Returns true when the buffer was owned by the shared cache and must not be
+// deleted by the caller.
+auto wki_remote_compute_release_elf_buffer(uint8_t* buffer) -> bool;
+
 // V2§A7.4: Forward signal to remote task if the target is a WKI proxy.
 // Called from kill() syscall. Returns true if signal was handled (forwarded).
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool;
@@ -177,10 +190,18 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
 // When a task exits, sends TASK_COMPLETE back to the submitter.
 void wki_remote_compute_check_completions();
 
-// Process deferred VFS_REF/RESOURCE_REF task submits (called from timer tick
-// deferred-work section).  These cannot run from NAPI poll context because
-// the remote VFS reads cause napi_poll_inline() re-entrance.
+// Process deferred VFS_REF/RESOURCE_REF task submits.  Drains the pending
+// queue inline (still called from the timer tick deferred section as a
+// fallback).  The primary processing path is the dedicated compute submit
+// kernel thread started by wki_remote_compute_start_submit_thread().
 void wki_remote_compute_process_pending_submits();
+
+// Start the dedicated kernel thread that processes VFS_REF/RESOURCE_REF
+// task submits.  Must be called after the scheduler is running.
+void wki_remote_compute_start_submit_thread();
+
+// Wake the compute submit thread after queuing a new pending submit.
+void wki_remote_compute_notify_pending_submit();
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers

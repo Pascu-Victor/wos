@@ -1,0 +1,107 @@
+# WOS VFS syscall descriptions for Syzkaller.
+#
+# WOS syscall ABI:
+#   RAX = 5 (callnums::vfs)
+#   RDI = vfs::ops enum (sub-operation)
+#   RSI..R10 = arguments a1..a4
+#
+# Syzkaller dispatches via the top-level wos_vfs() wrapper.
+
+include <abi/callnums/vfs.h>
+
+# Type aliases for clarity
+type fd int32
+type path ptr[in, filename]
+type dirfd fd
+
+# --- File operations ---
+
+wos_vfs$open(op const[0], path path, flags flags[open_flags], mode flags[open_mode]) fd
+wos_vfs$read(op const[1], fd fd, buf ptr[out, array[int8]], count len[buf]) int64
+wos_vfs$write(op const[2], fd fd, buf ptr[in, array[int8]], count len[buf]) int64
+wos_vfs$close(op const[3], fd fd) int64
+wos_vfs$lseek(op const[4], fd fd, offset int64, whence flags[seek_whence]) int64
+wos_vfs$isatty(op const[5], fd fd) int64
+wos_vfs$read_dir_entries(op const[6], fd fd, buf ptr[out, array[int8, 4096]], count const[4096]) int64
+
+# --- Mount / unmount ---
+
+wos_vfs$mount(op const[7], source path, target path, fstype ptr[in, string[fs_types]]) int64
+wos_vfs$umount(op const[14], target path) int64
+wos_vfs$pivot_root(op const[44], new_root path, put_old path) int64
+
+# --- Directory operations ---
+
+wos_vfs$mkdir(op const[8], path path, mode flags[open_mode]) int64
+wos_vfs$rmdir(op const[21], path path) int64
+wos_vfs$chdir(op const[18], path path) int64
+wos_vfs$getcwd(op const[17], buf ptr[out, array[int8, 256]], size const[256]) int64
+
+# --- Symlink / link ---
+
+wos_vfs$readlink(op const[9], path path, buf ptr[out, array[int8, 256]], size const[256]) int64
+wos_vfs$symlink(op const[10], target path, linkpath path) int64
+wos_vfs$link(op const[40], oldpath path, newpath path) int64
+wos_vfs$unlink(op const[20], path path) int64
+
+# --- Stat ---
+
+wos_vfs$stat(op const[12], path path, buf ptr[out, array[int8, 128]]) int64
+wos_vfs$fstat(op const[13], fd fd, buf ptr[out, array[int8, 128]]) int64
+
+# --- Dup ---
+
+wos_vfs$dup(op const[15], fd fd) fd
+wos_vfs$dup2(op const[16], oldfd fd, newfd fd) fd
+
+# --- Pipe ---
+
+wos_vfs$pipe(op const[25], pipefd ptr[out, array[fd, 2]]) int64
+
+# --- File manipulation ---
+
+wos_vfs$rename(op const[22], oldpath path, newpath path) int64
+wos_vfs$chmod(op const[23], path path, mode flags[open_mode]) int64
+wos_vfs$fchmod(op const[29], fd fd, mode flags[open_mode]) int64
+wos_vfs$truncate(op const[24], path path, length int64) int64
+wos_vfs$chown(op const[30], path path, uid int32, gid int32) int64
+wos_vfs$fchown(op const[31], fd fd, uid int32, gid int32) int64
+wos_vfs$access(op const[19], path path, mode flags[access_mode]) int64
+wos_vfs$sendfile(op const[11], out_fd fd, in_fd fd, offset int64) int64
+
+# --- pread / pwrite ---
+
+wos_vfs$pread(op const[26], fd fd, buf ptr[out, array[int8]], count len[buf], offset int64) int64
+wos_vfs$pwrite(op const[27], fd fd, buf ptr[in, array[int8]], count len[buf], offset int64) int64
+
+# --- fcntl / ioctl ---
+
+wos_vfs$fcntl(op const[28], fd fd, cmd int32, arg int64) int64
+wos_vfs$ioctl(op const[38], fd fd, request int32, arg int64) int64
+wos_vfs$fsync(op const[39], fd fd) int64
+
+# --- Epoll ---
+
+wos_vfs$epoll_create(op const[35], flags int32) fd
+wos_vfs$epoll_ctl(op const[36], epfd fd, ctl_op int32, fd fd, event ptr[in, array[int8, 16]]) int64
+wos_vfs$epoll_pwait(op const[37], epfd fd, events ptr[out, array[int8, 256]], maxevents int32, timeout int32) int64
+
+# --- *at variants ---
+
+wos_vfs$faccessat(op const[32], dirfd dirfd, path path, mode flags[access_mode]) int64
+wos_vfs$unlinkat(op const[33], dirfd dirfd, path path, flags int32) int64
+wos_vfs$renameat(op const[34], olddirfd dirfd, oldpath path, newdirfd dirfd, newpath path) int64
+
+# --- WKI VFS rules ---
+
+wos_vfs$wki_rule_add(op const[41], prefix path, route int32) int64
+wos_vfs$wki_rule_get(op const[42], index int32, buf ptr[out, array[int8, 264]]) int64
+wos_vfs$wki_rule_clear(op const[43]) int64
+
+# --- Flags ---
+
+open_flags = 0, 1, 2, 0x40, 0x200, 0x400, 0x800
+open_mode = 0, 0x1C0, 0x1A4, 0x1ED, 0x1FF
+seek_whence = 0, 1, 2
+access_mode = 0, 1, 2, 4
+fs_types = "tmpfs", "xfs", "fat32", "devfs", "procfs"

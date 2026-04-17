@@ -99,10 +99,6 @@
     "terminal.integrated.profiles.linux": {
         "WOS Development": {
             "path": "bash",
-            "args": [
-                "-c",
-                "source ~/.bashrc 2>/dev/null || true; source '${workspaceFolder}/.vscode/wos-env.sh'; exec bash"
-            ],
             "icon": "tools"
         },
         "WOS Development (Clean)": {

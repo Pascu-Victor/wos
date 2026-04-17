@@ -21,7 +21,9 @@ void init() {
         hcf();
     }
 
-    auto hpetAddr = mm::addr::get_virt_pointer(*(uint64_t*)((uint64_t)hpetResult.data + HPET_OFFSET));
+    uint64_t hpetPhys;
+    __builtin_memcpy(&hpetPhys, (const void*)((uint64_t)hpetResult.data + HPET_OFFSET), sizeof(hpetPhys));
+    auto hpetAddr = mm::addr::get_virt_pointer(hpetPhys);
 
     // Map HPET to the kernel page table so all CPUs can access it
     mm::virt::mapToKernelPageTable((uint64_t)hpetAddr, (uint64_t)mm::addr::get_phys_pointer((uint64_t)hpetAddr),

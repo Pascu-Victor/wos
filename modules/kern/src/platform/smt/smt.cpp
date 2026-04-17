@@ -12,6 +12,7 @@
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/tcp.hpp"
 #include "net/wki/peer.hpp"
+#include "net/wki/remote_compute.hpp"
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
@@ -552,6 +553,10 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
     // Start the WKI timer as a kernel thread (heartbeats, fencing, retransmit, load reports)
     ker::net::wki::wki_timer_thread_start();
+
+    // Start the WKI compute submit thread (processes VFS_REF/RESOURCE_REF task
+    // submits with blocking VFS I/O, decoupled from the timer tick)
+    ker::net::wki::wki_remote_compute_start_submit_thread();
 
     // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)
     for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {

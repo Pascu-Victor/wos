@@ -596,6 +596,59 @@ auto generate_kcontstat(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
+auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char* end = buf + bufsz - 1;
+
+    std::array<ker::mod::perf::WkiPerfSummarySnapshot, ker::mod::perf::WKI_PERF_SUMMARY_BUCKETS> rows{};
+    size_t row_count = ker::mod::perf::get_wki_summary_snapshots(rows.data(), rows.size());
+
+    for (size_t i = 0; i < row_count; ++i) {
+        const auto& row = rows[i];
+        if (row.calls == 0) {
+            continue;
+        }
+
+        uint64_t avg = row.calls != 0 ? (row.total_latency_us / row.calls) : 0;
+        append_sconst(p, end, "scope=");
+        append_sconst(p, end, ker::mod::perf::wki_scope_name(static_cast<ker::mod::perf::WkiPerfScope>(row.scope)));
+        append_sconst(p, end, " op=");
+        append_sconst(p, end, ker::mod::perf::wki_op_name(static_cast<ker::mod::perf::WkiPerfScope>(row.scope), row.op));
+        append_sconst(p, end, " peer=");
+        append_dec64(p, end, row.peer);
+        append_sconst(p, end, " channel=");
+        append_dec64(p, end, row.channel);
+        append_sconst(p, end, " calls=");
+        append_dec64(p, end, row.calls);
+        append_sconst(p, end, " errors=");
+        append_dec64(p, end, row.errors);
+        append_sconst(p, end, " retries=");
+        append_dec64(p, end, row.retries);
+        append_sconst(p, end, " bytes=");
+        append_dec64(p, end, row.bytes);
+        append_sconst(p, end, " avg_us=");
+        append_dec64(p, end, avg);
+        append_sconst(p, end, " max_us=");
+        append_dec64(p, end, row.max_latency_us);
+        append_sconst(p, end, " p95_us=");
+        append_dec64(p, end, row.p95_us);
+        append_sconst(p, end, " p99_us=");
+        append_dec64(p, end, row.p99_us);
+        append_sconst(p, end, " p999_us=");
+        append_dec64(p, end, row.p999_us);
+        append_sconst(p, end, " p9999_us=");
+        append_dec64(p, end, row.p9999_us);
+        append_sconst(p, end, " p99999_us=");
+        append_dec64(p, end, row.p99999_us);
+        if (p + 1 < end) {
+            *p++ = '\n';
+        }
+    }
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 // Hex helper
 static void append_hex64(char*& p, char* end, uint64_t v) {
     static const char hx[] = "0123456789abcdef";
@@ -659,6 +712,7 @@ static void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
 //   X <ts_ns> <cpu> <prev_pid> <next_pid> <lag_v> <flags> <run_us> <callsite>   SWITCH
 //   W <ts_ns> <cpu> <pid> <wake_at_us> <sleep_us> <flags> <callsite>            WAKE
 //   B <ts_ns> <cpu> <pid> <wake_at_us> <run_us>   <flags> <callsite>            SLEEP
+//   K <ts_ns> <cpu> <pid> <scope> <op> <phase> <peer> <channel> <corr> <status> <aux> <callsite>
 auto generate_kperf(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
     char* end = buf + bufsz - 1;
@@ -685,6 +739,9 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                     break;
                 case ker::mod::perf::PerfEventType::CONTAINER_STAT:
                     letter = 'C';
+                    break;
+                case ker::mod::perf::PerfEventType::WKI:
+                    letter = 'K';
                     break;
             }
             if (p + 2 >= end) break;
@@ -729,6 +786,38 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 *p++ = ' ';
                 if (ev.lag_v < 0 && p + 1 < end) *p++ = '-';
                 append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
+                *p++ = ' ';
+                append_dec64(p, end, ev.aux);
+                *p++ = ' ';
+                append_perf_callsite(p, end, ev.callsite);
+            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::WKI) {
+                ker::mod::perf::WkiPerfScope scope = ker::mod::perf::WkiPerfScope::NONE;
+                ker::mod::perf::WkiPerfPhase phase = ker::mod::perf::WkiPerfPhase::POINT;
+                uint8_t op = 0;
+                uint16_t peer = 0;
+                uint16_t channel = 0;
+                ker::mod::perf::wki_unpack_event_data(ev.data, scope, op, phase, peer, channel);
+
+                append_dec64(p, end, ev.pid);
+                *p++ = ' ';
+                append_sconst(p, end, ker::mod::perf::wki_scope_name(scope));
+                *p++ = ' ';
+                append_sconst(p, end, ker::mod::perf::wki_op_name(scope, op));
+                *p++ = ' ';
+                append_sconst(p, end, ker::mod::perf::wki_phase_name(phase));
+                *p++ = ' ';
+                append_dec64(p, end, peer);
+                *p++ = ' ';
+                append_dec64(p, end, channel);
+                *p++ = ' ';
+                append_dec64(p, end, ker::mod::perf::wki_unpack_trace_correlation(ev.lag_v));
+                *p++ = ' ';
+                if (ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0 && p + 1 < end) {
+                    *p++ = '-';
+                }
+                append_dec64(p, end, static_cast<uint64_t>(ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0
+                                                                ? -ker::mod::perf::wki_unpack_trace_status(ev.lag_v)
+                                                                : ker::mod::perf::wki_unpack_trace_status(ev.lag_v)));
                 *p++ = ' ';
                 append_dec64(p, end, ev.aux);
                 *p++ = ' ';
@@ -823,8 +912,8 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
-        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KCPUSTAT_FILE ||
-                         pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
+        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
+                 pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
         size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
         pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(alloc_sz));
         if (pfd->content == nullptr) {
@@ -852,6 +941,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::KPERF_FILE:
                 pfd->content_len = generate_kperf(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::KWKISTAT_FILE:
+                pfd->content_len = generate_kwkistat(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::KCPUSTAT_FILE:
                 pfd->content_len = generate_kcpustat(pfd->content, MAX_KPERF_BUF);
@@ -1091,6 +1183,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/kperf - drain kernel perf ring buffer as text events
     if (strcmp(path, "kperf") == 0) {
         return make_file(ProcNodeType::KPERF_FILE, 0, false);
+    }
+
+    // /proc/kwkistat - recording-scoped WKI summary statistics
+    if (strcmp(path, "kwkistat") == 0) {
+        return make_file(ProcNodeType::KWKISTAT_FILE, 0, false);
     }
 
     // /proc/kcpustat - per-CPU aggregate scheduler statistics

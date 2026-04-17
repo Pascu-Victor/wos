@@ -18,6 +18,8 @@ namespace ker::net::wki {
 
 constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
+constexpr size_t VFS_READLINK_CACHE_ENTRIES = 4;
+constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 
 // Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
@@ -56,6 +58,15 @@ struct RemoteVfsFd {
 // -----------------------------------------------------------------------------
 
 struct ProxyVfsState {
+    struct ReadlinkCacheEntry {
+        bool valid = false;
+        int16_t status = 0;
+        uint16_t target_len = 0;
+        uint64_t cached_at_us = 0;
+        std::array<char, VFS_READLINK_CACHE_TEXT_MAX> path = {};
+        std::array<char, VFS_READLINK_CACHE_TEXT_MAX> target = {};
+    };
+
     bool active = false;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
@@ -64,6 +75,8 @@ struct ProxyVfsState {
     std::atomic<bool> readlink_unsupported{false};
 
     std::atomic<bool> op_pending{false};
+    std::atomic<bool> op_draining{false};  // Set after timeout; cleared when late response arrives
+    uint64_t op_drain_deadline_us = 0;     // Force-release drain after this deadline
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
     int16_t op_status = 0;
@@ -79,6 +92,7 @@ struct ProxyVfsState {
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
     char local_mount_path[VFS_EXPORT_PATH_LEN] = {};
+    std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
 
     // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
     // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).

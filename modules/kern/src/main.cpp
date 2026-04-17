@@ -19,16 +19,6 @@ extern void (*__fini_array_end[])();       // NOLINT
 
 namespace {
 
-void callGlobalConstructors() {  // NOLINT
-    for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
-        (*ctor)();
-    }
-
-    for (auto* ctor = static_cast<void (**)()>(__init_array_start); ctor < static_cast<void (**)()>(__init_array_end); ++ctor) {
-        (*ctor)();
-    }
-}
-
 void callGlobalDestructors() {  // NOLINT
     for (auto* dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
         --dtor;
@@ -37,6 +27,23 @@ void callGlobalDestructors() {  // NOLINT
 }
 
 }  // namespace
+
+namespace ker::init::fns {
+
+// Called from the init registry after IDT (and KASan shadow paging) are ready.
+// With WOS_KASAN, instrumented global constructors access shadow memory; the
+// page-fault handler must be live first so shadow pages can be demand-allocated.
+void global_ctors_init() {  // NOLINT
+    for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
+        (*ctor)();
+    }
+    for (auto* ctor = static_cast<void (**)()>(__init_array_start); ctor < static_cast<void (**)()>(__init_array_end); ++ctor) {
+        (*ctor)();
+    }
+}
+
+}  // namespace ker::init::fns
+
 __attribute__((used, section(".requests"))) volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);  // NOLINT
 
 // Kernel entry point.
@@ -48,8 +55,10 @@ extern "C" [[noreturn]] void _start(void) {  // NOLINT
         }
     }
 
-    // Initialize C++ runtime
-    callGlobalConstructors();
+    // NOTE: Do NOT call callGlobalConstructors() here.
+    // With WOS_KASAN enabled, instrumented global constructors access shadow
+    // memory, which requires the page-fault handler (IDT) to demand-page shadow
+    // pages.  Global ctors are deferred to after IDT init via the init registry.
     uint64_t rsp = 0;
     asm volatile("mov %%rsp, %0" : "=r"(rsp));
     ker::init::set_kernel_rsp(rsp);

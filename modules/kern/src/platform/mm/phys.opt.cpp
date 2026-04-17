@@ -13,6 +13,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
+#include <sanitizer/kasan.hpp>
 
 #include "page_alloc.hpp"
 #include "platform/mm/addr.hpp"
@@ -413,6 +414,9 @@ auto pageAlloc(uint64_t size) -> void* {
                     }
                 }
                 memset(page, 0, size);
+#ifdef WOS_KASAN
+                if (kasan::is_enabled() && !kasan::in_shadow_fault()) kasan::unpoison_range(page, size);
+#endif
                 if (savedCr3 != 0) {
                     wrcr3(savedCr3);
                 }
@@ -462,6 +466,9 @@ auto pageAlloc(uint64_t size) -> void* {
     }
 
     memset(block, 0, size);
+#ifdef WOS_KASAN
+    if (kasan::is_enabled() && !kasan::in_shadow_fault()) kasan::unpoison_range(block, size);
+#endif
 
     if (savedCr3 != 0) {
         wrcr3(savedCr3);
@@ -497,6 +504,9 @@ auto pageAllocHuge(uint64_t size) -> void* {
     }
 
     memset(block, 0, size);
+#ifdef WOS_KASAN
+    if (kasan::is_enabled() && !kasan::in_shadow_fault()) kasan::unpoison_range(block, size);
+#endif
 
     if (savedCr3 != 0) {
         wrcr3(savedCr3);

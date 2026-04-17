@@ -32,7 +32,7 @@ constexpr size_t MAX_MOUNT_PATH = 512;
 
 // Resolve path through current task's root prefix so mount paths are stored
 // in the same namespace that find_mount_point receives from resolve_task_path_raw.
-// After pivot_root("/rootfs", ...), "/wki/node-xxx" → "/rootfs/wki/node-xxx".
+// After pivot_root("/rootfs", ...), "/wki/node-xxx" -> "/rootfs/wki/node-xxx".
 auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
     size_t path_len = std::strlen(path);
     if (path_len + 1 > outsize) return -1;

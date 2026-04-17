@@ -28,9 +28,13 @@ struct SlabHeader {
 };
 
 template <size_t size>
-struct MemoryBlock {
+struct alignas(16) MemoryBlock {
     uintptr_t slab_ptr;
+    uintptr_t _align_pad;  // padding so data starts at offset 16 (16-byte aligned)
     std::array<char, size> data;
+
+    // Offset from block start to user data (must match actual layout)
+    static constexpr size_t DATA_OFFSET = 16;
 };
 
 template <size_t slab_size, size_t memory_size>

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -29,7 +31,19 @@ struct TmpNode {
     uint32_t mode = 0;  // Permission bits (e.g. 0644 for files, 0755 for dirs)
     uint32_t uid = 0;   // Owner user ID
     uint32_t gid = 0;   // Owner group ID
+
+    // Reference counting for POSIX unlink semantics
+    std::atomic<uint32_t> open_count{0};
+    bool unlinked = false;  // true once removed from parent directory
 };
+
+// Free a TmpNode and its owned buffers. Call only when open_count == 0.
+void tmpfs_free_node(TmpNode* node);
+
+// Serialization — must be held when checking/modifying open_count + unlinked
+// together with tree mutations (unlink, rmdir, rename).
+void tmpfs_lock_tree();
+void tmpfs_unlock_tree();
 
 // Initialization
 void register_tmpfs();

@@ -1,5 +1,7 @@
 #include "exit.hpp"
 
+#include <net/wki/remote_compute.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
@@ -181,7 +183,9 @@ void wos_proc_exit(int status) {
 
         // Free ELF buffer
         if (current_task->elfBuffer != nullptr) {
-            delete[] current_task->elfBuffer;
+            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer)) {
+                delete[] current_task->elfBuffer;
+            }
             current_task->elfBuffer = nullptr;
             current_task->elfBufferSize = 0;
         }
@@ -217,6 +221,10 @@ void wos_proc_exit(int status) {
     // The syscallKernelStack and syscallScratchArea are left intact for now.
     // They will be cleaned up by jumpToNextTask when it moves the task to expiredTasks,
     // and eventually by a garbage collection mechanism.
+
+    // Unlink any WKI wait entries belonging to this task so the timer scan
+    // doesn't dereference freed stack memory after this task's stack is reclaimed.
+    ker::net::wki::wki_wait_cleanup_for_task(current_task);
 
     // TODO: Handle signal handlers cleanup
 

@@ -27,6 +27,7 @@ set(SOURCES
     src/perfbench.cpp
     src/mandelbench/lodepng.cpp
     src/mandelbench/mandelbench.cpp
+    src/mandelbench/mandelbench_wki.cpp
     src/mandelbench/util.cpp
     src/mandelbench/tinycthread.cpp
 )

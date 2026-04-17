@@ -353,4 +353,6 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
     return -WOS_ERESTARTSYS;
 }
 
+auto vfs_is_epoll_file(const File* f) -> bool { return f != nullptr && f->fops == &epoll_fops; }
+
 }  // namespace ker::vfs

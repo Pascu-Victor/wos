@@ -20,6 +20,7 @@ enum class ProcNodeType : uint8_t {
     UPTIME_FILE,    // /proc/uptime
     VERSION_FILE,   // /proc/version
     KPERF_FILE,     // /proc/kperf    -> drain kernel perf ring buffer as text events
+    KWKISTAT_FILE,  // /proc/kwkistat -> recording-scoped WKI summary statistics
     KCPUSTAT_FILE,  // /proc/kcpustat -> per-CPU aggregate scheduler statistics
     KPERFCTL_FILE,  // /proc/kperfctl -> write "enable"/"disable" to control recording
     KCONTSTAT_FILE,      // /proc/kcontstat -> per-subsystem container statistics

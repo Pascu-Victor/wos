@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <platform/sys/spinlock.hpp>
@@ -16,6 +17,13 @@ struct PerfCallsiteInfo {
     uint32_t reserved;
 };
 
+#define WOS_PERF_CALLSITE()                                                                                                       \
+    __extension__({                                                                                                               \
+        static const ::ker::mod::perf::PerfCallsiteInfo __wos_perf_site = {::ker::mod::perf::PERF_CALLSITE_MAGIC, __FILE__,     \
+                                                                            __func__, static_cast<uint32_t>(__LINE__), 0U};       \
+        reinterpret_cast<uint64_t>(&__wos_perf_site);                                                                            \
+    })
+
 // ===========================================================================
 // Event types and flags
 // ===========================================================================
@@ -26,9 +34,10 @@ enum class PerfEventType : uint8_t {
     WAKE = 2,            // Task woken from blocking wait (timer expiry)
     SLEEP = 3,           // Task entering blocking wait (kern_sleep_us / kern_block)
     CONTAINER_STAT = 4,  // Container/data structure operation (insert/remove/resize/OOM)
+    WKI = 5,             // WKI transport or RPC trace event
 };
 
-constexpr size_t PERF_EVENT_TYPE_COUNT = 5;
+constexpr size_t PERF_EVENT_TYPE_COUNT = 6;
 
 // Bitmask for selective event recording
 constexpr uint8_t PERF_MASK_SAMPLE = 1u << 0;
@@ -36,7 +45,9 @@ constexpr uint8_t PERF_MASK_SWITCH = 1u << 1;
 constexpr uint8_t PERF_MASK_WAKE = 1u << 2;
 constexpr uint8_t PERF_MASK_SLEEP = 1u << 3;
 constexpr uint8_t PERF_MASK_CONTAINER = 1u << 4;
-constexpr uint8_t PERF_MASK_ALL = 0x1F;
+constexpr uint8_t PERF_MASK_WKI = 1u << 5;
+constexpr uint8_t PERF_MASK_WKI_LAUNCH = 1u << 6;
+constexpr uint8_t PERF_MASK_ALL = 0x7F;
 
 // Flags for SAMPLE / SWITCH events
 constexpr uint8_t PERF_FLAG_USER_MODE = 0x01;      // (SAMPLE) RIP was in userspace
@@ -54,6 +65,104 @@ constexpr uint8_t PERF_FLAG_CT_RESIZE = 0x04;  // Container resized (rehash, gro
 constexpr uint8_t PERF_FLAG_CT_OOM = 0x08;     // Allocation failure
 constexpr uint8_t PERF_FLAG_CT_SPILL = 0x10;   // SmallVec inline->heap spill
 constexpr uint8_t PERF_FLAG_CT_LOOKUP = 0x20;  // Slow-path lookup (long collision chain)
+
+// Flags for WKI events
+constexpr uint8_t PERF_FLAG_WKI_BEGIN = 0x01;
+constexpr uint8_t PERF_FLAG_WKI_END = 0x02;
+constexpr uint8_t PERF_FLAG_WKI_POINT = 0x04;
+
+enum class WkiPerfScope : uint8_t {
+    NONE = 0,
+    TRANSPORT = 1,
+    REMOTE_VFS = 2,
+    REMOTE_COMPUTE = 3,
+    EVENT_BUS = 4,
+};
+
+enum class WkiPerfPhase : uint8_t {
+    BEGIN = 1,
+    END = 2,
+    POINT = 3,
+};
+
+enum class WkiPerfTransportOp : uint8_t {
+    SEND = 1,
+    ACK_RTT = 2,
+    RETRANSMIT = 3,
+    FAST_RETRANSMIT = 4,
+    NO_CREDITS = 5,
+    WAIT = 6,
+};
+
+enum class WkiPerfVfsOp : uint8_t {
+    ATTACH_WAIT = 1,
+    PROXY_WAIT = 2,
+    OPEN = 3,
+    STAT = 4,
+    READ = 5,
+    READDIR = 6,
+    WRITE = 7,
+    SEEK = 8,
+    TRUNCATE = 9,
+    READLINK = 10,
+    CLOSE = 11,
+    MKDIR = 12,
+    UNLINK = 13,
+    RMDIR = 14,
+    RENAME = 15,
+    RETRY = 16,
+};
+
+enum class WkiPerfComputeOp : uint8_t {
+    SUBMIT_INLINE = 1,
+    SUBMIT_VFS_REF = 2,
+    COMPLETE_WAIT = 3,
+    ACCEPT = 4,
+    REJECT = 5,
+    COMPLETE = 6,
+    PROXY_READY = 7,
+    DEFER_WAIT = 8,
+    LOAD_ELF = 9,
+    HANDLE_SUBMIT = 10,
+    TASK_RUNTIME = 11,
+    PROXY_READY_WAIT = 12,
+    COMPLETE_HOLD = 13,
+};
+
+enum class WkiPerfEventOp : uint8_t {
+    SUBSCRIBE = 1,
+    UNSUBSCRIBE = 2,
+    PUBLISH = 3,
+    ACK = 4,
+    RETRY = 5,
+    REPLAY = 6,
+};
+
+const char* wki_scope_name(WkiPerfScope scope);
+const char* wki_phase_name(WkiPerfPhase phase);
+const char* wki_op_name(WkiPerfScope scope, uint8_t op);
+
+constexpr size_t WKI_PERF_SUMMARY_BUCKETS = 256;
+constexpr size_t WKI_PERF_HIST_BUCKETS = 32;
+
+struct WkiPerfSummarySnapshot {
+    uint8_t scope;
+    uint8_t op;
+    uint16_t peer;
+    uint16_t channel;
+    uint16_t reserved;
+    uint64_t calls;
+    uint64_t errors;
+    uint64_t retries;
+    uint64_t bytes;
+    uint64_t total_latency_us;
+    uint32_t max_latency_us;
+    uint32_t p95_us;
+    uint32_t p99_us;
+    uint32_t p999_us;
+    uint32_t p9999_us;
+    uint32_t p99999_us;
+};
 
 // ===========================================================================
 // Subsystem identifiers for CONTAINER_STAT events
@@ -216,8 +325,23 @@ PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem);
 void set_event_mask(uint8_t mask);
 uint8_t get_event_mask();
 
+bool is_wki_recording_enabled();
+
+uint64_t wki_pack_event_data(WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel);
+void wki_unpack_event_data(uint64_t data, WkiPerfScope& scope, uint8_t& op, WkiPerfPhase& phase, uint16_t& peer, uint16_t& channel);
+uint64_t wki_pack_trace_state(uint32_t correlation, int32_t status);
+uint32_t wki_unpack_trace_correlation(int64_t packed);
+int32_t wki_unpack_trace_status(int64_t packed);
+
+uint32_t next_wki_trace_correlation();
+void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel,
+                      uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite);
+void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us,
+                        bool has_latency, uint32_t retries, uint64_t bytes);
+size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max);
+
 // Parse a comma-separated event type string into a mask.
-// Recognized names: sample, switch, wake, sleep, container
+// Recognized names: sample, switch, wake, sleep, container, wki, wki_launch
 // Returns 0 on parse error.
 uint8_t parse_event_mask(const char* str, size_t len);
 

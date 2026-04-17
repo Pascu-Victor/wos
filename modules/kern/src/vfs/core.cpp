@@ -1,19 +1,24 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
+#include <memory>
 #include <mod/io/serial/serial.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
@@ -51,6 +56,7 @@ constexpr size_t WKI_PATH_PREFIX_LEN = 5;
 auto make_absolute(const char* path, char* out, size_t outsize) -> int;
 auto canonicalize_path(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
+auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
 
 ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
 
@@ -58,6 +64,856 @@ struct VfsRouteDecision {
     uint8_t route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
     size_t prefix_len = 0;
 };
+
+constexpr size_t STREAM_CHUNK_SIZE = 65536;
+constexpr size_t STREAM_ENTRY_BYTE_CAP = 8 * 1024 * 1024;
+constexpr size_t STREAM_DETACHED_REUSE_MAX = 8 * 1024 * 1024;
+constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
+constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
+constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = 2 * 1024 * 1024;
+
+struct StreamFreshnessStamp {
+    off_t size = 0;
+    int64_t mtime_sec = 0;
+    int64_t mtime_nsec = 0;
+    int64_t ctime_sec = 0;
+    int64_t ctime_nsec = 0;
+    bool valid = false;
+};
+
+struct StreamCacheIdentity {
+    const void* scope_key = nullptr;
+    FSType fs_type = FSType::TMPFS;
+    ino_t ino = 0;
+};
+
+struct StreamChunk {
+    uint64_t offset = 0;
+    uint32_t size = 0;
+    std::array<uint8_t, STREAM_CHUNK_SIZE> data = {};
+};
+
+struct StreamCacheEntry;
+struct StreamIsland;
+
+struct StreamReaderAttachment {
+    StreamCacheEntry* entry = nullptr;
+    StreamIsland* island = nullptr;
+    uint64_t desired_offset = 0;
+    StreamReaderAttachment* prev = nullptr;
+    StreamReaderAttachment* next = nullptr;
+};
+
+struct StreamIsland {
+    bool retired = false;
+    bool eof = false;
+    bool producer_active = false;
+    int error = 0;
+    uint64_t next_fetch_offset = 0;
+    uint64_t last_access_us = 0;
+    StreamReaderAttachment* readers = nullptr;
+    std::deque<std::unique_ptr<StreamChunk>> chunks;
+};
+
+struct StreamCacheEntry {
+    StreamCacheIdentity identity = {};
+    StreamFreshnessStamp freshness = {};
+    bool can_reuse_detached = false;
+    bool retain_full_file = false;
+    uint64_t last_used_us = 0;
+    size_t cached_bytes = 0;
+    std::deque<std::unique_ptr<StreamIsland>> islands;
+};
+
+std::deque<std::unique_ptr<StreamCacheEntry>> g_stream_cache;
+ker::mod::sys::Mutex g_stream_cache_lock;
+
+auto stream_now_us() -> uint64_t { return ker::mod::time::getUs(); }
+
+auto stream_identity_equals(const StreamCacheIdentity& lhs, const StreamCacheIdentity& rhs) -> bool {
+    return lhs.scope_key == rhs.scope_key && lhs.fs_type == rhs.fs_type && lhs.ino == rhs.ino;
+}
+
+auto stream_stat_has_freshness(const stat& st) -> bool {
+    return st.st_mtim.tv_sec != 0 || st.st_mtim.tv_nsec != 0 || st.st_ctim.tv_sec != 0 || st.st_ctim.tv_nsec != 0;
+}
+
+auto stream_capture_freshness(const stat& st) -> StreamFreshnessStamp {
+    StreamFreshnessStamp stamp = {};
+    stamp.size = st.st_size;
+    stamp.mtime_sec = st.st_mtim.tv_sec;
+    stamp.mtime_nsec = st.st_mtim.tv_nsec;
+    stamp.ctime_sec = st.st_ctim.tv_sec;
+    stamp.ctime_nsec = st.st_ctim.tv_nsec;
+    stamp.valid = stream_stat_has_freshness(st);
+    return stamp;
+}
+
+auto stream_freshness_matches(const StreamFreshnessStamp& stamp, const stat& st) -> bool {
+    if (!stamp.valid) {
+        return false;
+    }
+
+    return stamp.size == st.st_size && stamp.mtime_sec == st.st_mtim.tv_sec && stamp.mtime_nsec == st.st_mtim.tv_nsec &&
+           stamp.ctime_sec == st.st_ctim.tv_sec && stamp.ctime_nsec == st.st_ctim.tv_nsec;
+}
+
+auto stream_island_start(const StreamIsland* island) -> uint64_t {
+    if (island == nullptr || island->chunks.empty()) {
+        return (island != nullptr) ? island->next_fetch_offset : 0;
+    }
+    return island->chunks.front()->offset;
+}
+
+auto stream_island_end(const StreamIsland* island) -> uint64_t {
+    if (island == nullptr || island->chunks.empty()) {
+        return (island != nullptr) ? island->next_fetch_offset : 0;
+    }
+    const auto* back = island->chunks.back().get();
+    return back->offset + back->size;
+}
+
+auto stream_island_span(const StreamIsland* island) -> uint64_t {
+    uint64_t start = stream_island_start(island);
+    uint64_t end = stream_island_end(island);
+    return (end > start) ? (end - start) : 0;
+}
+
+auto stream_island_reader_count(const StreamIsland* island) -> size_t {
+    size_t count = 0;
+    for (auto* reader = (island != nullptr) ? island->readers : nullptr; reader != nullptr; reader = reader->next) {
+        count++;
+    }
+    return count;
+}
+
+auto stream_island_slowest_offset(const StreamIsland* island) -> uint64_t {
+    uint64_t slowest = stream_island_end(island);
+    bool seen = false;
+    for (auto* reader = (island != nullptr) ? island->readers : nullptr; reader != nullptr; reader = reader->next) {
+        if (!seen || reader->desired_offset < slowest) {
+            slowest = reader->desired_offset;
+            seen = true;
+        }
+    }
+
+    if (!seen) {
+        return stream_island_end(island);
+    }
+    return slowest;
+}
+
+void stream_unlink_attachment(StreamReaderAttachment* attachment) {
+    if (attachment == nullptr || attachment->island == nullptr) {
+        return;
+    }
+
+    auto* island = attachment->island;
+    if (attachment->prev != nullptr) {
+        attachment->prev->next = attachment->next;
+    } else {
+        island->readers = attachment->next;
+    }
+    if (attachment->next != nullptr) {
+        attachment->next->prev = attachment->prev;
+    }
+
+    attachment->prev = nullptr;
+    attachment->next = nullptr;
+    attachment->island = nullptr;
+}
+
+void stream_link_attachment(StreamReaderAttachment* attachment, StreamIsland* island, uint64_t offset) {
+    if (attachment == nullptr) {
+        return;
+    }
+
+    if (attachment->island == island) {
+        attachment->desired_offset = offset;
+        return;
+    }
+
+    stream_unlink_attachment(attachment);
+    attachment->desired_offset = offset;
+    attachment->island = island;
+    if (island == nullptr) {
+        return;
+    }
+
+    attachment->next = island->readers;
+    if (island->readers != nullptr) {
+        island->readers->prev = attachment;
+    }
+    island->readers = attachment;
+}
+
+auto stream_entry_has_readers(const StreamCacheEntry* entry) -> bool {
+    if (entry == nullptr) {
+        return false;
+    }
+
+    for (const auto& island : entry->islands) {
+        if (island != nullptr && island->readers != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto stream_entry_is_fully_cached(const StreamCacheEntry* entry) -> bool {
+    if (entry == nullptr || !entry->retain_full_file || entry->freshness.size <= 0) {
+        return false;
+    }
+
+    for (const auto& island : entry->islands) {
+        if (island == nullptr || island->retired || !island->eof) {
+            continue;
+        }
+        if (stream_island_start(island.get()) == 0 && stream_island_end(island.get()) >= static_cast<uint64_t>(entry->freshness.size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto stream_entry_should_keep_detached(const StreamCacheEntry* entry, uint64_t now_us) -> bool {
+    if (entry == nullptr || stream_entry_has_readers(entry)) {
+        return false;
+    }
+    if (!entry->can_reuse_detached || !entry->retain_full_file || !stream_entry_is_fully_cached(entry)) {
+        return false;
+    }
+    return (now_us - entry->last_used_us) <= STREAM_DETACHED_TTL_US;
+}
+
+void stream_gc_locked(uint64_t now_us) {
+    for (auto entry_it = g_stream_cache.begin(); entry_it != g_stream_cache.end();) {
+        auto* entry = entry_it->get();
+        for (auto island_it = entry->islands.begin(); island_it != entry->islands.end();) {
+            auto* island = island_it->get();
+            if (island->retired && island->readers == nullptr && !island->producer_active) {
+                island_it = entry->islands.erase(island_it);
+            } else {
+                ++island_it;
+            }
+        }
+
+        if (!stream_entry_should_keep_detached(entry, now_us)) {
+            if (!stream_entry_has_readers(entry)) {
+                entry_it = g_stream_cache.erase(entry_it);
+                continue;
+            }
+        }
+        ++entry_it;
+    }
+}
+
+auto stream_find_entry_locked(const StreamCacheIdentity& identity) -> StreamCacheEntry* {
+    for (auto& entry : g_stream_cache) {
+        if (entry != nullptr && stream_identity_equals(entry->identity, identity)) {
+            return entry.get();
+        }
+    }
+    return nullptr;
+}
+
+auto stream_find_island_locked(StreamCacheEntry* entry, uint64_t offset) -> StreamIsland* {
+    StreamIsland* best = nullptr;
+    uint64_t best_gap = UINT64_MAX;
+
+    for (auto& island : entry->islands) {
+        if (island == nullptr || island->retired) {
+            continue;
+        }
+
+        uint64_t start = stream_island_start(island.get());
+        uint64_t end = stream_island_end(island.get());
+        if (offset >= start && offset <= end) {
+            return island.get();
+        }
+
+        if (!island->eof && offset > end) {
+            uint64_t gap = offset - end;
+            if (gap <= STREAM_CHUNK_SIZE && gap < best_gap) {
+                best = island.get();
+                best_gap = gap;
+            }
+        }
+    }
+
+    return best;
+}
+
+void stream_retire_island_locked(StreamCacheEntry* entry, StreamIsland* island) {
+    if (entry == nullptr || island == nullptr || island->retired) {
+        return;
+    }
+
+    island->retired = true;
+    island->eof = false;
+    island->error = 0;
+    if (!island->producer_active) {
+        for (const auto& chunk : island->chunks) {
+            if (chunk != nullptr) {
+                entry->cached_bytes -= chunk->size;
+            }
+        }
+        island->chunks.clear();
+    }
+}
+
+void stream_trim_island_front_locked(StreamCacheEntry* entry, StreamIsland* island) {
+    if (entry == nullptr || island == nullptr || entry->retain_full_file || island->chunks.empty()) {
+        return;
+    }
+
+    uint64_t slowest = stream_island_slowest_offset(island);
+    while (!island->chunks.empty()) {
+        auto* chunk = island->chunks.front().get();
+        uint64_t chunk_end = chunk->offset + chunk->size;
+        if (chunk_end > slowest) {
+            break;
+        }
+
+        entry->cached_bytes -= chunk->size;
+        island->chunks.pop_front();
+    }
+}
+
+void stream_enforce_entry_cap_locked(StreamCacheEntry* entry, uint64_t preferred_offset) {
+    if (entry == nullptr) {
+        return;
+    }
+
+    for (auto& island : entry->islands) {
+        if (island != nullptr) {
+            stream_trim_island_front_locked(entry, island.get());
+        }
+    }
+
+    while (entry->cached_bytes > STREAM_ENTRY_BYTE_CAP) {
+        StreamIsland* candidate = nullptr;
+        uint64_t candidate_distance = 0;
+        bool prefer_unread = false;
+
+        for (auto& island : entry->islands) {
+            if (island == nullptr || island->retired) {
+                continue;
+            }
+
+            uint64_t center = stream_island_start(island.get()) + (stream_island_span(island.get()) / 2);
+            uint64_t distance = (preferred_offset > center) ? (preferred_offset - center) : (center - preferred_offset);
+            bool unread = stream_island_reader_count(island.get()) == 0;
+
+            if (candidate == nullptr || (unread && !prefer_unread) || (unread == prefer_unread && distance > candidate_distance)) {
+                candidate = island.get();
+                candidate_distance = distance;
+                prefer_unread = unread;
+            }
+        }
+
+        if (candidate == nullptr) {
+            break;
+        }
+
+        stream_retire_island_locked(entry, candidate);
+
+        bool removed_any = false;
+        for (auto island_it = entry->islands.begin(); island_it != entry->islands.end();) {
+            auto* island = island_it->get();
+            if (island->retired && island->readers == nullptr && !island->producer_active) {
+                island_it = entry->islands.erase(island_it);
+                removed_any = true;
+            } else {
+                ++island_it;
+            }
+        }
+
+        if (!removed_any) {
+            break;
+        }
+    }
+}
+
+void stream_ensure_island_budget_locked(StreamCacheEntry* entry, uint64_t preferred_offset) {
+    size_t active_islands = 0;
+    for (const auto& island : entry->islands) {
+        if (island != nullptr && !island->retired) {
+            active_islands++;
+        }
+    }
+
+    while (active_islands >= STREAM_MAX_ACTIVE_ISLANDS) {
+        StreamIsland* candidate = nullptr;
+        uint64_t candidate_distance = 0;
+        bool prefer_unread = false;
+
+        for (auto& island : entry->islands) {
+            if (island == nullptr || island->retired) {
+                continue;
+            }
+
+            uint64_t center = stream_island_start(island.get()) + (stream_island_span(island.get()) / 2);
+            uint64_t distance = (preferred_offset > center) ? (preferred_offset - center) : (center - preferred_offset);
+            bool unread = stream_island_reader_count(island.get()) == 0;
+            if (candidate == nullptr || (unread && !prefer_unread) || (unread == prefer_unread && distance > candidate_distance)) {
+                candidate = island.get();
+                candidate_distance = distance;
+                prefer_unread = unread;
+            }
+        }
+
+        if (candidate == nullptr) {
+            break;
+        }
+
+        stream_retire_island_locked(entry, candidate);
+        active_islands--;
+    }
+}
+
+auto stream_create_island_locked(StreamCacheEntry* entry, uint64_t offset) -> StreamIsland* {
+    if (entry == nullptr) {
+        return nullptr;
+    }
+
+    stream_ensure_island_budget_locked(entry, offset);
+    entry->islands.push_back(std::make_unique<StreamIsland>());
+    auto* island = entry->islands.back().get();
+    island->next_fetch_offset = offset;
+    island->last_access_us = stream_now_us();
+    return island;
+}
+
+void stream_reset_entry_locked(StreamCacheEntry* entry) {
+    if (entry == nullptr) {
+        return;
+    }
+
+    entry->cached_bytes = 0;
+    for (auto& island : entry->islands) {
+        if (island == nullptr) {
+            continue;
+        }
+        island->retired = true;
+        island->eof = false;
+        island->error = 0;
+        island->chunks.clear();
+        if (island->readers == nullptr && !island->producer_active) {
+            island.reset();
+        }
+    }
+    std::erase_if(entry->islands, [](const std::unique_ptr<StreamIsland>& island) { return island == nullptr; });
+}
+
+auto stream_scope_key_for_mount(const MountPoint* mount) -> const void* {
+    if (mount == nullptr) {
+        return nullptr;
+    }
+    if (mount->fs_type == FSType::REMOTE) {
+        return mount->private_data;
+    }
+    return mount;
+}
+
+auto vfs_stream_cache_get_file_stat(File* file, stat* statbuf) -> int {
+    if (file == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    std::memset(statbuf, 0, sizeof(stat));
+
+    switch (file->fs_type) {
+        case FSType::TMPFS: {
+            // Pipes and epoll reuse FSType::TMPFS but private_data is not a TmpNode
+            if (file->fops != ker::vfs::tmpfs::get_tmpfs_fops()) {
+                return -ENOSYS;
+            }
+            auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
+            if (node == nullptr) {
+                return -EBADF;
+            }
+            statbuf->st_dev = 0;
+            statbuf->st_ino = reinterpret_cast<ino_t>(node);
+            statbuf->st_nlink = 1;
+            statbuf->st_uid = node->uid;
+            statbuf->st_gid = node->gid;
+            statbuf->st_rdev = 0;
+            statbuf->st_size = static_cast<off_t>(node->size);
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = (node->size + 511) / 512;
+            switch (node->type) {
+                case ker::vfs::tmpfs::TmpNodeType::FILE:
+                    statbuf->st_mode = S_IFREG | node->mode;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
+                    statbuf->st_mode = S_IFDIR | node->mode;
+                    break;
+                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
+                    statbuf->st_mode = S_IFLNK | node->mode;
+                    break;
+            }
+            return 0;
+        }
+        case FSType::FAT32:
+            return ker::vfs::fat32::fat32_fstat(file, statbuf);
+        case FSType::DEVFS:
+        case FSType::SOCKET:
+        case FSType::PROCFS:
+            return -ENOSYS;
+        case FSType::REMOTE: {
+            if (file->vfs_path == nullptr) {
+                return -ENOENT;
+            }
+            MountPoint* mount = find_mount_point(file->vfs_path);
+            if (mount == nullptr || mount->fs_type != FSType::REMOTE) {
+                return -ENOENT;
+            }
+            const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
+            return ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
+        }
+        case FSType::XFS:
+            return ker::vfs::xfs::xfs_fstat(file, statbuf);
+        default:
+            return -ENOSYS;
+    }
+}
+
+auto stream_build_identity(File* file, const stat& statbuf, StreamCacheIdentity* identity, StreamFreshnessStamp* stamp,
+                           bool* can_reuse_detached, bool* retain_full_file) -> int {
+    if (file == nullptr || file->vfs_path == nullptr || identity == nullptr) {
+        return -EINVAL;
+    }
+
+    MountPoint* mount = find_mount_point(file->vfs_path);
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+
+    const auto mode = static_cast<mode_t>(statbuf.st_mode & S_IFMT);
+    if (mode != S_IFREG) {
+        return -ENOTSUP;
+    }
+    if ((file->open_flags & 3) != 0) {
+        return -EACCES;
+    }
+
+    identity->scope_key = stream_scope_key_for_mount(mount);
+    identity->fs_type = mount->fs_type;
+    identity->ino = statbuf.st_ino;
+
+    if (identity->scope_key == nullptr || identity->ino == 0) {
+        return -ENOSYS;
+    }
+
+    if (stamp != nullptr) {
+        *stamp = stream_capture_freshness(statbuf);
+    }
+    if (can_reuse_detached != nullptr) {
+        *can_reuse_detached = stream_stat_has_freshness(statbuf);
+    }
+    if (retain_full_file != nullptr) {
+        *retain_full_file = stream_stat_has_freshness(statbuf) && statbuf.st_size > 0 &&
+                            static_cast<uint64_t>(statbuf.st_size) <= STREAM_DETACHED_REUSE_MAX;
+    }
+
+    return 0;
+}
+
+auto stream_copy_available_locked(StreamReaderAttachment* attachment, uint64_t offset, uint8_t* dst, size_t len) -> size_t {
+    if (attachment == nullptr || attachment->island == nullptr || attachment->island->retired) {
+        return 0;
+    }
+
+    size_t total = 0;
+    uint64_t cursor = offset;
+    for (const auto& chunk : attachment->island->chunks) {
+        if (chunk == nullptr) {
+            continue;
+        }
+        uint64_t chunk_end = chunk->offset + chunk->size;
+        if (cursor >= chunk_end) {
+            continue;
+        }
+        if (cursor < chunk->offset) {
+            break;
+        }
+
+        size_t in_chunk = static_cast<size_t>(cursor - chunk->offset);
+        size_t available = chunk->size - in_chunk;
+        size_t to_copy = std::min(len - total, available);
+        std::memcpy(dst + total, chunk->data.data() + in_chunk, to_copy);
+        total += to_copy;
+        cursor += to_copy;
+        if (total == len) {
+            break;
+        }
+    }
+    return total;
+}
+
+auto stream_select_island_locked(StreamReaderAttachment* attachment, uint64_t offset) -> StreamIsland* {
+    if (attachment == nullptr || attachment->entry == nullptr) {
+        return nullptr;
+    }
+
+    auto* entry = attachment->entry;
+    auto* current = attachment->island;
+    if (current != nullptr && !current->retired) {
+        uint64_t start = stream_island_start(current);
+        uint64_t end = stream_island_end(current);
+        if ((offset >= start && offset <= end) || (!current->eof && offset >= end && (offset - end) <= STREAM_CHUNK_SIZE)) {
+            stream_link_attachment(attachment, current, offset);
+            return current;
+        }
+
+        if (!entry->retain_full_file && stream_island_reader_count(current) > 1) {
+            uint64_t slowest = stream_island_slowest_offset(current);
+            if (offset > slowest && (offset - slowest) > STREAM_SPLIT_DISTANCE_BYTES) {
+                auto* new_island = stream_create_island_locked(entry, offset);
+                stream_link_attachment(attachment, new_island, offset);
+                return new_island;
+            }
+        }
+    }
+
+    if (auto* existing = stream_find_island_locked(entry, offset); existing != nullptr) {
+        stream_link_attachment(attachment, existing, offset);
+        return existing;
+    }
+
+    auto* island = stream_create_island_locked(entry, offset);
+    stream_link_attachment(attachment, island, offset);
+    return island;
+}
+
+auto stream_attach_file(File* file) -> StreamReaderAttachment* {
+    if (file == nullptr) {
+        return nullptr;
+    }
+
+    auto* existing = static_cast<StreamReaderAttachment*>(file->stream_cache_attachment);
+    if (existing != nullptr) {
+        return existing;
+    }
+
+    stat st = {};
+    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
+        return nullptr;
+    }
+
+    StreamCacheIdentity identity = {};
+    StreamFreshnessStamp freshness = {};
+    bool can_reuse_detached = false;
+    bool retain_full_file = false;
+    if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
+        return nullptr;
+    }
+
+    auto* attachment = new StreamReaderAttachment;
+    attachment->desired_offset = static_cast<uint64_t>(file->pos);
+
+    uint64_t now_us = stream_now_us();
+    g_stream_cache_lock.lock();
+    stream_gc_locked(now_us);
+
+    StreamCacheEntry* entry = stream_find_entry_locked(identity);
+    if (entry == nullptr) {
+        g_stream_cache.push_back(std::make_unique<StreamCacheEntry>());
+        entry = g_stream_cache.back().get();
+        entry->identity = identity;
+        entry->freshness = freshness;
+        entry->can_reuse_detached = can_reuse_detached;
+        entry->retain_full_file = retain_full_file;
+        entry->last_used_us = now_us;
+    } else if (!stream_entry_has_readers(entry)) {
+        if (!stream_entry_should_keep_detached(entry, now_us) || !stream_freshness_matches(entry->freshness, st)) {
+            stream_reset_entry_locked(entry);
+            entry->freshness = freshness;
+            entry->can_reuse_detached = can_reuse_detached;
+            entry->retain_full_file = retain_full_file;
+        }
+        entry->last_used_us = now_us;
+    }
+
+    attachment->entry = entry;
+    file->stream_cache_attachment = attachment;
+    g_stream_cache_lock.unlock();
+    return attachment;
+}
+
+void stream_detach_file(File* file) {
+    if (file == nullptr || file->stream_cache_attachment == nullptr) {
+        return;
+    }
+
+    auto* attachment = static_cast<StreamReaderAttachment*>(file->stream_cache_attachment);
+    file->stream_cache_attachment = nullptr;
+
+    g_stream_cache_lock.lock();
+    stream_unlink_attachment(attachment);
+    stream_gc_locked(stream_now_us());
+    g_stream_cache_lock.unlock();
+
+    delete attachment;
+}
+
+void stream_invalidate_identity_locked(const StreamCacheIdentity& identity) {
+    auto* entry = stream_find_entry_locked(identity);
+    if (entry == nullptr) {
+        return;
+    }
+
+    stream_reset_entry_locked(entry);
+    entry->last_used_us = stream_now_us();
+}
+
+void stream_invalidate_file(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr) {
+        return;
+    }
+
+    stat st = {};
+    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
+        return;
+    }
+
+    StreamCacheIdentity identity = {};
+    if (stream_build_identity(file, st, &identity, nullptr, nullptr, nullptr) != 0) {
+        return;
+    }
+
+    g_stream_cache_lock.lock();
+    stream_invalidate_identity_locked(identity);
+    stream_gc_locked(stream_now_us());
+    g_stream_cache_lock.unlock();
+}
+
+void stream_invalidate_scope_locked(FSType fs_type, const void* scope_key) {
+    if (scope_key == nullptr) {
+        return;
+    }
+
+    for (auto& entry : g_stream_cache) {
+        if (entry != nullptr && entry->identity.fs_type == fs_type && entry->identity.scope_key == scope_key) {
+            stream_reset_entry_locked(entry.get());
+        }
+    }
+}
+
+void stream_invalidate_mount_scope(FSType fs_type, const void* scope_key) {
+    g_stream_cache_lock.lock();
+    stream_invalidate_scope_locked(fs_type, scope_key);
+    stream_gc_locked(stream_now_us());
+    g_stream_cache_lock.unlock();
+}
+
+auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actual_size, ssize_t* result) -> bool {
+    if (result == nullptr || file == nullptr || buf == nullptr || count == 0 || file->fops == nullptr || file->fops->vfs_read == nullptr) {
+        return false;
+    }
+
+    auto* attachment = stream_attach_file(file);
+    if (attachment == nullptr || attachment->entry == nullptr) {
+        return false;
+    }
+
+    auto* dst = static_cast<uint8_t*>(buf);
+    size_t total = 0;
+
+    while (total < count) {
+        uint64_t offset = static_cast<uint64_t>(file->pos) + total;
+
+        g_stream_cache_lock.lock();
+        auto* island = stream_select_island_locked(attachment, offset);
+        if (island == nullptr) {
+            g_stream_cache_lock.unlock();
+            break;
+        }
+
+        attachment->entry->last_used_us = stream_now_us();
+        island->last_access_us = attachment->entry->last_used_us;
+
+        size_t copied = stream_copy_available_locked(attachment, offset, dst + total, count - total);
+        if (copied > 0) {
+            attachment->desired_offset = offset + copied;
+            stream_trim_island_front_locked(attachment->entry, island);
+            stream_enforce_entry_cap_locked(attachment->entry, attachment->desired_offset);
+            g_stream_cache_lock.unlock();
+            total += copied;
+            continue;
+        }
+
+        if (island->error != 0) {
+            int err = island->error;
+            g_stream_cache_lock.unlock();
+            if (total == 0) {
+                *result = err;
+                return true;
+            }
+            break;
+        }
+
+        uint64_t end = stream_island_end(island);
+        if (island->eof && offset >= end) {
+            g_stream_cache_lock.unlock();
+            break;
+        }
+
+        if (island->producer_active) {
+            g_stream_cache_lock.unlock();
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+
+        uint64_t fetch_offset = (offset > island->next_fetch_offset) ? offset : island->next_fetch_offset;
+        island->producer_active = true;
+        g_stream_cache_lock.unlock();
+
+        auto chunk = std::make_unique<StreamChunk>();
+        chunk->offset = fetch_offset;
+        ssize_t read_ret = file->fops->vfs_read(file, chunk->data.data(), STREAM_CHUNK_SIZE, static_cast<size_t>(fetch_offset));
+
+        g_stream_cache_lock.lock();
+        island->producer_active = false;
+        if (read_ret > 0) {
+            chunk->size = static_cast<uint32_t>(read_ret);
+            island->next_fetch_offset = fetch_offset + chunk->size;
+            attachment->entry->cached_bytes += chunk->size;
+            island->chunks.push_back(std::move(chunk));
+            if (attachment->entry->freshness.size > 0 &&
+                island->next_fetch_offset >= static_cast<uint64_t>(attachment->entry->freshness.size)) {
+                island->eof = true;
+            }
+            if (!attachment->entry->retain_full_file) {
+                stream_trim_island_front_locked(attachment->entry, island);
+            }
+            stream_enforce_entry_cap_locked(attachment->entry, offset);
+        } else if (read_ret == 0) {
+            island->eof = true;
+        } else {
+            island->error = static_cast<int>(read_ret);
+        }
+        g_stream_cache_lock.unlock();
+
+        if (read_ret < 0) {
+            if (total == 0) {
+                *result = read_ret;
+                return true;
+            }
+            break;
+        }
+        if (read_ret == 0) {
+            break;
+        }
+    }
+
+    if (actual_size != nullptr) {
+        *actual_size = total;
+    }
+    *result = static_cast<ssize_t>(total);
+    return true;
+}
 
 auto copy_path_string(const char* src, char* dst, size_t dst_size) -> int {
     if (src == nullptr || dst == nullptr || dst_size == 0) {
@@ -180,6 +1036,7 @@ auto create_synthetic_mount_dir_file(const char* path, FSType fs_type) -> File* 
     file->fd_flags = 0;
     file->vfs_path = nullptr;
     file->dir_fs_count = static_cast<size_t>(-1);
+    file->stream_cache_attachment = nullptr;
     return file;
 }
 
@@ -1369,15 +2226,19 @@ auto vfs_close(int fd) -> int {
         return -EBADF;
     }
 
-    // Decrement reference count
-    f->refcount--;
-
-    // Release the FD from the task's file descriptor table
+    // Remove the FD from the task's file descriptor table first so that
+    // another CPU racing to close the same shared fd won't find it valid.
     vfs_release_fd(t, fd);
     t->clear_fd_cloexec(static_cast<unsigned>(fd));
 
-    // Only call close and free if no more references
-    if (f->refcount <= 0) {
+    // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
+    if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
+        return 0;
+    }
+
+    // Last reference gone: destroy the file.
+    {
+        stream_detach_file(f);
         if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
             f->fops->vfs_close(f);
         }
@@ -1406,6 +2267,15 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
         return -EINVAL;
     }
+
+    ssize_t cached_result = 0;
+    if (vfs_stream_cache_try_read(f, buf, count, actual_size, &cached_result)) {
+        if (cached_result >= 0) {
+            f->pos += cached_result;
+        }
+        return cached_result;
+    }
+
     ssize_t r = f->fops->vfs_read(f, buf, count, (size_t)f->pos);
     if (r >= 0) {
         f->pos += r;
@@ -1431,6 +2301,7 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     }
     ssize_t r = f->fops->vfs_write(f, buf, count, (size_t)f->pos);
     if (r >= 0) {
+        stream_invalidate_file(f);
         f->pos += r;
         if (actual_size != nullptr) {
             *actual_size = static_cast<size_t>(r);
@@ -1971,7 +2842,7 @@ auto vfs_stat(const char* path, stat* statbuf) -> int {
     }
 
     // WOSLINK detection: compute canonical pre-rewrite path to detect /wki
-    // entries before resolve_task_path_raw rewrites them (e.g., /wki/host → /).
+    // entries before resolve_task_path_raw rewrites them (e.g., /wki/host -> /).
     bool is_wki_entry = false;
     {
         char pre_rewrite[MAX_PATH_LEN] = {};
@@ -2199,6 +3070,13 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
 
     switch (file->fs_type) {
         case FSType::TMPFS: {
+            // Pipes and epoll reuse FSType::TMPFS but private_data is not a TmpNode
+            if (file->fops != ker::vfs::tmpfs::get_tmpfs_fops()) {
+                // Return minimal stat for pseudo-TMPFS (pipes, epoll)
+                statbuf->st_mode = S_IFIFO;
+                statbuf->st_blksize = 4096;
+                return 0;
+            }
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
             if (node == nullptr) {
                 return -EBADF;
@@ -2306,6 +3184,10 @@ auto vfs_umount(const char* target) -> int {
     char resolved[MAX_PATH_LEN];
     if (resolve_task_path_raw(target, resolved, MAX_PATH_LEN) < 0) {
         return -ENAMETOOLONG;
+    }
+
+    if (MountPoint* mount = find_mount_point(resolved); mount != nullptr) {
+        stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));
     }
     return unmount_filesystem(resolved);
 }
@@ -2441,10 +3323,10 @@ auto vfs_dup(int oldfd) -> int {
     if (task == nullptr) return -ESRCH;
     auto* f = vfs_get_file(task, oldfd);
     if (f == nullptr) return -EBADF;
-    f->refcount++;
+    f->refcount.fetch_add(1, std::memory_order_relaxed);
     int newfd = vfs_alloc_fd(task, f);
     if (newfd < 0) {
-        f->refcount--;
+        f->refcount.fetch_sub(1, std::memory_order_relaxed);
         return -EMFILE;
     }
     return newfd;
@@ -2462,7 +3344,7 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     if (existing != nullptr) {
         vfs_close(newfd);
     }
-    f->refcount++;
+    f->refcount.fetch_add(1, std::memory_order_relaxed);
     task->fd_table.insert(static_cast<uint64_t>(newfd), f);
     // POSIX: dup2 does NOT inherit close-on-exec from the source fd
     task->clear_fd_cloexec(static_cast<unsigned>(newfd));
@@ -2638,6 +3520,8 @@ auto vfs_unlink(const char* path) -> int {
     if (child == nullptr) return -ENOENT;
     if (child->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -EISDIR;
 
+    // Hold tmpfs tree lock to serialize with open_count increment in tmpfs_open_path
+    ker::vfs::tmpfs::tmpfs_lock_tree();
     // Remove child from parent's children array
     for (size_t i = 0; i < parent->children_count; ++i) {
         if (parent->children[i] == child) {
@@ -2647,13 +3531,18 @@ auto vfs_unlink(const char* path) -> int {
             }
             parent->children_count--;
             parent->children[parent->children_count] = nullptr;
-            // Free node data
-            delete[] child->data;
-            delete[] child->symlink_target;
-            delete child;
+            child->parent = nullptr;
+            // POSIX: defer freeing if file handles are still open
+            if (child->open_count.load(std::memory_order_acquire) > 0) {
+                child->unlinked = true;
+            } else {
+                ker::vfs::tmpfs::tmpfs_free_node(child);
+            }
+            ker::vfs::tmpfs::tmpfs_unlock_tree();
             return 0;
         }
     }
+    ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
 }
 
@@ -2709,6 +3598,7 @@ auto vfs_rmdir(const char* path) -> int {
     if (child->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -ENOTDIR;
     if (child->children_count > 0) return -ENOTEMPTY;
 
+    ker::vfs::tmpfs::tmpfs_lock_tree();
     for (size_t i = 0; i < parent->children_count; ++i) {
         if (parent->children[i] == child) {
             for (size_t j = i; j + 1 < parent->children_count; ++j) {
@@ -2716,11 +3606,17 @@ auto vfs_rmdir(const char* path) -> int {
             }
             parent->children_count--;
             parent->children[parent->children_count] = nullptr;
-            delete[] child->children;
-            delete child;
+            child->parent = nullptr;
+            if (child->open_count.load(std::memory_order_acquire) > 0) {
+                child->unlinked = true;
+            } else {
+                ker::vfs::tmpfs::tmpfs_free_node(child);
+            }
+            ker::vfs::tmpfs::tmpfs_unlock_tree();
             return 0;
         }
     }
+    ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
 }
 
@@ -2792,6 +3688,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (newParent == nullptr || newName == nullptr || *newName == '\0') return -ENOENT;
 
     // If destination exists, remove it
+    ker::vfs::tmpfs::tmpfs_lock_tree();
     auto* existing = ker::vfs::tmpfs::tmpfs_lookup(newParent, newName);
     if (existing != nullptr) {
         // Remove existing from parent
@@ -2802,10 +3699,12 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
                 }
                 newParent->children_count--;
                 newParent->children[newParent->children_count] = nullptr;
-                delete[] existing->data;
-                delete[] existing->symlink_target;
-                delete[] existing->children;
-                delete existing;
+                existing->parent = nullptr;
+                if (existing->open_count.load(std::memory_order_acquire) > 0) {
+                    existing->unlinked = true;
+                } else {
+                    ker::vfs::tmpfs::tmpfs_free_node(existing);
+                }
                 break;
             }
         }
@@ -2843,6 +3742,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     newParent->children[newParent->children_count++] = oldNode;
     oldNode->parent = newParent;
 
+    ker::vfs::tmpfs::tmpfs_unlock_tree();
     return 0;
 }
 
@@ -2966,7 +3866,11 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
     auto* f = vfs_get_file(task, fd);
     if (f == nullptr) return -EBADF;
     if (f->fops == nullptr || f->fops->vfs_truncate == nullptr) return -ENOSYS;
-    return f->fops->vfs_truncate(f, length);
+    int ret = f->fops->vfs_truncate(f, length);
+    if (ret == 0) {
+        stream_invalidate_file(f);
+    }
+    return ret;
 }
 
 // --- fcntl ---
@@ -2979,10 +3883,10 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)
     switch (cmd) {
         case 0: {  // F_DUPFD - dup to fd >= arg
-            f->refcount++;
+            f->refcount.fetch_add(1, std::memory_order_relaxed);
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
             if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount--;
+                f->refcount.fetch_sub(1, std::memory_order_relaxed);
                 return -EMFILE;
             }
             task->clear_fd_cloexec(static_cast<unsigned>(slot));
@@ -3003,10 +3907,10 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             f->open_flags = static_cast<int>(arg);
             return 0;
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
-            f->refcount++;
+            f->refcount.fetch_add(1, std::memory_order_relaxed);
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
             if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount--;
+                f->refcount.fetch_sub(1, std::memory_order_relaxed);
                 return -EMFILE;
             }
             task->set_fd_cloexec(static_cast<unsigned>(slot));
@@ -3022,6 +3926,11 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
 // PipeState is shared between both ends. It includes wait queues for blocking.
 static constexpr ssize_t PIPE_WOS_ERESTARTSYS = 512;
 
+// File-scope pointers to the pipe fops (set once during first vfs_pipe() call).
+// Used by vfs_is_pipe_file() to identify pipe file descriptors.
+static FileOperations* g_pipe_read_fops_ptr = nullptr;
+static FileOperations* g_pipe_write_fops_ptr = nullptr;
+
 struct PipeState {
     char* buf;
     size_t capacity;
@@ -3030,6 +3939,9 @@ struct PipeState {
     size_t count;  // bytes in buffer
     bool write_closed;
     bool read_closed;
+    // Counts open file-ends (read + write). Initialized to 2; the closer that
+    // drives it to 0 is responsible for freeing buf and this struct.
+    std::atomic<int> open_ends{2};
     ker::mod::sys::Spinlock lock;
 
     // Wait queues for blocking pipe I/O
@@ -3238,12 +4150,12 @@ auto vfs_pipe(int pipefd[2]) -> int {
 
     static auto pipe_close_read = [](File* f) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
+        if (st == nullptr) return 0;
         uint64_t pending_writers[32]{};
         size_t pending_writers_count = 0;
         uint64_t pending_write_pollers[32]{};
         size_t pending_write_pollers_count = 0;
-        bool should_free = false;
-        if (st != nullptr) {
+        {
             uint64_t irqf = st->lock.lock_irqsave();
             st->read_closed = true;
             if (st->writers_waiting.size() > 0) {
@@ -3252,12 +4164,11 @@ auto vfs_pipe(int pipefd[2]) -> int {
             if (st->write_poll_waiting.size() > 0) {
                 pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
             }
-            should_free = st->write_closed;
             st->lock.unlock_irqrestore(irqf);
         }
         pipe_reschedule_waiters(pending_writers, pending_writers_count, true);
         pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
-        if (st != nullptr && should_free) {
+        if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             delete[] st->buf;
             delete st;
         }
@@ -3266,12 +4177,12 @@ auto vfs_pipe(int pipefd[2]) -> int {
 
     static auto pipe_close_write = [](File* f) -> int {
         auto* st = static_cast<PipeState*>(f->private_data);
+        if (st == nullptr) return 0;
         uint64_t pending_readers[32]{};
         size_t pending_readers_count = 0;
         uint64_t pending_read_pollers[32]{};
         size_t pending_read_pollers_count = 0;
-        bool should_free = false;
-        if (st != nullptr) {
+        {
             uint64_t irqf = st->lock.lock_irqsave();
             st->write_closed = true;
             if (st->readers_waiting.size() > 0) {
@@ -3280,12 +4191,11 @@ auto vfs_pipe(int pipefd[2]) -> int {
             if (st->read_poll_waiting.size() > 0) {
                 pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
             }
-            should_free = st->read_closed;
             st->lock.unlock_irqrestore(irqf);
         }
         pipe_reschedule_waiters(pending_readers, pending_readers_count);
         pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
-        if (st != nullptr && should_free) {
+        if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             delete[] st->buf;
             delete st;
         }
@@ -3355,6 +4265,10 @@ auto vfs_pipe(int pipefd[2]) -> int {
             return ok;
         },
     };
+
+    // Expose fops pointers for vfs_is_pipe_file() identity check
+    g_pipe_read_fops_ptr = &pipe_read_fops;
+    g_pipe_write_fops_ptr = &pipe_write_fops;
 
     // Create read-end File
     auto* rf = new File;
@@ -3557,6 +4471,8 @@ void init() {
 
     install_builtin_vfs_rules();
 }
+
+void vfs_stream_cache_invalidate_remote_scope(const void* remote_scope) { stream_invalidate_mount_scope(FSType::REMOTE, remote_scope); }
 
 void vfs_wki_load_default_rules() {
     install_builtin_vfs_rules();
@@ -3973,5 +4889,11 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
 
     return 0;
 }
+
+auto vfs_is_pipe_file(const File* f) -> bool {
+    return f != nullptr && (f->fops == g_pipe_read_fops_ptr || f->fops == g_pipe_write_fops_ptr) && g_pipe_read_fops_ptr != nullptr;
+}
+
+auto vfs_is_socket_file(const File* f) -> bool { return f != nullptr && f->fs_type == FSType::SOCKET; }
 
 }  // namespace ker::vfs

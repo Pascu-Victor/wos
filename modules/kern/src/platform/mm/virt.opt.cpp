@@ -7,6 +7,10 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
+
 #include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/tlb.hpp"
@@ -87,6 +91,16 @@ static inline paging::PageTableEntry pteFromRaw(uint64_t raw) {
 
 bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr) {
     PageFault pagefault = paging::createPageFault(frame.errCode, true);
+
+#ifdef WOS_KASAN
+    // KASan shadow-region demand paging.  Shadow pages are zeroed (accessible)
+    // on first access; KASan poisons them selectively afterwards.
+    // This must run before the COW path to avoid mistaking a shadow fault for
+    // a kernel panic.
+    if (kasan::handle_shadow_fault(control_register)) {
+        return true;
+    }
+#endif
 
     // COW handling for write faults to user-space COW pages.
     // This covers both user-mode writes AND kernel-mode writes to user pages

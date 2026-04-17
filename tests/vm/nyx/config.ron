@@ -1,0 +1,42 @@
+// Nyx fuzzer configuration for WOS kernel fuzzing.
+//
+// This file configures QEMU-Nyx for snapshot-based fuzzing of WOS.
+// Each agent target (vfs_mount, tcp_rx, wki_wire) has its own config section.
+//
+// Prerequisites:
+//   1. Install QEMU-Nyx: https://github.com/nyx-fuzz/QEMU-Nyx
+//   2. Build the Nyx agent (cross-compiled for WOS) and install to rootfs
+//   3. Set the correct paths below
+//
+// Usage:
+//   nyx-fuzz --config tests/vm/nyx/config.ron --target vfs_mount
+
+// Example configuration (RON format for Nyx):
+NyxConfig(
+    // QEMU binary (must be QEMU-Nyx, not standard QEMU)
+    qemu_binary: "/usr/local/bin/qemu-system-x86_64-nyx",
+
+    // WOS boot disk image
+    image: "disk.qcow2",
+
+    // WOS secondary disk (XFS rootfs)
+    secondary_image: "mountfs.qcow2",
+
+    // QEMU machine configuration
+    qemu_args: "-M q35 -cpu host -enable-kvm -m 4G -bios /usr/share/OVMF/x64/OVMF.4m.fd -smp 2 -no-reboot",
+
+    // Shared memory size for fuzz input (64KB)
+    input_buffer_size: 65536,
+
+    // Timeout per execution (milliseconds)
+    timeout_ms: 5000,
+
+    // Number of parallel workers
+    workers: 4,
+
+    // Output directory for crashes and corpus
+    workdir: "/tmp/nyx-wos",
+
+    // Agent binary path (inside the WOS rootfs)
+    agent_path: "/usr/bin/nyx_agent",
+)

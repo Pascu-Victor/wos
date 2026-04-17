@@ -25,6 +25,7 @@
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
 #include "mandelbench/mandelbench.hpp"
+#include "mandelbench/mandelbench_wki.hpp"
 #include "mandelbench/util.hpp"
 #include "netbench.hpp"
 #include "perfbench.hpp"
@@ -481,6 +482,37 @@ auto main(int argc, char** argv, char** envp) -> int {
         init_colormap(max_iter + 1, colormap.data());
 
         return mandelbench(width, height, max_iter, threads, repeat, image.data(), colormap.data());
+    }
+
+    if (command != nullptr && std::strcmp(command, "mandelbench-wki") == 0) {
+        int width = WIDTH;
+        int height = HEIGHT;
+        int max_iter = MAX_ITERATION;
+        int workers = THREADS;
+        int repeat = REPEAT;
+        const char* nodes = nullptr;
+
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
+                width = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
+                height = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--max-iter") == 0 && i + 1 < argc) {
+                max_iter = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+                workers = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
+                repeat = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--nodes") == 0 && i + 1 < argc) {
+                nodes = argv[++i];
+            }
+        }
+
+        return mandelbench_wki(width, height, max_iter, workers, repeat, nodes);
+    }
+
+    if (command != nullptr && std::strcmp(command, "mandelbench-worker") == 0) {
+        return mandelbench_worker(argc, argv);
     }
 
     std::println("testprog[t:{},p:{},launcher:{},runner:{}]: argc = {}", tid, pid, launcher, runner, argc);

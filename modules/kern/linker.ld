@@ -78,6 +78,10 @@ SECTIONS
         *(COMMON)
     } :data
 
+    /* End of kernel image — page-aligned so MMIO regions can be mapped right after. */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    PROVIDE(__kernel_end = .);
+
     /* Discard .note.* and .eh_frame* since they may cause issues on some hosts. */
     /* Also discard the program interpreter section since we do not need one. This is */
     /* more or less equivalent to the --no-dynamic-linker linker flag, except that it */

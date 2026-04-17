@@ -2,6 +2,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vfs/file_operations.hpp>
@@ -32,13 +33,16 @@ struct File {
     off_t pos;
     bool is_directory;
     FSType fs_type;
-    int refcount;    // reference count for shared file descriptors (fork/exec)
+    std::atomic<int> refcount;    // reference count for shared file descriptors (fork/exec)
     int open_flags;  // O_RDONLY, O_WRONLY, etc. - preserved from open() for fcntl F_GETFL
     int fd_flags;    // FD_CLOEXEC - per-descriptor flags for fcntl F_GETFD/F_SETFD
 
     // Mount-overlay directory listing support
     const char* vfs_path;  // Absolute VFS path (heap-allocated, set by vfs_open)
     size_t dir_fs_count;   // Cached FS readdir entry count ((size_t)-1 = unknown)
+
+    // Optional VFS-core streamed-read cache attachment.
+    void* stream_cache_attachment = nullptr;
 };
 
 }  // namespace ker::vfs

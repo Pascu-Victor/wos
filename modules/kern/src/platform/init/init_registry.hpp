@@ -9,6 +9,7 @@ namespace ker::init {
 // Forward declarations for all init wrapper functions
 namespace fns {
 // PHASE 0: Early boot
+void sse_init();  // must be first: enables OSXSAVE so VEX/BMI2 insns don't #UD
 void fb_init();
 void serial_init();
 void dbg_init();
@@ -26,6 +27,7 @@ void apic_init();
 void apic_mp_init();
 void time_init();
 void idt_init();
+void global_ctors_init();  // deferred from _start; needs IDT live for KASan shadow faults
 void sys_init();
 void ioapic_init();
 
@@ -65,7 +67,6 @@ void devfs_populate_net();
 void wki_eth_transport_init();
 void wki_ivshmem_transport_init();
 void ipv6_linklocal_init();
-void sse_init();
 void ntp_init();
 
 // PHASE 7: Kernel Start
@@ -78,14 +79,14 @@ void kernel_start();
 
 // PHASE 0: Early boot (no heap, no interrupts)
 inline constexpr std::array<ModuleDesc, 8> PHASE_0_MODULES = {{
-    {.name = "fb", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fb_init},
-    {.name = "serial", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::serial_init},
-    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},  // depends: serial
     {.name = "sse",
      .phase = BootPhase::PHASE_0_EARLY_BOOT,
-     .init_fn = fns::sse_init},  // must be before any VEX/BMI2 code runs (march=native)
+     .init_fn = fns::sse_init},  // MUST be first: enables OSXSAVE/XSave so VEX/BMI2 insns don't #UD
+    {.name = "fb", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fb_init},
+    {.name = "serial", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::serial_init},
+    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},            // depends: serial
     {.name = "mm", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::mm_init},              // depends: dbg
-    {.name = "fsgsbase", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fsgsbase_init},  // depends: stack_capture
+    {.name = "fsgsbase", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fsgsbase_init},
     {.name = "gdt", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::gdt_init},            // depends: fsgsbase
 }};
 
@@ -95,11 +96,14 @@ inline constexpr std::array<ModuleDesc, 1> PHASE_1_MODULES = {{
 }};
 
 // PHASE 2: Post-Interrupt (flattened from interrupt::init)
-inline constexpr std::array<ModuleDesc, 8> PHASE_2_MODULES = {{
+inline constexpr std::array<ModuleDesc, 9> PHASE_2_MODULES = {{
     {.name = "pic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::pic_remap},  // depends: kmalloc
     {.name = "idt",
      .phase = BootPhase::PHASE_2_POST_INTERRUPT,
      .init_fn = fns::idt_init},  // depends: pic - must be before acpi so faults are handled
+    {.name = "global_ctors",
+     .phase = BootPhase::PHASE_2_POST_INTERRUPT,
+     .init_fn = fns::global_ctors_init},  // depends: idt (KASan shadow faults need page-fault handler)
     {.name = "acpi", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::acpi_init},        // depends: idt
     {.name = "apic", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_init},        // depends: acpi
     {.name = "apic_mp", .phase = BootPhase::PHASE_2_POST_INTERRUPT, .init_fn = fns::apic_mp_init},  // depends: apic

@@ -1,6 +1,8 @@
 #include "dbg.hpp"
 
 #include <cstdarg>
+#include <cstdint>
+#include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <util/string.hpp>
 
@@ -199,15 +201,166 @@ void error(const char* str) {
     log(str);
 }
 
-void panic_handler(const char* msg) {
-    // Log the panic message
-    log("KERNEL PANIC: %s", msg);
+namespace {
 
-    // Try to halt other CPUs to stabilize global state for any dump/inspection
+// Minimal hex printer that avoids any allocations or locks.
+void panic_write_hex(uint64_t val) {
+    char hex[17];
+    for (int i = 15; i >= 0; --i) {
+        uint8_t nibble = (val >> (i * 4)) & 0xF;
+        hex[15 - i] = nibble < 10 ? static_cast<char>('0' + nibble) : static_cast<char>('a' + nibble - 10);
+    }
+    hex[16] = '\0';
+    io::serial::writeUnlocked(hex);
+}
+
+void panic_write_dec(uint64_t val) {
+    char buf[21];
+    int pos = 20;
+    buf[pos] = '\0';
+    if (val == 0) {
+        buf[--pos] = '0';
+    } else {
+        while (val > 0) {
+            buf[--pos] = static_cast<char>('0' + (val % 10));
+            val /= 10;
+        }
+    }
+    io::serial::writeUnlocked(buf + pos);
+}
+
+void panic_write_reg(const char* name, uint64_t val) {
+    io::serial::writeUnlocked("  ");
+    io::serial::writeUnlocked(name);
+    io::serial::writeUnlocked(": 0x");
+    panic_write_hex(val);
+    io::serial::writeUnlocked("\n");
+}
+
+// Walk the frame-pointer (RBP) chain and store return addresses.
+void panic_walk_stack(void** fp, void** out, int depth) {
+    for (int i = 0; i < depth; i++) {
+        out[i] = nullptr;
+        if (fp == nullptr || reinterpret_cast<uint64_t>(fp) < 0xffff000000000000ULL) {
+            break;
+        }
+        out[i] = *(fp + 1);  // return address at [rbp+8]
+        auto* next = reinterpret_cast<void**>(*fp);
+        if (next <= fp) {
+            break;
+        }
+        fp = next;
+    }
+}
+
+}  // namespace
+
+void panic_handler(const char* msg) {
+    // Enter panic mode so serial writes bypass locking (avoids deadlock if
+    // we panicked while the serial lock was already held).
+    io::serial::enterPanicMode();
+
+    // Halt other CPUs immediately so they stop writing to serial.
     ker::mod::smt::halt_other_cores();
 
-    // If stacktrace printing is desired and available, it can be called here.
-    // Finally, stop this CPU.
+    io::serial::writeUnlocked("\n========== KERNEL PANIC ==========\n");
+    io::serial::writeUnlocked("Reason: ");
+    io::serial::writeUnlocked(msg);
+    io::serial::writeUnlocked("\n");
+
+    // CPU id (best-effort)
+    io::serial::writeUnlocked("CPU: ");
+    panic_write_dec(cpu::currentCpu());
+    io::serial::writeUnlocked("\n");
+
+    // Capture general-purpose registers via inline asm.
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rflags, cr2, cr3;
+    asm volatile("movq %%rax, %0" : "=m"(rax));
+    asm volatile("movq %%rbx, %0" : "=m"(rbx));
+    asm volatile("movq %%rcx, %0" : "=m"(rcx));
+    asm volatile("movq %%rdx, %0" : "=m"(rdx));
+    asm volatile("movq %%rsi, %0" : "=m"(rsi));
+    asm volatile("movq %%rdi, %0" : "=m"(rdi));
+    asm volatile("movq %%rbp, %0" : "=m"(rbp));
+    asm volatile("movq %%rsp, %0" : "=m"(rsp));
+    asm volatile("movq %%r8,  %0" : "=m"(r8));
+    asm volatile("movq %%r9,  %0" : "=m"(r9));
+    asm volatile("movq %%r10, %0" : "=m"(r10));
+    asm volatile("movq %%r11, %0" : "=m"(r11));
+    asm volatile("movq %%r12, %0" : "=m"(r12));
+    asm volatile("movq %%r13, %0" : "=m"(r13));
+    asm volatile("movq %%r14, %0" : "=m"(r14));
+    asm volatile("movq %%r15, %0" : "=m"(r15));
+    asm volatile("pushfq; popq %0" : "=r"(rflags));
+    asm volatile("movq %%cr2, %0" : "=r"(cr2));
+    asm volatile("movq %%cr3, %0" : "=r"(cr3));
+
+    io::serial::writeUnlocked("\n--- Registers ---\n");
+    panic_write_reg("RAX", rax);
+    panic_write_reg("RBX", rbx);
+    panic_write_reg("RCX", rcx);
+    panic_write_reg("RDX", rdx);
+    panic_write_reg("RSI", rsi);
+    panic_write_reg("RDI", rdi);
+    panic_write_reg("RBP", rbp);
+    panic_write_reg("RSP", rsp);
+    panic_write_reg("R8 ", r8);
+    panic_write_reg("R9 ", r9);
+    panic_write_reg("R10", r10);
+    panic_write_reg("R11", r11);
+    panic_write_reg("R12", r12);
+    panic_write_reg("R13", r13);
+    panic_write_reg("R14", r14);
+    panic_write_reg("R15", r15);
+    panic_write_reg("RFLAGS", rflags);
+    panic_write_reg("CR2", cr2);
+    panic_write_reg("CR3", cr3);
+
+    // RIP via return address of this function
+    void* rip = __builtin_return_address(0);
+    panic_write_reg("RIP (caller)", reinterpret_cast<uint64_t>(rip));
+
+    // Stack trace via RBP chain
+    io::serial::writeUnlocked("\n--- Stack Trace ---\n");
+    constexpr int MAX_FRAMES = 32;
+    void* frames[MAX_FRAMES] = {};
+    auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
+    panic_walk_stack(fp, frames, MAX_FRAMES);
+    for (int i = 0; i < MAX_FRAMES; i++) {
+        if (frames[i] == nullptr) {
+            break;
+        }
+        io::serial::writeUnlocked("  #");
+        panic_write_dec(static_cast<uint64_t>(i));
+        io::serial::writeUnlocked(" 0x");
+        panic_write_hex(reinterpret_cast<uint64_t>(frames[i]));
+        io::serial::writeUnlocked("\n");
+    }
+
+    // Raw stack dump (top 64 qwords)
+    io::serial::writeUnlocked("\n--- Raw Stack (top 64 qwords) ---\n");
+    auto* rsp_ptr = reinterpret_cast<uint64_t*>(rsp);
+    auto rsp_addr = reinterpret_cast<uintptr_t>(rsp_ptr);
+    bool rsp_valid = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
+                     (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
+    if (rsp_valid) {
+        for (int i = 0; i < 64; i++) {
+            io::serial::writeUnlocked("  [RSP+0x");
+            panic_write_hex(static_cast<uint64_t>(i * 8));
+            io::serial::writeUnlocked("] 0x");
+            panic_write_hex(rsp_ptr[i]);
+            io::serial::writeUnlocked("\n");
+        }
+    } else {
+        io::serial::writeUnlocked("  RSP 0x");
+        panic_write_hex(rsp_addr);
+        io::serial::writeUnlocked(" is not in a valid kernel range, skipping\n");
+    }
+
+    io::serial::writeUnlocked("==================================\n\n");
+
     hcf();
 }
 

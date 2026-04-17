@@ -9,6 +9,7 @@
 #include <net/packet.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wire.hpp>
@@ -612,11 +613,18 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     if (binding == nullptr) {
-        // D11: OP_NET_RX_NOTIFY is sent server→consumer on the dynamic channel.
+        // D11: OP_NET_RX_NOTIFY is sent server->consumer on the dynamic channel.
         // The consumer has a proxy (not a server binding), so route to the
         // consumer-side handler instead of returning an error.
         if (req->op_id == OP_NET_RX_NOTIFY) {
             detail::handle_net_rx_notify(hdr, req_data, req_data_len);
+            return;
+        }
+
+        // IPC pipe/socket ops (0x0700-0x07FF) are routed to the IPC subsystem.
+        // These don't use device bindings — they use resource_ids.
+        if (req->op_id >= 0x0700 && req->op_id <= 0x07FF) {
+            wki_ipc_handle_dev_op_req(hdr->src_node, hdr->channel_id, payload, payload_len);
             return;
         }
 
@@ -636,6 +644,12 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // sit above OP_VFS_SEEK_END (0x040E).
     if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) {
         detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path), req->op_id, req_data, req_data_len);
+        return;
+    }
+
+    // IPC pipe/socket ops (0x0700-0x07FF) use resource_ids, not bindings
+    if (req->op_id >= 0x0700 && req->op_id <= 0x07FF) {
+        wki_ipc_handle_dev_op_req(hdr->src_node, hdr->channel_id, payload, payload_len);
         return;
     }
 
@@ -817,7 +831,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Block RDMA ring - tiered signaling (server → consumer)
+// Block RDMA ring - tiered signaling (server -> consumer)
 // -----------------------------------------------------------------------------
 
 namespace {

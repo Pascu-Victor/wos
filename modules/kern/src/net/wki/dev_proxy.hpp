@@ -115,7 +115,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id);
 
 // Resume suspended proxies after a peer reconnects.  Re-attaches the proxy
 // channel so that blocked I/O can complete.  Called from handle_hello()
-// on the FENCED → RECONNECTING → CONNECTED path.
+// on the FENCED -> RECONNECTING -> CONNECTED path.
 void wki_dev_proxy_resume_for_peer(uint16_t node_id);
 
 // Hard-detach all proxies for a peer (final teardown after fence timeout).

@@ -4,6 +4,7 @@
 
 // #define EXEC_DEBUG
 
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -218,7 +219,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
         if (parentTask->get_fd_cloexec(static_cast<unsigned>(key))) {
             return;  // FD_CLOEXEC is set - do NOT inherit
         }
-        __atomic_add_fetch(&parentFile->refcount, 1, __ATOMIC_ACQ_REL);
+        parentFile->refcount.fetch_add(1, std::memory_order_acq_rel);
         newTask->fd_table.insert(key, parentFile);
     });
 
@@ -528,7 +529,9 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
         }
 
         if (oldElfBuffer != nullptr) {
-            delete[] oldElfBuffer;
+            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(oldElfBuffer)) {
+                delete[] oldElfBuffer;
+            }
         }
 
         {
@@ -625,8 +628,14 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
     }
 
     ssize_t fileSize = vfs::vfs_lseek(fd, 0, 2);
-    if (fileSize <= 0) {
+    if (fileSize < 0) {
         dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, fileSize);
+        vfs::vfs_close(fd);
+        freeKernelArgEnv();
+        return static_cast<uint64_t>(-EIO);
+    }
+    if (fileSize == 0) {
+        dbg::log("wos_proc_execve: empty file '%s'", path);
         vfs::vfs_close(fd);
         freeKernelArgEnv();
         return static_cast<uint64_t>(-ENOEXEC);
@@ -706,7 +715,9 @@ auto wos_proc_execve(const char* path, const char* const argv[], const char* con
 
     // --- Free old ELF buffer ---
     if (task->elfBuffer != nullptr) {
-        delete[] task->elfBuffer;
+        if (!ker::net::wki::wki_remote_compute_release_elf_buffer(task->elfBuffer)) {
+            delete[] task->elfBuffer;
+        }
     }
 
     // --- Replace the pagemap with a fresh one ---

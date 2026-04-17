@@ -19,14 +19,15 @@ namespace ker::init {
 // The runtime registry (init_registry.hpp) must be kept in sync with this.
 // =============================================================================
 
-inline constexpr size_t MODULE_COUNT = 43;
+inline constexpr size_t MODULE_COUNT = 44;
 
 inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     // =========================================================================
     // PHASE 0: Early boot (no heap, no interrupts)
     // =========================================================================
-    make_meta("fb", BootPhase::PHASE_0_EARLY_BOOT),
-    make_meta("serial", BootPhase::PHASE_0_EARLY_BOOT),
+    make_meta("sse", BootPhase::PHASE_0_EARLY_BOOT),
+    make_meta("fb", BootPhase::PHASE_0_EARLY_BOOT, Dependency{"sse"}),
+    make_meta("serial", BootPhase::PHASE_0_EARLY_BOOT, Dependency{"sse"}),
     make_meta("dbg", BootPhase::PHASE_0_EARLY_BOOT, Dependency{"serial"}),
     make_meta("mm", BootPhase::PHASE_0_EARLY_BOOT, Dependency{"dbg"}),
     make_meta("stack_capture", BootPhase::PHASE_0_EARLY_BOOT, Dependency{"mm"}),
@@ -47,6 +48,7 @@ inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     make_meta("apic_mp", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"apic"}),
     make_meta("time", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"apic_mp"}),
     make_meta("idt", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"time"}),
+    make_meta("global_ctors", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"idt"}),
     make_meta("sys", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"idt"}),
     make_meta("ioapic", BootPhase::PHASE_2_POST_INTERRUPT, Dependency{"idt"}),
 
@@ -90,7 +92,6 @@ inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     make_meta("wki_eth_transport", BootPhase::PHASE_6_POST_SCHEDULER, Dependency{"sched"}, Dependency{"wki"}),
     make_meta("wki_ivshmem_transport", BootPhase::PHASE_6_POST_SCHEDULER, Dependency{"sched"}, Dependency{"wki"}),
     make_meta("ipv6_linklocal", BootPhase::PHASE_6_POST_SCHEDULER, Dependency{"sched"}, Dependency{"net"}),
-    make_meta("sse", BootPhase::PHASE_6_POST_SCHEDULER, Dependency{"sched"}),
 
     // =========================================================================
     // PHASE 7: Kernel Start (never returns)

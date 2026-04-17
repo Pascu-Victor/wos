@@ -60,12 +60,15 @@ constexpr int EVENT_MIN_TOKEN_COUNT = 4;
 constexpr int EVENT_EXTENDED_TOKEN_COUNT = 6;
 constexpr int HOTSPOT_ROW_LIMIT = 10;
 constexpr int EXEC_FAILURE_EXIT_CODE = 127;
+constexpr int DEFAULT_WKI_TRACE_EVENTS = 200;
+constexpr int DEFAULT_WKI_TAIL_ROWS = 15;
+constexpr int DEFAULT_WKI_LAUNCH_ROWS = 20;
 
 constexpr std::size_t INITIAL_FILE_CAPACITY = 131072;
 constexpr std::size_t PROC_READ_CAPACITY = 512;
 constexpr std::size_t PERF_DRAIN_CAPACITY = 65536;
 constexpr std::size_t CPUSTAT_READ_CAPACITY = 4096;
-constexpr std::size_t MAX_EVENT_TOKENS = 10;
+constexpr std::size_t MAX_EVENT_TOKENS = 14;
 
 constexpr std::size_t PID_PREFIX_SIZE = 4;
 constexpr std::size_t COMM_PREFIX_SIZE = 6;
@@ -79,11 +82,14 @@ constexpr std::string_view PROC_STAT_SUFFIX = "/stat";
 constexpr std::string_view PROC_CMDLINE_SUFFIX = "/cmdline";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
+constexpr std::string_view KWKISTAT_PATH = "/proc/kwkistat";
 constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
 constexpr std::string_view KCONTSTAT_PATH = "/proc/kcontstat";
 constexpr std::string_view SECTION_HEADER = "--- SECTION";
 constexpr std::string_view SECTION_EVENTS = "--- SECTION EVENTS ---\n";
 constexpr std::string_view SECTION_EVENTS_END = "--- END EVENTS ---\n";
+constexpr std::string_view SECTION_WKI_SUMMARY = "--- SECTION WKI_SUMMARY ---\n";
+constexpr std::string_view SECTION_WKI_SUMMARY_END = "--- END WKI_SUMMARY ---\n";
 constexpr std::string_view SECTION_PROC_MAP = "--- SECTION PROC_MAP ---\n";
 constexpr std::string_view SECTION_PROC_MAP_END = "--- END PROC_MAP ---\n";
 constexpr std::string_view END_PREFIX = "--- END";
@@ -180,9 +186,74 @@ struct EventInfo {
     uint64_t data{};
     std::string callsite;
     std::string subsys_name;
+    std::string scope_name;
+    std::string op_name;
+    std::string phase_name;
     int64_t lag{};
     uint8_t flags{};
     uint32_t aux{};
+    uint64_t peer{};
+    uint64_t channel{};
+    uint64_t correlation{};
+    int32_t status{};
+};
+
+struct WkiSummaryRow {
+    std::string scope;
+    std::string op;
+    uint64_t peer{};
+    uint64_t channel{};
+    uint64_t calls{};
+    uint64_t errors{};
+    uint64_t retries{};
+    uint64_t bytes{};
+    uint64_t avg_us{};
+    uint64_t max_us{};
+    uint64_t p95_us{};
+    uint64_t p99_us{};
+    uint64_t p999_us{};
+    uint64_t p9999_us{};
+    uint64_t p99999_us{};
+};
+
+struct WkiGapRow {
+    std::string scope;
+    std::string op;
+    uint64_t peer{};
+    uint64_t channel{};
+    uint64_t gap_ns{};
+    uint64_t prev_ts_ns{};
+    uint64_t next_ts_ns{};
+};
+
+struct WkiLaunchRow {
+    uint64_t peer{};
+    uint64_t correlation{};
+    std::optional<uint32_t> submit_total_us;
+    std::optional<int32_t> submit_status;
+    std::optional<uint32_t> handle_submit_us;
+    std::optional<int32_t> handle_status;
+    std::optional<uint32_t> load_elf_us;
+    std::optional<int32_t> load_status;
+    std::optional<uint32_t> defer_wait_us;
+    std::optional<uint32_t> task_runtime_us;
+    std::optional<uint32_t> proxy_ready_wait_us;
+    std::optional<uint32_t> complete_hold_us;
+    std::optional<uint32_t> complete_wait_us;
+    std::optional<int32_t> complete_status;
+    bool accepted{};
+    bool rejected{};
+    bool completed{};
+    bool proxy_ready{};
+};
+
+struct WkiTraceFilter {
+    std::string scope;
+    std::string op;
+    std::optional<uint64_t> peer;
+    std::optional<uint64_t> channel;
+    std::optional<uint64_t> pid;
+    std::optional<uint64_t> min_us;
 };
 
 struct HotspotStats {
@@ -509,6 +580,18 @@ auto write_section_events(int fd) -> ssize_t {
     return static_cast<ssize_t>(events->size());
 }
 
+auto write_section_wki_summary(int fd) -> ssize_t {
+    auto summary = read_file(KWKISTAT_PATH, PERF_DRAIN_CAPACITY);
+    if (!summary.has_value() || summary->empty()) {
+        return 0;
+    }
+
+    write_all(fd, SECTION_WKI_SUMMARY);
+    write_all(fd, *summary);
+    write_all(fd, SECTION_WKI_SUMMARY_END);
+    return static_cast<ssize_t>(summary->size());
+}
+
 void save_perf_data() {
     ScopedFd fd = open_write_trunc(PERF_DATA_FILE);
     if (!fd.valid()) {
@@ -518,6 +601,7 @@ void save_perf_data() {
 
     write_section_proc_map(fd.get());
     ssize_t event_bytes = write_section_events(fd.get());
+    write_section_wki_summary(fd.get());
 
     if (event_bytes <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
@@ -608,10 +692,58 @@ void cmd_record(int ms, const char* filter = nullptr) {
         write_all(control_fd.get(), "enable");
         std::println("perf: recording for {} ms...", ms);
     }
-    wall_sleep_ms(ms);
+
+    ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
+    if (data_fd.valid()) {
+        write_all(data_fd.get(), SECTION_EVENTS);
+    }
+
+    int64_t deadline_ms = now_ms() + ms;
+    int64_t last_drain_ms = now_ms();
+    ssize_t total_event_bytes = 0;
+
+    while (true) {
+        int64_t remaining_ms = deadline_ms - now_ms();
+        if (remaining_ms <= 0) {
+            break;
+        }
+
+        wall_sleep_ms(static_cast<int>(std::min<int64_t>(remaining_ms, SLEEP_SLICE_MS)));
+        if (!data_fd.valid() || (now_ms() - last_drain_ms) < DRAIN_INTERVAL_MS) {
+            continue;
+        }
+
+        auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
+        if (events.has_value() && !events->empty()) {
+            write_all(data_fd.get(), *events);
+            total_event_bytes += static_cast<ssize_t>(events->size());
+        }
+        last_drain_ms = now_ms();
+    }
+
     write_all(control_fd.get(), "disable");
     std::println("perf: recording stopped.");
-    save_perf_data();
+
+    if (!data_fd.valid()) {
+        save_perf_data();
+        return;
+    }
+
+    auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
+    if (events.has_value() && !events->empty()) {
+        write_all(data_fd.get(), *events);
+        total_event_bytes += static_cast<ssize_t>(events->size());
+    }
+
+    write_all(data_fd.get(), SECTION_EVENTS_END);
+    write_section_wki_summary(data_fd.get());
+    write_section_proc_map(data_fd.get());
+
+    if (total_event_bytes <= 0) {
+        std::println("perf: ring buffer empty - PROC_MAP saved, no events");
+    } else {
+        std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, total_event_bytes);
+    }
 }
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry> {
@@ -654,6 +786,80 @@ auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry
     return entries;
 }
 
+auto extract_value(std::string_view line, std::string_view key) -> std::string_view {
+    std::size_t key_pos = line.find(key);
+    if (key_pos == std::string_view::npos) {
+        return {};
+    }
+    key_pos += key.size();
+    std::size_t end = line.find(' ', key_pos);
+    return line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos);
+}
+
+auto parse_wki_summary_line(std::string_view line, WkiSummaryRow& out) -> bool {
+    if (line.empty() || !line.starts_with("scope=")) {
+        return false;
+    }
+
+    out = {};
+    auto scope = extract_value(line, "scope=");
+    auto op = extract_value(line, "op=");
+    auto peer = extract_value(line, "peer=");
+    auto channel = extract_value(line, "channel=");
+    auto calls = extract_value(line, "calls=");
+    if (scope.empty() || op.empty() || calls.empty()) {
+        return false;
+    }
+
+    out.scope = std::string(scope);
+    out.op = std::string(op);
+    out.peer = peer.empty() ? 0 : parse_u64(peer, 0);
+    out.channel = channel.empty() ? 0 : parse_u64(channel, 0);
+    out.calls = parse_u64(calls);
+    out.errors = parse_u64(extract_value(line, "errors="));
+    out.retries = parse_u64(extract_value(line, "retries="));
+    out.bytes = parse_u64(extract_value(line, "bytes="));
+    out.avg_us = parse_u64(extract_value(line, "avg_us="));
+    out.max_us = parse_u64(extract_value(line, "max_us="));
+    out.p95_us = parse_u64(extract_value(line, "p95_us="));
+    out.p99_us = parse_u64(extract_value(line, "p99_us="));
+    out.p999_us = parse_u64(extract_value(line, "p999_us="));
+    out.p9999_us = parse_u64(extract_value(line, "p9999_us="));
+    out.p99999_us = parse_u64(extract_value(line, "p99999_us="));
+    return true;
+}
+
+auto parse_wki_summary_section(std::string_view buffer, bool sectioned) -> std::vector<WkiSummaryRow> {
+    std::vector<WkiSummaryRow> rows;
+    std::size_t pos = 0;
+
+    if (sectioned) {
+        std::size_t header_pos = buffer.find(SECTION_WKI_SUMMARY);
+        if (header_pos == std::string_view::npos) {
+            return rows;
+        }
+
+        pos = buffer.find('\n', header_pos);
+        if (pos == std::string_view::npos) {
+            return rows;
+        }
+        ++pos;
+    }
+
+    while (pos < buffer.size()) {
+        std::string_view line = next_line(buffer, pos);
+        if (sectioned && line.starts_with(END_PREFIX)) {
+            break;
+        }
+        WkiSummaryRow row{};
+        if (parse_wki_summary_line(line, row)) {
+            rows.push_back(std::move(row));
+        }
+    }
+
+    return rows;
+}
+
 auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     constexpr int TOK_TS = 0;
     constexpr int TOK_CPU = 1;
@@ -663,6 +869,15 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     constexpr int TOK_FLAGS = 5;
     constexpr int TOK_AUX = 6;
     constexpr int TOK_CALLSITE = 7;
+    constexpr int TOK_SCOPE = 3;
+    constexpr int TOK_OP = 4;
+    constexpr int TOK_PHASE = 5;
+    constexpr int TOK_PEER = 6;
+    constexpr int TOK_CHANNEL = 7;
+    constexpr int TOK_CORR = 8;
+    constexpr int TOK_STATUS = 9;
+    constexpr int TOK_WKI_AUX = 10;
+    constexpr int TOK_WKI_CALLSITE = 11;
 
     out = {};
     if (line.size() < 2 || line[1] != ' ') {
@@ -745,6 +960,24 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
             }
             if (token_count >= TOK_CALLSITE + 1) {
                 out.callsite = std::string(tokens[TOK_CALLSITE]);
+            }
+            return true;
+
+        case 'K':
+            if (token_count < TOK_WKI_AUX + 1) {
+                return false;
+            }
+            out.pid = parse_u64(tokens[TOK_PID]);
+            out.scope_name = std::string(tokens[TOK_SCOPE]);
+            out.op_name = std::string(tokens[TOK_OP]);
+            out.phase_name = std::string(tokens[TOK_PHASE]);
+            out.peer = parse_u64(tokens[TOK_PEER], 0);
+            out.channel = parse_u64(tokens[TOK_CHANNEL], 0);
+            out.correlation = parse_u64(tokens[TOK_CORR], 0);
+            out.status = static_cast<int32_t>(parse_i64(tokens[TOK_STATUS], 0));
+            out.aux = parse_u32(tokens[TOK_WKI_AUX], 0);
+            if (token_count >= TOK_WKI_CALLSITE + 1) {
+                out.callsite = std::string(tokens[TOK_WKI_CALLSITE]);
             }
             return true;
 
@@ -1051,6 +1284,10 @@ void cmd_sched(int max_events) {
             std::println("CNT  {:>18}  {:>3}  {:<24} subsys={} count={} cap={} flags={} site={}", event.ts_ns, event.cpu,
                          format_pid_name(event.pid, proc_map), event.subsys_name, event.lag, event.aux, static_cast<unsigned>(event.flags),
                          display_callsite(event.callsite));
+        } else if (event.type == 'K') {
+            std::println("WKI  {:>18}  {:>3}  {:<24} {}:{}:{} peer={} ch={} corr={} status={} aux={} site={}", event.ts_ns, event.cpu,
+                         format_pid_name(event.pid, proc_map), event.scope_name, event.op_name, event.phase_name, event.peer, event.channel,
+                         event.correlation, event.status, event.aux, display_callsite(event.callsite));
         }
 
         ++count;
@@ -1135,6 +1372,540 @@ void cmd_contstat() {
     }
 }
 
+auto current_proc_map() -> std::vector<ProcMapEntry> {
+    std::vector<ProcMapEntry> proc_map;
+    for (const auto& stat : collect_stats()) {
+        proc_map.push_back(ProcMapEntry{.pid = stat.pid, .comm = stat.comm});
+    }
+    return proc_map;
+}
+
+struct WkiLoadedText {
+    std::string source;
+    std::string buffer;
+    bool sectioned{};
+};
+
+auto event_section_view(std::string_view view, bool sectioned) -> std::string_view {
+    if (!sectioned) {
+        return view;
+    }
+
+    std::size_t events_hdr = view.find(SECTION_EVENTS);
+    if (events_hdr == std::string_view::npos) {
+        return {};
+    }
+
+    std::size_t section_start = view.find('\n', events_hdr);
+    if (section_start == std::string_view::npos) {
+        return {};
+    }
+    return view.substr(section_start + 1);
+}
+
+auto collect_wki_events(std::string_view view, bool sectioned) -> std::vector<EventInfo> {
+    std::vector<EventInfo> events;
+    std::string_view event_view = event_section_view(view, sectioned);
+    std::size_t pos = 0;
+    EventInfo event{};
+    while (next_event(event_view, pos, sectioned, event)) {
+        if (event.type == 'K') {
+            events.push_back(event);
+        }
+    }
+    std::ranges::sort(events, [](const EventInfo& lhs, const EventInfo& rhs) { return lhs.ts_ns < rhs.ts_ns; });
+    return events;
+}
+
+auto load_wki_summary_text() -> std::optional<WkiLoadedText> {
+    if (access(PERF_DATA_FILE.begin(), R_OK) == 0) {
+        auto saved = read_file(PERF_DATA_FILE, PERF_DRAIN_CAPACITY);
+        if (saved.has_value() && !saved->empty()) {
+            WkiLoadedText loaded{.source = std::string(PERF_DATA_FILE), .buffer = std::move(*saved)};
+            loaded.sectioned = std::string_view(loaded.buffer).starts_with(SECTION_HEADER);
+            if (!parse_wki_summary_section(loaded.buffer, loaded.sectioned).empty()) {
+                return loaded;
+            }
+        }
+    }
+
+    auto live = read_file(KWKISTAT_PATH, PERF_DRAIN_CAPACITY);
+    if (!live.has_value() || live->empty()) {
+        return std::nullopt;
+    }
+
+    return WkiLoadedText{.source = std::string(KWKISTAT_PATH), .buffer = std::move(*live), .sectioned = false};
+}
+
+auto load_wki_event_text() -> std::optional<WkiLoadedText> {
+    if (access(PERF_DATA_FILE.begin(), R_OK) == 0) {
+        auto saved = read_file(PERF_DATA_FILE, PERF_DRAIN_CAPACITY);
+        if (saved.has_value() && !saved->empty()) {
+            WkiLoadedText loaded{.source = std::string(PERF_DATA_FILE), .buffer = std::move(*saved)};
+            loaded.sectioned = std::string_view(loaded.buffer).starts_with(SECTION_HEADER);
+            if (!collect_wki_events(loaded.buffer, loaded.sectioned).empty()) {
+                return loaded;
+            }
+        }
+    }
+
+    auto live = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
+    if (!live.has_value() || live->empty()) {
+        return std::nullopt;
+    }
+
+    return WkiLoadedText{.source = std::string(KPERF_PATH), .buffer = std::move(*live), .sectioned = false};
+}
+
+auto wki_trace_matches(const EventInfo& event, const WkiTraceFilter& filter) -> bool {
+    if (!filter.scope.empty() && event.scope_name != filter.scope) {
+        return false;
+    }
+    if (!filter.op.empty() && event.op_name != filter.op) {
+        return false;
+    }
+    if (filter.peer.has_value() && event.peer != *filter.peer) {
+        return false;
+    }
+    if (filter.channel.has_value() && event.channel != *filter.channel) {
+        return false;
+    }
+    if (filter.pid.has_value() && event.pid != *filter.pid) {
+        return false;
+    }
+    if (filter.min_us.has_value() && event.aux < *filter.min_us) {
+        return false;
+    }
+    return true;
+}
+
+auto is_wki_launch_event_op(std::string_view op) -> bool {
+    return op == "submit_inline" || op == "submit_vfs_ref" || op == "complete_wait" || op == "accept" || op == "reject" ||
+           op == "complete" || op == "proxy_ready" || op == "defer_wait" || op == "load_elf" || op == "handle_submit" ||
+           op == "task_runtime" || op == "proxy_ready_wait" || op == "complete_hold";
+}
+
+auto is_wki_launch_summary_op(std::string_view op) -> bool {
+    return op == "submit_inline" || op == "submit_vfs_ref" || op == "complete_wait" || op == "defer_wait" || op == "load_elf" ||
+           op == "handle_submit" || op == "task_runtime" || op == "proxy_ready_wait" || op == "complete_hold";
+}
+
+auto find_wki_launch_row(std::vector<WkiLaunchRow>& rows, uint64_t peer, uint64_t correlation) -> WkiLaunchRow& {
+    for (auto& row : rows) {
+        if (row.peer == peer && row.correlation == correlation) {
+            return row;
+        }
+    }
+
+    WkiLaunchRow row{};
+    row.peer = peer;
+    row.correlation = correlation;
+    rows.push_back(std::move(row));
+    return rows.back();
+}
+
+auto format_optional_us(const std::optional<uint32_t>& value) -> std::string {
+    return value.has_value() ? std::to_string(*value) : std::string("-");
+}
+
+auto format_wki_launch_result(const WkiLaunchRow& row) -> std::string {
+    if (row.rejected) {
+        if (row.submit_status.has_value()) {
+            return std::string("reject(") + std::to_string(*row.submit_status) + ')';
+        }
+        if (row.handle_status.has_value()) {
+            return std::string("reject(") + std::to_string(*row.handle_status) + ')';
+        }
+        return "reject";
+    }
+    if (row.completed) {
+        if (row.complete_status.has_value()) {
+            return std::string("complete(") + std::to_string(*row.complete_status) + ')';
+        }
+        return "complete";
+    }
+    if (row.accepted) {
+        return row.proxy_ready ? "accepted" : "accept";
+    }
+    if (row.submit_status.has_value() && *row.submit_status < 0) {
+        return std::string("submit(") + std::to_string(*row.submit_status) + ')';
+    }
+    if (row.handle_status.has_value() && *row.handle_status < 0) {
+        return std::string("handle(") + std::to_string(*row.handle_status) + ')';
+    }
+    if (row.load_status.has_value() && *row.load_status < 0) {
+        return std::string("load(") + std::to_string(*row.load_status) + ')';
+    }
+    return "inflight";
+}
+
+auto wki_launch_score(const WkiLaunchRow& row) -> uint32_t {
+    uint32_t score = 0;
+    if (row.submit_total_us.has_value()) {
+        score = std::max(score, *row.submit_total_us);
+    }
+    if (row.handle_submit_us.has_value()) {
+        score = std::max(score, *row.handle_submit_us);
+    }
+    if (row.load_elf_us.has_value()) {
+        score = std::max(score, *row.load_elf_us);
+    }
+    if (row.defer_wait_us.has_value()) {
+        score = std::max(score, *row.defer_wait_us);
+    }
+    if (row.task_runtime_us.has_value()) {
+        score = std::max(score, *row.task_runtime_us);
+    }
+    if (row.proxy_ready_wait_us.has_value()) {
+        score = std::max(score, *row.proxy_ready_wait_us);
+    }
+    if (row.complete_hold_us.has_value()) {
+        score = std::max(score, *row.complete_hold_us);
+    }
+    if (row.complete_wait_us.has_value()) {
+        score = std::max(score, *row.complete_wait_us);
+    }
+    return score;
+}
+
+void cmd_wki_launch(int limit) {
+    if (limit < 1) {
+        limit = DEFAULT_WKI_LAUNCH_ROWS;
+    }
+
+    auto summary_loaded = load_wki_summary_text();
+    std::vector<WkiSummaryRow> summary_rows;
+    if (summary_loaded.has_value()) {
+        auto rows = parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned);
+        for (const auto& row : rows) {
+            if (row.scope == "remote_compute" && is_wki_launch_summary_op(row.op)) {
+                summary_rows.push_back(row);
+            }
+        }
+        std::ranges::sort(summary_rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+            if (lhs.p99_us != rhs.p99_us) {
+                return lhs.p99_us > rhs.p99_us;
+            }
+            if (lhs.max_us != rhs.max_us) {
+                return lhs.max_us > rhs.max_us;
+            }
+            return lhs.calls > rhs.calls;
+        });
+
+        if (!summary_rows.empty()) {
+            std::println("=== perf wki-launch summary [{}] ====================================", summary_loaded->source);
+            std::println("{:<16}  {:>7}  {:>6}  {:>9}  {:>9}  {:>9}  {:>9}", "OP", "CALLS", "ERR", "AVG(us)", "P99(us)", "P999(us)",
+                         "MAX(us)");
+            std::println("{:->16}  {:->7}  {:->6}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "");
+            for (const auto& row : summary_rows) {
+                std::println("{:<16}  {:>7}  {:>6}  {:>9}  {:>9}  {:>9}  {:>9}", row.op, row.calls, row.errors, row.avg_us, row.p99_us,
+                             row.p999_us, row.max_us);
+            }
+        }
+    }
+
+    auto event_loaded = load_wki_event_text();
+    if (!event_loaded.has_value()) {
+        if (!summary_rows.empty()) {
+            std::println("");
+            std::println("perf: no raw WKI launch events available in perf.data or /proc/kperf");
+            return;
+        }
+        std::println("perf: no WKI launch data");
+        return;
+    }
+
+    auto events = collect_wki_events(event_loaded->buffer, event_loaded->sectioned);
+    std::vector<WkiLaunchRow> launch_rows;
+    for (const auto& event : events) {
+        if (event.scope_name != "remote_compute" || !is_wki_launch_event_op(event.op_name)) {
+            continue;
+        }
+
+        auto& row = find_wki_launch_row(launch_rows, event.peer, event.correlation);
+        if (event.phase_name == "end") {
+            if (event.op_name == "submit_vfs_ref" || event.op_name == "submit_inline") {
+                row.submit_total_us = event.aux;
+                row.submit_status = event.status;
+            } else if (event.op_name == "handle_submit") {
+                row.handle_submit_us = event.aux;
+                row.handle_status = event.status;
+            } else if (event.op_name == "load_elf") {
+                row.load_elf_us = event.aux;
+                row.load_status = event.status;
+            } else if (event.op_name == "defer_wait") {
+                row.defer_wait_us = event.aux;
+            } else if (event.op_name == "task_runtime") {
+                row.task_runtime_us = event.aux;
+                row.completed = true;
+                row.complete_status = event.status;
+            } else if (event.op_name == "proxy_ready_wait") {
+                row.proxy_ready_wait_us = event.aux;
+            } else if (event.op_name == "complete_hold") {
+                row.complete_hold_us = event.aux;
+            } else if (event.op_name == "complete_wait") {
+                row.complete_wait_us = event.aux;
+            }
+        } else if (event.phase_name == "point") {
+            if (event.op_name == "accept") {
+                row.accepted = true;
+            } else if (event.op_name == "reject") {
+                row.rejected = true;
+                row.submit_status = event.status;
+            } else if (event.op_name == "complete") {
+                row.completed = true;
+                row.complete_status = event.status;
+            } else if (event.op_name == "proxy_ready") {
+                row.proxy_ready = true;
+            }
+        }
+    }
+
+    if (launch_rows.empty()) {
+        if (!summary_rows.empty()) {
+            std::println("");
+            std::println("perf: no raw WKI launch rows found in {}", event_loaded->source);
+            return;
+        }
+        std::println("perf: no WKI launch rows found in {}", event_loaded->source);
+        return;
+    }
+
+    std::ranges::sort(launch_rows,
+                      [](const WkiLaunchRow& lhs, const WkiLaunchRow& rhs) { return wki_launch_score(lhs) > wki_launch_score(rhs); });
+
+    std::println("");
+    std::println("=== slowest WKI launches [{}] ======================================", event_loaded->source);
+    std::println("{:>6}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}", "PEER", "CORR", "TOTAL(us)",
+                 "HANDLE(us)", "LOAD(us)", "SETUP(us)", "QUEUE(us)", "RUN(us)", "READY(us)", "HOLD(us)", "WAIT(us)", "RESULT");
+    std::println("{:->6}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "", "",
+                 "", "", "", "", "", "", "", "");
+    for (int i = 0; i < static_cast<int>(launch_rows.size()) && i < limit; ++i) {
+        const auto& row = launch_rows[static_cast<std::size_t>(i)];
+        std::optional<uint32_t> setup_us;
+        if (row.handle_submit_us.has_value() && row.load_elf_us.has_value() && *row.handle_submit_us >= *row.load_elf_us) {
+            setup_us = *row.handle_submit_us - *row.load_elf_us;
+        }
+        std::println("{:>6}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}", row.peer, row.correlation,
+                     format_optional_us(row.submit_total_us), format_optional_us(row.handle_submit_us), format_optional_us(row.load_elf_us),
+                     format_optional_us(setup_us), format_optional_us(row.defer_wait_us), format_optional_us(row.task_runtime_us),
+                     format_optional_us(row.proxy_ready_wait_us), format_optional_us(row.complete_hold_us),
+                     format_optional_us(row.complete_wait_us), format_wki_launch_result(row));
+    }
+}
+
+void cmd_wki_report() {
+    auto loaded = load_wki_summary_text();
+    if (!loaded.has_value()) {
+        std::println("perf: no WKI summary data");
+        return;
+    }
+
+    auto rows = parse_wki_summary_section(loaded->buffer, loaded->sectioned);
+    if (rows.empty()) {
+        std::println("perf: no WKI summary rows found in {}", loaded->source);
+        return;
+    }
+
+    std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+        if (lhs.p99_us != rhs.p99_us) {
+            return lhs.p99_us > rhs.p99_us;
+        }
+        if (lhs.max_us != rhs.max_us) {
+            return lhs.max_us > rhs.max_us;
+        }
+        return lhs.calls > rhs.calls;
+    });
+
+    std::println("=== perf wki-report [{}] ============================================", loaded->source);
+    std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS",
+                 "ERR", "RETRY", "AVG(us)", "P99(us)", "P999(us)", "MAX(us)");
+    std::println("{:->14}  {:->16}  {:->6}  {:->4}  {:->7}  {:->6}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "",
+                 "", "", "");
+    for (const auto& row : rows) {
+        std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op, row.peer,
+                     row.channel, row.calls, row.errors, row.retries, row.avg_us, row.p99_us, row.p999_us, row.max_us);
+    }
+}
+
+void cmd_wki_tail(int limit) {
+    if (limit < 1) {
+        limit = DEFAULT_WKI_TAIL_ROWS;
+    }
+
+    auto summary_loaded = load_wki_summary_text();
+    std::vector<WkiSummaryRow> rows;
+    if (summary_loaded.has_value()) {
+        rows = parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned);
+        std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+            if (lhs.p99999_us != rhs.p99999_us) {
+                return lhs.p99999_us > rhs.p99999_us;
+            }
+            if (lhs.p9999_us != rhs.p9999_us) {
+                return lhs.p9999_us > rhs.p9999_us;
+            }
+            if (lhs.max_us != rhs.max_us) {
+                return lhs.max_us > rhs.max_us;
+            }
+            return lhs.calls > rhs.calls;
+        });
+
+        if (!rows.empty()) {
+            std::println("=== perf wki-tail summary [{}] ======================================", summary_loaded->source);
+            std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS",
+                         "P999(us)", "P9999(us)", "P99999(us)", "MAX(us)");
+            std::println("{:->14}  {:->16}  {:->6}  {:->4}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "");
+            for (int i = 0; i < static_cast<int>(rows.size()) && i < limit; ++i) {
+                const auto& row = rows[static_cast<std::size_t>(i)];
+                std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op, row.peer, row.channel,
+                             row.calls, row.p999_us, row.p9999_us, row.p99999_us, row.max_us);
+            }
+        }
+    }
+
+    auto event_loaded = load_wki_event_text();
+    if (!event_loaded.has_value()) {
+        if (!rows.empty()) {
+            std::println("");
+            std::println("perf: no raw WKI events available in perf.data or /proc/kperf");
+            return;
+        }
+        std::println("perf: no WKI summary or raw trace data");
+        return;
+    }
+
+    if (rows.empty()) {
+        std::println("perf: no WKI summary data; showing raw-event tail from {}", event_loaded->source);
+    }
+
+    auto events = collect_wki_events(event_loaded->buffer, event_loaded->sectioned);
+    if (events.empty()) {
+        if (!rows.empty()) {
+            std::println("");
+            std::println("perf: no raw WKI events found in {}", event_loaded->source);
+            return;
+        }
+        std::println("perf: no raw WKI events found in {}", event_loaded->source);
+        return;
+    }
+
+    std::vector<EventInfo> slow_events;
+    for (const auto& event : events) {
+        if ((event.phase_name == "end" || event.phase_name == "point") && event.aux > 0) {
+            slow_events.push_back(event);
+        }
+    }
+    std::ranges::sort(slow_events, [](const EventInfo& lhs, const EventInfo& rhs) { return lhs.aux > rhs.aux; });
+
+    std::println("");
+    std::println("=== slowest WKI events [{}] ========================================", event_loaded->source);
+    std::println("{:<14}  {:<16}  {:<6}  {:>6}  {:>4}  {:>8}  {:>8}  {:>10}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS",
+                 "CORR");
+    std::println("{:->14}  {:->16}  {:->6}  {:->6}  {:->4}  {:->8}  {:->8}  {:->10}", "", "", "", "", "", "", "", "");
+    for (int i = 0; i < static_cast<int>(slow_events.size()) && i < limit; ++i) {
+        const auto& event = slow_events[static_cast<std::size_t>(i)];
+        std::println("{:<14}  {:<16}  {:<6}  {:>6}  {:>4}  {:>8}  {:>8}  {:>10}", event.scope_name, event.op_name, event.phase_name,
+                     event.peer, event.channel, event.aux, event.status, event.correlation);
+    }
+
+    struct LastBegin {
+        std::string scope;
+        std::string op;
+        uint64_t peer{};
+        uint64_t channel{};
+        uint64_t last_ts_ns{};
+    };
+
+    std::vector<LastBegin> last_begins;
+    std::vector<WkiGapRow> gaps;
+    for (const auto& event : events) {
+        if (event.phase_name != "begin") {
+            continue;
+        }
+
+        auto it = std::ranges::find_if(last_begins, [&](const LastBegin& row) {
+            return row.scope == event.scope_name && row.op == event.op_name && row.peer == event.peer && row.channel == event.channel;
+        });
+
+        if (it != last_begins.end()) {
+            gaps.push_back(WkiGapRow{
+                .scope = event.scope_name,
+                .op = event.op_name,
+                .peer = event.peer,
+                .channel = event.channel,
+                .gap_ns = event.ts_ns - it->last_ts_ns,
+                .prev_ts_ns = it->last_ts_ns,
+                .next_ts_ns = event.ts_ns,
+            });
+            it->last_ts_ns = event.ts_ns;
+        } else {
+            last_begins.push_back(LastBegin{
+                .scope = event.scope_name, .op = event.op_name, .peer = event.peer, .channel = event.channel, .last_ts_ns = event.ts_ns});
+        }
+    }
+
+    std::ranges::sort(gaps, [](const WkiGapRow& lhs, const WkiGapRow& rhs) { return lhs.gap_ns > rhs.gap_ns; });
+
+    std::println("");
+    std::println("=== largest WKI inter-call gaps ====================================");
+    std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>12}", "SCOPE", "OP", "PEER", "CH", "GAP(us)");
+    std::println("{:->14}  {:->16}  {:->6}  {:->4}  {:->12}", "", "", "", "", "");
+    for (int i = 0; i < static_cast<int>(gaps.size()) && i < limit; ++i) {
+        const auto& gap = gaps[static_cast<std::size_t>(i)];
+        std::println("{:<14}  {:<16}  {:>6}  {:>4}  {:>12}", gap.scope, gap.op, gap.peer, gap.channel,
+                     gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
+    }
+}
+
+void cmd_wki_trace(int max_events, const WkiTraceFilter& filter) {
+    if (max_events < 1) {
+        max_events = DEFAULT_WKI_TRACE_EVENTS;
+    }
+
+    auto loaded = load_wki_event_text();
+    if (!loaded.has_value()) {
+        auto summary_loaded = load_wki_summary_text();
+        if (summary_loaded.has_value() && !parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned).empty()) {
+            std::println("perf: WKI summary data exists in {}, but no raw WKI events were saved", summary_loaded->source);
+        } else {
+            std::println("perf: no WKI trace data");
+        }
+        return;
+    }
+
+    auto proc_map = loaded->sectioned ? parse_proc_map_section(loaded->buffer) : current_proc_map();
+    auto events = collect_wki_events(loaded->buffer, loaded->sectioned);
+    if (events.empty()) {
+        auto summary_loaded = load_wki_summary_text();
+        if (summary_loaded.has_value() && !parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned).empty()) {
+            std::println("perf: WKI summary data exists in {}, but no raw WKI events were saved", summary_loaded->source);
+        } else {
+            std::println("perf: no WKI trace data");
+        }
+        return;
+    }
+
+    std::println("=== perf wki-trace [{}] ============================================", loaded->source);
+    std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:>6}  {:>4}  {:>8}  {:>8}  {:>8}  {}", "TIME(ns)", "CPU", "PID", "SCOPE",
+                 "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "CALLSITE");
+    std::println("{:->18}  {:->3}  {:->24}  {:->14}  {:->16}  {:->6}  {:->6}  {:->4}  {:->8}  {:->8}  {:->8}  {:->20}", "", "", "", "", "",
+                 "", "", "", "", "", "", "");
+
+    int printed = 0;
+    for (const auto& event : events) {
+        if (!wki_trace_matches(event, filter)) {
+            continue;
+        }
+        std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:>6}  {:>4}  {:>8}  {:>8}  {:>8}  {}", event.ts_ns, event.cpu,
+                     format_pid_name(event.pid, proc_map), event.scope_name, event.op_name, event.phase_name, event.peer, event.channel,
+                     event.aux, event.status, event.correlation, display_callsite(event.callsite));
+        printed++;
+        if (printed >= max_events) {
+            break;
+        }
+    }
+}
+
 // Resolve a command name to a full path by searching PATH.
 // If cmd already contains '/', returns it as-is (if accessible).
 // Returns empty string if not found.
@@ -1143,20 +1914,26 @@ auto resolve_command(const char* cmd) -> std::string {
 
     // If cmd contains '/', treat as a path (absolute or relative)
     if (std::strchr(cmd, '/') != nullptr) {
-        if (access(cmd, X_OK) == 0) return std::string(cmd);
+        if (access(cmd, X_OK) == 0) {
+            return {cmd};
+        }
         return {};
     }
 
     // Search PATH
     const char* path_env = getenv("PATH");
-    if (path_env == nullptr) path_env = "/bin";
+    if (path_env == nullptr) {
+        path_env = "/bin";
+    }
 
     std::string_view path_sv(path_env);
     std::size_t start = 0;
     while (start <= path_sv.size()) {
         auto colon = path_sv.find(':', start);
         auto dir = path_sv.substr(start, colon == std::string_view::npos ? std::string_view::npos : colon - start);
-        if (dir.empty()) dir = ".";
+        if (dir.empty()) {
+            dir = ".";
+        }
 
         std::string candidate;
         candidate.reserve(dir.size() + 1 + std::strlen(cmd));
@@ -1176,23 +1953,35 @@ auto resolve_command(const char* cmd) -> std::string {
 // or empty string if the file is not a script.
 auto read_shebang(const char* path) -> std::string {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return {};
+    if (fd < 0) {
+        return {};
+    }
     char hdr[256];
     ssize_t n = read(fd, hdr, sizeof(hdr) - 1);
     close(fd);
-    if (n < 3 || hdr[0] != '#' || hdr[1] != '!') return {};
+    if (n < 3 || hdr[0] != '#' || hdr[1] != '!') {
+        return {};
+    }
     hdr[n] = '\0';
     // Find end of first line
     char* nl = std::strchr(hdr + 2, '\n');
-    if (nl != nullptr) *nl = '\0';
+    if (nl != nullptr) {
+        *nl = '\0';
+    }
     // Skip whitespace after #!
     const char* p = hdr + 2;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '\0') return {};
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        return {};
+    }
     // Take only the interpreter path (stop at first space for args)
     const char* end = p;
-    while (*end != '\0' && *end != ' ' && *end != '\t') end++;
-    return std::string(p, end);
+    while (*end != '\0' && *end != ' ' && *end != '\t') {
+        end++;
+    }
+    return {p, end};
 }
 
 void cmd_run(int argc, char** argv) {
@@ -1242,12 +2031,16 @@ void cmd_run(int argc, char** argv) {
         // Build new argv: [interpreter, script_path, original_args[1:]]
         new_argv.push_back(interp.data());
         new_argv.push_back(resolved.data());
-        for (int i = 1; i < argc; i++) new_argv.push_back(argv[i]);
+        for (int i = 1; i < argc; i++) {
+            new_argv.push_back(argv[i]);
+        }
         new_argv.push_back(nullptr);
     } else {
         // ELF binary - use resolved path as argv[0], keep rest
         new_argv.push_back(resolved.data());
-        for (int i = 1; i < argc; i++) new_argv.push_back(argv[i]);
+        for (int i = 1; i < argc; i++) {
+            new_argv.push_back(argv[i]);
+        }
         new_argv.push_back(nullptr);
     }
 
@@ -1427,6 +2220,7 @@ void cmd_run(int argc, char** argv) {
         }
 
         write_all(data_fd.get(), SECTION_EVENTS_END);
+        write_section_wki_summary(data_fd.get());
         write_all(data_fd.get(), SECTION_PROC_MAP);
 
         for_each_process_stat([&](const StatInfo& stat, std::string_view) {
@@ -1529,13 +2323,17 @@ void usage() {
     std::println("Usage: perf <command> [args]");
     std::println("Commands:");
     std::println("  stat     [ms=1000]    CPU% per process (sampling window in ms)");
-    std::println("  record   [ms=1000] [--filter=switch,container]  Record events");
+    std::println("  record   [ms=1000] [--filter=switch,container,wki,wki_launch]  Record events");
     std::println("  report   [n=2000]     Display events from perf.data (or live ring buffer)");
     std::println("  sched    [n=2000]     Alias for report");
     std::println("  cpustat               Per-CPU aggregate scheduler statistics");
     std::println("  contstat              Per-subsystem container statistics");
+    std::println("  wki-report            WKI summary tables from perf.data or /proc/kwkistat");
+    std::println("  wki-launch [n=20]     Remote launch stage timings from perf.data or /proc/kperf");
+    std::println("  wki-tail [n=15]       WKI tail summary, slowest events, and inter-call gaps");
+    std::println("  wki-trace [n=200] [--scope=..] [--op=..] [--peer=N] [--channel=N] [--pid=N] [--min-us=N]");
     std::println("  top      [ms=1000]    Continuous CPU% snapshots");
-    std::println("  run      [--filter=switch,wake,sleep] <cmd> [args]  Trace cmd (default: no container)");
+    std::println("  run      [--filter=switch,wake,sleep,wki,wki_launch] <cmd> [args]  Trace cmd (default: no container)");
     std::println("  show-map              Show PID->name/cmdline map from perf.data");
 }
 }  // namespace
@@ -1570,6 +2368,36 @@ int main(int argc, char* argv[]) {
         cmd_cpustat();
     } else if (cmd == "contstat") {
         cmd_contstat();
+    } else if (cmd == "wki-report") {
+        cmd_wki_report();
+    } else if (cmd == "wki-launch") {
+        int rows = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_WKI_LAUNCH_ROWS;
+        cmd_wki_launch(rows);
+    } else if (cmd == "wki-tail") {
+        int rows = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_WKI_TAIL_ROWS;
+        cmd_wki_tail(rows);
+    } else if (cmd == "wki-trace") {
+        int max_events = DEFAULT_WKI_TRACE_EVENTS;
+        WkiTraceFilter filter{};
+        for (int i = 2; i < argc; ++i) {
+            std::string_view arg(argv[i]);
+            if (arg.starts_with("--scope=")) {
+                filter.scope = std::string(arg.substr(8));
+            } else if (arg.starts_with("--op=")) {
+                filter.op = std::string(arg.substr(5));
+            } else if (arg.starts_with("--peer=")) {
+                filter.peer = parse_u64(arg.substr(7), 0);
+            } else if (arg.starts_with("--channel=")) {
+                filter.channel = parse_u64(arg.substr(10), 0);
+            } else if (arg.starts_with("--pid=")) {
+                filter.pid = parse_u64(arg.substr(6), 0);
+            } else if (arg.starts_with("--min-us=")) {
+                filter.min_us = parse_u64(arg.substr(9), 0);
+            } else {
+                max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+            }
+        }
+        cmd_wki_trace(max_events, filter);
     } else if (cmd == "top") {
         int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
         cmd_top(ms);

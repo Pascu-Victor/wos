@@ -1,5 +1,6 @@
 #include "process.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -234,7 +235,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     parent->fd_table.for_each([&](uint64_t key, void* val) {
         if (val != nullptr) {
             auto* file = static_cast<ker::vfs::File*>(val);
-            __atomic_add_fetch(&file->refcount, 1, __ATOMIC_ACQ_REL);
+            file->refcount.fetch_add(1, std::memory_order_relaxed);  // Increment refcount for shared file
             child->fd_table.insert(key, file);
         }
     });
@@ -249,10 +250,12 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // Undo FD refcount increments
         child->fd_table.for_each([](uint64_t /*key*/, void* val) {
             if (val != nullptr) {
-                __atomic_sub_fetch(&static_cast<ker::vfs::File*>(val)->refcount, 1, __ATOMIC_ACQ_REL);
+                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
             }
         });
-        if (child->thread) delete child->thread;
+        if (child->thread) {
+            delete child->thread;
+        }
         delete (cpu::PerCpu*)child->context.syscallScratchArea;
         mm::virt::destroyUserSpace(child->pagemap);
         mm::phys::pageFree(child->pagemap);

@@ -84,6 +84,17 @@ void add_child(TmpNode* parent, TmpNode* child) {
 }
 }  // namespace
 
+void tmpfs_free_node(TmpNode* node) {
+    if (node == nullptr) return;
+    delete[] node->data;
+    delete[] node->symlink_target;
+    delete[] node->children;
+    delete node;
+}
+
+void tmpfs_lock_tree() { tmpfs_lock.lock(); }
+void tmpfs_unlock_tree() { tmpfs_lock.unlock(); }
+
 // --- Node operations ---
 
 auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode* {
@@ -253,6 +264,7 @@ auto get_root_node() -> TmpNode* { return root_node; }
 // --- File-level operations ---
 
 auto create_root_file() -> ker::vfs::File* {
+    root_node->open_count.fetch_add(1, std::memory_order_relaxed);
     auto* f = new File;
     f->private_data = root_node;
     f->fd = -1;
@@ -331,6 +343,9 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
             }
         }
     }
+    if (node != nullptr) {
+        node->open_count.fetch_add(1, std::memory_order_relaxed);
+    }
     tmpfs_lock.unlock();
 
     if (node == nullptr) {
@@ -402,7 +417,16 @@ auto tmpfs_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
 }
 
 auto tmpfs_fops_close(ker::vfs::File* f) -> int {
-    (void)f;
+    if (f == nullptr || f->private_data == nullptr) {
+        return 0;
+    }
+    auto* node = static_cast<TmpNode*>(f->private_data);
+    uint32_t prev = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1 && node->unlinked) {
+        // Last close of an unlinked node — free it now
+        tmpfs_free_node(node);
+    }
+    f->private_data = nullptr;
     return 0;
 }
 

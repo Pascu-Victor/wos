@@ -64,13 +64,20 @@ constexpr std::array<uint32_t, 40> kNiceToWeight = {
     1024,  820,   655,   526,   423,   335,   272,   215,   172,   137,   110,  87,   70,   56,   45,   36,   29,   23,   18,   15,
 };
 
-inline int clamp_nice(int nice) {
-    if (nice < -20) return -20;
-    if (nice > 19) return 19;
+constexpr int SCHED_NICE_MIN = -20;
+constexpr int SCHED_NICE_MAX = 19;
+
+inline auto clamp_nice(int nice) -> int {
+    if (nice < SCHED_NICE_MIN) {
+        return SCHED_NICE_MIN;
+    }
+    if (nice > SCHED_NICE_MAX) {
+        return SCHED_NICE_MAX;
+    }
     return nice;
 }
 
-inline uint32_t nice_to_weight(int nice) { return kNiceToWeight[static_cast<size_t>(clamp_nice(nice) + 20)]; }
+inline auto nice_to_weight(int nice) -> uint32_t { return kNiceToWeight[static_cast<size_t>(clamp_nice(nice) + 20)]; }
 
 inline bool has_short_burst_history(const task::Task* task) { return task->lastRunUs >= 250U && task->lastRunUs <= 8'000U; }
 
@@ -492,6 +499,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 task::Task* t = victim_rq->runnableHeap.entries[i];
                 if (t == nullptr) continue;
                 if (t == victim_current) continue;  // Never steal currently-executing task
+                if (t->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) continue;
                 if (t->cpu_pinned || t->domain_hard) continue;
                 if (t->type == task::TaskType::IDLE) continue;
                 // Never steal PROCESS tasks - they have large working sets and
@@ -882,10 +890,10 @@ task::Task* get_current_task() { return run_queues->this_cpu()->currentTask; }
 bool has_run_queues() { return run_queues != nullptr; }
 
 void remove_current_task() {
-    run_queues->this_cpu_locked_void([](RunQueue* rq) {
+    task::Task* task_to_gc = run_queues->this_cpu_locked([](RunQueue* rq) -> task::Task* {
         auto* task = rq->currentTask;
         if (task == nullptr) {
-            return;
+            return nullptr;
         }
 
         // Remove from heap if present
@@ -894,11 +902,17 @@ void remove_current_task() {
             rq->runnableHeap.remove(task);
         }
 
-        // Move to dead list for GC
-        task->schedQueue = task::Task::SchedQueue::DEAD_GC;
-        rq->deadList.push(task);
+        // Route all dead-task insertion through insert_into_dead_list() so the
+        // task is detached from any stale dead-list membership before relinking
+        // schedNext into the canonical GC list.
+        task->schedQueue = task::Task::SchedQueue::NONE;
         rq->currentTask = nullptr;
+        return task;
     });
+
+    if (task_to_gc != nullptr) {
+        insert_into_dead_list(task_to_gc);
+    }
 }
 
 // ============================================================================
@@ -1328,11 +1342,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
             if (exiting_task->schedQueue == task::Task::SchedQueue::WAITING) {
                 rq->waitList.remove(exiting_task);
             }
-            // Move to dead list if not already there
-            if (exiting_task->schedQueue != task::Task::SchedQueue::DEAD_GC) {
-                exiting_task->schedQueue = task::Task::SchedQueue::DEAD_GC;
-                rq->deadList.push(exiting_task);
-            }
+            exiting_task->schedQueue = task::Task::SchedQueue::NONE;
         }
 
         // Pick next task from heap
@@ -1347,6 +1357,10 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         rq->currentTask = next;
         return next;
     });
+
+    if (exiting_task != nullptr) {
+        insert_into_dead_list(exiting_task);
+    }
 
     if (next_task == nullptr) {
         // No runnable tasks - enter idle loop
@@ -2323,6 +2337,17 @@ void insert_into_dead_list(task::Task* task) {
                 break;
             }
         }
+    }
+
+    // A task can only be linked through schedNext once. Scrub any stale dead-list
+    // membership before deciding whether to enqueue it again; this prevents the
+    // same Task* from remaining reachable in multiple GC lists and being reclaimed
+    // twice later.
+    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+        run_queues->with_lock_void(cpu_no, [task](RunQueue* rq) {
+            while (rq->deadList.remove(task)) {
+            }
+        });
     }
 
     if (found_current) {

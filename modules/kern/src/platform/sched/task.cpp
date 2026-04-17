@@ -1,5 +1,6 @@
 #include "task.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <platform/loader/debug_info.hpp>
@@ -360,7 +361,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     // Inherit FDs: share the same File* pointers and bump each refcount
     parent->fd_table.for_each([&](uint64_t key, void* val) {
         if (val != nullptr) {
-            reinterpret_cast<ker::vfs::File*>(val)->refcount++;
+            reinterpret_cast<ker::vfs::File*>(val)->refcount.fetch_add(1, std::memory_order_relaxed);
         }
         t->fd_table.insert(key, val);
     });
