@@ -79,6 +79,10 @@ local msg_types = {
     [0x55] = "LOAD_REPORT",
 }
 
+local function get_msg_type_name(msg_type)
+    return msg_types[msg_type] or string.format("UNKNOWN_0x%02X", msg_type)
+end
+
 -- Well-known channel IDs
 local channel_names = {
     [0] = "CONTROL",
@@ -95,13 +99,25 @@ local resource_types = {
     [4] = "VFS",
     [5] = "COMPUTE",
     [6] = "CUSTOM",
+    [7] = "IPC_PIPE",
+    [8] = "IPC_EVENTFD",
+    [9] = "IPC_PTY",
+    [10] = "IPC_FUTEX",
+    [11] = "IPC_EPOLL",
+    [12] = "IPC_SOCKET",
 }
+
+local function get_resource_type_name(resource_type)
+    return resource_types[resource_type] or string.format("UNKNOWN_%d", resource_type)
+end
 
 -- Device operation IDs
 local op_ids = {
     [0x0100] = "BLOCK_READ",
     [0x0101] = "BLOCK_WRITE",
     [0x0102] = "BLOCK_FLUSH",
+    [0x0104] = "BLOCK_BULK_READ",
+    [0x0105] = "BLOCK_BULK_WRITE",
     [0x0200] = "CHAR_OPEN",
     [0x0201] = "CHAR_CLOSE",
     [0x0202] = "CHAR_READ",
@@ -110,6 +126,9 @@ local op_ids = {
     [0x0301] = "NET_SET_MAC",
     [0x0302] = "NET_RX_NOTIFY",
     [0x0303] = "NET_GET_STATS",
+    [0x0304] = "NET_OPEN",
+    [0x0305] = "NET_CLOSE",
+    [0x0306] = "NET_RX_CREDIT",
     [0x0400] = "VFS_OPEN",
     [0x0401] = "VFS_READ",
     [0x0402] = "VFS_WRITE",
@@ -119,7 +138,37 @@ local op_ids = {
     [0x0406] = "VFS_MKDIR",
     [0x0407] = "VFS_READLINK",
     [0x0408] = "VFS_SYMLINK",
+    [0x0409] = "VFS_UNLINK",
+    [0x040A] = "VFS_RMDIR",
+    [0x040B] = "VFS_RENAME",
+    [0x040C] = "VFS_FSYNC",
+    [0x040D] = "VFS_TRUNCATE",
+    [0x040E] = "VFS_SEEK_END",
+    [0x0410] = "VFS_READ_RDMA",
+    [0x0411] = "VFS_WRITE_RDMA",
+    [0x0412] = "VFS_READDIR_BATCH",
+    [0x0413] = "VFS_READ_BULK",
+    [0x0700] = "PIPE_CLOSE_READ",
+    [0x0701] = "PIPE_CLOSE_WRITE",
+    [0x0702] = "PIPE_DATA",
+    [0x0703] = "PIPE_POLL_STATE",
+    [0x0710] = "EVENTFD_CLOSE",
+    [0x0720] = "PTY_IOCTL",
+    [0x0721] = "PTY_CLOSE",
+    [0x0730] = "FUTEX_WAKE",
+    [0x0740] = "EPOLL_CTL",
+    [0x0741] = "EPOLL_READY_NOTIFY",
+    [0x0750] = "SOCK_ACCEPT",
+    [0x0751] = "SOCK_CLOSE",
+    [0x0752] = "SOCK_SHUTDOWN",
+    [0x0753] = "SOCK_GETPEERNAME",
+    [0x0754] = "SOCK_GETSOCKOPT",
+    [0x0755] = "SOCK_SETSOCKOPT",
 }
+
+local function get_op_name(op_id)
+    return op_ids[op_id] or string.format("UNKNOWN_0x%04X", op_id)
+end
 
 -- Event classes
 local event_classes = {
@@ -245,9 +294,11 @@ local pf_flag_priority = ProtoField.bool("wki.flags.priority", "Priority", 8, ni
 local pf_flag_fragment = ProtoField.bool("wki.flags.fragment", "Fragment", 8, nil, 0x02)
 local pf_flag_reserved = ProtoField.bool("wki.flags.reserved", "Reserved", 8, nil, 0x01)
 local pf_msg_type = ProtoField.uint8("wki.msg_type", "Message Type", base.HEX, msg_types)
+local pf_msg_type_name = ProtoField.string("wki.msg_type_name", "Message Type Name")
 local pf_src_node = ProtoField.uint16("wki.src_node", "Source Node", base.HEX)
 local pf_dst_node = ProtoField.uint16("wki.dst_node", "Destination Node", base.HEX)
 local pf_channel_id = ProtoField.uint16("wki.channel", "Channel ID", base.DEC)
+local pf_channel_name = ProtoField.string("wki.channel_name", "Channel Name")
 local pf_seq_num = ProtoField.uint32("wki.seq", "Sequence Number", base.DEC)
 local pf_ack_num = ProtoField.uint32("wki.ack", "ACK Number", base.DEC)
 local pf_payload_len = ProtoField.uint16("wki.payload_len", "Payload Length", base.DEC)
@@ -290,6 +341,7 @@ local pf_fence_reason = ProtoField.uint32("wki.fence.reason", "Reason", base.DEC
 -- Protocol fields - RESOURCE_ADVERT payload
 local pf_res_node = ProtoField.uint16("wki.resource.node_id", "Owner Node", base.HEX)
 local pf_res_type = ProtoField.uint16("wki.resource.type", "Resource Type", base.DEC, resource_types)
+local pf_res_type_name = ProtoField.string("wki.resource.type_name", "Resource Type Name")
 local pf_res_id = ProtoField.uint32("wki.resource.id", "Resource ID", base.DEC)
 local pf_res_flags = ProtoField.uint8("wki.resource.flags", "Flags", base.HEX)
 local pf_res_name_len = ProtoField.uint8("wki.resource.name_len", "Name Length", base.DEC)
@@ -322,6 +374,7 @@ local pf_event_delivery = ProtoField.uint8("wki.event.delivery", "Delivery Mode"
 -- Protocol fields - DEV_ATTACH_REQ payload
 local pf_dev_target = ProtoField.uint16("wki.dev.target_node", "Target Node", base.HEX)
 local pf_dev_res_type = ProtoField.uint16("wki.dev.resource_type", "Resource Type", base.DEC, resource_types)
+local pf_dev_res_type_name = ProtoField.string("wki.dev.resource_type_name", "Resource Type Name")
 local pf_dev_res_id = ProtoField.uint32("wki.dev.resource_id", "Resource ID", base.DEC)
 local pf_dev_attach_mode = ProtoField.uint8("wki.dev.attach_mode", "Attach Mode", base.DEC, attach_modes)
 local pf_dev_req_channel = ProtoField.uint16("wki.dev.requested_channel", "Requested Channel", base.DEC)
@@ -333,6 +386,7 @@ local pf_dev_max_op_size = ProtoField.uint16("wki.dev.max_op_size", "Max Op Size
 
 -- Protocol fields - DEV_OP payload
 local pf_dev_op_id = ProtoField.uint16("wki.dev.op_id", "Operation ID", base.HEX, op_ids)
+local pf_dev_op_name = ProtoField.string("wki.dev.op_name", "Operation Name")
 local pf_dev_op_data_len = ProtoField.uint16("wki.dev.data_len", "Data Length", base.DEC)
 local pf_dev_op_status = ProtoField.int16("wki.dev.op_status", "Status", base.DEC)
 
@@ -381,7 +435,7 @@ wki_proto.fields = {
     -- Header
     pf_version_flags, pf_version, pf_flags,
     pf_flag_ack, pf_flag_priority, pf_flag_fragment, pf_flag_reserved,
-    pf_msg_type, pf_src_node, pf_dst_node, pf_channel_id,
+    pf_msg_type, pf_msg_type_name, pf_src_node, pf_dst_node, pf_channel_id, pf_channel_name,
     pf_seq_num, pf_ack_num, pf_payload_len, pf_credits, pf_hop_ttl,
     pf_src_port, pf_dst_port, pf_checksum, pf_reserved,
     -- HELLO
@@ -395,7 +449,7 @@ wki_proto.fields = {
     -- FENCE
     pf_fence_fenced, pf_fence_fencing, pf_fence_reason,
     -- RESOURCE
-    pf_res_node, pf_res_type, pf_res_id, pf_res_flags, pf_res_name_len, pf_res_name,
+    pf_res_node, pf_res_type, pf_res_type_name, pf_res_id, pf_res_flags, pf_res_name_len, pf_res_name,
     -- ZONE
     pf_zone_id, pf_zone_size, pf_zone_access, pf_zone_notify_mode, pf_zone_type,
     pf_zone_status, pf_zone_phys_addr, pf_zone_rkey,
@@ -403,9 +457,9 @@ wki_proto.fields = {
     -- EVENT
     pf_event_class, pf_event_id, pf_event_origin, pf_event_data_len, pf_event_delivery,
     -- DEV
-    pf_dev_target, pf_dev_res_type, pf_dev_res_id, pf_dev_attach_mode, pf_dev_req_channel,
+    pf_dev_target, pf_dev_res_type, pf_dev_res_type_name, pf_dev_res_id, pf_dev_attach_mode, pf_dev_req_channel,
     pf_dev_status, pf_dev_assigned_ch, pf_dev_max_op_size,
-    pf_dev_op_id, pf_dev_op_data_len, pf_dev_op_status,
+    pf_dev_op_id, pf_dev_op_name, pf_dev_op_data_len, pf_dev_op_status,
     -- IRQ
     pf_irq_device, pf_irq_vector, pf_irq_status,
     -- CHANNEL
@@ -544,7 +598,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local hop_ttl = buffer(19, 1):uint()
 
     -- Build info column
-    local msg_name = msg_types[msg_type] or string.format("UNKNOWN(0x%02X)", msg_type)
+    local msg_name = get_msg_type_name(msg_type)
     local channel_name = get_channel_name(channel_id)
     pinfo.cols.info = string.format("%s %s->%s ch=%s seq=%d",
         msg_name,
@@ -701,9 +755,13 @@ function wki_proto.dissector(buffer, pinfo, tree)
     flags_tree:append_text(" (" .. build_flags_string(flags) .. ")")
 
     hdr_tree:add(pf_msg_type, buffer(1, 1)):append_text(" (" .. msg_name .. ")")
+    local msg_name_item = hdr_tree:add(pf_msg_type_name, msg_name)
+    msg_name_item:set_generated(true)
     hdr_tree:add_le(pf_src_node, buffer(2, 2)):append_text(" (" .. format_node_id(src_node) .. ")")
     hdr_tree:add_le(pf_dst_node, buffer(4, 2)):append_text(" (" .. format_node_id(dst_node) .. ")")
     hdr_tree:add_le(pf_channel_id, buffer(6, 2)):append_text(" (" .. channel_name .. ")")
+    local channel_name_item = hdr_tree:add(pf_channel_name, channel_name)
+    channel_name_item:set_generated(true)
     hdr_tree:add_le(pf_seq_num, buffer(8, 4))
 
     local ack_item = hdr_tree:add_le(pf_ack_num, buffer(12, 4))
@@ -833,8 +891,11 @@ function wki_proto.dissector(buffer, pinfo, tree)
         -- RESOURCE_ADVERT / RESOURCE_WITHDRAW
         elseif msg_type == 0x0A or msg_type == 0x0B then
             if payload_len >= 10 then
+                local resource_type = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_res_node, payload_buf(0, 2))
                 payload_tree:add_le(pf_res_type, payload_buf(2, 2))
+                local resource_type_name_item = payload_tree:add(pf_res_type_name, get_resource_type_name(resource_type))
+                resource_type_name_item:set_generated(true)
                 payload_tree:add_le(pf_res_id, payload_buf(4, 4))
                 payload_tree:add(pf_res_flags, payload_buf(8, 1))
                 local name_len = payload_buf(9, 1):uint()
@@ -904,8 +965,11 @@ function wki_proto.dissector(buffer, pinfo, tree)
         -- DEV_ATTACH_REQ
         elseif msg_type == 0x40 then
             if payload_len >= 12 then
+                local resource_type = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_dev_target, payload_buf(0, 2))
                 payload_tree:add_le(pf_dev_res_type, payload_buf(2, 2))
+                local resource_type_name_item = payload_tree:add(pf_dev_res_type_name, get_resource_type_name(resource_type))
+                resource_type_name_item:set_generated(true)
                 payload_tree:add_le(pf_dev_res_id, payload_buf(4, 4))
                 payload_tree:add(pf_dev_attach_mode, payload_buf(8, 1))
                 payload_tree:add_le(pf_dev_req_channel, payload_buf(10, 2))
@@ -931,8 +995,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
         elseif msg_type == 0x43 then
             if payload_len >= 4 then
                 local op_id = payload_buf(0, 2):le_uint()
-                local op_name = op_ids[op_id] or string.format("0x%04X", op_id)
+                local op_name = get_op_name(op_id)
                 payload_tree:add_le(pf_dev_op_id, payload_buf(0, 2)):append_text(" (" .. op_name .. ")")
+                local op_name_item = payload_tree:add(pf_dev_op_name, op_name)
+                op_name_item:set_generated(true)
                 local data_len = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_dev_op_data_len, payload_buf(2, 2))
                 if data_len > 0 and payload_len >= 4 + data_len then
@@ -944,8 +1010,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
         elseif msg_type == 0x44 then
             if payload_len >= 8 then
                 local op_id = payload_buf(0, 2):le_uint()
-                local op_name = op_ids[op_id] or string.format("0x%04X", op_id)
+                local op_name = get_op_name(op_id)
                 payload_tree:add_le(pf_dev_op_id, payload_buf(0, 2)):append_text(" (" .. op_name .. ")")
+                local op_name_item = payload_tree:add(pf_dev_op_name, op_name)
+                op_name_item:set_generated(true)
                 payload_tree:add_le(pf_dev_op_status, payload_buf(2, 2))
                 local data_len = payload_buf(4, 2):le_uint()
                 payload_tree:add_le(pf_dev_op_data_len, payload_buf(4, 2))
