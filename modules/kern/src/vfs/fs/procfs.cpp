@@ -244,10 +244,18 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append_int(task->cpu);
     append("\nSchedQueue:\t");
     switch (task->schedQueue) {
-        case ker::mod::sched::task::Task::SchedQueue::NONE: append("NONE"); break;
-        case ker::mod::sched::task::Task::SchedQueue::RUNNABLE: append("RUNNABLE"); break;
-        case ker::mod::sched::task::Task::SchedQueue::WAITING: append("WAITING"); break;
-        case ker::mod::sched::task::Task::SchedQueue::DEAD_GC: append("DEAD_GC"); break;
+        case ker::mod::sched::task::Task::SchedQueue::NONE:
+            append("NONE");
+            break;
+        case ker::mod::sched::task::Task::SchedQueue::RUNNABLE:
+            append("RUNNABLE");
+            break;
+        case ker::mod::sched::task::Task::SchedQueue::WAITING:
+            append("WAITING");
+            break;
+        case ker::mod::sched::task::Task::SchedQueue::DEAD_GC:
+            append("DEAD_GC");
+            break;
     }
 
     // Wait channel
@@ -397,7 +405,7 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("0 ");  // rss
 
     // rlim signal blocked sigignore sigcatch wchan nswap cnswap exit_signal processor
-    append("0 ");  // rlim
+    append("0 ");                  // rlim
     append_int(task->sigPending);  // signal (pending)
     append(" ");
     append_int(task->sigMask);  // blocked
@@ -411,9 +419,9 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         append("0");
     }
     append(" ");
-    append("0 ");  // nswap
-    append("0 ");  // cnswap
-    append("0 ");  // exit_signal
+    append("0 ");           // nswap
+    append("0 ");           // cnswap
+    append("0 ");           // exit_signal
     append_int(task->cpu);  // processor
 
     append("\n");
@@ -670,12 +678,16 @@ static void append_dec64(char*& p, char* end, uint64_t v) {
         }
     }
     // reverse into output
-    if (p + n >= end) return;
+    if (p + n >= end) {
+        return;
+    }
     for (int i = n - 1; i >= 0; --i) *p++ = tmp[i];
 }
 
 static void append_sconst(char*& p, char* end, const char* s) {
-    while (*s && p + 1 < end) *p++ = *s++;
+    while (((*s) != 0) && p + 1 < end) {
+        *p++ = *s++;
+    }
 }
 
 static void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
@@ -684,7 +696,7 @@ static void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
         return;
     }
 
-    if (callsite >= 0xffff800000000000ULL) {
+    if (callsite >= 0xffff800000000000ULL && (callsite & (alignof(ker::mod::perf::PerfCallsiteInfo) - 1)) == 0) {
         const auto* info = reinterpret_cast<const ker::mod::perf::PerfCallsiteInfo*>(callsite);
         if (info->magic == ker::mod::perf::PERF_CALLSITE_MAGIC && info->file != nullptr && info->line != 0) {
             const char* base = info->file;
@@ -815,9 +827,10 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 if (ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0 && p + 1 < end) {
                     *p++ = '-';
                 }
-                append_dec64(p, end, static_cast<uint64_t>(ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0
-                                                                ? -ker::mod::perf::wki_unpack_trace_status(ev.lag_v)
-                                                                : ker::mod::perf::wki_unpack_trace_status(ev.lag_v)));
+                append_dec64(p, end,
+                             static_cast<uint64_t>(ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0
+                                                       ? -ker::mod::perf::wki_unpack_trace_status(ev.lag_v)
+                                                       : ker::mod::perf::wki_unpack_trace_status(ev.lag_v)));
                 *p++ = ' ';
                 append_dec64(p, end, ev.aux);
                 *p++ = ' ';
@@ -913,7 +926,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
         bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
-                 pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
+                         pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
         size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
         pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(alloc_sz));
         if (pfd->content == nullptr) {

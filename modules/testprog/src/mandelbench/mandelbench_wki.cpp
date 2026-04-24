@@ -108,7 +108,6 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
     ker::process::wki_runner_node(runner, sizeof(runner));
 
     std::println(stderr, "mandelbench-wki: orchestrator on {} (launcher={})", runner, launcher);
-    std::println(stderr, "mandelbench-wki: {}x{} max_iter={} workers={} repeat={}", width, height, max_iteration, workers, repeat);
     if (node_list.empty()) {
         // Auto-discover peers by scanning /wki/ directory
         node_list = discover_wki_nodes(runner);
@@ -120,6 +119,15 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         for (const auto& n : node_list) std::print(stderr, " {}", n);
         std::println(stderr, "");
     }
+
+    // Scale workers to cluster size: each node should get the full thread count
+    // so total parallelism = threads_per_node × node_count.
+    // Only auto-scale if the caller used the default (THREADS).
+    if (workers == THREADS && node_list.size() > 1) {
+        workers = THREADS * static_cast<int>(node_list.size());
+    }
+
+    std::println(stderr, "mandelbench-wki: {}x{} max_iter={} workers={} repeat={}", width, height, max_iteration, workers, repeat);
 
     for (int r = 0; r < repeat; r++) {
         std::memset(image.data(), 0, image.size());
@@ -172,19 +180,11 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         };
 
         // Phase 1: fork remote workers
-        int remote_count = 0;
         for (int i = 0; i < workers; i++) {
             const auto& target = node_list[static_cast<size_t>(i) % node_list.size()];
             if (target != runner) {
                 if (!spawn_worker(i)) break;
-                remote_count++;
             }
-        }
-
-        // Brief delay to let the kernel start loading the binary on remote nodes
-        // before local workers saturate all CPUs.
-        if (remote_count > 0) {
-            usleep(200000);  // 200ms
         }
 
         // Phase 2: fork local workers
@@ -342,6 +342,18 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         return 1;
     }
 
+    // Count rows this worker will compute
+    int total_rows = 0;
+    for (int row = id; row < height; row += workers) {
+        total_rows++;
+    }
+
+    // Buffer all output in memory to avoid per-row remote VFS round-trips.
+    // Each row record: [row_index: uint32_t][rgba_data: width * 4 bytes]
+    size_t record_size = sizeof(uint32_t) + row_size;
+    std::vector<unsigned char> output_buf(static_cast<size_t>(total_rows) * record_size);
+    size_t buf_offset = 0;
+
     // Compute assigned rows (interleaved: row id, id+workers, id+2*workers, ...)
     int rows_done = 0;
     for (int row = id; row < height; row += workers) {
@@ -367,13 +379,17 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             row_buf[px + 3] = 255;
         }
 
-        // Write [row_index][rgba_data] to output file
+        // Append [row_index][rgba_data] to memory buffer
         auto row_u32 = static_cast<uint32_t>(row);
-        fwrite(&row_u32, sizeof(uint32_t), 1, f);
-        fwrite(row_buf.data(), 1, row_size, f);
+        std::memcpy(output_buf.data() + buf_offset, &row_u32, sizeof(uint32_t));
+        buf_offset += sizeof(uint32_t);
+        std::memcpy(output_buf.data() + buf_offset, row_buf.data(), row_size);
+        buf_offset += row_size;
         rows_done++;
     }
 
+    // Write all buffered output in one shot to minimize remote VFS round-trips
+    fwrite(output_buf.data(), 1, buf_offset, f);
     fclose(f);
 
     std::println(stderr, "mandelbench-worker[{}@{}]: computed {} rows, wrote to {}", id, runner, rows_done, actual_output);

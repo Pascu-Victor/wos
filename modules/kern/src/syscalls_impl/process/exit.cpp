@@ -103,7 +103,37 @@ void wos_proc_exit(int status) {
         }
     }
 
-    // Reschedule all tasks waiting for this process to exit
+    // Reparent all children of this process to init (PID 1), so init can reap them.
+    // Threads do not own children directly - skip reparenting for thread exits.
+    if (!current_task->isThread) {
+        uint32_t count = ker::mod::sched::get_active_task_count();
+        for (uint32_t i = 0; i < count; i++) {
+            auto* child = ker::mod::sched::get_active_task_at(i);
+            if (child != nullptr && child->parentPid == current_task->pid && child != current_task) {
+                child->parentPid = 1;  // Reparent to init
+            }
+        }
+    }
+
+    // Close all open file descriptors and free ELF buffer before waking waiters.
+    // This ensures files written by the exiting process are fully committed to
+    // the VFS before waitpid returns to the parent.
+    if (!current_task->isThread) {
+        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) { ker::vfs::vfs_close(static_cast<int>(key)); });
+
+        if (current_task->elfBuffer != nullptr) {
+            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer)) {
+                delete[] current_task->elfBuffer;
+            }
+            current_task->elfBuffer = nullptr;
+            current_task->elfBufferSize = 0;
+        }
+    }
+
+    // Reschedule all tasks waiting for this process to exit.
+    // This happens AFTER reparenting + FD cleanup so that any files written
+    // by the exiting process are fully committed to the VFS before waitpid
+    // returns to the waiter.
     for (size_t i = 0; i < current_task->awaitee_on_exit.size(); ++i) {
         uint64_t waiting_pid = current_task->awaitee_on_exit[i];
 #ifdef EXIT_DEBUG
@@ -157,37 +187,6 @@ void wos_proc_exit(int status) {
 #ifdef EXIT_DEBUG
             ker::mod::dbg::log("wos_proc_exit: Could not find waiting task PID %x", waitingPid);
 #endif
-        }
-    }
-
-    // Reparent all children of this process to init (PID 1), so init can reap them.
-    // Threads do not own children directly - skip reparenting for thread exits.
-    if (!current_task->isThread) {
-        uint32_t count = ker::mod::sched::get_active_task_count();
-        for (uint32_t i = 0; i < count; i++) {
-            auto* child = ker::mod::sched::get_active_task_at(i);
-            if (child != nullptr && child->parentPid == current_task->pid && child != current_task) {
-                child->parentPid = 1;  // Reparent to init
-            }
-        }
-    }
-
-    // CLEANUP TASK RESOURCES
-
-    if (!current_task->isThread) {
-        // For a full process exit: close FDs and free ELF buffer.
-        // Threads share both with their owner process - do not touch them.
-
-        // Close all open file descriptors
-        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) { ker::vfs::vfs_close(static_cast<int>(key)); });
-
-        // Free ELF buffer
-        if (current_task->elfBuffer != nullptr) {
-            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer)) {
-                delete[] current_task->elfBuffer;
-            }
-            current_task->elfBuffer = nullptr;
-            current_task->elfBufferSize = 0;
         }
     }
 

@@ -167,7 +167,7 @@ struct ScopedComputeMeasure {
 };
 
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
-constexpr size_t WKI_VFS_LOAD_CHUNK = 65536;
+constexpr size_t WKI_VFS_LOAD_CHUNK = 262144;  // 256 KB: fewer round-trips for remote binary fetch
 constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
 constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 8;
 constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
@@ -2691,7 +2691,16 @@ static void drain_pending_task_submits() {
 [[noreturn]] static void wki_compute_submit_thread() {
     for (;;) {
         drain_pending_task_submits();
-        ker::mod::sched::kern_sleep_us(10'000);  // 10ms idle poll
+
+        // Sleep until woken by wki_remote_compute_notify_pending_submit().
+        // No polling — kern_wake() delivers an immediate wakeup when a new
+        // VFS_REF/RESOURCE_REF submit is queued.
+        s_pending_submit_lock.lock();
+        bool empty = g_pending_task_submits.empty();
+        s_pending_submit_lock.unlock();
+        if (empty) {
+            ker::mod::sched::kern_block();
+        }
     }
 }
 

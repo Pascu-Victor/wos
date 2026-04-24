@@ -698,6 +698,26 @@ void cmd_record(int ms, const char* filter = nullptr) {
         write_all(data_fd.get(), SECTION_EVENTS);
     }
 
+    // Track all processes seen during recording so short-lived ones
+    // that exit before the final proc-map snapshot are still resolved.
+    std::vector<TrackedProc> tracked;
+    auto upsert_tracked = [&](const StatInfo& stat) {
+        for (auto& proc : tracked) {
+            if (proc.pid == stat.pid) {
+                proc.comm = stat.comm;
+                return;
+            }
+        }
+        tracked.push_back(TrackedProc{
+            .pid = stat.pid,
+            .comm = stat.comm,
+            .cmdline = read_cmdline(stat.pid),
+        });
+    };
+
+    // Initial snapshot of all running processes.
+    for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
+
     int64_t deadline_ms = now_ms() + ms;
     int64_t last_drain_ms = now_ms();
     ssize_t total_event_bytes = 0;
@@ -718,6 +738,10 @@ void cmd_record(int ms, const char* filter = nullptr) {
             write_all(data_fd.get(), *events);
             total_event_bytes += static_cast<ssize_t>(events->size());
         }
+
+        // Pick up any newly-spawned processes.
+        for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
+
         last_drain_ms = now_ms();
     }
 
@@ -737,7 +761,26 @@ void cmd_record(int ms, const char* filter = nullptr) {
 
     write_all(data_fd.get(), SECTION_EVENTS_END);
     write_section_wki_summary(data_fd.get());
-    write_section_proc_map(data_fd.get());
+
+    // Write proc map: current live processes plus any tracked ones that exited.
+    write_all(data_fd.get(), SECTION_PROC_MAP);
+    auto after = collect_stats();
+    for_each_process_stat([&](const StatInfo& info, std::string_view) {
+        write_all(data_fd.get(), proc_map_line(info.pid, info.comm, read_cmdline(info.pid)));
+    });
+    for (const auto& proc : tracked) {
+        bool alive = false;
+        for (const auto& current : after) {
+            if (current.pid == proc.pid) {
+                alive = true;
+                break;
+            }
+        }
+        if (!alive) {
+            write_all(data_fd.get(), proc_map_line(proc.pid, proc.comm, proc.cmdline));
+        }
+    }
+    write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
     if (total_event_bytes <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
