@@ -69,13 +69,18 @@ void hsv2rgb(float h, float s, float v, unsigned char* rgb) {
 }
 
 void init_colormap(int len, unsigned char* map) {
+    if (len <= 0 || map == nullptr) {
+        return;
+    }
+
     int i;
-    for (i = 0; i < len; i++) {
+    for (i = 0; i < len - 1; i++) {
         hsv2rgb(i / 4.0f, 1.0f, i / (i + 8.0f), &map[i * 3]);
     }
-    map[3 * len + 0] = 0;
-    map[3 * len + 1] = 0;
-    map[3 * len + 2] = 0;
+
+    map[3 * (len - 1) + 0] = 0;
+    map[3 * (len - 1) + 1] = 0;
+    map[3 * (len - 1) + 2] = 0;
 }
 
 void set_pixel(unsigned char* image, int width, int x, int y, unsigned char* c) {
@@ -87,15 +92,18 @@ void set_pixel(unsigned char* image, int width, int x, int y, unsigned char* c) 
 
 void save_image(const char* filename, const unsigned char* image, unsigned width, unsigned height) {
     unsigned error;
-    unsigned char* png;
-    size_t pngsize;
+    unsigned char* png = nullptr;
+    size_t pngsize = 0;
     LodePNGState state;
 
     lodepng_state_init(&state);
 
     error = lodepng_encode(&png, &pngsize, image, width, height, &state);
     if (!error) {
-        lodepng_save_file(png, pngsize, filename);
+        unsigned save_error = lodepng_save_file(png, pngsize, filename);
+        if (save_error != 0) {
+            std::println(stderr, "ERROR: {}: {}", save_error, lodepng_error_text(save_error));
+        }
     }
     if (error) {
         std::println(stderr, "ERROR: {}: {}", error, lodepng_error_text(error));

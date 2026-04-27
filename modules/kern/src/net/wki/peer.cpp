@@ -104,6 +104,47 @@ void wki_peer_send_hello_ack(WkiPeer* peer) {
     wki_send_raw(peer->node_id, MsgType::HELLO_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
 }
 
+void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const std::array<uint8_t, 6>& mac) {
+    if (transport == nullptr || peer_node == WKI_NODE_INVALID || peer_node == WKI_NODE_BROADCAST || peer_node == g_wki.my_node_id) {
+        return;
+    }
+
+    uint64_t now_us = wki_now_us();
+
+    g_wki.peer_lock.lock();
+
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer == nullptr) {
+        peer = wki_peer_alloc(peer_node);
+        if (peer == nullptr) {
+            g_wki.peer_lock.unlock();
+            return;
+        }
+    }
+
+    memcpy(peer->mac.data(), mac.data(), mac.size());
+    if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
+        peer->transport = transport;
+    }
+    if (peer->rdma_transport == nullptr) {
+        peer->rdma_transport = transport->rdma_capable ? transport : wki_roce_transport_get();
+    }
+    peer->is_direct = true;
+    peer->hop_count = 1;
+    peer->link_cost = 1;
+    peer->last_rx_activity = now_us;
+    if (peer->last_heartbeat == 0) {
+        peer->last_heartbeat = now_us;
+    }
+    if (peer->hostname[0] == '\0') {
+        snprintf(peer->hostname, WKI_HOSTNAME_MAX, "node-%04x", peer_node);
+    }
+
+    g_wki.peer_lock.unlock();
+
+    wki_eth_neighbor_add(peer_node, mac);
+}
+
 // -----------------------------------------------------------------------------
 // HELLO RX handler
 // -----------------------------------------------------------------------------

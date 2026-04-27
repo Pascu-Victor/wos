@@ -50,6 +50,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int;
 // Used by server-side subsystems (e.g. WKI remote VFS) that operate on files
 // outside of any userspace task context.
 auto vfs_open_file(const char* path, int flags, int mode) -> File*;
+// Open an already resolved absolute backing path without consulting the current
+// task's root or WKI routing policy.
+auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File*;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -61,9 +64,11 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 // Symlink operations
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
 
 // Stat operations
 auto vfs_stat(const char* path, stat* statbuf) -> int;
+auto vfs_stat_resolved(const char* path, stat* statbuf) -> int;
 auto vfs_fstat(int fd, stat* statbuf) -> int;
 
 // Directory operations

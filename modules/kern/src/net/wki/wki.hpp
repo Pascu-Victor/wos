@@ -52,7 +52,7 @@ constexpr uint8_t WKI_HEARTBEAT_JITTER_PERCENT = 25;  // +/- 25% jitter
 constexpr uint32_t WKI_INITIAL_RTO_US = 500;       // 500 us (Jacobson/Karels adapts to actual RTT)
 constexpr uint32_t WKI_MIN_RTO_US = 100;           // 100 us (floor: 5-10x single-hop RTT)
 constexpr uint32_t WKI_MAX_RTO_US = 50000;         // 50 ms (cap for pathological cases)
-constexpr uint32_t WKI_ACK_DELAY_US = 0;           // 0: immediate ACK on LATENCY channels
+constexpr uint32_t WKI_ACK_DELAY_US = 2000;        // 2 ms: window for piggybacking on BULK channels (LATENCY channels ack inline)
 constexpr uint8_t WKI_FAST_RETRANSMIT_THRESH = 3;  // 3 dup ACKs
 
 // Credit defaults
@@ -242,6 +242,7 @@ struct WkiChannel {
     uint32_t rx_seq = 0;          // next expected seq from peer
     uint32_t rx_ack_pending = 0;  // highest seq received, not yet ACKed
     bool ack_pending = false;
+    uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 
     // Flow control (credits)
     uint16_t tx_credits = 0;  // credits available for sending
@@ -334,6 +335,12 @@ struct WkiState {
 // Global WKI state singleton
 extern WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+constexpr auto wki_channel_allocator_node(uint16_t node_a, uint16_t node_b) -> uint16_t { return (node_a < node_b) ? node_a : node_b; }
+
+constexpr auto wki_requester_controls_dynamic_channel(uint16_t requester_node, uint16_t owner_node) -> bool {
+    return requester_node == wki_channel_allocator_node(requester_node, owner_node);
+}
+
 // -----------------------------------------------------------------------------
 // Public API - Core
 // -----------------------------------------------------------------------------
@@ -393,6 +400,10 @@ auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
 
 // Allocate a dynamic channel to a peer
 auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel*;
+
+// Reserve a specific dynamic channel ID to a peer. Returns nullptr if the
+// requested channel is already in use.
+auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority) -> WkiChannel*;
 
 // Close and free a channel
 void wki_channel_close(WkiChannel* ch);

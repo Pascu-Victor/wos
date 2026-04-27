@@ -17,6 +17,10 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node);
 // Send HELLO_ACK to a specific peer
 void wki_peer_send_hello_ack(WkiPeer* peer);
 
+// Learn a direct peer from any received Ethernet WKI frame so later control
+// traffic is not dropped if HELLO/HELLO_ACK delivery was asymmetric.
+void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const std::array<uint8_t, 6>& mac);
+
 // Send a heartbeat to all CONNECTED peers
 void wki_peer_send_heartbeats();
 

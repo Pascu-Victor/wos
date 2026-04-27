@@ -1,6 +1,8 @@
 #include "dev_server.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
@@ -17,6 +19,9 @@
 #include <net/wki/zone.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <utility>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -214,11 +219,21 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
         b.active = false;
     }
     // TODO: RAII for this \/
-    //  Free VFS RDMA write buffers before erasing (DevServerBinding has no destructor)
+    //  Free VFS RDMA buffers before erasing (DevServerBinding has no destructor)
     for (auto& b : g_bindings) {
-        if (!b.active && b.vfs_rdma_write_buf != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_write_buf);
-            b.vfs_rdma_write_buf = nullptr;
+        if (!b.active) {
+            if (b.vfs_rdma_write_buf != nullptr) {
+                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_write_buf);
+                b.vfs_rdma_write_buf = nullptr;
+            }
+            if (b.vfs_rdma_read_staging_buf != nullptr) {
+                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_read_staging_buf);
+                b.vfs_rdma_read_staging_buf = nullptr;
+            }
+            if (b.vfs_rdma_bulk_staging_buf != nullptr) {
+                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_bulk_staging_buf);
+                b.vfs_rdma_bulk_staging_buf = nullptr;
+            }
         }
     }
 
@@ -272,6 +287,17 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
 
 namespace detail {
 
+auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel) -> WkiChannel* {
+    if (wki_requester_controls_dynamic_channel(requester_node, g_wki.my_node_id)) {
+        if (requested_channel < WKI_CHAN_DYNAMIC_BASE) {
+            return nullptr;
+        }
+        return wki_channel_reserve(requester_node, requested_channel, PriorityClass::THROUGHPUT);
+    }
+
+    return wki_channel_alloc(requester_node, PriorityClass::THROUGHPUT);
+}
+
 void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(DevAttachReqPayload)) {
         return;
@@ -301,8 +327,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
-        // Allocate a dynamic channel for this binding
-        WkiChannel* ch = wki_channel_alloc(hdr->src_node, PriorityClass::THROUGHPUT);
+        // The lower node ID is the channel allocator for the peer pair.
+        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -383,8 +409,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
-        // Allocate a dynamic channel
-        WkiChannel* ch = wki_channel_alloc(hdr->src_node, PriorityClass::THROUGHPUT);
+        // The lower node ID is the channel allocator for the peer pair.
+        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -399,13 +425,14 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_type = ResourceType::VFS;
         binding.resource_id = req->resource_id;
         memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp->export_path), sizeof(binding.vfs_export_path));
+        memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp->name), sizeof(binding.vfs_export_name));
 
-        // RDMA-backed VFS writes: pre-register a server-side receive buffer so the
-        // consumer can rdma_write file data here, avoiding embedding data in messages.
+        // RDMA-backed VFS I/O: pre-register server-side buffers.
         // rdma_register_region is a local-only operation - safe to call in NAPI context.
         {
             WkiPeer* peer = wki_peer_find(hdr->src_node);
             if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
+                // Write receive buffer: consumer rdma_writes file data here.
                 constexpr uint32_t VFS_WRITE_BUF = 65536;
                 auto* wbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_WRITE_BUF));
                 if (wbuf != nullptr) {
@@ -421,6 +448,43 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                         ker::mod::mm::dyn::kmalloc::free(wbuf);
                     }
                 }
+
+                // Read staging buffer (RoCE pull mode only): server reads file data here;
+                // consumer rdma_reads to pull. Not needed for ivshmem (push is safe there).
+                bool peer_is_roce = (peer->rdma_transport->name != nullptr &&
+                                    std::strcmp(peer->rdma_transport->name, "wki-roce") == 0);
+                if (peer_is_roce) {
+                    auto* rbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BOUNCE_SIZE));
+                    if (rbuf != nullptr) {
+                        uint32_t rrkey = 0;
+                        int reg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(rbuf),
+                                                                                 VFS_RDMA_BOUNCE_SIZE, &rrkey);
+                        if (reg_ret == 0 && rrkey != 0) {
+                            binding.vfs_rdma_read_staging_buf = rbuf;
+                            binding.vfs_rdma_read_staging_rkey = rrkey;
+                            ack.rdma_flags |= DEV_ATTACH_RDMA_VFS_READ;
+                            ack.rdma_read_staging_rkey = rrkey;
+                        } else {
+                            ker::mod::mm::dyn::kmalloc::free(rbuf);
+                        }
+                    }
+
+                    // Bulk staging buffer (RoCE bulk pull mode): 2 MB staging for OP_VFS_READ_BULK.
+                    auto* bbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BULK_SIZE));
+                    if (bbuf != nullptr) {
+                        uint32_t brkey = 0;
+                        int breg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf),
+                                                                                  VFS_RDMA_BULK_SIZE, &brkey);
+                        if (breg_ret == 0 && brkey != 0) {
+                            binding.vfs_rdma_bulk_staging_buf = bbuf;
+                            binding.vfs_rdma_bulk_staging_rkey = brkey;
+                            ack.rdma_flags |= DEV_ATTACH_RDMA_BULK_PULL;
+                            ack.rdma_bulk_staging_rkey = brkey;
+                        } else {
+                            ker::mod::mm::dyn::kmalloc::free(bbuf);
+                        }
+                    }
+                }
             }
         }
 
@@ -434,8 +498,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.assigned_channel = ch->channel_id;
         ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
 
-        ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s rdma=%s", hdr->src_node, req->resource_id, ch->channel_id,
-                           static_cast<const char*>(exp->export_path), ((ack.rdma_flags & DEV_ATTACH_RDMA_VFS) != 0) ? "yes" : "no");
+        ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s rdma_write=%s read_staging_rkey=%u bulk_staging_rkey=%u",
+                           hdr->src_node, req->resource_id, ch->channel_id, static_cast<const char*>(exp->name),
+                           ((ack.rdma_flags & DEV_ATTACH_RDMA_VFS) != 0) ? "yes" : "no", ack.rdma_read_staging_rkey,
+                           ack.rdma_bulk_staging_rkey);
 
         // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
         // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
@@ -460,8 +526,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
-        // Allocate a dynamic channel
-        WkiChannel* ch = wki_channel_alloc(hdr->src_node, PriorityClass::THROUGHPUT);
+        // The lower node ID is the channel allocator for the peer pair.
+        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -541,6 +607,9 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         uint16_t assigned_channel;
         bool found;
         bool uninstall_rx_forward;
+        uint8_t* vfs_rdma_write_buf;
+        uint8_t* vfs_rdma_read_staging_buf;
+        uint8_t* vfs_rdma_bulk_staging_buf;
     };
     DetachInfo info = {};
 
@@ -557,6 +626,12 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             info.net_dev = it->net_dev;
             info.consumer_node = it->consumer_node;
             info.assigned_channel = it->assigned_channel;
+            info.vfs_rdma_write_buf = it->vfs_rdma_write_buf;
+            info.vfs_rdma_read_staging_buf = it->vfs_rdma_read_staging_buf;
+            info.vfs_rdma_bulk_staging_buf = it->vfs_rdma_bulk_staging_buf;
+            it->vfs_rdma_write_buf = nullptr;
+            it->vfs_rdma_read_staging_buf = nullptr;
+            it->vfs_rdma_bulk_staging_buf = nullptr;
             g_bindings.erase(it);
             if (info.net_dev != nullptr) {
                 info.uninstall_rx_forward = !has_net_binding_for_dev(info.net_dev);
@@ -571,6 +646,15 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     // Cleanup outside the lock
+    if (info.vfs_rdma_write_buf != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_write_buf);
+    }
+    if (info.vfs_rdma_read_staging_buf != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_read_staging_buf);
+    }
+    if (info.vfs_rdma_bulk_staging_buf != nullptr) {
+        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_bulk_staging_buf);
+    }
     if (info.blk_rdma_active && info.blk_zone_id != 0) {
         wki_zone_destroy(info.blk_zone_id);
     }
@@ -643,7 +727,8 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
     // sit above OP_VFS_SEEK_END (0x040E).
     if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) {
-        detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path), req->op_id, req_data, req_data_len);
+        detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path),
+                              static_cast<const char*>(binding->vfs_export_name), req->op_id, req_data, req_data_len);
         return;
     }
 
@@ -1239,6 +1324,32 @@ auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_i
     for (auto& b : g_bindings) {
         if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
             uint8_t* buf = b.vfs_rdma_write_buf;
+            s_server_lock.unlock_irqrestore(srv_flags);
+            return buf;
+        }
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+    return nullptr;
+}
+
+auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    for (auto& b : g_bindings) {
+        if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
+            uint8_t* buf = b.vfs_rdma_read_staging_buf;
+            s_server_lock.unlock_irqrestore(srv_flags);
+            return buf;
+        }
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+    return nullptr;
+}
+
+auto wki_dev_server_get_vfs_bulk_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    for (auto& b : g_bindings) {
+        if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
+            uint8_t* buf = b.vfs_rdma_bulk_staging_buf;
             s_server_lock.unlock_irqrestore(srv_flags);
             return buf;
         }

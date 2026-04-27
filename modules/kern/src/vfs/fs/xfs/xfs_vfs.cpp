@@ -129,8 +129,12 @@ auto xfs_vfs_close(File* f) -> int {
     }
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
     if (xfd != nullptr) {
-        // Flush any dirty buffers to disk before closing the file
-        if (xfd->mount != nullptr && xfd->mount->device != nullptr) {
+        // Remote VFS executable loads open files read-only; syncing the whole
+        // filesystem on every close stalls those fetches and can trip WKI fencing.
+        constexpr int XFS_O_TRUNC_FLAG = 01000;
+        int accmode = f->open_flags & 3;
+        if ((accmode == 1 || accmode == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0) && xfd->mount != nullptr &&
+            xfd->mount->device != nullptr) {
             sync_blockdev(xfd->mount->device);
         }
         if (xfd->inode != nullptr) {
@@ -325,6 +329,33 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
     const auto* src = static_cast<const uint8_t*>(buf);
     size_t total_written = 0;
 
+    auto buffered_write = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
+        size_t remaining_bytes = bytes;
+        size_t block_off = initial_block_off;
+        xfs_fsblock_t current_disk_block = disk_block;
+        size_t current_src_offset = src_offset;
+
+        while (remaining_bytes > 0) {
+            size_t chunk = std::min(ctx->block_size - block_off, remaining_bytes);
+            BufHead* bp =
+                (block_off == 0 && chunk == ctx->block_size) ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
+            if (bp == nullptr) {
+                return false;
+            }
+
+            std::memcpy(bp->data + block_off, src + current_src_offset, chunk);
+            bdirty(bp);
+            brelse(bp);
+
+            remaining_bytes -= chunk;
+            current_src_offset += chunk;
+            current_disk_block++;
+            block_off = 0;
+        }
+
+        return true;
+    };
+
 #ifdef XFS_BENCH
     static std::atomic<uint64_t> s_wr_calls{0};
     static std::atomic<uint64_t> s_wr_ns_bmap{0};
@@ -431,10 +462,8 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 break;
             }
 
-            // Write the data blocks covered by this allocation.
-            // Fast path: if the write fully covers the allocated extent with
-            // no partial leading/trailing block, bypass the buffer cache and
-            // issue a single multi-block write directly to the block device.
+            // Write the data blocks covered by this allocation through the
+            // buffer cache so subsequent cached reads observe the new contents.
             {
                 size_t extent_bytes = static_cast<size_t>(alloc_result.len) << ctx->block_log;
                 size_t write_end = offset + count;
@@ -446,45 +475,18 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 size_t slice_end = std::min(extent_end, write_end);
                 size_t slice_bytes = (slice_end > slice_start) ? (slice_end - slice_start) : 0;
 
-                bool leading_partial = (block_off != 0);
-                bool trailing_partial = ((slice_bytes & (ctx->block_size - 1)) != 0) && (slice_end < extent_end);
-
 #ifdef XFS_BENCH
                 t0 = ker::mod::tsc::getNs();
 #endif
-                if (!leading_partial && !trailing_partial && slice_bytes == extent_bytes) {
-                    // Entire extent is fully covered - write directly, no buffer cache.
-                    uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
-                    size_t dev_count = extent_bytes / ctx->device->block_size;
-                    dev::block_write(ctx->device, dev_block, dev_count, src + (slice_start - offset));
-                    total_written += slice_bytes;
-                } else {
-                    // Partial coverage - fall back to per-block buffer cache writes.
-                    for (xfs_extlen_t b = 0; b < alloc_result.len; b++) {
-                        size_t blk_start = static_cast<size_t>(file_block + b) << ctx->block_log;
-                        size_t blk_off = (b == 0) ? block_off : 0UL;
-                        size_t cur_pos = blk_start + blk_off;
-
-                        if (cur_pos >= write_end) {
-                            break;
-                        }
-
-                        size_t chunk = std::min(ctx->block_size - blk_off, write_end - cur_pos);
-                        xfs_fsblock_t blk_disk = disk_block + b;
-
-                        BufHead* bp = (blk_off == 0 && chunk == ctx->block_size) ? xfs_buf_get(ctx, blk_disk) : xfs_buf_read(ctx, blk_disk);
-                        if (bp == nullptr) {
+                if (slice_bytes > 0) {
+                    size_t slice_block_off = slice_start - extent_start;
+                    if (!buffered_write(disk_block, slice_block_off, slice_bytes, slice_start - offset)) {
 #ifdef XFS_BENCH
-                            acc_io += ker::mod::tsc::getNs() - t0;
+                        acc_io += ker::mod::tsc::getNs() - t0;
 #endif
-                            goto write_done;
-                        }
-
-                        std::memcpy(bp->data + blk_off, src + (cur_pos - offset), chunk);
-                        bdirty(bp);
-                        brelse(bp);
-                        total_written += chunk;
+                        goto write_done;
                     }
+                    total_written += slice_bytes;
                 }
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::getNs() - t0;
@@ -503,24 +505,11 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::getNs();
 #endif
-            if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-                // Aligned full-block write - go direct to the block device.
-                uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
-                size_t dev_count = chunk / ctx->device->block_size;
-                dev::block_write(ctx->device, dev_block, dev_count, src + total_written);
-            } else {
-                // Partial - fall back to per-block buffer cache.
-                chunk = std::min(ctx->block_size - block_off, count - total_written);
-                BufHead* bp = (block_off == 0 && chunk == ctx->block_size) ? xfs_buf_get(ctx, disk_block) : xfs_buf_read(ctx, disk_block);
-                if (bp == nullptr) {
+            if (!buffered_write(disk_block, block_off, chunk, total_written)) {
 #ifdef XFS_BENCH
-                    acc_io += ker::mod::tsc::getNs() - t0;
+                acc_io += ker::mod::tsc::getNs() - t0;
 #endif
-                    break;
-                }
-                std::memcpy(bp->data + block_off, src + total_written, chunk);
-                bdirty(bp);
-                brelse(bp);
+                break;
             }
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::getNs() - t0;

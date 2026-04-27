@@ -33,6 +33,7 @@ struct DevServerBinding {
     uint32_t resource_id = 0;
     dev::BlockDevice* block_dev = nullptr;
     char vfs_export_path[256] = {};  // NOLINT(modernize-avoid-c-arrays)
+    char vfs_export_name[256] = {};  // NOLINT(modernize-avoid-c-arrays)
     net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
@@ -55,6 +56,15 @@ struct DevServerBinding {
     // Allocated at DEV_ATTACH time when the peer has an RDMA-capable transport.
     uint8_t* vfs_rdma_write_buf = nullptr;  // server-side receive region for RDMA-backed writes
     uint32_t vfs_rdma_write_rkey = 0;       // rkey identifying this region to the remote consumer
+
+    // VFS read staging (RoCE pull mode): server reads file data here; client rdma_reads to pull.
+    // Only allocated for transports where client-pull is safe (wki-roce).
+    uint8_t* vfs_rdma_read_staging_buf = nullptr;
+    uint32_t vfs_rdma_read_staging_rkey = 0;
+
+    // VFS bulk staging (RoCE pull mode): 2 MB staging region for OP_VFS_READ_BULK pull mode.
+    uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
+    uint32_t vfs_rdma_bulk_staging_rkey = 0;
 
     // V2 I-4: custom move ops required because std::atomic<bool> is non-movable
     DevServerBinding() = default;
@@ -81,10 +91,17 @@ struct DevServerBinding {
           blk_remote_rkey(o.blk_remote_rkey),
           blk_rdma_transport(o.blk_rdma_transport),
           vfs_rdma_write_buf(o.vfs_rdma_write_buf),
-          vfs_rdma_write_rkey(o.vfs_rdma_write_rkey) {
+          vfs_rdma_write_rkey(o.vfs_rdma_write_rkey),
+          vfs_rdma_read_staging_buf(o.vfs_rdma_read_staging_buf),
+          vfs_rdma_read_staging_rkey(o.vfs_rdma_read_staging_rkey),
+          vfs_rdma_bulk_staging_buf(o.vfs_rdma_bulk_staging_buf),
+          vfs_rdma_bulk_staging_rkey(o.vfs_rdma_bulk_staging_rkey) {
         // Copy the C array manually
         __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+        __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
         o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+        o.vfs_rdma_read_staging_buf = nullptr;
+        o.vfs_rdma_bulk_staging_buf = nullptr;
     }
     auto operator=(DevServerBinding&& o) noexcept -> DevServerBinding& {
         if (this != &o) {
@@ -95,6 +112,7 @@ struct DevServerBinding {
             resource_id = o.resource_id;
             block_dev = o.block_dev;
             __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+            __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
             net_dev = o.net_dev;
             net_rx_filter = o.net_rx_filter;
             net_rx_credits = o.net_rx_credits;
@@ -110,7 +128,13 @@ struct DevServerBinding {
             blk_rdma_transport = o.blk_rdma_transport;
             vfs_rdma_write_buf = o.vfs_rdma_write_buf;
             vfs_rdma_write_rkey = o.vfs_rdma_write_rkey;
+            vfs_rdma_read_staging_buf = o.vfs_rdma_read_staging_buf;
+            vfs_rdma_read_staging_rkey = o.vfs_rdma_read_staging_rkey;
+            vfs_rdma_bulk_staging_buf = o.vfs_rdma_bulk_staging_buf;
+            vfs_rdma_bulk_staging_rkey = o.vfs_rdma_bulk_staging_rkey;
             o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+            o.vfs_rdma_read_staging_buf = nullptr;
+            o.vfs_rdma_bulk_staging_buf = nullptr;
         }
         return *this;
     }
@@ -133,6 +157,14 @@ void wki_dev_server_poll_rings();
 // Look up the pre-registered VFS write-receive buffer for a given binding.
 // Returns nullptr if the binding has no RDMA write buffer (msg-only path).
 auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
+// Look up the server-side VFS read staging buffer (RoCE pull mode).
+// Returns nullptr if pull mode is not active for this binding.
+auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
+// Look up the server-side VFS bulk staging buffer (RoCE bulk pull mode).
+// Returns nullptr if bulk pull mode is not active for this binding.
+auto wki_dev_server_get_vfs_bulk_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
 
 // Process deferred zone creations. Called from wki_timer_tick().
 // Zone creation is deferred from the RX handler because wki_zone_create()

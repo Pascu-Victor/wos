@@ -5,6 +5,7 @@
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
+#include <net/wki/peer.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -264,6 +265,11 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
     // peer, so HELLO_ACK and resource adverts go back on the right interface.
     WkiTransport* transport = get_or_create_eth_transport(dev);
     auto* priv = static_cast<EthTransportPrivate*>(transport->private_data);
+    const auto* hdr = reinterpret_cast<const WkiHeader*>(pkt->data);
+
+    if (hdr->src_node != WKI_NODE_INVALID && hdr->src_node != WKI_NODE_BROADCAST && hdr->src_node != g_wki.my_node_id) {
+        wki_peer_note_rx_contact(transport, hdr->src_node, pkt->src_mac);
+    }
 
     if (priv->rx_handler != nullptr) {
         priv->rx_handler(transport, pkt->data, static_cast<uint16_t>(pkt->len));

@@ -180,18 +180,30 @@ std::array<task::Task*, MAX_ACTIVE_TASKS> active_task_list = {nullptr};
 uint32_t active_task_count = 0;
 
 void active_list_insert(task::Task* t) {
+    if (t == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        auto* existing = active_task_list[i];
+        if (existing == t || (existing != nullptr && existing->pid == t->pid)) {
+            active_task_list[i] = t;
+            return;
+        }
+    }
     if (active_task_count < MAX_ACTIVE_TASKS) {
         active_task_list[active_task_count++] = t;
     }
 }
 
 void active_list_remove(uint64_t pid) {
-    for (uint32_t i = 0; i < active_task_count; i++) {
+    uint32_t i = 0;
+    while (i < active_task_count) {
         if (active_task_list[i] != nullptr && active_task_list[i]->pid == pid) {
             active_task_list[i] = active_task_list[--active_task_count];
             active_task_list[active_task_count] = nullptr;
-            return;
+            continue;
         }
+        ++i;
     }
 }
 
@@ -1338,10 +1350,9 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
                 remove_from_sums(rq, exiting_task);
                 rq->runnableHeap.remove(exiting_task);
             }
-            // Also try removing from waitList in case of race
-            if (exiting_task->schedQueue == task::Task::SchedQueue::WAITING) {
-                rq->waitList.remove(exiting_task);
-            }
+            // The intrusive wait list owns schedNext, so detach by actual
+            // membership rather than trusting schedQueue to still be accurate.
+            rq->waitList.remove(exiting_task);
             exiting_task->schedQueue = task::Task::SchedQueue::NONE;
         }
 
@@ -1799,7 +1810,15 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         // A concurrent wakeup may have seen this task as rq->currentTask and
         // set wakeupPending instead of moving it. Blocking now would lose that
         // wake and leave the task stuck, so treat it as a yield instead.
+        //
+        // Remote execve handoff is the exception: once execve has been
+        // accepted as a proxy task, a signal wake must not turn the handoff
+        // back into a normal syscall return or userspace observes a spurious
+        // successful execve() return.
         bool woke = current_task->wakeupPending.exchange(false, std::memory_order_acquire);
+        if (current_task->wki_proxy_task_id != 0) {
+            woke = false;
+        }
 
         if (is_yield || skip_wait_queue || woke) {
             // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
@@ -2062,10 +2081,8 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                                            found_and_removed = true;
                                            return;
                                        }
-                                       if (task->schedQueue == task::Task::SchedQueue::WAITING) {
-                                           if (rq->waitList.remove(task)) {
-                                               found_and_removed = true;
-                                           }
+                                       if (rq->waitList.remove(task)) {
+                                           found_and_removed = true;
                                        }
                                        if (rq->runnableHeap.contains(task)) {
                                            remove_from_sums(rq, task);
@@ -2091,13 +2108,11 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #endif
                         return;
                     }
-                    if (task->schedQueue == task::Task::SchedQueue::WAITING) {
-                        if (rq->waitList.remove(task)) {
-                            found_and_removed = true;
+                    if (rq->waitList.remove(task)) {
+                        found_and_removed = true;
 #ifdef SCHED_DEBUG
-                            dbg::log("RESCHED: PID %x removed from CPU %d waitList", task->pid, (int)search_cpu);
+                        dbg::log("RESCHED: PID %x removed from CPU %d waitList", task->pid, (int)search_cpu);
 #endif
-                        }
                     }
                     if (rq->runnableHeap.contains(task)) {
 #ifdef SCHED_DEBUG
@@ -2312,7 +2327,7 @@ void insert_into_dead_list(task::Task* task) {
             found_current = true;
             return;
         }
-        if (task->schedQueue == task::Task::SchedQueue::WAITING && rq->waitList.remove(task)) {
+        if (rq->waitList.remove(task)) {
             removed_from_queue = true;
             return;
         }

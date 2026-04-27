@@ -660,6 +660,7 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->rx_seq = 0;
     ch->rx_ack_pending = 0;
     ch->ack_pending = false;
+    ch->ack_pending_since_us = 0;
     ch->tx_credits = credits;
     ch->rx_credits = credits;
     ch->retransmit_head = nullptr;
@@ -730,7 +731,8 @@ auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
             continue;
         }
         if (ch->ack_pending) {
-            next_deadline = std::min(next_deadline, now_us + std::max<uint64_t>(WKI_ACK_DELAY_US, 1));
+            uint64_t fire_at = ch->ack_pending_since_us + WKI_ACK_DELAY_US;
+            next_deadline = std::min(next_deadline, fire_at > now_us ? fire_at : now_us + 1);
         }
         if (ch->retransmit_head != nullptr && ch->retransmit_deadline != 0) {
             next_deadline = std::min(next_deadline, ch->retransmit_deadline);
@@ -801,11 +803,16 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel
 
     s_channel_pool_lock.lock();
 
-    // Find next free dynamic channel ID for this peer via per-peer array
-    uint16_t next_id = WKI_CHAN_DYNAMIC_BASE;
+    // Find the first free dynamic channel ID for this peer via per-peer array.
+    uint16_t next_id = WKI_MAX_CHANNELS;
     for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_MAX_CHANNELS; i++) {
-        if (peer->channels[i] != nullptr && peer->channels[i]->active) {
-            next_id = i + 1;
+        WkiChannel* existing = peer->channels[i];
+        if (existing == nullptr || !existing->active) {
+            if (existing != nullptr && !existing->active) {
+                peer->channels[i] = nullptr;
+            }
+            next_id = i;
+            break;
         }
     }
 
@@ -815,6 +822,34 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel
     }
 
     WkiChannel* ch = channel_pool_alloc(peer, peer_node, next_id, priority, WKI_CREDITS_DYNAMIC);
+    s_channel_pool_lock.unlock();
+    return ch;
+}
+
+auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority) -> WkiChannel* {
+    channel_pool_init();
+
+    if (channel_id < WKI_CHAN_DYNAMIC_BASE || channel_id >= WKI_MAX_CHANNELS) {
+        return nullptr;
+    }
+
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer == nullptr) {
+        return nullptr;
+    }
+
+    s_channel_pool_lock.lock();
+
+    WkiChannel* existing = peer->channels[channel_id];
+    if (existing != nullptr) {
+        if (existing->active) {
+            s_channel_pool_lock.unlock();
+            return nullptr;
+        }
+        peer->channels[channel_id] = nullptr;
+    }
+
+    WkiChannel* ch = channel_pool_alloc(peer, peer_node, channel_id, priority, WKI_CREDITS_DYNAMIC);
     s_channel_pool_lock.unlock();
     return ch;
 }
@@ -1605,6 +1640,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->rx_seq++;
                 ch->rx_ack_pending = hdr->seq_num;
                 ch->ack_pending = true;
+                ch->ack_pending_since_us = wki_now_us();
                 ch->bytes_received += payload_len;
 
                 ch->lock.unlock();
@@ -1718,6 +1754,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 }
 
                 ch->ack_pending = true;
+                ch->ack_pending_since_us = 0;  // out-of-order: ACK immediately (no piggyback opportunity)
 
                 ch->lock.unlock();
                 wki_timer_notify();
@@ -1726,6 +1763,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 // queue gets drained.  Without this the sender never receives the
                 // ACK and keeps retransmitting the same stale packet.
                 ch->ack_pending = true;
+                ch->ack_pending_since_us = 0;  // duplicate: ACK immediately
                 ch->lock.unlock();
                 wki_timer_notify();
             }
@@ -1779,7 +1817,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         ch->retransmit_deadline = now_us + ch->rto_us;
     }
 
-    if (ch->ack_pending) {
+    if (ch->ack_pending && now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
         ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
         ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);
         ack_hdr.src_node = g_wki.my_node_id;
@@ -1888,10 +1926,10 @@ void wki_timer_tick(uint64_t now_us) {
             ch->retransmit_deadline = now_us + ch->rto_us;
         }
 
-        // Delayed ACK - send standalone ACK if pending
-        // Timer runs at ~10ms cadence which exceeds WKI_ACK_DELAY_US (1ms),
-        // so always send when ack_pending is set.
-        if (ch->ack_pending) {
+        // Delayed ACK - send standalone ACK if pending.
+        // wki_next_fast_timer_deadline_us() schedules the timer WKI_ACK_DELAY_US after
+        // ack_pending is set, giving outgoing messages time to piggyback the ACK first.
+        if (ch->ack_pending && now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
             // Build ACK header for TX outside lock
             ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
             ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);  // reuse as ACK carrier

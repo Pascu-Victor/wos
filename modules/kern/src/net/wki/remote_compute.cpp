@@ -167,7 +167,7 @@ struct ScopedComputeMeasure {
 };
 
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
-constexpr size_t WKI_VFS_LOAD_CHUNK = 262144;  // 256 KB: fewer round-trips for remote binary fetch
+constexpr size_t WKI_VFS_LOAD_CHUNK = 262144;                  // 256 KB: fewer round-trips for remote binary fetch
 constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
 constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 8;
 constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
@@ -453,22 +453,34 @@ void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
 }
 
 void write_proxy_output(ker::mod::sched::task::Task* proxy, const uint8_t* output_data, uint16_t output_len, uint32_t task_id) {
+#ifndef DEBUG_WKI_COMPUTE
+    (void)task_id;
+#endif
     if (proxy == nullptr || output_data == nullptr || output_len == 0) {
         return;
     }
 #ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Task %u remote output (%u bytes):", task_id, output_len);
 #endif
+#ifdef DEBUG_WKI_COMPUTE
     ssize_t write_ret = -1;
     bool had_stdout = false;
+#endif
     if (proxy->fd_table.lookup(1) != nullptr) {
+#ifdef DEBUG_WKI_COMPUTE
         had_stdout = true;
+#endif
         auto* file = static_cast<ker::vfs::File*>(proxy->fd_table.lookup(1));
         if (file->fops != nullptr && file->fops->vfs_write != nullptr) {
-            write_ret = file->fops->vfs_write(file, output_data, output_len, 0);
+#ifdef DEBUG_WKI_COMPUTE
+            write_ret =
+#endif
+                file->fops->vfs_write(file, output_data, output_len, 0);
         }
     }
+#ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Task %u replay output: len=%u had_stdout=%d ret=%ld", task_id, output_len, had_stdout ? 1 : 0, write_ret);
+#endif
 }
 
 void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status) {
@@ -1704,6 +1716,10 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
         if (rt.active && rt.submitter_node == node_id) {
             delete rt.output;
             rt.output = nullptr;
+            if (rt.task != nullptr) {
+                rt.task->release();
+                rt.task = nullptr;
+            }
             rt.active = false;
         }
     }
@@ -1770,9 +1786,15 @@ void wki_remote_compute_check_completions() {
         int32_t exit_status = -1;
         bool completed = false;
 
-        auto* task = ker::mod::sched::find_task_by_pid(rt.local_pid);
+        auto* task = rt.task;
         if (task == nullptr) {
-            // Task was garbage collected - treat as exited with unknown status
+            task = ker::mod::sched::find_task_by_pid(rt.local_pid);
+        }
+
+        if (task == nullptr) {
+            // Lost the task reference before we observed exit. Treat this as a
+            // failed remote task, but this path should now be rare because
+            // RunningRemoteTask holds a ref until completion is reported.
             completed = true;
         } else if (task->hasExited) {
             exit_status = task->exitStatus;
@@ -1791,6 +1813,10 @@ void wki_remote_compute_check_completions() {
                                               .output = rt.output};
         } else {
             delete rt.output;
+        }
+        if (rt.task != nullptr) {
+            rt.task->release();
+            rt.task = nullptr;
         }
         rt.output = nullptr;
         rt.active = false;
@@ -2631,6 +2657,9 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
     rt.task_id = submit->task_id;
     rt.submitter_node = hdr->src_node;
     rt.local_pid = launched_pid;
+    if (new_task->tryAcquire()) {
+        rt.task = new_task;
+    }
     rt.output = exec.output;
     s_compute_lock.lock();
     g_running_remote_tasks.push_back(rt);
@@ -2949,7 +2978,10 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     rt->active = false;
     s_compute_lock.unlock();
 
-    auto* task = ker::mod::sched::find_task_by_pid(local_pid);
+    auto* task = rt->task;
+    if (task == nullptr) {
+        task = ker::mod::sched::find_task_by_pid(local_pid);
+    }
     if (task != nullptr && !task->hasExited) {
         // Best-effort force-kill: transition to EXITING, set exit status, then DEAD.
         // The scheduler will skip DEAD tasks and GC will reclaim resources.
@@ -2961,6 +2993,11 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
             ker::mod::dbg::log("[WKI] Task cancelled: task_id=%u pid=0x%lx", cancel->task_id, local_pid);
         }
+    }
+
+    if (rt->task != nullptr) {
+        rt->task->release();
+        rt->task = nullptr;
     }
 
     // Send TASK_COMPLETE with exit_status=-9 (killed)

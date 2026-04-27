@@ -20,9 +20,9 @@
 
 namespace ker::net::wki {
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Storage
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 namespace {
 
@@ -260,9 +260,9 @@ const ker::net::NetDeviceOps g_proxy_net_ops = {
 
 }  // namespace
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Init
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 void wki_remote_net_init() {
     if (g_remote_net_initialized) {
@@ -272,9 +272,9 @@ void wki_remote_net_init() {
     ker::mod::dbg::log("[WKI] Remote NIC subsystem initialized");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Server Side - NET Operation Handlers
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 namespace detail {
 
@@ -429,9 +429,9 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
 
 }  // namespace detail
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Consumer Side - Attach / Response Handlers
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::net::NetDevice* {
     if (local_name == nullptr) {
@@ -452,7 +452,20 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::NET);
     attach_req.resource_id = resource_id;
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
-    attach_req.requested_channel = 0;
+
+    WkiChannel* reserved_channel = nullptr;
+    if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
+        reserved_channel = wki_channel_alloc(owner_node, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            s_net_proxy_lock.lock();
+            g_net_proxies.pop_back();
+            s_net_proxy_lock.unlock();
+            return nullptr;
+        }
+        attach_req.requested_channel = reserved_channel->channel_id;
+    } else {
+        attach_req.requested_channel = 0;
+    }
 
     WkiWaitEntry wait = {};
     state->attach_wait_entry = &wait;
@@ -463,6 +476,9 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
     if (send_ret != WKI_OK) {
         state->attach_wait_entry = nullptr;
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
         s_net_proxy_lock.lock();
         g_net_proxies.pop_back();
         s_net_proxy_lock.unlock();
@@ -473,6 +489,9 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->attach_wait_entry = nullptr;
     if (wait_rc == WKI_ERR_TIMEOUT) {
         state->attach_pending.store(false, std::memory_order_relaxed);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
         s_net_proxy_lock.lock();
         g_net_proxies.pop_back();
         s_net_proxy_lock.unlock();
@@ -482,13 +501,48 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
         ker::mod::dbg::log("[WKI] Remote NIC attach rejected: status=%u", state->attach_status);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
         s_net_proxy_lock.lock();
         g_net_proxies.pop_back();
         s_net_proxy_lock.unlock();
         return nullptr;
     }
 
-    state->assigned_channel = state->attach_channel;
+    if (reserved_channel != nullptr) {
+        if (state->attach_channel != reserved_channel->channel_id) {
+            ker::mod::dbg::log("[WKI] Remote NIC attach channel mismatch: node=0x%04x res_id=%u requested=%u assigned=%u", owner_node,
+                               resource_id, reserved_channel->channel_id, state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::NET);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            wki_channel_close(reserved_channel);
+            s_net_proxy_lock.lock();
+            g_net_proxies.pop_back();
+            s_net_proxy_lock.unlock();
+            return nullptr;
+        }
+    } else {
+        reserved_channel = wki_channel_reserve(owner_node, state->attach_channel, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            ker::mod::dbg::log("[WKI] Remote NIC attach local reserve failed: node=0x%04x res_id=%u ch=%u", owner_node, resource_id,
+                               state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::NET);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            s_net_proxy_lock.lock();
+            g_net_proxies.pop_back();
+            s_net_proxy_lock.unlock();
+            return nullptr;
+        }
+    }
+
+    state->assigned_channel = reserved_channel->channel_id;
     state->max_op_size = state->attach_max_op_size;
     state->active = true;
 
@@ -569,9 +623,9 @@ void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Consumer Side - RX Handlers
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 namespace detail {
 
@@ -704,9 +758,9 @@ void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t da
 
 }  // namespace detail
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // D13: Periodic stats polling (non-blocking, called from timer tick)
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 void wki_remote_net_poll_stats() {
     if (!g_remote_net_initialized) {
@@ -754,9 +808,9 @@ void wki_remote_net_poll_stats() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 // Fencing Cleanup
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
 
 void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
     // Collect channels to close under lock

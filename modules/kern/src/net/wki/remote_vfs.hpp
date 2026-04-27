@@ -75,8 +75,6 @@ struct ProxyVfsState {
     std::atomic<bool> readlink_unsupported{false};
 
     std::atomic<bool> op_pending{false};
-    std::atomic<bool> op_draining{false};  // Set after timeout; cleared when late response arrives
-    uint64_t op_drain_deadline_us = 0;     // Force-release drain after this deadline
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
     int16_t op_status = 0;
@@ -101,7 +99,9 @@ struct ProxyVfsState {
     WkiTransport* rdma_transport = nullptr;
     uint32_t rdma_read_rkey = 0;          // our bounce buffer's rkey (server writes file data here)
     uint8_t* rdma_bounce_buf = nullptr;   // 64 KB bounce buffer for reads and write staging
-    uint32_t rdma_server_write_rkey = 0;  // server's receive region rkey (consumer writes here for writes)
+    uint32_t rdma_server_write_rkey = 0;       // server's receive region rkey (consumer writes here for writes)
+    uint32_t rdma_server_read_staging_rkey = 0;  // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
+    uint32_t rdma_server_bulk_staging_rkey = 0;  // server's bulk staging rkey (RoCE bulk pull mode)
 
     // Bulk RDMA I/O - larger registered buffer for sequential reads > 64 KB.
     // Reduces round-trips from N (64 KB chunks) to 1 (up to 2 MB).
@@ -223,8 +223,8 @@ void wki_remote_vfs_gc_stale_fds();
 namespace detail {
 
 // Server side: handle VFS operations (called from dev_server handle_dev_op_req)
-void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, uint16_t op_id, const uint8_t* data,
-                   uint16_t data_len);
+void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,
+                   const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_OP_RESP for VFS proxy
 void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

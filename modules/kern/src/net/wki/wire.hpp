@@ -479,10 +479,12 @@ struct DevAttachAckPayload {
     uint32_t resource_id;  // echoed from DEV_ATTACH_REQ for consumer-side matching
     uint16_t max_op_size;  // max payload size for DEV_OP_REQ
     uint16_t rdma_flags;   // bit 0: RDMA block ring zone available
-    uint32_t blk_zone_id;  // RDMA zone ID for block ring (0 = not available)
+    uint32_t blk_zone_id;  // RDMA zone ID for block ring; for VFS: server write-recv rkey
+    uint32_t rdma_read_staging_rkey;  // DEV_ATTACH_RDMA_VFS_READ: server-side read staging rkey (RoCE pull mode)
+    uint32_t rdma_bulk_staging_rkey;  // DEV_ATTACH_RDMA_BULK_PULL: server-side bulk staging rkey (RoCE pull mode)
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckPayload) == 16, "DevAttachAckPayload must be 16 bytes");
+static_assert(sizeof(DevAttachAckPayload) == 24, "DevAttachAckPayload must be 24 bytes");
 
 // V2: Extended attach ACK for NET resources - includes owner NIC info [V2§A5.3]
 struct DevAttachAckNetPayload {
@@ -507,6 +509,8 @@ static_assert(sizeof(DevAttachAckNetPayload) == 32, "DevAttachAckNetPayload must
 constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
 constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;       // VFS RDMA available; blk_zone_id carries server write-recv rkey
 constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;      // bulk RDMA transfer supported (large sequential I/O)
+constexpr uint16_t DEV_ATTACH_RDMA_VFS_READ = 0x0008;  // VFS read staging buf available (pull mode); rdma_read_staging_rkey valid
+constexpr uint16_t DEV_ATTACH_RDMA_BULK_PULL = 0x0010; // VFS bulk staging buf available (pull mode); rdma_bulk_staging_rkey valid
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload - 8 bytes

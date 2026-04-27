@@ -47,15 +47,12 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     if (kernelStackBase == 0) return static_cast<uint64_t>(-ENOMEM);
     uint64_t kernelRsp = kernelStackBase + KERNEL_STACK_SIZE;
 
-    // --- Allocate child Task manually (skip ELF-loading constructor) ---
-    auto* child = static_cast<sched::task::Task*>(::operator new(sizeof(sched::task::Task)));
+    // --- Allocate child Task without the ELF-loading constructor ---
+    auto* child = new sched::task::Task{};
     if (child == nullptr) {
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
         return static_cast<uint64_t>(-ENOMEM);
     }
-
-    // Zero-initialize
-    memset(child, 0, sizeof(sched::task::Task));
 
     // --- Initialize child task fields ---
     // Copy name
@@ -93,11 +90,6 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->heapIndex = -1;
     child->schedQueue = sched::task::Task::SchedQueue::NONE;
     child->schedNext = nullptr;
-
-    // Lock-free lifecycle management
-    new (&child->state) std::atomic<sched::task::TaskState>(sched::task::TaskState::ACTIVE);
-    new (&child->refCount) std::atomic<uint32_t>(1);
-    new (&child->deathEpoch) std::atomic<uint64_t>(0);
 
     // Copy CWD
     memcpy(child->cwd, parent->cwd, sched::task::Task::CWD_MAX);
@@ -143,7 +135,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     if (child->pagemap == nullptr) {
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
-        ::operator delete(child);
+        delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
 
@@ -156,7 +148,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::phys::pageFree(child->pagemap);
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
-        ::operator delete(child);
+        delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
 
@@ -170,7 +162,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             mm::phys::pageFree(child->pagemap);
             delete[] child->name;
             mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
-            ::operator delete(child);
+            delete child;
             return static_cast<uint64_t>(-ENOMEM);
         }
         // Copy all fields - virtual addresses are the same (same address space layout via COW)
@@ -261,7 +253,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::phys::pageFree(child->pagemap);
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
-        ::operator delete(child);
+        delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
 

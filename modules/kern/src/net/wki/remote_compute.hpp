@@ -111,6 +111,7 @@ struct RunningRemoteTask {
     uint32_t task_id = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
+    ker::mod::sched::task::Task* task = nullptr;
 
     // D19: stdout/stderr capture
     TaskOutputCapture* output = nullptr;

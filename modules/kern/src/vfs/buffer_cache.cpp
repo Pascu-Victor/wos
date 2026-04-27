@@ -365,22 +365,8 @@ void brelse(BufHead* bh) {
     }
 
     int32_t prev = bh->refcount.fetch_sub(1, std::memory_order_acq_rel);
-    if (prev <= 1) {
-        // Refcount hit zero. If the buffer is not in the hash (multi-block),
-        // free it immediately.
-        if (bh->lru_prev == nullptr && bh->lru_next == nullptr && bh->hash_next == nullptr) {
-            // Not in cache (multi-block temporary buffer) - check if it's also
-            // not the sole entry in any hash bucket. For multi-block buffers
-            // (which are never inserted into the hash), just free.
-            // Simple heuristic: if size > block_size, it's a multi-block buffer.
-            if (bh->bdev != nullptr && bh->size > bh->bdev->block_size) {
-                mod::mm::dyn::kmalloc::free(bh->data);
-                mod::mm::dyn::kmalloc::free(bh);
-                return;
-            }
-        }
-        // Otherwise the buffer stays in the cache for potential reuse.
-        // LRU eviction will reclaim it when space is needed.
+    if (prev <= 0) {
+        bh->refcount.store(0, std::memory_order_relaxed);
     }
 }
 

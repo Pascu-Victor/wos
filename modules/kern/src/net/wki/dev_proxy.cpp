@@ -1524,7 +1524,20 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
     attach_req.resource_id = resource_id;
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
-    attach_req.requested_channel = 0;  // auto-assign
+
+    WkiChannel* reserved_channel = nullptr;
+    if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
+        reserved_channel = wki_channel_alloc(owner_node, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+        attach_req.requested_channel = reserved_channel->channel_id;
+    } else {
+        attach_req.requested_channel = 0;
+    }
 
     state->attach_pending.store(true, std::memory_order_release);
     state->attach_status = 0;
@@ -1574,6 +1587,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         ker::mod::dbg::log("[WKI-DBG] attach_block: TIMEOUT - setting attach_pending=false, popping proxy");
 #endif
         state->attach_pending.store(false, std::memory_order_relaxed);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
         s_proxy_lock.lock();
         g_proxies.pop_back();
         s_proxy_lock.unlock();
@@ -1586,13 +1602,48 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
         ker::mod::dbg::log("[WKI] Dev proxy attach rejected: node=0x%04x res_id=%u status=%u", owner_node, resource_id,
                            state->attach_status);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
         s_proxy_lock.lock();
         g_proxies.pop_back();
         s_proxy_lock.unlock();
         return nullptr;
     }
 
-    state->assigned_channel = state->attach_channel;
+    if (reserved_channel != nullptr) {
+        if (state->attach_channel != reserved_channel->channel_id) {
+            ker::mod::dbg::log("[WKI] Dev proxy attach channel mismatch: node=0x%04x res_id=%u requested=%u assigned=%u", owner_node,
+                               resource_id, reserved_channel->channel_id, state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            wki_channel_close(reserved_channel);
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+    } else {
+        reserved_channel = wki_channel_reserve(owner_node, state->attach_channel, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            ker::mod::dbg::log("[WKI] Dev proxy attach local reserve failed: node=0x%04x res_id=%u ch=%u", owner_node, resource_id,
+                               state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+    }
+
+    state->assigned_channel = reserved_channel->channel_id;
     state->max_op_size = state->attach_max_op_size;
 
     uint64_t block_size = 0;
