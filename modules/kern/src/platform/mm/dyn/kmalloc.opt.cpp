@@ -67,7 +67,12 @@ struct alignas(16) MediumAllocationHeader {
     MediumAllocationHeader* next;
     uint64_t size;   // Total allocation size including header
     uint64_t magic;  // For validation
-    uint64_t _pad;   // Pad to 32 bytes so (header + 1) is 16-byte aligned
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
+    uint32_t _pad;
+#else
+    uint64_t _pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
+#endif
     // Data follows immediately after this header
 };
 
@@ -78,17 +83,49 @@ struct alignas(16) LargeAllocationHeader {
     LargeAllocationHeader* next;
     uint64_t size;
     uint64_t magic;  // For validation
-    uint64_t _pad;   // Pad to 32 bytes so (header + 1) is 16-byte aligned
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
+    uint32_t _pad;
+#else
+    uint64_t _pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
+#endif
     // Data follows immediately after this header
 };
 
 constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
+
+static_assert(sizeof(MediumAllocationHeader) == sizeof(LargeAllocationHeader), "allocation header sizes must match");
+static_assert(sizeof(MediumAllocationHeader) == sizeof(void*) + (3 * sizeof(uint64_t)),
+              "MediumAllocationHeader must be 32 bytes (no accidental padding)");
 
 static MediumAllocationHeader* mediumAllocList = nullptr;
 static sys::Spinlock mediumAllocLock;
 
 static LargeAllocationHeader* largeAllocList = nullptr;
 static sys::Spinlock largeAllocLock;
+
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+// Per-allocation debug side-table.  Stored in .bss so it is always available during OOM.
+// Index 0 is a sentinel meaning "no info".  The counter never wraps back — once full,
+// new allocations silently get index 0.  64 KB total; zero runtime cost in release builds.
+struct AllocDebugInfo {
+    uintptr_t caller;  // return address captured at the kmalloc call site
+    const char* tag;   // compile-time string (type name or "::new"), may be null
+};
+static constexpr uint32_t ALLOC_DEBUG_NONE = 0;
+static constexpr size_t ALLOC_DEBUG_MAX = 4096;
+__attribute__((section(".bss"))) static std::array<AllocDebugInfo, ALLOC_DEBUG_MAX> s_alloc_debug{};
+static std::atomic<uint32_t> s_alloc_debug_next{1};
+
+static auto register_alloc_debug(uintptr_t caller, const char* tag) -> uint32_t {
+    uint32_t slot = s_alloc_debug_next.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= ALLOC_DEBUG_MAX) {
+        return ALLOC_DEBUG_NONE;
+    }
+    s_alloc_debug[slot] = {.caller = caller, .tag = tag};
+    return slot;
+}
+#endif
 
 void init() {
     // Initialize per-CPU allocators
@@ -120,16 +157,29 @@ void dumpTrackedAllocations() {
             mediumTotalBytes += curr->size;
             ker::mod::io::serial::write("  addr=0x");
             ker::mod::io::serial::writeHex((uint64_t)(curr + 1));
-            ker::mod::io::serial::write(" size=");
+            ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::writeHex(curr->size);
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+            if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
+                const auto& d = s_alloc_debug[curr->debug_idx];
+                if (d.caller != 0) {
+                    ker::mod::io::serial::write(" caller=0x");
+                    ker::mod::io::serial::writeHex(d.caller);
+                }
+                if (d.tag != nullptr) {
+                    ker::mod::io::serial::write(" tag=");
+                    ker::mod::io::serial::write(d.tag);
+                }
+            }
+#endif
             ker::mod::io::serial::write("\n");
         }
     }
     mediumAllocLock.unlock();
 
-    ker::mod::io::serial::write("  medium_total: ");
+    ker::mod::io::serial::write("  medium_total: 0x");
     ker::mod::io::serial::writeHex(mediumCount);
-    ker::mod::io::serial::write(" entries, ");
+    ker::mod::io::serial::write(" entries, 0x");
     ker::mod::io::serial::writeHex(mediumTotalBytes);
     ker::mod::io::serial::write(" bytes\n");
 
@@ -144,18 +194,55 @@ void dumpTrackedAllocations() {
             largeTotalBytes += curr->size;
             ker::mod::io::serial::write("  addr=0x");
             ker::mod::io::serial::writeHex((uint64_t)(curr + 1));  // Data starts after header
-            ker::mod::io::serial::write(" size=");
+            ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::writeHex(curr->size);
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+            if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
+                const auto& d = s_alloc_debug[curr->debug_idx];
+                if (d.caller != 0) {
+                    ker::mod::io::serial::write(" caller=0x");
+                    ker::mod::io::serial::writeHex(d.caller);
+                }
+                if (d.tag != nullptr) {
+                    ker::mod::io::serial::write(" tag=");
+                    ker::mod::io::serial::write(d.tag);
+                }
+            }
+#endif
             ker::mod::io::serial::write("\n");
         }
     }
 
-    ker::mod::io::serial::write("  large_total: ");
+    ker::mod::io::serial::write("  large_total: 0x");
     ker::mod::io::serial::writeHex(largeCount);
-    ker::mod::io::serial::write(" entries, ");
+    ker::mod::io::serial::write(" entries, 0x");
     ker::mod::io::serial::writeHex(largeTotalBytes);
     ker::mod::io::serial::write(" bytes\n");
     largeAllocLock.unlock();
+
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info (KASAN/KUBSAN):\n");
+    mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uint32_t dbg_idx) -> void {
+        if (dbg_idx == ALLOC_DEBUG_NONE || dbg_idx >= ALLOC_DEBUG_MAX) {
+            return;
+        }
+        const auto& d = s_alloc_debug[dbg_idx];
+        if (d.caller == 0) {
+            return;
+        }
+        ker::mod::io::serial::write("  addr=0x");
+        ker::mod::io::serial::writeHex((uint64_t)ptr);
+        ker::mod::io::serial::write(" sz=0x");
+        ker::mod::io::serial::writeHex(sz);
+        ker::mod::io::serial::write(" caller=0x");
+        ker::mod::io::serial::writeHex(d.caller);
+        if (d.tag != nullptr) {
+            ker::mod::io::serial::write(" tag=");
+            ker::mod::io::serial::write(d.tag);
+        }
+        ker::mod::io::serial::write("\n");
+    });
+#endif
 }
 
 void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
@@ -181,20 +268,38 @@ void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
     largeAllocLock.unlock();
 }
 
-static int size_to_slab_idx(uint64_t size) {
-    if (size <= 0x10) return 0;
-    if (size <= 0x20) return 1;
-    if (size <= 0x40) return 2;
-    if (size <= 0x80) return 3;
-    if (size <= 0x100) return 4;
-    if (size <= 0x200) return 5;
-    if (size <= 0x300) return 6;
-    if (size <= 0x400) return 7;
-    if (size <= 0x800) return 8;
+static auto size_to_slab_idx(uint64_t size) -> int {
+    if (size <= 0x10) {
+        return 0;
+    }
+    if (size <= 0x20) {
+        return 1;
+    }
+    if (size <= 0x40) {
+        return 2;
+    }
+    if (size <= 0x80) {
+        return 3;
+    }
+    if (size <= 0x100) {
+        return 4;
+    }
+    if (size <= 0x200) {
+        return 5;
+    }
+    if (size <= 0x300) {
+        return 6;
+    }
+    if (size <= 0x400) {
+        return 7;
+    }
+    if (size <= 0x800) {
+        return 8;
+    }
     return -1;
 }
 
-static int slab_size_to_idx(size_t slab_size) {
+static auto slab_size_to_idx(size_t slab_size) -> int {
     switch (slab_size) {
         case 0x10:
             return 0;
@@ -219,7 +324,7 @@ static int slab_size_to_idx(size_t slab_size) {
     }
 }
 
-void* malloc(uint64_t size) {
+static auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     if (size == 0) {
         return nullptr;
     }
@@ -249,6 +354,12 @@ void* malloc(uint64_t size) {
             kasan::unpoison_range(ptr, size);
         }
 #endif
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+        if (ptr != nullptr) {
+            // Store debug_idx in the lower 32 bits of _align_pad (the 8 bytes before user data).
+            *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(ptr) - sizeof(uintptr_t)) = register_alloc_debug(caller, tag);
+        }
+#endif
         return ptr;
     }
 
@@ -259,9 +370,9 @@ void* malloc(uint64_t size) {
         uint64_t alloc_size = (total_size + page_size - 1) & ~(page_size - 1);
 
 #ifdef DEBUG_KMALLOC
-        ker::mod::io::serial::write("kmalloc: Medium allocation (");
+        ker::mod::io::serial::write("kmalloc: Medium allocation (0x");
         ker::mod::io::serial::writeHex(size);
-        ker::mod::io::serial::write(" bytes), using pageAlloc (");
+        ker::mod::io::serial::write(" bytes), using pageAlloc (0x");
         ker::mod::io::serial::writeHex(alloc_size);
         ker::mod::io::serial::write(" bytes)\n");
 #endif
@@ -277,10 +388,12 @@ void* malloc(uint64_t size) {
         // Set up header with tracking info
         auto* header = static_cast<MediumAllocationHeader*>(alloc_ptr);
         header->size = alloc_size;
-        header->magic = MEDIUM_ALLOC_MAGIC;
 
-        // Add to linked list
+        // Add to linked list and set magic under the same lock.
+        // Magic must be set while holding the lock so that any concurrent free() that
+        // sees magic set is guaranteed to find the entry in the list (no TOCTOU window).
         mediumAllocLock.lock();
+        header->magic = MEDIUM_ALLOC_MAGIC;
         header->next = mediumAllocList;
         mediumAllocList = header;
         mediumAllocLock.unlock();
@@ -292,6 +405,9 @@ void* malloc(uint64_t size) {
         kasan::poison_range(static_cast<void*>(header), sizeof(MediumAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
         kasan::unpoison_range(data, size);
 #endif
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+        header->debug_idx = register_alloc_debug(caller, tag);
+#endif
         return data;
     }
 
@@ -301,9 +417,9 @@ void* malloc(uint64_t size) {
     uint64_t alloc_size = (total_size + page_size - 1) & ~(page_size - 1);
 
 #ifdef DEBUG_KMALLOC
-    ker::mod::io::serial::write("kmalloc: Large allocation (");
+    ker::mod::io::serial::write("kmalloc: Large allocation (0x");
     ker::mod::io::serial::writeHex(size);
-    ker::mod::io::serial::write(" bytes), using pageAllocHuge (");
+    ker::mod::io::serial::write(" bytes), using pageAllocHuge (0x");
     ker::mod::io::serial::writeHex(alloc_size);
     ker::mod::io::serial::write(" bytes)\n");
 #endif
@@ -324,10 +440,12 @@ void* malloc(uint64_t size) {
     // Set up header with tracking info
     auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
     header->size = alloc_size;
-    header->magic = LARGE_ALLOC_MAGIC;
 
-    // Add to linked list
+    // Add to linked list and set magic under the same lock.
+    // Magic must be set while holding the lock so that any concurrent free() that
+    // sees magic set is guaranteed to find the entry in the list (no TOCTOU window).
     largeAllocLock.lock();
+    header->magic = LARGE_ALLOC_MAGIC;
     header->next = largeAllocList;
     largeAllocList = header;
     largeAllocLock.unlock();
@@ -338,8 +456,21 @@ void* malloc(uint64_t size) {
     kasan::poison_range(static_cast<void*>(header), sizeof(LargeAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
     kasan::unpoison_range(data, size);
 #endif
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    header->debug_idx = register_alloc_debug(caller, tag);
+#endif
     return data;
 }
+
+auto malloc(uint64_t size) -> void* {
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    return malloc_impl(size, (uintptr_t)__builtin_return_address(0), nullptr);
+#else
+    return malloc_impl(size, 0, nullptr);
+#endif
+}
+
+auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void* { return malloc_impl(size, caller, tag); }
 
 // Helper to find and remove from medium alloc list
 static auto findAndRemoveMediumAlloc(void* dataPtr, uint64_t& outSize) -> bool {
@@ -436,13 +567,14 @@ auto realloc(void* ptr, int sz) -> void* {
 
             auto* newHeader = static_cast<LargeAllocationHeader*>(newAlloc);
             newHeader->size = newAllocSize;
-            newHeader->magic = LARGE_ALLOC_MAGIC;
 
             uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
             memcpy(newHeader + 1, ptr, copySize);
 
-            // Update linked list
+            // Update linked list; set magic under the lock alongside insertion
+            // so there is no window where magic is set but the entry is not yet in the list.
             largeAllocLock.lock();
+            newHeader->magic = LARGE_ALLOC_MAGIC;
             LargeAllocationHeader** prev = &largeAllocList;
             for (LargeAllocationHeader* curr = largeAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
                 if (curr == potentialLargeHeader) {
@@ -453,7 +585,10 @@ auto realloc(void* ptr, int sz) -> void* {
             newHeader->next = largeAllocList;
             largeAllocList = newHeader;
             largeAllocLock.unlock();
-
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+            newHeader->debug_idx = ALLOC_DEBUG_NONE;
+#endif
+            potentialLargeHeader->magic = 0;  // Clear before page free; stale magic causes false positives when pages are recycled for slab
             phys::pageFree(potentialLargeHeader);
             return static_cast<void*>(newHeader + 1);
         }
@@ -490,13 +625,14 @@ auto realloc(void* ptr, int sz) -> void* {
 
             auto* newHeader = static_cast<MediumAllocationHeader*>(newAlloc);
             newHeader->size = newAllocSize;
-            newHeader->magic = MEDIUM_ALLOC_MAGIC;
 
             uint64_t copySize = (oldSize < newSize) ? oldSize : newSize;
             memcpy(newHeader + 1, ptr, copySize);
 
-            // Update linked list
+            // Update linked list; set magic under the lock alongside insertion
+            // so there is no window where magic is set but the entry is not yet in the list.
             mediumAllocLock.lock();
+            newHeader->magic = MEDIUM_ALLOC_MAGIC;
             MediumAllocationHeader** prev = &mediumAllocList;
             for (MediumAllocationHeader* curr = mediumAllocList; curr != nullptr; prev = &curr->next, curr = curr->next) {
                 if (curr == potentialMediumHeader) {
@@ -507,7 +643,11 @@ auto realloc(void* ptr, int sz) -> void* {
             newHeader->next = mediumAllocList;
             mediumAllocList = newHeader;
             mediumAllocLock.unlock();
-
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+            newHeader->debug_idx = ALLOC_DEBUG_NONE;
+#endif
+            potentialMediumHeader->magic =
+                0;  // Clear before page free; stale magic causes false positives when pages are recycled for slab
             phys::pageFree(potentialMediumHeader);
             return static_cast<void*>(newHeader + 1);
         }
@@ -597,9 +737,9 @@ void free(void* ptr) {
         uint64_t size = 0;
         if (findAndRemoveLargeAlloc(ptr, size)) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: Freeing large allocation at ");
+            ker::mod::io::serial::write("kmalloc: Freeing large allocation at 0x");
             ker::mod::io::serial::writeHex((uint64_t)ptr);
-            ker::mod::io::serial::write(" (");
+            ker::mod::io::serial::write(" (0x");
             ker::mod::io::serial::writeHex(size);
             ker::mod::io::serial::write(" bytes)\n");
 #endif
@@ -607,8 +747,11 @@ void free(void* ptr) {
             // Poison entire allocation (header + user data) as freed.
             kasan::poison_range(static_cast<void*>(potentialLargeHeader), size, kasan::SHADOW_HEAP_FREED);
 #endif
+            potentialLargeHeader->magic = 0;  // Clear before page free; stale magic causes false positives when pages are recycled for slab
             phys::pageFree(potentialLargeHeader);  // Free from header, not data ptr
             return;
+        } else {
+            ker::mod::dbg::panic_handler("kmalloc: Double-free or corrupted large allocation detected");
         }
     }
 
@@ -618,17 +761,21 @@ void free(void* ptr) {
         uint64_t size = 0;
         if (findAndRemoveMediumAlloc(ptr, size)) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: Freeing medium allocation at ");
+            ker::mod::io::serial::write("kmalloc: Freeing medium allocation at 0x");
             ker::mod::io::serial::writeHex((uint64_t)ptr);
-            ker::mod::io::serial::write(" (");
+            ker::mod::io::serial::write(" (0x");
             ker::mod::io::serial::writeHex(size);
             ker::mod::io::serial::write(" bytes)\n");
 #endif
 #ifdef WOS_KASAN
             kasan::poison_range(static_cast<void*>(potentialMediumHeader), size, kasan::SHADOW_HEAP_FREED);
 #endif
+            potentialMediumHeader->magic =
+                0;  // Clear before page free; stale magic causes false positives when pages are recycled for slab
             phys::pageFree(potentialMediumHeader);  // Free from header, not data ptr
             return;
+        } else {
+            ker::mod::dbg::panic_handler("kmalloc: Double-free or corrupted medium allocation detected");
         }
     }
 
@@ -677,9 +824,21 @@ void free(void* ptr) {
 
 }  // namespace ker::mod::mm::dyn::kmalloc
 
-auto operator new(size_t sz) -> void* { return ker::mod::mm::dyn::kmalloc::malloc(sz); }
+auto operator new(size_t sz) -> void* {
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new");
+#else
+    return ker::mod::mm::dyn::kmalloc::malloc(sz);
+#endif
+}
 
-auto operator new[](size_t sz) -> void* { return ker::mod::mm::dyn::kmalloc::malloc(sz); }
+auto operator new[](size_t sz) -> void* {
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new[]");
+#else
+    return ker::mod::mm::dyn::kmalloc::malloc(sz);
+#endif
+}
 
 // void operator delete(void* ptr) noexcept {
 //     ker::mod::mm::dyn::kmalloc::kfree(ptr);

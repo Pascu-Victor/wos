@@ -23,14 +23,23 @@ void wake_socket(Socket* sock) {
         return;
     }
     uint64_t pid = sock->owner_pid;
+#ifdef TCP_DEBUG
+    ker::mod::dbg::log("[tcp] wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), pid);
+#endif
     if (pid != 0) {
         auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+#ifdef TCP_DEBUG
+        ker::mod::dbg::log("[tcp] wake_socket: pid=%lu task=%p", pid, static_cast<void*>(task));
+#endif
         if (task != nullptr) {
             task->deferredTaskSwitch = false;
             uint64_t target_cpu = task->cpu;
             if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
                 target_cpu = ker::mod::sched::get_least_loaded_cpu();
             }
+#ifdef TCP_DEBUG
+            ker::mod::dbg::log("[tcp] wake_socket: rescheduling pid=%lu on cpu=%lu", pid, target_cpu);
+#endif
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
             task->release();
         }
@@ -266,6 +275,11 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     if (child_sock != nullptr) {
                         child_sock->state = SocketState::CONNECTED;
                         TcpCB* listener = tcp_find_listener(saved_local_ip, saved_local_port);
+#ifdef TCP_DEBUG
+                        ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", saved_local_port,
+                                           static_cast<void*>(listener),
+                                           (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
+#endif
                         if (listener != nullptr && listener->socket != nullptr) {
                             Socket* lsock = listener->socket;
                             uint64_t lsock_flags = lsock->lock.lock_irqsave();
@@ -279,8 +293,15 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                                 lsock->aq_tail = child_sock;
                                 lsock->aq_count++;
                             }
+#ifdef TCP_DEBUG
+                            ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: enqueued child, aq_count=%zu", lsock->aq_count);
+#endif
                             lsock->lock.unlock_irqrestore(lsock_flags);
                             wake_socket(lsock);
+                        } else {
+#ifdef TCP_DEBUG
+                            ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: NO LISTENER found for port=%u", saved_local_port);
+#endif
                         }
                     }
 

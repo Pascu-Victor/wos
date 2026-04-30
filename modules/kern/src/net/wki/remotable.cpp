@@ -1,5 +1,6 @@
 #include "remotable.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -33,11 +34,11 @@ struct PendingVfsMount {
     uint16_t node_id;
     uint32_t resource_id;
     char mount_path[384];
+    bool force_remount = false;
     uint8_t retry_count = 0;
     uint64_t next_attempt_us = 0;
 };
 std::deque<PendingVfsMount> g_pending_vfs_mounts;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
 constexpr uint8_t VFS_AUTO_MOUNT_MAX_RETRIES = 8;
 constexpr uint64_t VFS_AUTO_MOUNT_RETRY_BASE_US = 250000;
 constexpr uint64_t VFS_AUTO_MOUNT_RETRY_MAX_US = 2000000;
@@ -104,6 +105,31 @@ void build_vfs_mount_path(char* out, size_t out_size, const char* hostname, cons
     } else {
         snprintf(out, out_size, "/wki/%s/%s", hostname, stripped);
     }
+}
+
+void queue_vfs_mount_locked(uint16_t node_id, uint32_t resource_id, const char* mount_path, bool force_remount) {
+    if (mount_path == nullptr || mount_path[0] == '\0') {
+        return;
+    }
+
+    for (auto& pending : g_pending_vfs_mounts) {
+        if (pending.node_id != node_id || pending.resource_id != resource_id) {
+            continue;
+        }
+
+        std::snprintf(pending.mount_path, sizeof(pending.mount_path), "%s", mount_path);
+        pending.force_remount = pending.force_remount || force_remount;
+        pending.retry_count = 0;
+        pending.next_attempt_us = 0;
+        return;
+    }
+
+    PendingVfsMount pending = {};
+    pending.node_id = node_id;
+    pending.resource_id = resource_id;
+    pending.force_remount = force_remount;
+    std::snprintf(pending.mount_path, sizeof(pending.mount_path), "%s", mount_path);
+    g_pending_vfs_mounts.push_back(pending);
 }
 
 }  // namespace
@@ -343,16 +369,36 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     memcpy(static_cast<void*>(res.name), resource_advert_name(adv), copy_len);
     res.name[copy_len] = '\0';
 
+    char desired_mount_path[384] = {};
+    bool queue_vfs_mount = false;
     s_remotable_lock.lock();
 
     // Check if we already have this resource (upsert)
     DiscoveredResource* existing = find_resource_unlocked(adv->node_id, type, adv->resource_id);
     if (existing != nullptr) {
+        bool name_changed =
+            std::strncmp(static_cast<const char*>(existing->name), static_cast<const char*>(res.name), sizeof(existing->name)) != 0;
+
         // Refresh mutable fields so reconnect/re-advertisement can correct a
         // stale visible name without requiring a reboot.
         existing->flags = adv->flags;
         memcpy(static_cast<void*>(existing->name), static_cast<const void*>(res.name), sizeof(existing->name));
+
+        if (type == ResourceType::VFS) {
+            const char* hostname = wki_peer_get_hostname(adv->node_id);
+            if (hostname != nullptr && hostname[0] != '\0') {
+                build_vfs_mount_path(desired_mount_path, sizeof(desired_mount_path), hostname, static_cast<const char*>(res.name));
+                queue_vfs_mount_locked(adv->node_id, adv->resource_id, desired_mount_path, true);
+                queue_vfs_mount = true;
+            }
+        }
+
         s_remotable_lock.unlock();
+
+        if (queue_vfs_mount && name_changed) {
+            ker::mod::dbg::log("[WKI] VFS resource renamed: node=0x%04x res_id=%u -> %s", adv->node_id, adv->resource_id,
+                               desired_mount_path);
+        }
 
         ker::vfs::devfs::devfs_wki_remove_resource(adv->node_id, adv->resource_type, adv->resource_id);
         ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type, adv->resource_id, adv->flags,
@@ -366,11 +412,8 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     if (type == ResourceType::VFS) {
         const char* hostname = wki_peer_get_hostname(adv->node_id);
         if (hostname != nullptr && hostname[0] != '\0') {
-            PendingVfsMount pending = {};
-            pending.node_id = adv->node_id;
-            pending.resource_id = adv->resource_id;
-            build_vfs_mount_path(pending.mount_path, sizeof(pending.mount_path), hostname, static_cast<const char*>(res.name));
-            g_pending_vfs_mounts.push_back(pending);
+            build_vfs_mount_path(desired_mount_path, sizeof(desired_mount_path), hostname, static_cast<const char*>(res.name));
+            queue_vfs_mount_locked(adv->node_id, adv->resource_id, desired_mount_path, false);
         }
     }
 
@@ -494,6 +537,18 @@ void wki_remotable_process_pending_mounts() {
             WkiPeer* peer = wki_peer_find(pending.node_id);
             if (peer == nullptr || peer->state != PeerState::CONNECTED) {
                 continue;
+            }
+
+            char existing_mount_path[384] = {};
+            bool mount_exists = wki_remote_vfs_find_mount_for_resource(pending.node_id, pending.resource_id, existing_mount_path,
+                                                                       sizeof(existing_mount_path));
+            if (mount_exists) {
+                bool same_path = std::strncmp(existing_mount_path, pending.mount_path, sizeof(existing_mount_path)) == 0;
+                if (!pending.force_remount && same_path) {
+                    continue;
+                }
+
+                wki_remote_vfs_unmount(existing_mount_path);
             }
 
             // Create intermediate directories (/wki/<hostname>)

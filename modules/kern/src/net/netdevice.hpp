@@ -61,6 +61,10 @@ struct NetDevice {
 // Register a new network device (assigns ifindex, auto-names "ethN" if name is empty)
 auto netdev_register(NetDevice* dev) -> int;
 
+// Unregister a network device. The caller must ensure no RX/TX path is still
+// using the device storage before freeing it.
+auto netdev_unregister(NetDevice* dev) -> int;
+
 // Lookup
 auto netdev_find_by_name(std::string_view name) -> NetDevice*;
 auto netdev_count() -> size_t;

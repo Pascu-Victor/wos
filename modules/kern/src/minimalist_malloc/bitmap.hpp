@@ -15,8 +15,8 @@ class Bitmap {
     void set_unused(unsigned position);
     unsigned find_unused(unsigned search_start = 0);
     unsigned find_used(unsigned search_start = 0);
-    bool check_used(unsigned position);
-    bool check_unused(unsigned position);
+    bool check_used(unsigned position) const;
+    bool check_unused(unsigned position) const;
 
     // Diagnostic accessors for debugging only
     [[nodiscard]] unsigned word_count() const { return SIZE; }
@@ -77,11 +77,11 @@ unsigned Bitmap<SIZE>::find_used(unsigned search_start) {
 }
 
 template <size_t SIZE>
-bool Bitmap<SIZE>::check_used(unsigned position) {
+bool Bitmap<SIZE>::check_used(unsigned position) const {
     return CHECK_BIT(m_bitmap_data[position / 32], position % 32);
 }
 
 template <size_t SIZE>
-bool Bitmap<SIZE>::check_unused(unsigned position) {
+bool Bitmap<SIZE>::check_unused(unsigned position) const {
     return !CHECK_BIT(m_bitmap_data[position / 32], position % 32);
 }

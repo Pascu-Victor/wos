@@ -33,6 +33,7 @@
 #include <platform/acpi/ioapic/ioapic.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/boot/handover.hpp>
+#include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/interrupt/idt.hpp>
@@ -165,6 +166,8 @@ void ndp_init() { net::proto::ndp_init(); }
 void wki_init() { net::wki::wki_init(); }
 
 void devfs_populate_net() { vfs::devfs::devfs_populate_net_nodes(); }
+
+void coredump_init() { mod::dbg::coredump::init(); }
 
 void smt_init() { mod::smt::init(); }
 

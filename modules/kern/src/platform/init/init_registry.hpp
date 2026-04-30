@@ -62,6 +62,7 @@ void backlog_init();
 void ndp_init();
 void wki_init();
 void devfs_populate_net();
+void coredump_init();
 
 // PHASE 6: Post-Scheduler (flattened from sched::init)
 void wki_eth_transport_init();
@@ -139,7 +140,7 @@ inline constexpr std::array<ModuleDesc, 3> PHASE_4_MODULES = {{
 }};
 
 // PHASE 5: Drivers
-inline constexpr std::array<ModuleDesc, 11> PHASE_5_MODULES = {{
+inline constexpr std::array<ModuleDesc, 12> PHASE_5_MODULES = {{
     {.name = "virtio_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::virtio_net_init},       // depends: pci, net, smt
     {.name = "e1000e", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::e1000e_init},               // depends: pci, net, smt
     {.name = "cdc_ether", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::cdc_ether_init},         // depends: pci, net, smt
@@ -150,6 +151,7 @@ inline constexpr std::array<ModuleDesc, 11> PHASE_5_MODULES = {{
     {.name = "ndp", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ndp_init},                     // depends: net
     {.name = "wki", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::wki_init},                     // depends: ndp
     {.name = "devfs_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::devfs_populate_net},     // depends: vfs, virtio, e1000e
+    {.name = "coredump", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::coredump_init},          // depends: sched, vfs
 }};
 
 // PHASE 6: Post-Scheduler (EpochManager required for packet transmission)

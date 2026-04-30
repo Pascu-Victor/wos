@@ -172,6 +172,8 @@ inline uint64_t compute_bursty_preempt_guard_us(const task::Task* task) {
     return std::clamp<uint64_t>(scaled_guard, SCHED_BURSTY_PREEMPT_BASE_US, SCHED_BURSTY_PREEMPT_MAX_US);
 }
 
+#include <platform/sys/spinlock.hpp>
+
 // Active PID tracking for fast process-group iteration (avoids scanning 16M-entry hash table)
 constexpr uint32_t MAX_ACTIVE_TASKS = 2048;
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -179,23 +181,29 @@ std::array<task::Task*, MAX_ACTIVE_TASKS> active_task_list = {nullptr};
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 uint32_t active_task_count = 0;
 
+static ker::mod::sys::Spinlock global_task_registry_lock;
+
 void active_list_insert(task::Task* t) {
     if (t == nullptr) {
         return;
     }
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
     for (uint32_t i = 0; i < active_task_count; ++i) {
         auto* existing = active_task_list[i];
         if (existing == t || (existing != nullptr && existing->pid == t->pid)) {
             active_task_list[i] = t;
+            global_task_registry_lock.unlock_irqrestore(flags);
             return;
         }
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
         active_task_list[active_task_count++] = t;
     }
+    global_task_registry_lock.unlock_irqrestore(flags);
 }
 
 void active_list_remove(uint64_t pid) {
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
     uint32_t i = 0;
     while (i < active_task_count) {
         if (active_task_list[i] != nullptr && active_task_list[i]->pid == pid) {
@@ -205,52 +213,72 @@ void active_list_remove(uint64_t pid) {
         }
         ++i;
     }
+    global_task_registry_lock.unlock_irqrestore(flags);
 }
 
-inline uint32_t pid_hash(uint64_t pid) {
+inline auto pid_hash(uint64_t pid) -> uint32_t {
     // Knuth multiplicative hash - spreads sequential PIDs well
+    // NOLINTBEGIN(readability-magic-numbers, cppcoreguidelines-avoid-magic-numbers)
     return (uint32_t)((pid * 11400714819323198485ULL) >> 40) & (MAX_PIDS - 1);
+    // NOLINTEND(readability-magic-numbers, cppcoreguidelines-avoid-magic-numbers)
 }
 
-bool pid_table_insert(task::Task* t) {
+auto pid_table_insert(task::Task* t) -> bool {
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
     uint32_t slot = pid_hash(t->pid);
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t idx = (slot + i) & (MAX_PIDS - 1);
         if (pid_table[idx].pid == 0) {
             pid_table[idx].pid = t->pid;
             pid_table[idx].task = t;
+            global_task_registry_lock.unlock_irqrestore(flags);
             return true;
         }
         if (pid_table[idx].pid == t->pid) {
             // Slot already taken by same PID - update pointer (shouldn't happen)
             pid_table[idx].task = t;
+            global_task_registry_lock.unlock_irqrestore(flags);
             return true;
         }
     }
+    global_task_registry_lock.unlock_irqrestore(flags);
     return false;  // Table full - MAX_PIDS concurrent processes exceeded
 }
 
-task::Task* pid_table_find(uint64_t pid) {
+__attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pid, bool acquire) -> task::Task* {
     if (pid == 0) {
         return nullptr;
     }
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
     uint32_t slot = pid_hash(pid);
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t idx = (slot + i) & (MAX_PIDS - 1);
         if (pid_table[idx].pid == 0) {
+            global_task_registry_lock.unlock_irqrestore(flags);
             return nullptr;  // Empty slot - not found
         }
         if (pid_table[idx].pid == pid) {
-            return pid_table[idx].task;
+            task::Task* t = pid_table[idx].task;
+            if (acquire) {
+                if (!t->tryAcquire()) {
+                    t = nullptr;
+                }
+            }
+            global_task_registry_lock.unlock_irqrestore(flags);
+            return t;
         }
     }
+    global_task_registry_lock.unlock_irqrestore(flags);
     return nullptr;
 }
+
+__attribute__((no_sanitize("address"))) auto pid_table_find(uint64_t pid) -> task::Task* { return pid_table_find_internal(pid, false); }
 
 void pid_table_remove(uint64_t pid) {
     if (pid == 0) {
         return;
     }
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
     uint32_t slot = pid_hash(pid);
     uint32_t idx = 0;
     bool found = false;
@@ -259,6 +287,7 @@ void pid_table_remove(uint64_t pid) {
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         idx = (slot + i) & (MAX_PIDS - 1);
         if (pid_table[idx].pid == 0) {
+            global_task_registry_lock.unlock_irqrestore(flags);
             return;  // Not in table
         }
         if (pid_table[idx].pid == pid) {
@@ -267,6 +296,7 @@ void pid_table_remove(uint64_t pid) {
         }
     }
     if (!found) {
+        global_task_registry_lock.unlock_irqrestore(flags);
         return;
     }
 
@@ -293,6 +323,7 @@ void pid_table_remove(uint64_t pid) {
         }
         next = (next + 1) & (MAX_PIDS - 1);
     }
+    global_task_registry_lock.unlock_irqrestore(flags);
 }
 
 // Per-CPU run queues with spinlocks for cross-CPU access
@@ -853,6 +884,10 @@ auto post_task_waiting(task::Task* task) -> bool {
     if (task == nullptr || task->schedQueue != task::Task::SchedQueue::NONE) {
         return false;
     }
+    auto task_state = task->state.load(std::memory_order_acquire);
+    if (task_state == task::TaskState::DEAD || task_state == task::TaskState::EXITING || task->gcQueued.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     uint64_t target_cpu = task->cpu;
     if (target_cpu >= smt::get_core_count()) {
@@ -1234,7 +1269,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         uint64_t background_preempt_granularity_us = SCHED_MIN_GRANULARITY_US;
         if (lower_priority_process_preempt) {
             uint64_t nice_delta = static_cast<uint64_t>(next->schedNice - current_task->schedNice);
-            uint64_t scaled_guard = SCHED_BACKGROUND_PREEMPT_BASE_US + nice_delta * SCHED_BACKGROUND_PREEMPT_PER_NICE_US;
+            uint64_t scaled_guard = SCHED_BACKGROUND_PREEMPT_BASE_US + (nice_delta * SCHED_BACKGROUND_PREEMPT_PER_NICE_US);
             background_preempt_granularity_us = std::min<uint64_t>(scaled_guard, SCHED_BACKGROUND_PREEMPT_MAX_US);
         }
         if (lower_weight_preempt) {
@@ -1335,7 +1370,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
     // normally (goes through switchTo->iretq or idle loop), so the guard
     // would never destruct. The critical section is "leaked" but OK:
     // the next processTasks call will create a new EpochGuard.
-    EpochManager::enterCritical();
+    uint64_t epoch_cpu = EpochManager::enterCritical();
 
     task::Task* exiting_task = get_current_task();
 #ifdef SCHED_DEBUG
@@ -1381,7 +1416,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         auto* rq = run_queues->this_cpu();
         rq->currentTask = rq->idleTask;
         debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
-        EpochManager::exitCritical();
+        EpochManager::exitCriticalForCpu(epoch_cpu);
         enter_idle_loop(rq);
     }
 
@@ -1390,7 +1425,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         auto* rq = run_queues->this_cpu();
         rq->currentTask = rq->idleTask;
         debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
-        EpochManager::exitCritical();
+        EpochManager::exitCriticalForCpu(epoch_cpu);
         enter_idle_loop(rq);
     }
 
@@ -1401,7 +1436,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         auto* rq = run_queues->this_cpu();
         rq->currentTask = rq->idleTask;
         debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
-        EpochManager::exitCritical();
+        EpochManager::exitCriticalForCpu(epoch_cpu);
         enter_idle_loop(rq);
     }
 
@@ -1411,7 +1446,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
         rq->currentTask = next_task;
         debug_task_ptrs[cpu::currentCpu()] = next_task;
         rq->isIdle.store(true, std::memory_order_release);
-        EpochManager::exitCritical();
+        EpochManager::exitCriticalForCpu(epoch_cpu);
         enter_idle_loop(rq);
     }
 
@@ -1737,26 +1772,30 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             // Wait-for-any-child: scan for an exited child of this task
             uint32_t count = get_active_task_count();
             for (uint32_t i = 0; i < count; i++) {
-                auto* child = get_active_task_at(i);
-                if (child != nullptr && child->parentPid == current_task->pid && child->hasExited && !child->waitedOn) {
-                    skip_wait_queue = true;
-                    current_task->context.regs.rax = child->pid;
-                    if (current_task->waitStatusPhysAddr != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(current_task->waitStatusPhysAddr));
-                        *status_ptr = child->exitStatus;
+                auto* child = get_active_task_at_safe(i);
+                if (child != nullptr) {
+                    if (child->parentPid == current_task->pid && child->hasExited && !child->waitedOn) {
+                        skip_wait_queue = true;
+                        current_task->context.regs.rax = child->pid;
+                        if (current_task->waitStatusPhysAddr != 0) {
+                            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(current_task->waitStatusPhysAddr));
+                            *status_ptr = child->exitStatus;
+                        }
+                        if (current_task->waitRusagePhysAddr != 0) {
+                            auto* ru = reinterpret_cast<syscall::process::KernRusage*>(
+                                mm::addr::get_virt_pointer(current_task->waitRusagePhysAddr));
+                            ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
+                            ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
+                            ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
+                            ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+                            current_task->waitRusagePhysAddr = 0;
+                        }
+                        current_task->waitingForPid = 0;
+                        child->waitedOn = true;
+                        child->release();
+                        break;
                     }
-                    if (current_task->waitRusagePhysAddr != 0) {
-                        auto* ru =
-                            reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(current_task->waitRusagePhysAddr));
-                        ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
-                        ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-                        ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
-                        ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
-                        current_task->waitRusagePhysAddr = 0;
-                    }
-                    current_task->waitingForPid = 0;
-                    child->waitedOn = true;
-                    break;
+                    child->release();
                 }
             }
         } else {
@@ -2250,23 +2289,34 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 // PID lookup (O(1) via registry)
 // ============================================================================
 
-auto find_task_by_pid(uint64_t pid) -> task::Task* { return pid_table_find(pid); }
+__attribute__((no_sanitize("address"))) auto find_task_by_pid(uint64_t pid) -> task::Task* { return pid_table_find(pid); }
 
-auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {
-    auto* task = pid_table_find(pid);
-    if (task != nullptr && task->tryAcquire()) {
-        return task;
-    }
-    return nullptr;
+__attribute__((no_sanitize("address"))) auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {
+    return pid_table_find_internal(pid, true);
 }
 
-auto get_active_task_count() -> uint32_t { return active_task_count; }
+auto get_active_task_count() -> uint32_t {
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
+    uint32_t count = active_task_count;
+    global_task_registry_lock.unlock_irqrestore(flags);
+    return count;
+}
 
 auto get_active_task_at(uint32_t index) -> task::Task* {
-    if (index >= active_task_count) {
-        return nullptr;
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
+    task::Task* task = (index < active_task_count) ? active_task_list[index] : nullptr;
+    global_task_registry_lock.unlock_irqrestore(flags);
+    return task;
+}
+
+auto get_active_task_at_safe(uint32_t index) -> task::Task* {
+    uint64_t flags = global_task_registry_lock.lock_irqsave();
+    task::Task* task = (index < active_task_count) ? active_task_list[index] : nullptr;
+    if (task != nullptr && !task->tryAcquire()) {
+        task = nullptr;
     }
-    return active_task_list[index];
+    global_task_registry_lock.unlock_irqrestore(flags);
+    return task;
 }
 
 void wake_task_for_signal(task::Task* task) {
@@ -2296,11 +2346,15 @@ void signal_process_group(uint64_t pgid, int sig) {
         return;
     }
     uint64_t mask = 1ULL << (sig - 1);
-    for (uint32_t i = 0; i < active_task_count; i++) {
-        auto* t = active_task_list[i];
-        if (t != nullptr && t->pgid == pgid && !t->hasExited) {
-            t->sigPending |= mask;
-            wake_task_for_signal(t);
+    uint32_t count = get_active_task_count();
+    for (uint32_t i = 0; i < count; i++) {
+        auto* t = get_active_task_at_safe(i);
+        if (t != nullptr) {
+            if (t->pgid == pgid && !t->hasExited) {
+                t->sigPending |= mask;
+                wake_task_for_signal(t);
+            }
+            t->release();
         }
     }
 }
@@ -2313,28 +2367,23 @@ void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
         return;
     }
-    if (task->schedQueue == task::Task::SchedQueue::DEAD_GC) {
+    if (task->schedQueue == task::Task::SchedQueue::DEAD_GC || task->gcQueued.load(std::memory_order_acquire)) {
         return;
     }
 
     bool found_current = false;
-    bool removed_from_queue = false;
     uint64_t last_cpu = task->cpu;
     uint64_t cpu_count = smt::get_core_count();
 
-    auto detach_from_cpu = [task, &found_current, &removed_from_queue](RunQueue* rq) {
+    auto detach_from_cpu = [task, &found_current](RunQueue* rq) {
         if (rq->currentTask == task) {
             found_current = true;
-            return;
         }
-        if (rq->waitList.remove(task)) {
-            removed_from_queue = true;
-            return;
+        while (rq->waitList.remove(task)) {
         }
-        if (rq->runnableHeap.contains(task)) {
+        while (rq->runnableHeap.contains(task)) {
             remove_from_sums(rq, task);
             rq->runnableHeap.remove(task);
-            removed_from_queue = true;
         }
     };
 
@@ -2342,16 +2391,11 @@ void insert_into_dead_list(task::Task* task) {
         run_queues->with_lock_void(last_cpu, detach_from_cpu);
     }
 
-    if (!found_current && !removed_from_queue) {
-        for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
-            if (cpu_no == last_cpu) {
-                continue;
-            }
-            run_queues->with_lock_void(cpu_no, detach_from_cpu);
-            if (found_current || removed_from_queue) {
-                break;
-            }
+    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+        if (cpu_no == last_cpu) {
+            continue;
         }
+        run_queues->with_lock_void(cpu_no, detach_from_cpu);
     }
 
     // A task can only be linked through schedNext once. Scrub any stale dead-list
@@ -2366,6 +2410,11 @@ void insert_into_dead_list(task::Task* task) {
     }
 
     if (found_current) {
+        return;
+    }
+
+    bool expected_gc_queued = false;
+    if (!task->gcQueued.compare_exchange_strong(expected_gc_queued, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return;
     }
 
@@ -2508,12 +2557,17 @@ void gc_expired_tasks() {
                     //   threads sharing the same pagemap are still alive (not yet DEAD).
                     if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON && !cur->isThread) {
                         bool sibling_alive = false;
-                        for (uint32_t ai = 0; ai < active_task_count; ai++) {
-                            auto* other = active_task_list[ai];
-                            if (other != nullptr && other != cur && other->pagemap == cur->pagemap &&
-                                other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
-                                sibling_alive = true;
-                                break;
+                        uint32_t active_count = get_active_task_count();
+                        for (uint32_t ai = 0; ai < active_count; ai++) {
+                            auto* other = get_active_task_at_safe(ai);
+                            if (other != nullptr) {
+                                if (other != cur && other->pagemap == cur->pagemap &&
+                                    other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+                                    sibling_alive = true;
+                                    other->release();
+                                    break;
+                                }
+                                other->release();
                             }
                         }
                         // Also scan the dead lists of all CPUs for threads sharing this
@@ -2828,7 +2882,7 @@ auto get_cpu_load(uint64_t cpu_no) -> uint32_t {
     return run_queues->with_lock(cpu_no, [](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq); });
 }
 
-size_t get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refcounts, size_t max_entries, size_t start_index) {
+auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refcounts, size_t max_entries, size_t start_index) -> size_t {
     if (run_queues == nullptr || pids == nullptr || refcounts == nullptr || max_entries == 0) {
         return 0;
     }

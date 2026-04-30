@@ -10,9 +10,11 @@
 // Gated behind WOS_KASAN; when the macro is not defined the file is still
 // compiled but everything inside the #ifdef is stripped by the preprocessor.
 
-#ifdef WOS_KASAN
+#include <string_view>
 
-#include "kasan.hpp"
+#include "platform/asm/cpu.hpp"
+#include "platform/interrupt/gates.hpp"
+#ifdef WOS_KASAN
 
 #include <atomic>
 #include <cstdint>
@@ -24,6 +26,9 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
+
+#include "kasan.hpp"
+#include "platform/asm/tlb.hpp"
 
 namespace ker::mod::kasan {
 
@@ -56,33 +61,62 @@ static constexpr uint64_t SHADOW_REGION_END = 0xfffffc2000000000ULL;
 // ---------------------------------------------------------------------------
 
 // Per-CPU re-entrancy guard for shadow fault handling.
-// pageAlloc and mapToKernelPageTable themselves are KASan-instrumented and can
-// trigger further shadow faults. We must prevent recursion on the *same* CPU
-// but allow different CPUs to handle shadow faults concurrently.
-// Uses an atomic bitmask indexed by LAPIC ID (read via GS-base per-CPU data
-// or CPUID). Supports up to 64 CPUs.
 static std::atomic<uint64_t> s_shadow_fault_cpus{0};  // NOLINT
 
 // Serialise concurrent mapToKernelPageTable calls so two CPUs don't race
 // to create the same PML entry and leak a page.
 static std::atomic_flag s_shadow_map_lock = ATOMIC_FLAG_INIT;  // NOLINT
 
+// Diagnostic counters.
+static std::atomic<uint64_t> s_shadow_fault_count{0};  // NOLINT
+static std::atomic<uint64_t> s_shadow_dup_count{0};    // already-mapped hits (concurrent CPUs) // NOLINT
+
+// Ring buffer of the last 16 unique shadow_vaddrs we mapped, to detect
+// the "mapping not sticking" bug (same address faults again and again).
+static constexpr size_t SFAULT_RECENT = 16;
+static uint64_t s_recent_shadow_vaddr[SFAULT_RECENT]{};    // NOLINT
+static std::atomic<uint32_t> s_recent_head{0};             // NOLINT
+static std::atomic_flag s_recent_lock = ATOMIC_FLAG_INIT;  // NOLINT
+
 // Get current CPU index — reads LAPIC ID via x2APIC MSR 0x802.
 // Before x2APIC is enabled (early boot), we're single-threaded on the BSP
 // so returning 0 is safe. We detect this by checking IA32_APIC_BASE (MSR 0x1B)
 // bit 10 (x2APIC enable).
-static inline uint64_t shadow_cpu_index() {
-    uint32_t apic_base_lo, apic_base_hi;
+static inline auto shadow_cpu_index() -> uint64_t {
+    uint32_t apic_base_lo = 0;
+    uint32_t apic_base_hi = 0;
     asm volatile("rdmsr" : "=a"(apic_base_lo), "=d"(apic_base_hi) : "c"(0x1Bu));
     if ((apic_base_lo & (1 << 10)) == 0) {
         return 0;  // x2APIC not yet enabled — single-threaded BSP
     }
-    uint32_t lo, hi;
+    uint32_t lo = 0;
+    uint32_t hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x802u));
     return lo & 63;
 }
 
-bool handle_shadow_fault(uint64_t cr2) {
+// Propagate the kernel pagemap's PML4 entry for shadow_vaddr into the currently
+// active pagemap, then flush the local TLB for that page.
+//
+// copyKernelMappings() does a SHALLOW PML4 copy at task-creation time. If the
+// PML4 entry covering this shadow address was created AFTER the task was made
+// (i.e. advance_page_table allocated a fresh PDPT for a new shadow region), the
+// task pagemap's PML4 slot is still NULL. The kernel pagemap has the mapping;
+// the task pagemap does not. We must propagate the slot here so the CPU can
+// walk the page tables correctly.
+static void sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) {
+    uint64_t kphys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::vaddr_t)kernel_pml4);
+    uint64_t cur_cr3 = rdcr3();
+    if (cur_cr3 != kphys) {
+        auto* cur_pml4 = (mm::paging::PageTable*)mm::addr::get_virt_pointer((mm::addr::paddr_t)cur_cr3);
+        size_t pml4_idx = (shadow_vaddr >> 39) & 0x1FF;
+        cur_pml4->entries[pml4_idx] = kernel_pml4->entries[pml4_idx];
+    }
+    invlpg(shadow_vaddr);
+}
+
+auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gates::interruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
+    -> bool {
     if (cr2 < SHADOW_REGION_BASE || cr2 >= SHADOW_REGION_END) {
         return false;  // Not our fault
     }
@@ -97,7 +131,7 @@ bool handle_shadow_fault(uint64_t cr2) {
     s_shadow_fault_cpus.fetch_or(cpu_bit, std::memory_order_acquire);
 
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
-    void* phys_page = mm::phys::pageAlloc(mm::paging::PAGE_SIZE);
+    void* phys_page = mm::phys::pageAlloc(mm::paging::PAGE_SIZE, SOURCE);
     if (phys_page == nullptr) {
         dbg::log("[KASan] OOM allocating shadow page for cr2=0x%lx", cr2);
         s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
@@ -117,17 +151,53 @@ bool handle_shadow_fault(uint64_t cr2) {
     // Another CPU may have already mapped this shadow page while we waited.
     auto* kernel_pt = mm::virt::getKernelPagemap();
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
-        // Already mapped — free our page and return success.
         s_shadow_map_lock.clear(std::memory_order_release);
-        // Note: we leak the phys_page here since there's no pageFree().
-        // This is harmless — it only happens on rare concurrent shadow faults
-        // to the exact same page.
+        uint64_t dups = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((dups % 1000) == 0) {
+            dbg::log(
+                "[KASan] already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
+                "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
+                "gpr info: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx "
+                "r13=0x%lx r14=0x%lx r15=0x%lx",
+                dups, shadow_vaddr, cr2, (int)SOURCE.size(), SOURCE.data(), frame.rip, frame.rsp, frame.flags,
+                s_shadow_dup_count.load(std::memory_order_relaxed), gpr.rax, gpr.rbx, gpr.rcx, gpr.rdx, gpr.rsi, gpr.rdi, gpr.r8, gpr.r9,
+                gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
+        }
+        sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
+        mm::phys::pageFree(phys_page);
         s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
         return true;
     }
 
     mm::virt::mapToKernelPageTable(shadow_vaddr, shadow_paddr, mm::paging::pageTypes::KERNEL);
     s_shadow_map_lock.clear(std::memory_order_release);
+    sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
+
+    uint64_t n = s_shadow_fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Check if this shadow_vaddr was recently mapped — if so, the mapping isn't sticking.
+    bool repeat = false;
+    while (s_recent_lock.test_and_set(std::memory_order_acquire)) {
+        asm volatile("pause");
+    }
+    for (size_t i = 0; i < SFAULT_RECENT; i++) {
+        if (s_recent_shadow_vaddr[i] == shadow_vaddr) {
+            repeat = true;
+            break;
+        }
+    }
+    uint32_t head = s_recent_head.load(std::memory_order_relaxed);
+    s_recent_shadow_vaddr[head % SFAULT_RECENT] = shadow_vaddr;
+    s_recent_head.store((head + 1) % SFAULT_RECENT, std::memory_order_relaxed);
+    s_recent_lock.clear(std::memory_order_release);
+
+    if (repeat) {
+        dbg::log("[KASan] REPEAT shadow fault #%lu: shadow_vaddr=0x%lx — mapping not sticking!", n, shadow_vaddr);
+    }
+    if ((n % 100000) == 0) {
+        dbg::log("[KASan] shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", n, cr2, shadow_vaddr,
+                 s_shadow_dup_count.load(std::memory_order_relaxed));
+    }
 
     s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
     return true;
@@ -522,41 +592,65 @@ static inline auto check_shadow(uintptr_t addr, size_t size) -> bool {
 // These perform the shadow check and only report on violations.
 
 void __asan_load1(uintptr_t addr) {
-    if (!check_shadow(addr, 1)) kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 1)) {
+        kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load2(uintptr_t addr) {
-    if (!check_shadow(addr, 2)) kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 2)) {
+        kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load4(uintptr_t addr) {
-    if (!check_shadow(addr, 4)) kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 4)) {
+        kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load8(uintptr_t addr) {
-    if (!check_shadow(addr, 8)) kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 8)) {
+        kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load16(uintptr_t addr) {
-    if (!check_shadow(addr, 16)) kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 16)) {
+        kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load_n(uintptr_t addr, size_t n) {
-    if (!check_shadow(addr, n)) kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, n)) {
+        kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 
 void __asan_store1(uintptr_t addr) {
-    if (!check_shadow(addr, 1)) kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 1)) {
+        kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store2(uintptr_t addr) {
-    if (!check_shadow(addr, 2)) kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 2)) {
+        kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store4(uintptr_t addr) {
-    if (!check_shadow(addr, 4)) kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 4)) {
+        kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store8(uintptr_t addr) {
-    if (!check_shadow(addr, 8)) kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 8)) {
+        kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store16(uintptr_t addr) {
-    if (!check_shadow(addr, 16)) kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 16)) {
+        kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store_n(uintptr_t addr, size_t n) {
-    if (!check_shadow(addr, n)) kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, n)) {
+        kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 
 // Noabort variants — emitted when -fsanitize-recover=address is in effect.
@@ -691,8 +785,10 @@ void __asan_handle_no_return() {}
 // ---- Sanitizer container annotation stubs ---------------------------------
 // Used by libc++ hardened containers to annotate ASan shadow for partial
 // buffer access detection.  Not applicable to kernel code.
-void __sanitizer_annotate_contiguous_container(const void*, const void*, const void*, const void*) {}
-void __sanitizer_annotate_double_ended_contiguous_container(const void*, const void*, const void*, const void*, const void*, const void*) {}
+void __sanitizer_annotate_contiguous_container(const void* /*unused*/, const void* /*unused*/, const void* /*unused*/,
+                                               const void* /*unused*/) {}
+void __sanitizer_annotate_double_ended_contiguous_container(const void* /*unused*/, const void* /*unused*/, const void* /*unused*/,
+                                                            const void* /*unused*/, const void* /*unused*/, const void* /*unused*/) {}
 
 // ---- Misc runtime options -------------------------------------------------
 int __asan_option_detect_stack_use_after_return = 0;
@@ -705,9 +801,9 @@ void __asan_version_mismatch_check_v8() {}
 // The compiler emits calls to these instead of the libc versions when ASan is
 // active.  We just delegate to the kernel's existing implementations.
 
-void* __asan_memset(void* dst, int c, size_t n) { return memset(dst, c, n); }
-void* __asan_memcpy(void* dst, const void* src, size_t n) { return memcpy(dst, src, n); }
-void* __asan_memmove(void* dst, const void* src, size_t n) { return memmove(dst, src, n); }
+auto __asan_memset(void* dst, int c, size_t n) -> void* { return memset(dst, c, n); }
+auto __asan_memcpy(void* dst, const void* src, size_t n) -> void* { return memcpy(dst, src, n); }
+auto __asan_memmove(void* dst, const void* src, size_t n) -> void* { return memmove(dst, src, n); }
 
 // ---- Poison/unpoison helpers called by the runtime ------------------------
 void __asan_poison_memory_region(void const volatile* addr, size_t size) {
@@ -717,7 +813,7 @@ void __asan_unpoison_memory_region(void const volatile* addr, size_t size) {
     ker::mod::kasan::unpoison_range((void*)addr, size);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 }
 
-int __asan_address_is_poisoned(void const volatile* addr) {
+auto __asan_address_is_poisoned(void const volatile* addr) -> int {
     auto a = (uintptr_t)addr;  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
     int8_t* shadow = ker::mod::kasan::addr_to_shadow(a);
     int8_t shadow_val = *shadow;

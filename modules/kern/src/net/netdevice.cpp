@@ -19,10 +19,13 @@ std::array<NetDevice*, MAX_NET_DEVICES> devices = {};
 size_t device_count = 0;
 uint32_t next_ifindex = 1;
 uint32_t next_eth_index = 0;
+mod::sys::Spinlock devices_lock;
 }  // namespace
 
 auto netdev_register(NetDevice* dev) -> int {
+    devices_lock.lock();
     if (dev == nullptr || device_count >= MAX_NET_DEVICES) {
+        devices_lock.unlock();
         return -1;
     }
 
@@ -50,6 +53,7 @@ auto netdev_register(NetDevice* dev) -> int {
 
     devices[device_count] = dev;
     device_count++;
+    devices_lock.unlock();
 
 #ifdef DEBUG_NETDEV
     ker::mod::dbg::log("net: Registered device %s (ifindex=%d, MAC=%x:%x:%x:%x:%x:%x)", dev->name, dev->ifindex, dev->mac[0], dev->mac[1],
@@ -59,25 +63,61 @@ auto netdev_register(NetDevice* dev) -> int {
     return 0;
 }
 
+auto netdev_unregister(NetDevice* dev) -> int {
+    if (dev == nullptr) {
+        return -1;
+    }
+
+    devices_lock.lock();
+    for (size_t i = 0; i < device_count; i++) {
+        if (devices[i] != dev) {
+            continue;
+        }
+
+        for (size_t j = i + 1; j < device_count; j++) {
+            devices[j - 1] = devices[j];
+        }
+        device_count--;
+        devices[device_count] = nullptr;
+        devices_lock.unlock();
+        return 0;
+    }
+    devices_lock.unlock();
+    return -1;
+}
+
 auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
     if (NAME.empty()) {
         return nullptr;
     }
+    devices_lock.lock();
     for (size_t i = 0; i < device_count; i++) {
         if (std::string_view(devices[i]->name.data()) == NAME) {
-            return devices[i];
+            NetDevice* result = devices[i];
+            devices_lock.unlock();
+            return result;
         }
     }
+    devices_lock.unlock();
     return nullptr;
 }
 
-auto netdev_count() -> size_t { return device_count; }
+auto netdev_count() -> size_t {
+    devices_lock.lock();
+    size_t count = device_count;
+    devices_lock.unlock();
+    return count;
+}
 
 auto netdev_at(size_t i) -> NetDevice* {
+    devices_lock.lock();
     if (i >= device_count) {
+        devices_lock.unlock();
         return nullptr;
     }
-    return devices[i];
+    NetDevice* dev = devices[i];
+    devices_lock.unlock();
+    return dev;
 }
 
 // Forward declaration - will be implemented in ethernet.cpp

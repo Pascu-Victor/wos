@@ -136,7 +136,8 @@
         {
             "name": "Attach All Cluster VMs",
             "configurations": [
-                "Attach Cluster VM0"
+                "Attach Cluster VM0",
+                "Attach Cluster VM1"
             ],
             "stopAll": true
         }

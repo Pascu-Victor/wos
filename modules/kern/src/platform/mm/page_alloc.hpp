@@ -57,8 +57,8 @@ struct PageAllocator {
     // per-page flags - callers do not need to supply the size.
     void free(void* ptr);
 
-    uint32_t getFreePages() const { return freeCount; }
-    uint32_t getUsablePages() const { return usablePages; }
+    __attribute__((no_sanitize("address"))) uint32_t getFreePages() const { return freeCount; }
+    __attribute__((no_sanitize("address"))) uint32_t getUsablePages() const { return usablePages; }
 };
 
 }  // namespace ker::mod::mm

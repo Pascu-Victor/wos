@@ -544,7 +544,6 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
     state->assigned_channel = reserved_channel->channel_id;
     state->max_op_size = state->attach_max_op_size;
-    state->active = true;
 
     // V2: Populate proxy NetDevice with proper name and MAC
     // Name: "wki-<hostname>" truncated to NETDEV_NAME_LEN-1
@@ -573,7 +572,21 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->rx_credits_remaining = WKI_NET_RX_CREDITS;
 
     // Register in the netdev subsystem
-    ker::net::netdev_register(&state->netdev);
+    if (ker::net::netdev_register(&state->netdev) != 0) {
+        DevDetachPayload det = {};
+        det.target_node = owner_node;
+        det.resource_type = static_cast<uint16_t>(ResourceType::NET);
+        det.resource_id = resource_id;
+        wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
+        s_net_proxy_lock.lock();
+        g_net_proxies.pop_back();
+        s_net_proxy_lock.unlock();
+        return nullptr;
+    }
+    state->active = true;
 
     ker::mod::dbg::log("[WKI] Remote NIC attached: %s -> node=0x%04x res_id=%u ch=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", local_name,
                        owner_node, resource_id, state->assigned_channel, state->netdev.mac[0], state->netdev.mac[1], state->netdev.mac[2],
@@ -598,6 +611,7 @@ void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
     owner_node = state->owner_node;
     resource_id = state->resource_id;
     assigned_channel = state->assigned_channel;
+    ker::net::netdev_unregister(&state->netdev);
     state->active = false;
 
     for (auto it = g_net_proxies.begin(); it != g_net_proxies.end();) {
@@ -843,6 +857,7 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
             to_close[close_count++] = {p->owner_node, p->assigned_channel};
         }
 
+        ker::net::netdev_unregister(&p->netdev);
         p->active = false;
     }
 

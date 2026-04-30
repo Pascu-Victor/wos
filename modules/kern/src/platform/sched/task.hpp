@@ -362,6 +362,7 @@ struct Task {
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
     alignas(4) std::atomic<uint32_t> refCount{1};    // Scheduler owns initial reference
     alignas(8) std::atomic<uint64_t> deathEpoch{0};  // Epoch when task became DEAD
+    std::atomic<bool> gcQueued{false};               // True once the task has been handed to dead-list GC
 
     void loadContext(cpu::GPRegs* gpr);
     void saveContext(cpu::GPRegs* gpr);

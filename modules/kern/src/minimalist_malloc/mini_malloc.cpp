@@ -112,6 +112,18 @@ uint64_t mini_get_total_slab_bytes() {
     return total_slab_bytes;
 }
 
+void mini_iter_live_debug_slots(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size, uint32_t debug_idx)) {
+    slab_0x10.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x20.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x40.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x80.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x100.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x200.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x300.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x400.iter_live_blocks_unlocked(userdata, fn);
+    slab_0x800.iter_live_blocks_unlocked(userdata, fn);
+}
+
 void mini_dump_stats() {
     // Print slab usage for each slab type
     struct SlabTypeInfo {
@@ -150,18 +162,18 @@ void mini_dump_stats() {
     for (auto& info : infos) {
         ker::mod::io::serial::write("  Slab ");
         ker::mod::io::serial::write(info.name);
-        ker::mod::io::serial::write(": slabs=");
+        ker::mod::io::serial::write(": slabs=0x");
         ker::mod::io::serial::writeHex(info.slab_count);
-        ker::mod::io::serial::write(" blocks_total=");
+        ker::mod::io::serial::write(" blocks_total=0x");
         ker::mod::io::serial::writeHex(info.total_blocks);
-        ker::mod::io::serial::write(" free_blocks=");
+        ker::mod::io::serial::write(" free_blocks=0x");
         ker::mod::io::serial::writeHex(info.free_blocks);
-        ker::mod::io::serial::write(" mem_bytes=");
+        ker::mod::io::serial::write(" mem_bytes=0x");
         ker::mod::io::serial::writeHex(info.page_bytes);
         ker::mod::io::serial::write("\n");
         total_slab_bytes += info.page_bytes;
     }
-    ker::mod::io::serial::write("  Total slab memory: ");
+    ker::mod::io::serial::write("  Total slab memory: 0x");
     ker::mod::io::serial::writeHex(total_slab_bytes);
     ker::mod::io::serial::write(" bytes\n");
 }

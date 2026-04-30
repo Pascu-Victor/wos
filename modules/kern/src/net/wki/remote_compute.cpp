@@ -437,6 +437,17 @@ auto encode_remote_wait_status(int32_t exit_status) -> int32_t {
     }
 }
 
+auto normalize_local_exit_status_for_wire(int32_t exit_status) -> int32_t {
+    switch (exit_status) {
+        case 128 + WKI_SIGKILL_NUM:
+            return -WKI_SIGKILL_NUM;
+        case 128 + WKI_SIGTERM_NUM:
+            return -WKI_SIGTERM_NUM;
+        default:
+            return exit_status;
+    }
+}
+
 void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->isThread) {
         return;
@@ -1743,9 +1754,6 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
     // Wake proxy tasks with error exit status (outside lock - scheduling operations)
     for (size_t i = 0; i < proxy_count; i++) {
         auto* proxy = proxy_tasks[i];
-        if (proxy->schedQueue == ker::mod::sched::task::Task::SchedQueue::NONE) {
-            ker::mod::sched::post_task_waiting(proxy);
-        }
         finalize_proxy_task(proxy, -1, nullptr, 0, 0);
 
         ker::mod::dbg::log("[WKI] Proxy task fenced: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
@@ -1797,7 +1805,7 @@ void wki_remote_compute_check_completions() {
             // RunningRemoteTask holds a ref until completion is reported.
             completed = true;
         } else if (task->hasExited) {
-            exit_status = task->exitStatus;
+            exit_status = normalize_local_exit_status_for_wire(task->exitStatus);
             completed = true;
         }
 
@@ -2973,53 +2981,23 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     uint64_t local_pid = rt->local_pid;
-    TaskOutputCapture* output = rt->output;
-    rt->output = nullptr;
-    rt->active = false;
     s_compute_lock.unlock();
 
     auto* task = rt->task;
+    bool drop_lookup_ref = false;
     if (task == nullptr) {
-        task = ker::mod::sched::find_task_by_pid(local_pid);
+        task = ker::mod::sched::find_task_by_pid_safe(local_pid);
+        drop_lookup_ref = (task != nullptr);
     }
     if (task != nullptr && !task->hasExited) {
-        // Best-effort force-kill: transition to EXITING, set exit status, then DEAD.
-        // The scheduler will skip DEAD tasks and GC will reclaim resources.
-        if (task->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
-            task->exitStatus = -9;
-            task->hasExited = true;
-            task->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
-            task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
-
-            ker::mod::dbg::log("[WKI] Task cancelled: task_id=%u pid=0x%lx", cancel->task_id, local_pid);
-        }
+        task->sigPending |= (1ULL << (WKI_SIGKILL_NUM - 1));
+        ker::mod::sched::wake_task_for_signal(task);
+        ker::mod::dbg::log("[WKI] Task cancel queued: task_id=%u pid=0x%lx", cancel->task_id, local_pid);
     }
 
-    if (rt->task != nullptr) {
-        rt->task->release();
-        rt->task = nullptr;
+    if (drop_lookup_ref) {
+        task->release();
     }
-
-    // Send TASK_COMPLETE with exit_status=-9 (killed)
-    // The completion monitor will also detect hasExited, but sending here is faster
-    uint16_t out_len = (output != nullptr) ? output->len : static_cast<uint16_t>(0);
-    auto msg_len = static_cast<uint16_t>(sizeof(TaskCompletePayload) + out_len);
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
-    if (buf != nullptr) {
-        auto* complete = reinterpret_cast<TaskCompletePayload*>(buf);
-        complete->task_id = cancel->task_id;
-        complete->exit_status = -9;
-        complete->output_len = out_len;
-
-        if (out_len > 0 && output != nullptr) {
-            memcpy(buf + sizeof(TaskCompletePayload), output->data.data(), out_len);
-        }
-
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_COMPLETE, buf, msg_len);
-        ker::mod::mm::dyn::kmalloc::free(buf);
-    }
-
-    delete output;
 }
 
 void handle_load_report(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {

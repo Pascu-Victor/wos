@@ -1,11 +1,13 @@
 #include "pci.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <mod/io/port/port.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
 
@@ -393,7 +395,7 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
     return static_cast<uint64_t>(~readback + 1);
 }
 
-auto pci_map_bar(PCIDevice* dev, int bar_idx) -> volatile void* {
+auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
     uint64_t phys = pci_get_bar_addr(dev, bar_idx);
     if (phys == 0) return nullptr;
 
@@ -406,10 +408,10 @@ auto pci_map_bar(PCIDevice* dev, int bar_idx) -> volatile void* {
     uint64_t phys_aligned = phys & ~0xFFFULL;
     uint64_t end = (phys + size + 0xFFF) & ~0xFFFULL;
 
-    // Map the MMIO range into the kernel page table
-    ker::mod::mm::virt::mapRangeToKernelPageTable(ker::mod::mm::virt::Range{phys_aligned, end}, ker::mod::mm::paging::pageTypes::KERNEL);
+    // Map the MMIO range into the kernel page table (uncacheable for MMIO correctness)
+    ker::mod::mm::virt::mapRangeToKernelPageTable(ker::mod::mm::virt::Range{phys_aligned, end}, ker::mod::mm::paging::pageTypes::MMIO);
 
-    return reinterpret_cast<volatile void*>(ker::mod::mm::addr::get_virt_pointer(phys));
+    return reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(phys));
 }
 
 // Legacy wrapper: find AHCI controller using full enumeration
@@ -429,10 +431,10 @@ auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector
     auto* bar_base = pci_map_bar(dev, table_bir);
     if (bar_base == nullptr) return -1;
 
-    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<volatile uint8_t*>(bar_base) + table_offset);
+    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uint8_t*>(bar_base) + table_offset);
 
     // Each entry is 4 x 32-bit words = 16 bytes.
-    volatile uint32_t* entry = table + entry_idx * 4;
+    volatile uint32_t* entry = table + (static_cast<size_t>(entry_idx) * 4);
     uint32_t apic_id = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
     entry[0] = 0xFEE00000u | (apic_id << 12);  // Message Address Lower
     entry[1] = 0;                              // Message Address Upper

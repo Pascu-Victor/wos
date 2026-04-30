@@ -19,6 +19,11 @@ void cpuid(struct CpuidContext* cpuid_context);
 uint64_t currentCpu(void);
 void setCurrentCpuid(uint64_t id);
 
+// Safe CPU ID getter - falls back to APIC ID during early boot before per-CPU
+// structures are initialized. Call notifyPerCpuReady() to enable the fast path.
+uint64_t getCurrentCpuIdSafe();
+void notifyPerCpuReady();
+
 struct GPRegs {
     uint64_t r15;
     uint64_t r14;

@@ -2,9 +2,16 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <util/string.hpp>
+
+#include "mod/gfx/fb.hpp"
+#include "mod/io/serial/serial.hpp"
+#include "platform/ktime/ktime.hpp"
+#include "platform/sys/spinlock.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::mod::dbg {
 namespace {
@@ -112,7 +119,7 @@ inline void fbLog(const char* str) {
 
         gfx::fb::drawChar(0, line, '[');
         // todo maybe print cpu id
-        int stampLen = 1;
+        int stamp_len = 1;
         if (isTimeAvailable) [[likely]] {
             char timeSec[10] = {0};  // good enough for 30 years of uptime
             char timeMs[5] = {0};
@@ -141,18 +148,18 @@ inline void fbLog(const char* str) {
             };
             int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
             int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
-            gfx::fb::drawString(stampLen, line, timeSec);
-            stampLen += secLen;
-            gfx::fb::drawChar(stampLen, line, '.');
-            stampLen++;
-            gfx::fb::drawString(stampLen, line, timeMs);
-            stampLen += msLen;
+            gfx::fb::drawString(stamp_len, line, timeSec);
+            stamp_len += secLen;
+            gfx::fb::drawChar(stamp_len, line, '.');
+            stamp_len++;
+            gfx::fb::drawString(stamp_len, line, timeMs);
+            stamp_len += msLen;
         }
-        gfx::fb::drawChar(stampLen, line, ']');
-        stampLen++;
-        gfx::fb::drawChar(stampLen, line, ':');
-        stampLen++;
-        linesLogged += gfx::fb::drawString(stampLen, line, str);
+        gfx::fb::drawChar(stamp_len, line, ']');
+        stamp_len++;
+        gfx::fb::drawChar(stamp_len, line, ':');
+        stamp_len++;
+        linesLogged += gfx::fb::drawString(stamp_len, line, str);
     } else {
         mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
     }
@@ -270,13 +277,29 @@ void panic_handler(const char* msg) {
 
     // CPU id (best-effort)
     io::serial::writeUnlocked("CPU: ");
-    panic_write_dec(cpu::currentCpu());
+    panic_write_dec(cpu::getCurrentCpuIdSafe());
     io::serial::writeUnlocked("\n");
 
     // Capture general-purpose registers via inline asm.
-    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
-    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
-    uint64_t rflags, cr2, cr3;
+    uint64_t rax = 0;
+    uint64_t rbx = 0;
+    uint64_t rcx = 0;
+    uint64_t rdx = 0;
+    uint64_t rsi = 0;
+    uint64_t rdi = 0;
+    uint64_t rbp = 0;
+    uint64_t rsp = 0;
+    uint64_t r8 = 0;
+    uint64_t r9 = 0;
+    uint64_t r10 = 0;
+    uint64_t r11 = 0;
+    uint64_t r12 = 0;
+    uint64_t r13 = 0;
+    uint64_t r14 = 0;
+    uint64_t r15 = 0;
+    uint64_t rflags = 0;
+    uint64_t cr2 = 0;
+    uint64_t cr3 = 0;
     asm volatile("movq %%rax, %0" : "=m"(rax));
     asm volatile("movq %%rbx, %0" : "=m"(rbx));
     asm volatile("movq %%rcx, %0" : "=m"(rcx));

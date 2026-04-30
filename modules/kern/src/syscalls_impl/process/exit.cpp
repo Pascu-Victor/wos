@@ -1,5 +1,8 @@
 #include "exit.hpp"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
@@ -15,6 +18,8 @@
 #include <platform/sys/context_switch.hpp>
 #include <vfs/vfs.hpp>
 
+#include "platform/sched/task.hpp"
+#include "platform/smt/smt.hpp"
 #include "waitpid.hpp"
 
 namespace ker::syscall::process {
@@ -119,7 +124,7 @@ void wos_proc_exit(int status) {
     // This ensures files written by the exiting process are fully committed to
     // the VFS before waitpid returns to the parent.
     if (!current_task->isThread) {
-        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) { ker::vfs::vfs_close(static_cast<int>(key)); });
+        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) -> void { ker::vfs::vfs_close(static_cast<int>(key)); });
 
         if (current_task->elfBuffer != nullptr) {
             if (!ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer)) {

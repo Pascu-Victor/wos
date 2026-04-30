@@ -135,7 +135,11 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
 
 void virtq_kick(Virtqueue* vq) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    ::outw(vq->io_base + VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+    if (vq->notify_addr != nullptr) {
+        *vq->notify_addr = vq->queue_index;
+    } else {
+        ::outw(vq->io_base + VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+    }
 }
 
 }  // namespace ker::dev::virtio

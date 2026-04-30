@@ -1,7 +1,5 @@
 #pragma once
 
-#include <extern/limine.h>
-
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>

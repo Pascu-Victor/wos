@@ -137,9 +137,15 @@ int tcp_listen(Socket* sock, int backlog) {
 int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr_len) {
     // Empty queue: park caller and return EAGAIN.
     sock->lock.lock();
+#ifdef TCP_DEBUG
+    ker::mod::dbg::log("[tcp] tcp_accept: sock=%p aq_count=%zu owner_pid=%lu", static_cast<void*>(sock), sock->aq_count, sock->owner_pid);
+#endif
     if (sock->aq_count == 0) {
         sock->lock.unlock();
         defer_socket_wait(sock);
+#ifdef TCP_DEBUG
+        ker::mod::dbg::log("[tcp] tcp_accept: queue empty, parking pid=%lu", sock->owner_pid);
+#endif
         return -EAGAIN;
     }
 
@@ -159,7 +165,9 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
         *reinterpret_cast<uint32_t*>(addr + 4) = htonl(child->remote_v4.addr);
         *addr_len = 8;
     }
-
+#ifdef TCP_DEBUG
+    ker::mod::dbg::log("[tcp] tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote_v4.port);
+#endif
     *new_sock_out = child;
     return 0;
 }

@@ -1,16 +1,18 @@
 #include "coredump.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <net/wki/remote_compute.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
-#include <platform/sched/epoch.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <vfs/vfs.hpp>
 
@@ -140,35 +142,88 @@ auto write_all(int fd, const void* buf, size_t count) -> bool {
     return true;
 }
 
-}  // namespace
+// Snapshot of all data needed to write a coredump, captured at exception time.
+// No heap allocation, no locks. Physical page reads happen via HHDM in the coredump task.
+struct CoreDumpRequest {
+    ker::mod::cpu::GPRegs gpr;
+    ker::mod::gates::interruptFrame frame;
+    ker::mod::gates::interruptFrame savedFrame;
+    ker::mod::cpu::GPRegs savedRegs;
+    uint64_t cr2;
+    uint64_t cr3;
+    uint64_t cpuId;
+    uint64_t pid;
+    uint64_t entry;
+    uint64_t elfHeaderAddr;
+    uint64_t programHeaderAddr;
+    uint8_t* elfBuffer;      // stolen from task->elfBuffer; coredump task frees after write
+    size_t elfBufferSize;
+    ker::mod::mm::paging::PageTable* pagemap;
+    uint64_t userRsp;
+    uint64_t timestamp;
+    ker::mod::sched::task::Task* taskPtr;  // holds a refcount to block GC; released when done
+    char name[48];
+};
 
-void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::interruptFrame& frame,
-                     uint64_t cr2, uint64_t cr3, uint64_t cpuId) {
-    if (task == nullptr) {
-        return;
+constexpr uint32_t RING_SIZE = 4;
+
+struct CoreDumpSlot {
+    CoreDumpRequest req;
+    std::atomic<bool> ready{false};
+};
+
+static CoreDumpSlot g_ring[RING_SIZE];                                  // NOLINT
+static std::atomic<uint32_t> g_write_seq{0};                           // NOLINT
+static uint32_t g_read_seq{0};                                         // NOLINT only touched by coredump task
+static ker::mod::sched::task::Task* g_coredump_task{nullptr};          // NOLINT
+
+static void perform_coredump(const CoreDumpRequest& req);
+
+[[noreturn]] static void coredump_task_fn() {
+    while (true) {
+        uint32_t idx = g_read_seq % RING_SIZE;
+
+        if (g_ring[idx].ready.load(std::memory_order_acquire)) {
+            CoreDumpRequest& req = g_ring[idx].req;
+
+            // Switch to kernel pagemap: VFS I/O and HHDM page reads require it.
+            // (The coredump task is a DAEMON so it already uses the kernel pagemap,
+            // but this makes the invariant explicit and handles any edge cases.)
+            ker::mod::mm::virt::switchToKernelPagemap();
+
+            perform_coredump(req);
+
+            // Free the ELF buffer stolen from the crashing task.
+            if (req.elfBuffer != nullptr) {
+                if (!ker::net::wki::wki_remote_compute_release_elf_buffer(req.elfBuffer)) {
+                    delete[] req.elfBuffer;
+                }
+                req.elfBuffer = nullptr;
+            }
+
+            // Release the refcount acquired at exception time.
+            // GC was blocked from reclaiming the task (and its pagemap) while rc > 1.
+            if (req.taskPtr != nullptr) {
+                req.taskPtr->release();
+                req.taskPtr = nullptr;
+            }
+
+            g_ring[idx].ready.store(false, std::memory_order_release);
+            g_read_seq++;
+        } else {
+            ker::mod::sched::kern_block();
+        }
     }
+}
 
-    // CRITICAL: Enter epoch critical section to prevent GC from freeing the task
-    // or its resources (pagemap, thread, etc.) while we're writing the coredump.
-    // This ensures the task pointer and all its fields remain valid for the duration.
-    ker::mod::sched::EpochGuard epochGuard;
-
-    // The fault may have happened while running on a userspace pagemap.
-    // Some kernel allocations (e.g. FAT tables, VFS metadata) are not guaranteed
-    // to be mapped there, so switch to the kernel pagemap for the duration.
-    uint64_t savedCr3 = rdcr3();
-    ker::mod::mm::virt::switchToKernelPagemap();
-
-    uint64_t timestamp = ker::mod::time::getTicks();
-
+static void perform_coredump(const CoreDumpRequest& req) {
     char prog[48];
-    sanitize_name(task->name, prog, sizeof(prog));
+    sanitize_name(req.name, prog, sizeof(prog));
 
     char ts[32];
-    u64_to_dec(ts, sizeof(ts), timestamp);
+    u64_to_dec(ts, sizeof(ts), req.timestamp);
 
     char path[160];
-    // Format: /mnt/disk/[PROGRAM]_[TIMESTAMP]_coredump.bin
     const char suffix[] = "_coredump.bin";
     size_t pos = 0;
     const char prefix[] = "/root/";
@@ -192,11 +247,9 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
     int fd = ker::vfs::vfs_open(path, O_CREAT, 0);
     if (fd < 0) {
         ker::mod::dbg::log("coredump: failed to open %s", path);
-        wrcr3(savedCr3);
         return;
     }
 
-    // Decide which user pages to snapshot (best-effort).
     constexpr uint64_t PAGE = 4096;
     constexpr uint64_t MAX_STACK_PAGES = 4;
     CoreDumpSegment segs[MAX_STACK_PAGES + 1] = {};
@@ -212,8 +265,8 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
         s.type = static_cast<uint32_t>(type);
 
         uint64_t phys = 0;
-        if (task->pagemap != nullptr) {
-            phys = ker::mod::mm::virt::translate(task->pagemap, vaddrPage);
+        if (req.pagemap != nullptr) {
+            phys = ker::mod::mm::virt::translate(req.pagemap, vaddrPage);
         }
 
         if (phys != ker::mod::mm::virt::PADDR_INVALID && is_ram(phys)) {
@@ -228,53 +281,46 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
         segs[segCount++] = s;
     };
 
-    // Stack pages around faulting user RSP (even if the trap was kernel-mode, this is still useful).
-    uint64_t userRsp = task->context.frame.rsp;
-    uint64_t stackPage = userRsp & ~(PAGE - 1);
+    uint64_t stackPage = req.userRsp & ~(PAGE - 1);
     for (uint64_t i = 0; i < MAX_STACK_PAGES; ++i) {
         add_page(stackPage - i * PAGE, SegmentType::StackPage);
     }
 
-    // Faulting address page (CR2).
-    uint64_t faultPage = cr2 & ~(PAGE - 1);
+    uint64_t faultPage = req.cr2 & ~(PAGE - 1);
     add_page(faultPage, SegmentType::FaultPage);
 
-    // Build header.
     CoreDumpHeader hdr{};
     hdr.magic = COREDUMP_MAGIC;
     hdr.version = COREDUMP_VERSION;
     hdr.headerSize = sizeof(CoreDumpHeader);
-    hdr.timestampQuantums = timestamp;
-    hdr.pid = task->pid;
-    hdr.cpu = cpuId;
-    hdr.intNum = frame.intNum;
-    hdr.errCode = frame.errCode;
-    hdr.cr2 = cr2;
-    hdr.cr3 = cr3;
-    hdr.trapFrame = frame;
-    hdr.trapRegs = gpr;
-    hdr.savedFrame = task->context.frame;
-    hdr.savedRegs = task->context.regs;
-    hdr.taskEntry = task->entry;
-    hdr.taskPagemap = reinterpret_cast<uint64_t>(task->pagemap);
-    hdr.elfHeaderAddr = task->elfHeaderAddr;
-    hdr.programHeaderAddr = task->programHeaderAddr;
+    hdr.timestampQuantums = req.timestamp;
+    hdr.pid = req.pid;
+    hdr.cpu = req.cpuId;
+    hdr.intNum = req.frame.intNum;
+    hdr.errCode = req.frame.errCode;
+    hdr.cr2 = req.cr2;
+    hdr.cr3 = req.cr3;
+    hdr.trapFrame = req.frame;
+    hdr.trapRegs = req.gpr;
+    hdr.savedFrame = req.savedFrame;
+    hdr.savedRegs = req.savedRegs;
+    hdr.taskEntry = req.entry;
+    hdr.taskPagemap = reinterpret_cast<uint64_t>(req.pagemap);
+    hdr.elfHeaderAddr = req.elfHeaderAddr;
+    hdr.programHeaderAddr = req.programHeaderAddr;
     hdr.segmentCount = segCount;
     hdr.segmentTableOffset = sizeof(CoreDumpHeader);
-
-    hdr.elfSize = task->elfBuffer != nullptr ? task->elfBufferSize : 0;
+    hdr.elfSize = req.elfBuffer != nullptr ? req.elfBufferSize : 0;
     hdr.elfOffset = nextOffset;
 
-    // Write header + full segment table array (fixed size) for simplicity.
     bool ok = write_all(fd, &hdr, sizeof(hdr));
     ok = ok && write_all(fd, &segs[0], sizeof(segs));
 
-    // Write segment contents.
     for (uint64_t i = 0; ok && i < segCount; ++i) {
         if (segs[i].present == 0) {
             continue;
         }
-        uint64_t phys = ker::mod::mm::virt::translate(task->pagemap, segs[i].vaddr);
+        uint64_t phys = ker::mod::mm::virt::translate(req.pagemap, segs[i].vaddr);
         if (phys == ker::mod::mm::virt::PADDR_INVALID || !is_ram(phys)) {
             continue;
         }
@@ -282,10 +328,9 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
         ok = write_all(fd, pagePtr, PAGE);
     }
 
-    // Write ELF image bytes if available.
-    if (ok && task->elfBuffer != nullptr && task->elfBufferSize != 0) {
-        const uint8_t* elf = task->elfBuffer;
-        size_t remaining = task->elfBufferSize;
+    if (ok && req.elfBuffer != nullptr && req.elfBufferSize != 0) {
+        const uint8_t* elf = req.elfBuffer;
+        size_t remaining = req.elfBufferSize;
         while (ok && remaining > 0) {
             size_t chunk = remaining > 4096 ? 4096 : remaining;
             ok = write_all(fd, elf, chunk);
@@ -296,14 +341,77 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
 
     ker::vfs::vfs_close(fd);
 
-    // Restore original address space before returning.
-    wrcr3(savedCr3);
-
     if (ok) {
         ker::mod::dbg::log("coredump: wrote %s", path);
     } else {
         ker::mod::dbg::log("coredump: failed while writing %s", path);
     }
+}
+
+}  // namespace
+
+void init() {
+    g_coredump_task = ker::mod::sched::task::Task::createKernelThread("coredump", coredump_task_fn);
+    if (g_coredump_task == nullptr) {
+        ker::mod::dbg::log("coredump: failed to create coredump task");
+        return;
+    }
+    ker::mod::sched::post_task_balanced(g_coredump_task);
+    ker::mod::dbg::log("coredump: task started");
+}
+
+void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::interruptFrame& frame,
+                     uint64_t cr2, uint64_t cr3, uint64_t cpuId) {
+    if (task == nullptr || g_coredump_task == nullptr) {
+        return;
+    }
+
+    // Claim a ring slot. Wrap around; drop if the consumer hasn't cleared this slot yet.
+    uint32_t seq = g_write_seq.fetch_add(1, std::memory_order_relaxed);
+    uint32_t idx = seq % RING_SIZE;
+    CoreDumpSlot& slot = g_ring[idx];
+
+    if (slot.ready.load(std::memory_order_acquire)) {
+        ker::mod::dbg::log("coredump: ring full, dropping coredump for PID %x", task->pid);
+        return;
+    }
+
+    // Take a refcount on the task. This prevents GC from reclaiming it (and its pagemap
+    // and user pages) while the coredump task reads them via HHDM. The coredump task
+    // calls task->release() when done. tryAcquire fails if task is already EXITING/DEAD.
+    if (!task->tryAcquire()) {
+        return;
+    }
+
+    CoreDumpRequest& req = slot.req;
+    req.gpr = gpr;
+    req.frame = frame;
+    req.savedFrame = task->context.frame;
+    req.savedRegs = task->context.regs;
+    req.cr2 = cr2;
+    req.cr3 = cr3;
+    req.cpuId = cpuId;
+    req.pid = task->pid;
+    req.entry = task->entry;
+    req.elfHeaderAddr = task->elfHeaderAddr;
+    req.programHeaderAddr = task->programHeaderAddr;
+    req.pagemap = task->pagemap;
+    req.userRsp = task->context.frame.rsp;
+    req.timestamp = ker::mod::time::getTicks();
+    req.taskPtr = task;
+    sanitize_name(task->name, req.name, sizeof(req.name));
+
+    // Steal elfBuffer so exit() won't free it before the coredump task writes it.
+    // The coredump task owns it from this point and frees it after writing.
+    req.elfBuffer = task->elfBuffer;
+    req.elfBufferSize = task->elfBufferSize;
+    task->elfBuffer = nullptr;
+    task->elfBufferSize = 0;
+
+    // Publish the slot and wake the coredump task. Safe from CPL=3 exception context:
+    // userspace-fault handlers cannot be holding any kernel spinlock.
+    slot.ready.store(true, std::memory_order_release);
+    ker::mod::sched::kern_wake(g_coredump_task);
 }
 
 }  // namespace ker::mod::dbg::coredump

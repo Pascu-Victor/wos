@@ -155,9 +155,9 @@ void tcp_timer_arm(TcpCB* cb);
 void tcp_timer_disarm(TcpCB* cb);
 auto get_tcp_proto_ops() -> SocketProtoOps*;
 
-bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len);
+auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) -> bool;
 void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t flags);
-bool tcp_send_ack(TcpCB* cb);
+auto tcp_send_ack(TcpCB* cb) -> bool;
 
 // Build ACK without sending; caller holds cb->lock.
 auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
@@ -176,12 +176,14 @@ void tcp_cb_release(TcpCB* cb);
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB*;
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB*;
 
-inline bool tcp_seq_before(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) < 0; }
-inline bool tcp_seq_after(uint32_t a, uint32_t b) { return tcp_seq_before(b, a); }
-inline bool tcp_seq_between(uint32_t seq, uint32_t low, uint32_t high) { return !tcp_seq_before(seq, low) && tcp_seq_before(seq, high); }
+inline auto tcp_seq_before(uint32_t a, uint32_t b) -> bool { return static_cast<int32_t>(a - b) < 0; }
+inline auto tcp_seq_after(uint32_t a, uint32_t b) -> bool { return tcp_seq_before(b, a); }
+inline auto tcp_seq_between(uint32_t seq, uint32_t low, uint32_t high) -> bool {
+    return !tcp_seq_before(seq, low) && tcp_seq_before(seq, high);
+}
 
 // Minimum shift so advertised window fits in 16 bits.
-constexpr uint8_t tcp_wscale_for_buf(size_t buf_size) {
+constexpr auto tcp_wscale_for_buf(size_t buf_size) -> uint8_t {
     uint8_t s = 0;
     while (s < 14 && (buf_size >> s) > 65535U) {
         ++s;

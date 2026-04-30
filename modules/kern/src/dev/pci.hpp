@@ -130,7 +130,7 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t;
 
 // Map a memory BAR into the kernel page table and return the virtual address.
 // Returns nullptr for I/O BARs or invalid BARs.
-auto pci_map_bar(PCIDevice* dev, int bar_idx) -> volatile void*;
+auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void*;
 
 // Legacy: find AHCI controller (wrapper around enumerate + find_by_class)
 auto pci_find_ahci_controller() -> PCIDevice*;

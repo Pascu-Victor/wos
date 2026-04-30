@@ -15,6 +15,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <string_view>
 
 #include "net/wki/wire.hpp"
@@ -887,6 +888,16 @@ void devfs_populate_net_nodes() {
 
 namespace {
 
+// Protects all g_wki_* state and DevFSNode tree mutations in devfs_wki_* functions.
+// Multiple CPUs run backlog handler threads concurrently; devfs_wki_* are called
+// after s_remotable_lock is dropped, so they need their own lock.
+ker::mod::sys::Spinlock g_wki_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct WkiAutoLock {
+    WkiAutoLock() { g_wki_lock.lock(); }
+    ~WkiAutoLock() { g_wki_lock.unlock(); }
+};
+
 // Persistent directory pointers (lazily initialized)
 DevFSNode* g_wki_dir = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 DevFSNode* g_wki_by_zone = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -1224,6 +1235,7 @@ void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node,
 }  // namespace
 
 void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name) {
+    WkiAutoLock guard;
     if (!wki_ensure_dirs()) {
         return;
     }
@@ -1327,6 +1339,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
 }
 
 void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id) {
+    WkiAutoLock guard;
     if (g_wki_dir == nullptr) {
         return;
     }
@@ -1348,6 +1361,7 @@ void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_
 }
 
 void devfs_wki_remove_peer_resources(uint16_t node_id) {
+    WkiAutoLock guard;
     if (g_wki_dir == nullptr) {
         return;
     }

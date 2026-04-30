@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -71,6 +72,12 @@ class Slab {
     // Outputs (by reference): number of slab pages, total blocks across all slabs,
     // and total free blocks across all slabs. This function does not allocate.
     void collect_stats(uint64_t& out_slab_count, uint64_t& out_total_blocks, uint64_t& out_free_blocks) const;
+
+    // Walk every live (allocated) block in this slab chain.
+    // For each live block, fn receives: userdata, pointer to user data, block size, and the
+    // debug_idx stored in the _align_pad field (lower 32 bits).  Safe to call without the
+    // slab_lock (caller must ensure quiescence, e.g. other CPUs halted during OOM dump).
+    void iter_live_blocks_unlocked(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size, uint32_t debug_idx)) const;
 };
 
 template <size_t slab_size, size_t memory_size>
@@ -201,6 +208,24 @@ void Slab<slab_size, memory_size>::collect_stats(uint64_t& out_slab_count, uint6
         out_slab_count++;
         out_total_blocks += MAX_BLOCKS;
         out_free_blocks += s->header.free_blocks;
+        s = s->header.next;
+    }
+}
+
+template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::iter_live_blocks_unlocked(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size,
+                                                                                        uint32_t debug_idx)) const {
+    const Slab* s = this;
+    while (s != nullptr) {
+        for (size_t i = 0; i < MAX_BLOCKS; ++i) {
+            if (!s->header.mem_map.check_used(i)) {
+                continue;
+            }
+            // debug_idx is stored in the lower 32 bits of _align_pad, which sits
+            // sizeof(uintptr_t) bytes before the user data pointer.
+            uint32_t debug_idx = *reinterpret_cast<const uint32_t*>(s->blocks[i].data.data() - sizeof(uintptr_t));
+            fn(userdata, s->blocks[i].data.data(), slab_size, debug_idx);
+        }
         s = s->header.next;
     }
 }

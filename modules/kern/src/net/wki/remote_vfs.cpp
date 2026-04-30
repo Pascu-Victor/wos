@@ -69,6 +69,32 @@ auto perf_current_cpu() -> uint32_t {
     return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
 }
 
+auto take_preserved_export_id(std::deque<VfsExport>* stale_exports, const char* name) -> uint32_t {
+    if (stale_exports == nullptr || name == nullptr) {
+        return 0;
+    }
+
+    for (auto it = stale_exports->begin(); it != stale_exports->end(); ++it) {
+        if (it->active && std::strncmp(static_cast<const char*>(it->name), name, VFS_EXPORT_NAME_LEN) == 0) {
+            uint32_t resource_id = it->resource_id;
+            stale_exports->erase(it);
+            return resource_id;
+        }
+    }
+
+    return 0;
+}
+
+auto max_preserved_export_id(const std::deque<VfsExport>& stale_exports) -> uint32_t {
+    uint32_t max_resource_id = 0;
+    for (const auto& exp : stale_exports) {
+        if (exp.active && exp.resource_id > max_resource_id) {
+            max_resource_id = exp.resource_id;
+        }
+    }
+    return max_resource_id;
+}
+
 auto perf_vfs_op(uint16_t op_id) -> uint8_t {
     switch (op_id) {
         case OP_VFS_OPEN:
@@ -745,8 +771,8 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
 auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src, uint32_t chunk,
                                    uint32_t* written_out) -> int {
-    if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr || state->rdma_bounce_buf == nullptr ||
-        state->rdma_server_write_rkey == 0) {
+    if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr ||
+        state->rdma_bounce_buf == nullptr || state->rdma_server_write_rkey == 0) {
         return -1;
     }
 
@@ -1729,7 +1755,7 @@ void wki_remote_vfs_init() {
 // Server Side - VFS Export Management
 // -------------------------------------------------------------------------------
 
-auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t {
+auto wki_remote_vfs_export_add_internal(const char* export_path, const char* name, uint32_t preferred_resource_id) -> uint32_t {
     if (export_path == nullptr || name == nullptr) {
         return 0;
     }
@@ -1748,7 +1774,14 @@ auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uin
 
     VfsExport exp;
     exp.active = true;
-    exp.resource_id = g_next_vfs_resource_id++;
+    if (preferred_resource_id != 0) {
+        exp.resource_id = preferred_resource_id;
+        if (g_next_vfs_resource_id <= preferred_resource_id) {
+            g_next_vfs_resource_id = preferred_resource_id + 1;
+        }
+    } else {
+        exp.resource_id = g_next_vfs_resource_id++;
+    }
 
     size_t path_len = strlen(export_path);
     if (path_len >= VFS_EXPORT_PATH_LEN) {
@@ -1771,6 +1804,10 @@ auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uin
     ker::mod::dbg::log("[WKI] VFS export added: %s -> %s (resource_id=%u)", static_cast<const char*>(exp.name),
                        static_cast<const char*>(exp.export_path), result_id);
     return result_id;
+}
+
+auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t {
+    return wki_remote_vfs_export_add_internal(export_path, name, 0);
 }
 
 auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport* {
@@ -3337,6 +3374,33 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
     ker::vfs::unmount_filesystem(local_mount_path);
 }
 
+auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resource_id, char* out, size_t out_size) -> bool {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        if (!proxy->active || proxy->owner_node != owner_node || proxy->resource_id != resource_id) {
+            continue;
+        }
+
+        size_t mount_len = std::strlen(proxy->local_mount_path);
+        if (mount_len + 1 > out_size) {
+            break;
+        }
+
+        std::memcpy(out, proxy->local_mount_path, mount_len + 1);
+        s_vfs_lock.unlock();
+        return true;
+    }
+    s_vfs_lock.unlock();
+
+    return false;
+}
+
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
     if (state == nullptr || !state->active) {
@@ -3778,11 +3842,7 @@ void wki_remote_vfs_gc_stale_fds() {
 // D9: Auto-Discover Exportable Mount Points
 // -------------------------------------------------------------------------------
 
-void wki_remote_vfs_auto_discover() {
-    if (!g_remote_vfs_initialized) {
-        return;
-    }
-
+void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports) {
     size_t mount_count = ker::vfs::get_mount_count();
     for (size_t i = 0; i < mount_count; i++) {
         auto* mp = ker::vfs::get_mount_at(i);
@@ -3816,8 +3876,17 @@ void wki_remote_vfs_auto_discover() {
         // namespace. After pivot_root("/rootfs", ...), this yields "/",
         // "/boot", and "/oldroot", which resolve correctly for all tasks whose
         // root has been updated to "/rootfs".
-        wki_remote_vfs_export_add(mp->path, export_name);
+        uint32_t preserved_resource_id = take_preserved_export_id(stale_exports, export_name);
+        wki_remote_vfs_export_add_internal(mp->path, export_name, preserved_resource_id);
     }
+}
+
+void wki_remote_vfs_auto_discover() {
+    if (!g_remote_vfs_initialized) {
+        return;
+    }
+
+    wki_remote_vfs_auto_discover_internal(nullptr);
 
     wki_remote_vfs_advertise_exports();
 }
@@ -3836,7 +3905,13 @@ void wki_remote_vfs_rebuild_exports() {
     }
     g_vfs_exports.clear();
     g_next_vfs_resource_id = 0x1000;
+    uint32_t max_stale_resource_id = max_preserved_export_id(stale_exports);
+    if (g_next_vfs_resource_id <= max_stale_resource_id) {
+        g_next_vfs_resource_id = max_stale_resource_id + 1;
+    }
     s_vfs_lock.unlock();
+
+    wki_remote_vfs_auto_discover_internal(&stale_exports);
 
     for (const auto& exp : stale_exports) {
         ResourceAdvertPayload withdraw = {};
@@ -3855,7 +3930,7 @@ void wki_remote_vfs_rebuild_exports() {
         }
     }
 
-    wki_remote_vfs_auto_discover();
+    wki_remote_vfs_advertise_exports();
 }
 
 // -------------------------------------------------------------------------------

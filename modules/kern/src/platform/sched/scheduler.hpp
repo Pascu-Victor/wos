@@ -154,6 +154,7 @@ void dump_scheduler_cpu_states();
 // Active task enumeration (for procfs)
 auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
+auto get_active_task_at_safe(uint32_t index) -> task::Task*;
 
 // Return up to maxEntries dead task PIDs and their refcounts for diagnostics,
 // starting at `startIndex` into the dead list. Returns the number of entries written.

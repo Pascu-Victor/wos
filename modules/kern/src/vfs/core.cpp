@@ -684,7 +684,35 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
 
     auto* existing = static_cast<StreamReaderAttachment*>(file->stream_cache_attachment);
     if (existing != nullptr) {
-        return existing;
+        uint64_t now_us = stream_now_us();
+        g_stream_cache_lock.lock();
+
+        bool entry_alive = false;
+        for (auto& entry : g_stream_cache) {
+            if (entry.get() == existing->entry) {
+                entry_alive = true;
+                break;
+            }
+        }
+
+        if (entry_alive) {
+            existing->desired_offset = static_cast<uint64_t>(file->pos);
+            if (existing->island == nullptr || existing->island->retired) {
+                if (stream_select_island_locked(existing, existing->desired_offset) == nullptr) {
+                    file->stream_cache_attachment = nullptr;
+                    g_stream_cache_lock.unlock();
+                    delete existing;
+                    return nullptr;
+                }
+            }
+            existing->entry->last_used_us = now_us;
+            g_stream_cache_lock.unlock();
+            return existing;
+        }
+
+        file->stream_cache_attachment = nullptr;
+        g_stream_cache_lock.unlock();
+        delete existing;
     }
 
     stat st = {};
@@ -727,6 +755,11 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
     }
 
     attachment->entry = entry;
+    if (stream_select_island_locked(attachment, attachment->desired_offset) == nullptr) {
+        g_stream_cache_lock.unlock();
+        delete attachment;
+        return nullptr;
+    }
     file->stream_cache_attachment = attachment;
     g_stream_cache_lock.unlock();
     return attachment;
@@ -3342,12 +3375,13 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
     {
         uint32_t count = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < count; ++i) {
-            auto* t = ker::mod::sched::get_active_task_at(i);
+            auto* t = ker::mod::sched::get_active_task_at_safe(i);
             if (t == nullptr) continue;
             // Only update tasks that still have the old root "/"
             if (t->root[0] == '/' && t->root[1] == '\0') {
                 std::memcpy(t->root, new_root, new_root_len + 1);
             }
+            t->release();
         }
     }
 

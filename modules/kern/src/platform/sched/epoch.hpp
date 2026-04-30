@@ -30,7 +30,8 @@ class EpochManager {
     // Enter a read-side critical section.
     // While in a critical section, the CPU promises not to access freed memory.
     // Call this before accessing task pointers outside of locks.
-    static void enterCritical();
+    static auto enterCritical() -> uint64_t;
+    static void enterCriticalForCpu(uint64_t cpuId);
 
     // Enter a read-side critical section using APIC ID.
     // Used in contexts where CPU ID cannot be obtained normally.
@@ -39,6 +40,7 @@ class EpochManager {
     // Exit a read-side critical section.
     // After this, the CPU no longer holds references to task pointers.
     static void exitCritical();
+    static void exitCriticalForCpu(uint64_t cpuId);
 
     // Get the current global epoch value.
     static auto currentEpoch() -> uint64_t;
@@ -60,14 +62,17 @@ class EpochManager {
 // Use this in scheduler functions that access task pointers.
 class EpochGuard {
    public:
-    EpochGuard() { EpochManager::enterCritical(); }
-    ~EpochGuard() { EpochManager::exitCritical(); }
+    EpochGuard() : cpuId(EpochManager::enterCritical()) {}
+    ~EpochGuard() { EpochManager::exitCriticalForCpu(cpuId); }
 
     // Non-copyable, non-movable
     EpochGuard(const EpochGuard&) = delete;
     EpochGuard(EpochGuard&&) = delete;
     auto operator=(const EpochGuard&) -> EpochGuard& = delete;
     auto operator=(EpochGuard&&) -> EpochGuard& = delete;
+
+   private:
+    uint64_t cpuId;
 };
 
 }  // namespace ker::mod::sched

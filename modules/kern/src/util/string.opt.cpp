@@ -1,6 +1,11 @@
 #include "string.hpp"
 
-#include <stdarg.h>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <span>
 
 namespace _std {
 __attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
@@ -139,7 +144,7 @@ int u64toh(uint64_t n, char s[]) {
 
 namespace std = _std;
 
-int snprintf(char* str, size_t size, const char* format, ...) {
+auto snprintf(char* str, size_t size, const char* format, ...) -> int {
     va_list args;
     va_start(args, format);
     int ret = _std::vsnprintf(str, size, format, args);
@@ -147,7 +152,7 @@ int snprintf(char* str, size_t size, const char* format, ...) {
     return ret;
 }
 
-char* strcat(char* dest, const char* src) {
+auto strcat(char* dest, const char* src) -> char* {
     size_t dest_len = _std::strlen(dest);
     size_t i;
 
@@ -160,7 +165,7 @@ char* strcat(char* dest, const char* src) {
     return dest;
 }
 
-size_t strlcat(char* dest, const char* src, size_t size) {
+auto strlcat(char* dest, const char* src, size_t size) -> size_t {
     size_t dest_len = _std::strlen(dest);
     size_t src_len = _std::strlen(src);
     size_t i;
@@ -225,6 +230,10 @@ int snprintf(char* str, size_t size, const char* format, ...) {
     int ret = _std::vsnprintf(str, size, format, args);
     va_end(args);
     return ret;
+}
+
+int vsnprintf(char* str, size_t size, const char* format, va_list args) {
+    return _std::vsnprintf(str, size, format, args);
 }
 
 char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }
