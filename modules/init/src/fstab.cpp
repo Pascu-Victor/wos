@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <print>
 
+#include "init_log.h"
 #include "sys/multiproc.h"
 
 namespace {
@@ -20,7 +21,7 @@ void mount_filesystems() {
 
     int fstab_fd = ker::abi::vfs::open("/etc/fstab", 0, 0);
     if (fstab_fd < 0) {
-        std::println("init[{}]: no /etc/fstab found, skipping mounts", cpuno);
+        init_info("init[%llu]: no /etc/fstab found, skipping mounts", static_cast<unsigned long long>(cpuno));
         return;
     }
 
@@ -29,12 +30,12 @@ void mount_filesystems() {
     ker::abi::vfs::close(fstab_fd);
 
     if (bytes_read <= 0) {
-        std::println("init[{}]: /etc/fstab is empty", cpuno);
+        init_info("init[%llu]: /etc/fstab is empty", static_cast<unsigned long long>(cpuno));
         return;
     }
 
     fstab_buf[static_cast<size_t>(bytes_read)] = '\0';
-    std::println("init[{}]: parsing /etc/fstab ({} bytes)", cpuno, bytes_read);
+    init_info("init[%llu]: parsing /etc/fstab (%ld bytes)", static_cast<unsigned long long>(cpuno), static_cast<long>(bytes_read));
 
     // Parse line by line
     char* line_start = fstab_buf.data();
@@ -99,12 +100,11 @@ void mount_filesystems() {
                 // Mount filesystem
                 int ret = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data());
                 if (ret == 0) {
-                    std::println("init[{}]: mounted {} at {} ({})", cpuno, device.data(), mountpoint.data(), fstype.data());
+                    init_info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(cpuno), device.data(), mountpoint.data(),
+                              fstype.data());
                 } else {
-                    std::println(
-                        "init[{}]: FAILED to mount {} at {} "
-                        "({}): error {}",
-                        cpuno, device.data(), mountpoint.data(), fstype.data(), ret);
+                    init_error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(cpuno), device.data(),
+                               mountpoint.data(), fstype.data(), ret);
                 }
             }
         }

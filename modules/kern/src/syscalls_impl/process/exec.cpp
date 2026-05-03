@@ -209,9 +209,10 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : parent_task->pid;
     new_task->controlling_tty = parent_task->controlling_tty;
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
-    if ((parent_task->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) == 0) {
-        memcpy(new_task->wki_target_hostname, parent_task->wki_target_hostname, sizeof(new_task->wki_target_hostname));
-        new_task->wki_target_flags = parent_task->wki_target_flags;
+    memcpy(new_task->wki_target_hostname, parent_task->wki_target_hostname, sizeof(new_task->wki_target_hostname));
+    new_task->wki_target_flags = parent_task->wki_target_flags;
+    if ((new_task->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) != 0) {
+        new_task->wki_target_flags &= ~sched::task::Task::WKI_TARGET_FLAG_NOINHERIT;
     }
     memcpy(new_task->wki_submitter_hostname, parent_task->wki_submitter_hostname, sizeof(new_task->wki_submitter_hostname));
     new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);

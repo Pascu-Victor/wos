@@ -68,13 +68,17 @@ if [ -f "$CWD/build/modules/perf/perf" ]; then
     cp "$CWD/build/modules/perf/perf" "$STAGING/usr/bin/perf"
     echo "  rootfs: added /usr/bin/perf"
 fi
+if [ -f "$CWD/build/modules/journal/journal" ]; then
+    cp "$CWD/build/modules/journal/journal" "$STAGING/usr/bin/journalctl"
+    echo "  rootfs: added /usr/bin/journalctl"
+fi
 
 # busybox + applet symlinks
 BUSYBOX_BINARY="$CWD/toolchain/sysroot/bin/busybox"
 if [ -f "$BUSYBOX_BINARY" ]; then
     cp "$BUSYBOX_BINARY" "$STAGING/usr/bin/busybox"
     chmod +x "$STAGING/usr/bin/busybox"
-    BUSYBOX_APPLETS="yes whoami wc uniq uname umount true tr touch time test tee tail stat sort sleep sha256sum sh seq rmdir rm realpath readlink pwd ps printf mv mount mkdir md5sum ls ln ifconfig id head grep find false env echo du dirname df dd date cut cp clear chown chmod cat basename"
+    BUSYBOX_APPLETS="yes whoami wc uniq uname umount true tr touch time test tee tail stat sort sleep sha256sum sh seq rmdir rm realpath readlink pwd ps printf mv mount mkdir md5sum ls ln ifconfig id head grep find false env echo du dirname df dd date cut cp clear chown chmod cat basename ip"
     for applet in $BUSYBOX_APPLETS; do
         ln -sf busybox "$STAGING/usr/bin/$applet"
     done
@@ -101,6 +105,10 @@ fi
 if [ -f "$CWD/build/modules/netd/netd" ]; then
     cp "$CWD/build/modules/netd/netd" "$STAGING/usr/sbin/netd"
     echo "  rootfs: added /usr/sbin/netd"
+fi
+if [ -f "$CWD/build/modules/journal/journal" ]; then
+    cp "$CWD/build/modules/journal/journal" "$STAGING/usr/sbin/journald"
+    echo "  rootfs: added /usr/sbin/journald"
 fi
 
 # --- usr-merge compat symlinks ---
@@ -177,6 +185,7 @@ echo "  rootfs: added /srv/ content"
 mkdir -p "$STAGING/dev/pts"
 mkdir -p "$STAGING/tmp"
 mkdir -p "$STAGING/run"
+mkdir -p "$STAGING/var/log/journal"
 mkdir -p "$STAGING/oldroot"
 
 # Stage a tarball with root:root ownership and correct permissions

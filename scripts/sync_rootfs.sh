@@ -33,9 +33,14 @@ fi
 mkdir -p "$STAGING/usr/bin"
 for binary in \
     "$CWD/build/modules/testprog/testprog" \
-    "$CWD/build/modules/perf/perf"; do
+    "$CWD/build/modules/perf/perf" \
+    "$CWD/build/modules/journal/journal"; do
     if [ -f "$binary" ]; then
-        cp "$binary" "$STAGING/usr/bin/"
+        if [ "$(basename "$binary")" = "journal" ]; then
+            cp "$binary" "$STAGING/usr/bin/journalctl"
+        else
+            cp "$binary" "$STAGING/usr/bin/"
+        fi
         CHANGED=1
     fi
 done
@@ -60,9 +65,14 @@ fi
 mkdir -p "$STAGING/usr/sbin"
 for binary in \
     "$CWD/build/modules/httpd/httpd" \
-    "$CWD/build/modules/netd/netd"; do
+    "$CWD/build/modules/netd/netd" \
+    "$CWD/build/modules/journal/journal"; do
     if [ -f "$binary" ]; then
-        cp "$binary" "$STAGING/usr/sbin/$(basename "$binary")"
+        if [ "$(basename "$binary")" = "journal" ]; then
+            cp "$binary" "$STAGING/usr/sbin/journald"
+        else
+            cp "$binary" "$STAGING/usr/sbin/$(basename "$binary")"
+        fi
         CHANGED=1
     fi
 done
@@ -75,6 +85,7 @@ fi
 
 # --- /etc/ config files ---
 mkdir -p "$STAGING/etc"
+mkdir -p "$STAGING/var/log/journal"
 cat > "$STAGING/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/bin/sh
 PASSWD

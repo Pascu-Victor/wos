@@ -14,6 +14,7 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/dbg/journal.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
@@ -716,6 +717,7 @@ void devfs_init() {
     }
 
     register_devfs();
+    ker::mod::dbg::journal::mark_devfs_ready();
     vfs_debug_log("devfs: initialized with ");
     vfs_debug_log_hex(root_node.children_count);
     vfs_debug_log(" device nodes\n");

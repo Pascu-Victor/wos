@@ -56,6 +56,9 @@ void wki_remote_net_init();
 // Consumer side: attach to a remote NIC and register a proxy NetDevice
 auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> net::NetDevice*;
 
+// Consumer side: true if a proxy for this remote NIC is already active.
+auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool;
+
 // Consumer side: detach from a remote NIC
 void wki_remote_net_detach(net::NetDevice* proxy_dev);
 

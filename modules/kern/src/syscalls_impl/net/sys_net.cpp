@@ -2,6 +2,7 @@
 
 #include <abi/callnums/net.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
@@ -164,6 +165,196 @@ void fill_sockaddr_v4(void* addr_out, size_t* addr_len, uint32_t ip, uint16_t po
     if (addr_len != nullptr) {
         *addr_len = 16;
     }
+}
+
+constexpr size_t WOS_NET_IF_NAME_LEN = 16;
+constexpr size_t WOS_NET_HWADDR_LEN = 8;
+constexpr size_t WOS_NET_ADDR_LEN = 16;
+
+constexpr uint32_t IFF_UP = 0x0001;
+constexpr uint32_t IFF_BROADCAST = 0x0002;
+constexpr uint32_t IFF_LOOPBACK = 0x0008;
+constexpr uint32_t IFF_RUNNING = 0x0040;
+constexpr uint32_t IFF_NOARP = 0x0080;
+constexpr uint32_t IFF_PROMISC = 0x0100;
+constexpr uint32_t IFF_MULTICAST = 0x1000;
+constexpr uint32_t IFF_LOWER_UP = 0x10000;
+
+constexpr uint16_t WOS_AF_INET = 2;
+constexpr uint16_t WOS_ARPHRD_ETHER = 1;
+constexpr uint16_t WOS_ARPHRD_LOOPBACK = 772;
+constexpr uint32_t WOS_IFA_F_PERMANENT = 0x80;
+
+constexpr uint32_t WOS_NET_LINK_SET_FLAGS = 1u << 0;
+constexpr uint32_t WOS_NET_LINK_SET_MTU = 1u << 1;
+constexpr uint32_t WOS_NET_LINK_SET_TXQLEN = 1u << 2;
+constexpr uint32_t WOS_NET_LINK_SET_NAME = 1u << 3;
+constexpr uint32_t WOS_NET_LINK_SET_HWADDR = 1u << 4;
+
+struct WosNetIfInfo {
+    uint32_t ifindex;
+    char name[WOS_NET_IF_NAME_LEN];
+    uint32_t flags;
+    uint32_t mtu;
+    uint32_t tx_queue_len;
+    uint16_t type;
+    uint8_t addr_len;
+    uint8_t operstate;
+    uint8_t addr[WOS_NET_HWADDR_LEN];
+    uint8_t broadcast[WOS_NET_HWADDR_LEN];
+};
+
+struct WosNetAddrInfo {
+    uint32_t ifindex;
+    uint16_t family;
+    uint8_t prefix_len;
+    uint8_t scope;
+    uint32_t flags;
+    char label[WOS_NET_IF_NAME_LEN];
+    uint8_t address[WOS_NET_ADDR_LEN];
+    uint8_t local[WOS_NET_ADDR_LEN];
+    uint8_t broadcast[WOS_NET_ADDR_LEN];
+};
+
+struct WosNetAddrReq {
+    uint32_t ifindex;
+    uint16_t family;
+    uint8_t prefix_len;
+    uint8_t scope;
+    uint32_t flags;
+    uint8_t address[WOS_NET_ADDR_LEN];
+    uint8_t local[WOS_NET_ADDR_LEN];
+    uint8_t replace;
+};
+
+struct WosNetLinkSetReq {
+    uint32_t ifindex;
+    char ifname[WOS_NET_IF_NAME_LEN];
+    uint32_t fields;
+    uint32_t flags;
+    uint32_t flag_mask;
+    uint32_t mtu;
+    uint32_t tx_queue_len;
+    char new_name[WOS_NET_IF_NAME_LEN];
+    uint8_t hwaddr[WOS_NET_HWADDR_LEN];
+    uint8_t hwaddr_len;
+};
+
+auto prefix_to_mask(uint8_t prefix) -> uint32_t {
+    if (prefix == 0) {
+        return 0;
+    }
+    if (prefix >= 32) {
+        return 0xFFFFFFFFu;
+    }
+    return 0xFFFFFFFFu << (32 - prefix);
+}
+
+auto mask_to_prefix(uint32_t mask) -> uint8_t {
+    uint8_t prefix = 0;
+    while ((mask & 0x80000000u) != 0) {
+        prefix++;
+        mask <<= 1;
+    }
+    return prefix;
+}
+
+auto effective_ifflags(ker::net::NetDevice* dev) -> uint32_t {
+    if (dev == nullptr) {
+        return 0;
+    }
+    uint32_t flags = dev->link_flags;
+    if (dev->state != 0) {
+        flags |= IFF_UP | IFF_RUNNING | IFF_LOWER_UP;
+    }
+    return flags;
+}
+
+void apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
+    if (dev == nullptr) {
+        return;
+    }
+
+    if ((mask & IFF_UP) != 0) {
+        if ((flags & IFF_UP) != 0) {
+            dev->state = 1;
+            if (dev->ops != nullptr && dev->ops->open != nullptr) {
+                dev->ops->open(dev);
+            }
+        } else {
+            dev->state = 0;
+            if (dev->ops != nullptr && dev->ops->close != nullptr) {
+                dev->ops->close(dev);
+            }
+        }
+    }
+
+    constexpr uint32_t stored_mask = IFF_BROADCAST | IFF_LOOPBACK | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST;
+    uint32_t store = mask & stored_mask;
+    dev->link_flags &= ~store;
+    dev->link_flags |= flags & store;
+}
+
+void fill_if_info(WosNetIfInfo& out, ker::net::NetDevice* dev) {
+    std::memset(&out, 0, sizeof(out));
+    if (dev == nullptr) {
+        return;
+    }
+    out.ifindex = dev->ifindex;
+    std::strncpy(out.name, dev->name.data(), sizeof(out.name) - 1);
+    out.flags = effective_ifflags(dev);
+    out.mtu = dev->mtu;
+    out.tx_queue_len = dev->tx_queue_len;
+    out.type = ((out.flags & IFF_LOOPBACK) != 0) ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
+    out.addr_len = 6;
+    out.operstate = dev->state != 0 ? 6 : 2;  // Linux IF_OPER_UP / IF_OPER_DOWN
+    std::memcpy(out.addr, dev->mac.data(), 6);
+    std::memset(out.broadcast, 0xff, 6);
+}
+
+auto find_dev_by_ifindex(uint32_t ifindex) -> ker::net::NetDevice* {
+    for (size_t i = 0; i < ker::net::netdev_count(); i++) {
+        auto* dev = ker::net::netdev_at(i);
+        if (dev != nullptr && dev->ifindex == ifindex) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+auto find_dev_for_link_req(const WosNetLinkSetReq* req) -> ker::net::NetDevice* {
+    if (req == nullptr) {
+        return nullptr;
+    }
+    if (req->ifindex != 0) {
+        return find_dev_by_ifindex(req->ifindex);
+    }
+    return ker::net::netdev_find_by_name(std::string_view(req->ifname, strnlen(req->ifname, WOS_NET_IF_NAME_LEN)));
+}
+
+auto rename_netdev(ker::net::NetDevice* dev, const char* new_name) -> int {
+    size_t len = strnlen(new_name, WOS_NET_IF_NAME_LEN);
+    if (dev == nullptr || len == 0 || len >= WOS_NET_IF_NAME_LEN) {
+        return -EINVAL;
+    }
+    if (ker::net::netdev_find_by_name(std::string_view(new_name, len)) != nullptr) {
+        return -EEXIST;
+    }
+    std::memset(dev->name.data(), 0, dev->name.size());
+    std::memcpy(dev->name.data(), new_name, len);
+    return 0;
+}
+
+auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t len) -> int {
+    if (dev == nullptr || hwaddr == nullptr || len != 6) {
+        return -EINVAL;
+    }
+    if (dev->ops != nullptr && dev->ops->set_mac != nullptr) {
+        dev->ops->set_mac(dev, hwaddr);
+    } else {
+        std::memcpy(dev->mac.data(), hwaddr, 6);
+    }
+    return 0;
 }
 }  // namespace
 
@@ -414,8 +605,15 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             constexpr uint32_t SIOC_SIFADDR = 0x8916;
             constexpr uint32_t SIOC_GIFNETMASK = 0x891B;
             constexpr uint32_t SIOC_SIFNETMASK = 0x891C;
+            constexpr uint32_t SIOC_GIFMTU = 0x8921;
+            constexpr uint32_t SIOC_SIFMTU = 0x8922;
+            constexpr uint32_t SIOC_SIFNAME = 0x8923;
+            constexpr uint32_t SIOC_SIFHWADDR = 0x8924;
+            constexpr uint32_t SIOC_SIFHWBROADCAST = 0x8937;
             constexpr uint32_t SIOC_GIFHWADDR = 0x8927;
             constexpr uint32_t SIOC_GIFINDEX = 0x8933;
+            constexpr uint32_t SIOC_GIFTXQLEN = 0x8942;
+            constexpr uint32_t SIOC_SIFTXQLEN = 0x8943;
             constexpr uint32_t SIOC_ADDRT = 0x890B;
             constexpr uint32_t SIOC_DELRT = 0x890C;
 
@@ -515,27 +713,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
             switch (request) {
                 case SIOC_GIFFLAGS: {
-                    int16_t flags = 0;
-                    if (dev->state != 0) {
-                        flags |= 0x0001;  // IFF_UP
-                    }
-                    flags |= 0x0040;  // IFF_RUNNING
-                    *reinterpret_cast<int16_t*>(arg + 16) = flags;
+                    *reinterpret_cast<int16_t*>(arg + 16) = static_cast<int16_t>(effective_ifflags(dev));
                     return 0;
                 }
                 case SIOC_SIFFLAGS: {
-                    int16_t flags = *reinterpret_cast<int16_t*>(arg + 16);
-                    if ((flags & 0x0001) != 0) {  // IFF_UP
-                        dev->state = 1;
-                        if (dev->ops != nullptr && dev->ops->open != nullptr) {
-                            dev->ops->open(dev);
-                        }
-                    } else {
-                        dev->state = 0;
-                        if (dev->ops != nullptr && dev->ops->close != nullptr) {
-                            dev->ops->close(dev);
-                        }
-                    }
+                    auto flags = static_cast<uint32_t>(*reinterpret_cast<uint16_t*>(arg + 16));
+                    apply_ifflags(dev, flags, IFF_UP | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST);
                     return 0;
                 }
                 case SIOC_GIFADDR: {
@@ -581,9 +764,44 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 case SIOC_GIFHWADDR: {
                     // sa_family = ARPHRD_ETHER (1), then 6 bytes of MAC
                     std::memset(arg + 16, 0, 16);
-                    *reinterpret_cast<uint16_t*>(arg + 16) = 1;  // ARPHRD_ETHER
+                    *reinterpret_cast<uint16_t*>(arg + 16) =
+                        (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
                     std::memcpy(arg + 18, dev->mac.data(), 6);
                     return 0;
+                }
+                case SIOC_GIFMTU: {
+                    *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->mtu);
+                    return 0;
+                }
+                case SIOC_SIFMTU: {
+                    int32_t mtu = *reinterpret_cast<int32_t*>(arg + 16);
+                    if (mtu <= 0) {
+                        return static_cast<uint64_t>(-EINVAL);
+                    }
+                    dev->mtu = static_cast<uint32_t>(mtu);
+                    return 0;
+                }
+                case SIOC_GIFTXQLEN: {
+                    *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->tx_queue_len);
+                    return 0;
+                }
+                case SIOC_SIFTXQLEN: {
+                    int32_t qlen = *reinterpret_cast<int32_t*>(arg + 16);
+                    if (qlen < 0) {
+                        return static_cast<uint64_t>(-EINVAL);
+                    }
+                    dev->tx_queue_len = static_cast<uint32_t>(qlen);
+                    return 0;
+                }
+                case SIOC_SIFHWADDR: {
+                    auto* sa = arg + 16;
+                    return static_cast<uint64_t>(set_netdev_hwaddr(dev, sa + 2, 6));
+                }
+                case SIOC_SIFHWBROADCAST: {
+                    return 0;
+                }
+                case SIOC_SIFNAME: {
+                    return static_cast<uint64_t>(rename_netdev(dev, reinterpret_cast<const char*>(arg + 16)));
                 }
                 case SIOC_GIFINDEX: {
                     *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->ifindex);
@@ -616,6 +834,136 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 uint64_t cpu = static_cast<uint64_t>(__builtin_ctzll(tmp));
                 int ret = dev->ops->set_queue_cpu(dev, pair_idx, cpu);
                 if (ret != 0) {
+                    return static_cast<uint64_t>(ret);
+                }
+            }
+            return 0;
+        }
+
+        case ker::abi::net::ops::NETCTL_IF_LIST: {
+            auto* out = reinterpret_cast<WosNetIfInfo*>(a1);
+            auto* count_ptr = reinterpret_cast<size_t*>(a2);
+            if (count_ptr == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            size_t cap = *count_ptr;
+            size_t total = ker::net::netdev_count();
+            size_t emit = (out != nullptr) ? std::min(cap, total) : 0;
+            for (size_t i = 0; i < emit; i++) {
+                fill_if_info(out[i], ker::net::netdev_at(i));
+            }
+            *count_ptr = total;
+            return 0;
+        }
+
+        case ker::abi::net::ops::NETCTL_ADDR_LIST: {
+            auto* out = reinterpret_cast<WosNetAddrInfo*>(a1);
+            auto* count_ptr = reinterpret_cast<size_t*>(a2);
+            if (count_ptr == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+
+            size_t cap = *count_ptr;
+            size_t total = 0;
+            size_t written = 0;
+            for (size_t i = 0; i < ker::net::netdev_count(); i++) {
+                auto* dev = ker::net::netdev_at(i);
+                auto* nif = ker::net::netif_get(dev);
+                if (dev == nullptr || nif == nullptr) {
+                    continue;
+                }
+                for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
+                    if (out != nullptr && written < cap) {
+                        auto& info = out[written];
+                        std::memset(&info, 0, sizeof(info));
+                        info.ifindex = dev->ifindex;
+                        info.family = WOS_AF_INET;
+                        info.prefix_len = mask_to_prefix(nif->ipv4_addrs[j].netmask);
+                        info.scope = (nif->ipv4_addrs[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
+                        info.flags = WOS_IFA_F_PERMANENT;
+                        std::strncpy(info.label, dev->name.data(), sizeof(info.label) - 1);
+                        uint32_t addr_be = ker::net::htonl(nif->ipv4_addrs[j].addr);
+                        uint32_t brd_be = ker::net::htonl(nif->ipv4_addrs[j].addr | ~nif->ipv4_addrs[j].netmask);
+                        std::memcpy(info.address, &addr_be, sizeof(addr_be));
+                        std::memcpy(info.local, &addr_be, sizeof(addr_be));
+                        std::memcpy(info.broadcast, &brd_be, sizeof(brd_be));
+                        written++;
+                    }
+                    total++;
+                }
+            }
+            *count_ptr = total;
+            return 0;
+        }
+
+        case ker::abi::net::ops::NETCTL_ADDR_SET: {
+            auto* req = reinterpret_cast<const WosNetAddrReq*>(a1);
+            if (req == nullptr || req->family != WOS_AF_INET) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* dev = find_dev_by_ifindex(req->ifindex);
+            if (dev == nullptr) {
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            uint32_t addr_be = 0;
+            std::memcpy(&addr_be, req->local, sizeof(addr_be));
+            if (addr_be == 0) {
+                std::memcpy(&addr_be, req->address, sizeof(addr_be));
+            }
+            uint32_t addr = ker::net::ntohl(addr_be);
+            uint32_t mask = prefix_to_mask(req->prefix_len);
+            int ret = ker::net::netif_set_ipv4(dev, addr, mask, req->replace != 0);
+            return static_cast<uint64_t>(ret);
+        }
+
+        case ker::abi::net::ops::NETCTL_ADDR_DEL: {
+            auto* req = reinterpret_cast<const WosNetAddrReq*>(a1);
+            if (req == nullptr || req->family != WOS_AF_INET) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* dev = find_dev_by_ifindex(req->ifindex);
+            if (dev == nullptr) {
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            uint32_t addr_be = 0;
+            std::memcpy(&addr_be, req->local, sizeof(addr_be));
+            if (addr_be == 0) {
+                std::memcpy(&addr_be, req->address, sizeof(addr_be));
+            }
+            uint32_t addr = ker::net::ntohl(addr_be);
+            uint32_t mask = prefix_to_mask(req->prefix_len);
+            int ret = ker::net::netif_del_ipv4(dev, addr, mask);
+            return static_cast<uint64_t>(ret);
+        }
+
+        case ker::abi::net::ops::NETCTL_LINK_SET: {
+            auto* req = reinterpret_cast<const WosNetLinkSetReq*>(a1);
+            auto* dev = find_dev_for_link_req(req);
+            if (dev == nullptr) {
+                return static_cast<uint64_t>(-ENODEV);
+            }
+
+            if ((req->fields & WOS_NET_LINK_SET_FLAGS) != 0) {
+                apply_ifflags(dev, req->flags, req->flag_mask);
+            }
+            if ((req->fields & WOS_NET_LINK_SET_MTU) != 0) {
+                if (req->mtu == 0) {
+                    return static_cast<uint64_t>(-EINVAL);
+                }
+                dev->mtu = req->mtu;
+            }
+            if ((req->fields & WOS_NET_LINK_SET_TXQLEN) != 0) {
+                dev->tx_queue_len = req->tx_queue_len;
+            }
+            if ((req->fields & WOS_NET_LINK_SET_HWADDR) != 0) {
+                int ret = set_netdev_hwaddr(dev, req->hwaddr, req->hwaddr_len);
+                if (ret < 0) {
+                    return static_cast<uint64_t>(ret);
+                }
+            }
+            if ((req->fields & WOS_NET_LINK_SET_NAME) != 0) {
+                int ret = rename_netdev(dev, req->new_name);
+                if (ret < 0) {
                     return static_cast<uint64_t>(ret);
                 }
             }

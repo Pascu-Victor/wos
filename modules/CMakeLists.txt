@@ -58,7 +58,8 @@ add_subdirectory(testprog)
 add_subdirectory(netd)
 add_subdirectory(httpd)
 add_subdirectory(perf)
+add_subdirectory(journal)
 
 # Aggregate target for all WOS modules
 add_custom_target(wos_modules)
-add_dependencies(wos_modules wos init testprog netd httpd perf)
+add_dependencies(wos_modules wos init testprog netd httpd perf journal)

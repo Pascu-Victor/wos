@@ -729,6 +729,19 @@ static auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_i
     return now_us + effective_interval;
 }
 
+static void wki_send_heartbeat_probe(WkiPeer* peer) {
+    if (peer == nullptr || peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED || !peer->is_direct) {
+        return;
+    }
+
+    HeartbeatPayload probe = {};
+    probe.send_timestamp = mod::time::getUs() * 1000;
+    probe.sender_load = 0;
+    probe.sender_mem_free = 0;
+    probe.reserved = 0;
+    wki_send_raw(peer->node_id, MsgType::HEARTBEAT, &probe, sizeof(probe), WKI_FLAG_PRIORITY);
+}
+
 void wki_peer_timer_tick(uint64_t now_us) {
     if (!g_wki.initialized) {
         return;
@@ -790,7 +803,23 @@ void wki_peer_timer_tick(uint64_t now_us) {
         uint64_t elapsed = now_us - last_seen;
         uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
 
-        if (elapsed >= timeout_us) {
+        if (elapsed < timeout_us) {
+            peer->missed_beats = 0;
+            continue;
+        }
+
+        // Two-phase fencing: first timeout only arms a probe/confirmation window.
+        // This avoids false fencing when elapsed hovers around the exact threshold.
+        uint64_t confirm_grace_us = std::max<uint64_t>(static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000, 500000);
+        if (peer->missed_beats == 0) {
+            peer->missed_beats = 1;
+            mod::dbg::log("[WKI] Heartbeat timeout candidate for peer 0x%04x (%llu us elapsed, timeout %llu us); probing before fence",
+                          peer->node_id, elapsed, timeout_us);
+            wki_send_heartbeat_probe(peer);
+            continue;
+        }
+
+        if (elapsed >= timeout_us + confirm_grace_us) {
             mod::dbg::log("[WKI] Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer->node_id, elapsed, timeout_us);
             wki_peer_fence(peer);
         }

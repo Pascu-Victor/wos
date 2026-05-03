@@ -1,5 +1,6 @@
 #include "pty.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -11,6 +12,11 @@
 #include <util/radix_tree.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
+
+#include "dev/device.hpp"
+#include "platform/sched/task.hpp"
+#include "platform/sys/spinlock.hpp"
+#include "util/smallvec.hpp"
 
 namespace ker::dev::pty {
 

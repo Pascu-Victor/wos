@@ -170,21 +170,36 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
                 return true;
             }
 
+            // Pin old_virt so it cannot be freed by a concurrent COW handler on
+            // another CPU between our refcount read and the memcpy below.  Without
+            // this, a racing handler could decrement the refcount to 0, freeing
+            // and zeroing the page, so our memcpy would copy zeros instead of the
+            // real content (causing e.g. RELR relocations to produce garbage VAs).
+            phys::pageRefInc(old_virt);
+
             // Multiple owners - allocate a new page and copy
-            void* newPage = phys::pageAlloc(paging::PAGE_SIZE);
-            if (newPage == nullptr) {
+            void* new_page = phys::pageAlloc(paging::PAGE_SIZE);
+            if (new_page == nullptr) {
+                phys::pageRefDec(old_virt);  // release pin
                 dbg::log("COW fault: OOM allocating new page for vaddr 0x%x", vaddr);
                 hcf();
                 return false;
             }
 
-            memcpy(newPage, old_virt, paging::PAGE_SIZE);
+            memcpy(new_page, old_virt, paging::PAGE_SIZE);  // safe: old page is pinned
 
-            // Decrement refcount on old page (may free it if we were last user elsewhere)
-            phys::pageRefDec(old_virt);
+            // Re-read the PTE: if PAGE_COW is already gone, another CPU handled
+            // this fault while we were copying.  Discard our copy; the other
+            // handler's mapping is already live.
+            uint64_t raw_now = pte_raw(pte);
+            if ((raw_now & paging::PAGE_COW) == 0U) {
+                phys::pageRefDec(new_page);  // discard unused allocation
+                phys::pageRefDec(old_virt);  // release pin only (PTE ref transferred by the other handler)
+                return true;
+            }
 
             // Map new page as writable, clear COW
-            auto new_phys = (paddr_t)addr::get_phys_pointer((vaddr_t)newPage);
+            auto new_phys = (paddr_t)addr::get_phys_pointer((vaddr_t)new_page);
             raw &= ~paging::PAGE_COW;
             raw |= paging::PAGE_WRITE;
             // Replace frame bits
@@ -192,6 +207,10 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             raw |= (new_phys & ~0xFFFULL);    // set new frame
             pte = pte_from_raw(raw);
             invlpg(vaddr);
+
+            // Release pin and our PTE reference to old_virt (two decrements).
+            phys::pageRefDec(old_virt);  // release pin (paired with pageRefInc above)
+            phys::pageRefDec(old_virt);  // release PTE reference (old_virt no longer mapped here)
             return true;
         }
     }

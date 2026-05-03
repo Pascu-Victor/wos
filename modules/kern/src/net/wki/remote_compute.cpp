@@ -71,6 +71,8 @@ ker::mod::sched::task::Task* s_compute_submit_task = nullptr;  // NOLINT(cppcore
 
 struct SharedElfCacheEntry {
     bool valid = false;
+    bool loading = false;
+    int32_t load_status = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
     std::array<char, 512> path = {};
     ker::vfs::stat freshness = {};
@@ -169,6 +171,9 @@ struct ScopedComputeMeasure {
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
 constexpr size_t WKI_VFS_LOAD_CHUNK = 262144;                  // 256 KB: fewer round-trips for remote binary fetch
 constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
+constexpr uint32_t WKI_VFS_LOAD_MAX_ATTEMPTS = 24;
+constexpr uint64_t WKI_VFS_LOAD_RETRY_WINDOW_US = 15000000;
+constexpr uint64_t WKI_VFS_LOAD_RETRY_BACKOFF_US = 750000;
 constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 8;
 constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
 constexpr uint64_t WKI_EXEC_CACHE_RETENTION_US = 30000000;
@@ -230,7 +235,24 @@ auto shared_elf_freshness_matches(const ker::vfs::stat& lhs, const ker::vfs::sta
 
 auto find_shared_elf_cache_locked(uint16_t submitter_node, const char* path, const ker::vfs::stat& freshness) -> SharedElfCacheEntry* {
     for (auto& entry : g_shared_elf_cache) {
-        if (!entry.valid || entry.submitter_node != submitter_node || entry.buffer == nullptr) {
+        if (!entry.valid || entry.loading || entry.submitter_node != submitter_node || entry.buffer == nullptr) {
+            continue;
+        }
+        if (!shared_elf_path_matches(entry, path)) {
+            continue;
+        }
+        if (!shared_elf_freshness_matches(entry.freshness, freshness)) {
+            continue;
+        }
+        return &entry;
+    }
+    return nullptr;
+}
+
+auto find_shared_elf_cache_entry_locked(uint16_t submitter_node, const char* path, const ker::vfs::stat& freshness)
+    -> SharedElfCacheEntry* {
+    for (auto& entry : g_shared_elf_cache) {
+        if (!entry.valid || entry.submitter_node != submitter_node) {
             continue;
         }
         if (!shared_elf_path_matches(entry, path)) {
@@ -890,6 +912,56 @@ auto localize_receiver_logical_path(const char* path, char* out, size_t out_size
 
     out[0] = '/';
     std::memcpy(out + 1, suffix, suffix_len + 1);
+    return true;
+}
+
+auto fallback_to_local_path_for_disconnected_wki_host(const char* path, char* out, size_t out_size) -> bool {
+    if (path == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+
+    constexpr char wki_prefix[] = "/wki/";
+    constexpr size_t wki_prefix_len = sizeof(wki_prefix) - 1;
+    if (std::strncmp(path, wki_prefix, wki_prefix_len) != 0) {
+        return false;
+    }
+
+    const char* host_part = path + wki_prefix_len;
+    const char* host_end = host_part;
+    while (*host_end != '\0' && *host_end != '/') {
+        host_end++;
+    }
+    if (host_end == host_part) {
+        return false;
+    }
+
+    std::array<char, WKI_HOSTNAME_MAX> host = {};
+    size_t host_len = static_cast<size_t>(host_end - host_part);
+    if (host_len >= host.size()) {
+        host_len = host.size() - 1;
+    }
+    std::memcpy(host.data(), host_part, host_len);
+    host[host_len] = '\0';
+
+    uint16_t host_node = wki_peer_find_by_hostname(host.data());
+    if (host_node != WKI_NODE_INVALID && host_node != g_wki.my_node_id) {
+        return false;
+    }
+
+    const char* suffix = (*host_end == '\0') ? "/" : host_end;
+    size_t suffix_len = std::strlen(suffix);
+    if (suffix_len + 1 > out_size) {
+        return false;
+    }
+
+    std::memcpy(out, suffix, suffix_len + 1);
+
+    ker::vfs::stat local_stat = {};
+    if (ker::vfs::vfs_stat(out, &local_stat) != 0 || local_stat.st_size <= 0) {
+        return false;
+    }
+
+    ker::mod::dbg::log("[WKI] VFS_REF: host '%s' unavailable, falling back to local path '%s'", host.data(), out);
     return true;
 }
 
@@ -1986,9 +2058,16 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                                       path != nullptr ? static_cast<uint32_t>(std::strlen(path)) : 0U, WOS_PERF_CALLSITE());
 
     std::array<char, 512> localized_path = {};
+    std::array<char, 512> fallback_local_path = {};
     const char* resolved_path = path;
     if (localize_receiver_logical_path(path, localized_path.data(), localized_path.size())) {
         resolved_path = localized_path.data();
+    }
+
+    bool using_disconnected_host_fallback = false;
+    if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
+        resolved_path = fallback_local_path.data();
+        using_disconnected_host_fallback = true;
     }
 
     ker::vfs::stat statbuf = {};
@@ -2004,54 +2083,186 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         return result;
     }
 
-    s_compute_lock.lock();
-    gc_shared_elf_cache_locked(wki_now_us());
-    if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, statbuf); cached != nullptr) {
-        cached->refcount++;
-        cached->last_used_us = wki_now_us();
-        result.buffer = cached->buffer;
-        result.size = cached->size;
-        result.shared = true;
-        s_compute_lock.unlock();
-        load_measure.finish(0, result.size);
-        return result;
-    }
-    s_compute_lock.unlock();
+    ker::vfs::stat cache_key = statbuf;
+    bool is_loader = false;
+    uint64_t inflight_deadline_us = wki_now_us() + WKI_TASK_SUBMIT_VFS_TIMEOUT_US;
 
-    int fd = ker::vfs::vfs_open(resolved_path, 0, 0);
-    if (fd < 0) {
-        ker::mod::dbg::log("[WKI] VFS_REF: failed to open '%s'", resolved_path);
-        result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
-        load_measure.finish(perf_compute_reject_status(result.reject_reason));
-        return result;
+    auto fail_inflight_load = [&]() {
+        if (!is_loader) {
+            return;
+        }
+
+        s_compute_lock.lock();
+        if (auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key); inflight != nullptr) {
+            inflight->loading = false;
+            inflight->load_status = -1;
+            inflight->last_used_us = wki_now_us();
+            inflight->valid = false;
+            gc_shared_elf_cache_locked(inflight->last_used_us);
+        }
+        s_compute_lock.unlock();
+    };
+
+    while (true) {
+        s_compute_lock.lock();
+        gc_shared_elf_cache_locked(wki_now_us());
+
+        if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, cache_key); cached != nullptr) {
+            cached->refcount++;
+            cached->last_used_us = wki_now_us();
+            result.buffer = cached->buffer;
+            result.size = cached->size;
+            result.shared = true;
+            s_compute_lock.unlock();
+            load_measure.finish(0, result.size);
+            return result;
+        }
+
+        auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key);
+        if (inflight != nullptr) {
+            if (inflight->loading) {
+                s_compute_lock.unlock();
+                if (wki_now_us() >= inflight_deadline_us) {
+                    result.reject_reason = TaskRejectReason::FETCH_FAILED;
+                    load_measure.finish(perf_compute_reject_status(result.reject_reason));
+                    return result;
+                }
+                ker::mod::sched::kern_yield();
+                continue;
+            }
+
+            if (inflight->buffer != nullptr && inflight->load_status == 0) {
+                inflight->refcount++;
+                inflight->last_used_us = wki_now_us();
+                result.buffer = inflight->buffer;
+                result.size = inflight->size;
+                result.shared = true;
+                s_compute_lock.unlock();
+                load_measure.finish(0, result.size);
+                return result;
+            }
+
+            inflight->valid = false;
+            gc_shared_elf_cache_locked(wki_now_us());
+        }
+
+        SharedElfCacheEntry pending = {};
+        pending.valid = true;
+        pending.loading = true;
+        pending.load_status = 0;
+        pending.submitter_node = submitter_node;
+        std::strncpy(pending.path.data(), resolved_path, pending.path.size() - 1);
+        pending.freshness = cache_key;
+        pending.last_used_us = wki_now_us();
+        g_shared_elf_cache.push_back(std::move(pending));
+        is_loader = true;
+        s_compute_lock.unlock();
+        break;
     }
 
     auto file_size = static_cast<size_t>(statbuf.st_size);
-    auto* buf = new uint8_t[file_size];  // NOLINT(cppcoreguidelines-owning-memory)
+    uint8_t* buf = nullptr;
     size_t total_read = 0;
-    uint32_t idle_retries = 0;
+    size_t final_file_size = file_size;
+    bool load_ok = false;
+    uint64_t retry_window_start_us = wki_now_us();
+    uint64_t retry_deadline_us = retry_window_start_us + WKI_VFS_LOAD_RETRY_WINDOW_US;
 
-    while (total_read < file_size) {
-        size_t chunk = std::min(WKI_VFS_LOAD_CHUNK, file_size - total_read);
-        size_t actual = 0;
-        ssize_t read_ret = ker::vfs::vfs_read(fd, buf + total_read, chunk, &actual);
+    for (uint32_t attempt = 0; attempt < WKI_VFS_LOAD_MAX_ATTEMPTS; attempt++) {
+        uint64_t now_us = wki_now_us();
+        bool retry_window_open = now_us < retry_deadline_us;
 
-        if (read_ret < 0 || actual == 0) {
-            if (++idle_retries >= WKI_VFS_LOAD_IDLE_RETRIES) {
-                break;
-            }
-            continue;
+        if (attempt > 0 && !retry_window_open) {
+            break;
         }
 
-        total_read += actual;
-        idle_retries = 0;
+        if (attempt > 0) {
+            if (!using_disconnected_host_fallback &&
+                fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
+                resolved_path = fallback_local_path.data();
+                using_disconnected_host_fallback = true;
+            }
+
+            ker::vfs::stat retry_stat = {};
+            if (ker::vfs::vfs_stat(resolved_path, &retry_stat) != 0 || retry_stat.st_size <= 0) {
+                if (retry_window_open && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
+                    uint64_t wait_until_us = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+                    while (wki_now_us() < wait_until_us) {
+                        ker::mod::sched::kern_yield();
+                    }
+                }
+                continue;
+            }
+            if (static_cast<uint64_t>(retry_stat.st_size) > static_cast<uint64_t>(UINT32_MAX)) {
+                fail_inflight_load();
+                result.reject_reason = TaskRejectReason::FETCH_FAILED;
+                load_measure.finish(perf_compute_reject_status(result.reject_reason));
+                return result;
+            }
+            file_size = static_cast<size_t>(retry_stat.st_size);
+        }
+
+        int fd = ker::vfs::vfs_open(resolved_path, 0, 0);
+        if (fd < 0) {
+            if (retry_window_open && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
+                uint64_t wait_until_us = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+                while (wki_now_us() < wait_until_us) {
+                    ker::mod::sched::kern_yield();
+                }
+                continue;
+            }
+
+            ker::mod::dbg::log("[WKI] VFS_REF: failed to open '%s'", resolved_path);
+            fail_inflight_load();
+            result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
+            load_measure.finish(perf_compute_reject_status(result.reject_reason));
+            return result;
+        }
+
+        buf = new uint8_t[file_size];  // NOLINT(cppcoreguidelines-owning-memory)
+        total_read = 0;
+        uint32_t idle_retries = 0;
+
+        while (total_read < file_size) {
+            size_t chunk = std::min(WKI_VFS_LOAD_CHUNK, file_size - total_read);
+            size_t actual = 0;
+            ssize_t read_ret = ker::vfs::vfs_read(fd, buf + total_read, chunk, &actual);
+
+            if (read_ret < 0 || actual == 0) {
+                if (++idle_retries >= WKI_VFS_LOAD_IDLE_RETRIES) {
+                    break;
+                }
+                continue;
+            }
+
+            total_read += actual;
+            idle_retries = 0;
+        }
+
+        ker::vfs::vfs_close(fd);
+
+        if (total_read == file_size) {
+            final_file_size = file_size;
+            load_ok = true;
+            break;
+        }
+
+        delete[] buf;
+        buf = nullptr;
+        if (retry_window_open && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
+            uint64_t elapsed_ms = (wki_now_us() - retry_window_start_us) / 1000;
+            ker::mod::dbg::log("[WKI] VFS_REF: short read retry for '%s' (%zu/%zu bytes) attempt %u/%u elapsed=%llu ms", resolved_path,
+                               total_read, file_size, attempt + 1, WKI_VFS_LOAD_MAX_ATTEMPTS, static_cast<unsigned long long>(elapsed_ms));
+            uint64_t wait_until_us = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+            while (wki_now_us() < wait_until_us) {
+                ker::mod::sched::kern_yield();
+            }
+        }
     }
 
-    ker::vfs::vfs_close(fd);
-
-    if (total_read != file_size) {
-        ker::mod::dbg::log("[WKI] VFS_REF: short read for '%s' (%zu/%zu bytes)", resolved_path, total_read, file_size);
-        delete[] buf;
+    if (!load_ok) {
+        fail_inflight_load();
+        ker::mod::dbg::log("[WKI] VFS_REF: short read for '%s' (%zu/%zu bytes)", resolved_path, total_read, final_file_size);
         result.reject_reason = TaskRejectReason::FETCH_FAILED;
         load_measure.finish(perf_compute_reject_status(result.reject_reason), total_read);
         return result;
@@ -2064,7 +2275,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 
     s_compute_lock.lock();
     gc_shared_elf_cache_locked(wki_now_us());
-    if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, statbuf); cached != nullptr) {
+    if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, cache_key); cached != nullptr) {
         cached->refcount++;
         cached->last_used_us = wki_now_us();
         result.buffer = cached->buffer;
@@ -2076,13 +2287,32 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         return result;
     }
 
+    auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key);
+    if (is_loader && inflight != nullptr && inflight->loading) {
+        inflight->loading = false;
+        inflight->load_status = 0;
+        inflight->buffer = buf;
+        inflight->size = static_cast<uint32_t>(final_file_size);
+        inflight->refcount = 1;
+        inflight->last_used_us = wki_now_us();
+        result.buffer = buf;
+        result.size = static_cast<uint32_t>(final_file_size);
+        result.shared = true;
+        gc_shared_elf_cache_locked(inflight->last_used_us);
+        s_compute_lock.unlock();
+        load_measure.finish(0, result.size);
+        return result;
+    }
+
     SharedElfCacheEntry cache_entry = {};
     cache_entry.valid = true;
+    cache_entry.loading = false;
+    cache_entry.load_status = 0;
     cache_entry.submitter_node = submitter_node;
     std::strncpy(cache_entry.path.data(), resolved_path, cache_entry.path.size() - 1);
-    cache_entry.freshness = statbuf;
+    cache_entry.freshness = cache_key;
     cache_entry.buffer = buf;
-    cache_entry.size = static_cast<uint32_t>(file_size);
+    cache_entry.size = static_cast<uint32_t>(final_file_size);
     cache_entry.refcount = 1;
     cache_entry.last_used_us = wki_now_us();
     g_shared_elf_cache.push_back(std::move(cache_entry));
@@ -2090,7 +2320,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
     s_compute_lock.unlock();
 
     result.buffer = buf;
-    result.size = static_cast<uint32_t>(file_size);
+    result.size = static_cast<uint32_t>(final_file_size);
     result.shared = true;
     load_measure.finish(0, result.size);
     return result;

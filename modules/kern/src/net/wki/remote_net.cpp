@@ -61,6 +61,16 @@ auto find_net_proxy_by_dev(ker::net::NetDevice* dev) -> ProxyNetState* {
     return nullptr;
 }
 
+// s_net_proxy_lock must be held by caller
+auto find_net_proxy_by_resource(uint16_t owner_node, uint32_t resource_id) -> ProxyNetState* {
+    for (auto& p : g_net_proxies) {
+        if (p->active && p->owner_node == owner_node && p->resource_id == resource_id) {
+            return p.get();
+        }
+    }
+    return nullptr;
+}
+
 // -----------------------------------------------------------------------------
 // Consumer-side NetDeviceOps
 // -----------------------------------------------------------------------------
@@ -440,6 +450,15 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
     // Allocate proxy state (lock protects deque mutation)
     s_net_proxy_lock.lock();
+    if (auto* existing = find_net_proxy_by_resource(owner_node, resource_id); existing != nullptr) {
+        auto* dev = &existing->netdev;
+        s_net_proxy_lock.unlock();
+        return dev;
+    }
+    if (ker::net::netdev_find_by_name(local_name) != nullptr) {
+        s_net_proxy_lock.unlock();
+        return nullptr;
+    }
     g_net_proxies.push_back(std::make_unique<ProxyNetState>());
     auto* state = g_net_proxies.back().get();
     state->owner_node = owner_node;
@@ -593,6 +612,13 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
                        state->netdev.mac[3], state->netdev.mac[4], state->netdev.mac[5]);
 
     return &state->netdev;
+}
+
+auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool {
+    s_net_proxy_lock.lock();
+    bool found = find_net_proxy_by_resource(owner_node, resource_id) != nullptr;
+    s_net_proxy_lock.unlock();
+    return found;
 }
 
 void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {

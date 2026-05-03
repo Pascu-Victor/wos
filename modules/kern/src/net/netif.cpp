@@ -1,6 +1,7 @@
 #include "netif.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 
@@ -55,6 +56,46 @@ auto netif_add_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int {
 #endif
 
     return 0;
+}
+
+auto netif_set_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask, bool replace) -> int {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
+        if (nif->ipv4_addrs[i].addr == addr) {
+            if (!replace && nif->ipv4_addrs[i].netmask == mask) {
+                return -EEXIST;
+            }
+            nif->ipv4_addrs[i].netmask = mask;
+            return 0;
+        }
+    }
+
+    return netif_add_ipv4(dev, addr, mask);
+}
+
+auto netif_del_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
+        if (nif->ipv4_addrs[i].addr != addr || nif->ipv4_addrs[i].netmask != mask) {
+            continue;
+        }
+        for (size_t j = i + 1; j < nif->ipv4_addr_count; j++) {
+            nif->ipv4_addrs[j - 1] = nif->ipv4_addrs[j];
+        }
+        nif->ipv4_addr_count--;
+        nif->ipv4_addrs[nif->ipv4_addr_count] = {};
+        return 0;
+    }
+
+    return -EADDRNOTAVAIL;
 }
 
 auto netif_add_ipv6(NetDevice* dev, const std::array<uint8_t, 16>& addr, uint8_t prefix) -> int {

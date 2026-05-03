@@ -96,7 +96,7 @@ static auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void*
         return -1;  // unknown peer MAC
     }
 
-    PacketBuffer* pkt = pkt_alloc();
+    PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;
     }

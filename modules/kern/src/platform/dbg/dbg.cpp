@@ -9,6 +9,7 @@
 
 #include "mod/gfx/fb.hpp"
 #include "mod/io/serial/serial.hpp"
+#include "platform/dbg/journal.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "util/hcf.hpp"
@@ -29,6 +30,7 @@ void init() {
         return;
     }
     io::serial::init();
+    journal::init();
     isInit = true;
 }
 
@@ -38,6 +40,7 @@ void enableTime() {
         panic_handler("Kernel time was already initialized");
     }
     isTimeAvailable = true;
+    journal::enable_time();
     log("Kernel time is now available");
 }
 
@@ -166,7 +169,7 @@ inline void fbLog(const char* str) {
 }
 
 void logString(const char* str) {
-    serialLogLine(str);
+    journal::emit(LogLevel::INFO, "kernel", str, journal::JOURNAL_FLAG_KERNEL);
     // logLock only protects the framebuffer state and linesLogged counter.
     logLock.lock();
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
@@ -176,13 +179,7 @@ void logString(const char* str) {
     logLock.unlock();
 }
 
-void logVa(const char* format, va_list& args) {
-    // 4k should be enough for everyone
-    char buf[4096];
-
-    std::vsnprintf(buf, sizeof(buf), format, args);
-    logString(buf);
-}
+void logVa(const char* format, va_list& args) { journal::emit_v(LogLevel::INFO, "kernel", format, args, journal::JOURNAL_FLAG_KERNEL); }
 
 void __logVar(const char* format, ...) {
     va_list args;
@@ -205,8 +202,19 @@ void logFbAdvance(void) {
 
 void error(const char* str) {
     // TODO: pretty print error
-    log(str);
+    journal::emit(LogLevel::ERROR, "kernel", str, journal::JOURNAL_FLAG_KERNEL);
 }
+
+void emit_log(const char* module, LogLevel level, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    journal::emit_v(level, module, format, args, journal::JOURNAL_FLAG_KERNEL);
+    va_end(args);
+}
+
+void set_serial_threshold(LogLevel level) { journal::set_serial_threshold(level); }
+
+auto get_serial_threshold() -> LogLevel { return journal::get_serial_threshold(); }
 
 namespace {
 

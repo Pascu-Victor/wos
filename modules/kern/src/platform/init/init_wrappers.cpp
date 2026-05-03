@@ -51,6 +51,7 @@
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
 #include <util/hostname.hpp>
+#include <util/netdevconf.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/initramfs.hpp>
 #include <vfs/vfs.hpp>
@@ -174,8 +175,11 @@ void smt_init() { mod::smt::init(); }
 void epoch_manager_init() { mod::sched::EpochManager::init(); }
 
 void wki_eth_transport_init() {
-    // Search for eth1, fall back to eth0
-    auto* wki_dev = net::netdev_find_by_name("eth1");
+    // Prefer config-assigned NIC; fall back to eth1 then eth0
+    auto* wki_dev = ker::util::netdevconf::find_device("wki");
+    if (wki_dev == nullptr) {
+        wki_dev = net::netdev_find_by_name("eth1");
+    }
     if (wki_dev == nullptr) {
         wki_dev = net::netdev_find_by_name("eth0");
     }
@@ -188,19 +192,16 @@ void wki_eth_transport_init() {
 void wki_ivshmem_transport_init() { net::wki::wki_ivshmem_transport_init(); }
 
 void ipv6_linklocal_init() {
-    // Configure IPv6 link-local addresses on eth0 and eth1
-    auto* eth0 = net::netdev_find_by_name("eth0");
-    if (eth0 != nullptr) {
+    // Assign IPv6 link-local addresses to all registered NICs that are not
+    // claimed as WKI transport (WKI manages its own transport NIC).
+    for (size_t i = 0; i < net::netdev_count(); i++) {
+        auto* dev = net::netdev_at(i);
+        if (dev == nullptr || dev->wki_transport) {
+            continue;
+        }
         std::array<uint8_t, 16> ll_addr{};
-        net::proto::ipv6_make_link_local(ll_addr, eth0->mac);
-        net::netif_add_ipv6(eth0, ll_addr, 64);
-    }
-
-    auto* eth1 = net::netdev_find_by_name("eth1");
-    if (eth1 != nullptr) {
-        std::array<uint8_t, 16> ll_addr{};
-        net::proto::ipv6_make_link_local(ll_addr, eth1->mac);
-        net::netif_add_ipv6(eth1, ll_addr, 64);
+        net::proto::ipv6_make_link_local(ll_addr, dev->mac);
+        net::netif_add_ipv6(dev, ll_addr, 64);
     }
 }
 

@@ -264,20 +264,30 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         return nullptr;
     }
 
-    hash_insert(bh);
-    lru_touch(bh);
-
     // Drop lock during disk I/O (disk read may be slow)
     cache_lock.unlock_irqrestore(irqflags);
 
     int rc = read_block_from_disk(bh);
     if (rc != 0) {
-        // Read failed - remove from cache
         irqflags = cache_lock.lock_irqsave();
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
         return nullptr;
     }
+
+    irqflags = cache_lock.lock_irqsave();
+    BufHead* existing = hash_lookup(bdev, block_no);
+    if (existing != nullptr) {
+        existing->refcount.fetch_add(1, std::memory_order_relaxed);
+        lru_touch(existing);
+        free_buffer(bh);
+        cache_lock.unlock_irqrestore(irqflags);
+        return existing;
+    }
+
+    hash_insert(bh);
+    lru_touch(bh);
+    cache_lock.unlock_irqrestore(irqflags);
 
     return bh;
 }
@@ -341,9 +351,6 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     cache_total_bytes += total_size;
     cache_total_buffers++;
 
-    hash_insert(bh);
-    lru_touch(bh);
-
     cache_lock.unlock_irqrestore(irqflags);
 
     // Read from disk outside the lock
@@ -355,6 +362,20 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         return nullptr;
     }
     bh->flags |= BH_VALID;
+
+    irqflags = cache_lock.lock_irqsave();
+    BufHead* existing = hash_lookup(bdev, block_no);
+    if (existing != nullptr && existing->size == total_size) {
+        existing->refcount.fetch_add(1, std::memory_order_relaxed);
+        lru_touch(existing);
+        free_buffer(bh);
+        cache_lock.unlock_irqrestore(irqflags);
+        return existing;
+    }
+
+    hash_insert(bh);
+    lru_touch(bh);
+    cache_lock.unlock_irqrestore(irqflags);
 
     return bh;
 }

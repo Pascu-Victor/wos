@@ -1,6 +1,7 @@
 #include "device.hpp"
 
 #include <mod/io/serial/serial.hpp>
+#include <platform/dbg/journal.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <util/smallvec.hpp>
 
@@ -93,6 +94,9 @@ auto dev_get_at_index(size_t index) -> Device* {
 
 auto dev_get_count() -> size_t { return devices.size(); }
 
-void dev_init() { mod::io::serial::write("dev: initializing device subsystem\n"); }
+void dev_init() {
+    ker::mod::dbg::journal::register_devices();
+    ker::mod::dbg::logger<"dev">::info("device subsystem initialized");
+}
 
 }  // namespace ker::dev

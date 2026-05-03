@@ -34,6 +34,8 @@ struct NetDevice {
     std::array<char, NETDEV_NAME_LEN> name{};
     std::array<uint8_t, 6> mac{};
     uint32_t mtu = 1500;
+    uint32_t tx_queue_len = 1000;
+    uint32_t link_flags = 0;
     uint8_t state = 0;  // 0=down, 1=up
     uint32_t ifindex = 0;
     NetDeviceOps const* ops = nullptr;
@@ -48,6 +50,10 @@ struct NetDevice {
     // D11: WKI RX forward hook - set by dev_server when a remote consumer is attached.
     // Called from netdev_rx() to forward received packets to remote consumers.
     void (*wki_rx_forward)(NetDevice* dev, PacketBuffer* pkt) = nullptr;
+
+    // Set by wki_eth_transport_init() when this NIC is claimed as the WKI transport.
+    // Prevents the NIC from being advertised as a remotable NET resource to peers.
+    bool wki_transport = false;
 
     // Statistics
     uint64_t rx_packets = 0;

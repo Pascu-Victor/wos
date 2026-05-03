@@ -48,6 +48,13 @@ else
     echo "# /etc/fstab - empty (no disks.conf found)" > "$INITRAMFS_DIR/etc/fstab"
 fi
 
+if [ -f "configs/netdevs.conf" ]; then
+    cp "configs/netdevs.conf" "$INITRAMFS_DIR/etc/netdevs"
+    echo "  initramfs: added /etc/netdevs from configs/netdevs.conf"
+else
+    echo "WARNING: configs/netdevs.conf not found, network device assignment will use hardcoded defaults"
+fi
+
 if [ -f "configs/vfstab" ]; then
     cp "configs/vfstab" "$INITRAMFS_DIR/etc/vfstab"
     echo "  initramfs: added /etc/vfstab from configs/vfstab"

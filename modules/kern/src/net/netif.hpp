@@ -33,6 +33,8 @@ auto netif_get(NetDevice* dev) -> NetInterface*;
 
 // Add addresses
 auto netif_add_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int;
+auto netif_set_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask, bool replace) -> int;
+auto netif_del_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int;
 auto netif_add_ipv6(NetDevice* dev, const std::array<uint8_t, 16>& addr, uint8_t prefix) -> int;
 
 // Lookup: find interface that owns a given IPv4 address

@@ -525,7 +525,9 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
 
     // Allocate controller state
     auto* hc = static_cast<XhciController*>(mod::mm::phys::pageAlloc(sizeof(XhciController)));
-    if (hc == nullptr) return -1;
+    if (hc == nullptr) {
+        return -1;
+    }
     std::memset(hc, 0, sizeof(XhciController));
 
     hc->base = base;

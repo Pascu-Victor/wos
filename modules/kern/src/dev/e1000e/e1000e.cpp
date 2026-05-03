@@ -1,6 +1,7 @@
 #include "e1000e.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -12,6 +13,9 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+
+#include "dev/pci.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::dev::e1000e {
 

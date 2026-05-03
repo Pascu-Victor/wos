@@ -81,6 +81,7 @@ if(WOS_KASAN)
     set(KASAN_EXCLUDED_SRCS
         # Early boot / logging (runs before any shadow pages exist)
         src/platform/dbg/dbg.cpp
+        src/platform/dbg/journal.cpp
         src/platform/dbg/coredump.cpp
         src/mod/io/serial/serial.cpp
         src/mod/gfx/fb.cpp
@@ -174,6 +175,5 @@ target_compile_definitions(${KERNEL} PRIVATE "WOS_BUILDER=\"${_WOS_USER}@${_WOS_
 target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 
 # target_link_libraries(${KERNEL} stdkern)
-
 
 

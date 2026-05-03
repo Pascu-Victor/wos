@@ -105,6 +105,168 @@
             ]
         },
         {
+            "name": "Attach Cluster VM2",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1236"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM3",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1237"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM4",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1238"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM5",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1239"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM6",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1240"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM7",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware"
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1241"
+            ]
+        },
+        {
             "name": "Debug WOS Userspace (Init Process)",
             "type": "lldb-dap",
             "request": "attach",
@@ -137,7 +299,13 @@
             "name": "Attach All Cluster VMs",
             "configurations": [
                 "Attach Cluster VM0",
-                "Attach Cluster VM1"
+                "Attach Cluster VM1",
+                "Attach Cluster VM2",
+                "Attach Cluster VM3",
+                "Attach Cluster VM4",
+                "Attach Cluster VM5",
+                "Attach Cluster VM6",
+                "Attach Cluster VM7"
             ],
             "stopAll": true
         }

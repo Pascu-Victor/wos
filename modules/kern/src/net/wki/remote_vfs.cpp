@@ -34,19 +34,31 @@ namespace ker::net::wki {
 
 namespace {
 
-auto transport_supports_vfs_push_rdma(const WkiTransport* transport) -> bool {
+auto transport_supports_vfs_write_push_rdma(const WkiTransport* transport) -> bool {
     if (transport == nullptr || transport->name == nullptr) {
         return false;
     }
 
     // ivshmem: rdma_write is a local memcpy — payload is visible before the control
-    // response is even enqueued. Safe for both read-push and write-push.
+    // response is even enqueued.
     //
     // RoCE: rdma_write and wki_send both use the same netdev TX queue, so RDMA_WRITE
-    // frames are enqueued (and thus delivered) before the WKI control message.
-    // Write-push is therefore safe for RoCE (Phase 2a). Read-push is NOT used for
-    // RoCE — see transport_supports_rdma_read_pull() for the client-pull alternative.
+    // frames are enqueued before the WKI control message. Write-push is therefore
+    // safe for RoCE.
     return std::strcmp(transport->name, "wki-ivshmem") == 0 || std::strcmp(transport->name, "wki-roce") == 0;
+}
+
+auto transport_supports_vfs_read_push_rdma(const WkiTransport* transport) -> bool {
+    if (transport == nullptr || transport->name == nullptr) {
+        return false;
+    }
+
+    // In read-push mode the server has already written into our local RDMA
+    // region, and the consumer-side "rdma_read" below is just a local sync/copy.
+    // That is true for ivshmem, but not for RoCE: a RoCE rdma_read would issue a
+    // network read against neighbor 0/local rkey, fail, and leave stale zeros in
+    // the bounce buffer. RoCE reads must use pull-mode staging or message I/O.
+    return std::strcmp(transport->name, "wki-ivshmem") == 0;
 }
 
 // Returns true for transports where the safe VFS read model is client-pull:
@@ -1018,8 +1030,8 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
 
     // RDMA path: push pending data to server's pre-registered receive buffer,
     // then send a tiny control message. Avoids embedding data in WKI packets.
-    if (transport_supports_vfs_push_rdma(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr &&
-        ctx->proxy->rdma_server_write_rkey != 0 && ctx->proxy->rdma_bounce_buf != nullptr) {
+    if (transport_supports_vfs_write_push_rdma(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
+        ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_write_rkey != 0 && ctx->proxy->rdma_bounce_buf != nullptr) {
         while (remaining > 0) {
             uint32_t chunk = std::min(remaining, VFS_RDMA_BOUNCE_SIZE);
 
@@ -1156,7 +1168,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     const bool BULK_PULL_CAPABLE = transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) && ctx->proxy->bulk_rdma_capable &&
                                    ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_bulk_staging_rkey != 0 &&
                                    ctx->proxy->rdma_bulk_buf != nullptr;
-    const bool BULK_PUSH_CAPABLE = !BULK_PULL_CAPABLE && transport_supports_vfs_push_rdma(ctx->proxy->rdma_transport) &&
+    const bool BULK_PUSH_CAPABLE = !BULK_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
                                    ctx->proxy->rdma_bulk_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
     if (BULK_PULL_CAPABLE || BULK_PUSH_CAPABLE) {
@@ -1212,12 +1224,23 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
 
             if (BULK_PULL_CAPABLE) {
                 // Pull mode: server staged data; fetch it via rdma_read from staging buf.
-                ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, ctx->proxy->owner_node,
-                                                      ctx->proxy->rdma_server_bulk_staging_rkey, 0, ctx->proxy->rdma_bulk_buf, bytes_read);
+                int rdma_ret = ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, ctx->proxy->owner_node,
+                                                                     ctx->proxy->rdma_server_bulk_staging_rkey, 0,
+                                                                     ctx->proxy->rdma_bulk_buf, bytes_read);
+                if (rdma_ret != 0) {
+                    ctx->bulk_cached_len = 0;
+                    ctx->proxy->bulk_owner_fd = -1;
+                    break;
+                }
             } else {
                 // Push mode: server wrote data into shared memory at rdma_bulk_rkey.
-                ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, 0, ctx->proxy->rdma_bulk_rkey, 0,
-                                                      ctx->proxy->rdma_bulk_buf, bytes_read);
+                int rdma_ret = ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, 0, ctx->proxy->rdma_bulk_rkey, 0,
+                                                                     ctx->proxy->rdma_bulk_buf, bytes_read);
+                if (rdma_ret != 0) {
+                    ctx->bulk_cached_len = 0;
+                    ctx->proxy->bulk_owner_fd = -1;
+                    break;
+                }
             }
 
             // Update prefetch cache metadata
@@ -1252,7 +1275,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     const bool rdma_pull_capable = transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
                                    ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_read_staging_rkey != 0 &&
                                    ctx->proxy->rdma_bounce_buf != nullptr;
-    const bool rdma_push_capable = !rdma_pull_capable && transport_supports_vfs_push_rdma(ctx->proxy->rdma_transport) &&
+    const bool rdma_push_capable = !rdma_pull_capable && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
                                    ctx->proxy->rdma_bounce_buf != nullptr;
     if (rdma_pull_capable || rdma_push_capable) {
@@ -1278,12 +1301,19 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             auto to_copy = std::min(static_cast<uint32_t>(bytes_read), remaining);
             if (rdma_pull_capable) {
                 // Pull mode: server staged data; fetch via rdma_read from server's staging buf.
-                ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, ctx->proxy->owner_node,
-                                                      ctx->proxy->rdma_server_read_staging_rkey, 0, ctx->proxy->rdma_bounce_buf, to_copy);
+                int rdma_ret = ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, ctx->proxy->owner_node,
+                                                                     ctx->proxy->rdma_server_read_staging_rkey, 0,
+                                                                     ctx->proxy->rdma_bounce_buf, to_copy);
+                if (rdma_ret != 0) {
+                    break;
+                }
             } else {
                 // Push mode: server wrote into shared memory at rdma_read_rkey; read locally.
-                ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, 0, ctx->proxy->rdma_read_rkey, 0,
-                                                      ctx->proxy->rdma_bounce_buf, to_copy);
+                int rdma_ret = ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, 0, ctx->proxy->rdma_read_rkey, 0,
+                                                                     ctx->proxy->rdma_bounce_buf, to_copy);
+                if (rdma_ret != 0) {
+                    break;
+                }
             }
             memcpy(dest, ctx->proxy->rdma_bounce_buf, to_copy);
 

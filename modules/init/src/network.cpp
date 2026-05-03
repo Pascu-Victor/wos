@@ -14,19 +14,20 @@
 #include <cstring>
 #include <print>
 
+#include "init_log.h"
 #include "sys/multiproc.h"
 
 void start_network() {
     int cpuno = ker::multiproc::currentThreadId();
 
-    std::println("init[{}]: spawning netd (DHCP daemon)", cpuno);
+    init_info("init[%d]: spawning netd (DHCP daemon)", cpuno);
     std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
     std::array<const char*, 1> netd_envp = {nullptr};
     uint64_t netd_pid = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
     if (netd_pid == 0) {
-        std::println("init[{}]: FAILED to spawn netd", cpuno);
+        init_error("init[%d]: failed to spawn netd", cpuno);
     } else {
-        std::println("init[{}]: netd spawned as PID {}", cpuno, netd_pid);
+        init_info("init[%d]: netd spawned as PID %llu", cpuno, static_cast<unsigned long long>(netd_pid));
     }
 
     // Poll eth0 for IP address readiness (wait for DHCP to complete)
@@ -45,7 +46,7 @@ void start_network() {
                 if (addr->sin_addr.s_addr != 0) {
                     std::array<char, INET_ADDRSTRLEN> ip_str{};
                     inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-                    std::println("init[{}]: eth0 configured with IP {}", cpuno, ip_str.data());
+                    init_info("init[%d]: eth0 configured with IP %s", cpuno, ip_str.data());
                     net_ready = true;
                     break;
                 }
@@ -59,7 +60,7 @@ void start_network() {
         }
         close(poll_sock);
         if (!net_ready) {
-            std::println("init[{}]: WARNING: eth0 not configured after polling, continuing anyway", cpuno);
+            init_warn("init[%d]: eth0 not configured after polling, continuing anyway", cpuno);
         }
     }
 }

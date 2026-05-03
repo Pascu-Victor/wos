@@ -95,23 +95,19 @@ auto parseElf(uint8_t* base) -> ElfFile {
                                       (static_cast<Elf64_Off>(elf.elfHead.e_shstrndx       // Section header string table index
                                                               * elf.elfHead.e_shentsize))  // Size of each section header
     );
-#ifdef ELF_DEBUG
-    // Determine load base for PIE executables
+    // Choose a non-zero base for PIE executables so their writable/data segments
+    // live in normal user space instead of the low pages near NULL.
     if (elf.elfHead.e_type == ET_DYN) {
-        // For PIE executables, we need to choose a base address
-        // For now just use 0x400000
-        // FIXME:add some address conflict detection and ASLR
-        elf.loadBase = 0;
-
+        elf.loadBase = 0x400000ULL;
+#ifdef ELF_DEBUG
         mod::dbg::log("Loading PIE executable with base address: 0x%x", elf.loadBase);
-    } else {
-        // For ET_EXEC, use 0 as there's no relocation needed
-        elf.loadBase = 0;
-        mod::dbg::log("Loading regular executable (ET_EXEC)");
-    }
-#else
-    elf.loadBase = 0;
 #endif
+    } else {
+        elf.loadBase = 0;
+#ifdef ELF_DEBUG
+        mod::dbg::log("Loading regular executable (ET_EXEC)");
+#endif
+    }
 
     return elf;
 }

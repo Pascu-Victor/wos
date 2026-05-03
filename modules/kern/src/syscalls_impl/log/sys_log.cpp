@@ -7,6 +7,7 @@
 #include "mod/gfx/fb.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/dbg/journal.hpp"
 
 namespace ker::syscall::log {
 #include <platform/mm/addr.hpp>
@@ -15,7 +16,7 @@ namespace ker::syscall::log {
 
 static constexpr size_t MAX_SYSLOG_COPY = 4096;
 
-auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, abi::sys_log::sys_log_device device) -> uint64_t {
+auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, uint64_t device_or_level, const char* module) -> uint64_t {
     auto* currentPagemap = _wOS_getCurrentPagemap();
 
     // Helper to safely copy from user/kernel pointer into a kernel buffer.
@@ -55,6 +56,7 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
 
     switch (op) {
         case abi::sys_log::sys_log_ops::log: {
+            auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
             if (device == abi::sys_log::sys_log_device::serial) {
                 if (str == nullptr) {
                     return 1;
@@ -66,12 +68,16 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
                     // if last byte is NUL, don't include it in write (strlen semantics)
                     if (copied && buf[copied - 1] == '\0') copied--;
                     if (copied == 0) return 0;
-                    mod::io::serial::write(buf, copied);
+                    if (copied >= MAX_SYSLOG_COPY) copied = MAX_SYSLOG_COPY - 1;
+                    buf[copied] = '\0';
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf, 0);
                 } else {
                     // Copy exactly 'len' bytes or until an unmapped page
                     if (!safe_copy_to_kernel(str, len, buf, copied)) return 1;
                     if (copied == 0) return 0;
-                    mod::io::serial::write(buf, copied);
+                    buf[(copied < MAX_SYSLOG_COPY) ? copied : (MAX_SYSLOG_COPY - 1)] = '\0';
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
+                                            copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
             } else if (device == abi::sys_log::sys_log_device::vga) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
@@ -94,6 +100,7 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
             }
         } break;
         case ker::abi::sys_log::sys_log_ops::logLine: {
+            auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
             if (device == abi::sys_log::sys_log_device::serial) {
                 if (str == nullptr) {
                     return 1;
@@ -104,19 +111,21 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
                     if (!safe_copy_to_kernel(str, 0, buf, copied)) return 1;
                     if (copied && buf[copied - 1] == '\0') copied--;
                     if (copied == 0) {
-                        mod::io::serial::write("\n");
+                        mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", "", 0);
                         return 0;
                     }
-                    mod::io::serial::write(buf, copied);
-                    mod::io::serial::write("\n");
+                    if (copied >= MAX_SYSLOG_COPY) copied = MAX_SYSLOG_COPY - 1;
+                    buf[copied] = '\0';
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf, 0);
                 } else {
                     if (!safe_copy_to_kernel(str, len, buf, copied)) return 1;
                     if (copied == 0) {
-                        mod::io::serial::write("\n");
+                        mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", "", 0);
                         return 0;
                     }
-                    mod::io::serial::write(buf, copied);
-                    mod::io::serial::write("\n");
+                    buf[(copied < MAX_SYSLOG_COPY) ? copied : (MAX_SYSLOG_COPY - 1)] = '\0';
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
+                                            copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
             } else if (device == abi::sys_log::sys_log_device::vga) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
@@ -138,6 +147,34 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ab
                 mod::io::serial::write("\n");
                 return 1;
             }
+        } break;
+        case ker::abi::sys_log::sys_log_ops::logEx: {
+            if (str == nullptr) {
+                return 1;
+            }
+            char buf[MAX_SYSLOG_COPY];
+            uint64_t copied = 0;
+            if (!safe_copy_to_kernel(str, len, buf, copied)) return 1;
+            if (copied >= MAX_SYSLOG_COPY) copied = MAX_SYSLOG_COPY - 1;
+            if (copied > 0 && len == 0 && buf[copied - 1] == '\0') copied--;
+            buf[copied] = '\0';
+
+            char module_buf[mod::dbg::journal::JOURNAL_MODULE_MAX]{};
+            uint64_t module_copied = 0;
+            if (module != nullptr && safe_copy_to_kernel(module, 0, module_buf, module_copied)) {
+                if (module_copied >= sizeof(module_buf)) module_copied = sizeof(module_buf) - 1;
+                if (module_copied > 0 && module_buf[module_copied - 1] == '\0') module_copied--;
+                module_buf[module_copied] = '\0';
+            } else {
+                std::memcpy(module_buf, "userspace", sizeof("userspace"));
+            }
+
+            uint64_t raw_level = device_or_level;
+            if (raw_level > static_cast<uint64_t>(mod::dbg::LogLevel::PANIC)) {
+                raw_level = static_cast<uint64_t>(mod::dbg::LogLevel::INFO);
+            }
+            mod::dbg::journal::emit(static_cast<mod::dbg::LogLevel>(raw_level), module_buf, buf,
+                                    copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
         } break;
         default:
             mod::io::serial::write("Invalid sysLog operation\n");

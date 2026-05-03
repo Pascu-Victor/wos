@@ -101,9 +101,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
 
     // Copy WKI spawn configuration
-    if ((parent->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) == 0) {
-        memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
-        child->wki_target_flags = parent->wki_target_flags;
+    memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
+    child->wki_target_flags = parent->wki_target_flags;
+    if ((child->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) != 0) {
+        child->wki_target_flags &= ~sched::task::Task::WKI_TARGET_FLAG_NOINHERIT;
     }
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
     child->wki_vfs_rules.clone_from(parent->wki_vfs_rules);

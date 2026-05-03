@@ -1110,10 +1110,10 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
     // Zero-copy TX: allocate PacketBuffer up front and build the WKI frame
     // directly in pkt->data, avoiding the extra memcpy in eth_wki_tx().
-    // pkt_alloc() sets data = storage + PKT_HEADROOM (64 bytes), leaving room
-    // for eth_tx() to prepend the 14-byte Ethernet header via push().
+    // Use pkt_alloc_tx() to preserve an RX reserve and avoid TX exhausting
+    // the global pool, which can starve ACK/heartbeat receive progress.
     uint16_t frame_len = WKI_HEADER_SIZE + payload_len;
-    net::PacketBuffer* pkt = net::pkt_alloc();
+    net::PacketBuffer* pkt = net::pkt_alloc_tx();
     if (pkt == nullptr) {
         return WKI_ERR_NO_MEM;
     }

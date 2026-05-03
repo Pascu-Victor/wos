@@ -30,6 +30,7 @@ struct CpuInfo {
 auto get_core_count() -> uint64_t;
 auto get_early_cpu_count() -> uint64_t;  // Safe to call before smt::init()
 auto get_cpu(uint64_t number) -> CpuInfo&;
+auto has_cpu_data() -> bool;
 
 // Get logical CPU index from APIC ID (reliable, doesn't depend on GS)
 auto get_cpu_index_from_apic_id(uint32_t apic_id) -> uint64_t;

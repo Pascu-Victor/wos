@@ -35,7 +35,7 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
     switch (callnum) {
         case abi::callnums::sys_log:
             return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
-                                             static_cast<abi::sys_log::sys_log_device>(a4));
+                                             a4, (const char*)a5);
         case abi::callnums::futex:
             return ker::syscall::futex::sys_futex(a1, a2, a3, a4);
         case abi::callnums::threading:

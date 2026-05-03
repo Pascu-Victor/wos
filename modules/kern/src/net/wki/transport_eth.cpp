@@ -5,8 +5,8 @@
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
-#include <net/wki/peer.hpp>
 #include <net/proto/ethernet.hpp>
+#include <net/wki/peer.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -128,8 +128,8 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
         }
     }
 
-    // Allocate a PacketBuffer
-    PacketBuffer* pkt = pkt_alloc();
+    // Allocate from TX path to preserve RX reserve under heavy load.
+    PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;
     }
@@ -313,11 +313,16 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     // Copy our MAC into global state
     memcpy(g_wki.my_mac.data(), netdev->mac.data(), 6);
 
+    // Mark this NIC as WKI-owned so it is not advertised to peers as a
+    // remotable NET resource and not eligible for remote-attach.
+    netdev->remotable = nullptr;
+    netdev->wki_transport = true;
+
     // Register with WKI core
     wki_transport_register(&s_eth_transport);
 
     s_eth_initialized = true;
-    ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s", netdev->name.data());
+    ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s (marked non-remotable)", netdev->name.data());
 }
 
 auto wki_eth_get_netdev() -> net::NetDevice* { return s_eth_priv.netdev; }

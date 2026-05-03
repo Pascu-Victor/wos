@@ -120,7 +120,7 @@ add_custom_target(boot_image
 )
 add_dependencies(boot_image wos_modules mountfs_disk)
 
-foreach(mod wos init testprog netd httpd perf)
+foreach(mod wos init testprog netd httpd perf journal)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
 # busybox and dropbear are only needed for image creation, not compilation.

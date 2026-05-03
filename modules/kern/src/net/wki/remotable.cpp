@@ -18,6 +18,8 @@
 
 namespace ker::net::wki {
 
+using log = ker::mod::dbg::logger<"wki">;
+
 // -----------------------------------------------------------------------------
 // Storage - discovered resources from remote peers
 // -----------------------------------------------------------------------------
@@ -49,8 +51,14 @@ struct PendingNetAttach {
     uint32_t resource_id;
     char nic_name[64];
     char hostname[64];
+    char remote_name[64];
+    uint8_t retry_count = 0;
+    uint64_t next_attempt_us = 0;
 };
 std::deque<PendingNetAttach> g_pending_net_attaches;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint8_t NET_AUTO_ATTACH_MAX_RETRIES = 8;
+constexpr uint64_t NET_AUTO_ATTACH_RETRY_BASE_US = 1000000;
+constexpr uint64_t NET_AUTO_ATTACH_RETRY_MAX_US = 5000000;
 
 ker::mod::sys::Spinlock s_remotable_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -107,16 +115,31 @@ void build_vfs_mount_path(char* out, size_t out_size, const char* hostname, cons
     }
 }
 
+auto pending_vfs_mount_is_live_locked(const PendingVfsMount& pending) -> bool {
+    return find_resource_unlocked(pending.node_id, ResourceType::VFS, pending.resource_id) != nullptr;
+}
+
+auto pending_net_attach_is_live_locked(const PendingNetAttach& pending) -> bool {
+    return find_resource_unlocked(pending.node_id, ResourceType::NET, pending.resource_id) != nullptr;
+}
+
 void queue_vfs_mount_locked(uint16_t node_id, uint32_t resource_id, const char* mount_path, bool force_remount) {
     if (mount_path == nullptr || mount_path[0] == '\0') {
         return;
     }
 
     for (auto& pending : g_pending_vfs_mounts) {
-        if (pending.node_id != node_id || pending.resource_id != resource_id) {
+        if (pending.node_id != node_id) {
             continue;
         }
 
+        bool same_resource = pending.resource_id == resource_id;
+        bool same_mount_path = std::strncmp(pending.mount_path, mount_path, sizeof(pending.mount_path)) == 0;
+        if (!same_resource && !same_mount_path) {
+            continue;
+        }
+
+        pending.resource_id = resource_id;
         std::snprintf(pending.mount_path, sizeof(pending.mount_path), "%s", mount_path);
         pending.force_remount = pending.force_remount || force_remount;
         pending.retry_count = 0;
@@ -130,6 +153,79 @@ void queue_vfs_mount_locked(uint16_t node_id, uint32_t resource_id, const char* 
     pending.force_remount = force_remount;
     std::snprintf(pending.mount_path, sizeof(pending.mount_path), "%s", mount_path);
     g_pending_vfs_mounts.push_back(pending);
+}
+
+void build_net_proxy_name(char* out, size_t out_size, const char* hostname, const char* remote_name, uint32_t resource_id) {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+
+    if (remote_name != nullptr && remote_name[0] == 'e' && remote_name[1] == 't' && remote_name[2] == 'h' && remote_name[3] != '\0' &&
+        remote_name[4] == '\0') {
+        std::snprintf(out, out_size, "wki-%s-e%c", hostname, remote_name[3]);
+    } else {
+        std::snprintf(out, out_size, "wki-%s-%u", hostname, resource_id);
+    }
+
+    if (std::strlen(out) >= ker::net::NETDEV_NAME_LEN) {
+        out[ker::net::NETDEV_NAME_LEN - 1] = '\0';
+    }
+}
+
+void queue_net_attach_locked(uint16_t node_id, uint32_t resource_id, const char* nic_name, const char* hostname, const char* remote_name,
+                             uint8_t retry_count = 0, uint64_t next_attempt_us = 0) {
+    if (nic_name == nullptr || nic_name[0] == '\0' || hostname == nullptr || hostname[0] == '\0') {
+        return;
+    }
+
+    for (auto& pending : g_pending_net_attaches) {
+        if (pending.node_id != node_id) {
+            continue;
+        }
+
+        bool same_resource = pending.resource_id == resource_id;
+        bool same_name = std::strncmp(pending.nic_name, nic_name, sizeof(pending.nic_name)) == 0;
+        if (!same_resource && !same_name) {
+            continue;
+        }
+
+        pending.resource_id = resource_id;
+        std::snprintf(pending.nic_name, sizeof(pending.nic_name), "%s", nic_name);
+        std::snprintf(pending.hostname, sizeof(pending.hostname), "%s", hostname);
+        std::snprintf(pending.remote_name, sizeof(pending.remote_name), "%s", remote_name != nullptr ? remote_name : "");
+        pending.retry_count = retry_count;
+        pending.next_attempt_us = next_attempt_us;
+        return;
+    }
+
+    PendingNetAttach pending = {};
+    pending.node_id = node_id;
+    pending.resource_id = resource_id;
+    pending.retry_count = retry_count;
+    pending.next_attempt_us = next_attempt_us;
+    std::snprintf(pending.nic_name, sizeof(pending.nic_name), "%s", nic_name);
+    std::snprintf(pending.hostname, sizeof(pending.hostname), "%s", hostname);
+    std::snprintf(pending.remote_name, sizeof(pending.remote_name), "%s", remote_name != nullptr ? remote_name : "");
+    g_pending_net_attaches.push_back(pending);
+}
+
+auto requeue_net_attach(PendingNetAttach& pending) -> bool {
+    if (pending.retry_count + 1 >= NET_AUTO_ATTACH_MAX_RETRIES) {
+        return false;
+    }
+
+    pending.retry_count++;
+    uint64_t delay_us = NET_AUTO_ATTACH_RETRY_BASE_US << (pending.retry_count - 1);
+    if (delay_us > NET_AUTO_ATTACH_RETRY_MAX_US) {
+        delay_us = NET_AUTO_ATTACH_RETRY_MAX_US;
+    }
+    pending.next_attempt_us = wki_now_us() + delay_us;
+
+    s_remotable_lock.lock();
+    queue_net_attach_locked(pending.node_id, pending.resource_id, pending.nic_name, pending.hostname, pending.remote_name,
+                            pending.retry_count, pending.next_attempt_us);
+    s_remotable_lock.unlock();
+    return true;
 }
 
 }  // namespace
@@ -391,6 +487,13 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
                 queue_vfs_mount_locked(adv->node_id, adv->resource_id, desired_mount_path, true);
                 queue_vfs_mount = true;
             }
+        } else if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL) {
+            const char* hostname = wki_peer_get_hostname(adv->node_id);
+            if (hostname != nullptr && hostname[0] != '\0') {
+                char nic_name[64] = {};
+                build_net_proxy_name(nic_name, sizeof(nic_name), hostname, static_cast<const char*>(res.name), adv->resource_id);
+                queue_net_attach_locked(adv->node_id, adv->resource_id, nic_name, hostname, static_cast<const char*>(res.name));
+            }
         }
 
         s_remotable_lock.unlock();
@@ -421,17 +524,9 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL) {
         const char* hostname = wki_peer_get_hostname(adv->node_id);
         if (hostname != nullptr && hostname[0] != '\0') {
-            PendingNetAttach pending = {};
-            pending.node_id = adv->node_id;
-            pending.resource_id = adv->resource_id;
-            // Build proxy NIC name: "wki-<hostname>" truncated to 15 chars
-            snprintf(pending.nic_name, sizeof(pending.nic_name), "wki-%s", hostname);
-            if (strlen(pending.nic_name) >= ker::net::NETDEV_NAME_LEN) {
-                pending.nic_name[ker::net::NETDEV_NAME_LEN - 1] = '\0';
-            }
-            strncpy(pending.hostname, hostname, sizeof(pending.hostname) - 1);
-            pending.hostname[sizeof(pending.hostname) - 1] = '\0';
-            g_pending_net_attaches.push_back(pending);
+            char nic_name[64] = {};
+            build_net_proxy_name(nic_name, sizeof(nic_name), hostname, static_cast<const char*>(res.name), adv->resource_id);
+            queue_net_attach_locked(adv->node_id, adv->resource_id, nic_name, hostname, static_cast<const char*>(res.name));
         }
     }
 
@@ -457,16 +552,7 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
     char mount_path[384] = {};  // NOLINT(modernize-avoid-c-arrays)
     bool do_vfs_unmount = false;
     if (type == ResourceType::VFS) {
-        const char* hostname = wki_peer_get_hostname(adv->node_id);
-        if (hostname != nullptr && hostname[0] != '\0') {
-            s_remotable_lock.lock();
-            DiscoveredResource* existing = find_resource_unlocked(adv->node_id, type, adv->resource_id);
-            if (existing != nullptr) {
-                build_vfs_mount_path(mount_path, sizeof(mount_path), hostname, static_cast<const char*>(existing->name));
-                do_vfs_unmount = true;
-            }
-            s_remotable_lock.unlock();
-        }
+        do_vfs_unmount = wki_remote_vfs_find_mount_for_resource(adv->node_id, adv->resource_id, mount_path, sizeof(mount_path));
     }
 
     // Blocking VFS unmount - outside lock
@@ -487,11 +573,35 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
     ker::vfs::devfs::devfs_wki_remove_resource(adv->node_id, adv->resource_type, adv->resource_id);
 
     // Remove from discovered table
+    size_t dropped_pending_mounts = 0;
+    size_t dropped_pending_net_attaches = 0;
     s_remotable_lock.lock();
     std::erase_if(g_discovered, [&](const DiscoveredResource& res) {
         return res.node_id == adv->node_id && res.resource_type == type && res.resource_id == adv->resource_id;
     });
+    if (type == ResourceType::VFS) {
+        size_t pending_before = g_pending_vfs_mounts.size();
+        std::erase_if(g_pending_vfs_mounts, [&](const PendingVfsMount& pending) {
+            return pending.node_id == adv->node_id && pending.resource_id == adv->resource_id;
+        });
+        dropped_pending_mounts = pending_before - g_pending_vfs_mounts.size();
+    } else if (type == ResourceType::NET) {
+        size_t pending_before = g_pending_net_attaches.size();
+        std::erase_if(g_pending_net_attaches, [&](const PendingNetAttach& pending) {
+            return pending.node_id == adv->node_id && pending.resource_id == adv->resource_id;
+        });
+        dropped_pending_net_attaches = pending_before - g_pending_net_attaches.size();
+    }
     s_remotable_lock.unlock();
+
+    if (dropped_pending_mounts != 0) {
+        log::debug("Dropped %llu stale VFS auto-mount(s): node=0x%04x res_id=%u",
+                   static_cast<unsigned long long>(dropped_pending_mounts), adv->node_id, adv->resource_id);
+    }
+    if (dropped_pending_net_attaches != 0) {
+        log::debug("Dropped %llu stale NET auto-attach(es): node=0x%04x res_id=%u",
+                   static_cast<unsigned long long>(dropped_pending_net_attaches), adv->node_id, adv->resource_id);
+    }
 
     ker::mod::dbg::log("[WKI] Resource withdrawn: node=0x%04x type=%u id=%u", adv->node_id, adv->resource_type, adv->resource_id);
 }
@@ -539,6 +649,15 @@ void wki_remotable_process_pending_mounts() {
                 continue;
             }
 
+            s_remotable_lock.lock();
+            bool resource_live = pending_vfs_mount_is_live_locked(pending);
+            s_remotable_lock.unlock();
+            if (!resource_live) {
+                log::debug("Skipping stale VFS auto-mount: node=0x%04x res_id=%u path=%s", pending.node_id, pending.resource_id,
+                           pending.mount_path);
+                continue;
+            }
+
             char existing_mount_path[384] = {};
             bool mount_exists = wki_remote_vfs_find_mount_for_resource(pending.node_id, pending.resource_id, existing_mount_path,
                                                                        sizeof(existing_mount_path));
@@ -579,7 +698,7 @@ void wki_remotable_process_pending_mounts() {
                 if (delay_us > VFS_AUTO_MOUNT_RETRY_MAX_US) {
                     delay_us = VFS_AUTO_MOUNT_RETRY_MAX_US;
                 }
-                pending.next_attempt_us = now_us + delay_us;
+                pending.next_attempt_us = wki_now_us() + delay_us;
 
                 s_remotable_lock.lock();
                 g_pending_vfs_mounts.push_back(pending);
@@ -601,60 +720,120 @@ void wki_remotable_process_pending_mounts() {
 // V2: Process deferred NET auto-attaches - called from timer tick
 void wki_remotable_process_pending_net_attaches() {
     while (true) {
+        uint64_t now_us = wki_now_us();
+
         s_remotable_lock.lock();
-        if (g_pending_net_attaches.empty()) {
+        size_t pending_count = g_pending_net_attaches.size();
+        if (pending_count == 0) {
             s_remotable_lock.unlock();
             break;
         }
-        PendingNetAttach pending = g_pending_net_attaches.front();
-        g_pending_net_attaches.pop_front();
         s_remotable_lock.unlock();
 
-        // Check if peer is still connected
-        WkiPeer* peer = wki_peer_find(pending.node_id);
-        if (peer == nullptr || peer->state != PeerState::CONNECTED) {
-            ker::mod::dbg::log("[WKI] NET auto-attach skipped: peer 0x%04x not connected", pending.node_id);
-            continue;
-        }
+        bool processed_any = false;
+        for (size_t i = 0; i < pending_count; i++) {
+            s_remotable_lock.lock();
+            if (g_pending_net_attaches.empty()) {
+                s_remotable_lock.unlock();
+                break;
+            }
+            PendingNetAttach pending = g_pending_net_attaches.front();
+            g_pending_net_attaches.pop_front();
+            s_remotable_lock.unlock();
 
-        // ATTACH_SPARSE: subnet overlap check is done after attach (since we need
-        // the ACK to get IP info). For ATTACH_ALL, skip the check entirely.
-        // The actual subnet check happens post-attach: if overlap is found, we detach.
-        ker::net::NetDevice* proxy_dev = wki_remote_net_attach(pending.node_id, pending.resource_id, pending.nic_name);
-        if (proxy_dev == nullptr) {
-            ker::mod::dbg::log("[WKI] NET auto-attach failed: %s -> node=0x%04x", pending.nic_name, pending.node_id);
-            continue;
-        }
+            if (pending.next_attempt_us != 0 && now_us < pending.next_attempt_us) {
+                s_remotable_lock.lock();
+                g_pending_net_attaches.push_back(pending);
+                s_remotable_lock.unlock();
+                continue;
+            }
 
-        // V2: ATTACH_SPARSE post-attach subnet overlap check
-        if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE) {
-            // Get the ProxyNetState to read owner IP info from the extended ACK
-            auto* state = static_cast<ProxyNetState*>(proxy_dev->private_data);
-            if (state != nullptr && state->owner_ipv4_addr != 0) {
-                if (has_local_subnet_overlap(state->owner_ipv4_addr, state->owner_ipv4_mask)) {
+            processed_any = true;
+
+            // Check if peer is still connected
+            WkiPeer* peer = wki_peer_find(pending.node_id);
+            if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+                ker::mod::dbg::log("[WKI] NET auto-attach skipped: peer 0x%04x not connected", pending.node_id);
+                continue;
+            }
+
+            s_remotable_lock.lock();
+            bool resource_live = pending_net_attach_is_live_locked(pending);
+            s_remotable_lock.unlock();
+            if (!resource_live) {
+                log::debug("Skipping stale NET auto-attach: node=0x%04x res_id=%u nic=%s", pending.node_id, pending.resource_id,
+                           pending.nic_name);
+                continue;
+            }
+
+            if (wki_remote_net_has_proxy(pending.node_id, pending.resource_id)) {
+                continue;
+            }
+
+            if (ker::net::netdev_find_by_name(pending.nic_name) != nullptr) {
+                log::debug("Skipping duplicate NET auto-attach name: %s node=0x%04x res_id=%u", pending.nic_name, pending.node_id,
+                           pending.resource_id);
+                continue;
+            }
+
+            // ATTACH_SPARSE: subnet overlap check is done after attach (since we need
+            // the ACK to get IP info). For ATTACH_ALL, skip the check entirely.
+            // The actual subnet check happens post-attach: if overlap is found, we detach.
+            ker::net::NetDevice* proxy_dev = wki_remote_net_attach(pending.node_id, pending.resource_id, pending.nic_name);
+            if (proxy_dev == nullptr) {
+                bool requeued = requeue_net_attach(pending);
+                ker::mod::dbg::log("[WKI] NET auto-attach failed: %s -> node=0x%04x%s", pending.nic_name, pending.node_id,
+                                   requeued ? " (retry queued)" : "");
+                continue;
+            }
+
+            auto* proxy_state = static_cast<ProxyNetState*>(proxy_dev->private_data);
+
+            // V2: ATTACH_SPARSE post-attach subnet overlap check
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE) {
+                // A zero owner IP means the remote NIC was advertised before its
+                // address was configured. Do not leave a useless proxy around;
+                // detach and retry while DHCP/static config has a chance to settle.
+                if (proxy_state == nullptr || proxy_state->owner_ipv4_addr == 0 || proxy_state->owner_ipv4_mask == 0) {
+                    wki_remote_net_detach(proxy_dev);
+                    bool requeued = requeue_net_attach(pending);
+                    if (requeued) {
+                        log::debug("NET auto-attach deferred: %s from %s/%s has no IPv4 yet (retry %u/%u)", pending.nic_name,
+                                   pending.hostname, pending.remote_name, pending.retry_count, NET_AUTO_ATTACH_MAX_RETRIES - 1);
+                    } else {
+                        ker::mod::dbg::log("[WKI] NET auto-attach skipped: %s from %s/%s has no IPv4", pending.nic_name,
+                                           pending.hostname, pending.remote_name);
+                    }
+                    continue;
+                }
+
+                if (has_local_subnet_overlap(proxy_state->owner_ipv4_addr, proxy_state->owner_ipv4_mask)) {
                     ker::mod::dbg::log("[WKI] Skipping remote NIC %s from %s: subnet overlap", pending.nic_name, pending.hostname);
                     wki_remote_net_detach(proxy_dev);
                     continue;
                 }
             }
+
+            ker::mod::dbg::log("[WKI] NET auto-attached: %s -> node=0x%04x", pending.nic_name, pending.node_id);
+
+            // In sparse mode we intentionally avoid auto-installing routes.
+            // Remote NIC discovery happens before local DHCP/static configuration
+            // is necessarily complete, so eagerly adding a same-subnet route can
+            // steal local traffic (e.g. SSH/NTP) until the real NIC is configured.
+            // ATTACH_ALL keeps the old behavior and auto-routes every remote NIC.
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_ALL && proxy_state != nullptr && proxy_state->owner_ipv4_addr != 0 &&
+                proxy_state->owner_ipv4_mask != 0) {
+                uint32_t remote_subnet = proxy_state->owner_ipv4_addr & proxy_state->owner_ipv4_mask;
+                int route_ret = ker::net::route_add(remote_subnet, proxy_state->owner_ipv4_mask, 0 /*gateway*/, 100 /*metric*/, proxy_dev);
+                if (route_ret == 0) {
+                    ker::mod::dbg::log("[WKI] Route installed: subnet=0x%08x mask=0x%08x via %s", remote_subnet,
+                                       proxy_state->owner_ipv4_mask, pending.nic_name);
+                }
+            }
         }
 
-        ker::mod::dbg::log("[WKI] NET auto-attached: %s -> node=0x%04x", pending.nic_name, pending.node_id);
-
-        // In sparse mode we intentionally avoid auto-installing routes.
-        // Remote NIC discovery happens before local DHCP/static configuration
-        // is necessarily complete, so eagerly adding a same-subnet route can
-        // steal local traffic (e.g. SSH/NTP) until the real NIC is configured.
-        // ATTACH_ALL keeps the old behavior and auto-routes every remote NIC.
-        auto* proxy_state = static_cast<ProxyNetState*>(proxy_dev->private_data);
-        if (g_wki.nic_policy == WkiNicPolicy::ATTACH_ALL && proxy_state != nullptr && proxy_state->owner_ipv4_addr != 0 &&
-            proxy_state->owner_ipv4_mask != 0) {
-            uint32_t remote_subnet = proxy_state->owner_ipv4_addr & proxy_state->owner_ipv4_mask;
-            int route_ret = ker::net::route_add(remote_subnet, proxy_state->owner_ipv4_mask, 0 /*gateway*/, 100 /*metric*/, proxy_dev);
-            if (route_ret == 0) {
-                ker::mod::dbg::log("[WKI] Route installed: subnet=0x%08x mask=0x%08x via %s", remote_subnet, proxy_state->owner_ipv4_mask,
-                                   pending.nic_name);
-            }
+        if (!processed_any) {
+            break;
         }
     }
 }

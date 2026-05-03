@@ -76,15 +76,17 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
         uint32_t apicId = apic::getApicId();
         uint64_t cpuIdFromApic = smt::get_cpu_index_from_apic_id(apicId);
-        dbg::log("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%x cr3=0x%lx taskPagemap=%p", apicId, cpuIdFromApic,
-                 currentTaskForDump, (currentTaskForDump != nullptr) ? currentTaskForDump->pid : 0xDEAD, cr3,
-                 (currentTaskForDump != nullptr) ? (void*)currentTaskForDump->pagemap : nullptr);
+        dbg::emit_log("kernel", dbg::LogLevel::WARN,
+                      "USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apicId, cpuIdFromApic,
+                      currentTaskForDump, (currentTaskForDump != nullptr) ? currentTaskForDump->pid : 0xDEAD, cr3,
+                      (currentTaskForDump != nullptr) ? (void*)currentTaskForDump->pagemap : nullptr);
 
         ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
         if (frame.intNum == 14) {
-            dbg::log("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%x", cr2, frame.errCode, frame.rip,
-                     frame.rsp, ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+            dbg::emit_log("kernel", dbg::LogLevel::WARN, "Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2,
+                          frame.errCode, frame.rip, frame.rsp,
+                          (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
 
             auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF);
             uint64_t idx4 = (cr2 >> 39) & 0x1FF;
@@ -127,7 +129,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         }
 
         dbg::log("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.intNum, frame.errCode, frame.rip,
-                 ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+                 (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
         ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
         __builtin_unreachable();
     }

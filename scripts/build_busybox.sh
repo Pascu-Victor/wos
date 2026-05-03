@@ -21,7 +21,7 @@ BB_RANLIB="$HOST/bin/llvm-ranlib"
 BB_OBJCOPY="$HOST/bin/llvm-objcopy"
 BB_NM="$HOST/bin/llvm-nm"
 BB_HOSTCC="gcc"
-BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector"
+BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector -Wno-string-plus-int"
 BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -Wl,--no-dynamic-linker"
 
 # Re-apply config from wos_defconfig to stay in sync.

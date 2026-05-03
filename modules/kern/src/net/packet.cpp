@@ -124,7 +124,7 @@ auto pkt_alloc_tx() -> PacketBuffer* {
 
     size_t avail = free_count.load(std::memory_order_relaxed);
     if (avail <= RX_RESERVE) {
-        ker::mod::dbg::log("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu)", avail, RX_RESERVE);
+        ker::mod::dbg::emit_log("net", mod::dbg::LogLevel::ERROR, "pkt_alloc_tx: REFUSED (free=%zu reserve=%zu)", avail, RX_RESERVE);
         return nullptr;  // Pool too low, reserve for RX
     }
 

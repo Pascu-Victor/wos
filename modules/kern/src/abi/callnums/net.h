@@ -22,6 +22,11 @@ enum class ops : uint64_t {
     POLL,
     IOCTL_NET,
     SET_DEV_CPU_AFFINITY,
+    NETCTL_IF_LIST,
+    NETCTL_ADDR_LIST,
+    NETCTL_ADDR_SET,
+    NETCTL_ADDR_DEL,
+    NETCTL_LINK_SET,
 };
 
 }  // namespace ker::abi::net

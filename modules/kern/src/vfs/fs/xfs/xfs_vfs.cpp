@@ -55,6 +55,13 @@ struct XfsFileData {
 
 namespace {
 
+auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
+    auto agno = xfs_ag_number(fsbno, ctx->ag_blk_log);
+    auto agbno = xfs_ag_block(fsbno, ctx->ag_blk_log);
+    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+    return linear_block * (ctx->block_size / ctx->device->block_size);
+}
+
 auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
     // Start at the root inode
     XfsInode* ip = xfs_inode_read(ctx, ctx->root_ino);
@@ -231,7 +238,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         bool dma_safe_dst = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
         if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0 && dma_safe_dst) {
             // Aligned, full-block read - go direct to the block device.
-            uint64_t dev_block = disk_block * (ctx->block_size / ctx->device->block_size);
+            uint64_t dev_block = xfs_fsblock_to_dev_block(ctx, disk_block);
             size_t dev_count = chunk / ctx->device->block_size;
             int rc = dev::block_read(ctx->device, dev_block, dev_count, dst + total_read);
 #ifdef XFS_BENCH

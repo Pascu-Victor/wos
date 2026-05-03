@@ -20,6 +20,10 @@ size_t device_count = 0;
 uint32_t next_ifindex = 1;
 uint32_t next_eth_index = 0;
 mod::sys::Spinlock devices_lock;
+
+constexpr uint32_t IFF_BROADCAST = 0x0002;
+constexpr uint32_t IFF_LOOPBACK = 0x0008;
+constexpr uint32_t IFF_MULTICAST = 0x1000;
 }  // namespace
 
 auto netdev_register(NetDevice* dev) -> int {
@@ -49,6 +53,17 @@ auto netdev_register(NetDevice* dev) -> int {
             buf[5] = '\0';
         }
         dev->name = buf;
+    }
+
+    if (dev->tx_queue_len == 0) {
+        dev->tx_queue_len = 1000;
+    }
+    if (dev->link_flags == 0) {
+        if (std::strcmp(dev->name.data(), "lo") == 0) {
+            dev->link_flags = IFF_LOOPBACK;
+        } else {
+            dev->link_flags = IFF_BROADCAST | IFF_MULTICAST;
+        }
     }
 
     devices[device_count] = dev;

@@ -118,6 +118,7 @@ void set_cpu_daemon_penalty(uint64_t cpu_no, uint32_t penalty);  // Set daemon_l
 void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_id on a CPU's RunQueue (Phase 8)
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
+bool can_query_current_task();
 void remove_current_task();                                       // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;               // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)

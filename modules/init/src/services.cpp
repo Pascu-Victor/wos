@@ -7,26 +7,45 @@
 #include <cstdint>
 #include <print>
 
+#include "init_log.h"
 #include "sys/multiproc.h"
 
 namespace {
 constexpr int BACKGROUND_SERVICE_NICE = 10;
 }
 
+void start_journald() {
+    int cpuno = ker::multiproc::currentThreadId();
+
+    init_info("init[%d]: spawning journald", cpuno);
+    std::array<const char*, 2> argv = {"/sbin/journald", nullptr};
+    std::array<const char*, 1> envp = {nullptr};
+    uint64_t pid = ker::process::exec("/sbin/journald", argv.data(), envp.data());
+    if (pid == 0) {
+        init_warn("init[%d]: failed to spawn journald", cpuno);
+    } else {
+        int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(pid), BACKGROUND_SERVICE_NICE);
+        init_info("init[%d]: journald spawned as PID %llu", cpuno, static_cast<unsigned long long>(pid));
+        if (prio_rc < 0) {
+            init_warn("init[%d]: failed to lower journald priority (%lld)", cpuno, static_cast<long long>(prio_rc));
+        }
+    }
+}
+
 void start_httpd() {
     int cpuno = ker::multiproc::currentThreadId();
 
-    std::println("init[{}]: spawning httpd (HTTP server on port 80)", cpuno);
+    init_info("init[%d]: spawning httpd (HTTP server on port 80)", cpuno);
     std::array<const char*, 2> httpd_argv = {"/sbin/httpd", nullptr};
     std::array<const char*, 1> httpd_envp = {nullptr};
     uint64_t httpd_pid = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_envp.data());
     if (httpd_pid == 0) {
-        std::println("init[{}]: FAILED to spawn httpd", cpuno);
+        init_error("init[%d]: failed to spawn httpd", cpuno);
     } else {
         int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(httpd_pid), BACKGROUND_SERVICE_NICE);
-        std::println("init[{}]: httpd spawned as PID {}", cpuno, httpd_pid);
+        init_info("init[%d]: httpd spawned as PID %llu", cpuno, static_cast<unsigned long long>(httpd_pid));
         if (prio_rc < 0) {
-            std::println("init[{}]: WARNING: failed to lower httpd priority ({})", cpuno, prio_rc);
+            init_warn("init[%d]: failed to lower httpd priority (%lld)", cpuno, static_cast<long long>(prio_rc));
         }
     }
 }
@@ -38,35 +57,35 @@ void start_dropbear() {
     int key_fd = ker::abi::vfs::open("/etc/dropbear/dropbear_rsa_host_key", 0, 0);
     if (key_fd >= 0) {
         ker::abi::vfs::close(key_fd);
-        std::println("init[{}]: dropbear host key already exists", cpuno);
+        init_info("init[%d]: dropbear host key already exists", cpuno);
     } else {
-        std::println("init[{}]: generating dropbear RSA host key...", cpuno);
+        init_info("init[%d]: generating dropbear RSA host key...", cpuno);
         std::array<const char*, 6> keygen_argv = {"/bin/dropbearkey", "-t", "rsa", "-f", "/etc/dropbear/dropbear_rsa_host_key", nullptr};
         std::array<const char*, 1> keygen_envp = {nullptr};
         uint64_t keygen_pid = ker::process::exec("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data());
         if (keygen_pid == 0) {
-            std::println("init[{}]: FAILED to spawn dropbearkey", cpuno);
+            init_error("init[%d]: failed to spawn dropbearkey", cpuno);
         } else {
             int exit_code = 0;
             ker::process::waitpid((int64_t)keygen_pid, &exit_code, 0, nullptr);
-            std::println("init[{}]: dropbearkey exited with code {}", cpuno, exit_code);
+            init_info("init[%d]: dropbearkey exited with code %d", cpuno, exit_code);
         }
     }
 
     // Start dropbear in foreground mode (no fork/daemon)
-    std::println("init[{}]: spawning dropbear SSH server", cpuno);
+    init_info("init[%d]: spawning dropbear SSH server", cpuno);
     std::array<const char*, 5> dropbear_argv = {"/bin/dropbear", "-r", "/etc/dropbear/dropbear_rsa_host_key",
                                                 "-F",  // foreground, don't fork
                                                 nullptr};
     std::array<const char*, 1> dropbear_envp = {nullptr};
     uint64_t dropbear_pid = ker::process::exec("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data());
     if (dropbear_pid == 0) {
-        std::println("init[{}]: FAILED to spawn dropbear", cpuno);
+        init_error("init[%d]: failed to spawn dropbear", cpuno);
     } else {
         int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(dropbear_pid), BACKGROUND_SERVICE_NICE);
-        std::println("init[{}]: dropbear spawned as PID {}", cpuno, dropbear_pid);
+        init_info("init[%d]: dropbear spawned as PID %llu", cpuno, static_cast<unsigned long long>(dropbear_pid));
         if (prio_rc < 0) {
-            std::println("init[{}]: WARNING: failed to lower dropbear priority ({})", cpuno, prio_rc);
+            init_warn("init[%d]: failed to lower dropbear priority (%lld)", cpuno, static_cast<long long>(prio_rc));
         }
     }
 }

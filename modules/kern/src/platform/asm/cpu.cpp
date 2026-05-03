@@ -17,8 +17,7 @@ auto getCurrentCpuIdSafe() -> uint64_t {
     }
     // Early boot: use APIC ID
     uint32_t apic_id = apic::getApicId();
-    uint64_t core_count = smt::get_core_count();
-    if (core_count > 0) {
+    if (smt::has_cpu_data()) {
         return smt::get_cpu_index_from_apic_id(apic_id);
     }
     return 0;  // BSP during very early init

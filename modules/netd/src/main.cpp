@@ -2,6 +2,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sched.h>
+#include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/net.h>
 #include <sys/socket.h>
@@ -332,11 +333,50 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
 
 }  // anonymous namespace
 
+// Parse /etc/netdevs and return the first ifname assigned to the given driver.
+// On failure, returns the provided fallback.
+static auto netdevs_find_ifname(const char* driver, const char* fallback) -> const char* {
+    static char s_ifname[16] = {};
+
+    FILE* f = fopen("/etc/netdevs", "r");
+    if (f == nullptr) {
+        return fallback;
+    }
+
+    char line[128];
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        // Skip comments and blank lines
+        char* p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') {
+            continue;
+        }
+
+        // Parse "<ifname> <driver>"
+        char tok_ifname[16] = {};
+        char tok_driver[32] = {};
+        if (sscanf(p, "%15s %31s", tok_ifname, tok_driver) != 2) {
+            continue;
+        }
+
+        if (std::strcmp(tok_driver, driver) == 0) {
+            fclose(f);
+            std::strncpy(s_ifname, tok_ifname, 15);
+            s_ifname[15] = '\0';
+            return s_ifname;
+        }
+    }
+    fclose(f);
+    return fallback;
+}
+
 auto main(int argc, char** argv) -> int {
     (void)argc;
     (void)argv;
 
-    const char* ifname = "eth0";
+    const char* ifname = netdevs_find_ifname("dhcp", "eth0");
     std::println("netd: starting DHCP client for {}", ifname);
 
     // Create UDP socket for DHCP

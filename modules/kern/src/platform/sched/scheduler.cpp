@@ -58,6 +58,7 @@ struct PidHashEntry {
 namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<PidHashEntry, MAX_PIDS> pid_table = {PidHashEntry{.pid = 0, .task = nullptr}};
+std::atomic<uint64_t> scheduler_task_context_ready_mask{0};
 
 constexpr std::array<uint32_t, 40> kNiceToWeight = {
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
@@ -848,6 +849,7 @@ void setup_queues() {
     // This is the portion of init() after smt::init() and EpochManager::init()
     // Used by the init dependency system for finer-grained control
     run_queues = new smt::PerCpuCrossAccess<RunQueue>();
+    scheduler_task_context_ready_mask.store(0, std::memory_order_release);
 
     // Allocate a dedicated vector for scheduler wake IPIs.
     wake_ipi_vector = gates::allocateVector();
@@ -933,6 +935,17 @@ auto post_task_balanced(task::Task* task) -> bool {
 // ============================================================================
 
 task::Task* get_current_task() { return run_queues->this_cpu()->currentTask; }
+
+bool can_query_current_task() {
+    if (run_queues == nullptr) {
+        return false;
+    }
+    uint64_t cpu_no = cpu::getCurrentCpuIdSafe();
+    if (cpu_no >= 64) {
+        return false;
+    }
+    return (scheduler_task_context_ready_mask.load(std::memory_order_acquire) & (1ULL << cpu_no)) != 0;
+}
 
 bool has_run_queues() { return run_queues != nullptr; }
 
@@ -1505,6 +1518,7 @@ void start_scheduler() {
     if (first_task == nullptr || first_task->type == task::TaskType::IDLE) {
         // Set idle task as current while waiting
         rq->currentTask = rq->idleTask;
+        scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::currentCpu(), std::memory_order_acq_rel);
 
         for (;;) {
             rq->isIdle.store(true, std::memory_order_release);
@@ -1542,6 +1556,8 @@ void start_scheduler() {
                 break;
             }
         }
+    } else {
+        scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::currentCpu(), std::memory_order_acq_rel);
     }
 
     // Check if task already ran before marking it - we need to know whether

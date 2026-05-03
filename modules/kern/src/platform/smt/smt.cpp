@@ -438,16 +438,20 @@ auto get_early_cpu_count() -> uint64_t {
     return 1;
 }
 
+auto has_cpu_data() -> bool { return cpuData != nullptr; }
+
 auto get_cpu(uint64_t number) -> CpuInfo& { return *cpuData->that_cpu(number); }
 
 // Get logical CPU index from APIC ID - doesn't depend on GS register
 auto get_cpu_index_from_apic_id(uint32_t apicId) -> uint64_t {
+    if (cpuData == nullptr) {
+        return 0;
+    }
     for (uint64_t i = 0; i < g_cpu_count; i++) {
         if (cpuData->that_cpu(i)->lapic_id == apicId) {
             return i;
         }
     }
-    // Fallback - shouldn't happen
     return 0;
 }
 namespace {
