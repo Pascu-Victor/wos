@@ -17,7 +17,6 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #include "platform/sys/spinlock.hpp"
@@ -582,7 +581,7 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
 
         // Build request: DevOpReqPayload + {lba:u64, count:u32} + data
         auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + 12 + chunk_bytes);
-        auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+        auto* req_buf = new (std::nothrow) uint8_t[req_total];
         if (req_buf == nullptr) {
             return -1;
         }
@@ -609,7 +608,7 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
 
         // Send request
         int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-        ker::mod::mm::dyn::kmalloc::free(req_buf);
+        delete[] req_buf;
 
         if (send_ret != WKI_OK) {
             state->op_wait_entry = nullptr;
@@ -1743,7 +1742,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 }
 
                 // Allocate read-ahead cache buffer (one data-slot's worth)
-                state->ra_buffer = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(ring_hdr->data_slot_size));
+                state->ra_buffer = new (std::nothrow) uint8_t[ring_hdr->data_slot_size];
                 if (state->ra_buffer != nullptr) {
                     state->ra_capacity = ring_hdr->data_slot_size / ring_hdr->block_size;
                 } else {
@@ -1853,7 +1852,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         constexpr uint32_t DEFAULT_BULK_STAGING = 2 * 1024 * 1024;
         uint32_t staging_sz = (state->bulk_max_transfer > 0 && state->bulk_max_transfer < DEFAULT_BULK_STAGING) ? state->bulk_max_transfer
                                                                                                                 : DEFAULT_BULK_STAGING;
-        state->bulk_staging_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(staging_sz));
+        state->bulk_staging_buf = new (std::nothrow) uint8_t[staging_sz];
         if (state->bulk_staging_buf != nullptr) {
             uint32_t rkey = 0;
             int reg_ret = state->rdma_transport->rdma_register_region(
@@ -1864,7 +1863,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 state->bdev.capabilities |= ker::dev::BDEV_CAP_BULK_RDMA;
                 ker::mod::dbg::log("[WKI] Dev proxy bulk staging registered: size=%uKB rkey=0x%08x", staging_sz / 1024, rkey);
             } else {
-                ker::mod::mm::dyn::kmalloc::free(state->bulk_staging_buf);
+                delete[] state->bulk_staging_buf;
                 state->bulk_staging_buf = nullptr;
                 state->bulk_capable = false;
                 ker::mod::dbg::log("[WKI] Dev proxy bulk staging register failed: err=%d", reg_ret);
@@ -1941,12 +1940,12 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
 
     // Free read-ahead cache
     if (ra_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(ra_buf);
+        delete[] ra_buf;
     }
 
     // Free bulk staging buffer
     if (bulk_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(bulk_buf);
+        delete[] bulk_buf;
     }
 
     // Destroy RDMA zone before sending detach
@@ -2053,7 +2052,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
     // Free RA buffers and close channels outside lock
     for (int i = 0; i < cleanup_count; i++) {
         if (cleanup[i].ra_buf != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(cleanup[i].ra_buf);
+            delete[] cleanup[i].ra_buf;
         }
         WkiChannel* ch = wki_channel_get(cleanup[i].owner_node, cleanup[i].channel);
         if (ch != nullptr) {
@@ -2164,7 +2163,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
 
                     // Re-allocate read-ahead cache if needed
                     if (p->ra_buffer == nullptr) {
-                        p->ra_buffer = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(ring_hdr->data_slot_size));
+                        p->ra_buffer = new (std::nothrow) uint8_t[ring_hdr->data_slot_size];
                         if (p->ra_buffer != nullptr) {
                             p->ra_capacity = ring_hdr->data_slot_size / ring_hdr->block_size;
                         }
@@ -2248,7 +2247,7 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
     // Cleanup outside lock: unregister + close channels + free RA + destroy zones
     for (int i = 0; i < info_count; i++) {
         if (info[i].ra_buf != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(info[i].ra_buf);
+            delete[] info[i].ra_buf;
         }
         if (info[i].rdma_zone_id != 0) {
             wki_zone_destroy(info[i].rdma_zone_id);

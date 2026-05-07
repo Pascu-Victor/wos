@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
@@ -459,15 +459,39 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
         }
     };
 
+    // Strip the task root prefix so mount points appear task-root-relative,
+    // matching what POSIX processes expect (e.g. "/dev" not "/rootfs/dev").
+    const char* task_root = "/";
+    size_t root_len = 1;
+    if (ker::mod::sched::can_query_current_task()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr && task->root[0] == '/' && task->root[1] != '\0') {
+            task_root = task->root;
+            root_len = std::strlen(task_root);
+        }
+    }
+
     // Iterate mount table
     for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
         auto* m = ker::vfs::get_mount_at(i);
         if (m == nullptr) {
             continue;
         }
+        const char* mount_path = (m->path != nullptr) ? m->path : "/";
+
+        // Compute the task-relative display path by stripping the task root prefix.
+        const char* display_path = mount_path;
+        if (root_len > 1 && std::strncmp(mount_path, task_root, root_len) == 0 &&
+            (mount_path[root_len] == '/' || mount_path[root_len] == '\0')) {
+            display_path = mount_path + root_len;
+            if (display_path[0] == '\0') {
+                display_path = "/";
+            }
+        }
+
         append((m->fstype != nullptr) ? m->fstype : "none");
         append(" ");
-        append((m->path != nullptr) ? m->path : "/");
+        append(display_path);
         append(" ");
         append((m->fstype != nullptr) ? m->fstype : "none");
         append(" rw 0 0\n");
@@ -862,8 +886,10 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
     char* end = buf + bufsz - 1;
 
     uint64_t cpu_count = ker::mod::smt::get_core_count();
-    if (cpu_count == 0) cpu_count = 8;
-    if (cpu_count > ker::mod::perf::get_num_perf_cpus()) cpu_count = ker::mod::perf::get_num_perf_cpus();
+    if (cpu_count == 0) {
+        cpu_count = 1;
+    }
+    cpu_count = std::min(cpu_count, ker::mod::perf::get_num_perf_cpus());
 
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
@@ -928,7 +954,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                          pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
         size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
-        pfd->content = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(alloc_sz));
+        pfd->content = new (std::nothrow) char[alloc_sz];
         if (pfd->content == nullptr) {
             return -ENOMEM;
         }
@@ -1046,7 +1072,8 @@ auto procfs_close(File* f) -> int {
     if (f->private_data != nullptr) {
         auto* pfd = static_cast<ProcFileData*>(f->private_data);
         if (pfd->content != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(pfd->content);
+            delete[] pfd->content;
+            pfd->content = nullptr;
         }
         delete pfd;
         f->private_data = nullptr;

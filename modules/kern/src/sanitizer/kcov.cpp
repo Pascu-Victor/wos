@@ -13,9 +13,9 @@
 
 #ifdef WOS_KCOV
 
-#include <sanitizer/kcov.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/dyn/kmalloc.hpp>
+#include <sanitizer/kcov.hpp>
 
 // Per-CPU KCOV buffer pointer.  In a full implementation this would be
 // stored in the Task struct (per-task).  For the initial bring-up we use
@@ -33,13 +33,12 @@ int alloc_buffer(size_t num_entries) {
         num_entries = KCOV_MAX_ENTRIES;
     }
 
-    auto* buf = ker::mod::mm::dyn::kmalloc::malloc<KcovBuffer>();
+    auto* buf = new (std::nothrow) KcovBuffer{};
     if (!buf) return -1;  // ENOMEM
 
-    buf->pcs = static_cast<uint64_t*>(
-        ker::mod::mm::dyn::kmalloc::malloc(num_entries * sizeof(uint64_t)));
+    buf->pcs = new (std::nothrow) uint64_t[num_entries];
     if (!buf->pcs) {
-        ker::mod::mm::dyn::kmalloc::free(buf);
+        delete buf;
         return -1;
     }
 
@@ -68,9 +67,7 @@ void reset() {
     }
 }
 
-KcovBuffer* current_buffer() {
-    return s_current_buffer;
-}
+KcovBuffer* current_buffer() { return s_current_buffer; }
 
 }  // namespace ker::sanitizer::kcov
 

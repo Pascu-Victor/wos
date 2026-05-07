@@ -14,12 +14,18 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+
+#include "net/endian.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -128,7 +134,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
 
     // Read body data
     uint32_t data_blocks = (body_size + block_size - 1) / block_size;
-    auto* body_buf = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(body_size));
+    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(data_blocks) * block_size];
     if (body_buf == nullptr) {
         return -1;
     }
@@ -140,7 +146,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
         uint64_t data_disk_block = log->log_start + cur_block;
         BufHead* data_bh = xfs_buf_read(ctx, data_disk_block);
         if (data_bh == nullptr) {
-            mod::mm::dyn::kmalloc::free(body_buf);
+            delete[] body_buf;
             return -1;
         }
 
@@ -200,7 +206,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
         }
     }
 
-    mod::mm::dyn::kmalloc::free(body_buf);
+    delete[] body_buf;
 
     mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u", replayed, num_logops, block);
 
@@ -412,7 +418,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t body_offset = 0;
 
     // Temporary buffer for assembling body data
-    auto* body_buf = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(body_size));
+    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(data_blocks) * block_size];
     if (body_buf == nullptr) {
         return -ENOMEM;
     }
@@ -445,7 +451,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         // Use xfs_buf_get - we zero+overwrite the full block, no read needed.
         BufHead* data_bh = xfs_buf_get(mount, data_disk_block);
         if (data_bh == nullptr) {
-            mod::mm::dyn::kmalloc::free(body_buf);
+            delete[] body_buf;
             return -EIO;
         }
 
@@ -461,7 +467,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         cur_block = (cur_block + 1) % log->log_blocks;
     }
 
-    mod::mm::dyn::kmalloc::free(body_buf);
+    delete[] body_buf;
 
     // Advance the log head
     log->tail_block = head;

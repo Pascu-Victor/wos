@@ -109,6 +109,14 @@ void* Slab<slab_size, memory_size>::alloc_unlocked() {
         }
     }
     if (header.next) {
+        // Validate before following the pointer — misaligned means page-reuse UAF.
+        auto next_addr = reinterpret_cast<uintptr_t>(header.next);
+        if ((next_addr & 0xfULL) != 0 || !((next_addr >= 0xffff800000000000ULL && next_addr < 0xffff900000000000ULL) ||
+                                           (next_addr >= 0xffffffff80000000ULL && next_addr < 0xffffffffc0000000ULL))) {
+            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u", (unsigned long long)next_addr,
+                               this, header.free_blocks, header.magic, header.size);
+            ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
+        }
         return header.next->alloc_unlocked();
     }
     return alloc_in_new_slab();
@@ -277,6 +285,15 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
 
     header.next_fit_block = block_index;
     header.free_blocks++;
+
+    // If a 0x100 slab is completely free, keep it linked instead of returning
+    // the page to the OS. Repeated stale frees in fork/pipe stress are currently
+    // turning into retired-page reuse panics before the first producer is visible.
+    // Quarantining this size class keeps the slab metadata intact long enough to
+    // surface the real invalid-free site.
+    if constexpr (slab_size == 0x100) {
+        return;
+    }
 
     // If slab is completely free and it's not the first slab, return it to OS
     if ((header.free_blocks == MAX_BLOCKS) && (header.prev)) {

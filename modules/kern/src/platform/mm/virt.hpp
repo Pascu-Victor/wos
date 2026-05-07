@@ -51,7 +51,7 @@ paddr_t translate(PageTable* pageTable, vaddr_t vaddr);
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact
 // After calling this, the pagemap itself should be freed with phys::pageFree
-void destroyUserSpace(PageTable* pagemap);
+void destroyUserSpace(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr);
 
 // Deep-copy user-space page tables from src to dst using COW.
 // Both src and dst PML1 entries are marked read-only + COW bit.
@@ -59,4 +59,9 @@ void destroyUserSpace(PageTable* pagemap);
 // Page table structures (PML3/PML2/PML1) are freshly allocated for dst.
 // Returns true on success, false on OOM.
 bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst);
+
+// Debug helper: log active/dead user mappings that still reference a physical page.
+// Intended for targeted fault-path diagnostics only.
+bool debugLogUserPhysMappings(uint64_t target_phys, const char* trigger, uint64_t owner_pid = 0, const char* owner_name = nullptr,
+                              bool log_when_empty = true);
 }  // namespace ker::mod::mm::virt

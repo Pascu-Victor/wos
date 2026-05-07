@@ -1,6 +1,8 @@
 #include "spinlock.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <mod/io/serial/serial.hpp>
 
 #if SPINLOCK_DEBUG

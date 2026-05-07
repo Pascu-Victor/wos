@@ -30,16 +30,19 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->parentPid = 0;        // Initialize to 0 (no parent by default, will be set by exec or fork)
     this->elfBuffer = nullptr;  // No ELF buffer by default
     this->elfBufferSize = 0;
-    this->hasRun = false;              // Task hasn't run yet, context.frame contains initial setup
-    this->exitStatus = 0;              // Initialize exit status
-    this->hasExited = false;           // Task hasn't exited yet
+    this->hasRun = false;     // Task hasn't run yet, context.frame contains initial setup
+    this->exitStatus = 0;     // Initialize exit status
+    this->hasExited = false;  // Task hasn't exited yet
+    this->waitedOn = false;
     this->deferredTaskSwitch = false;  // No deferred switch by default
     this->yieldSwitch = false;
     this->kthreadEntry = nullptr;
 
     // Waitpid state
     this->waitingForPid = 0;
+    this->waitStatusUserAddr = 0;
     this->waitStatusPhysAddr = 0;
+    this->waitRusageUserAddr = 0;
     this->waitRusagePhysAddr = 0;
 
     // Process time accounting
@@ -401,7 +404,9 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->yieldSwitch = false;
     t->voluntaryBlock = false;
     t->waitingForPid = 0;
+    t->waitStatusUserAddr = 0;
     t->waitStatusPhysAddr = 0;
+    t->waitRusageUserAddr = 0;
     t->waitRusagePhysAddr = 0;
     t->vruntime = 0;
     t->vdeadline = 0;

@@ -88,7 +88,7 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     int* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(phys_page) + offset);
 
     // Allocate a waiter node
-    auto* waiter = static_cast<FutexWaiter*>(mod::mm::dyn::kmalloc::malloc(sizeof(FutexWaiter)));
+    auto* waiter = new (std::nothrow) FutexWaiter{};
     if (waiter == nullptr) {
         return -ENOMEM;
     }
@@ -106,14 +106,19 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     // insert is unconditional, we check first, then insert.
     int current_value = *kernel_addr;
     if (current_value != expected) {
-        mod::mm::dyn::kmalloc::free(waiter);
+        delete waiter;
         return -EAGAIN;  // Value changed, don't wait
     }
 
     // Insert into hash table (per-bucket lock acquired internally)
     if (!futex_table.insert(waiter)) {
-        mod::mm::dyn::kmalloc::free(waiter);
+        delete waiter;
         return -ENOMEM;
+    }
+
+    void* previous_waiter = current_task->futexWaiter.exchange(waiter, std::memory_order_acq_rel);
+    if (previous_waiter != nullptr) {
+        mod::dbg::log("futex_wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
     }
 
     // Set deferred task switch to move task to wait queue
@@ -145,16 +150,39 @@ int64_t futex_wake(int* addr) {  // NOLINT
 
     // Remove all waiters on this address and wake them
     futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
-        auto* waiter_task = mod::sched::find_task_by_pid(waiter->task_pid);
+        bool own_waiter = true;
+        auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
+            void* expected_waiter = waiter;
+            if (!waiter_task->futexWaiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
+                                                                  std::memory_order_acquire)) {
+                own_waiter = false;
+            }
             waiter_task->deferredTaskSwitch = false;
             mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
             woken_count++;
+            waiter_task->release();
         }
-        mod::mm::dyn::kmalloc::free(waiter);
+        if (waiter_task == nullptr || own_waiter) {
+            delete waiter;
+        }
     });
 
     return woken_count;
+}
+
+void futex_wait_cleanup_for_task(mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    auto* waiter = static_cast<FutexWaiter*>(task->futexWaiter.exchange(nullptr, std::memory_order_acq_rel));
+    if (waiter == nullptr) {
+        return;
+    }
+
+    futex_table.remove(waiter);
+    delete waiter;
 }
 
 }  // namespace ker::syscall::futex

@@ -18,9 +18,9 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -437,9 +437,9 @@ void close_proxy_fd_table(ker::mod::sched::task::Task* task) {
                 file->fops->vfs_close(file);
             }
             if (file->vfs_path != nullptr) {
-                ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(file->vfs_path));
+                delete[] file->vfs_path;
             }
-            ker::mod::mm::dyn::kmalloc::free(file);
+            delete file;
         }
     }
 }
@@ -477,7 +477,9 @@ void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
 
     close_proxy_fd_table(task);
     if (task->elfBuffer != nullptr) {
-        if (!release_cached_elf_buffer(task->elfBuffer)) {
+        if (task->isElfBufferShared) {
+            release_cached_elf_buffer(task->elfBuffer);
+        } else {
             delete[] task->elfBuffer;
         }
         task->elfBuffer = nullptr;
@@ -529,9 +531,14 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
         if (waiting_task != nullptr) {
             if (!waiting_task->deferredTaskSwitch) {
                 waiting_task->context.regs.rax = proxy->pid;
-                if (waiting_task->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
-                    *status_ptr = wait_status;
+                if (waiting_task->waitStatusUserAddr != 0 && waiting_task->pagemap != nullptr) {
+                    uint64_t status_phys = ker::mod::mm::virt::translate(waiting_task->pagemap, waiting_task->waitStatusUserAddr);
+                    if (status_phys != ker::mod::mm::virt::PADDR_INVALID && status_phys != 0) {
+                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(status_phys));
+                        *status_ptr = wait_status;
+                    }
+                    waiting_task->waitStatusUserAddr = 0;
+                    waiting_task->waitStatusPhysAddr = 0;
                 }
             }
             uint64_t cpu = ker::mod::sched::get_least_loaded_cpu();
@@ -579,9 +586,14 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
             static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
             if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
                 parent->context.regs.rax = proxy->pid;
-                if (parent->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(parent->waitStatusPhysAddr));
-                    *status_ptr = wait_status;
+                if (parent->waitStatusUserAddr != 0 && parent->pagemap != nullptr) {
+                    uint64_t status_phys = ker::mod::mm::virt::translate(parent->pagemap, parent->waitStatusUserAddr);
+                    if (status_phys != ker::mod::mm::virt::PADDR_INVALID && status_phys != 0) {
+                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(status_phys));
+                        *status_ptr = wait_status;
+                    }
+                    parent->waitStatusUserAddr = 0;
+                    parent->waitStatusPhysAddr = 0;
                 }
                 parent->waitingForPid = 0;
                 proxy->waitedOn = true;
@@ -965,29 +977,6 @@ auto fallback_to_local_path_for_disconnected_wki_host(const char* path, char* ou
     return true;
 }
 
-void force_receiver_local_root_rule(ker::mod::sched::task::Task* task) {
-    if (task == nullptr) {
-        return;
-    }
-
-    for (size_t i = 0; i < task->wki_vfs_rules.size(); ++i) {
-        auto& rule = task->wki_vfs_rules[i];
-        if (rule.prefix_len == 1 && rule.prefix[0] == '/' && rule.prefix[1] == '\0') {
-            rule.route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
-            rule.reserved = 0;
-            return;
-        }
-    }
-
-    ker::mod::sched::task::WkiVfsRule local_root_rule{};
-    local_root_rule.prefix[0] = '/';
-    local_root_rule.prefix[1] = '\0';
-    local_root_rule.prefix_len = 1;
-    local_root_rule.route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
-    local_root_rule.reserved = 0;
-    (void)task->wki_vfs_rules.push_back(local_root_rule);
-}
-
 // -----------------------------------------------------------------------------
 // D17: Scheduler auto-placement hook (V2).
 // Called from postTaskBalanced() when WKI is active and task is a PROCESS.
@@ -1017,6 +1006,8 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> bool {
 }
 
 }  // namespace
+
+auto wki_preferred_remote_node() -> uint16_t;
 
 // ===============================================================================
 // Init
@@ -1081,6 +1072,8 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
     const bool explicit_target = task->wki_target_hostname[0] != '\0';
     const bool strict_target = explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
+    const bool prefer_remote = !explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
+    const bool strict_remote = prefer_remote && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
 
     uint16_t best_node = WKI_NODE_INVALID;
     if (explicit_target) {
@@ -1099,6 +1092,13 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         }
 
         best_node = node_id;
+    } else if (prefer_remote) {
+        s_compute_lock.lock();
+        best_node = wki_preferred_remote_node();
+        s_compute_lock.unlock();
+        if (best_node == WKI_NODE_INVALID) {
+            return strict_remote ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+        }
     } else {
         uint16_t local_load = compute_local_load();
         s_compute_lock.lock();
@@ -1166,7 +1166,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         return strict_target ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
     }
 
-    if (!release_cached_elf_buffer(task->elfBuffer)) {
+    if (task->isElfBufferShared) {
+        release_cached_elf_buffer(task->elfBuffer);
+    } else {
         delete[] task->elfBuffer;
     }
     task->elfBuffer = nullptr;
@@ -1283,7 +1285,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
 
     // Build TASK_SUBMIT message
     auto msg_len = static_cast<uint16_t>(total);
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
+    auto* buf = new (std::nothrow) uint8_t[msg_len];
     if (buf == nullptr) {
         s_compute_lock.lock();
         task_ptr->active = false;
@@ -1325,7 +1327,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     task_ptr->response_pending.store(true, std::memory_order_release);
 
     int send_ret = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
-    ker::mod::mm::dyn::kmalloc::free(buf);
+    delete[] buf;
 
     if (send_ret != WKI_OK) {
         task_ptr->response_wait_entry = nullptr;
@@ -1416,7 +1418,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, task_id, path_len, callsite);
 
     auto msg_len = static_cast<uint16_t>(total);
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
+    auto* buf = new (std::nothrow) uint8_t[msg_len];
     if (buf == nullptr) {
         s_compute_lock.lock();
         task_ptr->active = false;
@@ -1458,7 +1460,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     task_ptr->response_pending.store(true, std::memory_order_release);
 
     int send_ret = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
-    ker::mod::mm::dyn::kmalloc::free(buf);
+    delete[] buf;
 
     if (send_ret != WKI_OK) {
         task_ptr->response_wait_entry = nullptr;
@@ -1744,6 +1746,44 @@ auto wki_least_loaded_node(uint16_t local_load) -> uint16_t {
     return best_node;
 }
 
+// s_compute_lock must be held by caller.
+auto wki_preferred_remote_node() -> uint16_t {
+    uint16_t best_node = WKI_NODE_INVALID;
+    uint16_t best_load = UINT16_MAX;
+    uint64_t now = wki_now_us();
+
+    for (const auto& rl : g_remote_loads) {
+        if (!rl.valid) {
+            continue;
+        }
+        if (now - rl.last_update_us > 1000000) {
+            continue;
+        }
+        auto* peer = wki_peer_find(rl.node_id);
+        if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+            continue;
+        }
+        uint16_t adjusted = rl.avg_load_pct + WKI_REMOTE_PLACEMENT_PENALTY;
+        if (adjusted < best_load) {
+            best_load = adjusted;
+            best_node = rl.node_id;
+        }
+    }
+
+    if (best_node != WKI_NODE_INVALID) {
+        return best_node;
+    }
+
+    for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
+        auto* peer = &g_wki.peers[i];
+        if (peer->node_id != WKI_NODE_INVALID && peer->state == PeerState::CONNECTED) {
+            return peer->node_id;
+        }
+    }
+
+    return WKI_NODE_INVALID;
+}
+
 // ===============================================================================
 // Fencing Cleanup
 // ===============================================================================
@@ -1914,7 +1954,7 @@ void wki_remote_compute_check_completions() {
         // D19: Build TASK_COMPLETE with captured output
         uint16_t out_len = (info.output != nullptr) ? info.output->len : static_cast<uint16_t>(0);
         auto msg_len = static_cast<uint16_t>(sizeof(TaskCompletePayload) + out_len);
-        auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
+        auto* buf = new (std::nothrow) uint8_t[msg_len];
         if (buf != nullptr) {
             auto* complete = reinterpret_cast<TaskCompletePayload*>(buf);
             complete->task_id = info.task_id;
@@ -1926,7 +1966,7 @@ void wki_remote_compute_check_completions() {
             }
 
             wki_send(info.submitter_node, WKI_CHAN_RESOURCE, MsgType::TASK_COMPLETE, buf, msg_len);
-            ker::mod::mm::dyn::kmalloc::free(buf);
+            delete[] buf;
         }
 #if WKI_DEBUG
         ker::mod::dbg::log("[WKI] Remote task completed: task_id=%u pid=0x%lx exit=%d output=%u bytes", info.task_id, info.local_pid,
@@ -1998,6 +2038,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
 
     new_task->elfBuffer = elf_buffer;
     new_task->elfBufferSize = binary_len;
+    new_task->isElfBufferShared = shared_elf_buffer;
 
     // Set up stdin as /dev/null (EOF on read)
     {
@@ -2059,23 +2100,84 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 
     std::array<char, 512> localized_path = {};
     std::array<char, 512> fallback_local_path = {};
+    std::array<char, 512> local_strip_path = {};
     const char* resolved_path = path;
     if (localize_receiver_logical_path(path, localized_path.data(), localized_path.size())) {
         resolved_path = localized_path.data();
     }
 
+    // Before attempting any remote VFS path, check if stripping the /wki/<host>/
+    // prefix yields a path that exists locally. If it does, use it directly —
+    // this avoids remote VFS load entirely, preventing VFS traffic from
+    // overloading the submitter and causing false-positive heartbeat fencing.
     bool using_disconnected_host_fallback = false;
-    if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
-        resolved_path = fallback_local_path.data();
-        using_disconnected_host_fallback = true;
+    if (!using_disconnected_host_fallback) {
+        constexpr char wki_pfx[] = "/wki/";
+        constexpr size_t wki_pfx_len = sizeof(wki_pfx) - 1;
+        if (std::strncmp(resolved_path, wki_pfx, wki_pfx_len) == 0) {
+            const char* after_host = resolved_path + wki_pfx_len;
+            while (*after_host != '\0' && *after_host != '/') {
+                after_host++;
+            }
+            if (*after_host == '/') {
+                size_t suf_len = std::strlen(after_host);
+                if (suf_len + 1 <= local_strip_path.size()) {
+                    std::memcpy(local_strip_path.data(), after_host, suf_len + 1);
+                    ker::vfs::stat local_precheck = {};
+                    if (ker::vfs::vfs_stat(local_strip_path.data(), &local_precheck) == 0 && local_precheck.st_size > 0) {
+                        ker::mod::dbg::log("[WKI] VFS_REF: '%s' exists locally, skipping remote VFS load", local_strip_path.data());
+                        resolved_path = local_strip_path.data();
+                        using_disconnected_host_fallback = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!using_disconnected_host_fallback) {
+        if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
+            resolved_path = fallback_local_path.data();
+            using_disconnected_host_fallback = true;
+        }
     }
 
     ker::vfs::stat statbuf = {};
     if (ker::vfs::vfs_stat(resolved_path, &statbuf) != 0 || statbuf.st_size <= 0) {
-        ker::mod::dbg::log("[WKI] VFS_REF: failed to stat '%s'", resolved_path);
-        result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
-        load_measure.finish(perf_compute_reject_status(result.reject_reason));
-        return result;
+        // If the remote VFS path is inaccessible (e.g. /wki/<host> not mounted even
+        // though the peer is connected at WKI level), try the same relative path on
+        // the local filesystem before giving up.
+        bool did_local_strip_fallback = false;
+        if (!using_disconnected_host_fallback) {
+            constexpr char wki_pfx[] = "/wki/";
+            constexpr size_t wki_pfx_len = sizeof(wki_pfx) - 1;
+            if (std::strncmp(resolved_path, wki_pfx, wki_pfx_len) == 0) {
+                const char* after_host = resolved_path + wki_pfx_len;
+                while (*after_host != '\0' && *after_host != '/') {
+                    after_host++;
+                }
+                if (*after_host == '/') {
+                    size_t suf_len = std::strlen(after_host);
+                    if (suf_len + 1 <= local_strip_path.size()) {
+                        std::memcpy(local_strip_path.data(), after_host, suf_len + 1);
+                        ker::vfs::stat local_statbuf = {};
+                        if (ker::vfs::vfs_stat(local_strip_path.data(), &local_statbuf) == 0 && local_statbuf.st_size > 0) {
+                            ker::mod::dbg::log("[WKI] VFS_REF: remote path '%s' inaccessible, falling back to local '%s'", resolved_path,
+                                               local_strip_path.data());
+                            resolved_path = local_strip_path.data();
+                            using_disconnected_host_fallback = true;
+                            statbuf = local_statbuf;
+                            did_local_strip_fallback = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!did_local_strip_fallback) {
+            ker::mod::dbg::log("[WKI] VFS_REF: failed to stat '%s'", resolved_path);
+            result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
+            load_measure.finish(perf_compute_reject_status(result.reject_reason));
+            return result;
+        }
     }
     if (static_cast<uint64_t>(statbuf.st_size) > static_cast<uint64_t>(UINT32_MAX)) {
         result.reject_reason = TaskRejectReason::FETCH_FAILED;
@@ -2630,10 +2732,9 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
         task_cwd = logical_cwd.data();
     }
 
-    // Receiver-created tasks should resolve ordinary absolute and relative
-    // paths like local tasks on the receiver. Explicit /wki/host/... still
-    // reaches the submitter because /wki remains the more specific LOCAL rule.
-    force_receiver_local_root_rule(new_task);
+    // Receiver-created tasks keep the submitter hostname and inherited task VFS
+    // rules.  Ordinary paths are then routed by the effective WKI VFS policy
+    // rather than by a hidden receiver-local root override.
 
     size_t cwd_copy_len = std::strlen(task_cwd);
     if (cwd_copy_len >= ker::mod::sched::task::Task::CWD_MAX) {
@@ -2951,7 +3052,7 @@ static void drain_pending_task_submits() {
         }
 
         handle_task_submit_work(pending.src_node, pending.payload, pending.payload_len);
-        ker::mod::mm::dyn::kmalloc::free(pending.payload);
+        delete[] pending.payload;
     }
 }
 
@@ -3010,7 +3111,7 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     // re-entrance when dispatched from wki_rx().  Defer to the dedicated
     // compute submit thread where blocking VFS I/O is safe.
     if (mode == TaskDeliveryMode::VFS_REF || mode == TaskDeliveryMode::RESOURCE_REF) {
-        auto* copy = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(payload_len));
+        auto* copy = new (std::nothrow) uint8_t[payload_len];
         if (copy == nullptr) {
             TaskResponsePayload reject = {};
             reject.task_id = submit->task_id;

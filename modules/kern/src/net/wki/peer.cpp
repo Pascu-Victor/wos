@@ -466,11 +466,16 @@ void wki_peer_send_heartbeats() {
             continue;
         }
 
-        // Suppress heartbeat if we recently received traffic from this
-        // peer — active RX proves liveness, so an explicit ping is redundant.
+        // Suppress heartbeat only if we recently SENT traffic to this peer.
+        // Any data packet we send already proves our liveness to them; an
+        // explicit heartbeat is only needed when we have been silent.
+        // NOTE: do NOT suppress based on last_rx_activity (traffic received
+        // FROM the peer). That only proves THEIR liveness to us, not ours
+        // to them — using it caused false-positive fencing when a peer was
+        // sending to us but we weren't replying.
         uint64_t suppress_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000;
         uint64_t now_hb = wki_now_us();
-        if (peer->last_rx_activity != 0 && (now_hb - peer->last_rx_activity) < suppress_us) {
+        if (peer->last_tx_activity != 0 && (now_hb - peer->last_tx_activity) < suppress_us) {
             continue;
         }
 
@@ -729,6 +734,33 @@ static auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_i
     return now_us + effective_interval;
 }
 
+static auto wki_peer_observed_liveness_us(const WkiPeer* peer) -> uint64_t {
+    if (peer == nullptr) {
+        return 0;
+    }
+    return std::max(peer->last_heartbeat, peer->last_rx_activity);
+}
+
+static auto wki_peer_confirm_grace_us(const WkiPeer* peer) -> uint64_t {
+    if (peer == nullptr) {
+        return 0;
+    }
+    return std::max<uint64_t>(static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000, 500000);
+}
+
+static auto wki_peer_timeout_deadline_us(const WkiPeer* peer, uint64_t now_us) -> uint64_t {
+    if (peer == nullptr) {
+        return UINT64_MAX;
+    }
+
+    uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
+    uint64_t next_deadline = wki_peer_observed_liveness_us(peer) + timeout_us;
+    if (peer->missed_beats != 0) {
+        next_deadline += wki_peer_confirm_grace_us(peer);
+    }
+    return next_deadline > now_us ? next_deadline : now_us + 1;
+}
+
 static void wki_send_heartbeat_probe(WkiPeer* peer) {
     if (peer == nullptr || peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED || !peer->is_direct) {
         return;
@@ -796,10 +828,16 @@ void wki_peer_timer_tick(uint64_t now_us) {
         uint64_t last_rx = peer->last_rx_activity;
         uint64_t last_seen = (last_rx > last_hb) ? last_rx : last_hb;
 
-        // Handle race: activity arrived after we captured now_us
+        // Peer liveness must come from activity observed FROM the peer.
+        // Counting our own outbound traffic here can keep a dead or wedged peer
+        // "alive" forever because retries refresh the timestamp even when the
+        // peer never replies.
+
+        // Handle race: activity may arrive after we captured now_us.
         if (last_seen >= now_us) {
             continue;
         }
+
         uint64_t elapsed = now_us - last_seen;
         uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
 
@@ -810,7 +848,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
 
         // Two-phase fencing: first timeout only arms a probe/confirmation window.
         // This avoids false fencing when elapsed hovers around the exact threshold.
-        uint64_t confirm_grace_us = std::max<uint64_t>(static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000, 500000);
+        uint64_t confirm_grace_us = wki_peer_confirm_grace_us(peer);
         if (peer->missed_beats == 0) {
             peer->missed_beats = 1;
             mod::dbg::log("[WKI] Heartbeat timeout candidate for peer 0x%04x (%llu us elapsed, timeout %llu us); probing before fence",
@@ -946,8 +984,7 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
             continue;
         }
 
-        uint64_t timeout_us = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
-        next_deadline = std::min(next_deadline, peer->last_heartbeat + timeout_us);
+        next_deadline = std::min(next_deadline, wki_peer_timeout_deadline_us(peer, now_us));
     }
 
     return next_deadline;
@@ -963,9 +1000,10 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
         uint64_t sleep_us = WKI_TIMER_IDLE_SLEEP_US;
         if (next_deadline != UINT64_MAX) {
             if (next_deadline <= now_us) {
-                continue;
+                sleep_us = 1;
+            } else {
+                sleep_us = next_deadline - now_us;
             }
-            sleep_us = next_deadline - now_us;
         }
 
         if (wki_has_connected_peers()) {

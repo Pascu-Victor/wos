@@ -25,7 +25,7 @@
         {
             "id": 0,
             "name": "lan",
-            "nodes": 8,
+            "nodes": 2,
             "nic_model": "virtio-net-pci",
             "nic_queues": 2,
             "bridge": {
@@ -35,7 +35,7 @@
         {
             "id": 1,
             "name": "wki",
-            "nodes": 8,
+            "nodes": 2,
             "nic_model": "virtio-net-pci",
             "ivshmem": {
                 "enabled": false,

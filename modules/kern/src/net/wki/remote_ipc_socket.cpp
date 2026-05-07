@@ -3,7 +3,6 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -67,7 +66,7 @@ auto proxy_socket_close(ker::vfs::File* f) -> int {
 
     proxy->active = false;
     if (proxy->ring_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(proxy->ring_buf);
+        delete[] proxy->ring_buf;
         proxy->ring_buf = nullptr;
     }
     delete proxy;

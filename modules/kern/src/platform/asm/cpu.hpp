@@ -4,7 +4,6 @@
 #include <defines/defines.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/asm/msr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::mod::cpu {
 struct CpuidContext {

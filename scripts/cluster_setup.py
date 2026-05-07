@@ -33,7 +33,6 @@ from copy import deepcopy
 from pathlib import Path
 from itertools import combinations
 
-
 # ---------------------------------------------------------------------------
 # Config loading and resolution
 # ---------------------------------------------------------------------------
@@ -447,7 +446,9 @@ def inject_into_overlay(
         gf_cmds += "chmod 0600 /etc/dropbear/dropbear_rsa_host_key\n"
 
     if hostname:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".hostname", delete=False) as hf:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".hostname", delete=False
+        ) as hf:
             hf.write(hostname)
             hostname_file = hf.name
         gf_cmds += f"upload {hostname_file} /etc/hostname\n"
@@ -734,7 +735,9 @@ TCG_LOG_LEVELS = {
 }
 
 
-def build_qemu_args(node_id: int, node_info: dict, config: dict, tcg_level: str | None = None) -> list:
+def build_qemu_args(
+    node_id: int, node_info: dict, config: dict, tcg_level: str | None = None
+) -> list:
     """Build QEMU command line for a single node.
 
     tcg_level: None = KVM (default), "" = basic TCG, "int" = TCG+interrupts, "full" = TCG+cpu state
@@ -798,7 +801,9 @@ def build_qemu_args(node_id: int, node_info: dict, config: dict, tcg_level: str 
     if tcg_level is not None:
         accel_args = ["-accel", "tcg"]
         log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
-        print(f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}")
+        print(
+            f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}"
+        )
     else:
         accel_args = ["-cpu", "host", "--enable-kvm"]
         # Under KVM only trace events and guest_errors produce output;

@@ -34,6 +34,11 @@ bool enterPanicMode();
 // Returns true if panic mode is active.
 bool isPanicMode();
 
+// Returns true if this CPU is the one that won the panic lock (first caller of
+// enterPanicMode()). Use this to distinguish re-entrant calls on the owner CPU
+// (e.g. ubsan → panic_handler) from other CPUs entering panic paths.
+bool isPanicOwner();
+
 // Unlocked write variants - caller must hold lock via acquireLock()/releaseLock()
 void writeUnlocked(const char* str);
 void writeUnlocked(const char* str, uint64_t len);

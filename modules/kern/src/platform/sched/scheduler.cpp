@@ -56,6 +56,67 @@ struct PidHashEntry {
     task::Task* task;  // nullptr when slot empty
 };
 namespace {
+using wait_log = ker::mod::dbg::logger<"wait">;
+using resume_log = ker::mod::dbg::logger<"resume">;
+
+inline void validate_user_resume_target(task::Task* task, const char* path) {
+    if (task == nullptr || task->pagemap == nullptr || task->type != task::TaskType::PROCESS || task->voluntaryBlock) {
+        return;
+    }
+
+    const uint64_t rip = task->context.frame.rip;
+    const uint64_t rsp = task->context.frame.rsp;
+    const uint64_t rip_phys = mm::virt::translate(task->pagemap, rip);
+    const uint64_t rsp_phys = mm::virt::translate(task->pagemap, rsp);
+    const bool rip_bad = rip == 0 || rip >= 0x0000800000000000ULL || rip_phys == mm::virt::PADDR_INVALID;
+    const bool rsp_bad = rsp == 0 || rsp >= 0x0000800000000000ULL || rsp_phys == mm::virt::PADDR_INVALID;
+    if (!rip_bad && !rsp_bad) {
+        return;
+    }
+
+    resume_log::warn(
+        "resume anomaly: path=%s pid=%lu pagemap=%p rip=0x%llx rip_phys=0x%llx rsp=0x%llx rsp_phys=0x%llx cs=0x%llx ss=0x%llx "
+        "entry=0x%llx thread=%p scratch=%p",
+        path != nullptr ? path : "?", task->pid, static_cast<void*>(task->pagemap), (unsigned long long)rip,
+        (unsigned long long)((rip_phys == mm::virt::PADDR_INVALID) ? 0 : rip_phys), (unsigned long long)rsp,
+        (unsigned long long)((rsp_phys == mm::virt::PADDR_INVALID) ? 0 : rsp_phys), (unsigned long long)task->context.frame.cs,
+        (unsigned long long)task->context.frame.ss, (unsigned long long)task->entry, static_cast<void*>(task->thread),
+        reinterpret_cast<void*>(task->context.syscallScratchArea));
+}
+
+inline void validate_wait_resume_mapping(task::Task* waiter, task::Task* child, const char* path) {
+    if (waiter == nullptr || waiter->pagemap == nullptr) {
+        return;
+    }
+
+    if (waiter->waitResumeRipUserAddr != 0) {
+        uint64_t rip_phys = mm::virt::translate(waiter->pagemap, waiter->waitResumeRipUserAddr);
+        if (rip_phys == mm::virt::PADDR_INVALID || rip_phys == 0 ||
+            (waiter->waitResumeRipPhysAddr != 0 && waiter->waitResumeRipPhysAddr != rip_phys)) {
+            wait_log::warn(
+                "waitpid-resume drift: waiter=%lu child=%lu path=%s rip_va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp_va=0x%llx pagemap=%p",
+                waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
+                (unsigned long long)waiter->waitResumeRipUserAddr, (unsigned long long)waiter->waitResumeRipPhysAddr,
+                (unsigned long long)((rip_phys == mm::virt::PADDR_INVALID) ? 0 : rip_phys),
+                (unsigned long long)waiter->waitResumeRspUserAddr, static_cast<void*>(waiter->pagemap));
+        }
+        waiter->waitResumeRipPhysAddr = (rip_phys != mm::virt::PADDR_INVALID) ? rip_phys : 0;
+    }
+
+    if (waiter->waitResumeRspUserAddr != 0) {
+        uint64_t rsp_phys = mm::virt::translate(waiter->pagemap, waiter->waitResumeRspUserAddr);
+        if (rsp_phys == mm::virt::PADDR_INVALID || rsp_phys == 0 ||
+            (waiter->waitResumeRspPhysAddr != 0 && waiter->waitResumeRspPhysAddr != rsp_phys)) {
+            wait_log::warn(
+                "waitpid-stack drift: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
+                waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
+                (unsigned long long)waiter->waitResumeRspUserAddr, (unsigned long long)waiter->waitResumeRspPhysAddr,
+                (unsigned long long)((rsp_phys == mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
+                (unsigned long long)waiter->waitResumeRipUserAddr, static_cast<void*>(waiter->pagemap));
+        }
+        waiter->waitResumeRspPhysAddr = (rsp_phys != mm::virt::PADDR_INVALID) ? rsp_phys : 0;
+    }
+}
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<PidHashEntry, MAX_PIDS> pid_table = {PidHashEntry{.pid = 0, .task = nullptr}};
 std::atomic<uint64_t> scheduler_task_context_ready_mask{0};
@@ -1762,6 +1823,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     current_task->context.frame.flags = return_flags;
     current_task->context.frame.rsp = user_rsp;
     current_task->context.frame.ss = desc::gdt::GDT_USER_DS;
+    validate_user_resume_target(current_task, "deferred-save-current");
 
     // Save outgoing task's FPU/SSE/AVX state
     sys::context_switch::saveFpuState(current_task);
@@ -1793,17 +1855,35 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     if (child->parentPid == current_task->pid && child->hasExited && !child->waitedOn) {
                         skip_wait_queue = true;
                         current_task->context.regs.rax = child->pid;
-                        if (current_task->waitStatusPhysAddr != 0) {
-                            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(current_task->waitStatusPhysAddr));
-                            *status_ptr = child->exitStatus;
+                        validate_wait_resume_mapping(current_task, child, "sched-any");
+                        if (current_task->waitStatusUserAddr != 0 && current_task->pagemap != nullptr) {
+                            uint64_t status_phys = mm::virt::translate(current_task->pagemap, current_task->waitStatusUserAddr);
+                            if (status_phys != mm::virt::PADDR_INVALID && status_phys != 0) {
+                                if (current_task->waitStatusPhysAddr != 0 && current_task->waitStatusPhysAddr != status_phys) {
+                                    wait_log::warn(
+                                        "waitpid-status drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx "
+                                        "pagemap=%p "
+                                        "path=sched-any",
+                                        current_task->pid, child->pid, (unsigned long long)current_task->waitStatusUserAddr,
+                                        (unsigned long long)current_task->waitStatusPhysAddr, (unsigned long long)status_phys,
+                                        (unsigned long long)current_task->context.frame.rsp, static_cast<void*>(current_task->pagemap));
+                                }
+                                auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(status_phys));
+                                *status_ptr = child->exitStatus;
+                            }
+                            current_task->waitStatusUserAddr = 0;
+                            current_task->waitStatusPhysAddr = 0;
                         }
-                        if (current_task->waitRusagePhysAddr != 0) {
-                            auto* ru = reinterpret_cast<syscall::process::KernRusage*>(
-                                mm::addr::get_virt_pointer(current_task->waitRusagePhysAddr));
-                            ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
-                            ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-                            ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
-                            ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+                        if (current_task->waitRusageUserAddr != 0 && current_task->pagemap != nullptr) {
+                            uint64_t rusage_phys = mm::virt::translate(current_task->pagemap, current_task->waitRusageUserAddr);
+                            if (rusage_phys != mm::virt::PADDR_INVALID && rusage_phys != 0) {
+                                auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(rusage_phys));
+                                ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
+                                ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
+                                ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
+                                ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+                            }
+                            current_task->waitRusageUserAddr = 0;
                             current_task->waitRusagePhysAddr = 0;
                         }
                         current_task->waitingForPid = 0;
@@ -1820,17 +1900,35 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (target != nullptr && target->hasExited) {
                 skip_wait_queue = true;
                 current_task->context.regs.rax = target->pid;
-                if (current_task->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(current_task->waitStatusPhysAddr));
-                    *status_ptr = target->exitStatus;
+                validate_wait_resume_mapping(current_task, target, "sched-specific");
+                if (current_task->waitStatusUserAddr != 0 && current_task->pagemap != nullptr) {
+                    uint64_t status_phys = mm::virt::translate(current_task->pagemap, current_task->waitStatusUserAddr);
+                    if (status_phys != mm::virt::PADDR_INVALID && status_phys != 0) {
+                        if (current_task->waitStatusPhysAddr != 0 && current_task->waitStatusPhysAddr != status_phys) {
+                            wait_log::warn(
+                                "waitpid-status drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx "
+                                "pagemap=%p "
+                                "path=sched-specific",
+                                current_task->pid, target->pid, (unsigned long long)current_task->waitStatusUserAddr,
+                                (unsigned long long)current_task->waitStatusPhysAddr, (unsigned long long)status_phys,
+                                (unsigned long long)current_task->context.frame.rsp, static_cast<void*>(current_task->pagemap));
+                        }
+                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(status_phys));
+                        *status_ptr = target->exitStatus;
+                    }
+                    current_task->waitStatusUserAddr = 0;
+                    current_task->waitStatusPhysAddr = 0;
                 }
-                if (current_task->waitRusagePhysAddr != 0) {
-                    auto* ru =
-                        reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(current_task->waitRusagePhysAddr));
-                    ru->ru_utime_sec = (int64_t)(target->user_time_us / 1000000ULL);
-                    ru->ru_utime_usec = (int64_t)(target->user_time_us % 1000000ULL);
-                    ru->ru_stime_sec = (int64_t)(target->system_time_us / 1000000ULL);
-                    ru->ru_stime_usec = (int64_t)(target->system_time_us % 1000000ULL);
+                if (current_task->waitRusageUserAddr != 0 && current_task->pagemap != nullptr) {
+                    uint64_t rusage_phys = mm::virt::translate(current_task->pagemap, current_task->waitRusageUserAddr);
+                    if (rusage_phys != mm::virt::PADDR_INVALID && rusage_phys != 0) {
+                        auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(rusage_phys));
+                        ru->ru_utime_sec = (int64_t)(target->user_time_us / 1000000ULL);
+                        ru->ru_utime_usec = (int64_t)(target->user_time_us % 1000000ULL);
+                        ru->ru_stime_sec = (int64_t)(target->system_time_us / 1000000ULL);
+                        ru->ru_stime_usec = (int64_t)(target->system_time_us % 1000000ULL);
+                    }
+                    current_task->waitRusageUserAddr = 0;
                     current_task->waitRusagePhysAddr = 0;
                 }
                 current_task->waitingForPid = 0;
@@ -2001,6 +2099,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             hcf();
         }
     }
+    validate_user_resume_target(next_task, "deferred-resume-next");
 
     debug_task_ptrs[cpu::currentCpu()] = next_task;
 
@@ -2111,7 +2210,9 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // Don't reschedule tasks that are exiting or dead
     auto state = task->state.load(std::memory_order_acquire);
     if (state != task::TaskState::ACTIVE) {
+#ifdef SCHED_DEBUG
         dbg::log("RESCHED: PID %x SKIP - not ACTIVE (state=%d)", task->pid, (int)state);
+#endif
         return;
     }
 
@@ -2335,6 +2436,44 @@ auto get_active_task_at_safe(uint32_t index) -> task::Task* {
     return task;
 }
 
+auto get_dead_task_count(uint64_t cpu_no) -> size_t {
+    if (run_queues == nullptr || cpu_no >= smt::get_core_count()) {
+        return 0;
+    }
+    return run_queues->with_lock(cpu_no, [](RunQueue* rq) -> size_t {
+        size_t count = 0;
+        if (rq == nullptr) {
+            return 0;
+        }
+        for (task::Task* cur = rq->deadList.head; cur != nullptr; cur = cur->schedNext) {
+            ++count;
+        }
+        return count;
+    });
+}
+
+auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task* {
+    if (run_queues == nullptr || cpu_no >= smt::get_core_count()) {
+        return nullptr;
+    }
+    return run_queues->with_lock(cpu_no, [index](RunQueue* rq) -> task::Task* {
+        if (rq == nullptr) {
+            return nullptr;
+        }
+        size_t cur_index = 0;
+        for (task::Task* cur = rq->deadList.head; cur != nullptr; cur = cur->schedNext, ++cur_index) {
+            if (cur_index != index) {
+                continue;
+            }
+            if (!cur->tryAcquire()) {
+                return nullptr;
+            }
+            return cur;
+        }
+        return nullptr;
+    });
+}
+
 void wake_task_for_signal(task::Task* task) {
     if (task == nullptr) {
         return;
@@ -2383,6 +2522,7 @@ void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
         return;
     }
+
     if (task->schedQueue == task::Task::SchedQueue::DEAD_GC || task->gcQueued.load(std::memory_order_acquire)) {
         return;
     }
@@ -2414,17 +2554,6 @@ void insert_into_dead_list(task::Task* task) {
         run_queues->with_lock_void(cpu_no, detach_from_cpu);
     }
 
-    // A task can only be linked through schedNext once. Scrub any stale dead-list
-    // membership before deciding whether to enqueue it again; this prevents the
-    // same Task* from remaining reachable in multiple GC lists and being reclaimed
-    // twice later.
-    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
-        run_queues->with_lock_void(cpu_no, [task](RunQueue* rq) {
-            while (rq->deadList.remove(task)) {
-            }
-        });
-    }
-
     if (found_current) {
         return;
     }
@@ -2440,15 +2569,7 @@ void insert_into_dead_list(task::Task* task) {
 
 void gc_expired_tasks() {
     for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count(); ++cpu_no) {
-        run_queues->with_lock_void(cpu_no, [
-#ifdef SCHED_DEBUG
-                                               cpu_no
-#endif
-        ](RunQueue* rq) {
-            // Walk dead list, reclaiming tasks whose epoch grace period has elapsed.
-            // Duplicate insertion used to leave the same Task* reachable multiple
-            // times; remove all local occurrences before freeing so GC never visits
-            // a stale duplicate after the object is destroyed.
+        run_queues->with_lock_void(cpu_no, [cpu_no](RunQueue* rq) {
             bool made_progress = true;
             while (made_progress) {
                 made_progress = false;
@@ -2553,7 +2674,6 @@ void gc_expired_tasks() {
                         break;
                     }
 
-                    // Remove from dead list
                     while (rq->deadList.remove(cur)) {
                     }
 
@@ -2586,8 +2706,6 @@ void gc_expired_tasks() {
                                 other->release();
                             }
                         }
-                        // Also scan the dead lists of all CPUs for threads sharing this
-                        // pagemap that haven't been reclaimed yet (still in grace period).
                         if (!sibling_alive) {
                             for (uint64_t scan_cpu = 0; scan_cpu < smt::get_core_count() && !sibling_alive; scan_cpu++) {
                                 auto* dl = run_queues->that_cpu(scan_cpu)->deadList.head;
@@ -2601,7 +2719,7 @@ void gc_expired_tasks() {
                             }
                         }
                         if (!sibling_alive) {
-                            mm::virt::destroyUserSpace(cur->pagemap);
+                            mm::virt::destroyUserSpace(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
                             mm::phys::pageFree(cur->pagemap);
                         }
                         cur->pagemap = nullptr;
@@ -2681,7 +2799,6 @@ void gc_expired_tasks() {
                     loader::debug::unregisterProcess(cur->pid);
                     loader::debug::removeGdbDebugInfo(cur->pid);
 
-                    // Free task struct
                     delete cur;
 
                     made_progress = true;

@@ -275,6 +275,15 @@ void panic_handler(const char* msg) {
     // we panicked while the serial lock was already held).
     io::serial::enterPanicMode();
 
+    // If another CPU already owns the panic, halt immediately.  This covers
+    // races where multiple CPUs trigger sanitizer violations simultaneously,
+    // and also UBSAN paths that call enterPanicMode() themselves before
+    // calling panic_handler (making the second enterPanicMode() return false
+    // even though this IS the owner — isPanicOwner() handles that correctly).
+    if (!io::serial::isPanicOwner()) {
+        hcf();
+    }
+
     // Halt other CPUs immediately so they stop writing to serial.
     ker::mod::smt::halt_other_cores();
 

@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
+#include <new>
 
 #include "dev/block_device.hpp"
 
@@ -80,7 +80,7 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
     disk_info->partition_count = 0;
 
     // Allocate buffer for one sector
-    auto* sector_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(device->block_size));
+    auto* sector_buf = new (std::nothrow) uint8_t[device->block_size];
     if (sector_buf == nullptr) {
         gpt_log("gpt_enumerate: memory allocation failed\n");
         return -1;
@@ -128,8 +128,7 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
         }
 
         for (uint32_t i = 0; i < entries_in_sector; ++i) {
-            auto* entry = reinterpret_cast<GPTPartitionEntry*>(
-                sector_buf + (static_cast<size_t>(i) * entry_size));
+            auto* entry = reinterpret_cast<GPTPartitionEntry*>(sector_buf + (static_cast<size_t>(i) * entry_size));
 
             if (is_entry_empty(entry)) {
                 continue;
@@ -170,7 +169,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     }
 
     // Allocate buffer for one sector
-    auto* sector_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(device->block_size));
+    auto* sector_buf = new (std::nothrow) uint8_t[device->block_size];
     if (sector_buf == nullptr) {
         gpt_log("gpt_find_fat32_partition: Memory allocation failed\n");
         return 0;
@@ -179,7 +178,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     // Read GPT header from LBA 1 (primary GPT header)
     if (ker::dev::block_read(device, 1, 1, sector_buf) != 0) {
         gpt_log("gpt_find_fat32_partition: Failed to read GPT header\n");
-        // Note: Not freeing to avoid kmalloc::free() issues
+        // Intentionally leaking this boot-time buffer to preserve existing behavior.
         return 0;
     }
 
@@ -188,7 +187,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     // Validate GPT signature "EFI PART"
     if (gpt_header->signature != 0x5452415020494645ULL) {
         gpt_log("gpt_find_fat32_partition: Invalid GPT signature\n");
-        // Note: Not freeing to avoid kmalloc::free() issues
+        // Intentionally leaking this boot-time buffer to preserve existing behavior.
         return 0;
     }
 
@@ -227,7 +226,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
             gpt_log("gpt_find_fat32_partition: Failed to read partition entries sector ");
             gpt_log_hex(sector);
             gpt_log("\n");
-            // Note: Intentionally not freeing memory to avoid kmalloc::free() issues
+            // Intentionally leaking this boot-time buffer to preserve existing behavior.
             return 0;
         }
 
@@ -240,8 +239,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
         }
 
         for (uint32_t i = 0; i < entries_in_sector && !found; i++) {
-            auto* entry = reinterpret_cast<GPTPartitionEntry*>(
-                sector_buf + (static_cast<size_t>(i) * gpt_header->partition_entry_size));
+            auto* entry = reinterpret_cast<GPTPartitionEntry*>(sector_buf + (static_cast<size_t>(i) * gpt_header->partition_entry_size));
 
             if (is_entry_empty(entry)) {
                 continue;
@@ -289,7 +287,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
         }
     }
 
-    // Note: Intentionally not freeing sector_buf to avoid kmalloc::free() issues during boot
+    // Intentionally leaking this boot-time buffer to preserve existing behavior.
     // This is acceptable as GPT parsing happens once during initialization
 
     if (fat32_start_lba == 0) {

@@ -12,10 +12,17 @@
 #include "xfs_ialloc.hpp"
 
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
+
+#include "net/endian.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
+#include "vfs/fs/xfs/xfs_trans.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -184,7 +191,7 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
         }
     }
 
-    mod::dbg::log("[xfs ialloc] no free inodes\n");
+    mod::dbg::logger<"xfs">::error("xfs_ialloc: no free inodes available in any AG");
     return NULLFSINO;
 }
 
@@ -226,9 +233,16 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         return -EIO;
     }
 
+    const uint64_t inode_bit = static_cast<uint64_t>(1) << bit;
+    if ((rec.free_mask & inode_bit) != 0) {
+        mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)",
+                                      (unsigned long)ino, agno, agino, chunk_start, rec.freecount);
+        return -EEXIST;
+    }
+
     // 2-3. Set the free bit and increment freecount
     bool was_fully_allocated = (rec.freecount == 0);
-    rec.free_mask |= (static_cast<uint64_t>(1) << bit);
+    rec.free_mask |= inode_bit;
     rec.freecount++;
 
     // 4. Update inobt on disk
@@ -273,8 +287,9 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
         brelse(agi_bh);
     }
-
-    mod::dbg::log("[xfs ifree] freed inode %lu\n", (unsigned long)ino);
+#ifdef XFS_DEBUG
+    mod::dbg::logger<"xfs">::debug("xfs_ifree: freed inode %lu", (unsigned long)ino);
+#endif
     return 0;
 }
 

@@ -9,6 +9,7 @@
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
+#include <net/proto/ipv6.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -66,6 +67,25 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             PacketBuffer* next = reversed->next;
             reversed->next = nullptr;
             NET_TRACE_TICK();
+            if (reversed->dev != nullptr && reversed->dev->name[0] == 'l' && reversed->dev->name[1] == 'o' &&
+                reversed->dev->name[2] == '\0') {
+                if (reversed->len > 0) {
+                    uint8_t version = (reversed->data[0] >> 4) & 0xF;
+                    if (version == 4) {
+                        proto::ipv4_rx(reversed->dev, reversed);
+                        reversed = next;
+                        continue;
+                    }
+                    if (version == 6) {
+                        proto::ipv6_rx(reversed->dev, reversed);
+                        reversed = next;
+                        continue;
+                    }
+                }
+                pkt_free(reversed);
+                reversed = next;
+                continue;
+            }
             proto::eth_rx(reversed->dev, reversed);
             reversed = next;
         }

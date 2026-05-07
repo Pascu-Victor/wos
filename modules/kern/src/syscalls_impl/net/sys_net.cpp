@@ -127,7 +127,7 @@ auto allocate_socket_fd(ker::net::Socket* sock) -> int {
         return -1;
     }
 
-    auto* file = static_cast<ker::vfs::File*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::vfs::File)));
+    auto* file = new (std::nothrow) ker::vfs::File{};
     if (file == nullptr) {
         return -1;
     }
@@ -141,7 +141,7 @@ auto allocate_socket_fd(ker::net::Socket* sock) -> int {
 
     int fd = ker::vfs::vfs_alloc_fd(task, file);
     if (fd < 0) {
-        ker::mod::mm::dyn::kmalloc::free(static_cast<void*>(file));
+        delete file;
         return -1;
     }
     return fd;
@@ -764,8 +764,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 case SIOC_GIFHWADDR: {
                     // sa_family = ARPHRD_ETHER (1), then 6 bytes of MAC
                     std::memset(arg + 16, 0, 16);
-                    *reinterpret_cast<uint16_t*>(arg + 16) =
-                        (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
+                    *reinterpret_cast<uint16_t*>(arg + 16) = (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
                     std::memcpy(arg + 18, dev->mac.data(), 6);
                     return 0;
                 }

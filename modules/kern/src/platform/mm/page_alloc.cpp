@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/mm/paging.hpp>
 
 namespace ker::mod::mm {
@@ -28,12 +30,53 @@ static inline void* pageToPtr(uint64_t base, uint32_t pageIdx) {
 // Convert an HHDM pointer to a page index relative to the zone base.
 static inline uint32_t ptrToPage(uint64_t base, void* ptr) { return (uint32_t)(((uint64_t)ptr - base) / paging::PAGE_SIZE); }
 
+static inline bool ptrIsPageAligned(const void* ptr) { return (((uint64_t)ptr) & (paging::PAGE_SIZE - 1)) == 0; }
+
+static bool ptrInZone(const PageAllocator* alloc, const void* ptr) {
+    if (ptr == nullptr || !ptrIsPageAligned(ptr)) return false;
+
+    const uint64_t addr = reinterpret_cast<uint64_t>(ptr);
+    const uint64_t end = alloc->base + (uint64_t)alloc->totalPages * paging::PAGE_SIZE;
+    return addr >= alloc->base && addr < end;
+}
+
+static bool freeHeadIsValid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& pageIdx) {
+    if (!ptrInZone(alloc, block)) return false;
+
+    pageIdx = ptrToPage(alloc->base, block);
+    const uint32_t blockSize = 1u << order;
+    if (pageIdx >= alloc->totalPages || pageIdx + blockSize > alloc->totalPages) return false;
+
+    return alloc->pageFlags[pageIdx] == (PageAllocator::FLAG_FREE_HEAD | (uint8_t)order);
+}
+
+static void dropCorruptFreeListHead(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+    ker::mod::io::serial::write("page_alloc: dropping corrupt free-list head order=");
+    ker::mod::io::serial::write((uint64_t)order);
+    ker::mod::io::serial::write(" ptr=0x");
+    ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(block));
+    ker::mod::io::serial::write(" zone_base=0x");
+    ker::mod::io::serial::writeHex(alloc->base);
+    ker::mod::io::serial::write("\n");
+    alloc->freeList[order] = nullptr;
+}
+
 // Remove a specific FreeBlock from a singly-linked list.
 // Returns true if found and removed.
-static bool listRemove(PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) {
+static bool listRemove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) {
     PageAllocator::FreeBlock** prev = &head;
     PageAllocator::FreeBlock* cur = head;
     while (cur != nullptr) {
+        uint32_t curIdx = 0;
+        if (!freeHeadIsValid(alloc, cur, order, curIdx)) {
+            ker::mod::io::serial::write("page_alloc: corrupt free-list node while removing order=");
+            ker::mod::io::serial::write((uint64_t)order);
+            ker::mod::io::serial::write(" ptr=0x");
+            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(cur));
+            ker::mod::io::serial::write("\n");
+            *prev = nullptr;
+            return false;
+        }
         if (cur == target) {
             *prev = cur->next;
             return true;
@@ -131,16 +174,27 @@ void* PageAllocator::alloc(uint64_t sizeBytes) {
 
     // Walk up to find the smallest available block >= requested order.
     int k = order;
-    while (k <= MAX_ORDER && freeList[k] == nullptr) {
-        k++;
+    uint32_t pageIdx = 0;
+    FreeBlock* block = nullptr;
+    while (k <= MAX_ORDER) {
+        block = freeList[k];
+        if (block == nullptr) {
+            k++;
+            continue;
+        }
+
+        if (!freeHeadIsValid(this, block, k, pageIdx)) {
+            dropCorruptFreeListHead(this, k, block);
+            k++;
+            continue;
+        }
+
+        // Pop head of freeList[k].
+        freeList[k] = block->next;
+        break;
     }
+
     if (k > MAX_ORDER) return nullptr;  // OOM
-
-    // Pop head of freeList[k].
-    FreeBlock* block = freeList[k];
-    freeList[k] = block->next;
-
-    uint32_t pageIdx = ptrToPage(base, block);
 
     // Split down: put the upper buddy of each split into the free list.
     while (k > order) {
@@ -181,6 +235,14 @@ void* PageAllocator::alloc(uint64_t sizeBytes) {
 
 void PageAllocator::free(void* ptr) {
     if (ptr == nullptr) return;
+    if (!ptrInZone(this, ptr)) {
+        ker::mod::io::serial::write("page_alloc: rejecting free outside zone ptr=0x");
+        ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(ptr));
+        ker::mod::io::serial::write(" zone_base=0x");
+        ker::mod::io::serial::writeHex(base);
+        ker::mod::io::serial::write("\n");
+        return;
+    }
 
     uint32_t pageIdx = ptrToPage(base, ptr);
     if (pageIdx >= totalPages) return;
@@ -189,6 +251,22 @@ void PageAllocator::free(void* ptr) {
 
     // Must be an allocated head page.
     if ((flags & 0xC0) != 0x80) return;  // not FLAG_ALLOC_HEAD
+
+    // Guard: detect pageFree on a live kmalloc medium allocation.
+    // The MediumAllocationHeader layout is: next(8) size(8) magic(8) pad(8).
+    // Magic lives at offset +16 from the page base.
+    {
+        constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
+        const auto page_base = reinterpret_cast<uint64_t>(pageToPtr(base, pageIdx));
+        if (*reinterpret_cast<const uint64_t*>(page_base + 16) == MEDIUM_ALLOC_MAGIC) {
+            ker::mod::io::serial::write("BUG: pageFree on live medium alloc page=0x");
+            ker::mod::io::serial::writeHex(page_base);
+            ker::mod::io::serial::write(" caller_ptr=0x");
+            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(ptr));
+            ker::mod::io::serial::write("\n");
+            ker::mod::dbg::panic_handler("pageFree called on live kmalloc medium alloc");
+        }
+    }
 
     int order = flags & 0x1F;
     uint32_t blockSize = 1u << order;
@@ -212,7 +290,7 @@ void PageAllocator::free(void* ptr) {
 
         // Remove buddy from its free list.
         auto* buddyBlock = reinterpret_cast<FreeBlock*>(pageToPtr(base, buddyIdx));
-        if (!listRemove(freeList[k], buddyBlock)) break;
+        if (!listRemove(this, k, freeList[k], buddyBlock)) break;
 
         // Clear buddy's head flag (it becomes an interior page of the merged block).
         pageFlags[buddyIdx] = FLAG_FREE_INTERIOR;
@@ -230,6 +308,31 @@ void PageAllocator::free(void* ptr) {
     auto* freeBlock = reinterpret_cast<FreeBlock*>(pageToPtr(base, pageIdx));
     freeBlock->next = freeList[k];
     freeList[k] = freeBlock;
+}
+
+auto PageAllocator::splitAllocatedBlockToOrder0(void* ptr) -> bool {
+    if (ptr == nullptr || !ptrInZone(this, ptr)) return false;
+
+    uint32_t pageIdx = ptrToPage(base, ptr);
+    if (pageIdx >= totalPages) return false;
+
+    uint8_t flags = pageFlags[pageIdx];
+    if ((flags & 0xC0) != FLAG_ALLOC_HEAD) return false;
+
+    int order = flags & 0x1F;
+    if (order == 0) return true;
+
+    uint32_t blockSize = 1u << order;
+    if (pageIdx + blockSize > totalPages) return false;
+
+    for (uint32_t i = 0; i < blockSize; ++i) {
+        pageFlags[pageIdx + i] = FLAG_ALLOC_HEAD;
+        if (pageRefcounts[pageIdx + i] == 0) {
+            pageRefcounts[pageIdx + i] = 1;
+        }
+    }
+
+    return true;
 }
 
 }  // namespace ker::mod::mm

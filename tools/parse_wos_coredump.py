@@ -16,10 +16,11 @@ SEGMENT_TYPES = {
     0: "Zero/Unmapped",
     1: "StackPage",
     2: "FaultPage",
+    3: "MemoryPage",
 }
 
-SEGMENT_SIZE = 8 + 8 + 8 + 4 + 4  # 28 bytes per CoreDumpSegment
-MAX_SEGMENTS = 5  # MAX_STACK_PAGES (4) + 1 fault page
+SEGMENT_SIZE_V1 = 8 + 8 + 8 + 4 + 4  # 32 bytes per CoreDumpSegment
+SEGMENT_SIZE_V2 = SEGMENT_SIZE_V1 + 8 + 8
 
 
 @dataclass
@@ -59,6 +60,8 @@ class CoreDumpSegment:
     fileOffset: int
     type: int
     present: int
+    pteFlags: int = 0
+    physAddr: int = 0
 
     @property
     def type_name(self) -> str:
@@ -95,6 +98,22 @@ class CoreDump:
     segmentTableOffset: int
     elfSize: int
     elfOffset: int
+    segmentEntrySize: int
+    pageSize: int
+    snapshotFlags: int
+    interpBase: int
+    programHeaderCount: int
+    programHeaderEntSize: int
+    threadFsBase: int
+    threadGsBase: int
+    threadStackBase: int
+    threadStackSize: int
+    threadTlsBase: int
+    threadTlsSize: int
+    threadSafeStack: int
+    exePath: str
+    cwd: str
+    root: str
     segments: list[CoreDumpSegment]
     raw: bytes  # full file contents
 
@@ -443,6 +462,14 @@ def parse_gpregs(buf: bytes, off: int) -> tuple[GPRegs, int]:
     return GPRegs(*vals), off + 15 * 8
 
 
+def parse_cstr(buf: bytes, off: int, size: int) -> tuple[str, int]:
+    raw = buf[off : off + size]
+    end = raw.find(b"\x00")
+    if end < 0:
+        end = len(raw)
+    return raw[:end].decode("utf-8", errors="replace"), off + size
+
+
 def parse_coredump(data: bytes) -> CoreDump:
     off = 0
     (magic, version, headerSize) = struct.unpack_from("<QII", data, off)
@@ -473,14 +500,62 @@ def parse_coredump(data: bytes) -> CoreDump:
     ) = struct.unpack_from("<8Q", data, off)
     off += 8 * 8
 
-    # Parse segment table (fixed array of MAX_SEGMENTS entries).
+    segmentEntrySize = SEGMENT_SIZE_V1
+    pageSize = 4096
+    snapshotFlags = 0
+    interpBase = 0
+    programHeaderCount = 0
+    programHeaderEntSize = 0
+    threadFsBase = 0
+    threadGsBase = 0
+    threadStackBase = 0
+    threadStackSize = 0
+    threadTlsBase = 0
+    threadTlsSize = 0
+    threadSafeStack = 0
+    exePath = ""
+    cwd = ""
+    root = ""
+
+    if version >= 2 and headerSize >= off + (13 * 8):
+        (
+            segmentEntrySize,
+            pageSize,
+            snapshotFlags,
+            interpBase,
+            programHeaderCount,
+            programHeaderEntSize,
+            threadFsBase,
+            threadGsBase,
+            threadStackBase,
+            threadStackSize,
+            threadTlsBase,
+            threadTlsSize,
+            threadSafeStack,
+        ) = struct.unpack_from("<13Q", data, off)
+        off += 13 * 8
+        if headerSize >= off + 256 * 3:
+            exePath, off = parse_cstr(data, off, 256)
+            cwd, off = parse_cstr(data, off, 256)
+            root, off = parse_cstr(data, off, 256)
+
+    if segmentEntrySize < SEGMENT_SIZE_V1:
+        segmentEntrySize = SEGMENT_SIZE_V1
+
+    # Parse variable-length segment table.
     segments = []
-    for i in range(MAX_SEGMENTS):
-        soff = segmentTableOffset + i * SEGMENT_SIZE
+    for i in range(int(segmentCount)):
+        soff = segmentTableOffset + i * segmentEntrySize
         vaddr, size, fileOffset, stype, present = struct.unpack_from(
             "<QQQII", data, soff
         )
-        segments.append(CoreDumpSegment(vaddr, size, fileOffset, stype, present))
+        pteFlags = 0
+        physAddr = 0
+        if segmentEntrySize >= SEGMENT_SIZE_V2:
+            pteFlags, physAddr = struct.unpack_from("<QQ", data, soff + SEGMENT_SIZE_V1)
+        segments.append(
+            CoreDumpSegment(vaddr, size, fileOffset, stype, present, pteFlags, physAddr)
+        )
 
     return CoreDump(
         magic=magic,
@@ -505,6 +580,22 @@ def parse_coredump(data: bytes) -> CoreDump:
         segmentTableOffset=segmentTableOffset,
         elfSize=elfSize,
         elfOffset=elfOffset,
+        segmentEntrySize=segmentEntrySize,
+        pageSize=pageSize,
+        snapshotFlags=snapshotFlags,
+        interpBase=interpBase,
+        programHeaderCount=programHeaderCount,
+        programHeaderEntSize=programHeaderEntSize,
+        threadFsBase=threadFsBase,
+        threadGsBase=threadGsBase,
+        threadStackBase=threadStackBase,
+        threadStackSize=threadStackSize,
+        threadTlsBase=threadTlsBase,
+        threadTlsSize=threadTlsSize,
+        threadSafeStack=threadSafeStack,
+        exePath=exePath,
+        cwd=cwd,
+        root=root,
         segments=segments,
         raw=data,
     )
@@ -571,6 +662,20 @@ def print_header(
     print(
         f"  elfHeaderAddr={u64(dump.elfHeaderAddr)} programHeaderAddr={u64(dump.programHeaderAddr)}"
     )
+    if dump.version >= 2:
+        print(
+            f"  interpBase={u64(dump.interpBase)} phnum={dump.programHeaderCount} phentsize={dump.programHeaderEntSize}"
+        )
+        print(
+            f"  fsbase={u64(dump.threadFsBase)} gsbase={u64(dump.threadGsBase)} "
+            f"stack={u64(dump.threadStackBase)}..{u64(dump.threadStackBase + dump.threadStackSize)}"
+        )
+        print(
+            f"  tls={u64(dump.threadTlsBase)}..{u64(dump.threadTlsBase + dump.threadTlsSize)} "
+            f"safestack={u64(dump.threadSafeStack)}"
+        )
+        if dump.exePath or dump.cwd or dump.root:
+            print(f"  exe={dump.exePath!r} cwd={dump.cwd!r} root={dump.root!r}")
 
 
 def print_segments(dump: CoreDump) -> None:
@@ -578,10 +683,13 @@ def print_segments(dump: CoreDump) -> None:
     for i in range(int(dump.segmentCount)):
         seg = dump.segments[i]
         present_str = "present" if seg.present else "NOT present"
-        print(
+        line = (
             f"  [{i}] {seg.type_name:12s}  vaddr={u64(seg.vaddr)}..{u64(seg.vaddr_end)}  "
             f"size=0x{seg.size:x}  fileOffset=0x{seg.fileOffset:x}  {present_str}"
         )
+        if dump.version >= 2:
+            line += f"  phys={u64(seg.physAddr)} pte={u64(seg.pteFlags)}"
+        print(line)
 
 
 def print_elf(dump: CoreDump) -> None:

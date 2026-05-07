@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -13,9 +14,9 @@
 #include <net/wki/dev_server.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/mount.hpp>
@@ -632,7 +633,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     }
 
     auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + req_data_len);
-    auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+    auto* req_buf = new (std::nothrow) uint8_t[req_total];
     if (req_buf == nullptr) {
         return -1;
     }
@@ -669,7 +670,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     uint16_t expected_seq = 0;
     if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
         state->lock.unlock();
-        ker::mod::mm::dyn::kmalloc::free(req_buf);
+        delete[] req_buf;
         return -1;
     }
 
@@ -692,7 +693,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                      req_data_len, callsite);
 
     int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-    ker::mod::mm::dyn::kmalloc::free(req_buf);
+    delete[] req_buf;
 
     if (send_ret != WKI_OK) {
         state->lock.lock();
@@ -865,7 +866,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     memcpy(ctrl.data() + 12, &chunk, sizeof(uint32_t));
 
     auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + ctrl.size());
-    auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+    auto* req_buf = new (std::nothrow) uint8_t[req_total];
     if (req_buf == nullptr) {
         state->lock.lock();
         state->op_wait_entry = nullptr;
@@ -885,7 +886,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     memcpy(req_buf + sizeof(DevOpReqPayload), ctrl.data(), ctrl.size());
 
     int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-    ker::mod::mm::dyn::kmalloc::free(req_buf);
+    delete[] req_buf;
     if (send_ret != WKI_OK) {
         state->lock.lock();
         state->op_wait_entry = nullptr;
@@ -1059,7 +1060,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
             uint32_t chunk = (remaining > max_data) ? max_data : remaining;
 
             auto req_data_len = static_cast<uint16_t>(12 + chunk);
-            auto* req_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_data_len));
+            auto* req_data = new (std::nothrow) uint8_t[req_data_len];
             if (req_data == nullptr) {
                 break;
             }
@@ -1071,7 +1072,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
 
             uint32_t written = 0;
             int status = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len, &written, sizeof(uint32_t));
-            ker::mod::mm::dyn::kmalloc::free(req_data);
+            delete[] req_data;
             if (status != 0) {
                 keep_pending_tail(src, remaining, cur_offset);
                 return status;
@@ -1104,7 +1105,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         delete ctx->read_cache;
         delete ctx->write_buf;
-        ker::mod::mm::dyn::kmalloc::free(ctx);
+        delete ctx;
         f->private_data = nullptr;
         return -1;
     }
@@ -1125,7 +1126,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     delete ctx->read_cache;
     delete ctx->write_buf;
 
-    ker::mod::mm::dyn::kmalloc::free(ctx);
+    delete ctx;
     f->private_data = nullptr;
     return flush_status;
 }
@@ -1494,7 +1495,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
             uint32_t chunk = (remaining > max_data) ? max_data : remaining;
 
             auto req_data_len = static_cast<uint16_t>(12 + chunk);
-            auto* req_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_data_len));
+            auto* req_data = new (std::nothrow) uint8_t[req_data_len];
             if (req_data == nullptr) {
                 return (total_written > 0) ? total_written : -1;
             }
@@ -1506,7 +1507,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
 
             uint32_t written = 0;
             int status = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len, &written, sizeof(uint32_t));
-            ker::mod::mm::dyn::kmalloc::free(req_data);
+            delete[] req_data;
 
             if (status != 0) {
                 return (total_written > 0) ? total_written : -1;
@@ -1637,7 +1638,7 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
         static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
     constexpr size_t BATCH_RESP_SIZE = sizeof(uint32_t) + MAX_BATCH_ENTRIES * sizeof(ker::vfs::DirEntry);
 
-    auto* batch_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(BATCH_RESP_SIZE));
+    auto* batch_buf = new (std::nothrow) uint8_t[BATCH_RESP_SIZE];
     if (batch_buf == nullptr) {
         return -1;
     }
@@ -1647,17 +1648,17 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
         cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
         if (cache == nullptr) {
             s_vfs_lock.unlock();
-            ker::mod::mm::dyn::kmalloc::free(batch_buf);
+            delete[] batch_buf;
             return -1;
         }
         if (try_get_visible_cached_dirent(cache, ctx, index, entry)) {
             s_vfs_lock.unlock();
-            ker::mod::mm::dyn::kmalloc::free(batch_buf);
+            delete[] batch_buf;
             return 0;
         }
         if (cache->complete) {
             s_vfs_lock.unlock();
-            ker::mod::mm::dyn::kmalloc::free(batch_buf);
+            delete[] batch_buf;
             return -1;
         }
         auto fetch_idx = static_cast<uint32_t>(cache->entries.size());
@@ -1679,7 +1680,7 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
                 cache->complete = true;
             }
             s_vfs_lock.unlock();
-            ker::mod::mm::dyn::kmalloc::free(batch_buf);
+            delete[] batch_buf;
             return -1;
         }
 
@@ -2056,7 +2057,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             len = std::min<uint32_t>(len, max_resp_data);
 
             auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + len);
-            auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_total));
+            auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
             if (resp_buf == nullptr) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_READ;
@@ -2119,7 +2120,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             uint16_t send_len = (bytes_read > 0) ? static_cast<uint16_t>(sizeof(DevOpRespPayload) + bytes_read)
                                                  : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf, send_len);
-            ker::mod::mm::dyn::kmalloc::free(resp_buf);
+            delete[] resp_buf;
             break;
         }
 
@@ -2205,7 +2206,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 if (close_file->fops != nullptr && close_file->fops->vfs_close != nullptr) {
                     close_file->fops->vfs_close(close_file);
                 }
-                ker::mod::mm::dyn::kmalloc::free(close_file);
+                delete close_file;
             }
 
             DevOpRespPayload resp = {};
@@ -2314,7 +2315,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // Allocate response: DevOpRespPayload + {count:u32} + max_count×DirEntry
             auto data_size = static_cast<uint32_t>(sizeof(uint32_t) + max_count * sizeof(ker::vfs::DirEntry));
             auto resp_total = static_cast<uint32_t>(sizeof(DevOpRespPayload) + data_size);
-            auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_total));
+            auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
             if (resp_buf == nullptr) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_READDIR_BATCH;
@@ -2343,7 +2344,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             auto send_len = static_cast<uint16_t>(sizeof(DevOpRespPayload) + sizeof(uint32_t) + count * sizeof(ker::vfs::DirEntry));
             send_buffered_resp(resp_buf, send_len);
-            ker::mod::mm::dyn::kmalloc::free(resp_buf);
+            delete[] resp_buf;
             break;
         }
 
@@ -2396,7 +2397,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 send_simple_resp(resp);
             } else {
                 auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + sizeof(ker::vfs::stat));
-                auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_total));
+                auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
                 if (resp_buf == nullptr) {
                     DevOpRespPayload resp = {};
                     resp.op_id = OP_VFS_STAT;
@@ -2412,7 +2413,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp->data_len = sizeof(ker::vfs::stat);
                 memcpy(resp_buf + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::stat));
                 send_buffered_resp(resp_buf, resp_total);
-                ker::mod::mm::dyn::kmalloc::free(resp_buf);
+                delete[] resp_buf;
             }
             break;
         }
@@ -2523,7 +2524,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 // Response: {target_len:u16, target[]}
                 auto resp_data_len = static_cast<uint16_t>(2 + target_len);
                 auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + resp_data_len);
-                auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_total));
+                auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
                 if (resp_buf == nullptr) {
                     DevOpRespPayload resp = {};
                     resp.op_id = OP_VFS_READLINK;
@@ -2545,7 +2546,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 memcpy(resp_buf + sizeof(DevOpRespPayload) + 2, target_buf.data(), target_len);
 
                 wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf, resp_total);
-                ker::mod::mm::dyn::kmalloc::free(resp_buf);
+                delete[] resp_buf;
             }
             break;
         }
@@ -2958,7 +2959,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             s_vfs_lock.unlock();
 
             // Allocate a temporary buffer, read into it, then either push or stage.
-            auto* read_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+            auto* read_buf = new (std::nothrow) uint8_t[len];
             if (read_buf == nullptr) {
                 send_rdma_read_err();
                 break;
@@ -2975,7 +2976,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                                                           static_cast<uint32_t>(bytes_read));
                 }
             }
-            ker::mod::mm::dyn::kmalloc::free(read_buf);
+            delete[] read_buf;
 
             // Response: {bytes_read:u32} = 4 bytes (data is now in consumer bounce buf)
             uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
@@ -3044,7 +3045,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            auto* read_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+            auto* read_buf = new (std::nothrow) uint8_t[len];
             if (read_buf == nullptr) {
                 send_bulk_read_err();
                 break;
@@ -3061,7 +3062,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                                                           static_cast<uint32_t>(bytes_read));
                 }
             }
-            ker::mod::mm::dyn::kmalloc::free(read_buf);
+            delete[] read_buf;
 
             uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
             std::array<uint8_t, sizeof(DevOpRespPayload) + 4> bulk_resp_buf{};
@@ -3287,7 +3288,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     if (state->rdma_server_write_rkey != 0) {
         WkiPeer* peer = wki_peer_find(owner_node);
         if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
-            auto* bbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BOUNCE_SIZE));
+            auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_BOUNCE_SIZE];
             if (bbuf != nullptr) {
                 uint32_t rkey = 0;
                 int reg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf),
@@ -3302,7 +3303,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
                         owner_node, rkey, state->rdma_server_write_rkey, state->rdma_server_read_staging_rkey,
                         state->rdma_server_bulk_staging_rkey);
                 } else {
-                    ker::mod::mm::dyn::kmalloc::free(bbuf);
+                    delete[] bbuf;
                     state->rdma_server_write_rkey = 0;
                     ker::mod::dbg::log("[WKI] VFS RDMA region reg failed: node=0x%04x", owner_node);
                 }
@@ -3319,7 +3320,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     // still use the compact buffer while large sequential reads benefit from fewer
     // round-trips.
     if (state->rdma_capable && state->rdma_transport != nullptr && state->rdma_transport->rdma_register_region != nullptr) {
-        auto* bulk_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BULK_SIZE));
+        auto* bulk_buf = new (std::nothrow) uint8_t[VFS_RDMA_BULK_SIZE];
         if (bulk_buf != nullptr) {
             uint32_t bulk_rkey = 0;
             int reg_ret = state->rdma_transport->rdma_register_region(state->rdma_transport, reinterpret_cast<uint64_t>(bulk_buf),
@@ -3332,7 +3333,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
                 ker::mod::dbg::log("[WKI] VFS bulk RDMA enabled: node=0x%04x bulk_rkey=%u size=%u", owner_node, bulk_rkey,
                                    VFS_RDMA_BULK_SIZE);
             } else {
-                ker::mod::mm::dyn::kmalloc::free(bulk_buf);
+                delete[] bulk_buf;
                 ker::mod::dbg::log("[WKI] VFS bulk RDMA region reg failed: node=0x%04x", owner_node);
             }
         }
@@ -3349,16 +3350,27 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         return -1;
     }
 
-    // Find the mount point and set private_data + fops.
-    // mount_filesystem stores the path resolved through the task's root prefix,
-    // so we must resolve local_mount_path the same way before calling
-    // find_mount_point.
+    // Configure the exact REMOTE mount we just created.  During pivot_root(),
+    // mount_filesystem() and this lookup can observe different task roots, so
+    // try both the current-root-resolved path and the raw mount path.  Never use
+    // longest-prefix lookup here: if the exact mount is temporarily invisible,
+    // that can return the containing XFS root and corrupt its private_data.
     char resolved_mount[512] = {};
-    ker::vfs::resolve_mount_path(local_mount_path, resolved_mount, sizeof(resolved_mount));
-    ker::vfs::MountPoint* mount = ker::vfs::find_mount_point(resolved_mount);
-    if (mount != nullptr) {
-        mount->private_data = state;
-        mount->fops = &g_remote_vfs_fops;
+    bool configured = false;
+    if (ker::vfs::resolve_mount_path(local_mount_path, resolved_mount, sizeof(resolved_mount)) == 0) {
+        configured = ker::vfs::configure_mount_point_exact(resolved_mount, ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
+    }
+    if (!configured) {
+        configured = ker::vfs::configure_mount_point_exact(local_mount_path, ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
+    }
+    if (!configured) {
+        ker::mod::dbg::log("[WKI] Remote VFS mount configuration failed at %s", local_mount_path);
+        ker::vfs::unmount_filesystem(local_mount_path);
+        s_vfs_lock.lock();
+        state->active = false;
+        g_vfs_proxies.pop_back();
+        s_vfs_lock.unlock();
+        return -1;
     }
 
     ker::mod::dbg::log("[WKI] Remote VFS mounted: %s -> node=0x%04x res_id=%u ch=%u", local_mount_path, owner_node, resource_id,
@@ -3440,7 +3452,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     // Build request: {flags:u32, mode:u32, path_len:u16, path[N]}
     auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
     auto req_data_len = static_cast<uint16_t>(10 + path_len);
-    auto* req_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_data_len + 1));
+    auto* req_data = new (std::nothrow) uint8_t[req_data_len + 1];
     if (req_data == nullptr) {
         return nullptr;
     }
@@ -3460,25 +3472,23 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         uint8_t is_dir;
     } __attribute__((packed)) open_resp = {};
     int status = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, req_data_len, &open_resp, sizeof(open_resp));
-    ker::mod::mm::dyn::kmalloc::free(req_data);
+    delete[] req_data;
 
     if (status != 0 || open_resp.fd < 0) {
         return nullptr;
     }
 
     // Allocate File + RemoteFileContext
-    auto* file = static_cast<ker::vfs::File*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(ker::vfs::File)));
+    auto* file = new (std::nothrow) ker::vfs::File{};
     if (file == nullptr) {
         return nullptr;
     }
-    memset(file, 0, sizeof(ker::vfs::File));
 
-    auto* ctx = static_cast<RemoteFileContext*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(RemoteFileContext)));
+    auto* ctx = new (std::nothrow) RemoteFileContext{};
     if (ctx == nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(file);
+        delete file;
         return nullptr;
     }
-    memset(ctx, 0, sizeof(RemoteFileContext));
 
     ctx->proxy = state;
     ctx->remote_fd = open_resp.fd;
@@ -3855,7 +3865,7 @@ void wki_remote_vfs_gc_stale_fds() {
             if (rfd.file->fops != nullptr && rfd.file->fops->vfs_close != nullptr) {
                 rfd.file->fops->vfs_close(rfd.file);
             }
-            ker::mod::mm::dyn::kmalloc::free(rfd.file);
+            delete rfd.file;
             rfd.file = nullptr;
         }
         rfd.active = false;
@@ -3977,7 +3987,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             if (rfd.file->fops != nullptr && rfd.file->fops->vfs_close != nullptr) {
                 rfd.file->fops->vfs_close(rfd.file);
             }
-            ker::mod::mm::dyn::kmalloc::free(rfd.file);
+            delete rfd.file;
             rfd.file = nullptr;
         }
         rfd.active = false;

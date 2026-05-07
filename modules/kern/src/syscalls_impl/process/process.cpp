@@ -7,13 +7,16 @@
 #include <string_view>
 
 #include "abi/callnums/process.h"
+#include "mod/io/serial/serial.hpp"
 #include "net/wki/remote_compute.hpp"
 #include "platform/asm/cpu.hpp"
+#include "platform/interrupt/gdt.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sched/threading.hpp"
 #include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/getpid.hpp"
@@ -32,6 +35,36 @@ static constexpr uint64_t WOS_SA_RESTORER = 0x04000000;
 static constexpr int WOS_PRIO_PROCESS = 0;
 
 namespace ker::syscall::process {
+
+namespace {
+using fork_log = ker::mod::dbg::logger<"fork">;
+
+inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child,
+                                            uint64_t saved_rip, uint64_t saved_rsp, uint64_t saved_flags) {
+    if (child == nullptr || child->pagemap == nullptr) {
+        return;
+    }
+
+    const uint64_t rip_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rip);
+    const uint64_t rsp_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rsp);
+    const bool rip_bad = child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL ||
+                         rip_phys == ker::mod::mm::virt::PADDR_INVALID;
+    const bool rsp_bad = child->context.frame.rsp == 0 || child->context.frame.rsp >= 0x0000800000000000ULL ||
+                         rsp_phys == ker::mod::mm::virt::PADDR_INVALID;
+    if (!rip_bad && !rsp_bad) {
+        return;
+    }
+
+    fork_log::warn(
+        "fork child resume anomaly: parent=%lu child=%lu pagemap=%p rip=0x%llx rip_phys=0x%llx rsp=0x%llx rsp_phys=0x%llx gs_rip=0x%llx "
+        "gs_rsp=0x%llx gs_rflags=0x%llx parent_pagemap=%p",
+        parent != nullptr ? parent->pid : 0, child->pid, static_cast<void*>(child->pagemap), (unsigned long long)child->context.frame.rip,
+        (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys),
+        (unsigned long long)child->context.frame.rsp, (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
+        (unsigned long long)saved_rip, (unsigned long long)saved_rsp, (unsigned long long)saved_flags,
+        parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
+}
+}  // namespace
 
 static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
@@ -77,6 +110,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->kthreadEntry = nullptr;
     child->elfBuffer = nullptr;
     child->elfBufferSize = 0;
+    child->isElfBufferShared = false;
     child->waitingForPid = 0;
     child->waitStatusPhysAddr = 0;
 
@@ -100,14 +134,22 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy executable path
     memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
 
-    // Copy WKI spawn configuration
-    memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
-    child->wki_target_flags = parent->wki_target_flags;
-    if ((child->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) != 0) {
-        child->wki_target_flags &= ~sched::task::Task::WKI_TARGET_FLAG_NOINHERIT;
+    // Copy WKI spawn configuration. NOINHERIT applies when a process creates
+    // a child: the parent keeps its policy, but the child starts automatic.
+    if ((parent->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) != 0) {
+        child->wki_target_hostname[0] = '\0';
+        child->wki_target_flags = 0;
+    } else {
+        memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
+        child->wki_target_flags = parent->wki_target_flags;
     }
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
-    child->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
+    if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
+        delete[] child->name;
+        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        delete child;
+        return static_cast<uint64_t>(-ENOMEM);
+    }
     child->wki_skip_legacy_placement = false;
 
     // Copy POSIX credentials
@@ -145,7 +187,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // Deep-copy user pages with COW
     if (!mm::virt::deepCopyUserPagemapCOW(parent->pagemap, child->pagemap)) {
-        mm::virt::destroyUserSpace(child->pagemap);
+        mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-cow-fail");
         mm::phys::pageFree(child->pagemap);
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
@@ -157,9 +199,9 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // The child shares the same user-space layout (stack, TLS) via COW.
     // Allocate a Thread struct for the child that mirrors the parent's.
     if (parent->thread != nullptr) {
-        auto* childThread = new sched::threading::Thread();
-        if (childThread == nullptr) {
-            mm::virt::destroyUserSpace(child->pagemap);
+        auto* child_thread = new sched::threading::Thread();
+        if (child_thread == nullptr) {
+            mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
             mm::phys::pageFree(child->pagemap);
             delete[] child->name;
             mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
@@ -167,12 +209,12 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             return static_cast<uint64_t>(-ENOMEM);
         }
         // Copy all fields - virtual addresses are the same (same address space layout via COW)
-        *childThread = *parent->thread;
+        *child_thread = *parent->thread;
         // The physical pointers are now shared via COW so the child shouldn't free them
         // on thread destroy - we zero them to prevent double-free
-        childThread->tlsPhysPtr = 0;
-        childThread->stackPhysPtr = 0;
-        child->thread = childThread;
+        child_thread->tlsPhysPtr = 0;
+        child_thread->stackPhysPtr = 0;
+        child->thread = child_thread;
     } else {
         child->thread = nullptr;
     }
@@ -181,10 +223,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Child's kernel stack and per-CPU scratch area
     child->context.syscallKernelStack = kernelRsp;
 
-    auto* perCpu = new cpu::PerCpu();
-    perCpu->syscallStack = kernelRsp;
-    perCpu->cpuId = cpu::currentCpu();
-    child->context.syscallScratchArea = (uint64_t)perCpu;
+    auto* per_cpu = new cpu::PerCpu();
+    per_cpu->syscallStack = kernelRsp;
+    per_cpu->cpuId = cpu::currentCpu();
+    child->context.syscallScratchArea = (uint64_t)per_cpu;
 
     // Copy parent's register context - child will resume at the same RIP
     child->context.regs = parent->context.regs;
@@ -199,20 +241,24 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     //   gs:0x28 = RCX at entry = user return RIP
     //   gs:0x30 = R11 at entry = user RFLAGS
     //   gs:0x08 = user RSP at entry
+    uint64_t return_rip = 0;
+    uint64_t return_flags = 0;
+    uint64_t user_rsp = 0;
     {
-        uint64_t returnRip = 0, returnFlags = 0, userRsp = 0;
-        asm volatile("movq %%gs:0x28, %0" : "=r"(returnRip));
-        asm volatile("movq %%gs:0x30, %0" : "=r"(returnFlags));
-        asm volatile("movq %%gs:0x08, %0" : "=r"(userRsp));
+        asm volatile("movq %%gs:0x28, %0" : "=r"(return_rip));
+        asm volatile("movq %%gs:0x30, %0" : "=r"(return_flags));
+        asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
 
-        child->context.frame.rip = returnRip;
-        child->context.frame.rsp = userRsp;
-        child->context.frame.flags = returnFlags;
-        child->context.frame.cs = 0x23;  // GDT_USER_CS
-        child->context.frame.ss = 0x1b;  // GDT_USER_DS
+        child->context.frame.rip = return_rip;
+        child->context.frame.rsp = user_rsp;
+        child->context.frame.flags = return_flags;
+        child->context.frame.cs = desc::gdt::GDT_USER_CS;
+        child->context.frame.ss = desc::gdt::GDT_USER_DS;
         child->context.frame.intNum = 0;
         child->context.frame.errCode = 0;
     }
+
+    log_unmapped_child_resume_state(parent, child, return_rip, user_rsp, return_flags);
 
     // Child returns 0 from fork
     child->context.regs.rax = 0;
@@ -229,6 +275,8 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         if (val != nullptr) {
             auto* file = static_cast<ker::vfs::File*>(val);
             file->refcount.fetch_add(1, std::memory_order_relaxed);  // Increment refcount for shared file
+            // TODO: Checked insertion, should have a process cleanup system that can handle partially initialized processes if this fails
+            // instead of leaking
             child->fd_table.insert(key, file);
         }
     });
@@ -246,11 +294,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
                 static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
             }
         });
-        if (child->thread) {
-            delete child->thread;
-        }
+
+        delete child->thread;
         delete (cpu::PerCpu*)child->context.syscallScratchArea;
-        mm::virt::destroyUserSpace(child->pagemap);
+        mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::pageFree(child->pagemap);
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
@@ -408,13 +455,19 @@ static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
     if (which != WOS_PRIO_PROCESS) return static_cast<uint64_t>(-EINVAL);
 
     auto* self = mod::sched::get_current_task();
-    if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (self == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     if (who == 0) who = static_cast<int64_t>(self->pid);
-    if (who < 0) return static_cast<uint64_t>(-EINVAL);
+    if (who < 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
 
     auto* target = mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(who));
-    if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (target == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     if (self->euid != 0 && target->pid != self->pid) {
         target->release();
@@ -433,6 +486,13 @@ static auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t fla
     }
 
     if ((flags & ~ker::mod::sched::task::Task::WKI_TARGET_FLAGS_ALL) != 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if ((flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0 &&
+        (flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if (hostname != nullptr && len != 0 && (flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
 
@@ -642,16 +702,22 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto pid = a2;
             auto new_pgid = a3;
             // pid==0 means current process
-            if (pid == 0) pid = task->pid;
+            if (pid == 0) {
+                pid = task->pid;
+            }
             // pgid==0 means use pid as pgid
-            if (new_pgid == 0) new_pgid = pid;
+            if (new_pgid == 0) {
+                new_pgid = pid;
+            }
             if (pid == task->pid) {
                 task->pgid = new_pgid;
                 return 0;
             }
             // Setting pgid for another process (must be a child, same session)
             auto* target = ker::mod::sched::find_task_by_pid_safe(pid);
-            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if (target == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             if (target->parentPid != task->pid || target->session_id != task->session_id) {
                 target->release();
                 return static_cast<uint64_t>(-EPERM);
@@ -664,11 +730,15 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto pid = static_cast<int64_t>(a2);
             if (pid == 0) {
                 auto* task = ker::mod::sched::get_current_task();
-                if (!task) return static_cast<uint64_t>(-ESRCH);
+                if (task == nullptr) {
+                    return static_cast<uint64_t>(-ESRCH);
+                }
                 return task->pgid;
             }
             auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
-            if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if (target == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             auto pgid = target->pgid;
             target->release();
             return pgid;
@@ -681,17 +751,23 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::gethostname: {
             auto* buf = reinterpret_cast<char*>(a2);
             auto bufsize = static_cast<size_t>(a3);
-            if (buf == nullptr) return static_cast<uint64_t>(-EFAULT);
+            if (buf == nullptr) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             const char* name = ker::util::hostname::get();
             size_t len = strlen(name);
-            if (len + 1 > bufsize) return static_cast<uint64_t>(-ENAMETOOLONG);
+            if (len + 1 > bufsize) {
+                return static_cast<uint64_t>(-ENAMETOOLONG);
+            }
             memcpy(buf, name, len + 1);
             return 0;
         }
         case abi::process::procmgmt_ops::sethostname: {
-            auto* name = reinterpret_cast<const char*>(a2);
+            const auto* name = reinterpret_cast<const char*>(a2);
             auto len = static_cast<size_t>(a3);
-            if (name == nullptr) return static_cast<uint64_t>(-EFAULT);
+            if (name == nullptr) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             int r = ker::util::hostname::set(name, len);
             return (r < 0) ? static_cast<uint64_t>(r) : 0;
         }

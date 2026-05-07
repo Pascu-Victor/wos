@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::util {
@@ -228,16 +229,9 @@ class RadixTree {
         return cap;
     }
 
-    Node* alloc_node() {
-        auto* n = static_cast<Node*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(Node)));
-        if (n) {
-            memset(n->children, 0, sizeof(n->children));
-            n->populated = 0;
-        }
-        return n;
-    }
+    Node* alloc_node() { return new (std::nothrow) Node; }
 
-    void free_node(Node* n) { ker::mod::mm::dyn::kmalloc::free(n); }
+    void free_node(Node* n) { delete n; }
 
     // Grow tree depth by 1: allocate new root, make old root its child[0]
     [[nodiscard]] bool grow_depth() {

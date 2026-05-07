@@ -13,14 +13,12 @@ namespace wosdbg {
 // Magic number: "WOSCODMP" as little-endian uint64
 static constexpr uint64_t COREDUMP_MAGIC = 0x504D55444F43534FULL;
 
-// Maximum segments in a coredump (MAX_STACK_PAGES(4) + 1 fault page)
-static constexpr int MAX_SEGMENTS = 5;
-
 // Segment types
 enum class SegmentType : uint32_t {
     ZeroUnmapped = 0,
     StackPage = 1,
     FaultPage = 2,
+    MemoryPage = 3,
 };
 
 QString segmentTypeName(uint32_t type);
@@ -63,6 +61,8 @@ struct CoreDumpSegment {
     uint64_t fileOffset;
     uint32_t type;
     uint32_t present;
+    uint64_t pteFlags = 0;
+    uint64_t physAddr = 0;
 
     uint64_t vaddrEnd() const { return vaddr + size; }
     QString typeName() const { return segmentTypeName(type); }
@@ -100,6 +100,22 @@ struct CoreDump {
     uint64_t segmentTableOffset;
     uint64_t elfSize;
     uint64_t elfOffset;
+    uint64_t segmentEntrySize = 32;
+    uint64_t pageSize = 4096;
+    uint64_t snapshotFlags = 0;
+    uint64_t interpBase = 0;
+    uint64_t programHeaderCount = 0;
+    uint64_t programHeaderEntSize = 0;
+    uint64_t threadFsBase = 0;
+    uint64_t threadGsBase = 0;
+    uint64_t threadStackBase = 0;
+    uint64_t threadStackSize = 0;
+    uint64_t threadTlsBase = 0;
+    uint64_t threadTlsSize = 0;
+    uint64_t threadSafeStack = 0;
+    QString exePath;
+    QString cwd;
+    QString root;
 
     // Segment table
     std::vector<CoreDumpSegment> segments;

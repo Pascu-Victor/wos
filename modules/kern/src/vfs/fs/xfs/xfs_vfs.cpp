@@ -237,15 +237,23 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 #endif
         bool dma_safe_dst = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
         if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0 && dma_safe_dst) {
-            // Aligned, full-block read - go direct to the block device.
+            // Aligned, full-block read.  Check the buffer cache first: a dirty
+            // buffer contains data not yet flushed to disk, so a direct read
+            // would return stale on-disk bytes instead of the intended content.
             uint64_t dev_block = xfs_fsblock_to_dev_block(ctx, disk_block);
             size_t dev_count = chunk / ctx->device->block_size;
-            int rc = dev::block_read(ctx->device, dev_block, dev_count, dst + total_read);
+            BufHead* cache_bp = (dev_count <= 1) ? bread(ctx->device, dev_block) : bread_multi(ctx->device, dev_block, dev_count);
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::getNs() - t0;
 #endif
-            if (rc != 0) {
-                return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+            if (cache_bp != nullptr) {
+                std::memcpy(dst + total_read, cache_bp->data, chunk);
+                brelse(cache_bp);
+            } else {
+                int rc = dev::block_read(ctx->device, dev_block, dev_count, dst + total_read);
+                if (rc != 0) {
+                    return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+                }
             }
         } else {
             // Partial or unaligned - fall back to single cached block.
@@ -942,12 +950,11 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     }
 
     // Allocate File handle
-    auto* f = static_cast<File*>(mod::mm::dyn::kmalloc::malloc(sizeof(File)));
+    auto* f = new (std::nothrow) File{};
     if (f == nullptr) {
         xfs_inode_release(ip);
         return nullptr;
     }
-    std::memset(f, 0, sizeof(File));
 
     auto* xfd = new XfsFileData;
     xfd->mount = ctx;
@@ -1041,6 +1048,489 @@ auto xfs_fstat(File* f, ker::vfs::stat* statbuf) -> int {
     std::memset(statbuf, 0, sizeof(ker::vfs::stat));
     fill_stat(xfd->inode, statbuf);
     return 0;
+}
+
+auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::statvfs* buf) -> int {
+    if (ctx == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+
+    std::memset(buf, 0, sizeof(ker::vfs::statvfs));
+
+    uint64_t free_blocks = 0;
+    uint64_t total_inodes = 0;
+    uint64_t free_inodes = 0;
+    for (xfs_agnumber_t i = 0; i < ctx->ag_count; i++) {
+        free_blocks += ctx->per_ag[i].agf_freeblks;
+        total_inodes += ctx->per_ag[i].agi_count;
+        free_inodes += ctx->per_ag[i].agi_freecount;
+    }
+
+    // Derive a 64-bit fsid by XOR-folding the 128-bit UUID
+    uint64_t fsid_lo = 0;
+    uint64_t fsid_hi = 0;
+    for (int i = 0; i < 8; i++) {
+        fsid_lo |= static_cast<uint64_t>(ctx->uuid.b[i]) << (i * 8);
+        fsid_hi |= static_cast<uint64_t>(ctx->uuid.b[i + 8]) << (i * 8);
+    }
+
+    buf->f_bsize   = ctx->block_size;
+    buf->f_frsize  = ctx->block_size;
+    buf->f_blocks  = ctx->total_blocks;
+    buf->f_bfree   = free_blocks;
+    buf->f_bavail  = free_blocks;
+    buf->f_files   = total_inodes;
+    buf->f_ffree   = free_inodes;
+    buf->f_favail  = free_inodes;
+    buf->f_fsid    = fsid_lo ^ fsid_hi;
+    buf->f_flag    = ctx->read_only ? ker::vfs::ST_RDONLY : 0;
+    buf->f_namemax = 255;
+    return 0;
+}
+
+// ============================================================================
+// chmod
+// ============================================================================
+
+auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+
+    auto* ip = walk_path(ctx, fs_path);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+
+    static constexpr uint16_t XFS_IFMT = 0xF000;
+    static constexpr uint16_t XFS_PERM_MASK = 07777;
+    ip->mode = (ip->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
+    ip->dirty = true;
+
+    auto* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(ip);
+        return -ENOMEM;
+    }
+    xfs_trans_log_inode(tp, ip);
+    int ret = xfs_trans_commit(tp);
+    xfs_inode_release(ip);
+    return (ret == 0) ? 0 : -EIO;
+}
+
+auto xfs_fchmod(File* f, int mode) -> int {
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    if (xfd->mount->read_only) {
+        return -EROFS;
+    }
+
+    static constexpr uint16_t XFS_IFMT = 0xF000;
+    static constexpr uint16_t XFS_PERM_MASK = 07777;
+    auto* ip = xfd->inode;
+    ip->mode = (ip->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
+    ip->dirty = true;
+
+    auto* tp = xfs_trans_alloc(xfd->mount);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    xfs_trans_log_inode(tp, ip);
+    int ret = xfs_trans_commit(tp);
+    return (ret == 0) ? 0 : -EIO;
+}
+
+// ============================================================================
+// Mkdir
+// ============================================================================
+
+auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+
+    // Already exists?
+    XfsInode* existing = walk_path(ctx, fs_path);
+    if (existing != nullptr) {
+        bool is_dir = xfs_inode_isdir(existing);
+        xfs_inode_release(existing);
+        return is_dir ? -EEXIST : -ENOTDIR;
+    }
+
+    // Find parent directory and new name
+    const char* last_slash = nullptr;
+    for (const char* p = fs_path; *p != '\0'; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+
+    XfsInode* parent_ip = nullptr;
+    const char* dirname = nullptr;
+    uint16_t dirname_len = 0;
+
+    if (last_slash == nullptr || last_slash == fs_path) {
+        parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+        dirname = (last_slash == fs_path) ? fs_path + 1 : fs_path;
+    } else {
+        auto parent_len = static_cast<size_t>(last_slash - fs_path);
+        char parent_path[512] = {};  // NOLINT
+        if (parent_len >= sizeof(parent_path)) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
+        parent_path[parent_len] = '\0';
+        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
+        dirname = last_slash + 1;
+    }
+
+    if (parent_ip == nullptr || !xfs_inode_isdir(parent_ip)) {
+        if (parent_ip != nullptr) {
+            xfs_inode_release(parent_ip);
+        }
+        return -ENOENT;
+    }
+
+    for (const char* p = dirname; *p != '\0'; p++) {
+        dirname_len++;
+    }
+    if (dirname_len == 0) {
+        xfs_inode_release(parent_ip);
+        return -EINVAL;
+    }
+
+    // Save before parent_ip is released
+    xfs_ino_t parent_ino = parent_ip->ino;
+
+    // Allocate new inode
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(parent_ip);
+        return -ENOMEM;
+    }
+
+    int dir_mode = (mode == 0) ? 0755 : mode;
+    uint16_t inode_mode = static_cast<uint16_t>(dir_mode & 0xFFF) | 0040000;  // S_IFDIR
+    xfs_ino_t new_ino = xfs_ialloc(ctx, tp, inode_mode);
+    if (new_ino == NULLFSINO) {
+        xfs_trans_cancel(tp);
+        xfs_inode_release(parent_ip);
+        return -ENOSPC;
+    }
+
+    // Add entry in parent
+    int rc = xfs_dir_addname(parent_ip, dirname, dirname_len, new_ino, XFS_DIR3_FT_DIR, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+
+    rc = xfs_trans_commit(tp);
+    xfs_inode_release(parent_ip);
+    if (rc != 0) {
+        return rc;
+    }
+
+    // Initialize the new directory inode with a minimal shortform header
+    XfsInode* new_ip = xfs_inode_read(ctx, new_ino);
+    if (new_ip == nullptr) {
+        return -EIO;
+    }
+
+    new_ip->mode = inode_mode;
+    new_ip->size = 0;
+    new_ip->nlink = 2;  // . and parent ref
+    new_ip->nblocks = 0;
+    new_ip->nextents = 0;
+
+    // Build minimal shortform directory: count=0, parent=parent_ino
+    bool use_i8 = (parent_ino > 0xFFFFFFFFULL);
+    size_t ino_bytes = use_i8 ? 8 : 4;
+    size_t sf_size = 2 + ino_bytes;
+    auto* sf_data = new (std::nothrow) uint8_t[sf_size];
+    if (sf_data == nullptr) {
+        xfs_inode_release(new_ip);
+        return -ENOMEM;
+    }
+    sf_data[0] = 0;               // count
+    sf_data[1] = use_i8 ? 1 : 0;  // i8count
+    if (use_i8) {
+        for (int i = 7; i >= 0; i--) {
+            sf_data[2 + (7 - i)] = static_cast<uint8_t>((parent_ino >> (i * 8)) & 0xFF);
+        }
+    } else {
+        auto p32 = static_cast<uint32_t>(parent_ino);
+        for (int i = 3; i >= 0; i--) {
+            sf_data[2 + (3 - i)] = static_cast<uint8_t>((p32 >> (i * 8)) & 0xFF);
+        }
+    }
+
+    new_ip->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    new_ip->data_fork.local.data = sf_data;
+    new_ip->data_fork.local.size = static_cast<uint32_t>(sf_size);
+    new_ip->dirty = true;
+
+    XfsTransaction* tp2 = xfs_trans_alloc(ctx);
+    if (tp2 != nullptr) {
+        xfs_trans_log_inode(tp2, new_ip);
+        xfs_trans_commit(tp2);
+    }
+    xfs_inode_release(new_ip);
+    return 0;
+}
+
+// ============================================================================
+// Rmdir
+// ============================================================================
+
+namespace {
+
+auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInode** parent_out, const char** name_out,
+                              uint16_t* namelen_out) -> int {
+    const char* last_slash = nullptr;
+    for (const char* p = fs_path; *p != '\0'; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+
+    XfsInode* parent_ip = nullptr;
+    const char* name = nullptr;
+
+    if (last_slash == nullptr || last_slash == fs_path) {
+        parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+        name = (last_slash == fs_path) ? fs_path + 1 : fs_path;
+    } else {
+        auto parent_len = static_cast<size_t>(last_slash - fs_path);
+        char parent_path[512] = {};  // NOLINT
+        if (parent_len >= sizeof(parent_path)) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
+        parent_path[parent_len] = '\0';
+        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
+        name = last_slash + 1;
+    }
+
+    if (parent_ip == nullptr || !xfs_inode_isdir(parent_ip)) {
+        if (parent_ip != nullptr) {
+            xfs_inode_release(parent_ip);
+        }
+        return -ENOENT;
+    }
+
+    uint16_t namelen = 0;
+    for (const char* p = name; *p != '\0'; p++) {
+        namelen++;
+    }
+    if (namelen == 0) {
+        xfs_inode_release(parent_ip);
+        return -EINVAL;
+    }
+
+    *parent_out = parent_ip;
+    *name_out = name;
+    *namelen_out = namelen;
+    return 0;
+}
+
+auto count_real_entries(const XfsDirEntry* entry, void* ctx) -> int {
+    auto* count = static_cast<int*>(ctx);
+    if (entry->name[0] == '.' && (entry->namelen == 1 || (entry->namelen == 2 && entry->name[1] == '.'))) {
+        return 0;
+    }
+    (*count)++;
+    return 0;
+}
+
+}  // anonymous namespace
+
+auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+    if (fs_path[0] == '\0' || (fs_path[0] == '/' && fs_path[1] == '\0')) {
+        return -EBUSY;
+    }
+
+    XfsInode* parent_ip = nullptr;
+    const char* name = nullptr;
+    uint16_t namelen = 0;
+    int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &name, &namelen);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsDirEntry de{};
+    rc = xfs_dir_lookup(parent_ip, name, namelen, &de);
+    if (rc != 0) {
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+    if (de.ftype != XFS_DIR3_FT_DIR) {
+        xfs_inode_release(parent_ip);
+        return -ENOTDIR;
+    }
+
+    XfsInode* dir_ip = xfs_inode_read(ctx, de.ino);
+    if (dir_ip == nullptr) {
+        xfs_inode_release(parent_ip);
+        return -ENOENT;
+    }
+
+    int entry_count = 0;
+    xfs_dir_iterate(dir_ip, count_real_entries, &entry_count);
+    if (entry_count > 0) {
+        xfs_inode_release(dir_ip);
+        xfs_inode_release(parent_ip);
+        return -ENOTEMPTY;
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(dir_ip);
+        xfs_inode_release(parent_ip);
+        return -ENOMEM;
+    }
+
+    rc = xfs_dir_removename(parent_ip, name, namelen, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        xfs_inode_release(dir_ip);
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+
+    parent_ip->dirty = true;
+    xfs_trans_log_inode(tp, parent_ip);
+    // The removed directory loses both the parent entry and its self-reference.
+    dir_ip->nlink = 0;
+    dir_ip->dirty = true;
+    xfs_trans_log_inode(tp, dir_ip);
+
+    rc = xfs_trans_commit(tp);
+    xfs_inode_release(dir_ip);
+    xfs_inode_release(parent_ip);
+    return (rc == 0) ? 0 : -EIO;
+}
+
+// ============================================================================
+// Rename
+// ============================================================================
+
+auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx) -> int {
+    if (old_fs_path == nullptr || new_fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+
+    XfsInode* old_parent = nullptr;
+    const char* old_name = nullptr;
+    uint16_t old_namelen = 0;
+    int rc = xfs_find_parent_and_name(old_fs_path, ctx, &old_parent, &old_name, &old_namelen);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsDirEntry old_de{};
+    rc = xfs_dir_lookup(old_parent, old_name, old_namelen, &old_de);
+    if (rc != 0) {
+        xfs_inode_release(old_parent);
+        return rc;
+    }
+
+    XfsInode* new_parent = nullptr;
+    const char* new_name = nullptr;
+    uint16_t new_namelen = 0;
+    rc = xfs_find_parent_and_name(new_fs_path, ctx, &new_parent, &new_name, &new_namelen);
+    if (rc != 0) {
+        xfs_inode_release(old_parent);
+        return rc;
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(new_parent);
+        xfs_inode_release(old_parent);
+        return -ENOMEM;
+    }
+
+    // If destination exists, remove it first. Keep the displaced inode
+    // referenced until the transaction no longer points at it.
+    XfsDirEntry new_de{};
+    XfsInode* displaced = nullptr;
+    if (xfs_dir_lookup(new_parent, new_name, new_namelen, &new_de) == 0) {
+        rc = xfs_dir_removename(new_parent, new_name, new_namelen, tp);
+        if (rc != 0) {
+            xfs_trans_cancel(tp);
+            xfs_inode_release(new_parent);
+            xfs_inode_release(old_parent);
+            return rc;
+        }
+        // Decrement nlink on the displaced inode
+        displaced = xfs_inode_read(ctx, new_de.ino);
+        if (displaced != nullptr) {
+            if (displaced->nlink > 0) {
+                displaced->nlink--;
+            }
+            displaced->dirty = true;
+            xfs_trans_log_inode(tp, displaced);
+        }
+    }
+
+    // Add entry at new location
+    rc = xfs_dir_addname(new_parent, new_name, new_namelen, old_de.ino, old_de.ftype, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        if (displaced != nullptr) {
+            xfs_inode_release(displaced);
+        }
+        xfs_inode_release(new_parent);
+        xfs_inode_release(old_parent);
+        return rc;
+    }
+
+    // Remove old entry
+    rc = xfs_dir_removename(old_parent, old_name, old_namelen, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        if (displaced != nullptr) {
+            xfs_inode_release(displaced);
+        }
+        xfs_inode_release(new_parent);
+        xfs_inode_release(old_parent);
+        return rc;
+    }
+
+    old_parent->dirty = true;
+    new_parent->dirty = true;
+    xfs_trans_log_inode(tp, old_parent);
+    xfs_trans_log_inode(tp, new_parent);
+
+    rc = xfs_trans_commit(tp);
+    if (displaced != nullptr) {
+        xfs_inode_release(displaced);
+    }
+    xfs_inode_release(new_parent);
+    xfs_inode_release(old_parent);
+    return (rc == 0) ? 0 : -EIO;
 }
 
 // ============================================================================
@@ -1148,19 +1638,6 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
             target_ip->nlink--;
         }
         target_ip->dirty = true;
-
-        // If nlink reaches 0, the inode is deleted (would be unlinked / freed)
-        // For now, we just mark it in the inode, but in a full implementation
-        // this would add the inode to the unlinked list and trigger cleanup
-        // during filesystem check or when space is needed
-        if (target_ip->nlink == 0) {
-#ifdef XFS_DEBUG
-            mod::dbg::log("[xfs] unlink: ino=%lu nlink->0 (inode marked for deletion)", (unsigned long)de.ino);
-#endif
-            // TODO: Add inode to unlinked list  (di_next_unlinked chain)
-            // For now, just mark dirty and let it be handled at a higher level
-        }
-
         xfs_trans_log_inode(tp, target_ip);
     }
 

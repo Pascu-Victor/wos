@@ -6,7 +6,6 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>

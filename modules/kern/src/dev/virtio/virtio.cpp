@@ -1,12 +1,13 @@
 #include "virtio.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/phys.hpp>
 
+#include "net/packet.hpp"
 #include "platform/dbg/dbg.hpp"
 
 namespace ker::dev::virtio {

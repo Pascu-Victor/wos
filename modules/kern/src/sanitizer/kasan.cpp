@@ -440,6 +440,11 @@ void kasan_shadow_map(uintptr_t addr) {
 
 [[noreturn]] static void kasan_report(uintptr_t addr, size_t size, bool is_write, uintptr_t ret_addr) {
     ser::enterPanicMode();
+    // Non-owner CPUs halt immediately; only the first CPU to trigger KASAN
+    // proceeds to emit the report so output from concurrent faults can't race.
+    if (!ser::isPanicOwner()) {
+        hcf();
+    }
     ker::mod::smt::halt_other_cores();
 
     int8_t* shadow = ker::mod::kasan::addr_to_shadow(addr);

@@ -23,9 +23,9 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <ranges>
@@ -644,8 +644,8 @@ void rt_entry_free(WkiChannel* ch, WkiRetransmitEntry* rt) {
         ch->tx_rt_entry_in_use = false;
     } else {
         // Heap-allocated fallback
-        ker::mod::mm::dyn::kmalloc::free(rt->data);
-        ker::mod::mm::dyn::kmalloc::free(rt);
+        delete[] rt->data;
+        delete rt;
     }
 }
 
@@ -873,8 +873,8 @@ void wki_channel_close(WkiChannel* ch) {
     WkiReorderEntry* ro = ch->reorder_head;
     while (ro != nullptr) {
         WkiReorderEntry* next = ro->next;
-        ker::mod::mm::dyn::kmalloc::free(ro->data);
-        ker::mod::mm::dyn::kmalloc::free(ro);
+        delete[] ro->data;
+        delete ro;
         ro = next;
     }
 
@@ -911,8 +911,8 @@ void wki_channels_close_for_peer(uint16_t node_id) {
             WkiReorderEntry* ro = ch->reorder_head;
             while (ro != nullptr) {
                 WkiReorderEntry* next = ro->next;
-                ker::mod::mm::dyn::kmalloc::free(ro->data);
-                ker::mod::mm::dyn::kmalloc::free(ro);
+                delete[] ro->data;
+                delete ro;
                 ro = next;
             }
 
@@ -1174,7 +1174,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         hdr->checksum = wki_crc32(frame, frame_len);
     }
 
-    // Queue for retransmit - use inline entry if available, else kmalloc
+    // Queue for retransmit - use inline entry if available, else allocate from heap
     WkiRetransmitEntry* rt_entry = nullptr;
     uint8_t* rt_data = nullptr;
 
@@ -1185,11 +1185,11 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         ch->tx_rt_entry_in_use = true;
     } else {
         // Slow path: frame too large for inline buffer or multiple in-flight
-        rt_entry = static_cast<WkiRetransmitEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiRetransmitEntry)));
+        rt_entry = new (std::nothrow) WkiRetransmitEntry{};
         if (rt_entry != nullptr) {
-            rt_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(frame_len));
+            rt_data = new (std::nothrow) uint8_t[frame_len];
             if (rt_data == nullptr) {
-                ker::mod::mm::dyn::kmalloc::free(rt_entry);
+                delete rt_entry;
                 rt_entry = nullptr;
             }
         }
@@ -1249,6 +1249,11 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         perf_record_transport_end(dst_node, channel_id, trace_correlation, WKI_ERR_TX_FAILED, payload_len, trace_callsite);
         return WKI_ERR_TX_FAILED;
     }
+
+    // Update TX activity timestamp so the heartbeat suppression logic can
+    // correctly skip sending a heartbeat when we've recently proved our
+    // liveness to this peer via data traffic.
+    peer->last_tx_activity = wki_now_us();
 
     return WKI_OK;
 }
@@ -1419,7 +1424,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         }
 
         // Make a mutable copy to decrement TTL
-        auto* fwd_frame = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+        auto* fwd_frame = new (std::nothrow) uint8_t[len];
         if (fwd_frame == nullptr) {
             return;
         }
@@ -1429,7 +1434,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         fwd_hdr->hop_ttl--;
 
         fwd_transport->tx(fwd_transport, next_hop, fwd_frame, len);
-        ker::mod::mm::dyn::kmalloc::free(fwd_frame);
+        delete[] fwd_frame;
         return;
     }
 
@@ -1507,7 +1512,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                 if (ch->dup_ack_count >= WKI_FAST_RETRANSMIT_THRESH) {
                     WkiRetransmitEntry* rt = ch->retransmit_head;
-                    fast_retransmit_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rt->len));
+                    fast_retransmit_data = new (std::nothrow) uint8_t[rt->len];
                     if (fast_retransmit_data != nullptr) {
                         memcpy(fast_retransmit_data, rt->data, rt->len);
                         fast_retransmit_len = rt->len;
@@ -1543,7 +1548,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         transport->tx(transport, next_hop, fast_retransmit_data, fast_retransmit_len);
                     }
                 }
-                ker::mod::mm::dyn::kmalloc::free(fast_retransmit_data);
+                delete[] fast_retransmit_data;
             }
         }
     }
@@ -1664,8 +1669,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     // Re-dispatch reordered message through the same handler switch
                     wki_dispatch_reliable_msg(static_cast<MsgType>(ro->msg_type), hdr, ro->data, ro->len);
 
-                    ker::mod::mm::dyn::kmalloc::free(ro->data);
-                    ker::mod::mm::dyn::kmalloc::free(ro);
+                    delete[] ro->data;
+                    delete ro;
                     ch->lock.lock();
                 }
                 // For LATENCY channels, send ACK immediately instead of waiting
@@ -1728,9 +1733,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                     uint16_t max_reorder = default_credits_for_channel(ch->channel_id);
                     if (ch->reorder_count < max_reorder) {
-                        auto* ro = static_cast<WkiReorderEntry*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(WkiReorderEntry)));
+                        auto* ro = new (std::nothrow) WkiReorderEntry{};
                         if (ro != nullptr) {
-                            ro->data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(payload_len));
+                            ro->data = new (std::nothrow) uint8_t[payload_len];
                             if (ro->data != nullptr) {
                                 memcpy(ro->data, payload, payload_len);
                                 ro->len = payload_len;
@@ -1747,7 +1752,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                                 ch->reorder_count++;
                                 refresh_rx_credits(ch);
                             } else {
-                                ker::mod::mm::dyn::kmalloc::free(ro);
+                                delete ro;
                             }
                         }
                     }
@@ -1797,7 +1802,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
     if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
         WkiRetransmitEntry* rt = ch->retransmit_head;
 
-        retransmit_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rt->len));
+        retransmit_data = new (std::nothrow) uint8_t[rt->len];
         if (retransmit_data != nullptr) {
             memcpy(retransmit_data, rt->data, rt->len);
             retransmit_len = rt->len;
@@ -1846,7 +1851,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
                 transport->tx(transport, next_hop, retransmit_data, retransmit_len);
             }
         }
-        ker::mod::mm::dyn::kmalloc::free(retransmit_data);
+        delete[] retransmit_data;
     }
 
     if (do_ack) {
@@ -1905,7 +1910,7 @@ void wki_timer_tick(uint64_t now_us) {
             WkiRetransmitEntry* rt = ch->retransmit_head;
 
             // Copy data for TX outside lock
-            retransmit_data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rt->len));
+            retransmit_data = new (std::nothrow) uint8_t[rt->len];
             if (retransmit_data != nullptr) {
                 memcpy(retransmit_data, rt->data, rt->len);
                 retransmit_len = rt->len;
@@ -1960,7 +1965,7 @@ void wki_timer_tick(uint64_t now_us) {
                     transport->tx(transport, next_hop, retransmit_data, retransmit_len);
                 }
             }
-            ker::mod::mm::dyn::kmalloc::free(retransmit_data);
+            delete[] retransmit_data;
         }
 
         if (do_ack) {

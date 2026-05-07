@@ -20,6 +20,7 @@
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "page_alloc.hpp"
 #include "platform/asm/tlb.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/paging.hpp"
@@ -57,6 +58,13 @@ __attribute__((section(".data"))) paging::PageZone* hugePageZone = nullptr;  // 
 PerCpuPageCache* per_cpu_caches = nullptr;
 size_t num_cpus = 0;
 std::atomic<bool> per_cpu_ready{false};  // Set after per-CPU structures are initialized
+
+// The cache stores only bare 4 KiB pages, but pageFree() does not receive the
+// allocation size. Caching the base of a multi-page allocation leaves the buddy
+// metadata tagged with the original larger order and can later free/reuse pages
+// that are still mapped elsewhere. Keep the cache disabled until frees carry
+// enough size/order information to prove an allocation is order-0.
+constexpr bool USE_PER_CPU_PAGE_CACHE = false;
 
 struct TrackedSpinlock {
     std::atomic<bool> locked{false};
@@ -172,6 +180,8 @@ void dumpAllocStats() {
 }
 
 auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
+
+auto get_total_mem_bytes() -> uint64_t { return main_heap_size; }
 
 void dump_caller_page_stats() {
     io::serial::write("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
@@ -334,15 +344,15 @@ void init(limine_memmap_response* memmap_response) {
     }
 
     // Find the largest usable region for huge pages (reserve ~10% or largest region > 128MB)
-    limine_memmap_entry* hugePageEntry = nullptr;
-    uint64_t largestSize = 0;
-    size_t hugePageIdx = 0;
+    limine_memmap_entry* huge_page_entry = nullptr;
+    uint64_t largest_size = 0;
+    size_t huge_page_idx = 0;
 
     for (size_t i = 0; i < memmap.entry_count; i++) {
-        if (memmap.entries[i]->type == LIMINE_MEMMAP_USABLE && memmap.entries[i]->length > largestSize) {
-            largestSize = memmap.entries[i]->length;
-            hugePageEntry = memmap.entries[i];
-            hugePageIdx = i;
+        if (memmap.entries[i]->type == LIMINE_MEMMAP_USABLE && memmap.entries[i]->length > largest_size) {
+            largest_size = memmap.entries[i]->length;
+            huge_page_entry = memmap.entries[i];
+            huge_page_idx = i;
         }
     }
 
@@ -355,8 +365,8 @@ void init(limine_memmap_response* memmap_response) {
         }
 
         // If this is the huge page entry and it's large enough, split it
-        if (i == hugePageIdx && largestSize > 128 * 1024 * 1024) {
-            uint64_t huge_sz = largestSize / 4;  // 25% for huge pages
+        if (i == huge_page_idx && largest_size > 128 * 1024 * 1024) {
+            uint64_t huge_sz = largest_size / 4;  // 25% for huge pages
             huge_sz = std::max<uint64_t>(huge_sz, static_cast<const unsigned long>(16 * 1024 * 1024));
             huge_sz = PAGE_ALIGN_UP(huge_sz);
 
@@ -402,11 +412,7 @@ void setKernelCr3(uint64_t cr3) {
 void initHugePageZoneDeferred() {
     // Map and initialize per-CPU caches first
     if (per_cpu_caches_size > 0 && per_cpu_caches_phys_base != 0) {
-        io::serial::write("Mapping per-CPU caches: base=0x");
-        io::serial::writeHex(per_cpu_caches_phys_base);
-        io::serial::write(" size=0x");
-        io::serial::writeHex(per_cpu_caches_size);
-        io::serial::write("\n");
+        mod::dbg::log("Mapping per-CPU caches: base=0x%016x size=0x%016x", per_cpu_caches_phys_base, per_cpu_caches_size);
 
         for (uint64_t offset = 0; offset < per_cpu_caches_size; offset += paging::PAGE_SIZE) {
             uint64_t phys = per_cpu_caches_phys_base + offset;
@@ -414,7 +420,7 @@ void initHugePageZoneDeferred() {
             virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
         }
 
-        io::serial::write("Per-CPU caches mapped, initializing structures\n");
+        mod::dbg::log("Per-CPU caches mapped, initializing structures");
 
         // Now we can safely access the memory
         void* cache_memory = addr::get_virt_pointer(per_cpu_caches_phys_base);
@@ -423,19 +429,13 @@ void initHugePageZoneDeferred() {
             new (&per_cpu_caches[i]) PerCpuPageCache();  // Placement new
         }
 
-        io::serial::write("Per-CPU caches initialized for ");
-        io::serial::writeHex(num_cpus);
-        io::serial::write(" CPUs\n");
+        mod::dbg::log("Per-CPU caches initialized for %zu CPUs", num_cpus);
     }
 
     // Initialize the huge page zone after virt::initPagemap() has set up the kernel page map
     // This ensures the zone metadata is in mapped memory
     if (huge_page_size > 0 && huge_page_base != 0) {
-        io::serial::write("Mapping huge page region: base=0x");
-        io::serial::writeHex(huge_page_base);
-        io::serial::write(" size=0x");
-        io::serial::writeHex(huge_page_size);
-        io::serial::write("\n");
+        mod::dbg::log("Mapping huge page region: base=0x%016x size=0x%016x", huge_page_base, huge_page_size);
 
         for (uint64_t offset = 0; offset < huge_page_size; offset += paging::PAGE_SIZE) {
             uint64_t phys = huge_page_base + offset;
@@ -443,7 +443,7 @@ void initHugePageZoneDeferred() {
             virt::mapToKernelPageTable(virt, phys, paging::pageTypes::KERNEL);
         }
 
-        io::serial::write("Huge page region mapped, initializing zone\n");
+        mod::dbg::log("Huge page region mapped, initializing zone");
 
         uint64_t flags = memlock.lock_irq();
         // Pass physical addresses - initHugePageZone will convert to virtual
@@ -451,15 +451,10 @@ void initHugePageZoneDeferred() {
         memlock.unlock_irq(flags);
 
         if (hugePageZone != nullptr) {
-            io::serial::write("Huge page zone initialized: base=0x");
-            io::serial::writeHex(huge_page_base);
-            io::serial::write(" size=0x");
-            io::serial::writeHex(huge_page_size);
-            io::serial::write(" usable=");
-            io::serial::writeHex(hugePageZone->len);
-            io::serial::write("\n");
+            mod::dbg::log("Huge page zone initialized: start=0x%016x len=0x%016x pages=%zu", hugePageZone->start, hugePageZone->len,
+                          hugePageZone->pageCount);
         } else {
-            io::serial::write("WARNING: Failed to initialize huge page zone\n");
+            mod::dbg::log("Failed to initialize huge page zone");
         }
     }
 }
@@ -474,7 +469,7 @@ auto pageAlloc(uint64_t size, std::string_view name) -> void* {
     uint64_t num_pages = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
 
     // Try per-CPU cache first for single-page allocations
-    if (size == paging::PAGE_SIZE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
+    if (USE_PER_CPU_PAGE_CACHE && size == paging::PAGE_SIZE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
         uint64_t cpu_id = cpu::getCurrentCpuIdSafe();
         if (cpu_id < num_cpus) {
             PerCpuPageCache& cache = per_cpu_caches[cpu_id];
@@ -487,6 +482,14 @@ auto pageAlloc(uint64_t size, std::string_view name) -> void* {
 
                 total_allocated_bytes.fetch_add(size, std::memory_order_relaxed);
                 alloc_count.fetch_add(1, std::memory_order_relaxed);
+
+                // Double-alloc sentinel: if the page still holds a live slab header
+                // it was freed to this cache while still in the slab chain.
+                constexpr uint32_t SLAB_MAGIC_CACHE = 0x8CBEEFC8;
+                if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC_CACHE) {
+                    mod::dbg::log("DETECT: pageAlloc (cache) returning live slab page – double-alloc trap! virt=%p", page);
+                    hcf();
+                }
 
                 // Zero the page
                 uint64_t saved_cr3 = 0;
@@ -548,6 +551,15 @@ auto pageAlloc(uint64_t size, std::string_view name) -> void* {
     }
 
     // Zero outside the lock - the block is exclusively ours now
+    // Double-alloc sentinel (buddy path): if the page still holds a live slab
+    // header it was freed to the buddy while still referenced by the slab chain.
+    constexpr uint32_t SLAB_MAGIC_BUDDY = 0x8CBEEFC8;
+    if (*reinterpret_cast<const volatile uint32_t*>(block) == SLAB_MAGIC_BUDDY) {
+        mod::dbg::log("DETECT: pageAlloc (buddy) returning live slab page – double-alloc trap! virt=%p", block);
+        hcf();
+    }
+
+    // Zero outside the lock - the block is exclusively ours now
     uint64_t saved_cr3 = 0;
     if (kernelCr3 != 0) {
         uint64_t current_cr3 = rdcr3();
@@ -582,7 +594,7 @@ auto pageAllocHuge(uint64_t size) -> void* {
     memlock.unlock_irq(flags);
 
     if (block == nullptr) {
-        io::serial::write("OOM: pageAllocHuge failed for size ");
+        io::serial::write("OOM: pageAllocHuge failed for size 0x");
         io::serial::writeHex(size);
         io::serial::write(" bytes\n");
         return nullptr;
@@ -618,7 +630,7 @@ auto pageAllocHuge(uint64_t size) -> void* {
 
 void pageFree(void* page) {
     // Try to return single pages to per-CPU cache
-    if (per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
+    if (USE_PER_CPU_PAGE_CACHE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
         uint64_t cpu_id = cpu::getCurrentCpuIdSafe();
         if (cpu_id < num_cpus) {
             PerCpuPageCache& cache = per_cpu_caches[cpu_id];
@@ -668,6 +680,35 @@ void pageFree(void* page) {
     }
 
     memlock.unlock_irq(flags);
+}
+
+auto pageSplitToOrder0(void* page) -> bool {
+    if (page == nullptr) {
+        return false;
+    }
+
+    uint64_t flags = memlock.lock_irq();
+
+    if (hugePageZone != nullptr) {
+        if ((uint64_t)page >= hugePageZone->start && (uint64_t)page < hugePageZone->start + hugePageZone->len) {
+            bool ok = hugePageZone->allocator != nullptr && hugePageZone->allocator->splitAllocatedBlockToOrder0(page);
+            memlock.unlock_irq(flags);
+            return ok;
+        }
+    }
+
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if ((uint64_t)page < zone->start || (uint64_t)page >= zone->start + zone->len) {
+            continue;
+        }
+
+        bool ok = zone->allocator != nullptr && zone->allocator->splitAllocatedBlockToOrder0(page);
+        memlock.unlock_irq(flags);
+        return ok;
+    }
+
+    memlock.unlock_irq(flags);
+    return false;
 }
 
 // --- Frame reference counting helpers ---
@@ -721,16 +762,26 @@ auto pageRefDec(void* page) -> uint32_t {
     uint32_t idx = 0;
     uint64_t flags = memlock.lock_irq();
     if (find_allocator_for_page(page, alloc, idx)) {
-        if (alloc->pageRefcounts[idx] > 0) {
-            alloc->pageRefcounts[idx]--;
-        }
         uint32_t new_ref = alloc->pageRefcounts[idx];
-        if (new_ref == 0) {
-            // Refcount reached zero - free the page
-            alloc->free(page);
-            free_count.fetch_add(1, std::memory_order_relaxed);
-            total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+        if (new_ref > 0) {
+            new_ref = --alloc->pageRefcounts[idx];
+            if (new_ref == 0) {  // UAF sentinel: a live slab page must never reach refcount 0 via pageRefDec.
+                // If the first 4 bytes match the slab magic the page is still in the slab
+                // chain – some corrupt PTE is being incorrectly treated as a user data page.
+                constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
+                if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC) {
+                    memlock.unlock_irq(flags);
+                    mod::dbg::log("DETECT: pageRefDec freeing live slab page – UAF trap! virt=%p", page);
+                    hcf();
+                }
+
+                // Refcount reached zero - free the page
+                alloc->free(page);
+                free_count.fetch_add(1, std::memory_order_relaxed);
+                total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+            }
         }
+        // If new_ref was already 0 (page already freed), do NOT call alloc->free again.
         memlock.unlock_irq(flags);
         return new_ref;
     }

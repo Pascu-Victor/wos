@@ -43,7 +43,7 @@ constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
 constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 10;            // 10 misses = 10 second timeout
 
 // Grace period for newly connected peers
-constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = 5000;  // 5 seconds after connection
+constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = static_cast<uint32_t>(WKI_DEFAULT_MISS_THRESHOLD) * WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
 
 // Jitter range for heartbeat timing (percentage of interval)
 constexpr uint8_t WKI_HEARTBEAT_JITTER_PERCENT = 25;  // +/- 25% jitter
@@ -152,11 +152,12 @@ struct WkiPeer {
     WkiTransport* transport = nullptr;
     WkiTransport* rdma_transport = nullptr;  // RDMA-capable overlay (ivshmem or RoCE)
     PeerState state = PeerState::UNKNOWN;
-    uint64_t last_heartbeat = 0;                                         // timestamp of last recv'd heartbeat (microseconds)
-    uint64_t last_rx_activity = 0;                                       // timestamp of last received packet (any type) from this peer
-    uint64_t connected_time = 0;                                         // timestamp when peer transitioned to CONNECTED
-    uint32_t rtt_us = 0;                                                 // smoothed RTT (microseconds)
-    uint32_t rtt_var_us = 0;                                             // RTT variance
+    uint64_t last_heartbeat = 0;    // timestamp of last recv'd heartbeat (microseconds)
+    uint64_t last_rx_activity = 0;  // timestamp of last received packet (any type) from this peer
+    uint64_t last_tx_activity = 0;  // timestamp of last packet sent to this peer (any type); used to suppress redundant heartbeats
+    uint64_t connected_time = 0;    // timestamp when peer transitioned to CONNECTED
+    uint32_t rtt_us = 0;            // smoothed RTT (microseconds)
+    uint32_t rtt_var_us = 0;        // RTT variance
     uint16_t heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;  // in milliseconds
     uint8_t miss_threshold = WKI_DEFAULT_MISS_THRESHOLD;
     uint8_t missed_beats = 0;       // consecutive missed heartbeats

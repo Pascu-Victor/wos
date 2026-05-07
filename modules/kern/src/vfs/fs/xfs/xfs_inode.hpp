@@ -110,8 +110,9 @@ struct XfsInode {
 // same pointer with incremented refcount.
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode*;
 
-// Release a reference to an inode.  When refcount drops to 0, the inode may
-// be evicted from the cache (but is not necessarily freed immediately).
+// Release a reference to an inode. When refcount drops to 0, the inode is
+// evicted from the cache; unlinked inodes are physically freed at that final
+// inactivation point.
 void xfs_inode_release(XfsInode* ip);
 
 // Write back a dirty inode to disk.  Serializes the in-memory XfsInode back

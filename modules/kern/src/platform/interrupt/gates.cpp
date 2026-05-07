@@ -19,6 +19,7 @@
 
 namespace ker::mod::gates {
 namespace {
+using journal = dbg::logger<"kernel">;
 interruptHandler_t interruptHandlers[256] = {nullptr};
 std::atomic<bool> panicLock{false};
 std::atomic<int64_t> panicLockOwner{-1};
@@ -33,6 +34,38 @@ IrqContext irq_contexts[256] = {};
 
 // Next vector to try for allocation (48+ to avoid legacy ISA range)
 uint8_t next_alloc_vector = 48;
+
+static auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
+    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return nullptr;
+    }
+
+    const uint64_t idx4 = (vaddr >> 39) & 0x1FF;
+    const uint64_t idx3 = (vaddr >> 30) & 0x1FF;
+    const uint64_t idx2 = (vaddr >> 21) & 0x1FF;
+    const uint64_t idx1 = (vaddr >> 12) & 0x1FF;
+
+    if (!pagemap->entries[idx4].present) {
+        return nullptr;
+    }
+    auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+        ker::mod::mm::addr::get_virt_pointer(pagemap->entries[idx4].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml3->entries[idx3].present) {
+        return nullptr;
+    }
+    auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+        ker::mod::mm::addr::get_virt_pointer(pml3->entries[idx3].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml2->entries[idx2].present) {
+        return nullptr;
+    }
+    auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+        ker::mod::mm::addr::get_virt_pointer(pml2->entries[idx2].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml1->entries[idx1].present) {
+        return nullptr;
+    }
+
+    return &pml1->entries[idx1];
+}
 }  // namespace
 
 void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
@@ -76,17 +109,72 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
         uint32_t apicId = apic::getApicId();
         uint64_t cpuIdFromApic = smt::get_cpu_index_from_apic_id(apicId);
-        dbg::emit_log("kernel", dbg::LogLevel::WARN,
-                      "USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apicId, cpuIdFromApic,
+        journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apicId, cpuIdFromApic,
                       currentTaskForDump, (currentTaskForDump != nullptr) ? currentTaskForDump->pid : 0xDEAD, cr3,
                       (currentTaskForDump != nullptr) ? (void*)currentTaskForDump->pagemap : nullptr);
 
         ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
 
         if (frame.intNum == 14) {
-            dbg::emit_log("kernel", dbg::LogLevel::WARN, "Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2,
-                          frame.errCode, frame.rip, frame.rsp,
+            journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.errCode, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
+            if (currentTaskForDump != nullptr) {
+                bool ret_slot_matches_rip = false;
+                journal::warn(" task_ctx: saved_rip=0x%lx saved_rsp=0x%lx entry=0x%lx thread=%p scratch=%p",
+                              currentTaskForDump->context.frame.rip, currentTaskForDump->context.frame.rsp, currentTaskForDump->entry,
+                              currentTaskForDump->thread, reinterpret_cast<void*>(currentTaskForDump->context.syscallScratchArea));
+                if (currentTaskForDump->pagemap != nullptr) {
+                    const uint64_t rsp_phys = ker::mod::mm::virt::translate(currentTaskForDump->pagemap, frame.rsp);
+                    const uint64_t ret_slot_va = (frame.rsp >= sizeof(uint64_t)) ? (frame.rsp - sizeof(uint64_t)) : frame.rsp;
+                    const uint64_t ret_slot_phys = ker::mod::mm::virt::translate(currentTaskForDump->pagemap, ret_slot_va);
+
+                    if (ret_slot_phys != ker::mod::mm::virt::PADDR_INVALID && ret_slot_phys != 0) {
+                        const auto* ret_slot = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(ret_slot_phys));
+                        ret_slot_matches_rip = ret_slot[0] == frame.rip;
+                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x%lx q_m1=0x%lx rip_match=%d", ret_slot_va, ret_slot_phys,
+                                      ret_slot[0], ret_slot_matches_rip ? 1 : 0);
+                    } else {
+                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x0 (unmapped)", ret_slot_va);
+                    }
+
+                    if (rsp_phys != ker::mod::mm::virt::PADDR_INVALID && rsp_phys != 0) {
+                        const auto* stack_words = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(rsp_phys));
+                        const uint64_t page_off = frame.rsp & (ker::mod::mm::paging::PAGE_SIZE - 1);
+                        size_t words_available = (ker::mod::mm::paging::PAGE_SIZE - page_off) / sizeof(uint64_t);
+                        if (words_available > 4) {
+                            words_available = 4;
+                        }
+                        const uint64_t q0 = (words_available > 0) ? stack_words[0] : 0;
+                        const uint64_t q1 = (words_available > 1) ? stack_words[1] : 0;
+                        const uint64_t q2 = (words_available > 2) ? stack_words[2] : 0;
+                        const uint64_t q3 = (words_available > 3) ? stack_words[3] : 0;
+                        journal::warn(" fault_rsp_phys=0x%lx stack_qwords=%zu q0=0x%lx q1=0x%lx q2=0x%lx q3=0x%lx", rsp_phys,
+                                      words_available, q0, q1, q2, q3);
+                    } else {
+                        journal::warn(" fault_rsp_phys=0x0 (unmapped)");
+                    }
+
+                    if (const auto* stack_pte = lookup_user_pte(currentTaskForDump->pagemap, frame.rsp); stack_pte != nullptr) {
+                        const uint64_t stack_page_phys = static_cast<uint64_t>(stack_pte->frame) << ker::mod::mm::paging::PAGE_SHIFT;
+                        uint64_t stack_pte_raw = 0;
+                        __builtin_memcpy(&stack_pte_raw, stack_pte, sizeof(stack_pte_raw));
+                        const bool stack_cow = (stack_pte_raw & ker::mod::mm::paging::PAGE_COW) != 0U;
+                        const auto stack_ref =
+                            ker::mod::mm::phys::pageRefGet(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(stack_page_phys)));
+                        journal::warn(" stack_pte: vaddr=0x%lx phys=0x%lx user=%u rw=%u nx=%u cow=%u ref=%llu",
+                                      frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1), stack_page_phys, stack_pte->user,
+                                      stack_pte->writable, stack_pte->noExecute, stack_cow ? 1U : 0U,
+                                      static_cast<unsigned long long>(stack_ref));
+
+                        if (ret_slot_matches_rip) {
+                            ker::mod::mm::virt::debugLogUserPhysMappings(stack_page_phys, "userfault-stack-ret", currentTaskForDump->pid,
+                                                                         currentTaskForDump->name, true);
+                        }
+                    } else {
+                        journal::warn(" stack_pte: vaddr=0x%lx unmapped", frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
+                    }
+                }
+            }
 
             auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF);
             uint64_t idx4 = (cr2 >> 39) & 0x1FF;
@@ -94,19 +182,19 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             uint64_t idx2 = (cr2 >> 21) & 0x1FF;
             uint64_t idx1 = (cr2 >> 12) & 0x1FF;
 
-            dbg::log("PML4[%d]: present=%d frame=0x%lx", idx4, pml4->entries[idx4].present, pml4->entries[idx4].frame);
+            journal::warn("PML4[%d]: present=%d frame=0x%lx", idx4, pml4->entries[idx4].present, pml4->entries[idx4].frame);
             if (pml4->entries[idx4].present) {
                 auto* pml3 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml4->entries[idx4].frame << 12);
-                dbg::log(" PML3[%d]: present=%d frame=0x%lx", idx3, pml3->entries[idx3].present, pml3->entries[idx3].frame);
+                journal::warn(" PML3[%d]: present=%d frame=0x%lx", idx3, pml3->entries[idx3].present, pml3->entries[idx3].frame);
                 if (pml3->entries[idx3].present) {
                     auto* pml2 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml3->entries[idx3].frame << 12);
-                    dbg::log("  PML2[%d]: present=%d frame=0x%lx", idx2, pml2->entries[idx2].present, pml2->entries[idx2].frame);
+                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", idx2, pml2->entries[idx2].present, pml2->entries[idx2].frame);
                     if (pml2->entries[idx2].present) {
                         auto* pml1 =
                             (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml2->entries[idx2].frame << 12);
-                        dbg::log("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", idx1, pml1->entries[idx1].present,
-                                 pml1->entries[idx1].frame, pml1->entries[idx1].user, pml1->entries[idx1].writable,
-                                 pml1->entries[idx1].noExecute);
+                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", idx1, pml1->entries[idx1].present,
+                                      pml1->entries[idx1].frame, pml1->entries[idx1].user, pml1->entries[idx1].writable,
+                                      pml1->entries[idx1].noExecute);
                     }
                 }
             }
@@ -122,14 +210,14 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             uint64_t dr6_clear = 0xFFFF0FF0;  // reserved bits set, all status bits cleared
             asm volatile("mov %0, %%dr7" ::"r"(dr7_clear));
             asm volatile("mov %0, %%dr6" ::"r"(dr6_clear));
-            dbg::log("Userspace debug trap (INT 1): rip=0x%lx pid=%x", frame.rip,
-                     ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+            journal::debug("Userspace debug trap (INT 1): rip=0x%lx pid=%x", frame.rip,
+                           ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
             ker::syscall::process::wos_proc_exit(128 + 5);  // 133 = SIGTRAP
             __builtin_unreachable();
         }
 
-        dbg::log("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.intNum, frame.errCode, frame.rip,
-                 (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
+        journal::warn("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.intNum, frame.errCode, frame.rip,
+                      (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
         ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
         __builtin_unreachable();
     }
@@ -172,10 +260,10 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     dbg::log("Stack trace:");
     auto* rsp = (uint64_t*)frame.rsp;
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp);
-    bool rsp_valid = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
-                     (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
+    const bool RSP_VALID = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
+                           (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
 
-    if (rsp_valid) {
+    if (RSP_VALID) {
         constexpr uint64_t MAX_STACK_TRACE = 64;
         for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
             dbg::log("%d: 0x%lx", i, rsp[i]);
@@ -186,126 +274,126 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // Dump current task information - use getCurrentTask() instead of hardcoded address
     // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
-    uint64_t cpuId = apic::getApicId();
-    sched::task::Task* currentTask = nullptr;
+    uint64_t cpu_id = apic::getApicId();
+    sched::task::Task* current_task = nullptr;
 
     if (!sched::has_run_queues()) {
         dbg::log("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
         goto skip_task_dump;  // NOLINT
     }
 
-    currentTask = sched::get_current_task();
+    current_task = sched::get_current_task();
 
     dbg::log("=== Current Task Info ===");
-    dbg::log("debug_task_ptrs[%d] = 0x%lx", cpuId, (uint64_t)currentTask);
+    dbg::log("debug_task_ptrs[%d] = 0x%lx", cpu_id, (uint64_t)current_task);
 
-    if (currentTask != nullptr) {
+    if (current_task != nullptr) {
         // CRITICAL: Validate task pointer is in valid memory range before dereferencing
         // This prevents nested faults if GC is freeing the task concurrently
-        uintptr_t taskAddr = reinterpret_cast<uintptr_t>(currentTask);
-        bool inHHDM = (taskAddr >= 0xffff800000000000ULL && taskAddr < 0xffff900000000000ULL);
-        bool inKernelStatic = (taskAddr >= 0xffffffff80000000ULL && taskAddr < 0xffffffffc0000000ULL);
+        auto task_addr = reinterpret_cast<uintptr_t>(current_task);
+        const bool IN_HHDM = (task_addr >= 0xffff800000000000ULL && task_addr < 0xffff900000000000ULL);
+        const bool IN_KERNEL_STATIC = (task_addr >= 0xffffffff80000000ULL && task_addr < 0xffffffffc0000000ULL);
 
-        if (!inHHDM && !inKernelStatic) {
-            dbg::log("WARNING: currentTask pointer 0x%lx is out of valid kernel range!", (uint64_t)currentTask);
-            dbg::log("=========================");
+        if (!IN_HHDM && !IN_KERNEL_STATIC) {
+            journal::panic("currentTask pointer 0x%lx is out of valid kernel range!", (uint64_t)current_task);
+            journal::panic("=========================");
             goto skip_task_dump;  // NOLINT
         }
 
         // Use volatile access to detect if memory is being freed (may contain garbage)
-        dbg::log("Task address: 0x%lx", (uint64_t)currentTask);
+        journal::panic("Task address: 0x%lx", (uint64_t)current_task);
 
         // Validate and print name with extreme caution
-        const char* namePtr = currentTask->name;
-        if (namePtr != nullptr) {
-            uintptr_t nameAddr = reinterpret_cast<uintptr_t>(namePtr);
-            bool nameInHHDM = (nameAddr >= 0xffff800000000000ULL && nameAddr < 0xffff900000000000ULL);
-            bool nameInKStatic = (nameAddr >= 0xffffffff80000000ULL && nameAddr < 0xffffffffc0000000ULL);
+        const char* name_ptr = current_task->name;
+        if (name_ptr != nullptr) {
+            auto name_addr = reinterpret_cast<uintptr_t>(name_ptr);
+            const bool NAME_IN_HHDM = (name_addr >= 0xffff800000000000ULL && name_addr < 0xffff900000000000ULL);
+            const bool NAME_IN_KERNEL_STATIC = (name_addr >= 0xffffffff80000000ULL && name_addr < 0xffffffffc0000000ULL);
 
-            if (nameInHHDM || nameInKStatic) {
+            if (NAME_IN_HHDM || NAME_IN_KERNEL_STATIC) {
                 // Check first byte without assuming string is valid
-                volatile const char* volatileNamePtr = namePtr;
-                volatile char firstChar = volatileNamePtr[0];
-                if (firstChar >= 0x20 && firstChar <= 0x7e) {
-                    dbg::log("Task name: %s", namePtr);
+                volatile const char* volatile_name_ptr = name_ptr;
+                volatile char first_char = volatile_name_ptr[0];
+                if (first_char >= 0x20 && first_char <= 0x7e) {
+                    journal::panic("Task name: %s", name_ptr);
                 } else {
-                    dbg::log("Task name: <invalid: first byte 0x%x>", (unsigned char)firstChar);
+                    journal::panic("Task name: <invalid: first byte 0x%x>", (unsigned char)first_char);
                 }
             } else {
-                dbg::log("Task name ptr: 0x%lx <out of range>", nameAddr);
+                journal::panic("Task name ptr: 0x%lx <out of range>", name_addr);
             }
         } else {
-            dbg::log("Task name: <null>");
+            journal::panic("Task name: <null>");
         }
 
         // Print primitive fields (safe - no pointer dereference)
-        dbg::log("PID: 0x%x", currentTask->pid);
-        dbg::log("Type: 0x%x", (uint64_t)currentTask->type);
-        dbg::log("Entry: 0x%lx", currentTask->entry);
-        dbg::log("Pagemap: 0x%lx", (uint64_t)currentTask->pagemap);
-        dbg::log("Thread: 0x%lx", (uint64_t)currentTask->thread);
+        journal::panic("PID: 0x%x", current_task->pid);
+        journal::panic("Type: 0x%x", (uint64_t)current_task->type);
+        journal::panic("Entry: 0x%lx", current_task->entry);
+        journal::panic("Pagemap: 0x%lx", (uint64_t)current_task->pagemap);
+        journal::panic("Thread: 0x%lx", (uint64_t)current_task->thread);
 
-        dbg::log("Task Context Frame:");
-        dbg::log("  frame.rip: 0x%lx", currentTask->context.frame.rip);
-        dbg::log("  frame.cs: 0x%x", currentTask->context.frame.cs);
-        dbg::log("  frame.rsp: 0x%lx", currentTask->context.frame.rsp);
-        dbg::log("  frame.ss: 0x%x", currentTask->context.frame.ss);
-        dbg::log("  frame.flags: 0x%lx", currentTask->context.frame.flags);
+        journal::panic("Task Context Frame:");
+        journal::panic("  frame.rip: 0x%lx", current_task->context.frame.rip);
+        journal::panic("  frame.cs: 0x%x", current_task->context.frame.cs);
+        journal::panic("  frame.rsp: 0x%lx", current_task->context.frame.rsp);
+        journal::panic("  frame.ss: 0x%x", current_task->context.frame.ss);
+        journal::panic("  frame.flags: 0x%lx", current_task->context.frame.flags);
 
-        dbg::log("Task Context:");
-        dbg::log("  syscallKernelStack: 0x%lx", currentTask->context.syscallKernelStack);
-        dbg::log("  syscallScratchArea: 0x%lx", currentTask->context.syscallScratchArea);
+        journal::panic("Task Context:");
+        journal::panic("  syscallKernelStack: 0x%lx", current_task->context.syscallKernelStack);
+        journal::panic("  syscallScratchArea: 0x%lx", current_task->context.syscallScratchArea);
     } else {
-        dbg::log("WARNING: currentTask is NULL!");
+        journal::panic("WARNING: currentTask is NULL!");
     }
-    dbg::log("=========================");
+    journal::panic("=========================");
 
 skip_task_dump:
 
     // Check if page 0 is mapped (it should NOT be - null derefs should crash)
     auto* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
     uint64_t pml4e = pml4[0];                               // Entry for VA 0x0
-    dbg::log("Page 0 check: PML4[0] = 0x%lx (Present=%d)", pml4e, (pml4e & 1) ? 1 : 0);
+    journal::panic("Page 0 check: PML4[0] = 0x%lx (Present=%d)", pml4e, (pml4e & 1) ? 1 : 0);
     if ((pml4e & 1) != 0U) {
-        dbg::log("WARNING: Page 0 is mapped! NULL derefs won't crash!");
+        journal::panic("WARNING: Page 0 is mapped! NULL derefs won't crash!");
     }
 
     // print frame info
-    dbg::log("CPU: %d", (uint64_t)cpuId);
-    dbg::log("Interrupt number: %d", frame.intNum);
-    dbg::log("Error code: %d", frame.errCode);
-    dbg::log("RIP: 0x%lx", frame.rip);
-    dbg::log("CS: 0x%x", frame.cs);
-    dbg::log("CALCULATED PRIVILEGE LEVEL: %d", frame.cs & 0x3);
-    dbg::log("RFLAGS: 0x%lx", frame.flags);
-    dbg::log("RSP: 0x%lx", frame.rsp);
-    dbg::log("SS: 0x%x", frame.ss);
-    dbg::log("CR0: 0x%lx", cr0);
-    dbg::log("CR2: 0x%lx", cr2);
-    dbg::log("CR3: 0x%lx", cr3);
-    dbg::log("CR4: 0x%lx", cr4);
-    dbg::log("CR8: 0x%lx", cr8);
+    journal::panic("CPU: %d", (uint64_t)cpu_id);
+    journal::panic("Interrupt number: %d", frame.intNum);
+    journal::panic("Error code: %d", frame.errCode);
+    journal::panic("RIP: 0x%lx", frame.rip);
+    journal::panic("CS: 0x%x", frame.cs);
+    journal::panic("CALCULATED PRIVILEGE LEVEL: %d", frame.cs & 0x3);
+    journal::panic("RFLAGS: 0x%lx", frame.flags);
+    journal::panic("RSP: 0x%lx", frame.rsp);
+    journal::panic("SS: 0x%x", frame.ss);
+    journal::panic("CR0: 0x%lx", cr0);
+    journal::panic("CR2: 0x%lx", cr2);
+    journal::panic("CR3: 0x%lx", cr3);
+    journal::panic("CR4: 0x%lx", cr4);
+    journal::panic("CR8: 0x%lx", cr8);
 
     // print general purpose registers
-    dbg::log("General purpose registers:");
-    dbg::log("RAX: 0x%lx", gpr.rax);
-    dbg::log("RBX: 0x%lx", gpr.rbx);
-    dbg::log("RCX: 0x%lx", gpr.rcx);
-    dbg::log("RDX: 0x%lx", gpr.rdx);
-    dbg::log("RDI: 0x%lx", gpr.rdi);
-    dbg::log("RSI: 0x%lx", gpr.rsi);
-    dbg::log("RBP: 0x%lx", gpr.rbp);
-    dbg::log("R8: 0x%lx", gpr.r8);
-    dbg::log("R9: 0x%lx", gpr.r9);
-    dbg::log("R10: 0x%lx", gpr.r10);
-    dbg::log("R11: 0x%lx", gpr.r11);
-    dbg::log("R12: 0x%lx", gpr.r12);
-    dbg::log("R13: 0x%lx", gpr.r13);
-    dbg::log("R14: 0x%lx", gpr.r14);
-    dbg::log("R15: 0x%lx", gpr.r15);
+    journal::panic("General purpose registers:");
+    journal::panic("RAX: 0x%lx", gpr.rax);
+    journal::panic("RBX: 0x%lx", gpr.rbx);
+    journal::panic("RCX: 0x%lx", gpr.rcx);
+    journal::panic("RDX: 0x%lx", gpr.rdx);
+    journal::panic("RDI: 0x%lx", gpr.rdi);
+    journal::panic("RSI: 0x%lx", gpr.rsi);
+    journal::panic("RBP: 0x%lx", gpr.rbp);
+    journal::panic("R8: 0x%lx", gpr.r8);
+    journal::panic("R9: 0x%lx", gpr.r9);
+    journal::panic("R10: 0x%lx", gpr.r10);
+    journal::panic("R11: 0x%lx", gpr.r11);
+    journal::panic("R12: 0x%lx", gpr.r12);
+    journal::panic("R13: 0x%lx", gpr.r13);
+    journal::panic("R14: 0x%lx", gpr.r14);
+    journal::panic("R15: 0x%lx", gpr.r15);
 
     // print segment selectors and descriptors
-    dbg::log("Segment selectors and descriptors:");
+    journal::panic("Segment selectors and descriptors:");
     struct GDTR {
         uint16_t limit;
         uint64_t base;
@@ -314,7 +402,7 @@ skip_task_dump:
 
     // Validate GDTR before using it
     bool gdtr_valid = (gdtr.base >= 0xffff800000000000ULL || gdtr.base >= 0xffffffff80000000ULL);
-    dbg::log("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
+    journal::panic("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
 
     auto rdmsr = [](uint32_t msr) -> uint64_t {
         uint32_t lo, hi;
@@ -332,15 +420,15 @@ skip_task_dump:
     asm volatile("str %0" : "=r"(sel_tr));
 
     auto printSelector = [&](const char* name, uint16_t sel) {
-        dbg::log("%s: 0x%x (index=%d, rpl=%d)", name, sel, (uint64_t)(sel >> 3), (uint64_t)(sel & 0x3));
+        journal::panic("%s: 0x%x (index=%d, rpl=%d)", name, sel, (uint64_t)(sel >> 3), (uint64_t)(sel & 0x3));
 
         if (sel == 0) {
-            dbg::log("  NULL selector");
+            journal::panic("  NULL selector");
             return;
         }
 
         if (!gdtr_valid) {
-            dbg::log("  Skipping descriptor dump (invalid GDTR)");
+            journal::panic("  Skipping descriptor dump (invalid GDTR)");
             return;
         }
 
@@ -353,13 +441,13 @@ skip_task_dump:
                                (desc_addr >= 0xffffffff80000000ULL && desc_addr < 0xffffffffc0000000ULL);
 
         if (!desc_addr_valid) {
-            dbg::log("  Invalid descriptor address: 0x%lx", desc_addr);
+            journal::panic("  Invalid descriptor address: 0x%lx", desc_addr);
             return;
         }
 
         uint64_t desc = *(uint64_t*)(desc_addr);
 
-        dbg::log("  Raw descriptor: 0x%lx", desc);
+        journal::panic("  Raw descriptor: 0x%lx", desc);
 
         uint64_t limit_low = desc & 0xFFFF;
         uint64_t base_0_15 = (desc >> 16) & 0xFFFF;
@@ -388,17 +476,17 @@ skip_task_dump:
                 uint64_t desc_high = *(uint64_t*)(desc_addr_high);
                 uint64_t base_high = desc_high & 0xFFFFFFFF;
                 uint64_t full_base = base | (base_high << 32);
-                dbg::log("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", full_base, limit);
-                dbg::log("  Access: 0x%x, Flags: 0x%x", access, flags);
-                dbg::log("  Raw high: 0x%lx", desc_high);
+                journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", full_base, limit);
+                journal::panic("  Access: 0x%x, Flags: 0x%x", access, flags);
+                journal::panic("  Raw high: 0x%lx", desc_high);
             } else {
-                dbg::log("  System descriptor (TSS). Base (partial): 0x%lx, Limit: 0x%lx", base, limit);
-                dbg::log("  Access: 0x%x, Flags: 0x%x (high descriptor invalid)", access, flags);
+                journal::panic("  System descriptor (TSS). Base (partial): 0x%lx, Limit: 0x%lx", base, limit);
+                journal::panic("  Access: 0x%x, Flags: 0x%x (high descriptor invalid)", access, flags);
             }
         } else {
             // code/data descriptor
-            dbg::log("  Code/Data descriptor. Base: 0x%lx, Limit: 0x%lx", base, limit);
-            dbg::log("  Access: 0x%x, Flags: 0x%x", access, flags);
+            journal::panic("  Code/Data descriptor. Base: 0x%lx, Limit: 0x%lx", base, limit);
+            journal::panic("  Access: 0x%x, Flags: 0x%x", access, flags);
         }
     };
 
@@ -411,7 +499,7 @@ skip_task_dump:
     printSelector("TR", sel_tr);
 
     // print common MSRs
-    dbg::log("Common MSRs:");
+    journal::panic("Common MSRs:");
     struct MsrInfo {
         const char* name;
         uint32_t id;
@@ -423,10 +511,10 @@ skip_task_dump:
                       {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
     for (auto& m : msrs) {
         uint64_t val = rdmsr(m.id);
-        dbg::log("%s: 0x%lx", m.name, val);
+        journal::panic("%s: 0x%lx", m.name, val);
     }
 
-    dbg::log("Halting");
+    journal::panic("Halting");
     panicLockOwner.store(-1, std::memory_order_release);
     panicLock.store(false, std::memory_order_release);
     hcf();

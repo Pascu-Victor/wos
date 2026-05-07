@@ -237,6 +237,9 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
                                               uintptr_t val) {
     // Use direct serial writes for panic-safe output
     ser::enterPanicMode();
+    if (!ser::isPanicOwner()) {
+        hcf();
+    }
     ser::writeUnlocked("\n[UBSAN] ");
     ser::writeUnlocked(kind);
     ser::writeUnlocked(" at ");
@@ -277,6 +280,9 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
 [[noreturn]] static void ubsan_abort_with_vals(const char* kind, const UbsanSourceLocation* loc, const UbsanTypeDescriptor* type,
                                                uintptr_t lhs, uintptr_t rhs) {
     ser::enterPanicMode();
+    if (!ser::isPanicOwner()) {
+        hcf();
+    }
     ser::writeUnlocked("\n[UBSAN] ");
     ser::writeUnlocked(kind);
     ser::writeUnlocked(" at ");
@@ -317,6 +323,9 @@ void __ubsan_handle_type_mismatch_v1(UbsanTypeMismatchDataV1* data, uintptr_t pt
     }
     if (data->log_alignment != 0 && (ptr & ((1UL << data->log_alignment) - 1)) != 0) {
         ser::enterPanicMode();
+        if (!ser::isPanicOwner()) {
+            hcf();
+        }
         ser::writeUnlocked("\n[UBSAN] misaligned-access at ");
         ser::writeUnlocked(data->loc.file ? data->loc.file : "?");
         ser::writeUnlocked(":");
@@ -388,6 +397,9 @@ void __ubsan_handle_pointer_overflow(UbsanPointerOverflowData* data, uintptr_t b
 
 void __ubsan_handle_implicit_conversion(UbsanImplicitConversionData* data, uintptr_t src, uintptr_t dst) {
     ser::enterPanicMode();
+    if (!ser::isPanicOwner()) {
+        hcf();
+    }
     ser::writeUnlocked("\n[UBSAN] implicit-conversion at ");
     ser::writeUnlocked(data->loc.file ? data->loc.file : "?");
     ser::writeUnlocked(":");

@@ -18,6 +18,12 @@ __attribute__((used, section(".requests"))) volatile limine_module_request g_ker
     .internal_modules = nullptr,
 };
 
+__attribute__((used, section(".requests"))) volatile limine_executable_cmdline_request g_kernel_cmdline_request = {
+    .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
 __attribute__((used, section(".requests_end_marker"))) volatile uint64_t limine_requests_end_marker[] =
     LIMINE_REQUESTS_END_MARKER;  // NOLINT
 
@@ -30,5 +36,11 @@ auto get_kernel_module_request() -> volatile limine_module_request& { return g_k
 auto get_kernel_rsp() -> uint64_t { return g_kernel_rsp; }
 
 void set_kernel_rsp(uint64_t rsp) { g_kernel_rsp = rsp; }
+
+auto get_kernel_cmdline() -> const char* {
+    if (g_kernel_cmdline_request.response == nullptr) { return ""; }
+    if (g_kernel_cmdline_request.response->cmdline == nullptr) { return ""; }
+    return g_kernel_cmdline_request.response->cmdline;
+}
 
 }  // namespace ker::init

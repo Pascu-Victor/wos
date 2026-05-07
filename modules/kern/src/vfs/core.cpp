@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -22,6 +24,7 @@
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
+#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/fs/fat32.hpp>
@@ -35,8 +38,11 @@
 #include "fs/devfs.hpp"
 #include "fs/fat32.hpp"
 #include "fs/tmpfs.hpp"
-#include "platform/mm/dyn/kmalloc.hpp"
+#include "net/wki/wire.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "vfs.hpp"
+#include "vfs/file_operations.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs {
 
@@ -97,6 +103,8 @@ struct StreamCacheEntry;
 struct StreamIsland;
 
 struct StreamReaderAttachment {
+    static constexpr uint64_t MAGIC = 0x53545245414d5241ULL;  // "STREAMRA"
+    uint64_t magic = MAGIC;
     StreamCacheEntry* entry = nullptr;
     StreamIsland* island = nullptr;
     uint64_t desired_offset = 0;
@@ -127,6 +135,13 @@ struct StreamCacheEntry {
 
 std::deque<std::unique_ptr<StreamCacheEntry>> g_stream_cache;
 ker::mod::sys::Mutex g_stream_cache_lock;
+
+auto stream_attachment_pointer_looks_valid(const void* ptr) -> bool {
+    auto addr = reinterpret_cast<uint64_t>(ptr);
+    bool in_hhdm = addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL;
+    bool in_kernel_static = addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL;
+    return (in_hhdm || in_kernel_static) && ((addr & (alignof(StreamReaderAttachment) - 1)) == 0);
+}
 
 auto stream_now_us() -> uint64_t { return ker::mod::time::getUs(); }
 
@@ -523,6 +538,9 @@ auto vfs_stream_cache_get_file_stat(File* file, stat* statbuf) -> int {
 
     std::memset(statbuf, 0, sizeof(stat));
 
+    MountPoint* sc_mount = file->vfs_path ? find_mount_point(file->vfs_path) : nullptr;
+    uint32_t sc_dev_id = sc_mount ? sc_mount->dev_id : 0;
+
     switch (file->fs_type) {
         case FSType::TMPFS: {
             // Pipes and epoll reuse FSType::TMPFS but private_data is not a TmpNode
@@ -533,7 +551,7 @@ auto vfs_stream_cache_get_file_stat(File* file, stat* statbuf) -> int {
             if (node == nullptr) {
                 return -EBADF;
             }
-            statbuf->st_dev = 0;
+            statbuf->st_dev = sc_dev_id;
             statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
             statbuf->st_uid = node->uid;
@@ -555,15 +573,21 @@ auto vfs_stream_cache_get_file_stat(File* file, stat* statbuf) -> int {
             }
             return 0;
         }
-        case FSType::FAT32:
-            return ker::vfs::fat32::fat32_fstat(file, statbuf);
+        case FSType::FAT32: {
+            int r = ker::vfs::fat32::fat32_fstat(file, statbuf);
+            if (r == 0) statbuf->st_dev = sc_dev_id;
+            return r;
+        }
         case FSType::DEVFS:
         case FSType::SOCKET:
         case FSType::PROCFS:
         case FSType::REMOTE:  // REMOTE has its own caching (ReadAheadCache/WriteBehindBuffer/RDMA); not in kernel stream cache
             return -ENOSYS;
-        case FSType::XFS:
-            return ker::vfs::xfs::xfs_fstat(file, statbuf);
+        case FSType::XFS: {
+            int r = ker::vfs::xfs::xfs_fstat(file, statbuf);
+            if (r == 0) statbuf->st_dev = sc_dev_id;
+            return r;
+        }
         default:
             return -ENOSYS;
     }
@@ -772,12 +796,16 @@ void stream_detach_file(File* file) {
 
     auto* attachment = static_cast<StreamReaderAttachment*>(file->stream_cache_attachment);
     file->stream_cache_attachment = nullptr;
+    if (!stream_attachment_pointer_looks_valid(attachment) || attachment->magic != StreamReaderAttachment::MAGIC) {
+        return;
+    }
 
     g_stream_cache_lock.lock();
     stream_unlink_attachment(attachment);
     stream_gc_locked(stream_now_us());
     g_stream_cache_lock.unlock();
 
+    attachment->magic = 0;
     delete attachment;
 }
 
@@ -1533,7 +1561,7 @@ auto normalize_task_path_inplace(char* path, size_t bufsize) -> int {
 
     char routed[MAX_PATH_LEN] = {};
     ker::mod::sched::task::Task* current_task = nullptr;
-    if (ker::mod::sched::has_run_queues()) {
+    if (ker::mod::sched::can_query_current_task()) {
         current_task = ker::mod::sched::get_current_task();
     }
 
@@ -1554,7 +1582,7 @@ auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
     // Prepend per-process root prefix when it differs from "/".
     // This makes pivot_root transparent: after pivot_root("/rootfs", ...),
     // task->root becomes "/rootfs" and all absolute paths get prefixed.
-    if (ker::mod::sched::has_run_queues()) {
+    if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
             size_t root_len = std::strlen(task->root);
@@ -1654,9 +1682,8 @@ void release_open_file(File* file) {
     if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
         file->fops->vfs_close(file);
     }
-    if (file->vfs_path != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free((void*)file->vfs_path);
-    }
+
+    delete[] file->vfs_path;
     delete file;
 }
 
@@ -1718,25 +1745,35 @@ void load_vfs_rules_from_buffer(char* buffer) {
 // If the path is already absolute, copies it as-is.
 // Returns 0 on success, negative on error.
 auto make_absolute(const char* path, char* out, size_t outsize) -> int {
-    if (path == nullptr || out == nullptr || outsize == 0) return -EINVAL;
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
     size_t plen = std::strlen(path);
-    if (plen == 0) return -EINVAL;
+    if (plen == 0) {
+        return -EINVAL;
+    }
 
     if (path[0] == '/') {
-        if (plen + 1 > outsize) return -ENAMETOOLONG;
+        if (plen + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
         std::memcpy(out, path, plen + 1);
         return 0;
     }
 
     // Relative path - prepend task CWD
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
 
     size_t cwdlen = std::strlen(task->cwd);
     // Need: cwd + "/" + path + '\0'
     bool need_sep = (cwdlen > 1);  // Root "/" doesn't need extra /
     size_t total = cwdlen + (need_sep ? 1 : 0) + plen + 1;
-    if (total > outsize) return -ENAMETOOLONG;
+    if (total > outsize) {
+        return -ENAMETOOLONG;
+    }
 
     std::memcpy(out, task->cwd, cwdlen);
     if (need_sep) {
@@ -2011,13 +2048,13 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (f == nullptr) return 0;
             if (f->fops == nullptr || f->fops->vfs_readlink == nullptr) {
                 ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-                ker::mod::mm::dyn::kmalloc::free(f);
+                delete f;
                 return 0;
             }
             char linkbuf[MAX_PATH_LEN];
             ssize_t link_len = f->fops->vfs_readlink(f, linkbuf, MAX_PATH_LEN - 1);
             ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-            ker::mod::mm::dyn::kmalloc::free(f);
+            delete f;
             if (link_len <= 0) return 0;  // Not a symlink or error
             linkbuf[link_len] = '\0';
             if (linkbuf[0] == '/') {
@@ -2248,7 +2285,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     // Store the absolute VFS path for mount-overlay directory listing
     size_t path_len = std::strlen(pathBuffer);
-    auto* path_copy = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(path_len + 1));
+    auto* path_copy = new char[path_len + 1];
     if (path_copy != nullptr) {
         std::memcpy(path_copy, pathBuffer, path_len + 1);
         f->vfs_path = path_copy;
@@ -2262,8 +2299,12 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     // Permission check: verify R/W access based on open flags
     // Build required access bits from open flags
     int required_access = 0;
-    if (accmode == 0 || accmode == 2) required_access |= 4;  // R_OK
-    if (accmode == 1 || accmode == 2) required_access |= 2;  // W_OK
+    if (accmode == 0 || accmode == 2) {
+        required_access |= 4;  // R_OK
+    }
+    if (accmode == 1 || accmode == 2) {
+        required_access |= 2;  // W_OK
+    }
 
     // Get the file's mode/uid/gid for permission check
     if (required_access != 0 && f->fs_type == FSType::TMPFS) {
@@ -2272,8 +2313,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             int perm_ret = vfs_check_permission(node->mode, node->uid, node->gid, required_access);
             if (perm_ret < 0) {
                 // Permission denied - clean up and return
-                if (f->vfs_path != nullptr) ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(f->vfs_path));
-                ker::mod::mm::dyn::kmalloc::free(f);
+                delete[] f->vfs_path;
+                delete f;
                 return perm_ret;
             }
         }
@@ -2318,13 +2359,12 @@ auto vfs_close(int fd) -> int {
             close_result = f->fops->vfs_close(f);
         }
         // Free the VFS path string if allocated
-        if (f->vfs_path != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(f->vfs_path));
-        }
+        delete[] f->vfs_path;
         // Free the File descriptor object (just the handle/wrapper)
         // but keep the underlying fs node (f->private_data) intact
         // so the file can be reopened later
-        ker::mod::mm::dyn::kmalloc::free((void*)f);
+        f->private_data = nullptr;
+        delete f;
     }
 
     return close_result;
@@ -2373,6 +2413,9 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     }
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
         return -EINVAL;
+    }
+    if ((f->open_flags & ker::vfs::O_APPEND) && (f->fops->vfs_lseek != nullptr)) {
+        f->fops->vfs_lseek(f, 0, 2);  // SEEK_END
     }
     ssize_t r = f->fops->vfs_write(f, buf, count, (size_t)f->pos);
     if (r >= 0) {
@@ -2813,10 +2856,12 @@ auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_
         const char* fsp = strip_mount_prefix(mount, absPath);
 
         auto* f = ker::vfs::procfs::procfs_open_path(fsp, 0, 0);
-        if (f == nullptr) return -ENOENT;
+        if (f == nullptr) {
+            return -ENOENT;
+        }
         ssize_t ret = ker::vfs::procfs::get_procfs_fops()->vfs_readlink(f, buf, bufsize);
         ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
-        ker::mod::mm::dyn::kmalloc::free(f);
+        delete f;
         return ret;
     }
 
@@ -2837,10 +2882,12 @@ auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_
         const char* fs_path = strip_mount_prefix(mount, absPath);
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
-        if (f == nullptr) return -ENOENT;
+        if (f == nullptr) {
+            return -ENOENT;
+        }
         ssize_t ret = ker::vfs::xfs::get_xfs_fops()->vfs_readlink(f, buf, bufsize);
         ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-        ker::mod::mm::dyn::kmalloc::free(f);
+        delete f;
         return ret;
     }
 
@@ -2856,7 +2903,7 @@ auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_
             if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
                 f->fops->vfs_close(f);
             }
-            ker::mod::mm::dyn::kmalloc::free(f);
+            delete f;
             return -ENOSYS;
         }
 
@@ -2864,7 +2911,7 @@ auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_
         if (f->fops->vfs_close != nullptr) {
             f->fops->vfs_close(f);
         }
-        ker::mod::mm::dyn::kmalloc::free(f);
+        delete f;
         return ret;
     }
 
@@ -2906,7 +2953,9 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     }
 
     char absPath[MAX_PATH_LEN];
-    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
+    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) {
+        return -ENOENT;
+    }
 
     return readlink_resolved(absPath, buf, bufsize);
 }
@@ -2918,21 +2967,35 @@ auto vfs_mkdir(const char* path, int mode) -> int {
     }
 
     char absPath[MAX_PATH_LEN];
-    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) return -ENOENT;
+    if (resolve_task_path_raw(path, absPath, MAX_PATH_LEN) < 0) {
+        return -ENOENT;
+    }
 
     MountPoint* mount = find_mount_point(absPath);
     if (mount == nullptr) {
         return -ENOENT;
     }
 
-    if (mount->fs_type != FSType::TMPFS) {
-        return -ENOSYS;  // Only tmpfs supports mkdir for now
-    }
-
     const char* fs_path = strip_mount_prefix(mount, absPath);
 
-    auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, true);
-    return (node != nullptr) ? 0 : -1;
+    if (mount->fs_type == FSType::TMPFS) {
+        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, true);
+        return (node != nullptr) ? 0 : -1;
+    }
+
+    if (mount->fs_type == FSType::XFS) {
+        auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
+        int r = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx);
+        // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
+        return (r == -EEXIST) ? 0 : r;
+    }
+
+    // For other mounts (devfs, procfs, etc.) return 0 if the directory exists
+    ker::vfs::stat st{};
+    if (vfs_stat(absPath, &st) == 0) {
+        return 0;
+    }
+    return -ENOSYS;
 }
 
 auto vfs_stat_impl(const char* path, stat* statbuf, bool resolve_task_path, bool apply_task_policy) -> int {
@@ -3024,8 +3087,9 @@ auto vfs_stat_impl(const char* path, stat* statbuf, bool resolve_task_path, bool
             if (node == nullptr) {
                 return -ENOENT;
             }
-            statbuf->st_dev = 0;
-            statbuf->st_ino = reinterpret_cast<ino_t>(node);  // Use node address as inode
+            // Access node fields immediately while potentially still holding any implicit lock
+            statbuf->st_dev = mount->dev_id;
+            statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
             statbuf->st_uid = node->uid;
             statbuf->st_gid = node->gid;
@@ -3057,7 +3121,7 @@ auto vfs_stat_impl(const char* path, stat* statbuf, bool resolve_task_path, bool
             if (node == nullptr) {
                 return -ENOENT;
             }
-            statbuf->st_dev = 0;
+            statbuf->st_dev = mount->dev_id;
             statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
             statbuf->st_uid = node->uid;
@@ -3088,7 +3152,7 @@ auto vfs_stat_impl(const char* path, stat* statbuf, bool resolve_task_path, bool
             // procfs: open the path, check if it exists
             auto* f = ker::vfs::procfs::procfs_open_path(fs_path, 0, 0);
             if (f == nullptr) return -ENOENT;
-            statbuf->st_dev = 0;
+            statbuf->st_dev = mount->dev_id;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
             statbuf->st_uid = 0;
@@ -3139,6 +3203,10 @@ auto vfs_stat_impl(const char* path, stat* statbuf, bool resolve_task_path, bool
         result = fill_synthetic_mount_dir_stat(pathBuffer, statbuf);
     }
 
+    if (result == 0 && mount != nullptr) {
+        statbuf->st_dev = mount->dev_id;
+    }
+
     // WOSLINK post-processing: mark WKI entry directories with S_WOSLINK
     // so userspace tools (e.g., ls -R) can avoid infinite recursion through
     // /wki/host/wki/host/... or /wki/node-1/wki/node-0/wki/node-1/...
@@ -3175,6 +3243,9 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
         return fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
     }
 
+    MountPoint* fstat_mount = file->vfs_path ? find_mount_point(file->vfs_path) : nullptr;
+    uint32_t fstat_dev_id = fstat_mount ? fstat_mount->dev_id : 0;
+
     switch (file->fs_type) {
         case FSType::TMPFS: {
             // Pipes and epoll reuse FSType::TMPFS but private_data is not a TmpNode
@@ -3188,7 +3259,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             if (node == nullptr) {
                 return -EBADF;
             }
-            statbuf->st_dev = 0;
+            statbuf->st_dev = fstat_dev_id;
             statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
             statbuf->st_uid = node->uid;
@@ -3211,11 +3282,13 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             return 0;
         }
         case FSType::FAT32: {
-            return ker::vfs::fat32::fat32_fstat(file, statbuf);
+            int r = ker::vfs::fat32::fat32_fstat(file, statbuf);
+            if (r == 0) statbuf->st_dev = fstat_dev_id;
+            return r;
         }
         case FSType::DEVFS: {
             auto* node = static_cast<ker::vfs::devfs::DevFSNode*>(file->private_data);
-            statbuf->st_dev = 0;
+            statbuf->st_dev = fstat_dev_id;
             statbuf->st_ino = node ? reinterpret_cast<ino_t>(node) : 1;
             statbuf->st_nlink = 1;
             statbuf->st_uid = node ? node->uid : 0;
@@ -3234,7 +3307,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             return 0;
         }
         case FSType::SOCKET: {
-            statbuf->st_dev = 0;
+            statbuf->st_dev = fstat_dev_id;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
             statbuf->st_mode = S_IFSOCK | 0666;
@@ -3253,13 +3326,14 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                     const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
                     int ret = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
                     if (ret == 0) {
+                        statbuf->st_dev = mount->dev_id;
                         return 0;
                     }
                 }
             }
 
             // Fall back to a synthetic stat if path-based remote metadata lookup fails.
-            statbuf->st_dev = 0;
+            statbuf->st_dev = fstat_dev_id;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
             statbuf->st_uid = 0;
@@ -3277,8 +3351,141 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             return 0;
         }
         case FSType::XFS: {
-            return ker::vfs::xfs::xfs_fstat(file, statbuf);
+            int r = ker::vfs::xfs::xfs_fstat(file, statbuf);
+            if (r == 0) statbuf->st_dev = fstat_dev_id;
+            return r;
         }
+        default:
+            return -ENOSYS;
+    }
+}
+
+// --- statvfs / fstatvfs ---
+
+static void fill_synthetic_statvfs(statvfs* buf) {
+    std::memset(buf, 0, sizeof(statvfs));
+    buf->f_bsize   = 4096;
+    buf->f_frsize  = 4096;
+    buf->f_namemax = 255;
+}
+
+auto vfs_statvfs(const char* path, statvfs* buf) -> int {
+    if (path == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+
+    char pathBuffer[MAX_PATH_LEN];
+    if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) {
+        return -ENOENT;
+    }
+
+    char resolved[MAX_PATH_LEN];
+    if (resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true) < 0) {
+        return -ENOENT;
+    }
+
+    MountPoint* mount = find_mount_point(resolved);
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+
+    std::memset(buf, 0, sizeof(statvfs));
+
+    switch (mount->fs_type) {
+        case FSType::XFS:
+            return ker::vfs::xfs::xfs_statvfs(
+                static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+        case FSType::FAT32:
+            return ker::vfs::fat32::fat32_statvfs(
+                static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+        case FSType::TMPFS: {
+            uint64_t total_blocks = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
+            uint64_t free_blocks  = ker::mod::mm::phys::get_free_mem_bytes()  / 4096;
+            buf->f_bsize   = 4096;
+            buf->f_frsize  = 4096;
+            buf->f_blocks  = total_blocks;
+            buf->f_bfree   = free_blocks;
+            buf->f_bavail  = free_blocks;
+            buf->f_files   = total_blocks;
+            buf->f_ffree   = free_blocks;
+            buf->f_favail  = free_blocks;
+            buf->f_namemax = 255;
+            return 0;
+        }
+        case FSType::DEVFS:
+        case FSType::PROCFS:
+        case FSType::SOCKET:
+            fill_synthetic_statvfs(buf);
+            return 0;
+        case FSType::REMOTE:
+            fill_synthetic_statvfs(buf);
+            buf->f_flag = ST_RDONLY;
+            return 0;
+        default:
+            return -ENOSYS;
+    }
+}
+
+auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
+    if (buf == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* file = vfs_get_file(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    std::memset(buf, 0, sizeof(statvfs));
+
+    // For any fs type that has a path, delegate to vfs_statvfs so mount
+    // context lookup is centralised.
+    if (file->vfs_path != nullptr) {
+        MountPoint* mount = find_mount_point(file->vfs_path);
+        if (mount != nullptr) {
+            switch (mount->fs_type) {
+                case FSType::XFS:
+                    return ker::vfs::xfs::xfs_statvfs(
+                        static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+                case FSType::FAT32:
+                    return ker::vfs::fat32::fat32_statvfs(
+                        static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+                default:
+                    break;
+            }
+        }
+    }
+
+    // Fallback: synthesise by fs_type on the file itself
+    switch (file->fs_type) {
+        case FSType::TMPFS: {
+            uint64_t total_blocks = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
+            uint64_t free_blocks  = ker::mod::mm::phys::get_free_mem_bytes()  / 4096;
+            buf->f_bsize   = 4096;
+            buf->f_frsize  = 4096;
+            buf->f_blocks  = total_blocks;
+            buf->f_bfree   = free_blocks;
+            buf->f_bavail  = free_blocks;
+            buf->f_files   = total_blocks;
+            buf->f_ffree   = free_blocks;
+            buf->f_favail  = free_blocks;
+            buf->f_namemax = 255;
+            return 0;
+        }
+        case FSType::DEVFS:
+        case FSType::PROCFS:
+        case FSType::SOCKET:
+            fill_synthetic_statvfs(buf);
+            return 0;
+        case FSType::REMOTE:
+            fill_synthetic_statvfs(buf);
+            buf->f_flag = ST_RDONLY;
+            return 0;
         default:
             return -ENOSYS;
     }
@@ -3286,8 +3493,9 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
 
 // --- umount ---
 auto vfs_umount(const char* target) -> int {
-    // Resolve path through the task's root prefix so that, after pivot_root,
-    // umount("/oldroot") correctly matches the renamed mount entry.
+    // Resolve once for mount-scope invalidation lookup.
+    // unmount_filesystem() performs its own task-root-aware resolution,
+    // so passing an already-resolved path would double-prefix after pivot_root.
     char resolved[MAX_PATH_LEN];
     if (resolve_task_path_raw(target, resolved, MAX_PATH_LEN) < 0) {
         return -ENAMETOOLONG;
@@ -3296,7 +3504,7 @@ auto vfs_umount(const char* target) -> int {
     if (MountPoint* mount = find_mount_point(resolved); mount != nullptr) {
         stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));
     }
-    return unmount_filesystem(resolved);
+    return unmount_filesystem(target);
 }
 
 // --- pivot_root ---
@@ -3310,59 +3518,15 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
         return -ESRCH;
     }
 
-    // Validate that new_root is an existing mount point
-    MountPoint* new_mount = find_mount_point(new_root);
-    if (new_mount == nullptr) {
-        ker::mod::dbg::log("pivot_root: new_root '%s' is not a mount point", new_root);
-        return -EINVAL;
-    }
-
-    // Check that new_root path matches the mount point exactly
-    if (std::strcmp(new_mount->path, new_root) != 0) {
-        ker::mod::dbg::log("pivot_root: new_root '%s' is not an exact mount point (found '%s')", new_root, new_mount->path);
-        return -EINVAL;
-    }
-
-    // Rename the old root mount from "/" to put_old so it can be accessed
-    // (and unmounted) under the new root.
-    MountPoint* old_root_mount = find_mount_point("/");
-    if (old_root_mount != nullptr && std::strcmp(old_root_mount->path, "/") == 0) {
-        size_t put_old_len = std::strlen(put_old);
-        auto* new_path = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(put_old_len + 1));
-        if (new_path != nullptr) {
-            std::memcpy(new_path, put_old, put_old_len + 1);
-            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(old_root_mount->path));
-            old_root_mount->path = new_path;
-        }
-    }
-
-    // Remap child mounts of the old root so they remain accessible under
-    // the new root.  After pivot_root("/rootfs", ...), a devfs at "/dev"
-    // must become "/rootfs/dev" because task path resolution will prepend
-    // the root prefix, turning user "/dev/urandom" into "/rootfs/dev/urandom".
+    // Rewrite mount paths under the mount-table lock so concurrent WKI
+    // auto-mounts cannot race a path free/update in find_mount_point().
     size_t new_root_len = std::strlen(new_root);
-    size_t mount_count = get_mount_count();
-    for (size_t i = 0; i < mount_count; ++i) {
-        MountPoint* mp = get_mount_at(i);
-        if (mp == nullptr || mp->path == nullptr) continue;
-
-        // Skip the new root mount itself
-        if (std::strcmp(mp->path, new_root) == 0) continue;
-
-        // Skip mounts already under the new root (including the just-renamed old root)
-        if (std::strncmp(mp->path, new_root, new_root_len) == 0 && (mp->path[new_root_len] == '/' || mp->path[new_root_len] == '\0'))
-            continue;
-
-        // This mount is under the old root — prefix it with new_root
-        size_t mp_len = std::strlen(mp->path);
-        auto* remapped = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(new_root_len + mp_len + 1));
-        if (remapped != nullptr) {
-            std::memcpy(remapped, new_root, new_root_len);
-            std::memcpy(remapped + new_root_len, mp->path, mp_len + 1);
-            ker::mod::dbg::log("pivot_root: remapped mount '%s' -> '%s'", mp->path, remapped);
-            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(mp->path));
-            mp->path = remapped;
+    int remap_ret = remap_mounts_for_pivot(new_root, put_old);
+    if (remap_ret != 0) {
+        if (remap_ret == -EINVAL) {
+            ker::mod::dbg::log("pivot_root: new_root '%s' is not an exact mount point", new_root);
         }
+        return remap_ret;
     }
 
     // Set root to new_root for ALL active tasks (not just the caller).
@@ -3388,33 +3552,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
     // WKI auto-mounts are driven by deferred work and can land after the
     // initial mount snapshot above, while this pivot is still in progress.
     // Rebase any stale /wki mounts once task roots now point at new_root.
-    {
-        size_t refreshed_mount_count = get_mount_count();
-        for (size_t i = 0; i < refreshed_mount_count; ++i) {
-            MountPoint* mp = get_mount_at(i);
-            if (mp == nullptr || mp->path == nullptr) continue;
-
-            if (std::strcmp(mp->path, "/wki") != 0 && std::strncmp(mp->path, "/wki/", 5) != 0) {
-                continue;
-            }
-
-            if (std::strncmp(mp->path, new_root, new_root_len) == 0 && (mp->path[new_root_len] == '/' || mp->path[new_root_len] == '\0')) {
-                continue;
-            }
-
-            size_t mp_len = std::strlen(mp->path);
-            auto* remapped = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(new_root_len + mp_len + 1));
-            if (remapped == nullptr) {
-                continue;
-            }
-
-            std::memcpy(remapped, new_root, new_root_len);
-            std::memcpy(remapped + new_root_len, mp->path, mp_len + 1);
-            ker::mod::dbg::log("pivot_root: rebased late WKI mount '%s' -> '%s'", mp->path, remapped);
-            ker::mod::mm::dyn::kmalloc::free(const_cast<char*>(mp->path));
-            mp->path = remapped;
-        }
-    }
+    rebase_wki_mounts_for_new_root(new_root);
 
     ker::mod::dbg::log("pivot_root: task '%s' (pid %x) root set to '%s'", task->name, task->pid, new_root);
 
@@ -3442,18 +3580,29 @@ auto vfs_dup(int oldfd) -> int {
 
 auto vfs_dup2(int oldfd, int newfd) -> int {
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
-    if (newfd < 0 || static_cast<unsigned>(newfd) >= ker::mod::sched::task::Task::FD_TABLE_SIZE) return -EBADF;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (newfd < 0 || static_cast<unsigned>(newfd) >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return -EBADF;
+    }
     auto* f = vfs_get_file(task, oldfd);
-    if (f == nullptr) return -EBADF;
-    if (oldfd == newfd) return newfd;
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    if (oldfd == newfd) {
+        return newfd;
+    }
     // Close newfd if it's open
     auto* existing = vfs_get_file(task, newfd);
     if (existing != nullptr) {
         vfs_close(newfd);
     }
     f->refcount.fetch_add(1, std::memory_order_relaxed);
-    task->fd_table.insert(static_cast<uint64_t>(newfd), f);
+    if (!task->fd_table.insert(static_cast<uint64_t>(newfd), f)) {
+        f->refcount.fetch_sub(1, std::memory_order_relaxed);
+        return -EMFILE;
+    }
     // POSIX: dup2 does NOT inherit close-on-exec from the source fd
     task->clear_fd_cloexec(static_cast<unsigned>(newfd));
     return newfd;
@@ -3461,19 +3610,29 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
 
 // --- getcwd / chdir ---
 auto vfs_getcwd(char* buf, size_t size) -> int {
-    if (buf == nullptr || size == 0) return -EINVAL;
+    if (buf == nullptr || size == 0) {
+        return -EINVAL;
+    }
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
     size_t len = std::strlen(task->cwd);
-    if (len + 1 > size) return -ERANGE;
+    if (len + 1 > size) {
+        return -ERANGE;
+    }
     std::memcpy(buf, task->cwd, len + 1);
     return 0;
 }
 
 auto vfs_chdir(const char* path) -> int {
-    if (path == nullptr) return -EINVAL;
+    if (path == nullptr) {
+        return -EINVAL;
+    }
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
 
     char logical[MAX_PATH_LEN] = {};
     int absolute = make_absolute(path, logical, MAX_PATH_LEN);
@@ -3490,12 +3649,18 @@ auto vfs_chdir(const char* path) -> int {
     // resolution internally, so pass the logical (user-visible) path.
     ker::vfs::stat st{};
     int ret = vfs_stat(logical, &st);
-    if (ret < 0) return ret;
-    if ((st.st_mode & S_IFDIR) == 0) return -ENOTDIR;
+    if (ret < 0) {
+        return ret;
+    }
+    if ((st.st_mode & S_IFDIR) == 0) {
+        return -ENOTDIR;
+    }
 
     // Copy to task cwd
     size_t rlen = std::strlen(logical);
-    if (rlen + 1 > ker::mod::sched::task::Task::CWD_MAX) return -ENAMETOOLONG;
+    if (rlen + 1 > ker::mod::sched::task::Task::CWD_MAX) {
+        return -ENAMETOOLONG;
+    }
     std::memcpy(task->cwd, logical, rlen + 1);
     return 0;
 }
@@ -3503,10 +3668,14 @@ auto vfs_chdir(const char* path) -> int {
 // --- access ---
 // R_OK=4, W_OK=2, X_OK=1, F_OK=0
 auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_gid, int access_bits) -> int {
-    if (access_bits == 0) return 0;  // F_OK - existence only
+    if (access_bits == 0) {
+        return 0;  // F_OK - existence only
+    }
 
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
 
     // Root can do anything (except execute if no execute bit set anywhere)
     if (task->euid == 0) {
@@ -3516,7 +3685,7 @@ auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_g
         return 0;
     }
 
-    uint32_t perm_bits;
+    uint32_t perm_bits{};
     if (task->euid == file_uid) {
         perm_bits = (file_mode >> 6) & 7;  // Owner bits
     } else if (task->egid == file_gid) {
@@ -3525,9 +3694,15 @@ auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_g
         perm_bits = file_mode & 7;  // Other bits
     }
 
-    if ((access_bits & 4) && !(perm_bits & 4)) return -EACCES;  // R_OK
-    if ((access_bits & 2) && !(perm_bits & 2)) return -EACCES;  // W_OK
-    if ((access_bits & 1) && !(perm_bits & 1)) return -EACCES;  // X_OK
+    if ((access_bits & 4) && !(perm_bits & 4)) {
+        return -EACCES;  // R_OK
+    }
+    if ((access_bits & 2) && !(perm_bits & 2)) {
+        return -EACCES;  // W_OK
+    }
+    if ((access_bits & 1) && !(perm_bits & 1)) {
+        return -EACCES;  // X_OK
+    }
     return 0;
 }
 
@@ -3554,56 +3729,78 @@ auto vfs_access(const char* path, int mode) -> int {
 // --- pread / pwrite ---
 auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
     auto* f = vfs_get_file(task, fd);
-    if (f == nullptr) return -EBADF;
-    if (f->fops == nullptr || f->fops->vfs_read == nullptr) return -ENOSYS;
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
+        return -ENOSYS;
+    }
     // Read at given offset without modifying file position
     return f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset));
 }
 
 auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t {
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) return -ESRCH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
     auto* f = vfs_get_file(task, fd);
-    if (f == nullptr) return -EBADF;
-    if (f->fops == nullptr || f->fops->vfs_write == nullptr) return -ENOSYS;
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    if (f->fops == nullptr || f->fops->vfs_write == nullptr) {
+        return -ENOSYS;
+    }
     return f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset));
 }
 
 // --- unlink ---
 auto vfs_unlink(const char* path) -> int {
-    if (path == nullptr) return -EINVAL;
+    if (path == nullptr) {
+        return -EINVAL;
+    }
 
-    char path_buf[MAX_PATH_LEN];
-    if (resolve_task_path_raw(path, path_buf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    std::array<char, MAX_PATH_LEN> path_buf{};
+    if (resolve_task_path_raw(path, path_buf.data(), MAX_PATH_LEN) < 0) {
+        return -ENAMETOOLONG;
+    }
 
-    MountPoint* mount = find_mount_point(path_buf);
-    if (mount == nullptr) return -ENOENT;
+    MountPoint* mount = find_mount_point(path_buf.data());
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
 
     if (mount->fs_type == FSType::XFS) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf);
+        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
         return ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
     }
 
     if (mount->fs_type == FSType::FAT32) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf);
+        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
         return ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf);
+        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
         return ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
     }
 
-    if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
+    if (mount->fs_type != FSType::TMPFS) {
+        return -ENOSYS;
+    }
 
-    const char* fs_path = strip_mount_prefix(mount, path_buf);
+    const char* fs_path = strip_mount_prefix(mount, path_buf.data());
 
     // Walk to parent, then find child
     const char* last_slash = nullptr;
-    for (const char* p = fs_path; *p; ++p) {
-        if (*p == '/') last_slash = p;
+    for (const char* p = fs_path; (*p) != 0; ++p) {
+        if (*p == '/') {
+            last_slash = p;
+        }
     }
 
     ker::vfs::tmpfs::TmpNode* parent = nullptr;
@@ -3615,18 +3812,26 @@ auto vfs_unlink(const char* path) -> int {
     } else {
         char parent_path[MAX_PATH_LEN];
         auto paren_len = static_cast<size_t>(last_slash - fs_path);
-        if (paren_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+        if (paren_len >= MAX_PATH_LEN) {
+            return -ENAMETOOLONG;
+        }
         std::memcpy(parent_path, fs_path, paren_len);
         parent_path[paren_len] = '\0';
         parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path, false);
         name = last_slash + 1;
     }
 
-    if (parent == nullptr || name == nullptr || *name == '\0') return -ENOENT;
+    if (parent == nullptr || name == nullptr || *name == '\0') {
+        return -ENOENT;
+    }
 
     auto* child = ker::vfs::tmpfs::tmpfs_lookup(parent, name);
-    if (child == nullptr) return -ENOENT;
-    if (child->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -EISDIR;
+    if (child == nullptr) {
+        return -ENOENT;
+    }
+    if (child->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+        return -EISDIR;
+    }
 
     // Hold tmpfs tree lock to serialize with open_count increment in tmpfs_open_path
     ker::vfs::tmpfs::tmpfs_lock_tree();
@@ -3656,31 +3861,46 @@ auto vfs_unlink(const char* path) -> int {
 
 // --- rmdir ---
 auto vfs_rmdir(const char* path) -> int {
-    if (path == nullptr) return -EINVAL;
+    if (path == nullptr) {
+        return -EINVAL;
+    }
 
-    char pathBuf[MAX_PATH_LEN];
-    if (resolve_task_path_raw(path, pathBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
+    char path_buf[MAX_PATH_LEN];
+    if (resolve_task_path_raw(path, path_buf, MAX_PATH_LEN) < 0) {
+        return -ENAMETOOLONG;
+    }
 
-    MountPoint* mount = find_mount_point(pathBuf);
-    if (mount == nullptr) return -ENOENT;
+    MountPoint* mount = find_mount_point(path_buf);
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
 
     if (mount->fs_type == FSType::FAT32) {
-        const char* fs_path = strip_mount_prefix(mount, pathBuf);
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
         return ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, pathBuf);
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
         return ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
     }
 
-    if (mount->fs_type != FSType::TMPFS) return -ENOSYS;
+    if (mount->fs_type == FSType::XFS) {
+        const char* fs_path = strip_mount_prefix(mount, path_buf);
+        return ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+    }
 
-    const char* fs_path = strip_mount_prefix(mount, pathBuf);
+    if (mount->fs_type != FSType::TMPFS) {
+        return -ENOSYS;
+    }
+
+    const char* fs_path = strip_mount_prefix(mount, path_buf);
 
     const char* last_slash = nullptr;
-    for (const char* p = fs_path; *p; ++p) {
-        if (*p == '/') last_slash = p;
+    for (const char* p = fs_path; (*p) != 0; ++p) {
+        if (*p == '/') {
+            last_slash = p;
+        }
     }
 
     ker::vfs::tmpfs::TmpNode* parent = nullptr;
@@ -3692,19 +3912,29 @@ auto vfs_rmdir(const char* path) -> int {
     } else {
         char parent_path[MAX_PATH_LEN];
         auto paren_len = static_cast<size_t>(last_slash - fs_path);
-        if (paren_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+        if (paren_len >= MAX_PATH_LEN) {
+            return -ENAMETOOLONG;
+        }
         std::memcpy(parent_path, fs_path, paren_len);
         parent_path[paren_len] = '\0';
         parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path, false);
         name = last_slash + 1;
     }
 
-    if (parent == nullptr || name == nullptr || *name == '\0') return -ENOENT;
+    if (parent == nullptr || name == nullptr || *name == '\0') {
+        return -ENOENT;
+    }
 
     auto* child = ker::vfs::tmpfs::tmpfs_lookup(parent, name);
-    if (child == nullptr) return -ENOENT;
-    if (child->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) return -ENOTDIR;
-    if (child->children_count > 0) return -ENOTEMPTY;
+    if (child == nullptr) {
+        return -ENOENT;
+    }
+    if (child->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    if (child->children_count > 0) {
+        return -ENOTEMPTY;
+    }
 
     ker::vfs::tmpfs::tmpfs_lock_tree();
     for (size_t i = 0; i < parent->children_count; ++i) {
@@ -3730,83 +3960,113 @@ auto vfs_rmdir(const char* path) -> int {
 
 // --- rename ---
 auto vfs_rename(const char* oldpath, const char* newpath) -> int {
-    if (oldpath == nullptr || newpath == nullptr) return -EINVAL;
-
-    char oldBuf[MAX_PATH_LEN], newBuf[MAX_PATH_LEN];
-    if (resolve_task_path_raw(oldpath, oldBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-    if (resolve_task_path_raw(newpath, newBuf, MAX_PATH_LEN) < 0) return -ENAMETOOLONG;
-
-    MountPoint* oldMount = find_mount_point(oldBuf);
-    MountPoint* newMount = find_mount_point(newBuf);
-    if (!oldMount || !newMount) return -ENOENT;
-
-    if (oldMount->fs_type == FSType::FAT32 && newMount->fs_type == FSType::FAT32 && oldMount == newMount) {
-        return ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(oldMount->private_data),
-                                                  strip_mount_prefix(oldMount, oldBuf), strip_mount_prefix(newMount, newBuf));
+    if (oldpath == nullptr || newpath == nullptr) {
+        return -EINVAL;
     }
 
-    if (oldMount->fs_type == FSType::REMOTE && newMount->fs_type == FSType::REMOTE && oldMount == newMount) {
-        return ker::net::wki::wki_remote_vfs_rename(oldMount->private_data, strip_mount_prefix(oldMount, oldBuf),
-                                                    strip_mount_prefix(newMount, newBuf));
+    char old_buf[MAX_PATH_LEN];
+    char new_buf[MAX_PATH_LEN];
+    if (resolve_task_path_raw(oldpath, old_buf, MAX_PATH_LEN) < 0) {
+        return -ENAMETOOLONG;
+    }
+    if (resolve_task_path_raw(newpath, new_buf, MAX_PATH_LEN) < 0) {
+        return -ENAMETOOLONG;
     }
 
-    if (oldMount->fs_type != FSType::TMPFS || newMount->fs_type != FSType::TMPFS) return -ENOSYS;
+    MountPoint* old_mount = find_mount_point(old_buf);
+    MountPoint* new_mount = find_mount_point(new_buf);
+    if ((old_mount == nullptr) || (new_mount == nullptr)) {
+        return -ENOENT;
+    }
+
+    if (old_mount->fs_type == FSType::FAT32 && new_mount->fs_type == FSType::FAT32 && old_mount == new_mount) {
+        return ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(old_mount->private_data),
+                                                  strip_mount_prefix(old_mount, old_buf), strip_mount_prefix(new_mount, new_buf));
+    }
+
+    if (old_mount->fs_type == FSType::REMOTE && new_mount->fs_type == FSType::REMOTE && old_mount == new_mount) {
+        return ker::net::wki::wki_remote_vfs_rename(old_mount->private_data, strip_mount_prefix(old_mount, old_buf),
+                                                    strip_mount_prefix(new_mount, new_buf));
+    }
+
+    if (old_mount->fs_type == FSType::XFS && new_mount->fs_type == FSType::XFS && old_mount == new_mount) {
+        return ker::vfs::xfs::xfs_rename_path(strip_mount_prefix(old_mount, old_buf), strip_mount_prefix(new_mount, new_buf),
+                                              static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data));
+    }
+
+    if (old_mount->fs_type != FSType::TMPFS || new_mount->fs_type != FSType::TMPFS) {
+        return -ENOSYS;
+    }
 
     // Helper lambda to strip mount prefix
     auto strip_mount = [](const char* buf, MountPoint* m) -> const char* {
         size_t ml = std::strlen(m->path);
-        if (ml == 1 && m->path[0] == '/') return buf + 1;
-        if (buf[ml] == '/') return buf + ml + 1;
+        if (ml == 1 && m->path[0] == '/') {
+            return buf + 1;
+        }
+        if (buf[ml] == '/') {
+            return buf + ml + 1;
+        }
         return buf + ml;
     };
 
-    const char* oldFs = strip_mount(oldBuf, oldMount);
-    const char* newFs = strip_mount(newBuf, newMount);
+    const char* oldFs = strip_mount(old_buf, old_mount);
+    const char* newFs = strip_mount(new_buf, new_mount);
 
     // Lookup old node
     auto* oldNode = ker::vfs::tmpfs::tmpfs_walk_path(oldFs, false);
-    if (oldNode == nullptr) return -ENOENT;
+    if (oldNode == nullptr) {
+        return -ENOENT;
+    }
 
     // Find old parent
     auto* oldParent = oldNode->parent;
-    if (oldParent == nullptr) return -EINVAL;  // Can't rename root
+    if (oldParent == nullptr) {
+        return -EINVAL;  // Can't rename root
+    }
 
     // Walk to new parent, extract new name
-    const char* newLastSlash = nullptr;
-    for (const char* p = newFs; *p; ++p) {
-        if (*p == '/') newLastSlash = p;
+    const char* new_last_slash = nullptr;
+    for (const char* p = newFs; (*p) != 0; ++p) {
+        if (*p == '/') {
+            new_last_slash = p;
+        }
     }
 
-    ker::vfs::tmpfs::TmpNode* newParent = nullptr;
-    const char* newName = nullptr;
+    ker::vfs::tmpfs::TmpNode* new_parent = nullptr;
+    const char* new_name = nullptr;
 
-    if (newLastSlash == nullptr) {
-        newParent = ker::vfs::tmpfs::get_root_node();
-        newName = newFs;
+    if (new_last_slash == nullptr) {
+        new_parent = ker::vfs::tmpfs::get_root_node();
+        new_name = newFs;
     } else {
-        char parentPath[MAX_PATH_LEN];
-        auto plen = static_cast<size_t>(newLastSlash - newFs);
-        if (plen >= MAX_PATH_LEN) return -ENAMETOOLONG;
-        std::memcpy(parentPath, newFs, plen);
-        parentPath[plen] = '\0';
-        newParent = ker::vfs::tmpfs::tmpfs_walk_path(parentPath, false);
-        newName = newLastSlash + 1;
+        char parent_path[MAX_PATH_LEN];
+        auto plen = static_cast<size_t>(new_last_slash - newFs);
+        if (plen >= MAX_PATH_LEN) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(parent_path, newFs, plen);
+        parent_path[plen] = '\0';
+        new_parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path, false);
+        new_name = new_last_slash + 1;
     }
 
-    if (newParent == nullptr || newName == nullptr || *newName == '\0') return -ENOENT;
+    if (new_parent == nullptr || new_name == nullptr || *new_name == '\0') {
+        return -ENOENT;
+    }
 
     // If destination exists, remove it
     ker::vfs::tmpfs::tmpfs_lock_tree();
-    auto* existing = ker::vfs::tmpfs::tmpfs_lookup(newParent, newName);
+    auto* existing = ker::vfs::tmpfs::tmpfs_lookup(new_parent, new_name);
     if (existing != nullptr) {
         // Remove existing from parent
-        for (size_t i = 0; i < newParent->children_count; ++i) {
-            if (newParent->children[i] == existing) {
-                for (size_t j = i; j + 1 < newParent->children_count; ++j) {
-                    newParent->children[j] = newParent->children[j + 1];
+        for (size_t i = 0; i < new_parent->children_count; ++i) {
+            if (new_parent->children[i] == existing) {
+                for (size_t j = i; j + 1 < new_parent->children_count; ++j) {
+                    new_parent->children[j] = new_parent->children[j + 1];
                 }
-                newParent->children_count--;
-                newParent->children[newParent->children_count] = nullptr;
+                new_parent->children_count--;
+                new_parent->children[new_parent->children_count] = nullptr;
                 existing->parent = nullptr;
                 if (existing->open_count.load(std::memory_order_acquire) > 0) {
                     existing->unlinked = true;
@@ -3831,24 +4091,24 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     }
 
     // Rename and reparent
-    size_t nn_len = std::strlen(newName);
+    size_t nn_len = std::strlen(new_name);
     size_t copy_len = nn_len < ker::vfs::tmpfs::TMPFS_NAME_MAX - 1 ? nn_len : ker::vfs::tmpfs::TMPFS_NAME_MAX - 1;
-    std::memcpy(oldNode->name.data(), newName, copy_len);
+    std::memcpy(oldNode->name.data(), new_name, copy_len);
     oldNode->name[copy_len] = '\0';
 
     // Add to new parent (inline - avoid circular include of tmpfs internal helpers)
     // Grow children array if needed
-    if (newParent->children_count >= newParent->children_capacity) {
-        size_t new_cap = (newParent->children_capacity == 0) ? 8 : newParent->children_capacity * 2;
+    if (new_parent->children_count >= new_parent->children_capacity) {
+        size_t new_cap = (new_parent->children_capacity == 0) ? 8 : new_parent->children_capacity * 2;
         auto** new_arr = new ker::vfs::tmpfs::TmpNode*[new_cap];
-        for (size_t i = 0; i < newParent->children_count; ++i) new_arr[i] = newParent->children[i];
-        for (size_t i = newParent->children_count; i < new_cap; ++i) new_arr[i] = nullptr;
-        delete[] newParent->children;
-        newParent->children = new_arr;
-        newParent->children_capacity = new_cap;
+        for (size_t i = 0; i < new_parent->children_count; ++i) new_arr[i] = new_parent->children[i];
+        for (size_t i = new_parent->children_count; i < new_cap; ++i) new_arr[i] = nullptr;
+        delete[] new_parent->children;
+        new_parent->children = new_arr;
+        new_parent->children_capacity = new_cap;
     }
-    newParent->children[newParent->children_count++] = oldNode;
-    oldNode->parent = newParent;
+    new_parent->children[new_parent->children_count++] = oldNode;
+    oldNode->parent = new_parent;
 
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return 0;
@@ -3880,9 +4140,9 @@ auto vfs_chmod(const char* path, int mode) -> int {
             return 0;
         }
         case FSType::FAT32:
+            return 0;  // FAT32 has no permission model; silently accept
         case FSType::XFS:
-            // FAT32/XFS have no on-disk permission model or are read-only; accept silently
-            return 0;
+            return ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
         default:
             return -ENOSYS;
     }
@@ -3903,8 +4163,9 @@ auto vfs_fchmod(int fd, int mode) -> int {
         }
         case FSType::DEVFS:
         case FSType::FAT32:
+            return 0;  // No permission model; silently accept
         case FSType::XFS:
-            return 0;  // Accept silently
+            return ker::vfs::xfs::xfs_fchmod(f, mode);
         default:
             return -ENOSYS;
     }
@@ -4686,6 +4947,24 @@ auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, 
     return static_cast<int>(rule.prefix_len);
 }
 
+auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int {
+    if (index >= g_default_vfs_rules.size()) {
+        return -ENOENT;
+    }
+
+    const auto& rule = g_default_vfs_rules[index];
+    if (prefix_buf != nullptr) {
+        if (rule.prefix_len + 1 > prefix_buf_size) {
+            return -ERANGE;
+        }
+        std::memcpy(prefix_buf, rule.prefix, rule.prefix_len + 1);
+    }
+    if (route_out != nullptr) {
+        *route_out = rule.route;
+    }
+    return static_cast<int>(rule.prefix_len);
+}
+
 auto vfs_wki_rule_clear() -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
@@ -4792,7 +5071,7 @@ auto vfs_open_file_impl(const char* path, int flags, int mode, bool resolve_task
     // Store the absolute VFS path for mount-overlay directory listing
     if (f != nullptr) {
         size_t pl = std::strlen(pathBuffer);
-        auto* pc = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(pl + 1));
+        auto* pc = new char[pl + 1];
         if (pc != nullptr) {
             std::memcpy(pc, pathBuffer, pl + 1);
             f->vfs_path = pc;
@@ -4831,7 +5110,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     // Keep the staging buffer modest so blocking outputs do not cause sendfile()
     // to pre-read large chunks that cannot be written in the same call.
     constexpr size_t BUF_SIZE = 64UL * 1024UL;
-    auto* buffer = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
+    auto* buffer = new char[BUF_SIZE];
     if (buffer == nullptr) {
         return -ENOMEM;
     }
@@ -4845,7 +5124,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         ssize_t read_result = vfs_pread(infd, buffer, to_read, source_offset);
         if (read_result < 0) {
             if (total_sent == 0) {
-                ker::mod::mm::dyn::kmalloc::free(buffer);
+                delete[] buffer;
                 return read_result;
             }
             break;
@@ -4863,7 +5142,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
             if (write_result < 0) {
                 auto* current = mod::sched::get_current_task();
                 if (current != nullptr && current->deferredTaskSwitch) {
-                    ker::mod::mm::dyn::kmalloc::free(buffer);
+                    delete[] buffer;
                     if (offset != nullptr) {
                         *offset = source_offset;
                     } else {
@@ -4872,7 +5151,12 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
                     return total_sent > 0 ? total_sent : write_result;
                 }
                 if (total_sent == 0) {
-                    ker::mod::mm::dyn::kmalloc::free(buffer);
+                    delete[] buffer;
+                    if (offset != nullptr) {
+                        *offset = source_offset;
+                    } else {
+                        infile->pos = source_offset;
+                    }
                     return write_result;
                 }
                 chunk_offset = chunk_size;
@@ -4899,7 +5183,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         infile->pos = source_offset;
     }
 
-    ker::mod::mm::dyn::kmalloc::free(buffer);
+    delete[] buffer;
     return total_sent;
 }
 

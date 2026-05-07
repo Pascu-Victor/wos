@@ -7,18 +7,18 @@
 # The test build uses a host-Linux clang (not the WOS cross-compiler).
 
 CompileFlags:
-  CompilationDatabase: /tmp/wos-tests
-  Add:
-    - --target=x86_64-pc-linux-gnu
+    CompilationDatabase: ../build_tests
+    Add:
+        - --target=x86_64-pc-linux-gnu
 
 Diagnostics:
-  UnusedIncludes: Strict
-  ClangTidy:
-    Add:
-      - bugprone-*
-      - modernize-*
-      - readability-*
-    Remove:
-      - modernize-use-trailing-return-type
-      - readability-magic-numbers
-      - readability-identifier-length
+    UnusedIncludes: Strict
+    ClangTidy:
+        Add:
+            - bugprone-*
+            - modernize-*
+            - readability-*
+        Remove:
+            - modernize-use-trailing-return-type
+            - readability-magic-numbers
+            - readability-identifier-length

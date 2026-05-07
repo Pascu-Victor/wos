@@ -9,6 +9,9 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/tsc/tsc.hpp>
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
 
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
@@ -25,6 +28,15 @@ namespace ker::mod::sys::context_switch {
 // This function is now a no-op since the scheduler tracks currentTask internally.
 static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpuId) {
     // No-op: scheduler's runQueues->thisCpu()->currentTask is the authoritative source
+}
+
+static inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr) {
+#ifdef WOS_KASAN
+    if (ker::mod::kasan::is_enabled()) {
+        // Built by hardware/assembly, then patched by C++ before iretq.
+        ker::mod::kasan::unpoison_range(stack_ptr, sizeof(cpu::GPRegs) + sizeof(gates::interruptFrame));
+    }
+#endif
 }
 
 // Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
@@ -248,6 +260,8 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
         sched::gc_expired_tasks();
     }
 
+    kasan_unpoison_irq_save_area(stack_ptr);
+
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
@@ -324,6 +338,8 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
 }
 
 extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
+    kasan_unpoison_irq_save_area(stack_ptr);
+
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 

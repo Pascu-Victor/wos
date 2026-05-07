@@ -9,6 +9,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/list.hpp>
+#include <util/hcf.hpp>
 
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -68,6 +69,14 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     for (uint64_t offset = 0; offset < stackSize; offset += mm::paging::PAGE_SIZE) {
         uint64_t stackPhys = (uint64_t)mm::addr::get_phys_pointer((uint64_t)stack + offset);
         mm::virt::mapPage(pageTable, stackVirtAddr + offset, stackPhys, mm::paging::pageTypes::USER);
+    }
+
+    // TLS and user stacks are reclaimed one 4 KiB leaf at a time during
+    // destroyUserSpace() / COW teardown, so split the bulk allocations into
+    // independently freeable pages once the mappings are established.
+    if (!mm::phys::pageSplitToOrder0(tls) || !mm::phys::pageSplitToOrder0(stack)) {
+        dbg::log("createThread: failed to split TLS/stack backing pages");
+        hcf();
     }
 
     // TCB goes at the TOP of the TLS area (highest address)

@@ -8,15 +8,18 @@
 #include "xfs_attr.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
-#include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_inode.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+
+#include "net/endian.hpp"
+#include "vfs/buffer_cache.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -164,7 +167,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
     if (!ip->has_attr_fork || ip->attr_fork.format != XFS_DINODE_FMT_LOCAL || ip->attr_fork.local.data == nullptr) {
         // Allocate initial shortform: header + new entry
         size_t alloc_size = sizeof(XfsAttrSfHdr) + new_entry_size;
-        auto* buf = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(alloc_size));
+        auto* buf = new (std::nothrow) uint8_t[alloc_size];
         if (buf == nullptr) {
             return -ENOMEM;
         }
@@ -184,7 +187,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
 
         // Install into inode
         if (ip->attr_fork.format == XFS_DINODE_FMT_LOCAL && ip->attr_fork.local.data != nullptr) {
-            mod::mm::dyn::kmalloc::free(ip->attr_fork.local.data);
+            delete[] ip->attr_fork.local.data;
         }
         ip->attr_fork.format = XFS_DINODE_FMT_LOCAL;
         ip->attr_fork.local.data = buf;
@@ -270,7 +273,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
     }
 
     // Reallocate the buffer
-    auto* new_buf = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(new_total));
+    auto* new_buf = new uint8_t[new_total];
     if (new_buf == nullptr) {
         return -ENOMEM;
     }
@@ -290,7 +293,7 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
     new_hdr->totsize = __be16::from_cpu(static_cast<uint16_t>(new_total));
 
     // Replace buffer in inode
-    mod::mm::dyn::kmalloc::free(ip->attr_fork.local.data);
+    delete[] ip->attr_fork.local.data;
     ip->attr_fork.local.data = new_buf;
     ip->attr_fork.local.size = new_total;
     ip->dirty = true;

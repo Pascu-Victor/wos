@@ -57,6 +57,12 @@ struct PageAllocator {
     // per-page flags - callers do not need to supply the size.
     void free(void* ptr);
 
+    // Re-tag a contiguous allocated block as a run of independently freeable
+    // order-0 pages while preserving the existing per-page refcounts.
+    // Use this when a multi-page allocation will be mapped/freed as separate
+    // 4 KiB leaves.
+    auto splitAllocatedBlockToOrder0(void* ptr) -> bool;
+
     __attribute__((no_sanitize("address"))) uint32_t getFreePages() const { return freeCount; }
     __attribute__((no_sanitize("address"))) uint32_t getUsablePages() const { return usablePages; }
 };

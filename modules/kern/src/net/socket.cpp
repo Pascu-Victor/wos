@@ -1,11 +1,14 @@
 #include "socket.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <net/proto/raw.hpp>
 #include <net/proto/tcp.hpp>
 #include <net/proto/udp.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <util/fast_copy.hpp>
 
 namespace ker::net {
@@ -55,13 +58,10 @@ auto RingBuffer::read(void* buf, size_t len) -> ssize_t {
 }
 
 auto socket_create(int domain, int type, int protocol) -> Socket* {
-    auto* sock = static_cast<Socket*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(Socket)));
+    auto* sock = new (std::nothrow) Socket{};
     if (sock == nullptr) {
         return nullptr;
     }
-
-    // Placement-construct the socket-level spinlock (rcvbuf/sndbuf are lock-free SPSC)
-    new (&sock->lock) ker::mod::sys::Spinlock();
 
     int base_type = type & SOCK_TYPE_MASK;
     sock->nonblock = (type & SOCK_NONBLOCK) != 0;
@@ -96,7 +96,7 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
     }
 
     if (socket_init_buffers(sock, rcvbuf_size) < 0) {
-        ker::mod::mm::dyn::kmalloc::free(sock);
+        delete sock;
         return nullptr;
     }
 
@@ -112,15 +112,13 @@ void socket_destroy(Socket* sock) {
         sock->proto_ops->close(sock);
     }
 
-    if (sock->rcvbuf.data != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(sock->rcvbuf.data);
-    }
+    delete[] sock->rcvbuf.data;
 
-    ker::mod::mm::dyn::kmalloc::free(sock);
+    delete sock;
 }
 
 auto socket_init_buffers(Socket* sock, size_t rcvbuf_size) -> int {
-    sock->rcvbuf.data = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(rcvbuf_size));
+    sock->rcvbuf.data = new (std::nothrow) uint8_t[rcvbuf_size];
     if (sock->rcvbuf.data == nullptr) {
         return -1;
     }
@@ -142,12 +140,12 @@ auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int {
         return -1;
     }
 
-    auto* new_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(new_size));
+    auto* new_buf = new (std::nothrow) uint8_t[new_size];
     if (new_buf == nullptr) {
         return -1;
     }
 
-    ker::mod::mm::dyn::kmalloc::free(sock->rcvbuf.data);
+    delete[] sock->rcvbuf.data;
     sock->rcvbuf.data = new_buf;
     sock->rcvbuf.capacity = new_size;
     sock->rcvbuf.read_pos = 0;

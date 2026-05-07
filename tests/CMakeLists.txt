@@ -66,7 +66,7 @@ function(wos_add_unit_test name)
     target_compile_options(${name} PRIVATE
         -g -O1 -fno-omit-frame-pointer
         -fsanitize=address,undefined
-        -fno-sanitize=function,vptr
+        -fno-sanitize=vptr
         -Wall -Wextra
     )
     target_link_options(${name} PRIVATE -fsanitize=address,undefined)
@@ -91,7 +91,7 @@ function(wos_add_fuzz_target name)
     target_compile_options(${name} PRIVATE
         -g -O1 -fno-omit-frame-pointer
         -fsanitize=address,undefined,fuzzer
-        -fno-sanitize=function,vptr
+        -fno-sanitize=vptr
         -Wall -Wextra
     )
     target_link_options(${name} PRIVATE -fsanitize=address,undefined,fuzzer)

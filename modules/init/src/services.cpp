@@ -2,6 +2,7 @@
 
 #include <sys/process.h>
 #include <sys/vfs.h>
+#include <time.h>
 
 #include <array>
 #include <cstdint>
@@ -87,5 +88,32 @@ void start_dropbear() {
         if (prio_rc < 0) {
             init_warn("init[%d]: failed to lower dropbear priority (%lld)", cpuno, static_cast<long long>(prio_rc));
         }
+    }
+}
+
+void start_testd() {
+    int cpuno = ker::multiproc::currentThreadId();
+
+    // Only spawn testd if the binary is present (development/test builds only).
+    int probe_fd = ker::abi::vfs::open("/usr/bin/testd", 0, 0);
+    if (probe_fd < 0) {
+        return;
+    }
+    ker::abi::vfs::close(probe_fd);
+
+    // Wait for all previously spawned services (netd, httpd, dropbear) to finish
+    // initializing. There are no service-ready signals yet, so a fixed delay is used.
+    init_info("init[%d]: testd: waiting 10s for services to settle...", cpuno);
+    struct timespec settle{ .tv_sec = 10, .tv_nsec = 0 };
+    nanosleep(&settle, nullptr);
+
+    init_info("init[%d]: spawning testd (kernel test daemon)", cpuno);
+    std::array<const char*, 2> argv = {"/usr/bin/testd", nullptr};
+    std::array<const char*, 1> envp = {nullptr};
+    uint64_t pid = ker::process::exec("/usr/bin/testd", argv.data(), envp.data());
+    if (pid == 0) {
+        init_warn("init[%d]: failed to spawn testd", cpuno);
+    } else {
+        init_info("init[%d]: testd spawned as PID %llu", cpuno, static_cast<unsigned long long>(pid));
     }
 }

@@ -15,7 +15,6 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/dbg/journal.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 
@@ -50,7 +49,7 @@ void ensure_children_capacity(DevFSNode* node) {
         return;
     }
     size_t new_cap = (node->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : node->children_capacity * 2;
-    auto** new_arr = static_cast<DevFSNode**>(ker::mod::mm::dyn::kmalloc::malloc(new_cap * sizeof(DevFSNode*)));
+    auto** new_arr = new DevFSNode*[new_cap];
     if (new_arr == nullptr) {
         return;
     }
@@ -485,14 +484,14 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     }
 
     // Allocate File + DevFSFile wrapper
-    auto* file = static_cast<File*>(ker::mod::mm::dyn::kmalloc::malloc(sizeof(File)));
+    auto* file = new File();
     if (file == nullptr) {
         return nullptr;
     }
 
     auto* devfs_file = new DevFSFile();
     if (devfs_file == nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(file);
+        delete file;
         return nullptr;
     }
     devfs_file->node = node;
@@ -516,7 +515,7 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
         if (node->device != nullptr && node->device->char_ops != nullptr && node->device->char_ops->open != nullptr) {
             if (node->device->char_ops->open(file) != 0) {
                 delete devfs_file;
-                ker::mod::mm::dyn::kmalloc::free(file);
+                delete file;
                 return nullptr;
             }
         }
@@ -750,7 +749,7 @@ void devfs_populate_net_nodes() {
         }
 
         // Allocate a Device struct to hold the netdev pointer
-        auto* dev = static_cast<ker::dev::Device*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::dev::Device)));
+        auto* dev = new ker::dev::Device();
         if (dev == nullptr) {
             continue;
         }
@@ -923,6 +922,9 @@ auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
             return "compute";
         case RT::CUSTOM:
             return "custom";
+        default:
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            break;
     }
     return "unknown";
 }
@@ -943,6 +945,9 @@ auto wki_type_prefix(ker::net::wki::ResourceType type) -> const char* {
             return "cmp";
         case RT::CUSTOM:
             return "cst";
+        default:
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            break;
     }
     return "unk";
 }
@@ -962,6 +967,9 @@ auto wki_type_name(ker::net::wki::ResourceType type) -> const char* {
             return "compute";
         case RT::CUSTOM:
             return "custom";
+        default:
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            break;
     }
     return "unknown";
 }
@@ -1050,6 +1058,8 @@ ker::dev::CharDeviceOps wki_resource_ops = {
     },
     .write = nullptr,
     .isatty = nullptr,
+    .ioctl = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // Format a uint32 into a char buffer, returns bytes written
@@ -1167,9 +1177,9 @@ void wki_remove_named_child(DevFSNode* dir, const char* name) {
     // Free associated allocations for device nodes
     if (child->type == DevFSNodeType::DEVICE && child->device != nullptr) {
         if (child->device->private_data != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(child->device->private_data);
+            delete static_cast<WkiDevfsCtx*>(child->device->private_data);
         }
-        ker::mod::mm::dyn::kmalloc::free(child->device);
+        delete child->device;
     }
     delete child;
 }
@@ -1227,9 +1237,9 @@ void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node,
     remove_child(type_dir, device_node);
     if (device_node->device != nullptr) {
         if (device_node->device->private_data != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(device_node->device->private_data);
+            delete static_cast<WkiDevfsCtx*>(device_node->device->private_data);
         }
-        ker::mod::mm::dyn::kmalloc::free(device_node->device);
+        delete device_node->device;
     }
     delete device_node;
 }
@@ -1267,7 +1277,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     }
 
     // Allocate context (also holds persistent dev_name for Device::name)
-    auto* rctx = static_cast<WkiDevfsCtx*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(WkiDevfsCtx)));
+    auto* rctx = new WkiDevfsCtx();
     if (rctx == nullptr) {
         return;
     }
@@ -1287,7 +1297,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     wki_build_dev_name(rctx->dev_name, sizeof(rctx->dev_name), zone_id, node_id, type, local_num);
 
     // Allocate Device struct
-    auto* dev = static_cast<ker::dev::Device*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(ker::dev::Device)));
+    auto* dev = new ker::dev::Device();
     if (dev == nullptr) {
         return;
     }
@@ -1544,6 +1554,8 @@ static ker::dev::CharDeviceOps s_node_state_ops = {
     .isatty = nullptr,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
+    .ioctl = nullptr,
 };
 
 static ker::dev::CharDeviceOps s_node_load_ops = {
@@ -1594,7 +1606,7 @@ auto make_node_device(const char* hostname, uint16_t node_id, uint8_t file_type,
         return nullptr;
     }
 
-    auto* ctx = static_cast<NodeDevfsCtx*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(NodeDevfsCtx)));
+    auto* ctx = new NodeDevfsCtx();
     if (ctx == nullptr) {
         delete dev;
         return nullptr;

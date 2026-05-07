@@ -1,14 +1,18 @@
 #include "tmpfs.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
 
 #include "vfs/file_operations.hpp"
+#include "vfs/vfs.hpp"
 
 namespace {
 auto _kstrcmp(const char* a, const char* b) -> int {

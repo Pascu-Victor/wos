@@ -18,6 +18,34 @@ class list {
         m_size = 0;
     }
 
+    ~list() { clear(); }
+
+    list(const list&) = delete;
+    auto operator=(const list&) -> list& = delete;
+
+    list(list&& other) noexcept {
+        head = other.head;
+        tail = other.tail;
+        m_size = other.m_size;
+        other.head = nullptr;
+        other.tail = nullptr;
+        other.m_size = 0;
+    }
+
+    auto operator=(list&& other) noexcept -> list& {
+        if (this == &other) {
+            return *this;
+        }
+        clear();
+        head = other.head;
+        tail = other.tail;
+        m_size = other.m_size;
+        other.head = nullptr;
+        other.tail = nullptr;
+        other.m_size = 0;
+        return *this;
+    }
+
     void push_back(T data) {
         Node* node = new Node();
         node->data = data;
@@ -138,6 +166,16 @@ class list {
     }
 
     auto size() -> uint64_t { return this->m_size; }
+
+    void clear() {
+        while (head) {
+            Node* next = head->next;
+            delete head;
+            head = next;
+        }
+        tail = nullptr;
+        m_size = 0;
+    }
 
     Node* getHead() const { return head; }
     Node* getTail() const { return tail; }

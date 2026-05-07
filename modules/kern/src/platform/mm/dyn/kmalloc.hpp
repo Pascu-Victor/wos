@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <minimalist_malloc/mini_malloc.hpp>
+#include <new>
 
 namespace ker::mod::mm::dyn::kmalloc {
 void init();
@@ -26,9 +27,7 @@ auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void*;
 template <typename T>
 inline static auto malloc() -> T* {
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
-    return static_cast<T*>(malloc_tagged(sizeof(T),
-                                         reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
-                                         __PRETTY_FUNCTION__));
+    return static_cast<T*>(malloc_tagged(sizeof(T), reinterpret_cast<uintptr_t>(__builtin_return_address(0)), __PRETTY_FUNCTION__));
 #else
     return static_cast<T*>(malloc(sizeof(T)));
 #endif
@@ -49,3 +48,6 @@ void operator delete[](void* ptr, size_t size) noexcept;
 
 void operator delete(void* ptr) noexcept;
 void operator delete[](void* ptr) noexcept;
+
+auto operator new(unsigned long size, std::nothrow_t const&) noexcept -> void*;
+auto operator new[](unsigned long size, std::nothrow_t const&) noexcept -> void*;

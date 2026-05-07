@@ -1,9 +1,9 @@
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <net/wki/channel.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::net::wki {
 
@@ -119,8 +119,8 @@ void wki_channel_reset(WkiChannel* ch) {
     WkiRetransmitEntry* rt = ch->retransmit_head;
     while (rt != nullptr) {
         WkiRetransmitEntry* next = rt->next;
-        ker::mod::mm::dyn::kmalloc::free(rt->data);
-        ker::mod::mm::dyn::kmalloc::free(rt);
+        delete[] rt->data;
+        delete rt;
         rt = next;
     }
 
@@ -128,8 +128,8 @@ void wki_channel_reset(WkiChannel* ch) {
     WkiReorderEntry* ro = ch->reorder_head;
     while (ro != nullptr) {
         WkiReorderEntry* next = ro->next;
-        ker::mod::mm::dyn::kmalloc::free(ro->data);
-        ker::mod::mm::dyn::kmalloc::free(ro);
+        delete[] ro->data;
+        delete ro;
         ro = next;
     }
 

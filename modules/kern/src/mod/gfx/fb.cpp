@@ -1,8 +1,18 @@
 #include "fb.hpp"
 
+#include <extern/limine.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <platform/mm/virt.hpp>
+
+#include "mod/gfx/fb_font.hpp"
+#include "mod/io/serial/serial.hpp"
+#include "platform/mm/addr.hpp"
+#include "util/hcf.hpp"
 __attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebufferRequest = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
     .revision = 0,

@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
@@ -18,6 +19,11 @@
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+
+#include "net/endian.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_inode.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -339,7 +345,7 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
     uint32_t magic = hdr->hdr.magic.to_cpu();
     if (magic != XFS_DIR3_BLOCK_MAGIC) {
-        mod::dbg::log("[xfs dir] block: bad magic 0x%x\n", magic);
+        mod::dbg::logger<"xfs">::error("dir block: bad magic 0x%x", magic);
         brelse(bh);
         return -EINVAL;
     }
@@ -1138,8 +1144,8 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     dp->dirty = true;
     xfs_trans_log_inode(tp, dp);
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", (unsigned long)dp->ino,
-                  (unsigned long)disk_block, total_entries);
+    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", (unsigned long)dp->ino, (unsigned long)disk_block,
+                  total_entries);
 #endif
     return 0;
 }

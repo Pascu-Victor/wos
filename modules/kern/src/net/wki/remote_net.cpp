@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -13,10 +15,12 @@
 #include <net/wki/dev_server.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -187,7 +191,7 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
         return -1;
     }
 
-    auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+    auto* req_buf = new (std::nothrow) uint8_t[req_total];
     if (req_buf == nullptr) {
         return -1;
     }
@@ -198,7 +202,7 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
     memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt->len);
 
     int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-    ker::mod::mm::dyn::kmalloc::free(req_buf);
+    delete[] req_buf;
 
     if (send_ret == WKI_OK) {
         dev->tx_packets++;

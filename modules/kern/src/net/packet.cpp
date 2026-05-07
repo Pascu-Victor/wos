@@ -2,11 +2,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
+#include <new>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net {
@@ -28,7 +29,7 @@ std::atomic<size_t> free_count{0};
 
 void add_buffers_to_pool(size_t count) {
     // Allocate new buffers
-    auto* new_buffers = static_cast<PacketBuffer*>(ker::mod::mm::dyn::kmalloc::calloc(count, sizeof(PacketBuffer)));
+    auto* new_buffers = new (std::nothrow) PacketBuffer[count]{};
     if (new_buffers == nullptr) {
         ker::mod::dbg::log("net: Failed to allocate %zu packet buffers", count);
         return;
@@ -124,7 +125,7 @@ auto pkt_alloc_tx() -> PacketBuffer* {
 
     size_t avail = free_count.load(std::memory_order_relaxed);
     if (avail <= RX_RESERVE) {
-        ker::mod::dbg::emit_log("net", mod::dbg::LogLevel::ERROR, "pkt_alloc_tx: REFUSED (free=%zu reserve=%zu)", avail, RX_RESERVE);
+        ker::mod::dbg::logger<"net">::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu)", avail, RX_RESERVE);
         return nullptr;  // Pool too low, reserve for RX
     }
 

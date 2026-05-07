@@ -14,7 +14,6 @@
 #include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/sched/scheduler.hpp>
 
@@ -178,7 +177,11 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
     // Command list entry size = 32 bytes
     // Command list entry maxim count = 32
     // Command list maxium size = 32*32 = 1K per port
-    auto* clb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(1024));
+    auto* clb_virt = new (std::nothrow) uint8_t[1024];
+    if (clb_virt == nullptr) {
+        ker::mod::dbg::log("ahci: failed to allocate CLB kernel allocation");
+        hcf();
+    }
     std::memset(clb_virt, 0, 1024);
     uint64_t clb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(clb_virt));
     if (clb_phys == ker::mod::mm::virt::PADDR_INVALID) {
@@ -193,7 +196,11 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
 
     // FIS offset: 32K+256*portno
     // FIS entry size = 256 bytes per port
-    auto* fb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(256));
+    auto* fb_virt = new (std::nothrow) uint8_t[256];
+    if (fb_virt == nullptr) {
+        ker::mod::dbg::log("ahci: failed to allocate FIS buffer kernel allocation");
+        hcf();
+    }
     std::memset(fb_virt, 0, 256);
     uint64_t fb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(fb_virt));
     if (fb_phys == ker::mod::mm::virt::PADDR_INVALID) {
@@ -214,7 +221,11 @@ void port_rebase(volatile HBA_PORT* port, size_t portno) {
         // 8192 entries × 4KB/page = 32MB per command (ATA sector count is 16-bit = 32MB max).
         constexpr size_t CTB_SIZE = 128 + (8192 * sizeof(HBA_PRDT_ENTRY));
         cmdheader[i].prdtl = 8192;
-        auto* ctb_virt = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(CTB_SIZE));
+        auto* ctb_virt = new (std::nothrow) uint8_t[CTB_SIZE];
+        if (ctb_virt == nullptr) {
+            ker::mod::dbg::log("ahci: failed to allocate CTB kernel allocation");
+            hcf();
+        }
         std::memset(ctb_virt, 0, CTB_SIZE);
         uint64_t ctb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(ctb_virt));
         if (ctb_phys == ker::mod::mm::virt::PADDR_INVALID) {
@@ -684,7 +695,7 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
     }
 
     // Allocate a 512-byte buffer for the IDENTIFY response
-    auto* id_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(512));
+    auto* id_buf = new (std::nothrow) uint8_t[512];
     if (id_buf == nullptr) {
         if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
             port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
@@ -729,7 +740,7 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
     }
     if (spin == MAX_SPIN) {
         ahci_log("identify_disk: port is hung\n");
-        ker::mod::mm::dyn::kmalloc::free(id_buf);
+        delete[] id_buf;
         if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
             port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
             port_locks[portno].unlock();
@@ -750,7 +761,7 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
         }
         if ((mmio_read32(port->is) & HBA_PxIS_TFES) != 0U) {
             ahci_log("identify_disk: error\n");
-            ker::mod::mm::dyn::kmalloc::free(id_buf);
+            delete[] id_buf;
             if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
                 port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
             }
@@ -761,7 +772,7 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
 
     if ((mmio_read32(port->is) & HBA_PxIS_TFES) != 0U) {
         ahci_log("identify_disk: error after completion\n");
-        ker::mod::mm::dyn::kmalloc::free(id_buf);
+        delete[] id_buf;
         if (portno >= 0 && static_cast<size_t>(portno) < MAX_PORTS) {
             port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
         }
@@ -789,7 +800,7 @@ auto identify_disk(volatile HBA_PORT* port, int portno) -> uint64_t {
         total = static_cast<uint64_t>(id_words[60]) | (static_cast<uint64_t>(id_words[61]) << 16);
     }
 
-    ker::mod::mm::dyn::kmalloc::free(id_buf);
+    delete[] id_buf;
 
     ahci_log("identify_disk: total sectors = 0x");
     ahci_log_hex(total);

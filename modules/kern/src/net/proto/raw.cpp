@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <net/endian.hpp>
 #include <net/packet.hpp>
@@ -9,7 +10,6 @@
 #include <net/proto/ipv4.hpp>
 #include <net/socket.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::proto {
@@ -221,7 +221,7 @@ SocketProtoOps raw_proto_ops = {
     .poll_check = nullptr,
 };
 
-}
+}  // namespace
 
 auto get_raw_proto_ops() -> SocketProtoOps* { return &raw_proto_ops; }
 

@@ -1,5 +1,8 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <dev/ahci.hpp>
 #include <dev/block_device.hpp>
@@ -38,8 +41,9 @@
 #include <platform/interrupt/gdt.hpp>
 #include <platform/interrupt/idt.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+
+#include "platform/mm/dyn/kmalloc.hpp"
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
 #endif
@@ -58,6 +62,10 @@
 
 #include "init_registry.hpp"
 #include "limine_requests.hpp"
+#ifdef WOS_SELFTEST
+#include <cstring>
+#include <test/ktest.hpp>
+#endif
 
 namespace ker::init::fns {
 
@@ -239,6 +247,12 @@ void sched_init() {
     ker::mod::perf::init();
 
     mod::sched::setup_queues();
+#ifdef WOS_SELFTEST
+    if (strcmp(get_kernel_cmdline(), "--selftest") == 0) {
+        ker::test::run_all();
+        hcf();
+    }
+#endif
 
     // Build HandoverModules from limine module request
     mod::boot::HandoverModules modules{};

@@ -1,5 +1,7 @@
 #include "ipv4.hpp"
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -11,6 +13,9 @@
 #include <net/proto/udp.hpp>
 #include <net/route.hpp>
 #include <platform/dbg/dbg.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 

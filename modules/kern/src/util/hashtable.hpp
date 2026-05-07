@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -40,13 +41,7 @@ class IntrHashTable {
     IntrHashTable() = default;
 
     explicit IntrHashTable(size_t initial_buckets) : m_bucket_count(next_pow2(initial_buckets)), m_mask(m_bucket_count - 1) {
-        m_buckets = static_cast<Bucket*>(ker::mod::mm::dyn::kmalloc::calloc(m_bucket_count, sizeof(Bucket)));
-        if (m_buckets) {
-            for (size_t i = 0; i < m_bucket_count; ++i) {
-                m_buckets[i].head = nullptr;
-                m_buckets[i].count = 0;
-            }
-        }
+        m_buckets = new (std::nothrow) Bucket[m_bucket_count];
     }
 
     // Deferred initialization — call after memory allocator is available.
@@ -55,20 +50,12 @@ class IntrHashTable {
         if (m_buckets) return true;  // already initialized
         m_bucket_count = next_pow2(initial_buckets);
         m_mask = m_bucket_count - 1;
-        m_buckets = static_cast<Bucket*>(ker::mod::mm::dyn::kmalloc::calloc(m_bucket_count, sizeof(Bucket)));
-        if (m_buckets) {
-            for (size_t i = 0; i < m_bucket_count; ++i) {
-                m_buckets[i].head = nullptr;
-                m_buckets[i].count = 0;
-            }
-        }
+        m_buckets = new (std::nothrow) Bucket[m_bucket_count];
         return m_buckets != nullptr;
     }
 
     ~IntrHashTable() {
-        if (m_buckets) {
-            ker::mod::mm::dyn::kmalloc::free(m_buckets);
-        }
+        delete[] m_buckets;
     }
 
     // No copy

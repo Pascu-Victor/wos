@@ -12,11 +12,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
+#include <vfs/fs/xfs/xfs_ialloc.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 
 #include "net/endian.hpp"
@@ -24,6 +25,10 @@
 #include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
+
+#ifdef WOS_KASAN
+extern "C" uintptr_t __asan_region_is_poisoned(uintptr_t beg, size_t size);
+#endif
 
 // ============================================================================
 // Inode cache - simple hash table
@@ -85,19 +90,19 @@ void free_ifork(XfsIfork* fork) {
     switch (fork->format) {
         case XFS_DINODE_FMT_LOCAL:
             if (fork->local.data != nullptr) {
-                mod::mm::dyn::kmalloc::free(fork->local.data);
+                delete[] fork->local.data;
                 fork->local.data = nullptr;
             }
             break;
         case XFS_DINODE_FMT_EXTENTS:
             if (fork->extents.list != nullptr) {
-                mod::mm::dyn::kmalloc::free(fork->extents.list);
+                delete[] fork->extents.list;
                 fork->extents.list = nullptr;
             }
             break;
         case XFS_DINODE_FMT_BTREE:
             if (fork->btree.root != nullptr) {
-                mod::mm::dyn::kmalloc::free(fork->btree.root);
+                delete[] fork->btree.root;
                 fork->btree.root = nullptr;
             }
             break;
@@ -115,6 +120,31 @@ void free_inode(XfsInode* ip) {
     delete ip;
 }
 
+void inactivate_unlinked_inode(XfsInode* ip) {
+    if (ip == nullptr || ip->mount == nullptr || ip->mount->read_only || ip->nlink != 0) {
+        return;
+    }
+
+    auto* tp = xfs_trans_alloc(ip->mount);
+    if (tp == nullptr) {
+        mod::dbg::logger<"xfs">::error("xfs_inode_release: failed to allocate inactivation transaction for inode %lu",
+                                       (unsigned long)ip->ino);
+        return;
+    }
+
+    int rc = xfs_ifree(ip->mount, tp, ip->ino);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree failed for inode %lu rc=%d", (unsigned long)ip->ino, rc);
+        return;
+    }
+
+    rc = xfs_trans_commit(tp);
+    if (rc != 0) {
+        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree commit failed for inode %lu rc=%d", (unsigned long)ip->ino, rc);
+    }
+}
+
 // Parse a fork from the on-disk inode.  data_ptr points to the start of the
 // fork data within the inode, data_size is the available space.
 auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t data_size, uint32_t nextents) -> int {
@@ -124,7 +154,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
     switch (format) {
         case XFS_DINODE_FMT_LOCAL: {
             fork->local.size = data_size;
-            fork->local.data = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(data_size));
+            fork->local.data = new (std::nothrow) uint8_t[data_size];
             if (fork->local.data == nullptr) {
                 return -ENOMEM;
             }
@@ -138,8 +168,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
                 fork->extents.list = nullptr;
                 break;
             }
-            size_t list_size = sizeof(XfsBmbtIrec) * nextents;
-            fork->extents.list = static_cast<XfsBmbtIrec*>(mod::mm::dyn::kmalloc::malloc(list_size));
+            fork->extents.list = new (std::nothrow) XfsBmbtIrec[nextents];
             if (fork->extents.list == nullptr) {
                 return -ENOMEM;
             }
@@ -162,7 +191,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
             fork->btree.numrecs = bmdr->bb_numrecs.to_cpu();
             // Copy the entire fork data (header + keys + ptrs) for later traversal
             fork->btree.root_size = data_size;
-            fork->btree.root = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(data_size));
+            fork->btree.root = new (std::nothrow) uint8_t[data_size];
             if (fork->btree.root == nullptr) {
                 return -ENOMEM;
             }
@@ -173,7 +202,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
         case XFS_DINODE_FMT_DEV:
             // Device inodes: store the 4-byte dev_t in the local data
             fork->local.size = data_size < 4 ? data_size : 4;
-            fork->local.data = static_cast<uint8_t*>(mod::mm::dyn::kmalloc::malloc(4));
+            fork->local.data = new (std::nothrow) uint8_t[4];
             if (fork->local.data == nullptr) {
                 return -ENOMEM;
             }
@@ -273,6 +302,15 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
         return nullptr;
     }
 
+#ifdef WOS_KASAN
+    if (uintptr_t poisoned = __asan_region_is_poisoned(reinterpret_cast<uintptr_t>(dip), mount->inode_size); poisoned != 0) {
+        mod::dbg::log("[xfs] inode %lu: poisoned inode buffer bh=%p data=%p size=%lu block=%lu offset=%lu bad=0x%lx", (unsigned long)ino,
+                      (void*)bh, (void*)bh->data, (unsigned long)bh->size, (unsigned long)block, (unsigned long)offset,
+                      (unsigned long)poisoned);
+        brelse(bh);
+        return nullptr;
+    }
+#endif
     // Verify CRC
     uint32_t computed = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
     if (computed != dip->di_crc) {
@@ -366,7 +404,6 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     // Check for a race - another thread might have loaded the same inode
     XfsInode* existing = icache_lookup_locked(ino, bucket);
     if (existing != nullptr) {
-        // Another thread beat us; free our copy and use theirs
         icache[bucket].lock.unlock_irqrestore(flags);
         free_inode(ip);
         return existing;
@@ -388,8 +425,12 @@ void xfs_inode_release(XfsInode* ip) {
     ip->refcount--;
     if (ip->refcount <= 0) {
         // Inode is no longer referenced - remove from cache and free
+        bool needs_inactivation = (ip->nlink == 0);
         icache_remove_locked(ip, bucket);
         icache[bucket].lock.unlock_irqrestore(flags);
+        if (needs_inactivation) {
+            inactivate_unlinked_inode(ip);
+        }
         free_inode(ip);
         return;
     }

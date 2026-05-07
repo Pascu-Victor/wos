@@ -19,6 +19,7 @@ void enablePerCpuAllocations();   // Call after cpuParamInit to enable per-CPU p
 auto pageAlloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
 auto pageAllocHuge(uint64_t size) -> void*;  // Allocate from huge page zone
 void pageFree(void* page);
+auto pageSplitToOrder0(void* page) -> bool;
 
 // --- Frame reference counting (for COW fork) ---
 // Increment the refcount for a physical page (HHDM pointer).
@@ -45,7 +46,8 @@ void dumpAllocStats();          // Dump allocation/free counters for debugging
 void dump_caller_page_stats();  // Dump per-call-site page allocation histogram
 void enable_stack_overlap_check();
 
-uint64_t get_free_mem_bytes();
+auto get_free_mem_bytes() -> uint64_t;
+auto get_total_mem_bytes() -> uint64_t;
 
 template <typename T>
 inline static void pageFree(T* page) {

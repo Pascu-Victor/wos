@@ -1,11 +1,11 @@
 #include "block_device.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <util/smallvec.hpp>
 

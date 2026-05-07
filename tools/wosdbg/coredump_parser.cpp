@@ -15,6 +15,8 @@ QString segmentTypeName(uint32_t type) {
             return "StackPage";
         case 2:
             return "FaultPage";
+        case 3:
+            return "MemoryPage";
         default:
             return QString("Unknown(%1)").arg(type);
     }
@@ -132,6 +134,14 @@ static GPRegs parseGPRegs(const char* data, size_t& off) {
     return r;
 }
 
+static QString parseCString(const char* data, size_t& off, size_t size) {
+    QByteArray raw(data + off, static_cast<qsizetype>(size));
+    off += size;
+    int nul = raw.indexOf('\0');
+    if (nul >= 0) raw.truncate(nul);
+    return QString::fromUtf8(raw);
+}
+
 std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
     // Minimum size: header (16) + 7x8 fields + 2x(7x8 + 15x8) frames/regs + 8x8 task metadata = 488 bytes
     static constexpr size_t MIN_HEADER_SIZE = 488;
@@ -201,13 +211,49 @@ std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
     dump.elfOffset = readLE<uint64_t>(d + off);
     off += 8;
 
-    // Parse segment table (fixed array of MAX_SEGMENTS entries)
-    // Each segment: vaddr(8) + size(8) + fileOffset(8) + type(4) + present(4) = 32 bytes
-    static constexpr size_t SEGMENT_ENTRY_SIZE = 32;
-    dump.segments.reserve(MAX_SEGMENTS);
-    for (int i = 0; i < MAX_SEGMENTS; ++i) {
-        size_t soff = dump.segmentTableOffset + static_cast<size_t>(i) * SEGMENT_ENTRY_SIZE;
-        if (soff + SEGMENT_ENTRY_SIZE > static_cast<size_t>(data.size())) {
+    static constexpr size_t SEGMENT_ENTRY_SIZE_V1 = 32;
+    static constexpr size_t SEGMENT_ENTRY_SIZE_V2 = 48;
+    if (dump.version >= 2 && dump.headerSize >= off + 13 * 8) {
+        dump.segmentEntrySize = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.pageSize = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.snapshotFlags = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.interpBase = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.programHeaderCount = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.programHeaderEntSize = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadFsBase = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadGsBase = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadStackBase = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadStackSize = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadTlsBase = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadTlsSize = readLE<uint64_t>(d + off);
+        off += 8;
+        dump.threadSafeStack = readLE<uint64_t>(d + off);
+        off += 8;
+        if (dump.headerSize >= off + 256 * 3) {
+            dump.exePath = parseCString(d, off, 256);
+            dump.cwd = parseCString(d, off, 256);
+            dump.root = parseCString(d, off, 256);
+        }
+    }
+    if (dump.segmentEntrySize < SEGMENT_ENTRY_SIZE_V1) {
+        dump.segmentEntrySize = SEGMENT_ENTRY_SIZE_V1;
+    }
+
+    dump.segments.reserve(static_cast<size_t>(dump.segmentCount));
+    for (uint64_t i = 0; i < dump.segmentCount; ++i) {
+        size_t soff = dump.segmentTableOffset + static_cast<size_t>(i) * static_cast<size_t>(dump.segmentEntrySize);
+        if (soff + SEGMENT_ENTRY_SIZE_V1 > static_cast<size_t>(data.size())) {
             qWarning() << "Segment table extends beyond file at segment" << i;
             break;
         }
@@ -217,6 +263,10 @@ std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
         seg.fileOffset = readLE<uint64_t>(d + soff + 16);
         seg.type = readLE<uint32_t>(d + soff + 24);
         seg.present = readLE<uint32_t>(d + soff + 28);
+        if (dump.segmentEntrySize >= SEGMENT_ENTRY_SIZE_V2 && soff + SEGMENT_ENTRY_SIZE_V2 <= static_cast<size_t>(data.size())) {
+            seg.pteFlags = readLE<uint64_t>(d + soff + 32);
+            seg.physAddr = readLE<uint64_t>(d + soff + 40);
+        }
         dump.segments.push_back(seg);
     }
 

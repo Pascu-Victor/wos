@@ -20,21 +20,101 @@
 
 #include "platform/sched/task.hpp"
 #include "platform/smt/smt.hpp"
+#include "syscalls_impl/futex/futex.hpp"
 #include "waitpid.hpp"
 
 namespace ker::syscall::process {
 
+namespace {
+using log = ker::mod::dbg::logger<"pexit">;
+}
+
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
 static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
-    if (waiter->waitRusagePhysAddr == 0) {
+    if (waiter->waitRusageUserAddr == 0 || waiter->pagemap == nullptr) {
+        waiter->waitRusageUserAddr = 0;
+        waiter->waitRusagePhysAddr = 0;
         return;
     }
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(waiter->waitRusagePhysAddr));
+    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitRusageUserAddr);
+    if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
+        waiter->waitRusageUserAddr = 0;
+        waiter->waitRusagePhysAddr = 0;
+        return;
+    }
+    if (waiter->waitRusagePhysAddr != 0 && waiter->waitRusagePhysAddr != phys) {
+        log::warn("waitpid-rusage drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx pagemap=%p", waiter->pid,
+                  child != nullptr ? child->pid : 0, (unsigned long long)waiter->waitRusageUserAddr,
+                  (unsigned long long)waiter->waitRusagePhysAddr, (unsigned long long)phys, (unsigned long long)waiter->context.frame.rsp,
+                  static_cast<void*>(waiter->pagemap));
+    }
+    waiter->waitRusagePhysAddr = phys;
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(phys));
     ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
     ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
     ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
     ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+    waiter->waitRusageUserAddr = 0;
     waiter->waitRusagePhysAddr = 0;
+}
+
+static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) {
+    if (waiter->waitStatusUserAddr == 0 || waiter->pagemap == nullptr) {
+        waiter->waitStatusUserAddr = 0;
+        waiter->waitStatusPhysAddr = 0;
+        return;
+    }
+    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitStatusUserAddr);
+    if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
+        waiter->waitStatusUserAddr = 0;
+        waiter->waitStatusPhysAddr = 0;
+        return;
+    }
+    if (waiter->waitStatusPhysAddr != 0 && waiter->waitStatusPhysAddr != phys) {
+        log::warn("waitpid-status drift: waiter=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx pagemap=%p status=0x%x",
+                  waiter->pid, (unsigned long long)waiter->waitStatusUserAddr, (unsigned long long)waiter->waitStatusPhysAddr,
+                  (unsigned long long)phys, (unsigned long long)waiter->context.frame.rsp, static_cast<void*>(waiter->pagemap),
+                  (unsigned)status);
+    }
+    waiter->waitStatusPhysAddr = phys;
+    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(phys));
+    *status_ptr = status;
+    waiter->waitStatusUserAddr = 0;
+    waiter->waitStatusPhysAddr = 0;
+}
+
+static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
+    if (waiter == nullptr || waiter->pagemap == nullptr) {
+        return;
+    }
+
+    if (waiter->waitResumeRipUserAddr != 0) {
+        uint64_t rip_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitResumeRipUserAddr);
+        if (rip_phys == ker::mod::mm::virt::PADDR_INVALID || rip_phys == 0 ||
+            (waiter->waitResumeRipPhysAddr != 0 && waiter->waitResumeRipPhysAddr != rip_phys)) {
+            log::warn(
+                "waitpid-resume drift: waiter=%lu child=%lu path=%s rip_va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp_va=0x%llx pagemap=%p",
+                waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
+                (unsigned long long)waiter->waitResumeRipUserAddr, (unsigned long long)waiter->waitResumeRipPhysAddr,
+                (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys),
+                (unsigned long long)waiter->waitResumeRspUserAddr, static_cast<void*>(waiter->pagemap));
+        }
+        waiter->waitResumeRipPhysAddr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
+    }
+
+    if (waiter->waitResumeRspUserAddr != 0) {
+        uint64_t rsp_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitResumeRspUserAddr);
+        if (rsp_phys == ker::mod::mm::virt::PADDR_INVALID || rsp_phys == 0 ||
+            (waiter->waitResumeRspPhysAddr != 0 && waiter->waitResumeRspPhysAddr != rsp_phys)) {
+            log::warn(
+                "waitpid-stack drift: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
+                waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
+                (unsigned long long)waiter->waitResumeRspUserAddr, (unsigned long long)waiter->waitResumeRspPhysAddr,
+                (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
+                (unsigned long long)waiter->waitResumeRipUserAddr, static_cast<void*>(waiter->pagemap));
+        }
+        waiter->waitResumeRspPhysAddr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
+    }
 }
 
 void wos_proc_exit(int status) {
@@ -63,7 +143,11 @@ void wos_proc_exit(int status) {
     // Store exit status in POSIX waitpid format
     current_task->exitStatus = (status & 0xff) << 8;
     current_task->hasExited = true;
-
+#ifdef EXIT_DEBUG
+    log::trace("wos_proc_exit: pid=%lu name=%s status=%d thread=%d owner=%lu pagemap=%p", current_task->pid,
+               current_task->name != nullptr ? current_task->name : "?", status, current_task->isThread, current_task->ownerPid,
+               static_cast<void*>(current_task->pagemap));
+#endif
     // Send SIGCHLD to parent process.
     // Threads do not send SIGCHLD - their exit is handled via futex (pthread_join).
     if (!current_task->isThread && current_task->parentPid != 0) {
@@ -80,10 +164,8 @@ void wos_proc_exit(int status) {
             static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
             if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
                 parent->context.regs.rax = current_task->pid;
-                if (parent->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(parent->waitStatusPhysAddr));
-                    *status_ptr = current_task->exitStatus;
-                }
+                validate_waiter_resume_for_exit(parent, current_task, "exit-any");
+                write_wait_status_for_waiter(parent, current_task->exitStatus);
                 fill_rusage_for_waiter(parent, current_task);
                 parent->waitingForPid = 0;
                 current_task->waitedOn = true;
@@ -124,10 +206,29 @@ void wos_proc_exit(int status) {
     // This ensures files written by the exiting process are fully committed to
     // the VFS before waitpid returns to the parent.
     if (!current_task->isThread) {
-        current_task->fd_table.for_each([](uint64_t key, void* /*val*/) -> void { ker::vfs::vfs_close(static_cast<int>(key)); });
+        // Snapshot descriptor numbers before closing. vfs_close() removes from
+        // fd_table and may free radix-tree nodes, so mutating during for_each()
+        // can invalidate the traversal.
+        while (!current_task->fd_table.empty()) {
+            uint64_t fds[ker::mod::sched::task::Task::FD_TABLE_SIZE]{};
+            size_t fd_count = 0;
+            current_task->fd_table.for_each([&](uint64_t key, void* /*val*/) -> void {
+                if (fd_count < ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+                    fds[fd_count++] = key;
+                }
+            });
+            if (fd_count == 0) {
+                break;
+            }
+            for (size_t i = 0; i < fd_count; ++i) {
+                ker::vfs::vfs_close(static_cast<int>(fds[i]));
+            }
+        }
 
         if (current_task->elfBuffer != nullptr) {
-            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer)) {
+            if (current_task->isElfBufferShared) {
+                ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer);
+            } else {
                 delete[] current_task->elfBuffer;
             }
             current_task->elfBuffer = nullptr;
@@ -139,8 +240,17 @@ void wos_proc_exit(int status) {
     // This happens AFTER reparenting + FD cleanup so that any files written
     // by the exiting process are fully committed to the VFS before waitpid
     // returns to the waiter.
-    for (size_t i = 0; i < current_task->awaitee_on_exit.size(); ++i) {
-        uint64_t waiting_pid = current_task->awaitee_on_exit[i];
+    uint64_t waiter_lock_flags = current_task->exitWaitersLock.lock_irqsave();
+    const size_t waiter_count = current_task->awaitee_on_exit.size();
+    uint64_t waiting_pids[16] = {};
+    const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+    for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
+        waiting_pids[i] = current_task->awaitee_on_exit[i];
+    }
+    current_task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+
+    for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
+        uint64_t waiting_pid = waiting_pids[i];
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waitingPid);
 #endif
@@ -156,15 +266,13 @@ void wos_proc_exit(int status) {
             // correctly before re-scheduling the task (see scheduler.cpp deferredTaskSwitch).
             if (!waiting_task->deferredTaskSwitch) {
                 waiting_task->context.regs.rax = current_task->pid;
-
-                if (waiting_task->waitStatusPhysAddr != 0) {
-                    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(waiting_task->waitStatusPhysAddr));
-                    *status_ptr = current_task->exitStatus;
+                validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
+                write_wait_status_for_waiter(waiting_task, current_task->exitStatus);
 #ifdef EXIT_DEBUG
-                    ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exitStatus, waitingPid);
+                ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exitStatus, waitingPid);
 #endif
-                }
                 fill_rusage_for_waiter(waiting_task, current_task);
+                waiting_task->waitingForPid = 0;
             }
 
             // Mark that this waiter has consumed the exit status (zombie can now be reaped)
@@ -229,6 +337,10 @@ void wos_proc_exit(int status) {
     // Unlink any WKI wait entries belonging to this task so the timer scan
     // doesn't dereference freed stack memory after this task's stack is reclaimed.
     ker::net::wki::wki_wait_cleanup_for_task(current_task);
+
+    // Remove any futex waiter node still owned by this task. Otherwise a later
+    // futex_wake() can target a DEAD task and keep stale 64-byte wait nodes alive.
+    ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
 
     // TODO: Handle signal handlers cleanup
 

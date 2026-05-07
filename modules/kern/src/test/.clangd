@@ -1,0 +1,10 @@
+Diagnostics:
+    ClangTidy:
+        Remove:
+            - misc-use-anonymous-namespace
+            - cppcoreguidelines-avoid-c-arrays
+            - cppcoreguidelines-avoid-magic-numbers
+            - readability-magic-numbers
+            - modernize-avoid-c-arrays
+            - modernize-loop-convert
+            - misc-use-internal-linkage

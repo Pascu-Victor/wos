@@ -21,6 +21,7 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
     switch (op) {
         case ops::open: {
             const char* path = reinterpret_cast<const char*>(a1);
+            if (path == nullptr) { return -EFAULT; }
             int flags = static_cast<int>(a2);
             int mode = static_cast<int>(a3);
             int fd = ker::vfs::vfs_open(path, flags, mode);
@@ -318,6 +319,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* route_out = reinterpret_cast<uint32_t*>(a4);
             return static_cast<int64_t>(ker::vfs::vfs_wki_rule_get(index, prefix_buf, prefix_buf_size, route_out));
         }
+        case ops::wki_rule_get_default: {
+            auto index = static_cast<uint32_t>(a1);
+            auto* prefix_buf = reinterpret_cast<char*>(a2);
+            auto prefix_buf_size = static_cast<size_t>(a3);
+            auto* route_out = reinterpret_cast<uint32_t*>(a4);
+            return static_cast<int64_t>(ker::vfs::vfs_wki_default_rule_get(index, prefix_buf, prefix_buf_size, route_out));
+        }
         case ops::wki_rule_clear: {
             return static_cast<int64_t>(ker::vfs::vfs_wki_rule_clear());
         }
@@ -325,6 +333,16 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const auto* new_root = reinterpret_cast<const char*>(a1);
             const auto* put_old = reinterpret_cast<const char*>(a2);
             return static_cast<int64_t>(ker::vfs::vfs_pivot_root(new_root, put_old));
+        }
+        case ops::statvfs: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            auto* buf = reinterpret_cast<ker::vfs::statvfs*>(a2);
+            return static_cast<int64_t>(ker::vfs::vfs_statvfs(path, buf));
+        }
+        case ops::fstatvfs: {
+            int fd = static_cast<int>(a1);
+            auto* buf = reinterpret_cast<ker::vfs::statvfs*>(a2);
+            return static_cast<int64_t>(ker::vfs::vfs_fstatvfs(fd, buf));
         }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");

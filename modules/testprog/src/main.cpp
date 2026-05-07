@@ -477,38 +477,7 @@ auto main(int argc, char** argv, char** envp) -> int {
                          width, height, max_iter, threads, repeat);
         }
 
-        std::vector<unsigned char> image(static_cast<size_t>(width * height * 4));
-        std::vector<unsigned char> colormap(static_cast<size_t>((max_iter + 1) * 3));
-        init_colormap(max_iter + 1, colormap.data());
-
-        return mandelbench(width, height, max_iter, threads, repeat, image.data(), colormap.data());
-    }
-
-    if (command != nullptr && std::strcmp(command, "mandelbench-wki") == 0) {
-        int width = WIDTH;
-        int height = HEIGHT;
-        int max_iter = MAX_ITERATION;
-        int workers = THREADS;
-        int repeat = REPEAT;
-        const char* nodes = nullptr;
-
-        for (int i = 2; i < argc; i++) {
-            if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
-                width = std::atoi(argv[++i]);
-            } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
-                height = std::atoi(argv[++i]);
-            } else if (std::strcmp(argv[i], "--max-iter") == 0 && i + 1 < argc) {
-                max_iter = std::atoi(argv[++i]);
-            } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
-                workers = std::atoi(argv[++i]);
-            } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
-                repeat = std::atoi(argv[++i]);
-            } else if (std::strcmp(argv[i], "--nodes") == 0 && i + 1 < argc) {
-                nodes = argv[++i];
-            }
-        }
-
-        return mandelbench_wki(width, height, max_iter, workers, repeat, nodes);
+        return mandelbench_wki(width, height, max_iter, threads, repeat, nullptr);
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench-worker") == 0) {

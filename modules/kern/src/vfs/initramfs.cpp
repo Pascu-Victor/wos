@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/fs/tmpfs.hpp>
 
 namespace ker::vfs::initramfs {
@@ -166,7 +165,7 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
                 if (parent != nullptr) {
                     auto* fnode = tmpfs::tmpfs_create_file(parent, leaf, static_cast<uint32_t>(mode) & 07777);
                     if (fnode != nullptr && filesize > 0) {
-                        fnode->data = static_cast<char*>(ker::mod::mm::dyn::kmalloc::malloc(static_cast<size_t>(filesize)));
+                        fnode->data = new char[filesize];
                         if (fnode->data != nullptr) {
                             std::memcpy(fnode->data, file_data, static_cast<size_t>(filesize));
                             fnode->size = static_cast<size_t>(filesize);

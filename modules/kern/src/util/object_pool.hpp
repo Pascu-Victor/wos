@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -36,7 +37,7 @@ class ObjectPool {
         PoolEntry* cur = m_free_list;
         while (cur) {
             PoolEntry* next = cur->free_next;
-            ker::mod::mm::dyn::kmalloc::free(cur);
+            delete cur;
             cur = next;
         }
         m_free_list = nullptr;
@@ -61,8 +62,7 @@ class ObjectPool {
             m_free_count--;
         } else {
             // Allocate new
-            entry = static_cast<PoolEntry*>(
-                ker::mod::mm::dyn::kmalloc::malloc(sizeof(PoolEntry)));
+            entry = new (std::nothrow) PoolEntry;
             if (!entry) {
                 m_lock.unlock_irqrestore(saved);
                 return nullptr;

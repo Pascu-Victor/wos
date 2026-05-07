@@ -19,6 +19,13 @@ extern void (*__fini_array_end[])();       // NOLINT
 
 namespace {
 
+// Compiler-generated TU constructors/destructors in __init_array/__fini_array
+// are not annotated with KCFI type hashes by Clang's KCFI pass (they are
+// emitted as raw assembly stubs, not typed C++ functions).  Calling them
+// through void(*)() pointers with KCFI checking enabled therefore always
+// triggers a KCFI violation.  These are trusted kernel-internal functions so
+// CFI protection on these call sites provides no security value.
+[[clang::no_sanitize("kcfi")]]
 void callGlobalDestructors() {  // NOLINT
     for (auto* dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
         --dtor;
@@ -33,6 +40,13 @@ namespace ker::init::fns {
 // Called from the init registry after IDT (and KASan shadow paging) are ready.
 // With WOS_KASAN, instrumented global constructors access shadow memory; the
 // page-fault handler must be live first so shadow pages can be demand-allocated.
+//
+// [[clang::no_sanitize("kcfi")]]: compiler-generated _GLOBAL__sub_I_*.cpp TU
+// constructors in __init_array are not annotated with KCFI type hashes (Clang
+// does not emit hash prefixes for auto-generated ELF init-array stubs).
+// Calling them via void(*)() pointers with KCFI enabled would always trap.
+// These are closed, trusted kernel constructors so no CFI protection is needed.
+[[clang::no_sanitize("kcfi")]]
 void global_ctors_init() {  // NOLINT
     for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
         (*ctor)();

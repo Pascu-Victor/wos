@@ -147,8 +147,8 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     pag->agf_flfirst = agf->agf_flfirst.to_cpu();
     pag->agf_fllast = agf->agf_fllast.to_cpu();
 
-    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u", agno, pag->agf_flfirst,
-                  pag->agf_fllast, pag->agf_flcount, pag->agf_bno_root, pag->agf_cnt_root);
+    mod::dbg::log("[xfs] AG %u read_agf: flfirst=%u fllast=%u flcount=%u bno_root=%u cnt_root=%u", agno, pag->agf_flfirst, pag->agf_fllast,
+                  pag->agf_flcount, pag->agf_bno_root, pag->agf_cnt_root);
 
     brelse(bh);
     return 0;
@@ -324,19 +324,18 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 
     // --- Allocate per-AG state and read AGF/AGI headers ---
     size_t pag_size = sizeof(XfsPerAG) * ctx->ag_count;
-    ctx->per_ag = static_cast<XfsPerAG*>(mod::mm::dyn::kmalloc::malloc(pag_size));
+    ctx->per_ag = new (std::nothrow) XfsPerAG[ctx->ag_count]{};
     if (ctx->per_ag == nullptr) {
         mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)", ctx->ag_count);
         delete ctx;
         return -ENOMEM;
     }
-    __builtin_memset(ctx->per_ag, 0, pag_size);
 
     for (xfs_agnumber_t ag = 0; ag < ctx->ag_count; ag++) {
         int rc = read_agf(ctx, ag);
         if (rc != 0) {
             mod::dbg::log("[xfs] failed to read AGF for AG %u", ag);
-            mod::mm::dyn::kmalloc::free(ctx->per_ag);
+            delete[] ctx->per_ag;
             delete ctx;
             return rc;
         }
@@ -344,7 +343,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         rc = read_agi(ctx, ag);
         if (rc != 0) {
             mod::dbg::log("[xfs] failed to read AGI for AG %u", ag);
-            mod::mm::dyn::kmalloc::free(ctx->per_ag);
+            delete[] ctx->per_ag;
             delete ctx;
             return rc;
         }
@@ -383,7 +382,7 @@ void xfs_unmount(XfsMountContext* ctx) {
 
     // Free per-AG state
     if (ctx->per_ag != nullptr) {
-        mod::mm::dyn::kmalloc::free(ctx->per_ag);
+        delete[] ctx->per_ag;
         ctx->per_ag = nullptr;
     }
 

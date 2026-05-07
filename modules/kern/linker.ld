@@ -37,6 +37,13 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* In-kernel self-test registry (populated by KTEST() macro, iterated by run_all()) */
+    .ktests : {
+        __start_ktests = .;
+        KEEP(*(.ktests))
+        __stop_ktests = .;
+    } :rodata
+
     /* Move to the next memory page for .data */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 

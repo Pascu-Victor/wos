@@ -2,8 +2,10 @@
 
 #include <array>
 #include <cstring>
+#include <net/backlog.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 
 #include "net/route.hpp"
@@ -17,12 +19,22 @@ int lo_open(NetDevice*) { return 0; }
 void lo_close(NetDevice*) {}
 
 int lo_xmit(NetDevice* dev, PacketBuffer* pkt) {
-    // Loopback: feed the packet directly back into the RX path
+    // Loopback packets must not recurse directly back into TCP RX because
+    // loopback ACK generation can otherwise re-enter the same control-block path.
 #ifdef DEBUG_LOOPBACK
     ker::mod::dbg::log("lo_xmit: looping back packet len=%zu\n", pkt->len);
 #endif
     dev->tx_packets++;
     dev->tx_bytes += pkt->len;
+
+    if (backlog_ready()) {
+        pkt->dev = dev;
+        dev->rx_packets++;
+        dev->rx_bytes += pkt->len;
+        backlog_enqueue(ker::mod::cpu::currentCpu(), pkt);
+        return 0;
+    }
+
     netdev_rx(dev, pkt);
     return 0;
 }

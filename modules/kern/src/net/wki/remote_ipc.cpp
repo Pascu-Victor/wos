@@ -9,7 +9,6 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -119,7 +118,7 @@ static void ipc_release_file_ref(ker::vfs::File* file) {
         if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
             file->fops->vfs_close(file);
         }
-        ker::mod::mm::dyn::kmalloc::free(file);
+        delete file;
     }
 }
 
@@ -151,7 +150,7 @@ static void free_pending_pipe_delivery(PendingPipeDelivery* pending) {
     }
     for (auto& chunk : pending->chunks) {
         if (chunk.data != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(chunk.data);
+            delete[] chunk.data;
         }
     }
     delete pending;
@@ -196,7 +195,7 @@ static void free_export_pipe_write_backlog(ExportPipeWriteBacklog* backlog) {
 
     for (auto& chunk : backlog->chunks) {
         if (chunk.data != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(chunk.data);
+            delete[] chunk.data;
         }
     }
     delete backlog;
@@ -231,7 +230,7 @@ static auto queue_export_pipe_write_data(WkiIpcExport* exp, const uint8_t* data,
         return true;
     }
 
-    auto* copy = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+    auto* copy = new (std::nothrow) uint8_t[len];
     if (copy == nullptr) {
         return false;
     }
@@ -241,7 +240,7 @@ static auto queue_export_pipe_write_data(WkiIpcExport* exp, const uint8_t* data,
     auto* backlog = ensure_export_pipe_write_backlog_locked(exp);
     if (backlog == nullptr) {
         s_ipc_lock.unlock_irqrestore(irqf);
-        ker::mod::mm::dyn::kmalloc::free(copy);
+        delete[] copy;
         return false;
     }
 
@@ -331,7 +330,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
                 if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
                     file->fops->vfs_close(file);
                 }
-                ker::mod::mm::dyn::kmalloc::free(file);
+                delete file;
             }
             free_export_pipe_write_backlog(backlog);
             continue;
@@ -363,7 +362,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
             chunk.offset = static_cast<uint16_t>(chunk.offset + advanced);
             backlog->buffered_bytes -= advanced;
             if (chunk.offset == chunk.len) {
-                ker::mod::mm::dyn::kmalloc::free(chunk.data);
+                delete[] chunk.data;
                 backlog->chunks.pop_front();
             }
 
@@ -395,7 +394,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
             if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
                 file->fops->vfs_close(file);
             }
-            ker::mod::mm::dyn::kmalloc::free(file);
+            delete file;
         }
         free_export_pipe_write_backlog(backlog);
     }
@@ -406,7 +405,7 @@ static auto queue_pending_pipe_data(uint16_t home_node, uint32_t resource_id, co
         return true;
     }
 
-    auto* copy = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(len));
+    auto* copy = new (std::nothrow) uint8_t[len];
     if (copy == nullptr) {
         return false;
     }
@@ -418,7 +417,7 @@ static auto queue_pending_pipe_data(uint16_t home_node, uint32_t resource_id, co
         pending = new PendingPipeDelivery();
         if (pending == nullptr) {
             s_ipc_lock.unlock_irqrestore(irqf);
-            ker::mod::mm::dyn::kmalloc::free(copy);
+            delete[] copy;
             return false;
         }
         pending->home_node = home_node;
@@ -470,7 +469,7 @@ static auto drain_pending_pipe_data(uint16_t home_node, uint32_t resource_id, vo
     pending->buffered_bytes -= static_cast<uint32_t>(to_copy);
 
     if (chunk.offset == chunk.len) {
-        ker::mod::mm::dyn::kmalloc::free(chunk.data);
+        delete[] chunk.data;
         pending->chunks.pop_front();
     }
 
@@ -613,7 +612,7 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
 
     size_t to_send = count < max_chunk ? count : max_chunk;
     size_t msg_size = HEADER_SIZE + to_send;
-    auto* msg = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_size));
+    auto* msg = new (std::nothrow) uint8_t[msg_size];
     if (msg == nullptr) return -ENOMEM;
 
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
@@ -626,7 +625,7 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     std::memcpy(msg + HEADER_SIZE, buf, to_send);
 
     int ret = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(msg_size));
-    ker::mod::mm::dyn::kmalloc::free(msg);
+    delete[] msg;
 
     if (ret != WKI_OK) return -EIO;
     return static_cast<ssize_t>(to_send);
@@ -772,11 +771,11 @@ template <int SLOT>
 
         constexpr size_t BUF_SIZE = 4096;
         constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-        auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(BUF_SIZE));
-        auto* msg = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(HEADER_SIZE + BUF_SIZE));
+        auto* buf = new (std::nothrow) uint8_t[BUF_SIZE];
+        auto* msg = new (std::nothrow) uint8_t[HEADER_SIZE + BUF_SIZE];
         if (buf == nullptr || msg == nullptr) {
-            if (buf) ker::mod::mm::dyn::kmalloc::free(buf);
-            if (msg) ker::mod::mm::dyn::kmalloc::free(msg);
+            if (buf) delete[] buf;
+            if (msg) delete[] msg;
             exp->pump_running.store(false, std::memory_order_release);
             arg->exp.store(nullptr, std::memory_order_release);
             ker::mod::dbg::log("[WKI] IPC pump: malloc failed for resource_id=%u", resource_id);
@@ -847,8 +846,8 @@ template <int SLOT>
             }
         }
 
-        ker::mod::mm::dyn::kmalloc::free(buf);
-        ker::mod::mm::dyn::kmalloc::free(msg);
+        delete[] buf;
+        delete[] msg;
         exp->pump_running.store(false, std::memory_order_release);
         arg->exp.store(nullptr, std::memory_order_release);
     }
@@ -1118,7 +1117,7 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
                     if (exp->file->fops != nullptr && exp->file->fops->vfs_close != nullptr) {
                         exp->file->fops->vfs_close(exp->file);
                     }
-                    ker::mod::mm::dyn::kmalloc::free(exp->file);
+                    delete exp->file;
                 }
                 exp->file = nullptr;
             }
@@ -1379,7 +1378,7 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                 if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
                     f->fops->vfs_close(f);
                 }
-                ker::mod::mm::dyn::kmalloc::free(f);
+                delete f;
             }
             return;
         }

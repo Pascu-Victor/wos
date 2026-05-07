@@ -106,13 +106,11 @@ void Workqueue::drain_loop() {
 }
 
 auto Workqueue::create(const char* name) -> Workqueue* {
-    auto* wq = static_cast<Workqueue*>(mm::dyn::kmalloc::malloc(sizeof(Workqueue)));
+    auto* wq = new (std::nothrow) Workqueue();
     if (wq == nullptr) {
         return nullptr;
     }
 
-    // Placement-new to get proper atomic initialisation
-    new (wq) Workqueue();
     wq->name_ = name;
     wq->head_ = nullptr;
     wq->tail_ = nullptr;
@@ -125,7 +123,7 @@ auto Workqueue::create(const char* name) -> Workqueue* {
     wq->thread_ = task::Task::createKernelThread(name, worker_entry);
     if (wq->thread_ == nullptr) {
         mod::dbg::log("[workqueue] failed to create worker thread '%s'\n", name);
-        mm::dyn::kmalloc::free(wq);
+        delete wq;
         return nullptr;
     }
 

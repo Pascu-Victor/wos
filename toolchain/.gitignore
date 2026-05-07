@@ -3,3 +3,4 @@ sysroot
 host
 *-headers
 *-bootstrap
+*-install

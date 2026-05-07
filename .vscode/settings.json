@@ -132,7 +132,6 @@
     // Clangd settings
     "clangd.path": "/usr/bin/clangd",
     "clangd.arguments": [
-        "--compile-commands-dir=${workspaceFolder}/build",
         "--resource-dir=${workspaceFolder}/toolchain/host/lib/clang/22",
         "--background-index",
         "--clang-tidy",

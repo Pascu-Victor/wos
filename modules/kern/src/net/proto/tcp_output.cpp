@@ -4,8 +4,8 @@
 #include <net/endian.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 
 #include "tcp.hpp"
 
@@ -16,6 +16,9 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     if (pkt == nullptr) {
         return false;
     }
+
+    const uint32_t seq = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
+    const size_t seq_len = len + (((flags & TCP_SYN) != 0) ? 1U : 0U) + (((flags & TCP_FIN) != 0) ? 1U : 0U);
 
     // SYN options: MSS + WSCALE.
     uint8_t options[8] = {};
@@ -46,7 +49,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     auto* hdr = reinterpret_cast<TcpHeader*>(payload);
     hdr->src_port = htons(cb->local_port);
     hdr->dst_port = htons(cb->remote_port);
-    hdr->seq = htonl(cb->snd_nxt - ((flags & TCP_SYN) ? 1 : 0));
+    hdr->seq = htonl(seq);
     if ((flags & TCP_ACK) != 0) {
         hdr->ack = htonl(cb->rcv_nxt);
     } else {
@@ -65,6 +68,26 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
 
     hdr->checksum = pseudo_header_checksum(cb->local_ip, cb->remote_ip, 6, pkt->data, pkt->len);
 
+    PacketBuffer* rtx_pkt = nullptr;
+    if (seq_len > 0) {
+        rtx_pkt = pkt_alloc_tx();
+        if (rtx_pkt == nullptr) {
+            ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu) port=%u snd_nxt=%u", ker::net::pkt_pool_free_count(), cb->local_port,
+                               cb->snd_nxt);
+        } else {
+            std::memcpy(rtx_pkt->storage.data(), pkt->storage.data(), PKT_BUF_SIZE);
+            rtx_pkt->data = rtx_pkt->storage.data() + (pkt->data - pkt->storage.data());
+            rtx_pkt->len = pkt->len;
+        }
+    }
+
+    if (ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64) < 0) {
+        if (rtx_pkt != nullptr) {
+            pkt_free(rtx_pkt);
+        }
+        return false;
+    }
+
     if ((flags & TCP_ACK) != 0 && len > 0) {
         cb->segs_pending_ack = 0;
         cb->delayed_ack_deadline = 0;
@@ -78,55 +101,43 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         cb->snd_nxt++;
     }
 
-    if (len > 0 || (flags & (TCP_SYN | TCP_FIN)) != 0) {
-        auto* rtx_pkt = pkt_alloc_tx();
-        if (rtx_pkt == nullptr) {
-            ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu) port=%u snd_nxt=%u", ker::net::pkt_pool_free_count(), cb->local_port,
-                               cb->snd_nxt);
-        }
-        if (rtx_pkt != nullptr) {
-            std::memcpy(rtx_pkt->storage.data(), pkt->storage.data(), PKT_BUF_SIZE);
-            rtx_pkt->data = rtx_pkt->storage.data() + (pkt->data - pkt->storage.data());
-            rtx_pkt->len = pkt->len;
+    if (rtx_pkt != nullptr) {
+        auto* entry = new (std::nothrow) RetransmitEntry{};
+        if (entry != nullptr) {
+            entry->pkt = rtx_pkt;
+            entry->seq = seq;
+            entry->len = seq_len;
+            entry->send_time_ms = tcp_now_ms();
+            entry->retries = 0;
+            entry->next = nullptr;
 
-            auto* entry = static_cast<RetransmitEntry*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(RetransmitEntry)));
-            if (entry != nullptr) {
-                entry->pkt = rtx_pkt;
-                entry->seq = ntohl(hdr->seq);
-                entry->len = len + (((flags & TCP_SYN) != 0) ? 1 : 0) + (((flags & TCP_FIN) != 0) ? 1 : 0);
-                entry->send_time_ms = tcp_now_ms();
-                entry->retries = 0;
-                entry->next = nullptr;
-
-                // Append to retransmit queue
-                if (cb->retransmit_head == nullptr) {
-                    cb->retransmit_head = entry;
-                    cb->retransmit_tail = entry;
-                    cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
-                    tcp_timer_arm(cb);
-                } else {
-                    cb->retransmit_tail->next = entry;
-                    cb->retransmit_tail = entry;
-                }
-#ifdef TCP_DEBUG
-                {
-                    size_t depth = 0;
-                    for (auto* e = cb->retransmit_head; e != nullptr; e = e->next) {
-                        depth++;
-                    }
-                    if (depth == 64 || depth == 256 || depth == 512) {
-                        ker::mod::dbg::log("[net] RTX QUEUE depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port,
-                                           ker::net::pkt_pool_free_count(), cb->snd_wnd);
-                    }
-                }
-#endif
+            // Append to retransmit queue
+            if (cb->retransmit_head == nullptr) {
+                cb->retransmit_head = entry;
+                cb->retransmit_tail = entry;
+                cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
+                tcp_timer_arm(cb);
             } else {
-                pkt_free(rtx_pkt);
+                cb->retransmit_tail->next = entry;
+                cb->retransmit_tail = entry;
             }
+#ifdef TCP_DEBUG
+            {
+                size_t depth = 0;
+                for (auto* e = cb->retransmit_head; e != nullptr; e = e->next) {
+                    depth++;
+                }
+                if (depth == 64 || depth == 256 || depth == 512) {
+                    ker::mod::dbg::log("[net] RTX QUEUE depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port,
+                                       ker::net::pkt_pool_free_count(), cb->snd_wnd);
+                }
+            }
+#endif
+        } else {
+            pkt_free(rtx_pkt);
         }
     }
 
-    ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64);
     return true;
 }
 

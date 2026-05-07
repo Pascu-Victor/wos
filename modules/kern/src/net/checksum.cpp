@@ -1,6 +1,8 @@
 #include "checksum.hpp"
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <net/endian.hpp>
 
 namespace ker::net {

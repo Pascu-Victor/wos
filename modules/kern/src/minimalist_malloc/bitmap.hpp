@@ -1,4 +1,7 @@
 #pragma once
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <defines/defines.hpp>
 
 #define CHECK_BIT(value, bit) ((value >> bit) & 1)

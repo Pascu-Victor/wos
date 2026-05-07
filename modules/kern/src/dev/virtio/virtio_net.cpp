@@ -16,7 +16,6 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
@@ -521,7 +520,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     volatile uint8_t* devcfg_va = (devcfg_cap != 0) ? map_virtio_cap_region(pci_dev, devcfg_cap) : nullptr;
 
-    auto* dev = static_cast<VirtIONetDevice*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(VirtIONetDevice)));
+    auto* dev = new (std::nothrow) VirtIONetDevice{};
     if (dev == nullptr) {
         return -1;
     }
@@ -569,7 +568,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if ((cfg->device_status & VIRTIO_STATUS_FEATURES_OK) == 0) {
         ker::mod::io::serial::write("virtio-net: modern FEATURES_OK rejected\n");
         cfg->device_status = VIRTIO_STATUS_FAILED;
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->negotiated_features = our_lo;
@@ -604,14 +603,14 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (dev->rxq == nullptr) {
         ker::mod::io::serial::write("virtio-net: modern RX queue failed\n");
         cfg->device_status = VIRTIO_STATUS_FAILED;
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->txq = setup_queue(1, VIRTQ_MAX_SIZE);
     if (dev->txq == nullptr) {
         ker::mod::io::serial::write("virtio-net: modern TX queue failed\n");
         cfg->device_status = VIRTIO_STATUS_FAILED;
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
 
@@ -654,7 +653,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (vector == 0) {
         ker::mod::io::serial::write("virtio-net: no free IRQ vector\n");
         cfg->device_status = VIRTIO_STATUS_FAILED;
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->irq_vector = vector;
@@ -834,7 +833,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
     ::outl(io_base + VIRTIO_REG_GUEST_FEATURES, our_features);
 
-    auto* dev = static_cast<VirtIONetDevice*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(VirtIONetDevice)));
+    auto* dev = new (std::nothrow) VirtIONetDevice{};
     if (dev == nullptr) {
         write_status(io_base, VIRTIO_STATUS_FAILED);
         return -1;
@@ -849,7 +848,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (rxq_size == 0) {
         ker::mod::io::serial::write("virtio-net: RX queue size is 0\n");
         write_status(io_base, VIRTIO_STATUS_FAILED);
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     rxq_size = std::min(rxq_size, VIRTQ_MAX_SIZE);
@@ -858,7 +857,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (dev->rxq == nullptr) {
         ker::mod::io::serial::write("virtio-net: failed to alloc RX queue\n");
         write_status(io_base, VIRTIO_STATUS_FAILED);
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->rxq->io_base = io_base;
@@ -872,7 +871,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (txq_size == 0) {
         ker::mod::io::serial::write("virtio-net: TX queue size is 0\n");
         write_status(io_base, VIRTIO_STATUS_FAILED);
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     txq_size = std::min(txq_size, VIRTQ_MAX_SIZE);
@@ -881,7 +880,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (dev->txq == nullptr) {
         ker::mod::io::serial::write("virtio-net: failed to alloc TX queue\n");
         write_status(io_base, VIRTIO_STATUS_FAILED);
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->txq->io_base = io_base;
@@ -951,7 +950,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (vector == 0) {
         ker::mod::io::serial::write("virtio-net: no free IRQ vector\n");
         write_status(io_base, VIRTIO_STATUS_FAILED);
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return -1;
     }
     dev->irq_vector = vector;

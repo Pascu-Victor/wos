@@ -92,8 +92,17 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             task->deathEpoch.store(mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
             task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
             // Wake anyone waiting on this thread (e.g. via awaitee list)
-            for (size_t i = 0; i < task->awaitee_on_exit.size(); i++) {
-                auto* waiter = mod::sched::find_task_by_pid_safe(task->awaitee_on_exit[i]);
+            uint64_t waiter_lock_flags = task->exitWaitersLock.lock_irqsave();
+            const size_t waiter_count = task->awaitee_on_exit.size();
+            uint64_t waiting_pids[16] = {};
+            const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+            for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
+                waiting_pids[i] = task->awaitee_on_exit[i];
+            }
+            task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+
+            for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; i++) {
+                auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids[i]);
                 if (waiter != nullptr) {
                     mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
                     waiter->release();

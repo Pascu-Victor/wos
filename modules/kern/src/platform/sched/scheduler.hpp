@@ -156,6 +156,8 @@ void dump_scheduler_cpu_states();
 auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
 auto get_active_task_at_safe(uint32_t index) -> task::Task*;
+auto get_dead_task_count(uint64_t cpu_no) -> size_t;
+auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task*;
 
 // Return up to maxEntries dead task PIDs and their refcounts for diagnostics,
 // starting at `startIndex` into the dead list. Returns the number of entries written.

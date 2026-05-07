@@ -11,6 +11,7 @@
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <util/list.hpp>
 #include <util/radix_tree.hpp>
 #include <util/smallvec.hpp>
@@ -127,6 +128,7 @@ struct Task {
     // ELF buffer for cleanup
     uint8_t* elfBuffer;
     size_t elfBufferSize;
+    bool isElfBufferShared = false;  // True if buffer is from shared cache, don't delete[]
 
     // ELF metadata for auxv setup
     uint64_t programHeaderAddr;         // Virtual address of program headers (AT_PHDR)
@@ -183,8 +185,10 @@ struct Task {
     static constexpr unsigned WKI_TARGET_HOSTNAME_MAX = 64;
     static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
     static constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1;      // pin task to local node (skip remote placement)
-    static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to children on exec
-    static constexpr uint32_t WKI_TARGET_FLAGS_ALL = WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT;
+    static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to child processes
+    static constexpr uint32_t WKI_TARGET_FLAG_REMOTE = 1U << 3;     // prefer a remote node, falling back locally unless strict
+    static constexpr uint32_t WKI_TARGET_FLAGS_ALL =
+        WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT | WKI_TARGET_FLAG_REMOTE;
     char wki_target_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
     uint32_t wki_target_flags = 0;
 
@@ -226,6 +230,8 @@ struct Task {
 
     // List of task IDs waiting for this task to exit
     // When this task exits, all tasks in this list will be rescheduled on their respective CPUs
+    // Protected by exitWaitersLock because waitpid() and exit paths touch it concurrently.
+    mod::sys::Spinlock exitWaitersLock;
     ker::util::SmallVec<uint64_t, 4> awaitee_on_exit;
 
     // Flag indicating that this task should be moved to wait queue after syscall returns
@@ -245,8 +251,14 @@ struct Task {
 
     // Waitpid state: when this task is waiting for another task to exit
     uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
-    uint64_t waitStatusPhysAddr;  // Physical address of status variable (for waitpid)
-    uint64_t waitRusagePhysAddr;  // Physical address of rusage struct (for wait3/wait4, 0 if unused)
+    uint64_t waitStatusUserAddr;  // Userspace virtual address of status variable (for waitpid)
+    uint64_t waitStatusPhysAddr;  // Last translated physical address (debug/compat)
+    uint64_t waitRusageUserAddr;  // Userspace virtual address of rusage struct (for wait3/wait4)
+    uint64_t waitRusagePhysAddr;  // Last translated physical address (debug/compat)
+    uint64_t waitResumeRipUserAddr;  // Userspace RIP expected when returning from waitpid
+    uint64_t waitResumeRipPhysAddr;  // Last translated physical address for waitResumeRipUserAddr
+    uint64_t waitResumeRspUserAddr;  // Userspace RSP expected when returning from waitpid
+    uint64_t waitResumeRspPhysAddr;  // Last translated physical address for waitResumeRspUserAddr
 
     // --- Signal infrastructure ---
     // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)
@@ -346,6 +358,11 @@ struct Task {
     // Set at every block site (deferredTaskSwitch, kern_block, kern_sleep_us).
     // Cleared when the task is rescheduled. Visible via /proc/<pid>/stat (wchan).
     const char* wait_channel = nullptr;
+
+    // Owned futex waiter node while this task is blocked in futex_wait().
+    // Wake and exit cleanup atomically exchange this pointer to guarantee the
+    // waiter is detached and freed exactly once.
+    std::atomic<void*> futexWaiter{nullptr};
 
     // Set when a task transitions from the wait list to the runnable heap
     // (timer expiry or kern_wake).  process_tasks uses this to enforce a

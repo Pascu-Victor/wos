@@ -17,8 +17,8 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <utility>
 
 #include "platform/sys/spinlock.hpp"
@@ -168,7 +168,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     }
 
     for (size_t i = 0; i < target_count; i++) {
-        auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+        auto* req_buf = new (std::nothrow) uint8_t[req_total];
         if (req_buf == nullptr) {
             continue;
         }
@@ -177,7 +177,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         req->data_len = pkt_data_len;
         memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt_data_len);
         wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-        ker::mod::mm::dyn::kmalloc::free(req_buf);
+        delete[] req_buf;
     }
 }
 
@@ -223,15 +223,15 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
     for (auto& b : g_bindings) {
         if (!b.active) {
             if (b.vfs_rdma_write_buf != nullptr) {
-                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_write_buf);
+                delete[] b.vfs_rdma_write_buf;
                 b.vfs_rdma_write_buf = nullptr;
             }
             if (b.vfs_rdma_read_staging_buf != nullptr) {
-                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_read_staging_buf);
+                delete[] b.vfs_rdma_read_staging_buf;
                 b.vfs_rdma_read_staging_buf = nullptr;
             }
             if (b.vfs_rdma_bulk_staging_buf != nullptr) {
-                ker::mod::mm::dyn::kmalloc::free(b.vfs_rdma_bulk_staging_buf);
+                delete[] b.vfs_rdma_bulk_staging_buf;
                 b.vfs_rdma_bulk_staging_buf = nullptr;
             }
         }
@@ -434,7 +434,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
                 // Write receive buffer: consumer rdma_writes file data here.
                 constexpr uint32_t VFS_WRITE_BUF = 65536;
-                auto* wbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_WRITE_BUF));
+                auto* wbuf = new (std::nothrow) uint8_t[VFS_WRITE_BUF];
                 if (wbuf != nullptr) {
                     uint32_t rkey = 0;
                     int reg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(wbuf),
@@ -445,16 +445,15 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                         ack.rdma_flags |= DEV_ATTACH_RDMA_VFS;
                         ack.blk_zone_id = rkey;  // carry server write-recv rkey to consumer
                     } else {
-                        ker::mod::mm::dyn::kmalloc::free(wbuf);
+                        delete[] wbuf;
                     }
                 }
 
                 // Read staging buffer (RoCE pull mode only): server reads file data here;
                 // consumer rdma_reads to pull. Not needed for ivshmem (push is safe there).
-                bool peer_is_roce = (peer->rdma_transport->name != nullptr &&
-                                    std::strcmp(peer->rdma_transport->name, "wki-roce") == 0);
+                bool peer_is_roce = (peer->rdma_transport->name != nullptr && std::strcmp(peer->rdma_transport->name, "wki-roce") == 0);
                 if (peer_is_roce) {
-                    auto* rbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BOUNCE_SIZE));
+                    auto* rbuf = new (std::nothrow) uint8_t[VFS_RDMA_BOUNCE_SIZE];
                     if (rbuf != nullptr) {
                         uint32_t rrkey = 0;
                         int reg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(rbuf),
@@ -465,12 +464,12 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                             ack.rdma_flags |= DEV_ATTACH_RDMA_VFS_READ;
                             ack.rdma_read_staging_rkey = rrkey;
                         } else {
-                            ker::mod::mm::dyn::kmalloc::free(rbuf);
+                            delete[] rbuf;
                         }
                     }
 
                     // Bulk staging buffer (RoCE bulk pull mode): 2 MB staging for OP_VFS_READ_BULK.
-                    auto* bbuf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(VFS_RDMA_BULK_SIZE));
+                    auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_BULK_SIZE];
                     if (bbuf != nullptr) {
                         uint32_t brkey = 0;
                         int breg_ret = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf),
@@ -481,7 +480,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                             ack.rdma_flags |= DEV_ATTACH_RDMA_BULK_PULL;
                             ack.rdma_bulk_staging_rkey = brkey;
                         } else {
-                            ker::mod::mm::dyn::kmalloc::free(bbuf);
+                            delete[] bbuf;
                         }
                     }
                 }
@@ -647,13 +646,13 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     // Cleanup outside the lock
     if (info.vfs_rdma_write_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_write_buf);
+        delete[] info.vfs_rdma_write_buf;
     }
     if (info.vfs_rdma_read_staging_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_read_staging_buf);
+        delete[] info.vfs_rdma_read_staging_buf;
     }
     if (info.vfs_rdma_bulk_staging_buf != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(info.vfs_rdma_bulk_staging_buf);
+        delete[] info.vfs_rdma_bulk_staging_buf;
     }
     if (info.blk_rdma_active && info.blk_zone_id != 0) {
         wki_zone_destroy(info.blk_zone_id);
@@ -822,7 +821,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             }
 
             auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + data_bytes);
-            auto* buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_total));
+            auto* buf = new (std::nothrow) uint8_t[resp_total];
             if (buf == nullptr) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_BLOCK_READ;
@@ -845,7 +844,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             uint16_t send_len = (ret == 0) ? resp_total : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, buf, send_len);
 
-            ker::mod::mm::dyn::kmalloc::free(buf);
+            delete[] buf;
             break;
         }
 
@@ -1107,7 +1106,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                 // consumer's pre-registered staging buffer (rkey in data_slot).
                 uint32_t consumer_rkey = sqe->data_slot;
                 uint32_t total_bytes = sqe->block_count * hdr->block_size;
-                auto* staging = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(total_bytes));
+                auto* staging = new (std::nothrow) uint8_t[total_bytes];
                 if (staging == nullptr) {
                     cqe.status = -12;  // ENOMEM
                     cqe.bytes_transferred = 0;
@@ -1124,7 +1123,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                     cqe.bytes_transferred = 0;
                 }
                 cqe.status = ret;
-                ker::mod::mm::dyn::kmalloc::free(staging);
+                delete[] staging;
                 // Bulk ops push data directly via RDMA - no ring data slot involved
                 data_bytes = 0;
                 break;
@@ -1134,7 +1133,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                 // registered staging buffer, then write blocks to device.
                 uint32_t consumer_rkey = sqe->data_slot;
                 uint32_t total_bytes = sqe->block_count * hdr->block_size;
-                auto* staging = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(total_bytes));
+                auto* staging = new (std::nothrow) uint8_t[total_bytes];
                 if (staging == nullptr) {
                     cqe.status = -12;  // ENOMEM
                     cqe.bytes_transferred = 0;
@@ -1152,7 +1151,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                 }
                 cqe.status = ret;
                 cqe.bytes_transferred = 0;
-                ker::mod::mm::dyn::kmalloc::free(staging);
+                delete[] staging;
                 data_bytes = 0;
                 break;
             }

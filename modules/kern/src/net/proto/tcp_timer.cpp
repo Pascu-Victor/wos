@@ -7,7 +7,6 @@
 #include <net/proto/ipv4.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 
@@ -41,7 +40,7 @@ struct DeferredRetransmit {
     uint32_t local_ip;
     uint32_t remote_ip;
     uint32_t seq_end;
-    const TcpCB* cb;
+    TcpCB* cb;
     TcpCB* ack_cb;
 };
 
@@ -69,6 +68,7 @@ void retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* d
     deferred[deferred_count].local_ip = cb->local_ip;
     deferred[deferred_count].remote_ip = cb->remote_ip;
     deferred[deferred_count].seq_end = entry->seq + static_cast<uint32_t>(entry->len);
+    tcp_cb_acquire(cb);
     deferred[deferred_count].cb = cb;
     deferred_count++;
 }
@@ -224,10 +224,6 @@ void tcp_timer_tick(uint64_t now_ms) {
         if (should_remove) {
             *pp = cb->timer_next;
             cb->on_timer_list = false;
-            // Reuse timer_next to chain to_free; keep hash_next intact.
-            if (cb->socket != nullptr) {
-                cb->socket->proto_data = nullptr;
-            }
             cb->timer_next = to_free;
             to_free = cb;
             continue;
@@ -356,7 +352,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                     if (e->pkt != nullptr) {
                         pkt_free(e->pkt);
                     }
-                    ker::mod::mm::dyn::kmalloc::free(e);
+                    delete e;
                 }
                 rcb->retransmit_tail = nullptr;
                 if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
@@ -394,7 +390,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                         if (e->pkt != nullptr) {
                             pkt_free(e->pkt);
                         }
-                        ker::mod::mm::dyn::kmalloc::free(e);
+                        delete e;
                     }
                     rcb->retransmit_tail = nullptr;
                     if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
@@ -436,6 +432,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             uint32_t una = deferred[i].cb->snd_una;
             if (!tcp_seq_after(deferred[i].seq_end, una)) {
                 pkt_free(deferred[i].pkt);
+                tcp_cb_release(deferred[i].cb);
                 if (deferred[i].ack_cb != nullptr) {
                     tcp_cb_release(deferred[i].ack_cb);
                 }
@@ -443,6 +440,10 @@ void tcp_timer_tick(uint64_t now_ms) {
             }
         }
         tx_res = ipv4_tx(deferred[i].pkt, deferred[i].local_ip, deferred[i].remote_ip, 6, 64);
+
+        if (deferred[i].cb != nullptr) {
+            tcp_cb_release(deferred[i].cb);
+        }
 
         if (deferred[i].ack_cb != nullptr) {
             TcpCB* ack_cb = deferred[i].ack_cb;

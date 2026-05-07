@@ -59,4 +59,24 @@ constexpr mode_t S_WOSLINK = 0x10000;
 
 inline constexpr bool S_ISWLNK(mode_t m) { return (m & S_WOSLINK) != 0; }
 
+// Kernel-side statvfs structure matching the mlibc ABI.
+// On x86_64, unsigned long == uint64_t, so this is ABI-compatible with
+// the userspace struct statvfs from <sys/statvfs.h>.
+struct statvfs {
+    uint64_t f_bsize;    // preferred I/O block size
+    uint64_t f_frsize;   // fundamental block size (= f_bsize for most FSes)
+    uint64_t f_blocks;   // total blocks in filesystem (in f_frsize units)
+    uint64_t f_bfree;    // free blocks
+    uint64_t f_bavail;   // free blocks available to unprivileged users
+    uint64_t f_files;    // total file nodes (inodes)
+    uint64_t f_ffree;    // free file nodes
+    uint64_t f_favail;   // free file nodes for unprivileged users
+    uint64_t f_fsid;     // filesystem ID
+    uint64_t f_flag;     // mount flags (ST_RDONLY = 1, ST_NOSUID = 2)
+    uint64_t f_namemax;  // maximum filename length
+};
+
+constexpr uint64_t ST_RDONLY = 1;
+constexpr uint64_t ST_NOSUID = 2;
+
 }  // namespace ker::vfs

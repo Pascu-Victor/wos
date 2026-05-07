@@ -11,8 +11,12 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <vfs/stat.hpp>
+#include <vfs/vfs.hpp>
+#include <util/hcf.hpp>
 
 namespace ker::syscall::vmem {
+using log = ker::mod::dbg::logger<"vmem">;
 
 // Linux x86_64 user space address range
 // User space: 0x0000000000000000 - 0x00007FFFFFFFFFFF (128TB)
@@ -24,6 +28,11 @@ constexpr uint64_t MMAP_START = 0x0000100000000000ULL;        // mmap base - avo
 namespace {
 // Get the current task
 inline auto getCurrentTask() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
+
+constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
+constexpr uint64_t WATCH_MMAP_VADDR = 0x00001000007da000ULL;
+
+inline auto isWatchedMmapVaddr(uint64_t vaddr) -> bool { return ENABLE_WATCHED_MMAP_LOGS && vaddr == WATCH_MMAP_VADDR; }
 
 // Find a free virtual address range of the given size
 // Uses a simple linear search through allocated regions
@@ -168,7 +177,6 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
     for (uint64_t i = 0; i < num_pages; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
         auto* phys_page = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(phys_pages) + (i * ker::mod::mm::paging::PAGE_SIZE));
-
         // Get physical address
         auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(phys_page)));
 
@@ -177,6 +185,17 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
 
         // Map the page
         ker::mod::mm::virt::mapPage(task->pagemap, current_vaddr, paddr, page_flags);
+
+        if (isWatchedMmapVaddr(current_vaddr)) {
+            log::warn("watch mmap-map: pid=%lu name=%s pagemap=%p kind=anon vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx",
+                      task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
+                      (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot);
+        }
+    }
+
+    if (!ker::mod::mm::phys::pageSplitToOrder0(phys_pages)) {
+        ker::mod::dbg::log("vmem: failed to split anon backing block for leaf reclaim");
+        hcf();
     }
 
     return vaddr;
@@ -230,6 +249,11 @@ auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
 
         // Check if page is mapped
         if (ker::mod::mm::virt::isPageMapped(task->pagemap, currentVaddr)) {
+            if (isWatchedMmapVaddr(currentVaddr)) {
+                const auto phys = ker::mod::mm::virt::translate(task->pagemap, currentVaddr);
+                log::warn("watch mmap-unmap: pid=%lu name=%s pagemap=%p vaddr=0x%llx phys=0x%llx size=0x%llx", task->pid, task->name,
+                          static_cast<void*>(task->pagemap), (unsigned long long)currentVaddr, (unsigned long long)phys, (unsigned long long)size);
+            }
             // Unmap the page (this also frees the physical page)
             ker::mod::mm::virt::unmapPage(task->pagemap, currentVaddr);
         }
@@ -238,6 +262,78 @@ auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
     ker::mod::dbg::log("vmem: freed %x bytes at %p", size, addr);
 #endif
     return 0;  // Success
+}
+
+// Allocate file-backed (MAP_PRIVATE) memory
+auto fileAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset) -> uint64_t {
+    auto* task = getCurrentTask();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
+    }
+
+    if (size == 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    ker::vfs::stat st{};
+    if (ker::vfs::vfs_fstat(fd, &st) < 0) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    size = PAGE_ALIGN_UP(size);
+
+    uint64_t vaddr = 0;
+    if (((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0) {
+        if (hint < USER_SPACE_START || hint + size > USER_SPACE_END) {
+            return (uint64_t)(-ker::abi::vmem::VMEM_EINVAL);
+        }
+        vaddr = hint;
+    } else {
+        vaddr = findFreeRange(task, size, hint);
+        if (vaddr == 0) {
+            return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+    }
+
+    auto page_flags = protToPageFlags(prot);
+    auto num_pages = size / ker::mod::mm::paging::PAGE_SIZE;
+
+    void* phys_pages = ker::mod::mm::phys::pageAlloc(size);
+    if (phys_pages == nullptr) {
+        return (uint64_t)(-ker::abi::vmem::VMEM_ENOMEM);
+    }
+    memset(phys_pages, 0, size);
+
+    // Read file content into the backing pages
+    uint64_t file_size = (uint64_t)st.st_size;
+    if (offset < file_size) {
+        uint64_t read_size = file_size - offset;
+        if (read_size > size) {
+            read_size = size;
+        }
+        ker::vfs::vfs_lseek(fd, (off_t)offset, 0 /* SEEK_SET */);
+        ker::vfs::vfs_read(fd, phys_pages, (size_t)read_size);
+    }
+
+    for (uint64_t i = 0; i < num_pages; i++) {
+        auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+        auto* phys_page = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(phys_pages) + (i * ker::mod::mm::paging::PAGE_SIZE));
+        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(phys_page)));
+        ker::mod::mm::virt::mapPage(task->pagemap, current_vaddr, paddr, page_flags);
+        if (isWatchedMmapVaddr(current_vaddr)) {
+            log::warn("watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx fd=%d off=0x%llx",
+                      task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
+                      (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot, fd,
+                      (unsigned long long)offset);
+        }
+    }
+
+    if (!ker::mod::mm::phys::pageSplitToOrder0(phys_pages)) {
+        ker::mod::dbg::log("vmem: failed to split file backing block for leaf reclaim");
+        hcf();
+    }
+
+    return vaddr;
 }
 
 }  // anonymous namespace
@@ -305,13 +401,9 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 }
 
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
-    // For now, only support anonymous mappings
     if (fd != (uint64_t)(-1)) {
-        ker::mod::dbg::log("vmem_map: only anonymous mappings supported");
-        return (uint64_t)(-ker::abi::vmem::VMEM_ENOSYS);
+        return fileAllocate(hint, size, prot, flags, (int)fd, offset);
     }
-
-    // Use anonAllocate for anonymous mappings
     return anonAllocate(hint, size, prot, flags);
 }
 

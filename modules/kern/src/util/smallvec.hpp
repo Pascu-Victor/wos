@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::util {
@@ -24,11 +25,7 @@ class SmallVec {
    public:
     SmallVec() = default;
 
-    ~SmallVec() {
-        if (m_heap) {
-            ker::mod::mm::dyn::kmalloc::free(m_heap);
-        }
-    }
+    ~SmallVec() { delete[] m_heap; }
 
     // No copy - explicit clone() instead to make allocation visible
     SmallVec(const SmallVec&) = delete;
@@ -39,9 +36,7 @@ class SmallVec {
 
     SmallVec& operator=(SmallVec&& other) noexcept {
         if (this != &other) {
-            if (m_heap) {
-                ker::mod::mm::dyn::kmalloc::free(m_heap);
-            }
+            delete[] m_heap;
             move_from(other);
         }
         return *this;
@@ -164,14 +159,14 @@ class SmallVec {
 
     [[nodiscard]] bool grow() {
         size_t new_cap = m_capacity == 0 ? InlineN : m_capacity * 2;
-        auto* new_buf = static_cast<T*>(ker::mod::mm::dyn::kmalloc::malloc(new_cap * sizeof(T)));
+        auto* new_buf = new (std::nothrow) T[new_cap];
         if (!new_buf) return false;  // OOM
 
         // Copy existing heap elements
         if (m_heap && m_capacity > 0) {
             size_t heap_used = m_size - InlineN;
             memcpy(new_buf, m_heap, heap_used * sizeof(T));
-            ker::mod::mm::dyn::kmalloc::free(m_heap);
+            delete[] m_heap;
         }
         m_heap = new_buf;
         m_capacity = new_cap;

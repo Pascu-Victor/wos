@@ -103,6 +103,7 @@ auto main(int argc, char** argv) -> int {
     start_network();
     start_httpd();
     start_dropbear();
+    start_testd();
 
     // Keep init alive and reap orphaned zombie children.
     // When children are still alive, block in waitpid() until one exits.

@@ -11,7 +11,6 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
 #include <vector>
 
@@ -444,7 +443,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 
         // Build variable-length ZONE_WRITE_REQ: header + data
         auto msg_len = static_cast<uint16_t>(sizeof(ZoneWriteReqPayload) + chunk);
-        auto* msg_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
+        auto* msg_buf = new (std::nothrow) uint8_t[msg_len];
         if (msg_buf == nullptr) {
             return WKI_ERR_ZONE_NO_MEM;
         }
@@ -464,7 +463,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         zone->lock.unlock();
 
         int ret = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
-        ker::mod::mm::dyn::kmalloc::free(msg_buf);
+        delete[] msg_buf;
 
         if (ret != WKI_OK) {
             zone->write_wait_entry = nullptr;
@@ -974,7 +973,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     // Build response: ZoneReadRespPayload + data
     uint32_t data_len = req->length;
     auto resp_len = static_cast<uint16_t>(sizeof(ZoneReadRespPayload) + data_len);
-    auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_len));
+    auto* resp_buf = new (std::nothrow) uint8_t[resp_len];
     if (resp_buf == nullptr) {
         return;
     }
@@ -988,7 +987,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, data_len);
 
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
-    ker::mod::mm::dyn::kmalloc::free(resp_buf);
+    delete[] resp_buf;
 }
 
 void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {

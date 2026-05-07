@@ -7,10 +7,11 @@ set(KERNEL wos)
 # ---------------------------------------------------------------------------
 # Sanitizer / instrumentation options (all default OFF for release builds)
 # ---------------------------------------------------------------------------
-option(WOS_KCFI   "Enable Clang Kernel Control-Flow Integrity"            OFF)
-option(WOS_KUBSAN "Enable Kernel UndefinedBehaviorSanitizer"              OFF)
-option(WOS_KASAN  "Enable Kernel AddressSanitizer (requires shadow map)"  OFF)
-option(WOS_KCOV   "Enable kernel coverage instrumentation (for Syzkaller)" OFF)
+option(WOS_KCFI     "Enable Clang Kernel Control-Flow Integrity"            ON)
+option(WOS_KUBSAN   "Enable Kernel UndefinedBehaviorSanitizer"              ON)
+option(WOS_KASAN    "Enable Kernel AddressSanitizer (requires shadow map)"  ON)
+option(WOS_KCOV     "Enable kernel coverage instrumentation (for Syzkaller)" ON)
+option(WOS_SELFTEST "Enable kernel self-test mode (--selftest cmdline flag)" ON)
 
 # Internal flags
 set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
@@ -22,6 +23,13 @@ file(GLOB_RECURSE CFILES src/*.c)
 file(GLOB_RECURSE ASFILES src/*.S)
 file(GLOB_RECURSE NASMFILES src/*.asm)
 file(GLOB_RECURSE CXXFILES src/*.cpp)
+
+# Exclude test sources unless self-test mode is explicitly enabled.
+# GLOB_RECURSE picks up src/test/*.cpp; strip them in production builds.
+if(NOT WOS_SELFTEST)
+    file(GLOB_RECURSE KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
+    list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})
+endif()
 
 # Add executable
 add_executable(${KERNEL} ${CFILES} ${ASFILES} ${NASMFILES} ${CXXFILES})
@@ -141,6 +149,11 @@ if(WOS_KCOV)
     )
     target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV=1)
     message(STATUS "[WOS] KCOV enabled (for Syzkaller coverage)")
+endif()
+
+if(WOS_SELFTEST)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_SELFTEST=1)
+    message(STATUS "[WOS] Self-test mode enabled (boot with --selftest to run)")
 endif()
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)

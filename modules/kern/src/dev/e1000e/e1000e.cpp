@@ -10,7 +10,6 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -386,7 +385,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
         return;
     }
 
-    auto* dev = static_cast<E1000Device*>(ker::mod::mm::dyn::kmalloc::calloc(1, sizeof(E1000Device)));
+    auto* dev = new (std::nothrow) E1000Device{};
     if (dev == nullptr) {
         return;
     }
@@ -401,7 +400,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     auto* bar0_ptr = pci::pci_map_bar(pci_dev, 0);
     if (bar0_ptr == nullptr) {
         ker::mod::dbg::log("e1000e: BAR0 is 0, cannot map MMIO");
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return;
     }
 
@@ -457,7 +456,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     uint8_t vector = ker::mod::gates::allocateVector();
     if (vector == 0) {
         ker::mod::dbg::log("e1000e: Failed to allocate IRQ vector");
-        ker::mod::mm::dyn::kmalloc::free(dev);
+        delete dev;
         return;
     }
 

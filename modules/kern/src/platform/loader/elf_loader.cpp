@@ -127,7 +127,7 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
             secName = shstr + sectionHeader->sh_name;
         }
 
-        if ((secName != nullptr) && ((std::strncmp(secName, ".relr", 5) == 0) || (std::strncmp(secName, ".relr.dyn", 9) == 0))) {
+        if ((secName != nullptr) && ((std::strcmp(secName, ".relr") == 0) || (std::strcmp(secName, ".relr.dyn") == 0))) {
 #ifdef ELF_DEBUG
             mod::dbg::log("Processing SHT_RELR (.relr) relocations in section %d (%s)", i, (secName != nullptr) ? secName : "");
 #endif
@@ -626,7 +626,7 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
             auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
             mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
-                                   mod::mm::paging::pageTypes::USER);
+                                   mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
             memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
@@ -654,7 +654,8 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
         auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
             auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
-            mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr, mod::mm::paging::pageTypes::USER);
+            mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
+                                   mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
             memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
@@ -693,45 +694,11 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
                               sectionHeader->sh_size);
 #endif
             } else if (std::strncmp(sectionName, ".debug_", 7) == 0) {
-                // Pure debug sections (no sh_addr) - allocate in high memory so debuggers can read them
-                uint64_t debugPages = PAGE_ALIGN_UP(sectionHeader->sh_size) / mod::mm::virt::PAGE_SIZE;
-                uint64_t debugVaddr = 0x600000000000ULL + (sectionIndex * 0x1000000);
-
-                uint64_t remainingSize = sectionHeader->sh_size;
-                uint64_t sourceOffset = 0;
-                bool allocationSuccess = true;
-                for (uint64_t i = 0; i < debugPages && remainingSize > 0; i++) {
-                    auto debugPaddr = (uint64_t)mod::mm::phys::pageAlloc();
-                    if (debugPaddr != 0) {
-                        auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(debugPaddr);
-                        mod::mm::virt::mapPage(pagemap, debugVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
-                                               mod::mm::paging::pageTypes::USER);
-                        memset((void*)debugPaddr, 0, mod::mm::virt::PAGE_SIZE);
-                        uint64_t copySize = (remainingSize > mod::mm::virt::PAGE_SIZE) ? mod::mm::virt::PAGE_SIZE : remainingSize;
-                        memcpy((void*)debugPaddr, elf.base + sectionHeader->sh_offset + sourceOffset, copySize);
-                        remainingSize -= copySize;
-                        sourceOffset += copySize;
-                    } else {
-                        allocationSuccess = false;
-                        break;
-                    }
-                }
-
-                if (allocationSuccess) {
-                    if (sectionHeadersPhysPtr != 0) {
-                        auto* mappedSectionHeader = (Elf64_Shdr*)(sectionHeadersPhysPtr + (sectionIndex * elf.elfHead.e_shentsize));
-                        mappedSectionHeader->sh_addr = debugVaddr;
-                    }
-                    debug::addDebugSection(pid, sectionName, debugVaddr, debugVaddr, sectionHeader->sh_size, sectionHeader->sh_offset,
-                                           sectionHeader->sh_type);
+                debug::addDebugSection(pid, sectionName, 0, 0, sectionHeader->sh_size, sectionHeader->sh_offset, sectionHeader->sh_type);
 #ifdef ELF_DEBUG
-                    mod::dbg::log("Allocated debug section %s at vaddr: %x, size: %x", sectionName, debugVaddr, sectionHeader->sh_size);
+                mod::dbg::log("Recorded debug section metadata only: %s (size=%x, fileOff=%x)", sectionName, sectionHeader->sh_size,
+                              sectionHeader->sh_offset);
 #endif
-                } else {
-#ifdef ELF_DEBUG
-                    mod::dbg::log("Failed to allocate memory for debug section %s", sectionName);
-#endif
-                }
             }
         }
         // Additionally, record GOT sections in debug info registry for diagnostics (no remapping or copying here)

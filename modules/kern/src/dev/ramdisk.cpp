@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
+#include <new>
 
 #include "dev/block_device.hpp"
 
@@ -83,7 +83,7 @@ auto ramdisk_create(size_t size_bytes) -> BlockDevice* {
     }
 
     // Allocate buffer
-    priv->buffer = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(size_bytes));
+    priv->buffer = new (std::nothrow) uint8_t[size_bytes];
     if (priv->buffer == nullptr) {
         ker::mod::io::serial::write("ramdisk_create: failed to allocate buffer\n");
         delete priv;
@@ -98,7 +98,7 @@ auto ramdisk_create(size_t size_bytes) -> BlockDevice* {
     auto* bdev = new BlockDevice;
     if (bdev == nullptr) {
         ker::mod::io::serial::write("ramdisk_create: failed to allocate BlockDevice\n");
-        ker::mod::mm::dyn::kmalloc::free(priv->buffer);
+        delete[] priv->buffer;
         delete priv;
         return nullptr;
     }
@@ -133,7 +133,7 @@ auto ramdisk_destroy(BlockDevice* disk) -> int {
     auto* priv = static_cast<RamdiskPrivate*>(disk->private_data);
     if (priv != nullptr) {
         if (priv->buffer != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(priv->buffer);
+            delete[] priv->buffer;
         }
         delete priv;
     }

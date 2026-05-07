@@ -32,13 +32,24 @@ bool enterPanicMode() {
     constexpr uint64_t ADDR_MASK = 0xFFFFU;
     auto fallback = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&expected) & ADDR_MASK);
     uint64_t cpu_id = cpu_id_available.load(std::memory_order_acquire) ? cpu::currentCpu() : fallback;
-    return panic_owner_cpu.compare_exchange_strong(expected, cpu_id,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire);
+    return panic_owner_cpu.compare_exchange_strong(expected, cpu_id, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
-bool isPanicMode() {
-    return in_panic_mode.load(std::memory_order_acquire);
+bool isPanicMode() { return in_panic_mode.load(std::memory_order_acquire); }
+
+bool isPanicOwner() {
+    if (!in_panic_mode.load(std::memory_order_acquire)) {
+        return false;
+    }
+    uint64_t owner = panic_owner_cpu.load(std::memory_order_acquire);
+    if (owner == NO_PANIC_OWNER) {
+        return false;
+    }
+    if (!cpu_id_available.load(std::memory_order_acquire)) {
+        // Very early boot, single CPU — assume this CPU is the owner.
+        return true;
+    }
+    return cpu::currentCpu() == owner;
 }
 
 void acquireLock() {
@@ -48,9 +59,7 @@ void acquireLock() {
         return;
     }
 
-    uint64_t cpu = cpu_id_available.load(std::memory_order_acquire)
-                       ? cpu::currentCpu()
-                       : 0;
+    uint64_t cpu = cpu_id_available.load(std::memory_order_acquire) ? cpu::currentCpu() : 0;
 
     // If we already own the lock, just increment depth (reentrant)
     if (lock_owner.load(std::memory_order_relaxed) == cpu) {
@@ -89,7 +98,7 @@ static void write_char_unlocked(char c) {
 // the serial lock when flushing a complete line or on overflow. This prevents
 // characters from different CPUs interleaving within a single output line.
 static constexpr size_t MAX_CPUS = 256;
-static constexpr size_t BUF_DATA_SIZE = 256 - sizeof(size_t); // 248 bytes, struct = 256 = 4 cache lines
+static constexpr size_t BUF_DATA_SIZE = 256 - sizeof(size_t);  // 248 bytes, struct = 256 = 4 cache lines
 
 struct alignas(64) CpuSerialBuf {
     size_t len = 0;
@@ -101,14 +110,16 @@ static CpuSerialBuf cpu_bufs[MAX_CPUS];
 
 static size_t get_buf_idx() {
     if (!cpu_id_available.load(std::memory_order_acquire)) {
-        return 0; // during early boot all CPUs share buffer 0 (they run serially at that point)
+        return 0;  // during early boot all CPUs share buffer 0 (they run serially at that point)
     }
     return cpu::currentCpu() % MAX_CPUS;
 }
 
 static void flush_buf(size_t idx) {
     CpuSerialBuf& buf = cpu_bufs[idx];
-    if (buf.len == 0) { return; }
+    if (buf.len == 0) {
+        return;
+    }
     acquireLock();
     for (size_t i = 0; i < buf.len; i++) {
         write_char_unlocked(buf.data[i]);
@@ -141,16 +152,18 @@ void init() {
 }
 
 void write(const char* str) {
-    for (size_t i = 0; str[i] != '\0'; i++) { buf_char(str[i]); }
+    for (size_t i = 0; str[i] != '\0'; i++) {
+        buf_char(str[i]);
+    }
 }
 
 void write(const char* str, uint64_t len) {
-    for (size_t i = 0; i < len; i++) { buf_char(str[i]); }
+    for (size_t i = 0; i < len; i++) {
+        buf_char(str[i]);
+    }
 }
 
-void write(const char c) {
-    buf_char(c);
-}
+void write(const char c) { buf_char(c); }
 
 void write(uint64_t num) {
     char str[21];
@@ -176,7 +189,9 @@ void writeHex(uint64_t num) {
         num >>= 4;
     }
     int start = 0;
-    while (start < 15 && str[start] == '0') { ++start; }
+    while (start < 15 && str[start] == '0') {
+        ++start;
+    }
     write(str + start);
 }
 
@@ -217,7 +232,9 @@ void writeUnlocked(uint64_t num) {
         }
     }
     int len = 20 - pos;
-    for (int i = 0; i < len; ++i) { str[i] = str[pos + i]; }
+    for (int i = 0; i < len; ++i) {
+        str[i] = str[pos + i];
+    }
     str[len] = '\0';
     writeUnlocked(str);
 }
@@ -231,9 +248,13 @@ void writeHexUnlocked(uint64_t num) {
         num >>= 4;
     }
     int start = 0;
-    while (start < 15 && str[start] == '0') { ++start; }
+    while (start < 15 && str[start] == '0') {
+        ++start;
+    }
     int len = 16 - start;
-    for (int i = 0; i < len; ++i) { str[i] = str[start + i]; }
+    for (int i = 0; i < len; ++i) {
+        str[i] = str[start + i];
+    }
     str[len] = '\0';
     writeUnlocked(str);
 }
