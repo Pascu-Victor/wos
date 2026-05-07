@@ -666,16 +666,29 @@ inline auto xfs_attr_sf_entry_value(const XfsAttrSfEntry* e) -> const uint8_t* {
 
 // --- Leaf attribute structures ---
 constexpr uint16_t XFS_ATTR3_LEAF_MAGIC = 0x3BEE;
+constexpr size_t XFS_ATTR_LEAF_MAPSIZE = 3;  // slots in the freespace map
+
+// Run-length-encoded free region within a leaf block
+struct XfsAttrLeafMap {
+    __be16 base;  // base of free region
+    __be16 size;  // length of free region
+} __attribute__((packed));
+static_assert(sizeof(XfsAttrLeafMap) == 4);
 
 struct XfsAttr3LeafHdr {
-    XfsDa3Blkinfo info;  // DA btree block info
-    __be16 count;        // number of entries
-    __be16 usedbytes;    // bytes used for entries + names/values
-    __be16 firstused;    // first used byte in name area
-    uint8_t holes;       // non-zero if compaction needed
+    XfsDa3Blkinfo info;                          // DA btree block info
+    __be16 count;                                // number of entries
+    __be16 usedbytes;                            // bytes used for name/value payloads
+    __be16 firstused;                            // first used byte in name area
+    uint8_t holes;                               // non-zero if compaction needed
     uint8_t pad1;
+    XfsAttrLeafMap freemap[XFS_ATTR_LEAF_MAPSIZE];  // N largest free regions
     // Followed by XfsAttrLeafEntry[] array
 } __attribute__((packed));
+static_assert(sizeof(XfsAttr3LeafHdr) == 76);
+
+// CRC field is at offsetof(XfsAttr3LeafHdr, info.crc) = sizeof(XfsDaBlkinfo) = 12
+constexpr size_t XFS_ATTR3_LEAF_CRC_OFF = 12;
 
 struct XfsAttrLeafEntry {
     __be32 hashval;  // hash of attr name
@@ -683,6 +696,7 @@ struct XfsAttrLeafEntry {
     uint8_t flags;   // XFS_ATTR_* flags
     uint8_t pad2;
 } __attribute__((packed));
+static_assert(sizeof(XfsAttrLeafEntry) == 8);
 
 // Local attribute name+value in leaf block (pointed to by nameidx)
 struct XfsAttrLeafNameLocal {
@@ -693,11 +707,27 @@ struct XfsAttrLeafNameLocal {
 
 // Remote attribute name in leaf block (value stored in separate block)
 struct XfsAttrLeafNameRemote {
-    __be32 valueblk;  // block number of value data
-    __be32 valuelen;  // length of value
+    __be32 valueblk;  // logical attr block number of value data
+    __be32 valuelen;  // total length of value
     uint8_t namelen;  // length of name
     uint8_t name[];   // name bytes  // NOLINT(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 } __attribute__((packed));
+
+// --- Remote attribute value block header (XFS v5) ---
+constexpr uint32_t XFS_ATTR3_RMT_MAGIC = 0x5841524d;  // 'XARM'
+constexpr size_t XFS_ATTR3_RMT_CRC_OFF = 12;           // offsetof(XfsAttr3RmtHdr, rm_crc)
+
+struct XfsAttr3RmtHdr {
+    __be32 rm_magic;   // XFS_ATTR3_RMT_MAGIC
+    __be32 rm_offset;  // byte offset of this block's data within the total value
+    __be32 rm_bytes;   // data bytes stored in this block
+    __be32 rm_crc;     // CRC of block (with this field set to zero during computation)
+    __be64 rm_owner;   // owning inode number
+    __be64 rm_blkno;   // device block number of this block
+    __be64 rm_lsn;     // log sequence number
+    XfsUuidT rm_uuid;  // filesystem UUID
+} __attribute__((packed));
+static_assert(sizeof(XfsAttr3RmtHdr) == 56);
 
 // ============================================================================
 // Parent Pointer Structures (XFS_SB_FEAT_INCOMPAT_PARENT)
