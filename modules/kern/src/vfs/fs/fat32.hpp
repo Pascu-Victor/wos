@@ -2,36 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
 #include "bits/ssize_t.h"
+#include "vfs/stat.hpp"
 
 namespace ker::dev {
 struct BlockDevice;
 }
 
 namespace ker::vfs::fat32 {
-
-// FAT32 logging control - define FAT32_DISABLE_LOGGING to disable all logging
-// Helper inline functions for logging (optimizes away when FAT32_DISABLE_LOGGING is defined)
-inline void fat32_log(const char* msg) {
-#ifdef FAT32_DEBUG
-    ker::mod::io::serial::writeHex(msg);
-#else
-    (void)msg;
-#endif
-}
-
-inline void fat32_log_hex(uint64_t value) {
-#ifdef FAT32_DEBUG
-    ker::mod::io::serial::writeHex(value);
-#else
-    (void)value;
-#endif
-}
 
 // FAT32 Mount Context - stores per-mount filesystem information
 struct FAT32MountContext {

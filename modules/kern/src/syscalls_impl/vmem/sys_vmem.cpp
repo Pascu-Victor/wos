@@ -3,6 +3,7 @@
 #include <abi/callnums/vmem.h>
 #include <assert.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
@@ -11,9 +12,9 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <util/hcf.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
-#include <util/hcf.hpp>
 
 namespace ker::syscall::vmem {
 using log = ker::mod::dbg::logger<"vmem">;
@@ -187,14 +188,16 @@ auto anonAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -
         ker::mod::mm::virt::mapPage(task->pagemap, current_vaddr, paddr, page_flags);
 
         if (isWatchedMmapVaddr(current_vaddr)) {
-            log::warn("watch mmap-map: pid=%lu name=%s pagemap=%p kind=anon vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx",
-                      task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
-                      (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot);
+            log::warn(
+                "watch mmap-map: pid=%lu name=%s pagemap=%p kind=anon vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx "
+                "prot=0x%llx",
+                task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
+                (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot);
         }
     }
 
     if (!ker::mod::mm::phys::pageSplitToOrder0(phys_pages)) {
-        ker::mod::dbg::log("vmem: failed to split anon backing block for leaf reclaim");
+        log::error("failed to split anon backing block for leaf reclaim");
         hcf();
     }
 
@@ -206,12 +209,12 @@ auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
     // Get current task
     auto* task = getCurrentTask();
     if (task == nullptr) {
-        ker::mod::dbg::error("vmem: no current task for free");
+        log::error("vmem: no current task for free");
         return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
     }
 
     if (task->pagemap == nullptr) {
-        ker::mod::dbg::error("vmem: task has no pagemap for free");
+        log::error("vmem: task has no pagemap for free");
         return (uint64_t)(-ker::abi::vmem::VMEM_EFAULT);
     }
 
@@ -252,7 +255,8 @@ auto anonFree(uint64_t addr, uint64_t size) -> uint64_t {
             if (isWatchedMmapVaddr(currentVaddr)) {
                 const auto phys = ker::mod::mm::virt::translate(task->pagemap, currentVaddr);
                 log::warn("watch mmap-unmap: pid=%lu name=%s pagemap=%p vaddr=0x%llx phys=0x%llx size=0x%llx", task->pid, task->name,
-                          static_cast<void*>(task->pagemap), (unsigned long long)currentVaddr, (unsigned long long)phys, (unsigned long long)size);
+                          static_cast<void*>(task->pagemap), (unsigned long long)currentVaddr, (unsigned long long)phys,
+                          (unsigned long long)size);
             }
             // Unmap the page (this also frees the physical page)
             ker::mod::mm::virt::unmapPage(task->pagemap, currentVaddr);
@@ -305,12 +309,10 @@ auto fileAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, i
     memset(phys_pages, 0, size);
 
     // Read file content into the backing pages
-    uint64_t file_size = (uint64_t)st.st_size;
+    auto file_size = (uint64_t)st.st_size;
     if (offset < file_size) {
         uint64_t read_size = file_size - offset;
-        if (read_size > size) {
-            read_size = size;
-        }
+        read_size = std::min(read_size, size);
         ker::vfs::vfs_lseek(fd, (off_t)offset, 0 /* SEEK_SET */);
         ker::vfs::vfs_read(fd, phys_pages, (size_t)read_size);
     }
@@ -321,15 +323,17 @@ auto fileAllocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, i
         auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(phys_page)));
         ker::mod::mm::virt::mapPage(task->pagemap, current_vaddr, paddr, page_flags);
         if (isWatchedMmapVaddr(current_vaddr)) {
-            log::warn("watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx fd=%d off=0x%llx",
-                      task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
-                      (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot, fd,
-                      (unsigned long long)offset);
+            log::warn(
+                "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx "
+                "prot=0x%llx fd=%d off=0x%llx",
+                task->pid, task->name, static_cast<void*>(task->pagemap), (unsigned long long)current_vaddr, (unsigned long long)paddr,
+                (unsigned long long)hint, (unsigned long long)size, (unsigned long long)flags, (unsigned long long)prot, fd,
+                (unsigned long long)offset);
         }
     }
 
     if (!ker::mod::mm::phys::pageSplitToOrder0(phys_pages)) {
-        ker::mod::dbg::log("vmem: failed to split file backing block for leaf reclaim");
+        log::error("vmem: failed to split file backing block for leaf reclaim");
         hcf();
     }
 

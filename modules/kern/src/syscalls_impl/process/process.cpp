@@ -144,6 +144,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->wki_target_flags = parent->wki_target_flags;
     }
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
+    child->wki_remote_pid =
+        (child->wki_submitter_hostname[0] != '\0' &&
+         std::strcmp(child->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+            ? child->pid
+            : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
         delete[] child->name;
         mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
@@ -438,7 +443,8 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
     if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
 
-    // Forward SIGKILL/SIGTERM to remote node if target is a WKI proxy task
+    // Forward interrupt/termination signals to the remote node if target is a
+    // WKI proxy task.
     ker::net::wki::wki_proxy_task_forward_signal(target, sig);
 
     // Set the signal pending bit (signal N is bit N-1)

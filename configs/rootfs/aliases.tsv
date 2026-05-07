@@ -8,6 +8,7 @@ symlink	/usr/bin/wkictl	/usr/bin/locally
 symlink	/usr/bin/wkictl	/usr/bin/remotely
 symlink	/usr/bin/wkictl	/usr/bin/on
 symlink	/usr/bin/wkictl	/usr/bin/forward
+symlink	/usr/bin/wkictl	/usr/bin/wosid
 copy	toolchain/sysroot/bin/dropbearmulti	/usr/bin/dropbearmulti
 symlink	/usr/bin/dropbearmulti	/usr/bin/dropbear
 symlink	/usr/bin/dropbearmulti	/usr/bin/dbclient

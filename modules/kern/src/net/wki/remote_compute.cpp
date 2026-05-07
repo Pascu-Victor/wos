@@ -177,6 +177,7 @@ constexpr uint64_t WKI_VFS_LOAD_RETRY_BACKOFF_US = 750000;
 constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 8;
 constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
 constexpr uint64_t WKI_EXEC_CACHE_RETENTION_US = 30000000;
+constexpr int32_t WKI_SIGINT_NUM = 2;
 constexpr int32_t WKI_SIGKILL_NUM = 9;
 constexpr int32_t WKI_SIGTERM_NUM = 15;
 constexpr uint64_t WKI_SIGCHLD_NUM = 17;
@@ -424,23 +425,14 @@ void close_proxy_fd_table(ker::mod::sched::task::Task* task) {
     }
 
     for (unsigned fd = 0; fd < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++fd) {
-        auto* file = ker::vfs::vfs_get_file(task, static_cast<int>(fd));
+        auto* file = ker::vfs::vfs_get_file_retain(task, static_cast<int>(fd));
         if (file == nullptr) {
             continue;
         }
 
-        file->refcount--;
         ker::vfs::vfs_release_fd(task, static_cast<int>(fd));
-
-        if (file->refcount <= 0) {
-            if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-                file->fops->vfs_close(file);
-            }
-            if (file->vfs_path != nullptr) {
-                delete[] file->vfs_path;
-            }
-            delete file;
-        }
+        task->clear_fd_cloexec(fd);
+        ker::vfs::vfs_put_file(file);
     }
 }
 
@@ -1276,7 +1268,6 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     st.proxy_ready = false;
 
     g_submitted_tasks.push_back(std::move(st));
-    SubmittedTask* task_ptr = &g_submitted_tasks.back();
     s_compute_lock.unlock();
 
     uint64_t started_us = wki_now_us();
@@ -1288,7 +1279,9 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     auto* buf = new (std::nothrow) uint8_t[msg_len];
     if (buf == nullptr) {
         s_compute_lock.lock();
-        task_ptr->active = false;
+        if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+            task_ptr->active = false;
+        }
         s_compute_lock.unlock();
         return 0;
     }
@@ -1323,16 +1316,23 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
 
     // V2 I-4: Set up async wait entry before sending
     WkiWaitEntry wait = {};
-    task_ptr->response_wait_entry = &wait;
-    task_ptr->response_pending.store(true, std::memory_order_release);
+    s_compute_lock.lock();
+    if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+        task_ptr->response_wait_entry = &wait;
+        task_ptr->response_pending.store(true, std::memory_order_release);
+    }
+    s_compute_lock.unlock();
 
     int send_ret = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
     delete[] buf;
 
     if (send_ret != WKI_OK) {
-        task_ptr->response_wait_entry = nullptr;
         s_compute_lock.lock();
-        task_ptr->active = false;
+        if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+            task_ptr->response_wait_entry = nullptr;
+            task_ptr->response_pending.store(false, std::memory_order_relaxed);
+            task_ptr->active = false;
+        }
         s_compute_lock.unlock();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, task_id, send_ret,
                                 static_cast<uint32_t>(wki_now_us() - started_us), binary_len, callsite);
@@ -1340,10 +1340,21 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     }
 
     int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
-    task_ptr->response_wait_entry = nullptr;
+    uint8_t accept_status = 0;
+    uint64_t remote_pid = 0;
+    s_compute_lock.lock();
+    auto* task_ptr = find_submitted_task_any(task_id);
+    if (task_ptr != nullptr) {
+        task_ptr->response_wait_entry = nullptr;
+        accept_status = task_ptr->accept_status;
+        remote_pid = task_ptr->remote_pid;
+    }
     if (wait_rc != 0) {
-        task_ptr->response_pending.store(false, std::memory_order_relaxed);
-        task_ptr->active = false;
+        if (task_ptr != nullptr) {
+            task_ptr->response_pending.store(false, std::memory_order_relaxed);
+            task_ptr->active = false;
+        }
+        s_compute_lock.unlock();
         ker::mod::dbg::log("[WKI] Task submit wait failed: task_id=%u target=0x%04x rc=%d (%s)", task_id, target_node, wait_rc,
                            errno_name(wait_rc));
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, task_id, wait_rc,
@@ -1351,16 +1362,20 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
         return 0;
     }
 
-    if (task_ptr->accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
-        ker::mod::dbg::log("[WKI] Task rejected: task_id=%u status=%u", task_id, task_ptr->accept_status);
-        task_ptr->active = false;
+    if (task_ptr == nullptr || accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
+        if (task_ptr != nullptr) {
+            task_ptr->active = false;
+        }
+        s_compute_lock.unlock();
+        ker::mod::dbg::log("[WKI] Task rejected: task_id=%u status=%u", task_id, accept_status);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, task_id,
-                                -static_cast<int32_t>(task_ptr->accept_status == 0 ? 1 : task_ptr->accept_status),
+                                -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
                                 static_cast<uint32_t>(wki_now_us() - started_us), binary_len, callsite);
         return 0;
     }
+    s_compute_lock.unlock();
 
-    ker::mod::dbg::log("[WKI] Task accepted: task_id=%u remote_pid=%lu", task_id, task_ptr->remote_pid);
+    ker::mod::dbg::log("[WKI] Task accepted: task_id=%u remote_pid=%lu", task_id, remote_pid);
     perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, task_id, 0,
                             static_cast<uint32_t>(wki_now_us() - started_us), binary_len, callsite);
     return task_id;
@@ -1410,7 +1425,6 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     st.proxy_ready = false;
 
     g_submitted_tasks.push_back(std::move(st));
-    SubmittedTask* task_ptr = &g_submitted_tasks.back();
     s_compute_lock.unlock();
 
     uint64_t started_us = wki_now_us();
@@ -1421,7 +1435,9 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     auto* buf = new (std::nothrow) uint8_t[msg_len];
     if (buf == nullptr) {
         s_compute_lock.lock();
-        task_ptr->active = false;
+        if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+            task_ptr->active = false;
+        }
         s_compute_lock.unlock();
         return 0;
     }
@@ -1456,16 +1472,23 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
 
     // V2 I-4: Set up async wait entry before sending
     WkiWaitEntry wait = {};
-    task_ptr->response_wait_entry = &wait;
-    task_ptr->response_pending.store(true, std::memory_order_release);
+    s_compute_lock.lock();
+    if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+        task_ptr->response_wait_entry = &wait;
+        task_ptr->response_pending.store(true, std::memory_order_release);
+    }
+    s_compute_lock.unlock();
 
     int send_ret = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
     delete[] buf;
 
     if (send_ret != WKI_OK) {
-        task_ptr->response_wait_entry = nullptr;
         s_compute_lock.lock();
-        task_ptr->active = false;
+        if (auto* task_ptr = find_submitted_task_any(task_id); task_ptr != nullptr) {
+            task_ptr->response_wait_entry = nullptr;
+            task_ptr->response_pending.store(false, std::memory_order_relaxed);
+            task_ptr->active = false;
+        }
         s_compute_lock.unlock();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, task_id, send_ret,
                                 static_cast<uint32_t>(wki_now_us() - started_us), path_len, callsite);
@@ -1473,10 +1496,21 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     }
 
     int wait_rc = wki_wait_for_op(&wait, WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
-    task_ptr->response_wait_entry = nullptr;
+    uint8_t accept_status = 0;
+    uint64_t remote_pid = 0;
+    s_compute_lock.lock();
+    auto* task_ptr = find_submitted_task_any(task_id);
+    if (task_ptr != nullptr) {
+        task_ptr->response_wait_entry = nullptr;
+        accept_status = task_ptr->accept_status;
+        remote_pid = task_ptr->remote_pid;
+    }
     if (wait_rc != 0) {
-        task_ptr->response_pending.store(false, std::memory_order_relaxed);
-        task_ptr->active = false;
+        if (task_ptr != nullptr) {
+            task_ptr->response_pending.store(false, std::memory_order_relaxed);
+            task_ptr->active = false;
+        }
+        s_compute_lock.unlock();
         ker::mod::dbg::log("[WKI] VFS_REF submit wait failed: task_id=%u rc=%d (%s) timeout_us=%llu", task_id, wait_rc, errno_name(wait_rc),
                            WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, task_id, wait_rc,
@@ -1484,16 +1518,20 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
         return 0;
     }
 
-    if (task_ptr->accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
-        ker::mod::dbg::log("[WKI] VFS_REF task rejected: task_id=%u status=%u", task_id, task_ptr->accept_status);
-        task_ptr->active = false;
+    if (task_ptr == nullptr || accept_status != static_cast<uint8_t>(TaskRejectReason::ACCEPTED)) {
+        if (task_ptr != nullptr) {
+            task_ptr->active = false;
+        }
+        s_compute_lock.unlock();
+        ker::mod::dbg::log("[WKI] VFS_REF task rejected: task_id=%u status=%u", task_id, accept_status);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, task_id,
-                                -static_cast<int32_t>(task_ptr->accept_status == 0 ? 1 : task_ptr->accept_status),
+                                -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
                                 static_cast<uint32_t>(wki_now_us() - started_us), path_len, callsite);
         return 0;
     }
+    s_compute_lock.unlock();
 #ifdef WKI_DEBUG
-    ker::mod::dbg::log("[WKI] VFS_REF task accepted: task_id=%u remote_pid=%lu", task_id, task_ptr->remote_pid);
+    ker::mod::dbg::log("[WKI] VFS_REF task accepted: task_id=%u remote_pid=%lu", task_id, remote_pid);
 #endif
     perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, task_id, 0,
                             static_cast<uint32_t>(wki_now_us() - started_us), path_len, callsite);
@@ -1524,24 +1562,37 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, target_node, task_id, 0, callsite);
 
     int wait_rc = wki_wait_for_op(&wait, timeout_us);
-    task->complete_wait_entry = nullptr;
+    int32_t completed_exit_status = -1;
+    bool task_still_present = false;
+    s_compute_lock.lock();
+    task = find_submitted_task_any(task_id);
+    if (task != nullptr) {
+        task_still_present = true;
+        task->complete_wait_entry = nullptr;
+        completed_exit_status = task->exit_status;
+    }
     if (wait_rc == WKI_ERR_TIMEOUT) {
-        task->complete_pending.store(false, std::memory_order_relaxed);
+        if (task != nullptr) {
+            task->complete_pending.store(false, std::memory_order_relaxed);
+        }
+        s_compute_lock.unlock();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, target_node, task_id, wait_rc,
                                 static_cast<uint32_t>(wki_now_us() - started_us), 0, callsite);
         return -1;
     }
+    if (task != nullptr) {
+        task->active = false;
+    }
+    s_compute_lock.unlock();
 
     if (exit_status != nullptr) {
-        *exit_status = task->exit_status;
+        *exit_status = completed_exit_status;
     }
 
     perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, target_node, task_id, 0,
                             static_cast<uint32_t>(wki_now_us() - started_us), 0, callsite);
 
-    // Clean up
-    task->active = false;
-    return 0;
+    return task_still_present ? 0 : -1;
 }
 
 void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
@@ -1622,8 +1673,12 @@ void wki_task_cancel(uint32_t task_id) {
     wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
 
     s_compute_lock.lock();
-    task->active = false;
-    task->complete_pending = false;
+    task = find_submitted_task_any(task_id);
+    if (task != nullptr) {
+        task->active = false;
+        task->complete_pending = false;
+        task->complete_wait_entry = nullptr;
+    }
     s_compute_lock.unlock();
 }
 
@@ -1636,8 +1691,10 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
         return false;
     }
 
-    // Only forward SIGKILL and SIGTERM - other signals have no meaning on remote.
-    if (signum != WKI_SIGKILL_NUM && signum != WKI_SIGTERM_NUM) {
+    // Remote compute currently exposes cancel semantics, not full POSIX job
+    // control. Treat terminal-generated interrupts as cancellation requests so
+    // Ctrl-C can stop remote foreground work promptly.
+    if (signum != WKI_SIGINT_NUM && signum != WKI_SIGKILL_NUM && signum != WKI_SIGTERM_NUM) {
         return false;
     }
 
@@ -2623,6 +2680,7 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
     } else {
         std::snprintf(new_task->wki_submitter_hostname, sizeof(new_task->wki_submitter_hostname), "node-%04x", hdr->src_node);
     }
+    new_task->wki_remote_pid = new_task->pid;
 
     std::array<char, ker::mod::sched::task::Task::EXE_PATH_MAX> logical_exe_path = {};
     const char* task_exe_path = exe_path_buf.data();
@@ -3158,6 +3216,9 @@ void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     task->remote_pid = resp->remote_pid;
     task->accepted_at_us = wki_now_us();
     task->complete_received_at_us = 0;
+    if (task->local_task != nullptr) {
+        task->local_task->wki_remote_pid = resp->remote_pid;
+    }
 
     task->response_pending.store(false, std::memory_order_release);
     WkiWaitEntry* waiter = task->response_wait_entry;
@@ -3187,6 +3248,9 @@ void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     task->accept_status = resp->status;
     task->remote_pid = 0;
+    if (task->local_task != nullptr) {
+        task->local_task->wki_remote_pid = 0;
+    }
 
     task->response_pending.store(false, std::memory_order_release);
     WkiWaitEntry* waiter = task->response_wait_entry;
@@ -3210,6 +3274,8 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     bool emit_task_runtime = false;
     uint32_t task_runtime_us = 0;
     uint64_t complete_now_us = wki_now_us();
+    ker::mod::sched::task::Task* proxy = nullptr;
+    ker::mod::sched::task::Task* local_task_for_output = nullptr;
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(comp->task_id);
@@ -3225,12 +3291,13 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         task_runtime_us = static_cast<uint32_t>(complete_now_us - task->accepted_at_us);
     }
 
-    auto* proxy = task->proxy_ready ? task->local_task : nullptr;
+    proxy = task->proxy_ready ? task->local_task : nullptr;
     if (proxy != nullptr) {
         task->local_task = nullptr;
         task->complete_received_at_us = 0;
     } else {
         task->complete_received_at_us = complete_now_us;
+        local_task_for_output = task->local_task;
     }
 
     task->complete_pending.store(false, std::memory_order_release);
@@ -3271,13 +3338,13 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         ker::mod::dbg::log("[WKI] TASK_COMPLETE early (proxy not ready): task_id=%u exit=%d local_task=%p", comp->task_id,
                            comp->exit_status, task->local_task);
 #endif
-        if (task->local_task != nullptr) {
+        if (local_task_for_output != nullptr) {
             const uint8_t* output_data = payload + sizeof(TaskCompletePayload);
             uint16_t out_len = comp->output_len;
             if (out_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
                 auto avail = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
                 out_len = std::min(out_len, avail);
-                write_proxy_output(task->local_task, output_data, out_len, comp->task_id);
+                write_proxy_output(local_task_for_output, output_data, out_len, comp->task_id);
             }
         }
 #ifdef DEBUG_WKI_COMPUTE
@@ -3312,9 +3379,15 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     uint64_t local_pid = rt->local_pid;
+    auto* task = rt->task;
+    bool drop_task_ref = false;
+    if (task != nullptr && task->tryAcquire()) {
+        drop_task_ref = true;
+    } else {
+        task = nullptr;
+    }
     s_compute_lock.unlock();
 
-    auto* task = rt->task;
     bool drop_lookup_ref = false;
     if (task == nullptr) {
         task = ker::mod::sched::find_task_by_pid_safe(local_pid);
@@ -3327,6 +3400,9 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     if (drop_lookup_ref) {
+        task->release();
+    }
+    if (drop_task_ref) {
         task->release();
     }
 }

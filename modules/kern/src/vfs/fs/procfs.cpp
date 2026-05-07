@@ -130,7 +130,8 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     }
 
     if (pfd->node.type == ProcNodeType::PID_DIR) {
-        // /proc/<pid>: index 2 = "stat", 3 = "status", 4 = "cmdline", 5 = "exe"
+        // /proc/<pid>: index 2 = "stat", 3 = "status", 4 = "cmdline",
+        // 5 = "exe", 6 = "wki_launcher", 7 = "wki_runner", 8 = "wki_remote_pid"
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -161,6 +162,30 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_LNK;
             std::memcpy(buf->d_name.data(), "exe", 4);
+            return 0;
+        }
+        if (count == 6) {
+            buf->d_ino = 14;
+            buf->d_off = 7;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "wki_launcher", 13);
+            return 0;
+        }
+        if (count == 7) {
+            buf->d_ino = 15;
+            buf->d_off = 8;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "wki_runner", 11);
+            return 0;
+        }
+        if (count == 8) {
+            buf->d_ino = 16;
+            buf->d_off = 9;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
             return 0;
         }
         return -1;  // No more entries
@@ -571,6 +596,36 @@ auto generate_wki_runner(char* buf, size_t bufsz) -> size_t {
     buf[len] = '\n';
     buf[len + 1] = '\0';
     return len + 1;
+}
+
+auto task_wki_remote_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
+    if (task == nullptr) {
+        return 0;
+    }
+    if (task->wki_remote_pid != 0) {
+        return task->wki_remote_pid;
+    }
+    const char* local_hostname = ker::net::wki::g_wki.local_hostname;
+    if (task->wki_submitter_hostname[0] != '\0' && local_hostname != nullptr && local_hostname[0] != '\0' &&
+        std::strcmp(task->wki_submitter_hostname, local_hostname) != 0) {
+        return task->pid;
+    }
+    return 0;
+}
+
+auto generate_wki_remote_pid(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    int len = std::snprintf(buf, bufsz, "%llu\n", static_cast<unsigned long long>(task_wki_remote_pid(task)));
+    if (len < 0) {
+        if (bufsz != 0) {
+            buf[0] = '\0';
+        }
+        return 0;
+    }
+    if (static_cast<size_t>(len) >= bufsz) {
+        return bufsz != 0 ? bufsz - 1 : 0;
+    }
+    return static_cast<size_t>(len);
 }
 
 // Generate content for /proc/version
@@ -999,6 +1054,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::WKI_RUNNER_FILE:
                 pfd->content_len = generate_wki_runner(pfd->content, MAX_PROCFS_BUF);
                 break;
+            case ProcNodeType::WKI_REMOTE_PID_FILE:
+                pfd->content_len = generate_wki_remote_pid(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
@@ -1273,6 +1331,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/wki_runner") == 0) {
         return make_file(ProcNodeType::WKI_RUNNER_FILE, self_pid, false);
     }
+    // /proc/self/wki_remote_pid
+    if (strcmp(path, "self/wki_remote_pid") == 0) {
+        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, self_pid, false);
+    }
 
     // /proc/<pid>
     // Find first / in path
@@ -1331,6 +1393,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "wki_runner") == 0) {
         return make_file(ProcNodeType::WKI_RUNNER_FILE, static_cast<uint64_t>(pid), false);
+    }
+    if (strcmp(sub, "wki_remote_pid") == 0) {
+        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, static_cast<uint64_t>(pid), false);
     }
 
     return nullptr;  // Unknown procfs path

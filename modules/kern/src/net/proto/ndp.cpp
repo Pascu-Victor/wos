@@ -79,7 +79,7 @@ bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, 
 
 // Send a Neighbor Solicitation for the given target address
 void send_ns(NetDevice* dev, const std::array<uint8_t, 16>& target_ip, const std::array<uint8_t, 16>& src_ip) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }
@@ -116,7 +116,7 @@ void send_ns(NetDevice* dev, const std::array<uint8_t, 16>& target_ip, const std
 
 // Send a Neighbor Advertisement in response to a Solicitation
 void send_na(NetDevice* dev, const std::array<uint8_t, 16>& target_ip, const std::array<uint8_t, 16>& dst_ip, bool solicited) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }

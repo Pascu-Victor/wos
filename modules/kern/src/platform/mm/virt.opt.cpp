@@ -592,7 +592,7 @@ static constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 
 static auto phys_is_in_ram(uint64_t phys_addr) -> bool {
     for (auto* zone = phys::getZones(); zone != nullptr; zone = zone->next) {
-        uint64_t zone_start_phys = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(zone->start)));
+        auto zone_start_phys = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(zone->start)));
         if (phys_addr >= zone_start_phys && phys_addr < zone_start_phys + zone->len) {
             return true;
         }

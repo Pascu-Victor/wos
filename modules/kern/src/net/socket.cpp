@@ -9,6 +9,8 @@
 #include <net/proto/udp.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <util/fast_copy.hpp>
 
 namespace ker::net {
@@ -163,6 +165,38 @@ auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int {
     }
 
     return 0;
+}
+
+void socket_defer_wait(Socket* sock, const char* wait_channel) {
+    auto* current_task = ker::mod::sched::get_current_task();
+    if (current_task == nullptr) {
+        return;
+    }
+
+    if (sock != nullptr) {
+        sock->owner_pid = current_task->pid;
+    }
+    current_task->wait_channel = wait_channel;
+    current_task->deferredTaskSwitch = true;
+}
+
+void socket_wake_waiters(Socket* sock) {
+    if (sock == nullptr || sock->owner_pid == 0) {
+        return;
+    }
+
+    auto* task = ker::mod::sched::find_task_by_pid_safe(sock->owner_pid);
+    if (task == nullptr) {
+        return;
+    }
+
+    task->deferredTaskSwitch = false;
+    uint64_t target_cpu = task->cpu;
+    if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
+        target_cpu = ker::mod::sched::get_least_loaded_cpu();
+    }
+    ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
+    task->release();
 }
 
 }  // namespace ker::net

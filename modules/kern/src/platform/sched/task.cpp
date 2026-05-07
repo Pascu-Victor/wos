@@ -388,6 +388,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     memcpy(t->wki_target_hostname, parent->wki_target_hostname, sizeof(t->wki_target_hostname));
     t->wki_target_flags = parent->wki_target_flags;
     memcpy(t->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(t->wki_submitter_hostname));
+    t->wki_remote_pid = parent->wki_remote_pid;
     t->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
     t->wki_skip_legacy_placement = false;
 
@@ -418,7 +419,7 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
     t->schedQueue = SchedQueue::NONE;
     t->schedNext = nullptr;
 
-    // Signals: inherit mask and handlers from parent (POSIX §2.4)
+    // Signals: inherit mask and handlers from parent (POSIX  2.4)
     t->sigPending = 0;
     t->sigMask = parent->sigMask;
     t->inSignalHandler = false;

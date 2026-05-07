@@ -449,44 +449,44 @@ skip_task_dump:
 
         journal::panic("  Raw descriptor: 0x%lx", desc);
 
-        uint64_t limit_low = desc & 0xFFFF;
-        uint64_t base_0_15 = (desc >> 16) & 0xFFFF;
-        uint64_t base_16_23 = (desc >> 32) & 0xFF;
-        uint64_t access = (desc >> 40) & 0xFF;
-        uint64_t limit_16_19 = (desc >> 48) & 0xF;
-        uint64_t flags = (desc >> 52) & 0xF;
-        uint64_t base_24_31 = (desc >> 56) & 0xFF;
+        const uint64_t LIMIT_LOW = desc & 0xFFFF;
+        const uint64_t BASE_0_15 = (desc >> 16) & 0xFFFF;
+        const uint64_t BASE_16_23 = (desc >> 32) & 0xFF;
+        const uint64_t ACCESS = (desc >> 40) & 0xFF;
+        const uint64_t LIMIT_16_19 = (desc >> 48) & 0xF;
+        const uint64_t FLAGS = (desc >> 52) & 0xF;
+        const uint64_t BASE_24_31 = (desc >> 56) & 0xFF;
 
-        uint64_t limit = limit_low | (limit_16_19 << 16);
-        bool gran = (flags >> 3) & 1;
+        uint64_t limit = LIMIT_LOW | (LIMIT_16_19 << 16);
+        bool gran = (FLAGS >> 3) & 1;
         if (gran) {
             limit = (limit << 12) | 0xFFF;
         }
 
-        uint64_t base = base_0_15 | (base_16_23 << 16) | (base_24_31 << 24);
+        const uint64_t BASE = BASE_0_15 | (BASE_16_23 << 16) | (BASE_24_31 << 24);
 
-        bool s_bit = (access >> 4) & 1;  // 0 = system, 1 = code/data
+        bool s_bit = (ACCESS >> 4) & 1;  // 0 = system, 1 = code/data
         if (!s_bit) {
             // system descriptor (e.g., TSS) -- read second qword for full base
-            uint64_t desc_addr_high = desc_addr + 8;
-            bool desc_addr_high_valid = (desc_addr_high >= 0xffff800000000000ULL && desc_addr_high < 0xffff900000000000ULL) ||
-                                        (desc_addr_high >= 0xffffffff80000000ULL && desc_addr_high < 0xffffffffc0000000ULL);
+            const uint64_t DESC_ADDR_HIGH = desc_addr + 8;
+            const bool DESC_ADDR_HIGH_VALID = (DESC_ADDR_HIGH >= 0xffff800000000000ULL && DESC_ADDR_HIGH < 0xffff900000000000ULL) ||
+                                              (DESC_ADDR_HIGH >= 0xffffffff80000000ULL && DESC_ADDR_HIGH < 0xffffffffc0000000ULL);
 
-            if (desc_addr_high_valid) {
-                uint64_t desc_high = *(uint64_t*)(desc_addr_high);
-                uint64_t base_high = desc_high & 0xFFFFFFFF;
-                uint64_t full_base = base | (base_high << 32);
-                journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", full_base, limit);
-                journal::panic("  Access: 0x%x, Flags: 0x%x", access, flags);
-                journal::panic("  Raw high: 0x%lx", desc_high);
+            if (DESC_ADDR_HIGH_VALID) {
+                const uint64_t DESC_HIGH = *(uint64_t*)(DESC_ADDR_HIGH);
+                const uint64_t BASE_HIGH = DESC_HIGH & 0xFFFFFFFF;
+                const uint64_t FULL_BASE = BASE | (BASE_HIGH << 32);
+                journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", FULL_BASE, limit);
+                journal::panic("  Access: 0x%x, Flags: 0x%x", ACCESS, FLAGS);
+                journal::panic("  Raw high: 0x%lx", DESC_HIGH);
             } else {
-                journal::panic("  System descriptor (TSS). Base (partial): 0x%lx, Limit: 0x%lx", base, limit);
-                journal::panic("  Access: 0x%x, Flags: 0x%x (high descriptor invalid)", access, flags);
+                journal::panic("  System descriptor (TSS). Base (partial): 0x%lx, Limit: 0x%lx", BASE, limit);
+                journal::panic("  Access: 0x%x, Flags: 0x%x (high descriptor invalid)", ACCESS, FLAGS);
             }
         } else {
             // code/data descriptor
-            journal::panic("  Code/Data descriptor. Base: 0x%lx, Limit: 0x%lx", base, limit);
-            journal::panic("  Access: 0x%x, Flags: 0x%x", access, flags);
+            journal::panic("  Code/Data descriptor. Base: 0x%lx, Limit: 0x%lx", BASE, limit);
+            journal::panic("  Access: 0x%x, Flags: 0x%x", ACCESS, FLAGS);
         }
     };
 
@@ -504,12 +504,12 @@ skip_task_dump:
         const char* name;
         uint32_t id;
     };
-    MsrInfo msrs[] = {{.name = "IA32_EFER", .id = 0xC0000080},      {.name = "IA32_STAR", .id = 0xC0000081},
-                      {.name = "IA32_LSTAR", .id = 0xC0000082},     {.name = "IA32_FMASK", .id = 0xC0000084},
-                      {.name = "IA32_APIC_BASE", .id = 0x1B},       {.name = "IA32_PAT", .id = 0x277},
-                      {.name = "IA32_MISC_ENABLE", .id = 0x1A0},    {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
-                      {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
-    for (auto& m : msrs) {
+    const MsrInfo MSRS[] = {{.name = "IA32_EFER", .id = 0xC0000080},      {.name = "IA32_STAR", .id = 0xC0000081},
+                            {.name = "IA32_LSTAR", .id = 0xC0000082},     {.name = "IA32_FMASK", .id = 0xC0000084},
+                            {.name = "IA32_APIC_BASE", .id = 0x1B},       {.name = "IA32_PAT", .id = 0x277},
+                            {.name = "IA32_MISC_ENABLE", .id = 0x1A0},    {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
+                            {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
+    for (const auto& m : MSRS) {
         uint64_t val = rdmsr(m.id);
         journal::panic("%s: 0x%lx", m.name, val);
     }
@@ -553,36 +553,33 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
 // It must NEVER be assigned to any other handler.
 static constexpr uint8_t TIMER_VECTOR = 32;
 
-void setInterruptHandler(uint8_t intNum, interruptHandler_t handler) {
-    if (intNum == TIMER_VECTOR) {
+void setInterruptHandler(uint8_t int_num, interruptHandler_t handler) {
+    if (int_num == TIMER_VECTOR) {
         ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
         return;
     }
-    if (interruptHandlers[intNum] != nullptr) {
+    if (interruptHandlers[int_num] != nullptr) {
         ker::mod::io::serial::write("Handler already set\n");
         return;
     }
-    interruptHandlers[intNum] = handler;
+    interruptHandlers[int_num] = handler;
 }
 
-void removeInterruptHandler(uint8_t intNum) { interruptHandlers[intNum] = nullptr; }
+void removeInterruptHandler(uint8_t int_num) { interruptHandlers[int_num] = nullptr; }
 
-bool isInterruptHandlerSet(uint8_t intNum) { return interruptHandlers[intNum] != nullptr; }
+auto isInterruptHandlerSet(uint8_t int_num) -> bool { return interruptHandlers[int_num] != nullptr; }
 
 auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
     if (vector == TIMER_VECTOR) {
-        ker::mod::io::serial::write("requestIrq: vector 32 is reserved for timer\n");
+        journal::error("requestIrq: vector 32 is reserved for timer");
         return -1;
     }
     if (interruptHandlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
-        ker::mod::io::serial::write("requestIrq: vector already in use\n");
+        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interruptHandlers[vector],
+                       irq_contexts[vector].handler);
         return -1;
     }
-    ker::mod::io::serial::write("requestIrq: allocated vector ");
-    ker::mod::io::serial::writeHex(vector);
-    ker::mod::io::serial::write(" for ");
-    ker::mod::io::serial::write(name);
-    ker::mod::io::serial::write("\n");
+    journal::info("requestIrq: vector=%d name=%s", vector, name);
     irq_contexts[vector].handler = handler;
     irq_contexts[vector].data = data;
     irq_contexts[vector].name = name;

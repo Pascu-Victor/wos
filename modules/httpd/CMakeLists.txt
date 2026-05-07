@@ -39,4 +39,4 @@ target_link_options(httpd PRIVATE
     "-Wl,-z,now"
 )
 
-target_link_libraries(httpd PRIVATE c++abi c++ c unwind)
+target_link_libraries(httpd PRIVATE journal_lib c++abi c++ c unwind)

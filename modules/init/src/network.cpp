@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sched.h>
 #include <sys/ioctl.h>
+#include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -14,20 +15,23 @@
 #include <cstring>
 #include <print>
 
-#include "init_log.h"
 #include "sys/multiproc.h"
+
+namespace {
+using init_log = wos::journal<"init">;
+}
 
 void start_network() {
     int cpuno = ker::multiproc::currentThreadId();
 
-    init_info("init[%d]: spawning netd (DHCP daemon)", cpuno);
+    init_log::info("init[%d]: spawning netd (DHCP daemon)", cpuno);
     std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
     std::array<const char*, 1> netd_envp = {nullptr};
     uint64_t netd_pid = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
     if (netd_pid == 0) {
-        init_error("init[%d]: failed to spawn netd", cpuno);
+        init_log::error("init[%d]: failed to spawn netd", cpuno);
     } else {
-        init_info("init[%d]: netd spawned as PID %llu", cpuno, static_cast<unsigned long long>(netd_pid));
+        init_log::info("init[%d]: netd spawned as PID %llu", cpuno, static_cast<unsigned long long>(netd_pid));
     }
 
     // Poll eth0 for IP address readiness (wait for DHCP to complete)
@@ -46,7 +50,7 @@ void start_network() {
                 if (addr->sin_addr.s_addr != 0) {
                     std::array<char, INET_ADDRSTRLEN> ip_str{};
                     inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-                    init_info("init[%d]: eth0 configured with IP %s", cpuno, ip_str.data());
+                    init_log::info("init[%d]: eth0 configured with IP %s", cpuno, ip_str.data());
                     net_ready = true;
                     break;
                 }
@@ -60,7 +64,7 @@ void start_network() {
         }
         close(poll_sock);
         if (!net_ready) {
-            init_warn("init[%d]: eth0 not configured after polling, continuing anyway", cpuno);
+            init_log::warn("init[%d]: eth0 not configured after polling, continuing anyway", cpuno);
         }
     }
 }

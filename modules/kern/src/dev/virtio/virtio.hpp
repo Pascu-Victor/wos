@@ -51,35 +51,35 @@ constexpr uint32_t VIRTIO_NET_F_CSUM = (1u << 0);
 constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1u << 1);
 constexpr uint32_t VIRTIO_NET_F_MQ = (1u << 22);  // Multi-queue (requires CTRL_VQ)
 
-// Modern virtio PCI capabilities (virtio 1.0 §4.1.4)
-constexpr uint8_t  VIRTIO_PCI_CAP_VNDR       = 0x09;  // PCI vendor cap ID
-constexpr uint8_t  VIRTIO_PCI_CAP_COMMON_CFG = 1;
-constexpr uint8_t  VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
-constexpr uint8_t  VIRTIO_PCI_CAP_DEVICE_CFG = 4;
-constexpr uint32_t VIRTIO_F_VERSION_1        = (1u << 0);  // bit 0 of upper features word
+// Modern virtio PCI capabilities (virtio 1.0  4.1.4)
+constexpr uint8_t VIRTIO_PCI_CAP_VNDR = 0x09;  // PCI vendor cap ID
+constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
+constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
+constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
+constexpr uint32_t VIRTIO_F_VERSION_1 = (1u << 0);  // bit 0 of upper features word
 
-// Modern virtio common configuration MMIO layout (virtio 1.0 §4.1.4.3)
+// Modern virtio common configuration MMIO layout (virtio 1.0  4.1.4.3)
 struct VirtioModernCfg {
     volatile uint32_t device_feature_select;  // 0
-    volatile uint32_t device_feature;          // 4
+    volatile uint32_t device_feature;         // 4
     volatile uint32_t driver_feature_select;  // 8
-    volatile uint32_t driver_feature;          // 12
+    volatile uint32_t driver_feature;         // 12
     volatile uint16_t config_msix_vector;     // 16
-    volatile uint16_t num_queues;              // 18
-    volatile uint8_t  device_status;           // 20
-    volatile uint8_t  config_generation;       // 21
-    volatile uint16_t queue_select;            // 22
-    volatile uint16_t queue_size;              // 24
-    volatile uint16_t queue_msix_vector;       // 26
-    volatile uint16_t queue_enable;            // 28
-    volatile uint16_t queue_notify_off;        // 30
-    volatile uint64_t queue_desc;              // 32
-    volatile uint64_t queue_avail;             // 40
-    volatile uint64_t queue_used;              // 48
+    volatile uint16_t num_queues;             // 18
+    volatile uint8_t device_status;           // 20
+    volatile uint8_t config_generation;       // 21
+    volatile uint16_t queue_select;           // 22
+    volatile uint16_t queue_size;             // 24
+    volatile uint16_t queue_msix_vector;      // 26
+    volatile uint16_t queue_enable;           // 28
+    volatile uint16_t queue_notify_off;       // 30
+    volatile uint64_t queue_desc;             // 32
+    volatile uint64_t queue_avail;            // 40
+    volatile uint64_t queue_used;             // 48
 };
-static_assert(offsetof(VirtioModernCfg, queue_desc)  == 32);
+static_assert(offsetof(VirtioModernCfg, queue_desc) == 32);
 static_assert(offsetof(VirtioModernCfg, queue_avail) == 40);
-static_assert(offsetof(VirtioModernCfg, queue_used)  == 48);
+static_assert(offsetof(VirtioModernCfg, queue_used) == 48);
 
 // Control queue class/command for activating multi-queue pairs
 constexpr uint8_t VIRTIO_NET_CTRL_CLASS_MQ = 4;
@@ -102,7 +102,7 @@ struct VirtIONetHeader {
 } __attribute__((packed));
 
 constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);  // 10 bytes (legacy / no VERSION_1)
-constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = 12;  // virtio 1.0: num_buffers field always present
+constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = 12;                // virtio 1.0: num_buffers field always present
 
 // Virtqueue structures (packed to match hardware layout)
 struct VirtqDesc {
@@ -145,8 +145,8 @@ struct Virtqueue {
     // Map descriptor index -> PacketBuffer for RX completion
     ker::net::PacketBuffer* pkt_map[VIRTQ_MAX_SIZE];
 
-    uint16_t io_base;      // BAR0 for legacy notify (unused in modern mode)
-    uint16_t queue_index;  // Which queue (0=RX, 1=TX, ...)
+    uint16_t io_base;                  // BAR0 for legacy notify (unused in modern mode)
+    uint16_t queue_index;              // Which queue (0=RX, 1=TX, ...)
     volatile uint16_t* notify_addr{};  // Modern MMIO notify addr; nullptr = legacy I/O
 
     ker::mod::sys::Spinlock lock;

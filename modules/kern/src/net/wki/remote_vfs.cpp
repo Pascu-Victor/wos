@@ -1853,11 +1853,9 @@ auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport* {
     return nullptr;
 }
 
-void wki_remote_vfs_advertise_exports() {
-    if (!g_remote_vfs_initialized) {
-        return;
-    }
+namespace {
 
+void advertise_exports_to_peer(uint16_t peer_node) {
     s_vfs_lock.lock();
     size_t export_count = g_vfs_exports.size();
     s_vfs_lock.unlock();
@@ -1892,13 +1890,36 @@ void wki_remote_vfs_advertise_exports() {
         memcpy(buf.data() + sizeof(ResourceAdvertPayload), static_cast<const void*>(exp.name), name_len);
         s_vfs_lock.unlock();
 
-        for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-            WkiPeer* peer = &g_wki.peers[p];
-            if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
-                continue;
-            }
-            wki_send(peer->node_id, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
+        wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
+    }
+}
+
+}  // namespace
+
+void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) {
+    if (!g_remote_vfs_initialized || peer_node == WKI_NODE_INVALID) {
+        return;
+    }
+
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+        return;
+    }
+
+    advertise_exports_to_peer(peer_node);
+}
+
+void wki_remote_vfs_advertise_exports() {
+    if (!g_remote_vfs_initialized) {
+        return;
+    }
+
+    for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
+        WkiPeer* peer = &g_wki.peers[p];
+        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
+            continue;
         }
+        advertise_exports_to_peer(peer->node_id);
     }
 }
 
@@ -3929,6 +3950,14 @@ void wki_remote_vfs_auto_discover() {
     wki_remote_vfs_auto_discover_internal(nullptr);
 
     wki_remote_vfs_advertise_exports();
+}
+
+void wki_remote_vfs_refresh_exports() {
+    if (!g_remote_vfs_initialized) {
+        return;
+    }
+
+    wki_remote_vfs_auto_discover_internal(nullptr);
 }
 
 void wki_remote_vfs_rebuild_exports() {

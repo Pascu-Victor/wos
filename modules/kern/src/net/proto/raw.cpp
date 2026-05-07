@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/packet.hpp>
 #include <net/proto/icmp.hpp>
@@ -15,6 +16,13 @@
 namespace ker::net::proto {
 
 namespace {
+struct RawRecvRecord {
+    uint16_t packet_len;  // bytes following this record
+    uint16_t reserved = 0;
+    uint32_t src_ip;  // host byte order
+} __attribute__((packed));
+static_assert(sizeof(RawRecvRecord) == 8);
+
 // Global list of raw sockets for packet delivery
 constexpr size_t MAX_RAW_SOCKETS = 64;
 std::array<Socket*, MAX_RAW_SOCKETS> raw_sockets = {};
@@ -58,7 +66,7 @@ auto raw_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
     (void)port;  // Not used for raw sockets
 
     // Allocate packet buffer
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -ENOBUFS;
     }
@@ -96,7 +104,10 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
         return -EINVAL;
     }
 
-    if (sock->rcvbuf.available() == 0) {
+    if (sock->rcvbuf.available() < sizeof(RawRecvRecord)) {
+        if (!sock->nonblock) {
+            socket_defer_wait(sock, "raw_wait");
+        }
         return -EAGAIN;
     }
 
@@ -104,10 +115,47 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
     ker::mod::dbg::log("raw_recvfrom: pid=%zu has %zu bytes available\n", sock->owner_pid, sock->rcvbuf.available());
 #endif
 
-    ssize_t n = sock->rcvbuf.read(buf, len);
+    RawRecvRecord record{};
+    ssize_t hdr_n = sock->rcvbuf.read(&record, sizeof(record));
+    if (hdr_n != static_cast<ssize_t>(sizeof(record))) {
+        return -EIO;
+    }
+
+    size_t packet_len = record.packet_len;
+    if (packet_len == 0 || packet_len > sock->rcvbuf.capacity) {
+        return -EIO;
+    }
+
+    if (sock->rcvbuf.available() < packet_len) {
+        return -EIO;
+    }
+
+    size_t to_copy = len < packet_len ? len : packet_len;
+    ssize_t n = sock->rcvbuf.read(buf, to_copy);
+    if (n != static_cast<ssize_t>(to_copy)) {
+        return -EIO;
+    }
+
+    std::array<uint8_t, 256> discard{};
+    size_t remaining = packet_len - to_copy;
+    while (remaining > 0) {
+        size_t chunk = remaining < discard.size() ? remaining : discard.size();
+        ssize_t discarded = sock->rcvbuf.read(discard.data(), chunk);
+        if (discarded <= 0) {
+            return -EIO;
+        }
+        remaining -= static_cast<size_t>(discarded);
+    }
 
     if (addr_out != nullptr && addr_len != nullptr) {
         std::memset(addr_out, 0, *addr_len);
+        if (*addr_len >= 8) {
+            auto* addr = static_cast<uint8_t*>(addr_out);
+            *reinterpret_cast<uint16_t*>(addr) = 2;  // AF_INET
+            *reinterpret_cast<uint16_t*>(addr + 2) = 0;
+            *reinterpret_cast<uint32_t*>(addr + 4) = htonl(record.src_ip);
+        }
+        *addr_len = 16;
     }
 
     return n;
@@ -126,7 +174,7 @@ auto raw_close(Socket* sock) -> void {
 }  // namespace
 
 // Deliver a packet to matching raw sockets
-void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
+void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t dst_ip, uint8_t ttl) {
     // For ICMP, try to match the ID field to route to correct socket
     uint16_t icmp_id = 0;
     bool has_icmp_id = false;
@@ -148,7 +196,34 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
     ker::mod::dbg::log("raw_deliver: proto=%u len=%zu has_icmp_id=%d icmp_id=%u\n", protocol, pkt->len, has_icmp_id, icmp_id);
 #endif
 
+    size_t payload_len = pkt->len;
+    constexpr size_t prepend_len = sizeof(RawRecvRecord) + sizeof(IPv4Header);
+    if (pkt->headroom() < prepend_len) {
+        pkt_free(pkt);
+        return;
+    }
+
+    auto* frame = pkt->push(prepend_len);
+    auto* record = reinterpret_cast<RawRecvRecord*>(frame);
+    auto* ip = reinterpret_cast<IPv4Header*>(frame + sizeof(RawRecvRecord));
+
+    record->packet_len = static_cast<uint16_t>(sizeof(IPv4Header) + payload_len);
+    record->reserved = 0;
+    record->src_ip = src_ip;
+
+    std::memset(ip, 0, sizeof(*ip));
+    ip->ihl_version = (4 << 4) | 5;
+    ip->total_len = htons(record->packet_len);
+    ip->flags_fragoff = htons(0x4000);
+    ip->ttl = ttl;
+    ip->protocol = protocol;
+    ip->src_addr = htonl(src_ip);
+    ip->dst_addr = htonl(dst_ip);
+    ip->checksum = checksum_compute(ip, sizeof(*ip));
+
     raw_sockets_lock.lock();
+    std::array<Socket*, MAX_RAW_SOCKETS> sockets_to_wake = {};
+    size_t wake_count = 0;
 
     for (auto* sock : raw_sockets) {
         if (sock != nullptr && sock->protocol == protocol) {
@@ -175,8 +250,10 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
                 continue;  // Not enough space in receive buffer
             }
 
-            // Copy packet data to socket receive buffer
-            sock->rcvbuf.write(pkt->data, pkt->len);
+            // Copy the record plus full IPv4 packet into the socket buffer.
+            if (sock->rcvbuf.write(pkt->data, pkt->len) > 0 && wake_count < sockets_to_wake.size()) {
+                sockets_to_wake[wake_count++] = sock;
+            }
 
 #ifdef DEBUG_RAW
             ker::mod::dbg::log("raw_deliver: delivered to socket, now used=%zu\n", sock->rcvbuf.used);
@@ -185,6 +262,9 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol) {
     }
 
     raw_sockets_lock.unlock();
+    for (size_t i = 0; i < wake_count; ++i) {
+        socket_wake_waiters(sockets_to_wake[i]);
+    }
     pkt_free(pkt);
 }
 

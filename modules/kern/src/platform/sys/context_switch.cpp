@@ -19,6 +19,7 @@
 #include "platform/interrupt/gdt.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sys/signal.hpp"
 
 namespace ker::mod::sys::context_switch {
 
@@ -272,6 +273,8 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
 
     sched::process_tasks(*gpr_ptr, *frame_ptr);
 
+    sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
+
     apic::oneShotTimer(timerQuantum);
 
     auto* current_task = sched::get_current_task();
@@ -344,6 +347,7 @@ extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
     auto* frame_ptr = reinterpret_cast<gates::interruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
     sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
+    sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
 }
 
 void startSchedTimer() {

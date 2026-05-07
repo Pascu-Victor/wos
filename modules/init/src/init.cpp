@@ -1,3 +1,4 @@
+#include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
 #include <time.h>
@@ -8,12 +9,13 @@
 #include <print>
 
 #include "fstab.h"
-#include "init_log.h"
 #include "network.h"
 #include "services.h"
 #include "sys/multiproc.h"
 
 namespace {
+
+using init_log = wos::journal<"init">;
 
 // Simple atoi implementation
 int simple_atoi(const char* str) {
@@ -42,7 +44,7 @@ auto main(int argc, char** argv) -> int {
         int spawn_count = simple_atoi(argv[1]);
         const char* prog_path = argv[2];
 
-        init_info("sub-init[%d]: starting - will spawn %d instances of '%s'", cpuno, spawn_count, prog_path);
+        init_log::info("sub-init[%d]: starting - will spawn %d instances of '%s'", cpuno, spawn_count, prog_path);
 
         for (int i = 0; i < spawn_count; i++) {
             std::array<const char*, 4> child_argv = {prog_path, "child-arg1", "child-arg2", nullptr};
@@ -50,22 +52,23 @@ auto main(int argc, char** argv) -> int {
 
             uint64_t child_pid = ker::process::exec(prog_path, child_argv.data(), child_envp.data());
             if (child_pid == 0) {
-                init_error("sub-init[%d]: failed to exec '%s' (instance %d)", cpuno, prog_path, i);
+                init_log::error("sub-init[%d]: failed to exec '%s' (instance %d)", cpuno, prog_path, i);
             } else {
-                init_info("sub-init[%d]: spawned '%s' as PID %llu (instance %d/%d)", cpuno, prog_path,
-                          static_cast<unsigned long long>(child_pid), i + 1, spawn_count);
+                init_log::info("sub-init[%d]: spawned '%s' as PID %llu (instance %d/%d)", cpuno, prog_path,
+                               static_cast<unsigned long long>(child_pid), i + 1, spawn_count);
                 int exit_code = 0;
                 ker::process::waitpid((int64_t)child_pid, &exit_code, 0, nullptr);
-                init_info("sub-init[%d]: child PID %llu exited with code %d", cpuno, static_cast<unsigned long long>(child_pid), exit_code);
+                init_log::info("sub-init[%d]: child PID %llu exited with code %d", cpuno, static_cast<unsigned long long>(child_pid),
+                               exit_code);
             }
         }
 
-        init_info("sub-init[%d]: all children completed, exiting", cpuno);
+        init_log::info("sub-init[%d]: all children completed, exiting", cpuno);
         return 0;
     }
 
     // === ROOT INIT MODE ===
-    init_info("init[%d]: root init starting", cpuno);
+    init_log::info("init[%d]: root init starting", cpuno);
 
     // Pin init and its direct children (system services) to the local node.
     // NOINHERIT ensures that processes spawned BY those services (e.g. SSH
@@ -79,9 +82,9 @@ auto main(int argc, char** argv) -> int {
     // pivot_root makes it appear as "/" for this task and all children.
     int pivot_ret = ker::abi::vfs::pivot_root_vfs("/rootfs", "/rootfs/oldroot");
     if (pivot_ret < 0) {
-        init_warn("init[%d]: pivot_root failed (ret=%d), continuing with initramfs root", cpuno, pivot_ret);
+        init_log::warn("init[%d]: pivot_root failed (ret=%d), continuing with initramfs root", cpuno, pivot_ret);
     } else {
-        init_info("init[%d]: pivot_root succeeded, root is now /rootfs", cpuno);
+        init_log::info("init[%d]: pivot_root succeeded, root is now /rootfs", cpuno);
 
         // Recreate /wki on the new root filesystem so WKI remote VFS mounts
         // survive the old initramfs root being unmounted.
@@ -90,9 +93,9 @@ auto main(int argc, char** argv) -> int {
         // Unmount the old initramfs root to free its RAM.
         int umount_ret = ker::abi::vfs::umount("/oldroot");
         if (umount_ret < 0) {
-            init_warn("init[%d]: umount /oldroot failed (ret=%d)", cpuno, umount_ret);
+            init_log::warn("init[%d]: umount /oldroot failed (ret=%d)", cpuno, umount_ret);
         } else {
-            init_info("init[%d]: unmounted old initramfs root", cpuno);
+            init_log::info("init[%d]: unmounted old initramfs root", cpuno);
         }
     }
 

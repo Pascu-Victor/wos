@@ -33,13 +33,14 @@ struct ProxyNetState {
     uint16_t attach_max_op_size = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
-    // V2: Extended attach info from NET ACK [V2§A5.3]
+    // V2: Extended attach info from NET ACK [V2 A5.3]
     uint32_t owner_ipv4_addr = 0;
     uint32_t owner_ipv4_mask = 0;
     std::array<uint8_t, 6> owner_real_mac = {};
     uint16_t owner_link_state = 0;
+    uint32_t owner_mtu = 1500;
 
-    // V2: RX backpressure credit tracking [V2§A5.6]
+    // V2: RX backpressure credit tracking [V2 A5.6]
     uint16_t rx_credits_remaining = 0;  // credits granted to server (server-side tracking)
 
     net::NetDevice netdev;
@@ -83,6 +84,9 @@ void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
 // D11: Consumer side: handle OP_NET_RX_NOTIFY (owner forwarding received packets)
 void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len);
+
+// Consumer side: handle owner-pushed NIC state updates for an attached proxy.
+void handle_net_state_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_ATTACH_ACK for NET proxy
 void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

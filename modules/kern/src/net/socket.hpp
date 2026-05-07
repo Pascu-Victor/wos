@@ -123,4 +123,11 @@ auto socket_init_buffers(Socket* sock, size_t rcvbuf_size) -> int;
 // Returns 0 on success, -1 on failure (ENOMEM or buffer non-empty).
 auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int;
 
+// Block the current task waiting for socket I/O and arrange for the next
+// packet arrival to wake it.
+void socket_defer_wait(Socket* sock, const char* wait_channel = "sock_wait");
+
+// Wake a task blocked on this socket's wait channel.
+void socket_wake_waiters(Socket* sock);
+
 }  // namespace ker::net

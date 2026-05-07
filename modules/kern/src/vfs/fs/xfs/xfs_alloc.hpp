@@ -5,6 +5,7 @@
 //
 // Reference: reference/xfs/libxfs/xfs_alloc.h, reference/xfs/libxfs/xfs_alloc.c
 
+#include <cstdint>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>

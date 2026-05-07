@@ -62,6 +62,14 @@ constexpr uint64_t NET_AUTO_ATTACH_RETRY_MAX_US = 5000000;
 
 ker::mod::sys::Spinlock s_remotable_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+struct NetAdvertState {
+    uint32_t ipv4_addr = 0;
+    uint32_t ipv4_mask = 0;
+    std::array<uint8_t, 6> real_mac = {};
+    uint16_t link_state = 0;
+    uint32_t mtu = 1500;
+};
+
 // Unlocked helper - caller must hold s_remotable_lock
 auto find_resource_unlocked(uint16_t node_id, ResourceType type, uint32_t resource_id) -> DiscoveredResource* {
     for (auto& res : g_discovered) {
@@ -119,8 +127,32 @@ auto pending_vfs_mount_is_live_locked(const PendingVfsMount& pending) -> bool {
     return find_resource_unlocked(pending.node_id, ResourceType::VFS, pending.resource_id) != nullptr;
 }
 
-auto pending_net_attach_is_live_locked(const PendingNetAttach& pending) -> bool {
-    return find_resource_unlocked(pending.node_id, ResourceType::NET, pending.resource_id) != nullptr;
+auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
+    NetAdvertState state = {};
+    if (dev == nullptr) {
+        return state;
+    }
+
+    auto* nif = ker::net::netif_get(dev);
+    if (nif != nullptr && nif->ipv4_addr_count != 0) {
+        state.ipv4_addr = nif->ipv4_addrs[0].addr;
+        state.ipv4_mask = nif->ipv4_addrs[0].netmask;
+    }
+
+    state.real_mac = dev->mac;
+    state.link_state = static_cast<uint16_t>(dev->state != 0 ? 1 : 0);
+    state.mtu = dev->mtu != 0 ? dev->mtu : 1500;
+    return state;
+}
+
+auto net_resource_ready(const DiscoveredResource& res) -> bool { return res.net_ipv4_addr != 0 && res.net_ipv4_mask != 0; }
+
+void update_net_resource_fields(DiscoveredResource& res, const ResourceAdvertNetPayload& adv) {
+    res.net_ipv4_addr = adv.ipv4_addr;
+    res.net_ipv4_mask = adv.ipv4_mask;
+    res.net_real_mac = adv.real_mac;
+    res.net_link_state = adv.link_state;
+    res.net_mtu = adv.mtu != 0 ? adv.mtu : 1500;
 }
 
 void queue_vfs_mount_locked(uint16_t node_id, uint32_t resource_id, const char* mount_path, bool force_remount) {
@@ -285,14 +317,15 @@ void send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
         name_len++;
     }
 
-    auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertPayload) + name_len);
-    std::array<uint8_t, sizeof(ResourceAdvertPayload) + 64> buf{};
+    auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertNetPayload) + name_len);
+    std::array<uint8_t, sizeof(ResourceAdvertNetPayload) + 64> buf{};
 
-    auto* adv = reinterpret_cast<ResourceAdvertPayload*>(buf.data());
+    auto* adv = reinterpret_cast<ResourceAdvertNetPayload*>(buf.data());
     adv->node_id = g_wki.my_node_id;
     adv->resource_type = static_cast<uint16_t>(ResourceType::NET);
     adv->resource_id = resource_id;
     adv->flags = 0;
+    adv->reserved = 0;
 
     if (ndev->remotable != nullptr) {
         if (ndev->remotable->can_share()) {
@@ -303,16 +336,22 @@ void send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
         }
     }
 
+    NetAdvertState state = capture_net_advert_state(ndev);
+    adv->ipv4_addr = state.ipv4_addr;
+    adv->ipv4_mask = state.ipv4_mask;
+    adv->real_mac = state.real_mac;
+    adv->link_state = state.link_state;
+    adv->mtu = state.mtu;
+
     adv->name_len = name_len;
-    memcpy(buf.data() + sizeof(ResourceAdvertPayload), ndev->name.data(), name_len);
+    memcpy(buf.data() + sizeof(ResourceAdvertNetPayload), ndev->name.data(), name_len);
 
     wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
 }
 
-}  // namespace
-
-void wki_resource_advertise_all() {
-    if (!g_remotable_initialized) {
+void advertise_resources_to_peer(uint16_t peer_node) {
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (peer == nullptr || peer->state != PeerState::CONNECTED) {
         return;
     }
 
@@ -327,26 +366,11 @@ void wki_resource_advertise_all() {
             continue;
         }
 
-        // resource_id = minor number (unique per block device)
         auto resource_id = static_cast<uint32_t>(bdev->minor);
-
-        // Send to all CONNECTED peers
-        for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-            WkiPeer* peer = &g_wki.peers[p];
-            if (peer->node_id == WKI_NODE_INVALID) {
-                continue;
-            }
-            if (peer->state != PeerState::CONNECTED) {
-                continue;
-            }
-
-            send_resource_advert_to_peer(peer->node_id, bdev, resource_id);
-        }
+        send_resource_advert_to_peer(peer_node, bdev, resource_id);
     }
 
-    // V2: Also advertise VFS exports
-    wki_remote_vfs_auto_discover();
-    wki_remote_vfs_advertise_exports();
+    wki_remote_vfs_advertise_exports_to_peer(peer_node);
 
     // Iterate all registered net devices
     size_t ndev_count = ker::net::netdev_count();
@@ -359,21 +383,50 @@ void wki_resource_advertise_all() {
             continue;
         }
 
-        // resource_id = ifindex (unique per net device)
         auto net_resource_id = ndev->ifindex;
+        send_net_resource_advert_to_peer(peer_node, ndev, net_resource_id);
+    }
+}
 
-        // Send to all CONNECTED peers
-        for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-            WkiPeer* peer = &g_wki.peers[p];
-            if (peer->node_id == WKI_NODE_INVALID) {
-                continue;
-            }
-            if (peer->state != PeerState::CONNECTED) {
-                continue;
-            }
+}  // namespace
 
-            send_net_resource_advert_to_peer(peer->node_id, ndev, net_resource_id);
+void wki_resource_advertise_all() {
+    if (!g_remotable_initialized) {
+        return;
+    }
+
+    // Keep the export set up to date before broadcasting it.
+    wki_remote_vfs_refresh_exports();
+
+    for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
+        WkiPeer* peer = &g_wki.peers[p];
+        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
+            continue;
         }
+        advertise_resources_to_peer(peer->node_id);
+    }
+}
+
+void wki_resource_advertise_to_peer(uint16_t peer_node) {
+    if (!g_remotable_initialized || peer_node == WKI_NODE_INVALID) {
+        return;
+    }
+
+    wki_remote_vfs_refresh_exports();
+    advertise_resources_to_peer(peer_node);
+}
+
+void wki_remotable_notify_net_changed(ker::net::NetDevice* dev) {
+    if (!g_remotable_initialized || dev == nullptr || dev->remotable == nullptr || !dev->remotable->can_remote()) {
+        return;
+    }
+
+    for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
+        WkiPeer* peer = &g_wki.peers[p];
+        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
+            continue;
+        }
+        send_net_resource_advert_to_peer(peer->node_id, dev, dev->ifindex);
     }
 }
 
@@ -438,17 +491,22 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
 
     const auto* adv = reinterpret_cast<const ResourceAdvertPayload*>(payload);
 
-    // Validate name_len
-    if (sizeof(ResourceAdvertPayload) + adv->name_len > payload_len) {
-        return;
-    }
-
     // Ignore adverts from ourselves
     if (adv->node_id == g_wki.my_node_id) {
         return;
     }
 
     auto type = static_cast<ResourceType>(adv->resource_type);
+    const ResourceAdvertNetPayload* net_adv = nullptr;
+    size_t header_size = sizeof(ResourceAdvertPayload);
+    if (type == ResourceType::NET && payload_len >= sizeof(ResourceAdvertNetPayload)) {
+        net_adv = reinterpret_cast<const ResourceAdvertNetPayload*>(payload);
+        header_size = sizeof(ResourceAdvertNetPayload);
+    }
+
+    if (header_size + adv->name_len > payload_len) {
+        return;
+    }
 
     // Build the resource entry on-stack before locking
     DiscoveredResource res;
@@ -462,7 +520,12 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     if (copy_len >= DISCOVERED_RESOURCE_NAME_LEN) {
         copy_len = DISCOVERED_RESOURCE_NAME_LEN - 1;
     }
-    memcpy(static_cast<void*>(res.name), resource_advert_name(adv), copy_len);
+    if (net_adv != nullptr) {
+        update_net_resource_fields(res, *net_adv);
+        memcpy(static_cast<void*>(res.name), resource_advert_name(net_adv), copy_len);
+    } else {
+        memcpy(static_cast<void*>(res.name), resource_advert_name(adv), copy_len);
+    }
     res.name[copy_len] = '\0';
 
     char desired_mount_path[384] = {};
@@ -472,13 +535,33 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     // Check if we already have this resource (upsert)
     DiscoveredResource* existing = find_resource_unlocked(adv->node_id, type, adv->resource_id);
     if (existing != nullptr) {
+        bool net_ready_before = type == ResourceType::NET ? net_resource_ready(*existing) : false;
         bool name_changed =
             std::strncmp(static_cast<const char*>(existing->name), static_cast<const char*>(res.name), sizeof(existing->name)) != 0;
+        bool flags_changed = existing->flags != adv->flags;
+        bool net_fields_changed = false;
+        if (type == ResourceType::NET) {
+            net_fields_changed = existing->net_ipv4_addr != res.net_ipv4_addr || existing->net_ipv4_mask != res.net_ipv4_mask ||
+                                 existing->net_real_mac != res.net_real_mac || existing->net_link_state != res.net_link_state ||
+                                 existing->net_mtu != res.net_mtu;
+        }
 
         // Refresh mutable fields so reconnect/re-advertisement can correct a
         // stale visible name without requiring a reboot.
         existing->flags = adv->flags;
         memcpy(static_cast<void*>(existing->name), static_cast<const void*>(res.name), sizeof(existing->name));
+        if (type == ResourceType::NET) {
+            existing->net_ipv4_addr = res.net_ipv4_addr;
+            existing->net_ipv4_mask = res.net_ipv4_mask;
+            existing->net_real_mac = res.net_real_mac;
+            existing->net_link_state = res.net_link_state;
+            existing->net_mtu = res.net_mtu;
+        }
+
+        if (!name_changed && !flags_changed && !net_fields_changed) {
+            s_remotable_lock.unlock();
+            return;
+        }
 
         if (type == ResourceType::VFS) {
             const char* hostname = wki_peer_get_hostname(adv->node_id);
@@ -489,7 +572,10 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
             }
         } else if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL) {
             const char* hostname = wki_peer_get_hostname(adv->node_id);
-            if (hostname != nullptr && hostname[0] != '\0') {
+            bool net_ready_after = net_resource_ready(*existing);
+            bool should_attach = !wki_remote_net_has_proxy(adv->node_id, adv->resource_id) && net_ready_after &&
+                                 (name_changed || net_fields_changed || !net_ready_before);
+            if (hostname != nullptr && hostname[0] != '\0' && should_attach) {
                 char nic_name[64] = {};
                 build_net_proxy_name(nic_name, sizeof(nic_name), hostname, static_cast<const char*>(res.name), adv->resource_id);
                 queue_net_attach_locked(adv->node_id, adv->resource_id, nic_name, hostname, static_cast<const char*>(res.name));
@@ -521,7 +607,7 @@ void handle_resource_advert(const WkiHeader* /*hdr*/, const uint8_t* payload, ui
     }
 
     // V2: Queue deferred NET auto-attach based on NIC policy
-    if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL) {
+    if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL && net_resource_ready(res)) {
         const char* hostname = wki_peer_get_hostname(adv->node_id);
         if (hostname != nullptr && hostname[0] != '\0') {
             char nic_name[64] = {};
@@ -758,10 +844,17 @@ void wki_remotable_process_pending_net_attaches() {
             }
 
             s_remotable_lock.lock();
-            bool resource_live = pending_net_attach_is_live_locked(pending);
+            DiscoveredResource* live_resource = find_resource_unlocked(pending.node_id, ResourceType::NET, pending.resource_id);
+            bool resource_live = live_resource != nullptr;
+            bool resource_ready = resource_live && net_resource_ready(*live_resource);
             s_remotable_lock.unlock();
             if (!resource_live) {
                 log::debug("Skipping stale NET auto-attach: node=0x%04x res_id=%u nic=%s", pending.node_id, pending.resource_id,
+                           pending.nic_name);
+                continue;
+            }
+            if (!resource_ready) {
+                log::debug("Skipping unready NET auto-attach: node=0x%04x res_id=%u nic=%s", pending.node_id, pending.resource_id,
                            pending.nic_name);
                 continue;
             }
@@ -791,19 +884,10 @@ void wki_remotable_process_pending_net_attaches() {
 
             // V2: ATTACH_SPARSE post-attach subnet overlap check
             if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE) {
-                // A zero owner IP means the remote NIC was advertised before its
-                // address was configured. Do not leave a useless proxy around;
-                // detach and retry while DHCP/static config has a chance to settle.
                 if (proxy_state == nullptr || proxy_state->owner_ipv4_addr == 0 || proxy_state->owner_ipv4_mask == 0) {
                     wki_remote_net_detach(proxy_dev);
-                    bool requeued = requeue_net_attach(pending);
-                    if (requeued) {
-                        log::debug("NET auto-attach deferred: %s from %s/%s has no IPv4 yet (retry %u/%u)", pending.nic_name,
-                                   pending.hostname, pending.remote_name, pending.retry_count, NET_AUTO_ATTACH_MAX_RETRIES - 1);
-                    } else {
-                        ker::mod::dbg::log("[WKI] NET auto-attach skipped: %s from %s/%s has no IPv4", pending.nic_name,
-                                           pending.hostname, pending.remote_name);
-                    }
+                    log::debug("Dropping stale NET auto-attach: %s from %s/%s is still missing IPv4 after ready advert", pending.nic_name,
+                               pending.hostname, pending.remote_name);
                     continue;
                 }
 

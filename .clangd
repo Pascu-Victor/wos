@@ -71,6 +71,9 @@ If:
 CompileFlags:
     Add:
         - -std=c++23
+        - -D_DEFAULT_SOURCE
+        - -D__WOS__=1
+        - -D_GNU_SOURCE=1
 
 ---
 If:

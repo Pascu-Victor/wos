@@ -51,7 +51,7 @@ struct SubmittedTask {
     uint64_t accepted_at_us = 0;
     uint64_t complete_received_at_us = 0;
 
-    // V2§A7: Proxy task pointer - kept alive in WAITING state until remote completes
+    // V2 A7: Proxy task pointer - kept alive in WAITING state until remote completes
     ker::mod::sched::task::Task* local_task = nullptr;
     bool proxy_ready = false;
 
@@ -183,8 +183,9 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id);
 // deleted by the caller.
 auto wki_remote_compute_release_elf_buffer(uint8_t* buffer) -> bool;
 
-// V2§A7.4: Forward signal to remote task if the target is a WKI proxy.
-// Called from kill() syscall. Returns true if signal was handled (forwarded).
+// V2 A7.4: Forward an interrupt/termination signal to a remote task if the
+// target is a WKI proxy. Called from kill()/process-group signal delivery.
+// Returns true if signal was handled (forwarded).
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool;
 
 // Check running remote tasks for completion (called from timer tick).

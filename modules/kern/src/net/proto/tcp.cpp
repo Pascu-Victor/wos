@@ -254,9 +254,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     // Insert into hash table now that endpoints are set
     tcp_insert_cb(cb);
 
-    uint64_t cb_lock_flags = cb->lock.lock_irqsave();
     tcp_send_segment(cb, TCP_SYN, nullptr, 0);
-    cb->lock.unlock_irqrestore(cb_lock_flags);
 
     if (sock->nonblock) {
         return -EINPROGRESS;
@@ -336,8 +334,8 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
         uint32_t available = window - in_flight;
         chunk = std::min<size_t>(chunk, available);
 
-        bool ok = tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
         cb->lock.unlock();
+        bool ok = tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
 
         if (!ok) {
             if (sent > 0) {
@@ -451,6 +449,8 @@ void tcp_close_op(Socket* sock) {
     cb->lock.lock();
 
     bool was_listener = (cb->state == TcpState::LISTEN);
+    bool send_fin = false;
+    TcpState next_state = cb->state;
 
     // Drain outstanding retransmits.
     size_t rtx_drained = 0;
@@ -480,19 +480,13 @@ void tcp_close_op(Socket* sock) {
             break;
 
         case TcpState::ESTABLISHED:
-            if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
-                cb->state = TcpState::FIN_WAIT_1;
-            } else {
-                cb->state = TcpState::CLOSED;
-            }
+            send_fin = true;
+            next_state = TcpState::FIN_WAIT_1;
             break;
 
         case TcpState::CLOSE_WAIT:
-            if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
-                cb->state = TcpState::LAST_ACK;
-            } else {
-                cb->state = TcpState::CLOSED;
-            }
+            send_fin = true;
+            next_state = TcpState::LAST_ACK;
             break;
 
         case TcpState::FIN_WAIT_1:
@@ -507,6 +501,18 @@ void tcp_close_op(Socket* sock) {
             break;
     }
     cb->lock.unlock();
+
+    if (send_fin) {
+        if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+            cb->lock.lock();
+            cb->state = next_state;
+            cb->lock.unlock();
+        } else {
+            cb->lock.lock();
+            cb->state = TcpState::CLOSED;
+            cb->lock.unlock();
+        }
+    }
 
     if (was_listener) {
         tcp_remove_listener(cb);
@@ -528,6 +534,8 @@ void tcp_close_op(Socket* sock) {
     if (cb->state == TcpState::CLOSED) {
         tcp_free_cb(cb);
     }
+    // Drop the owning socket ref; timer/hash/listener refs keep the TCB alive if needed.
+    tcp_cb_release(cb);
 }
 
 int tcp_shutdown_op(Socket* sock, int how) {
@@ -547,13 +555,17 @@ int tcp_shutdown_op(Socket* sock, int how) {
     for (;;) {
         cb->lock.lock();
         if (cb->state == TcpState::ESTABLISHED) {
+            cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+                cb->lock.lock();
                 cb->state = TcpState::FIN_WAIT_1;
                 cb->lock.unlock();
                 return 0;
             }
         } else if (cb->state == TcpState::CLOSE_WAIT) {
+            cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
+                cb->lock.lock();
                 cb->state = TcpState::LAST_ACK;
                 cb->lock.unlock();
                 return 0;
@@ -562,8 +574,6 @@ int tcp_shutdown_op(Socket* sock, int how) {
             cb->lock.unlock();
             return 0;
         }
-
-        cb->lock.unlock();
         if (sock->nonblock) {
             return -EAGAIN;
         }
@@ -667,6 +677,8 @@ void tcp_insert_cb(TcpCB* cb) {
     uint32_t idx = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
     auto& bucket = tcb_hash[idx];
     bucket.lock.lock();
+    // Hash membership owns a ref so lookups can safely retain under the bucket lock.
+    tcp_cb_acquire(cb);
     cb->hash_next = bucket.head;
     bucket.head = cb;
     bucket.lock.unlock();
@@ -676,6 +688,8 @@ void tcp_insert_listener(TcpCB* cb) {
     uint32_t idx = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
     auto& bucket = listener_hash[idx];
     bucket.lock.lock();
+    // Listener-table membership owns a ref independent of the owning socket.
+    tcp_cb_acquire(cb);
     cb->hash_next = bucket.head;
     bucket.head = cb;
     bucket.lock.unlock();
@@ -684,17 +698,22 @@ void tcp_insert_listener(TcpCB* cb) {
 void tcp_remove_listener(TcpCB* cb) {
     uint32_t idx = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
     auto& bucket = listener_hash[idx];
+    bool removed = false;
     bucket.lock.lock();
     TcpCB** pp = &bucket.head;
     while (*pp != nullptr) {
         if (*pp == cb) {
             *pp = cb->hash_next;
             cb->hash_next = nullptr;
+            removed = true;
             break;
         }
         pp = &(*pp)->hash_next;
     }
     bucket.lock.unlock();
+    if (removed) {
+        tcp_cb_release(cb);
+    }
 }
 
 void tcp_cb_acquire(TcpCB* cb) {
@@ -784,6 +803,7 @@ auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
         if (cb->state == TcpState::LISTEN && cb->local_port == local_port && (cb->local_ip == local_ip || cb->local_ip == 0)) {
+            tcp_cb_acquire(cb);
             bucket.lock.unlock();
             return cb;
         }

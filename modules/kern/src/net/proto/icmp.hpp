@@ -18,6 +18,6 @@ struct IcmpHeader {
     uint16_t sequence;   // network order
 } __attribute__((packed));
 
-void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip);
+void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip, uint8_t ttl);
 
 }  // namespace ker::net::proto

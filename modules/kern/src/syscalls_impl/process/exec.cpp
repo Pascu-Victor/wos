@@ -315,6 +315,11 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     memcpy(new_task->wki_target_hostname, parent_task->wki_target_hostname, sizeof(new_task->wki_target_hostname));
     new_task->wki_target_flags = parent_task->wki_target_flags;
     memcpy(new_task->wki_submitter_hostname, parent_task->wki_submitter_hostname, sizeof(new_task->wki_submitter_hostname));
+    new_task->wki_remote_pid =
+        (new_task->wki_submitter_hostname[0] != '\0' &&
+         std::strcmp(new_task->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+            ? new_task->pid
+            : 0;
     [[maybe_unused]] bool cloned_rules = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
 
     // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
@@ -651,14 +656,18 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // --- Read the ELF file ---
     int fd = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
     if (fd < 0) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", path, fd);
+#endif
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOENT);
     }
 
     int access_ret = vfs::vfs_access(path, 1 /* X_OK */);
     if (access_ret < 0) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", path, access_ret);
+#endif
         vfs::vfs_close(fd);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EACCES);
@@ -666,7 +675,9 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     ssize_t file_size = vfs::vfs_lseek(fd, 0, 2);
     if (file_size < 0) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, file_size);
+#endif
         vfs::vfs_close(fd);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EIO);
@@ -681,7 +692,9 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     auto* elf_buffer = new uint8_t[file_size];
     if (elf_buffer == nullptr) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", path, file_size);
+#endif
         vfs::vfs_close(fd);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOMEM);
@@ -692,7 +705,9 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     vfs::vfs_close(fd);
 
     if (bytes_read != file_size) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, bytes_read, file_size);
+#endif
         delete[] elf_buffer;
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EIO);
@@ -716,11 +731,63 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     auto* elf_header = reinterpret_cast<Elf64_Ehdr*>(elf_buffer);
     if (elf_header->e_ident[EI_MAG0] != ELFMAG0 || elf_header->e_ident[EI_MAG1] != ELFMAG1 || elf_header->e_ident[EI_MAG2] != ELFMAG2 ||
         elf_header->e_ident[EI_MAG3] != ELFMAG3 || elf_header->e_ident[EI_CLASS] != ELFCLASS64) {
+#ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF magic check failed for '%s' (bytes: %02x %02x %02x %02x class=%02x)", path, elf_header->e_ident[0],
                  elf_header->e_ident[1], elf_header->e_ident[2], elf_header->e_ident[3], elf_header->e_ident[4]);
+#endif
         delete[] elf_buffer;
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
+    }
+
+    {
+        uint8_t* saved_elf_buffer = task->elfBuffer;
+        size_t saved_elf_buffer_size = task->elfBufferSize;
+        bool saved_is_elf_buffer_shared = task->isElfBufferShared;
+        bool saved_wki_skip_legacy_placement = task->wki_skip_legacy_placement;
+        uint64_t saved_wki_remote_pid = task->wki_remote_pid;
+        std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
+        std::memcpy(saved_exe_path.data(), task->exe_path, saved_exe_path.size());
+
+        size_t path_len = std::strlen(path);
+        if (path_len >= sched::task::Task::EXE_PATH_MAX) {
+            path_len = sched::task::Task::EXE_PATH_MAX - 1;
+        }
+
+        task->elfBuffer = elf_buffer;
+        task->elfBufferSize = static_cast<size_t>(file_size);
+        task->isElfBufferShared = false;
+        std::memcpy(task->exe_path, path, path_len);
+        task->exe_path[path_len] = '\0';
+
+        ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
+            .argv = argv,
+            .envp = envp,
+            .cwd = task->cwd,
+        };
+        auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);
+
+        task->elfBuffer = saved_elf_buffer;
+        task->elfBufferSize = saved_elf_buffer_size;
+        task->isElfBufferShared = saved_is_elf_buffer_shared;
+
+        if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
+            task->deferredTaskSwitch = true;
+            task->yieldSwitch = false;
+            task->wait_channel = "wki_execve_proxy";
+            free_kernel_arg_env_once();
+            return 0;
+        }
+
+        std::memcpy(task->exe_path, saved_exe_path.data(), saved_exe_path.size());
+        task->wki_skip_legacy_placement = saved_wki_skip_legacy_placement;
+        task->wki_remote_pid = saved_wki_remote_pid;
+
+        if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
+            delete[] elf_buffer;
+            free_kernel_arg_env_once();
+            return static_cast<uint64_t>(-EHOSTUNREACH);
+        }
     }
 
     // --- Replace the pagemap with a fresh one ---

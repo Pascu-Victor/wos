@@ -32,6 +32,7 @@
 #include "platform/smt/smt.hpp"
 #include "platform/sys/context_switch.hpp"
 #include "platform/sys/signal.hpp"
+#include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/waitpid.hpp"
 #include "util/hcf.hpp"
@@ -1063,9 +1064,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
 
     // Wake any tasks sleeping via nanosleep whose deadline has passed.
     // Scan this CPU's wait list; tasks with wakeAtUs != 0 are timer sleeps.
+    // Also arm ITIMER_REAL for blocked tasks so signal-driven interfaces
+    // like ping can wake from a blocking recvfrom().
+    task::Task* signal_wake[16] = {};
+    uint32_t signal_wake_count = 0;
     {
         uint64_t now_us = time::getUs();
-        run_queues->this_cpu_locked_void([now_us](RunQueue* rq) {
+        run_queues->this_cpu_locked_void([now_us, &signal_wake, &signal_wake_count](RunQueue* rq) {
             // Collect tasks to wake (can't modify list while iterating)
             task::Task* to_wake[16];
             uint32_t wake_count = 0;
@@ -1073,6 +1078,14 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             while (t != nullptr && wake_count < 16) {
                 if (t->wakeAtUs != 0 && now_us >= t->wakeAtUs) {
                     to_wake[wake_count++] = t;
+                } else if (t->itimer_real_expire_us != 0 && now_us >= t->itimer_real_expire_us && signal_wake_count < 16) {
+                    t->sigPending |= (1ULL << (14 - 1));  // SIGALRM = 14
+                    if (t->itimer_real_interval_us != 0) {
+                        t->itimer_real_expire_us = now_us + t->itimer_real_interval_us;
+                    } else {
+                        t->itimer_real_expire_us = 0;
+                    }
+                    signal_wake[signal_wake_count++] = t;
                 }
                 t = t->schedNext;
             }
@@ -1098,6 +1111,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
                 }
             }
         });
+    }
+    for (uint32_t i = 0; i < signal_wake_count; ++i) {
+        wake_task_for_signal(signal_wake[i]);
     }
 
     auto* rq = run_queues->this_cpu();
@@ -1974,6 +1990,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         }
 
         if (is_yield || skip_wait_queue || woke) {
+            // A signal or concurrent wake can abort a futex block after the
+            // waiter node has already been published. Detach it here so a
+            // later futex_wait() does not keep replacing stale nodes.
+            ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
+
             // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
             if (rq->runnableHeap.contains(current_task)) {
                 note_perf_wait_callsite(current_task, current_task->context.frame.rip);
@@ -2483,8 +2504,12 @@ void wake_task_for_signal(task::Task* task) {
     }
 
     // Nudge the task's current CPU immediately so hlt/deferred paths react fast.
-    // This is cheap and avoids latency when signal delivery races scheduler state.
-    wake_cpu(task->cpu);
+    // For same-CPU delivery we cannot self-IPI, so arm the local timer instead.
+    if (task->cpu == cpu::currentCpu()) {
+        request_local_reschedule();
+    } else {
+        wake_cpu(task->cpu);
+    }
 
     // If the task is blocked or sleeping in a syscall path, put it back on
     // a runnable queue so it can process pending signals promptly.
@@ -2506,6 +2531,7 @@ void signal_process_group(uint64_t pgid, int sig) {
         auto* t = get_active_task_at_safe(i);
         if (t != nullptr) {
             if (t->pgid == pgid && !t->hasExited) {
+                ker::net::wki::wki_proxy_task_forward_signal(t, sig);
                 t->sigPending |= mask;
                 wake_task_for_signal(t);
             }

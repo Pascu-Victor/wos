@@ -291,11 +291,14 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) return -ESRCH;
             if (fd < 0) return -EBADF;
-            auto* file = static_cast<ker::vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+            auto* file = ker::vfs::vfs_get_file_retain(task, fd);
             if (file == nullptr) return -EBADF;
             if (file->fs_type == ker::vfs::FSType::DEVFS) {
-                return static_cast<int64_t>(ker::vfs::devfs::devfs_ioctl(file, cmd, arg));
+                int64_t result = static_cast<int64_t>(ker::vfs::devfs::devfs_ioctl(file, cmd, arg));
+                ker::vfs::vfs_put_file(file);
+                return result;
             }
+            ker::vfs::vfs_put_file(file);
             return -ENOTTY;
         }
         case ops::fsync: {

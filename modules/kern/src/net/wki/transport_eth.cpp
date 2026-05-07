@@ -128,7 +128,6 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
         }
     }
 
-    // Allocate from TX path to preserve RX reserve under heavy load.
     PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;

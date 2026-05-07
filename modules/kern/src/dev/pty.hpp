@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <platform/sys/spinlock.hpp>
@@ -103,6 +104,10 @@ static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
 
 // A single PTY pair (master + slave)
 struct PtyPair {
+    // Lifetime is shared by the radix tree and each live master/slave File.
+    // This prevents the embedded waiter SmallVecs from being freed while a
+    // devfs File wrapper can still reach the pair during poll/retry paths.
+    std::atomic<uint32_t> refcount{1};
     int index;                // PTY number (for /dev/pts/N)
     bool allocated;           // In use
     bool slave_locked;        // TIOCSPTLCK lock (must be unlocked before slave can be opened)
@@ -156,6 +161,9 @@ auto pty_alloc() -> int;
 
 // Get PtyPair by index (nullptr if invalid/unallocated)
 auto pty_get(int index) -> PtyPair*;
+
+// Release a PtyPair reference previously obtained from pty_get().
+void pty_put(PtyPair* pair);
 
 // Get the ptmx device (for explicit open)
 auto get_ptmx_device() -> Device*;

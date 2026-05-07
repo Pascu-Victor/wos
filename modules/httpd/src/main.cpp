@@ -30,13 +30,17 @@ constexpr uint16_t HTTP_PORT = 80;
 // constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
 constexpr const char* SERVE_ROOT = "/";
 
+using httpd_log = wos::journal<"httpd">;
+
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
+    std::string msg = std::format(fmt, std::forward<Args>(args)...);
+    httpd_log::info("%s", msg.c_str());
     // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
     // if (log_stream.is_open()) {
-        std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
-        // log_stream.close();
+    std::cout << msg << '\n';
+    // log_stream.close();
     // }
 }
 constexpr size_t REQUEST_BUFFER_SIZE = 4096;
@@ -304,7 +308,8 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 is_blk = S_ISBLK(st.st_mode);
             }
 
-            entries.push_back({name, is_dir, is_blk, static_cast<uint32_t>(st.st_mode), static_cast<uint32_t>(st.st_uid), static_cast<uint32_t>(st.st_gid)});
+            entries.push_back({name, is_dir, is_blk, static_cast<uint32_t>(st.st_mode), static_cast<uint32_t>(st.st_uid),
+                               static_cast<uint32_t>(st.st_gid)});
         }
         closedir(dir);
 
@@ -358,7 +363,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             {
                 char mode_str[32];
                 // rwx string
-                const char *rwx = "rwxrwxrwx";
+                const char* rwx = "rwxrwxrwx";
                 char perms[11];
                 perms[0] = ent.is_dir ? 'd' : (ent.is_blk ? 'b' : '-');
                 for (int b = 0; b < 9; b++) {

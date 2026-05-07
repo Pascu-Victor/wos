@@ -27,6 +27,8 @@
 namespace ker::dev::virtio {
 
 namespace {
+using net_log = ker::mod::dbg::logger<"net">;
+
 auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
@@ -77,6 +79,14 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
 }
 
 void fill_rx_queue_for(Virtqueue* rxq) {
+    size_t target_free = ker::net::pkt_pool_free_count();
+    if (rxq->num_free > 0) {
+        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_GROW_CHUNK);
+        ker::net::pkt_pool_ensure_free(target_free);
+    }
+
+    size_t before_free = ker::net::pkt_pool_free_count();
+    uint16_t before_slots = rxq->num_free;
     while (rxq->num_free > 0) {
         auto* pkt = ker::net::pkt_alloc();
         if (pkt == nullptr) {
@@ -89,6 +99,12 @@ void fill_rx_queue_for(Virtqueue* rxq) {
         uint32_t buf_len = ker::net::PKT_BUF_SIZE;
 
         virtq_add_buf(rxq, phys, buf_len, VRING_DESC_F_WRITE, pkt);
+    }
+
+    uint16_t filled = static_cast<uint16_t>(before_slots - rxq->num_free);
+    if (filled != 0 && before_free <= (ker::net::PKT_POOL_GROW_CHUNK + ker::net::PKT_POOL_GROW_CHUNK)) {
+        net_log::warn("virtio rx refill: q=%u filled=%u remaining_slots=%u pool_free=%zu", rxq->queue_index, filled, rxq->num_free,
+                      ker::net::pkt_pool_free_count());
     }
     virtq_kick(rxq);
 }
@@ -375,18 +391,18 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
     // Prevent preemption while holding txq->lock.
     uint64_t txflags = dev->txq->lock.lock_irqsave();
 
-    ker::net::PacketBuffer* reclaimed = nullptr;
+    // Reap completed TX buffers opportunistically on every send. This keeps
+    // the packet pool healthy even if TX completion interrupts are delayed or
+    // absent for a while, instead of waiting until the ring is already full.
+    ker::net::PacketBuffer* reclaimed = collect_tx(dev);
     if (dev->txq->num_free == 0) {
-        reclaimed = collect_tx(dev);
-        if (dev->txq->num_free == 0) {
-            dev->txq->lock.unlock_irqrestore(txflags);
-            free_pkt_list(reclaimed);
-            netdev->tx_dropped++;
-            ker::mod::dbg::log("[net] TX RING FULL drop #%lu pool_free=%zu", static_cast<unsigned long>(netdev->tx_dropped),
-                               ker::net::pkt_pool_free_count());
-            ker::net::pkt_free(pkt);
-            return -1;
-        }
+        dev->txq->lock.unlock_irqrestore(txflags);
+        free_pkt_list(reclaimed);
+        netdev->tx_dropped++;
+        ker::mod::dbg::log("[net] TX RING FULL drop #%lu pool_free=%zu", static_cast<unsigned long>(netdev->tx_dropped),
+                           ker::net::pkt_pool_free_count());
+        ker::net::pkt_free(pkt);
+        return -1;
     }
 
     auto* hdr = reinterpret_cast<VirtIONetHeader*>(pkt->push(dev->hdr_size));

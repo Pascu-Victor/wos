@@ -190,4 +190,83 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     task->inSignalHandler = true;
 }
 
+void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& frame) {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) return;
+
+    // Only deliver on a direct return to userspace. Voluntary-blocked tasks
+    // can carry a kernel-mode context in frame/gpr and must use the existing
+    // deferred resume path instead.
+    if ((frame.cs & 0x3) != 0x3 || task->voluntaryBlock) {
+        return;
+    }
+
+    if (task->inSignalHandler) {
+        return;
+    }
+
+    uint64_t deliverable = task->sigPending & ~task->sigMask;
+    if (deliverable == 0) {
+        return;
+    }
+
+    int signo = __builtin_ctzll(deliverable) + 1;
+    unsigned idx = static_cast<unsigned>(signo - 1);
+    task->sigPending &= ~(1ULL << idx);
+
+    auto& handler = task->sigHandlers[idx];
+
+    if (handler.handler == WOS_SIG_DFL) {
+        if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
+            return;
+        }
+        if (signo == WOS_SIGSTOP) {
+            task->voluntaryBlock = true;
+            return;
+        }
+        if (signo == 20 || signo == 21 || signo == 22) {
+            task->voluntaryBlock = true;
+            return;
+        }
+        if (signo == WOS_SIGHUP || signo == WOS_SIGINT || signo == WOS_SIGQUIT || signo == WOS_SIGTERM || signo == WOS_SIGKILL ||
+            signo == 13 || signo == 11 || signo == 6 || signo == 8 || signo == 4 || signo == 7) {
+            ker::syscall::process::wos_proc_exit(128 + signo);
+            __builtin_unreachable();
+        }
+
+        ker::syscall::process::wos_proc_exit(128 + signo);
+        __builtin_unreachable();
+    }
+
+    if (handler.handler == WOS_SIG_IGN) {
+        return;
+    }
+
+    uint64_t frame_addr = ((frame.rsp - sizeof(SignalFrame)) & ~0xFULL) - 8;
+    auto* sigframe = reinterpret_cast<SignalFrame*>(frame_addr);
+
+    sigframe->pretcode = handler.restorer;
+    sigframe->signo = static_cast<uint64_t>(signo);
+    sigframe->saved_mask = task->sigMask;
+    sigframe->saved_rip = frame.rip;
+    sigframe->saved_rsp = frame.rsp;
+    sigframe->saved_rflags = frame.flags;
+    sigframe->saved_retval = gpr.rax;
+
+    const uint64_t* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
+    for (int i = 0; i < 15; i++) {
+        sigframe->saved_regs[i] = regs_arr[i];
+    }
+
+    gpr.rdi = static_cast<uint64_t>(signo);
+    frame.rip = handler.handler;
+    frame.rsp = frame_addr;
+
+    task->sigMask |= handler.mask;
+    if (!(handler.flags & 0x40000000ULL)) {
+        task->sigMask |= (1ULL << idx);
+    }
+    task->inSignalHandler = true;
+}
+
 }  // namespace ker::mod::sys::signal

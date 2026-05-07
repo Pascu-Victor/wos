@@ -14,7 +14,7 @@ void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uin
     // Build echo reply with same payload
     size_t payload_len = pkt->len;  // includes ICMPv6 header + echo header + data
 
-    auto* reply = pkt_alloc();
+    auto* reply = pkt_alloc_tx();
     if (reply == nullptr) {
         pkt_free(pkt);
         return;

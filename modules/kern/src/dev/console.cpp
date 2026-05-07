@@ -1,11 +1,15 @@
 #include "console.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <dev/pty.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/file.hpp>
+
+#include "dev/device.hpp"
+#include "platform/dbg/dbg.hpp"
 
 namespace ker::dev::console {
 
@@ -131,6 +135,7 @@ int tty_open(ker::vfs::File* file) {
 #ifdef CONSOLE_DEBUG
         ker::mod::io::serial::write("tty_open: invalid controlling_tty index\n");
 #endif
+        task->controlling_tty = -1;
         return -ENXIO;
     }
 
@@ -144,13 +149,17 @@ int tty_open(ker::vfs::File* file) {
         ker::dev::Device* device;
         uint32_t magic;
     };
-    if (file != nullptr && file->private_data != nullptr) {
-        auto* dff = static_cast<DevFSFileHack*>(file->private_data);
-        dff->device = &pair->slave_dev;
+    if (file == nullptr || file->private_data == nullptr) {
+        ker::dev::pty::pty_put(pair);
+        return -ENOMEM;
     }
+    auto* dff = static_cast<DevFSFileHack*>(file->private_data);
+    dff->device = &pair->slave_dev;
 
     // Increment slave open refcount so the matching close is balanced
+    uint64_t irqf = pair->lock.lock_irqsave();
     pair->slave_opened++;
+    pair->lock.unlock_irqrestore(irqf);
 
     return 0;
 }
@@ -177,7 +186,7 @@ Device tty_device = {
 }  // anonymous namespace
 
 void console_init() {
-    ker::mod::io::serial::write("console: initializing console devices\n");
+    mod::dbg::logger<"console">::info("Initializing console devices");
 
     // Register serial console
     dev_register(&serial_device);

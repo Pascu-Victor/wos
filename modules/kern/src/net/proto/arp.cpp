@@ -50,7 +50,7 @@ auto cache_alloc(uint32_t ip) -> ArpEntry* {
 }
 
 void send_arp_request(NetDevice* dev, uint32_t target_ip, uint32_t sender_ip) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }
@@ -70,7 +70,7 @@ void send_arp_request(NetDevice* dev, uint32_t target_ip, uint32_t sender_ip) {
 }
 
 void send_arp_reply(NetDevice* dev, const std::array<uint8_t, 6>& dst_mac, uint32_t dst_ip, uint32_t src_ip) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }

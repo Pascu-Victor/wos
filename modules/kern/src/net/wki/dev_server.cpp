@@ -6,9 +6,11 @@
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
+#include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
 #include <net/packet.hpp>
+#include <net/proto/ethernet.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_ipc.hpp>
@@ -45,6 +47,16 @@ auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> Dev
 }
 
 // s_server_lock must be held by caller
+auto find_binding_by_resource(uint16_t consumer_node, ResourceType resource_type, uint32_t resource_id) -> DevServerBinding* {
+    for (auto& b : g_bindings) {
+        if (b.active && b.consumer_node == consumer_node && b.resource_type == resource_type && b.resource_id == resource_id) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+// s_server_lock must be held by caller
 auto find_binding_by_zone_id(uint32_t zone_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
         if (b.active && b.blk_rdma_active && b.blk_zone_id == zone_id) {
@@ -74,6 +86,121 @@ auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice
         }
     }
     return nullptr;
+}
+
+struct ExistingNetBindingInfo {
+    bool found = false;
+    uint16_t assigned_channel = 0;
+    ker::net::NetDevice* net_dev = nullptr;
+};
+
+struct NetStateSnapshot {
+    uint32_t ipv4_addr = 0;
+    uint32_t ipv4_mask = 0;
+    std::array<uint8_t, 6> real_mac = {};
+    uint16_t link_state = 0;
+    uint32_t mtu = 1500;
+};
+
+auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool;
+
+auto find_existing_net_binding(uint16_t consumer_node, uint32_t resource_id) -> ExistingNetBindingInfo {
+    ExistingNetBindingInfo info = {};
+
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    if (auto* binding = find_binding_by_resource(consumer_node, ResourceType::NET, resource_id); binding != nullptr) {
+        info.found = true;
+        info.assigned_channel = binding->assigned_channel;
+        info.net_dev = binding->net_dev;
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+
+    return info;
+}
+
+auto forwarded_frame_is_wki(const ker::net::PacketBuffer* pkt) -> bool {
+    if (pkt == nullptr || pkt->len < ker::net::proto::ETH_HLEN) {
+        return false;
+    }
+
+    const auto* eth = reinterpret_cast<const ker::net::proto::EthernetHeader*>(pkt->data);
+    uint16_t ethertype = ntohs(eth->ethertype);
+    return ethertype == ker::net::proto::ETH_TYPE_WKI || ethertype == ker::net::proto::ETH_TYPE_WKI_ROCE;
+}
+
+auto capture_net_state(ker::net::NetDevice* ndev) -> NetStateSnapshot {
+    NetStateSnapshot snap = {};
+    if (ndev == nullptr) {
+        return snap;
+    }
+
+    snap.real_mac = ndev->mac;
+    snap.link_state = ndev->state;
+    snap.mtu = ndev->mtu;
+
+    auto* nif = ker::net::netif_get(ndev);
+    if (nif != nullptr && nif->ipv4_addr_count > 0) {
+        snap.ipv4_addr = nif->ipv4_addrs[0].addr;
+        snap.ipv4_mask = nif->ipv4_addrs[0].netmask;
+    }
+
+    return snap;
+}
+
+void fill_net_state_payload(NetStateNotifyPayload& payload, const NetStateSnapshot& snap) {
+    payload.ipv4_addr = snap.ipv4_addr;
+    payload.ipv4_mask = snap.ipv4_mask;
+    payload.real_mac = snap.real_mac;
+    payload.link_state = snap.link_state;
+    payload.mtu = snap.mtu;
+}
+
+void record_binding_net_state(DevServerBinding& binding, const NetStateSnapshot& snap) {
+    binding.net_state_valid = true;
+    binding.net_last_ipv4_addr = snap.ipv4_addr;
+    binding.net_last_ipv4_mask = snap.ipv4_mask;
+    binding.net_last_real_mac = snap.real_mac;
+    binding.net_last_link_state = snap.link_state;
+    binding.net_last_mtu = snap.mtu;
+}
+
+void build_net_attach_ack(DevAttachAckNetPayload& ack, ker::net::NetDevice* ndev, uint32_t resource_id, uint16_t assigned_channel) {
+    ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
+    ack.assigned_channel = assigned_channel;
+    ack.resource_id = resource_id;
+    ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
+    NetStateSnapshot snap = capture_net_state(ndev);
+    ack.real_mac = snap.real_mac;
+    ack.link_state = snap.link_state;
+    ack.ipv4_addr = snap.ipv4_addr;
+    ack.ipv4_mask = snap.ipv4_mask;
+    ack.mtu = snap.mtu;
+}
+
+void rollback_net_binding(uint16_t consumer_node, uint32_t resource_id, ker::net::NetDevice* ndev, WkiChannel* ch) {
+    bool uninstall_rx_forward = false;
+
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
+        if (!it->active || it->consumer_node != consumer_node || it->resource_type != ResourceType::NET || it->resource_id != resource_id) {
+            continue;
+        }
+
+        g_bindings.erase(it);
+        uninstall_rx_forward = !has_net_binding_for_dev(ndev);
+        break;
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+
+    if (ndev != nullptr && ndev->remotable != nullptr) {
+        ndev->remotable->on_remote_detach(consumer_node);
+    }
+    if (ch != nullptr) {
+        wki_channel_close(ch);
+    }
+    if (uninstall_rx_forward && ndev != nullptr) {
+        ndev->wki_rx_forward = nullptr;
+    }
 }
 
 }  // namespace
@@ -114,6 +241,13 @@ auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
 
 void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) {
     if (dev == nullptr || pkt == nullptr || pkt->len == 0) {
+        return;
+    }
+
+    // Remote NIC sharing is for guest-visible Ethernet traffic, not for WKI's
+    // own transport frames. Forwarding WKI or RoCE packets into proxy NICs can
+    // make them re-enter the WKI stack and explode traffic fanout with many peers.
+    if (forwarded_frame_is_wki(pkt)) {
         return;
     }
 
@@ -178,6 +312,57 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt_data_len);
         wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
         delete[] req_buf;
+    }
+}
+
+void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+
+    struct NotifyTarget {
+        uint16_t consumer_node;
+        uint16_t assigned_channel;
+    };
+    constexpr size_t MAX_NOTIFY_TARGETS = 32;
+    std::array<NotifyTarget, MAX_NOTIFY_TARGETS> targets = {};
+    size_t target_count = 0;
+
+    NetStateSnapshot snap = capture_net_state(dev);
+
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    for (auto& b : g_bindings) {
+        if (!b.active || b.resource_type != ResourceType::NET || b.net_dev != dev) {
+            continue;
+        }
+
+        bool changed = !b.net_state_valid || b.net_last_ipv4_addr != snap.ipv4_addr || b.net_last_ipv4_mask != snap.ipv4_mask ||
+                       b.net_last_real_mac != snap.real_mac || b.net_last_link_state != snap.link_state || b.net_last_mtu != snap.mtu;
+        if (!changed) {
+            continue;
+        }
+
+        record_binding_net_state(b, snap);
+        if (target_count < MAX_NOTIFY_TARGETS) {
+            targets[target_count++] = {b.consumer_node, b.assigned_channel};
+        }
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+
+    if (target_count == 0) {
+        return;
+    }
+
+    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(NetStateNotifyPayload)> msg{};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
+    req->op_id = OP_NET_STATE_NOTIFY;
+    req->data_len = sizeof(NetStateNotifyPayload);
+    auto* state = reinterpret_cast<NetStateNotifyPayload*>(msg.data() + sizeof(DevOpReqPayload));
+    fill_net_state_payload(*state, snap);
+
+    for (size_t i = 0; i < target_count; i++) {
+        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, msg.data(),
+                 static_cast<uint16_t>(msg.size()));
     }
 }
 
@@ -525,6 +710,17 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
+        if (auto existing = find_existing_net_binding(hdr->src_node, req->resource_id); existing.found && existing.net_dev != nullptr) {
+            DevAttachAckNetPayload existing_ack = {};
+            build_net_attach_ack(existing_ack, existing.net_dev, req->resource_id, existing.assigned_channel);
+
+            int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &existing_ack, sizeof(existing_ack));
+            if (ack_ret != WKI_OK) {
+                ker::mod::dbg::log("[WKI] NET attach ACK resend failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
+            }
+            return;
+        }
+
         // The lower node ID is the channel allocator for the peer pair.
         WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
         if (ch == nullptr) {
@@ -550,6 +746,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_type = ResourceType::NET;
         binding.resource_id = req->resource_id;
         binding.net_dev = ndev;
+        record_binding_net_state(binding, capture_net_state(ndev));
 
         {
             uint64_t srv_flags = s_server_lock.lock_irqsave();
@@ -562,19 +759,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
         // V2: Send extended NET attach ACK with owner NIC info
         DevAttachAckNetPayload net_ack = {};
-        net_ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
-        net_ack.assigned_channel = ch->channel_id;
-        net_ack.resource_id = req->resource_id;
-        net_ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
-        net_ack.real_mac = ndev->mac;
-        net_ack.link_state = ndev->state;
-
-        // Populate IPv4 info from the network interface config
-        auto* nif = ker::net::netif_get(ndev);
-        if (nif != nullptr && nif->ipv4_addr_count > 0) {
-            net_ack.ipv4_addr = nif->ipv4_addrs[0].addr;
-            net_ack.ipv4_mask = nif->ipv4_addrs[0].netmask;
-        }
+        build_net_attach_ack(net_ack, ndev, req->resource_id, ch->channel_id);
 
         ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u ip=0x%08x mask=0x%08x", hdr->src_node, req->resource_id,
                            ch->channel_id, net_ack.ipv4_addr, net_ack.ipv4_mask);
@@ -582,6 +767,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         int ack_ret = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &net_ack, sizeof(net_ack));
         if (ack_ret != WKI_OK) {
             ker::mod::dbg::log("[WKI] NET attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ack_ret);
+            rollback_net_binding(hdr->src_node, req->resource_id, ndev, ch);
         }
     } else {
         ack.status = static_cast<uint8_t>(DevAttachStatus::NOT_FOUND);
@@ -703,6 +889,10 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             detail::handle_net_rx_notify(hdr, req_data, req_data_len);
             return;
         }
+        if (req->op_id == OP_NET_STATE_NOTIFY) {
+            detail::handle_net_state_notify(hdr, req_data, req_data_len);
+            return;
+        }
 
         // IPC pipe/socket ops (0x0700-0x07FF) are routed to the IPC subsystem.
         // These don't use device bindings — they use resource_ids.
@@ -738,7 +928,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     // Dispatch NET operations to remote_net handler
-    if (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_RX_CREDIT) {
+    if (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_STATE_NOTIFY) {
         if (binding->net_dev == nullptr) {
             DevOpRespPayload resp = {};
             resp.op_id = req->op_id;

@@ -314,11 +314,8 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         // Topology changed: regenerate our LSA and flood
         wki_lsa_generate_and_flood();
 
-        // Re-advertise our remotable devices (reconnected peer lost knowledge of our resources)
-        wki_resource_advertise_all();
-
-        // D9: Auto-discover and advertise exportable local mount points as VFS resources
-        wki_remote_vfs_auto_discover();
+        // Re-advertise our remotable devices only to the newly connected peer.
+        wki_resource_advertise_to_peer(peer_node);
 
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(peer->hostname, peer_node);
@@ -419,11 +416,8 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     if (newly_connected) {
         wki_lsa_generate_and_flood();
 
-        // Advertise our remotable devices to all peers
-        wki_resource_advertise_all();
-
-        // D9: Auto-discover and advertise exportable local mount points as VFS resources
-        wki_remote_vfs_auto_discover();
+        // Advertise our remotable devices only to the newly connected peer.
+        wki_resource_advertise_to_peer(peer_node);
 
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(peer->hostname, peer_node);
@@ -673,13 +667,11 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 // Track when we last sent heartbeats / HELLOs
 static uint64_t s_last_heartbeat_send = 0;
 static uint64_t s_last_hello_broadcast = 0;
-static uint64_t s_last_vfs_fd_gc = 0;       // D10: stale FD GC
-static uint64_t s_last_net_stats_poll = 0;  // D13: NIC stats polling
-static uint64_t s_jitter_state = 0;         // Simple PRNG state for jitter
+static uint64_t s_last_vfs_fd_gc = 0;  // D10: stale FD GC
+static uint64_t s_jitter_state = 0;    // Simple PRNG state for jitter
 static uint64_t s_next_heartbeat_send_deadline = 0;
 constexpr uint64_t HELLO_BROADCAST_INTERVAL_US = 1000000;  // 1 second
 constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;       // 10 seconds
-constexpr uint64_t NET_STATS_POLL_INTERVAL_US = 1000000;   // 1 second
 
 // Simple xorshift64 for jitter generation (not cryptographic, just for timing variance)
 static uint64_t wki_jitter_rand() {
@@ -882,12 +874,6 @@ void wki_peer_timer_tick(uint64_t now_us) {
         s_last_vfs_fd_gc = now_us;
     }
 
-    // D13: Periodically poll stats from remote NICs (non-blocking)
-    if (now_us - s_last_net_stats_poll >= NET_STATS_POLL_INTERVAL_US) {
-        wki_remote_net_poll_stats();
-        s_last_net_stats_poll = now_us;
-    }
-
     // Run routing periodic tasks (LSA refresh, LSDB aging)
     wki_routing_timer_tick(now_us);
 
@@ -971,7 +957,6 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
     }
 
     next_deadline = std::min(next_deadline, s_last_vfs_fd_gc + VFS_FD_GC_INTERVAL_US);
-    next_deadline = std::min(next_deadline, s_last_net_stats_poll + NET_STATS_POLL_INTERVAL_US);
 
     uint64_t grace_period_us = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {

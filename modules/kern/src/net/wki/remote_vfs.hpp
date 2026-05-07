@@ -97,9 +97,9 @@ struct ProxyVfsState {
     // For writes, consumer rdma_writes into server's pre-registered receive region.
     bool rdma_capable = false;
     WkiTransport* rdma_transport = nullptr;
-    uint32_t rdma_read_rkey = 0;          // our bounce buffer's rkey (server writes file data here)
-    uint8_t* rdma_bounce_buf = nullptr;   // 64 KB bounce buffer for reads and write staging
-    uint32_t rdma_server_write_rkey = 0;       // server's receive region rkey (consumer writes here for writes)
+    uint32_t rdma_read_rkey = 0;                 // our bounce buffer's rkey (server writes file data here)
+    uint8_t* rdma_bounce_buf = nullptr;          // 64 KB bounce buffer for reads and write staging
+    uint32_t rdma_server_write_rkey = 0;         // server's receive region rkey (consumer writes here for writes)
     uint32_t rdma_server_read_staging_rkey = 0;  // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
     uint32_t rdma_server_bulk_staging_rkey = 0;  // server's bulk staging rkey (RoCE bulk pull mode)
 
@@ -172,6 +172,9 @@ auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport*;
 // Server side: advertise all VFS exports to all connected peers
 void wki_remote_vfs_advertise_exports();
 
+// Server side: advertise all VFS exports to one connected peer.
+void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
+
 // Consumer side: mount a remote VFS at local_mount_path
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
 
@@ -190,13 +193,13 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
 
-// Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2§A9]
+// Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2 A9]
 auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int;
 
-// Consumer side: called from vfs_rmdir() for FSType::REMOTE mounts [V2§A9]
+// Consumer side: called from vfs_rmdir() for FSType::REMOTE mounts [V2 A9]
 auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int;
 
-// Consumer side: called from vfs_rename() for FSType::REMOTE mounts [V2§A9]
+// Consumer side: called from vfs_rename() for FSType::REMOTE mounts [V2 A9]
 auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int;
 
 // Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
@@ -207,6 +210,9 @@ auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
 
 // D9: Auto-discover and advertise exportable local mount points as VFS resources
 void wki_remote_vfs_auto_discover();
+
+// Refresh the local export table without sending adverts.
+void wki_remote_vfs_refresh_exports();
 
 // Rebuild and re-advertise VFS exports after mount topology changes such as
 // pivot_root(). Sends withdraws for stale exports before advertising the new set.

@@ -87,13 +87,13 @@ struct Task {
 
     // Factory for kernel threads (DAEMON tasks).
     // entryFunc: [[noreturn]] void func() - the kernel thread body.
-    static Task* createKernelThread(const char* name, void (*entryFunc)());
+    static auto createKernelThread(const char* name, void (*entryFunc)()) -> Task*;
 
     // Factory for userspace threads (PROCESS tasks that share the parent's pagemap).
     // tcbVaddr: virtual address of the mlibc TCB (becomes FS base / fsbase).
     // userSp:   prepared stack pointer (sys_prepare_stack pushed entry+user_arg below it).
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
-    static Task* createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa);
+    static auto createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa) -> Task*;
 
     Task(const Task& task) = delete;
 
@@ -140,6 +140,7 @@ struct Task {
     // File descriptor table for the task (per-process model).
     // Dynamic radix tree: no fixed upper bound on FD count.
     // FD_TABLE_SIZE retained as a soft limit for dup2/fcntl bounds checking.
+    mod::sys::Spinlock fd_table_lock;
     static constexpr unsigned FD_TABLE_SIZE = 256;
     ker::util::RadixTree<void*> fd_table;
 
@@ -177,7 +178,7 @@ struct Task {
     // 0 for regular processes.
     uint64_t ownerPid = 0;
 
-    // WKI: prefer inline delivery for remote compute placement (V2§A6.4)
+    // WKI: prefer inline delivery for remote compute placement (V2 A6.4)
     bool wki_prefer_inline = false;
 
     // WKI: optional explicit remote target hostname for spawned processes.
@@ -195,6 +196,11 @@ struct Task {
     // WKI: hostname of the logical submitter host whose filesystem should be
     // treated as /wki/host for this task.
     char wki_submitter_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
+
+    // WKI: PID visible on the remote execution host. For receiver-side tasks
+    // this matches pid; for submitter-side proxy tasks it is filled in once the
+    // remote launch is accepted.
+    uint64_t wki_remote_pid = 0;
 
     // WKI: explicit task-local VFS rules layered over defaults from /etc/vfstab.
     ker::util::SmallVec<WkiVfsRule, 4> wki_vfs_rules;
@@ -250,11 +256,11 @@ struct Task {
     volatile bool voluntaryBlock = false;
 
     // Waitpid state: when this task is waiting for another task to exit
-    uint64_t waitingForPid;       // PID we're waiting for (for waitpid return value)
-    uint64_t waitStatusUserAddr;  // Userspace virtual address of status variable (for waitpid)
-    uint64_t waitStatusPhysAddr;  // Last translated physical address (debug/compat)
-    uint64_t waitRusageUserAddr;  // Userspace virtual address of rusage struct (for wait3/wait4)
-    uint64_t waitRusagePhysAddr;  // Last translated physical address (debug/compat)
+    uint64_t waitingForPid;          // PID we're waiting for (for waitpid return value)
+    uint64_t waitStatusUserAddr;     // Userspace virtual address of status variable (for waitpid)
+    uint64_t waitStatusPhysAddr;     // Last translated physical address (debug/compat)
+    uint64_t waitRusageUserAddr;     // Userspace virtual address of rusage struct (for wait3/wait4)
+    uint64_t waitRusagePhysAddr;     // Last translated physical address (debug/compat)
     uint64_t waitResumeRipUserAddr;  // Userspace RIP expected when returning from waitpid
     uint64_t waitResumeRipPhysAddr;  // Last translated physical address for waitResumeRipUserAddr
     uint64_t waitResumeRspUserAddr;  // Userspace RSP expected when returning from waitpid

@@ -5,7 +5,6 @@ set(TARGET init)
 set(CXXFILES
     src/init.cpp
     src/fstab.cpp
-    src/init_log.cpp
     src/network.cpp
     src/services.cpp
 )

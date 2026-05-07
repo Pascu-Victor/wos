@@ -157,22 +157,25 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
         return -ESRCH;
     }
 
-    auto* epfile = vfs_get_file(task, epfd);
+    auto* epfile = vfs_get_file_retain(task, epfd);
     if (epfile == nullptr) {
         return -EBADF;
     }
 
     auto* inst = static_cast<EpollInstance*>(epfile->private_data);
     if (inst == nullptr) {
+        vfs_put_file(epfile);
         return -EINVAL;
     }
 
     // Validate target fd exists (except for DEL, where we allow stale)
     if (op != EPOLL_CTL_DEL) {
-        auto* target = vfs_get_file(task, fd);
+        auto* target = vfs_get_file_retain(task, fd);
         if (target == nullptr) {
+            vfs_put_file(epfile);
             return -EBADF;
         }
+        vfs_put_file(target);
     }
 
     switch (op) {
@@ -180,6 +183,7 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
             // Check for duplicate
             for (auto& interest : inst->interests) {
                 if (interest.active && interest.fd == fd) {
+                    vfs_put_file(epfile);
                     return -EEXIST;
                 }
             }
@@ -191,9 +195,11 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
                     interest.data = (event != nullptr) ? event->data.u64 : 0;
                     interest.active = true;
                     inst->count++;
+                    vfs_put_file(epfile);
                     return 0;
                 }
             }
+            vfs_put_file(epfile);
             return -ENOMEM;  // interest list full
         }
 
@@ -202,9 +208,11 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
                 if (interest.active && interest.fd == fd) {
                     interest.events = (event != nullptr) ? event->events : 0;
                     interest.data = (event != nullptr) ? event->data.u64 : 0;
+                    vfs_put_file(epfile);
                     return 0;
                 }
             }
+            vfs_put_file(epfile);
             return -ENOENT;
         }
 
@@ -213,13 +221,16 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
                 if (interest.active && interest.fd == fd) {
                     interest.active = false;
                     inst->count--;
+                    vfs_put_file(epfile);
                     return 0;
                 }
             }
+            vfs_put_file(epfile);
             return -ENOENT;
         }
 
         default:
+            vfs_put_file(epfile);
             return -EINVAL;
     }
 }
@@ -236,13 +247,14 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return -ESRCH;
     }
 
-    auto* epfile = vfs_get_file(task, epfd);
+    auto* epfile = vfs_get_file_retain(task, epfd);
     if (epfile == nullptr) {
         return -EBADF;
     }
 
     auto* inst = static_cast<EpollInstance*>(epfile->private_data);
     if (inst == nullptr) {
+        vfs_put_file(epfile);
         return -EINVAL;
     }
 
@@ -255,7 +267,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             continue;
         }
 
-        auto* target = vfs_get_file(task, inst->interests[i].fd);
+        auto* target = vfs_get_file_retain(task, inst->interests[i].fd);
         if (target == nullptr) {
             // fd was closed - auto-remove from interest list
             inst->interests[i].active = false;
@@ -264,6 +276,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         }
 
         uint32_t revents = poll_fd(target, inst->interests[i].events);
+        vfs_put_file(target);
         if (revents != 0) {
             events[ready].events = revents;
             events[ready].data.u64 = inst->interests[i].data;
@@ -278,11 +291,13 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
 
     if (ready > 0 || timeout_ms == 0) {
         clear_poll_timeout(task);
+        vfs_put_file(epfile);
         return ready;
     }
 
     if (deadline_us != 0 && ker::mod::time::getUs() >= deadline_us) {
         clear_poll_timeout(task);
+        vfs_put_file(epfile);
         return 0;
     }
 
@@ -293,6 +308,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         uint64_t deliverable = task->sigPending & ~task->sigMask;
         if (deliverable != 0) {
             clear_poll_timeout(task);
+            vfs_put_file(epfile);
             return -EINTR;
         }
     }
@@ -303,8 +319,12 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             if (!interest.active) {
                 continue;
             }
-            auto* f = vfs_get_file(task, interest.fd);
-            if (f == nullptr || !register_poll_waiter(f, task->pid)) {
+            auto* f = vfs_get_file_retain(task, interest.fd);
+            bool ok = (f != nullptr) && register_poll_waiter(f, task->pid);
+            if (f != nullptr) {
+                vfs_put_file(f);
+            }
+            if (!ok) {
                 can_block = false;
                 break;
             }
@@ -322,10 +342,15 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         // any concurrent wake_waiters will clear it, preventing a block.
         int recheck = 0;
         for (size_t i = 0; i < EPOLL_MAX_INTEREST && recheck < maxevents; i++) {
-            if (!inst->interests[i].active) continue;
-            auto* target = vfs_get_file(task, inst->interests[i].fd);
-            if (target == nullptr) continue;
+            if (!inst->interests[i].active) {
+                continue;
+            }
+            auto* target = vfs_get_file_retain(task, inst->interests[i].fd);
+            if (target == nullptr) {
+                continue;
+            }
             uint32_t revents = poll_fd(target, inst->interests[i].events);
+            vfs_put_file(target);
             if (revents != 0) {
                 events[recheck].events = revents;
                 events[recheck].data.u64 = inst->interests[i].data;
@@ -340,9 +365,11 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             task->wakeAtUs = 0;
             task->wait_channel = nullptr;
             clear_poll_timeout(task);
+            vfs_put_file(epfile);
             return recheck;
         }
 
+        vfs_put_file(epfile);
         return -WOS_ERESTARTSYS;
     }
 
@@ -350,6 +377,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         clear_poll_timeout(task);
     }
     ker::mod::sched::kern_yield();
+    vfs_put_file(epfile);
     return -WOS_ERESTARTSYS;
 }
 

@@ -75,8 +75,9 @@ auto parse_level(const char* text, uint8_t* out) -> bool {
         uint8_t level;
     };
     constexpr Pair pairs[] = {
-        {"trace", 0}, {"debug", 1}, {"info", 2}, {"notice", 3},   {"warn", 4},  {"warning", 4},
-        {"err", 5},   {"error", 5}, {"crit", 6}, {"critical", 6}, {"panic", 7},
+        {.name = "trace", .level = 0}, {.name = "debug", .level = 1},    {.name = "info", .level = 2},  {.name = "notice", .level = 3},
+        {.name = "warn", .level = 4},  {.name = "warning", .level = 4},  {.name = "err", .level = 5},   {.name = "error", .level = 5},
+        {.name = "crit", .level = 6},  {.name = "critical", .level = 6}, {.name = "panic", .level = 7},
     };
     for (const auto& pair : pairs) {
         if (std::strcmp(text, pair.name) == 0) {

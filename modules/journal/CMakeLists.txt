@@ -30,3 +30,24 @@ target_link_options(journal PRIVATE
 )
 
 target_link_libraries(journal PRIVATE c++abi c++ c unwind)
+
+add_library(journal_lib SHARED src/journal_lib.cpp)
+set_target_properties(journal_lib PROPERTIES
+    OUTPUT_NAME journal
+    POSITION_INDEPENDENT_CODE ON
+)
+set_target_properties(journal_lib PROPERTIES LINK_OPTIONS "")
+
+target_link_options(journal_lib PRIVATE
+    "--sysroot=${CMAKE_SYSROOT}"
+    "-fuse-ld=lld"
+    "-L${CMAKE_SYSROOT}/lib"
+    "-Wl,-z,now"
+)
+
+target_link_libraries(journal_lib PRIVATE c)
+
+add_custom_command(TARGET journal_lib POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:journal_lib>" "${CMAKE_SYSROOT}/lib/libjournal.so"
+    COMMENT "Installing libjournal.so into sysroot"
+)

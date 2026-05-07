@@ -223,7 +223,7 @@ rootfs_finalize_usr_merge() {
 rootfs_write_managed_paths() {
     local managed_out
 
-    managed_out="$ROOTFS_STAGING/etc/wos-managed-paths.txt"
+    managed_out="$ROOTFS_STAGING/etc/wos-managed-paths"
     mkdir -p "$(dirname "$managed_out")"
     sort -u "$ROOTFS_MANAGED_TMP" > "$managed_out"
 }
@@ -245,7 +245,7 @@ rootfs_stage_tree() {
     rootfs_stage_srv
     rootfs_stage_misc_dirs
     rootfs_finalize_usr_merge
-    rootfs_record_managed_path "/etc/wos-managed-paths.txt"
+    rootfs_record_managed_path "/etc/wos-managed-paths"
     rootfs_write_managed_paths
 
     rm -f "$ROOTFS_MANAGED_TMP"
@@ -263,7 +263,7 @@ rootfs_remove_old_managed_paths() {
     if guestfish --ro -a "$disk" > /dev/null 2>&1 <<EOF
 run
 mount /dev/sda1 /
-download /etc/wos-managed-paths.txt $managed_tmp
+download /etc/wos-managed-paths $managed_tmp
 EOF
     then
         path_count=$(grep -cve '^[[:space:]]*$' "$managed_tmp" || true)

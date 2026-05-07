@@ -1,5 +1,7 @@
 #include "ipv6.hpp"
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/endian.hpp>
 #include <net/netif.hpp>
@@ -7,6 +9,9 @@
 #include <net/proto/icmpv6.hpp>
 #include <net/proto/ndp.hpp>
 #include <platform/dbg/dbg.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
@@ -169,6 +174,15 @@ void ipv6_tx(PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::a
     hdr->hop_limit = hop_limit;
     std::memcpy(hdr->src.data(), src.data(), hdr->src.size());
     std::memcpy(hdr->dst.data(), dst.data(), hdr->dst.size());
+
+    // Packets destined to one of our own interface addresses should be
+    // reinjected locally instead of depending on NIC/NDP self-delivery.
+    if (auto* local_nif = netif_find_by_ipv6(dst); local_nif != nullptr && local_nif->dev != nullptr) {
+        pkt->dev = local_nif->dev;
+        pkt->src_mac = local_nif->dev->mac;
+        ipv6_rx(local_nif->dev, pkt);
+        return;  // pkt ownership transferred to ipv6_rx()
+    }
 
     // Determine destination MAC
     std::array<uint8_t, 6> dst_mac{};

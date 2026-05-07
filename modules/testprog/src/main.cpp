@@ -30,6 +30,8 @@
 #include "netbench.hpp"
 #include "perfbench.hpp"
 
+using tprog_log = wos::journal<"tprog">;
+
 // ICMP Echo Request structure
 struct icmp_header {
     uint8_t type;
@@ -69,7 +71,7 @@ auto ping(const char* ip_str) -> bool {
     // Create raw socket for ICMP
     int sock = socket(AF_INET, SOCK_RAW, 1);  // 1 = IPPROTO_ICMP
     if (sock < 0) {
-        std::println("testprog[t:{},p:{}]: Failed to create socket: {}", tid, pid, sock);
+        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket: %d", tid, pid, sock);
         return false;
     }
 
@@ -101,7 +103,7 @@ auto ping(const char* ip_str) -> bool {
     ssize_t sent = sendto(sock, packet.data(), packet_size, 0, reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
 
     if (sent < 0) {
-        std::println("testprog[t:{},p:{}]: Failed to send ping: {}", tid, pid, sent);
+        tprog_log::error("testprog[t:%d,p:%d]: failed to send ping: %lld", tid, pid, static_cast<long long>(sent));
         close(sock);
         return false;
     }
@@ -127,7 +129,7 @@ auto ping(const char* ip_str) -> bool {
     if (received > 0) {
         return true;
     }
-    std::println("testprog[t:{},p:{}]: No response from {} (received={})", tid, pid, ip_str, received);
+    tprog_log::warn("testprog[t:%d,p:%d]: no response from %s (received=%lld)", tid, pid, ip_str, static_cast<long long>(received));
     return false;
 }
 
@@ -140,7 +142,7 @@ auto get_interface_info(const char* ifname) -> bool {
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        std::println("testprog[t:{},p:{}]: Failed to create socket for ioctl", tid, pid);
+        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket for ioctl", tid, pid);
         return false;
     }
 
@@ -156,7 +158,7 @@ auto get_interface_info(const char* ifname) -> bool {
         inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
         // std::println("testprog[t:{},p:{}]:   IP address: {}", tid, pid, ip_str);
     } else {
-        std::println("testprog[t:{},p:{}]:   Failed to get IP address", tid, pid);
+        tprog_log::error("testprog[t:%d,p:%d]: failed to get IP address", tid, pid);
         close(sock);
         return false;
     }

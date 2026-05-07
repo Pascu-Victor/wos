@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(llvm-objdump *)",
+      "Bash(llvm-addr2line *)",
+      "Bash(llvm-readelf *)",
+      "Bash(guestfish --ro *)",
+      "Bash(sed -n *)"
+    ]
+  }
+}

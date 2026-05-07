@@ -90,14 +90,14 @@ enum class Locality : uint8_t {
     REMOTE = 2,      // multi-hop, routed
 };
 
-// V2: NIC attachment policy [V2§A5.1]
+// V2: NIC attachment policy [V2 A5.1]
 enum class WkiNicPolicy : uint8_t {
     ATTACH_ALL = 0,     // Auto-attach every discovered remote NIC
     ATTACH_SPARSE = 1,  // Auto-attach only if no local NIC covers that subnet (default)
     MANUAL = 2,         // Never auto-attach; require explicit kernel API call
 };
 
-// V2: RX backpressure credits for forwarded NET packets [V2§A5.6]
+// V2: RX backpressure credits for forwarded NET packets [V2 A5.6]
 constexpr uint16_t WKI_NET_RX_CREDITS = 64;
 
 // -----------------------------------------------------------------------------
@@ -165,7 +165,7 @@ struct WkiPeer {
     uint16_t rdma_zone_id = 0;      // RDMA zone (0 = none)
     uint32_t rdma_zone_bitmap = 0;  // peer's zone membership
 
-    // V2: Hostname identity [V2§A1.5]
+    // V2: Hostname identity [V2 A1.5]
     char hostname[WKI_HOSTNAME_MAX] = {};
 
     // Routing (for non-direct peers)
@@ -302,7 +302,7 @@ struct WkiState {
     std::array<uint8_t, 6> my_mac = {};
     bool initialized = false;
 
-    // V2: Local hostname identity [V2§A1.6]
+    // V2: Local hostname identity [V2 A1.6]
     char local_hostname[WKI_HOSTNAME_MAX] = {};
 
     // Peer table
@@ -326,10 +326,10 @@ struct WkiState {
     // LSA state
     uint32_t my_lsa_seq = 0;
 
-    // V2: NIC attachment policy [V2§A5.1]
+    // V2: NIC attachment policy [V2 A5.1]
     WkiNicPolicy nic_policy = WkiNicPolicy::ATTACH_SPARSE;
 
-    // V2: Sequential index for proxy NIC MAC generation [V2§A5.4]
+    // V2: Sequential index for proxy NIC MAC generation [V2 A5.4]
     uint8_t proxy_nic_index = 0;
 };
 
@@ -448,7 +448,7 @@ auto wki_crc32(const void* data, size_t len) -> uint32_t;
 auto wki_crc32_continue(uint32_t crc, const void* data, size_t len) -> uint32_t;
 
 // -----------------------------------------------------------------------------
-// V2: Hostname Lookup API [V2§A1.7]
+// V2: Hostname Lookup API [V2 A1.7]
 // -----------------------------------------------------------------------------
 
 // Resolve hostname to node_id. Returns WKI_NODE_INVALID on failure.
@@ -458,7 +458,7 @@ auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t;
 auto wki_peer_get_hostname(uint16_t node_id) -> const char*;
 
 // -----------------------------------------------------------------------------
-// V2: Async Wait Queue API [V2§A8]
+// V2: Async Wait Queue API [V2 A8]
 // -----------------------------------------------------------------------------
 
 // Forward declaration for Task -  avoiding circular header inclusion

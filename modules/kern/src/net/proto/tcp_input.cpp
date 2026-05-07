@@ -143,9 +143,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, u
 
     tcp_insert_cb(child_cb);
 
-    uint64_t child_cb_lock_flags = child_cb->lock.lock_irqsave();
     tcp_send_segment(child_cb, TCP_SYN | TCP_ACK, nullptr, 0);
-    child_cb->lock.unlock_irqrestore(child_cb_lock_flags);
 }
 }  // namespace
 
@@ -158,7 +156,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     // Build ACK/wake decisions under lock, execute after unlock.
     PacketBuffer* deferred_ack = nullptr;
-    uint32_t defer_local = 0, defer_remote = 0;
+    uint32_t defer_local = 0;
+    uint32_t defer_remote = 0;
     bool defer_ack_pending = false;
     bool deferred_wake = false;
     uint64_t cb_lock_flags = 0;
@@ -373,6 +372,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 #ifdef TCP_DEBUG
                             ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: NO LISTENER found for port=%u", saved_local_port);
 #endif
+                        }
+                        if (listener != nullptr) {
+                            tcp_cb_release(listener);
                         }
                     }
 
@@ -595,6 +597,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 TcpCB* listener = tcp_find_listener(dst_ip, l_port);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, src_ip, dst_ip);
+                    tcp_cb_release(listener);
                 }
                 return;
             }
@@ -659,6 +662,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 TcpCB* listener = tcp_find_listener(dst_ip, l_port);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, src_ip, dst_ip);
+                    tcp_cb_release(listener);
                 }
                 return;
             }
@@ -739,6 +743,7 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
         TcpCB* listener = tcp_find_listener(dst_ip, dst_port);
         if (listener != nullptr) {
             handle_listen_syn(listener, hdr, src_ip, dst_ip);
+            tcp_cb_release(listener);
             pkt_free(pkt);
             return;
         }

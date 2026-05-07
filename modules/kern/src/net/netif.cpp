@@ -3,6 +3,8 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <net/wki/dev_server.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::net {
@@ -49,6 +51,8 @@ auto netif_add_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int {
     nif->ipv4_addrs[nif->ipv4_addr_count].addr = addr;
     nif->ipv4_addrs[nif->ipv4_addr_count].netmask = mask;
     nif->ipv4_addr_count++;
+    ker::net::wki::wki_dev_server_notify_net_changed(dev);
+    ker::net::wki::wki_remotable_notify_net_changed(dev);
 
 #ifdef DEBUG_NETIF
     ker::mod::dbg::log("net: %s: added IPv4 %d.%d.%d.%d/%d.%d.%d.%d", dev->name, (addr >> 24) & 0xFF, (addr >> 16) & 0xFF,
@@ -70,6 +74,8 @@ auto netif_set_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask, bool replace) 
                 return -EEXIST;
             }
             nif->ipv4_addrs[i].netmask = mask;
+            ker::net::wki::wki_dev_server_notify_net_changed(dev);
+            ker::net::wki::wki_remotable_notify_net_changed(dev);
             return 0;
         }
     }
@@ -92,6 +98,8 @@ auto netif_del_ipv4(NetDevice* dev, uint32_t addr, uint32_t mask) -> int {
         }
         nif->ipv4_addr_count--;
         nif->ipv4_addrs[nif->ipv4_addr_count] = {};
+        ker::net::wki::wki_dev_server_notify_net_changed(dev);
+        ker::net::wki::wki_remotable_notify_net_changed(dev);
         return 0;
     }
 

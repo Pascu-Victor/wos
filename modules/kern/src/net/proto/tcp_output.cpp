@@ -142,7 +142,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
 }
 
 void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t extra_flags) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }
@@ -166,7 +166,7 @@ void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t 
 
 // Build an ACK without sending; caller holds cb->lock.
 auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer* {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return nullptr;
     }
@@ -191,7 +191,7 @@ auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> Pack
 }
 
 bool tcp_send_ack(TcpCB* cb) {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return false;
     }
@@ -216,7 +216,7 @@ bool tcp_send_ack(TcpCB* cb) {
 
 // Build a keepalive probe: ACK with seq = snd_una - 1
 auto tcp_build_keepalive_probe(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer* {
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return nullptr;
     }

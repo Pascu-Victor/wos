@@ -2,6 +2,9 @@
 
 #include <cstdint>
 
+#include "platform/asm/cpu.hpp"
+#include "platform/interrupt/gates.hpp"
+
 namespace ker::mod::sys::signal {
 
 // Signal frame pushed onto user stack during signal delivery.
@@ -17,5 +20,9 @@ struct SignalFrame {
     uint64_t saved_regs[15];  // raw GP register save (r15..rax, same order as stack)
 };
 // Total: 7*8 + 15*8 = 176 bytes
+
+// Deliver one pending signal when an interrupt/scheduler path is about to
+// return directly to userspace via iretq.
+void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& frame);
 
 }  // namespace ker::mod::sys::signal

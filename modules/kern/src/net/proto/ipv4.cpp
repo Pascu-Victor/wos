@@ -109,7 +109,7 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
             ker::mod::dbg::log("ipv4_rx: ICMP packet from %u.%u.%u.%u to %u.%u.%u.%u\n", (src >> 24) & 0xFF, (src >> 16) & 0xFF,
                                (src >> 8) & 0xFF, src & 0xFF, (dst >> 24) & 0xFF, (dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF);
 #endif
-            icmp_rx(dev, pkt, src, dst);
+            icmp_rx(dev, pkt, src, dst, hdr->ttl);
             break;
         case IPPROTO_UDP:
             udp_rx(dev, pkt, src, dst);
@@ -141,6 +141,15 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
 
     // Compute header checksum
     hdr->checksum = checksum_compute(hdr, sizeof(IPv4Header));
+
+    // Packets destined to one of our own interface addresses should be
+    // reinjected locally instead of depending on NIC/ARP self-delivery.
+    if (auto* local_nif = netif_find_by_ipv4(dst); local_nif != nullptr && local_nif->dev != nullptr) {
+        pkt->dev = local_nif->dev;
+        pkt->src_mac = local_nif->dev->mac;
+        ipv4_rx(local_nif->dev, pkt);
+        return 0;  // pkt ownership transferred to ipv4_rx()
+    }
 
     // Route the packet
     auto* route = route_lookup(dst);

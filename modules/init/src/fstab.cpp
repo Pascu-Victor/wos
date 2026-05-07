@@ -1,5 +1,6 @@
 #include "fstab.h"
 
+#include <sys/logging.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -8,12 +9,12 @@
 #include <cstdint>
 #include <print>
 
-#include "init_log.h"
 #include "sys/multiproc.h"
 
 namespace {
 constexpr size_t FSTAB_BUF_SIZE = 4096;
 constexpr size_t FIELD_MAX = 256;
+using init_log = wos::journal<"init">;
 }  // namespace
 
 void mount_filesystems() {
@@ -21,7 +22,7 @@ void mount_filesystems() {
 
     int fstab_fd = ker::abi::vfs::open("/etc/fstab", 0, 0);
     if (fstab_fd < 0) {
-        init_info("init[%llu]: no /etc/fstab found, skipping mounts", static_cast<unsigned long long>(cpuno));
+        init_log::info("init[%llu]: no /etc/fstab found, skipping mounts", static_cast<unsigned long long>(cpuno));
         return;
     }
 
@@ -30,12 +31,12 @@ void mount_filesystems() {
     ker::abi::vfs::close(fstab_fd);
 
     if (bytes_read <= 0) {
-        init_info("init[%llu]: /etc/fstab is empty", static_cast<unsigned long long>(cpuno));
+        init_log::info("init[%llu]: /etc/fstab is empty", static_cast<unsigned long long>(cpuno));
         return;
     }
 
     fstab_buf[static_cast<size_t>(bytes_read)] = '\0';
-    init_info("init[%llu]: parsing /etc/fstab (%ld bytes)", static_cast<unsigned long long>(cpuno), static_cast<long>(bytes_read));
+    init_log::info("init[%llu]: parsing /etc/fstab (%ld bytes)", static_cast<unsigned long long>(cpuno), static_cast<long>(bytes_read));
 
     // Parse line by line
     char* line_start = fstab_buf.data();
@@ -100,11 +101,11 @@ void mount_filesystems() {
                 // Mount filesystem
                 int ret = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data());
                 if (ret == 0) {
-                    init_info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(cpuno), device.data(), mountpoint.data(),
-                              fstype.data());
+                    init_log::info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(cpuno), device.data(),
+                                   mountpoint.data(), fstype.data());
                 } else {
-                    init_error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(cpuno), device.data(),
-                               mountpoint.data(), fstype.data(), ret);
+                    init_log::error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(cpuno),
+                                    device.data(), mountpoint.data(), fstype.data(), ret);
                 }
             }
         }

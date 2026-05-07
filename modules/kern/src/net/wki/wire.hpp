@@ -161,7 +161,7 @@ struct HelloPayload {
     uint32_t rdma_zone_bitmap;  // RDMA zone membership (32 zones max)
     std::array<uint8_t, 8> reserved;
     // --- V2 extension (offset 32) ---
-    char hostname[WKI_HOSTNAME_MAX];  // NUL-terminated hostname string [V2§A1.3]
+    char hostname[WKI_HOSTNAME_MAX];  // NUL-terminated hostname string [V2 A1.3]
 } __attribute__((packed));
 
 static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
@@ -261,12 +261,37 @@ struct ResourceAdvertPayload {
     // Followed by name_len bytes of name (e.g., "sda", "eth0")
 } __attribute__((packed));
 
+struct ResourceAdvertNetPayload {
+    uint16_t node_id;        // owner node
+    uint16_t resource_type;  // ResourceType::NET
+    uint32_t resource_id;    // unique on owning node
+    uint8_t flags;           // RESOURCE_FLAG_*
+    uint8_t name_len;
+    uint16_t reserved;
+    uint32_t ipv4_addr;               // owner NIC IPv4 address (host byte order)
+    uint32_t ipv4_mask;               // owner NIC IPv4 mask (host byte order)
+    std::array<uint8_t, 6> real_mac;  // owner NIC real MAC
+    uint16_t link_state;              // 0=DOWN, 1=UP
+    uint32_t mtu;                     // owner NIC MTU
+    // Followed by name_len bytes of name (e.g., "eth0")
+} __attribute__((packed));
+
+static_assert(sizeof(ResourceAdvertNetPayload) == 32, "ResourceAdvertNetPayload must be 32 bytes");
+
 inline auto resource_advert_name(ResourceAdvertPayload* p) -> char* {
     return reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(p) + sizeof(ResourceAdvertPayload));
 }
 
 inline auto resource_advert_name(const ResourceAdvertPayload* p) -> const char* {
     return reinterpret_cast<const char*>(reinterpret_cast<const uint8_t*>(p) + sizeof(ResourceAdvertPayload));
+}
+
+inline auto resource_advert_name(ResourceAdvertNetPayload* p) -> char* {
+    return reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(p) + sizeof(ResourceAdvertNetPayload));
+}
+
+inline auto resource_advert_name(const ResourceAdvertNetPayload* p) -> const char* {
+    return reinterpret_cast<const char*>(reinterpret_cast<const uint8_t*>(p) + sizeof(ResourceAdvertNetPayload));
 }
 
 // -----------------------------------------------------------------------------
@@ -476,17 +501,17 @@ struct DevAttachAckPayload {
     uint8_t status;  // DevAttachStatus
     uint8_t reserved;
     uint16_t assigned_channel;
-    uint32_t resource_id;  // echoed from DEV_ATTACH_REQ for consumer-side matching
-    uint16_t max_op_size;  // max payload size for DEV_OP_REQ
-    uint16_t rdma_flags;   // bit 0: RDMA block ring zone available
-    uint32_t blk_zone_id;  // RDMA zone ID for block ring; for VFS: server write-recv rkey
+    uint32_t resource_id;             // echoed from DEV_ATTACH_REQ for consumer-side matching
+    uint16_t max_op_size;             // max payload size for DEV_OP_REQ
+    uint16_t rdma_flags;              // bit 0: RDMA block ring zone available
+    uint32_t blk_zone_id;             // RDMA zone ID for block ring; for VFS: server write-recv rkey
     uint32_t rdma_read_staging_rkey;  // DEV_ATTACH_RDMA_VFS_READ: server-side read staging rkey (RoCE pull mode)
     uint32_t rdma_bulk_staging_rkey;  // DEV_ATTACH_RDMA_BULK_PULL: server-side bulk staging rkey (RoCE pull mode)
 } __attribute__((packed));
 
 static_assert(sizeof(DevAttachAckPayload) == 24, "DevAttachAckPayload must be 24 bytes");
 
-// V2: Extended attach ACK for NET resources - includes owner NIC info [V2§A5.3]
+// V2: Extended attach ACK for NET resources - includes owner NIC info [V2 A5.3]
 struct DevAttachAckNetPayload {
     // V1 base fields (identical layout to DevAttachAckPayload)
     uint8_t status;
@@ -501,16 +526,27 @@ struct DevAttachAckNetPayload {
     uint32_t ipv4_mask;               // Owner NIC's IPv4 subnet mask
     std::array<uint8_t, 6> real_mac;  // Owner NIC's real MAC address
     uint16_t link_state;              // 0=DOWN, 1=UP
+    uint32_t mtu;                     // Owner NIC MTU
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckNetPayload) == 32, "DevAttachAckNetPayload must be 32 bytes");
+static_assert(sizeof(DevAttachAckNetPayload) == 36, "DevAttachAckNetPayload must be 36 bytes");
+
+struct NetStateNotifyPayload {
+    uint32_t ipv4_addr;               // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask;               // Owner NIC's IPv4 subnet mask
+    std::array<uint8_t, 6> real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state;              // 0=DOWN, 1=UP
+    uint32_t mtu;                     // Owner NIC MTU
+} __attribute__((packed));
+
+static_assert(sizeof(NetStateNotifyPayload) == 20, "NetStateNotifyPayload must be 20 bytes");
 
 // RDMA flags for DevAttachAckPayload
-constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
-constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;       // VFS RDMA available; blk_zone_id carries server write-recv rkey
-constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;      // bulk RDMA transfer supported (large sequential I/O)
-constexpr uint16_t DEV_ATTACH_RDMA_VFS_READ = 0x0008;  // VFS read staging buf available (pull mode); rdma_read_staging_rkey valid
-constexpr uint16_t DEV_ATTACH_RDMA_BULK_PULL = 0x0010; // VFS bulk staging buf available (pull mode); rdma_bulk_staging_rkey valid
+constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;   // block ring RDMA zone available
+constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;        // VFS RDMA available; blk_zone_id carries server write-recv rkey
+constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;       // bulk RDMA transfer supported (large sequential I/O)
+constexpr uint16_t DEV_ATTACH_RDMA_VFS_READ = 0x0008;   // VFS read staging buf available (pull mode); rdma_read_staging_rkey valid
+constexpr uint16_t DEV_ATTACH_RDMA_BULK_PULL = 0x0010;  // VFS bulk staging buf available (pull mode); rdma_bulk_staging_rkey valid
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload - 8 bytes
@@ -556,9 +592,10 @@ constexpr uint16_t OP_NET_XMIT = 0x0300;
 constexpr uint16_t OP_NET_SET_MAC = 0x0301;
 constexpr uint16_t OP_NET_RX_NOTIFY = 0x0302;
 constexpr uint16_t OP_NET_GET_STATS = 0x0303;
-constexpr uint16_t OP_NET_OPEN = 0x0304;       // V2: bring up remote NIC [V2§A5.5]
-constexpr uint16_t OP_NET_CLOSE = 0x0305;      // V2: shut down remote NIC [V2§A5.5]
-constexpr uint16_t OP_NET_RX_CREDIT = 0x0306;  // V2: replenish RX credits [V2§A5.6]
+constexpr uint16_t OP_NET_OPEN = 0x0304;          // V2: bring up remote NIC [V2 A5.5]
+constexpr uint16_t OP_NET_CLOSE = 0x0305;         // V2: shut down remote NIC [V2 A5.5]
+constexpr uint16_t OP_NET_RX_CREDIT = 0x0306;     // V2: replenish RX credits [V2 A5.6]
+constexpr uint16_t OP_NET_STATE_NOTIFY = 0x0307;  // V3: owner-pushed NIC state update
 
 constexpr uint16_t OP_VFS_OPEN = 0x0400;
 constexpr uint16_t OP_VFS_READ = 0x0401;
@@ -569,12 +606,12 @@ constexpr uint16_t OP_VFS_STAT = 0x0405;
 constexpr uint16_t OP_VFS_MKDIR = 0x0406;
 constexpr uint16_t OP_VFS_READLINK = 0x0407;  // D8: symlink target resolution
 constexpr uint16_t OP_VFS_SYMLINK = 0x0408;   // D8: symlink creation
-constexpr uint16_t OP_VFS_UNLINK = 0x0409;    // V2: file deletion [V2§A9.1]
-constexpr uint16_t OP_VFS_RMDIR = 0x040A;     // V2: directory removal [V2§A9.1]
-constexpr uint16_t OP_VFS_RENAME = 0x040B;    // V2: rename/move [V2§A9.1]
-constexpr uint16_t OP_VFS_FSYNC = 0x040C;     // V2: flush to disk [V2§A9.1]
-constexpr uint16_t OP_VFS_TRUNCATE = 0x040D;  // V2: truncate file [V2§A9.1]
-constexpr uint16_t OP_VFS_SEEK_END = 0x040E;  // V2: seek from end [V2§A9.1]
+constexpr uint16_t OP_VFS_UNLINK = 0x0409;    // V2: file deletion [V2 A9.1]
+constexpr uint16_t OP_VFS_RMDIR = 0x040A;     // V2: directory removal [V2 A9.1]
+constexpr uint16_t OP_VFS_RENAME = 0x040B;    // V2: rename/move [V2 A9.1]
+constexpr uint16_t OP_VFS_FSYNC = 0x040C;     // V2: flush to disk [V2 A9.1]
+constexpr uint16_t OP_VFS_TRUNCATE = 0x040D;  // V2: truncate file [V2 A9.1]
+constexpr uint16_t OP_VFS_SEEK_END = 0x040E;  // V2: seek from end [V2 A9.1]
 constexpr uint16_t OP_VFS_READ_RDMA =
     0x0410;  // RDMA read:  req={fd:i32,len:u32,off:i64,rkey:u32}(20B) resp={bytes:u32}(4B), data pushed via rdma_write
 constexpr uint16_t OP_VFS_WRITE_RDMA =

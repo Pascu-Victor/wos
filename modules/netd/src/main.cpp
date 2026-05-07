@@ -1,17 +1,18 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <sched.h>
-#include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/net.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <print>
 
 #include "abi-bits/route.h"
@@ -49,6 +50,9 @@ constexpr int RECV_TIMEOUT_SECS = 5;  // real-time timeout for DHCP responses
 constexpr int MAX_DISCOVER_RETRIES = 5;
 constexpr int MAX_REQUEST_RETRIES = 3;
 constexpr int MAX_NAK_RESTARTS = 3;  // restart from DISCOVER on NAK
+constexpr uint32_t RENEWAL_FAILURE_LOG_INTERVAL = 10;
+constexpr uint32_t DHCP_RENEWAL_RETRY_SECS = 60;
+constexpr uint32_t USEC_PER_SEC = 1000000;
 
 // ---- BOOTP/DHCP packet ----
 
@@ -82,7 +86,7 @@ struct DhcpLease {
 // ---- Helpers ----
 
 auto get_mac(int sock, const char* ifname, std::array<uint8_t, 6>& mac) -> bool {
-    struct ifreq ifr{};
+    ifreq ifr{};
     std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0) {
         return false;
@@ -265,7 +269,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
 
     // Set IP address
     {
-        struct ifreq ifr{};
+        ifreq ifr{};
         std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         addr->sin_family = AF_INET;
@@ -275,7 +279,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
 
     // Set netmask
     if (lease.subnet_mask != 0) {
-        struct ifreq ifr{};
+        ifreq ifr{};
         std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         addr->sin_family = AF_INET;
@@ -305,30 +309,108 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
 }
 
 auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> ssize_t {
-    struct timespec start{};
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    bool logged_err = false;
-
     for (;;) {
+        struct pollfd pfd{};
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+
+        int ready = poll(&pfd, 1, timeout_secs * 1000);
+        if (ready == 0) {
+            return -1;  // timeout
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::println("netd: poll failed: {}", errno);
+            return -1;
+        }
+
         ssize_t n = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
         if (n > 0) {
             return n;  // got data
         }
-        // Log unexpected errors once (not EAGAIN -11)
-        if (n < 0 && n != -11 && !logged_err) {
+
+        if (n == -EINTR || n == -EAGAIN) {
+            continue;
+        }
+
+        if (n < 0) {
             std::println("netd: recvfrom returned {}, retrying...", n);
-            logged_err = true;
         }
-
-        struct timespec now{};
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed = now.tv_sec - start.tv_sec;
-        if (elapsed >= timeout_secs) {
-            return -1;  // timeout
-        }
-
-        sched_yield();
     }
+}
+
+auto monotonic_now_us() -> uint64_t {
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<uint64_t>(now.tv_sec) * USEC_PER_SEC + static_cast<uint64_t>(now.tv_nsec / 1000);
+}
+
+void sleep_until_us(uint64_t deadline_us) {
+    for (;;) {
+        uint64_t now_us = monotonic_now_us();
+        if (now_us >= deadline_us) {
+            return;
+        }
+
+        uint64_t remaining_us = deadline_us - now_us;
+        struct timespec ts{};
+        ts.tv_sec = static_cast<time_t>(remaining_us / USEC_PER_SEC);
+        ts.tv_nsec = static_cast<long>((remaining_us % USEC_PER_SEC) * 1000);
+
+        if (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+            continue;
+        }
+    }
+}
+
+void sleep_for_seconds(uint32_t seconds) { sleep_until_us(monotonic_now_us() + (static_cast<uint64_t>(seconds) * USEC_PER_SEC)); }
+
+auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t expected_xid, int timeout_secs, DhcpLease* lease)
+    -> uint8_t {
+    uint64_t deadline_us = monotonic_now_us() + (static_cast<uint64_t>(timeout_secs) * USEC_PER_SEC);
+
+    while (monotonic_now_us() < deadline_us) {
+        uint64_t now_us = monotonic_now_us();
+        uint64_t remaining_us = deadline_us - now_us;
+        int timeout_ms = static_cast<int>((remaining_us + 999) / 1000);
+        if (timeout_ms <= 0) {
+            timeout_ms = 1;
+        }
+
+        struct pollfd pfd{};
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+
+        int ready = poll(&pfd, 1, timeout_ms);
+        if (ready == 0) {
+            return 0;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::println("netd: poll failed: {}", errno);
+            return 0;
+        }
+
+        ssize_t n = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
+        if (n == -EINTR || n == -EAGAIN) {
+            continue;
+        }
+        if (n < 0) {
+            std::println("netd: recvfrom returned {}, retrying...", n);
+            continue;
+        }
+
+        uint8_t msg = parse_reply(buf, static_cast<size_t>(n), expected_xid, lease);
+        if (msg != 0) {
+            return msg;
+        }
+    }
+
+    return 0;
 }
 
 }  // anonymous namespace
@@ -520,23 +602,22 @@ request_failed:
     if (lease.lease_time == 0) {
         std::println("netd: infinite lease, sleeping forever");
         for (;;) {
-            // Sleep for a very long time instead of busy-spinning
-            struct timespec ts{};
-            ts.tv_sec = 86400;  // 24 hours
-            nanosleep(&ts, nullptr);
+            // Sleep for a very long time instead of busy-spinning.
+            sleep_for_seconds(86400);  // 24 hours
         }
     }
 
     uint32_t t1_seconds = lease.lease_time / 2;
     std::println("netd: will renew in ~{} seconds (T1)", t1_seconds);
+    uint32_t consecutive_renewal_failures = 0;
 
     for (;;) {
-        // Sleep until T1
-        struct timespec ts{};
-        ts.tv_sec = t1_seconds;
-        nanosleep(&ts, nullptr);
+        // Sleep until T1, even if interrupted by signals.
+        sleep_for_seconds(t1_seconds);
 
-        std::println("netd: T1 reached, sending renewal REQUEST");
+        if (consecutive_renewal_failures == 0) {
+            std::println("netd: T1 reached, sending renewal REQUEST");
+        }
         ++xid;
 
         size_t pkt_len = build_renewal(&pkt, mac.data(), xid, lease.your_ip);
@@ -549,21 +630,31 @@ request_failed:
 
         sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
 
-        ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
-        if (n > 0) {
-            DhcpLease renew_lease{};
-            uint8_t msg = parse_reply(recv_buf.data(), static_cast<size_t>(n), xid, &renew_lease);
-            if (msg == DHCPACK) {
-                if (renew_lease.lease_time != 0) {
-                    lease.lease_time = renew_lease.lease_time;
-                }
-                t1_seconds = lease.lease_time / 2;
-                std::println("netd: lease renewed, next renewal in ~{}s", t1_seconds);
-            } else {
-                std::println("netd: renewal failed (msg={}), will retry", msg);
+        DhcpLease renew_lease{};
+        uint8_t msg = recv_dhcp_reply_until_timeout(sock, recv_buf.data(), recv_buf.size(), xid, RECV_TIMEOUT_SECS, &renew_lease);
+        if (msg == DHCPACK) {
+            if (renew_lease.lease_time != 0) {
+                lease.lease_time = renew_lease.lease_time;
             }
+            t1_seconds = lease.lease_time / 2;
+            if (consecutive_renewal_failures > 0) {
+                std::println("netd: lease renewed after {} failed attempt(s), next renewal in ~{}s", consecutive_renewal_failures,
+                             t1_seconds);
+                consecutive_renewal_failures = 0;
+            } else {
+                std::println("netd: lease renewed, next renewal in ~{}s", t1_seconds);
+            }
+        } else if (msg == DHCPNAK) {
+            std::println("netd: renewal received NAK, restarting from DISCOVER");
+            close(sock);
+            return 1;
         } else {
-            std::println("netd: renewal timeout, will retry");
+            ++consecutive_renewal_failures;
+            if (consecutive_renewal_failures == 1 || consecutive_renewal_failures % RENEWAL_FAILURE_LOG_INTERVAL == 0) {
+                std::println("netd: renewal timed out, retrying in {}s ({} consecutive failures)", DHCP_RENEWAL_RETRY_SECS,
+                             consecutive_renewal_failures);
+            }
+            t1_seconds = DHCP_RENEWAL_RETRY_SECS;
         }
     }
 

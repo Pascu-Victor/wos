@@ -1,8 +1,12 @@
 #include "random_device.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <vfs/file.hpp>
+
+#include "dev/device.hpp"
+#include "platform/dbg/dbg.hpp"
 
 namespace ker::dev::random_device {
 
@@ -89,17 +93,20 @@ Device urandom_dev = {
 
 void random_device_init() {
     // Check RDRAND support via CPUID (leaf 1, ECX bit 30)
-    uint32_t eax, ebx, ecx, edx;
+    uint32_t eax = 0;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
     asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-    if (!(ecx & (1u << 30))) {
-        ker::mod::io::serial::write("random_device: WARNING - RDRAND not supported, /dev/urandom unavailable\n");
+    if ((ecx & (1U << 30)) == 0U) {
+        ker::mod::dbg::logger<"random_device">::warn("RDRAND not supported, /dev/urandom unavailable\n");
         return;
     }
 
-    ker::mod::io::serial::write("random_device: initializing /dev/urandom (RDRAND)\n");
+    ker::mod::dbg::logger<"random_device">::info("Initializing /dev/urandom (RDRAND)\n");
     dev_register(&urandom_dev);
 }
 
-Device* get_urandom_device() { return &urandom_dev; }
+auto get_urandom_device() -> Device* { return &urandom_dev; }
 
 }  // namespace ker::dev::random_device

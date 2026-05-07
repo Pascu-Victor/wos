@@ -1,14 +1,18 @@
 #include "icmp.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/raw.hpp>
 #include <platform/dbg/dbg.hpp>
 
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
+
 namespace ker::net::proto {
 
-void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip) {
+void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip, uint8_t ttl) {
     (void)dev;
 
     if (pkt->len < sizeof(IcmpHeader)) {
@@ -48,7 +52,7 @@ void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip
 #ifdef DEBUG_ICMP
             ker::mod::dbg::log("icmp_rx: got ECHO_REPLY, delivering to raw sockets\n");
 #endif
-            raw_deliver(pkt, IPPROTO_ICMP);
+            raw_deliver(pkt, IPPROTO_ICMP, src_ip, dst_ip, ttl);
             // Packet freed by raw_deliver
             return;
 

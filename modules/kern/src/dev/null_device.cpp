@@ -4,6 +4,9 @@
 #include <mod/io/serial/serial.hpp>
 #include <vfs/file.hpp>
 
+#include "dev/device.hpp"
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::dev::null_device {
 
 namespace {
@@ -82,12 +85,12 @@ Device zero_dev = {
 }  // anonymous namespace
 
 void null_device_init() {
-    ker::mod::io::serial::write("null_device: initializing /dev/null and /dev/zero\n");
+    ker::mod::dbg::logger<"null_device">::info("Initializing /dev/null and /dev/zero\n");
     dev_register(&null_dev);
     dev_register(&zero_dev);
 }
 
-Device* get_null_device() { return &null_dev; }
-Device* get_zero_device() { return &zero_dev; }
+auto get_null_device() -> Device* { return &null_dev; }
+auto get_zero_device() -> Device* { return &zero_dev; }
 
 }  // namespace ker::dev::null_device

@@ -48,6 +48,8 @@ namespace ker::vfs {
 
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto readlink_resolved(const char* absPath, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> File*;
+void vfs_put_file(File* f);
 
 // Keep in sync with userspace fcntl.h (Linux-compatible octal values)
 constexpr int O_NONBLOCK = 04000;
@@ -77,6 +79,41 @@ constexpr size_t STREAM_DETACHED_REUSE_MAX = 8 * 1024 * 1024;
 constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
 constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = 2 * 1024 * 1024;
+
+void stream_detach_file(File* file);
+void stream_invalidate_file(File* file);
+auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actual_size, ssize_t* result) -> bool;
+
+auto vfs_destroy_file(File* f) -> int {
+    if (f == nullptr) {
+        return 0;
+    }
+
+    int close_result = 0;
+    stream_detach_file(f);
+    if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
+        close_result = f->fops->vfs_close(f);
+    }
+    delete[] f->vfs_path;
+    f->private_data = nullptr;
+    delete f;
+    return close_result;
+}
+
+auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
+    if (task == nullptr || fd < 0) {
+        return nullptr;
+    }
+
+    auto* file = reinterpret_cast<File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    if (file == nullptr) {
+        return nullptr;
+    }
+
+    task->fd_table.remove(static_cast<uint64_t>(fd));
+    task->clear_fd_cloexec(static_cast<unsigned>(fd));
+    return file;
+}
 
 struct StreamFreshnessStamp {
     off_t size = 0;
@@ -2336,38 +2373,24 @@ auto vfs_close(int fd) -> int {
     if (t == nullptr) {
         return -ESRCH;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    uint64_t irqf = t->fd_table_lock.lock_irqsave();
+    ker::vfs::File* f = vfs_take_fd_locked(t, fd);
+    size_t fd_count = t->fd_table.size();
+    t->fd_table_lock.unlock_irqrestore(irqf);
     if (f == nullptr) {
         return -EBADF;
     }
 
-    // Remove the FD from the task's file descriptor table first so that
-    // another CPU racing to close the same shared fd won't find it valid.
-    vfs_release_fd(t, fd);
-    t->clear_fd_cloexec(static_cast<unsigned>(fd));
+    ker::mod::perf::record_container_stat(0, t->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                          static_cast<int64_t>(fd_count), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
     // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
     if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
         return 0;
     }
 
-    // Last reference gone: destroy the file.
-    int close_result = 0;
-    {
-        stream_detach_file(f);
-        if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
-            close_result = f->fops->vfs_close(f);
-        }
-        // Free the VFS path string if allocated
-        delete[] f->vfs_path;
-        // Free the File descriptor object (just the handle/wrapper)
-        // but keep the underlying fs node (f->private_data) intact
-        // so the file can be reopened later
-        f->private_data = nullptr;
-        delete f;
-    }
-
-    return close_result;
+    return vfs_destroy_file(f);
 }
 
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
@@ -2375,11 +2398,12 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if (t == nullptr) {
         return -ESRCH;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
+        vfs_put_file(f);
         return -EINVAL;
     }
 
@@ -2388,6 +2412,7 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
         if (cached_result >= 0) {
             f->pos += cached_result;
         }
+        vfs_put_file(f);
         return cached_result;
     }
 
@@ -2397,8 +2422,10 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
         if (actual_size != nullptr) {
             *actual_size = static_cast<size_t>(r);
         }
+        vfs_put_file(f);
         return r;
     }
+    vfs_put_file(f);
     return r;
 }
 
@@ -2407,11 +2434,12 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     if (t == nullptr) {
         return -ESRCH;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
+        vfs_put_file(f);
         return -EINVAL;
     }
     if ((f->open_flags & ker::vfs::O_APPEND) && (f->fops->vfs_lseek != nullptr)) {
@@ -2424,8 +2452,10 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
         if (actual_size != nullptr) {
             *actual_size = static_cast<size_t>(r);
         }
+        vfs_put_file(f);
         return r;
     }
+    vfs_put_file(f);
     return r;
 }
 
@@ -2434,27 +2464,35 @@ auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
     if (t == nullptr) {
         return -ESRCH;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_lseek == nullptr)) {
+        vfs_put_file(f);
         return -ESPIPE;
     }
-    return f->fops->vfs_lseek(f, offset, whence);
+    off_t rc = f->fops->vfs_lseek(f, offset, whence);
+    vfs_put_file(f);
+    return rc;
 }
 
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     if ((task == nullptr) || (file == nullptr)) {
         return -1;
     }
+    uint64_t irqf = task->fd_table_lock.lock_irqsave();
     uint64_t slot = task->fd_table.find_first_unset(0);
-    if (slot == UINT64_MAX || !task->fd_table.insert(slot, file)) {
+    bool inserted = slot != UINT64_MAX && task->fd_table.insert(slot, file);
+    size_t fd_count = task->fd_table.size();
+    task->fd_table_lock.unlock_irqrestore(irqf);
+
+    if (!inserted) {
         return -1;  // EMFILE (too many open files) or OOM
     }
     file->fd = static_cast<int>(slot);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
-                                          static_cast<int64_t>(task->fd_table.size()), 0,
+                                          static_cast<int64_t>(fd_count), 0,
                                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return static_cast<int>(slot);
 }
@@ -2463,16 +2501,46 @@ auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
     if (task == nullptr || fd < 0) {
         return nullptr;
     }
-    return reinterpret_cast<struct File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    uint64_t irqf = task->fd_table_lock.lock_irqsave();
+    auto* file = reinterpret_cast<struct File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    task->fd_table_lock.unlock_irqrestore(irqf);
+    return file;
+}
+
+auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> File* {
+    if (task == nullptr || fd < 0) {
+        return nullptr;
+    }
+    uint64_t irqf = task->fd_table_lock.lock_irqsave();
+    auto* file = reinterpret_cast<File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    if (file == nullptr) {
+        task->fd_table_lock.unlock_irqrestore(irqf);
+        return nullptr;
+    }
+    file->refcount.fetch_add(1, std::memory_order_acq_rel);
+    task->fd_table_lock.unlock_irqrestore(irqf);
+    return file;
+}
+
+void vfs_put_file(File* f) {
+    if (f == nullptr) {
+        return;
+    }
+    if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        vfs_destroy_file(f);
+    }
 }
 
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     if (task == nullptr || fd < 0) {
         return -1;
     }
+    uint64_t irqf = task->fd_table_lock.lock_irqsave();
     task->fd_table.remove(static_cast<uint64_t>(fd));
+    size_t fd_count = task->fd_table.size();
+    task->fd_table_lock.unlock_irqrestore(irqf);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                          static_cast<int64_t>(task->fd_table.size()), 0,
+                                          static_cast<int64_t>(fd_count), 0,
                                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return 0;
 }
@@ -2495,11 +2563,24 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
     if (dirfd == AT_FDCWD) {
         base = task->cwd;
     } else {
-        auto* file = vfs_get_file(task, dirfd);
+        auto* file = vfs_get_file_retain(task, dirfd);
         if (file == nullptr) return -EBADF;
-        if (!file->is_directory) return -ENOTDIR;
-        base = file->vfs_path;
-        if (base == nullptr) return -EBADF;
+        if (!file->is_directory) {
+            vfs_put_file(file);
+            return -ENOTDIR;
+        }
+        if (file->vfs_path == nullptr) {
+            vfs_put_file(file);
+            return -EBADF;
+        }
+        size_t base_len = strlen(file->vfs_path);
+        if (base_len >= resolved_size) {
+            vfs_put_file(file);
+            return -ENAMETOOLONG;
+        }
+        memcpy(resolved, file->vfs_path, base_len + 1);
+        vfs_put_file(file);
+        base = resolved;
     }
 
     // Concatenate base + "/" + pathname
@@ -2527,14 +2608,17 @@ auto vfs_isatty(int fd) -> bool {
     if (t == nullptr) {
         return false;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
         return false;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_isatty == nullptr)) {
+        vfs_put_file(f);
         return false;
     }
-    return f->fops->vfs_isatty(f);
+    bool result = f->fops->vfs_isatty(f);
+    vfs_put_file(f);
+    return result;
 }
 
 auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
@@ -2542,18 +2626,20 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     if (t == nullptr) {
         return -ESRCH;
     }
-    ker::vfs::File* f = vfs_get_file(t, fd);
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
         return -EBADF;
     }
 
     // Check if this is a directory
     if (!f->is_directory) {
+        vfs_put_file(f);
         return -ENOTDIR;
     }
 
     // Buffer must be large enough for at least one DirEntry
     if (buffer == nullptr || max_size < sizeof(DirEntry)) {
+        vfs_put_file(f);
         return -EINVAL;
     }
 
@@ -2779,7 +2865,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     // Update file position
     f->pos += static_cast<off_t>(entries_read);
 
-    return static_cast<ssize_t>(entries_read * sizeof(DirEntry));
+    auto result = static_cast<ssize_t>(entries_read * sizeof(DirEntry));
+    vfs_put_file(f);
+    return result;
 }
 
 // --- Symlink / mkdir / mount operations ---
@@ -3231,7 +3319,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
         return -ESRCH;
     }
 
-    auto* file = vfs_get_file(task, fd);
+    auto* file = vfs_get_file_retain(task, fd);
     if (file == nullptr) {
         return -EBADF;
     }
@@ -3240,7 +3328,9 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
     memset(statbuf, 0, sizeof(stat));
 
     if (file->fops == nullptr && file->private_data == nullptr && file->is_directory && file->vfs_path != nullptr) {
-        return fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
+        int result = fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
+        vfs_put_file(file);
+        return result;
     }
 
     MountPoint* fstat_mount = file->vfs_path ? find_mount_point(file->vfs_path) : nullptr;
@@ -3253,10 +3343,12 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                 // Return minimal stat for pseudo-TMPFS (pipes, epoll)
                 statbuf->st_mode = S_IFIFO;
                 statbuf->st_blksize = 4096;
+                vfs_put_file(file);
                 return 0;
             }
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
             if (node == nullptr) {
+                vfs_put_file(file);
                 return -EBADF;
             }
             statbuf->st_dev = fstat_dev_id;
@@ -3279,11 +3371,13 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            vfs_put_file(file);
             return 0;
         }
         case FSType::FAT32: {
             int r = ker::vfs::fat32::fat32_fstat(file, statbuf);
             if (r == 0) statbuf->st_dev = fstat_dev_id;
+            vfs_put_file(file);
             return r;
         }
         case FSType::DEVFS: {
@@ -3304,6 +3398,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             } else {
                 statbuf->st_mode = S_IFCHR | (node ? node->mode : 0666);
             }
+            vfs_put_file(file);
             return 0;
         }
         case FSType::SOCKET: {
@@ -3317,6 +3412,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
+            vfs_put_file(file);
             return 0;
         }
         case FSType::REMOTE: {
@@ -3327,6 +3423,7 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                     int ret = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
                     if (ret == 0) {
                         statbuf->st_dev = mount->dev_id;
+                        vfs_put_file(file);
                         return 0;
                     }
                 }
@@ -3348,14 +3445,17 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
                 statbuf->st_mode = S_IFREG | 0644;
                 statbuf->st_size = 0;
             }
+            vfs_put_file(file);
             return 0;
         }
         case FSType::XFS: {
             int r = ker::vfs::xfs::xfs_fstat(file, statbuf);
             if (r == 0) statbuf->st_dev = fstat_dev_id;
+            vfs_put_file(file);
             return r;
         }
         default:
+            vfs_put_file(file);
             return -ENOSYS;
     }
 }
@@ -3436,7 +3536,7 @@ auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
         return -ESRCH;
     }
 
-    auto* file = vfs_get_file(task, fd);
+    auto* file = vfs_get_file_retain(task, fd);
     if (file == nullptr) {
         return -EBADF;
     }
@@ -3450,11 +3550,19 @@ auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
         if (mount != nullptr) {
             switch (mount->fs_type) {
                 case FSType::XFS:
-                    return ker::vfs::xfs::xfs_statvfs(
-                        static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+                    {
+                        int result = ker::vfs::xfs::xfs_statvfs(
+                            static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+                        vfs_put_file(file);
+                        return result;
+                    }
                 case FSType::FAT32:
-                    return ker::vfs::fat32::fat32_statvfs(
-                        static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+                    {
+                        int result = ker::vfs::fat32::fat32_statvfs(
+                            static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+                        vfs_put_file(file);
+                        return result;
+                    }
                 default:
                     break;
             }
@@ -3475,18 +3583,22 @@ auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
             buf->f_ffree   = free_blocks;
             buf->f_favail  = free_blocks;
             buf->f_namemax = 255;
+            vfs_put_file(file);
             return 0;
         }
         case FSType::DEVFS:
         case FSType::PROCFS:
         case FSType::SOCKET:
             fill_synthetic_statvfs(buf);
+            vfs_put_file(file);
             return 0;
         case FSType::REMOTE:
             fill_synthetic_statvfs(buf);
             buf->f_flag = ST_RDONLY;
+            vfs_put_file(file);
             return 0;
         default:
+            vfs_put_file(file);
             return -ENOSYS;
     }
 }
@@ -3567,12 +3679,11 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
 auto vfs_dup(int oldfd) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* f = vfs_get_file(task, oldfd);
+    auto* f = vfs_get_file_retain(task, oldfd);
     if (f == nullptr) return -EBADF;
-    f->refcount.fetch_add(1, std::memory_order_relaxed);
     int newfd = vfs_alloc_fd(task, f);
     if (newfd < 0) {
-        f->refcount.fetch_sub(1, std::memory_order_relaxed);
+        vfs_put_file(f);
         return -EMFILE;
     }
     return newfd;
@@ -3586,25 +3697,32 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     if (newfd < 0 || static_cast<unsigned>(newfd) >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
         return -EBADF;
     }
-    auto* f = vfs_get_file(task, oldfd);
+    auto* f = vfs_get_file_retain(task, oldfd);
     if (f == nullptr) {
         return -EBADF;
     }
     if (oldfd == newfd) {
+        vfs_put_file(f);
         return newfd;
     }
-    // Close newfd if it's open
-    auto* existing = vfs_get_file(task, newfd);
-    if (existing != nullptr) {
-        vfs_close(newfd);
-    }
-    f->refcount.fetch_add(1, std::memory_order_relaxed);
-    if (!task->fd_table.insert(static_cast<uint64_t>(newfd), f)) {
-        f->refcount.fetch_sub(1, std::memory_order_relaxed);
+
+    uint64_t irqf = task->fd_table_lock.lock_irqsave();
+    auto* existing = vfs_take_fd_locked(task, newfd);
+    bool inserted = task->fd_table.insert(static_cast<uint64_t>(newfd), f);
+    task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+    task->fd_table_lock.unlock_irqrestore(irqf);
+
+    if (!inserted) {
+        if (existing != nullptr) {
+            vfs_put_file(existing);
+        }
+        vfs_put_file(f);
         return -EMFILE;
     }
-    // POSIX: dup2 does NOT inherit close-on-exec from the source fd
-    task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+
+    if (existing != nullptr) {
+        vfs_put_file(existing);
+    }
     return newfd;
 }
 
@@ -3732,15 +3850,18 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     if (task == nullptr) {
         return -ESRCH;
     }
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) {
         return -EBADF;
     }
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
+        vfs_put_file(f);
         return -ENOSYS;
     }
     // Read at given offset without modifying file position
-    return f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset));
+    auto result = f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset));
+    vfs_put_file(f);
+    return result;
 }
 
 auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t {
@@ -3748,14 +3869,17 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
     if (task == nullptr) {
         return -ESRCH;
     }
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) {
         return -EBADF;
     }
     if (f->fops == nullptr || f->fops->vfs_write == nullptr) {
+        vfs_put_file(f);
         return -ENOSYS;
     }
-    return f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset));
+    auto result = f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset));
+    vfs_put_file(f);
+    return result;
 }
 
 // --- unlink ---
@@ -4151,22 +4275,32 @@ auto vfs_chmod(const char* path, int mode) -> int {
 auto vfs_fchmod(int fd, int mode) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) return -EBADF;
 
     switch (f->fs_type) {
         case FSType::TMPFS: {
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(f->private_data);
-            if (node == nullptr) return -EBADF;
+            if (node == nullptr) {
+                vfs_put_file(f);
+                return -EBADF;
+            }
             node->mode = static_cast<uint32_t>(mode) & 07777;
+            vfs_put_file(f);
             return 0;
         }
         case FSType::DEVFS:
         case FSType::FAT32:
+            vfs_put_file(f);
             return 0;  // No permission model; silently accept
         case FSType::XFS:
-            return ker::vfs::xfs::xfs_fchmod(f, mode);
+            {
+                int result = ker::vfs::xfs::xfs_fchmod(f, mode);
+                vfs_put_file(f);
+                return result;
+            }
         default:
+            vfs_put_file(f);
             return -ENOSYS;
     }
 }
@@ -4208,22 +4342,28 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
 auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) return -EBADF;
 
     switch (f->fs_type) {
         case FSType::TMPFS: {
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(f->private_data);
-            if (node == nullptr) return -EBADF;
+            if (node == nullptr) {
+                vfs_put_file(f);
+                return -EBADF;
+            }
             if (owner != static_cast<uint32_t>(-1)) node->uid = owner;
             if (group != static_cast<uint32_t>(-1)) node->gid = group;
+            vfs_put_file(f);
             return 0;
         }
         case FSType::DEVFS:
         case FSType::FAT32:
         case FSType::XFS:
+            vfs_put_file(f);
             return 0;  // Accept silently
         default:
+            vfs_put_file(f);
             return -ENOSYS;
     }
 }
@@ -4232,13 +4372,17 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
 auto vfs_ftruncate(int fd, off_t length) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) return -EBADF;
-    if (f->fops == nullptr || f->fops->vfs_truncate == nullptr) return -ENOSYS;
+    if (f->fops == nullptr || f->fops->vfs_truncate == nullptr) {
+        vfs_put_file(f);
+        return -ENOSYS;
+    }
     int ret = f->fops->vfs_truncate(f, length);
     if (ret == 0) {
         stream_invalidate_file(f);
     }
+    vfs_put_file(f);
     return ret;
 }
 
@@ -4246,46 +4390,71 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
 auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* f = vfs_get_file(task, fd);
+    auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) return -EBADF;
 
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)
     switch (cmd) {
         case 0: {  // F_DUPFD - dup to fd >= arg
-            f->refcount.fetch_add(1, std::memory_order_relaxed);
+            uint64_t irqf = task->fd_table_lock.lock_irqsave();
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
-            if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount.fetch_sub(1, std::memory_order_relaxed);
+            bool inserted = slot != UINT64_MAX && task->fd_table.insert(slot, f);
+            if (inserted) {
+                task->clear_fd_cloexec(static_cast<unsigned>(slot));
+            }
+            task->fd_table_lock.unlock_irqrestore(irqf);
+            if (!inserted) {
+                vfs_put_file(f);
                 return -EMFILE;
             }
-            task->clear_fd_cloexec(static_cast<unsigned>(slot));
             return static_cast<int>(slot);
         }
         case 1:  // F_GETFD
-            return task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
-        case 2:  // F_SETFD
-            if (arg & 1) {
-                task->set_fd_cloexec(static_cast<unsigned>(fd));
-            } else {
-                task->clear_fd_cloexec(static_cast<unsigned>(fd));
+            {
+                uint64_t irqf = task->fd_table_lock.lock_irqsave();
+                int result = task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
+                task->fd_table_lock.unlock_irqrestore(irqf);
+                vfs_put_file(f);
+                return result;
             }
-            return 0;
+        case 2:  // F_SETFD
+            {
+                uint64_t irqf = task->fd_table_lock.lock_irqsave();
+                if (arg & 1) {
+                    task->set_fd_cloexec(static_cast<unsigned>(fd));
+                } else {
+                    task->clear_fd_cloexec(static_cast<unsigned>(fd));
+                }
+                task->fd_table_lock.unlock_irqrestore(irqf);
+                vfs_put_file(f);
+                return 0;
+            }
         case 3:  // F_GETFL
-            return f->open_flags;
+            {
+                int result = f->open_flags;
+                vfs_put_file(f);
+                return result;
+            }
         case 4:  // F_SETFL
             f->open_flags = static_cast<int>(arg);
+            vfs_put_file(f);
             return 0;
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
-            f->refcount.fetch_add(1, std::memory_order_relaxed);
+            uint64_t irqf = task->fd_table_lock.lock_irqsave();
             uint64_t slot = task->fd_table.find_first_unset(static_cast<uint64_t>(arg));
-            if (slot == UINT64_MAX || !task->fd_table.insert(slot, f)) {
-                f->refcount.fetch_sub(1, std::memory_order_relaxed);
+            bool inserted = slot != UINT64_MAX && task->fd_table.insert(slot, f);
+            if (inserted) {
+                task->set_fd_cloexec(static_cast<unsigned>(slot));
+            }
+            task->fd_table_lock.unlock_irqrestore(irqf);
+            if (!inserted) {
+                vfs_put_file(f);
                 return -EMFILE;
             }
-            task->set_fd_cloexec(static_cast<unsigned>(slot));
             return static_cast<int>(slot);
         }
         default:
+            vfs_put_file(f);
             return -EINVAL;
     }
 }
@@ -5096,14 +5265,15 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     }
 
     // Get input file
-    auto* infile = vfs_get_file(task, infd);
+    auto* infile = vfs_get_file_retain(task, infd);
     if (infile == nullptr) {
         return -EBADF;
     }
 
     // Get output file
-    auto* outfile = vfs_get_file(task, outfd);
+    auto* outfile = vfs_get_file_retain(task, outfd);
     if (outfile == nullptr) {
+        vfs_put_file(infile);
         return -EBADF;
     }
 
@@ -5112,6 +5282,8 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     constexpr size_t BUF_SIZE = 64UL * 1024UL;
     auto* buffer = new char[BUF_SIZE];
     if (buffer == nullptr) {
+        vfs_put_file(outfile);
+        vfs_put_file(infile);
         return -ENOMEM;
     }
 
@@ -5125,6 +5297,8 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         if (read_result < 0) {
             if (total_sent == 0) {
                 delete[] buffer;
+                vfs_put_file(outfile);
+                vfs_put_file(infile);
                 return read_result;
             }
             break;
@@ -5148,6 +5322,8 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
                     } else {
                         infile->pos = source_offset;
                     }
+                    vfs_put_file(outfile);
+                    vfs_put_file(infile);
                     return total_sent > 0 ? total_sent : write_result;
                 }
                 if (total_sent == 0) {
@@ -5157,6 +5333,8 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
                     } else {
                         infile->pos = source_offset;
                     }
+                    vfs_put_file(outfile);
+                    vfs_put_file(infile);
                     return write_result;
                 }
                 chunk_offset = chunk_size;
@@ -5184,24 +5362,32 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     }
 
     delete[] buffer;
+    vfs_put_file(outfile);
+    vfs_put_file(infile);
     return total_sent;
 }
 
 auto vfs_fsync(int fd) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) return -ESRCH;
-    auto* file = vfs_get_file(task, fd);
+    auto* file = vfs_get_file_retain(task, fd);
     if (file == nullptr) return -EBADF;
 
     switch (file->fs_type) {
         case FSType::FAT32:
-            return ker::vfs::fat32::fat32_fsync(file);
+            {
+                int result = ker::vfs::fat32::fat32_fsync(file);
+                vfs_put_file(file);
+                return result;
+            }
         case FSType::XFS:
         case FSType::TMPFS:
         case FSType::DEVFS:
         case FSType::PROCFS:
+            vfs_put_file(file);
             return 0;  // No-op for in-memory or read-only filesystems
         default:
+            vfs_put_file(file);
             return 0;
     }
 }

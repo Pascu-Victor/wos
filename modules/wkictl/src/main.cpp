@@ -5,6 +5,7 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -25,8 +26,8 @@ auto command_basename(const char* path) -> const char* {
 auto usage() -> int {
     std::println(stderr,
                  "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  on <hostname> <command> [args...]\n  forward "
-                 "[+include_path] [-exclude_path] [--] <command> [args...]\n  wkictl "
-                 "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>");
+                 "[+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
+                 "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl wosid");
     return 1;
 }
 
@@ -34,6 +35,49 @@ auto exec_command(char** argv) -> int {
     execvp(argv[0], argv);
     std::println(stderr, "{}: exec failed: {}", argv[0], std::strerror(errno));
     return 127;
+}
+
+auto read_trimmed_file(const char* path, char* out, size_t out_size) -> bool {
+    if (path == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        out[0] = '\0';
+        return false;
+    }
+
+    ssize_t n = read(fd, out, out_size - 1);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    if (n <= 0) {
+        out[0] = '\0';
+        return false;
+    }
+
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) {
+        --n;
+    }
+    out[n] = '\0';
+    return true;
+}
+
+auto print_wosid() -> int {
+    std::array<char, 64> launcher = {};
+    std::array<char, 64> runner = {};
+    std::array<char, 32> remote_pid = {};
+
+    const char* launcher_text =
+        read_trimmed_file("/proc/self/wki_launcher", launcher.data(), launcher.size()) ? launcher.data() : "<unknown>";
+    const char* runner_text =
+        read_trimmed_file("/proc/self/wki_runner", runner.data(), runner.size()) ? runner.data() : "<unknown>";
+    const char* remote_pid_text =
+        read_trimmed_file("/proc/self/wki_remote_pid", remote_pid.data(), remote_pid.size()) ? remote_pid.data() : "0";
+
+    std::println("spawner={} host={} pid={} remote_pid={}", launcher_text, runner_text, ker::process::getpid(), remote_pid_text);
+    return 0;
 }
 
 auto route_name(uint32_t route) -> const char*;
@@ -377,6 +421,9 @@ auto run_wkictl(int argc, char** argv) -> int {
     if (argc < 2) {
         return usage();
     }
+    if (std::strcmp(argv[1], "wosid") == 0) {
+        return print_wosid();
+    }
     if (std::strcmp(argv[1], "target") == 0) {
         return handle_target(argc, argv);
     }
@@ -404,6 +451,9 @@ auto main(int argc, char** argv) -> int {
     }
     if (std::strcmp(name, "forward") == 0) {
         return run_forward(argc, argv);
+    }
+    if (std::strcmp(name, "wosid") == 0) {
+        return print_wosid();
     }
     return run_wkictl(argc, argv);
 }

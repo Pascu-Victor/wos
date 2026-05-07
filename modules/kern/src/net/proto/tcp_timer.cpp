@@ -44,20 +44,20 @@ struct DeferredRetransmit {
     TcpCB* ack_cb;
 };
 
-void retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* deferred, size_t& deferred_count) {
+auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* deferred, size_t deferred_count) -> size_t {
     entry->retries++;
     entry->send_time_ms = tcp_now_ms();
 
     if (entry->pkt == nullptr) {
-        return;
+        return deferred_count;
     }
     if (deferred_count >= MAX_DEFERRED_RETRANSMITS) {
-        return;
+        return deferred_count;
     }
 
     auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
-        return;
+        return deferred_count;
     }
 
     std::memcpy(pkt->storage.data(), entry->pkt->storage.data(), PKT_BUF_SIZE);
@@ -70,7 +70,7 @@ void retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* d
     deferred[deferred_count].seq_end = entry->seq + static_cast<uint32_t>(entry->len);
     tcp_cb_acquire(cb);
     deferred[deferred_count].cb = cb;
-    deferred_count++;
+    return deferred_count + 1;
 }
 
 void wake_socket_timer(Socket* sock) {
@@ -280,17 +280,23 @@ void tcp_timer_tick(uint64_t now_ms) {
         // hash_next still has the original bucket chain.
         uint32_t idx = tcp_hash_4tuple(to_free->local_ip, to_free->local_port, to_free->remote_ip, to_free->remote_port) % TCB_HASH_SIZE;
         auto& bucket = tcb_hash[idx];
+        bool removed_from_hash = false;
         bucket.lock.lock();
         TcpCB** hp = &bucket.head;
         while (*hp != nullptr) {
             if (*hp == to_free) {
                 *hp = to_free->hash_next;
                 to_free->hash_next = nullptr;
+                removed_from_hash = true;
                 break;
             }
             hp = &(*hp)->hash_next;
         }
         bucket.lock.unlock();
+        if (removed_from_hash) {
+            tcp_cb_release(to_free);
+        }
+        // Releasing the timer-list membership ref is separate from hash removal.
         tcp_cb_release(to_free);
         to_free = next_free;
     }
@@ -397,12 +403,12 @@ void tcp_timer_tick(uint64_t now_ms) {
                         sockets_to_wake[wake_count++] = rcb->socket;
                     }
                 } else {
-                    retransmit_segment(rcb, entry, deferred, deferred_count);
+                    deferred_count = retransmit_segment(rcb, entry, deferred, deferred_count);
 
                     if (entry->retries == 1) {
                         auto* nxt = entry->next;
                         while (nxt != nullptr && nxt->retries == 0 && deferred_count < MAX_TIMER_BATCH_ENTRIES) {
-                            retransmit_segment(rcb, nxt, deferred, deferred_count);
+                            deferred_count = retransmit_segment(rcb, nxt, deferred, deferred_count);
                             nxt = nxt->next;
                         }
                     }

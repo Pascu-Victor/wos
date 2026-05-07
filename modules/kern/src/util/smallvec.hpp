@@ -29,12 +29,12 @@ class SmallVec {
 
     // No copy - explicit clone() instead to make allocation visible
     SmallVec(const SmallVec&) = delete;
-    SmallVec& operator=(const SmallVec&) = delete;
+    auto operator=(const SmallVec&) -> SmallVec& = delete;
 
     // Move
     SmallVec(SmallVec&& other) noexcept { move_from(other); }
 
-    SmallVec& operator=(SmallVec&& other) noexcept {
+    auto operator=(SmallVec&& other) noexcept -> SmallVec& {
         if (this != &other) {
             delete[] m_heap;
             move_from(other);
@@ -43,24 +43,30 @@ class SmallVec {
     }
 
     // Deep copy - returns false on OOM
-    [[nodiscard]] bool clone_from(const SmallVec& other) {
-        if (this == &other) return true;
+    [[nodiscard]] auto clone_from(const SmallVec& other) -> bool {
+        if (this == &other) {
+            return true;
+        }
         clear();
         for (size_t i = 0; i < other.m_size; ++i) {
-            if (!push_back(other[i])) return false;
+            if (!push_back(other[i])) {
+                return false;
+            }
         }
         return true;
     }
 
     // Append element. Returns false on OOM (element NOT added).
-    [[nodiscard]] bool push_back(const T& val) {
+    [[nodiscard]] auto push_back(const T& val) -> bool {
         if (m_size < InlineN) {
             m_inline[m_size++] = val;
             return true;
         }
         // Need heap
         if (m_size >= m_capacity) {
-            if (!grow()) return false;
+            if (!grow()) {
+                return false;
+            }
         }
         m_heap[m_size - InlineN] = val;
         m_size++;
@@ -74,8 +80,10 @@ class SmallVec {
     }
 
     // Remove element at index, shift remaining left. Returns false if index out of bounds.
-    bool remove_at(size_t index) {
-        if (index >= m_size) return false;
+    auto remove_at(size_t index) -> bool {
+        if (index >= m_size) {
+            return false;
+        }
         // Shift everything left by 1
         for (size_t i = index; i < m_size - 1; ++i) {
             at_mut(i) = at_ref(i + 1);
@@ -85,7 +93,7 @@ class SmallVec {
     }
 
     // Remove first occurrence of val. Returns true if found and removed.
-    bool remove(const T& val) {
+    auto remove(const T& val) -> bool {
         for (size_t i = 0; i < m_size; ++i) {
             if (at_ref(i) == val) {
                 return remove_at(i);
@@ -95,23 +103,25 @@ class SmallVec {
     }
 
     // Find index of val, returns m_size if not found
-    [[nodiscard]] size_t find(const T& val) const {
+    [[nodiscard]] auto find(const T& val) const -> size_t {
         for (size_t i = 0; i < m_size; ++i) {
-            if (at_ref(i) == val) return i;
+            if (at_ref(i) == val) {
+                return i;
+            }
         }
         return m_size;
     }
 
-    [[nodiscard]] bool contains(const T& val) const { return find(val) < m_size; }
+    [[nodiscard]] auto contains(const T& val) const -> bool { return find(val) < m_size; }
 
     // Access
-    const T& operator[](size_t i) const { return at_ref(i); }
-    T& operator[](size_t i) { return at_mut(i); }
+    auto operator[](size_t i) const -> const T& { return at_ref(i); }
+    auto operator[](size_t i) -> T& { return at_mut(i); }
 
-    [[nodiscard]] size_t size() const { return m_size; }
-    [[nodiscard]] bool empty() const { return m_size == 0; }
-    [[nodiscard]] size_t capacity() const { return m_capacity > 0 ? InlineN + m_capacity : InlineN; }
-    [[nodiscard]] bool is_spilled() const { return m_heap != nullptr; }
+    [[nodiscard]] auto size() const -> size_t { return m_size; }
+    [[nodiscard]] auto empty() const -> bool { return m_size == 0; }
+    [[nodiscard]] auto capacity() const -> size_t { return m_capacity > 0 ? InlineN + m_capacity : InlineN; }
+    [[nodiscard]] auto is_spilled() const -> bool { return m_heap != nullptr; }
 
     void clear() {
         m_size = 0;
@@ -120,23 +130,27 @@ class SmallVec {
 
     // Iterate
     template <typename Fn>
-    void for_each(Fn&& fn) const {
+    void for_each(Fn& fn) const {
         for (size_t i = 0; i < m_size; ++i) {
             fn(at_ref(i));
         }
     }
 
     template <typename Fn>
-    void for_each(Fn&& fn) {
+    void for_each(Fn& fn) {
         for (size_t i = 0; i < m_size; ++i) {
             fn(at_mut(i));
         }
     }
 
     // Pointer access for C-style APIs
-    T* data() {
-        if (m_size == 0) return nullptr;
-        if (m_size <= InlineN) return m_inline;
+    auto data() -> T* {
+        if (m_size == 0) {
+            return nullptr;
+        }
+        if (m_size <= InlineN) {
+            return m_inline;
+        }
         // Can't return contiguous pointer across inline+heap
         return nullptr;
     }
@@ -147,20 +161,26 @@ class SmallVec {
     size_t m_size{0};
     size_t m_capacity{0};  // heap capacity (elements beyond InlineN)
 
-    const T& at_ref(size_t i) const {
-        if (i < InlineN) return m_inline[i];
+    auto at_ref(size_t i) const -> const T& {
+        if (i < InlineN) {
+            return m_inline[i];
+        }
         return m_heap[i - InlineN];
     }
 
-    T& at_mut(size_t i) {
-        if (i < InlineN) return m_inline[i];
+    auto at_mut(size_t i) -> T& {
+        if (i < InlineN) {
+            return m_inline[i];
+        }
         return m_heap[i - InlineN];
     }
 
-    [[nodiscard]] bool grow() {
+    [[nodiscard]] auto grow() -> bool {
         size_t new_cap = m_capacity == 0 ? InlineN : m_capacity * 2;
         auto* new_buf = new (std::nothrow) T[new_cap];
-        if (!new_buf) return false;  // OOM
+        if (new_buf == nullptr) {
+            return false;  // OOM
+        }
 
         // Copy existing heap elements
         if (m_heap && m_capacity > 0) {

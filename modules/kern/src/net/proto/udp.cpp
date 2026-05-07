@@ -1,11 +1,17 @@
 #include "udp.hpp"
 
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/proto/ipv4.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
+#include "net/socket.hpp"
 
 namespace ker::net::proto {
 
@@ -118,7 +124,7 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
         return -1;
     }
     // Use connected destination
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;
     }
@@ -138,7 +144,15 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
                                                                                          : static_cast<ssize_t>(-1);
 }
 
-auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t { return sock->rcvbuf.read(buf, len); }
+auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
+    if (sock->rcvbuf.available() == 0) {
+        if (!sock->nonblock) {
+            socket_defer_wait(sock, "udp_wait");
+        }
+        return -EAGAIN;
+    }
+    return sock->rcvbuf.read(buf, len);
+}
 
 auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
     if (addr_raw == nullptr || addr_len < 8) {
@@ -162,7 +176,7 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
         udp_lock.unlock();
     }
 
-    auto* pkt = pkt_alloc();
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;
     }
@@ -187,10 +201,23 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
 }
 
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_raw, size_t* addr_len) -> ssize_t {
-    // For now, return data without source address info
-    // TODO: store per-datagram source address
-    (void)addr_raw;
-    (void)addr_len;
+    if (sock->rcvbuf.available() == 0) {
+        if (!sock->nonblock) {
+            socket_defer_wait(sock, "udp_wait");
+        }
+        return -EAGAIN;
+    }
+
+    if (addr_raw != nullptr && addr_len != nullptr) {
+        std::memset(addr_raw, 0, *addr_len);
+        if (*addr_len >= 8) {
+            auto* addr = static_cast<uint8_t*>(addr_raw);
+            *reinterpret_cast<uint16_t*>(addr) = 2;  // AF_INET
+            *reinterpret_cast<uint16_t*>(addr + 2) = htons(sock->remote_v4.port);
+            *reinterpret_cast<uint32_t*>(addr + 4) = htonl(sock->remote_v4.addr);
+        }
+        *addr_len = 16;
+    }
     return sock->rcvbuf.read(buf, len);
 }
 
@@ -278,6 +305,7 @@ void udp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     size_t data_len = payload_len - sizeof(UdpHeader);
     pkt->len = data_len;
 
+    Socket* wake_sock = nullptr;
     udp_lock.lock();
     auto* binding = find_binding(dst_ip, dst_port);
     if (binding == nullptr) {
@@ -287,13 +315,20 @@ void udp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
 
     if (binding != nullptr && binding->sock != nullptr) {
         // Deliver to socket receive buffer
-        binding->sock->rcvbuf.write(pkt->data, pkt->len);
+        ssize_t written = binding->sock->rcvbuf.write(pkt->data, pkt->len);
+        if (written > 0) {
+            wake_sock = binding->sock;
+        }
 
         // Store sender info for recvfrom
         binding->sock->remote_v4.addr = src_ip;
         binding->sock->remote_v4.port = ntohs(reinterpret_cast<const UdpHeader*>(pkt->data - sizeof(UdpHeader))->src_port);
     }
     udp_lock.unlock();
+
+    if (wake_sock != nullptr) {
+        socket_wake_waiters(wake_sock);
+    }
 
     pkt_free(pkt);
 }

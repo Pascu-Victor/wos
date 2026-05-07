@@ -37,9 +37,15 @@ struct DevServerBinding {
     net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
-    // V2: RX backpressure credit tracking [V2§A5.6]
+    // V2: RX backpressure credit tracking [V2 A5.6]
     uint16_t net_rx_credits = 0;  // credits granted by consumer for RX forwarding
     bool net_nic_opened = false;  // V2: true after OP_NET_OPEN received from consumer
+    bool net_state_valid = false;
+    uint32_t net_last_ipv4_addr = 0;
+    uint32_t net_last_ipv4_mask = 0;
+    std::array<uint8_t, 6> net_last_real_mac = {};
+    uint16_t net_last_link_state = 0;
+    uint32_t net_last_mtu = 1500;
 
     // RDMA block ring state (Phase 2: shared memory SQ/CQ for block I/O)
     uint32_t blk_zone_id = 0;
@@ -81,6 +87,12 @@ struct DevServerBinding {
           net_rx_filter(o.net_rx_filter),
           net_rx_credits(o.net_rx_credits),
           net_nic_opened(o.net_nic_opened),
+          net_state_valid(o.net_state_valid),
+          net_last_ipv4_addr(o.net_last_ipv4_addr),
+          net_last_ipv4_mask(o.net_last_ipv4_mask),
+          net_last_real_mac(o.net_last_real_mac),
+          net_last_link_state(o.net_last_link_state),
+          net_last_mtu(o.net_last_mtu),
           blk_zone_id(o.blk_zone_id),
           blk_zone_ptr(o.blk_zone_ptr),
           blk_rdma_active(o.blk_rdma_active),
@@ -117,6 +129,12 @@ struct DevServerBinding {
             net_rx_filter = o.net_rx_filter;
             net_rx_credits = o.net_rx_credits;
             net_nic_opened = o.net_nic_opened;
+            net_state_valid = o.net_state_valid;
+            net_last_ipv4_addr = o.net_last_ipv4_addr;
+            net_last_ipv4_mask = o.net_last_ipv4_mask;
+            net_last_real_mac = o.net_last_real_mac;
+            net_last_link_state = o.net_last_link_state;
+            net_last_mtu = o.net_last_mtu;
             blk_zone_id = o.blk_zone_id;
             blk_zone_ptr = o.blk_zone_ptr;
             blk_rdma_active = o.blk_rdma_active;
@@ -174,6 +192,10 @@ void wki_dev_server_process_pending_zones();
 // D11: RX forward callback - installed on NetDevice when remote consumer is attached.
 // Forwards received packets to all NET bindings for this device.
 void wki_dev_server_forward_net_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
+
+// Push the current owner NIC state (IPv4/link/MAC/MTU) to attached remote
+// proxies when a real NIC changes locally.
+void wki_dev_server_notify_net_changed(net::NetDevice* dev);
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

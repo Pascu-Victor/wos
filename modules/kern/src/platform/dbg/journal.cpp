@@ -54,7 +54,7 @@ std::atomic<uint64_t> s_latest_sequence{0};
 std::atomic<bool> s_time_available{false};
 std::atomic<bool> s_devices_registered{false};
 std::atomic<bool> s_devfs_ready{false};
-std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::TRACE)};
+std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::WARN)};
 uint64_t s_boot_id = 0x574f530000000001ULL;
 
 auto level_name(LogLevel level) -> const char* {

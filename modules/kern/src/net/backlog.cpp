@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
@@ -19,7 +18,6 @@
 namespace ker::net {
 
 namespace {
-
 BacklogQueue* queues = nullptr;
 std::atomic<bool> ready{false};
 uint64_t num_cpus = 0;

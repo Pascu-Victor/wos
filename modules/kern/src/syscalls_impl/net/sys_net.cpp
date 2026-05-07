@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <net/endian.hpp>
@@ -11,17 +12,28 @@
 #include <net/netif.hpp>
 #include <net/route.hpp>
 #include <net/socket.hpp>
+#include <net/wki/dev_server.hpp>
+#include <net/wki/remotable.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <string_view>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
+
+#include "platform/ktime/ktime.hpp"
+#include "vfs/file_operations.hpp"
 
 namespace ker::syscall::net {
 
 namespace {
 constexpr int WOS_ERESTARTSYS = 512;
+constexpr int WOS_MSG_DONTWAIT = 0x0040;
+constexpr int WOS_O_NONBLOCK = 04000;
+constexpr int WOS_O_RDWR = 2;
 constexpr uint64_t USEC_PER_MSEC = 1000;
 
 auto register_poll_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
@@ -58,6 +70,49 @@ void clear_poll_timeout(ker::mod::sched::task::Task* task) {
     }
 }
 
+auto socket_effective_nonblock(const ker::vfs::File* file, const ker::net::Socket* sock, int call_flags) -> bool {
+    bool file_nonblock = file != nullptr && (file->open_flags & WOS_O_NONBLOCK) != 0;
+    bool msg_nonblock = (call_flags & WOS_MSG_DONTWAIT) != 0;
+    bool socket_nonblock = sock != nullptr && sock->nonblock;
+    return file_nonblock || msg_nonblock || socket_nonblock;
+}
+
+struct SocketNonblockGuard {
+    ker::net::Socket* sock;
+    bool saved_nonblock;
+
+    SocketNonblockGuard(ker::net::Socket* sock_, bool effective_nonblock)
+        : sock(sock_), saved_nonblock(sock_ != nullptr ? sock_->nonblock : false) {
+        if (sock != nullptr) {
+            sock->nonblock = effective_nonblock;
+        }
+    }
+
+    ~SocketNonblockGuard() {
+        if (sock != nullptr) {
+            sock->nonblock = saved_nonblock;
+        }
+    }
+};
+
+template <typename T>
+auto maybe_restart_socket_wait(T result, bool nonblock) -> T {
+    if ((result == static_cast<T>(-EAGAIN) || result == static_cast<T>(-EINPROGRESS)) && !nonblock) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr && task->deferredTaskSwitch) {
+            return static_cast<T>(-WOS_ERESTARTSYS);
+        }
+    }
+    return result;
+}
+
+template <typename T, typename Fn>
+auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, Fn&& fn) -> T {
+    bool effective_nonblock = socket_effective_nonblock(file, sock, call_flags);
+    SocketNonblockGuard guard(sock, effective_nonblock);
+    return maybe_restart_socket_wait<T>(fn(), effective_nonblock);
+}
+
 // Socket file operations (integrate sockets with VFS fd table)
 int socket_fops_close(ker::vfs::File* f) {
     if (f == nullptr || f->private_data == nullptr) {
@@ -77,7 +132,7 @@ ssize_t socket_fops_read(ker::vfs::File* f, void* buf, size_t count, size_t) {
     if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
         return -ENOSYS;
     }
-    return sock->proto_ops->recv(sock, buf, count, 0);
+    return run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->recv(sock, buf, count, 0); });
 }
 
 ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t) {
@@ -88,7 +143,7 @@ ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size
     if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
         return -ENOSYS;
     }
-    return sock->proto_ops->send(sock, buf, count, 0);
+    return run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->send(sock, buf, count, 0); });
 }
 
 ker::vfs::FileOperations socket_fops = {
@@ -105,19 +160,36 @@ ker::vfs::FileOperations socket_fops = {
     .vfs_poll_register_waiter = nullptr,
 };
 
+struct SocketHandle {
+    ker::vfs::File* file = nullptr;
+    ker::net::Socket* sock = nullptr;
+
+    ~SocketHandle() {
+        if (file != nullptr) {
+            ker::vfs::vfs_put_file(file);
+        }
+    }
+};
+
 // Get socket from fd using VFS helpers
-auto fd_to_socket(uint64_t fd_num) -> ker::net::Socket* {
+auto fd_to_socket(uint64_t fd_num) -> SocketHandle {
+    SocketHandle handle;
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
-        return nullptr;
+        return handle;
     }
 
-    auto* file = ker::vfs::vfs_get_file(task, static_cast<int>(fd_num));
-    if (file == nullptr || file->fs_type != ker::vfs::FSType::SOCKET) {
-        return nullptr;
+    handle.file = ker::vfs::vfs_get_file_retain(task, static_cast<int>(fd_num));
+    if (handle.file == nullptr || handle.file->fs_type != ker::vfs::FSType::SOCKET) {
+        if (handle.file != nullptr) {
+            ker::vfs::vfs_put_file(handle.file);
+            handle.file = nullptr;
+        }
+        return handle;
     }
 
-    return static_cast<ker::net::Socket*>(file->private_data);
+    handle.sock = static_cast<ker::net::Socket*>(handle.file->private_data);
+    return handle;
 }
 
 // Allocate fd for a socket using VFS helpers
@@ -135,6 +207,7 @@ auto allocate_socket_fd(ker::net::Socket* sock) -> int {
     file->private_data = sock;
     file->fops = &socket_fops;
     file->pos = 0;
+    file->open_flags = WOS_O_RDWR | (sock->nonblock ? WOS_O_NONBLOCK : 0);
     file->is_directory = false;
     file->fs_type = ker::vfs::FSType::SOCKET;
     file->refcount = 1;
@@ -293,6 +366,8 @@ void apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
     uint32_t store = mask & stored_mask;
     dev->link_flags &= ~store;
     dev->link_flags |= flags & store;
+    ker::net::wki::wki_dev_server_notify_net_changed(dev);
+    ker::net::wki::wki_remotable_notify_net_changed(dev);
 }
 
 void fill_if_info(WosNetIfInfo& out, ker::net::NetDevice* dev) {
@@ -354,6 +429,8 @@ auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t 
     } else {
         std::memcpy(dev->mac.data(), hwaddr, 6);
     }
+    ker::net::wki::wki_dev_server_notify_net_changed(dev);
+    ker::net::wki::wki_remotable_notify_net_changed(dev);
     return 0;
 }
 }  // namespace
@@ -390,7 +467,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::BIND: {
             // a1=fd, a2=addr_ptr, a3=addr_len
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -403,7 +481,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::LISTEN: {
             // a1=fd, a2=backlog
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -416,7 +495,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::ACCEPT: {
             // a1=fd, a2=addr_ptr, a3=addr_len_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -425,7 +505,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             ker::net::Socket* new_sock = nullptr;
             auto* addr_len_ptr = reinterpret_cast<size_t*>(a3);
-            int result = sock->proto_ops->accept(sock, &new_sock, reinterpret_cast<void*>(a2), addr_len_ptr);
+            int result = run_socket_call<int>(handle.file, sock, 0, [&]() {
+                return sock->proto_ops->accept(sock, &new_sock, reinterpret_cast<void*>(a2), addr_len_ptr);
+            });
             if (result < 0 || new_sock == nullptr) {
                 return static_cast<uint64_t>(result);
             }
@@ -445,40 +527,49 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::CONNECT: {
             // a1=fd, a2=addr_ptr, a3=addr_len
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->connect == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int result = sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3));
+            int result = run_socket_call<int>(handle.file, sock, 0, [&]() {
+                return sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3));
+            });
             return static_cast<uint64_t>(result);
         }
 
         case ker::abi::net::ops::SEND: {
             // a1=fd, a2=buf, a3=len, a4=flags
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            ssize_t result = sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            ssize_t result = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
+                return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            });
             return static_cast<uint64_t>(result);
         }
 
         case ker::abi::net::ops::RECV: {
             // a1=fd, a2=buf, a3=len, a4=flags
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            ssize_t result = sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            ssize_t result = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
+                return sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            });
             return static_cast<uint64_t>(result);
         }
 
@@ -490,7 +581,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SENDTO: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=addr_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -498,14 +590,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            ssize_t result = sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
-                                                     reinterpret_cast<const void*>(a5), alen);
+            ssize_t result = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
+                return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
+                                               reinterpret_cast<const void*>(a5), alen);
+            });
             return static_cast<uint64_t>(result);
         }
 
         case ker::abi::net::ops::RECVFROM: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=addr_out_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -513,14 +608,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            ssize_t result = sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
-                                                       reinterpret_cast<void*>(a5), &alen);
+            ssize_t result = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
+                return sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
+                                                 reinterpret_cast<void*>(a5), &alen);
+            });
             return static_cast<uint64_t>(result);
         }
 
         case ker::abi::net::ops::SETSOCKOPT: {
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -534,7 +632,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETSOCKOPT: {
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -548,7 +647,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SHUTDOWN: {
             // a1=fd, a2=how
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -561,7 +661,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETPEERNAME: {
             // a1=fd, a2=addr_out, a3=addr_len_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -579,7 +680,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETSOCKNAME: {
             // a1=fd, a2=addr_out, a3=addr_len_ptr
-            auto* sock = fd_to_socket(a1);
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
@@ -966,6 +1068,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return static_cast<uint64_t>(ret);
                 }
             }
+            if ((req->fields & (WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_NAME)) != 0) {
+                ker::net::wki::wki_dev_server_notify_net_changed(dev);
+                ker::net::wki::wki_remotable_notify_net_changed(dev);
+            }
             return 0;
         }
 
@@ -995,7 +1101,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     continue;
                 }
 
-                auto* file = ker::vfs::vfs_get_file(task, fds[i].fd);
+                auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
                 if (file == nullptr) {
                     fds[i].revents = 0x0020;  // POLLNVAL
                     num_events++;
@@ -1014,6 +1120,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     // Non-socket fds without poll_check (regular files, devices) are always ready
                     fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));  // POLLIN|POLLOUT
                 }
+                ker::vfs::vfs_put_file(file);
 
                 if (fds[i].revents != 0) {
                     num_events++;
@@ -1045,8 +1152,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (fds[i].fd < 0) {
                         continue;
                     }
-                    auto* file = ker::vfs::vfs_get_file(task, fds[i].fd);
-                    if (file == nullptr || !register_poll_waiter(file, task->pid)) {
+                    auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
+                    bool ok = (file != nullptr) && register_poll_waiter(file, task->pid);
+                    if (file != nullptr) {
+                        ker::vfs::vfs_put_file(file);
+                    }
+                    if (!ok) {
                         can_block = false;
                         break;
                     }
@@ -1067,7 +1178,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 for (size_t i = 0; i < nfds; i++) {
                     fds[i].revents = 0;
                     if (fds[i].fd < 0) continue;
-                    auto* rf = ker::vfs::vfs_get_file(task, fds[i].fd);
+                    auto* rf = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
                     if (rf == nullptr) continue;
                     if (rf->fs_type == ker::vfs::FSType::SOCKET) {
                         auto* sock = static_cast<ker::net::Socket*>(rf->private_data);
@@ -1079,6 +1190,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     } else {
                         fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));
                     }
+                    ker::vfs::vfs_put_file(rf);
                     if (fds[i].revents != 0) recheck++;
                 }
                 if (recheck > 0) {
