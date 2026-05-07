@@ -1,14 +1,19 @@
 #include "xhci.hpp"
 
+#include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
+#include "dev/pci.hpp"
+#include "util/hcf.hpp"
+
 namespace ker::dev::usb {
+
+using log = ker::mod::dbg::logger<"xhci">;
 
 constexpr size_t MAX_XHCI_CONTROLLERS = 2;
 XhciController* controllers[MAX_XHCI_CONTROLLERS] = {};
@@ -47,18 +52,22 @@ struct Alloc {
 
 auto alloc_page() -> Alloc {
     void* v = mod::mm::phys::pageAlloc(4096);
-    if (v == nullptr) return {nullptr, 0};
+    if (v == nullptr) {
+        return {.virt = nullptr, .phys = 0};
+    }
     std::memset(v, 0, 4096);
-    return {v, virt_to_phys(v)};
+    return {.virt = v, .phys = virt_to_phys(v)};
 }
 
 auto alloc_pages(size_t bytes) -> Alloc {
     // Round up to page
     size_t pages = (bytes + 4095) / 4096;
     void* v = mod::mm::phys::pageAlloc(pages * 4096);
-    if (v == nullptr) return {nullptr, 0};
+    if (v == nullptr) {
+        return {.virt = nullptr, .phys = 0};
+    }
     std::memset(v, 0, pages * 4096);
-    return {v, virt_to_phys(v)};
+    return {.virt = v, .phys = virt_to_phys(v)};
 }
 
 // -- Ring operations --
@@ -105,7 +114,7 @@ auto send_command(XhciController* hc, uint64_t param, uint32_t status, uint32_t 
     }
 
     hc->cmd_lock.unlock();
-    mod::io::serial::write("xhci: command timeout\n");
+    log::warn("command timeout");
     return -1;
 }
 
@@ -215,11 +224,7 @@ void process_event(XhciController* hc, Trb* evt) {
 
         if (portsc & XHCI_PORTSC_CCS) {
             uint8_t spd = (portsc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
-            mod::io::serial::write("xhci: port ");
-            mod::io::serial::writeHex(port_id);
-            mod::io::serial::write(" connect speed=");
-            mod::io::serial::writeHex(spd);
-            mod::io::serial::write("\n");
+            log::debug("port %u connect speed=%u", port_id, spd);
 
             // For USB2 ports, need to reset. USB3 ports auto-enable.
             if (spd < XHCI_SPEED_SUPER) {
@@ -283,15 +288,11 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     // 1. Enable Slot
     int slot = enable_slot(hc);
     if (slot <= 0 || slot >= static_cast<int>(MAX_XHCI_SLOTS)) {
-        mod::io::serial::write("xhci: enable slot failed\n");
+        log::warn("enable slot failed");
         return;
     }
 
-    mod::io::serial::write("xhci: slot ");
-    mod::io::serial::writeHex(slot);
-    mod::io::serial::write(" for port ");
-    mod::io::serial::writeHex(port);
-    mod::io::serial::write("\n");
+    log::debug("slot %u for port %u", slot, port);
 
     auto& dev = hc->devices[slot];
     dev.slot_id = static_cast<uint8_t>(slot);
@@ -333,7 +334,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
 
     // 6. Address Device
     if (address_device(hc, dev.slot_id, dev.input_ctx_phys) != 0) {
-        mod::io::serial::write("xhci: address device failed\n");
+        log::warn("address device failed");
         dev.active = false;
         return;
     }
@@ -348,7 +349,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     setup.wLength = sizeof(UsbDeviceDescriptor);
 
     if (xhci_control_transfer(hc, dev.slot_id, &setup, &desc, sizeof(desc), true) != 0) {
-        mod::io::serial::write("xhci: get device descriptor failed\n");
+        log::warn("get device descriptor failed");
         return;
     }
 
@@ -358,13 +359,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     dev.device_subclass = desc.bDeviceSubClass;
     dev.device_protocol = desc.bDeviceProtocol;
 
-    mod::io::serial::write("xhci: USB device ");
-    mod::io::serial::writeHex(desc.idVendor);
-    mod::io::serial::write(":");
-    mod::io::serial::writeHex(desc.idProduct);
-    mod::io::serial::write(" class=");
-    mod::io::serial::writeHex(desc.bDeviceClass);
-    mod::io::serial::write("\n");
+    log::info("USB device %04x:%04x class=0x%02x", desc.idVendor, desc.idProduct, desc.bDeviceClass);
 
     // 8. Get Configuration Descriptor
     if (desc.bNumConfigurations == 0) return;
@@ -374,7 +369,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     setup.wValue = (USB_DESC_CONFIG << 8);
     setup.wLength = sizeof(UsbConfigDescriptor);
     if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf, sizeof(UsbConfigDescriptor), true) != 0) {
-        mod::io::serial::write("xhci: get config descriptor failed\n");
+        log::warn("get config descriptor failed");
         return;
     }
 
@@ -385,7 +380,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     // Now fetch full config
     setup.wLength = total_len;
     if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf, total_len, true) != 0) {
-        mod::io::serial::write("xhci: get full config failed\n");
+        log::warn("get full config failed");
         return;
     }
 
@@ -416,9 +411,7 @@ void probe_class_drivers(XhciController* hc, UsbDevice* dev, uint8_t* config_dat
             auto* iface = reinterpret_cast<UsbInterfaceDescriptor*>(config_data + offset);
             for (auto* drv = class_drivers; drv != nullptr; drv = drv->next) {
                 if (drv->probe(dev, iface)) {
-                    mod::io::serial::write("xhci: class driver '");
-                    mod::io::serial::write(drv->name);
-                    mod::io::serial::write("' matched\n");
+                    log::info("class driver '%s' matched", drv->name);
                     drv->attach(dev, iface, config_data, config_len);
                     return;
                 }
@@ -434,11 +427,7 @@ void scan_ports(XhciController* hc) {
         uint32_t portsc = read32(hc->op, XHCI_OP_PORTSC + (p - 1) * 0x10);
         if (portsc & XHCI_PORTSC_CCS) {
             uint8_t spd = (portsc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
-            mod::io::serial::write("xhci: port ");
-            mod::io::serial::writeHex(p);
-            mod::io::serial::write(" already connected speed=");
-            mod::io::serial::writeHex(spd);
-            mod::io::serial::write("\n");
+            log::debug("port %u already connected speed=%u", p, spd);
 
             if (spd >= XHCI_SPEED_SUPER) {
                 enumerate_device(hc, p, spd);
@@ -467,7 +456,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     // Map BAR0 (MMIO) into kernel page table
     auto* bar0_ptr = pci::pci_map_bar(pci_dev, 0);
     if (bar0_ptr == nullptr) {
-        mod::io::serial::write("xhci: BAR0 is zero\n");
+        log::error("BAR0 is zero");
         return -1;
     }
 
@@ -489,15 +478,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     if (max_slots > MAX_XHCI_SLOTS) max_slots = MAX_XHCI_SLOTS;
     if (max_ports > MAX_XHCI_PORTS) max_ports = MAX_XHCI_PORTS;
 
-    mod::io::serial::write("xhci: slots=");
-    mod::io::serial::writeHex(max_slots);
-    mod::io::serial::write(" ports=");
-    mod::io::serial::writeHex(max_ports);
-    mod::io::serial::write(" intrs=");
-    mod::io::serial::writeHex(max_intrs);
-    mod::io::serial::write(" ctx64=");
-    mod::io::serial::writeHex(ctx64 ? 1 : 0);
-    mod::io::serial::write("\n");
+    log::info("slots=%u ports=%u intrs=%u ctx64=%u", max_slots, max_ports, max_intrs, ctx64 ? 1u : 0u);
 
     auto* op = const_cast<volatile uint8_t*>(base + cap_length);
     auto* rt = const_cast<volatile uint8_t*>(base + rtsoff);
@@ -609,7 +590,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     // 8. Set up IRQ
     uint8_t vector = mod::gates::allocateVector();
     if (vector == 0) {
-        mod::io::serial::write("xhci: no free IRQ vector\n");
+        log::error("no free IRQ vector");
         return -1;
     }
     hc->irq_vector = vector;
@@ -634,9 +615,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
 
     controllers[controller_count++] = hc;
 
-    mod::io::serial::write("xhci: controller ready, vec=");
-    mod::io::serial::writeHex(hc->irq_vector);
-    mod::io::serial::write("\n");
+    log::info("controller ready, vec=0x%02x", hc->irq_vector);
 
     // 10. Scan ports for already-connected devices
     scan_ports(hc);
@@ -703,7 +682,7 @@ auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* 
         asm volatile("pause");
     }
 
-    mod::io::serial::write("xhci: control transfer timeout\n");
+    log::warn("control transfer timeout");
     return -1;
 }
 
@@ -731,7 +710,7 @@ auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* ep, vo
         asm volatile("pause");
     }
 
-    mod::io::serial::write("xhci: bulk transfer timeout\n");
+    log::warn("bulk transfer timeout");
     return -1;
 }
 
@@ -746,13 +725,7 @@ auto xhci_init() -> int {
         // xHCI: class=0x0C, subclass=0x03, prog_if=0x30
         if (dev->class_code == pci::PCI_CLASS_SERIAL_BUS && dev->subclass_code == pci::PCI_SUBCLASS_USB &&
             dev->prog_if == pci::PCI_PROG_IF_XHCI) {
-            mod::io::serial::write("xhci: found controller at PCI ");
-            mod::io::serial::writeHex(dev->bus);
-            mod::io::serial::write(":");
-            mod::io::serial::writeHex(dev->slot);
-            mod::io::serial::write(".");
-            mod::io::serial::writeHex(dev->function);
-            mod::io::serial::write("\n");
+            log::info("found controller at PCI %02x:%02x.%x", dev->bus, dev->slot, dev->function);
 
             if (init_controller(dev) == 0) {
                 found++;
@@ -761,7 +734,7 @@ auto xhci_init() -> int {
     }
 
     if (found == 0) {
-        mod::io::serial::write("xhci: no controllers found\n");
+        log::info("no controllers found");
     }
 
     return found;

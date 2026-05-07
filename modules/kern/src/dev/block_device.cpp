@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
-#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <util/smallvec.hpp>
@@ -12,6 +11,8 @@
 #include "device.hpp"
 
 namespace ker::dev {
+
+using log = ker::mod::dbg::logger<"bdev">;
 
 // Block device registry
 namespace {
@@ -21,18 +22,16 @@ ker::util::SmallVec<Device, 8> block_dev_nodes;
 
 auto block_device_register(BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
-        mod::io::serial::write("block_device_register: invalid device\n");
+        log::warn("block_device_register: invalid device");
         return -1;
     }
 
     if (!block_devices.push_back(bdev)) {
-        mod::io::serial::write("block_device_register: device table full (OOM)\n");
+        log::warn("block_device_register: device table full (OOM)");
         return -1;
     }
 
-    mod::io::serial::write("block_device_register: registered ");
-    mod::io::serial::write(bdev->name.data());
-    mod::io::serial::write("\n");
+    log::debug("block_device_register: registered %s", bdev->name.data());
 
     // Also register as a device node in /dev
     // Create a Device wrapper for this block device
@@ -47,7 +46,7 @@ auto block_device_register(BlockDevice* bdev) -> int {
     if (!block_dev_nodes.push_back(dev_node)) {
         // Undo block_devices push
         block_devices.remove_at(block_devices.size() - 1);
-        mod::io::serial::write("block_device_register: dev node alloc failed (OOM)\n");
+        log::warn("block_device_register: dev node alloc failed (OOM)");
         return -1;
     }
 
@@ -76,9 +75,7 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
             mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_REMOVE,
                                              static_cast<int64_t>(block_devices.size()), 0, 0);
 
-            mod::io::serial::write("block_device_unregister: removed ");
-            mod::io::serial::write(bdev->name.data());
-            mod::io::serial::write("\n");
+            log::debug("block_device_unregister: removed %s", bdev->name.data());
             return 0;
         }
     }
@@ -123,14 +120,13 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
     }
 
     if (block + count > bdev->total_blocks) {
-        mod::dbg::log("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p\n",
-                      (unsigned long)block, (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0),
-                      __builtin_return_address(1));
+        log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p", (unsigned long)block,
+                  (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0), __builtin_return_address(1));
         return -1;
     }
 
     if (bdev->read_blocks == nullptr) {
-        mod::io::serial::write("block_read: read_blocks not implemented\n");
+        log::error("block_read: read_blocks not implemented");
         return -1;
     }
 
@@ -143,14 +139,13 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
     }
 
     if (block + count > bdev->total_blocks) {
-        mod::dbg::log("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p\n",
-                      (unsigned long)block, (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0),
-                      __builtin_return_address(1));
+        log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p", (unsigned long)block,
+                  (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0), __builtin_return_address(1));
         return -1;
     }
 
     if (bdev->write_blocks == nullptr) {
-        mod::io::serial::write("block_write: write_blocks not implemented\n");
+        log::error("block_write: write_blocks not implemented");
         return -1;
     }
 
@@ -279,14 +274,14 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
 
     block_device_register(part);
 
-    ker::mod::dbg::log("Created partition %s PARTUUID=%s", part->name.data(), part->partuuid_str.data());
+    log::debug("Created partition %s PARTUUID=%s", part->name.data(), part->partuuid_str.data());
 
     return part;
 }
 
 // Initializes block devices and enumerates GPT partitions on all registered disks
 auto block_device_init() -> void {
-    ker::mod::dbg::log("Initializing block devices");
+    log::debug("Initializing block devices");
 
     // Enumerate GPT partitions on all registered whole-disk block devices
     // We snapshot the current count since enumeration will register new partition devices
@@ -299,11 +294,11 @@ auto block_device_init() -> void {
 
         gpt::GPTDiskInfo disk_info{};
         if (gpt::gpt_enumerate_partitions(disk, &disk_info) != 0) {
-            ker::mod::dbg::log("No GPT found on %s", disk->name.data());
+            log::debug("No GPT found on %s", disk->name.data());
             continue;
         }
 
-        ker::mod::dbg::log("GPT: %s has %d partitions", disk->name.data(), disk_info.partition_count);
+        log::debug("GPT: %s has %d partitions", disk->name.data(), disk_info.partition_count);
 
         for (uint32_t p = 0; p < disk_info.partition_count; ++p) {
             auto& part = disk_info.partitions[p];
@@ -311,7 +306,7 @@ auto block_device_init() -> void {
         }
     }
 
-    ker::mod::dbg::log("Block device init complete: %d devices registered", static_cast<unsigned>(block_devices.size()));
+    log::debug("Block device init complete: %d devices registered", static_cast<unsigned>(block_devices.size()));
 }
 
 }  // namespace ker::dev

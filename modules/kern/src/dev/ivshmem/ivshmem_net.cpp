@@ -1,16 +1,23 @@
 #include "ivshmem_net.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <net/packet.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
 
+#include "dev/pci.hpp"
+#include "net/netdevice.hpp"
+#include "net/netpoll.hpp"
+
 namespace ker::dev::ivshmem {
 
+using log = ker::mod::dbg::logger<"ivsh">;
+
 // Forward declarations for NAPI
-int ivshmem_poll(ker::net::NapiStruct* napi, int budget);
+auto ivshmem_poll(ker::net::NapiStruct* napi, int budget) -> int;
 
 namespace {
 constexpr size_t MAX_IVSHMEM_DEVICES = 2;
@@ -173,7 +180,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     // Map BAR0 (registers) into kernel page table
     auto* bar0_ptr = pci::pci_map_bar(pci_dev, 0);
     if (bar0_ptr == nullptr) {
-        ker::mod::io::serial::write("ivshmem: BAR0 is zero\n");
+        log::error("BAR0 is zero");
         return -1;
     }
     auto* regs = reinterpret_cast<volatile uint32_t*>(bar0_ptr);
@@ -181,7 +188,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     // Map BAR2 (shared memory) into kernel page table
     auto* bar2_ptr = pci::pci_map_bar(pci_dev, 2);
     if (bar2_ptr == nullptr) {
-        ker::mod::io::serial::write("ivshmem: BAR2 is zero\n");
+        log::error("BAR2 is zero");
         return -1;
     }
     auto* shmem = const_cast<uint8_t*>(reinterpret_cast<volatile uint8_t*>(bar2_ptr));
@@ -291,13 +298,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
 
     devices[device_count++] = idev;
 
-    ker::mod::io::serial::write("ivshmem-net: ");
-    ker::mod::io::serial::write(idev->netdev.name.data());
-    ker::mod::io::serial::write(" vm_id=");
-    ker::mod::io::serial::writeHex(idev->my_vm_id);
-    ker::mod::io::serial::write(" shmem=");
-    ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(shmem));
-    ker::mod::io::serial::write(" ready\n");
+    log::info("%s vm_id=%u shmem=0x%lx ready", idev->netdev.name.data(), idev->my_vm_id, reinterpret_cast<uint64_t>(shmem));
 
     return 0;
 }
@@ -360,13 +361,7 @@ auto ivshmem_net_init() -> int {
         if (dev == nullptr) continue;
 
         if (dev->vendor_id == IVSHMEM_VENDOR && dev->device_id == IVSHMEM_DEVICE) {
-            ker::mod::io::serial::write("ivshmem: found device at PCI ");
-            ker::mod::io::serial::writeHex(dev->bus);
-            ker::mod::io::serial::write(":");
-            ker::mod::io::serial::writeHex(dev->slot);
-            ker::mod::io::serial::write(".");
-            ker::mod::io::serial::writeHex(dev->function);
-            ker::mod::io::serial::write("\n");
+            log::info("found device at PCI %02x:%02x.%x", dev->bus, dev->slot, dev->function);
 
             if (init_device(dev) == 0) {
                 found++;
@@ -375,7 +370,7 @@ auto ivshmem_net_init() -> int {
     }
 
     if (found == 0) {
-        ker::mod::io::serial::write("ivshmem: no devices found\n");
+        log::info("no devices found");
     }
 
     return found;

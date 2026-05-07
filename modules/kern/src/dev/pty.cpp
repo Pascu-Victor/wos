@@ -19,6 +19,8 @@
 
 namespace ker::dev::pty {
 
+using log = ker::mod::dbg::logger<"pty">;
+
 // ioctl command numbers (Linux-compatible)
 static constexpr unsigned long TIOCGPTN = 0x80045430;    // Get PTY number
 static constexpr unsigned long TIOCSPTLCK = 0x40045431;  // Set/clear PTY lock
@@ -1390,7 +1392,7 @@ Device ptmx_dev = {
 // --- Public API ---
 
 void pty_init() {
-    ker::mod::io::serial::write("pty: initializing PTY subsystem\n");
+    log::info("initializing PTY subsystem");
 
     // Register /dev/ptmx
     dev_register(&ptmx_dev);
@@ -1403,7 +1405,7 @@ void pty_init() {
     vfs::devfs::devfs_create_directory("pts");
 
     pty_initialized = true;
-    ker::mod::io::serial::write("pty: initialized (dynamic allocation)\n");
+    log::info("initialized (dynamic allocation)");
 }
 
 auto pty_alloc() -> int {

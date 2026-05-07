@@ -27,7 +27,6 @@
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-// constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
 constexpr const char* SERVE_ROOT = "/";
 
 using httpd_log = wos::journal<"httpd">;
@@ -37,11 +36,6 @@ template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
     std::string msg = std::format(fmt, std::forward<Args>(args)...);
     httpd_log::info("%s", msg.c_str());
-    // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
-    // if (log_stream.is_open()) {
-    std::cout << msg << '\n';
-    // log_stream.close();
-    // }
 }
 constexpr size_t REQUEST_BUFFER_SIZE = 4096;
 constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
@@ -791,7 +785,6 @@ auto main(int argc, char** argv) -> int {
     auto tid = ker::multiproc::currentThreadId();
 
     log_message("httpd[t:{},p:{}]: Starting HTTP server on 0.0.0.0:{}", tid, pid, HTTP_PORT);
-    std::println("httpd[t:{},p:{}]: Starting HTTP server on 0.0.0.0:{}", tid, pid, HTTP_PORT);
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);

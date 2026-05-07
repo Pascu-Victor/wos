@@ -4,6 +4,7 @@
 #include <sys/process.h>
 #include <sys/vfs.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstdint>
@@ -14,6 +15,76 @@
 namespace {
 constexpr int BACKGROUND_SERVICE_NICE = 10;
 using init_log = wos::journal<"init">;
+
+// Spawn a process with stdout and stderr captured to the journal under `tag`.
+// A drain child reads lines from the pipe and emits them as INFO journal entries.
+// Returns the service PID, or 0 on failure.
+static uint64_t spawn_with_journal_stdio(const char* path, const char* const argv[], const char* const envp[], const char* tag) {
+    int pipefd[2];
+    if (::pipe(pipefd) != 0) {
+        return 0;
+    }
+
+    int64_t service_pid = ker::process::fork();
+    if (service_pid < 0) {
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        return 0;
+    }
+    if (service_pid == 0) {
+        // Service child: redirect stdout and stderr to the write end, then exec.
+        ::dup2(pipefd[1], STDOUT_FILENO);
+        ::dup2(pipefd[1], STDERR_FILENO);
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        ker::process::execve(path, argv, envp);
+        ker::process::exit(127);
+        __builtin_unreachable();
+    }
+
+    // Parent: close write end so the drain child sees EOF when the service exits.
+    ::close(pipefd[1]);
+
+    int64_t drain_pid = ker::process::fork();
+    if (drain_pid < 0) {
+        ::close(pipefd[0]);
+        return static_cast<uint64_t>(service_pid);
+    }
+    if (drain_pid == 0) {
+        // Drain child: read lines from the pipe and emit each to the journal.
+        char buf[512];
+        char line[512];
+        int line_len = 0;
+        ssize_t n;
+        while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
+            for (ssize_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_len > 0) {
+                        line[line_len] = '\0';
+                        ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::info, line, static_cast<uint64_t>(line_len));
+                        line_len = 0;
+                    }
+                } else if (line_len < static_cast<int>(sizeof(line)) - 1) {
+                    line[line_len++] = c;
+                }
+            }
+        }
+        // Flush any partial line without trailing newline.
+        if (line_len > 0) {
+            line[line_len] = '\0';
+            ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::info, line, static_cast<uint64_t>(line_len));
+        }
+        ::close(pipefd[0]);
+        ker::process::exit(0);
+        __builtin_unreachable();
+    }
+
+    // Parent: drain child owns the read end.
+    ::close(pipefd[0]);
+    return static_cast<uint64_t>(service_pid);
+}
+
 }  // namespace
 
 void start_journald() {
@@ -64,7 +135,7 @@ void start_dropbear() {
         init_log::info("init[%d]: generating dropbear RSA host key...", cpuno);
         std::array<const char*, 6> keygen_argv = {"/bin/dropbearkey", "-t", "rsa", "-f", "/etc/dropbear/dropbear_rsa_host_key", nullptr};
         std::array<const char*, 1> keygen_envp = {nullptr};
-        uint64_t keygen_pid = ker::process::exec("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data());
+        uint64_t keygen_pid = spawn_with_journal_stdio("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data(), "sshd");
         if (keygen_pid == 0) {
             init_log::error("init[%d]: failed to spawn dropbearkey", cpuno);
         } else {
@@ -80,7 +151,7 @@ void start_dropbear() {
                                                 "-F",  // foreground, don't fork
                                                 nullptr};
     std::array<const char*, 1> dropbear_envp = {nullptr};
-    uint64_t dropbear_pid = ker::process::exec("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data());
+    uint64_t dropbear_pid = spawn_with_journal_stdio("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data(), "sshd");
     if (dropbear_pid == 0) {
         init_log::error("init[%d]: failed to spawn dropbear", cpuno);
     } else {

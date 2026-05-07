@@ -9,7 +9,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <vfs/buffer_cache.hpp>
@@ -35,6 +34,8 @@
 #endif
 
 namespace ker::vfs::xfs {
+
+using log = ker::mod::dbg::logger<"xfs">;
 
 // ============================================================================
 // Per-open-file state
@@ -1074,16 +1075,16 @@ auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::statvfs* buf) -> int {
         fsid_hi |= static_cast<uint64_t>(ctx->uuid.b[i + 8]) << (i * 8);
     }
 
-    buf->f_bsize   = ctx->block_size;
-    buf->f_frsize  = ctx->block_size;
-    buf->f_blocks  = ctx->total_blocks;
-    buf->f_bfree   = free_blocks;
-    buf->f_bavail  = free_blocks;
-    buf->f_files   = total_inodes;
-    buf->f_ffree   = free_inodes;
-    buf->f_favail  = free_inodes;
-    buf->f_fsid    = fsid_lo ^ fsid_hi;
-    buf->f_flag    = ctx->read_only ? ker::vfs::ST_RDONLY : 0;
+    buf->f_bsize = ctx->block_size;
+    buf->f_frsize = ctx->block_size;
+    buf->f_blocks = ctx->total_blocks;
+    buf->f_bfree = free_blocks;
+    buf->f_bavail = free_blocks;
+    buf->f_files = total_inodes;
+    buf->f_ffree = free_inodes;
+    buf->f_favail = free_inodes;
+    buf->f_fsid = fsid_lo ^ fsid_hi;
+    buf->f_flag = ctx->read_only ? ker::vfs::ST_RDONLY : 0;
     buf->f_namemax = 255;
     return 0;
 }
@@ -1663,52 +1664,29 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
     XfsMountContext* ctx = nullptr;
     int ret = xfs_mount(device, false /* read_write */, &ctx);
     if (ret != 0) {
-        ker::mod::io::serial::write("xfs: mount failed with error ");
-        // Simple integer print
-        std::array<char, 16> tmp{};
-        int abs_ret = ret < 0 ? -ret : ret;
-        int pos = 0;
-        if (abs_ret == 0) {
-            tmp[pos++] = '0';
-        } else {
-            std::array<char, 16> rev{};
-            int rp = 0;
-            while (abs_ret > 0) {
-                rev[rp++] = static_cast<char>('0' + (abs_ret % 10));
-                abs_ret /= 10;
-            }
-            if (ret < 0) {
-                tmp[pos++] = '-';
-            }
-            while (rp > 0) {
-                tmp[pos++] = rev[--rp];
-            }
-        }
-        tmp[pos] = '\0';
-        ker::mod::io::serial::write(tmp.data());
-        ker::mod::io::serial::write("\n");
+        log::error("mount failed with error %d", ret);
         return nullptr;
     }
 
     // Initialize the log
     ret = xfs_log_mount(ctx);
     if (ret != 0) {
-        ker::mod::io::serial::write("xfs: log mount failed\n");
+        log::error("log mount failed");
         xfs_unmount(ctx);
         return nullptr;
     }
 
     if (xfs_log_needs_recovery(ctx)) {
-        ker::mod::io::serial::write("xfs: WARNING - journal is dirty, recovery not implemented\n");
+        log::warn("journal is dirty, recovery not implemented");
     }
 
-    ker::mod::io::serial::write(ctx->read_only ? "xfs: mounted successfully (read-only)\n" : "xfs: mounted successfully (read-write)\n");
+    log::info("mounted successfully (%s)", ctx->read_only ? "read-only" : "read-write");
     return ctx;
 }
 
 void register_xfs() {
     xfs_icache_init();
-    ker::mod::io::serial::write("xfs: filesystem driver registered\n");
+    log::info("filesystem driver registered");
 }
 
 }  // namespace ker::vfs::xfs

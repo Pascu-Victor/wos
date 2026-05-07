@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
-#include <mod/io/serial/serial.hpp>
 #include <net/net_trace.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -34,22 +33,16 @@ auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
 auto remotable_on_attach(uint16_t node_id) -> int {
     (void)node_id;
-#if NET_TRACE_ENABLE
-    ker::mod::io::serial::write("virtio-net: remote attach\n");
-#endif
+    net_log::trace("remote attach");
     return 0;
 }
 void remotable_on_detach(uint16_t node_id) {
     (void)node_id;
-#if NET_TRACE_ENABLE
-    ker::mod::io::serial::write("virtio-net: remote detach\n");
-#endif
+    net_log::trace("remote detach");
 }
 void remotable_on_fault(uint16_t node_id) {
     (void)node_id;
-#if NET_TRACE_ENABLE
-    ker::mod::io::serial::write("virtio-net: remote fault\n");
-#endif
+    net_log::trace("remote fault");
 }
 const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
@@ -70,7 +63,7 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     if (addr >= mod::mm::addr::get_hhdm_offset()) {
         uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
-            ker::mod::dbg::log("virtio_net: virt_to_phys failed for kernel address 0x%lx", addr);
+            net_log::error("virt_to_phys: failed for kernel address 0x%lx", addr);
             hcf();
         }
         return phys;
@@ -370,7 +363,7 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev) -> bool {
         }
         asm volatile("pause" ::: "memory");
     }
-    ker::mod::io::serial::write("virtio-net: ctrl-queue MQ ack timeout\n");
+    net_log::warn("ctrl-queue MQ ack timeout");
     return false;
 }
 
@@ -399,8 +392,8 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
         dev->txq->lock.unlock_irqrestore(txflags);
         free_pkt_list(reclaimed);
         netdev->tx_dropped++;
-        ker::mod::dbg::log("[net] TX RING FULL drop #%lu pool_free=%zu", static_cast<unsigned long>(netdev->tx_dropped),
-                           ker::net::pkt_pool_free_count());
+        net_log::warn("TX ring full: drop #%lu pool_free=%zu", static_cast<unsigned long>(netdev->tx_dropped),
+                      ker::net::pkt_pool_free_count());
         ker::net::pkt_free(pkt);
         return -1;
     }
@@ -582,7 +575,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     cfg->device_status = static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if ((cfg->device_status & VIRTIO_STATUS_FEATURES_OK) == 0) {
-        ker::mod::io::serial::write("virtio-net: modern FEATURES_OK rejected\n");
+        net_log::error("modern FEATURES_OK rejected");
         cfg->device_status = VIRTIO_STATUS_FAILED;
         delete dev;
         return -1;
@@ -617,14 +610,14 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     dev->rxq = setup_queue(0, VIRTQ_MAX_SIZE);
     if (dev->rxq == nullptr) {
-        ker::mod::io::serial::write("virtio-net: modern RX queue failed\n");
+        net_log::error("modern RX queue failed");
         cfg->device_status = VIRTIO_STATUS_FAILED;
         delete dev;
         return -1;
     }
     dev->txq = setup_queue(1, VIRTQ_MAX_SIZE);
     if (dev->txq == nullptr) {
-        ker::mod::io::serial::write("virtio-net: modern TX queue failed\n");
+        net_log::error("modern TX queue failed");
         cfg->device_status = VIRTIO_STATUS_FAILED;
         delete dev;
         return -1;
@@ -667,7 +660,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     uint8_t vector = ker::mod::gates::allocateVector();
     if (vector == 0) {
-        ker::mod::io::serial::write("virtio-net: no free IRQ vector\n");
+        net_log::error("no free IRQ vector");
         cfg->device_status = VIRTIO_STATUS_FAILED;
         delete dev;
         return -1;
@@ -678,7 +671,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (want_mq) {
         vector2 = ker::mod::gates::allocateVector();
         if (vector2 == 0) {
-            ker::mod::io::serial::write("virtio-net: no second IRQ vector, disabling MQ\n");
+            net_log::warn("no second IRQ vector, disabling MQ");
             want_mq = false;
         } else {
             dev->irq_vector2 = vector2;
@@ -690,7 +683,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         dev->msix_enabled = true;
         if (want_mq) {
             if (ker::dev::pci::pci_configure_msix_entry(pci_dev, 1, vector2, net_cpu1) != 0) {
-                ker::mod::io::serial::write("virtio-net: MSI-X entry 1 failed, disabling MQ\n");
+                net_log::warn("MSI-X entry 1 failed, disabling MQ");
                 want_mq = false;
             }
         }
@@ -707,19 +700,19 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         };
 
         if (!assign_vec(0, 0)) {
-            ker::mod::io::serial::write("virtio-net: MSI-X RX0 vector rejected\n");
+            net_log::warn("MSI-X RX0 vector rejected");
             dev->msix_enabled = false;
         }
         if (dev->msix_enabled && !assign_vec(1, 0)) {
-            ker::mod::io::serial::write("virtio-net: MSI-X TX0 vector rejected\n");
+            net_log::warn("MSI-X TX0 vector rejected");
             dev->msix_enabled = false;
         }
         if (dev->msix_enabled && want_mq && !assign_vec(2, 1)) {
-            ker::mod::io::serial::write("virtio-net: MSI-X RX1 rejected, disabling MQ\n");
+            net_log::warn("MSI-X RX1 rejected, disabling MQ");
             want_mq = false;
         }
         if (dev->msix_enabled && want_mq && !assign_vec(3, 1)) {
-            ker::mod::io::serial::write("virtio-net: MSI-X TX1 rejected, disabling MQ\n");
+            net_log::warn("MSI-X TX1 rejected, disabling MQ");
             want_mq = false;
         }
         if (dev->ctrlq != nullptr) {
@@ -757,7 +750,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     fill_rx_queue_for(dev->rxq);
     if (dev->num_queue_pairs == 2) {
         if (!send_mq_ctrl_cmd(dev)) {
-            ker::mod::io::serial::write("virtio-net: MQ activation failed, downgrading to single-queue\n");
+            net_log::warn("MQ activation failed, downgrading to single-queue");
             virtio_net_irq_disable_pair(dev, 1);
             dev->num_queue_pairs = 1;
         }
@@ -787,21 +780,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     devices[device_count++] = dev;
 
-    ker::mod::io::serial::write("virtio-net: ");
-    ker::mod::io::serial::write(dev->netdev.name.data());
-    ker::mod::io::serial::write(" MAC=");
-    for (int i = 0; i < 6; i++) {
-        if (i > 0) {
-            ker::mod::io::serial::write(":");
-        }
-        ker::mod::io::serial::writeHex(dev->netdev.mac[i]);
-    }
-    ker::mod::io::serial::write(" vec=");
-    ker::mod::io::serial::writeHex(vector);
-    ker::mod::io::serial::write(dev->msix_enabled ? " modern msix" : " modern msi/intx");
-    ker::mod::io::serial::write(" pairs=");
-    ker::mod::io::serial::writeHex(dev->num_queue_pairs);
-    ker::mod::io::serial::write(" napi ready\n");
+    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(), dev->netdev.mac[0],
+                  dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5], vector,
+                  dev->msix_enabled ? " modern msix" : " modern msi/intx", dev->num_queue_pairs);
 
     return 0;
 }
@@ -817,7 +798,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     auto io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
     if (io_base == 0) {
-        ker::mod::io::serial::write("virtio-net: BAR0 is zero\n");
+        net_log::error("BAR0 is zero");
         return -1;
     }
 
@@ -862,7 +843,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 0);
     uint16_t rxq_size = ::inw(io_base + VIRTIO_REG_QUEUE_SIZE);
     if (rxq_size == 0) {
-        ker::mod::io::serial::write("virtio-net: RX queue size is 0\n");
+        net_log::error("RX queue size is 0");
         write_status(io_base, VIRTIO_STATUS_FAILED);
         delete dev;
         return -1;
@@ -871,7 +852,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     dev->rxq = virtq_alloc(rxq_size);
     if (dev->rxq == nullptr) {
-        ker::mod::io::serial::write("virtio-net: failed to alloc RX queue\n");
+        net_log::error("failed to alloc RX queue");
         write_status(io_base, VIRTIO_STATUS_FAILED);
         delete dev;
         return -1;
@@ -885,7 +866,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 1);
     uint16_t txq_size = ::inw(io_base + VIRTIO_REG_QUEUE_SIZE);
     if (txq_size == 0) {
-        ker::mod::io::serial::write("virtio-net: TX queue size is 0\n");
+        net_log::error("TX queue size is 0");
         write_status(io_base, VIRTIO_STATUS_FAILED);
         delete dev;
         return -1;
@@ -894,7 +875,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     dev->txq = virtq_alloc(txq_size);
     if (dev->txq == nullptr) {
-        ker::mod::io::serial::write("virtio-net: failed to alloc TX queue\n");
+        net_log::error("failed to alloc TX queue");
         write_status(io_base, VIRTIO_STATUS_FAILED);
         delete dev;
         return -1;
@@ -964,7 +945,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     // Try MSI-X first (needed for per-pair CPU steering), then MSI, then INTx.
     uint8_t vector = ker::mod::gates::allocateVector();
     if (vector == 0) {
-        ker::mod::io::serial::write("virtio-net: no free IRQ vector\n");
+        net_log::error("no free IRQ vector");
         write_status(io_base, VIRTIO_STATUS_FAILED);
         delete dev;
         return -1;
@@ -980,7 +961,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (want_mq) {
         vector2 = ker::mod::gates::allocateVector();
         if (vector2 == 0) {
-            ker::mod::io::serial::write("virtio-net: no second IRQ vector, disabling MQ\n");
+            net_log::warn("no second IRQ vector, disabling MQ");
             want_mq = false;
         } else {
             dev->irq_vector2 = vector2;
@@ -997,7 +978,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         // Configure MSI-X entry 1 for pair 1 (pair 0 was configured by pci_enable_msix).
         if (want_mq) {
             if (ker::dev::pci::pci_configure_msix_entry(pci_dev, 1, vector2, net_cpu1) != 0) {
-                ker::mod::io::serial::write("virtio-net: MSI-X entry 1 failed, disabling MQ\n");
+                net_log::warn("MSI-X entry 1 failed, disabling MQ");
                 want_mq = false;
             }
         }
@@ -1009,13 +990,13 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 0);
         ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
         if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
-            ker::mod::io::serial::write("virtio-net: MSI-X RX0 vector rejected\n");
+            net_log::warn("MSI-X RX0 vector rejected");
             dev->msix_enabled = false;
         }
         ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 1);
         ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
         if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
-            ker::mod::io::serial::write("virtio-net: MSI-X TX0 vector rejected\n");
+            net_log::warn("MSI-X TX0 vector rejected");
             dev->msix_enabled = false;
         }
 
@@ -1024,7 +1005,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
             ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 2);
             ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 1);
             if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
-                ker::mod::io::serial::write("virtio-net: MSI-X RX1 rejected, disabling MQ\n");
+                net_log::warn("MSI-X RX1 rejected, disabling MQ");
                 want_mq = false;
             }
         }
@@ -1032,7 +1013,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
             ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 3);
             ::outw(io_base + VIRTIO_MSI_QUEUE_VECTOR, 1);
             if (::inw(io_base + VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
-                ker::mod::io::serial::write("virtio-net: MSI-X TX1 rejected, disabling MQ\n");
+                net_log::warn("MSI-X TX1 rejected, disabling MQ");
                 want_mq = false;
             }
         }
@@ -1074,7 +1055,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     fill_rx_queue_for(dev->rxq);
     if (dev->num_queue_pairs == 2) {
         if (!send_mq_ctrl_cmd(dev)) {
-            ker::mod::io::serial::write("virtio-net: MQ activation failed, downgrading to single-queue\n");
+            net_log::warn("MQ activation failed, downgrading to single-queue");
             virtio_net_irq_disable_pair(dev, 1);
             dev->num_queue_pairs = 1;
         }
@@ -1101,25 +1082,9 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     devices[device_count++] = dev;
 
-    ker::mod::io::serial::write("virtio-net: ");
-    ker::mod::io::serial::write(dev->netdev.name.data());
-    ker::mod::io::serial::write(" MAC=");
-    for (int i = 0; i < 6; i++) {
-        if (i > 0) {
-            ker::mod::io::serial::write(":");
-        }
-        ker::mod::io::serial::writeHex(dev->netdev.mac[i]);
-    }
-    ker::mod::io::serial::write(" rxq=");
-    ker::mod::io::serial::writeHex(rxq_size);
-    ker::mod::io::serial::write(" txq=");
-    ker::mod::io::serial::writeHex(txq_size);
-    ker::mod::io::serial::write(" vec=");
-    ker::mod::io::serial::writeHex(vector);
-    ker::mod::io::serial::write(dev->msix_enabled ? " msix" : " legacy");
-    ker::mod::io::serial::write(" pairs=");
-    ker::mod::io::serial::writeHex(dev->num_queue_pairs);
-    ker::mod::io::serial::write(" napi ready\n");
+    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x rxq=%u txq=%u vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(),
+                  dev->netdev.mac[0], dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5],
+                  rxq_size, txq_size, vector, dev->msix_enabled ? " msix" : " legacy", dev->num_queue_pairs);
 
     return 0;
 }
@@ -1152,13 +1117,7 @@ auto virtio_net_init() -> int {
             continue;
         }
 
-        ker::mod::io::serial::write("virtio-net: found device at PCI ");
-        ker::mod::io::serial::writeHex(dev->bus);
-        ker::mod::io::serial::write(":");
-        ker::mod::io::serial::writeHex(dev->slot);
-        ker::mod::io::serial::write(".");
-        ker::mod::io::serial::writeHex(dev->function);
-        ker::mod::io::serial::write("\n");
+        net_log::info("found device at PCI %02x:%02x.%x", dev->bus, dev->slot, dev->function);
 
         if (init_device(dev) == 0) {
             found++;
@@ -1166,7 +1125,7 @@ auto virtio_net_init() -> int {
     }
 
     if (found == 0) {
-        ker::mod::io::serial::write("virtio-net: no devices found\n");
+        net_log::info("no devices found");
     }
 
     return found;
