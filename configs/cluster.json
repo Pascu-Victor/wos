@@ -25,9 +25,10 @@
         {
             "id": 0,
             "name": "lan",
-            "nodes": 2,
+            "nodes": 8,
             "nic_model": "virtio-net-pci",
             "nic_queues": 2,
+            "netdev_driver": "dhcp",
             "bridge": {
                 "ip": "10.10.0.100/16"
             }
@@ -35,8 +36,9 @@
         {
             "id": 1,
             "name": "wki",
-            "nodes": 2,
+            "nodes": 8,
             "nic_model": "virtio-net-pci",
+            "netdev_driver": "wki",
             "ivshmem": {
                 "enabled": false,
                 "topology": "full-mesh"

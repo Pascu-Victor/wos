@@ -31,6 +31,7 @@ target_link_options(${TARGET} PRIVATE
 )
 
 target_link_libraries(${TARGET} PRIVATE
+    journal_lib
     c++abi
     c++
     c

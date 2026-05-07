@@ -2,6 +2,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/logging.h>
 #include <sys/net.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
@@ -9,13 +10,15 @@
 
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <print>
 
 #include "abi-bits/route.h"
+
+using logger = wos::journal<"netd">;
 
 namespace {
 
@@ -198,7 +201,7 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
         return 0;  // 236 fixed + 4 magic cookie minimum
     }
 
-    auto* pkt = reinterpret_cast<const DhcpPacket*>(data);
+    const auto* pkt = reinterpret_cast<const DhcpPacket*>(data);
     if (pkt->op != DHCP_OP_REPLY) {
         return 0;
     }
@@ -235,22 +238,34 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
 
         switch (code) {
             case OPT_MSG_TYPE:
-                if (olen >= 1) msg_type = opt[0];
+                if (olen >= 1) {
+                    msg_type = opt[0];
+                }
                 break;
             case OPT_SUBNET_MASK:
-                if (olen >= 4) lease->subnet_mask = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                if (olen >= 4) {
+                    lease->subnet_mask = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                }
                 break;
             case OPT_ROUTER:
-                if (olen >= 4) lease->router = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                if (olen >= 4) {
+                    lease->router = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                }
                 break;
             case OPT_DNS:
-                if (olen >= 4) lease->dns = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                if (olen >= 4) {
+                    lease->dns = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                }
                 break;
             case OPT_SERVER_ID:
-                if (olen >= 4) lease->server_ip = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                if (olen >= 4) {
+                    lease->server_ip = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                }
                 break;
             case OPT_LEASE_TIME:
-                if (olen >= 4) lease->lease_time = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                if (olen >= 4) {
+                    lease->lease_time = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                }
                 break;
             default:
                 break;
@@ -322,7 +337,7 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
             if (errno == EINTR) {
                 continue;
             }
-            std::println("netd: poll failed: {}", errno);
+            logger::warn("netd: poll failed: %d", errno);
             return -1;
         }
 
@@ -336,7 +351,7 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
         }
 
         if (n < 0) {
-            std::println("netd: recvfrom returned {}, retrying...", n);
+            logger::warn("netd: recvfrom returned %zd, retrying...", n);
         }
     }
 }
@@ -391,7 +406,7 @@ auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t 
             if (errno == EINTR) {
                 continue;
             }
-            std::println("netd: poll failed: {}", errno);
+            logger::warn("netd: poll failed: %d", errno);
             return 0;
         }
 
@@ -400,7 +415,7 @@ auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t 
             continue;
         }
         if (n < 0) {
-            std::println("netd: recvfrom returned {}, retrying...", n);
+            logger::warn("netd: recvfrom returned %zd, retrying...", n);
             continue;
         }
 
@@ -459,12 +474,12 @@ auto main(int argc, char** argv) -> int {
     (void)argv;
 
     const char* ifname = netdevs_find_ifname("dhcp", "eth0");
-    std::println("netd: starting DHCP client for {}", ifname);
+    logger::info("netd: starting DHCP client for %s", ifname);
 
     // Create UDP socket for DHCP
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        std::println("netd: failed to create socket: {}", sock);
+        logger::error("netd: failed to create socket: %d", sock);
         return 1;
     }
 
@@ -474,7 +489,7 @@ auto main(int argc, char** argv) -> int {
     bind_addr.sin_port = htons(68);
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(sock, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
-        std::println("netd: failed to bind to port 68");
+        logger::error("netd: failed to bind to port 68");
         close(sock);
         return 1;
     }
@@ -488,7 +503,7 @@ auto main(int argc, char** argv) -> int {
             close(tmp);
         }
     }
-    std::println("netd: MAC = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    logger::info("netd: MAC = %02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     // DHCP destination: 255.255.255.255:67
     struct sockaddr_in dst_addr{};
@@ -509,7 +524,7 @@ nak_restart:
     bool got_offer = false;
     lease = {};  // reset lease on restart
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
-        std::println("netd: sending DISCOVER (attempt {}/{})", attempt + 1, MAX_DISCOVER_RETRIES);
+        logger::debug("netd: sending DISCOVER (attempt %d/%d)", attempt + 1, MAX_DISCOVER_RETRIES);
         size_t pkt_len = build_discover(&pkt, mac.data(), xid);
         sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
@@ -526,14 +541,14 @@ nak_restart:
                 ip_to_str(lease.your_ip, ip_str, sizeof(ip_str));
                 ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
                 ip_to_str(lease.router, gw_str, sizeof(gw_str));
-                std::println("netd: received OFFER: ip={} mask={} gw={}", ip_str, mask_str, gw_str);
+                logger::info("netd: received OFFER: ip=%s mask=%s gw=%s", ip_str, mask_str, gw_str);
             }
             // msg == 0 or other types: wrong xid or irrelevant, keep trying until timeout
         }
     }
 
     if (!got_offer) {
-        std::println("netd: no DHCP offer received, exiting");
+        logger::error("netd: no DHCP offer received, exiting");
         close(sock);
         return 1;
     }
@@ -541,7 +556,7 @@ nak_restart:
     // === DHCP REQUEST ===
     bool got_ack = false;
     for (int attempt = 0; attempt < MAX_REQUEST_RETRIES && !got_ack; attempt++) {
-        std::println("netd: sending REQUEST (attempt {}/{})", attempt + 1, MAX_REQUEST_RETRIES);
+        logger::debug("netd: sending REQUEST (attempt %d/%d)", attempt + 1, MAX_REQUEST_RETRIES);
         size_t pkt_len = build_request(&pkt, mac.data(), xid, htonl(lease.your_ip), htonl(lease.server_ip));
         sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
@@ -564,11 +579,11 @@ nak_restart:
             } else if (msg == DHCPNAK) {
                 nak_restarts++;
                 if (nak_restarts < MAX_NAK_RESTARTS) {
-                    std::println("netd: received NAK, restarting from DISCOVER (attempt {}/{})", nak_restarts, MAX_NAK_RESTARTS);
+                    logger::warn("netd: received NAK, restarting from DISCOVER (attempt %d/%d)", nak_restarts, MAX_NAK_RESTARTS);
                     ++xid;  // use new transaction ID on restart
                     goto nak_restart;
                 }
-                std::println("netd: received NAK, max restarts exceeded");
+                logger::error("netd: received NAK, max restarts exceeded");
                 goto request_failed;
             }
             // msg == 0 means wrong xid or invalid packet, keep trying until timeout
@@ -577,13 +592,13 @@ nak_restart:
 request_failed:
 
     if (!got_ack) {
-        std::println("netd: DHCP failed - no ACK received");
+        logger::error("netd: DHCP failed - no ACK received");
         close(sock);
         return 1;
     }
 
     // === APPLY CONFIGURATION ===
-    std::println("netd: DHCP ACK received, applying configuration");
+    logger::info("netd: DHCP ACK received, applying configuration");
     apply_lease(ifname, lease);
 
     {
@@ -592,7 +607,7 @@ request_failed:
         ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
         ip_to_str(lease.router, gw_str, sizeof(gw_str));
         ip_to_str(lease.dns, dns_str, sizeof(dns_str));
-        std::println("netd: {} configured: ip={} mask={} gw={} dns={} lease={}s", ifname, ip_str, mask_str, gw_str, dns_str,
+        logger::info("netd: %s configured: ip=%s mask=%s gw=%s dns=%s lease=%us", ifname, ip_str, mask_str, gw_str, dns_str,
                      lease.lease_time);
     }
 
@@ -600,7 +615,7 @@ request_failed:
     // T1 = lease_time / 2 (standard renewal time)
 
     if (lease.lease_time == 0) {
-        std::println("netd: infinite lease, sleeping forever");
+        logger::info("netd: infinite lease, sleeping forever");
         for (;;) {
             // Sleep for a very long time instead of busy-spinning.
             sleep_for_seconds(86400);  // 24 hours
@@ -608,7 +623,7 @@ request_failed:
     }
 
     uint32_t t1_seconds = lease.lease_time / 2;
-    std::println("netd: will renew in ~{} seconds (T1)", t1_seconds);
+    logger::debug("netd: will renew in ~%u seconds (T1)", t1_seconds);
     uint32_t consecutive_renewal_failures = 0;
 
     for (;;) {
@@ -616,7 +631,7 @@ request_failed:
         sleep_for_seconds(t1_seconds);
 
         if (consecutive_renewal_failures == 0) {
-            std::println("netd: T1 reached, sending renewal REQUEST");
+            logger::debug("netd: T1 reached, sending renewal REQUEST");
         }
         ++xid;
 
@@ -638,20 +653,20 @@ request_failed:
             }
             t1_seconds = lease.lease_time / 2;
             if (consecutive_renewal_failures > 0) {
-                std::println("netd: lease renewed after {} failed attempt(s), next renewal in ~{}s", consecutive_renewal_failures,
+                logger::info("netd: lease renewed after %u failed attempt(s), next renewal in ~%us", consecutive_renewal_failures,
                              t1_seconds);
                 consecutive_renewal_failures = 0;
             } else {
-                std::println("netd: lease renewed, next renewal in ~{}s", t1_seconds);
+                logger::debug("netd: lease renewed, next renewal in ~%us", t1_seconds);
             }
         } else if (msg == DHCPNAK) {
-            std::println("netd: renewal received NAK, restarting from DISCOVER");
+            logger::warn("netd: renewal received NAK, restarting from DISCOVER");
             close(sock);
             return 1;
         } else {
             ++consecutive_renewal_failures;
             if (consecutive_renewal_failures == 1 || consecutive_renewal_failures % RENEWAL_FAILURE_LOG_INTERVAL == 0) {
-                std::println("netd: renewal timed out, retrying in {}s ({} consecutive failures)", DHCP_RENEWAL_RETRY_SECS,
+                logger::warn("netd: renewal timed out, retrying in %us (%u consecutive failures)", DHCP_RENEWAL_RETRY_SECS,
                              consecutive_renewal_failures);
             }
             t1_seconds = DHCP_RENEWAL_RETRY_SECS;
