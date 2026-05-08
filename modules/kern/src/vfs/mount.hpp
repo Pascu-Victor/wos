@@ -22,6 +22,14 @@ struct MountPoint {
     uint32_t dev_id;                // Unique synthetic st_dev for this mount
 };
 
+constexpr size_t MOUNT_PATH_MAX = 512;
+
+struct MountSnapshot {
+    char path[MOUNT_PATH_MAX];
+    FSType fs_type;
+    uint32_t dev_id;
+};
+
 // Mount point management
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int;
 auto unmount_filesystem(const char* path) -> int;
@@ -41,5 +49,6 @@ auto fstype_to_enum(const char* fstype) -> FSType;
 // D9: Iteration API for auto-discovery of exportable mount points
 auto get_mount_count() -> size_t;
 auto get_mount_at(size_t index) -> MountPoint*;
+auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool;
 
 }  // namespace ker::vfs

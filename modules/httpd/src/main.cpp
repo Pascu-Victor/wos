@@ -178,10 +178,17 @@ auto format_size(size_t size) -> std::string {
     if (size < 1024) {
         return std::format("{} B", size);
     }
+
+    auto format_tenths = [](size_t value, size_t unit, const char* suffix) -> std::string {
+        size_t whole = value / unit;
+        size_t tenth = ((value % unit) * 10) / unit;
+        return std::format("{}.{} {}", whole, tenth, suffix);
+    };
+
     if (size < static_cast<size_t>(1024 * 1024)) {
-        return std::format("{:.1f} KB", static_cast<double>(size) / 1024.0);
+        return format_tenths(size, 1024, "KB");
     }
-    return std::format("{:.1f} MB", static_cast<double>(size) / (1024.0 * 1024.0));
+    return format_tenths(size, 1024 * 1024, "MB");
 }
 
 // Simple HTTP response templates

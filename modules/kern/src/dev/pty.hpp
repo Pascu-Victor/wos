@@ -8,6 +8,10 @@
 
 #include "device.hpp"
 
+namespace ker::vfs {
+struct File;
+}  // namespace ker::vfs
+
 namespace ker::dev::pty {
 
 // Linux-compatible winsize struct
@@ -78,6 +82,31 @@ static constexpr uint32_t TIOS_ECHONL = 0000100;
 static constexpr uint32_t TIOS_NOFLSH = 0000200;
 static constexpr uint32_t TIOS_TOSTOP = 0000400;
 static constexpr uint32_t TIOS_IEXTEN = 0100000;
+
+// ioctl command numbers (Linux-compatible)
+static constexpr unsigned long TIOCGPTN = 0x80045430;    // Get PTY number
+static constexpr unsigned long TIOCSPTLCK = 0x40045431;  // Set/clear PTY lock
+static constexpr unsigned long TIOCGWINSZ = 0x5413;      // Get window size
+static constexpr unsigned long TIOCSWINSZ = 0x5414;      // Set window size
+static constexpr unsigned long TIOCSCTTY = 0x540E;       // Set controlling terminal
+static constexpr unsigned long TIOCGPGRP = 0x540F;       // Get foreground process group
+static constexpr unsigned long TIOCSPGRP = 0x5410;       // Set foreground process group
+static constexpr unsigned long TIOCNOTTY = 0x5422;       // Disconnect from controlling terminal
+static constexpr unsigned long TCGETS = 0x5401;          // Get termios
+static constexpr unsigned long TCSETS = 0x5402;          // Set termios immediately
+static constexpr unsigned long TCSETSW = 0x5403;         // Set termios after output drain
+static constexpr unsigned long TCSETSF = 0x5404;         // Set termios after flush
+static constexpr unsigned long TCFLSH = 0x540B;          // Flush terminal I/O
+
+// Signal numbers
+static constexpr int SIG_INT = 2;
+static constexpr int SIG_QUIT = 3;
+static constexpr int SIG_TSTP = 20;
+
+// poll event bits (Linux-compatible)
+static constexpr int POLLIN = 0x001;
+static constexpr int POLLOUT = 0x004;
+static constexpr int POLLHUP = 0x010;
 
 // Returns a default termios (cooked mode, echo on, signals on)
 KTermios default_termios();
@@ -167,5 +196,8 @@ void pty_put(PtyPair* pair);
 
 // Get the ptmx device (for explicit open)
 auto get_ptmx_device() -> Device*;
+
+// Returns true if the file is a devfs-backed PTY master or slave file.
+auto pty_is_file(ker::vfs::File* f) -> bool;
 
 }  // namespace ker::dev::pty

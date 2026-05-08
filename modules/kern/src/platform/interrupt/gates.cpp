@@ -1,6 +1,8 @@
 #include "gates.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -15,14 +17,15 @@
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/mm/paging.hpp"
+#include "platform/mm/phys.hpp"
 #include "platform/sched/scheduler.hpp"
 
 namespace ker::mod::gates {
 namespace {
 using journal = dbg::logger<"kernel">;
-interruptHandler_t interruptHandlers[256] = {nullptr};
-std::atomic<bool> panicLock{false};
-std::atomic<int64_t> panicLockOwner{-1};
+interruptHandler_t interrupt_handlers[256] = {nullptr};
+std::atomic<bool> panic_lock{false};
+std::atomic<int64_t> panic_lock_owner{-1};
 
 // Context-based IRQ handlers (parallel array)
 struct IrqContext {
@@ -40,31 +43,31 @@ static auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t v
         return nullptr;
     }
 
-    const uint64_t idx4 = (vaddr >> 39) & 0x1FF;
-    const uint64_t idx3 = (vaddr >> 30) & 0x1FF;
-    const uint64_t idx2 = (vaddr >> 21) & 0x1FF;
-    const uint64_t idx1 = (vaddr >> 12) & 0x1FF;
+    const uint64_t IDX4 = (vaddr >> 39) & 0x1FF;
+    const uint64_t IDX3 = (vaddr >> 30) & 0x1FF;
+    const uint64_t IDX2 = (vaddr >> 21) & 0x1FF;
+    const uint64_t IDX1 = (vaddr >> 12) & 0x1FF;
 
-    if (!pagemap->entries[idx4].present) {
+    if (!pagemap->entries[IDX4].present) {
         return nullptr;
     }
     auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pagemap->entries[idx4].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml3->entries[idx3].present) {
+        ker::mod::mm::addr::get_virt_pointer(pagemap->entries[IDX4].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml3->entries[IDX3].present) {
         return nullptr;
     }
     auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml3->entries[idx3].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml2->entries[idx2].present) {
+        ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml2->entries[IDX2].present) {
         return nullptr;
     }
     auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml2->entries[idx2].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml1->entries[idx1].present) {
+        ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml1->entries[IDX1].present) {
         return nullptr;
     }
 
-    return &pml1->entries[idx1];
+    return &pml1->entries[IDX1];
 }
 }  // namespace
 
@@ -75,7 +78,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // hit a COW fault at the same time the old code would make the second CPU
     // think it was a nested panic and halt.
     if (frame.intNum == 14) {
-        uint64_t cr2;
+        uint64_t cr2 = cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
 
         // If pagefault_handler resolved a COW fault, we're done.
@@ -104,71 +107,70 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // simultaneously) and must never be mistaken for nested kernel panics.
     uint64_t cpl = frame.cs & 0x3;
     if (cpl == 3) {
-        auto* currentTaskForDump = ker::mod::sched::get_current_task();
+        auto* current_task_for_dump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
-        uint32_t apicId = apic::getApicId();
-        uint64_t cpuIdFromApic = smt::get_cpu_index_from_apic_id(apicId);
-        journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apicId, cpuIdFromApic,
-                      currentTaskForDump, (currentTaskForDump != nullptr) ? currentTaskForDump->pid : 0xDEAD, cr3,
-                      (currentTaskForDump != nullptr) ? (void*)currentTaskForDump->pagemap : nullptr);
+        uint32_t apic_id = apic::getApicId();
+        uint64_t cpu_id_from_apic = smt::get_cpu_index_from_apic_id(apic_id);
+        journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apic_id, cpu_id_from_apic,
+                      current_task_for_dump, (current_task_for_dump != nullptr) ? current_task_for_dump->pid : 0xDEAD, cr3,
+                      (current_task_for_dump != nullptr) ? (void*)current_task_for_dump->pagemap : nullptr);
 
-        ker::mod::dbg::coredump::tryWriteForTask(currentTaskForDump, gpr, frame, cr2, cr3, apic::getApicId());
+        ker::mod::dbg::coredump::tryWriteForTask(current_task_for_dump, gpr, frame, cr2, cr3, apic::getApicId());
 
         if (frame.intNum == 14) {
             journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.errCode, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
-            if (currentTaskForDump != nullptr) {
+            if (current_task_for_dump != nullptr) {
                 bool ret_slot_matches_rip = false;
                 journal::warn(" task_ctx: saved_rip=0x%lx saved_rsp=0x%lx entry=0x%lx thread=%p scratch=%p",
-                              currentTaskForDump->context.frame.rip, currentTaskForDump->context.frame.rsp, currentTaskForDump->entry,
-                              currentTaskForDump->thread, reinterpret_cast<void*>(currentTaskForDump->context.syscallScratchArea));
-                if (currentTaskForDump->pagemap != nullptr) {
-                    const uint64_t rsp_phys = ker::mod::mm::virt::translate(currentTaskForDump->pagemap, frame.rsp);
-                    const uint64_t ret_slot_va = (frame.rsp >= sizeof(uint64_t)) ? (frame.rsp - sizeof(uint64_t)) : frame.rsp;
-                    const uint64_t ret_slot_phys = ker::mod::mm::virt::translate(currentTaskForDump->pagemap, ret_slot_va);
+                              current_task_for_dump->context.frame.rip, current_task_for_dump->context.frame.rsp,
+                              current_task_for_dump->entry, current_task_for_dump->thread,
+                              reinterpret_cast<void*>(current_task_for_dump->context.syscallScratchArea));
+                if (current_task_for_dump->pagemap != nullptr) {
+                    const uint64_t RSP_PHYS = ker::mod::mm::virt::translate(current_task_for_dump->pagemap, frame.rsp);
+                    const uint64_t RET_SLOT_VA = (frame.rsp >= sizeof(uint64_t)) ? (frame.rsp - sizeof(uint64_t)) : frame.rsp;
+                    const uint64_t RET_SLOT_PHYS = ker::mod::mm::virt::translate(current_task_for_dump->pagemap, RET_SLOT_VA);
 
-                    if (ret_slot_phys != ker::mod::mm::virt::PADDR_INVALID && ret_slot_phys != 0) {
-                        const auto* ret_slot = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(ret_slot_phys));
+                    if (RET_SLOT_PHYS != ker::mod::mm::virt::PADDR_INVALID && RET_SLOT_PHYS != 0) {
+                        const auto* ret_slot = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(RET_SLOT_PHYS));
                         ret_slot_matches_rip = ret_slot[0] == frame.rip;
-                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x%lx q_m1=0x%lx rip_match=%d", ret_slot_va, ret_slot_phys,
+                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x%lx q_m1=0x%lx rip_match=%d", RET_SLOT_VA, RET_SLOT_PHYS,
                                       ret_slot[0], ret_slot_matches_rip ? 1 : 0);
                     } else {
-                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x0 (unmapped)", ret_slot_va);
+                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x0 (unmapped)", RET_SLOT_VA);
                     }
 
-                    if (rsp_phys != ker::mod::mm::virt::PADDR_INVALID && rsp_phys != 0) {
-                        const auto* stack_words = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(rsp_phys));
-                        const uint64_t page_off = frame.rsp & (ker::mod::mm::paging::PAGE_SIZE - 1);
-                        size_t words_available = (ker::mod::mm::paging::PAGE_SIZE - page_off) / sizeof(uint64_t);
-                        if (words_available > 4) {
-                            words_available = 4;
-                        }
-                        const uint64_t q0 = (words_available > 0) ? stack_words[0] : 0;
-                        const uint64_t q1 = (words_available > 1) ? stack_words[1] : 0;
-                        const uint64_t q2 = (words_available > 2) ? stack_words[2] : 0;
-                        const uint64_t q3 = (words_available > 3) ? stack_words[3] : 0;
-                        journal::warn(" fault_rsp_phys=0x%lx stack_qwords=%zu q0=0x%lx q1=0x%lx q2=0x%lx q3=0x%lx", rsp_phys,
-                                      words_available, q0, q1, q2, q3);
+                    if (RSP_PHYS != ker::mod::mm::virt::PADDR_INVALID && RSP_PHYS != 0) {
+                        const auto* stack_words = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(RSP_PHYS));
+                        const uint64_t PAGE_OFF = frame.rsp & (ker::mod::mm::paging::PAGE_SIZE - 1);
+                        size_t words_available = (ker::mod::mm::paging::PAGE_SIZE - PAGE_OFF) / sizeof(uint64_t);
+                        words_available = std::min<size_t>(words_available, 4);
+                        const uint64_t Q0 = (words_available > 0) ? stack_words[0] : 0;
+                        const uint64_t Q1 = (words_available > 1) ? stack_words[1] : 0;
+                        const uint64_t Q2 = (words_available > 2) ? stack_words[2] : 0;
+                        const uint64_t Q3 = (words_available > 3) ? stack_words[3] : 0;
+                        journal::warn(" fault_rsp_phys=0x%lx stack_qwords=%zu q0=0x%lx q1=0x%lx q2=0x%lx q3=0x%lx", RSP_PHYS,
+                                      words_available, Q0, Q1, Q2, Q3);
                     } else {
                         journal::warn(" fault_rsp_phys=0x0 (unmapped)");
                     }
 
-                    if (const auto* stack_pte = lookup_user_pte(currentTaskForDump->pagemap, frame.rsp); stack_pte != nullptr) {
-                        const uint64_t stack_page_phys = static_cast<uint64_t>(stack_pte->frame) << ker::mod::mm::paging::PAGE_SHIFT;
+                    if (const auto* stack_pte = lookup_user_pte(current_task_for_dump->pagemap, frame.rsp); stack_pte != nullptr) {
+                        const uint64_t STACK_PAGE_PHYS = static_cast<uint64_t>(stack_pte->frame) << ker::mod::mm::paging::PAGE_SHIFT;
                         uint64_t stack_pte_raw = 0;
                         __builtin_memcpy(&stack_pte_raw, stack_pte, sizeof(stack_pte_raw));
-                        const bool stack_cow = (stack_pte_raw & ker::mod::mm::paging::PAGE_COW) != 0U;
-                        const auto stack_ref =
-                            ker::mod::mm::phys::pageRefGet(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(stack_page_phys)));
+                        const bool STACK_COW = (stack_pte_raw & ker::mod::mm::paging::PAGE_COW) != 0U;
+                        const auto STACK_REF =
+                            ker::mod::mm::phys::pageRefGet(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(STACK_PAGE_PHYS)));
                         journal::warn(" stack_pte: vaddr=0x%lx phys=0x%lx user=%u rw=%u nx=%u cow=%u ref=%llu",
-                                      frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1), stack_page_phys, stack_pte->user,
-                                      stack_pte->writable, stack_pte->noExecute, stack_cow ? 1U : 0U,
-                                      static_cast<unsigned long long>(stack_ref));
+                                      frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1), STACK_PAGE_PHYS, stack_pte->user,
+                                      stack_pte->writable, stack_pte->noExecute, STACK_COW ? 1U : 0U,
+                                      static_cast<unsigned long long>(STACK_REF));
 
                         if (ret_slot_matches_rip) {
-                            ker::mod::mm::virt::debugLogUserPhysMappings(stack_page_phys, "userfault-stack-ret", currentTaskForDump->pid,
-                                                                         currentTaskForDump->name, true);
+                            ker::mod::mm::virt::debugLogUserPhysMappings(STACK_PAGE_PHYS, "userfault-stack-ret", current_task_for_dump->pid,
+                                                                         current_task_for_dump->name, true);
                         }
                     } else {
                         journal::warn(" stack_pte: vaddr=0x%lx unmapped", frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
@@ -177,24 +179,24 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             }
 
             auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF);
-            uint64_t idx4 = (cr2 >> 39) & 0x1FF;
-            uint64_t idx3 = (cr2 >> 30) & 0x1FF;
-            uint64_t idx2 = (cr2 >> 21) & 0x1FF;
-            uint64_t idx1 = (cr2 >> 12) & 0x1FF;
+            const uint64_t IDX4 = (cr2 >> 39) & 0x1FF;
+            const uint64_t IDX3 = (cr2 >> 30) & 0x1FF;
+            const uint64_t IDX2 = (cr2 >> 21) & 0x1FF;
+            const uint64_t IDX1 = (cr2 >> 12) & 0x1FF;
 
-            journal::warn("PML4[%d]: present=%d frame=0x%lx", idx4, pml4->entries[idx4].present, pml4->entries[idx4].frame);
-            if (pml4->entries[idx4].present) {
-                auto* pml3 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml4->entries[idx4].frame << 12);
-                journal::warn(" PML3[%d]: present=%d frame=0x%lx", idx3, pml3->entries[idx3].present, pml3->entries[idx3].frame);
-                if (pml3->entries[idx3].present) {
-                    auto* pml2 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml3->entries[idx3].frame << 12);
-                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", idx2, pml2->entries[idx2].present, pml2->entries[idx2].frame);
-                    if (pml2->entries[idx2].present) {
+            journal::warn("PML4[%d]: present=%d frame=0x%lx", IDX4, pml4->entries[IDX4].present, pml4->entries[IDX4].frame);
+            if (pml4->entries[IDX4].present) {
+                auto* pml3 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml4->entries[IDX4].frame << 12);
+                journal::warn(" PML3[%d]: present=%d frame=0x%lx", IDX3, pml3->entries[IDX3].present, pml3->entries[IDX3].frame);
+                if (pml3->entries[IDX3].present) {
+                    auto* pml2 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << 12);
+                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", IDX2, pml2->entries[IDX2].present, pml2->entries[IDX2].frame);
+                    if (pml2->entries[IDX2].present) {
                         auto* pml1 =
-                            (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml2->entries[idx2].frame << 12);
-                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", idx1, pml1->entries[idx1].present,
-                                      pml1->entries[idx1].frame, pml1->entries[idx1].user, pml1->entries[idx1].writable,
-                                      pml1->entries[idx1].noExecute);
+                            (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << 12);
+                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1->entries[IDX1].present,
+                                      pml1->entries[IDX1].frame, pml1->entries[IDX1].user, pml1->entries[IDX1].writable,
+                                      pml1->entries[IDX1].noExecute);
                     }
                 }
             }
@@ -206,12 +208,12 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
         if (frame.intNum == 1) {
             // Debug exception (hardware breakpoint or TF single-step).
-            uint64_t dr7_clear = 0x400;       // bit 10 reserved=1, all enable bits=0
-            uint64_t dr6_clear = 0xFFFF0FF0;  // reserved bits set, all status bits cleared
-            asm volatile("mov %0, %%dr7" ::"r"(dr7_clear));
-            asm volatile("mov %0, %%dr6" ::"r"(dr6_clear));
+            const uint64_t DR7_CLEAR = 0x400;       // bit 10 reserved=1, all enable bits=0
+            const uint64_t DR6_CLEAR = 0xFFFF0FF0;  // reserved bits set, all status bits cleared
+            asm volatile("mov %0, %%dr7" ::"r"(DR7_CLEAR));
+            asm volatile("mov %0, %%dr6" ::"r"(DR6_CLEAR));
             journal::debug("Userspace debug trap (INT 1): rip=0x%lx pid=%x", frame.rip,
-                           ker::mod::sched::get_current_task() ? ker::mod::sched::get_current_task()->pid : 0);
+                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
             ker::syscall::process::wos_proc_exit(128 + 5);  // 133 = SIGTRAP
             __builtin_unreachable();
         }
@@ -232,15 +234,15 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // If this CPU already owns the lock (nested fault during dump), release and halt immediately.
     {
         auto my_apic_id = static_cast<int64_t>(apic::getApicId());
-        if (panicLockOwner.load(std::memory_order_acquire) == my_apic_id) {
-            panicLock.store(false, std::memory_order_release);
-            panicLockOwner.store(-1, std::memory_order_release);
+        if (panic_lock_owner.load(std::memory_order_acquire) == my_apic_id) {
+            panic_lock.store(false, std::memory_order_release);
+            panic_lock_owner.store(-1, std::memory_order_release);
             hcf();
         }
-        while (panicLock.exchange(true, std::memory_order_acquire)) {
+        while (panic_lock.exchange(true, std::memory_order_acquire)) {
             asm volatile("pause");
         }
-        panicLockOwner.store(my_apic_id, std::memory_order_release);
+        panic_lock_owner.store(my_apic_id, std::memory_order_release);
     }
 
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
@@ -254,10 +256,10 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     io::serial::acquireLock();
     io::serial::enterPanicMode();
 
-    dbg::log("PANIC!");
+    journal::panic("PANIC!");
 
     // stack trace - validate RSP before dereferencing
-    dbg::log("Stack trace:");
+    journal::panic("Stack trace:");
     auto* rsp = (uint64_t*)frame.rsp;
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp);
     const bool RSP_VALID = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
@@ -266,10 +268,10 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     if (RSP_VALID) {
         constexpr uint64_t MAX_STACK_TRACE = 64;
         for (uint64_t i = 0; i < MAX_STACK_TRACE; i++) {
-            dbg::log("%d: 0x%lx", i, rsp[i]);
+            journal::panic("%d: 0x%lx", i, rsp[i]);
         }
     } else {
-        dbg::log("Invalid RSP: 0x%lx - skipping stack trace", rsp_addr);
+        journal::panic("Invalid RSP: 0x%lx - skipping stack trace", rsp_addr);
     }
 
     // Dump current task information - use getCurrentTask() instead of hardcoded address
@@ -278,14 +280,14 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     sched::task::Task* current_task = nullptr;
 
     if (!sched::has_run_queues()) {
-        dbg::log("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
+        journal::panic("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
         goto skip_task_dump;  // NOLINT
     }
 
     current_task = sched::get_current_task();
 
-    dbg::log("=== Current Task Info ===");
-    dbg::log("debug_task_ptrs[%d] = 0x%lx", cpu_id, (uint64_t)current_task);
+    journal::panic("=== Current Task Info ===");
+    journal::panic("debug_task_ptrs[%d] = 0x%lx", cpu_id, (uint64_t)current_task);
 
     if (current_task != nullptr) {
         // CRITICAL: Validate task pointer is in valid memory range before dereferencing
@@ -359,7 +361,7 @@ skip_task_dump:
     }
 
     // print frame info
-    journal::panic("CPU: %d", (uint64_t)cpu_id);
+    journal::panic("CPU: %d", cpu_id);
     journal::panic("Interrupt number: %d", frame.intNum);
     journal::panic("Error code: %d", frame.errCode);
     journal::panic("RIP: 0x%lx", frame.rip);
@@ -405,12 +407,19 @@ skip_task_dump:
     journal::panic("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
 
     auto rdmsr = [](uint32_t msr) -> uint64_t {
-        uint32_t lo, hi;
+        uint32_t lo = 0;
+        uint32_t hi = 0;
         asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
         return ((uint64_t)hi << 32) | lo;
     };
 
-    uint16_t sel_cs, sel_ds, sel_es, sel_fs, sel_gs, sel_ss, sel_tr;
+    uint16_t sel_cs = sel_cs;
+    uint16_t sel_ds = sel_ds;
+    uint16_t sel_es = sel_es;
+    uint16_t sel_fs = sel_fs;
+    uint16_t sel_gs = sel_gs;
+    uint16_t sel_ss = sel_ss;
+    uint16_t sel_tr = sel_tr;
     asm volatile("mov %%cs, %0" : "=r"(sel_cs));
     asm volatile("mov %%ds, %0" : "=r"(sel_ds));
     asm volatile("mov %%es, %0" : "=r"(sel_es));
@@ -419,7 +428,7 @@ skip_task_dump:
     asm volatile("mov %%ss, %0" : "=r"(sel_ss));
     asm volatile("str %0" : "=r"(sel_tr));
 
-    auto printSelector = [&](const char* name, uint16_t sel) {
+    auto print_selector = [&](const char* name, uint16_t sel) -> void {
         journal::panic("%s: 0x%x (index=%d, rpl=%d)", name, sel, (uint64_t)(sel >> 3), (uint64_t)(sel & 0x3));
 
         if (sel == 0) {
@@ -434,13 +443,13 @@ skip_task_dump:
 
         uint64_t gdt_base = gdtr.base;
         uint64_t index = (sel >> 3);
-        uint64_t desc_addr = gdt_base + index * 8;
+        uint64_t desc_addr = gdt_base + (index * 8);
 
         // Validate descriptor address is in valid kernel memory
-        bool desc_addr_valid = (desc_addr >= 0xffff800000000000ULL && desc_addr < 0xffff900000000000ULL) ||
-                               (desc_addr >= 0xffffffff80000000ULL && desc_addr < 0xffffffffc0000000ULL);
+        const bool DESC_ADDR_VALID = (desc_addr >= 0xffff800000000000ULL && desc_addr < 0xffff900000000000ULL) ||
+                                     (desc_addr >= 0xffffffff80000000ULL && desc_addr < 0xffffffffc0000000ULL);
 
-        if (!desc_addr_valid) {
+        if (!DESC_ADDR_VALID) {
             journal::panic("  Invalid descriptor address: 0x%lx", desc_addr);
             return;
         }
@@ -490,13 +499,13 @@ skip_task_dump:
         }
     };
 
-    printSelector("CS", sel_cs);
-    printSelector("DS", sel_ds);
-    printSelector("ES", sel_es);
-    printSelector("FS", sel_fs);
-    printSelector("GS", sel_gs);
-    printSelector("SS", sel_ss);
-    printSelector("TR", sel_tr);
+    print_selector("CS", sel_cs);
+    print_selector("DS", sel_ds);
+    print_selector("ES", sel_es);
+    print_selector("FS", sel_fs);
+    print_selector("GS", sel_gs);
+    print_selector("SS", sel_ss);
+    print_selector("TR", sel_tr);
 
     // print common MSRs
     journal::panic("Common MSRs:");
@@ -515,8 +524,8 @@ skip_task_dump:
     }
 
     journal::panic("Halting");
-    panicLockOwner.store(-1, std::memory_order_release);
-    panicLock.store(false, std::memory_order_release);
+    panic_lock_owner.store(-1, std::memory_order_release);
+    panic_lock.store(false, std::memory_order_release);
     hcf();
 }
 
@@ -533,8 +542,8 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
         return;
     }
 
-    if (interruptHandlers[frame.intNum] != nullptr) {
-        interruptHandlers[frame.intNum](gpr, frame);
+    if (interrupt_handlers[frame.intNum] != nullptr) {
+        interrupt_handlers[frame.intNum](gpr, frame);
     } else if (isIrq(frame.intNum)) {
         // Unexpected hardware IRQ with no handler - log and ignore.
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
@@ -558,24 +567,24 @@ void setInterruptHandler(uint8_t int_num, interruptHandler_t handler) {
         ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
         return;
     }
-    if (interruptHandlers[int_num] != nullptr) {
+    if (interrupt_handlers[int_num] != nullptr) {
         ker::mod::io::serial::write("Handler already set\n");
         return;
     }
-    interruptHandlers[int_num] = handler;
+    interrupt_handlers[int_num] = handler;
 }
 
-void removeInterruptHandler(uint8_t int_num) { interruptHandlers[int_num] = nullptr; }
+void removeInterruptHandler(uint8_t int_num) { interrupt_handlers[int_num] = nullptr; }
 
-auto isInterruptHandlerSet(uint8_t int_num) -> bool { return interruptHandlers[int_num] != nullptr; }
+auto isInterruptHandlerSet(uint8_t int_num) -> bool { return interrupt_handlers[int_num] != nullptr; }
 
 auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
     if (vector == TIMER_VECTOR) {
         journal::error("requestIrq: vector 32 is reserved for timer");
         return -1;
     }
-    if (interruptHandlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
-        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interruptHandlers[vector],
+    if (interrupt_handlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
+        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interrupt_handlers[vector],
                        irq_contexts[vector].handler);
         return -1;
     }
@@ -600,14 +609,14 @@ auto allocateVector() -> uint8_t {
     // Vectors 33-47 are reserved for legacy ISA IRQs.
     // Vectors 48-255 are available for MSI/dynamic allocation.
     for (uint16_t v = next_alloc_vector; v < 256; v++) {
-        if (interruptHandlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+        if (interrupt_handlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
             next_alloc_vector = static_cast<uint8_t>(v + 1);
             return static_cast<uint8_t>(v);
         }
     }
     // Wrap around and search from 48
     for (uint16_t v = 48; v < next_alloc_vector; v++) {
-        if (interruptHandlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+        if (interrupt_handlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
             return static_cast<uint8_t>(v);
         }
     }

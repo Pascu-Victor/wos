@@ -16,11 +16,15 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <array>
@@ -33,6 +37,7 @@
 #include <ctime>
 #include <print>
 #include <string_view>
+
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
 // ---------------------------------------------------------------------------
 // Test reporting helpers
@@ -74,7 +79,7 @@ void testd_pass_impl(const char* name) {
 
 void fail(const char* name, const char* reason) {
     g_fail++;
-    std::println("[TESTD] {}/{} FAIL: {}: {} (errno={})", g_pass, total_tests(), name, reason, errno);
+    std::fprintf(stdout, "[TESTD] %d/%d FAIL: %s: %s (errno=%d)\n", g_pass, total_tests(), name, reason, errno);
     fflush(stdout);
 }
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
@@ -95,6 +100,67 @@ void fail(const char* name, const char* reason) {
         }                        \
         TESTD_PASS((name));      \
     } while (0)
+
+// ---------------------------------------------------------------------------
+// Remote IPC helpers
+// ---------------------------------------------------------------------------
+constexpr std::string_view RH_PIPE_WRITE_MSG = "remote_pipe_ok\n";
+constexpr std::string_view RH_PIPE_READ_EXPECT = "parent_pipe_ok\n";
+constexpr std::string_view RH_SOCKET_WRITE_MSG = "remote_sock_ok\n";
+constexpr int RH_SOCKET_CTRL_RCVBUF = 16384;
+constexpr int RH_EXIT_EXEC_FAILED = 127;
+constexpr int RH_EXIT_UNKNOWN_MODE = 127;
+
+// Fork a child and exec testd --rh <mode> <fd>.
+// Closes close_fd in the child (the end we don't want the child to have).
+// Returns child pid or -1 on error.
+pid_t spawn_remote_helper(const char* mode, int fd, int close_fd) {
+    std::array<char, 16> fd_str{};
+    std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (close_fd >= 0) {
+            close(close_fd);
+        }
+        std::array<char, 15> exec_path{};
+        std::array<char, 5> rh_flag{};
+        std::array<char, 16> mode_buf{};
+        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
+        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
+        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
+        std::array<char*, 5> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    return pid;
+}
+
+pid_t spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) {
+    std::array<char, 16> fd_str{};
+    std::array<char, 16> arg_str{};
+    std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
+    std::snprintf(arg_str.data(), arg_str.size(), "%s", arg);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (close_fd >= 0) {
+            close(close_fd);
+        }
+        std::array<char, 15> exec_path{};
+        std::array<char, 5> rh_flag{};
+        std::array<char, 16> mode_buf{};
+        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
+        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
+        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
+        std::array<char*, 6> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), arg_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    return pid;
+}
 
 // ---------------------------------------------------------------------------
 // B2: VFS syscall coverage
@@ -1064,32 +1130,505 @@ TESTD_RUN(test_truncate) {
 }
 
 TESTD_RUN_END(test_truncate)
+// ---------------------------------------------------------------------------
+// Remote IPC tests — exercise WKI IPC proxy by spawning a child on a remote
+// node that operates on inherited IPC file descriptors.
+// ---------------------------------------------------------------------------
+
+// Child writes through an inherited pipe write-end (IPC_PIPE proxy on remote).
+TESTD_RUN(test_remote_ipc_pipe_child_write) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("remote_pipe_create", "pipe failed");
+        return;
+    }
+    TESTD_PASS("remote_pipe_create");
+
+    // Set REMOTE so the child's exec is routed to a remote node.
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper("pipe-write", fds[1], fds[0]);
+    // Restore flags on the parent immediately after fork.
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("remote_pipe_fork", "fork failed");
+        return;
+    }
+    // Parent holds the read end; close the write end so we get EOF when child exits.
+    close(fds[1]);
+
+    std::array<char, 64> buf{};
+    ssize_t nr = read(fds[0], buf.data(), buf.size() - 1);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (nr != static_cast<ssize_t>(RH_PIPE_WRITE_MSG.size()) ||
+        std::string_view(buf.data(), static_cast<size_t>(nr)) != RH_PIPE_WRITE_MSG) {
+        fail("remote_pipe_child_write", "data mismatch or short read");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_pipe_child_exit", "child exited with error");
+        return;
+    }
+    TESTD_PASS("remote_pipe_child_write");
+}
+TESTD_RUN_END(test_remote_ipc_pipe_child_write)
+
+// Parent writes through its own pipe write-end; remote child reads (IPC_PIPE proxy on remote).
+TESTD_RUN(test_remote_ipc_pipe_parent_write) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("remote_pipe_parent_create", "pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper("pipe-read", fds[0], fds[1]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("remote_pipe_parent_fork", "fork failed");
+        return;
+    }
+    // Parent holds the write end; child holds the read end.
+    close(fds[0]);
+
+    ssize_t nw = write(fds[1], RH_PIPE_READ_EXPECT.data(), RH_PIPE_READ_EXPECT.size());
+    close(fds[1]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (nw != static_cast<ssize_t>(RH_PIPE_READ_EXPECT.size())) {
+        fail("remote_pipe_parent_write", "short write");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_pipe_parent_write", "child rejected data or errored");
+        return;
+    }
+    TESTD_PASS("remote_pipe_parent_write");
+}
+TESTD_RUN_END(test_remote_ipc_pipe_parent_write)
+
+// Remote child inherits a PTY slave fd and performs TIOCGWINSZ ioctl through
+// the IPC_PTY proxy.
+TESTD_RUN(test_remote_ipc_pty_ioctl) {
+    int master_fd = open("/dev/ptmx", O_RDWR);
+    if (master_fd < 0) {
+        fail("remote_pty_open_master", "open /dev/ptmx failed");
+        return;
+    }
+
+    // Get the PTY number so we can open the slave.
+    unsigned int pty_num = 0;
+    if (ioctl(master_fd, TIOCGPTN, &pty_num) != 0) {
+        close(master_fd);
+        fail("remote_pty_tiocgptn", "TIOCGPTN failed");
+        return;
+    }
+
+    // PTY slave starts locked; unlock before opening /dev/pts/<n>.
+    int unlock = 0;
+    if (ioctl(master_fd, TIOCSPTLCK, &unlock) != 0) {
+        close(master_fd);
+        fail("remote_pty_unlock_slave", "TIOCSPTLCK unlock failed");
+        return;
+    }
+
+    std::array<char, 32> slave_path{};
+    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    int slave_fd = open(slave_path.data(), O_RDWR);
+    if (slave_fd < 0) {
+        close(master_fd);
+        fail("remote_pty_open_slave", "open slave failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper("pty-ioctl", slave_fd, master_fd);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(master_fd);
+        close(slave_fd);
+        fail("remote_pty_fork", "fork failed");
+        return;
+    }
+    // Parent keeps master; child gets slave via WKI proxy.
+    close(slave_fd);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(master_fd);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_pty_ioctl", "child ioctl failed or exited with error");
+        return;
+    }
+    TESTD_PASS("remote_pty_ioctl");
+}
+TESTD_RUN_END(test_remote_ipc_pty_ioctl)
+
+// Remote child writes on an inherited connected TCP socket (IPC_SOCKET proxy).
+TESTD_RUN(test_remote_ipc_socket_child_write) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        fail("remote_sock_listen_socket", "socket failed");
+        return;
+    }
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_addr.sin_port = 0;  // ephemeral port
+    if (bind(listen_fd, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+        close(listen_fd);
+        fail("remote_sock_bind", "bind failed");
+        return;
+    }
+    if (listen(listen_fd, 1) != 0) {
+        close(listen_fd);
+        fail("remote_sock_listen", "listen failed");
+        return;
+    }
+
+    struct sockaddr_in got_addr{};
+    socklen_t got_len = sizeof(got_addr);
+    if (getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&got_addr), &got_len) != 0) {
+        close(listen_fd);
+        fail("remote_sock_getsockname", "getsockname failed");
+        return;
+    }
+
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        close(listen_fd);
+        fail("remote_sock_client_socket", "socket failed");
+        return;
+    }
+    if (connect(client_fd, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr)) != 0) {
+        close(client_fd);
+        close(listen_fd);
+        fail("remote_sock_connect", "connect failed");
+        return;
+    }
+
+    int server_fd = accept(listen_fd, nullptr, nullptr);
+    close(listen_fd);
+    if (server_fd < 0) {
+        close(client_fd);
+        fail("remote_sock_accept", "accept failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper("sock-write", client_fd, server_fd);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(client_fd);
+        close(server_fd);
+        fail("remote_sock_fork", "fork failed");
+        return;
+    }
+
+    close(client_fd);
+
+    std::array<char, 64> recv_buf{};
+    ssize_t nr = recv(server_fd, recv_buf.data(), recv_buf.size(), 0);
+    close(server_fd);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (nr != static_cast<ssize_t>(RH_SOCKET_WRITE_MSG.size()) ||
+        std::string_view(recv_buf.data(), static_cast<size_t>(nr)) != RH_SOCKET_WRITE_MSG) {
+        fail("remote_sock_child_write", "socket payload mismatch");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_sock_child_exit", "child exited with error");
+        return;
+    }
+    TESTD_PASS("remote_sock_child_write");
+}
+TESTD_RUN_END(test_remote_ipc_socket_child_write)
+
+// Remote child performs socket control ops on an inherited connected TCP
+// socket: getpeername, setsockopt, getsockopt, and shutdown.
+TESTD_RUN(test_remote_ipc_socket_control_ops) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        fail("remote_sock_ctrl_listen_socket", "socket failed");
+        return;
+    }
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_addr.sin_port = 0;
+    if (bind(listen_fd, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+        close(listen_fd);
+        fail("remote_sock_ctrl_bind", "bind failed");
+        return;
+    }
+    if (listen(listen_fd, 1) != 0) {
+        close(listen_fd);
+        fail("remote_sock_ctrl_listen", "listen failed");
+        return;
+    }
+
+    struct sockaddr_in got_addr{};
+    socklen_t got_len = sizeof(got_addr);
+    if (getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&got_addr), &got_len) != 0) {
+        close(listen_fd);
+        fail("remote_sock_ctrl_getsockname", "getsockname failed");
+        return;
+    }
+
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        close(listen_fd);
+        fail("remote_sock_ctrl_client_socket", "socket failed");
+        return;
+    }
+    if (connect(client_fd, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr)) != 0) {
+        close(client_fd);
+        close(listen_fd);
+        fail("remote_sock_ctrl_connect", "connect failed");
+        return;
+    }
+
+    int server_fd = accept(listen_fd, nullptr, nullptr);
+    close(listen_fd);
+    if (server_fd < 0) {
+        close(client_fd);
+        fail("remote_sock_ctrl_accept", "accept failed");
+        return;
+    }
+
+    std::array<char, 16> port_buf{};
+    std::snprintf(port_buf.data(), port_buf.size(), "%u", static_cast<unsigned>(ntohs(got_addr.sin_port)));
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper_arg("sock-ctrl", client_fd, server_fd, port_buf.data());
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(client_fd);
+        close(server_fd);
+        fail("remote_sock_ctrl_fork", "fork failed");
+        return;
+    }
+
+    close(client_fd);
+
+    char eof_probe = 0;
+    ssize_t nr = recv(server_fd, &eof_probe, sizeof(eof_probe), 0);
+    close(server_fd);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (nr != 0) {
+        fail("remote_sock_ctrl_shutdown", "expected EOF after remote shutdown");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_sock_ctrl_ops", "child control-op checks failed");
+        return;
+    }
+    TESTD_PASS("remote_ipc_socket_control_ops");
+}
+TESTD_RUN_END(test_remote_ipc_socket_control_ops)
+
+// Remote child blocks in epoll_wait() on an inherited IPC pipe proxy and wakes on parent write.
+TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_epoll_wait_pipe", "pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipe_fds[1]);
+
+        std::array<char, 16> fd_str{};
+        std::snprintf(fd_str.data(), fd_str.size(), "%d", pipe_fds[0]);
+
+        std::array<char, 15> exec_path{};
+        std::array<char, 5> rh_flag{};
+        std::array<char, 16> mode_buf{};
+        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
+        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
+        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", "epoll-wait");
+        std::array<char*, 5> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+
+    if (pid < 0) {
+        close(pipe_fds[1]);
+        fail("remote_epoll_wait_fork", "fork failed");
+        return;
+    }
+
+    // Give the remote helper a short head start so it can enter epoll_wait()
+    // before we make the pipe readable.
+    usleep(200000);
+
+    std::string_view msg = "E";
+    if (write(pipe_fds[1], msg.data(), msg.size()) != static_cast<ssize_t>(msg.size())) {
+        close(pipe_fds[1]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        fail("remote_epoll_wait_write", "write failed");
+        return;
+    }
+    close(pipe_fds[1]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_epoll_wait_child", "remote epoll_wait child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_epoll_wait_pipe_readable");
+}
+TESTD_RUN_END(test_remote_ipc_epoll_wait_pipe_readable)
+
+// Remote child performs epoll_ctl(ADD) on inherited epoll fd (IPC_EPOLL proxy).
+TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("remote_epoll_pipe", "pipe failed");
+        return;
+    }
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("remote_epoll_create", "epoll_create1 failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[1]);
+        std::array<char, 16> epfd_str{};
+        std::array<char, 16> rfd_str{};
+        std::snprintf(epfd_str.data(), epfd_str.size(), "%d", epfd);
+        std::snprintf(rfd_str.data(), rfd_str.size(), "%d", fds[0]);
+
+        std::array<char, 15> exec_path{};
+        std::array<char, 5> rh_flag{};
+        std::array<char, 10> mode_buf{};
+        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
+        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
+        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", "epoll-add");
+        std::array<char*, 6> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), epfd_str.data(), rfd_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        close(epfd);
+        fail("remote_epoll_fork", "fork failed");
+        return;
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        close(epfd);
+        fail("remote_epoll_ctl_add", "remote epoll_ctl add failed");
+        return;
+    }
+
+    std::string_view msg = "E";
+    if (write(fds[1], msg.data(), msg.size()) != static_cast<ssize_t>(msg.size())) {
+        close(fds[0]);
+        close(fds[1]);
+        close(epfd);
+        fail("remote_epoll_write", "write failed");
+        return;
+    }
+
+    struct epoll_event ev{};
+    int ready = epoll_wait(epfd, &ev, 1, 1000);
+    close(fds[0]);
+    close(fds[1]);
+    close(epfd);
+
+    if (ready != 1 || ev.data.fd != fds[0] || (ev.events & EPOLLIN) == 0) {
+        fail("remote_epoll_wait", "expected EPOLLIN event on pipe read fd");
+        return;
+    }
+    TESTD_PASS("remote_epoll_ctl_add");
+}
+TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
+
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define TESTD_TESTS(X)                \
-    X(test_vfs_open_write_read_close) \
-    X(test_vfs_stat)                  \
-    X(test_vfs_lseek)                 \
-    X(test_vfs_mkdir_rmdir)           \
-    X(test_vfs_unlink_rename)         \
-    X(test_vfs_dup)                   \
-    X(test_vfs_dup2)                  \
-    X(test_vfs_readdir)               \
-    X(test_vfs_access)                \
-    X(test_chmod)                     \
-    X(test_truncate)                  \
-    X(test_pipe_basic)                \
-    X(test_pipe_eof_on_writer_close)  \
-    X(test_getpid_getppid)            \
-    X(test_getcwd_chdir)              \
-    X(test_fork_exit)                 \
-    X(test_fork_pipe_byte)            \
-    X(test_fork_pipe_communication)   \
-    X(test_fork_multiple)             \
-    X(test_mmap_anon)                 \
-    X(test_file_write_read)           \
-    X(test_mmap_file)                 \
-    X(test_tcp_loopback)              \
-    X(test_tcp_nonblocking_connect_refused)
+#define TESTD_TESTS(X)                      \
+    X(test_vfs_open_write_read_close)       \
+    X(test_vfs_stat)                        \
+    X(test_vfs_lseek)                       \
+    X(test_vfs_mkdir_rmdir)                 \
+    X(test_vfs_unlink_rename)               \
+    X(test_vfs_dup)                         \
+    X(test_vfs_dup2)                        \
+    X(test_vfs_readdir)                     \
+    X(test_vfs_access)                      \
+    X(test_chmod)                           \
+    X(test_truncate)                        \
+    X(test_pipe_basic)                      \
+    X(test_pipe_eof_on_writer_close)        \
+    X(test_getpid_getppid)                  \
+    X(test_getcwd_chdir)                    \
+    X(test_fork_exit)                       \
+    X(test_fork_pipe_byte)                  \
+    X(test_fork_pipe_communication)         \
+    X(test_fork_multiple)                   \
+    X(test_mmap_anon)                       \
+    X(test_file_write_read)                 \
+    X(test_mmap_file)                       \
+    X(test_tcp_loopback)                    \
+    X(test_tcp_nonblocking_connect_refused) \
+    X(test_remote_ipc_pipe_child_write)     \
+    X(test_remote_ipc_pipe_parent_write)    \
+    X(test_remote_ipc_pty_ioctl)            \
+    X(test_remote_ipc_socket_child_write)   \
+    X(test_remote_ipc_socket_control_ops)   \
+    X(test_remote_ipc_epoll_wait_pipe_readable) \
+    X(test_remote_ipc_epoll_ctl_add)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 constexpr auto K_TESTS = std::array{
 #define TESTD_MAKE_SPEC(fn) TestSpec{fn, fn##_pass_count},
@@ -1117,7 +1656,134 @@ constexpr auto total_tests() -> int { return G_TOTAL; }
 // Main: run all tests
 // ---------------------------------------------------------------------------
 
-auto main() -> int {
+auto main(int argc, char** argv) -> int {
+    // Remote helper mode: child process execed to run on a remote node.
+    // argv: testd --rh <mode> <fd>
+    if (argc >= 4 && std::strcmp(argv[1], "--rh") == 0) {
+        const char* mode = argv[2];
+        int fd = std::atoi(argv[3]);
+        if (std::strcmp(mode, "pipe-write") == 0) {
+            ssize_t n = write(fd, RH_PIPE_WRITE_MSG.data(), RH_PIPE_WRITE_MSG.size());
+            close(fd);
+            return (n == static_cast<ssize_t>(RH_PIPE_WRITE_MSG.size())) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "pipe-read") == 0) {
+            std::array<char, 32> buf{};
+            ssize_t n = read(fd, buf.data(), buf.size() - 1);
+            close(fd);
+            if (n <= 0) {
+                return 1;
+            }
+            std::string_view got{buf.data(), static_cast<size_t>(n)};
+            return (got == RH_PIPE_READ_EXPECT) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "pty-ioctl") == 0) {
+            struct winsize ws{};
+            int rc = ioctl(fd, TIOCGWINSZ, &ws);
+            close(fd);
+            return (rc == 0) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "sock-write") == 0) {
+            ssize_t n = send(fd, RH_SOCKET_WRITE_MSG.data(), RH_SOCKET_WRITE_MSG.size(), 0);
+            close(fd);
+            return (n == static_cast<ssize_t>(RH_SOCKET_WRITE_MSG.size())) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "sock-ctrl") == 0) {
+            if (argc < 5) {
+                close(fd);
+                return 1;
+            }
+            int expected_port = std::atoi(argv[4]);
+            struct sockaddr_in peer{};
+            socklen_t peer_len = sizeof(peer);
+            if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) != 0) {
+                close(fd);
+                return 1;
+            }
+            if (peer_len != sizeof(peer) || peer.sin_family != AF_INET || ntohl(peer.sin_addr.s_addr) != INADDR_LOOPBACK ||
+                ntohs(peer.sin_port) != expected_port) {
+                close(fd);
+                return 1;
+            }
+
+            int rcvbuf = RH_SOCKET_CTRL_RCVBUF;
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
+                close(fd);
+                return 1;
+            }
+
+            int got_rcvbuf = 0;
+            socklen_t got_rcvbuf_len = sizeof(got_rcvbuf);
+            if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got_rcvbuf, &got_rcvbuf_len) != 0) {
+                close(fd);
+                return 1;
+            }
+            if (got_rcvbuf_len != sizeof(got_rcvbuf) || got_rcvbuf != RH_SOCKET_CTRL_RCVBUF) {
+                close(fd);
+                return 1;
+            }
+
+            int keepalive = 1;
+            if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) != 0) {
+                close(fd);
+                return 1;
+            }
+
+            if (shutdown(fd, SHUT_WR) != 0) {
+                close(fd);
+                return 1;
+            }
+
+            usleep(100000);
+            close(fd);
+            return 0;
+        }
+        if (std::strcmp(mode, "epoll-add") == 0) {
+            if (argc < 5) {
+                close(fd);
+                return 1;
+            }
+            int target_fd = std::atoi(argv[4]);
+            struct epoll_event ev{};
+            ev.events = EPOLLIN;
+            ev.data.fd = target_fd;
+            int rc = epoll_ctl(fd, EPOLL_CTL_ADD, target_fd, &ev);
+            close(fd);
+            return (rc == 0) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "epoll-wait") == 0) {
+            int epfd = epoll_create1(0);
+            if (epfd < 0) {
+                close(fd);
+                return 1;
+            }
+
+            struct epoll_event ev{};
+            ev.events = EPOLLIN;
+            ev.data.fd = fd;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+                close(epfd);
+                close(fd);
+                return 1;
+            }
+
+            struct epoll_event out{};
+            int rc = epoll_wait(epfd, &out, 1, 1000);
+            if (rc != 1 || out.data.fd != fd || (out.events & EPOLLIN) == 0) {
+                close(epfd);
+                close(fd);
+                return 1;
+            }
+
+            char byte = 0;
+            ssize_t nr = read(fd, &byte, sizeof(byte));
+            close(epfd);
+            close(fd);
+            return (nr == 1 && byte == 'E') ? 0 : 1;
+        }
+        return RH_EXIT_UNKNOWN_MODE;
+    }
+
     std::println("[TESTD] starting");
     fflush(stdout);
 

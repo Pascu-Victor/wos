@@ -3,9 +3,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/sys/spinlock.hpp>
 
 #include "bits/ssize_t.h"
+#include "net/endian.hpp"
 
 namespace ker::net {
 
@@ -15,6 +17,44 @@ constexpr size_t UDP_RCVBUF_SIZE = 65536;       // 64 KB - datagrams don't pipel
 constexpr size_t RAW_RCVBUF_SIZE = 65536;       // 64 KB
 constexpr size_t SOCKET_RCVBUF_MIN = 8192;      // 8 KB floor for SO_RCVBUF
 constexpr size_t SOCKET_RCVBUF_MAX = 10485760;  // 10 MB ceiling for SO_RCVBUF
+constexpr uint16_t SOCKADDR_V4_FAMILY = 2;
+constexpr size_t SOCKADDR_V4_MIN_LEN = 8;
+constexpr size_t SOCKADDR_V4_LEN = 16;
+
+inline auto socket_parse_sockaddr_v4(const void* addr_raw, size_t addr_len, uint32_t* ip_out, uint16_t* port_out) -> bool {
+    if (addr_raw == nullptr || addr_len < SOCKADDR_V4_MIN_LEN || ip_out == nullptr || port_out == nullptr) {
+        return false;
+    }
+
+    const auto* addr = static_cast<const uint8_t*>(addr_raw);
+    uint16_t port_be = 0;
+    uint32_t ip_be = 0;
+    std::memcpy(&port_be, addr + 2, sizeof(port_be));
+    std::memcpy(&ip_be, addr + 4, sizeof(ip_be));
+    *port_out = ntohs(port_be);
+    *ip_out = ntohl(ip_be);
+    return true;
+}
+
+inline auto socket_fill_sockaddr_v4(void* addr_out, size_t max_len, size_t* addr_len, uint32_t ip, uint16_t port) -> bool {
+    if (addr_len != nullptr) {
+        *addr_len = SOCKADDR_V4_LEN;
+    }
+    if (addr_out == nullptr || max_len < SOCKADDR_V4_MIN_LEN) {
+        return false;
+    }
+
+    uint8_t encoded[SOCKADDR_V4_LEN] = {};
+    const uint16_t family = SOCKADDR_V4_FAMILY;
+    const uint16_t port_be = htons(port);
+    const uint32_t ip_be = htonl(ip);
+    std::memcpy(encoded, &family, sizeof(family));
+    std::memcpy(encoded + 2, &port_be, sizeof(port_be));
+    std::memcpy(encoded + 4, &ip_be, sizeof(ip_be));
+    const size_t copy_len = max_len < SOCKADDR_V4_LEN ? max_len : SOCKADDR_V4_LEN;
+    std::memcpy(addr_out, encoded, copy_len);
+    return true;
+}
 
 // Socket flags (Linux-compatible values for ease of userspace reuse)
 constexpr int SOCK_NONBLOCK = 0x800;  // matches Linux SOCK_NONBLOCK

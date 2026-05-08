@@ -49,9 +49,7 @@ static auto try_sync(uint32_t server_ip) -> bool {
 
     // Build destination sockaddr: family(2B) + port(2B) + addr(4B) + padding(8B)
     uint8_t remote[16] = {};
-    *reinterpret_cast<uint16_t*>(remote + 0) = 2;                           // AF_INET
-    *reinterpret_cast<uint16_t*>(remote + 2) = ker::net::htons(NTP_PORT);   // network byte order
-    *reinterpret_cast<uint32_t*>(remote + 4) = ker::net::htonl(server_ip);  // network byte order
+    ker::net::socket_fill_sockaddr_v4(remote, sizeof(remote), nullptr, server_ip, NTP_PORT);
 
     // Build SNTP client request (48 bytes, all zero except first byte).
     // Byte 0: LI=0, VN=4, Mode=3 (client) -> 0b 00 100 011 = 0x23

@@ -740,9 +740,9 @@ def collect_unique_nodes(config: dict) -> dict:
 
 # TCG log-level presets (only useful with software emulation, no-ops under KVM)
 TCG_LOG_LEVELS = {
-    "": "cpu_reset,int,in_asm,nochain,guest_errors,page",
-    "int": "cpu_reset,int,pcall,in_asm,nochain,guest_errors,page",
-    "full": "cpu_reset,int,exec,cpu,fpu,pcall,in_asm,nochain,guest_errors,page,mmu",
+    "": "cpu_reset,int,tid,in_asm,nochain,guest_errors,page",
+    "int": "cpu_reset,int,tid,pcall,in_asm,nochain,guest_errors,page",
+    "full": "cpu_reset,int,tid,exec,cpu,fpu,pcall,in_asm,nochain,guest_errors,page,mmu",
 }
 
 
@@ -800,18 +800,24 @@ def build_qemu_args(
         print(f"  ERROR creating overlay {overlay1}: {result.stderr.strip()}")
 
     serial_log = f"serial-vm{node_id}.log"
-    qemu_log = f"qemu-vm{node_id}.%d.log"
+    qemu_log = f"qemu-vm{node_id}.log"
 
     # Remove old logs
-    for f in Path(".").glob(f"qemu-vm{node_id}.*log"):
-        f.unlink()
+    for pattern in (
+        f"qemu-vm{node_id}.log",
+        f"qemu-vm{node_id}.*log",
+        f"qemu-vm{node_id}-cpu*.log",
+    ):
+        for f in Path(".").glob(pattern):
+            f.unlink()
     if os.path.exists(serial_log):
         os.remove(serial_log)
 
     # Acceleration: KVM (default) or TCG (software emulation for full tracing)
     if tcg_level is not None:
-        accel_args = ["-accel", "tcg"]
+        accel_args = ["-accel", "tcg,thread=multi", "-cpu", "max"]
         log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
+        qemu_log = f"qemu-vm{node_id}-cpu%d.log"
         print(
             f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}"
         )

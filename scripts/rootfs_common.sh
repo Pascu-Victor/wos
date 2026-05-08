@@ -271,6 +271,14 @@ EOF
             {
                 echo "run"
                 echo "mount /dev/sda1 /"
+                # Clean up legacy usr-merge artifacts from older image creation
+                # flows that could leave recursive links like /bin/bin.
+                echo "rm-f /usr/bin/bin"
+                echo "rm-f /usr/sbin/sbin"
+                echo "rm-f /usr/lib/lib"
+                echo "rm-f /bin/bin"
+                echo "rm-f /sbin/sbin"
+                echo "rm-f /lib/lib"
                 while IFS= read -r path; do
                     [ -n "$path" ] || continue
                     printf 'glob rm-rf %s\n' "$path"

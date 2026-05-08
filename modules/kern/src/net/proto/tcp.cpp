@@ -73,13 +73,11 @@ auto generate_iss() -> uint32_t {
 auto alloc_ephemeral_port() -> uint16_t { return tcp_ephemeral_port++; }
 
 int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
-    if (addr_len < 8) {
+    uint16_t port = 0;
+    uint32_t ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
     }
-
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
 
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
@@ -163,12 +161,8 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     sock->aq_count--;
     sock->lock.unlock();
 
-    if (addr_out != nullptr && addr_len != nullptr && *addr_len >= 8) {
-        auto* addr = static_cast<uint8_t*>(addr_out);
-        *reinterpret_cast<uint16_t*>(addr) = 2;  // AF_INET
-        *reinterpret_cast<uint16_t*>(addr + 2) = htons(child->remote_v4.port);
-        *reinterpret_cast<uint32_t*>(addr + 4) = htonl(child->remote_v4.addr);
-        *addr_len = 8;
+    if (addr_out != nullptr && addr_len != nullptr && *addr_len >= SOCKADDR_V4_MIN_LEN) {
+        socket_fill_sockaddr_v4(addr_out, *addr_len, addr_len, child->remote_v4.addr, child->remote_v4.port);
     }
 #ifdef TCP_DEBUG
     ker::mod::dbg::log("[tcp] tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote_v4.port);
@@ -211,13 +205,11 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     }
 
     // First connect call
-    if (addr_len < 8) {
+    uint16_t port = 0;
+    uint32_t ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
     }
-
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
 
     // Auto-bind if not already bound
     if (cb->local_port == 0) {
@@ -584,20 +576,25 @@ int tcp_shutdown_op(Socket* sock, int how) {
 }
 
 int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+    int optint = 0;
+    if (optval != nullptr && optlen >= sizeof(optint)) {
+        std::memcpy(&optint, optval, sizeof(optint));
+    }
+
     if (optname == 2 && optlen >= sizeof(int)) {  // SO_REUSEADDR
-        sock->reuse_addr = *static_cast<const int*>(optval) != 0;
+        sock->reuse_addr = optint != 0;
     }
     if (optname == 15 && optlen >= sizeof(int)) {  // SO_REUSEPORT
-        sock->reuse_port = *static_cast<const int*>(optval) != 0;
+        sock->reuse_port = optint != 0;
     }
     if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
-        socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+        socket_resize_rcvbuf(sock, static_cast<size_t>(optint));
     }
     if (optname == 9 && optlen >= sizeof(int)) {  // SO_KEEPALIVE
         auto* cb = static_cast<TcpCB*>(sock->proto_data);
         if (cb != nullptr) {
             uint64_t flags = cb->lock.lock_irqsave();
-            cb->keepalive_enabled = *static_cast<const int*>(optval) != 0;
+            cb->keepalive_enabled = optint != 0;
             if (cb->keepalive_enabled && cb->state == TcpState::ESTABLISHED) {
                 cb->keepalive_count = 0;
                 cb->keepalive_deadline = tcp_now_ms() + cb->keepalive_idle_ms;
@@ -613,7 +610,8 @@ int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t
 
 int tcp_getsockopt_op(Socket* sock, int, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
-        *static_cast<int*>(optval) = static_cast<int>(sock->rcvbuf.capacity);
+        int value = static_cast<int>(sock->rcvbuf.capacity);
+        std::memcpy(optval, &value, sizeof(value));
         *optlen = sizeof(int);
     }
     return 0;

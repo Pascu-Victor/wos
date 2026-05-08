@@ -197,6 +197,11 @@ void wki_dev_server_forward_net_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
 // proxies when a real NIC changes locally.
 void wki_dev_server_notify_net_changed(net::NetDevice* dev);
 
+// Refresh cached VFS export path/name for active bindings attached to a
+// resource whose advertised backing path changed (for example after
+// pivot_root() rebuilds the export table).
+void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export_path, const char* export_name);
+
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------

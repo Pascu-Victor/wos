@@ -5,6 +5,7 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 
@@ -119,7 +120,19 @@ struct ProxyIpcState {
     // Blocked reader task (for wakeup from message handler)
     std::atomic<ker::mod::sched::task::Task*> blocked_reader{nullptr};
 
+    // poll()/epoll_wait() waiters registered on this proxy fd.
+    ker::util::SmallVec<uint64_t, 2> poll_waiters;
+
     ker::mod::sys::Spinlock lock;
+
+    // Synchronous control-op wait state (socket control ops: SHUTDOWN, GETPEERNAME, etc.)
+    // Protected by lock; only one in-flight control op per proxy at a time.
+    WkiWaitEntry* pending_wait = nullptr;
+    uint16_t pending_wait_op = 0;
+    int pending_wait_status = 0;
+    static constexpr size_t SOCK_CTRL_RESP_MAX = 128;
+    uint8_t pending_wait_resp[SOCK_CTRL_RESP_MAX] = {};
+    uint16_t pending_wait_resp_len = 0;
 
     // Reference count: one per live fops user (read, close, message handler).
     // Initialized to 1 (held by the File that owns this proxy).
@@ -175,6 +188,30 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
 
 // Cleanup all IPC exports/proxies for a fenced peer
 void wki_ipc_cleanup_for_peer(uint16_t node_id);
+
+// Shared proxy teardown helper for non-pipe proxy fops.
+void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy);
+
+// Shared proxy poll waiter helpers for pipe/socket/pty proxy fops.
+auto wki_ipc_proxy_register_poll_waiter(ProxyIpcState* proxy, uint64_t pid) -> bool;
+void wki_ipc_proxy_wake_poll_waiters(ProxyIpcState* proxy);
+
+// Socket proxy fops (implemented in remote_ipc_socket.cpp).
+extern ker::vfs::FileOperations g_proxy_socket_fops;
+
+// Socket proxy helpers for net syscalls operating on inherited remote sockets.
+auto wki_ipc_is_socket_proxy_file(const ker::vfs::File* file) -> bool;
+auto wki_ipc_socket_shutdown(ker::vfs::File* file, int how) -> int;
+auto wki_ipc_socket_getpeername(ker::vfs::File* file, void* addr_out, size_t* addr_len) -> int;
+auto wki_ipc_socket_getsockopt(ker::vfs::File* file, int level, int optname, void* optval, size_t* optlen) -> int;
+auto wki_ipc_socket_setsockopt(ker::vfs::File* file, int level, int optname, const void* optval, size_t optlen) -> int;
+
+// Socket-specific DEV_OP_RESP handling hook.
+void wki_ipc_socket_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len);
+
+// Forward a local epoll_ctl() on an IPC_EPOLL proxy fd to the home node.
+// Returns -EOPNOTSUPP when epfile is not an IPC_EPOLL proxy.
+auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t events, uint64_t data) -> int;
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers

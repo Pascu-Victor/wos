@@ -13,6 +13,7 @@
 #include <net/route.hpp>
 #include <net/socket.hpp>
 #include <net/wki/dev_server.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/remotable.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
@@ -158,6 +159,7 @@ ker::vfs::FileOperations socket_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = nullptr,  // Sockets use SocketProtoOps::poll_check instead
     .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
 };
 
 struct SocketHandle {
@@ -165,6 +167,16 @@ struct SocketHandle {
     ker::net::Socket* sock = nullptr;
 
     ~SocketHandle() {
+        if (file != nullptr) {
+            ker::vfs::vfs_put_file(file);
+        }
+    }
+};
+
+struct FileHandle {
+    ker::vfs::File* file = nullptr;
+
+    ~FileHandle() {
         if (file != nullptr) {
             ker::vfs::vfs_put_file(file);
         }
@@ -189,6 +201,17 @@ auto fd_to_socket(uint64_t fd_num) -> SocketHandle {
     }
 
     handle.sock = static_cast<ker::net::Socket*>(handle.file->private_data);
+    return handle;
+}
+
+auto fd_to_file(uint64_t fd_num) -> FileHandle {
+    FileHandle handle;
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return handle;
+    }
+
+    handle.file = ker::vfs::vfs_get_file_retain(task, static_cast<int>(fd_num));
     return handle;
 }
 
@@ -230,14 +253,11 @@ auto addr_len_for_domain(int domain) -> size_t {
 
 // Fill a sockaddr_in from socket local address
 void fill_sockaddr_v4(void* addr_out, size_t* addr_len, uint32_t ip, uint16_t port) {
-    auto* out = static_cast<uint8_t*>(addr_out);
-    std::memset(out, 0, 16);
-    *reinterpret_cast<uint16_t*>(out) = 2;  // AF_INET
-    *reinterpret_cast<uint16_t*>(out + 2) = ker::net::htons(port);
-    *reinterpret_cast<uint32_t*>(out + 4) = ker::net::htonl(ip);
+    size_t max_len = ker::net::SOCKADDR_V4_LEN;
     if (addr_len != nullptr) {
-        *addr_len = 16;
+        max_len = *addr_len;
     }
+    ker::net::socket_fill_sockaddr_v4(addr_out, max_len, addr_len, ip, port);
 }
 
 constexpr size_t WOS_NET_IF_NAME_LEN = 16;
@@ -546,6 +566,18 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    if (static_cast<int>(a4) != 0) {
+                        return static_cast<uint64_t>(-EOPNOTSUPP);
+                    }
+                    if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_write == nullptr) {
+                        return static_cast<uint64_t>(-ENOSYS);
+                    }
+                    auto result =
+                        file_handle.file->fops->vfs_write(file_handle.file, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), 0);
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
@@ -562,6 +594,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    if (static_cast<int>(a4) != 0) {
+                        return static_cast<uint64_t>(-EOPNOTSUPP);
+                    }
+                    if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_read == nullptr) {
+                        return static_cast<uint64_t>(-ENOSYS);
+                    }
+                    auto result = file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0);
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
@@ -620,6 +663,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    int result = ker::net::wki::wki_ipc_socket_setsockopt(
+                        file_handle.file, static_cast<int>(a2), static_cast<int>(a3), reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->setsockopt == nullptr) {
@@ -635,6 +684,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    int result = ker::net::wki::wki_ipc_socket_getsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
+                                                                          reinterpret_cast<void*>(a4), reinterpret_cast<size_t*>(a5));
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->getsockopt == nullptr) {
@@ -650,6 +705,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    int result = ker::net::wki::wki_ipc_socket_shutdown(file_handle.file, static_cast<int>(a2));
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->proto_ops == nullptr || sock->proto_ops->shutdown == nullptr) {
@@ -664,6 +724,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
+                auto file_handle = fd_to_file(a1);
+                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                    int result =
+                        ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, reinterpret_cast<void*>(a2), reinterpret_cast<size_t*>(a3));
+                    return static_cast<uint64_t>(result);
+                }
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->domain == 2) {  // AF_INET

@@ -28,12 +28,11 @@ run
 mount /dev/sda1 /
 mkdir /EFI
 mkdir /EFI/BOOT
-mkdir /boot
-mkdir /boot/limine
-copy-in $CWD/build/modules/kern/wos /boot
-copy-in $CWD/modules/kern/limine.conf /boot/limine
+mkdir /limine
+copy-in $CWD/build/modules/kern/wos /
+copy-in $CWD/modules/kern/limine.conf /limine
 copy-in /usr/share/limine/BOOTX64.EFI /EFI/BOOT
-copy-in $CWD/build/initramfs.cpio /boot
+copy-in $CWD/build/initramfs.cpio /
 umount /
 _EOF_
 

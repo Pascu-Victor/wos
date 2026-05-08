@@ -25,4 +25,9 @@ int64_t futex_wake(int* addr);
 // Detach and free the current task's waiter if it exits while blocked in futex_wait().
 void futex_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 
+// Wake threads waiting on a futex physical address (no virtual→physical translation needed).
+// Used by the WKI remote IPC subsystem to forward OP_FUTEX_WAKE from a remote node.
+// Returns the number of threads woken, or -EINVAL if phys_addr == 0.
+int64_t futex_wake_by_phys(uint64_t phys_addr);
+
 }  // namespace ker::syscall::futex

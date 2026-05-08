@@ -1616,6 +1616,14 @@ auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
         return absolute;
     }
 
+    // Canonicalize before applying the per-task root prefix. If we prepend
+    // first, paths like "/.." become "/rootfs/.." and collapse to "/",
+    // escaping the pivot_root namespace.
+    int canonical = canonicalize_path(out, outsize);
+    if (canonical < 0) {
+        return canonical;
+    }
+
     // Prepend per-process root prefix when it differs from "/".
     // This makes pivot_root transparent: after pivot_root("/rootfs", ...),
     // task->root becomes "/rootfs" and all absolute paths get prefixed.
@@ -2382,8 +2390,7 @@ auto vfs_close(int fd) -> int {
     }
 
     ker::mod::perf::record_container_stat(0, t->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                          static_cast<int64_t>(fd_count), 0,
-                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+                                          static_cast<int64_t>(fd_count), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
     // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
     if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
@@ -2492,8 +2499,7 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     }
     file->fd = static_cast<int>(slot);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
-                                          static_cast<int64_t>(fd_count), 0,
-                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+                                          static_cast<int64_t>(fd_count), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return static_cast<int>(slot);
 }
 
@@ -2540,8 +2546,7 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     size_t fd_count = task->fd_table.size();
     task->fd_table_lock.unlock_irqrestore(irqf);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                          static_cast<int64_t>(fd_count), 0,
-                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+                                          static_cast<int64_t>(fd_count), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return 0;
 }
 
@@ -2740,13 +2745,13 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
             size_t child_count = 0;
 
             for (size_t mi = 0; mi < get_mount_count(); ++mi) {
-                MountPoint* mp = get_mount_at(mi);
-                if (mp == nullptr || mp->path == nullptr) {
+                MountSnapshot mount_snapshot = {};
+                if (!get_mount_snapshot_at(mi, &mount_snapshot)) {
                     continue;
                 }
 
                 char visible_mount_path[MAX_PATH_LEN] = {};
-                if (strip_current_task_root_prefix(mp->path, visible_mount_path, sizeof(visible_mount_path)) < 0) {
+                if (strip_current_task_root_prefix(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path)) < 0) {
                     continue;
                 }
 
@@ -2778,11 +2783,11 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                 // Dedup against earlier mounts that yield the same child name
                 bool dup_mount = false;
                 for (size_t mj = 0; mj < mi; ++mj) {
-                    MountPoint* mp2 = get_mount_at(mj);
-                    if (mp2 == nullptr || mp2->path == nullptr) continue;
+                    MountSnapshot mount_snapshot2 = {};
+                    if (!get_mount_snapshot_at(mj, &mount_snapshot2)) continue;
 
                     char visible_mount_path2[MAX_PATH_LEN] = {};
-                    if (strip_current_task_root_prefix(mp2->path, visible_mount_path2, sizeof(visible_mount_path2)) < 0) {
+                    if (strip_current_task_root_prefix(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2)) < 0) {
                         continue;
                     }
 
@@ -2828,7 +2833,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 
                 if (child_count == mount_idx) {
                     // Fill the synthetic DirEntry
-                    entries[entries_read].d_ino = reinterpret_cast<uint64_t>(mp);
+                    entries[entries_read].d_ino = (static_cast<uint64_t>(mount_snapshot.dev_id) << 32) | 0x4d4e5455ULL;
                     entries[entries_read].d_off = actual_index + 1;
                     entries[entries_read].d_reclen = sizeof(DirEntry);
 
@@ -3464,8 +3469,8 @@ auto vfs_fstat(int fd, stat* statbuf) -> int {
 
 static void fill_synthetic_statvfs(statvfs* buf) {
     std::memset(buf, 0, sizeof(statvfs));
-    buf->f_bsize   = 4096;
-    buf->f_frsize  = 4096;
+    buf->f_bsize = 4096;
+    buf->f_frsize = 4096;
     buf->f_namemax = 255;
 }
 
@@ -3493,22 +3498,20 @@ auto vfs_statvfs(const char* path, statvfs* buf) -> int {
 
     switch (mount->fs_type) {
         case FSType::XFS:
-            return ker::vfs::xfs::xfs_statvfs(
-                static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+            return ker::vfs::xfs::xfs_statvfs(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
         case FSType::FAT32:
-            return ker::vfs::fat32::fat32_statvfs(
-                static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+            return ker::vfs::fat32::fat32_statvfs(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
         case FSType::TMPFS: {
             uint64_t total_blocks = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
-            uint64_t free_blocks  = ker::mod::mm::phys::get_free_mem_bytes()  / 4096;
-            buf->f_bsize   = 4096;
-            buf->f_frsize  = 4096;
-            buf->f_blocks  = total_blocks;
-            buf->f_bfree   = free_blocks;
-            buf->f_bavail  = free_blocks;
-            buf->f_files   = total_blocks;
-            buf->f_ffree   = free_blocks;
-            buf->f_favail  = free_blocks;
+            uint64_t free_blocks = ker::mod::mm::phys::get_free_mem_bytes() / 4096;
+            buf->f_bsize = 4096;
+            buf->f_frsize = 4096;
+            buf->f_blocks = total_blocks;
+            buf->f_bfree = free_blocks;
+            buf->f_bavail = free_blocks;
+            buf->f_files = total_blocks;
+            buf->f_ffree = free_blocks;
+            buf->f_favail = free_blocks;
             buf->f_namemax = 255;
             return 0;
         }
@@ -3549,20 +3552,16 @@ auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
         MountPoint* mount = find_mount_point(file->vfs_path);
         if (mount != nullptr) {
             switch (mount->fs_type) {
-                case FSType::XFS:
-                    {
-                        int result = ker::vfs::xfs::xfs_statvfs(
-                            static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
-                        vfs_put_file(file);
-                        return result;
-                    }
-                case FSType::FAT32:
-                    {
-                        int result = ker::vfs::fat32::fat32_statvfs(
-                            static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
-                        vfs_put_file(file);
-                        return result;
-                    }
+                case FSType::XFS: {
+                    int result = ker::vfs::xfs::xfs_statvfs(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), buf);
+                    vfs_put_file(file);
+                    return result;
+                }
+                case FSType::FAT32: {
+                    int result = ker::vfs::fat32::fat32_statvfs(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
+                    vfs_put_file(file);
+                    return result;
+                }
                 default:
                     break;
             }
@@ -3573,15 +3572,15 @@ auto vfs_fstatvfs(int fd, statvfs* buf) -> int {
     switch (file->fs_type) {
         case FSType::TMPFS: {
             uint64_t total_blocks = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
-            uint64_t free_blocks  = ker::mod::mm::phys::get_free_mem_bytes()  / 4096;
-            buf->f_bsize   = 4096;
-            buf->f_frsize  = 4096;
-            buf->f_blocks  = total_blocks;
-            buf->f_bfree   = free_blocks;
-            buf->f_bavail  = free_blocks;
-            buf->f_files   = total_blocks;
-            buf->f_ffree   = free_blocks;
-            buf->f_favail  = free_blocks;
+            uint64_t free_blocks = ker::mod::mm::phys::get_free_mem_bytes() / 4096;
+            buf->f_bsize = 4096;
+            buf->f_frsize = 4096;
+            buf->f_blocks = total_blocks;
+            buf->f_bfree = free_blocks;
+            buf->f_bavail = free_blocks;
+            buf->f_files = total_blocks;
+            buf->f_ffree = free_blocks;
+            buf->f_favail = free_blocks;
             buf->f_namemax = 255;
             vfs_put_file(file);
             return 0;
@@ -4293,12 +4292,11 @@ auto vfs_fchmod(int fd, int mode) -> int {
         case FSType::FAT32:
             vfs_put_file(f);
             return 0;  // No permission model; silently accept
-        case FSType::XFS:
-            {
-                int result = ker::vfs::xfs::xfs_fchmod(f, mode);
-                vfs_put_file(f);
-                return result;
-            }
+        case FSType::XFS: {
+            int result = ker::vfs::xfs::xfs_fchmod(f, mode);
+            vfs_put_file(f);
+            return result;
+        }
         default:
             vfs_put_file(f);
             return -ENOSYS;
@@ -4410,31 +4408,31 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             return static_cast<int>(slot);
         }
         case 1:  // F_GETFD
-            {
-                uint64_t irqf = task->fd_table_lock.lock_irqsave();
-                int result = task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
-                task->fd_table_lock.unlock_irqrestore(irqf);
-                vfs_put_file(f);
-                return result;
-            }
+        {
+            uint64_t irqf = task->fd_table_lock.lock_irqsave();
+            int result = task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
+            task->fd_table_lock.unlock_irqrestore(irqf);
+            vfs_put_file(f);
+            return result;
+        }
         case 2:  // F_SETFD
-            {
-                uint64_t irqf = task->fd_table_lock.lock_irqsave();
-                if (arg & 1) {
-                    task->set_fd_cloexec(static_cast<unsigned>(fd));
-                } else {
-                    task->clear_fd_cloexec(static_cast<unsigned>(fd));
-                }
-                task->fd_table_lock.unlock_irqrestore(irqf);
-                vfs_put_file(f);
-                return 0;
+        {
+            uint64_t irqf = task->fd_table_lock.lock_irqsave();
+            if (arg & 1) {
+                task->set_fd_cloexec(static_cast<unsigned>(fd));
+            } else {
+                task->clear_fd_cloexec(static_cast<unsigned>(fd));
             }
+            task->fd_table_lock.unlock_irqrestore(irqf);
+            vfs_put_file(f);
+            return 0;
+        }
         case 3:  // F_GETFL
-            {
-                int result = f->open_flags;
-                vfs_put_file(f);
-                return result;
-            }
+        {
+            int result = f->open_flags;
+            vfs_put_file(f);
+            return result;
+        }
         case 4:  // F_SETFL
             f->open_flags = static_cast<int>(arg);
             vfs_put_file(f);
@@ -5374,12 +5372,11 @@ auto vfs_fsync(int fd) -> int {
     if (file == nullptr) return -EBADF;
 
     switch (file->fs_type) {
-        case FSType::FAT32:
-            {
-                int result = ker::vfs::fat32::fat32_fsync(file);
-                vfs_put_file(file);
-                return result;
-            }
+        case FSType::FAT32: {
+            int result = ker::vfs::fat32::fat32_fsync(file);
+            vfs_put_file(file);
+            return result;
+        }
         case FSType::XFS:
         case FSType::TMPFS:
         case FSType::DEVFS:

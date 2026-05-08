@@ -185,4 +185,32 @@ void futex_wait_cleanup_for_task(mod::sched::task::Task* task) {
     delete waiter;
 }
 
+int64_t futex_wake_by_phys(uint64_t phys_addr) {
+    if (phys_addr == 0) {
+        return -EINVAL;
+    }
+    ensure_futex_table();
+
+    int woken_count = 0;
+    futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
+        bool own_waiter = true;
+        auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
+        if (waiter_task != nullptr) {
+            void* expected_waiter = waiter;
+            if (!waiter_task->futexWaiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
+                                                                  std::memory_order_acquire)) {
+                own_waiter = false;
+            }
+            waiter_task->deferredTaskSwitch = false;
+            mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
+            woken_count++;
+            waiter_task->release();
+        }
+        if (waiter_task == nullptr || own_waiter) {
+            delete waiter;
+        }
+    });
+    return woken_count;
+}
+
 }  // namespace ker::syscall::futex

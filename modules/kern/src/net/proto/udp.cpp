@@ -51,14 +51,11 @@ auto alloc_binding() -> UdpBinding* {
 }
 
 int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
-    if (addr_len < 8) {
+    uint16_t port = 0;
+    uint32_t ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
     }
-
-    // sockaddr_in layout: family(2) + port(2) + addr(4)
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
 
     udp_lock.lock();
 
@@ -92,12 +89,11 @@ int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 int udp_listen(Socket*, int) { return -1; }  // UDP doesn't listen
 int udp_accept(Socket*, Socket**, void*, size_t*) { return -1; }
 int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
-    if (addr_len < 8) {
+    uint16_t port = 0;
+    uint32_t ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
     }
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
 
     sock->remote_v4.addr = ip;
     sock->remote_v4.port = port;
@@ -155,13 +151,11 @@ auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
 }
 
 auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
-    if (addr_raw == nullptr || addr_len < 8) {
+    uint16_t port = 0;
+    uint32_t ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
     }
-
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
 
     // Auto-bind if not bound
     if (sock->local_v4.port == 0) {
@@ -210,13 +204,10 @@ auto udp_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_raw, size
 
     if (addr_raw != nullptr && addr_len != nullptr) {
         std::memset(addr_raw, 0, *addr_len);
-        if (*addr_len >= 8) {
-            auto* addr = static_cast<uint8_t*>(addr_raw);
-            *reinterpret_cast<uint16_t*>(addr) = 2;  // AF_INET
-            *reinterpret_cast<uint16_t*>(addr + 2) = htons(sock->remote_v4.port);
-            *reinterpret_cast<uint32_t*>(addr + 4) = htonl(sock->remote_v4.addr);
+        if (*addr_len >= SOCKADDR_V4_MIN_LEN) {
+            socket_fill_sockaddr_v4(addr_raw, *addr_len, nullptr, sock->remote_v4.addr, sock->remote_v4.port);
         }
-        *addr_len = 16;
+        *addr_len = SOCKADDR_V4_LEN;
     }
     return sock->rcvbuf.read(buf, len);
 }
@@ -236,21 +227,27 @@ void udp_close(Socket* sock) {
 
 int udp_shutdown(Socket*, int) { return 0; }
 int udp_setsockopt(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+    int optint = 0;
+    if (optval != nullptr && optlen >= sizeof(optint)) {
+        std::memcpy(&optint, optval, sizeof(optint));
+    }
+
     if (optname == 2 && optlen >= sizeof(int)) {  // SO_REUSEADDR
-        sock->reuse_addr = *static_cast<const int*>(optval) != 0;
+        sock->reuse_addr = optint != 0;
     }
     if (optname == 15 && optlen >= sizeof(int)) {  // SO_REUSEPORT
-        sock->reuse_port = *static_cast<const int*>(optval) != 0;
+        sock->reuse_port = optint != 0;
     }
     if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
-        socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+        socket_resize_rcvbuf(sock, static_cast<size_t>(optint));
     }
     // SO_SNDBUF (7): UDP has no kernel send buffer - accept silently
     return 0;
 }
 int udp_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
-        *static_cast<int*>(optval) = static_cast<int>(sock->rcvbuf.capacity);
+        int value = static_cast<int>(sock->rcvbuf.capacity);
+        std::memcpy(optval, &value, sizeof(value));
         *optlen = sizeof(int);
     }
     return 0;

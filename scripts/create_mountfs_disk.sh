@@ -63,9 +63,6 @@ sync
 mount /dev/sda1 /
 tar-in $STAGING.tar /
 mkdir-p /oldroot
-ln-sf /usr/lib /lib
-ln-sf /usr/bin /bin
-ln-sf /usr/sbin /sbin
 sync
 _EOF_
 

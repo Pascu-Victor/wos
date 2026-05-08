@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <net/socket.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <vfs/epoll.hpp>
@@ -166,6 +167,17 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
     if (inst == nullptr) {
         vfs_put_file(epfile);
         return -EINVAL;
+    }
+
+    // IPC_EPOLL proxy fd: forward control op to home node.
+    {
+        uint32_t ev = (event != nullptr) ? event->events : 0;
+        uint64_t user_data = (event != nullptr) ? event->data.u64 : 0;
+        int remote_rc = ker::net::wki::wki_ipc_epoll_ctl_forward(epfile, op, fd, ev, user_data);
+        if (remote_rc != -EOPNOTSUPP) {
+            vfs_put_file(epfile);
+            return remote_rc;
+        }
     }
 
     // Validate target fd exists (except for DEL, where we allow stale)

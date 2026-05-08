@@ -20,32 +20,6 @@
 namespace ker::dev::pty {
 
 using log = ker::mod::dbg::logger<"pty">;
-
-// ioctl command numbers (Linux-compatible)
-static constexpr unsigned long TIOCGPTN = 0x80045430;    // Get PTY number
-static constexpr unsigned long TIOCSPTLCK = 0x40045431;  // Set/clear PTY lock
-static constexpr unsigned long TIOCGWINSZ = 0x5413;      // Get window size
-static constexpr unsigned long TIOCSWINSZ = 0x5414;      // Set window size
-static constexpr unsigned long TIOCSCTTY = 0x540E;       // Set controlling terminal
-static constexpr unsigned long TIOCGPGRP = 0x540F;       // Get foreground process group
-static constexpr unsigned long TIOCSPGRP = 0x5410;       // Set foreground process group
-static constexpr unsigned long TIOCNOTTY = 0x5422;       // Disconnect from controlling terminal
-static constexpr unsigned long TCGETS = 0x5401;          // Get termios
-static constexpr unsigned long TCSETS = 0x5402;          // Set termios immediately
-static constexpr unsigned long TCSETSW = 0x5403;         // Set termios after output drain
-static constexpr unsigned long TCSETSF = 0x5404;         // Set termios after flush
-static constexpr unsigned long TCFLSH = 0x540B;          // Flush terminal I/O
-
-// Signal numbers
-static constexpr int SIG_INT = 2;
-static constexpr int SIG_QUIT = 3;
-static constexpr int SIG_TSTP = 20;
-
-// poll event bits (Linux-compatible)
-static constexpr int POLLIN = 0x001;
-static constexpr int POLLOUT = 0x004;
-static constexpr int POLLHUP = 0x010;
-
 // WOS-internal "yield and retry" error code (never reaches userspace applications).
 // Returned by device reads that would block; the mlibc sysdep layer retries internally.
 // Distinct from EAGAIN (11) which is returned for non-blocking I/O.
@@ -1519,5 +1493,12 @@ auto pty_get(int index) -> PtyPair* {
 void pty_put(PtyPair* pair) { pty_pair_release(pair); }
 
 auto get_ptmx_device() -> Device* { return &ptmx_dev; }
+
+auto pty_is_file(ker::vfs::File* f) -> bool {
+    if (f == nullptr || f->fs_type != ker::vfs::FSType::DEVFS) {
+        return false;
+    }
+    return pair_from_file(f) != nullptr;
+}
 
 }  // namespace ker::dev::pty

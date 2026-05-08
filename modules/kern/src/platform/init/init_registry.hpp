@@ -85,10 +85,10 @@ inline constexpr std::array<ModuleDesc, 8> PHASE_0_MODULES = {{
      .init_fn = fns::sse_init},  // MUST be first: enables OSXSAVE/XSave so VEX/BMI2 insns don't #UD
     {.name = "fb", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fb_init},
     {.name = "serial", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::serial_init},
-    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},            // depends: serial
-    {.name = "mm", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::mm_init},              // depends: dbg
+    {.name = "dbg", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::dbg_init},  // depends: serial
+    {.name = "mm", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::mm_init},    // depends: dbg
     {.name = "fsgsbase", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::fsgsbase_init},
-    {.name = "gdt", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::gdt_init},            // depends: fsgsbase
+    {.name = "gdt", .phase = BootPhase::PHASE_0_EARLY_BOOT, .init_fn = fns::gdt_init},  // depends: fsgsbase
 }};
 
 // PHASE 1: Post-MM (kmalloc available)
@@ -151,13 +151,12 @@ inline constexpr std::array<ModuleDesc, 12> PHASE_5_MODULES = {{
     {.name = "ndp", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ndp_init},                     // depends: net
     {.name = "wki", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::wki_init},                     // depends: ndp
     {.name = "devfs_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::devfs_populate_net},     // depends: vfs, virtio, e1000e
-    {.name = "coredump", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::coredump_init},          // depends: sched, vfs
+    {.name = "coredump", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::coredump_init},           // depends: sched, vfs
 }};
 
 // PHASE 6: Post-Scheduler (EpochManager required for packet transmission)
 // This is the key phase that MUST come after all drivers!
 // WKI transport and IPv6 linklocal send packets, which requires EpochManager
-// smt and epoch_manager are now initialized in PHASE_3, so sched can use them here
 inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
     {.name = "wki_eth_transport",
      .phase = BootPhase::PHASE_6_POST_SCHEDULER,

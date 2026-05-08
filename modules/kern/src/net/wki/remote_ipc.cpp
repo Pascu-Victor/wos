@@ -1,10 +1,13 @@
 #include "remote_ipc.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <dev/pty.hpp>
+#include <net/socket.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -12,8 +15,11 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <syscalls_impl/futex/futex.hpp>
+#include <vfs/epoll.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
+#include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::net::wki {
@@ -67,6 +73,40 @@ ker::mod::sched::task::Task* g_export_pipe_write_flush_task = nullptr;
 constexpr ssize_t WKI_IPC_PIPE_RESTARTSYS = -512;
 constexpr uint64_t WKI_IPC_PIPE_WRITE_RETRY_US = 100;
 constexpr uint64_t WKI_IPC_WORKER_IDLE_SLEEP_US = 60'000'000;
+
+static auto proxy_register_waiter_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+    for (size_t i = 0; i < waiters.size(); i++) {
+        if (waiters[i] == pid) {
+            return true;
+        }
+    }
+    return waiters.push_back(pid);
+}
+
+static void proxy_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t* pending, size_t* pending_count) {
+    *pending_count = std::min(waiters.size(), size_t{32});
+    for (size_t i = 0; i < *pending_count; i++) {
+        pending[i] = waiters[i];
+    }
+    waiters.clear();
+}
+
+static void proxy_reschedule_waiters(const uint64_t* waiters, size_t waiter_count) {
+    for (size_t i = 0; i < waiter_count; i++) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
+        if (waiter == nullptr) {
+            continue;
+        }
+
+        waiter->deferredTaskSwitch = false;
+        uint64_t target_cpu = waiter->cpu;
+        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+            target_cpu = ker::mod::sched::get_least_loaded_cpu();
+        }
+        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        waiter->release();
+    }
+}
 
 // ---- Proxy fops for pipe (message-based, local ring buffer) ----
 
@@ -318,6 +358,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         close_pending = backlog->close_pending;
 
         if (!backlog->chunks.empty()) {
+            file->refcount.fetch_add(1, std::memory_order_acq_rel);
             auto& chunk = backlog->chunks.front();
             remaining = static_cast<uint16_t>(chunk.len - chunk.offset);
             data_ptr = chunk.data + chunk.offset;
@@ -352,6 +393,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         if (exp == nullptr || !exp->active || exp->file != file) {
             erase_export_pipe_write_backlog_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
+            ipc_release_file_ref(file);
             free_export_pipe_write_backlog(backlog);
             continue;
         }
@@ -372,6 +414,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
                 erase_export_pipe_write_backlog_locked(backlog);
             }
             s_ipc_lock.unlock_irqrestore(irqf);
+            ipc_release_file_ref(file);
             if (backlog->chunks.empty() && !backlog->close_pending) {
                 free_export_pipe_write_backlog(backlog);
             }
@@ -381,6 +424,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         if (write_ret == WKI_IPC_PIPE_RESTARTSYS || write_ret == -EAGAIN) {
             queue_export_pipe_write_flush_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
+            ipc_release_file_ref(file);
             ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_WRITE_RETRY_US);
             continue;
         }
@@ -390,6 +434,7 @@ static auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         exp->active = false;
         erase_export_pipe_write_backlog_locked(backlog);
         s_ipc_lock.unlock_irqrestore(irqf);
+        ipc_release_file_ref(file);
         if (file->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
                 file->fops->vfs_close(file);
@@ -506,6 +551,8 @@ static void proxy_mark_pipe_closed(ProxyIpcState* proxy, uint32_t resource_id) {
         reader->wait_channel = nullptr;
         ker::mod::sched::kern_wake(reader);
     }
+
+    wki_ipc_proxy_wake_poll_waiters(proxy);
 }
 
 static void wake_proxy_reader(ProxyIpcState* proxy) {
@@ -619,8 +666,7 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     req->op_id = OP_PIPE_DATA;
     req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + to_send);
 
-    auto* res_id_ptr = reinterpret_cast<uint32_t*>(msg + sizeof(DevOpReqPayload));
-    *res_id_ptr = proxy->resource_id;
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     std::memcpy(msg + HEADER_SIZE, buf, to_send);
 
@@ -643,34 +689,13 @@ auto proxy_pipe_close(ker::vfs::File* f) -> int {
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
     req->op_id = op;
     req->data_len = sizeof(uint32_t);
-    auto* res_id_ptr = reinterpret_cast<uint32_t*>(msg + sizeof(DevOpReqPayload));
-    *res_id_ptr = proxy->resource_id;
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     if (proxy->home_node != WKI_NODE_INVALID) {
         wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE));
     }
 
-    bool dropped_registry_ref = false;
-    {
-        uint64_t irqf = s_ipc_lock.lock_irqsave();
-        proxy->active.store(false, std::memory_order_release);
-        dropped_registry_ref = proxy_unregister_locked(proxy);
-        s_ipc_lock.unlock_irqrestore(irqf);
-    }
-
-    // Wake any task blocked in proxy_pipe_read so it doesn't sleep forever.
-    auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
-    if (reader != nullptr) {
-        reader->deferredTaskSwitch = false;
-        reader->wait_channel = nullptr;
-        ker::mod::sched::kern_wake(reader);
-    }
-
-    f->private_data = nullptr;
-    if (dropped_registry_ref) {
-        proxy_release(proxy);
-    }
-    proxy_release(proxy);
+    wki_ipc_detach_proxy_file(f, proxy);
     return 0;
 }
 
@@ -695,9 +720,9 @@ auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
     return ready;
 }
 
-auto proxy_pipe_poll_register_waiter(ker::vfs::File* /*f*/, uint64_t /*pid*/) -> bool {
-    // For now, rely on the doorbell wake mechanism
-    return true;
+auto proxy_pipe_poll_register_waiter(ker::vfs::File* f, uint64_t pid) -> bool {
+    auto* proxy = (f != nullptr) ? static_cast<ProxyIpcState*>(f->private_data) : nullptr;
+    return wki_ipc_proxy_register_poll_waiter(proxy, pid);
 }
 
 ker::vfs::FileOperations g_proxy_pipe_read_fops = {
@@ -729,6 +754,188 @@ ker::vfs::FileOperations g_proxy_pipe_write_fops = {
 };
 
 // ---- Server-side helpers ----
+
+// ---- Proxy fops for epoll (IPC_EPOLL) ----
+//
+// The EpollInstance MUST be the first member of ProxyEpollFile so that
+// static_cast<EpollInstance*>(file->private_data) works in kernel epoll_ctl /
+// epoll_pwait (standard-layout guarantee: address of first member == address of
+// the enclosing struct).
+
+struct ProxyEpollFile {
+    ker::vfs::EpollInstance inst;  // MUST be first — addr(inst) == addr(ProxyEpollFile)
+    uint32_t resource_id = 0;
+    uint16_t home_node = WKI_NODE_INVALID;
+};
+
+static_assert(__builtin_offsetof(ProxyEpollFile, inst) == 0, "EpollInstance must be at offset 0 in ProxyEpollFile");
+
+static auto proxy_epoll_close(ker::vfs::File* f) -> int {
+    auto* epf = reinterpret_cast<ProxyEpollFile*>(f->private_data);
+    if (epf == nullptr) {
+        return 0;
+    }
+
+    uint32_t resource_id = epf->resource_id;
+    uint16_t home_node = epf->home_node;
+    f->private_data = nullptr;
+    delete epf;
+
+    ProxyIpcState* proxy = nullptr;
+    {
+        uint64_t irqf = s_ipc_lock.lock_irqsave();
+        proxy = find_proxy_by_resource_id_locked(resource_id);
+        s_ipc_lock.unlock_irqrestore(irqf);
+    }
+
+    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
+        if (proxy != nullptr) {
+            proxy_release(proxy);
+        }
+        return 0;
+    }
+
+    // Send OP_PIPE_CLOSE_READ to home node — the server handler tears down the export
+    // (sets exp->active = false, releases file ref) for any resource type.
+    constexpr size_t CLOSE_MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    uint8_t close_msg[CLOSE_MSG_SIZE] = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(close_msg);
+    req->op_id = OP_PIPE_CLOSE_READ;
+    req->data_len = sizeof(uint32_t);
+    std::memcpy(close_msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
+    if (home_node != WKI_NODE_INVALID) {
+        wki_send(home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, close_msg, static_cast<uint16_t>(CLOSE_MSG_SIZE));
+    }
+
+    wki_ipc_detach_proxy_file(f, proxy);
+    return 0;
+}
+
+ker::vfs::FileOperations g_proxy_epoll_fops = {
+    .vfs_open = nullptr,
+    .vfs_close = proxy_epoll_close,
+    .vfs_read = nullptr,
+    .vfs_write = nullptr,
+    .vfs_lseek = nullptr,
+    .vfs_isatty = nullptr,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
+};
+
+// ---- Proxy fops for PTY (IPC_PTY) ----
+//
+// Data plane: same ring-buffer / pump path as pipes.
+// Control plane: ioctl forwarded to home node via OP_PTY_IOCTL.
+// Close: OP_PTY_CLOSE fires and the export tears down.
+
+constexpr size_t PTY_IOCTL_ARG_SIZE = 128;  // max bytes we send/receive for ioctl arg
+
+static auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) -> int {
+    auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) return -EBADF;
+    if (proxy->home_node == WKI_NODE_INVALID) return -EHOSTUNREACH;
+
+    // Wire layout (after resource_id): [cmd:u64][arg_val:u64][arg_in:128B]
+    constexpr size_t EXTRA = sizeof(uint64_t) + sizeof(uint64_t) + PTY_IOCTL_ARG_SIZE;
+    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t) + EXTRA;
+    uint8_t msg[MSG_SIZE] = {};
+
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    req->op_id = OP_PTY_IOCTL;
+    req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + EXTRA);
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+
+    uint64_t cmd64 = static_cast<uint64_t>(cmd);
+    uint64_t arg64 = static_cast<uint64_t>(arg);
+    size_t cursor = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    std::memcpy(msg + cursor, &cmd64, sizeof(uint64_t));
+    cursor += sizeof(uint64_t);
+    std::memcpy(msg + cursor, &arg64, sizeof(uint64_t));
+    cursor += sizeof(uint64_t);
+
+    // If arg looks like a pointer, copy the pointed-to data into the request
+    if (arg >= 4096) {
+        std::memcpy(msg + cursor, reinterpret_cast<const void*>(arg), PTY_IOCTL_ARG_SIZE);
+    }
+
+    WkiWaitEntry wait = {};
+    uint64_t irqf = proxy->lock.lock_irqsave();
+    if (proxy->pending_wait != nullptr) {
+        proxy->lock.unlock_irqrestore(irqf);
+        return -EBUSY;
+    }
+    proxy->pending_wait = &wait;
+    proxy->pending_wait_op = OP_PTY_IOCTL;
+    proxy->pending_wait_status = -ETIMEDOUT;
+    proxy->pending_wait_resp_len = 0;
+    proxy->lock.unlock_irqrestore(irqf);
+
+    int tx = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    if (tx != WKI_OK) {
+        irqf = proxy->lock.lock_irqsave();
+        proxy->pending_wait = nullptr;
+        proxy->lock.unlock_irqrestore(irqf);
+        return -EIO;
+    }
+
+    int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    if (wait_rc != 0) {
+        irqf = proxy->lock.lock_irqsave();
+        proxy->pending_wait = nullptr;
+        proxy->lock.unlock_irqrestore(irqf);
+        return -ETIMEDOUT;
+    }
+
+    irqf = proxy->lock.lock_irqsave();
+    int status = proxy->pending_wait_status;
+    // Copy response arg_out back to caller's pointer (output ioctls)
+    if (arg >= 4096 && proxy->pending_wait_resp_len >= PTY_IOCTL_ARG_SIZE) {
+        std::memcpy(reinterpret_cast<void*>(arg), proxy->pending_wait_resp, PTY_IOCTL_ARG_SIZE);
+    }
+    proxy->pending_wait = nullptr;
+    proxy->lock.unlock_irqrestore(irqf);
+    return status;
+}
+
+static auto proxy_pty_isatty(ker::vfs::File* /*f*/) -> bool { return true; }
+
+static auto proxy_pty_close(ker::vfs::File* f) -> int {
+    auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    if (proxy == nullptr) return 0;
+
+    // Send OP_PTY_CLOSE to home node (no response expected)
+    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    uint8_t msg[MSG_SIZE] = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    req->op_id = OP_PTY_CLOSE;
+    req->data_len = sizeof(uint32_t);
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+    if (proxy->home_node != WKI_NODE_INVALID) {
+        wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    }
+
+    wki_ipc_detach_proxy_file(f, proxy);
+    return 0;
+}
+
+ker::vfs::FileOperations g_proxy_pty_fops = {
+    .vfs_open = nullptr,
+    .vfs_close = proxy_pty_close,
+    .vfs_read = proxy_pipe_read,    // reuse ring-buffer read
+    .vfs_write = proxy_pipe_write,  // reuse OP_PIPE_DATA write
+    .vfs_lseek = nullptr,
+    .vfs_isatty = proxy_pty_isatty,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = proxy_pipe_poll_check,
+    .vfs_poll_register_waiter = proxy_pipe_poll_register_waiter,
+    .vfs_ioctl = proxy_pty_ioctl,
+};
 
 auto find_export_by_resource_id(uint32_t resource_id) -> WkiIpcExport* {
     for (auto* exp : g_ipc_exports) {
@@ -765,9 +972,22 @@ template <int SLOT>
             continue;
         }
 
-        auto* file = exp->file;
-        uint16_t target = exp->consumer_node;
-        uint32_t resource_id = exp->resource_id;
+        ker::vfs::File* file = nullptr;
+        uint16_t target = WKI_NODE_INVALID;
+        uint32_t resource_id = 0;
+        {
+            uint64_t irqf = s_ipc_lock.lock_irqsave();
+            if (arg->exp.load(std::memory_order_acquire) != exp || !exp->active || exp->file == nullptr) {
+                s_ipc_lock.unlock_irqrestore(irqf);
+                ker::mod::sched::kern_sleep_us(100);
+                continue;
+            }
+            file = exp->file;
+            file->refcount.fetch_add(1, std::memory_order_acq_rel);
+            target = exp->consumer_node;
+            resource_id = exp->resource_id;
+            s_ipc_lock.unlock_irqrestore(irqf);
+        }
 
         constexpr size_t BUF_SIZE = 4096;
         constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
@@ -776,6 +996,7 @@ template <int SLOT>
         if (buf == nullptr || msg == nullptr) {
             if (buf) delete[] buf;
             if (msg) delete[] msg;
+            ipc_release_file_ref(file);
             exp->pump_running.store(false, std::memory_order_release);
             arg->exp.store(nullptr, std::memory_order_release);
             ker::mod::dbg::log("[WKI] IPC pump: malloc failed for resource_id=%u", resource_id);
@@ -796,8 +1017,7 @@ template <int SLOT>
                 auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
                 req->op_id = OP_PIPE_DATA;
                 req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + n);
-                auto* res_id_ptr = reinterpret_cast<uint32_t*>(msg + sizeof(DevOpReqPayload));
-                *res_id_ptr = resource_id;
+                std::memcpy(msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
                 std::memcpy(msg + HEADER_SIZE, buf, static_cast<size_t>(n));
 
                 int ret = WKI_ERR_TX_FAILED;
@@ -816,8 +1036,7 @@ template <int SLOT>
                 auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
                 req->op_id = OP_PIPE_CLOSE_WRITE;
                 req->data_len = sizeof(uint32_t);
-                auto* res_id_ptr = reinterpret_cast<uint32_t*>(msg + sizeof(DevOpReqPayload));
-                *res_id_ptr = resource_id;
+                std::memcpy(msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
                 int ret = WKI_ERR_TX_FAILED;
                 uint32_t retries = 0;
                 while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
@@ -848,6 +1067,7 @@ template <int SLOT>
 
         delete[] buf;
         delete[] msg;
+        ipc_release_file_ref(file);
         exp->pump_running.store(false, std::memory_order_release);
         arg->exp.store(nullptr, std::memory_order_release);
     }
@@ -917,6 +1137,34 @@ void wki_ipc_subsystem_init() {
     ker::mod::dbg::log("[WKI] IPC proxy subsystem initialized");
 }
 
+auto wki_ipc_proxy_register_poll_waiter(ProxyIpcState* proxy, uint64_t pid) -> bool {
+    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    uint64_t irqf = proxy->lock.lock_irqsave();
+    bool ok = proxy->active.load(std::memory_order_acquire) && proxy_register_waiter_locked(proxy->poll_waiters, pid);
+    proxy->lock.unlock_irqrestore(irqf);
+    return ok;
+}
+
+void wki_ipc_proxy_wake_poll_waiters(ProxyIpcState* proxy) {
+    if (proxy == nullptr) {
+        return;
+    }
+
+    uint64_t pending_waiters[32]{};
+    size_t pending_waiter_count = 0;
+
+    uint64_t irqf = proxy->lock.lock_irqsave();
+    if (proxy->poll_waiters.size() > 0) {
+        proxy_collect_waiters_locked(proxy->poll_waiters, pending_waiters, &pending_waiter_count);
+    }
+    proxy->lock.unlock_irqrestore(irqf);
+
+    proxy_reschedule_waiters(pending_waiters, pending_waiter_count);
+}
+
 // =============================================================================
 // Public API: Export task fds for remote submission
 // =============================================================================
@@ -937,7 +1185,9 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         } else if (ker::vfs::vfs_is_socket_file(file)) {
             res_type = ResourceType::IPC_SOCKET;
         } else if (ker::vfs::vfs_is_epoll_file(file)) {
-            return;  // Epoll instances stay pinned
+            res_type = ResourceType::IPC_EPOLL;
+        } else if (ker::dev::pty::pty_is_file(file)) {
+            res_type = ResourceType::IPC_PTY;
         } else {
             return;
         }
@@ -957,9 +1207,13 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         g_ipc_exports.push_back(exp);
         s_ipc_lock.unlock_irqrestore(irqf);
 
-        // Start pump thread for pipe read-ends (data flows home->consumer)
+        // Start pump thread for pipe read-ends, sockets, and PTY files (data flows home->consumer)
         if (res_type == ResourceType::IPC_PIPE && file->open_flags == 0) {
             start_pipe_pump(exp);
+        } else if (res_type == ResourceType::IPC_SOCKET) {
+            start_pipe_pump(exp);  // reuse pump: reads from socket file fops then sends OP_PIPE_DATA
+        } else if (res_type == ResourceType::IPC_PTY) {
+            start_pipe_pump(exp);  // reuse pump: reads from PTY devfs fops then sends OP_PIPE_DATA
         }
 
         auto& entry = map_out[count];
@@ -993,8 +1247,9 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         proxy->resource_id = entry.resource_id;
         proxy->assigned_channel = WKI_CHAN_RESOURCE;
 
-        // Allocate local ring buffer for pipe read proxies
-        if (proxy->res_type == ResourceType::IPC_PIPE) {
+        // Allocate local ring buffer for pipe read proxies, sockets, and PTY files (recv data)
+        if (proxy->res_type == ResourceType::IPC_PIPE || proxy->res_type == ResourceType::IPC_SOCKET ||
+            proxy->res_type == ResourceType::IPC_PTY) {
             constexpr uint32_t PIPE_RING_CAPACITY = 65536;  // 64 KB
             auto* rb = new uint8_t[PIPE_RING_CAPACITY];
             if (rb != nullptr) {
@@ -1034,9 +1289,26 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
                 proxy_file->fops = &g_proxy_pipe_write_fops;
             }
         } else if (proxy->res_type == ResourceType::IPC_SOCKET) {
-            proxy_file->fops = &g_proxy_pipe_read_fops;
+            proxy_file->fops = &g_proxy_socket_fops;
             proxy_file->open_flags = 0;
-            proxy_file->fs_type = ker::vfs::FSType::SOCKET;
+            proxy_file->fs_type = ker::vfs::FSType::TMPFS;  // not SOCKET to avoid bad cast via fd_to_socket
+        } else if (proxy->res_type == ResourceType::IPC_EPOLL) {
+            // Allocate a local EpollInstance so kernel epoll_ctl / epoll_pwait work
+            // transparently on this fd.  EpollInstance MUST be at offset 0 in
+            // ProxyEpollFile so the cast in epoll_ctl is valid.
+            auto* epf = new ProxyEpollFile();
+            epf->inst.count = 0;
+            std::memset(epf->inst.interests.data(), 0, sizeof(epf->inst.interests));
+            epf->resource_id = proxy->resource_id;
+            epf->home_node = proxy->home_node;
+            proxy_file->private_data = epf;  // epoll_ctl casts this to EpollInstance*
+            proxy_file->fops = &g_proxy_epoll_fops;
+            proxy_file->open_flags = 0;
+        } else if (proxy->res_type == ResourceType::IPC_PTY) {
+            // PTY proxy: ring-buffer data plane + ioctl forwarding
+            // private_data is already set to proxy above
+            proxy_file->fops = &g_proxy_pty_fops;
+            proxy_file->open_flags = 0;
         } else {
             proxy_file->fops = &g_proxy_pipe_read_fops;
             proxy_file->open_flags = 0;
@@ -1079,6 +1351,104 @@ void wki_ipc_doorbell_rx(uint16_t /*src_node*/, uint32_t /*doorbell_value*/) {
     // No longer used — pipe data flows via wire messages, not RDMA doorbells
 }
 
+auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t events, uint64_t data) -> int {
+    if (epfile == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* epf = reinterpret_cast<ProxyEpollFile*>(epfile->private_data);
+    if (epf == nullptr || epfile->fops != &g_proxy_epoll_fops) {
+        return -EOPNOTSUPP;
+    }
+
+    ProxyIpcState* proxy = nullptr;
+    {
+        uint64_t irqf = s_ipc_lock.lock_irqsave();
+        proxy = find_proxy_by_resource_id_locked(epf->resource_id);
+        s_ipc_lock.unlock_irqrestore(irqf);
+    }
+    if (proxy == nullptr) {
+        return -EBADF;
+    }
+
+    auto release_proxy = [&]() {
+        if (proxy != nullptr) {
+            proxy_release(proxy);
+            proxy = nullptr;
+        }
+    };
+
+    if (!proxy->active.load(std::memory_order_acquire)) {
+        release_proxy();
+        return -EBADF;
+    }
+    if (proxy->home_node == WKI_NODE_INVALID) {
+        release_proxy();
+        return -EHOSTUNREACH;
+    }
+
+    struct __attribute__((packed)) EpollCtlWire {
+        int32_t op;
+        int32_t fd;
+        uint32_t events;
+        uint64_t data;
+    } ctl = {
+        .op = static_cast<int32_t>(op),
+        .fd = static_cast<int32_t>(fd),
+        .events = events,
+        .data = data,
+    };
+
+    constexpr size_t RID_SIZE = sizeof(uint32_t);
+    constexpr size_t EXTRA_SIZE = sizeof(EpollCtlWire);
+    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + RID_SIZE + EXTRA_SIZE;
+    uint8_t msg[MSG_SIZE] = {};
+
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    req->op_id = OP_EPOLL_CTL;
+    req->data_len = static_cast<uint16_t>(RID_SIZE + EXTRA_SIZE);
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, RID_SIZE);
+    std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE, &ctl, EXTRA_SIZE);
+
+    WkiWaitEntry wait = {};
+    uint64_t irqf = proxy->lock.lock_irqsave();
+    if (proxy->pending_wait != nullptr) {
+        proxy->lock.unlock_irqrestore(irqf);
+        release_proxy();
+        return -EBUSY;
+    }
+    proxy->pending_wait = &wait;
+    proxy->pending_wait_op = OP_EPOLL_CTL;
+    proxy->pending_wait_status = -ETIMEDOUT;
+    proxy->pending_wait_resp_len = 0;
+    proxy->lock.unlock_irqrestore(irqf);
+
+    int tx = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    if (tx != WKI_OK) {
+        irqf = proxy->lock.lock_irqsave();
+        proxy->pending_wait = nullptr;
+        proxy->lock.unlock_irqrestore(irqf);
+        release_proxy();
+        return -EIO;
+    }
+
+    int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    if (wait_rc != 0) {
+        irqf = proxy->lock.lock_irqsave();
+        proxy->pending_wait = nullptr;
+        proxy->lock.unlock_irqrestore(irqf);
+        release_proxy();
+        return -ETIMEDOUT;
+    }
+
+    irqf = proxy->lock.lock_irqsave();
+    int status = proxy->pending_wait_status;
+    proxy->pending_wait = nullptr;
+    proxy->lock.unlock_irqrestore(irqf);
+    release_proxy();
+    return status;
+}
+
 // =============================================================================
 // DEV_OP response handler for IPC control ops
 // =============================================================================
@@ -1089,14 +1459,143 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
 
     if (len < sizeof(DevOpRespPayload)) return;
 
-    auto* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
-    uint16_t op_id = resp->op_id;
+    DevOpRespPayload resp = {};
+    std::memcpy(&resp, payload, sizeof(resp));
+    uint16_t op_id = resp.op_id;
 
     // Handle pipe close acknowledgement
     if (op_id == OP_PIPE_CLOSE_READ || op_id == OP_PIPE_CLOSE_WRITE) {
         // Close acknowledged — no further action needed
         return;
     }
+
+    if (op_id == OP_PIPE_POLL_STATE) {
+        // Home node responded to a poll-state query with readiness flags.
+        // Wake any blocked reader so it can re-check availability.
+        if (len < static_cast<uint16_t>(sizeof(DevOpRespPayload) + 2 * sizeof(uint32_t))) return;
+        uint32_t poll_resource_id = 0;
+        std::memcpy(&poll_resource_id, payload + sizeof(DevOpRespPayload), sizeof(uint32_t));
+        uint64_t irqf = s_ipc_lock.lock_irqsave();
+        auto* proxy = find_proxy_by_resource_id_locked(poll_resource_id);
+        if (proxy != nullptr) {
+            proxy->refcount.fetch_add(1, std::memory_order_acq_rel);
+        }
+        s_ipc_lock.unlock_irqrestore(irqf);
+        if (proxy != nullptr) {
+            auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
+            if (reader != nullptr) {
+                reader->deferredTaskSwitch = false;
+                reader->wait_channel = nullptr;
+                ker::mod::sched::kern_wake(reader);
+            }
+            proxy_release(proxy);
+        }
+        return;
+    }
+
+    if (op_id == OP_EPOLL_CTL || op_id == OP_FUTEX_WAKE || op_id == OP_PTY_IOCTL) {
+        // Control-op completion path: payload carries [resource_id] first in data.
+        wki_ipc_socket_handle_dev_op_resp(src_node, channel, payload, len);
+        return;
+    }
+
+    if (op_id >= OP_SOCK_ACCEPT && op_id <= OP_SOCK_SETSOCKOPT) {
+        wki_ipc_socket_handle_dev_op_resp(src_node, channel, payload, len);
+    }
+}
+
+void wki_ipc_socket_handle_dev_op_resp(uint16_t /*src_node*/, uint16_t /*channel*/, const uint8_t* payload, uint16_t len) {
+    if (len < sizeof(DevOpRespPayload)) return;
+
+    DevOpRespPayload resp = {};
+    std::memcpy(&resp, payload, sizeof(resp));
+
+    uint16_t data_len = resp.data_len;
+    if (len < static_cast<uint16_t>(sizeof(DevOpRespPayload) + data_len)) return;
+    const uint8_t* resp_data = payload + sizeof(DevOpRespPayload);
+
+    // First 4 bytes of response data = resource_id
+    if (data_len < sizeof(uint32_t)) return;
+    uint32_t resource_id = 0;
+    std::memcpy(&resource_id, resp_data, sizeof(uint32_t));
+    uint16_t extra_len = static_cast<uint16_t>(data_len - sizeof(uint32_t));
+    const uint8_t* extra_data = resp_data + sizeof(uint32_t);
+
+    uint64_t irqf = s_ipc_lock.lock_irqsave();
+    ProxyIpcState* target_proxy = nullptr;
+    for (auto* p : g_ipc_proxies) {
+        if (p != nullptr && p->resource_id == resource_id) {
+            target_proxy = p;
+            target_proxy->refcount.fetch_add(1, std::memory_order_acq_rel);
+            break;
+        }
+    }
+    s_ipc_lock.unlock_irqrestore(irqf);
+
+    if (target_proxy == nullptr) return;
+
+    WkiWaitEntry* wait = nullptr;
+    {
+        uint64_t proxy_irqf = target_proxy->lock.lock_irqsave();
+        wait = target_proxy->pending_wait;
+        if (wait != nullptr && target_proxy->pending_wait_op == resp.op_id) {
+            target_proxy->pending_wait_status = static_cast<int>(resp.status);
+            if (extra_len > 0) {
+                uint16_t copy_len =
+                    extra_len < ProxyIpcState::SOCK_CTRL_RESP_MAX ? extra_len : static_cast<uint16_t>(ProxyIpcState::SOCK_CTRL_RESP_MAX);
+                std::memcpy(target_proxy->pending_wait_resp, extra_data, copy_len);
+                target_proxy->pending_wait_resp_len = copy_len;
+            } else {
+                target_proxy->pending_wait_resp_len = 0;
+            }
+        } else {
+            wait = nullptr;  // op_id mismatch — stale response
+        }
+        target_proxy->lock.unlock_irqrestore(proxy_irqf);
+    }
+
+    if (wait != nullptr) {
+        wki_wake_op(wait, resp.status);
+    }
+
+    if (target_proxy->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (target_proxy->ring_buf != nullptr) delete[] target_proxy->ring_buf;
+        delete target_proxy;
+    }
+}
+
+void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
+    if (proxy == nullptr) {
+        if (f != nullptr) {
+            f->private_data = nullptr;
+        }
+        return;
+    }
+
+    bool dropped_registry_ref = false;
+    {
+        uint64_t irqf = s_ipc_lock.lock_irqsave();
+        proxy->active.store(false, std::memory_order_release);
+        dropped_registry_ref = proxy_unregister_locked(proxy);
+        s_ipc_lock.unlock_irqrestore(irqf);
+    }
+
+    auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
+    if (reader != nullptr) {
+        reader->deferredTaskSwitch = false;
+        reader->wait_channel = nullptr;
+        ker::mod::sched::kern_wake(reader);
+    }
+    wki_ipc_proxy_wake_poll_waiters(proxy);
+
+    if (f != nullptr) {
+        f->private_data = nullptr;
+    }
+
+    if (dropped_registry_ref) {
+        proxy_release(proxy);
+    }
+    proxy_release(proxy);
 }
 
 // =============================================================================
@@ -1180,6 +1679,7 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
             reader->wait_channel = nullptr;
             ker::mod::sched::kern_wake(reader);
         }
+        wki_ipc_proxy_wake_poll_waiters(proxy);
         proxy_release(proxy);
     }
 
@@ -1203,17 +1703,26 @@ void handle_ipc_attach_ack(const WkiHeader* /*hdr*/, const uint8_t* /*payload*/,
 }
 
 void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(DevOpReqPayload)) return;
+    if (payload_len < sizeof(DevOpReqPayload)) {
+        return;
+    }
 
-    auto* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-    uint16_t op_id = req->op_id;
+    DevOpReqPayload req = {};
+    std::memcpy(&req, payload, sizeof(req));
+    uint16_t op_id = req.op_id;
 
     // All IPC ops carry resource_id as first 4 bytes of data
-    if (req->data_len < sizeof(uint32_t)) return;
+    if (req.data_len < sizeof(uint32_t)) {
+        return;
+    }
+    if (sizeof(DevOpReqPayload) + req.data_len > payload_len) {
+        return;
+    }
     const auto* data = payload + sizeof(DevOpReqPayload);
-    uint32_t resource_id = *reinterpret_cast<const uint32_t*>(data);
+    uint32_t resource_id = 0;
+    std::memcpy(&resource_id, data, sizeof(uint32_t));
     const auto* op_data = data + sizeof(uint32_t);
-    uint16_t op_data_len = req->data_len - sizeof(uint32_t);
+    uint16_t op_data_len = req.data_len - sizeof(uint32_t);
 
     if (op_id == OP_PIPE_DATA) {
         // Consumer receives pipe data — write into the local proxy ring if
@@ -1238,6 +1747,7 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                     ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, op_data_len);
                 } else {
                     wake_proxy_reader(proxy);
+                    wki_ipc_proxy_wake_poll_waiters(proxy);
                 }
                 proxy_release(proxy);
                 return;
@@ -1252,6 +1762,7 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                     ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, op_data_len);
                 } else {
                     wake_proxy_reader(proxy);
+                    wki_ipc_proxy_wake_poll_waiters(proxy);
                 }
                 proxy_release(proxy);
                 return;
@@ -1294,6 +1805,7 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                 reader->wait_channel = nullptr;
                 ker::mod::sched::kern_wake(reader);
             }
+            wki_ipc_proxy_wake_poll_waiters(proxy);
             proxy_release(proxy);
             return;
         }
@@ -1329,6 +1841,195 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             }
         }
         ipc_release_file_ref(export_file);
+        return;
+    }
+
+    if (op_id == OP_PIPE_POLL_STATE) {
+        // Consumer queries current readiness of the exported pipe/socket.
+        // Server checks poll_check on the underlying file and sends back a
+        // response with readiness flags.
+        ker::vfs::File* f = nullptr;
+        {
+            uint64_t irqf = s_ipc_lock.lock_irqsave();
+            f = ipc_acquire_export_file_locked(resource_id);
+            s_ipc_lock.unlock_irqrestore(irqf);
+        }
+
+        DevOpRespPayload poll_resp = {};
+        poll_resp.op_id = OP_PIPE_POLL_STATE;
+        poll_resp.status = 0;
+        poll_resp.data_len = sizeof(uint32_t) * 2;  // [resource_id, ready_flags]
+        poll_resp.reserved = 0;
+
+        uint8_t poll_resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t) * 2] = {};
+        std::memcpy(poll_resp_buf, &poll_resp, sizeof(poll_resp));
+        std::memcpy(poll_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+
+        int ready_flags = 0;
+        if (f != nullptr) {
+            if (f->fops != nullptr && f->fops->vfs_poll_check != nullptr) {
+                ready_flags = f->fops->vfs_poll_check(f, 0x0001 | 0x0004);  // POLLIN | POLLOUT
+            }
+            ipc_release_file_ref(f);
+        } else {
+            poll_resp.status = -ENOENT;
+        }
+
+        std::memcpy(poll_resp_buf + sizeof(DevOpRespPayload) + sizeof(uint32_t), &ready_flags, sizeof(uint32_t));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, poll_resp_buf, static_cast<uint16_t>(sizeof(poll_resp_buf)));
+        return;
+    }
+
+    if (op_id == OP_EPOLL_CTL) {
+        // Forward epoll_ctl to the home node epoll fd.
+        // op_data layout: [op:i32][fd:i32][events:u32][data:u64]
+        DevOpRespPayload ctl_resp = {};
+        ctl_resp.op_id = OP_EPOLL_CTL;
+        ctl_resp.status = -EINVAL;
+        ctl_resp.data_len = sizeof(uint32_t);  // [resource_id]
+
+        uint8_t ctl_resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t)] = {};
+        std::memcpy(ctl_resp_buf, &ctl_resp, sizeof(ctl_resp));
+        std::memcpy(ctl_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+
+        if (op_data_len >= sizeof(int32_t) + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t)) {
+            int32_t ctl_op = 0;
+            int32_t ctl_fd = -1;
+            uint32_t ctl_events = 0;
+            uint64_t ctl_data = 0;
+            size_t cursor = 0;
+            std::memcpy(&ctl_op, op_data + cursor, sizeof(int32_t));
+            cursor += sizeof(int32_t);
+            std::memcpy(&ctl_fd, op_data + cursor, sizeof(int32_t));
+            cursor += sizeof(int32_t);
+            std::memcpy(&ctl_events, op_data + cursor, sizeof(uint32_t));
+            cursor += sizeof(uint32_t);
+            std::memcpy(&ctl_data, op_data + cursor, sizeof(uint64_t));
+
+            ker::vfs::File* f = nullptr;
+            {
+                uint64_t irqf = s_ipc_lock.lock_irqsave();
+                f = ipc_acquire_export_file_locked(resource_id);
+                s_ipc_lock.unlock_irqrestore(irqf);
+            }
+
+            if (f != nullptr && ker::vfs::vfs_is_epoll_file(f)) {
+                ker::vfs::EpollEvent event = {};
+                event.events = ctl_events;
+                event.data.u64 = ctl_data;
+                ctl_resp.status = static_cast<int16_t>(ker::vfs::epoll_ctl(f->fd, ctl_op, ctl_fd, &event));
+                ipc_release_file_ref(f);
+            } else if (f != nullptr) {
+                ctl_resp.status = -EINVAL;
+                ipc_release_file_ref(f);
+            } else {
+                ctl_resp.status = -ENOENT;
+            }
+        }
+
+        std::memcpy(ctl_resp_buf, &ctl_resp, sizeof(ctl_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, ctl_resp_buf, static_cast<uint16_t>(sizeof(ctl_resp_buf)));
+        return;
+    }
+
+    if (op_id == OP_FUTEX_WAKE) {
+        // Wake waiters for a physical futex address owned by this node.
+        // op_data layout: [phys_addr:u64]
+        DevOpRespPayload wake_resp = {};
+        wake_resp.op_id = OP_FUTEX_WAKE;
+        wake_resp.status = -EINVAL;
+        wake_resp.data_len = sizeof(uint32_t);  // [resource_id]
+
+        uint8_t wake_resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t)] = {};
+        std::memcpy(wake_resp_buf, &wake_resp, sizeof(wake_resp));
+        std::memcpy(wake_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+
+        if (op_data_len >= sizeof(uint64_t)) {
+            uint64_t phys_addr = 0;
+            std::memcpy(&phys_addr, op_data, sizeof(uint64_t));
+            wake_resp.status = static_cast<int16_t>(ker::syscall::futex::futex_wake_by_phys(phys_addr));
+        }
+
+        std::memcpy(wake_resp_buf, &wake_resp, sizeof(wake_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, wake_resp_buf, static_cast<uint16_t>(sizeof(wake_resp_buf)));
+        return;
+    }
+
+    if (op_id == OP_PTY_IOCTL) {
+        // Forward ioctl to the home-node PTY file and return result.
+        // op_data layout: [cmd:u64][arg_val:u64][arg_in:128B]
+        constexpr size_t PTY_ARG_SIZE = 128;
+        DevOpRespPayload pty_resp = {};
+        pty_resp.op_id = OP_PTY_IOCTL;
+        pty_resp.status = -EINVAL;
+        pty_resp.data_len = static_cast<uint16_t>(sizeof(uint32_t) + PTY_ARG_SIZE);
+
+        constexpr size_t RESP_BUF_SIZE = sizeof(DevOpRespPayload) + sizeof(uint32_t) + PTY_ARG_SIZE;
+        uint8_t pty_resp_buf[RESP_BUF_SIZE] = {};
+        std::memcpy(pty_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+
+        constexpr size_t MIN_REQ = sizeof(uint64_t) + sizeof(uint64_t) + PTY_ARG_SIZE;
+        if (op_data_len >= MIN_REQ) {
+            uint64_t ioctl_cmd = 0;
+            uint64_t ioctl_arg_val = 0;
+            std::memcpy(&ioctl_cmd, op_data, sizeof(uint64_t));
+            std::memcpy(&ioctl_arg_val, op_data + sizeof(uint64_t), sizeof(uint64_t));
+            const uint8_t* arg_in = op_data + sizeof(uint64_t) + sizeof(uint64_t);
+
+            ker::vfs::File* f = nullptr;
+            {
+                uint64_t irqf = s_ipc_lock.lock_irqsave();
+                f = ipc_acquire_export_file_locked(resource_id);
+                s_ipc_lock.unlock_irqrestore(irqf);
+            }
+
+            if (f != nullptr) {
+                unsigned long effective_arg = 0;
+                alignas(8) uint8_t local_buf[PTY_ARG_SIZE] = {};
+                if (ioctl_arg_val >= 4096) {
+                    // Pointer-type ioctl: use local buffer
+                    std::memcpy(local_buf, arg_in, PTY_ARG_SIZE);
+                    effective_arg = reinterpret_cast<unsigned long>(local_buf);
+                } else {
+                    // Value-type ioctl: pass arg_val directly
+                    effective_arg = static_cast<unsigned long>(ioctl_arg_val);
+                }
+
+                int rc = ker::vfs::devfs::devfs_ioctl(f, static_cast<unsigned long>(ioctl_cmd), effective_arg);
+                pty_resp.status = static_cast<int16_t>(rc < 0 ? rc : 0);
+
+                // Always copy back local buffer (for output ioctls)
+                std::memcpy(pty_resp_buf + sizeof(DevOpRespPayload) + sizeof(uint32_t), local_buf, PTY_ARG_SIZE);
+                ipc_release_file_ref(f);
+            } else {
+                pty_resp.status = -ENOENT;
+            }
+        }
+
+        std::memcpy(pty_resp_buf, &pty_resp, sizeof(pty_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, pty_resp_buf, static_cast<uint16_t>(RESP_BUF_SIZE));
+        return;
+    }
+
+    if (op_id == OP_PTY_CLOSE) {
+        // Consumer closed its proxy PTY — tear down the export
+        uint64_t irqf = s_ipc_lock.lock_irqsave();
+        auto* exp = find_export_by_resource_id(resource_id);
+        if (exp != nullptr && exp->active) {
+            exp->pump_running.store(false, std::memory_order_release);
+            ker::vfs::File* f = exp->file;
+            exp->file = nullptr;
+            exp->active = false;
+            s_ipc_lock.unlock_irqrestore(irqf);
+            if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
+                    f->fops->vfs_close(f);
+                }
+                delete f;
+            }
+        } else {
+            s_ipc_lock.unlock_irqrestore(irqf);
+        }
         return;
     }
 
@@ -1386,6 +2087,168 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
+    if (op_id >= OP_SOCK_ACCEPT && op_id <= OP_SOCK_SETSOCKOPT) {
+        // Build a response with resource_id as first 4 bytes so the consumer
+        // can find the right proxy in wki_ipc_socket_handle_dev_op_resp().
+        constexpr size_t RESP_HEADER = sizeof(DevOpRespPayload);
+        constexpr size_t RID_SIZE = sizeof(uint32_t);
+
+        // Reserve up to 128 bytes for optional response payload (e.g. getpeername addr)
+        constexpr size_t EXTRA_MAX = 128;
+        uint8_t resp_buf[RESP_HEADER + RID_SIZE + EXTRA_MAX] = {};
+        auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
+        resp->op_id = op_id;
+        resp->status = -ENOSYS;
+        resp->data_len = RID_SIZE;  // at minimum include resource_id
+        std::memcpy(resp_buf + RESP_HEADER, &resource_id, RID_SIZE);
+
+        if (op_id == OP_SOCK_CLOSE) {
+            uint64_t irqf = s_ipc_lock.lock_irqsave();
+            auto* exp = find_export_by_resource_id(resource_id);
+            if (exp != nullptr && exp->active) {
+                exp->pump_running.store(false, std::memory_order_release);
+                ker::vfs::File* f = exp->file;
+                exp->file = nullptr;
+                exp->active = false;
+                s_ipc_lock.unlock_irqrestore(irqf);
+
+                if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
+                        f->fops->vfs_close(f);
+                    }
+                    delete f;
+                }
+                resp->status = 0;
+            } else {
+                s_ipc_lock.unlock_irqrestore(irqf);
+                resp->status = -ENOENT;
+            }
+        } else if (op_id == OP_SOCK_SHUTDOWN) {
+            // op_data: [how:int32]
+            if (op_data_len >= sizeof(int32_t)) {
+                int32_t how = 0;
+                std::memcpy(&how, op_data, sizeof(int32_t));
+                ker::vfs::File* f = nullptr;
+                {
+                    uint64_t irqf = s_ipc_lock.lock_irqsave();
+                    f = ipc_acquire_export_file_locked(resource_id);
+                    s_ipc_lock.unlock_irqrestore(irqf);
+                }
+                if (f != nullptr) {
+                    auto* sock = static_cast<ker::net::Socket*>(f->private_data);
+                    if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->shutdown != nullptr) {
+                        resp->status = static_cast<int16_t>(sock->proto_ops->shutdown(sock, static_cast<int>(how)));
+                    } else {
+                        resp->status = -ENOSYS;
+                    }
+                    ipc_release_file_ref(f);
+                } else {
+                    resp->status = -ENOENT;
+                }
+            } else {
+                resp->status = -EINVAL;
+            }
+        } else if (op_id == OP_SOCK_GETPEERNAME) {
+            // op_data: [] (no extra args needed)
+            ker::vfs::File* f = nullptr;
+            {
+                uint64_t irqf = s_ipc_lock.lock_irqsave();
+                f = ipc_acquire_export_file_locked(resource_id);
+                s_ipc_lock.unlock_irqrestore(irqf);
+            }
+            if (f != nullptr) {
+                auto* sock = static_cast<ker::net::Socket*>(f->private_data);
+                if (sock != nullptr) {
+                    // Serialize peer addr as: [family:u16][addr:u32][port:u16] (AF_INET)
+                    struct {
+                        uint16_t family;
+                        uint32_t addr;
+                        uint16_t port;
+                    } __attribute__((packed)) peer_addr = {};
+                    static_assert(sizeof(peer_addr) == 8);
+                    peer_addr.family = static_cast<uint16_t>(sock->domain);
+                    peer_addr.addr = sock->remote_v4.addr;
+                    peer_addr.port = sock->remote_v4.port;
+                    std::memcpy(resp_buf + RESP_HEADER + RID_SIZE, &peer_addr, sizeof(peer_addr));
+                    resp->data_len = static_cast<uint16_t>(RID_SIZE + sizeof(peer_addr));
+                    resp->status = 0;
+                } else {
+                    resp->status = -ENOTSOCK;
+                }
+                ipc_release_file_ref(f);
+            } else {
+                resp->status = -ENOENT;
+            }
+        } else if (op_id == OP_SOCK_GETSOCKOPT) {
+            // op_data: [level:int32][optname:int32]
+            if (op_data_len >= 2 * sizeof(int32_t)) {
+                int32_t level = 0;
+                int32_t optname = 0;
+                std::memcpy(&level, op_data, sizeof(int32_t));
+                std::memcpy(&optname, op_data + sizeof(int32_t), sizeof(int32_t));
+                ker::vfs::File* f = nullptr;
+                {
+                    uint64_t irqf = s_ipc_lock.lock_irqsave();
+                    f = ipc_acquire_export_file_locked(resource_id);
+                    s_ipc_lock.unlock_irqrestore(irqf);
+                }
+                if (f != nullptr) {
+                    auto* sock = static_cast<ker::net::Socket*>(f->private_data);
+                    if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->getsockopt != nullptr) {
+                        uint8_t opt_val[64] = {};
+                        size_t opt_len = sizeof(opt_val);
+                        int rc = sock->proto_ops->getsockopt(sock, static_cast<int>(level), static_cast<int>(optname), opt_val, &opt_len);
+                        resp->status = static_cast<int16_t>(rc);
+                        if (rc == 0 && opt_len > 0 && opt_len <= EXTRA_MAX) {
+                            std::memcpy(resp_buf + RESP_HEADER + RID_SIZE, opt_val, opt_len);
+                            resp->data_len = static_cast<uint16_t>(RID_SIZE + opt_len);
+                        }
+                    } else {
+                        resp->status = -ENOSYS;
+                    }
+                    ipc_release_file_ref(f);
+                } else {
+                    resp->status = -ENOENT;
+                }
+            } else {
+                resp->status = -EINVAL;
+            }
+        } else if (op_id == OP_SOCK_SETSOCKOPT) {
+            // op_data: [level:int32][optname:int32][optval...]
+            if (op_data_len >= 2 * sizeof(int32_t)) {
+                int32_t level = 0;
+                int32_t optname = 0;
+                std::memcpy(&level, op_data, sizeof(int32_t));
+                std::memcpy(&optname, op_data + sizeof(int32_t), sizeof(int32_t));
+                const uint8_t* optval = op_data + 2 * sizeof(int32_t);
+                uint16_t optval_len = static_cast<uint16_t>(op_data_len - 2 * sizeof(int32_t));
+                ker::vfs::File* f = nullptr;
+                {
+                    uint64_t irqf = s_ipc_lock.lock_irqsave();
+                    f = ipc_acquire_export_file_locked(resource_id);
+                    s_ipc_lock.unlock_irqrestore(irqf);
+                }
+                if (f != nullptr) {
+                    auto* sock = static_cast<ker::net::Socket*>(f->private_data);
+                    if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->setsockopt != nullptr) {
+                        int rc = sock->proto_ops->setsockopt(sock, static_cast<int>(level), static_cast<int>(optname), optval, optval_len);
+                        resp->status = static_cast<int16_t>(rc);
+                    } else {
+                        resp->status = -ENOSYS;
+                    }
+                    ipc_release_file_ref(f);
+                } else {
+                    resp->status = -ENOENT;
+                }
+            } else {
+                resp->status = -EINVAL;
+            }
+        }
+
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf, static_cast<uint16_t>(RESP_HEADER + resp->data_len));
+        return;
+    }
+
     (void)hdr;
 }
 
@@ -1401,10 +2264,11 @@ void handle_ipc_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16
 
 void wki_ipc_handle_dev_op_req(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len) {
     if (len < sizeof(DevOpReqPayload)) return;
-    auto* req = reinterpret_cast<const DevOpReqPayload*>(payload);
+    DevOpReqPayload req = {};
+    std::memcpy(&req, payload, sizeof(req));
 
     // Route IPC ops (0x0700 - 0x07FF)
-    if (req->op_id >= 0x0700 && req->op_id <= 0x07FF) {
+    if (req.op_id >= 0x0700 && req.op_id <= 0x07FF) {
         WkiHeader hdr = {};
         hdr.src_node = src_node;
         hdr.channel_id = channel;

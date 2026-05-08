@@ -54,7 +54,7 @@ std::atomic<uint64_t> s_latest_sequence{0};
 std::atomic<bool> s_time_available{false};
 std::atomic<bool> s_devices_registered{false};
 std::atomic<bool> s_devfs_ready{false};
-std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::WARN)};
+std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::TRACE)};
 uint64_t s_boot_id = 0x574f530000000001ULL;
 
 auto level_name(LogLevel level) -> const char* {
@@ -375,6 +375,31 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         copy_lower_module(module_buf, sizeof(module_buf), module);
     } else {
         rec_flags |= JOURNAL_FLAG_PREFIX_COMPAT;
+    }
+
+    if (mod::io::serial::isPanicMode()) {
+        JournalRecord rec{};
+        rec.magic = JOURNAL_RECORD_MAGIC;
+        rec.version = JOURNAL_RECORD_VERSION;
+        rec.header_size = sizeof(JournalRecord) - JOURNAL_MESSAGE_MAX;
+        rec.boot_id = s_boot_id;
+        rec.monotonic_us = s_time_available.load(std::memory_order_acquire) ? ker::mod::time::getUs() : 0;
+        rec.cpu = static_cast<uint32_t>(ker::mod::cpu::getCurrentCpuIdSafe());
+        rec.level = static_cast<uint8_t>(level);
+        rec.flags = rec_flags;
+        std::memcpy(rec.module, module_buf, sizeof(rec.module));
+
+        size_t msg_len = std::strlen(body);
+        if (msg_len >= JOURNAL_MESSAGE_MAX) {
+            msg_len = JOURNAL_MESSAGE_MAX - 1;
+            rec.flags |= JOURNAL_FLAG_TRUNCATED;
+        }
+        std::memcpy(rec.message, body, msg_len);
+        rec.message[msg_len] = '\0';
+        rec.message_len = static_cast<uint16_t>(msg_len);
+
+        serial_write_record(rec);
+        return;
     }
 
     JournalRecord rec{};

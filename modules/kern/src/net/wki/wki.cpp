@@ -1340,6 +1340,7 @@ static void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const 
             detail::handle_dev_op_resp(hdr, payload, payload_len);
             detail::handle_vfs_op_resp(hdr, payload, payload_len);
             detail::handle_net_op_resp(hdr, payload, payload_len);
+            detail::handle_ipc_dev_op_resp(hdr, payload, payload_len);
             break;
         case MsgType::EVENT_SUBSCRIBE:
             detail::handle_event_subscribe(hdr, payload, payload_len);
@@ -1563,8 +1564,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         rt->send_time_us = now;
                         ch->retransmits++;
                         ch->retransmit_deadline = now + ch->rto_us;
-                        perf_record_transport_point(mod::perf::WkiPerfTransportOp::FAST_RETRANSMIT, ch->peer_node_id, ch->channel_id,
-                                                    0, rt->len, rt->seq, 0);
+                        perf_record_transport_point(mod::perf::WkiPerfTransportOp::FAST_RETRANSMIT, ch->peer_node_id, ch->channel_id, 0,
+                                                    rt->len, rt->seq, 0);
                     } else {
                         ch->retransmit_deadline = now + ch->rto_us;
                     }

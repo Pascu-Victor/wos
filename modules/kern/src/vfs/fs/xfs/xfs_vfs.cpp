@@ -56,6 +56,13 @@ struct XfsFileData {
 
 namespace {
 
+auto pointer_looks_like_kernel_object(const void* ptr) -> bool {
+    auto addr = reinterpret_cast<uint64_t>(ptr);
+    bool in_hhdm = addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL;
+    bool in_kernel_static = addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL;
+    return (in_hhdm || in_kernel_static) && ((addr & 0x7ULL) == 0);
+}
+
 auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
     auto agno = xfs_ag_number(fsbno, ctx->ag_blk_log);
     auto agbno = xfs_ag_block(fsbno, ctx->ag_blk_log);
@@ -141,9 +148,12 @@ auto xfs_vfs_close(File* f) -> int {
         // filesystem on every close stalls those fetches and can trip WKI fencing.
         constexpr int XFS_O_TRUNC_FLAG = 01000;
         int accmode = f->open_flags & 3;
-        if ((accmode == 1 || accmode == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0) && xfd->mount != nullptr &&
-            xfd->mount->device != nullptr) {
-            sync_blockdev(xfd->mount->device);
+        bool write_like_close = (accmode == 1 || accmode == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0);
+        if (write_like_close && pointer_looks_like_kernel_object(xfd->mount)) {
+            auto* mount = xfd->mount;
+            if (pointer_looks_like_kernel_object(mount->device)) {
+                sync_blockdev(mount->device);
+            }
         }
         if (xfd->inode != nullptr) {
             xfs_inode_release(xfd->inode);

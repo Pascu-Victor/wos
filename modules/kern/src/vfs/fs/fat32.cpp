@@ -622,6 +622,12 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     f->fops = nullptr;
     f->is_directory = false;
     f->fs_type = FSType::FAT32;
+    f->refcount = 1;
+    f->open_flags = 0;
+    f->fd_flags = 0;
+    f->vfs_path = nullptr;
+    f->dir_fs_count = static_cast<size_t>(-1);
+    f->stream_cache_attachment = nullptr;
 
     delete[] cluster_buf;
     return f;
@@ -664,6 +670,12 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         file->pos = 0;
         file->is_directory = true;
         file->fs_type = FSType::FAT32;
+        file->refcount = 1;
+        file->open_flags = 0;
+        file->fd_flags = 0;
+        file->vfs_path = nullptr;
+        file->dir_fs_count = static_cast<size_t>(-1);
+        file->stream_cache_attachment = nullptr;
 
         log::trace("fat32_open_path: root directory opened");
         return file;
@@ -699,6 +711,12 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 
         // Skip empty components (from double slashes)
         if (comp_len == 0) {
+            continue;
+        }
+
+        // Current-directory components should not require a directory lookup.
+        // Userspace frequently opens/stats "." while inside mounted FAT32 paths.
+        if (comp_len == 1 && component[0] == '.') {
             continue;
         }
 
@@ -762,10 +780,8 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
                     lfn_len = extract_lfn_name(lfn_buffer, lfn_count, lfn_name, sizeof(lfn_name));
                 }
 
-                log::trace("  entry[%zu]: name='%.11s' attr=0x%x%s%s", i,
-                    entry->name, entry->attributes,
-                    lfn_len > 0 ? " lfn='" : "",
-                    lfn_len > 0 ? lfn_name : "");
+                log::trace("  entry[%zu]: name='%.11s' attr=0x%x%s%s", i, entry->name, entry->attributes, lfn_len > 0 ? " lfn='" : "",
+                           lfn_len > 0 ? lfn_name : "");
                 // Compare filename: check LFN first (if present), then 8.3 short name
                 bool name_match = false;
                 if (lfn_len > 0) {
@@ -859,6 +875,12 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     f->fops = nullptr;  // Will be set by vfs_open
     f->is_directory = node->is_directory;
     f->fs_type = FSType::FAT32;
+    f->refcount = 1;
+    f->open_flags = 0;
+    f->fd_flags = 0;
+    f->vfs_path = nullptr;
+    f->dir_fs_count = static_cast<size_t>(-1);
+    f->stream_cache_attachment = nullptr;
 
     log::debug("fat32_open_path: opened %s", node->is_directory ? "directory" : "file");
 
@@ -913,8 +935,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     uint32_t byte_offset = offset % cluster_size;
     uint32_t current_cluster = node->start_cluster;
 
-    log::trace("fat32_read: cluster_offset=0x%x, byte_offset=0x%x, current_cluster=0x%x",
-        cluster_offset, byte_offset, current_cluster);
+    log::trace("fat32_read: cluster_offset=0x%x, byte_offset=0x%x, current_cluster=0x%x", cluster_offset, byte_offset, current_cluster);
 
     // Skip to the correct cluster
     for (uint32_t i = 0; i < cluster_offset; ++i) {
@@ -924,7 +945,6 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
             return -1;
         }
     }
-
 
     // Allocate buffer for reading clusters
     auto* cluster_buf = new uint8_t[cluster_size];
@@ -1007,7 +1027,6 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 
         memcpy(dest, cluster_buf + byte_offset, bytes_in_cluster);
 
-
         bytes_read += bytes_in_cluster;
         dest += bytes_in_cluster;
         byte_offset = 0;
@@ -1085,8 +1104,8 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     const FAT32MountContext* ctx = node->context;
     uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
-    log::trace("update_directory_entry: updating entry at cluster 0x%x, offset 0x%x, new size 0x%x",
-        node->dir_entry_cluster, node->dir_entry_offset, new_size);
+    log::trace("update_directory_entry: updating entry at cluster 0x%x, offset 0x%x, new size 0x%x", node->dir_entry_cluster,
+               node->dir_entry_offset, new_size);
 
     // Allocate buffer for the cluster
     auto* cluster_buf = new uint8_t[cluster_size];
@@ -1535,6 +1554,11 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
             remaining_path++;
         }
 
+        // Treat "." as a no-op path component.
+        if (comp_len == 1 && component[0] == '.') {
+            continue;
+        }
+
         // Search directory for component
         uint32_t bytes_per_cluster = ctx->bytes_per_sector * ctx->sectors_per_cluster;
         auto* cluster_buf = new uint8_t[bytes_per_cluster];
@@ -1704,11 +1728,10 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::statvfs* buf) -> int {
     std::memset(buf, 0, sizeof(ker::vfs::statvfs));
 
     uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    uint32_t fat_entry_count = static_cast<uint32_t>(
-        (static_cast<uint64_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector) / sizeof(uint32_t));
-    uint32_t data_clusters = (ctx->total_sectors > ctx->data_start_sector)
-        ? (ctx->total_sectors - ctx->data_start_sector) / ctx->sectors_per_cluster
-        : 0;
+    uint32_t fat_entry_count =
+        static_cast<uint32_t>((static_cast<uint64_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector) / sizeof(uint32_t));
+    uint32_t data_clusters =
+        (ctx->total_sectors > ctx->data_start_sector) ? (ctx->total_sectors - ctx->data_start_sector) / ctx->sectors_per_cluster : 0;
     // Valid cluster indices are [2, 2 + data_clusters); clamp to FAT table size
     uint32_t max_cluster = (fat_entry_count < 2 + data_clusters) ? fat_entry_count : 2 + data_clusters;
 
@@ -1721,16 +1744,16 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::statvfs* buf) -> int {
         }
     }
 
-    buf->f_bsize   = cluster_size;
-    buf->f_frsize  = cluster_size;
-    buf->f_blocks  = data_clusters;
-    buf->f_bfree   = free_clusters;
-    buf->f_bavail  = free_clusters;
-    buf->f_files   = 0;  // FAT32 has no fixed inode table
-    buf->f_ffree   = 0;
-    buf->f_favail  = 0;
-    buf->f_fsid    = 0;
-    buf->f_flag    = 0;
+    buf->f_bsize = cluster_size;
+    buf->f_frsize = cluster_size;
+    buf->f_blocks = data_clusters;
+    buf->f_bfree = free_clusters;
+    buf->f_bavail = free_clusters;
+    buf->f_files = 0;  // FAT32 has no fixed inode table
+    buf->f_ffree = 0;
+    buf->f_favail = 0;
+    buf->f_fsid = 0;
+    buf->f_flag = 0;
     buf->f_namemax = 255;
     return 0;
 }

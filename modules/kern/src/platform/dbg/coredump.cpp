@@ -300,34 +300,34 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
 struct CoreDumpRequest {
     ker::mod::cpu::GPRegs gpr;
     ker::mod::gates::interruptFrame frame;
-    ker::mod::gates::interruptFrame savedFrame;
-    ker::mod::cpu::GPRegs savedRegs;
+    ker::mod::gates::interruptFrame saved_frame;
+    ker::mod::cpu::GPRegs saved_regs;
     uint64_t cr2;
     uint64_t cr3;
-    uint64_t cpuId;
+    uint64_t cpu_id;
     uint64_t pid;
     uint64_t entry;
-    uint64_t elfHeaderAddr;
-    uint64_t programHeaderAddr;
-    uint64_t interpBase;
-    uint64_t programHeaderCount;
-    uint64_t programHeaderEntSize;
-    uint64_t threadFsBase;
-    uint64_t threadGsBase;
-    uint64_t threadStackBase;
-    uint64_t threadStackSize;
-    uint64_t threadTlsBase;
-    uint64_t threadTlsSize;
-    uint64_t threadSafeStack;
-    uint8_t* elfBuffer;      // stolen from task->elfBuffer; retained after write to avoid allocator re-entry during crash handling
-    size_t elfBufferSize;
-    bool elfBufferShared;
+    uint64_t elf_header_addr;
+    uint64_t program_header_addr;
+    uint64_t interp_base;
+    uint64_t program_header_count;
+    uint64_t program_header_ent_size;
+    uint64_t thread_fs_base;
+    uint64_t thread_gs_base;
+    uint64_t thread_stack_base;
+    uint64_t thread_stack_size;
+    uint64_t thread_tls_base;
+    uint64_t thread_tls_size;
+    uint64_t thread_safe_stack;
+    uint8_t* elf_buffer;  // stolen from task->elfBuffer; retained after write to avoid allocator re-entry during crash handling
+    size_t elf_buffer_size;
+    bool elf_buffer_shared;
     ker::mod::mm::paging::PageTable* pagemap;
-    uint64_t userRsp;
+    uint64_t user_rsp;
     uint64_t timestamp;
-    ker::mod::sched::task::Task* taskPtr;  // holds a refcount to block GC; released when done
+    ker::mod::sched::task::Task* task_ptr;  // holds a refcount to block GC; released when done
     char name[48];
-    char exePath[ker::mod::sched::task::Task::EXE_PATH_MAX];
+    char exe_path[ker::mod::sched::task::Task::EXE_PATH_MAX];
     char cwd[ker::mod::sched::task::Task::CWD_MAX];
     char root[ker::mod::sched::task::Task::CWD_MAX];
 };
@@ -339,10 +339,10 @@ struct CoreDumpSlot {
     std::atomic<bool> ready{false};
 };
 
-static CoreDumpSlot g_ring[RING_SIZE];                                  // NOLINT
-static std::atomic<uint32_t> g_write_seq{0};                           // NOLINT
-static uint32_t g_read_seq{0};                                         // NOLINT only touched by coredump task
-static ker::mod::sched::task::Task* g_coredump_task{nullptr};          // NOLINT
+static CoreDumpSlot g_ring[RING_SIZE];                         // NOLINT
+static std::atomic<uint32_t> g_write_seq{0};                   // NOLINT
+static uint32_t g_read_seq{0};                                 // NOLINT only touched by coredump task
+static ker::mod::sched::task::Task* g_coredump_task{nullptr};  // NOLINT
 
 static void perform_coredump(const CoreDumpRequest& req);
 
@@ -365,18 +365,18 @@ static void perform_coredump(const CoreDumpRequest& req);
             // freeing those here can re-enter fragile allocator state immediately
             // before GC reclaims the crashed task. Shared cache buffers only need
             // their cache reference released.
-            if (req.elfBuffer != nullptr) {
-                if (req.elfBufferShared) {
-                    ker::net::wki::wki_remote_compute_release_elf_buffer(req.elfBuffer);
+            if (req.elf_buffer != nullptr) {
+                if (req.elf_buffer_shared) {
+                    ker::net::wki::wki_remote_compute_release_elf_buffer(req.elf_buffer);
                 }
-                req.elfBuffer = nullptr;
+                req.elf_buffer = nullptr;
             }
 
             // Release the refcount acquired at exception time.
             // GC was blocked from reclaiming the task (and its pagemap) while rc > 1.
-            if (req.taskPtr != nullptr) {
-                req.taskPtr->release();
-                req.taskPtr = nullptr;
+            if (req.task_ptr != nullptr) {
+                req.task_ptr->release();
+                req.task_ptr = nullptr;
             }
 
             g_ring[idx].ready.store(false, std::memory_order_release);
@@ -425,7 +425,7 @@ static void perform_coredump(const CoreDumpRequest& req) {
     }
 
     constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
-    uint64_t stackPage = req.userRsp & ~(PAGE - 1);
+    uint64_t stackPage = req.user_rsp & ~(PAGE - 1);
     uint64_t faultPage = req.cr2 & ~(PAGE - 1);
 
     UserPageWalkStats walkStats{};
@@ -466,7 +466,8 @@ static void perform_coredump(const CoreDumpRequest& req) {
             s.type = static_cast<uint32_t>(SegmentType::MemoryPage);
             if (vaddr == faultPage) {
                 s.type = static_cast<uint32_t>(SegmentType::FaultPage);
-            } else if (req.threadStackBase != 0 && vaddr >= req.threadStackBase && vaddr < req.threadStackBase + req.threadStackSize) {
+            } else if (req.thread_stack_base != 0 && vaddr >= req.thread_stack_base &&
+                       vaddr < req.thread_stack_base + req.thread_stack_size) {
                 s.type = static_cast<uint32_t>(SegmentType::StackPage);
             } else if (vaddr <= stackPage && stackPage < vaddr + PAGE) {
                 s.type = static_cast<uint32_t>(SegmentType::StackPage);
@@ -482,37 +483,37 @@ static void perform_coredump(const CoreDumpRequest& req) {
     hdr.headerSize = sizeof(CoreDumpHeader);
     hdr.timestampQuantums = req.timestamp;
     hdr.pid = req.pid;
-    hdr.cpu = req.cpuId;
+    hdr.cpu = req.cpu_id;
     hdr.intNum = req.frame.intNum;
     hdr.errCode = req.frame.errCode;
     hdr.cr2 = req.cr2;
     hdr.cr3 = req.cr3;
     hdr.trapFrame = req.frame;
     hdr.trapRegs = req.gpr;
-    hdr.savedFrame = req.savedFrame;
-    hdr.savedRegs = req.savedRegs;
+    hdr.savedFrame = req.saved_frame;
+    hdr.savedRegs = req.saved_regs;
     hdr.taskEntry = req.entry;
     hdr.taskPagemap = reinterpret_cast<uint64_t>(req.pagemap);
-    hdr.elfHeaderAddr = req.elfHeaderAddr;
-    hdr.programHeaderAddr = req.programHeaderAddr;
+    hdr.elfHeaderAddr = req.elf_header_addr;
+    hdr.programHeaderAddr = req.program_header_addr;
     hdr.segmentCount = segCapacity;
     hdr.segmentTableOffset = sizeof(CoreDumpHeader);
-    hdr.elfSize = req.elfBuffer != nullptr ? req.elfBufferSize : 0;
+    hdr.elfSize = req.elf_buffer != nullptr ? req.elf_buffer_size : 0;
     hdr.elfOffset = nextOffset;
     hdr.segmentEntrySize = sizeof(CoreDumpSegment);
     hdr.pageSize = PAGE;
     hdr.snapshotFlags = 1;  // Full present-user-page snapshot.
-    hdr.interpBase = req.interpBase;
-    hdr.programHeaderCount = req.programHeaderCount;
-    hdr.programHeaderEntSize = req.programHeaderEntSize;
-    hdr.threadFsBase = req.threadFsBase;
-    hdr.threadGsBase = req.threadGsBase;
-    hdr.threadStackBase = req.threadStackBase;
-    hdr.threadStackSize = req.threadStackSize;
-    hdr.threadTlsBase = req.threadTlsBase;
-    hdr.threadTlsSize = req.threadTlsSize;
-    hdr.threadSafeStack = req.threadSafeStack;
-    std::memcpy(hdr.exePath, req.exePath, sizeof(hdr.exePath));
+    hdr.interpBase = req.interp_base;
+    hdr.programHeaderCount = req.program_header_count;
+    hdr.programHeaderEntSize = req.program_header_ent_size;
+    hdr.threadFsBase = req.thread_fs_base;
+    hdr.threadGsBase = req.thread_gs_base;
+    hdr.threadStackBase = req.thread_stack_base;
+    hdr.threadStackSize = req.thread_stack_size;
+    hdr.threadTlsBase = req.thread_tls_base;
+    hdr.threadTlsSize = req.thread_tls_size;
+    hdr.threadSafeStack = req.thread_safe_stack;
+    std::memcpy(hdr.exePath, req.exe_path, sizeof(hdr.exePath));
     std::memcpy(hdr.cwd, req.cwd, sizeof(hdr.cwd));
     std::memcpy(hdr.root, req.root, sizeof(hdr.root));
 
@@ -531,9 +532,9 @@ static void perform_coredump(const CoreDumpRequest& req) {
         ok = write_all(fd, pagePtr, PAGE);
     }
 
-    if (ok && req.elfBuffer != nullptr && req.elfBufferSize != 0) {
-        const uint8_t* elf = req.elfBuffer;
-        size_t remaining = req.elfBufferSize;
+    if (ok && req.elf_buffer != nullptr && req.elf_buffer_size != 0) {
+        const uint8_t* elf = req.elf_buffer;
+        size_t remaining = req.elf_buffer_size;
         while (ok && remaining > 0) {
             size_t chunk = remaining > 4096 ? 4096 : remaining;
             ok = write_all(fd, elf, chunk);
@@ -554,17 +555,19 @@ static void perform_coredump(const CoreDumpRequest& req) {
         }
         if (walkStats.invalidPml3Frames != 0 || walkStats.invalidPml2Frames != 0 || walkStats.invalidPml1Frames != 0 ||
             walkStats.skippedDataPages != 0) {
-            log::warn("coredump: pid=%lu name=%s pagemap=%p dump completed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
-                      req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
-                      walkStats.invalidPml1Frames, walkStats.skippedDataPages);
+            log::warn(
+                "coredump: pid=%lu name=%s pagemap=%p dump completed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
+                req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
+                walkStats.invalidPml1Frames, walkStats.skippedDataPages);
         }
     } else {
         ker::mod::dbg::log("coredump: failed while writing %s", path);
         if (walkStats.invalidPml3Frames != 0 || walkStats.invalidPml2Frames != 0 || walkStats.invalidPml1Frames != 0 ||
             walkStats.skippedDataPages != 0) {
-            log::warn("coredump: pid=%lu name=%s pagemap=%p dump failed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
-                      req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
-                      walkStats.invalidPml1Frames, walkStats.skippedDataPages);
+            log::warn(
+                "coredump: pid=%lu name=%s pagemap=%p dump failed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
+                req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
+                walkStats.invalidPml1Frames, walkStats.skippedDataPages);
         }
     }
 }
@@ -583,17 +586,6 @@ void init() {
 
 void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::interruptFrame& frame,
                      uint64_t cr2, uint64_t cr3, uint64_t cpuId) {
-    // Crash-path coredumps are temporarily disabled. They are currently
-    // provoking secondary allocator / filesystem failures that make the real
-    // userspace mapping bug much harder to isolate.
-    (void)task;
-    (void)gpr;
-    (void)frame;
-    (void)cr2;
-    (void)cr3;
-    (void)cpuId;
-    return;
-
     if (task == nullptr || g_coredump_task == nullptr) {
         return;
     }
@@ -618,48 +610,48 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
     CoreDumpRequest& req = slot.req;
     req.gpr = gpr;
     req.frame = frame;
-    req.savedFrame = task->context.frame;
-    req.savedRegs = task->context.regs;
+    req.saved_frame = task->context.frame;
+    req.saved_regs = task->context.regs;
     req.cr2 = cr2;
     req.cr3 = cr3;
-    req.cpuId = cpuId;
+    req.cpu_id = cpuId;
     req.pid = task->pid;
     req.entry = task->entry;
-    req.elfHeaderAddr = task->elfHeaderAddr;
-    req.programHeaderAddr = task->programHeaderAddr;
-    req.interpBase = task->interpBase;
-    req.programHeaderCount = task->programHeaderCount;
-    req.programHeaderEntSize = task->programHeaderEntSize;
-    req.threadFsBase = 0;
-    req.threadGsBase = 0;
-    req.threadStackBase = 0;
-    req.threadStackSize = 0;
-    req.threadTlsBase = 0;
-    req.threadTlsSize = 0;
-    req.threadSafeStack = 0;
+    req.elf_header_addr = task->elfHeaderAddr;
+    req.program_header_addr = task->programHeaderAddr;
+    req.interp_base = task->interpBase;
+    req.program_header_count = task->programHeaderCount;
+    req.program_header_ent_size = task->programHeaderEntSize;
+    req.thread_fs_base = 0;
+    req.thread_gs_base = 0;
+    req.thread_stack_base = 0;
+    req.thread_stack_size = 0;
+    req.thread_tls_base = 0;
+    req.thread_tls_size = 0;
+    req.thread_safe_stack = 0;
     if (task->thread != nullptr) {
-        req.threadFsBase = task->thread->fsbase;
-        req.threadGsBase = task->thread->gsbase;
-        req.threadStackBase = task->thread->gsbase;
-        req.threadStackSize = task->thread->stackSize;
-        req.threadTlsBase = task->thread->tlsBaseVirt;
-        req.threadTlsSize = task->thread->tlsSize;
-        req.threadSafeStack = task->thread->safestackPtrValue;
+        req.thread_fs_base = task->thread->fsbase;
+        req.thread_gs_base = task->thread->gsbase;
+        req.thread_stack_base = task->thread->gsbase;
+        req.thread_stack_size = task->thread->stackSize;
+        req.thread_tls_base = task->thread->tlsBaseVirt;
+        req.thread_tls_size = task->thread->tlsSize;
+        req.thread_safe_stack = task->thread->safestackPtrValue;
     }
     req.pagemap = task->pagemap;
-    req.userRsp = frame.rsp;
+    req.user_rsp = frame.rsp;
     req.timestamp = ker::mod::time::getTicks();
-    req.taskPtr = task;
+    req.task_ptr = task;
     sanitize_name(task->name, req.name, sizeof(req.name));
-    std::memcpy(req.exePath, task->exe_path, sizeof(req.exePath));
+    std::memcpy(req.exe_path, task->exe_path, sizeof(req.exe_path));
     std::memcpy(req.cwd, task->cwd, sizeof(req.cwd));
     std::memcpy(req.root, task->root, sizeof(req.root));
 
     // Steal elfBuffer so exit() won't free it before the coredump task writes it.
     // Private buffers are intentionally retained after writing; see coredump_task_fn().
-    req.elfBuffer = task->elfBuffer;
-    req.elfBufferSize = task->elfBufferSize;
-    req.elfBufferShared = task->isElfBufferShared;
+    req.elf_buffer = task->elfBuffer;
+    req.elf_buffer_size = task->elfBufferSize;
+    req.elf_buffer_shared = task->isElfBufferShared;
     task->elfBuffer = nullptr;
     task->elfBufferSize = 0;
     task->isElfBufferShared = false;

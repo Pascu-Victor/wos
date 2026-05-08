@@ -460,4 +460,35 @@ auto get_mount_at(size_t index) -> MountPoint* {
     return mp;
 }
 
+auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
+    if (out == nullptr) {
+        return false;
+    }
+
+    mount_lock.lock();
+    if (index >= mounts.size()) {
+        mount_lock.unlock();
+        return false;
+    }
+
+    MountPoint* mp = mounts[index];
+    if (mp == nullptr || mp->path == nullptr) {
+        mount_lock.unlock();
+        return false;
+    }
+
+    size_t path_len = std::strlen(mp->path);
+    if (path_len >= MOUNT_PATH_MAX) {
+        mount_lock.unlock();
+        return false;
+    }
+
+    std::memcpy(out->path, mp->path, path_len + 1);
+    out->fs_type = mp->fs_type;
+    out->dev_id = mp->dev_id;
+
+    mount_lock.unlock();
+    return true;
+}
+
 }  // namespace ker::vfs

@@ -54,14 +54,15 @@ void unregister_raw_socket(Socket* sock) {
 
 // Raw socket sendto - for ICMP and other raw IP protocols
 auto raw_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
-    if (buf == nullptr || addr_raw == nullptr || addr_len < 16) {
+    if (buf == nullptr) {
         return -EINVAL;
     }
 
-    // Parse destination address (sockaddr_in)
-    const auto* addr = static_cast<const uint8_t*>(addr_raw);
-    uint16_t port = ntohs(*reinterpret_cast<const uint16_t*>(addr + 2));
-    uint32_t dst_ip = ntohl(*reinterpret_cast<const uint32_t*>(addr + 4));
+    uint16_t port = 0;
+    uint32_t dst_ip = 0;
+    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &dst_ip, &port)) {
+        return -EINVAL;
+    }
 
     (void)port;  // Not used for raw sockets
 
@@ -149,13 +150,10 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
 
     if (addr_out != nullptr && addr_len != nullptr) {
         std::memset(addr_out, 0, *addr_len);
-        if (*addr_len >= 8) {
-            auto* addr = static_cast<uint8_t*>(addr_out);
-            *reinterpret_cast<uint16_t*>(addr) = 2;  // AF_INET
-            *reinterpret_cast<uint16_t*>(addr + 2) = 0;
-            *reinterpret_cast<uint32_t*>(addr + 4) = htonl(record.src_ip);
+        if (*addr_len >= SOCKADDR_V4_MIN_LEN) {
+            socket_fill_sockaddr_v4(addr_out, *addr_len, nullptr, record.src_ip, 0);
         }
-        *addr_len = 16;
+        *addr_len = SOCKADDR_V4_LEN;
     }
 
     return n;
@@ -271,15 +269,21 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t 
 namespace {
 
 int raw_setsockopt(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+    int optint = 0;
+    if (optval != nullptr && optlen >= sizeof(optint)) {
+        std::memcpy(&optint, optval, sizeof(optint));
+    }
+
     if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
-        socket_resize_rcvbuf(sock, static_cast<size_t>(*static_cast<const int*>(optval)));
+        socket_resize_rcvbuf(sock, static_cast<size_t>(optint));
     }
     return 0;
 }
 
 int raw_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
-        *static_cast<int*>(optval) = static_cast<int>(sock->rcvbuf.capacity);
+        int value = static_cast<int>(sock->rcvbuf.capacity);
+        std::memcpy(optval, &value, sizeof(value));
         *optlen = sizeof(int);
     }
     return 0;

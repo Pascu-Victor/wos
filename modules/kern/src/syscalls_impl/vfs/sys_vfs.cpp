@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/epoll.hpp>
 #include <vfs/file.hpp>
@@ -16,12 +18,39 @@
 namespace ker::syscall::vfs {
 using ker::abi::vfs::ops;
 
+namespace {
+template <typename T>
+auto copy_value_to_user(T* user_ptr, T value) -> int {
+    if (user_ptr == nullptr) {
+        return 0;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return -EFAULT;
+    }
+
+    auto user_addr = reinterpret_cast<uint64_t>(user_ptr);
+    const auto* src = reinterpret_cast<const uint8_t*>(&value);
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        uint64_t phys = ker::mod::mm::virt::translate(task->pagemap, user_addr + i);
+        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+            return -EFAULT;
+        }
+        *reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(phys)) = src[i];
+    }
+    return 0;
+}
+}  // namespace
+
 auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> int64_t {
     ops op = static_cast<ops>(op_raw);
     switch (op) {
         case ops::open: {
             const char* path = reinterpret_cast<const char*>(a1);
-            if (path == nullptr) { return -EFAULT; }
+            if (path == nullptr) {
+                return -EFAULT;
+            }
             int flags = static_cast<int>(a2);
             int mode = static_cast<int>(a3);
             int fd = ker::vfs::vfs_open(path, flags, mode);
@@ -35,9 +64,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             void* buf = reinterpret_cast<void*>(a2);
             auto len = static_cast<size_t>(a3);
             auto* actual_size = reinterpret_cast<size_t*>(a4);
-            ssize_t ret = ker::vfs::vfs_read(fd, buf, len, actual_size);
+            size_t actual = 0;
+            ssize_t ret = ker::vfs::vfs_read(fd, buf, len, actual_size != nullptr ? &actual : nullptr);
             if (ret < 0) {
                 return static_cast<int64_t>(ret);
+            }
+            if (int copy_ret = copy_value_to_user(actual_size, actual); copy_ret < 0) {
+                return copy_ret;
             }
             return static_cast<int64_t>(ret);
         }
@@ -46,9 +79,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const void* buf = reinterpret_cast<const void*>(a2);
             auto len = static_cast<size_t>(a3);
             auto* actual_size = reinterpret_cast<size_t*>(a4);
-            ssize_t ret = ker::vfs::vfs_write(fd, buf, len, actual_size);
+            size_t actual = 0;
+            ssize_t ret = ker::vfs::vfs_write(fd, buf, len, actual_size != nullptr ? &actual : nullptr);
             if (ret < 0) {
                 return static_cast<int64_t>(ret);
+            }
+            if (int copy_ret = copy_value_to_user(actual_size, actual); copy_ret < 0) {
+                return copy_ret;
             }
             return static_cast<int64_t>(ret);
         }
@@ -69,8 +106,8 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (ret < 0) {
                 return static_cast<int64_t>(ret);
             }
-            if (new_offset != nullptr) {
-                *new_offset = ret;
+            if (int copy_ret = copy_value_to_user(new_offset, ret); copy_ret < 0) {
+                return copy_ret;
             }
             return static_cast<int64_t>(ret);
         }
@@ -295,6 +332,12 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (file == nullptr) return -EBADF;
             if (file->fs_type == ker::vfs::FSType::DEVFS) {
                 int64_t result = static_cast<int64_t>(ker::vfs::devfs::devfs_ioctl(file, cmd, arg));
+                ker::vfs::vfs_put_file(file);
+                return result;
+            }
+            // Fallback: fops-backed ioctl (e.g. remote PTY proxy)
+            if (file->fops != nullptr && file->fops->vfs_ioctl != nullptr) {
+                int64_t result = static_cast<int64_t>(file->fops->vfs_ioctl(file, cmd, arg));
                 ker::vfs::vfs_put_file(file);
                 return result;
             }

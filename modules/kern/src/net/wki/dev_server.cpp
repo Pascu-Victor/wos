@@ -366,6 +366,43 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
     }
 }
 
+void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export_path, const char* export_name) {
+    if (export_path == nullptr || export_name == nullptr) {
+        return;
+    }
+
+    uint64_t srv_flags = s_server_lock.lock_irqsave();
+    for (auto& binding : g_bindings) {
+        if (!binding.active || binding.resource_type != ResourceType::VFS || binding.resource_id != resource_id) {
+            continue;
+        }
+
+        if (std::strncmp(static_cast<const char*>(binding.vfs_export_path), export_path, sizeof(binding.vfs_export_path)) == 0 &&
+            std::strncmp(static_cast<const char*>(binding.vfs_export_name), export_name, sizeof(binding.vfs_export_name)) == 0) {
+            continue;
+        }
+
+        size_t path_len = std::strlen(export_path);
+        if (path_len >= sizeof(binding.vfs_export_path)) {
+            path_len = sizeof(binding.vfs_export_path) - 1;
+        }
+        std::memcpy(static_cast<void*>(binding.vfs_export_path), export_path, path_len);
+        binding.vfs_export_path[path_len] = '\0';
+
+        size_t name_len = std::strlen(export_name);
+        if (name_len >= sizeof(binding.vfs_export_name)) {
+            name_len = sizeof(binding.vfs_export_name) - 1;
+        }
+        std::memcpy(static_cast<void*>(binding.vfs_export_name), export_name, name_len);
+        binding.vfs_export_name[name_len] = '\0';
+
+        ker::mod::dbg::log("[WKI] Refreshed VFS binding: node=0x%04x res_id=%u ch=%u path='%s' name='%s'", binding.consumer_node,
+                           resource_id, binding.assigned_channel, static_cast<const char*>(binding.vfs_export_path),
+                           static_cast<const char*>(binding.vfs_export_name));
+    }
+    s_server_lock.unlock_irqrestore(srv_flags);
+}
+
 // -----------------------------------------------------------------------------
 // Fencing cleanup
 // -----------------------------------------------------------------------------

@@ -45,17 +45,48 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
             }
 
             switch (format[i]) {
-                case '.':
+                case '.': {
                     i++;
+                    int precision = 0;
                     if (format[i] == '*') {
                         i++;
                         if (format[i] == 's') {
-                            // %.*s - precision-limited string
-                            int precision = va_arg(args, int);
+                            // %.*s - precision from arg
+                            precision = va_arg(args, int);
                             const char* s = va_arg(args, const char*);
-                            int len = static_cast<int>(strlen(s));
-                            int copy_len = (precision < len) ? precision : len;
-                            if (j + copy_len < size) {
+                            if (s == nullptr) {
+                                break;
+                            }
+                            // count up to precision chars without calling strlen
+                            size_t slen = 0;
+                            while (slen < (size_t)precision && s[slen] != '\0') {
+                                slen++;
+                            }
+                            size_t copy_len = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            if (copy_len > 0) {
+                                strncpy(str + j, s, copy_len);
+                                j += copy_len;
+                            }
+                            break;
+                        }
+                    } else if (format[i] >= '0' && format[i] <= '9') {
+                        // parse numeric precision  e.g. %.11s
+                        while (format[i] >= '0' && format[i] <= '9') {
+                            precision = precision * 10 + (format[i] - '0');
+                            i++;
+                        }
+                        if (format[i] == 's') {
+                            // %.Ns - fixed numeric precision
+                            const char* s = va_arg(args, const char*);
+                            if (s == nullptr) {
+                                break;
+                            }
+                            size_t slen = 0;
+                            while (slen < (size_t)precision && s[slen] != '\0') {
+                                slen++;
+                            }
+                            size_t copy_len = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            if (copy_len > 0) {
                                 strncpy(str + j, s, copy_len);
                                 j += copy_len;
                             }
@@ -65,8 +96,11 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     // Unsupported format, treat literally
                     str[j++] = '%';
                     str[j++] = '.';
-                    str[j++] = format[i];
+                    // don't re-print format[i] — it was already consumed by the numeric-precision loop
+                    // Step back so the outer i++ lands on the unrecognised char
+                    i--;
                     break;
+                }
                 case 'd': {
                     if (width_from_arg) {
                         width = va_arg(args, int);
@@ -341,6 +375,18 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                 }
                 case 's': {
                     const char* s = va_arg(args, const char*);
+                    if (s == nullptr) {
+                        // Print "(null)" like standard printf
+                        const char* null_str = "(null)";
+                        size_t null_len = 6;
+                        size_t space_left = (j < size) ? (size - j - 1) : 0;
+                        size_t to_copy = (null_len < space_left) ? null_len : space_left;
+                        if (to_copy > 0) {
+                            strncpy(str + j, null_str, to_copy);
+                            j += to_copy;
+                        }
+                        break;
+                    }
                     size_t src_len = strlen(s);
                     size_t space_left = (j < size) ? (size - j - 1) : 0;
                     size_t to_copy = (src_len < space_left) ? src_len : space_left;

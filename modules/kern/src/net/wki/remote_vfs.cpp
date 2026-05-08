@@ -3938,7 +3938,10 @@ void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports)
         // "/boot", and "/oldroot", which resolve correctly for all tasks whose
         // root has been updated to "/rootfs".
         uint32_t preserved_resource_id = take_preserved_export_id(stale_exports, export_name);
-        wki_remote_vfs_export_add_internal(mp->path, export_name, preserved_resource_id);
+        uint32_t resource_id = wki_remote_vfs_export_add_internal(mp->path, export_name, preserved_resource_id);
+        if (resource_id != 0) {
+            wki_dev_server_refresh_vfs_binding(resource_id, mp->path, export_name);
+        }
     }
 }
 
