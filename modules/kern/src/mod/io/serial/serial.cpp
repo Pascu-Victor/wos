@@ -1,8 +1,11 @@
 #include "serial.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
+
+#include "mod/io/port/port.hpp"
 
 namespace ker::mod::io::serial {
 bool isInit = false;
@@ -22,11 +25,11 @@ constexpr uint64_t NO_PANIC_OWNER = UINT64_MAX;
 std::atomic<uint64_t> panic_owner_cpu{NO_PANIC_OWNER};
 }  // namespace
 
-void markCpuIdAvailable() { cpu_id_available.store(true, std::memory_order_release); }
+void mark_cpu_id_available() { cpu_id_available.store(true, std::memory_order_release); }
 
 // Returns true if this CPU is the first to enter panic mode (becomes the panic owner).
 // Returns false for every subsequent caller.
-bool enterPanicMode() {
+bool enter_panic_mode() {
     in_panic_mode.store(true, std::memory_order_release);
     uint64_t expected = NO_PANIC_OWNER;
     constexpr uint64_t ADDR_MASK = 0xFFFFU;
@@ -35,9 +38,9 @@ bool enterPanicMode() {
     return panic_owner_cpu.compare_exchange_strong(expected, cpu_id, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
-bool isPanicMode() { return in_panic_mode.load(std::memory_order_acquire); }
+bool is_panic_mode() { return in_panic_mode.load(std::memory_order_acquire); }
 
-bool isPanicOwner() {
+bool is_panic_owner() {
     if (!in_panic_mode.load(std::memory_order_acquire)) {
         return false;
     }
@@ -52,7 +55,7 @@ bool isPanicOwner() {
     return cpu::currentCpu() == owner;
 }
 
-void acquireLock() {
+void acquire_lock() {
     // In panic mode all locking is a no-op: the panic owner holds the normal
     // lock before calling enterPanicMode(), so other CPUs must not spin on it.
     if (in_panic_mode.load(std::memory_order_acquire)) {
@@ -76,7 +79,7 @@ void acquireLock() {
     lock_depth.store(1, std::memory_order_relaxed);
 }
 
-void releaseLock() {
+void release_lock() {
     // In panic mode all locking is a no-op.
     if (in_panic_mode.load(std::memory_order_acquire)) {
         return;
@@ -120,11 +123,11 @@ static void flush_buf(size_t idx) {
     if (buf.len == 0) {
         return;
     }
-    acquireLock();
+    acquire_lock();
     for (size_t i = 0; i < buf.len; i++) {
         write_char_unlocked(buf.data[i]);
     }
-    releaseLock();
+    release_lock();
     buf.len = 0;
 }
 
@@ -180,7 +183,7 @@ void write(uint64_t num) {
     write(str + pos);
 }
 
-void writeHex(uint64_t num) {
+void write_hex(uint64_t num) {
     char str[17];
     str[16] = '\0';
     const char* hex = "0123456789abcdef";
@@ -195,7 +198,7 @@ void writeHex(uint64_t num) {
     write(str + start);
 }
 
-void writeBin(uint64_t num) {
+void write_bin(uint64_t num) {
     char str[65];
     str[64] = '\0';
     for (uint64_t i = 64; i > 0; i--) {
@@ -205,21 +208,21 @@ void writeBin(uint64_t num) {
 }
 
 // Unlocked write variants - caller must hold lock
-void writeUnlocked(const char* str) {
+void write_unlocked(const char* str) {
     for (size_t i = 0; str[i] != '\0'; i++) {
         write_char_unlocked(str[i]);
     }
 }
 
-void writeUnlocked(const char* str, uint64_t len) {
+void write_unlocked(const char* str, uint64_t len) {
     for (size_t i = 0; i < len; i++) {
         write_char_unlocked(str[i]);
     }
 }
 
-void writeUnlocked(const char c) { write_char_unlocked(c); }
+void write_unlocked(const char c) { write_char_unlocked(c); }
 
-void writeUnlocked(uint64_t num) {
+void write_unlocked(uint64_t num) {
     char str[21];
     str[20] = '\0';
     int pos = 20;
@@ -236,10 +239,10 @@ void writeUnlocked(uint64_t num) {
         str[i] = str[pos + i];
     }
     str[len] = '\0';
-    writeUnlocked(str);
+    write_unlocked(str);
 }
 
-void writeHexUnlocked(uint64_t num) {
+void write_hex_unlocked(uint64_t num) {
     char str[17];
     str[16] = '\0';
     const char* hex = "0123456789abcdef";
@@ -256,15 +259,15 @@ void writeHexUnlocked(uint64_t num) {
         str[i] = str[start + i];
     }
     str[len] = '\0';
-    writeUnlocked(str);
+    write_unlocked(str);
 }
 
-void writeBinUnlocked(uint64_t num) {
+void write_bin_unlocked(uint64_t num) {
     char str[65];
     str[64] = '\0';
     for (uint64_t i = 64; i > 0; i--) {
         str[64 - i] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
     }
-    writeUnlocked(str);
+    write_unlocked(str);
 }
 }  // namespace ker::mod::io::serial

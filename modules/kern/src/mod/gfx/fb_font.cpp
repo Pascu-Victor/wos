@@ -51,11 +51,11 @@ FbFont::FbFont(const FbFont& other) {
     }
 }
 
-uint8_t FbFont::getWidth() const { return width; }
+uint8_t FbFont::get_width() const { return width; }
 
-uint8_t FbFont::getHeight() const { return height; }
+uint8_t FbFont::get_height() const { return height; }
 
-const uint64_t* FbFont::getData(char c) const { return data[(uint64_t)c]; }
+const uint64_t* FbFont::get_data(char c) const { return data[(uint64_t)c]; }
 
 void FbFont::loadFont() {
     this->data[' '][0] = 0b0000000000000000;

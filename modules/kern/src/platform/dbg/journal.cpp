@@ -202,45 +202,45 @@ auto oldest_sequence_locked() -> uint64_t {
 
 void serial_write_record(const JournalRecord& rec) {
     auto ms = static_cast<uint64_t>((rec.monotonic_us / 1000ULL) % 1000ULL);
-    if (mod::io::serial::isPanicMode()) {
-        mod::io::serial::writeUnlocked('[');
-        mod::io::serial::writeUnlocked(static_cast<uint64_t>(rec.monotonic_us / 1000000ULL));
-        mod::io::serial::writeUnlocked('.');
+    if (mod::io::serial::is_panic_mode()) {
+        mod::io::serial::write_unlocked('[');
+        mod::io::serial::write_unlocked(static_cast<uint64_t>(rec.monotonic_us / 1000000ULL));
+        mod::io::serial::write_unlocked('.');
         if (ms < 10) {
-            mod::io::serial::writeUnlocked('0');
+            mod::io::serial::write_unlocked('0');
         }
         if (ms < 100) {
-            mod::io::serial::writeUnlocked('0');
+            mod::io::serial::write_unlocked('0');
         }
-        mod::io::serial::writeUnlocked(ms);
-        mod::io::serial::writeUnlocked("] ");
-        mod::io::serial::writeUnlocked(level_name(static_cast<LogLevel>(rec.level)));
-        mod::io::serial::writeUnlocked(' ');
-        mod::io::serial::writeUnlocked(static_cast<const char*>(rec.module));
-        mod::io::serial::writeUnlocked(": ");
-        mod::io::serial::writeUnlocked(static_cast<const char*>(rec.message), rec.message_len);
-        mod::io::serial::writeUnlocked('\n');
+        mod::io::serial::write_unlocked(ms);
+        mod::io::serial::write_unlocked("] ");
+        mod::io::serial::write_unlocked(level_name(static_cast<LogLevel>(rec.level)));
+        mod::io::serial::write_unlocked(' ');
+        mod::io::serial::write_unlocked(static_cast<const char*>(rec.module));
+        mod::io::serial::write_unlocked(": ");
+        mod::io::serial::write_unlocked(static_cast<const char*>(rec.message), rec.message_len);
+        mod::io::serial::write_unlocked('\n');
         return;
     }
 
     mod::io::serial::ScopedLock lock;
-    mod::io::serial::writeUnlocked('[');
-    mod::io::serial::writeUnlocked(static_cast<uint64_t>(rec.monotonic_us / 1000000ULL));
-    mod::io::serial::writeUnlocked('.');
+    mod::io::serial::write_unlocked('[');
+    mod::io::serial::write_unlocked(static_cast<uint64_t>(rec.monotonic_us / 1000000ULL));
+    mod::io::serial::write_unlocked('.');
     if (ms < 10) {
-        mod::io::serial::writeUnlocked('0');
+        mod::io::serial::write_unlocked('0');
     }
     if (ms < 100) {
-        mod::io::serial::writeUnlocked('0');
+        mod::io::serial::write_unlocked('0');
     }
-    mod::io::serial::writeUnlocked(ms);
-    mod::io::serial::writeUnlocked("] ");
-    mod::io::serial::writeUnlocked(level_name(static_cast<LogLevel>(rec.level)));
-    mod::io::serial::writeUnlocked(' ');
-    mod::io::serial::writeUnlocked(static_cast<const char*>(rec.module));
-    mod::io::serial::writeUnlocked(": ");
-    mod::io::serial::writeUnlocked(static_cast<const char*>(rec.message), rec.message_len);
-    mod::io::serial::writeUnlocked('\n');
+    mod::io::serial::write_unlocked(ms);
+    mod::io::serial::write_unlocked("] ");
+    mod::io::serial::write_unlocked(level_name(static_cast<LogLevel>(rec.level)));
+    mod::io::serial::write_unlocked(' ');
+    mod::io::serial::write_unlocked(static_cast<const char*>(rec.module));
+    mod::io::serial::write_unlocked(": ");
+    mod::io::serial::write_unlocked(static_cast<const char*>(rec.message), rec.message_len);
+    mod::io::serial::write_unlocked('\n');
 }
 
 void wake_waiters() {
@@ -382,7 +382,7 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         rec_flags |= JOURNAL_FLAG_PREFIX_COMPAT;
     }
 
-    if (mod::io::serial::isPanicMode()) {
+    if (mod::io::serial::is_panic_mode()) {
         JournalRecord rec{};
         rec.magic = JOURNAL_RECORD_MAGIC;
         rec.version = JOURNAL_RECORD_VERSION;

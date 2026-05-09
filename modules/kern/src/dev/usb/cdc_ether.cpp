@@ -298,9 +298,9 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     }
 
     ker::mod::io::serial::write("cdc-ether: bulk_in=");
-    ker::mod::io::serial::writeHex(ep_in->bEndpointAddress);
+    ker::mod::io::serial::write_hex(ep_in->bEndpointAddress);
     ker::mod::io::serial::write(" bulk_out=");
-    ker::mod::io::serial::writeHex(ep_out->bEndpointAddress);
+    ker::mod::io::serial::write_hex(ep_out->bEndpointAddress);
     ker::mod::io::serial::write("\n");
 
     // Set up bulk endpoints
@@ -331,7 +331,7 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     ker::mod::io::serial::write(" MAC=");
     for (int i = 0; i < 6; i++) {
         if (i > 0) ker::mod::io::serial::write(":");
-        ker::mod::io::serial::writeHex(cdc->netdev.mac[i]);
+        ker::mod::io::serial::write_hex(cdc->netdev.mac[i]);
     }
     ker::mod::io::serial::write(" ready\n");
 

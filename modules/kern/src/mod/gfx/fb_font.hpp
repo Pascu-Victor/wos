@@ -1,8 +1,7 @@
 #pragma once
-#include <string.h>
-
+#include <cstdint>
+#include <cstring>
 #include <defines/defines.hpp>
-#include <util/mem.hpp>
 namespace ker::mod::gfx::fb {
 class FbFont {
    public:
@@ -12,16 +11,15 @@ class FbFont {
     uint8_t width;   // max 64
     uint64_t data[256][64];
 
-   public:
     FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]);
     FbFont();
     FbFont(const FbFont& other);
-    FbFont& operator=(const FbFont& other);
+    auto operator=(const FbFont& other) -> FbFont&;
 
-    uint8_t getHeight() const;
+    [[nodiscard]] auto get_height() const -> uint8_t;
 
-    uint8_t getWidth() const;
+    [[nodiscard]] auto get_width() const -> uint8_t;
 
-    const uint64_t* getData(char c) const;
+    [[nodiscard]] auto get_data(char c) const -> const uint64_t*;
 };
 }  // namespace ker::mod::gfx::fb

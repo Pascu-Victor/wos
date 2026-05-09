@@ -3,7 +3,6 @@
 #include <cstdarg>
 #include <cstring>
 #include <span>
-#include <util/mem.hpp>
 
 namespace _std {
 

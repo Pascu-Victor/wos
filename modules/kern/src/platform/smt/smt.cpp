@@ -606,7 +606,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     cpu::setCurrentCpuid(0);
 
     // GS base is now valid - cpu::currentCpu() works, safe to enable CPU ID in serial logs
-    io::serial::markCpuIdAvailable();
+    io::serial::mark_cpu_id_available();
 
     // Store the BSP's PerCpu pointer for later retrieval
     if (kernelPerCpuPtrs != nullptr) {

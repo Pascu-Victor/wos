@@ -2,11 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <util/hcf.hpp>
-#include <util/mem.hpp>
 
 namespace ker::mod::dbg {
 enum class LogLevel : uint8_t {

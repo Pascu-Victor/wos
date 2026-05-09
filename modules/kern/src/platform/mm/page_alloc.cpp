@@ -54,9 +54,9 @@ static void dropCorruptFreeListHead(PageAllocator* alloc, int order, PageAllocat
     ker::mod::io::serial::write("page_alloc: dropping corrupt free-list head order=");
     ker::mod::io::serial::write((uint64_t)order);
     ker::mod::io::serial::write(" ptr=0x");
-    ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(block));
+    ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(block));
     ker::mod::io::serial::write(" zone_base=0x");
-    ker::mod::io::serial::writeHex(alloc->base);
+    ker::mod::io::serial::write_hex(alloc->base);
     ker::mod::io::serial::write("\n");
     alloc->freeList[order] = nullptr;
 }
@@ -72,7 +72,7 @@ static bool listRemove(PageAllocator* alloc, int order, PageAllocator::FreeBlock
             ker::mod::io::serial::write("page_alloc: corrupt free-list node while removing order=");
             ker::mod::io::serial::write((uint64_t)order);
             ker::mod::io::serial::write(" ptr=0x");
-            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(cur));
+            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(cur));
             ker::mod::io::serial::write("\n");
             *prev = nullptr;
             return false;
@@ -237,9 +237,9 @@ void PageAllocator::free(void* ptr) {
     if (ptr == nullptr) return;
     if (!ptrInZone(this, ptr)) {
         ker::mod::io::serial::write("page_alloc: rejecting free outside zone ptr=0x");
-        ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(ptr));
+        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
         ker::mod::io::serial::write(" zone_base=0x");
-        ker::mod::io::serial::writeHex(base);
+        ker::mod::io::serial::write_hex(base);
         ker::mod::io::serial::write("\n");
         return;
     }
@@ -260,9 +260,9 @@ void PageAllocator::free(void* ptr) {
         const auto page_base = reinterpret_cast<uint64_t>(pageToPtr(base, pageIdx));
         if (*reinterpret_cast<const uint64_t*>(page_base + 16) == MEDIUM_ALLOC_MAGIC) {
             ker::mod::io::serial::write("BUG: pageFree on live medium alloc page=0x");
-            ker::mod::io::serial::writeHex(page_base);
+            ker::mod::io::serial::write_hex(page_base);
             ker::mod::io::serial::write(" caller_ptr=0x");
-            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(ptr));
+            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
             ker::mod::io::serial::write("\n");
             ker::mod::dbg::panic_handler("pageFree called on live kmalloc medium alloc");
         }

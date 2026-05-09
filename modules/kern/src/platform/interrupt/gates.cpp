@@ -256,8 +256,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // a no-op for other CPUs - they cannot deadlock waiting for our lock.
     // Other CPUs have been halted, but keep the serial panic path in its
     // unlocked mode so a nested panic on this CPU cannot deadlock on logging.
-    io::serial::acquireLock();
-    io::serial::enterPanicMode();
+    io::serial::acquire_lock();
+    io::serial::enter_panic_mode();
 
     journal::panic("PANIC!");
 
@@ -350,13 +350,11 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         journal::panic("  syscallKernelStack: 0x%lx", current_task->context.syscallKernelStack);
         journal::panic("  syscallScratchArea: 0x%lx", current_task->context.syscallScratchArea);
         journal::panic("Task Scheduler State:");
-        journal::panic("  cpu=%lu queue=%u voluntary=%u wantsBlock=%u deferred=%u yield=%u",
-                       current_task->cpu, static_cast<unsigned>(current_task->schedQueue),
-                       current_task->voluntaryBlock ? 1U : 0U, current_task->wantsBlock ? 1U : 0U,
-                       current_task->deferredTaskSwitch ? 1U : 0U, current_task->yieldSwitch ? 1U : 0U);
-        journal::panic("  preemptDepth=%u preemptPending=%u preemptMaxUs=%lu",
-                       current_task->preemptDisableDepth, current_task->preemptPending ? 1U : 0U,
-                       current_task->preemptDisableMaxUs);
+        journal::panic("  cpu=%lu queue=%u voluntary=%u wantsBlock=%u deferred=%u yield=%u", current_task->cpu,
+                       static_cast<unsigned>(current_task->schedQueue), current_task->voluntaryBlock ? 1U : 0U,
+                       current_task->wantsBlock ? 1U : 0U, current_task->deferredTaskSwitch ? 1U : 0U, current_task->yieldSwitch ? 1U : 0U);
+        journal::panic("  preemptDepth=%u preemptPending=%u preemptMaxUs=%lu", current_task->preemptDisableDepth,
+                       current_task->preemptPending ? 1U : 0U, current_task->preemptDisableMaxUs);
     } else {
         journal::panic("WARNING: currentTask is NULL!");
     }
@@ -558,7 +556,7 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
     } else if (isIrq(frame.intNum)) {
         // Unexpected hardware IRQ with no handler - log and ignore.
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
-        ker::mod::io::serial::writeHex(static_cast<uint8_t>(frame.intNum));
+        ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.intNum));
         ker::mod::io::serial::write("\n");
     } else {
         // CPU exception with no registered handler - route to exception_handler

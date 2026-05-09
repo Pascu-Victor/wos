@@ -286,7 +286,7 @@ void kasan_write_hex(uint64_t val) {
         buf[2 + (15 - i)] = hex[(val >> (i * 4)) & 0xf];
     }
     buf[18] = '\0';
-    ser::writeUnlocked(buf);
+    ser::write_unlocked(buf);
 }
 
 void kasan_write_dec(uint64_t val) {
@@ -301,7 +301,7 @@ void kasan_write_dec(uint64_t val) {
             val /= 10;
         }
     }
-    ser::writeUnlocked(buf + pos);
+    ser::write_unlocked(buf + pos);
 }
 
 // Describe a shadow byte value (ASan convention)
@@ -344,43 +344,43 @@ void kasan_hexdump(uintptr_t addr, size_t size) {
     uintptr_t end = start + 128;
     if (start < 0xffff000000000000ULL) return;
 
-    ser::writeUnlocked("\n--- Memory around ");
+    ser::write_unlocked("\n--- Memory around ");
     kasan_write_hex(addr);
-    ser::writeUnlocked(" ---\n");
+    ser::write_unlocked(" ---\n");
 
     constexpr const char* hex = "0123456789abcdef";
     for (uintptr_t row = start; row < end; row += 16) {
         if (addr >= row && addr < row + 16) {
-            ser::writeUnlocked("=>");
+            ser::write_unlocked("=>");
         } else {
-            ser::writeUnlocked("  ");
+            ser::write_unlocked("  ");
         }
         kasan_write_hex(row);
-        ser::writeUnlocked(": ");
+        ser::write_unlocked(": ");
 
         auto* p = reinterpret_cast<const uint8_t*>(row);
         for (int i = 0; i < 16; i++) {
             bool is_target = ((row + static_cast<uintptr_t>(i)) >= addr && (row + static_cast<uintptr_t>(i)) < addr + size);
-            if (is_target) ser::writeUnlocked("[");
+            if (is_target) ser::write_unlocked("[");
             char h[3];
             h[0] = hex[p[i] >> 4];
             h[1] = hex[p[i] & 0xf];
             h[2] = '\0';
-            ser::writeUnlocked(h);
+            ser::write_unlocked(h);
             if (is_target) {
-                ser::writeUnlocked("]");
+                ser::write_unlocked("]");
             } else {
-                ser::writeUnlocked(" ");
+                ser::write_unlocked(" ");
             }
-            if (i == 7) ser::writeUnlocked(" ");
+            if (i == 7) ser::write_unlocked(" ");
         }
 
-        ser::writeUnlocked(" |");
+        ser::write_unlocked(" |");
         for (int i = 0; i < 16; i++) {
             char c = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
-            ser::writeUnlocked(c);
+            ser::write_unlocked(c);
         }
-        ser::writeUnlocked("|\n");
+        ser::write_unlocked("|\n");
     }
 }
 
@@ -394,55 +394,55 @@ void kasan_shadow_map(uintptr_t addr) {
     uintptr_t start = (shadow_addr - 64) & ~0xFULL;  // align to 16 bytes
     uintptr_t end = start + 144;
 
-    ser::writeUnlocked("\n--- Shadow memory around ");
+    ser::write_unlocked("\n--- Shadow memory around ");
     kasan_write_hex(shadow_addr);
-    ser::writeUnlocked(" (each byte covers 8 app bytes) ---\n");
+    ser::write_unlocked(" (each byte covers 8 app bytes) ---\n");
 
     constexpr const char* hex = "0123456789abcdef";
     for (uintptr_t row = start; row < end; row += 16) {
         // Arrow on the row containing the faulting shadow byte
         if (shadow_addr >= row && shadow_addr < row + 16) {
-            ser::writeUnlocked("=>");
+            ser::write_unlocked("=>");
         } else {
-            ser::writeUnlocked("  ");
+            ser::write_unlocked("  ");
         }
         kasan_write_hex(row);
-        ser::writeUnlocked(": ");
+        ser::write_unlocked(": ");
 
         auto* p = reinterpret_cast<const int8_t*>(row);
         for (int i = 0; i < 16; i++) {
             bool is_target = (row + static_cast<uintptr_t>(i) == shadow_addr);
-            if (is_target) ser::writeUnlocked("[");
+            if (is_target) ser::write_unlocked("[");
             char h[3];
             auto byte = static_cast<uint8_t>(p[i]);
             h[0] = hex[byte >> 4];
             h[1] = hex[byte & 0xf];
             h[2] = '\0';
-            ser::writeUnlocked(h);
+            ser::write_unlocked(h);
             if (is_target) {
-                ser::writeUnlocked("]");
+                ser::write_unlocked("]");
             } else {
-                ser::writeUnlocked(" ");
+                ser::write_unlocked(" ");
             }
-            if (i == 7) ser::writeUnlocked(" ");
+            if (i == 7) ser::write_unlocked(" ");
         }
-        ser::writeUnlocked("\n");
+        ser::write_unlocked("\n");
     }
 
     // Legend
-    ser::writeUnlocked("  Shadow byte legend:\n");
-    ser::writeUnlocked("    00=accessible  01-07=partial  f1=heap-left-rz  f2=heap-mid-rz\n");
-    ser::writeUnlocked("    f3=heap-right-rz  f5=stack-left-rz  f8=freed  f9=global-rz\n");
-    ser::writeUnlocked("    ff=poisoned\n");
+    ser::write_unlocked("  Shadow byte legend:\n");
+    ser::write_unlocked("    00=accessible  01-07=partial  f1=heap-left-rz  f2=heap-mid-rz\n");
+    ser::write_unlocked("    f3=heap-right-rz  f5=stack-left-rz  f8=freed  f9=global-rz\n");
+    ser::write_unlocked("    ff=poisoned\n");
 }
 
 }  // namespace
 
 [[noreturn]] static void kasan_report(uintptr_t addr, size_t size, bool is_write, uintptr_t ret_addr) {
-    ser::enterPanicMode();
+    ser::enter_panic_mode();
     // Non-owner CPUs halt immediately; only the first CPU to trigger KASAN
     // proceeds to emit the report so output from concurrent faults can't race.
-    if (!ser::isPanicOwner()) {
+    if (!ser::is_panic_owner()) {
         hcf();
     }
     ker::mod::smt::halt_other_cores();
@@ -452,25 +452,25 @@ void kasan_shadow_map(uintptr_t addr) {
     auto shadow_addr = reinterpret_cast<uintptr_t>(shadow);
 
     // Header — mimic LLVM ASan format
-    ser::writeUnlocked("\n==================================================================\n");
-    ser::writeUnlocked("ERROR: KernelAddressSanitizer: ");
-    ser::writeUnlocked(kasan_shadow_desc(s));
-    ser::writeUnlocked(" on address ");
+    ser::write_unlocked("\n==================================================================\n");
+    ser::write_unlocked("ERROR: KernelAddressSanitizer: ");
+    ser::write_unlocked(kasan_shadow_desc(s));
+    ser::write_unlocked(" on address ");
     kasan_write_hex(addr);
-    ser::writeUnlocked("\n");
+    ser::write_unlocked("\n");
 
     // Access details
-    ser::writeUnlocked(is_write ? "WRITE" : "READ");
-    ser::writeUnlocked(" of size ");
+    ser::write_unlocked(is_write ? "WRITE" : "READ");
+    ser::write_unlocked(" of size ");
     kasan_write_dec(size);
-    ser::writeUnlocked(" at ");
+    ser::write_unlocked(" at ");
     kasan_write_hex(addr);
-    ser::writeUnlocked("\n");
+    ser::write_unlocked("\n");
 
     // Shadow details
-    ser::writeUnlocked("  Shadow addr: ");
+    ser::write_unlocked("  Shadow addr: ");
     kasan_write_hex(shadow_addr);
-    ser::writeUnlocked("  Shadow byte: ");
+    ser::write_unlocked("  Shadow byte: ");
     {
         constexpr const char* hex = "0123456789abcdef";
         char h[5];
@@ -479,14 +479,14 @@ void kasan_shadow_map(uintptr_t addr) {
         h[2] = hex[(static_cast<uint8_t>(s)) >> 4];
         h[3] = hex[(static_cast<uint8_t>(s)) & 0xf];
         h[4] = '\0';
-        ser::writeUnlocked(h);
+        ser::write_unlocked(h);
     }
-    ser::writeUnlocked(" (");
-    ser::writeUnlocked(kasan_shadow_desc(s));
-    ser::writeUnlocked(")\n");
+    ser::write_unlocked(" (");
+    ser::write_unlocked(kasan_shadow_desc(s));
+    ser::write_unlocked(")\n");
 
     // Adjacent shadow bytes
-    ser::writeUnlocked("  Adjacent: prev=");
+    ser::write_unlocked("  Adjacent: prev=");
     {
         constexpr const char* hex = "0123456789abcdef";
         char h[5];
@@ -495,11 +495,11 @@ void kasan_shadow_map(uintptr_t addr) {
         h[2] = hex[(static_cast<uint8_t>(shadow[-1])) >> 4];
         h[3] = hex[(static_cast<uint8_t>(shadow[-1])) & 0xf];
         h[4] = '\0';
-        ser::writeUnlocked(h);
+        ser::write_unlocked(h);
     }
-    ser::writeUnlocked("(");
-    ser::writeUnlocked(kasan_shadow_desc(shadow[-1]));
-    ser::writeUnlocked(")  next=");
+    ser::write_unlocked("(");
+    ser::write_unlocked(kasan_shadow_desc(shadow[-1]));
+    ser::write_unlocked(")  next=");
     {
         constexpr const char* hex = "0123456789abcdef";
         char h[5];
@@ -508,16 +508,16 @@ void kasan_shadow_map(uintptr_t addr) {
         h[2] = hex[(static_cast<uint8_t>(shadow[1])) >> 4];
         h[3] = hex[(static_cast<uint8_t>(shadow[1])) & 0xf];
         h[4] = '\0';
-        ser::writeUnlocked(h);
+        ser::write_unlocked(h);
     }
-    ser::writeUnlocked("(");
-    ser::writeUnlocked(kasan_shadow_desc(shadow[1]));
-    ser::writeUnlocked(")\n");
+    ser::write_unlocked("(");
+    ser::write_unlocked(kasan_shadow_desc(shadow[1]));
+    ser::write_unlocked(")\n");
 
     // Caller
-    ser::writeUnlocked("  Caller: ");
+    ser::write_unlocked("  Caller: ");
     kasan_write_hex(ret_addr);
-    ser::writeUnlocked("\n");
+    ser::write_unlocked("\n");
 
     // Hex dump of application memory
     kasan_hexdump(addr, size);
@@ -525,7 +525,7 @@ void kasan_shadow_map(uintptr_t addr) {
     // Shadow memory map
     kasan_shadow_map(addr);
 
-    ser::writeUnlocked("==================================================================\n");
+    ser::write_unlocked("==================================================================\n");
 
     ker::mod::dbg::panic_handler("KASan: memory access violation (see above)");
     __builtin_unreachable();

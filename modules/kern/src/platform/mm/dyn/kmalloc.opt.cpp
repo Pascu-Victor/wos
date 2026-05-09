@@ -157,15 +157,15 @@ void dumpTrackedAllocations() {
             mediumCount++;
             mediumTotalBytes += curr->size;
             ker::mod::io::serial::write("  addr=0x");
-            ker::mod::io::serial::writeHex((uint64_t)(curr + 1));
+            ker::mod::io::serial::write_hex((uint64_t)(curr + 1));
             ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::writeHex(curr->size);
+            ker::mod::io::serial::write_hex(curr->size);
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
             if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
                 const auto& d = s_alloc_debug[curr->debug_idx];
                 if (d.caller != 0) {
                     ker::mod::io::serial::write(" caller=0x");
-                    ker::mod::io::serial::writeHex(d.caller);
+                    ker::mod::io::serial::write_hex(d.caller);
                 }
                 if (d.tag != nullptr) {
                     ker::mod::io::serial::write(" tag=");
@@ -179,9 +179,9 @@ void dumpTrackedAllocations() {
     mediumAllocLock.unlock_irqrestore(mediumLockFlags);
 
     ker::mod::io::serial::write("  medium_total: 0x");
-    ker::mod::io::serial::writeHex(mediumCount);
+    ker::mod::io::serial::write_hex(mediumCount);
     ker::mod::io::serial::write(" entries, 0x");
-    ker::mod::io::serial::writeHex(mediumTotalBytes);
+    ker::mod::io::serial::write_hex(mediumTotalBytes);
     ker::mod::io::serial::write(" bytes\n");
 
     uint64_t largeLockFlags = largeAllocLock.lock_irqsave();
@@ -194,15 +194,15 @@ void dumpTrackedAllocations() {
             largeCount++;
             largeTotalBytes += curr->size;
             ker::mod::io::serial::write("  addr=0x");
-            ker::mod::io::serial::writeHex((uint64_t)(curr + 1));  // Data starts after header
+            ker::mod::io::serial::write_hex((uint64_t)(curr + 1));  // Data starts after header
             ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::writeHex(curr->size);
+            ker::mod::io::serial::write_hex(curr->size);
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
             if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
                 const auto& d = s_alloc_debug[curr->debug_idx];
                 if (d.caller != 0) {
                     ker::mod::io::serial::write(" caller=0x");
-                    ker::mod::io::serial::writeHex(d.caller);
+                    ker::mod::io::serial::write_hex(d.caller);
                 }
                 if (d.tag != nullptr) {
                     ker::mod::io::serial::write(" tag=");
@@ -215,9 +215,9 @@ void dumpTrackedAllocations() {
     }
 
     ker::mod::io::serial::write("  large_total: 0x");
-    ker::mod::io::serial::writeHex(largeCount);
+    ker::mod::io::serial::write_hex(largeCount);
     ker::mod::io::serial::write(" entries, 0x");
-    ker::mod::io::serial::writeHex(largeTotalBytes);
+    ker::mod::io::serial::write_hex(largeTotalBytes);
     ker::mod::io::serial::write(" bytes\n");
     largeAllocLock.unlock_irqrestore(largeLockFlags);
 
@@ -232,11 +232,11 @@ void dumpTrackedAllocations() {
             return;
         }
         ker::mod::io::serial::write("  addr=0x");
-        ker::mod::io::serial::writeHex((uint64_t)ptr);
+        ker::mod::io::serial::write_hex((uint64_t)ptr);
         ker::mod::io::serial::write(" sz=0x");
-        ker::mod::io::serial::writeHex(sz);
+        ker::mod::io::serial::write_hex(sz);
         ker::mod::io::serial::write(" caller=0x");
-        ker::mod::io::serial::writeHex(d.caller);
+        ker::mod::io::serial::write_hex(d.caller);
         if (d.tag != nullptr) {
             ker::mod::io::serial::write(" tag=");
             ker::mod::io::serial::write(d.tag);
@@ -522,7 +522,7 @@ static auto tryFreeMediumAlloc(void* dataPtr, uint64_t& outSize) -> TrackedFreeR
             const auto& d = s_alloc_debug[node->debug_idx];
             if (d.caller != 0) {
                 ker::mod::io::serial::write(" caller=0x");
-                ker::mod::io::serial::writeHex(d.caller);
+                ker::mod::io::serial::write_hex(d.caller);
             }
             if (d.tag != nullptr) {
                 ker::mod::io::serial::write(" tag=");
@@ -535,9 +535,9 @@ static auto tryFreeMediumAlloc(void* dataPtr, uint64_t& outSize) -> TrackedFreeR
     };
 
     ker::mod::io::serial::write("kmalloc: DoubleFree chain dump (target=0x");
-    ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(header));
+    ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(header));
     ker::mod::io::serial::write(" size=0x");
-    ker::mod::io::serial::writeHex(header->size);
+    ker::mod::io::serial::write_hex(header->size);
     printDebugInfo(header);
     ker::mod::io::serial::write("):\n");
 
@@ -547,11 +547,11 @@ static auto tryFreeMediumAlloc(void* dataPtr, uint64_t& outSize) -> TrackedFreeR
     for (MediumAllocationHeader* c = mediumAllocList; c != nullptr && n < 8192; c = c->next, ++n) {
         if (c->magic != MEDIUM_ALLOC_MAGIC) {
             ker::mod::io::serial::write("  BAD node=0x");
-            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(c));
+            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(c));
             ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::writeHex(c->size);
+            ker::mod::io::serial::write_hex(c->size);
             ker::mod::io::serial::write(" magic=0x");
-            ker::mod::io::serial::writeHex(c->magic);
+            ker::mod::io::serial::write_hex(c->magic);
             ker::mod::io::serial::write(" (prev had this as next)\n");
             foundCorrupt = true;
             break;
@@ -559,24 +559,24 @@ static auto tryFreeMediumAlloc(void* dataPtr, uint64_t& outSize) -> TrackedFreeR
         MediumAllocationHeader* nxt = c->next;
         if (nxt != nullptr && nxt->magic != MEDIUM_ALLOC_MAGIC) {
             ker::mod::io::serial::write("  CORRUPT node=0x");
-            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(c));
+            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(c));
             ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::writeHex(c->size);
+            ker::mod::io::serial::write_hex(c->size);
             printDebugInfo(c);
             ker::mod::io::serial::write(" ->next=0x");
-            ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(nxt));
+            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(nxt));
             ker::mod::io::serial::write(" (next_magic=0x");
-            ker::mod::io::serial::writeHex(nxt->magic);
+            ker::mod::io::serial::write_hex(nxt->magic);
             ker::mod::io::serial::write(")\n");
             const auto* data = reinterpret_cast<const uint64_t*>(c + 1);
             ker::mod::io::serial::write("  CORRUPT node data[0..3]: 0x");
-            ker::mod::io::serial::writeHex(data[0]);
+            ker::mod::io::serial::write_hex(data[0]);
             ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::writeHex(data[1]);
+            ker::mod::io::serial::write_hex(data[1]);
             ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::writeHex(data[2]);
+            ker::mod::io::serial::write_hex(data[2]);
             ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::writeHex(data[3]);
+            ker::mod::io::serial::write_hex(data[3]);
             ker::mod::io::serial::write("\n");
             foundCorrupt = true;
             break;
@@ -587,32 +587,32 @@ static auto tryFreeMediumAlloc(void* dataPtr, uint64_t& outSize) -> TrackedFreeR
         // Chain ended without finding target — the predecessor of target had its
         // ->next overwritten with null (or some other valid node, skipping target).
         ker::mod::io::serial::write("  TRUNCATED: last valid node=0x");
-        ker::mod::io::serial::writeHex(reinterpret_cast<uint64_t>(lastNode));
+        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(lastNode));
         ker::mod::io::serial::write(" size=0x");
-        ker::mod::io::serial::writeHex(lastNode->size);
+        ker::mod::io::serial::write_hex(lastNode->size);
         printDebugInfo(lastNode);
         ker::mod::io::serial::write(" ->next=0x0\n");
         const auto* data = reinterpret_cast<const uint64_t*>(lastNode + 1);
         ker::mod::io::serial::write("  TRUNCATED node data[0..7]: 0x");
-        ker::mod::io::serial::writeHex(data[0]);
+        ker::mod::io::serial::write_hex(data[0]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[1]);
+        ker::mod::io::serial::write_hex(data[1]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[2]);
+        ker::mod::io::serial::write_hex(data[2]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[3]);
+        ker::mod::io::serial::write_hex(data[3]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[4]);
+        ker::mod::io::serial::write_hex(data[4]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[5]);
+        ker::mod::io::serial::write_hex(data[5]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[6]);
+        ker::mod::io::serial::write_hex(data[6]);
         ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::writeHex(data[7]);
+        ker::mod::io::serial::write_hex(data[7]);
         ker::mod::io::serial::write("\n");
     }
     ker::mod::io::serial::write("kmalloc: DoubleFree chain dump done (");
-    ker::mod::io::serial::writeHex(n);
+    ker::mod::io::serial::write_hex(n);
     ker::mod::io::serial::write(" nodes walked)\n");
 
     mediumAllocLock.unlock_irqrestore(flags);

@@ -2,11 +2,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <util/hcf.hpp>
-#include <util/mem.hpp>
 // NOLINTBEGIN(readability-identifier-naming,misc-use-internal-linkage)
 extern "C" {
 // Kernel-friendly assert handler used by C library headers that call

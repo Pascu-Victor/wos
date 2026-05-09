@@ -15,6 +15,7 @@
 
 #include "mutex.hpp"
 
+#include <atomic>
 #include <platform/sched/scheduler.hpp>
 
 namespace ker::mod::sys {

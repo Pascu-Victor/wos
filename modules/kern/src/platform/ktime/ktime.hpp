@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/hpet/hpet.hpp>
@@ -9,7 +10,6 @@
 #include <platform/sched/task.hpp>
 #include <platform/tsc/tsc.hpp>
 #include <util/list.hpp>
-#include <util/mem.hpp>
 
 namespace ker::mod::time {
 

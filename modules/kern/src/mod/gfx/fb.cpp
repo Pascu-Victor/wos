@@ -65,7 +65,7 @@ inline void swapBuffers(void) {
     }
 }
 
-inline void writePixel(uint16_t x, uint16_t y, uint32_t color) {
+inline void write_pixel(uint16_t x, uint16_t y, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
         backBuffer[x + y * __framebuffer->width] = color;
     } else {
@@ -84,22 +84,22 @@ void clear(uint32_t color) {
     }
 }
 
-void drawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color, FillMode fill) {
+void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color, FillMode fill) {
     if constexpr (WOS_HAS_GFX_FB) {
         if (fill == FillMode::FILL) {
             for (size_t i = 0; i < h; i++) {
                 for (size_t j = 0; j < w; j++) {
-                    writePixel(x + j, y + i, color);
+                    write_pixel(x + j, y + i, color);
                 }
             }
         } else {
             for (size_t i = 0; i < w; i++) {
-                writePixel(x + i, y, color);
-                writePixel(x + i, y + h, color);
+                write_pixel(x + i, y, color);
+                write_pixel(x + i, y + h, color);
             }
             for (size_t i = 0; i < h; i++) {
-                writePixel(x, y + i, color);
-                writePixel(x + w, y + i, color);
+                write_pixel(x, y + i, color);
+                write_pixel(x + w, y + i, color);
             }
         }
         swapBuffers();
@@ -114,13 +114,13 @@ inline void drawCharNoSwap(uint16_t x, uint16_t y, char c, uint32_t color, uint3
             x *= __currentFont.width;
             y *= __currentFont.height;
         }
-        const uint64_t* data = __currentFont.getData(c);
+        const uint64_t* data = __currentFont.get_data(c);
         for (size_t i = 0; i < __currentFont.height; i++) {
             for (size_t j = 0; j < __currentFont.width; j++) {
                 if (data[i] & (1ULL << j)) {
-                    writePixel(x + __currentFont.width - j, y + i, color);
+                    write_pixel(x + __currentFont.width - j, y + i, color);
                 } else {
-                    writePixel(x + __currentFont.width - j, y + i, bg_color);
+                    write_pixel(x + __currentFont.width - j, y + i, bg_color);
                 }
             }
         }
@@ -129,7 +129,7 @@ inline void drawCharNoSwap(uint16_t x, uint16_t y, char c, uint32_t color, uint3
     }
 }
 
-void drawChar(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
+void draw_char(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
         drawCharNoSwap(x, y, c, color, bg_color, mode);
         swapBuffers();
@@ -138,7 +138,7 @@ void drawChar(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color,
     }
 }
 
-uint64_t drawString(uint16_t x, uint16_t y, const char* str, uint32_t color, uint32_t bg_color, OffsetMode mode) {
+uint64_t draw_string(uint16_t x, uint16_t y, const char* str, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
         uint64_t lines = 0;
         for (size_t i = 0; str[i] != '\0'; i++) {
@@ -199,7 +199,7 @@ void drawLineNoSwap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t
         }
         int numerator = longest >> 1;
         for (int i = 0; i <= longest; i++) {
-            writePixel(x1, y1, color);
+            write_pixel(x1, y1, color);
             numerator += shortest;
             if (!(numerator < longest)) {
                 numerator -= longest;
@@ -215,7 +215,7 @@ void drawLineNoSwap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t
     }
 }
 
-void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
+void draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
         drawLineNoSwap(x1, y1, x2, y2, color);
         swapBuffers();
@@ -224,7 +224,7 @@ void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color
     }
 }
 
-void drawCircle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMode fill) {
+void draw_circle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMode fill) {
     if constexpr (WOS_HAS_GFX_FB) {
         int f = 1 - radius;
         int ddF_x = 1;
@@ -235,10 +235,10 @@ void drawCircle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMod
         if (fill == FillMode::FILL) {
             drawLineNoSwap(x, y - radius, x, y + radius, color);
         } else {
-            writePixel(x, y + radius, color);
-            writePixel(x, y - radius, color);
-            writePixel(x + radius, y, color);
-            writePixel(x - radius, y, color);
+            write_pixel(x, y + radius, color);
+            write_pixel(x, y - radius, color);
+            write_pixel(x + radius, y, color);
+            write_pixel(x - radius, y, color);
         }
 
         while (x1 < y1) {
@@ -256,14 +256,14 @@ void drawCircle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMod
                 drawLineNoSwap(x - y1, y + x1, x + y1, y + x1, color);
                 drawLineNoSwap(x - y1, y - x1, x + y1, y - x1, color);
             } else {
-                writePixel(x + x1, y + y1, color);
-                writePixel(x - x1, y + y1, color);
-                writePixel(x + x1, y - y1, color);
-                writePixel(x - x1, y - y1, color);
-                writePixel(x + y1, y + x1, color);
-                writePixel(x - y1, y + x1, color);
-                writePixel(x + y1, y - x1, color);
-                writePixel(x - y1, y - x1, color);
+                write_pixel(x + x1, y + y1, color);
+                write_pixel(x - x1, y + y1, color);
+                write_pixel(x + x1, y - y1, color);
+                write_pixel(x - x1, y - y1, color);
+                write_pixel(x + y1, y + x1, color);
+                write_pixel(x - y1, y + x1, color);
+                write_pixel(x + y1, y - x1, color);
+                write_pixel(x - y1, y - x1, color);
             }
         }
         swapBuffers();
@@ -272,7 +272,7 @@ void drawCircle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMod
     }
 }
 
-uint64_t viewportWidth(void) {
+uint64_t viewport_width(void) {
     if (WOS_HAS_GFX_FB) {
         return __framebuffer->width;
     } else {
@@ -280,7 +280,7 @@ uint64_t viewportWidth(void) {
     }
 }
 
-uint64_t viewportHeight(void) {
+uint64_t viewport_height(void) {
     if constexpr (WOS_HAS_GFX_FB) {
         return __framebuffer->height;
     } else {
@@ -288,7 +288,7 @@ uint64_t viewportHeight(void) {
     }
 }
 
-uint64_t viewportWidthChars(void) {
+uint64_t viewport_width_chars(void) {
     if constexpr (WOS_HAS_GFX_FB) {
         return __framebuffer->width / __currentFont.width;
     } else {
@@ -296,7 +296,7 @@ uint64_t viewportWidthChars(void) {
     }
 }
 
-uint64_t viewportHeightChars(void) {
+uint64_t viewport_height_chars(void) {
     if constexpr (WOS_HAS_GFX_FB) {
         return __framebuffer->height / __currentFont.height;
     } else {
@@ -326,7 +326,7 @@ void scroll() {
 //     return 0;
 // }
 
-void mapFramebuffer(void) {
+void map_framebuffer(void) {
     if constexpr (WOS_HAS_GFX_FB) {
         auto fbPhys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::paddr_t)(__framebuffer->address));
 
@@ -339,14 +339,14 @@ void mapFramebuffer(void) {
         ker::mod::io::serial::write(__framebuffer->height);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Start physical address: ");
-        ker::mod::io::serial::writeHex(fbPhys);
+        ker::mod::io::serial::write_hex(fbPhys);
         uint64_t framebufferSize = __framebuffer->width * __framebuffer->height * __framebuffer->bpp / 8;
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Theoretical end physical address: ");
-        ker::mod::io::serial::writeHex((uint64_t)fbPhys + framebufferSize);
+        ker::mod::io::serial::write_hex((uint64_t)fbPhys + framebufferSize);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Framebuffer size: ");
-        ker::mod::io::serial::writeHex(framebufferSize);
+        ker::mod::io::serial::write_hex(framebufferSize);
         ker::mod::io::serial::write("\n");
     } else {
         hcf();

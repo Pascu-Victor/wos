@@ -167,15 +167,15 @@ void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
 
 void dumpAllocStats() {
     io::serial::write("Physical alloc stats: allocated=");
-    io::serial::writeHex(total_allocated_bytes.load());
+    io::serial::write_hex(total_allocated_bytes.load());
     io::serial::write(" freed=");
-    io::serial::writeHex(total_freed_bytes.load());
+    io::serial::write_hex(total_freed_bytes.load());
     io::serial::write(" delta=");
-    io::serial::writeHex(total_allocated_bytes.load() - total_freed_bytes.load());
+    io::serial::write_hex(total_allocated_bytes.load() - total_freed_bytes.load());
     io::serial::write(" allocCount=");
-    io::serial::writeHex(alloc_count.load());
+    io::serial::write_hex(alloc_count.load());
     io::serial::write(" freeCount=");
-    io::serial::writeHex(free_count.load());
+    io::serial::write_hex(free_count.load());
     io::serial::write("\n");
 }
 
@@ -219,7 +219,7 @@ void dump_caller_page_stats() {
             break;
         }
         io::serial::write("  0x");
-        io::serial::writeHex(snapshot[i].caller);
+        io::serial::write_hex(snapshot[i].caller);
         io::serial::write(": ");
         io::serial::write(snapshot[i].pages);
         io::serial::write(" pages (");
@@ -525,10 +525,10 @@ auto pageAlloc(uint64_t size, std::string_view name) -> void* {
     if (block == nullptr) {
         // OOM condition - dump allocation info for debugging
         io::serial::write("OOM: pageAlloc failed for size ");
-        io::serial::writeHex(size);
+        io::serial::write_hex(size);
         io::serial::write(" bytes\n");
         io::serial::write("Allocation site: 0x");
-        io::serial::writeHex((uint64_t)caller_addr);
+        io::serial::write_hex((uint64_t)caller_addr);
         io::serial::write(" (");
         io::serial::write(name.data(), name.size());
         io::serial::write(")\n");
@@ -545,7 +545,7 @@ auto pageAlloc(uint64_t size, std::string_view name) -> void* {
     constexpr uint64_t HHDM_END = 0xffff808000000000ULL;  // ~512GB max physical
     if (block_addr < HHDM_BASE || block_addr >= HHDM_END) {
         io::serial::write("FATAL: pageAlloc returned invalid HHDM addr: ");
-        io::serial::writeHex(block_addr);
+        io::serial::write_hex(block_addr);
         io::serial::write("\n");
         hcf();
     }
@@ -595,7 +595,7 @@ auto pageAllocHuge(uint64_t size) -> void* {
 
     if (block == nullptr) {
         io::serial::write("OOM: pageAllocHuge failed for size 0x");
-        io::serial::writeHex(size);
+        io::serial::write_hex(size);
         io::serial::write(" bytes\n");
         return nullptr;
     }

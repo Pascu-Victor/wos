@@ -163,18 +163,18 @@ void mini_dump_stats() {
         ker::mod::io::serial::write("  Slab ");
         ker::mod::io::serial::write(info.name);
         ker::mod::io::serial::write(": slabs=0x");
-        ker::mod::io::serial::writeHex(info.slab_count);
+        ker::mod::io::serial::write_hex(info.slab_count);
         ker::mod::io::serial::write(" blocks_total=0x");
-        ker::mod::io::serial::writeHex(info.total_blocks);
+        ker::mod::io::serial::write_hex(info.total_blocks);
         ker::mod::io::serial::write(" free_blocks=0x");
-        ker::mod::io::serial::writeHex(info.free_blocks);
+        ker::mod::io::serial::write_hex(info.free_blocks);
         ker::mod::io::serial::write(" mem_bytes=0x");
-        ker::mod::io::serial::writeHex(info.page_bytes);
+        ker::mod::io::serial::write_hex(info.page_bytes);
         ker::mod::io::serial::write("\n");
         total_slab_bytes += info.page_bytes;
     }
     ker::mod::io::serial::write("  Total slab memory: 0x");
-    ker::mod::io::serial::writeHex(total_slab_bytes);
+    ker::mod::io::serial::write_hex(total_slab_bytes);
     ker::mod::io::serial::write(" bytes\n");
 }
 

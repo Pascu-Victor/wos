@@ -93,18 +93,18 @@ inline void serialLogLine(const char* str) {
             };
             u64toa_local(static_cast<uint64_t>(logTimeMsPart), timeMs, 10);
             u64toa_local(static_cast<uint64_t>(logTimeSecPart), timeSec, 10);
-            io::serial::writeUnlocked('[');
-            io::serial::writeUnlocked(timeSec);
-            io::serial::writeUnlocked('.');
-            io::serial::writeUnlocked(timeMs);
-            io::serial::writeUnlocked("]:");
+            io::serial::write_unlocked('[');
+            io::serial::write_unlocked(timeSec);
+            io::serial::write_unlocked('.');
+            io::serial::write_unlocked(timeMs);
+            io::serial::write_unlocked("]:");
         }
-        io::serial::writeUnlocked(str);
-        io::serial::writeUnlocked('\n');
+        io::serial::write_unlocked(str);
+        io::serial::write_unlocked('\n');
     };
 
     // In panic mode the caller already holds the panic lock for the whole dump.
-    if (io::serial::isPanicMode()) {
+    if (io::serial::is_panic_mode()) {
         writeLineUnlocked();
         return;
     }
@@ -115,12 +115,12 @@ inline void serialLogLine(const char* str) {
 inline void fbLog(const char* str) {
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
         uint64_t line = linesLogged;
-        if (linesLogged >= gfx::fb::viewportHeightChars()) {
+        if (linesLogged >= gfx::fb::viewport_height_chars()) {
             gfx::fb::scroll();
-            line = gfx::fb::viewportHeightChars() - 1;
+            line = gfx::fb::viewport_height_chars() - 1;
         }
 
-        gfx::fb::drawChar(0, line, '[');
+        gfx::fb::draw_char(0, line, '[');
         // todo maybe print cpu id
         int stamp_len = 1;
         if (isTimeAvailable) [[likely]] {
@@ -151,18 +151,18 @@ inline void fbLog(const char* str) {
             };
             int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
             int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
-            gfx::fb::drawString(stamp_len, line, timeSec);
+            gfx::fb::draw_string(stamp_len, line, timeSec);
             stamp_len += secLen;
-            gfx::fb::drawChar(stamp_len, line, '.');
+            gfx::fb::draw_char(stamp_len, line, '.');
             stamp_len++;
-            gfx::fb::drawString(stamp_len, line, timeMs);
+            gfx::fb::draw_string(stamp_len, line, timeMs);
             stamp_len += msLen;
         }
-        gfx::fb::drawChar(stamp_len, line, ']');
+        gfx::fb::draw_char(stamp_len, line, ']');
         stamp_len++;
-        gfx::fb::drawChar(stamp_len, line, ':');
+        gfx::fb::draw_char(stamp_len, line, ':');
         stamp_len++;
-        linesLogged += gfx::fb::drawString(stamp_len, line, str);
+        linesLogged += gfx::fb::draw_string(stamp_len, line, str);
     } else {
         mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
     }
@@ -226,7 +226,7 @@ void panic_write_hex(uint64_t val) {
         hex[15 - i] = nibble < 10 ? static_cast<char>('0' + nibble) : static_cast<char>('a' + nibble - 10);
     }
     hex[16] = '\0';
-    io::serial::writeUnlocked(hex);
+    io::serial::write_unlocked(hex);
 }
 
 void panic_write_dec(uint64_t val) {
@@ -241,15 +241,15 @@ void panic_write_dec(uint64_t val) {
             val /= 10;
         }
     }
-    io::serial::writeUnlocked(buf + pos);
+    io::serial::write_unlocked(buf + pos);
 }
 
 void panic_write_reg(const char* name, uint64_t val) {
-    io::serial::writeUnlocked("  ");
-    io::serial::writeUnlocked(name);
-    io::serial::writeUnlocked(": 0x");
+    io::serial::write_unlocked("  ");
+    io::serial::write_unlocked(name);
+    io::serial::write_unlocked(": 0x");
     panic_write_hex(val);
-    io::serial::writeUnlocked("\n");
+    io::serial::write_unlocked("\n");
 }
 
 // Walk the frame-pointer (RBP) chain and store return addresses.
@@ -273,29 +273,29 @@ void panic_walk_stack(void** fp, void** out, int depth) {
 void panic_handler(const char* msg) {
     // Enter panic mode so serial writes bypass locking (avoids deadlock if
     // we panicked while the serial lock was already held).
-    io::serial::enterPanicMode();
+    io::serial::enter_panic_mode();
 
     // If another CPU already owns the panic, halt immediately.  This covers
     // races where multiple CPUs trigger sanitizer violations simultaneously,
     // and also UBSAN paths that call enterPanicMode() themselves before
     // calling panic_handler (making the second enterPanicMode() return false
     // even though this IS the owner — isPanicOwner() handles that correctly).
-    if (!io::serial::isPanicOwner()) {
+    if (!io::serial::is_panic_owner()) {
         hcf();
     }
 
     // Halt other CPUs immediately so they stop writing to serial.
     ker::mod::smt::halt_other_cores();
 
-    io::serial::writeUnlocked("\n========== KERNEL PANIC ==========\n");
-    io::serial::writeUnlocked("Reason: ");
-    io::serial::writeUnlocked(msg);
-    io::serial::writeUnlocked("\n");
+    io::serial::write_unlocked("\n========== KERNEL PANIC ==========\n");
+    io::serial::write_unlocked("Reason: ");
+    io::serial::write_unlocked(msg);
+    io::serial::write_unlocked("\n");
 
     // CPU id (best-effort)
-    io::serial::writeUnlocked("CPU: ");
+    io::serial::write_unlocked("CPU: ");
     panic_write_dec(cpu::getCurrentCpuIdSafe());
-    io::serial::writeUnlocked("\n");
+    io::serial::write_unlocked("\n");
 
     // Capture general-purpose registers via inline asm.
     uint64_t rax = 0;
@@ -337,7 +337,7 @@ void panic_handler(const char* msg) {
     asm volatile("movq %%cr2, %0" : "=r"(cr2));
     asm volatile("movq %%cr3, %0" : "=r"(cr3));
 
-    io::serial::writeUnlocked("\n--- Registers ---\n");
+    io::serial::write_unlocked("\n--- Registers ---\n");
     panic_write_reg("RAX", rax);
     panic_write_reg("RBX", rbx);
     panic_write_reg("RCX", rcx);
@@ -363,7 +363,7 @@ void panic_handler(const char* msg) {
     panic_write_reg("RIP (caller)", reinterpret_cast<uint64_t>(rip));
 
     // Stack trace via RBP chain
-    io::serial::writeUnlocked("\n--- Stack Trace ---\n");
+    io::serial::write_unlocked("\n--- Stack Trace ---\n");
     constexpr int MAX_FRAMES = 32;
     void* frames[MAX_FRAMES] = {};
     auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
@@ -372,34 +372,34 @@ void panic_handler(const char* msg) {
         if (frames[i] == nullptr) {
             break;
         }
-        io::serial::writeUnlocked("  #");
+        io::serial::write_unlocked("  #");
         panic_write_dec(static_cast<uint64_t>(i));
-        io::serial::writeUnlocked(" 0x");
+        io::serial::write_unlocked(" 0x");
         panic_write_hex(reinterpret_cast<uint64_t>(frames[i]));
-        io::serial::writeUnlocked("\n");
+        io::serial::write_unlocked("\n");
     }
 
     // Raw stack dump (top 64 qwords)
-    io::serial::writeUnlocked("\n--- Raw Stack (top 64 qwords) ---\n");
+    io::serial::write_unlocked("\n--- Raw Stack (top 64 qwords) ---\n");
     auto* rsp_ptr = reinterpret_cast<uint64_t*>(rsp);
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp_ptr);
     bool rsp_valid = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
                      (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
     if (rsp_valid) {
         for (int i = 0; i < 64; i++) {
-            io::serial::writeUnlocked("  [RSP+0x");
+            io::serial::write_unlocked("  [RSP+0x");
             panic_write_hex(static_cast<uint64_t>(i * 8));
-            io::serial::writeUnlocked("] 0x");
+            io::serial::write_unlocked("] 0x");
             panic_write_hex(rsp_ptr[i]);
-            io::serial::writeUnlocked("\n");
+            io::serial::write_unlocked("\n");
         }
     } else {
-        io::serial::writeUnlocked("  RSP 0x");
+        io::serial::write_unlocked("  RSP 0x");
         panic_write_hex(rsp_addr);
-        io::serial::writeUnlocked(" is not in a valid kernel range, skipping\n");
+        io::serial::write_unlocked(" is not in a valid kernel range, skipping\n");
     }
 
-    io::serial::writeUnlocked("==================================\n\n");
+    io::serial::write_unlocked("==================================\n\n");
 
     hcf();
 }
