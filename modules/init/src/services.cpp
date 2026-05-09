@@ -33,6 +33,10 @@ static uint64_t spawn_with_journal_stdio(const char* path, const char* const arg
     }
     if (service_pid == 0) {
         // Service child: redirect stdout and stderr to the write end, then exec.
+        // Root init uses NOINHERIT, so forked service children start with automatic
+        // WKI placement. Re-pin daemons locally before exec; login/session
+        // boundaries can opt their own descendants back into automatic placement.
+        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL);
         ::dup2(pipefd[1], STDOUT_FILENO);
         ::dup2(pipefd[1], STDERR_FILENO);
         ::close(pipefd[0]);

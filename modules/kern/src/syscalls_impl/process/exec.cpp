@@ -761,8 +761,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         task->exe_path[path_len] = '\0';
 
         ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
-            .argv = argv,
-            .envp = envp,
+            .argv = k_argv,
+            .envp = k_envp,
             .cwd = task->cwd,
         };
         auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);

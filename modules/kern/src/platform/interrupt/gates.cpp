@@ -228,15 +228,15 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // as that would require memory allocation which could cause deadlocks if we
     // faulted while holding a spinlock (e.g., in pageAlloc).
     // Coredumps are only for userspace crashes, handled above.
+    asm volatile("cli" ::: "memory");
+    apic::oneShotTimer(0);
 
-    // Serialize all panicking CPUs: spin-acquire a TAS lock, dump, release, halt.
-    // Every CPU gets to print before halting - one at a time, no interleaving.
-    // If this CPU already owns the lock (nested fault during dump), release and halt immediately.
+    // Serialize all panicking CPUs: the first CPU owns the dump and halts the
+    // rest.  If this CPU already owns the lock, this is a nested fault during
+    // panic reporting; halt immediately.
     {
         auto my_apic_id = static_cast<int64_t>(apic::getApicId());
         if (panic_lock_owner.load(std::memory_order_acquire) == my_apic_id) {
-            panic_lock.store(false, std::memory_order_release);
-            panic_lock_owner.store(-1, std::memory_order_release);
             hcf();
         }
         while (panic_lock.exchange(true, std::memory_order_acquire)) {
@@ -245,6 +245,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         panic_lock_owner.store(my_apic_id, std::memory_order_release);
     }
 
+    ker::mod::smt::halt_other_cores();
+
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
     // or its fields while we're printing panic info.
     ker::mod::sched::EpochManager::enterCriticalAPIC();
@@ -252,7 +254,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // Acquire the serial lock BEFORE entering panic mode so other CPUs still
     // respect it. Once enterPanicMode() is called, all serial locking becomes
     // a no-op for other CPUs - they cannot deadlock waiting for our lock.
-    // We hold this lock for the entire dump (never released, ends in hcf()).
+    // Other CPUs have been halted, but keep the serial panic path in its
+    // unlocked mode so a nested panic on this CPU cannot deadlock on logging.
     io::serial::acquireLock();
     io::serial::enterPanicMode();
 
@@ -332,6 +335,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         journal::panic("PID: 0x%x", current_task->pid);
         journal::panic("Type: 0x%x", (uint64_t)current_task->type);
         journal::panic("Entry: 0x%lx", current_task->entry);
+        journal::panic("KthreadEntry: 0x%lx", (uint64_t)current_task->kthreadEntry);
         journal::panic("Pagemap: 0x%lx", (uint64_t)current_task->pagemap);
         journal::panic("Thread: 0x%lx", (uint64_t)current_task->thread);
 
@@ -345,6 +349,14 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         journal::panic("Task Context:");
         journal::panic("  syscallKernelStack: 0x%lx", current_task->context.syscallKernelStack);
         journal::panic("  syscallScratchArea: 0x%lx", current_task->context.syscallScratchArea);
+        journal::panic("Task Scheduler State:");
+        journal::panic("  cpu=%lu queue=%u voluntary=%u wantsBlock=%u deferred=%u yield=%u",
+                       current_task->cpu, static_cast<unsigned>(current_task->schedQueue),
+                       current_task->voluntaryBlock ? 1U : 0U, current_task->wantsBlock ? 1U : 0U,
+                       current_task->deferredTaskSwitch ? 1U : 0U, current_task->yieldSwitch ? 1U : 0U);
+        journal::panic("  preemptDepth=%u preemptPending=%u preemptMaxUs=%lu",
+                       current_task->preemptDisableDepth, current_task->preemptPending ? 1U : 0U,
+                       current_task->preemptDisableMaxUs);
     } else {
         journal::panic("WARNING: currentTask is NULL!");
     }
@@ -524,8 +536,7 @@ skip_task_dump:
     }
 
     journal::panic("Halting");
-    panic_lock_owner.store(-1, std::memory_order_release);
-    panic_lock.store(false, std::memory_order_release);
+    apic::oneShotTimer(0);
     hcf();
 }
 

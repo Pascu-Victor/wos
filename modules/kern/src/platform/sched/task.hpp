@@ -255,16 +255,25 @@ struct Task {
     // saving and restoring kernel-mode context.  Set before hlt, cleared after wake.
     volatile bool voluntaryBlock = false;
 
+    // Plain spinlocks disable task preemption without masking interrupts.  This
+    // keeps preemptible DAEMON/NAPI workers from being switched out while they
+    // hold locks that other CPUs may spin on.
+    uint32_t preemptDisableDepth = 0;
+    bool preemptPending = false;
+    uint64_t preemptDisableStartUs = 0;
+    uint64_t preemptDisableMaxUs = 0;
+    uint64_t preemptDisableOwner = 0;
+
     // Waitpid state: when this task is waiting for another task to exit
     uint64_t waitingForPid;          // PID we're waiting for (for waitpid return value)
     uint64_t waitStatusUserAddr;     // Userspace virtual address of status variable (for waitpid)
-    uint64_t waitStatusPhysAddr;     // Last translated physical address (debug/compat)
+    uint64_t waitStatusPhysAddr;     // Last translated physical address (debug; may change after COW)
     uint64_t waitRusageUserAddr;     // Userspace virtual address of rusage struct (for wait3/wait4)
-    uint64_t waitRusagePhysAddr;     // Last translated physical address (debug/compat)
+    uint64_t waitRusagePhysAddr;     // Last translated physical address (debug; may change after COW)
     uint64_t waitResumeRipUserAddr;  // Userspace RIP expected when returning from waitpid
     uint64_t waitResumeRipPhysAddr;  // Last translated physical address for waitResumeRipUserAddr
     uint64_t waitResumeRspUserAddr;  // Userspace RSP expected when returning from waitpid
-    uint64_t waitResumeRspPhysAddr;  // Last translated physical address for waitResumeRspUserAddr
+    uint64_t waitResumeRspPhysAddr;  // Last translated physical address for waitResumeRspUserAddr (debug; may change after COW)
 
     // --- Signal infrastructure ---
     // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)

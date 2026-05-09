@@ -111,8 +111,8 @@ void* Slab<slab_size, memory_size>::alloc_unlocked() {
     if (header.next) {
         // Validate before following the pointer — misaligned means page-reuse UAF.
         auto next_addr = reinterpret_cast<uintptr_t>(header.next);
-        if ((next_addr & 0xfULL) != 0 || !((next_addr >= 0xffff800000000000ULL && next_addr < 0xffff900000000000ULL) ||
-                                           (next_addr >= 0xffffffff80000000ULL && next_addr < 0xffffffffc0000000ULL))) {
+        if ((next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
+                                          (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL))) {
             ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u", (unsigned long long)next_addr,
                                this, header.free_blocks, header.magic, header.size);
             ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");

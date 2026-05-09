@@ -148,7 +148,9 @@ EOF
 
     cat > "$ROOTFS_STAGING/etc/profile" <<'EOF'
 export USER="${USER:-root}"
-HOSTNAME=$(uname -n 2>/dev/null) || { read -r HOSTNAME < /etc/hostname 2>/dev/null || HOSTNAME="wos"; }
+if ! read -r HOSTNAME < /etc/hostname 2>/dev/null || [ -z "$HOSTNAME" ]; then
+    HOSTNAME="wos"
+fi
 export HOSTNAME
 export HOME="${HOME:-/root}"
 export PS1="$USER@$HOSTNAME:\w\$ "

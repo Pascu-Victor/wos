@@ -70,9 +70,10 @@ auto main(int argc, char** argv) -> int {
     // === ROOT INIT MODE ===
     init_log::info("init[%d]: root init starting", cpuno);
 
-    // Pin init and its direct children (system services) to the local node.
-    // NOINHERIT ensures that processes spawned BY those services (e.g. SSH
-    // sessions started by dropbear) are free for WKI remote placement.
+    // Pin init itself to the local node. NOINHERIT makes forked children start
+    // with automatic WKI placement; service launch code re-pins daemons locally
+    // before exec, and login/session boundaries can opt descendants back into
+    // automatic placement.
     ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT);
 
     mount_filesystems();

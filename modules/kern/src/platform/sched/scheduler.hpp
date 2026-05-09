@@ -98,6 +98,9 @@ struct SchedulerCpuState {
     bool current_voluntary_block;
     bool current_wants_block;
     bool current_cpu_pinned;
+    uint32_t current_preempt_depth;
+    bool current_preempt_pending;
+    uint64_t current_preempt_max_us;
     bool is_idle;
     uint64_t runnable_count;
     uint64_t wait_queue_count;
@@ -140,6 +143,22 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
 void arm_idle_timer_for_this_cpu();
 void note_scheduler_timer_interrupt();
 bool has_run_queues();
+
+void preempt_disable();
+void preempt_disable_at(uint64_t caller);
+void preempt_enable();
+void preempt_enable_at(uint64_t caller);
+auto preempt_count() -> uint32_t;
+bool preemptible();
+void note_preempt_disabled_block(const char* op, uint64_t perf_callsite);
+
+struct PreemptGuard {
+    PreemptGuard() { preempt_disable(); }
+    ~PreemptGuard() { preempt_enable(); }
+    PreemptGuard(const PreemptGuard&) = delete;
+    auto operator=(const PreemptGuard&) -> PreemptGuard& = delete;
+};
+
 // OOM diagnostics - get queue sizes for a specific CPU
 struct RunQueueStats {
     uint64_t active_task_count;   // runnableHeap.size
@@ -156,6 +175,7 @@ void dump_scheduler_cpu_states();
 auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
 auto get_active_task_at_safe(uint32_t index) -> task::Task*;
+auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto get_dead_task_count(uint64_t cpu_no) -> size_t;
 auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task*;
 
@@ -187,14 +207,23 @@ extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcore
 //   while (!condition) { kern_yield(); }
 //
 inline void kern_yield_impl(uint64_t perf_callsite) {
+    if (preempt_count() != 0) {
+        note_preempt_disabled_block("kern_yield", perf_callsite);
+    }
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
         task->wait_channel = "kern_yield";
         task->voluntaryBlock = true;
+        if (task->wakeupPending.exchange(false, std::memory_order_acquire)) {
+            task->voluntaryBlock = false;
+            task->wait_channel = nullptr;
+            return;
+        }
     }
     asm volatile("sti\n\thlt" ::: "memory");
     if (task != nullptr) {
+        (void)task->wakeupPending.exchange(false, std::memory_order_acquire);
         task->voluntaryBlock = false;
         task->wait_channel = nullptr;
     }
@@ -207,15 +236,39 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
 // under the run queue lock with interrupts disabled.
 // Must only be called from DAEMON kernel threads.
 inline void kern_block_impl(uint64_t perf_callsite) {
+    if (preempt_count() != 0) {
+        note_preempt_disabled_block("kern_block", perf_callsite);
+    }
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
         task->wait_channel = "kern_block";
         task->wantsBlock = true;
         task->voluntaryBlock = true;
+        if (task->wakeupPending.exchange(false, std::memory_order_acquire)) {
+            task->wantsBlock = false;
+            task->voluntaryBlock = false;
+            task->wait_channel = nullptr;
+            return;
+        }
     }
-    asm volatile("sti\n\thlt" ::: "memory");
+    for (;;) {
+        asm volatile("sti\n\thlt" ::: "memory");
+        if (task == nullptr) {
+            break;
+        }
+        if (task->wakeupPending.exchange(false, std::memory_order_acquire)) {
+            task->wakeAtUs = 0;
+            task->wantsBlock = false;
+            break;
+        }
+        if (!task->wantsBlock && task->wakeAtUs == 0) {
+            break;
+        }
+    }
     if (task != nullptr) {
+        task->wakeAtUs = 0;
+        task->wantsBlock = false;
         task->voluntaryBlock = false;
         task->wait_channel = nullptr;
     }
@@ -230,6 +283,9 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         return;
     }
 
+    if (preempt_count() != 0) {
+        note_preempt_disabled_block("kern_sleep", perf_callsite);
+    }
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perfWaitCallsite = perf_callsite;
@@ -237,9 +293,31 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
         task->wantsBlock = true;
         task->voluntaryBlock = true;
+        if (task->wakeupPending.exchange(false, std::memory_order_acquire)) {
+            task->wakeAtUs = 0;
+            task->wantsBlock = false;
+            task->voluntaryBlock = false;
+            task->wait_channel = nullptr;
+            return;
+        }
     }
-    asm volatile("sti\n\thlt" ::: "memory");
+    for (;;) {
+        asm volatile("sti\n\thlt" ::: "memory");
+        if (task == nullptr) {
+            break;
+        }
+        if (task->wakeupPending.exchange(false, std::memory_order_acquire)) {
+            task->wakeAtUs = 0;
+            task->wantsBlock = false;
+            break;
+        }
+        if (!task->wantsBlock && task->wakeAtUs == 0) {
+            break;
+        }
+    }
     if (task != nullptr) {
+        task->wakeAtUs = 0;
+        task->wantsBlock = false;
         task->voluntaryBlock = false;
         task->wait_channel = nullptr;
     }
@@ -254,6 +332,7 @@ void kern_wake(task::Task* task);
 extern "C" auto _wOS_getCurrentTask() -> ker::mod::sched::task::Task*;
 extern "C" const uint64_t _wOS_DEFERRED_TASK_SWITCH_OFFSET;
 extern "C" void _wOS_deferredTaskSwitchReturn(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::interruptFrame* frame_ptr);
+extern "C" [[noreturn]] void _wOS_startKernelThread(uint64_t stack_top, void (*entry)());
 
 #define WOS_SCHED_PERF_CALLSITE()                                                                                                 \
     __extension__({                                                                                                               \

@@ -247,7 +247,9 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
         return nullptr;
     }
 
+#ifdef FAT32_DEBUG
     log::debug("fat32_init_device: reading boot sector from LBA 0x%llx", partition_start_lba);
+#endif
 
     // Allocate mount context
     auto* context = new FAT32MountContext{};
@@ -284,10 +286,11 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
 
     auto* boot_sector = reinterpret_cast<FAT32BootSector*>(boot_buf);
 
-    log::trace("Boot sector signature: 0x%x", *reinterpret_cast<uint16_t*>(boot_buf + 510));
-
     uint32_t* spt_ptr = reinterpret_cast<uint32_t*>(boot_buf + 0x24);
+#ifdef FAT32_DEBUG
+    log::trace("Boot sector signature: 0x%x", *reinterpret_cast<uint16_t*>(boot_buf + 510));
     log::trace("Raw bytes at offset 0x24 (sectors_per_fat_32): 0x%x", *spt_ptr);
+#endif
 
     context->bytes_per_sector = boot_sector->bytes_per_sector;
     context->sectors_per_cluster = boot_sector->sectors_per_cluster;
@@ -295,23 +298,22 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
     context->total_sectors = boot_sector->total_sectors_32;
     context->root_cluster = boot_sector->root_cluster;
 
-    log::trace("bytes_per_sector: 0x%x", context->bytes_per_sector);
-    log::trace("sectors_per_cluster: 0x%x", context->sectors_per_cluster);
-    log::trace("reserved_sectors: 0x%x", context->reserved_sectors);
-
     // Calculate data start sector (relative to partition start)
     context->sectors_per_fat = boot_sector->sectors_per_fat_32;
     context->num_fats = boot_sector->num_fats;
-
-    log::trace("sectors_per_fat: 0x%x", context->sectors_per_fat);
-    log::trace("num_fats: 0x%x", context->num_fats);
 
     context->data_start_sector = context->reserved_sectors + (static_cast<uint32_t>(context->sectors_per_fat * context->num_fats));
 
     // Allocate and read FAT table
     size_t fat_size = static_cast<size_t>(context->sectors_per_fat) * context->bytes_per_sector;
-
+#ifdef FAT32_DEBUG
+    log::trace("bytes_per_sector: 0x%x", context->bytes_per_sector);
+    log::trace("sectors_per_cluster: 0x%x", context->sectors_per_cluster);
+    log::trace("reserved_sectors: 0x%x", context->reserved_sectors);
+    log::trace("sectors_per_fat: 0x%x", context->sectors_per_fat);
+    log::trace("num_fats: 0x%x", context->num_fats);
     log::trace("FAT size to allocate: 0x%zx bytes", fat_size);
+#endif
 
     // Validate boot sector values before allocation
     if (context->bytes_per_sector == 0 || context->bytes_per_sector > 4096 || context->sectors_per_fat == 0 ||
@@ -335,7 +337,9 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
         return nullptr;
     }
 
+#ifdef FAT32_DEBUG
     log::debug("fat32_init_device: initialized successfully");
+#endif
     return context;
 }
 
@@ -407,7 +411,9 @@ auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
     // dir_name is from directory entry (11 chars, space-padded, no dot)
     // search_name is the filename we're looking for (e.g., "testprog" or "hello.txt")
 
+#ifdef FAT32_DEBUG
     log::trace("compare_fat32_name: dir_name='%.11s' search='%s'", dir_name, search_name);
+#endif
 
     std::array<char, FAT32_NAME_PART_LEN> name_part = {0};  // 8 chars + null
     std::array<char, FAT32_EXT_PART_LEN> ext_part = {0};
@@ -468,7 +474,9 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
         return nullptr;
     }
 
+#ifdef FAT32_DEBUG
     log::debug("create_file_in_directory: creating '%s' in cluster 0x%x", filename, parent_cluster);
+#endif
 
     size_t cluster_size = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
     auto* cluster_buf = new uint8_t[cluster_size];
@@ -599,7 +607,9 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     // Flush device
     ker::dev::block_flush(ctx->device);
 
+#ifdef FAT32_DEBUG
     log::debug("create_file_in_directory: created file entry successfully");
+#endif
 
     // Create file node
     auto* node = new FAT32Node;
@@ -635,7 +645,9 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
 
 // Open a file by path
 auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContext* ctx) -> ker::vfs::File* {
+#ifdef FAT32_DEBUG
     log::trace("fat32_open_path: path='%s'", path);
+#endif
     if (ctx == nullptr) {
         log::warn("fat32_open_path: ctx is null");
         return nullptr;
@@ -648,11 +660,15 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         remaining_path++;
     }
 
+#ifdef FAT32_DEBUG
     log::trace("fat32_open_path: searching for '%s'", remaining_path);
+#endif
 
     // If path is empty, we're opening the root directory
     if (remaining_path[0] == '\0') {
+#ifdef FAT32_DEBUG
         log::trace("fat32_open_path: opening root directory");
+#endif
 
         auto* node = new FAT32Node;
         node->start_cluster = ctx->root_cluster;
@@ -677,7 +693,9 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         file->dir_fs_count = static_cast<size_t>(-1);
         file->stream_cache_attachment = nullptr;
 
+#ifdef FAT32_DEBUG
         log::trace("fat32_open_path: root directory opened");
+#endif
         return file;
     }
 
@@ -720,7 +738,9 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
             continue;
         }
 
+#ifdef FAT32_DEBUG
         log::trace("fat32_open_path: looking for component '%s'", component);
+#endif
 
         // Search current directory for this component
         bool found = false;
@@ -729,7 +749,9 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         uint32_t found_offset = 0;
         uint32_t search_cluster = current_cluster;
 
+#ifdef FAT32_DEBUG
         log::trace("fat32_open_path: searching in cluster 0x%x for '%s'", search_cluster, component);
+#endif
         while (search_cluster >= 2 && search_cluster < FAT32_EOC_MIN) {
             if (read_cluster(ctx, search_cluster, cluster_buf) != 0) {
                 log::warn("fat32_open_path: failed to read cluster");
@@ -780,8 +802,10 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
                     lfn_len = extract_lfn_name(lfn_buffer, lfn_count, lfn_name, sizeof(lfn_name));
                 }
 
+#ifdef FAT32_DEBUG
                 log::trace("  entry[%zu]: name='%.11s' attr=0x%x%s%s", i, entry->name, entry->attributes, lfn_len > 0 ? " lfn='" : "",
                            lfn_len > 0 ? lfn_name : "");
+#endif
                 // Compare filename: check LFN first (if present), then 8.3 short name
                 bool name_match = false;
                 if (lfn_len > 0) {
@@ -810,11 +834,15 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 
     component_search_done:
         if (!found) {
+#ifdef FAT32_DEBUG
             log::debug("fat32_open_path: component not found: '%s'", component);
+#endif
 
             // If O_CREAT and this is the last component, create the file
             if ((flags & O_CREAT) != 0 && *remaining_path == '\0') {
+#ifdef FAT32_DEBUG
                 log::debug("fat32_open_path: O_CREAT - creating file in parent cluster 0x%x", current_cluster);
+#endif
 
                 delete[] cluster_buf;
                 return create_file_in_directory(ctx, current_cluster, component);
@@ -845,7 +873,9 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     delete[] cluster_buf;
 
     if (!found_final) {
+#ifdef FAT32_DEBUG
         log::debug("fat32_open_path: file not found");
+#endif
         return nullptr;
     }
 
@@ -882,14 +912,18 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     f->dir_fs_count = static_cast<size_t>(-1);
     f->stream_cache_attachment = nullptr;
 
+#ifdef FAT32_DEBUG
     log::debug("fat32_open_path: opened %s", node->is_directory ? "directory" : "file");
+#endif
 
     return f;
 }
 
 // Read from a FAT32 file
 auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
+#ifdef FAT32_DEBUG
     log::trace("fat32_read: called, count=0x%zx, offset=0x%zx", count, offset);
+#endif
 
     if ((f == nullptr) || (f->private_data == nullptr)) {
         log::warn("fat32_read: invalid file or private_data");
@@ -907,7 +941,9 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     // Lock the mount context for the duration of the read
     ctx->lock.lock();
 
+#ifdef FAT32_DEBUG
     log::trace("fat32_read: file_size=0x%x, start_cluster=0x%x", node->file_size, node->start_cluster);
+#endif
 
     if ((buf == nullptr) || count == 0) {
         ctx->lock.unlock();
@@ -918,7 +954,9 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     uint32_t bytes_available = node->file_size - std::min(offset, (size_t)node->file_size);
     size_t to_read = std::min(count, (size_t)bytes_available);
 
+#ifdef FAT32_DEBUG
     log::trace("fat32_read: to_read=0x%zx", to_read);
+#endif
 
     if (to_read == 0) {
         ctx->lock.unlock();
@@ -929,13 +967,17 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 
     size_t cluster_size = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
+#ifdef FAT32_DEBUG
     log::trace("fat32_read: cluster_size=0x%zx", cluster_size);
+#endif
 
     uint32_t cluster_offset = offset / cluster_size;
     uint32_t byte_offset = offset % cluster_size;
     uint32_t current_cluster = node->start_cluster;
 
+#ifdef FAT32_DEBUG
     log::trace("fat32_read: cluster_offset=0x%x, byte_offset=0x%x, current_cluster=0x%x", cluster_offset, byte_offset, current_cluster);
+#endif
 
     // Skip to the correct cluster
     for (uint32_t i = 0; i < cluster_offset; ++i) {
@@ -1022,9 +1064,9 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         }
 
         size_t bytes_in_cluster = std::min(to_read - bytes_read, cluster_size - byte_offset);
-
+#ifdef FAT32_DEBUG
         log::trace("fat32_read: copying 0x%zx bytes", bytes_in_cluster);
-
+#endif
         memcpy(dest, cluster_buf + byte_offset, bytes_in_cluster);
 
         bytes_read += bytes_in_cluster;
@@ -1051,7 +1093,9 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
     size_t fat_size_bytes = static_cast<size_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector;
     size_t fat_sectors = (fat_size_bytes + ctx->bytes_per_sector - 1) / ctx->bytes_per_sector;
 
+#ifdef FAT32_DEBUG
     log::trace("flush_fat_table: writing FAT table, %zu sectors", fat_sectors);
+#endif
 
     // Write FAT table to both FAT1 and FAT2
     int result = ker::dev::block_write(ctx->device, ctx->partition_offset + ctx->reserved_sectors, static_cast<uint32_t>(fat_sectors),
@@ -1071,7 +1115,9 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
         return -1;
     }
 
+#ifdef FAT32_DEBUG
     log::trace("flush_fat_table: FAT table flushed successfully");
+#endif
     return 0;
 }
 
@@ -1104,8 +1150,10 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     const FAT32MountContext* ctx = node->context;
     uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
+#ifdef FAT32_DEBUG
     log::trace("update_directory_entry: updating entry at cluster 0x%x, offset 0x%x, new size 0x%x", node->dir_entry_cluster,
                node->dir_entry_offset, new_size);
+#endif
 
     // Allocate buffer for the cluster
     auto* cluster_buf = new uint8_t[cluster_size];
@@ -1135,7 +1183,9 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     entry->cluster_low = static_cast<uint16_t>(node->start_cluster & 0xFFFFu);
     entry->cluster_high = static_cast<uint16_t>((node->start_cluster >> 16) & 0xFFFFu);
 
+#ifdef FAT32_DEBUG
     log::trace("update_directory_entry: writing cluster back");
+#endif
 
     // Write the cluster back to disk
     if (ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, cluster_buf) != 0) {
@@ -1143,7 +1193,9 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
         return -1;
     }
 
+#ifdef FAT32_DEBUG
     log::trace("update_directory_entry: directory entry updated successfully");
+#endif
     return 0;
 }
 
@@ -1284,7 +1336,9 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
         return -1;
     }
 
+#ifdef FAT32_DEBUG
     log::debug("fat32_write: wrote %zu bytes, new file size: 0x%x", bytes_written, node->file_size);
+#endif
 
     return (ssize_t)bytes_written;
 }
@@ -2373,7 +2427,9 @@ ker::vfs::FileOperations fat32_fops_instance = {
 auto get_fat32_fops() -> ker::vfs::FileOperations* { return &fat32_fops_instance; }
 
 void register_fat32() {
+#ifdef FAT32_DEBUG
     log::debug("fat32: register_fat32 called");
+#endif
     // Placeholder for registration logic
     // In a full implementation, this would set up the FAT32 filesystem
 }

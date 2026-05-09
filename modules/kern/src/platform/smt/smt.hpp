@@ -23,7 +23,7 @@ struct CpuInfo {
     CpuGotoAddr* goto_address = nullptr;
     uint64_t* stack_pointer_ref = nullptr;
     sched::task::Task* currentTask = nullptr;
-    // Used by panic/OOM to indicate this CPU has entered the halted state for diagnostics
+    // Used by panic/OOM to indicate this CPU has entered the halted state for diagnostics.
     std::atomic<bool> isHaltedForOom{false};
 };
 
@@ -252,9 +252,8 @@ auto cpu_count() -> uint64_t;
 
 auto set_tcb(void* tcb) -> uint64_t;
 
-// Halt all other CPUs immediately by scheduling a HLT loop on them.
-// This is safe to call from panic/OOM paths where we want other cores
-// quiesced to avoid further concurrent access to global state.
+// Permanently stop all other CPUs. This is a crash/OOM primitive: it sends NMI,
+// fixed IPI, then INIT as a one-way fallback and does not expect CPUs to resume.
 void halt_other_cores();
 
 // C-linkage wrapper used by external C code to request halting other CPUs.

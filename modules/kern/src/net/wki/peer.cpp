@@ -190,6 +190,12 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     }
 
     uint16_t peer_node = hello->node_id;
+    std::array<char, WKI_HOSTNAME_MAX> log_hostname{};
+    std::array<char, WKI_HOSTNAME_MAX> local_hostname_fallback{};
+    const char* log_transport_name = "?";
+    bool log_hostname_collision = false;
+    bool log_reconnecting = false;
+    bool log_connected = false;
 
     g_wki.peer_lock.lock();
 
@@ -232,7 +238,9 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         if (mac_cmp < 0) {
             // Remote has lower MAC -> remote keeps hostname, we fall back
             snprintf(g_wki.local_hostname, WKI_HOSTNAME_MAX, "node-%04x", g_wki.my_node_id);
-            mod::dbg::log("[WKI] Hostname collision with 0x%04x, falling back to '%s'", peer_node, g_wki.local_hostname);
+            memcpy(local_hostname_fallback.data(), g_wki.local_hostname, local_hostname_fallback.size());
+            local_hostname_fallback[WKI_HOSTNAME_MAX - 1] = '\0';
+            log_hostname_collision = true;
         } else if (mac_cmp > 0) {
             // We have lower MAC -> we keep hostname, remote will fall back on their end
             // Clear peer's hostname so it gets the fallback on our records
@@ -270,24 +278,36 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         }
     }
 
-    // Register MAC in the Ethernet neighbor table
-    wki_eth_neighbor_add(peer_node, hello->mac_addr);
-
     // Track if this is a new connection (state transition to CONNECTED)
     bool newly_connected = false;
 
     if (was_fenced) {
         peer->state = PeerState::RECONNECTING;
-        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnecting (was fenced)", peer_node, peer->hostname);
+        log_reconnecting = true;
     } else if (peer->state == PeerState::UNKNOWN || peer->state == PeerState::HELLO_SENT) {
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         newly_connected = true;
-        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (direct, transport=%s)", peer_node, peer->hostname,
-                      peer->transport != nullptr ? peer->transport->name : "?");
+        log_connected = true;
     }
+    memcpy(log_hostname.data(), peer->hostname, log_hostname.size());
+    log_hostname[WKI_HOSTNAME_MAX - 1] = '\0';
+    log_transport_name = peer->transport != nullptr ? peer->transport->name : "?";
 
     g_wki.peer_lock.unlock();
+
+    // Keep peer_lock strictly for peer-table mutation. Neighbor updates and
+    // journal emission can take other locks and must not run under peer_lock.
+    wki_eth_neighbor_add(peer_node, hello->mac_addr);
+
+    if (log_reconnecting) {
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnecting (was fenced)", peer_node, log_hostname.data());
+    } else if (log_connected) {
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (direct, transport=%s)", peer_node, log_hostname.data(), log_transport_name);
+    }
+    if (log_hostname_collision) {
+        mod::dbg::log("[WKI] Hostname collision with 0x%04x, falling back to '%s'", peer_node, local_hostname_fallback.data());
+    }
 
     // Send HELLO_ACK
     wki_peer_send_hello_ack(peer);
@@ -300,8 +320,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         g_wki.peer_lock.lock();
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
+        memcpy(log_hostname.data(), peer->hostname, log_hostname.size());
+        log_hostname[WKI_HOSTNAME_MAX - 1] = '\0';
         g_wki.peer_lock.unlock();
-        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnected, reconciling", peer_node, peer->hostname);
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' reconnected, reconciling", peer_node, log_hostname.data());
         newly_connected = true;
 
         // Resume any suspended block device proxies - re-attach channels
@@ -318,7 +340,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         wki_resource_advertise_to_peer(peer_node);
 
         // V2: Register peer in /dev/nodes/ hierarchy
-        vfs::devfs::devfs_nodes_add_peer(peer->hostname, peer_node);
+        vfs::devfs::devfs_nodes_add_peer(log_hostname.data(), peer_node);
 
         // Emit NODE_JOIN event
         wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
@@ -339,6 +361,8 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     }
 
     uint16_t peer_node = ack->node_id;
+    std::array<char, WKI_HOSTNAME_MAX> log_hostname{};
+    const char* log_transport_name = "?";
 
     g_wki.peer_lock.lock();
 
@@ -399,21 +423,25 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         }
     }
 
-    wki_eth_neighbor_add(peer_node, ack->mac_addr);
-
     bool newly_connected = false;
     if (peer->state == PeerState::HELLO_SENT || peer->state == PeerState::UNKNOWN) {
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         newly_connected = true;
-        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, peer->hostname,
-                      peer->transport != nullptr ? peer->transport->name : "?");
     }
+    memcpy(log_hostname.data(), peer->hostname, log_hostname.size());
+    log_hostname[WKI_HOSTNAME_MAX - 1] = '\0';
+    log_transport_name = peer->transport != nullptr ? peer->transport->name : "?";
 
     g_wki.peer_lock.unlock();
 
+    wki_eth_neighbor_add(peer_node, ack->mac_addr);
+
     // Topology changed: regenerate our LSA and flood
     if (newly_connected) {
+        mod::dbg::log("[WKI] Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, log_hostname.data(),
+                      log_transport_name);
+
         wki_lsa_generate_and_flood();
 
         // Advertise our remotable devices only to the newly connected peer.
@@ -931,6 +959,7 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 
 constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 50000;
 constexpr uint64_t WKI_TIMER_IDLE_SLEEP_US = 1000000;
+constexpr uint64_t WKI_TIMER_OVERDUE_BACKOFF_US = 1000;
 static mod::sched::task::Task* s_wki_timer_task = nullptr;
 
 static auto wki_has_connected_peers() -> bool {
@@ -985,7 +1014,7 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
         uint64_t sleep_us = WKI_TIMER_IDLE_SLEEP_US;
         if (next_deadline != UINT64_MAX) {
             if (next_deadline <= now_us) {
-                sleep_us = 1;
+                sleep_us = WKI_TIMER_OVERDUE_BACKOFF_US;
             } else {
                 sleep_us = next_deadline - now_us;
             }

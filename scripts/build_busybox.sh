@@ -61,6 +61,11 @@ merge_busybox_config() {
     done < "$overlay"
 }
 
+busybox_config_enabled() {
+    local sym="$1"
+    grep -q "^${sym}=y$" "$B/busybox-build/.config"
+}
+
 # Re-apply config from wos_defconfig to stay in sync.
 BB_SRC="$B/src/busybox"
 if [ -f "$BB_SRC/configs/wos_defconfig" ]; then
@@ -142,28 +147,35 @@ if ! make -C "$B/busybox-build" \
     exit 1
 fi
 
-if [ -f "$BB_SHARED_DIR/busybox" ]; then
-    install -m 755 "$BB_SHARED_DIR/busybox" "$BB_INSTALL/bin/busybox"
+# Always stage the freshly linked top-level BusyBox binary. When shared BusyBox
+# was enabled in an earlier build, 0_lib/ can keep stale launcher artifacts
+# around even after the config flips back to monolithic mode.
+if [ -f "$B/busybox-build/busybox" ]; then
+    install -m 755 "$B/busybox-build/busybox" "$BB_INSTALL/bin/busybox"
 fi
 
 shared_lib=""
-for candidate in "$BB_SHARED_DIR"/libbusybox.so.*; do
-    case "$candidate" in
-        *"_unstripped"*|*.map|*.out)
-            continue
-            ;;
-    esac
-    if [ -f "$candidate" ]; then
-        shared_lib="$candidate"
-        break
-    fi
-done
+if busybox_config_enabled CONFIG_FEATURE_SHARED_BUSYBOX; then
+    for candidate in "$BB_SHARED_DIR"/libbusybox.so.*; do
+        case "$candidate" in
+            *"_unstripped"*|*.map|*.out)
+                continue
+                ;;
+        esac
+        if [ -f "$candidate" ]; then
+            shared_lib="$candidate"
+            break
+        fi
+    done
+fi
 
 if [ -n "$shared_lib" ]; then
     mkdir -p "$BB_INSTALL/lib"
     rm -f "$BB_INSTALL/lib"/libbusybox.so*
     cp -pPR "$shared_lib" "$BB_INSTALL/lib/"
     ln -sfn "$(basename "$shared_lib")" "$BB_INSTALL/lib/libbusybox.so"
+else
+    rm -rf "$BB_INSTALL/lib"
 fi
 
 echo "busybox installed to $BB_INSTALL"

@@ -1498,7 +1498,23 @@ auto pty_is_file(ker::vfs::File* f) -> bool {
     if (f == nullptr || f->fs_type != ker::vfs::FSType::DEVFS) {
         return false;
     }
-    return pair_from_file(f) != nullptr;
+
+    auto* dff = devfs_file_from_file(f, "is_file");
+    if (dff == nullptr || dff->device == nullptr) {
+        return false;
+    }
+
+    auto* device = dff->device;
+    if (device->char_ops != &master_ops && device->char_ops != &slave_ops) {
+        return false;
+    }
+
+    auto* pair = static_cast<PtyPair*>(device->private_data);
+    if (pair == nullptr || !is_valid_kernel_pointer(pair)) {
+        return false;
+    }
+
+    return device == &pair->master_dev || device == &pair->slave_dev;
 }
 
 }  // namespace ker::dev::pty

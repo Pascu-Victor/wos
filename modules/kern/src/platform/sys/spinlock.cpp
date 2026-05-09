@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #if SPINLOCK_DEBUG
 // Number of pause iterations before emitting a warning.  Each pause is ~100
@@ -76,11 +77,9 @@ void print_stack(void** frames, int depth, const char* label) {
 
 #endif
 
-}  // namespace
-
-void Spinlock::lock() {
+void lock_ticket(Spinlock* lock) {
     // Take a ticket - this is our position in the FIFO queue.
-    uint32_t my_ticket = next_ticket.fetch_add(1, std::memory_order_relaxed);
+    uint32_t my_ticket = lock->next_ticket.fetch_add(1, std::memory_order_relaxed);
 
 #if SPINLOCK_DEBUG
     uint64_t spins = 0;
@@ -88,7 +87,7 @@ void Spinlock::lock() {
 #endif
 
     // Spin until the lock is "serving" our ticket.
-    while (now_serving.load(std::memory_order_acquire) != my_ticket) {
+    while (lock->now_serving.load(std::memory_order_acquire) != my_ticket) {
         asm volatile("pause");
 #if SPINLOCK_DEBUG
         if (!warned && ++spins >= SPINLOCK_DEBUG_THRESHOLD) {
@@ -97,65 +96,88 @@ void Spinlock::lock() {
             io::serial::writeUnlocked("!!! SPINLOCK STUCK: waiter=0x");
             print_hex(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
             io::serial::writeUnlocked(" owner=0x");
-            print_hex(reinterpret_cast<uint64_t>(owner_caller));
+            print_hex(reinterpret_cast<uint64_t>(lock->owner_caller));
             io::serial::writeUnlocked("\n");
 
             // Waiter stack trace (current execution context)
-            std::array<void*, SPINLOCK_STACK_DEPTH> waiter_frames{};
+            std::array<void*, Spinlock::SPINLOCK_STACK_DEPTH> waiter_frames{};
             auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
-            walk_stack(fp, waiter_frames.data(), SPINLOCK_STACK_DEPTH);
-            print_stack(waiter_frames.data(), SPINLOCK_STACK_DEPTH, "== WAITER STACK ==");
+            walk_stack(fp, waiter_frames.data(), Spinlock::SPINLOCK_STACK_DEPTH);
+            print_stack(waiter_frames.data(), Spinlock::SPINLOCK_STACK_DEPTH, "== WAITER STACK ==");
 
             // Owner stack trace (saved at acquisition time)
-            print_stack(owner_stack.data(), SPINLOCK_STACK_DEPTH, "== OWNER STACK ==");
+            print_stack(lock->owner_stack.data(), Spinlock::SPINLOCK_STACK_DEPTH, "== OWNER STACK ==");
         }
 #endif
     }
 
 #if SPINLOCK_DEBUG
     // Record who acquired the lock.
-    owner_caller = __builtin_return_address(0);
+    lock->owner_caller = __builtin_return_address(0);
     auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
-    walk_stack(fp, owner_stack.data(), SPINLOCK_STACK_DEPTH);
+    walk_stack(fp, lock->owner_stack.data(), Spinlock::SPINLOCK_STACK_DEPTH);
 #endif
 }
 
-auto Spinlock::try_lock() -> bool {
+auto try_lock_ticket(Spinlock* lock) -> bool {
     // Only succeed if no one else is waiting or holding the lock.
-    uint32_t current = now_serving.load(std::memory_order_relaxed);
-    if (!next_ticket.compare_exchange_strong(current, current + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+    uint32_t current = lock->now_serving.load(std::memory_order_relaxed);
+    if (!lock->next_ticket.compare_exchange_strong(current, current + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
         return false;
     }
 #if SPINLOCK_DEBUG
-    owner_caller = __builtin_return_address(0);
+    lock->owner_caller = __builtin_return_address(0);
     auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
-    walk_stack(fp, owner_stack.data(), SPINLOCK_STACK_DEPTH);
+    walk_stack(fp, lock->owner_stack.data(), Spinlock::SPINLOCK_STACK_DEPTH);
 #endif
     return true;
 }
 
-void Spinlock::unlock() {
+void unlock_ticket(Spinlock* lock) {
 #if SPINLOCK_DEBUG
-    owner_caller = nullptr;
-    owner_stack.fill(nullptr);
+    lock->owner_caller = nullptr;
+    lock->owner_stack.fill(nullptr);
 #endif
     // Advance now_serving so the next ticket holder stops spinning.
-    now_serving.fetch_add(1, std::memory_order_release);
+    lock->now_serving.fetch_add(1, std::memory_order_release);
+}
+
+}  // namespace
+
+void Spinlock::lock() {
+    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    lock_ticket(this);
+}
+
+auto Spinlock::try_lock() -> bool {
+    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    if (!try_lock_ticket(this)) {
+        sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        return false;
+    }
+    return true;
+}
+
+void Spinlock::unlock() {
+    unlock_ticket(this);
+    sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 auto Spinlock::lock_irqsave() -> uint64_t {
     uint64_t flags = 0;
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli");
-    lock();
+    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    lock_ticket(this);
     return flags;
 }
 
 void Spinlock::unlock_irqrestore(uint64_t flags) {
-    unlock();
+    unlock_ticket(this);
     if ((flags & 0x200) != 0) {
         asm volatile("sti");
     }
+    sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 }  // namespace ker::mod::sys

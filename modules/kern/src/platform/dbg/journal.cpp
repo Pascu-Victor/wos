@@ -80,6 +80,7 @@ auto level_name(LogLevel level) -> const char* {
 }
 
 auto is_upper_ascii(char c) -> bool { return c >= 'A' && c <= 'Z'; }
+auto is_digit_ascii(char c) -> bool { return c >= '0' && c <= '9'; }
 auto is_module_char(char c) -> bool {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
@@ -103,13 +104,17 @@ auto extract_prefix_module(const char* message, char* out_module, size_t out_mod
     }
 
     size_t i = 1;
+    bool has_non_digit = false;
     while (message[i] != '\0' && message[i] != ']' && i <= JOURNAL_MODULE_MAX) {
         if (!is_module_char(message[i])) {
             return false;
         }
+        if (!is_digit_ascii(message[i])) {
+            has_non_digit = true;
+        }
         i++;
     }
-    if (message[i] != ']' || i == 1) {
+    if (message[i] != ']' || i == 1 || !has_non_digit) {
         return false;
     }
 

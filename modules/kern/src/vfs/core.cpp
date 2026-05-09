@@ -5212,6 +5212,9 @@ auto vfs_open_file_impl(const char* path, int flags, int mode, bool resolve_task
                 f->fs_type = FSType::TMPFS;
             }
             break;
+        case FSType::REMOTE:
+            f = ker::net::wki::wki_remote_vfs_open_path(fs_relative_path, flags, mode, mount->private_data);
+            break;
         case FSType::XFS:
             f = ker::vfs::xfs::xfs_open_path(fs_relative_path, flags, mode,
                                              static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));

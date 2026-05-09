@@ -17,8 +17,37 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         return false;
     }
 
-    const uint32_t seq = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
     const size_t seq_len = len + (((flags & TCP_SYN) != 0) ? 1U : 0U) + (((flags & TCP_FIN) != 0) ? 1U : 0U);
+    PacketBuffer* rtx_pkt = nullptr;
+    RetransmitEntry* rtx_entry = nullptr;
+
+    if (seq_len > 0) {
+        rtx_pkt = pkt_alloc_tx();
+        if (rtx_pkt == nullptr) {
+            ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu)", ker::net::pkt_pool_free_count());
+        } else {
+            rtx_entry = new (std::nothrow) RetransmitEntry{};
+            if (rtx_entry == nullptr) {
+                pkt_free(rtx_pkt);
+                rtx_pkt = nullptr;
+            }
+        }
+        if (rtx_pkt == nullptr || rtx_entry == nullptr) {
+            pkt_free(pkt);
+            return false;
+        }
+    }
+
+    uint32_t local_ip = 0;
+    uint32_t remote_ip = 0;
+    bool queued_for_retransmit = false;
+
+    cb->lock.lock();
+
+    local_ip = cb->local_ip;
+    remote_ip = cb->remote_ip;
+
+    const uint32_t seq = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
 
     // SYN options: MSS + WSCALE.
     uint8_t options[8] = {};
@@ -68,24 +97,10 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
 
     hdr->checksum = pseudo_header_checksum(cb->local_ip, cb->remote_ip, 6, pkt->data, pkt->len);
 
-    PacketBuffer* rtx_pkt = nullptr;
-    if (seq_len > 0) {
-        rtx_pkt = pkt_alloc_tx();
-        if (rtx_pkt == nullptr) {
-            ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu) port=%u snd_nxt=%u", ker::net::pkt_pool_free_count(), cb->local_port,
-                               cb->snd_nxt);
-        } else {
-            std::memcpy(rtx_pkt->storage.data(), pkt->storage.data(), PKT_BUF_SIZE);
-            rtx_pkt->data = rtx_pkt->storage.data() + (pkt->data - pkt->storage.data());
-            rtx_pkt->len = pkt->len;
-        }
-    }
-
-    if (ipv4_tx(pkt, cb->local_ip, cb->remote_ip, 6, 64) < 0) {
-        if (rtx_pkt != nullptr) {
-            pkt_free(rtx_pkt);
-        }
-        return false;
+    if (rtx_pkt != nullptr) {
+        std::memcpy(rtx_pkt->storage.data(), pkt->storage.data(), PKT_BUF_SIZE);
+        rtx_pkt->data = rtx_pkt->storage.data() + (pkt->data - pkt->storage.data());
+        rtx_pkt->len = pkt->len;
     }
 
     if ((flags & TCP_ACK) != 0 && len > 0) {
@@ -101,41 +116,44 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         cb->snd_nxt++;
     }
 
-    if (rtx_pkt != nullptr) {
-        auto* entry = new (std::nothrow) RetransmitEntry{};
-        if (entry != nullptr) {
-            entry->pkt = rtx_pkt;
-            entry->seq = seq;
-            entry->len = seq_len;
-            entry->send_time_ms = tcp_now_ms();
-            entry->retries = 0;
-            entry->next = nullptr;
+    if (rtx_pkt != nullptr && rtx_entry != nullptr) {
+        rtx_entry->pkt = rtx_pkt;
+        rtx_entry->seq = seq;
+        rtx_entry->len = seq_len;
+        rtx_entry->send_time_ms = tcp_now_ms();
+        rtx_entry->retries = 0;
+        rtx_entry->next = nullptr;
 
-            // Append to retransmit queue
-            if (cb->retransmit_head == nullptr) {
-                cb->retransmit_head = entry;
-                cb->retransmit_tail = entry;
-                cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
-                tcp_timer_arm(cb);
-            } else {
-                cb->retransmit_tail->next = entry;
-                cb->retransmit_tail = entry;
-            }
-#ifdef TCP_DEBUG
-            {
-                size_t depth = 0;
-                for (auto* e = cb->retransmit_head; e != nullptr; e = e->next) {
-                    depth++;
-                }
-                if (depth == 64 || depth == 256 || depth == 512) {
-                    ker::mod::dbg::log("[net] RTX QUEUE depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port,
-                                       ker::net::pkt_pool_free_count(), cb->snd_wnd);
-                }
-            }
-#endif
+        // Append to retransmit queue before transmit. An immediate peer ACK can
+        // then race only after snd_nxt and RTX bookkeeping are coherent.
+        if (cb->retransmit_head == nullptr) {
+            cb->retransmit_head = rtx_entry;
+            cb->retransmit_tail = rtx_entry;
+            cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
+            tcp_timer_arm(cb);
         } else {
-            pkt_free(rtx_pkt);
+            cb->retransmit_tail->next = rtx_entry;
+            cb->retransmit_tail = rtx_entry;
         }
+        queued_for_retransmit = true;
+#ifdef TCP_DEBUG
+        {
+            size_t depth = 0;
+            for (auto* e = cb->retransmit_head; e != nullptr; e = e->next) {
+                depth++;
+            }
+            if (depth == 64 || depth == 256 || depth == 512) {
+                ker::mod::dbg::log("[net] RTX QUEUE depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port,
+                                   ker::net::pkt_pool_free_count(), cb->snd_wnd);
+            }
+        }
+#endif
+    }
+
+    cb->lock.unlock();
+
+    if (ipv4_tx(pkt, local_ip, remote_ip, 6, 64) < 0) {
+        return queued_for_retransmit;
     }
 
     return true;

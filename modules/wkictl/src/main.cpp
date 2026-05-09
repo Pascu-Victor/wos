@@ -25,7 +25,7 @@ auto command_basename(const char* path) -> const char* {
 
 auto usage() -> int {
     std::println(stderr,
-                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  on <hostname> <command> [args...]\n  forward "
+                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  homeward <command> [args...]\n  on <hostname> <command> [args...]\n  forward "
                  "[+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
                  "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl wosid");
     return 1;
@@ -117,6 +117,27 @@ auto run_on(int argc, char** argv) -> int {
         return 1;
     }
     return exec_command(argv + 2);
+}
+
+auto run_homeward(int argc, char** argv) -> int {
+    if (argc < 2) {
+        return usage();
+    }
+
+    std::array<char, 64> launcher = {};
+    int64_t launcher_len = ker::process::wki_launcher_node(launcher.data(), launcher.size());
+    if (launcher_len <= 0 || launcher[0] == '\0') {
+        std::println(stderr, "homeward: failed to resolve launcher node");
+        return 1;
+    }
+
+    int64_t rc = ker::process::setwkitarget(launcher.data(), static_cast<uint64_t>(launcher_len),
+                                            ker::process::WKI_TARGET_FLAG_STRICT);
+    if (rc < 0) {
+        std::println(stderr, "homeward: failed to target launcher '{}': {}", launcher.data(), static_cast<long>(rc));
+        return 1;
+    }
+    return exec_command(argv + 1);
 }
 
 auto has_glob_meta(const char* text) -> bool {
@@ -445,6 +466,9 @@ auto main(int argc, char** argv) -> int {
     }
     if (std::strcmp(name, "remotely") == 0) {
         return run_remotely(argc, argv);
+    }
+    if (std::strcmp(name, "homeward") == 0) {
+        return run_homeward(argc, argv);
     }
     if (std::strcmp(name, "on") == 0) {
         return run_on(argc, argv);

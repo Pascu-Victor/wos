@@ -6,6 +6,7 @@ copy	build/modules/journal/journal	/usr/bin/journalctl
 copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
 symlink	/usr/bin/wkictl	/usr/bin/locally
 symlink	/usr/bin/wkictl	/usr/bin/remotely
+symlink	/usr/bin/wkictl	/usr/bin/homeward
 symlink	/usr/bin/wkictl	/usr/bin/on
 symlink	/usr/bin/wkictl	/usr/bin/forward
 symlink	/usr/bin/wkictl	/usr/bin/wosid

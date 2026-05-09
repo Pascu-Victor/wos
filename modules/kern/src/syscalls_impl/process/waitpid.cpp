@@ -54,6 +54,12 @@ static void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
     task->waitResumeRspPhysAddr = 0;
 }
 
+static auto current_syscall_user_rsp() -> uint64_t {
+    uint64_t rsp = 0;
+    asm volatile("movq %%gs:0x08, %0" : "=r"(rsp)::"memory");
+    return rsp;
+}
+
 static void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mod::cpu::GPRegs& gpr) {
     if (task == nullptr || task->pagemap == nullptr) {
         clear_wait_resume_debug(task);
@@ -64,7 +70,7 @@ static void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mo
     uint64_t rip_phys = ker::mod::mm::virt::translate(task->pagemap, gpr.rcx);
     task->waitResumeRipPhysAddr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
 
-    task->waitResumeRspUserAddr = task->context.frame.rsp;
+    task->waitResumeRspUserAddr = current_syscall_user_rsp();
     if (task->waitResumeRspUserAddr != 0) {
         uint64_t rsp_phys = ker::mod::mm::virt::translate(task->pagemap, task->waitResumeRspUserAddr);
         task->waitResumeRspPhysAddr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;

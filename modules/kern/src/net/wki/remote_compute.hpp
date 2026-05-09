@@ -6,6 +6,8 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
+#include "platform/sched/task.hpp"
+
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------

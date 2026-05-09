@@ -42,12 +42,6 @@ static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod
         waiter->waitRusagePhysAddr = 0;
         return;
     }
-    if (waiter->waitRusagePhysAddr != 0 && waiter->waitRusagePhysAddr != phys) {
-        log::warn("waitpid-rusage drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx pagemap=%p", waiter->pid,
-                  child != nullptr ? child->pid : 0, (unsigned long long)waiter->waitRusageUserAddr,
-                  (unsigned long long)waiter->waitRusagePhysAddr, (unsigned long long)phys, (unsigned long long)waiter->context.frame.rsp,
-                  static_cast<void*>(waiter->pagemap));
-    }
     waiter->waitRusagePhysAddr = phys;
     auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(phys));
     ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
@@ -69,12 +63,6 @@ static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, in
         waiter->waitStatusUserAddr = 0;
         waiter->waitStatusPhysAddr = 0;
         return;
-    }
-    if (waiter->waitStatusPhysAddr != 0 && waiter->waitStatusPhysAddr != phys) {
-        log::warn("waitpid-status drift: waiter=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx pagemap=%p status=0x%x",
-                  waiter->pid, (unsigned long long)waiter->waitStatusUserAddr, (unsigned long long)waiter->waitStatusPhysAddr,
-                  (unsigned long long)phys, (unsigned long long)waiter->context.frame.rsp, static_cast<void*>(waiter->pagemap),
-                  (unsigned)status);
     }
     waiter->waitStatusPhysAddr = phys;
     auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(phys));
@@ -104,10 +92,9 @@ static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter,
 
     if (waiter->waitResumeRspUserAddr != 0) {
         uint64_t rsp_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitResumeRspUserAddr);
-        if (rsp_phys == ker::mod::mm::virt::PADDR_INVALID || rsp_phys == 0 ||
-            (waiter->waitResumeRspPhysAddr != 0 && waiter->waitResumeRspPhysAddr != rsp_phys)) {
+        if (rsp_phys == ker::mod::mm::virt::PADDR_INVALID || rsp_phys == 0) {
             log::warn(
-                "waitpid-stack drift: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
+                "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
                 (unsigned long long)waiter->waitResumeRspUserAddr, (unsigned long long)waiter->waitResumeRspPhysAddr,
                 (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),

@@ -224,6 +224,29 @@ auto find_running_task(uint32_t task_id, uint16_t submitter) -> RunningRemoteTas
     return nullptr;
 }
 
+// s_compute_lock must be held by caller
+void compact_running_remote_tasks_locked() {
+    if (g_running_remote_tasks.empty()) {
+        return;
+    }
+
+    size_t write_index = 0;
+    for (size_t read_index = 0; read_index < g_running_remote_tasks.size(); read_index++) {
+        if (!g_running_remote_tasks[read_index].active) {
+            continue;
+        }
+
+        if (write_index != read_index) {
+            g_running_remote_tasks[write_index] = std::move(g_running_remote_tasks[read_index]);
+        }
+        write_index++;
+    }
+
+    while (g_running_remote_tasks.size() > write_index) {
+        g_running_remote_tasks.pop_back();
+    }
+}
+
 auto shared_elf_path_matches(const SharedElfCacheEntry& entry, const char* path) -> bool {
     return path != nullptr && std::strncmp(entry.path.data(), path, entry.path.size()) == 0;
 }
@@ -618,9 +641,62 @@ struct SubmitContextInfo {
     uint16_t envc = 0;
     uint16_t cwd_len = 0;
     uint16_t args_len = 0;
+    uint16_t identity_len = 0;
     uint16_t policy_len = 0;
     uint16_t data_len = 0;
 };
+
+struct WkiTaskIdentityContext {
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t euid;
+    uint32_t egid;
+    uint32_t suid;
+    uint32_t sgid;
+    uint32_t umask;
+    uint64_t session_id;
+    uint64_t pgid;
+    int32_t controlling_tty;
+} __attribute__((packed));
+
+static_assert(sizeof(WkiTaskIdentityContext) == 48, "WkiTaskIdentityContext must stay wire-stable");
+
+void fill_task_identity_context(const ker::mod::sched::task::Task* task, WkiTaskIdentityContext* identity) {
+    if (task == nullptr || identity == nullptr) {
+        return;
+    }
+
+    identity->uid = task->uid;
+    identity->gid = task->gid;
+    identity->euid = task->euid;
+    identity->egid = task->egid;
+    identity->suid = task->suid;
+    identity->sgid = task->sgid;
+    identity->umask = task->umask;
+    identity->session_id = task->session_id;
+    identity->pgid = task->pgid;
+    identity->controlling_tty = static_cast<int32_t>(task->controlling_tty);
+}
+
+void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiTaskIdentityContext& identity) {
+    if (task == nullptr) {
+        return;
+    }
+
+    task->uid = identity.uid;
+    task->gid = identity.gid;
+    task->euid = identity.euid;
+    task->egid = identity.egid;
+    task->suid = identity.suid;
+    task->sgid = identity.sgid;
+    task->umask = identity.umask & 0777U;
+    task->session_id = identity.session_id;
+    task->pgid = identity.pgid != 0 ? identity.pgid : task->pid;
+    // PTY indexes are node-local. Remote tasks use exported PTY fds rather
+    // than a receiver-local controlling tty, so detach instead of accidentally
+    // binding /dev/tty to a same-numbered PTY on the receiver.
+    task->controlling_tty = -1;
+}
 
 auto serialized_task_vfs_rules_size(const ker::mod::sched::task::Task* task) -> uint16_t {
     if (task == nullptr || task->wki_vfs_rules.size() == 0) {
@@ -761,9 +837,11 @@ auto build_submit_context_info(const ker::mod::sched::task::Task* task, const ch
     }
 
     info->args_len = static_cast<uint16_t>(argv_bytes + envp_bytes + info->cwd_len);
+    info->identity_len = task != nullptr ? static_cast<uint16_t>(sizeof(WkiTaskIdentityContext)) : 0;
     info->policy_len = serialized_task_vfs_rules_size(task);
 
-    uint32_t total = static_cast<uint32_t>(info->args_len) + static_cast<uint32_t>(info->policy_len);
+    uint32_t total = static_cast<uint32_t>(info->args_len) + static_cast<uint32_t>(info->identity_len) +
+                     static_cast<uint32_t>(info->policy_len);
     if (total > 0xFFFFU) {
         return false;
     }
@@ -795,6 +873,12 @@ void copy_submit_context_data(uint8_t* dest, const char* const* argv, const char
         size_t len = std::strlen(cwd) + 1;
         memcpy(cursor, cwd, len);
     }
+}
+
+void copy_submit_identity_data(uint8_t* dest, const ker::mod::sched::task::Task* task) {
+    WkiTaskIdentityContext identity = {};
+    fill_task_identity_context(task, &identity);
+    memcpy(dest, &identity, sizeof(identity));
 }
 
 auto compute_local_load() -> uint16_t {
@@ -1033,6 +1117,11 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         return WkiRemoteSpawnResult::LOCAL;
     }
 
+    const bool explicit_target = task->wki_target_hostname[0] != '\0';
+    const bool strict_target = explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
+    const bool prefer_remote = !explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
+    const bool strict_remote = prefer_remote && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
+
     // A task that was already submitted from another node should stay on its
     // receiver node for subsequent exec/fork paths.  Re-placing those tasks
     // remotely again turns wrappers such as /bin/time into nested cross-node
@@ -1061,11 +1150,6 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     }
 
     task->wki_skip_legacy_placement = true;
-
-    const bool explicit_target = task->wki_target_hostname[0] != '\0';
-    const bool strict_target = explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
-    const bool prefer_remote = !explicit_target && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
-    const bool strict_remote = prefer_remote && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
 
     uint16_t best_node = WKI_NODE_INVALID;
     if (explicit_target) {
@@ -1242,8 +1326,8 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
         return 0;
     }
 
-    // Check total size fits in WKI message
-    // TaskSubmitPayload(16) + binary_len(4) + binary + argv/envp/cwd blob + IPC fd entries
+    // Check total size fits in WKI message:
+    // TaskSubmitPayload + binary_len + binary + argv/envp/cwd + identity + policy + IPC fd entries.
     uint32_t ipc_data_len = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
     auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint32_t) + binary_len + context_info.data_len + ipc_data_len);
     if (total > WKI_ETH_MAX_PAYLOAD) {
@@ -1294,9 +1378,11 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     submit->argc = context_info.argc;
     submit->envc = context_info.envc;
     submit->cwd_len = context_info.cwd_len;
+    submit->identity_len = context_info.identity_len;
     submit->ipc_fd_count = ipc_fd_count;
+    submit->reserved = 0;
 
-    // INLINE format: {binary_len:u32, binary[binary_len], argv/envp/cwd blob, ipc_fd_entries[]}
+    // INLINE format: {binary_len:u32, binary[binary_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
     uint8_t* cursor = buf + sizeof(TaskSubmitPayload);
     memcpy(cursor, &binary_len, sizeof(uint32_t));
     cursor += sizeof(uint32_t);
@@ -1305,6 +1391,10 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     if (context_info.args_len > 0) {
         copy_submit_context_data(cursor, argv, envp, cwd);
         cursor += context_info.args_len;
+    }
+    if (context_info.identity_len > 0) {
+        copy_submit_identity_data(cursor, local_task);
+        cursor += context_info.identity_len;
     }
     if (context_info.policy_len > 0) {
         serialize_task_vfs_rules(cursor, local_task);
@@ -1401,7 +1491,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
         return 0;
     }
 
-    // TaskSubmitPayload(16) + path_len_field(2) + path + argv/envp/cwd blob + IPC fd entries
+    // TaskSubmitPayload + path_len + path + argv/envp/cwd + identity + policy + IPC fd entries.
     uint32_t ipc_data_len = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
     auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint16_t) + path_len + context_info.data_len + ipc_data_len);
     if (total > WKI_ETH_MAX_PAYLOAD) {
@@ -1450,9 +1540,11 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     submit->argc = context_info.argc;
     submit->envc = context_info.envc;
     submit->cwd_len = context_info.cwd_len;
+    submit->identity_len = context_info.identity_len;
     submit->ipc_fd_count = ipc_fd_count;
+    submit->reserved = 0;
 
-    // VFS_REF format: {path_len:u16, path[path_len], argv/envp/cwd blob, ipc_fd_entries[]}
+    // VFS_REF format: {path_len:u16, path[path_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
     uint8_t* cursor = buf + sizeof(TaskSubmitPayload);
     memcpy(cursor, &path_len, sizeof(uint16_t));
     cursor += sizeof(uint16_t);
@@ -1461,6 +1553,10 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const c
     if (context_info.args_len > 0) {
         copy_submit_context_data(cursor, argv, envp, cwd);
         cursor += context_info.args_len;
+    }
+    if (context_info.identity_len > 0) {
+        copy_submit_identity_data(cursor, local_task);
+        cursor += context_info.identity_len;
     }
     if (context_info.policy_len > 0) {
         serialize_task_vfs_rules(cursor, local_task);
@@ -1903,7 +1999,7 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
             rt.active = false;
         }
     }
-    std::erase_if(g_running_remote_tasks, [](const RunningRemoteTask& rt) { return !rt.active; });
+    compact_running_remote_tasks_locked();
 
     for (auto& entry : g_shared_elf_cache) {
         if (entry.submitter_node != node_id) {
@@ -2000,7 +2096,7 @@ void wki_remote_compute_check_completions() {
     }
 
     // Clean up inactive entries
-    std::erase_if(g_running_remote_tasks, [](const RunningRemoteTask& rt) { return !rt.active; });
+    compact_running_remote_tasks_locked();
 
     s_compute_lock.unlock();
 
@@ -2157,79 +2253,31 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 
     std::array<char, 512> localized_path = {};
     std::array<char, 512> fallback_local_path = {};
-    std::array<char, 512> local_strip_path = {};
     const char* resolved_path = path;
     if (localize_receiver_logical_path(path, localized_path.data(), localized_path.size())) {
         resolved_path = localized_path.data();
     }
 
-    // Before attempting any remote VFS path, check if stripping the /wki/<host>/
-    // prefix yields a path that exists locally. If it does, use it directly —
-    // this avoids remote VFS load entirely, preventing VFS traffic from
-    // overloading the submitter and causing false-positive heartbeat fencing.
+    // Keep explicit /wki/<host>/... references on that host. Falling back to
+    // the receiver's same local path mixes binary and dependency namespaces.
     bool using_disconnected_host_fallback = false;
-    if (!using_disconnected_host_fallback) {
-        constexpr char wki_pfx[] = "/wki/";
-        constexpr size_t wki_pfx_len = sizeof(wki_pfx) - 1;
-        if (std::strncmp(resolved_path, wki_pfx, wki_pfx_len) == 0) {
-            const char* after_host = resolved_path + wki_pfx_len;
-            while (*after_host != '\0' && *after_host != '/') {
-                after_host++;
-            }
-            if (*after_host == '/') {
-                size_t suf_len = std::strlen(after_host);
-                if (suf_len + 1 <= local_strip_path.size()) {
-                    std::memcpy(local_strip_path.data(), after_host, suf_len + 1);
-                    ker::vfs::stat local_precheck = {};
-                    if (ker::vfs::vfs_stat(local_strip_path.data(), &local_precheck) == 0 && local_precheck.st_size > 0) {
-                        ker::mod::dbg::log("[WKI] VFS_REF: '%s' exists locally, skipping remote VFS load", local_strip_path.data());
-                        resolved_path = local_strip_path.data();
-                        using_disconnected_host_fallback = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if (!using_disconnected_host_fallback) {
-        if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
-            resolved_path = fallback_local_path.data();
-            using_disconnected_host_fallback = true;
-        }
+    if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
+        resolved_path = fallback_local_path.data();
+        using_disconnected_host_fallback = true;
     }
 
     ker::vfs::stat statbuf = {};
-    if (ker::vfs::vfs_stat(resolved_path, &statbuf) != 0 || statbuf.st_size <= 0) {
-        // If the remote VFS path is inaccessible (e.g. /wki/<host> not mounted even
-        // though the peer is connected at WKI level), try the same relative path on
-        // the local filesystem before giving up.
-        bool did_local_strip_fallback = false;
+    bool have_vfs_ref_stat = ker::vfs::vfs_stat(resolved_path, &statbuf) == 0 && statbuf.st_size > 0;
+    if (!have_vfs_ref_stat) {
         if (!using_disconnected_host_fallback) {
-            constexpr char wki_pfx[] = "/wki/";
-            constexpr size_t wki_pfx_len = sizeof(wki_pfx) - 1;
-            if (std::strncmp(resolved_path, wki_pfx, wki_pfx_len) == 0) {
-                const char* after_host = resolved_path + wki_pfx_len;
-                while (*after_host != '\0' && *after_host != '/') {
-                    after_host++;
-                }
-                if (*after_host == '/') {
-                    size_t suf_len = std::strlen(after_host);
-                    if (suf_len + 1 <= local_strip_path.size()) {
-                        std::memcpy(local_strip_path.data(), after_host, suf_len + 1);
-                        ker::vfs::stat local_statbuf = {};
-                        if (ker::vfs::vfs_stat(local_strip_path.data(), &local_statbuf) == 0 && local_statbuf.st_size > 0) {
-                            ker::mod::dbg::log("[WKI] VFS_REF: remote path '%s' inaccessible, falling back to local '%s'", resolved_path,
-                                               local_strip_path.data());
-                            resolved_path = local_strip_path.data();
-                            using_disconnected_host_fallback = true;
-                            statbuf = local_statbuf;
-                            did_local_strip_fallback = true;
-                        }
-                    }
-                }
+            if (fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
+                resolved_path = fallback_local_path.data();
+                using_disconnected_host_fallback = true;
+                have_vfs_ref_stat = ker::vfs::vfs_stat(resolved_path, &statbuf) == 0 && statbuf.st_size > 0;
             }
         }
-        if (!did_local_strip_fallback) {
+
+        if (!have_vfs_ref_stat) {
             ker::mod::dbg::log("[WKI] VFS_REF: failed to stat '%s'", resolved_path);
             result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
             load_measure.finish(perf_compute_reject_status(result.reject_reason));
@@ -2633,7 +2681,19 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
             break;
     }
 
-    if (submit->args_len > submit_context_len) {
+    uint16_t context_without_ipc = submit_context_len;
+    auto ipc_tail_size = static_cast<uint32_t>(submit->ipc_fd_count) * sizeof(WkiIpcFdEntry);
+    if (ipc_tail_size > submit_context_len || ipc_tail_size > 0xFFFFU) {
+        reject_reason = TaskRejectReason::FETCH_FAILED;
+    } else {
+        context_without_ipc = static_cast<uint16_t>(submit_context_len - ipc_tail_size);
+    }
+
+    if (submit->args_len > context_without_ipc) {
+        reject_reason = TaskRejectReason::FETCH_FAILED;
+    } else if (submit->identity_len > static_cast<uint16_t>(context_without_ipc - submit->args_len)) {
+        reject_reason = TaskRejectReason::FETCH_FAILED;
+    } else if (submit->identity_len != 0 && submit->identity_len != sizeof(WkiTaskIdentityContext)) {
         reject_reason = TaskRejectReason::FETCH_FAILED;
     }
 
@@ -2698,13 +2758,17 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
     const char* cwd_string = "/";
     bool parse_ok = true;
 
-    // IPC fd entries are appended after args+policy in the submit context.
+    // IPC fd entries are appended after args+identity+policy in the submit context.
     // Subtract their size so policy_len covers only the actual VFS rules.
-    uint16_t ipc_tail_len = static_cast<uint16_t>(submit->ipc_fd_count * sizeof(WkiIpcFdEntry));
-    uint16_t context_without_ipc =
-        (submit_context_len >= ipc_tail_len) ? static_cast<uint16_t>(submit_context_len - ipc_tail_len) : submit_context_len;
-    const uint8_t* policy_cursor = submit_context + submit->args_len;
-    uint16_t policy_len = static_cast<uint16_t>(context_without_ipc - submit->args_len);
+    const uint8_t* identity_cursor = submit_context + submit->args_len;
+    const uint8_t* policy_cursor = identity_cursor + submit->identity_len;
+    uint16_t policy_len = static_cast<uint16_t>(context_without_ipc - submit->args_len - submit->identity_len);
+    WkiTaskIdentityContext submitted_identity = {};
+    bool has_submitted_identity = false;
+    if (submit->identity_len == sizeof(WkiTaskIdentityContext)) {
+        memcpy(&submitted_identity, identity_cursor, sizeof(submitted_identity));
+        has_submitted_identity = true;
+    }
 
     if (submit->argc > 0) {
         argv_strings = new const char*[static_cast<size_t>(submit->argc) + 1];
@@ -2782,6 +2846,10 @@ static void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, u
         wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::FETCH_FAILED), binary_len);
         return;
+    }
+
+    if (has_submitted_identity) {
+        apply_submitted_task_identity(new_task, submitted_identity);
     }
 
     std::array<char, ker::mod::sched::task::Task::CWD_MAX> logical_cwd = {};

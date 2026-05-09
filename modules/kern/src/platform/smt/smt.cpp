@@ -43,6 +43,8 @@ __attribute__((used, section(".requests"))) const static volatile limine_mp_requ
 namespace ker::mod::smt {
 namespace {
 static PerCpuCrossAccess<CpuInfo>* cpuData;
+static std::atomic<uint64_t> halted_cpu_mask{0};
+static std::atomic<bool> halt_other_cores_requested{false};
 uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t g_cpu_count;
@@ -458,16 +460,102 @@ namespace {
 // IPI vector used for halting other CPUs, dynamically allocated via gates::allocateVector()
 uint8_t halt_ipi_vector = 0;
 
+static constexpr uint64_t HALT_ACK_SPINS = 25000;
+
+auto try_get_cpu_index_from_apic_id(uint32_t apic_id, uint64_t& cpu_index) -> bool {
+    if (cpuData == nullptr) {
+        return false;
+    }
+    for (uint64_t i = 0; i < g_cpu_count; ++i) {
+        if (cpuData->that_cpu(i)->lapic_id == apic_id) {
+            cpu_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+[[noreturn]] void halt_this_cpu_forever() {
+    uint64_t cpu_index = 0;
+    if (try_get_cpu_index_from_apic_id(ker::mod::apic::getApicId(), cpu_index)) {
+        if (cpu_index < 64) {
+            halted_cpu_mask.fetch_or(1ULL << cpu_index, std::memory_order_release);
+        }
+        cpuData->that_cpu(cpu_index)->isHaltedForOom.store(true, std::memory_order_release);
+    }
+
+    ker::mod::apic::oneShotTimer(0);
+    ker::mod::apic::eoi();
+    asm volatile("cli" ::: "memory");
+    for (;;) {
+        asm volatile("hlt" ::: "memory");
+    }
+}
+
+void send_halt_nmi_to_others() {
+    ker::mod::apic::IPIConfig ipi = {};
+    ipi.vector = 0;
+    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::NMI;
+    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.level = ker::mod::apic::IPILevel::ASSERT;
+    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
+    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+}
+
+void send_fixed_halt_ipi_to_others() {
+    if (halt_ipi_vector == 0) {
+        return;
+    }
+    ker::mod::apic::IPIConfig ipi = {};
+    ipi.vector = halt_ipi_vector;
+    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::FIXED;
+    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.level = ker::mod::apic::IPILevel::ASSERT;
+    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
+    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+}
+
+void send_init_ipi_to_others() {
+    ker::mod::apic::IPIConfig ipi = {};
+    ipi.vector = 0;
+    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::INIT;
+    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.level = ker::mod::apic::IPILevel::ASSERT;
+    ipi.triggerMode = ker::mod::apic::IPITriggerMode::LEVEL;
+    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+}
+
+auto halt_acknowledged(uint64_t expected_mask) -> bool {
+    return (halted_cpu_mask.load(std::memory_order_acquire) & expected_mask) == expected_mask;
+}
+
+auto wait_for_halt_ack(uint64_t expected_mask) -> bool {
+    for (uint64_t iter = 0; iter < HALT_ACK_SPINS; ++iter) {
+        if (halt_acknowledged(expected_mask)) {
+            return true;
+        }
+        asm volatile("pause" ::: "memory");
+    }
+    return halt_acknowledged(expected_mask);
+}
+
 // Helper interrupt handler executed on other CPUs to halt them in a tight HLT loop.
 void halt_ipi_handler(uint8_t vector, void* private_data) {
     (void)vector;
     (void)private_data;
-    // Mark this CPU as halted for the OOM/panic sequence so the sender can wait
-    cpuData->this_cpu_locked_void([](CpuInfo* c) { c->isHaltedForOom.store(true, std::memory_order_release); });
-    asm volatile("cli");
-    for (;;) {
-        asm volatile("hlt");
+    halt_this_cpu_forever();
+}
+
+void halt_nmi_handler(cpu::GPRegs gpr, gates::interruptFrame frame) {
+    (void)gpr;
+    (void)frame;
+    if (halt_other_cores_requested.load(std::memory_order_acquire)) {
+        halt_this_cpu_forever();
     }
+    ker::mod::dbg::panic_handler("unexpected NMI");
 }
 }  // namespace
 
@@ -489,6 +577,7 @@ void init() {
     assert(halt_ipi_vector != 0);
     gates::requestIrq(halt_ipi_vector, halt_ipi_handler, nullptr, "halt_ipi");
     dbg::log("Registered halt IPI handler for vector 0x%x", (int)halt_ipi_vector);
+    gates::setInterruptHandler(2, halt_nmi_handler);
 
     // Initialise CPU domain hierarchy (ROOT + GROUP_0; no LEAFs yet)
     init_cpu_domains();
@@ -611,61 +700,42 @@ auto set_tcb(void* tcb) -> uint64_t {
 }
 
 void halt_other_cores() {
+    if (cpuData == nullptr || get_core_count() <= 1) {
+        return;
+    }
+
     uint64_t core_count = get_core_count();
 
-    // Clear halted flags on all cpus first (so stale flags won't confuse us)
-    for (uint64_t i = 0; i < core_count; ++i) {
-        if (i == cpu::currentCpu()) {
-            continue;
+    uint64_t this_cpu = 0;
+    bool found_this_cpu = try_get_cpu_index_from_apic_id(ker::mod::apic::getApicId(), this_cpu);
+    bool can_verify_all = found_this_cpu && core_count <= 64;
+    uint64_t expected_mask = 0;
+    for (uint64_t i = 0; i < core_count && i < 64; ++i) {
+        if (!found_this_cpu || i != this_cpu) {
+            expected_mask |= 1ULL << i;
         }
-        cpuData->with_lock_void(i, [](CpuInfo* c) -> void { c->isHaltedForOom.store(false, std::memory_order_relaxed); });
     }
 
-    // Use APIC to broadcast an IPI to all other CPUs without allocating memory.
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-    ker::mod::apic::IPIConfig ipi = {};
-    ipi.vector = halt_ipi_vector;
-    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::FIXED;
-    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
-    ipi.level = ker::mod::apic::IPILevel::ASSERT;
-    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
-    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
-    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
+    halt_other_cores_requested.store(true, std::memory_order_release);
 
-    // Destination is ignored when using ALL_EXCLUDING_SELF shorthand but provide a value anyway.
-    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
-
-    // Wait for other CPUs to set their halted flag, with a timeout. Best-effort.
-    const uint64_t MAX_ITER = 2000000;  // tuned for reasonable timeout
-    uint64_t iter = 0;
-    while (iter++ < MAX_ITER) {
-        bool all_halted = true;
-        for (uint64_t i = 0; i < core_count; ++i) {
-            if (i == cpu::currentCpu()) {
-                continue;
-            }
-            bool halted = cpuData->with_lock(i, [](CpuInfo* c) -> bool { return c->isHaltedForOom.load(std::memory_order_acquire); });
-            if (!halted) {
-                all_halted = false;
-                break;
-            }
-        }
-        if (all_halted) {
-            dbg::log("haltOtherCores: all other CPUs reported halted");
-            return;
-        }
-        asm volatile("pause");
+    // NMI ignores IF, so it can stop CPUs that are spinning with interrupts
+    // masked or wedged in panic-lock paths.
+    send_halt_nmi_to_others();
+    if (can_verify_all && wait_for_halt_ack(expected_mask)) {
+        return;
     }
 
-    // Timed out waiting - log which cpus did not report halt (best-effort)
-    dbg::log("haltOtherCores: timeout waiting for halted CPUs");
-    for (uint64_t i = 0; i < core_count; ++i) {
-        if (i == cpu::currentCpu()) {
-            continue;
-        }
-        bool halted = cpuData->with_lock(i, [](CpuInfo* c) -> bool { return c->isHaltedForOom.load(std::memory_order_acquire); });
-        dbg::log("  CPU %d halted=%d", (int)i, (int)halted);
+    // Try the normal vector too for environments that handle fixed IPIs more
+    // reliably than NMI delivery.
+    send_fixed_halt_ipi_to_others();
+    if (can_verify_all && wait_for_halt_ack(expected_mask)) {
+        return;
     }
+
+    // Final one-way stop: INIT leaves APs waiting for a SIPI that we will never
+    // send. This is intentionally destructive and only appropriate because
+    // halt_other_cores() is used by crash/OOM paths.
+    send_init_ipi_to_others();
 }
 
 // Get the kernel PerCpu structure for a given CPU index

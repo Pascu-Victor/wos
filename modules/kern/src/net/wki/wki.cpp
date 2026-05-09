@@ -39,6 +39,8 @@
 #include "platform/sys/spinlock.hpp"
 namespace ker::net::wki {
 
+using log = ker::mod::dbg::logger<"wki">;
+
 // -----------------------------------------------------------------------------
 // Global state
 // -----------------------------------------------------------------------------
@@ -71,6 +73,9 @@ struct DeferredGuard {
 };
 
 namespace {
+
+auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport*;
+auto resolve_next_hop(uint16_t dst_node) -> uint16_t;
 
 auto perf_current_pid() -> uint64_t {
     auto* task = mod::sched::get_current_task();
@@ -222,36 +227,48 @@ static void wait_list_unlink(WkiWaitEntry* entry) {
 }
 
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
-    // Record the calling task so wake_op can send an IPI
+    // Record the calling task so wake_op can send an IPI. Do not reset
+    // completed/result here: many callers publish the stack wait entry before
+    // sending, and a fast response may complete it before we enter this helper.
     entry->task = mod::sched::get_current_task();
-    entry->completed.store(false, std::memory_order_release);
-    entry->result = 0;
     entry->deadline_us = (timeout_us > 0) ? (wki_now_us() + timeout_us) : 0;
 
-    // Link into pending list (for timeout scan)
-    wait_list_link(entry);
-    if (entry->deadline_us != 0) {
-        wki_timer_notify();
+    bool linked = false;
+    if (!entry->completed.load(std::memory_order_acquire)) {
+        // Link into pending list (for timeout scan)
+        wait_list_link(entry);
+        linked = true;
+        if (entry->deadline_us != 0) {
+            wki_timer_notify();
+        }
     }
 
-    // Poll until completed or deadline. Each loop explicitly pumps delayed
-    // ACKs/retransmits before yielding the CPU so the waiter does not busy-spin
-    // for long accept/completion paths under load.
+    // Sleep until RX/timer completion.  This used to actively call
+    // wki_spin_yield(), which let multiple remote exec/VFS/IPC waiters turn
+    // into full-time NAPI/timer pollers and starve unrelated networking.
     while (!entry->completed.load(std::memory_order_acquire)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
             // Timed out - unlink and return error
-            wait_list_unlink(entry);
+            if (linked) {
+                wait_list_unlink(entry);
+            }
             return WKI_ERR_TIMEOUT;
         }
-        wki_spin_yield();
+        if (entry->task != nullptr) {
+            entry->task->wait_channel = "wki_wait";
+            mod::sched::kern_block();
+        } else {
+            mod::sched::kern_yield();
+        }
         if (entry->completed.load(std::memory_order_acquire)) {
             break;
         }
-        mod::sched::kern_yield();
     }
 
     // Completed - unlink and return result
-    wait_list_unlink(entry);
+    if (linked) {
+        wait_list_unlink(entry);
+    }
     return entry->result;
 }
 
@@ -262,9 +279,10 @@ void wki_wake_op(WkiWaitEntry* entry, int result) {
         return;  // already completed - stale wake
     }
 
-    // Send wake IPI to break the hlt in kern_yield() for immediate response
+    // Wake the waiter whether it has already moved to WAITING or is still at
+    // the current-task voluntary block point.
     if (entry->task != nullptr) {
-        mod::sched::wake_cpu(entry->task->cpu);
+        mod::sched::kern_wake(entry->task);
     }
 }
 
@@ -293,7 +311,7 @@ void wki_wait_timeout_scan(uint64_t now_us) {
             if (cur->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
                 should_unlink = true;
                 if (cur->task != nullptr) {
-                    ker::mod::sched::wake_cpu(cur->task->cpu);
+                    ker::mod::sched::kern_wake(cur->task);
                 }
             }
         }
@@ -715,6 +733,49 @@ void refresh_rx_credits(WkiChannel* ch) {
     uint16_t max_credits = default_credits_for_channel(ch->channel_id);
     uint32_t used = std::min<uint32_t>(ch->reorder_count, max_credits);
     ch->rx_credits = static_cast<uint16_t>(max_credits - used);
+}
+
+struct AckSnapshot {
+    WkiHeader hdr = {};
+    uint16_t peer = WKI_NODE_INVALID;
+    uint32_t ack_num = 0;
+};
+
+auto capture_ack_snapshot_locked(WkiChannel* ch) -> AckSnapshot {
+    AckSnapshot ack = {};
+    ack.hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
+    ack.hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);
+    ack.hdr.src_node = g_wki.my_node_id;
+    ack.hdr.dst_node = ch->peer_node_id;
+    ack.hdr.channel_id = ch->channel_id;
+    ack.hdr.seq_num = 0;
+    ack.hdr.ack_num = ch->rx_ack_pending;
+    ack.hdr.payload_len = 0;
+    ack.hdr.credits = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
+    ack.hdr.hop_ttl = WKI_DEFAULT_TTL;
+    ack.hdr.checksum = 0;
+    ack.hdr.reserved = 0;
+    ack.peer = ch->peer_node_id;
+    ack.ack_num = ch->rx_ack_pending;
+    return ack;
+}
+
+auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
+    if (ack.peer == WKI_NODE_INVALID) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    WkiTransport* transport = find_transport_for_peer(ack.peer);
+    if (transport == nullptr) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    uint16_t next_hop = resolve_next_hop(ack.peer);
+    if (next_hop == WKI_NODE_INVALID) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    return transport->tx(transport, next_hop, &ack.hdr, WKI_HEADER_SIZE);
 }
 
 }  // namespace
@@ -1204,6 +1265,14 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         rt_entry->send_time_us = 0;
         rt_entry->retries = 0;
         rt_entry->next = nullptr;
+    } else {
+        // Reliable sequence numbers are only safe to publish if the frame is
+        // recoverable. Sending without a retransmit copy can permanently wedge
+        // the receiver behind a missing head-of-line packet.
+        ch->lock.unlock();
+        net::pkt_free(pkt);
+        perf_record_transport_end(dst_node, channel_id, trace_correlation, WKI_ERR_NO_MEM, payload_len, trace_callsite);
+        return WKI_ERR_NO_MEM;
     }
 
 #ifdef DEBUG_WKI_TRANSPORT
@@ -1755,6 +1824,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
             } else if (seq_after(hdr->seq_num, ch->rx_seq)) {
                 // Out-of-order: buffer in reorder queue, send dup ACK
+                AckSnapshot dup_ack = {};
                 bool already_buffered = false;
                 for (WkiReorderEntry* cur = ch->reorder_head; cur != nullptr; cur = cur->next) {
                     if (cur->seq == hdr->seq_num) {
@@ -1764,8 +1834,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 }
 
                 if (!already_buffered) {
-                    ker::mod::dbg::log("[WKI] Out-of-order msg: src=0x%04x ch=%u seq=%u expected=%u type=%u", hdr->src_node,
-                                       hdr->channel_id, hdr->seq_num, ch->rx_seq, hdr->msg_type);
+                    log::debug("Out-of-order msg: src=0x%04x ch=%u seq=%u expected=%u type=%u", hdr->src_node, hdr->channel_id,
+                               hdr->seq_num, ch->rx_seq, hdr->msg_type);
 
                     uint16_t max_reorder = default_credits_for_channel(ch->channel_id);
                     if (ch->reorder_count < max_reorder) {
@@ -1796,17 +1866,38 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                 ch->ack_pending = true;
                 ch->ack_pending_since_us = 0;  // out-of-order: ACK immediately (no piggyback opportunity)
+                dup_ack = capture_ack_snapshot_locked(ch);
 
                 ch->lock.unlock();
-                wki_timer_notify();
+                int ack_ret = transmit_ack_snapshot(dup_ack);
+                if (ack_ret >= 0) {
+                    ch->lock.lock();
+                    if (ch->active && ch->ack_pending && ch->rx_ack_pending == dup_ack.ack_num) {
+                        ch->ack_pending = false;
+                    }
+                    ch->lock.unlock();
+                } else {
+                    wki_timer_notify();
+                }
             } else {
                 // Old/duplicate: discard but re-arm ACK so the sender's retransmit
                 // queue gets drained.  Without this the sender never receives the
                 // ACK and keeps retransmitting the same stale packet.
+                AckSnapshot dup_ack = {};
                 ch->ack_pending = true;
                 ch->ack_pending_since_us = 0;  // duplicate: ACK immediately
+                dup_ack = capture_ack_snapshot_locked(ch);
                 ch->lock.unlock();
-                wki_timer_notify();
+                int ack_ret = transmit_ack_snapshot(dup_ack);
+                if (ack_ret >= 0) {
+                    ch->lock.lock();
+                    if (ch->active && ch->ack_pending && ch->rx_ack_pending == dup_ack.ack_num) {
+                        ch->ack_pending = false;
+                    }
+                    ch->lock.unlock();
+                } else {
+                    wki_timer_notify();
+                }
             }
             return;
         }
@@ -1847,6 +1938,8 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
             retransmit_peer = ch->peer_node_id;
             retransmit_seq = rt->seq;
             do_retransmit = true;
+        } else {
+            ch->retransmit_deadline = now_us + ch->rto_us;
         }
     }
 
@@ -1973,6 +2066,8 @@ void wki_timer_tick(uint64_t now_us) {
                 retransmit_peer = ch->peer_node_id;
                 retransmit_seq = rt->seq;
                 do_retransmit = true;
+            } else {
+                ch->retransmit_deadline = now_us + ch->rto_us;
             }
         }
 

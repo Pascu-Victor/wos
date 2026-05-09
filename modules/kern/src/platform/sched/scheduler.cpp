@@ -38,7 +38,18 @@
 #include "util/hcf.hpp"
 
 // Kernel idle loop - defined in context_switch.asm
-extern "C" void _wOS_kernel_idle_loop();  // NOLINT(readability-identifier-naming)
+extern "C" void _wOS_kernel_idle_loop();          // NOLINT(readability-identifier-naming)
+extern "C" void _wOS_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
+
+extern "C" [[noreturn]] void _wOS_kernel_thread_returned() {  // NOLINT(readability-identifier-naming)
+    auto* task = ker::mod::sched::get_current_task();
+    ker::mod::dbg::logger<"sched">::error("kernel thread returned: pid=%lu name=%s", task != nullptr ? task->pid : 0,
+                                          (task != nullptr && task->name != nullptr) ? task->name : "?");
+    ker::syscall::process::wos_proc_exit(0);
+    for (;;) {
+        asm volatile("cli\n\thlt" ::: "memory");
+    }
+}
 
 namespace ker::mod::sched {
 
@@ -59,6 +70,77 @@ struct PidHashEntry {
 namespace {
 using wait_log = ker::mod::dbg::logger<"wait">;
 using resume_log = ker::mod::dbg::logger<"resume">;
+using preempt_log = ker::mod::dbg::logger<"preempt">;
+
+std::atomic<uint64_t> g_preempt_block_warnings{0};
+
+inline auto is_valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
+
+inline void validate_kernel_resume_target(task::Task* task, const char* path) {
+    if (task == nullptr) {
+        return;
+    }
+    if (task->context.frame.cs == desc::gdt::GDT_USER_CS && task->type == task::TaskType::PROCESS) {
+        return;
+    }
+
+    const uint64_t rip = task->context.frame.rip;
+    const uint64_t rsp = task->context.frame.rsp;
+    const bool cs_bad = task->context.frame.cs != desc::gdt::GDT_KERN_CS;
+    const bool ss_bad = task->context.frame.ss != desc::gdt::GDT_KERN_DS;
+    const bool rip_bad = rip < 0xffffffff80000000ULL || rip >= 0xffffffffc0000000ULL;
+    const bool rsp_bad = !is_valid_kernel_stack(rsp);
+    const bool flags_bad = (task->context.frame.flags & 0x2ULL) == 0;
+    if (!cs_bad && !ss_bad && !rip_bad && !rsp_bad && !flags_bad) {
+        return;
+    }
+
+    resume_log::error(
+        "kernel resume anomaly: path=%s pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx entry=0x%llx kentry=%p "
+        "scratch=%p",
+        path != nullptr ? path : "?", task->pid, task->name != nullptr ? task->name : "?", (unsigned long long)task->context.frame.cs,
+        (unsigned long long)task->context.frame.ss, (unsigned long long)rip, (unsigned long long)rsp,
+        (unsigned long long)task->context.frame.flags, (unsigned long long)task->entry, reinterpret_cast<void*>(task->kthreadEntry),
+        reinterpret_cast<void*>(task->context.syscallScratchArea));
+    hcf();
+}
+
+inline void prepare_first_run_daemon(task::Task* task, const char* path) {
+    if (task == nullptr || task->type != task::TaskType::DAEMON || task->hasRun) {
+        return;
+    }
+
+    if (task->kthreadEntry == nullptr) {
+        resume_log::error("first-run daemon without entry: path=%s pid=%lu name=%s", path != nullptr ? path : "?", task->pid,
+                          task->name != nullptr ? task->name : "?");
+        hcf();
+    }
+
+    uint64_t stack = task->context.syscallKernelStack;
+    if (!is_valid_kernel_stack(stack)) {
+        resume_log::error("first-run daemon bad syscall stack: path=%s pid=%lu name=%s stack=0x%llx frame_rsp=0x%llx",
+                          path != nullptr ? path : "?", task->pid, task->name != nullptr ? task->name : "?", (unsigned long long)stack,
+                          (unsigned long long)task->context.frame.rsp);
+        hcf();
+    }
+
+    if (!is_valid_kernel_stack(task->context.frame.rsp)) {
+        resume_log::warn("first-run daemon stack repair: path=%s pid=%lu name=%s old_rsp=0x%llx stack=0x%llx entry=%p",
+                         path != nullptr ? path : "?", task->pid, task->name != nullptr ? task->name : "?",
+                         (unsigned long long)task->context.frame.rsp, (unsigned long long)stack,
+                         reinterpret_cast<void*>(task->kthreadEntry));
+    }
+
+    task->context.regs = cpu::GPRegs();
+    task->context.regs.rdi = reinterpret_cast<uint64_t>(task->kthreadEntry);
+    task->context.frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_thread_trampoline);
+    task->context.frame.cs = desc::gdt::GDT_KERN_CS;
+    task->context.frame.ss = desc::gdt::GDT_KERN_DS;
+    task->context.frame.flags = 0x202;
+    task->context.frame.rsp = stack;
+    task->context.frame.intNum = 0;
+    task->context.frame.errCode = 0;
+}
 
 inline void validate_user_resume_target(task::Task* task, const char* path) {
     if (task == nullptr || task->pagemap == nullptr || task->type != task::TaskType::PROCESS || task->voluntaryBlock) {
@@ -106,10 +188,10 @@ inline void validate_wait_resume_mapping(task::Task* waiter, task::Task* child, 
 
     if (waiter->waitResumeRspUserAddr != 0) {
         uint64_t rsp_phys = mm::virt::translate(waiter->pagemap, waiter->waitResumeRspUserAddr);
-        if (rsp_phys == mm::virt::PADDR_INVALID || rsp_phys == 0 ||
-            (waiter->waitResumeRspPhysAddr != 0 && waiter->waitResumeRspPhysAddr != rsp_phys)) {
+        if (rsp_phys == mm::virt::PADDR_INVALID || rsp_phys == 0) {
             wait_log::warn(
-                "waitpid-stack drift: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
+                "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx "
+                "pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
                 (unsigned long long)waiter->waitResumeRspUserAddr, (unsigned long long)waiter->waitResumeRspPhysAddr,
                 (unsigned long long)((rsp_phys == mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
@@ -122,7 +204,7 @@ inline void validate_wait_resume_mapping(task::Task* waiter, task::Task* child, 
 std::array<PidHashEntry, MAX_PIDS> pid_table = {PidHashEntry{.pid = 0, .task = nullptr}};
 std::atomic<uint64_t> scheduler_task_context_ready_mask{0};
 
-constexpr std::array<uint32_t, 40> kNiceToWeight = {
+constexpr std::array<uint32_t, 40> K_NICE_TO_WEIGHT = {
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
     1024,  820,   655,   526,   423,   335,   272,   215,   172,   137,   110,  87,   70,   56,   45,   36,   29,   23,   18,   15,
 };
@@ -140,7 +222,7 @@ inline auto clamp_nice(int nice) -> int {
     return nice;
 }
 
-inline auto nice_to_weight(int nice) -> uint32_t { return kNiceToWeight[static_cast<size_t>(clamp_nice(nice) + 20)]; }
+inline auto nice_to_weight(int nice) -> uint32_t { return K_NICE_TO_WEIGHT[static_cast<size_t>(clamp_nice(nice) + 20)]; }
 
 inline bool has_short_burst_history(const task::Task* task) { return task->lastRunUs >= 250U && task->lastRunUs <= 8'000U; }
 
@@ -408,6 +490,13 @@ uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-glob
 
 void request_local_reschedule();
 
+inline auto current_task_for_preempt() -> task::Task* {
+    if (!can_query_current_task()) {
+        return nullptr;
+    }
+    return get_current_task();
+}
+
 // Restore kernel GS_BASE before entering idle loop.
 // Ensures cpu::currentCpu() returns the correct CPU index when
 // timer interrupts wake us from idle and call processTasks.
@@ -497,7 +586,7 @@ void set_task_nice_impl(task::Task* task, int nice) {
 // but they should not alternate 50/50 with CPU-bound workers just because sleep
 // time freezes vruntime. Charge a small wakeup tax only for short-run + short-sleep
 // wakeups; long-idle interactive wakes keep zero penalty.
-inline int64_t compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us) {
+inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us) -> int64_t {
     int64_t avg = compute_avg_vruntime(rq);
     int64_t fair_vruntime = std::max((int64_t)rq->minVruntime, avg);
 
@@ -795,7 +884,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
 
 // Send a scheduler wake IPI to a specific CPU if it's currently idle.
 // This ensures idle CPUs don't sleep up to 10ms before noticing new work.
-static void request_local_reschedule() {
+void request_local_reschedule() {
     auto* rq = run_queues->this_cpu();
     if (rq != nullptr) {
         rq->localRescheduleRequests.fetch_add(1, std::memory_order_relaxed);
@@ -803,7 +892,7 @@ static void request_local_reschedule() {
     sys::context_switch::request_reschedule();
 }
 
-static void arm_idle_timer_locked(RunQueue* rq) {
+void arm_idle_timer_locked(RunQueue* rq) {
     rq->idleTimerArms.fetch_add(1, std::memory_order_relaxed);
     if (idle_timer_ticks == 0) {
         idle_timer_ticks = apic::calibrateTimer(10000);
@@ -996,9 +1085,9 @@ auto post_task_balanced(task::Task* task) -> bool {
 // Current task access
 // ============================================================================
 
-task::Task* get_current_task() { return run_queues->this_cpu()->currentTask; }
+auto get_current_task() -> task::Task* { return run_queues->this_cpu()->currentTask; }
 
-bool can_query_current_task() {
+auto can_query_current_task() -> bool {
     if (run_queues == nullptr) {
         return false;
     }
@@ -1009,7 +1098,83 @@ bool can_query_current_task() {
     return (scheduler_task_context_ready_mask.load(std::memory_order_acquire) & (1ULL << cpu_no)) != 0;
 }
 
-bool has_run_queues() { return run_queues != nullptr; }
+auto has_run_queues() -> bool { return run_queues != nullptr; }
+
+void preempt_disable_at(uint64_t caller) {
+    auto* task = current_task_for_preempt();
+    if (task == nullptr) {
+        return;
+    }
+
+    if (task->preemptDisableDepth == 0) {
+        task->preemptDisableStartUs = time::getUs();
+        task->preemptDisableOwner = caller;
+    }
+    task->preemptDisableDepth++;
+}
+
+void preempt_disable() { preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
+
+void preempt_enable_at(uint64_t caller) {
+    auto* task = current_task_for_preempt();
+    if (task == nullptr) {
+        return;
+    }
+
+    if (task->preemptDisableDepth == 0) {
+        uint64_t count = g_preempt_block_warnings.fetch_add(1, std::memory_order_relaxed);
+        if ((count & 0xffULL) == 0) {
+            preempt_log::warn("preempt_enable without disable: pid=%lu caller=0x%llx rip=0x%llx", task->pid, (unsigned long long)caller,
+                              (unsigned long long)task->context.frame.rip);
+        }
+        return;
+    }
+
+    task->preemptDisableDepth--;
+    if (task->preemptDisableDepth != 0) {
+        return;
+    }
+
+    if (task->preemptDisableStartUs != 0) {
+        uint64_t now_us = time::getUs();
+        if (now_us >= task->preemptDisableStartUs) {
+            uint64_t held_us = now_us - task->preemptDisableStartUs;
+            task->preemptDisableMaxUs = std::max(held_us, task->preemptDisableMaxUs);
+        }
+        task->preemptDisableStartUs = 0;
+    }
+    task->preemptDisableOwner = 0;
+
+    if (task->preemptPending) {
+        task->preemptPending = false;
+        if (run_queues != nullptr) {
+            request_local_reschedule();
+        }
+    }
+}
+
+void preempt_enable() { preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
+
+auto preempt_count() -> uint32_t {
+    auto* task = current_task_for_preempt();
+    return task != nullptr ? task->preemptDisableDepth : 0;
+}
+
+auto preemptible() -> bool { return preempt_count() == 0; }
+
+void note_preempt_disabled_block(const char* op, uint64_t perf_callsite) {
+    auto* task = current_task_for_preempt();
+    if (task == nullptr || task->preemptDisableDepth == 0) {
+        return;
+    }
+
+    uint64_t count = g_preempt_block_warnings.fetch_add(1, std::memory_order_relaxed);
+    if ((count & 0x3fULL) == 0) {
+        preempt_log::warn("blocking with preemption disabled: op=%s pid=%lu depth=%u owner=0x%llx callsite=0x%llx",
+                          op != nullptr ? op : "?", task->pid, task->preemptDisableDepth, (unsigned long long)task->preemptDisableOwner,
+                          (unsigned long long)perf_callsite);
+    }
+}
 
 void remove_current_task() {
     task::Task* task_to_gc = run_queues->this_cpu_locked([](RunQueue* rq) -> task::Task* {
@@ -1165,7 +1330,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
 #endif
         rq->isIdle.store(false, std::memory_order_release);
         debug_task_ptrs[cpu::currentCpu()] = next_task;
-        next_task->hasRun = true;
+        prepare_first_run_daemon(next_task, "idle-switch");
         rq->lastTickUs = time::getUs();
 
         if (!sys::context_switch::switchTo(gpr, frame, next_task)) {
@@ -1176,6 +1341,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             debug_task_ptrs[cpu::currentCpu()] = rq->idleTask;
             rq->isIdle.store(true, std::memory_order_release);
             arm_idle_timer_for_this_cpu();
+        } else {
+            next_task->hasRun = true;
         }
         return;
     }
@@ -1193,7 +1360,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
     // A PROCESS task that set voluntaryBlock is at a safe preemption point
     // (e.g. sti;hlt wait loop in a syscall).  Treat it like a DAEMON for
     // context-save and preemption purposes.
-    bool can_preempt_kernel = is_daemon || current_task->voluntaryBlock;
+    bool kernel_preempt_safe = is_daemon || current_task->voluntaryBlock;
+    bool preempt_disabled = current_task->preemptDisableDepth != 0;
+    bool can_preempt_kernel = kernel_preempt_safe && !preempt_disabled;
 
     // Save GPR/frame context: user-mode PROCESS tasks, or DAEMON/voluntaryBlock tasks (always kernel mode but preemptible)
     // NOTE: FPU save is deferred until we know a context switch is actually needed,
@@ -1207,8 +1376,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
 
     bool blocked_current_task = false;
     int64_t perf_lag_out = 0;
-    task::Task* next_task = run_queues->this_cpu_locked([current_task, in_kernel_mode, can_preempt_kernel, &blocked_current_task,
-                                                         &perf_lag_out](RunQueue* rq) -> task::Task* {
+    task::Task* next_task = run_queues->this_cpu_locked([current_task, in_kernel_mode, kernel_preempt_safe, can_preempt_kernel,
+                                                         &blocked_current_task, &perf_lag_out](RunQueue* rq) -> task::Task* {
         // Compute time delta since last tick
         uint64_t now_us = time::getUs();
         auto delta_us = (int64_t)(now_us - rq->lastTickUs);
@@ -1293,6 +1462,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
         // unless they set voluntaryBlock (safe blocking point).
         // DAEMON tasks are always in kernel mode but must be preemptible.
         if (in_kernel_mode && !can_preempt_kernel) {
+            if (kernel_preempt_safe && current_task->preemptDisableDepth != 0) {
+                current_task->preemptPending = true;
+            }
             return nullptr;
         }
 
@@ -1412,8 +1584,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
             restore_kernel_gs_for_idle();
 
             frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_idle_loop);
-            frame.cs = 0x08;
-            frame.ss = 0x10;
+            frame.cs = desc::gdt::GDT_KERN_CS;
+            frame.ss = desc::gdt::GDT_KERN_DS;
             frame.rsp = (idle_rq->idleTask != nullptr) ? idle_rq->idleTask->context.syscallKernelStack
                                                        : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
             frame.flags = 0x202;
@@ -1441,11 +1613,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& 
     task::Task* original_task = current_task;
     debug_task_ptrs[cpu::currentCpu()] = next_task;
     rq->isIdle.store(false, std::memory_order_release);
-    next_task->hasRun = true;
+    prepare_first_run_daemon(next_task, "timer-switch");
 
     if (!sys::context_switch::switchTo(gpr, frame, next_task)) {
         rq->currentTask = original_task;
         debug_task_ptrs[cpu::currentCpu()] = original_task;
+    } else {
+        next_task->hasRun = true;
     }
 }
 
@@ -1545,7 +1719,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
     rq->isIdle.store(false, std::memory_order_release);
     rq->currentTask = next_task;
     debug_task_ptrs[cpu::currentCpu()] = next_task;
-    next_task->hasRun = true;
+    prepare_first_run_daemon(next_task, "exit-switch");
 
     if (!sys::context_switch::switchTo(gpr, frame, next_task)) {
 #ifdef SCHED_DEBUG
@@ -1564,6 +1738,8 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFra
                                               : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
         frame.flags = 0x202;
         gpr = cpu::GPRegs();
+    } else {
+        next_task->hasRun = true;
     }
 }
 
@@ -1637,9 +1813,8 @@ void start_scheduler() {
         scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::currentCpu(), std::memory_order_acq_rel);
     }
 
-    // Check if task already ran before marking it - we need to know whether
-    // to resume from saved context or start fresh at the entry point.
     bool already_ran = first_task->hasRun;
+    prepare_first_run_daemon(first_task, "start-first");
     first_task->hasRun = true;
     rq->currentTask = first_task;
 
@@ -1669,7 +1844,13 @@ void start_scheduler() {
     // Initialize HPET timestamp for first tick
     rq->lastTickUs = time::getUs();
 
-    // Start the scheduler timer
+    // Keep interrupts masked until the final handoff has installed the target
+    // task stack. Otherwise an APIC timer can save `first_task` while we are
+    // still executing start_scheduler() on the CPU bootstrap stack.
+    asm volatile("cli" ::: "memory");
+
+    // Start the scheduler timer. The eventual enter path restores IF from the
+    // target frame or enables it after switching to the kernel-thread stack.
     sys::context_switch::startSchedTimer();
 
     // Restore FPU/SSE/AVX state (PROCESS tasks only, and only if previously saved).
@@ -1684,17 +1865,26 @@ void start_scheduler() {
         dbg::log("CPU %d: Resuming PID %x from saved context (rip=0x%x)", cpu::currentCpu(), first_task->pid,
                  first_task->context.frame.rip);
 #endif
+        validate_kernel_resume_target(first_task, "start-resume");
         _wOS_deferredTaskSwitchReturn(&first_task->context.regs, &first_task->context.frame);
         __builtin_unreachable();
     }
 
-    // DAEMON kernel thread - enter at kthreadEntry in ring 0 via iretq
+    // Brand-new DAEMON kernel thread: there is no interrupted kernel frame to
+    // resume yet, so install the initial stack directly and enter the thread
+    // trampoline. Preempted DAEMONs still use the generic resume path above.
     if (first_task->type == task::TaskType::DAEMON) {
 #ifdef SCHED_DEBUG
         dbg::log("CPU %d: Starting kernel thread PID %x '%s' (rip=0x%x)", cpu::currentCpu(), first_task->pid,
                  first_task->name ? first_task->name : "?", first_task->context.frame.rip);
 #endif
-        _wOS_deferredTaskSwitchReturn(&first_task->context.regs, &first_task->context.frame);
+        validate_kernel_resume_target(first_task, "start-daemon");
+        if (first_task->kthreadEntry == nullptr) {
+            resume_log::error("kernel thread without entry: pid=%lu name=%s", first_task->pid,
+                              first_task->name != nullptr ? first_task->name : "?");
+            hcf();
+        }
+        _wOS_startKernelThread(first_task->context.frame.rsp, first_task->kthreadEntry);
         __builtin_unreachable();
     }
 
@@ -1718,6 +1908,14 @@ void start_scheduler() {
 // Called with GS and pagemap already switched to `task`.
 static void check_pending_signals_deferred(task::Task* task) {
     if (task->type != task::TaskType::PROCESS) {
+        return;
+    }
+
+    // A PROCESS can be resumed here with a saved kernel frame when it was
+    // preempted at a voluntary syscall wait point.  Signal frames must only be
+    // built on a real user stack; the syscall/interrupt return paths will
+    // deliver the signal once the task reaches a user-mode return boundary.
+    if ((task->context.frame.cs & 0x3) != 0x3 || task->voluntaryBlock) {
         return;
     }
 
@@ -1809,6 +2007,9 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     if (current_task == nullptr) {
         return;
     }
+    if (current_task->preemptDisableDepth != 0) {
+        note_preempt_disabled_block("deferred_task_switch", current_task->perfWaitCallsite);
+    }
 
     // Build interrupt frame from syscall scratch area (syscall doesn't push one).
     // gs:0x28 = saved RCX (return RIP), gs:0x30 = saved R11 (RFLAGS), gs:0x08 = user RSP
@@ -1875,15 +2076,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                         if (current_task->waitStatusUserAddr != 0 && current_task->pagemap != nullptr) {
                             uint64_t status_phys = mm::virt::translate(current_task->pagemap, current_task->waitStatusUserAddr);
                             if (status_phys != mm::virt::PADDR_INVALID && status_phys != 0) {
-                                if (current_task->waitStatusPhysAddr != 0 && current_task->waitStatusPhysAddr != status_phys) {
-                                    wait_log::warn(
-                                        "waitpid-status drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx "
-                                        "pagemap=%p "
-                                        "path=sched-any",
-                                        current_task->pid, child->pid, (unsigned long long)current_task->waitStatusUserAddr,
-                                        (unsigned long long)current_task->waitStatusPhysAddr, (unsigned long long)status_phys,
-                                        (unsigned long long)current_task->context.frame.rsp, static_cast<void*>(current_task->pagemap));
-                                }
                                 auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(status_phys));
                                 *status_ptr = child->exitStatus;
                             }
@@ -1920,15 +2112,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 if (current_task->waitStatusUserAddr != 0 && current_task->pagemap != nullptr) {
                     uint64_t status_phys = mm::virt::translate(current_task->pagemap, current_task->waitStatusUserAddr);
                     if (status_phys != mm::virt::PADDR_INVALID && status_phys != 0) {
-                        if (current_task->waitStatusPhysAddr != 0 && current_task->waitStatusPhysAddr != status_phys) {
-                            wait_log::warn(
-                                "waitpid-status drift: waiter=%lu child=%lu va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp=0x%llx "
-                                "pagemap=%p "
-                                "path=sched-specific",
-                                current_task->pid, target->pid, (unsigned long long)current_task->waitStatusUserAddr,
-                                (unsigned long long)current_task->waitStatusPhysAddr, (unsigned long long)status_phys,
-                                (unsigned long long)current_task->context.frame.rsp, static_cast<void*>(current_task->pagemap));
-                        }
                         auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(status_phys));
                         *status_ptr = target->exitStatus;
                     }
@@ -2056,6 +2239,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         ker::net::wki::wki_proxy_task_blocked(current_task);
     }
 
+    if (next_task == current_task) {
+        current_task->hasRun = true;
+        debug_task_ptrs[cpu::currentCpu()] = current_task;
+        return;
+    }
+
     if (next_task == nullptr || next_task->type == task::TaskType::IDLE) {
         // Enter idle loop
         auto* rq = run_queues->this_cpu();
@@ -2080,6 +2269,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         __builtin_unreachable();
     }
 
+    prepare_first_run_daemon(next_task, "deferred-switch");
     next_task->hasRun = true;
 
     // Set up GS/FS for next task
@@ -2124,6 +2314,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     debug_task_ptrs[cpu::currentCpu()] = next_task;
 
+    validate_kernel_resume_target(next_task, "deferred-resume-next");
     check_pending_signals_deferred(next_task);
 
     // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
@@ -2180,7 +2371,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
     dbg::log("placeTaskInWaitQueue: Moved PID %x to wait queue", currentTask->pid);
 #endif
     if (next_task != nullptr && next_task->type != task::TaskType::IDLE) {
-        next_task->hasRun = true;
+        prepare_first_run_daemon(next_task, "waitqueue-switch");
         if (!sys::context_switch::switchTo(gpr, frame, next_task)) {
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
             auto* rq = run_queues->this_cpu();
@@ -2197,6 +2388,8 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::inter
                                                   : reinterpret_cast<uint64_t>(mm::phys::pageAlloc(4096)) + 4096;
             frame.flags = 0x202;
             gpr = cpu::GPRegs();
+        } else {
+            next_task->hasRun = true;
         }
     } else {
         // Only idle or no tasks - enter idle via iretq
@@ -2455,6 +2648,27 @@ auto get_active_task_at_safe(uint32_t index) -> task::Task* {
     }
     global_task_registry_lock.unlock_irqrestore(flags);
     return task;
+}
+
+auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
+    if (rsp < 0xffff800000000000ULL || rsp >= 0xffff900000000000ULL) {
+        return nullptr;
+    }
+    uint32_t count = active_task_count;
+    if (count > MAX_ACTIVE_TASKS) {
+        count = MAX_ACTIVE_TASKS;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        auto* task = active_task_list[i];
+        if (task == nullptr || task->context.syscallKernelStack == 0) {
+            continue;
+        }
+        uint64_t stack_top = task->context.syscallKernelStack;
+        if (rsp > stack_top - KERNEL_STACK_SIZE && rsp <= stack_top) {
+            return task;
+        }
+    }
+    return nullptr;
 }
 
 auto get_dead_task_count(uint64_t cpu_no) -> size_t {
@@ -2923,6 +3137,9 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.current_voluntary_block = current->voluntaryBlock;
             state.current_wants_block = current->wantsBlock;
             state.current_cpu_pinned = current->cpu_pinned;
+            state.current_preempt_depth = current->preemptDisableDepth;
+            state.current_preempt_pending = current->preemptPending;
+            state.current_preempt_max_us = current->preemptDisableMaxUs;
         }
 
         return state;

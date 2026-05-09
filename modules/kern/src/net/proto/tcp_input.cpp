@@ -452,9 +452,20 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     // Keep advertised window in sync with receive buffer.
                     cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                 }
-                // Delayed ACK: every 2 segments or 40 ms.
-                cb->segs_pending_ack++;
-                if (cb->segs_pending_ack >= 2) {
+                // Interactive streams such as SSH commonly send tiny PSH
+                // records during key exchange. ACK those immediately; relying
+                // on the delayed-ACK timer here can stall the peer if the timer
+                // worker is not scheduled quickly enough under early boot/load.
+                const bool ack_immediately = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
+                if (ack_immediately) {
+                    cb->segs_pending_ack = 0;
+                    cb->delayed_ack_deadline = 0;
+                    build_deferred_ack();
+                    if (deferred_ack == nullptr) {
+                        cb->ack_pending = true;
+                        tcp_timer_arm(cb);
+                    }
+                } else if (++cb->segs_pending_ack >= 2) {
                     cb->segs_pending_ack = 0;
                     cb->delayed_ack_deadline = 0;
                     build_deferred_ack();
@@ -467,10 +478,15 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     tcp_timer_arm(cb);
                 }
             } else if (payload_len > 0) {
-                // Drop out-of-order data; no dup-ACK path here.
+                // Duplicate or out-of-order data still needs an ACK carrying
+                // the current rcv_nxt. Without this, a lost delayed ACK leaves
+                // the peer retransmitting a segment we already consumed.
                 if (cb->socket != nullptr) {
                     cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                 }
+                cb->segs_pending_ack = 0;
+                cb->delayed_ack_deadline = 0;
+                build_deferred_ack();
             } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(seg_seq, cb->rcv_nxt)) {
                 // Keepalive probe
                 build_deferred_ack();

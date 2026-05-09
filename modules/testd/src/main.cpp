@@ -106,6 +106,7 @@ void fail(const char* name, const char* reason) {
 // ---------------------------------------------------------------------------
 constexpr std::string_view RH_PIPE_WRITE_MSG = "remote_pipe_ok\n";
 constexpr std::string_view RH_PIPE_READ_EXPECT = "parent_pipe_ok\n";
+constexpr std::string_view RH_PTY_WRITE_MSG = "remote_pty_ok\n";
 constexpr std::string_view RH_SOCKET_WRITE_MSG = "remote_sock_ok\n";
 constexpr int RH_SOCKET_CTRL_RCVBUF = 16384;
 constexpr int RH_EXIT_EXEC_FAILED = 127;
@@ -1218,6 +1219,73 @@ TESTD_RUN(test_remote_ipc_pipe_parent_write) {
 }
 TESTD_RUN_END(test_remote_ipc_pipe_parent_write)
 
+// Remote child writes through an inherited PTY slave fd (IPC_PTY proxy) and
+// the local PTY master receives the bytes.
+TESTD_RUN(test_remote_ipc_pty_child_write) {
+    int master_fd = open("/dev/ptmx", O_RDWR);
+    if (master_fd < 0) {
+        fail("remote_pty_data_open_master", "open /dev/ptmx failed");
+        return;
+    }
+
+    unsigned int pty_num = 0;
+    if (ioctl(master_fd, TIOCGPTN, &pty_num) != 0) {
+        close(master_fd);
+        fail("remote_pty_data_tiocgptn", "TIOCGPTN failed");
+        return;
+    }
+
+    int unlock = 0;
+    if (ioctl(master_fd, TIOCSPTLCK, &unlock) != 0) {
+        close(master_fd);
+        fail("remote_pty_data_unlock_slave", "TIOCSPTLCK unlock failed");
+        return;
+    }
+
+    std::array<char, 32> slave_path{};
+    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    int slave_fd = open(slave_path.data(), O_RDWR);
+    if (slave_fd < 0) {
+        close(master_fd);
+        fail("remote_pty_data_open_slave", "open slave failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t pid = spawn_remote_helper("pty-write", slave_fd, master_fd);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    if (pid < 0) {
+        close(master_fd);
+        close(slave_fd);
+        fail("remote_pty_data_fork", "fork failed");
+        return;
+    }
+
+    close(slave_fd);
+
+    std::array<char, 64> buf{};
+    ssize_t n = read(master_fd, buf.data(), buf.size());
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(master_fd);
+
+    if (n != static_cast<ssize_t>(RH_PTY_WRITE_MSG.size()) ||
+        std::string_view(buf.data(), static_cast<size_t>(n)) != RH_PTY_WRITE_MSG) {
+        fail("remote_pty_data", "PTY payload mismatch");
+        return;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_pty_child_exit", "child exited with error");
+        return;
+    }
+
+    TESTD_PASS("remote_pty_data");
+}
+TESTD_RUN_END(test_remote_ipc_pty_child_write)
+
 // Remote child inherits a PTY slave fd and performs TIOCGWINSZ ioctl through
 // the IPC_PTY proxy.
 TESTD_RUN(test_remote_ipc_pty_ioctl) {
@@ -1624,6 +1692,7 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_tcp_nonblocking_connect_refused) \
     X(test_remote_ipc_pipe_child_write)     \
     X(test_remote_ipc_pipe_parent_write)    \
+    X(test_remote_ipc_pty_child_write)      \
     X(test_remote_ipc_pty_ioctl)            \
     X(test_remote_ipc_socket_child_write)   \
     X(test_remote_ipc_socket_control_ops)   \
@@ -1682,6 +1751,11 @@ auto main(int argc, char** argv) -> int {
             int rc = ioctl(fd, TIOCGWINSZ, &ws);
             close(fd);
             return (rc == 0) ? 0 : 1;
+        }
+        if (std::strcmp(mode, "pty-write") == 0) {
+            ssize_t n = write(fd, RH_PTY_WRITE_MSG.data(), RH_PTY_WRITE_MSG.size());
+            close(fd);
+            return (n == static_cast<ssize_t>(RH_PTY_WRITE_MSG.size())) ? 0 : 1;
         }
         if (std::strcmp(mode, "sock-write") == 0) {
             ssize_t n = send(fd, RH_SOCKET_WRITE_MSG.data(), RH_SOCKET_WRITE_MSG.size(), 0);

@@ -2,6 +2,55 @@ bits 64
 
 %include "platform/asm/helpers.asm"
 
+%assign GPREGS_SIZE 120
+%assign IRETQ_KERNEL_FRAME_SIZE 24
+
+%macro build_kernel_return_from_stack 0
+    mov r10, [rsp + GPREGS_SIZE + 40]  ; saved kernel RSP
+    mov r12, [rsp + GPREGS_SIZE + 16]  ; RIP
+    mov r13, [rsp + GPREGS_SIZE + 24]  ; CS
+    mov r14, [rsp + GPREGS_SIZE + 32]  ; RFLAGS
+    sub r10, GPREGS_SIZE + IRETQ_KERNEL_FRAME_SIZE
+
+    %assign i 14
+    %rep 15
+        mov r11, [rsp + i * 8]
+        mov [r10 + i * 8], r11
+        %assign i i - 1
+    %endrep
+
+    mov [r10 + GPREGS_SIZE], r12
+    mov [r10 + GPREGS_SIZE + 8], r13
+    mov [r10 + GPREGS_SIZE + 16], r14
+
+    mov rsp, r10
+    popq
+    iretq
+%endmacro
+
+%macro build_kernel_return_from_ptrs 0
+    mov r10, [rsi + 40]  ; saved kernel RSP
+    mov r12, [rsi + 16]  ; RIP
+    mov r13, [rsi + 24]  ; CS
+    mov r14, [rsi + 32]  ; RFLAGS
+    sub r10, GPREGS_SIZE + IRETQ_KERNEL_FRAME_SIZE
+
+    %assign i 14
+    %rep 15
+        mov r11, [rdi + i * 8]
+        mov [r10 + i * 8], r11
+        %assign i i - 1
+    %endrep
+
+    mov [r10 + GPREGS_SIZE], r12
+    mov [r10 + GPREGS_SIZE + 8], r13
+    mov [r10 + GPREGS_SIZE + 16], r14
+
+    mov rsp, r10
+    popq
+    iretq
+%endmacro
+
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace
     je .%1
@@ -16,6 +65,42 @@ _wOS_kernel_idle_loop:
     sti         ; Enable interrupts
     hlt         ; Halt until interrupt
     jmp _wOS_kernel_idle_loop  ; Loop forever
+
+extern _wOS_kernel_thread_returned
+global _wOS_kernel_thread_trampoline
+_wOS_kernel_thread_trampoline:
+    ; Kernel thread tasks enter here via iretq with rdi = entry function and
+    ; rsp 16-byte aligned. Calling the entry gives C++ the normal SysV stack
+    ; shape: callee entry sees rsp % 16 == 8 and has a real return address.
+    call rdi
+    call _wOS_kernel_thread_returned
+.kernel_thread_return_halt:
+    cli
+    hlt
+    jmp .kernel_thread_return_halt
+
+global _wOS_startKernelThread
+_wOS_startKernelThread:
+    ; rdi = initial kernel stack top
+    ; rsi = kernel thread entry function
+    ;
+    ; Brand-new kernel threads do not have a previously interrupted kernel
+    ; frame to resume. Start them by installing the stack directly, then jump
+    ; into the normal trampoline with the entry function in rdi.
+    mov rsp, rdi
+    mov rdi, rsi
+    sti
+    jmp _wOS_kernel_thread_trampoline
+
+global _wOS_enterIdleStack
+_wOS_enterIdleStack:
+    ; rdi = idle kernel stack top
+    ;
+    ; Idle has no meaningful continuation. Re-entering it directly avoids
+    ; constructing a same-CPL iret frame at the very top of the idle stack.
+    mov rsp, rdi
+    sti
+    jmp _wOS_kernel_idle_loop
 
 global _wOS_asm_enterUsermode
 _wOS_asm_enterUsermode:
@@ -70,11 +155,16 @@ task_switch_handler:
     mov rdi, rsp
     call _wOS_schedTimer
 
+    ; Same-CPL iretq does not pop SS:RSP, so kernel-mode task switches
+    ; must explicitly move to the target kernel stack first.
+    cmp qword [rsp + GPREGS_SIZE + 24], qword 0x23
+    jne .kernel_return
+
     popq
     ; Check if returning to userspace (CS at offset 24 == 0x23)
     cmp qword [rsp + 24], qword 0x23
     jne .no_swapgs_exit
-    
+
     ; Returning to userspace - set up data segment selectors
     push rax
     push r8
@@ -91,11 +181,13 @@ task_switch_handler:
     pop r9
     pop r8
     pop rax
-    
+
     swapgs
     .no_swapgs_exit:
     add rsp, 16  ; Skip intNum and errCode
     iretq
+    .kernel_return:
+    build_kernel_return_from_stack
 
 ; Jump to next task without saving current task state
 ; Used when a task is exiting and doesn't need its context preserved
@@ -132,11 +224,16 @@ jump_to_next_task_no_save:
     mov rdi, rsp
     call _wOS_jumpToNextTaskNoSave
 
+    ; Same-CPL iretq does not restore RSP; kernel targets need a frame on
+    ; their own stack.
+    cmp qword [rsp + GPREGS_SIZE + 24], qword 0x23
+    jne .kernel_return_jump
+
     popq
     ; Check if returning to userspace (CS at offset 24 == 0x23)
     cmp qword [rsp + 24], qword 0x23
     jne .no_swapgs_exit_jump
-    
+
     ; Returning to userspace - set up data segment selectors
     push rax
     push r8
@@ -153,12 +250,13 @@ jump_to_next_task_no_save:
     pop r9
     pop r8
     pop rax
-    
+
     swapgs
     .no_swapgs_exit_jump:
     add rsp, 16  ; Skip intNum and errCode
-    sti
     iretq
+    .kernel_return_jump:
+    build_kernel_return_from_stack
 
 ; Return from deferred task switch
 ; rdi = pointer to GPRegs structure in memory
@@ -175,6 +273,11 @@ jump_to_next_task_no_save:
 global _wOS_deferredTaskSwitchReturn
 _wOS_deferredTaskSwitchReturn:
     ; rdi = GPRegs*, rsi = interruptFrame*
+
+    ; Returning to a kernel-mode task is a same-CPL iretq. Build the return
+    ; frame on the saved kernel stack so RSP is restored correctly.
+    cmp qword [rsi + 24], qword 0x23
+    jne .kernel_return_deferred
 
     ; First, build the interrupt frame on the stack for iretq
     ; iretq expects (from bottom to top): ss, rsp, flags, cs, rip
@@ -213,7 +316,7 @@ _wOS_deferredTaskSwitchReturn:
     ; Check if we need swapgs (cs == 0x23 means userspace)
     cmp qword [rsp], 0x23
     jne .no_swapgs_deferred
-    
+
     ; Returning to userspace - set up data segment selectors
     ; Must do this BEFORE swapgs since we need scratch registers
     push rax
@@ -233,15 +336,14 @@ _wOS_deferredTaskSwitchReturn:
     pop r9
     pop r8
     pop rax
-    
+
     swapgs
 .no_swapgs_deferred:
     ; Remove the saved cs from stack
     add rsp, 8
 
-    ; Enable interrupts and return
-    sti
+    ; Return with the interrupt state from the saved frame.  Do not force STI
+    ; here: synthetic kernel frames must preserve their original IF state.
     iretq
-
-
-
+    .kernel_return_deferred:
+    build_kernel_return_from_ptrs

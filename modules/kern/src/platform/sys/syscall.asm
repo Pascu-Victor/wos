@@ -62,7 +62,9 @@ _wOS_asm_syscallHandler:
     lea rsi, [rsp+136]     ; Frame pointer (after GPRegs)
     sub rsp, 8  ; Align stack for call
     call deferred_task_switch
-    ; deferred_task_switch will not return - it switches tasks
+    ; deferred_task_switch returns only if it decided to resume this task via
+    ; the normal syscall exit path.
+    add rsp, 8
 
 .no_deferred_switch:
     ; Check for pending signals before returning to userspace
@@ -88,7 +90,6 @@ _wOS_asm_syscallHandler:
 
     mov rsp, [gs:0x08] ; restore usermode stack
     swapgs
-    sti
     o64 sysret
 
 .sysret_rcx_corrupt:

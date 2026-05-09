@@ -977,7 +977,7 @@ auto vfs_read_retry_timeout_us(uint16_t op_id, uint32_t attempt) -> uint64_t {
 }
 
 auto vfs_read_status_is_retryable(int status) -> bool {
-    return status == WKI_ERR_TIMEOUT || status == WKI_ERR_NO_CREDITS || status == WKI_ERR_TX_FAILED;
+    return status == WKI_ERR_TIMEOUT || status == WKI_ERR_NO_CREDITS || status == WKI_ERR_TX_FAILED || status == WKI_ERR_NO_MEM;
 }
 
 auto vfs_proxy_read_with_retry(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,

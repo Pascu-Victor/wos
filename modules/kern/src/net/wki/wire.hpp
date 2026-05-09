@@ -725,17 +725,20 @@ struct TaskSubmitPayload {
     uint16_t argc;          // Number of NUL-separated argument strings
     uint16_t envc;          // Number of NUL-separated env strings (KEY=VALUE)
     uint16_t cwd_len;       // Length of CWD string (0 = use default "/")
-    uint16_t ipc_fd_count;  // Number of WkiIpcFdEntry following argv/envp/cwd
-    // Variable portion follows at offset 16, depends on delivery_mode:
+    uint16_t identity_len;  // Length of task identity block after argv/envp/cwd
+    uint16_t ipc_fd_count;  // Number of WkiIpcFdEntry following context/policy data
+    uint16_t reserved;
+    // Variable portion follows at offset 20, depends on delivery_mode:
     //   INLINE:       uint32_t binary_len, binary[binary_len]
     //   VFS_REF:      uint16_t path_len, path[path_len]
     //   RESOURCE_REF: uint16_t ref_node_id, uint32_t ref_resource_id,
     //                 uint16_t path_len, path[path_len]
     // Then: argc NUL-terminated arg strings, envc NUL-terminated env strings,
-    //       cwd string (cwd_len bytes including NUL)
+    //       cwd string (cwd_len bytes including NUL), identity block, VFS policy,
+    //       IPC fd entries.
 } __attribute__((packed));
 
-static_assert(sizeof(TaskSubmitPayload) == 16, "TaskSubmitPayload V2 must be 16 bytes");
+static_assert(sizeof(TaskSubmitPayload) == 20, "TaskSubmitPayload V3 must be 20 bytes");
 
 // -----------------------------------------------------------------------------
 // TASK_ACCEPT / TASK_REJECT Payload - 16 bytes

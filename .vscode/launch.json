@@ -302,10 +302,6 @@
                 "Attach Cluster VM1",
                 "Attach Cluster VM2",
                 "Attach Cluster VM3",
-                "Attach Cluster VM4",
-                "Attach Cluster VM5",
-                "Attach Cluster VM6",
-                "Attach Cluster VM7"
             ],
             "stopAll": true
         }

@@ -29,10 +29,12 @@ ker::mod::sched::task::Task* timer_task = nullptr;
 
 // Earliest deadline across timer-list entries.
 std::atomic<uint64_t> timer_earliest{UINT64_MAX};
+std::atomic<uint64_t> timer_lock_contentions{0};
 
 constexpr uint8_t MAX_RETRIES = 8;
 constexpr size_t MAX_DEFERRED_RETRANSMITS = 16;
 constexpr uint64_t TCP_TIMER_IDLE_SLEEP_US = 100000;
+constexpr uint64_t TCP_TIMER_OVERDUE_BACKOFF_US = 1000;
 constexpr uint64_t TCP_TIMER_MS_TO_US = 1000;
 
 struct DeferredRetransmit {
@@ -43,6 +45,19 @@ struct DeferredRetransmit {
     TcpCB* cb;
     TcpCB* ack_cb;
 };
+
+void timer_lock_acquire() {
+    // Lock order: callers may hold cb->lock when arming/disarming. The timer
+    // worker snapshots the list under timer_lock, drops it, then takes cb->lock
+    // for protocol work. Spinlock itself disables task preemption, so this lock
+    // stays IRQ-enabled while still being safe for preemptible DAEMON workers.
+    if (!timer_lock.try_lock()) {
+        timer_lock_contentions.fetch_add(1, std::memory_order_relaxed);
+        timer_lock.lock();
+    }
+}
+
+void timer_lock_release() { timer_lock.unlock(); }
 
 auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* deferred, size_t deferred_count) -> size_t {
     entry->retries++;
@@ -122,7 +137,7 @@ void tcp_timer_arm(TcpCB* cb) {
     }
 
     bool wake_timer = false;
-    timer_lock.lock();
+    timer_lock_acquire();
     if (!cb->on_timer_list) {
         tcp_cb_acquire(cb);
         cb->timer_next = timer_head;
@@ -135,7 +150,7 @@ void tcp_timer_arm(TcpCB* cb) {
         timer_earliest.store(deadline, std::memory_order_relaxed);
         wake_timer = true;
     }
-    timer_lock.unlock();
+    timer_lock_release();
 
     if (wake_timer && timer_task != nullptr) {
         ker::mod::sched::kern_wake(timer_task);
@@ -143,9 +158,9 @@ void tcp_timer_arm(TcpCB* cb) {
 }
 
 void tcp_timer_disarm(TcpCB* cb) {
-    timer_lock.lock();
+    timer_lock_acquire();
     if (!cb->on_timer_list) {
-        timer_lock.unlock();
+        timer_lock_release();
         return;
     }
 
@@ -155,14 +170,14 @@ void tcp_timer_disarm(TcpCB* cb) {
             *pp = cb->timer_next;
             cb->timer_next = nullptr;
             cb->on_timer_list = false;
-            timer_lock.unlock();
+            timer_lock_release();
             tcp_cb_release(cb);
             return;
         }
         pp = &(*pp)->timer_next;
     }
     cb->on_timer_list = false;
-    timer_lock.unlock();
+    timer_lock_release();
 }
 
 void tcp_timer_tick(uint64_t now_ms) {
@@ -172,13 +187,13 @@ void tcp_timer_tick(uint64_t now_ms) {
     if (now_ms - last_status_ms >= 5000) {
         last_status_ms = now_ms;
         size_t timer_list_len = 0;
-        timer_lock.lock();
+        timer_lock_acquire();
         for (TcpCB* c = timer_head; c != nullptr; c = c->timer_next) {
             timer_list_len++;
         }
-        timer_lock.unlock();
-        ker::mod::dbg::log("[net] pool_free=%zu/%zu timer_list=%zu", ker::net::pkt_pool_free_count(), ker::net::pkt_pool_size(),
-                           timer_list_len);
+        timer_lock_release();
+        ker::mod::dbg::log("[net] pool_free=%zu/%zu timer_list=%zu timer_lock_contentions=%lu", ker::net::pkt_pool_free_count(),
+                           ker::net::pkt_pool_size(), timer_list_len, timer_lock_contentions.load(std::memory_order_relaxed));
     }
 #endif
 
@@ -195,7 +210,7 @@ void tcp_timer_tick(uint64_t now_ms) {
     TcpCB* to_free = nullptr;
     uint64_t next_earliest = UINT64_MAX;
 
-    timer_lock.lock();
+    timer_lock_acquire();
     TcpCB** pp = &timer_head;
     while (*pp != nullptr && batch_count < MAX_BATCH) {
         TcpCB* cb = *pp;
@@ -271,7 +286,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         pp = &(*pp)->timer_next;
     }
     timer_earliest.store(next_earliest, std::memory_order_relaxed);
-    timer_lock.unlock();
+    timer_lock_release();
 
     // Free dead TCBs after removing from hash table.
     while (to_free != nullptr) {
@@ -484,9 +499,10 @@ void tcp_timer_tick(uint64_t now_ms) {
         earliest = timer_earliest.load(std::memory_order_relaxed);
         if (earliest != UINT64_MAX) {
             if (earliest <= now_ms) {
-                continue;
+                sleep_us = TCP_TIMER_OVERDUE_BACKOFF_US;
+            } else {
+                sleep_us = std::max<uint64_t>((earliest - now_ms) * TCP_TIMER_MS_TO_US, 1);
             }
-            sleep_us = std::max<uint64_t>((earliest - now_ms) * TCP_TIMER_MS_TO_US, 1);
         }
 #ifdef NET_TRACE
         ker::net::trace::flush();

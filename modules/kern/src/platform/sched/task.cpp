@@ -14,6 +14,8 @@
 
 #include "platform/asm/msr.hpp"
 
+extern "C" void _wOS_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
+
 namespace ker::mod::sched::task {
 Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
@@ -37,6 +39,11 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->deferredTaskSwitch = false;  // No deferred switch by default
     this->yieldSwitch = false;
     this->kthreadEntry = nullptr;
+    this->preemptDisableDepth = 0;
+    this->preemptPending = false;
+    this->preemptDisableStartUs = 0;
+    this->preemptDisableMaxUs = 0;
+    this->preemptDisableOwner = 0;
 
     // Waitpid state
     this->waitingForPid = 0;
@@ -439,6 +446,11 @@ Task* Task::createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, u
 }
 
 Task* Task::createKernelThread(const char* name, void (*entryFunc)()) {
+    if (entryFunc == nullptr) {
+        dbg::log("createKernelThread: null entry for '%s'", name != nullptr ? name : "?");
+        return nullptr;
+    }
+
     auto stackBase = (uint64_t)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
     if (stackBase == 0) {
         dbg::log("createKernelThread: OOM allocating kernel stack for '%s'", name);
@@ -448,7 +460,8 @@ Task* Task::createKernelThread(const char* name, void (*entryFunc)()) {
 
     auto* task = new Task(name, 0, kernelRsp, TaskType::DAEMON);
     task->kthreadEntry = entryFunc;
-    task->context.frame.rip = (uint64_t)entryFunc;
+    task->context.frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_thread_trampoline);
+    task->context.regs.rdi = reinterpret_cast<uint64_t>(entryFunc);
     return task;
 }
 
