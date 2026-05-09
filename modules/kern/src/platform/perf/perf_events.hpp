@@ -16,13 +16,14 @@ struct PerfCallsiteInfo {
     uint32_t line;
     uint32_t reserved;
 };
-
-#define WOS_PERF_CALLSITE()                                                                                                       \
-    __extension__({                                                                                                               \
-        static const ::ker::mod::perf::PerfCallsiteInfo __wos_perf_site = {::ker::mod::perf::PERF_CALLSITE_MAGIC, __FILE__,     \
-                                                                            __func__, static_cast<uint32_t>(__LINE__), 0U};       \
-        reinterpret_cast<uint64_t>(&__wos_perf_site);                                                                            \
+// NOLINTBEGIN(cppcoreguidelines-macro-usage)
+#define WOS_PERF_CALLSITE()                                                                                                           \
+    __extension__({                                                                                                                   \
+        static const ::ker::mod::perf::PerfCallsiteInfo __wos_perf_site = {::ker::mod::perf::PERF_CALLSITE_MAGIC, __FILE__, __func__, \
+                                                                           static_cast<uint32_t>(__LINE__), 0U};                      \
+        reinterpret_cast<uint64_t>(&__wos_perf_site);                                                                                 \
     })
+// NOLINTEND(cppcoreguidelines-macro-usage)
 
 // ===========================================================================
 // Event types and flags
@@ -40,13 +41,13 @@ enum class PerfEventType : uint8_t {
 constexpr size_t PERF_EVENT_TYPE_COUNT = 6;
 
 // Bitmask for selective event recording
-constexpr uint8_t PERF_MASK_SAMPLE = 1u << 0;
-constexpr uint8_t PERF_MASK_SWITCH = 1u << 1;
-constexpr uint8_t PERF_MASK_WAKE = 1u << 2;
-constexpr uint8_t PERF_MASK_SLEEP = 1u << 3;
-constexpr uint8_t PERF_MASK_CONTAINER = 1u << 4;
-constexpr uint8_t PERF_MASK_WKI = 1u << 5;
-constexpr uint8_t PERF_MASK_WKI_LAUNCH = 1u << 6;
+constexpr uint8_t PERF_MASK_SAMPLE = 1U << 0;
+constexpr uint8_t PERF_MASK_SWITCH = 1U << 1;
+constexpr uint8_t PERF_MASK_WAKE = 1U << 2;
+constexpr uint8_t PERF_MASK_SLEEP = 1U << 3;
+constexpr uint8_t PERF_MASK_CONTAINER = 1U << 4;
+constexpr uint8_t PERF_MASK_WKI = 1U << 5;
+constexpr uint8_t PERF_MASK_WKI_LAUNCH = 1U << 6;
 constexpr uint8_t PERF_MASK_ALL = 0x7F;
 
 // Flags for SAMPLE / SWITCH events
@@ -252,7 +253,7 @@ struct PerfCpuStats {
 // ===========================================================================
 
 constexpr size_t PERF_RING_SHIFT = 11;
-constexpr size_t PERF_RING_ENTRIES = 1u << PERF_RING_SHIFT;  // 2048
+constexpr size_t PERF_RING_ENTRIES = 1U << PERF_RING_SHIFT;  // 2048
 constexpr size_t PERF_RING_MASK = PERF_RING_ENTRIES - 1;
 constexpr size_t PERF_MAX_CPUS = 16;
 

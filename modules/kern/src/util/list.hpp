@@ -4,6 +4,7 @@
 
 namespace std {
 template <typename T>
+// NOLINTNEXTLINE(readability-identifier-naming)
 class list {
    public:
     struct Node {
@@ -12,21 +13,14 @@ class list {
         Node* prev;
     };
 
-    list() {
-        head = nullptr;
-        tail = nullptr;
-        m_size = 0;
-    }
+    list() : head(nullptr), tail(nullptr), m_size(0) {}
 
     ~list() { clear(); }
 
     list(const list&) = delete;
     auto operator=(const list&) -> list& = delete;
 
-    list(list&& other) noexcept {
-        head = other.head;
-        tail = other.tail;
-        m_size = other.m_size;
+    list(list&& other) noexcept : head(other.head), tail(other.tail), m_size(other.m_size) {
         other.head = nullptr;
         other.tail = nullptr;
         other.m_size = 0;
@@ -58,7 +52,7 @@ class list {
 
         tail = node;
 
-        if (!head) {
+        if (head == nullptr) {
             head = node;
         }
 
@@ -77,7 +71,7 @@ class list {
 
         head = node;
 
-        if (!tail) {
+        if (tail == nullptr) {
             tail = node;
         }
 
@@ -85,7 +79,7 @@ class list {
     }
 
     auto pop_back() -> T {
-        if (!tail) {
+        if (tail == nullptr) {
             return T();
         }
 
@@ -99,7 +93,7 @@ class list {
         delete tail;
         tail = prev;
 
-        if (!tail) {
+        if (tail == nullptr) {
             head = nullptr;
         }
 
@@ -109,7 +103,7 @@ class list {
     }
 
     auto pop_front() -> T {
-        if (!head) {
+        if (head == nullptr) {
             return T();
         }
 
@@ -123,7 +117,7 @@ class list {
         delete head;
         head = next;
 
-        if (!head) {
+        if (head == nullptr) {
             tail = nullptr;
         }
 
@@ -143,7 +137,7 @@ class list {
     void remove(const T& data) {
         Node* current = head;
         while (current) {
-            Node* nextNode = current->next;  // Save next before potentially deleting current
+            Node* next_node = current->next;  // Save next before potentially deleting current
             if (current->data == data) {
                 if (current->prev) {
                     current->prev->next = current->next;
@@ -161,7 +155,7 @@ class list {
                 m_size--;
                 // Continue to remove ALL occurrences, not just the first
             }
-            current = nextNode;
+            current = next_node;
         }
     }
 
@@ -177,8 +171,8 @@ class list {
         m_size = 0;
     }
 
-    Node* getHead() const { return head; }
-    Node* getTail() const { return tail; }
+    Node* get_head() const { return head; }
+    Node* get_tail() const { return tail; }
 
    private:
     Node* head;

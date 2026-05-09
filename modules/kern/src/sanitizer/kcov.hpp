@@ -21,10 +21,10 @@ constexpr size_t KCOV_MAX_ENTRIES = 256 * 1024;
 // Per-task KCOV buffer.  Allocated lazily when userspace enables coverage
 // collection for a task via ioctl/procfs.
 struct KcovBuffer {
-    uint64_t* pcs = nullptr;     // Ring buffer of recorded PCs
-    uint64_t count = 0;          // Number of PCs recorded so far
-    uint64_t capacity = 0;       // Allocated size (in entries)
-    bool enabled = false;        // Coverage collection active?
+    uint64_t* pcs = nullptr;  // Ring buffer of recorded PCs
+    uint64_t count = 0;       // Number of PCs recorded so far
+    uint64_t capacity = 0;    // Allocated size (in entries)
+    bool enabled = false;     // Coverage collection active?
 };
 
 // Initialize the KCOV subsystem (called from kernel init)

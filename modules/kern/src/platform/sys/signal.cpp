@@ -60,20 +60,20 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     if (task == nullptr) return;
 
     // Get PerCpu struct to read/write user RSP, RIP, and RFLAGS
-    auto* perCpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscallScratchArea);
+    auto* perCpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
 
     // --- Handle sigreturn first ---
-    if (task->doSigreturn) {
-        task->doSigreturn = false;
+    if (task->do_sigreturn) {
+        task->do_sigreturn = false;
 
         // User RSP at sigreturn syscall entry points to &frame.signo
         // (restorer's `ret` already popped pretcode, so RSP = pretcode + 8 = &signo)
-        uint64_t userRsp = perCpu->userRsp;
-        auto* frameStart = reinterpret_cast<uint8_t*>(userRsp - 8);  // back up to pretcode
+        uint64_t user_rsp = perCpu->user_rsp;
+        auto* frameStart = reinterpret_cast<uint8_t*>(user_rsp - 8);  // back up to pretcode
         auto* frame = reinterpret_cast<SignalFrame*>(frameStart);
 
         // Restore signal mask
-        task->sigMask = frame->saved_mask;
+        task->sig_mask = frame->saved_mask;
 
         // Restore GP registers to the on-stack positions
         for (int i = 0; i < 15; i++) {
@@ -84,20 +84,20 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
         stack_write(stack_base, STACK_OFF_RETVAL, frame->saved_retval);
 
         // Restore user RIP, RSP, and RFLAGS through PerCpu
-        perCpu->userRsp = frame->saved_rsp;
-        perCpu->syscallRetRip = frame->saved_rip;
-        perCpu->syscallRetFlags = frame->saved_rflags;
+        perCpu->user_rsp = frame->saved_rsp;
+        perCpu->syscall_ret_rip = frame->saved_rip;
+        perCpu->syscall_ret_flags = frame->saved_rflags;
 
         // Also update the on-stack RCX (used by sysret) and R11 (RFLAGS)
         stack_write(stack_base, STACK_OFF_RCX, frame->saved_rip);
         stack_write(stack_base, STACK_OFF_R11, frame->saved_rflags);
 
-        task->inSignalHandler = false;
+        task->in_signal_handler = false;
         return;  // Don't deliver new signals right after sigreturn
     }
 
     // --- Check for deliverable signals ---
-    uint64_t deliverable = task->sigPending & ~task->sigMask;
+    uint64_t deliverable = task->sig_pending & ~task->sig_mask;
     if (deliverable == 0) return;
 
     // Find the first pending signal (1-based)
@@ -105,9 +105,9 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     unsigned idx = static_cast<unsigned>(signo - 1);
 
     // Clear the pending bit
-    task->sigPending &= ~(1ULL << idx);
+    task->sig_pending &= ~(1ULL << idx);
 
-    auto& handler = task->sigHandlers[idx];
+    auto& handler = task->sig_handlers[idx];
 
     // Handle SIG_DFL
     if (handler.handler == WOS_SIG_DFL) {
@@ -120,13 +120,13 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
         }
         // Uncatchable stop signal
         if (signo == WOS_SIGSTOP) {
-            task->voluntaryBlock = true;
+            task->voluntary_block = true;
             return;
         }
         // Job control stop signals: default action is to stop the process
         if (signo == 20 || signo == 21 || signo == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
             // Block the task so the scheduler won't run it until SIGCONT
-            task->voluntaryBlock = true;
+            task->voluntary_block = true;
             return;
         }
         // Default terminate semantics for normal fatal signals.
@@ -148,9 +148,9 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     }
 
     // --- Deliver the signal: set up signal frame on user stack ---
-    uint64_t user_rsp = perCpu->userRsp;
-    uint64_t user_rip = perCpu->syscallRetRip;
-    uint64_t user_rflags = perCpu->syscallRetFlags;
+    uint64_t user_rsp = perCpu->user_rsp;
+    uint64_t user_rip = perCpu->syscall_ret_rip;
+    uint64_t user_rflags = perCpu->syscall_ret_flags;
 
     // Compute frame location on user stack. make sure it is 16 byte aligned
     // for system V compat
@@ -161,7 +161,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     // (We're still in the task's pagemap during syscall, so direct writes work)
     frame->pretcode = handler.restorer;  // sa_restorer trampoline
     frame->signo = static_cast<uint64_t>(signo);
-    frame->saved_mask = task->sigMask;
+    frame->saved_mask = task->sig_mask;
     frame->saved_rip = user_rip;
     frame->saved_rsp = user_rsp;
     frame->saved_rflags = user_rflags;
@@ -177,17 +177,17 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     stack_write(stack_base, STACK_OFF_RDI, static_cast<uint64_t>(signo));  // arg1 = signo
 
     // Update PerCpu for the modified return path
-    perCpu->userRsp = frame_addr;             // new user stack (with frame)
-    perCpu->syscallRetRip = handler.handler;  // update diagnostic check value
+    perCpu->user_rsp = frame_addr;              // new user stack (with frame)
+    perCpu->syscall_ret_rip = handler.handler;  // update diagnostic check value
 
     // Block additional signals during handler execution
     // Block the handler's sa_mask + the signal itself (unless SA_NODEFER)
-    task->sigMask |= handler.mask;
+    task->sig_mask |= handler.mask;
     if (!(handler.flags & 0x40000000ULL)) {  // SA_NODEFER = 0x40000000
-        task->sigMask |= (1ULL << idx);
+        task->sig_mask |= (1ULL << idx);
     }
 
-    task->inSignalHandler = true;
+    task->in_signal_handler = true;
 }
 
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& frame) {
@@ -197,35 +197,35 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& fr
     // Only deliver on a direct return to userspace. Voluntary-blocked tasks
     // can carry a kernel-mode context in frame/gpr and must use the existing
     // deferred resume path instead.
-    if ((frame.cs & 0x3) != 0x3 || task->voluntaryBlock) {
+    if ((frame.cs & 0x3) != 0x3 || task->voluntary_block) {
         return;
     }
 
-    if (task->inSignalHandler) {
+    if (task->in_signal_handler) {
         return;
     }
 
-    uint64_t deliverable = task->sigPending & ~task->sigMask;
+    uint64_t deliverable = task->sig_pending & ~task->sig_mask;
     if (deliverable == 0) {
         return;
     }
 
     int signo = __builtin_ctzll(deliverable) + 1;
     unsigned idx = static_cast<unsigned>(signo - 1);
-    task->sigPending &= ~(1ULL << idx);
+    task->sig_pending &= ~(1ULL << idx);
 
-    auto& handler = task->sigHandlers[idx];
+    auto& handler = task->sig_handlers[idx];
 
     if (handler.handler == WOS_SIG_DFL) {
         if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
             return;
         }
         if (signo == WOS_SIGSTOP) {
-            task->voluntaryBlock = true;
+            task->voluntary_block = true;
             return;
         }
         if (signo == 20 || signo == 21 || signo == 22) {
-            task->voluntaryBlock = true;
+            task->voluntary_block = true;
             return;
         }
         if (signo == WOS_SIGHUP || signo == WOS_SIGINT || signo == WOS_SIGQUIT || signo == WOS_SIGTERM || signo == WOS_SIGKILL ||
@@ -247,7 +247,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& fr
 
     sigframe->pretcode = handler.restorer;
     sigframe->signo = static_cast<uint64_t>(signo);
-    sigframe->saved_mask = task->sigMask;
+    sigframe->saved_mask = task->sig_mask;
     sigframe->saved_rip = frame.rip;
     sigframe->saved_rsp = frame.rsp;
     sigframe->saved_rflags = frame.flags;
@@ -262,11 +262,11 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& fr
     frame.rip = handler.handler;
     frame.rsp = frame_addr;
 
-    task->sigMask |= handler.mask;
+    task->sig_mask |= handler.mask;
     if (!(handler.flags & 0x40000000ULL)) {
-        task->sigMask |= (1ULL << idx);
+        task->sig_mask |= (1ULL << idx);
     }
-    task->inSignalHandler = true;
+    task->in_signal_handler = true;
 }
 
 }  // namespace ker::mod::sys::signal

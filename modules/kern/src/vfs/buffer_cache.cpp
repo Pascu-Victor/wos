@@ -40,8 +40,10 @@ auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no) -> size_t {
 // Used to detect hash chain corruption before it spreads to live entries.
 bool is_valid_bufhead_ptr(const BufHead* ptr) {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
-    if ((addr & 7U) != 0) { return false; }  // must be at least 8-byte aligned
-    const bool in_hhdm   = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
+    if ((addr & 7U) != 0) {
+        return false;
+    }  // must be at least 8-byte aligned
+    const bool in_hhdm = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
     const bool in_static = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
     return in_hhdm || in_static;
 }
@@ -56,11 +58,8 @@ void dump_hash_bucket(size_t idx) {
             mod::dbg::log("  [%d] CORRUPT ptr=%p (not a valid kernel address)", depth, (void*)bh);
             break;
         }
-        mod::dbg::log("  [%d] bh=%p bdev=%p block=%llu refcount=%d hash_next=%p",
-                      depth, (void*)bh, (void*)bh->bdev,
-                      (unsigned long long)bh->block_no,
-                      (int)bh->refcount.load(std::memory_order_relaxed),
-                      (void*)bh->hash_next);
+        mod::dbg::log("  [%d] bh=%p bdev=%p block=%llu refcount=%d hash_next=%p", depth, (void*)bh, (void*)bh->bdev,
+                      (unsigned long long)bh->block_no, (int)bh->refcount.load(std::memory_order_relaxed), (void*)bh->hash_next);
         bh = bh->hash_next;
         depth++;
     }
@@ -71,11 +70,9 @@ auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     BufHead* prev = nullptr;
     for (BufHead* bh = hash_buckets[idx]; bh != nullptr; bh = bh->hash_next) {
         if (!is_valid_bufhead_ptr(bh)) {
-            mod::dbg::log("buffer_cache: corrupt hash chain in lookup(bdev=%p block=%llu bucket=%zu)",
-                          (void*)bdev, (unsigned long long)block_no, idx);
-            mod::dbg::log("  bad ptr=%p loaded from %s=%p",
-                          (void*)bh,
-                          prev ? "prev->hash_next" : "hash_buckets[idx]",
+            mod::dbg::log("buffer_cache: corrupt hash chain in lookup(bdev=%p block=%llu bucket=%zu)", (void*)bdev,
+                          (unsigned long long)block_no, idx);
+            mod::dbg::log("  bad ptr=%p loaded from %s=%p", (void*)bh, prev ? "prev->hash_next" : "hash_buckets[idx]",
                           prev ? (void*)prev : (void*)&hash_buckets[idx]);
             dump_hash_bucket(idx);
             mod::dbg::panic_handler("buffer_cache: corrupt hash chain detected in lookup");
@@ -92,8 +89,8 @@ void hash_insert(BufHead* bh) {
     size_t idx = hash_key(bh->bdev, bh->block_no);
     BufHead* old_head = hash_buckets[idx];
     if (old_head != nullptr && !is_valid_bufhead_ptr(old_head)) {
-        mod::dbg::log("buffer_cache: corrupt bucket head in insert(bh=%p bdev=%p block=%llu bucket=%zu) old_head=%p",
-                      (void*)bh, (void*)bh->bdev, (unsigned long long)bh->block_no, idx, (void*)old_head);
+        mod::dbg::log("buffer_cache: corrupt bucket head in insert(bh=%p bdev=%p block=%llu bucket=%zu) old_head=%p", (void*)bh,
+                      (void*)bh->bdev, (unsigned long long)bh->block_no, idx, (void*)old_head);
         mod::dbg::panic_handler("buffer_cache: corrupt bucket head detected in insert");
     }
     bh->hash_next = old_head;
@@ -105,16 +102,15 @@ void hash_remove(BufHead* bh) {
     // Validate bh->hash_next before propagating — if it is garbage it would
     // corrupt the live predecessor's hash_next and cause the crash we've seen.
     if (bh->hash_next != nullptr && !is_valid_bufhead_ptr(bh->hash_next)) {
-        mod::dbg::log("buffer_cache: corrupt hash_next in remove(bh=%p bdev=%p block=%llu bucket=%zu) hash_next=%p",
-                      (void*)bh, (void*)bh->bdev, (unsigned long long)bh->block_no, idx, (void*)bh->hash_next);
+        mod::dbg::log("buffer_cache: corrupt hash_next in remove(bh=%p bdev=%p block=%llu bucket=%zu) hash_next=%p", (void*)bh,
+                      (void*)bh->bdev, (unsigned long long)bh->block_no, idx, (void*)bh->hash_next);
         dump_hash_bucket(idx);
         mod::dbg::panic_handler("buffer_cache: corrupt hash_next detected in remove — not propagating");
     }
     BufHead** pp = &hash_buckets[idx];
     while (*pp != nullptr) {
         if (!is_valid_bufhead_ptr(*pp)) {
-            mod::dbg::log("buffer_cache: corrupt chain entry in remove walk(bh=%p bucket=%zu bad_ptr=%p)",
-                          (void*)bh, idx, (void*)*pp);
+            mod::dbg::log("buffer_cache: corrupt chain entry in remove walk(bh=%p bucket=%zu bad_ptr=%p)", (void*)bh, idx, (void*)*pp);
             mod::dbg::panic_handler("buffer_cache: corrupt chain entry during remove walk");
         }
         if (*pp == bh) {

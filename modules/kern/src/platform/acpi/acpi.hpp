@@ -16,5 +16,5 @@ struct ACPIResult {
 
 void init();
 
-ACPIResult parseAcpiTables(const char* ident);
+ACPIResult parse_acpi_tables(const char* ident);
 }  // namespace ker::mod::acpi

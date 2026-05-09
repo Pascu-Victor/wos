@@ -42,11 +42,11 @@ struct ElfFile {
     TlsModule tlsInfo;          // TLS information for this ELF
 };
 
-auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName,
-             bool registerSpecialSymbols = true, uint64_t baseAddress = 0) -> ElfLoadResult;
+auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName,
+              bool registerSpecialSymbols = true, uint64_t baseAddress = 0) -> ElfLoadResult;
 
 // Extract TLS information from ELF without fully loading it
-auto extractTlsInfo(void* elfData) -> TlsModule;
+auto extract_tls_info(void* elfData) -> TlsModule;
 
 // Remove the global getter - TLS info should be passed per-process
 // TlsModule getTlsModule();

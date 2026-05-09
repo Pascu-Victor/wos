@@ -19,7 +19,7 @@ struct Rsdp {
     uint8_t reserved[3];
 } __attribute__((packed));
 
-Rsdp get(void);
-bool useXsdt(void);
-void init(uint64_t rsdpAddr);
+Rsdp get();
+bool use_xsdt();
+void init(uint64_t rsdp_addr);
 }  // namespace ker::mod::acpi::rsdp

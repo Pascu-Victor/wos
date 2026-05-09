@@ -34,7 +34,7 @@ void init() {
     isInit = true;
 }
 
-void enableTime() {
+void enable_time() {
     if (isTimeAvailable) {
         // Panic! should only be called once when ktime is initialized
         panic_handler("Kernel time was already initialized");
@@ -46,7 +46,7 @@ void enableTime() {
 
 void break_into_debugger() { __asm__ volatile("int $3"); }
 
-void enableKmalloc() {
+void enable_kmalloc() {
     if (isKmallocAvailable) {
         // Panic! should only be called once when kmalloc is initialized
         panic_handler("Kernel kmalloc already initialized");
@@ -68,7 +68,7 @@ inline void serialLogLine(const char* str) {
         if (isTimeAvailable) [[likely]] {
             char timeSec[10] = {0};
             char timeMs[5] = {0};
-            int logTime = time::getMs();
+            int logTime = time::get_ms();
             int logTimeMsPart = logTime % 1000;
             int logTimeSecPart = logTime / 1000;
             auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
@@ -126,7 +126,7 @@ inline void fbLog(const char* str) {
         if (isTimeAvailable) [[likely]] {
             char timeSec[10] = {0};  // good enough for 30 years of uptime
             char timeMs[5] = {0};
-            int logTime = time::getMs();
+            int logTime = time::get_ms();
             int logTimeMsPart = logTime % 1000;
             int logTimeSecPart = logTime / 1000;
             auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
@@ -168,7 +168,7 @@ inline void fbLog(const char* str) {
     }
 }
 
-void logString(const char* str) {
+void log_string(const char* str) {
     journal::emit(LogLevel::INFO, "kernel", str, journal::JOURNAL_FLAG_KERNEL);
     // logLock only protects the framebuffer state and linesLogged counter.
     logLock.lock();
@@ -179,22 +179,22 @@ void logString(const char* str) {
     logLock.unlock();
 }
 
-void logVa(const char* format, va_list& args) { journal::emit_v(LogLevel::INFO, "kernel", format, args, journal::JOURNAL_FLAG_KERNEL); }
+static void log_va(const char* format, va_list& args) { journal::emit_v(LogLevel::INFO, "kernel", format, args, journal::JOURNAL_FLAG_KERNEL); }
 
-void __logVar(const char* format, ...) {
+void log_var(const char* format, ...) {
     va_list args;
     va_start(args, format);
-    logVa(format, args);
+    log_va(format, args);
     va_end(args);
 }
 
-void logFbOnly(const char* str) {
+void log_fb_only(const char* str) {
     logLock.lock();
     fbLog(str);
     logLock.unlock();
 }
 
-void logFbAdvance(void) {
+void log_fb_advance() {
     logLock.lock();
     linesLogged++;
     logLock.unlock();
@@ -294,7 +294,7 @@ void panic_handler(const char* msg) {
 
     // CPU id (best-effort)
     io::serial::write_unlocked("CPU: ");
-    panic_write_dec(cpu::getCurrentCpuIdSafe());
+    panic_write_dec(cpu::get_current_cpu_id_safe());
     io::serial::write_unlocked("\n");
 
     // Capture general-purpose registers via inline asm.

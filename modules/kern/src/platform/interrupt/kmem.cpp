@@ -16,7 +16,7 @@
 // };
 
 namespace ker::mod::mem {
-limine_bootloader_info_response *bootloader_info;
+limine_bootloader_info_response* bootloader_info;
 
 bool isInit = false;
 void init(void) {

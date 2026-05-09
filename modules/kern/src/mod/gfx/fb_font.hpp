@@ -5,7 +5,7 @@
 namespace ker::mod::gfx::fb {
 class FbFont {
    public:
-    void loadFont();
+    void load_font();
     char name[256];
     uint8_t height;  // max 64
     uint8_t width;   // max 64

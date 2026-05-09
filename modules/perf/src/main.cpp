@@ -1900,8 +1900,8 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
     std::println("=== slowest WKI launches [{}] ======================================", event_loaded->source);
     std::println("{:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}", "PEER", "CORR", "TOTAL(us)",
                  "HANDLE(us)", "LOAD(us)", "SETUP(us)", "QUEUE(us)", "RUN(us)", "READY(us)", "HOLD(us)", "WAIT(us)", "RESULT");
-    std::println("{:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "", "",
-                 "", "", "", "", "", "", "", "");
+    std::println("{:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "",
+                 "", "", "", "", "", "", "", "", "");
     for (int i = 0; i < static_cast<int>(launch_rows.size()) && i < limit; ++i) {
         const auto& row = launch_rows[static_cast<std::size_t>(i)];
         std::optional<uint32_t> setup_us;
@@ -1909,9 +1909,9 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
             setup_us = *row.handle_submit_us - *row.load_elf_us;
         }
         std::println("{:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
-                     wki_peer_label(row.peer, peer_resolver), row.correlation,
-                     format_optional_us(row.submit_total_us), format_optional_us(row.handle_submit_us), format_optional_us(row.load_elf_us),
-                     format_optional_us(setup_us), format_optional_us(row.defer_wait_us), format_optional_us(row.task_runtime_us),
+                     wki_peer_label(row.peer, peer_resolver), row.correlation, format_optional_us(row.submit_total_us),
+                     format_optional_us(row.handle_submit_us), format_optional_us(row.load_elf_us), format_optional_us(setup_us),
+                     format_optional_us(row.defer_wait_us), format_optional_us(row.task_runtime_us),
                      format_optional_us(row.proxy_ready_wait_us), format_optional_us(row.complete_hold_us),
                      format_optional_us(row.complete_wait_us), format_wki_launch_result(row));
     }
@@ -1944,8 +1944,8 @@ void cmd_wki_report(const WkiDisplayOptions& display_options) {
     std::println("=== perf wki-report [{}] ============================================", loaded->source);
     std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS",
                  "ERR", "RETRY", "AVG(us)", "P99(us)", "P999(us)", "MAX(us)");
-    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->6}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "",
-                 "", "", "");
+    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->6}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "",
+                 "", "", "", "");
     for (const auto& row : rows) {
         std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
                      wki_peer_label(row.peer, peer_resolver), row.channel, row.calls, row.errors, row.retries, row.avg_us, row.p99_us,
@@ -2080,8 +2080,8 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
     std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}", "", "", "", "", "");
     for (int i = 0; i < static_cast<int>(gaps.size()) && i < limit; ++i) {
         const auto& gap = gaps[static_cast<std::size_t>(i)];
-        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", gap.scope, gap.op, wki_peer_label(gap.peer, event_peer_resolver),
-                     gap.channel, gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
+        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", gap.scope, gap.op, wki_peer_label(gap.peer, event_peer_resolver), gap.channel,
+                     gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
     }
 }
 

@@ -31,44 +31,44 @@ using log = ker::mod::dbg::logger<"pexit">;
 
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
 static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
-    if (waiter->waitRusageUserAddr == 0 || waiter->pagemap == nullptr) {
-        waiter->waitRusageUserAddr = 0;
-        waiter->waitRusagePhysAddr = 0;
+    if (waiter->wait_rusage_user_addr == 0 || waiter->pagemap == nullptr) {
+        waiter->wait_rusage_user_addr = 0;
+        waiter->wait_rusage_phys_addr = 0;
         return;
     }
-    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitRusageUserAddr);
+    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
     if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
-        waiter->waitRusageUserAddr = 0;
-        waiter->waitRusagePhysAddr = 0;
+        waiter->wait_rusage_user_addr = 0;
+        waiter->wait_rusage_phys_addr = 0;
         return;
     }
-    waiter->waitRusagePhysAddr = phys;
+    waiter->wait_rusage_phys_addr = phys;
     auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(phys));
     ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
     ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
     ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
     ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
-    waiter->waitRusageUserAddr = 0;
-    waiter->waitRusagePhysAddr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
 }
 
 static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) {
-    if (waiter->waitStatusUserAddr == 0 || waiter->pagemap == nullptr) {
-        waiter->waitStatusUserAddr = 0;
-        waiter->waitStatusPhysAddr = 0;
+    if (waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
+        waiter->wait_status_user_addr = 0;
+        waiter->wait_status_phys_addr = 0;
         return;
     }
-    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitStatusUserAddr);
+    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
     if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
-        waiter->waitStatusUserAddr = 0;
-        waiter->waitStatusPhysAddr = 0;
+        waiter->wait_status_user_addr = 0;
+        waiter->wait_status_phys_addr = 0;
         return;
     }
-    waiter->waitStatusPhysAddr = phys;
+    waiter->wait_status_phys_addr = phys;
     auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(phys));
     *status_ptr = status;
-    waiter->waitStatusUserAddr = 0;
-    waiter->waitStatusPhysAddr = 0;
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
 }
 
 static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
@@ -76,31 +76,32 @@ static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter,
         return;
     }
 
-    if (waiter->waitResumeRipUserAddr != 0) {
-        uint64_t rip_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitResumeRipUserAddr);
+    if (waiter->wait_resume_rip_user_addr != 0) {
+        uint64_t rip_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rip_user_addr);
         if (rip_phys == ker::mod::mm::virt::PADDR_INVALID || rip_phys == 0 ||
-            (waiter->waitResumeRipPhysAddr != 0 && waiter->waitResumeRipPhysAddr != rip_phys)) {
+            (waiter->wait_resume_rip_phys_addr != 0 && waiter->wait_resume_rip_phys_addr != rip_phys)) {
             log::warn(
                 "waitpid-resume drift: waiter=%lu child=%lu path=%s rip_va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp_va=0x%llx pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
-                (unsigned long long)waiter->waitResumeRipUserAddr, (unsigned long long)waiter->waitResumeRipPhysAddr,
+                (unsigned long long)waiter->wait_resume_rip_user_addr, (unsigned long long)waiter->wait_resume_rip_phys_addr,
                 (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys),
-                (unsigned long long)waiter->waitResumeRspUserAddr, static_cast<void*>(waiter->pagemap));
+                (unsigned long long)waiter->wait_resume_rsp_user_addr, static_cast<void*>(waiter->pagemap));
         }
-        waiter->waitResumeRipPhysAddr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
+        waiter->wait_resume_rip_phys_addr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
     }
 
-    if (waiter->waitResumeRspUserAddr != 0) {
-        uint64_t rsp_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->waitResumeRspUserAddr);
+    if (waiter->wait_resume_rsp_user_addr != 0) {
+        uint64_t rsp_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rsp_user_addr);
         if (rsp_phys == ker::mod::mm::virt::PADDR_INVALID || rsp_phys == 0) {
             log::warn(
-                "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx pagemap=%p",
+                "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx "
+                "pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
-                (unsigned long long)waiter->waitResumeRspUserAddr, (unsigned long long)waiter->waitResumeRspPhysAddr,
+                (unsigned long long)waiter->wait_resume_rsp_user_addr, (unsigned long long)waiter->wait_resume_rsp_phys_addr,
                 (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
-                (unsigned long long)waiter->waitResumeRipUserAddr, static_cast<void*>(waiter->pagemap));
+                (unsigned long long)waiter->wait_resume_rip_user_addr, static_cast<void*>(waiter->pagemap));
         }
-        waiter->waitResumeRspPhysAddr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
+        waiter->wait_resume_rsp_phys_addr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
     }
 }
 
@@ -113,7 +114,7 @@ void wos_proc_exit(int status) {
     // CRITICAL: Atomically transition to EXITING state.
     // This prevents other CPUs from scheduling this task while we're cleaning up.
     // If this fails, another CPU already started our exit (shouldn't happen).
-    if (!current_task->transitionState(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
+    if (!current_task->transition_state(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
         // Already exiting - this shouldn't happen but handle it gracefully
         for (;;) {
             asm volatile("hlt");
@@ -128,44 +129,44 @@ void wos_proc_exit(int status) {
 #endif
 
     // Store exit status in POSIX waitpid format
-    current_task->exitStatus = (status & 0xff) << 8;
-    current_task->hasExited = true;
+    current_task->exit_status = (status & 0xff) << 8;
+    current_task->has_exited = true;
 #ifdef EXIT_DEBUG
     log::trace("wos_proc_exit: pid=%lu name=%s status=%d thread=%d owner=%lu pagemap=%p", current_task->pid,
-               current_task->name != nullptr ? current_task->name : "?", status, current_task->isThread, current_task->ownerPid,
+               current_task->name != nullptr ? current_task->name : "?", status, current_task->is_thread, current_task->owner_pid,
                static_cast<void*>(current_task->pagemap));
 #endif
     // Send SIGCHLD to parent process.
     // Threads do not send SIGCHLD - their exit is handled via futex (pthread_join).
-    if (!current_task->isThread && current_task->parentPid != 0) {
-        auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parentPid);
+    if (!current_task->is_thread && current_task->parent_pid != 0) {
+        auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parent_pid);
         if (parent != nullptr) {
             // Set SIGCHLD (signal 17) pending on parent
-            parent->sigPending |= (1ULL << (17 - 1));
+            parent->sig_pending |= (1ULL << (17 - 1));
 
             // If parent is waiting for any child (pid==-1 / WAIT_ANY_CHILD),
             // set the return value so waitpid returns the exited child's PID.
-            // Only safe when deferredTaskSwitch is false (parent is in wait queue,
-            // its context is stable). If deferredTaskSwitch is still true,
+            // Only safe when deferred_task_switch is false (parent is in wait queue,
+            // its context is stable). If deferred_task_switch is still true,
             // the deferred_task_switch race check will handle it.
             static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-            if (parent->waitingForPid == WAIT_ANY_CHILD && !parent->deferredTaskSwitch) {
+            if (parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch) {
                 parent->context.regs.rax = current_task->pid;
                 validate_waiter_resume_for_exit(parent, current_task, "exit-any");
-                write_wait_status_for_waiter(parent, current_task->exitStatus);
+                write_wait_status_for_waiter(parent, current_task->exit_status);
                 fill_rusage_for_waiter(parent, current_task);
-                parent->waitingForPid = 0;
-                current_task->waitedOn = true;
-                // Parent is in the wait queue (not deferredTaskSwitch, not voluntaryBlock) -
+                parent->waiting_for_pid = 0;
+                current_task->waited_on = true;
+                // Parent is in the wait queue (not deferred_task_switch, not voluntary_block) -
                 // we must explicitly reschedule it so it actually wakes up.
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if (parent->deferredTaskSwitch || parent->voluntaryBlock) {
+            } else if (parent->deferred_task_switch || parent->voluntary_block) {
                 // Parent is blocked for another reason (or WAIT_ANY_CHILD with
-                // deferredTaskSwitch still true - race check will handle RAX).
+                // deferred_task_switch still true - race check will handle RAX).
                 // Wake it so it can handle the signal / race check.
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
@@ -179,12 +180,12 @@ void wos_proc_exit(int status) {
 
     // Reparent all children of this process to init (PID 1), so init can reap them.
     // Threads do not own children directly - skip reparenting for thread exits.
-    if (!current_task->isThread) {
+    if (!current_task->is_thread) {
         uint32_t count = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < count; i++) {
             auto* child = ker::mod::sched::get_active_task_at(i);
-            if (child != nullptr && child->parentPid == current_task->pid && child != current_task) {
-                child->parentPid = 1;  // Reparent to init
+            if (child != nullptr && child->parent_pid == current_task->pid && child != current_task) {
+                child->parent_pid = 1;  // Reparent to init
             }
         }
     }
@@ -192,7 +193,7 @@ void wos_proc_exit(int status) {
     // Close all open file descriptors and free ELF buffer before waking waiters.
     // This ensures files written by the exiting process are fully committed to
     // the VFS before waitpid returns to the parent.
-    if (!current_task->isThread) {
+    if (!current_task->is_thread) {
         // Snapshot descriptor numbers before closing. vfs_close() removes from
         // fd_table and may free radix-tree nodes, so mutating during for_each()
         // can invalidate the traversal.
@@ -212,14 +213,14 @@ void wos_proc_exit(int status) {
             }
         }
 
-        if (current_task->elfBuffer != nullptr) {
-            if (current_task->isElfBufferShared) {
-                ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elfBuffer);
+        if (current_task->elf_buffer != nullptr) {
+            if (current_task->is_elf_buffer_shared) {
+                ker::net::wki::wki_remote_compute_release_elf_buffer(current_task->elf_buffer);
             } else {
-                delete[] current_task->elfBuffer;
+                delete[] current_task->elf_buffer;
             }
-            current_task->elfBuffer = nullptr;
-            current_task->elfBufferSize = 0;
+            current_task->elf_buffer = nullptr;
+            current_task->elf_buffer_size = 0;
         }
     }
 
@@ -227,46 +228,46 @@ void wos_proc_exit(int status) {
     // This happens AFTER reparenting + FD cleanup so that any files written
     // by the exiting process are fully committed to the VFS before waitpid
     // returns to the waiter.
-    uint64_t waiter_lock_flags = current_task->exitWaitersLock.lock_irqsave();
+    uint64_t waiter_lock_flags = current_task->exit_waiters_lock.lock_irqsave();
     const size_t waiter_count = current_task->awaitee_on_exit.size();
     uint64_t waiting_pids[16] = {};
     const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
     for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
         waiting_pids[i] = current_task->awaitee_on_exit[i];
     }
-    current_task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+    current_task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
 
     for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
         uint64_t waiting_pid = waiting_pids[i];
 #ifdef EXIT_DEBUG
-        ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waitingPid);
+        ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waiting_pid);
 #endif
 
         // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
         auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(waiting_pid);
         if (waiting_task != nullptr) {
             // Only modify the waiting task's saved context when it's safely in waitQueue
-            // (deferredTaskSwitch is false). When deferredTaskSwitch is true, the task is
+            // (deferred_task_switch is false). When deferred_task_switch is true, the task is
             // still running on another CPU - writing to context.regs is a data race and the
-            // values would be overwritten by deferredTaskSwitch's context save anyway.
-            // In that case, deferredTaskSwitch() will detect hasExited==true and set rax
-            // correctly before re-scheduling the task (see scheduler.cpp deferredTaskSwitch).
-            if (!waiting_task->deferredTaskSwitch) {
+            // values would be overwritten by deferred_task_switch's context save anyway.
+            // In that case, deferred_task_switch() will detect hasExited==true and set rax
+            // correctly before re-scheduling the task (see scheduler.cpp deferred_task_switch).
+            if (!waiting_task->deferred_task_switch) {
                 waiting_task->context.regs.rax = current_task->pid;
                 validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
-                write_wait_status_for_waiter(waiting_task, current_task->exitStatus);
+                write_wait_status_for_waiter(waiting_task, current_task->exit_status);
 #ifdef EXIT_DEBUG
-                ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exitStatus, waitingPid);
+                ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exit_status, waitingPid);
 #endif
                 fill_rusage_for_waiter(waiting_task, current_task);
-                waiting_task->waitingForPid = 0;
+                waiting_task->waiting_for_pid = 0;
             }
 
             // Mark that this waiter has consumed the exit status (zombie can now be reaped)
             // Note: If multiple processes wait for the same child (not typical but possible),
-            // only the first one marks waitedOn. In Linux, only one waiter succeeds anyway.
+            // only the first one marks waited_on. In Linux, only one waiter succeeds anyway.
             if (i == 0) {  // First waiter marks the process as waited-on
-                current_task->waitedOn = true;
+                current_task->waited_on = true;
             }
 
             // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration
@@ -304,11 +305,11 @@ void wos_proc_exit(int status) {
     // The downside is user pages remain allocated ~1 second longer, but this is
     // necessary for correctness in the face of concurrent scheduling.
     //
-    // For threads (isThread == true): the pagemap is shared with the owning process
+    // For threads (is_thread == true): the pagemap is shared with the owning process
     // and must NEVER be freed or even switched away from here; GC will skip it.
-    if (!current_task->isThread && current_task->pagemap != nullptr) {
+    if (!current_task->is_thread && current_task->pagemap != nullptr) {
         // Switch to kernel pagemap so we don't use our own pagemap anymore
-        ker::mod::mm::virt::switchToKernelPagemap();
+        ker::mod::mm::virt::switch_to_kernel_pagemap();
         // Pagemap destruction deferred to gcExpiredTasks()
     }
 
@@ -317,7 +318,7 @@ void wos_proc_exit(int status) {
     // NOTE: We CANNOT free the kernel stack here because we're still running on it!
     // The kernel stack will be freed later when the task is fully cleaned up
     // (after switching to a different task's kernel stack).
-    // The syscallKernelStack and syscallScratchArea are left intact for now.
+    // The syscall_kernel_stack and syscall_scratch_area are left intact for now.
     // They will be cleaned up by jumpToNextTask when it moves the task to expiredTasks,
     // and eventually by a garbage collection mechanism.
 
@@ -333,7 +334,7 @@ void wos_proc_exit(int status) {
 
     // Transition to DEAD state and record death epoch for garbage collection.
     // The task will be reclaimed once all CPUs have passed through the grace period.
-    current_task->deathEpoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+    current_task->death_epoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
     current_task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
 
 #ifdef EXIT_DEBUG

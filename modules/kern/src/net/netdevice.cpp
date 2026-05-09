@@ -186,7 +186,7 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     if (backlog_ready()) {
         uint64_t target = backlog_flow_hash(pkt, ker::mod::smt::get_core_count());
         // If the flow hashes to THIS CPU, process inline to avoid expensive reschedule
-        if (target != ker::mod::cpu::currentCpu()) {
+        if (target != ker::mod::cpu::current_cpu()) {
             backlog_enqueue(target, pkt);
             return;
         }

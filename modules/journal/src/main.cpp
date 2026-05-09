@@ -1,6 +1,7 @@
+#include <abi-bits/fcntl.h>
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
 #include <fcntl.h>
-#include <sys/logging.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -10,8 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <print>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "callnums/sys_log.h"
@@ -74,12 +77,12 @@ auto parse_level(const char* text, uint8_t* out) -> bool {
         const char* name;
         uint8_t level;
     };
-    constexpr Pair pairs[] = {
+    constexpr Pair PAIRS[] = {
         {.name = "trace", .level = 0}, {.name = "debug", .level = 1},    {.name = "info", .level = 2},  {.name = "notice", .level = 3},
         {.name = "warn", .level = 4},  {.name = "warning", .level = 4},  {.name = "err", .level = 5},   {.name = "error", .level = 5},
         {.name = "crit", .level = 6},  {.name = "critical", .level = 6}, {.name = "panic", .level = 7},
     };
-    for (const auto& pair : pairs) {
+    for (const auto& pair : PAIRS) {
         if (std::strcmp(text, pair.name) == 0) {
             *out = pair.level;
             return true;
@@ -89,22 +92,22 @@ auto parse_level(const char* text, uint8_t* out) -> bool {
 }
 
 void sleep_short() {
-    timespec ts{
+    timespec const TS{
         .tv_sec = 0,
         .tv_nsec = 200 * 1000 * 1000,
     };
-    nanosleep(&ts, nullptr);
+    nanosleep(&TS, nullptr);
 }
 
 auto write_all(int fd, const void* data, size_t len) -> bool {
     const auto* p = static_cast<const char*>(data);
     size_t done = 0;
     while (done < len) {
-        ssize_t n = write(fd, p + done, len - done);
-        if (n <= 0) {
+        ssize_t const N = write(fd, p + done, len - done);
+        if (N <= 0) {
             return false;
         }
-        done += static_cast<size_t>(n);
+        done += static_cast<size_t>(N);
     }
     return true;
 }
@@ -151,11 +154,11 @@ void print_record(const JournalRecord& rec) {
 void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
     JournalRecord rec{};
     for (;;) {
-        ssize_t n = read(fd, &rec, sizeof(rec));
-        if (n == 0) {
+        ssize_t const N = read(fd, &rec, sizeof(rec));
+        if (N == 0) {
             break;
         }
-        if (n != static_cast<ssize_t>(sizeof(rec))) {
+        if (std::cmp_not_equal(N, sizeof(rec))) {
             break;
         }
         if (valid_record(rec)) {
@@ -169,8 +172,8 @@ auto open_journal_file_append() -> int {
     if (fd < 0) {
         return fd;
     }
-    off_t end = lseek(fd, 0, SEEK_END);
-    if (end >= ROTATE_BYTES) {
+    off_t const END = lseek(fd, 0, SEEK_END);
+    if (END >= ROTATE_BYTES) {
         close(fd);
         unlink(JOURNAL_FILE_OLD);
         rename(JOURNAL_FILE, JOURNAL_FILE_OLD);
@@ -183,37 +186,37 @@ auto open_journal_file_append() -> int {
 }
 
 auto run_daemon() -> int {
-    int dev = open(JOURNAL_DEVICE, O_RDONLY);
-    if (dev < 0) {
+    int const DEV = open(JOURNAL_DEVICE, O_RDONLY);
+    if (DEV < 0) {
         return 1;
     }
 
     int out = open_journal_file_append();
     if (out < 0) {
-        close(dev);
+        close(DEV);
         return 1;
     }
 
     for (;;) {
         JournalRecord batch[16]{};
-        ssize_t n = read(dev, batch, sizeof(batch));
-        if (n <= 0) {
+        ssize_t const N = read(DEV, batch, sizeof(batch));
+        if (N <= 0) {
             sleep_short();
             continue;
         }
-        size_t records = static_cast<size_t>(n) / sizeof(JournalRecord);
-        for (size_t i = 0; i < records; i++) {
+        size_t const RECORDS = static_cast<size_t>(N) / sizeof(JournalRecord);
+        for (size_t i = 0; i < RECORDS; i++) {
             if (!valid_record(batch[i])) {
                 continue;
             }
-            off_t pos = lseek(out, 0, SEEK_END);
-            if (pos >= ROTATE_BYTES) {
+            off_t const POS = lseek(out, 0, SEEK_END);
+            if (POS >= ROTATE_BYTES) {
                 close(out);
                 unlink(JOURNAL_FILE_OLD);
                 rename(JOURNAL_FILE, JOURNAL_FILE_OLD);
                 out = open_journal_file_append();
                 if (out < 0) {
-                    close(dev);
+                    close(DEV);
                     return 1;
                 }
             }
@@ -222,26 +225,26 @@ auto run_daemon() -> int {
     }
 }
 
-void usage() { std::printf("usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec]\n"); }
+void usage() { std::println("usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec]"); }
 
 auto parse_args(int argc, char** argv, Options& opts) -> bool {
     for (int i = 1; i < argc; i++) {
-        std::string_view arg(argv[i]);
-        if (arg == "--daemon") {
+        std::string_view const ARG(argv[i]);
+        if (ARG == "--daemon") {
             opts.daemon = true;
-        } else if (arg == "-f") {
+        } else if (ARG == "-f") {
             opts.follow = true;
-        } else if (arg == "-k") {
+        } else if (ARG == "-k") {
             opts.kernel_only = true;
-        } else if ((arg == "-p") && i + 1 < argc) {
+        } else if ((ARG == "-p") && i + 1 < argc) {
             if (!parse_level(argv[++i], &opts.min_level)) {
                 return false;
             }
-        } else if ((arg == "-u" || arg == "-m") && i + 1 < argc) {
+        } else if ((ARG == "-u" || ARG == "-m") && i + 1 < argc) {
             opts.module = argv[++i];
-        } else if (arg == "-n" && i + 1 < argc) {
+        } else if (ARG == "-n" && i + 1 < argc) {
             opts.tail = static_cast<size_t>(strtoull(argv[++i], nullptr, 10));
-        } else if (arg == "--since" && i + 1 < argc) {
+        } else if (ARG == "--since" && i + 1 < argc) {
             opts.since_us = static_cast<uint64_t>(strtoull(argv[++i], nullptr, 10));
         } else {
             return false;
@@ -255,20 +258,20 @@ auto run_query(const Options& opts) -> int {
     uint64_t persisted_boot = 0;
     uint64_t persisted_latest = 0;
 
-    int file = open(JOURNAL_FILE, O_RDONLY);
-    if (file >= 0) {
-        load_records_from_fd(file, records);
-        close(file);
+    int const FILE = open(JOURNAL_FILE, O_RDONLY);
+    if (FILE >= 0) {
+        load_records_from_fd(FILE, records);
+        close(FILE);
         for (const auto& rec : records) {
             persisted_boot = rec.boot_id;
             persisted_latest = std::max(persisted_latest, rec.sequence);
         }
     }
 
-    int dev = open(JOURNAL_DEVICE, O_RDONLY);
-    if (dev >= 0) {
+    int const DEV = open(JOURNAL_DEVICE, O_RDONLY);
+    if (DEV >= 0) {
         std::vector<JournalRecord> live;
-        load_records_from_fd(dev, live);
+        load_records_from_fd(DEV, live);
         for (const auto& rec : live) {
             if (rec.boot_id == persisted_boot && rec.sequence <= persisted_latest) {
                 continue;
@@ -292,16 +295,16 @@ auto run_query(const Options& opts) -> int {
         print_record(filtered[i]);
     }
 
-    if (opts.follow && dev >= 0) {
+    if (opts.follow && DEV >= 0) {
         for (;;) {
             JournalRecord batch[16]{};
-            ssize_t n = read(dev, batch, sizeof(batch));
-            if (n <= 0) {
+            ssize_t const N = read(DEV, batch, sizeof(batch));
+            if (N <= 0) {
                 sleep_short();
                 continue;
             }
-            size_t count = static_cast<size_t>(n) / sizeof(JournalRecord);
-            for (size_t i = 0; i < count; i++) {
+            size_t const COUNT = static_cast<size_t>(N) / sizeof(JournalRecord);
+            for (size_t i = 0; i < COUNT; i++) {
                 if (record_matches(batch[i], opts)) {
                     print_record(batch[i]);
                 }
@@ -309,8 +312,8 @@ auto run_query(const Options& opts) -> int {
         }
     }
 
-    if (dev >= 0) {
-        close(dev);
+    if (DEV >= 0) {
+        close(DEV);
     }
     return 0;
 }

@@ -54,9 +54,7 @@ class IntrHashTable {
         return m_buckets != nullptr;
     }
 
-    ~IntrHashTable() {
-        delete[] m_buckets;
-    }
+    ~IntrHashTable() { delete[] m_buckets; }
 
     // No copy
     IntrHashTable(const IntrHashTable&) = delete;

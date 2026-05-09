@@ -13,8 +13,8 @@
 #include <net/route.hpp>
 #include <net/socket.hpp>
 #include <net/wki/dev_server.hpp>
-#include <net/wki/remote_ipc.hpp>
 #include <net/wki/remotable.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -59,15 +59,15 @@ auto begin_poll_timeout(ker::mod::sched::task::Task* task, int timeout_ms) -> ui
     if (task == nullptr || timeout_ms <= 0) {
         return 0;
     }
-    if (task->pollWaitDeadlineUs == 0) {
-        task->pollWaitDeadlineUs = ker::mod::time::getUs() + (static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC);
+    if (task->poll_wait_deadline_us == 0) {
+        task->poll_wait_deadline_us = ker::mod::time::get_us() + (static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC);
     }
-    return task->pollWaitDeadlineUs;
+    return task->poll_wait_deadline_us;
 }
 
 void clear_poll_timeout(ker::mod::sched::task::Task* task) {
     if (task != nullptr) {
-        task->pollWaitDeadlineUs = 0;
+        task->poll_wait_deadline_us = 0;
     }
 }
 
@@ -100,7 +100,7 @@ template <typename T>
 auto maybe_restart_socket_wait(T result, bool nonblock) -> T {
     if ((result == static_cast<T>(-EAGAIN) || result == static_cast<T>(-EINPROGRESS)) && !nonblock) {
         auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr && task->deferredTaskSwitch) {
+        if (task != nullptr && task->deferred_task_switch) {
             return static_cast<T>(-WOS_ERESTARTSYS);
         }
     }
@@ -602,7 +602,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_read == nullptr) {
                         return static_cast<uint64_t>(-ENOSYS);
                     }
-                    auto result = file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0);
+                    auto result =
+                        file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0);
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -665,8 +666,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
                 if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int result = ker::net::wki::wki_ipc_socket_setsockopt(
-                        file_handle.file, static_cast<int>(a2), static_cast<int>(a3), reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
+                    int result = ker::net::wki::wki_ipc_socket_setsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
+                                                                          reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -726,8 +727,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
                 if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int result =
-                        ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, reinterpret_cast<void*>(a2), reinterpret_cast<size_t*>(a3));
+                    int result = ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, reinterpret_cast<void*>(a2),
+                                                                           reinterpret_cast<size_t*>(a3));
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -1198,14 +1199,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(num_events);
             }
 
-            if (deadline_us != 0 && ker::mod::time::getUs() >= deadline_us) {
+            if (deadline_us != 0 && ker::mod::time::get_us() >= deadline_us) {
                 clear_poll_timeout(task);
                 return 0;
             }
 
             // No events - check for deliverable signals before retrying.
             {
-                uint64_t deliverable = task->sigPending & ~task->sigMask;
+                uint64_t deliverable = task->sig_pending & ~task->sig_mask;
                 if (deliverable != 0) {
                     clear_poll_timeout(task);
                     return static_cast<uint64_t>(-EINTR);
@@ -1231,13 +1232,13 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             if (can_block) {
-                task->wakeAtUs = deadline_us;
+                task->wake_at_us = deadline_us;
                 task->wait_channel = "poll";
-                task->deferredTaskSwitch = true;
+                task->deferred_task_switch = true;
 
                 // Re-check fds after registration + deferred mark to close
                 // the race window where an event fires between the initial
-                // poll_check and waiter registration.  With deferredTaskSwitch
+                // poll_check and waiter registration.  With deferred_task_switch
                 // already set, any concurrent wake_waiters will clear it, so
                 // syscall.asm will skip the block and retry the syscall.
                 int recheck = 0;
@@ -1260,8 +1261,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (fds[i].revents != 0) recheck++;
                 }
                 if (recheck > 0) {
-                    task->deferredTaskSwitch = false;
-                    task->wakeAtUs = 0;
+                    task->deferred_task_switch = false;
+                    task->wake_at_us = 0;
                     task->wait_channel = nullptr;
                     clear_poll_timeout(task);
                     return static_cast<uint64_t>(recheck);

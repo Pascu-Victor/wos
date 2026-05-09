@@ -20,46 +20,46 @@ void enumerateDevices(MultiApicTable* madtPtr) {
         switch (currentApic->type) {
             case MADT_TYPE_LAPIC: {
                 LAPIC* lapic = (LAPIC*)currentApic;
-                dbg::log("LAPIC Processor ID: %d", lapic->acpiProcessorId);
-                dbg::log("LAPIC ID: %d", lapic->apicId);
+                dbg::log("LAPIC Processor ID: %d", lapic->acpi_processor_id);
+                dbg::log("LAPIC ID: %d", lapic->apic_id);
                 dbg::log("LAPIC Flags: %d", lapic->flags);
-                apicDevice.lapics[apicDevice.usableLAPICs++] = *lapic;
+                apicDevice.lapics[apicDevice.usable_lapics++] = *lapic;
             } break;
             case MADT_TYPE_IOAPIC: {
                 IOApic* ioApic = (IOApic*)currentApic;
-                dbg::log("IOAPIC ID: %d", ioApic->ioApicId);
-                dbg::log("IOAPIC Addr: %x", ioApic->ioApicAddr);
-                dbg::log("Global Sys Int Base: %d", ioApic->globalSysIntBase);
-                apicDevice.ioapics[apicDevice.usableIOAPICs++] = *ioApic;
+                dbg::log("IOAPIC ID: %d", ioApic->io_apic_id);
+                dbg::log("IOAPIC Addr: %x", ioApic->io_apic_addr);
+                dbg::log("Global Sys Int Base: %d", ioApic->global_sys_int_base);
+                apicDevice.ioapics[apicDevice.usable_ioapics++] = *ioApic;
             } break;
             case MADT_TYPE_IOAPIC_INT_SRC_OVERRIDE: {
                 LAPICIntSrcOverride* ioApicIntSrcOverride = (LAPICIntSrcOverride*)currentApic;
                 dbg::log("IOAPIC Int Src Override Bus: %d", ioApicIntSrcOverride->bus);
                 dbg::log("IOAPIC Int Src Override Source: %d", ioApicIntSrcOverride->source);
-                dbg::log("IOAPIC Int Src Override Global Sys Int: %d", ioApicIntSrcOverride->globalSysInt);
+                dbg::log("IOAPIC Int Src Override Global Sys Int: %d", ioApicIntSrcOverride->global_sys_int);
                 dbg::log("IOAPIC Int Src Override Flags: %d", ioApicIntSrcOverride->flags);
-                apicDevice.ioapicISOs[apicDevice.usableIOAPICISOs++] = *ioApicIntSrcOverride;
+                apicDevice.ioapic_isos[apicDevice.usable_ioapic_isos++] = *ioApicIntSrcOverride;
             } break;
             case MADT_TYPE_LAPIC_NMI: {
                 LAPICNMI* lapicNMI = (LAPICNMI*)currentApic;
-                dbg::log("LAPIC NMI Processor ID: %d", lapicNMI->acpiProcessorId);
+                dbg::log("LAPIC NMI Processor ID: %d", lapicNMI->acpi_processor_id);
                 dbg::log("LAPIC NMI Flags: %d", lapicNMI->flags);
                 dbg::log("LAPIC NMI LINT: %d", lapicNMI->lint);
-                apicDevice.lapicNMIs[apicDevice.usableLAPICNMIs++] = *lapicNMI;
+                apicDevice.lapic_nmis[apicDevice.usable_lapic_nmis++] = *lapicNMI;
             } break;
             case MADT_TYPE_LAPIC_ADDR_OVERRIDE: {
                 LAPIC* lapic = (LAPIC*)currentApic;
-                dbg::log("LAPIC Processor ID: %d", lapic->acpiProcessorId);
-                dbg::log("LAPIC ID: %d", lapic->apicId);
+                dbg::log("LAPIC Processor ID: %d", lapic->acpi_processor_id);
+                dbg::log("LAPIC ID: %d", lapic->apic_id);
                 dbg::log("LAPIC Flags: %d", lapic->flags);
-                apicDevice.lapics[apicDevice.usableLAPICs++] = *lapic;
+                apicDevice.lapics[apicDevice.usable_lapics++] = *lapic;
             } break;
             case MADT_TYPE_LAPIC_X2APIC: {
                 X2APIC* x2apic = (X2APIC*)currentApic;
-                dbg::log("X2APIC ID: %d", x2apic->x2apicId);
+                dbg::log("X2APIC ID: %d", x2apic->x2apic_id);
                 dbg::log("X2APIC Flags: %d", x2apic->flags);
-                dbg::log("X2APIC Processor UID: %d", x2apic->acpiProcessorUid);
-                apicDevice.x2apics[apicDevice.usableX2APICs++] = *x2apic;
+                dbg::log("X2APIC Processor UID: %d", x2apic->acpi_processor_uid);
+                apicDevice.x2apics[apicDevice.usable_x2_apics++] = *x2apic;
             } break;
             default:
                 dbg::log("Unknown APIC type: %d", currentApic->type);
@@ -70,7 +70,7 @@ void enumerateDevices(MultiApicTable* madtPtr) {
     }
 }
 
-ApicInfo parseMadt(void* madtBasePtr) {
+ApicInfo parse_madt(void* madtBasePtr) {
     MultiApicTable* madtPtr = (MultiApicTable*)((uint64_t*)madtBasePtr);
     uint8_t oemString[7] = {0};
     for (int i = 0; i < 6; i++) {
@@ -84,7 +84,7 @@ ApicInfo parseMadt(void* madtBasePtr) {
     }
     tableString[8] = 0;
 
-    apicDevice.lapicAddr = madtPtr->localApicAddr;
+    apicDevice.lapic_addr = madtPtr->local_apic_addr;
 
     pic::disable();
     enumerateDevices(madtPtr);
@@ -94,5 +94,5 @@ ApicInfo parseMadt(void* madtBasePtr) {
     return apicDevice;
 }
 
-auto getApicInfo() -> const ApicInfo& { return apicDevice; }
+auto get_apic_info() -> const ApicInfo& { return apicDevice; }
 }  // namespace ker::mod::acpi::madt

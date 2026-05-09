@@ -681,8 +681,8 @@ void handle_resource_withdraw(const WkiHeader* /*hdr*/, const uint8_t* payload, 
     s_remotable_lock.unlock();
 
     if (dropped_pending_mounts != 0) {
-        log::debug("Dropped %llu stale VFS auto-mount(s): node=0x%04x res_id=%u",
-                   static_cast<unsigned long long>(dropped_pending_mounts), adv->node_id, adv->resource_id);
+        log::debug("Dropped %llu stale VFS auto-mount(s): node=0x%04x res_id=%u", static_cast<unsigned long long>(dropped_pending_mounts),
+                   adv->node_id, adv->resource_id);
     }
     if (dropped_pending_net_attaches != 0) {
         log::debug("Dropped %llu stale NET auto-attach(es): node=0x%04x res_id=%u",

@@ -4,30 +4,29 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 
-namespace ker::mod::mm::dyn::slab
-{
-    struct Slab; //forward declaration
-    
-    struct FreeSlab {
-        void* mem;
-        FreeSlab* next;
-        Slab* parent;
-    };
+namespace ker::mod::mm::dyn::slab {
+struct Slab;  // forward declaration
 
-    struct Slab {
-        Slab* next;
-        Slab* prev;
-        FreeSlab* freelist;
-        uint64_t refs;
-    };
+struct FreeSlab {
+    void* mem;
+    FreeSlab* next;
+    Slab* parent;
+};
 
-    struct SlabCache {
-        uint64_t size;
-        uint64_t objectSize;
-        const char* name;
-        Slab* slabs;
-    };
+struct Slab {
+    Slab* next;
+    Slab* prev;
+    FreeSlab* freelist;
+    uint64_t refs;
+};
 
-    bool cacheGrow(SlabCache* cache, uint64_t count);
-    SlabCache* newCache(uint64_t objectSize, const char* name, uint64_t align);
-}
+struct SlabCache {
+    uint64_t size;
+    uint64_t objectSize;
+    const char* name;
+    Slab* slabs;
+};
+
+bool cacheGrow(SlabCache* cache, uint64_t count);
+SlabCache* newCache(uint64_t objectSize, const char* name, uint64_t align);
+}  // namespace ker::mod::mm::dyn::slab

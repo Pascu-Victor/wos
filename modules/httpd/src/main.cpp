@@ -1,4 +1,11 @@
+#include <abi-bits/fcntl.h>
+#include <abi-bits/in.h>
+#include <abi-bits/socket.h>
+#include <abi-bits/socklen_t.h>
+#include <abi-bits/stat.h>
 #include <arpa/inet.h>
+#include <bits/posix/stat.h>
+#include <bits/ssize_t.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -15,13 +22,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
-#include <fstream>
-#include <iostream>
-#include <print>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -34,8 +40,8 @@ using httpd_log = wos::journal<"httpd">;
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
-    std::string msg = std::format(fmt, std::forward<Args>(args)...);
-    httpd_log::info("%s", msg.c_str());
+    std::string const MSG = std::format(fmt, std::forward<Args>(args)...);
+    httpd_log::info("%s", MSG.c_str());
 }
 constexpr size_t REQUEST_BUFFER_SIZE = 4096;
 constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
@@ -152,9 +158,9 @@ auto url_decode(std::string_view encoded) -> std::string {
         if (encoded[i] == '%' && i + 2 < encoded.size()) {
             std::array<char, 3> hex = {encoded[i + 1], encoded[i + 2], '\0'};
             char* end = nullptr;
-            long val = strtol(hex.data(), &end, 16);
+            long const VAL = strtol(hex.data(), &end, 16);
             if (end == hex.data() + 2) {
-                result += static_cast<char>(val);
+                result += static_cast<char>(VAL);
                 i += 2;
                 continue;
             }
@@ -289,8 +295,8 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
 
         struct dirent* entry = nullptr;
         while ((entry = readdir(dir)) != nullptr) {
-            std::string name{static_cast<const char*>(entry->d_name)};
-            if (name == "." || name == "..") {
+            std::string const NAME{static_cast<const char*>(entry->d_name)};
+            if (NAME == "." || NAME == "..") {
                 continue;
             }
 
@@ -299,7 +305,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             if (full_path.back() != '/') {
                 full_path += '/';
             }
-            full_path += name;
+            full_path += NAME;
 
             struct stat st{};
             bool is_dir = false;
@@ -309,8 +315,12 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 is_blk = S_ISBLK(st.st_mode);
             }
 
-            entries.push_back({name, is_dir, is_blk, static_cast<uint32_t>(st.st_mode), static_cast<uint32_t>(st.st_uid),
-                               static_cast<uint32_t>(st.st_gid)});
+            entries.push_back({.name = NAME,
+                               .is_dir = is_dir,
+                               .is_blk = is_blk,
+                               .mode = static_cast<uint32_t>(st.st_mode),
+                               .uid = static_cast<uint32_t>(st.st_uid),
+                               .gid = static_cast<uint32_t>(st.st_gid)});
         }
         closedir(dir);
 
@@ -368,19 +378,19 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 char perms[11];
                 perms[0] = ent.is_dir ? 'd' : (ent.is_blk ? 'b' : '-');
                 for (int b = 0; b < 9; b++) {
-                    perms[1 + b] = (ent.mode & (1 << (8 - b))) ? rwx[b] : '-';
+                    perms[1 + b] = ((ent.mode & (1 << (8 - b))) != 0U) ? rwx[b] : '-';
                 }
                 perms[10] = '\0';
-                int n = snprintf(mode_str, sizeof(mode_str), "%s (%04o)", perms, ent.mode & 07777);
-                if (n > 0 && n < static_cast<int>(sizeof(mode_str))) {
-                    html.append(mode_str, n);
+                int const N = snprintf(mode_str, sizeof(mode_str), "%s (%04o)", perms, ent.mode & 07777);
+                if (N > 0 && std::cmp_less(N, sizeof(mode_str))) {
+                    html.append(mode_str, N);
                 }
             }
             html += "</td><td>";
             {
                 char owner_str[32];
-                int n = snprintf(owner_str, sizeof(owner_str), "%u:%u", ent.uid, ent.gid);
-                html.append(owner_str, n);
+                int const N = snprintf(owner_str, sizeof(owner_str), "%u:%u", ent.uid, ent.gid);
+                html.append(owner_str, N);
             }
             html += "</td><td class='size'>";
             html += ent.is_dir ? "-" : format_size(size);
@@ -425,10 +435,10 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
     constexpr int MAX_SEND_RETRIES = 10000;
 
     while (remaining > 0) {
-        ssize_t sent = send(fd, ptr, remaining, 0);
-        if (sent < 0) {
+        ssize_t const SENT = send(fd, ptr, remaining, 0);
+        if (SENT < 0) {
             // EAGAIN (-11): window full or buffer exhaustion - retry
-            if (sent == -11 && retries < MAX_SEND_RETRIES) {
+            if (SENT == -11 && retries < MAX_SEND_RETRIES) {
                 retries++;
                 sched_yield();
                 continue;
@@ -437,15 +447,15 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
             if (total_sent > 0) {
                 return static_cast<ssize_t>(total_sent);
             }
-            return sent;
+            return SENT;
         }
-        if (sent == 0) {
+        if (SENT == 0) {
             // Connection closed
             break;
         }
-        ptr += sent;
-        remaining -= sent;
-        total_sent += sent;
+        ptr += SENT;
+        remaining -= SENT;
+        total_sent += SENT;
         retries = 0;  // Reset retry counter on progress
     }
 
@@ -457,17 +467,17 @@ auto send_response(int client_fd, int status_code, const char* status_text, cons
     -> ssize_t {
     // Build header
     std::array<char, 512> header{};
-    int header_len = snprintf(header.data(), header.size(),
-                              "HTTP/1.1 %d %s\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Connection: close\r\n"
-                              "Server: WOS-httpd/1.0\r\n"
-                              "\r\n",
-                              status_code, status_text, content_type, body_len);
+    int const HEADER_LEN = snprintf(header.data(), header.size(),
+                                    "HTTP/1.1 %d %s\r\n"
+                                    "Content-Type: %s\r\n"
+                                    "Content-Length: %zu\r\n"
+                                    "Connection: close\r\n"
+                                    "Server: WOS-httpd/1.0\r\n"
+                                    "\r\n",
+                                    status_code, status_text, content_type, body_len);
 
     // Send header (using send_all to handle partial sends)
-    ssize_t sent = send_all(client_fd, header.data(), header_len);
+    ssize_t sent = send_all(client_fd, header.data(), HEADER_LEN);
     if (sent < 0) {
         return sent;
     }
@@ -518,8 +528,8 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
     }
 
     // Read file
-    int fd = open(fs_path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    int const FD = open(fs_path.c_str(), O_RDONLY);
+    if (FD < 0) {
         log_message("httpd[t:{},p:{}]: Failed to open file: {}", tid, pid, fs_path);
         send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
         return false;
@@ -527,34 +537,34 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
 
     // Send response header first, then stream file body in chunks.
     const char* mime_type = get_mime_type(fs_path);
-    ssize_t header_sent = send_response(client_fd, 200, "OK", mime_type, nullptr, static_cast<size_t>(st.st_size));
-    if (header_sent < 0) {
-        close(fd);
+    ssize_t const HEADER_SENT = send_response(client_fd, 200, "OK", mime_type, nullptr, static_cast<size_t>(st.st_size));
+    if (HEADER_SENT < 0) {
+        close(FD);
         return false;
     }
 
     std::vector<char> io_buf(FILE_STREAM_BUFFER_SIZE);
     ssize_t total_sent = 0;
     for (;;) {
-        ssize_t bytes_read = read(fd, io_buf.data(), io_buf.size());
-        if (bytes_read < 0) {
+        ssize_t const BYTES_READ = read(FD, io_buf.data(), io_buf.size());
+        if (BYTES_READ < 0) {
             log_message("httpd[t:{},p:{}]: Failed to read file: {}", tid, pid, fs_path);
-            close(fd);
+            close(FD);
             return false;
         }
-        if (bytes_read == 0) {
+        if (BYTES_READ == 0) {
             break;
         }
 
-        ssize_t bytes_sent = send_all(client_fd, io_buf.data(), static_cast<size_t>(bytes_read));
-        if (bytes_sent < 0) {
-            close(fd);
+        ssize_t const BYTES_SENT = send_all(client_fd, io_buf.data(), static_cast<size_t>(BYTES_READ));
+        if (BYTES_SENT < 0) {
+            close(FD);
             return false;
         }
-        total_sent += bytes_sent;
+        total_sent += BYTES_SENT;
     }
 
-    close(fd);
+    close(FD);
 
     log_message("httpd[t:{},p:{}]: Served file: {} ({} bytes, {})", tid, pid, fs_path, total_sent, mime_type);
     return true;
@@ -738,19 +748,19 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
     if (decoded_path == "/info") {
         std::array<char, 1024> info_body{};
-        int body_len = snprintf(info_body.data(), info_body.size(),
-                                "<html><head><title>Server Info</title></head><body>"
-                                "<h1>Server Information</h1>"
-                                "<ul>"
-                                "<li><strong>Process ID:</strong> %lu</li>"
-                                "<li><strong>Thread ID:</strong> %lu</li>"
-                                "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
-                                "<li><strong>Port:</strong> %d</li>"
-                                "<li><strong>Document Root:</strong> %s</li>"
-                                "</ul>"
-                                "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
-                                pid, tid, HTTP_PORT, SERVE_ROOT);
-        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", info_body.data(), body_len);
+        int const BODY_LEN = snprintf(info_body.data(), info_body.size(),
+                                      "<html><head><title>Server Info</title></head><body>"
+                                      "<h1>Server Information</h1>"
+                                      "<ul>"
+                                      "<li><strong>Process ID:</strong> %lu</li>"
+                                      "<li><strong>Thread ID:</strong> %lu</li>"
+                                      "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
+                                      "<li><strong>Port:</strong> %d</li>"
+                                      "<li><strong>Document Root:</strong> %s</li>"
+                                      "</ul>"
+                                      "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
+                                      pid, tid, HTTP_PORT, SERVE_ROOT);
+        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", info_body.data(), BODY_LEN);
         log_message("httpd[t:{},p:{}]: Served /info", tid, pid);
         return;
     }
@@ -767,14 +777,14 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     }
 
     // Remove trailing slash for stat (but keep track for directory handling)
-    bool had_trailing_slash = !fs_path.empty() && fs_path.back() == '/';
+    bool const HAD_TRAILING_SLASH = !fs_path.empty() && fs_path.back() == '/';
     while (fs_path.size() > 1 && fs_path.back() == '/') {
         fs_path.pop_back();
     }
 
     // Ensure URL path for directory listing has trailing slash
     std::string url_for_listing = decoded_path;
-    if (had_trailing_slash && !url_for_listing.empty() && url_for_listing.back() != '/') {
+    if (HAD_TRAILING_SLASH && !url_for_listing.empty() && url_for_listing.back() != '/') {
         url_for_listing += '/';
     }
 
@@ -865,12 +875,12 @@ auto main(int argc, char** argv) -> int {
         }
 
         buffer[received] = '\0';
-        std::string_view request(buffer.data(), received);
+        std::string_view const REQUEST(buffer.data(), received);
 
         log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), client_port);
 
         // Handle request and send response
-        handle_request(client_fd, request);
+        handle_request(client_fd, REQUEST);
 
         // Graceful close: shut down the write side first so the client
         // receives FIN, then drain any unread data the client may have

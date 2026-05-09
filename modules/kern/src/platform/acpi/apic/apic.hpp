@@ -9,7 +9,7 @@
 #include <platform/mm/addr.hpp>
 
 namespace ker::mod::apic {
-static uint64_t APIC_BASE = 0x0;
+static uint64_t apic_base = 0x0;
 
 enum class APICRegisters {
     ID = 0x20,
@@ -104,38 +104,38 @@ enum class IPITriggerMode : uint8_t {
 union IPIConfig {
     struct {
         uint8_t vector;
-        IPIDeliveryMode deliveryMode : 3;
-        IPIDestinationMode destinationMode : 1;
+        IPIDeliveryMode delivery_mode : 3;
+        IPIDestinationMode destination_mode : 1;
         uint8_t reserved1 : 2;
         IPILevel level : 1;
-        IPITriggerMode triggerMode : 1;
+        IPITriggerMode trigger_mode : 1;
         uint8_t reserved2 : 2;
-        IPIDestinationShorthand destinationShorthand : 2;
+        IPIDestinationShorthand destination_shorthand : 2;
         uint32_t reserved3 : 12;
     } __attribute__((packed));
-    uint32_t packedValue;
+    uint32_t packed_value;
 };
 
-void writeReg(uint32_t reg, uint64_t value);
+void write_reg(uint32_t reg, uint64_t value);
 
-uint32_t readReg(uint32_t reg);
+uint32_t read_reg(uint32_t reg);
 
 void eoi();
 
-void sendIpi(IPIConfig messageType, uint32_t destination);
+void send_ipi(IPIConfig message_type, uint32_t destination);
 
-void resetApicCounter();
+void reset_apic_counter();
 
-uint64_t getTicks();
+uint64_t get_ticks();
 
-uint32_t calibrateTimer(uint64_t us);
+uint32_t calibrate_timer(uint64_t us);
 
-void oneShotTimer(uint64_t ticks);
+void one_shot_timer(uint64_t ticks);
 
 void init();
-void initApicMP();
+void init_apic_mp();
 
-uint32_t getApicId();
+uint32_t get_apic_id();
 
 // void startInterrupts();
 }  // namespace ker::mod::apic

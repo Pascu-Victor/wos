@@ -1271,8 +1271,7 @@ TESTD_RUN(test_remote_ipc_pty_child_write) {
     waitpid(pid, &status, 0);
     close(master_fd);
 
-    if (n != static_cast<ssize_t>(RH_PTY_WRITE_MSG.size()) ||
-        std::string_view(buf.data(), static_cast<size_t>(n)) != RH_PTY_WRITE_MSG) {
+    if (n != static_cast<ssize_t>(RH_PTY_WRITE_MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(n)) != RH_PTY_WRITE_MSG) {
         fail("remote_pty_data", "PTY payload mismatch");
         return;
     }
@@ -1665,37 +1664,37 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
 TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
 
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define TESTD_TESTS(X)                      \
-    X(test_vfs_open_write_read_close)       \
-    X(test_vfs_stat)                        \
-    X(test_vfs_lseek)                       \
-    X(test_vfs_mkdir_rmdir)                 \
-    X(test_vfs_unlink_rename)               \
-    X(test_vfs_dup)                         \
-    X(test_vfs_dup2)                        \
-    X(test_vfs_readdir)                     \
-    X(test_vfs_access)                      \
-    X(test_chmod)                           \
-    X(test_truncate)                        \
-    X(test_pipe_basic)                      \
-    X(test_pipe_eof_on_writer_close)        \
-    X(test_getpid_getppid)                  \
-    X(test_getcwd_chdir)                    \
-    X(test_fork_exit)                       \
-    X(test_fork_pipe_byte)                  \
-    X(test_fork_pipe_communication)         \
-    X(test_fork_multiple)                   \
-    X(test_mmap_anon)                       \
-    X(test_file_write_read)                 \
-    X(test_mmap_file)                       \
-    X(test_tcp_loopback)                    \
-    X(test_tcp_nonblocking_connect_refused) \
-    X(test_remote_ipc_pipe_child_write)     \
-    X(test_remote_ipc_pipe_parent_write)    \
-    X(test_remote_ipc_pty_child_write)      \
-    X(test_remote_ipc_pty_ioctl)            \
-    X(test_remote_ipc_socket_child_write)   \
-    X(test_remote_ipc_socket_control_ops)   \
+#define TESTD_TESTS(X)                          \
+    X(test_vfs_open_write_read_close)           \
+    X(test_vfs_stat)                            \
+    X(test_vfs_lseek)                           \
+    X(test_vfs_mkdir_rmdir)                     \
+    X(test_vfs_unlink_rename)                   \
+    X(test_vfs_dup)                             \
+    X(test_vfs_dup2)                            \
+    X(test_vfs_readdir)                         \
+    X(test_vfs_access)                          \
+    X(test_chmod)                               \
+    X(test_truncate)                            \
+    X(test_pipe_basic)                          \
+    X(test_pipe_eof_on_writer_close)            \
+    X(test_getpid_getppid)                      \
+    X(test_getcwd_chdir)                        \
+    X(test_fork_exit)                           \
+    X(test_fork_pipe_byte)                      \
+    X(test_fork_pipe_communication)             \
+    X(test_fork_multiple)                       \
+    X(test_mmap_anon)                           \
+    X(test_file_write_read)                     \
+    X(test_mmap_file)                           \
+    X(test_tcp_loopback)                        \
+    X(test_tcp_nonblocking_connect_refused)     \
+    X(test_remote_ipc_pipe_child_write)         \
+    X(test_remote_ipc_pipe_parent_write)        \
+    X(test_remote_ipc_pty_child_write)          \
+    X(test_remote_ipc_pty_ioctl)                \
+    X(test_remote_ipc_socket_child_write)       \
+    X(test_remote_ipc_socket_control_ops)       \
     X(test_remote_ipc_epoll_wait_pipe_readable) \
     X(test_remote_ipc_epoll_ctl_add)
 // NOLINTEND(cppcoreguidelines-macro-usage)

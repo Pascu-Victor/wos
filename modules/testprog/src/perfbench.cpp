@@ -61,7 +61,7 @@ static auto count_threads_on_cpu(const std::vector<SpawnArg>& args, int cpu_id) 
 static auto spawn_thread(void* param) -> int {
     auto* a = static_cast<SpawnArg*>(param);
     a->start_ns = now_ns();
-    a->cpu_id = (int)ker::multiproc::getCurrentCpu();
+    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
     return 0;
 }
 
@@ -228,7 +228,7 @@ static auto par_eff_thread(void* param) -> int {
     while (!a->go->load(std::memory_order_acquire)) {
         thrd_yield();
     }
-    a->cpu_id = (int)ker::multiproc::getCurrentCpu();
+    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
     a->cpu_end_id = a->cpu_id;
     a->cpu_mask = cpu_bit(a->cpu_id);
     a->cpu_changes = 0;
@@ -241,11 +241,11 @@ static auto par_eff_thread(void* param) -> int {
     constexpr int SAMPLE_STRIDE = 1 << 20;
     for (int i = start; i < end; ++i) {
         if (((i - start) % SAMPLE_STRIDE) == 0) {
-            note_cpu_sample(a, (int)ker::multiproc::getCurrentCpu());
+            note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
         }
         sum = scramble_work(sum, static_cast<uint64_t>(i));
     }
-    note_cpu_sample(a, (int)ker::multiproc::getCurrentCpu());
+    note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
     a->result = sum;
     a->end_ns = now_ns();
     a->cpu_ns = rdtsc() - cpu_start;
@@ -305,7 +305,7 @@ struct PhaseProbeArg {
 
 static auto phase_probe_thread(void* param) -> int {
     auto* probe = static_cast<PhaseProbeArg*>(param);
-    probe->cpu_id = (int)ker::multiproc::getCurrentCpu();
+    probe->cpu_id = (int)ker::multiproc::getcurrent_cpu();
     return 0;
 }
 

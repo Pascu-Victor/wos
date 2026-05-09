@@ -1568,14 +1568,14 @@ void QemuLogViewer::onInterruptsReceived(const std::vector<LogEntry>& interrupts
     std::unordered_set<std::string> seenInterrupts;
 
     for (const auto& entry : interrupts) {
-        std::string intNum = entry.interruptNumber;
+        std::string int_num = entry.interruptNumber;
 
         // Populate Panel
-        if (groups.find(intNum) == groups.end()) {
+        if (groups.find(int_num) == groups.end()) {
             auto* item = new QTreeWidgetItem(interruptsPanel);
 
             // Format interrupt name
-            QString s = QString::fromStdString(intNum);
+            QString s = QString::fromStdString(int_num);
             bool ok;
             int val = s.toInt(&ok, 16);
             QString display;
@@ -1591,18 +1591,18 @@ void QemuLogViewer::onInterruptsReceived(const std::vector<LogEntry>& interrupts
             }
 
             item->setText(0, display);
-            item->setData(0, Qt::UserRole, QString::fromStdString(intNum));
-            groups[intNum] = item;
+            item->setData(0, Qt::UserRole, QString::fromStdString(int_num));
+            groups[int_num] = item;
         }
 
-        auto* groupItem = groups[intNum];
+        auto* groupItem = groups[int_num];
         auto* child = new QTreeWidgetItem(groupItem);
         child->setText(0, QString("Line %1: %2").arg(entry.lineNumber).arg(QString::fromStdString(entry.cpuStateInfo)));
         child->setData(0, Qt::UserRole, entry.lineNumber);
 
         // Populate Combo Box
-        if (interruptFilterCombo && seenInterrupts.insert(intNum).second) {
-            QString s = QString::fromStdString(intNum);
+        if (interruptFilterCombo && seenInterrupts.insert(int_num).second) {
+            QString s = QString::fromStdString(int_num);
             bool ok;
             int val = s.toInt(&ok, 16);
             QString display;
@@ -2457,7 +2457,7 @@ void QemuLogViewer::openCoredump(const QString& filePath) {
                              .arg(fi.fileName())
                              .arg(currentCoreDump_->pid)
                              .arg(currentCoreDump_->cpu)
-                             .arg(wosdbg::interruptName(currentCoreDump_->intNum)));
+                             .arg(wosdbg::interruptName(currentCoreDump_->int_num)));
 }
 
 void QemuLogViewer::closeCoredump() {

@@ -161,7 +161,7 @@ class SmallVec {
     size_t m_size{0};
     size_t m_capacity{0};  // heap capacity (elements beyond InlineN)
 
-    auto at_ref(size_t i) const -> const T& {
+    [[nodiscard]] auto at_ref(size_t i) const -> const T& {
         if (i < InlineN) {
             return m_inline[i];
         }

@@ -8,11 +8,11 @@ extern "C" void jump_to_next_task_no_save();
 namespace ker::mod::sys::context_switch {
 // Returns true if switch was successful, false if task validation failed
 // and caller should fall back to idle loop
-bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask);
-void startSchedTimer();
+auto switch_to(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* next_task) -> bool;
+void start_sched_timer();
 void request_reschedule();
 
 // Save/restore FPU/SSE/AVX state for a task (xsave if available, fxsave otherwise)
-void saveFpuState(sched::task::Task* task);
-void restoreFpuState(sched::task::Task* task);
+void save_fpu_state(sched::task::Task* task);
+void restore_fpu_state(sched::task::Task* task);
 }  // namespace ker::mod::sys::context_switch

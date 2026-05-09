@@ -189,7 +189,7 @@ __attribute__((no_sanitize("address"))) auto is_in_hhdm_range(uint64_t addr) -> 
 // Helper to check if a physical address falls within one of our known memory zones
 // This is the SAFEST check - if it passes, we know the memory is accessible
 __attribute__((no_sanitize("address"))) auto is_phys_addr_in_zone(uint64_t phys_addr) -> bool {
-    for (paging::PageZone* zone = getZones(); zone != nullptr; zone = zone->next) {
+    for (paging::PageZone* zone = get_zones(); zone != nullptr; zone = zone->next) {
         // Zone stores virtual addresses (HHDM mapped), convert back to physical
         uint64_t zone_phys_start = zone->start - cached_hhdm_offset;
         uint64_t zone_phys_end = zone_phys_start + zone->len;
@@ -479,7 +479,7 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                 // Categorize by permissions
                 if (pml3->entries[i3].writable != 0) {
                     stats.rw_pages += page_count;
-                } else if (pml3->entries[i3].noExecute == 0) {
+                } else if (pml3->entries[i3].no_execute == 0) {
                     stats.rx_pages += page_count;
                 } else {
                     stats.ro_pages += page_count;
@@ -520,7 +520,7 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
 
                     if (pml2->entries[i2].writable != 0) {
                         stats.rw_pages += page_count;
-                    } else if (pml2->entries[i2].noExecute == 0) {
+                    } else if (pml2->entries[i2].no_execute == 0) {
                         stats.rx_pages += page_count;
                     } else {
                         stats.ro_pages += page_count;
@@ -561,7 +561,7 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                     // Categorize by permissions
                     if (pml1->entries[i1].writable != 0) {
                         stats.rw_pages++;
-                    } else if (pml1->entries[i1].noExecute == 0) {
+                    } else if (pml1->entries[i1].no_execute == 0) {
                         stats.rx_pages++;
                     } else {
                         stats.ro_pages++;
@@ -615,7 +615,7 @@ __attribute__((no_sanitize("address"))) void collect_task_info(sched::task::Task
     info.pid = task->pid;
     info.name = task->name;
     info.is_active = is_active;
-    info.has_exited = task->hasExited;
+    info.has_exited = task->has_exited;
 
     // Validate pagemap pointer
     paging::PageTable* pagemap = task->pagemap;
@@ -674,7 +674,7 @@ __attribute__((no_sanitize("address"))) void collect_task_info(sched::task::Task
 
 // Dump page allocation status when OOM - uses NO dynamic allocations
 // This function uses only pre-allocated static buffers and serial output
-__attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
+__attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     asm volatile("cli");  // Disable interrupts to avoid concurrency issues during OOM dump
 
     // Atomically try to claim the OOM dump - only one CPU can proceed
@@ -698,8 +698,8 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
     // use the computed totals there to refine the unaccounted memory estimate.
     // For now just call the raw dumps so they appear early in the log for visibility.
     mini_dump_stats();
-    ker::mod::mm::dyn::kmalloc::dumpTrackedAllocations();
-    dumpAllocStats();  // Dump page allocation counters
+    ker::mod::mm::dyn::kmalloc::dump_tracked_allocations();
+    dump_alloc_stats();  // Dump page allocation counters
 
     // Reset tracking arrays
     oom_task_count = 0;
@@ -714,7 +714,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
     io::serial::write("│ PHYSICAL MEMORY ZONES                                               │\n");
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
-    paging::PageZone* zones = getZones();
+    paging::PageZone* zones = get_zones();
     if (zones == nullptr) {
         io::serial::write("ERROR: No memory zones initialized!\n");
         return;
@@ -727,7 +727,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
         zone_count++;
 
         io::serial::write("Zone ");
-        io::serial::write(u64_to_dec_no_alloc(zone->zoneNum, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(u64_to_dec_no_alloc(zone->zone_num, oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(": ");
         if (zone->name != nullptr) {
             io::serial::write(zone->name);
@@ -746,7 +746,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
         io::serial::write(" MB)\n");
 
         io::serial::write("  Page count: ");
-        io::serial::write(u64_to_dec_no_alloc(zone->pageCount, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(u64_to_dec_no_alloc(zone->page_count, oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write("\n");
 
         total_memory += zone->len;
@@ -808,7 +808,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
         while (current_pid <= MAX_PID_SCAN && oom_task_count < MAX_OOM_TRACKED_TASKS) {
             sched::task::Task* task = sched::find_task_by_pid(current_pid);
             if (task != nullptr) {
-                collect_task_info(task, !task->hasExited);
+                collect_task_info(task, !task->has_exited);
             }
             current_pid++;
         }
@@ -951,7 +951,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
         io::serial::write(u64_to_dec_no_alloc(cpu_no, oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(":\n");
 
-        io::serial::write("    runnableHeap:  ");
+        io::serial::write("    runnable_heap:  ");
         io::serial::write(u64_to_dec_no_alloc(rq_stats.active_task_count, oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(" tasks\n");
 
@@ -1027,7 +1027,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
     io::serial::write("    Scheduler list memory: 0 bytes (zero-alloc EEVDF)\n");
 
     io::serial::write("\nThread Tracking:\n");
-    uint64_t active_thread_count = sched::threading::getActiveThreadCount();
+    uint64_t active_thread_count = sched::threading::get_active_thread_count();
     // std::list<Thread*> node: prev + next + data = 24 bytes each
     constexpr uint64_t STD_LIST_NODE_SIZE = 24;
     io::serial::write("  activeThreads list: ");
@@ -1091,7 +1091,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
 
     // Sum free pages across all zones
     uint64_t total_free_pages = 0;
-    for (paging::PageZone* z = getZones(); z != nullptr; z = z->next) {
+    for (paging::PageZone* z = get_zones(); z != nullptr; z = z->next) {
         if (z->allocator != nullptr) {
             total_free_pages += z->allocator->getFreePages();
         }
@@ -1166,7 +1166,7 @@ __attribute__((no_sanitize("address"))) void dumpPageAllocationsOOM() {
     // Show allocator-level accounting
     uint64_t kmalloc_count = 0;
     uint64_t kmalloc_bytes = 0;
-    ker::mod::mm::dyn::kmalloc::getTrackedAllocTotals(kmalloc_count, kmalloc_bytes);
+    ker::mod::mm::dyn::kmalloc::get_tracked_alloc_totals(kmalloc_count, kmalloc_bytes);
     uint64_t slab_bytes = mini_get_total_slab_bytes();
 
     io::serial::write("\n");

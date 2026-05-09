@@ -241,8 +241,8 @@ auto attr_extents_map_logblk(const XfsBmbtIrec* extents, uint32_t count, xfs_dab
 // valuelen: total value byte count
 // buf/buflen: caller buffer (nullptr for size-only query)
 // extents/ext_count: attr fork extent mapping
-auto attr_read_remote_value(XfsMountContext* mount, const XfsBmbtIrec* extents, uint32_t ext_count, xfs_dablk_t valueblk,
-                            uint32_t valuelen, void* buf, uint32_t buflen) -> int {
+auto attr_read_remote_value(XfsMountContext* mount, const XfsBmbtIrec* extents, uint32_t ext_count, xfs_dablk_t valueblk, uint32_t valuelen,
+                            void* buf, uint32_t buflen) -> int {
     if (buf == nullptr) {
         return static_cast<int>(valuelen);
     }
@@ -527,8 +527,8 @@ void attr_leaf_compute_crc(uint8_t* block, size_t block_size) {
 // At call time ip->attr_fork.local still holds the existing shortform data
 // (with the old duplicate entry already removed by sf_set if applicable).
 // The new attr (name/namelen/val/valuelen/flags) must be appended.
-auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* val,
-                        uint32_t valuelen, uint8_t flags) -> int {
+auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* val, uint32_t valuelen,
+                        uint8_t flags) -> int {
     XfsMountContext* ctx = ip->mount;
     const size_t blk_size = ctx->block_size;
 

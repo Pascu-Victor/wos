@@ -136,8 +136,8 @@ void CoredumpRegisterPanel::populateFrameTable(QTableWidget* table, const wosdbg
     addReg("CS", frame.cs);
     addReg("SS", frame.ss);
     addReg("RFLAGS", frame.rflags);
-    addReg("IntNum", frame.intNum);
-    addReg("ErrCode", frame.errCode);
+    addReg("int_num", frame.int_num);
+    addReg("err_code", frame.err_code);
 
     // General purpose registers
     addReg("RAX", regs.rax);
@@ -164,8 +164,8 @@ void CoredumpRegisterPanel::loadCoreDump(const wosdbg::CoreDump& dump, const std
     // Populate header info
     headerTable_->setItem(0, 0, makeItem(QString::number(dump.pid)));
     headerTable_->setItem(0, 1, makeItem(QString::number(dump.cpu)));
-    headerTable_->setItem(0, 2, makeItem(QString("%1 (%2)").arg(dump.intNum).arg(wosdbg::interruptName(dump.intNum))));
-    headerTable_->setItem(0, 3, makeItem(wosdbg::formatU64(dump.errCode)));
+    headerTable_->setItem(0, 2, makeItem(QString("%1 (%2)").arg(dump.int_num).arg(wosdbg::interruptName(dump.int_num))));
+    headerTable_->setItem(0, 3, makeItem(wosdbg::formatU64(dump.err_code)));
     headerTable_->setItem(0, 4, makeAddrItem(dump.cr2, symTables, sectionMaps));
     headerTable_->setItem(0, 5, makeItem(wosdbg::formatU64(dump.cr3)));
     headerTable_->setItem(0, 6, makeItem(QString::number(dump.timestamp)));

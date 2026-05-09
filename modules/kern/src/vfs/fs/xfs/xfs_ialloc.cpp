@@ -235,8 +235,8 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
 
     const uint64_t inode_bit = static_cast<uint64_t>(1) << bit;
     if ((rec.free_mask & inode_bit) != 0) {
-        mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)",
-                                      (unsigned long)ino, agno, agino, chunk_start, rec.freecount);
+        mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)", (unsigned long)ino,
+                                      agno, agino, chunk_start, rec.freecount);
         return -EEXIST;
     }
 

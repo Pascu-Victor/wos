@@ -88,19 +88,19 @@ void mm_init() { mod::mm::init(); }
 
 void fsgsbase_init() {
     // Enable FSGSBASE instructions
-    mod::cpu::enableFSGSBASE();
+    mod::cpu::enable_fsgsbase();
 }
 
 void gdt_init() {
     // Initialize GDT with the captured stack pointer
     uint64_t rsp = get_kernel_rsp();
     auto* stack = reinterpret_cast<uint8_t*>(rsp);
-    mod::desc::gdt::initDescriptors(reinterpret_cast<uint64_t*>(stack) + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
+    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack) + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
 }
 
 void kmalloc_init() {
     mod::mm::dyn::kmalloc::init();
-    mod::dbg::enableKmalloc();
+    mod::dbg::enable_kmalloc();
 #ifdef WOS_KASAN
     ker::mod::kasan::init();
 #endif
@@ -112,15 +112,15 @@ void acpi_init() { mod::acpi::init(); }
 
 void apic_init() { mod::apic::init(); }
 
-void apic_mp_init() { mod::apic::initApicMP(); }
+void apic_mp_init() { mod::apic::init_apic_mp(); }
 
 void time_init() {
     mod::time::init();
-    mod::dbg::enableTime();
+    mod::dbg::enable_time();
 }
 
 void idt_init() {
-    mod::desc::idt::idtInit();
+    mod::desc::idt::idt_init();
 #ifdef WOS_KASAN
     // IDT is live — shadow demand-faulting now works.
     ker::mod::kasan::enable();
@@ -214,8 +214,8 @@ void ipv6_linklocal_init() {
 }
 
 void sse_init() {
-    mod::cpu::enableSSE();
-    mod::cpu::enableXSave();
+    mod::cpu::enable_sse();
+    mod::cpu::enable_xsave();
 }
 
 void ntp_init() { mod::ntp::init(); }

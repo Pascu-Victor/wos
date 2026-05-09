@@ -34,9 +34,9 @@ __idt_isr_handler:
         %assign j j + 1
     %endrep
 
-    mov r11, [r10 + GPREGS_SIZE + 0x00] ; intNum
+    mov r11, [r10 + GPREGS_SIZE + 0x00] ; int_num
     mov [rsp + GPREGS_SIZE + 0x00], r11
-    mov r11, [r10 + GPREGS_SIZE + 0x08] ; errCode
+    mov r11, [r10 + GPREGS_SIZE + 0x08] ; err_code
     mov [rsp + GPREGS_SIZE + 0x08], r11
     mov r11, [r10 + GPREGS_SIZE + 0x10] ; RIP
     mov [rsp + GPREGS_SIZE + 0x10], r11
@@ -183,8 +183,8 @@ isr32:
     jmp task_switch_handler
 
 .user_or_outer:
-    push qword 0   ; errCode (none for IRQ)
-    push qword 32  ; intNum
+    push qword 0   ; err_code (none for IRQ)
+    push qword 32  ; int_num
     isr_swapgs isr32_entry
     pushq
     jmp task_switch_handler

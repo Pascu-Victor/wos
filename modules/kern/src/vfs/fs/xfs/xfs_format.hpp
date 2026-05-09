@@ -676,11 +676,11 @@ struct XfsAttrLeafMap {
 static_assert(sizeof(XfsAttrLeafMap) == 4);
 
 struct XfsAttr3LeafHdr {
-    XfsDa3Blkinfo info;                          // DA btree block info
-    __be16 count;                                // number of entries
-    __be16 usedbytes;                            // bytes used for name/value payloads
-    __be16 firstused;                            // first used byte in name area
-    uint8_t holes;                               // non-zero if compaction needed
+    XfsDa3Blkinfo info;  // DA btree block info
+    __be16 count;        // number of entries
+    __be16 usedbytes;    // bytes used for name/value payloads
+    __be16 firstused;    // first used byte in name area
+    uint8_t holes;       // non-zero if compaction needed
     uint8_t pad1;
     XfsAttrLeafMap freemap[XFS_ATTR_LEAF_MAPSIZE];  // N largest free regions
     // Followed by XfsAttrLeafEntry[] array
@@ -715,7 +715,7 @@ struct XfsAttrLeafNameRemote {
 
 // --- Remote attribute value block header (XFS v5) ---
 constexpr uint32_t XFS_ATTR3_RMT_MAGIC = 0x5841524d;  // 'XARM'
-constexpr size_t XFS_ATTR3_RMT_CRC_OFF = 12;           // offsetof(XfsAttr3RmtHdr, rm_crc)
+constexpr size_t XFS_ATTR3_RMT_CRC_OFF = 12;          // offsetof(XfsAttr3RmtHdr, rm_crc)
 
 struct XfsAttr3RmtHdr {
     __be32 rm_magic;   // XFS_ATTR3_RMT_MAGIC

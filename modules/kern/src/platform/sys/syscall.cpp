@@ -34,16 +34,14 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
 
     switch (callnum) {
         case abi::callnums::sys_log:
-            return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3,
-                                             a4, (const char*)a5);
+            return ker::syscall::log::sysLog(static_cast<abi::sys_log::sys_log_ops>(a1), (const char*)a2, a3, a4, (const char*)a5);
         case abi::callnums::futex:
             return ker::syscall::futex::sys_futex(a1, a2, a3, a4);
         case abi::callnums::threading:
             // Dispatch based on operation - threadControlOps start at 0x100
             if (a1 >= 0x100) {
-                return ker::syscall::multiproc::threadControl(
-                    static_cast<abi::multiproc::threadControlOps>(a1),
-                    (void*)a2, (void*)a3, (void*)a4);
+                return ker::syscall::multiproc::threadControl(static_cast<abi::multiproc::threadControlOps>(a1), (void*)a2, (void*)a3,
+                                                              (void*)a4);
             }
             return ker::syscall::multiproc::threadInfo(static_cast<abi::multiproc::threadInfoOps>(a1));
         case abi::callnums::time:
@@ -99,34 +97,34 @@ extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t {
 
 // Called from syscall.asm when RCX (return RIP) was corrupted during syscall handling.
 // This means the kernel stack has been overwritten between pushq (entry) and popq (exit).
-extern "C" [[noreturn]] void _wOS_sysret_corrupt_panic(uint64_t actualRcx, uint64_t expectedRcx, uint64_t userRsp) {
+extern "C" [[noreturn]] void wos_sysret_corrupt_panic(uint64_t actual_rcx, uint64_t expected_rcx, uint64_t user_rsp) {
     io::serial::write("\n!!! SYSRET CORRUPTION DETECTED !!!\n");
     io::serial::write("  RCX (actual):   0x");
-    io::serial::write(actualRcx);
+    io::serial::write(actual_rcx);
     io::serial::write("\n  RCX (expected): 0x");
-    io::serial::write(expectedRcx);
+    io::serial::write(expected_rcx);
     io::serial::write("\n  User RSP:       0x");
-    io::serial::write(userRsp);
+    io::serial::write(user_rsp);
 
     // Dump CPU and task info
     io::serial::write("\n  CPU: ");
-    io::serial::write((uint64_t)cpu::currentCpu());
+    io::serial::write(cpu::current_cpu());
 
     // Read the scratch area fields that might explain what happened
-    uint64_t gsKernStack = 0;
-    asm volatile("movq %%gs:0x0, %0" : "=r"(gsKernStack));
+    uint64_t gs_kern_stack = 0;
+    asm volatile("movq %%gs:0x0, %0" : "=r"(gs_kern_stack));
     io::serial::write("\n  gs:0x00 (kernel stack): 0x");
-    io::serial::write(gsKernStack);
+    io::serial::write(gs_kern_stack);
 
-    uint64_t gsSavedRip = 0;
-    asm volatile("movq %%gs:0x28, %0" : "=r"(gsSavedRip));
+    uint64_t gs_saved_rip = 0;
+    asm volatile("movq %%gs:0x28, %0" : "=r"(gs_saved_rip));
     io::serial::write("\n  gs:0x28 (saved RIP):    0x");
-    io::serial::write(gsSavedRip);
+    io::serial::write(gs_saved_rip);
 
-    uint64_t gsCpuId = 0;
-    asm volatile("movq %%gs:0x10, %0" : "=r"(gsCpuId));
+    uint64_t gs_cpu_id = 0;
+    asm volatile("movq %%gs:0x10, %0" : "=r"(gs_cpu_id));
     io::serial::write("\n  gs:0x10 (cpuId):        0x");
-    io::serial::write(gsCpuId);
+    io::serial::write(gs_cpu_id);
 
     io::serial::write("\n  Halting.\n");
     for (;;) asm volatile("hlt");
@@ -134,16 +132,16 @@ extern "C" [[noreturn]] void _wOS_sysret_corrupt_panic(uint64_t actualRcx, uint6
 
 void init() {
     uint64_t efer = 0;
-    cpuGetMSR(IA32_EFER, &efer);
-    cpuSetMSR(IA32_EFER, efer | (1 << 0));                                                       // Enable syscall/sysret
-    cpuSetMSR(IA32_FMASK, (1 << 9) | (1 << 8));                                                  // clear IF and TF
+    cpu_get_msr(IA32_EFER, &efer);
+    cpu_set_msr(IA32_EFER, efer | (1 << 0));                                                     // Enable syscall/sysret
+    cpu_set_msr(IA32_FMASK, (1 << 9) | (1 << 8));                                                // clear IF and TF
     const uint64_t kernCS = (desc::gdt::GDT_ENTRY_KERNEL_CODE) * 8;                              // Kernel CS
     const uint64_t userCS = ((desc::gdt::GDT_ENTRY_USER_CODE) * 8 | desc::gdt::GDT_RING3) - 16;  // -16 since 64 bit sysret offsets
     const uint64_t* STARValue = (uint64_t*)((kernCS | (userCS << 16)) << 32);                    // kern/user CS stored in high half of STAR
-    cpuSetMSR(IA32_STAR, (uint64_t)STARValue);
-    cpuSetMSR(IA32_LSTAR, (uint64_t)&_wOS_asm_syscallHandler);
+    cpu_set_msr(IA32_STAR, (uint64_t)STARValue);
+    cpu_set_msr(IA32_LSTAR, (uint64_t)&_wOS_asm_syscallHandler);
     uint32_t eax = 0;
     uint32_t edx = 0;
-    cpuGetMSR(IA32_STAR, &eax, &edx);
+    cpu_get_msr(IA32_STAR, &eax, &edx);
 }
 }  // namespace ker::mod::sys

@@ -32,10 +32,10 @@ namespace {
 inline auto valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
 
 inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool {
-    if (task == nullptr || !valid_kernel_stack(task->context.syscallKernelStack)) {
+    if (task == nullptr || !valid_kernel_stack(task->context.syscall_kernel_stack)) {
         return false;
     }
-    uint64_t stack_top = task->context.syscallKernelStack;
+    uint64_t stack_top = task->context.syscall_kernel_stack;
     return rsp > stack_top - KERNEL_STACK_SIZE && rsp <= stack_top;
 }
 
@@ -46,19 +46,17 @@ inline void validate_kernel_frame(const gates::interruptFrame& frame, sched::tas
         }
         dbg::logger<"ctxswitch">::error(
             "user return frame for non-process: path=%s pid=%lu name=%s type=%u ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
-            path != nullptr ? path : "?", task != nullptr ? task->pid : 0,
-            (task != nullptr && task->name != nullptr) ? task->name : "?", task != nullptr ? static_cast<unsigned>(task->type) : 0U,
-            (unsigned long long)frame.ss, (unsigned long long)frame.rip, (unsigned long long)frame.rsp, (unsigned long long)frame.flags,
-            static_cast<void*>(task));
+            path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+            task != nullptr ? static_cast<unsigned>(task->type) : 0U, (unsigned long long)frame.ss, (unsigned long long)frame.rip,
+            (unsigned long long)frame.rsp, (unsigned long long)frame.flags, static_cast<void*>(task));
         hcf();
     }
 
     if (frame.cs != desc::gdt::GDT_KERN_CS) {
         dbg::logger<"ctxswitch">::error(
             "bad return frame selector: path=%s pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
-            path != nullptr ? path : "?", task != nullptr ? task->pid : 0,
-            (task != nullptr && task->name != nullptr) ? task->name : "?", (unsigned long long)frame.cs,
-            (unsigned long long)frame.ss, (unsigned long long)frame.rip, (unsigned long long)frame.rsp,
+            path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+            (unsigned long long)frame.cs, (unsigned long long)frame.ss, (unsigned long long)frame.rip, (unsigned long long)frame.rsp,
             (unsigned long long)frame.flags, static_cast<void*>(task));
         hcf();
     }
@@ -78,16 +76,16 @@ inline void validate_kernel_frame(const gates::interruptFrame& frame, sched::tas
         "flags=0x%llx task=%p",
         path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
         (unsigned long long)frame.rip, (unsigned long long)frame.rsp,
-        task != nullptr ? (unsigned long long)task->context.syscallKernelStack : 0ULL, owner != nullptr ? owner->pid : 0UL,
+        task != nullptr ? (unsigned long long)task->context.syscall_kernel_stack : 0ULL, owner != nullptr ? owner->pid : 0UL,
         (owner != nullptr && owner->name != nullptr) ? owner->name : "?", (unsigned long long)frame.cs, (unsigned long long)frame.ss,
         (unsigned long long)frame.flags, static_cast<void*>(task));
     hcf();
 }
 
 inline auto is_kernel_thread_trampoline_frame(const gates::interruptFrame& frame, const cpu::GPRegs& gpr, sched::task::Task* task) -> bool {
-    return task != nullptr && task->type == sched::task::TaskType::DAEMON && task->kthreadEntry != nullptr &&
+    return task != nullptr && task->type == sched::task::TaskType::DAEMON && task->kthread_entry != nullptr &&
            frame.cs == desc::gdt::GDT_KERN_CS && frame.rip == reinterpret_cast<uint64_t>(_wOS_kernel_thread_trampoline) &&
-           gpr.rdi == reinterpret_cast<uint64_t>(task->kthreadEntry);
+           gpr.rdi == reinterpret_cast<uint64_t>(task->kthread_entry);
 }
 
 inline auto is_idle_return_frame(const gates::interruptFrame& frame, sched::task::Task* task) -> bool {
@@ -117,11 +115,11 @@ void validate_timer_stack(const gates::interruptFrame& frame, const cpu::GPRegs&
         "timer on non-task stack: current=%lu(%s) rip=0x%llx caller=0x%llx rsp=0x%llx stack=0x%llx type=%u hasRun=%u owner=%lu(%s) "
         "owner_stack=0x%llx owner_cpu=%llu owner_q=%u owner_heap=%d",
         task->pid, task->name != nullptr ? task->name : "?", (unsigned long long)frame.rip, (unsigned long long)caller,
-        (unsigned long long)frame.rsp, (unsigned long long)task->context.syscallKernelStack, static_cast<unsigned>(task->type),
-        task->hasRun ? 1U : 0U, owner != nullptr ? owner->pid : 0UL, (owner != nullptr && owner->name != nullptr) ? owner->name : "?",
-        owner != nullptr ? (unsigned long long)owner->context.syscallKernelStack : 0ULL,
-        owner != nullptr ? (unsigned long long)owner->cpu : 0ULL, owner != nullptr ? static_cast<unsigned>(owner->schedQueue) : 0U,
-        owner != nullptr ? owner->heapIndex : -1);
+        (unsigned long long)frame.rsp, (unsigned long long)task->context.syscall_kernel_stack, static_cast<unsigned>(task->type),
+        task->has_run ? 1U : 0U, owner != nullptr ? owner->pid : 0UL, (owner != nullptr && owner->name != nullptr) ? owner->name : "?",
+        owner != nullptr ? (unsigned long long)owner->context.syscall_kernel_stack : 0ULL,
+        owner != nullptr ? (unsigned long long)owner->cpu : 0ULL, owner != nullptr ? static_cast<unsigned>(owner->sched_queue) : 0U,
+        owner != nullptr ? owner->heap_index : -1);
     hcf();
 }
 
@@ -139,18 +137,18 @@ auto current_stack_matches_current_task() -> bool {
 }
 
 [[noreturn]] void enter_idle_from_timer(sched::task::Task* task, const gates::interruptFrame& frame) {
-    uint64_t stack = task != nullptr ? task->context.syscallKernelStack : 0;
+    uint64_t stack = task != nullptr ? task->context.syscall_kernel_stack : 0;
     if (!valid_kernel_stack(stack)) {
         dbg::logger<"ctxswitch">::error("timer idle return bad rsp: pid=%lu frame_rsp=0x%llx stack=0x%llx", task != nullptr ? task->pid : 0,
                                         (unsigned long long)frame.rsp, (unsigned long long)stack);
         hcf();
     }
 
-    mm::virt::switchToKernelPagemap();
-    auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscallScratchArea);
-    scratch->cpuId = cpu::currentCpu();
-    cpu::wrgsbase(task->context.syscallScratchArea);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, task->context.syscallScratchArea);
+    mm::virt::switch_to_kernel_pagemap();
+    auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    scratch->cpu_id = cpu::current_cpu();
+    cpu::wrgsbase(task->context.syscall_scratch_area);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, task->context.syscall_scratch_area);
 
     _wOS_enterIdleStack(stack);
 }
@@ -160,7 +158,7 @@ auto current_stack_matches_current_task() -> bool {
 // NOTE: The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
 // Now we just use the scheduler's getCurrentTask() instead of a separate debug array.
 // This function is now a no-op since the scheduler tracks currentTask internally.
-static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpuId) {
+static inline void updateDebugTaskPtr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpu_id) {
     // No-op: scheduler's runQueues->thisCpu()->currentTask is the authoritative source
 }
 
@@ -175,36 +173,36 @@ static inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr
 
 // Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
 // The memory operand must be 64-byte aligned for xsave, 16-byte for fxsave.
-// FxState::aligned() guarantees 64-byte alignment regardless of Task placement.
-void saveFpuState(sched::task::Task* task) {
-    auto* buf = task->fxState.aligned();
-    if (cpu::xsaveAreaSize > 0) {
+// fx_state::aligned() guarantees 64-byte alignment regardless of Task placement.
+void save_fpu_state(sched::task::Task* task) {
+    auto* buf = task->fx_state.aligned();
+    if (cpu::xsave_area_size > 0) {
         asm volatile("xsave64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
     } else {
         asm volatile("fxsave64 (%0)" : : "r"(buf) : "memory");
     }
-    task->fxState.saved = true;
+    task->fx_state.saved = true;
 }
 
 // Restore FPU/SSE/AVX state of a task. Uses xrstor if available, fxrstor otherwise.
-void restoreFpuState(sched::task::Task* task) {
-    auto* buf = task->fxState.aligned();
-    if (cpu::xsaveAreaSize > 0) {
+void restore_fpu_state(sched::task::Task* task) {
+    auto* buf = task->fx_state.aligned();
+    if (cpu::xsave_area_size > 0) {
         asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
     } else {
         asm volatile("fxrstor64 (%0)" : : "r"(buf) : "memory");
     }
 }
 
-bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* nextTask) {
+auto switch_to(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task* next_task) -> bool {
     // CRITICAL: We must do ALL validation BEFORE modifying any state.
     // If we modify gpr/frame but fail to switch pagemap, the iretq will use
     // the new task's RIP/RSP with the wrong pagemap - causing a crash.
 
     // First state check - bail out immediately if task is not ACTIVE
-    if (nextTask->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
-        dbg::log("switchTo: FAIL early - PID %x not ACTIVE (state=%d)", nextTask->pid,
-                 (int)nextTask->state.load(std::memory_order_relaxed));
+    if (next_task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
+        dbg::log("switchTo: FAIL early - PID %x not ACTIVE (state=%d)", next_task->pid,
+                 (int)next_task->state.load(std::memory_order_relaxed));
         return false;
     }
 
@@ -215,30 +213,30 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
 
     // Validate task has required resources for a user task
     // IDLE and DAEMON tasks use the kernel pagemap and have no user thread
-    if (nextTask->type == sched::task::TaskType::PROCESS) {
+    if (next_task->type == sched::task::TaskType::PROCESS) {
         // User process must have pagemap
-        if (nextTask->pagemap == nullptr) {
-            dbg::log("switchTo: FAIL - PID %x pagemap==nullptr", nextTask->pid);
+        if (next_task->pagemap == nullptr) {
+            dbg::log("switchTo: FAIL - PID %x pagemap==nullptr", next_task->pid);
             // Task is being torn down, don't switch to it
             return false;
         }
 
         // Validate pagemap pointer is in valid HHDM range (not kernel static range)
-        auto pm_addr = reinterpret_cast<uintptr_t>(nextTask->pagemap);
+        auto pm_addr = reinterpret_cast<uintptr_t>(next_task->pagemap);
         if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
-            dbg::log("switchTo: FAIL - PID %x pagemap ptr invalid (pmAddr=0x%x)", nextTask->pid, pm_addr);
+            dbg::log("switchTo: FAIL - PID %x pagemap ptr invalid (pmAddr=0x%x)", next_task->pid, pm_addr);
             // Corrupted pagemap pointer - task struct was freed/corrupted
             return false;
         }
 
         // Validate thread pointer if present
-        if (nextTask->thread != nullptr) {
-            auto thread_addr = reinterpret_cast<uintptr_t>(nextTask->thread);
+        if (next_task->thread != nullptr) {
+            auto thread_addr = reinterpret_cast<uintptr_t>(next_task->thread);
             // Accept either HHDM or kernel-static addresses as valid
             bool th_in_hhdm = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
             bool th_in_kernel_static = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
             if (!th_in_hhdm && !th_in_kernel_static) {
-                dbg::log("switchTo: FAIL - PID %x thread ptr invalid (thread=0x%lx)", nextTask->pid, thread_addr);
+                dbg::log("switchTo: FAIL - PID %x thread ptr invalid (thread=0x%lx)", next_task->pid, thread_addr);
                 // Corrupted thread pointer - task struct was freed/corrupted
                 return false;
             }
@@ -246,9 +244,9 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
     }
 
     // Second state check after reading resources - task might have started exiting
-    if (nextTask->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
-        dbg::log("switchTo: FAIL 2nd check - PID %x changed state (state=%d)", nextTask->pid,
-                 (int)nextTask->state.load(std::memory_order_relaxed));
+    if (next_task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE) {
+        dbg::log("switchTo: FAIL 2nd check - PID %x changed state (state=%d)", next_task->pid,
+                 (int)next_task->state.load(std::memory_order_relaxed));
         return false;
     }
 
@@ -258,85 +256,85 @@ bool switchTo(cpu::GPRegs& gpr, gates::interruptFrame& frame, sched::task::Task*
     // (thread, pagemap) won't be freed until after we exit the critical section.
 
     // Get real CPU ID from GS (no MSR / VM exit)
-    uint64_t real_cpu_id = cpu::currentCpu();
+    uint64_t real_cpu_id = cpu::current_cpu();
 
     // Update debug task pointer for panic inspection
-    updateDebugTaskPtr(nextTask, real_cpu_id);
+    updateDebugTaskPtr(next_task, real_cpu_id);
 
     // Now safe to modify interrupt frame and registers.
-    if (nextTask->type == sched::task::TaskType::DAEMON && !valid_kernel_stack(nextTask->context.frame.rsp) &&
-        valid_kernel_stack(nextTask->context.syscallKernelStack)) {
-        dbg::logger<"ctxswitch">::warn("repairing daemon rsp before switch: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx", nextTask->pid,
-                                       nextTask->name != nullptr ? nextTask->name : "?", (unsigned long long)nextTask->context.frame.rsp,
-                                       (unsigned long long)nextTask->context.syscallKernelStack);
-        nextTask->context.frame.rsp = nextTask->context.syscallKernelStack;
+    if (next_task->type == sched::task::TaskType::DAEMON && !valid_kernel_stack(next_task->context.frame.rsp) &&
+        valid_kernel_stack(next_task->context.syscall_kernel_stack)) {
+        dbg::logger<"ctxswitch">::warn("repairing daemon rsp before switch: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx", next_task->pid,
+                                       next_task->name != nullptr ? next_task->name : "?", (unsigned long long)next_task->context.frame.rsp,
+                                       (unsigned long long)next_task->context.syscall_kernel_stack);
+        next_task->context.frame.rsp = next_task->context.syscall_kernel_stack;
     }
 
-    frame.rip = nextTask->context.frame.rip;
-    frame.rsp = nextTask->context.frame.rsp;
-    frame.cs = nextTask->context.frame.cs;
-    frame.ss = nextTask->context.frame.ss;
-    frame.flags = nextTask->context.frame.flags;
+    frame.rip = next_task->context.frame.rip;
+    frame.rsp = next_task->context.frame.rsp;
+    frame.cs = next_task->context.frame.cs;
+    frame.ss = next_task->context.frame.ss;
+    frame.flags = next_task->context.frame.flags;
 
-    gpr = nextTask->context.regs;
-    validate_kernel_frame(frame, nextTask, "switchTo");
+    gpr = next_task->context.regs;
+    validate_kernel_frame(frame, next_task, "switchTo");
 
     // Validate context before restoring - catch corruption before it causes a crash
     // in userspace where debugging is much harder.
     // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
-    // Skip validation when voluntaryBlock is set - the saved context is legitimately
+    // Skip validation when voluntary_block is set - the saved context is legitimately
     // kernel-mode (task was preempted at a safe blocking point like sti;hlt in a syscall).
-    if (nextTask->type == sched::task::TaskType::PROCESS && !nextTask->voluntaryBlock) {
+    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->voluntary_block) {
         if (frame.cs != desc::gdt::GDT_USER_CS) {
-            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, nextTask->pid);
+            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, next_task->pid);
             for (;;) {
                 asm volatile("hlt");
             };
         }
         if (frame.ss != desc::gdt::GDT_USER_DS) {
-            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x", frame.ss, desc::gdt::GDT_USER_DS, nextTask->pid);
+            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x", frame.ss, desc::gdt::GDT_USER_DS, next_task->pid);
             for (;;) {
                 asm volatile("hlt");
             };
         }
         if (frame.rip >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x", frame.rip, nextTask->pid);
+            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x", frame.rip, next_task->pid);
             for (;;) {
                 asm volatile("hlt");
             };
         }
         if (frame.rsp >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x", frame.rsp, nextTask->pid);
+            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x", frame.rsp, next_task->pid);
             for (;;) {
                 asm volatile("hlt");
             };
         }
     }
 
-    // Update scratch area cpuId
-    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(nextTask->context.syscallScratchArea);
-    scratch_area->cpuId = real_cpu_id;
+    // Update scratch area cpu_id
+    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(next_task->context.syscall_scratch_area);
+    scratch_area->cpu_id = real_cpu_id;
 
     // Set up GS/FS bases
-    if (nextTask->thread != nullptr) {
-        cpu::wrgsbase(nextTask->context.syscallScratchArea);
-        cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->thread->gsbase);
-        cpu::wrfsbase(nextTask->thread->fsbase);
+    if (next_task->thread != nullptr) {
+        cpu::wrgsbase(next_task->context.syscall_scratch_area);
+        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->thread->gsbase);
+        cpu::wrfsbase(next_task->thread->fsbase);
     } else {
         // Idle task uses kernel-allocated scratch area for both
-        cpu::wrgsbase(nextTask->context.syscallScratchArea);
-        cpuSetMSR(IA32_KERNEL_GS_BASE, nextTask->context.syscallScratchArea);
+        cpu::wrgsbase(next_task->context.syscall_scratch_area);
+        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->context.syscall_scratch_area);
     }
 
     // Switch pagemap for user tasks
     // We've already validated pagemap != nullptr for user tasks above
-    if (nextTask->pagemap != nullptr) {
-        mm::virt::switchPagemap(nextTask);
+    if (next_task->pagemap != nullptr) {
+        mm::virt::switch_pagemap(next_task);
     }
 
     // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
-    if (nextTask->type == sched::task::TaskType::PROCESS && nextTask->fxState.saved) {
-        restoreFpuState(nextTask);
+    if (next_task->type == sched::task::TaskType::PROCESS && next_task->fx_state.saved) {
+        restore_fpu_state(next_task);
     }
 
     return true;
@@ -371,7 +369,7 @@ struct IrqStats {
     std::atomic<uint64_t> total_ns{0};      // total ns spent inside _wOS_schedTimer
     std::atomic<uint64_t> count{0};         // number of timer interrupts
     std::atomic<uint64_t> ctx_switches{0};  // number of context switches performed
-    std::atomic<uint64_t> xsave_ns{0};      // total ns spent in saveFpuState
+    std::atomic<uint64_t> xsave_ns{0};      // total ns spent in save_fpu_state
 };
 static std::array<IrqStats, 16> irqStats;
 
@@ -406,7 +404,7 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
 
     // Advance epoch and run garbage collection periodically on CPU 0 only.
     uint64_t ticks = timer_tick_count.fetch_add(1, std::memory_order_relaxed);
-    if (cpu::currentCpu() == 0 && (ticks % 10) == 0) {
+    if (cpu::current_cpu() == 0 && (ticks % 10) == 0) {
         sched::EpochManager::advanceEpoch();
         sched::gc_expired_tasks();
     }
@@ -433,30 +431,30 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
         enter_idle_from_timer(current_task, *frame_ptr);
     }
 
-    apic::oneShotTimer(timer_quantum);
+    apic::one_shot_timer(timer_quantum);
 
     if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, current_task)) {
         uint64_t stack = frame_ptr->rsp;
-        if (!valid_kernel_stack(stack) && current_task != nullptr && valid_kernel_stack(current_task->context.syscallKernelStack)) {
+        if (!valid_kernel_stack(stack) && current_task != nullptr && valid_kernel_stack(current_task->context.syscall_kernel_stack)) {
             dbg::logger<"ctxswitch">::warn("direct daemon start repaired rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
                                            current_task->pid, current_task->name != nullptr ? current_task->name : "?",
                                            (unsigned long long)frame_ptr->rsp,
-                                           (unsigned long long)current_task->context.syscallKernelStack);
-            stack = current_task->context.syscallKernelStack;
+                                           (unsigned long long)current_task->context.syscall_kernel_stack);
+            stack = current_task->context.syscall_kernel_stack;
         }
         if (!valid_kernel_stack(stack)) {
-            dbg::logger<"ctxswitch">::error("direct daemon start bad rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
-                                            current_task != nullptr ? current_task->pid : 0,
-                                            (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?",
-                                            (unsigned long long)frame_ptr->rsp,
-                                            current_task != nullptr ? (unsigned long long)current_task->context.syscallKernelStack : 0ULL);
+            dbg::logger<"ctxswitch">::error(
+                "direct daemon start bad rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
+                current_task != nullptr ? current_task->pid : 0,
+                (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?", (unsigned long long)frame_ptr->rsp,
+                current_task != nullptr ? (unsigned long long)current_task->context.syscall_kernel_stack : 0ULL);
             hcf();
         }
-        _wOS_startKernelThread(stack, current_task->kthreadEntry);
+        wos_start_kernel_thread(stack, current_task->kthread_entry);
         __builtin_unreachable();
     }
 
-    uint64_t cpu_no = cpu::currentCpu();
+    uint64_t cpu_no = cpu::current_cpu();
     if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
         if (cpu_no < hot_task_trackers.size()) {
             auto& tracker = hot_task_trackers[cpu_no];
@@ -474,8 +472,8 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
                 auto stats = sched::get_run_queue_stats(cpu_no);
                 dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
                          (unsigned long)cpu_no, (unsigned long)current_task->pid, current_task->name != nullptr ? current_task->name : "?",
-                         (unsigned long)tracker.streak, (unsigned)current_task->type, current_task->voluntaryBlock ? 1U : 0U,
-                         current_task->wantsBlock ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U, (unsigned long)stats.active_task_count,
+                         (unsigned long)tracker.streak, (unsigned)current_task->type, current_task->voluntary_block ? 1U : 0U,
+                         current_task->wants_block ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U, (unsigned long)stats.active_task_count,
                          (unsigned long)stats.wait_queue_count, (unsigned)frame_ptr->cs);
             }
         }
@@ -489,7 +487,7 @@ extern "C" void _wOS_schedTimer(void* stack_ptr) {
 
 #ifdef SCHED_DEBUG
     auto* task_after = sched::get_current_task();
-    uint64_t elapsed_ns = tsc::ticksToNs(rdtsc() - t0);
+    uint64_t elapsed_ns = tsc::ticks_to_ns(rdtsc() - t0);
     uint64_t cpu = cpu_no;
     if (cpu < 16) {
         irqStats[cpu].total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
@@ -529,9 +527,9 @@ extern "C" void _wOS_jumpToNextTaskNoSave(void* stack_ptr) {
     validate_kernel_frame(*frame_ptr, sched::get_current_task(), "exit-return");
 }
 
-void startSchedTimer() {
-    timer_quantum = apic::calibrateTimer(4000);  // 4ms (matches Linux CFS typical quantum)
-    apic::oneShotTimer(timer_quantum);
+void start_sched_timer() {
+    timer_quantum = apic::calibrate_timer(4000);  // 4ms (matches Linux CFS typical quantum)
+    apic::one_shot_timer(timer_quantum);
 }
 
 void request_reschedule() {
@@ -546,10 +544,10 @@ void request_reschedule() {
             dbg::logger<"ctxswitch">::warn("skip local resched on non-current stack: current=%lu(%s) rsp=0x%llx stack=0x%llx",
                                            task != nullptr ? task->pid : 0UL, (task != nullptr && task->name != nullptr) ? task->name : "?",
                                            (unsigned long long)rsp,
-                                           task != nullptr ? (unsigned long long)task->context.syscallKernelStack : 0ULL);
+                                           task != nullptr ? (unsigned long long)task->context.syscall_kernel_stack : 0ULL);
         }
         return;
     }
-    apic::oneShotTimer(1);
+    apic::one_shot_timer(1);
 }
 }  // namespace ker::mod::sys::context_switch

@@ -1,5 +1,8 @@
 #include "services.h"
 
+#include <abi-bits/resource.h>
+#include <bits/ssize_t.h>
+#include <callnums/sys_log.h>
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
@@ -8,7 +11,7 @@
 
 #include <array>
 #include <cstdint>
-#include <print>
+#include <ctime>
 
 #include "sys/multiproc.h"
 
@@ -19,19 +22,19 @@ using init_log = wos::journal<"init">;
 // Spawn a process with stdout and stderr captured to the journal under `tag`.
 // A drain child reads lines from the pipe and emits them as INFO journal entries.
 // Returns the service PID, or 0 on failure.
-static uint64_t spawn_with_journal_stdio(const char* path, const char* const argv[], const char* const envp[], const char* tag) {
+uint64_t spawn_with_journal_stdio(const char* path, const char* const argv[], const char* const envp[], const char* tag) {
     int pipefd[2];
     if (::pipe(pipefd) != 0) {
         return 0;
     }
 
-    int64_t service_pid = ker::process::fork();
-    if (service_pid < 0) {
+    int64_t const SERVICE_PID = ker::process::fork();
+    if (SERVICE_PID < 0) {
         ::close(pipefd[0]);
         ::close(pipefd[1]);
         return 0;
     }
-    if (service_pid == 0) {
+    if (SERVICE_PID == 0) {
         // Service child: redirect stdout and stderr to the write end, then exec.
         // Root init uses NOINHERIT, so forked service children start with automatic
         // WKI placement. Re-pin daemons locally before exec; login/session
@@ -49,35 +52,35 @@ static uint64_t spawn_with_journal_stdio(const char* path, const char* const arg
     // Parent: close write end so the drain child sees EOF when the service exits.
     ::close(pipefd[1]);
 
-    int64_t drain_pid = ker::process::fork();
-    if (drain_pid < 0) {
+    int64_t const DRAIN_PID = ker::process::fork();
+    if (DRAIN_PID < 0) {
         ::close(pipefd[0]);
-        return static_cast<uint64_t>(service_pid);
+        return static_cast<uint64_t>(SERVICE_PID);
     }
-    if (drain_pid == 0) {
+    if (DRAIN_PID == 0) {
         // Drain child: read lines from the pipe and emit each to the journal.
         char buf[512];
         char line[512];
         int line_len = 0;
-        ssize_t n;
+        ssize_t n = 0;
         while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
             for (ssize_t i = 0; i < n; i++) {
-                char c = buf[i];
-                if (c == '\n' || c == '\r') {
+                char const C = buf[i];
+                if (C == '\n' || C == '\r') {
                     if (line_len > 0) {
                         line[line_len] = '\0';
-                        ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::info, line, static_cast<uint64_t>(line_len));
+                        ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::INFO, line, static_cast<uint64_t>(line_len));
                         line_len = 0;
                     }
                 } else if (line_len < static_cast<int>(sizeof(line)) - 1) {
-                    line[line_len++] = c;
+                    line[line_len++] = C;
                 }
             }
         }
         // Flush any partial line without trailing newline.
         if (line_len > 0) {
             line[line_len] = '\0';
-            ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::info, line, static_cast<uint64_t>(line_len));
+            ker::logging::logEx(tag, ker::abi::sys_log::sys_log_level::INFO, line, static_cast<uint64_t>(line_len));
         }
         ::close(pipefd[0]);
         ker::process::exit(0);
@@ -86,110 +89,110 @@ static uint64_t spawn_with_journal_stdio(const char* path, const char* const arg
 
     // Parent: drain child owns the read end.
     ::close(pipefd[0]);
-    return static_cast<uint64_t>(service_pid);
+    return static_cast<uint64_t>(SERVICE_PID);
 }
 
 }  // namespace
 
 void start_journald() {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
-    init_log::info("init[%d]: spawning journald", cpuno);
+    init_log::info("init[%d]: spawning journald", CPUNO);
     std::array<const char*, 2> argv = {"/sbin/journald", nullptr};
     std::array<const char*, 1> envp = {nullptr};
-    uint64_t pid = ker::process::exec("/sbin/journald", argv.data(), envp.data());
-    if (pid == 0) {
-        init_log::warn("init[%d]: failed to spawn journald", cpuno);
+    uint64_t const PID = ker::process::exec("/sbin/journald", argv.data(), envp.data());
+    if (PID == 0) {
+        init_log::warn("init[%d]: failed to spawn journald", CPUNO);
     } else {
-        int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(pid), BACKGROUND_SERVICE_NICE);
-        init_log::info("init[%d]: journald spawned as PID %llu", cpuno, static_cast<unsigned long long>(pid));
-        if (prio_rc < 0) {
-            init_log::warn("init[%d]: failed to lower journald priority (%lld)", cpuno, static_cast<long long>(prio_rc));
+        int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(PID), BACKGROUND_SERVICE_NICE);
+        init_log::info("init[%d]: journald spawned as PID %llu", CPUNO, static_cast<unsigned long long>(PID));
+        if (PRIO_RC < 0) {
+            init_log::warn("init[%d]: failed to lower journald priority (%lld)", CPUNO, static_cast<long long>(PRIO_RC));
         }
     }
 }
 
 void start_httpd() {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
-    init_log::info("init[%d]: spawning httpd (HTTP server on port 80)", cpuno);
+    init_log::info("init[%d]: spawning httpd (HTTP server on port 80)", CPUNO);
     std::array<const char*, 2> httpd_argv = {"/sbin/httpd", nullptr};
     std::array<const char*, 1> httpd_envp = {nullptr};
-    uint64_t httpd_pid = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_envp.data());
-    if (httpd_pid == 0) {
-        init_log::error("init[%d]: failed to spawn httpd", cpuno);
+    uint64_t const HTTPD_PID = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_envp.data());
+    if (HTTPD_PID == 0) {
+        init_log::error("init[%d]: failed to spawn httpd", CPUNO);
     } else {
-        int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(httpd_pid), BACKGROUND_SERVICE_NICE);
-        init_log::info("init[%d]: httpd spawned as PID %llu", cpuno, static_cast<unsigned long long>(httpd_pid));
-        if (prio_rc < 0) {
-            init_log::warn("init[%d]: failed to lower httpd priority (%lld)", cpuno, static_cast<long long>(prio_rc));
+        int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(HTTPD_PID), BACKGROUND_SERVICE_NICE);
+        init_log::info("init[%d]: httpd spawned as PID %llu", CPUNO, static_cast<unsigned long long>(HTTPD_PID));
+        if (PRIO_RC < 0) {
+            init_log::warn("init[%d]: failed to lower httpd priority (%lld)", CPUNO, static_cast<long long>(PRIO_RC));
         }
     }
 }
 
 void start_dropbear() {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
     // Generate RSA host key if it doesn't exist
-    int key_fd = ker::abi::vfs::open("/etc/dropbear/dropbear_rsa_host_key", 0, 0);
-    if (key_fd >= 0) {
-        ker::abi::vfs::close(key_fd);
-        init_log::info("init[%d]: dropbear host key already exists", cpuno);
+    int const KEY_FD = ker::abi::vfs::open("/etc/dropbear/dropbear_rsa_host_key", 0, 0);
+    if (KEY_FD >= 0) {
+        ker::abi::vfs::close(KEY_FD);
+        init_log::info("init[%d]: dropbear host key already exists", CPUNO);
     } else {
-        init_log::info("init[%d]: generating dropbear RSA host key...", cpuno);
+        init_log::info("init[%d]: generating dropbear RSA host key...", CPUNO);
         std::array<const char*, 6> keygen_argv = {"/bin/dropbearkey", "-t", "rsa", "-f", "/etc/dropbear/dropbear_rsa_host_key", nullptr};
         std::array<const char*, 1> keygen_envp = {nullptr};
-        uint64_t keygen_pid = spawn_with_journal_stdio("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data(), "sshd");
-        if (keygen_pid == 0) {
-            init_log::error("init[%d]: failed to spawn dropbearkey", cpuno);
+        uint64_t const KEYGEN_PID = spawn_with_journal_stdio("/bin/dropbearkey", keygen_argv.data(), keygen_envp.data(), "sshd");
+        if (KEYGEN_PID == 0) {
+            init_log::error("init[%d]: failed to spawn dropbearkey", CPUNO);
         } else {
             int exit_code = 0;
-            ker::process::waitpid((int64_t)keygen_pid, &exit_code, 0, nullptr);
-            init_log::info("init[%d]: dropbearkey exited with code %d", cpuno, exit_code);
+            ker::process::waitpid(static_cast<int64_t>(KEYGEN_PID), &exit_code, 0, nullptr);
+            init_log::info("init[%d]: dropbearkey exited with code %d", CPUNO, exit_code);
         }
     }
 
     // Start dropbear in foreground mode (no fork/daemon)
-    init_log::info("init[%d]: spawning dropbear SSH server", cpuno);
+    init_log::info("init[%d]: spawning dropbear SSH server", CPUNO);
     std::array<const char*, 5> dropbear_argv = {"/bin/dropbear", "-r", "/etc/dropbear/dropbear_rsa_host_key",
                                                 "-F",  // foreground, don't fork
                                                 nullptr};
     std::array<const char*, 1> dropbear_envp = {nullptr};
-    uint64_t dropbear_pid = spawn_with_journal_stdio("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data(), "sshd");
-    if (dropbear_pid == 0) {
-        init_log::error("init[%d]: failed to spawn dropbear", cpuno);
+    uint64_t const DROPBEAR_PID = spawn_with_journal_stdio("/bin/dropbear", dropbear_argv.data(), dropbear_envp.data(), "sshd");
+    if (DROPBEAR_PID == 0) {
+        init_log::error("init[%d]: failed to spawn dropbear", CPUNO);
     } else {
-        int64_t prio_rc = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(dropbear_pid), BACKGROUND_SERVICE_NICE);
-        init_log::info("init[%d]: dropbear spawned as PID %llu", cpuno, static_cast<unsigned long long>(dropbear_pid));
-        if (prio_rc < 0) {
-            init_log::warn("init[%d]: failed to lower dropbear priority (%lld)", cpuno, static_cast<long long>(prio_rc));
+        int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), BACKGROUND_SERVICE_NICE);
+        init_log::info("init[%d]: dropbear spawned as PID %llu", CPUNO, static_cast<unsigned long long>(DROPBEAR_PID));
+        if (PRIO_RC < 0) {
+            init_log::warn("init[%d]: failed to lower dropbear priority (%lld)", CPUNO, static_cast<long long>(PRIO_RC));
         }
     }
 }
 
 void start_testd() {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
     // Only spawn testd if the binary is present (development/test builds only).
-    int probe_fd = ker::abi::vfs::open("/usr/bin/testd", 0, 0);
-    if (probe_fd < 0) {
+    int const PROBE_FD = ker::abi::vfs::open("/usr/bin/testd", 0, 0);
+    if (PROBE_FD < 0) {
         return;
     }
-    ker::abi::vfs::close(probe_fd);
+    ker::abi::vfs::close(PROBE_FD);
 
     // Wait for all previously spawned services (netd, httpd, dropbear) to finish
     // initializing. There are no service-ready signals yet, so a fixed delay is used.
-    init_log::info("init[%d]: testd: waiting 10s for services to settle...", cpuno);
-    struct timespec settle{.tv_sec = 10, .tv_nsec = 0};
-    nanosleep(&settle, nullptr);
+    init_log::info("init[%d]: testd: waiting 10s for services to settle...", CPUNO);
+    struct timespec const SETTLE{.tv_sec = 10, .tv_nsec = 0};
+    nanosleep(&SETTLE, nullptr);
 
-    init_log::info("init[%d]: spawning testd (kernel test daemon)", cpuno);
+    init_log::info("init[%d]: spawning testd (kernel test daemon)", CPUNO);
     std::array<const char*, 2> argv = {"/usr/bin/testd", nullptr};
     std::array<const char*, 1> envp = {nullptr};
-    uint64_t pid = ker::process::exec("/usr/bin/testd", argv.data(), envp.data());
-    if (pid == 0) {
-        init_log::warn("init[%d]: failed to spawn testd", cpuno);
+    uint64_t const PID = ker::process::exec("/usr/bin/testd", argv.data(), envp.data());
+    if (PID == 0) {
+        init_log::warn("init[%d]: failed to spawn testd", CPUNO);
     } else {
-        init_log::info("init[%d]: testd spawned as PID %llu", cpuno, static_cast<unsigned long long>(pid));
+        init_log::info("init[%d]: testd spawned as PID %llu", CPUNO, static_cast<unsigned long long>(PID));
     }
 }

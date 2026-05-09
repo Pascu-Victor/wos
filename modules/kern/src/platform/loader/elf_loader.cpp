@@ -278,10 +278,10 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
+                            auto newPaddr = (uint64_t)mod::mm::phys::page_alloc();
                             if (newPaddr != 0) {
                                 auto physPtrPage = (uint64_t)mod::mm::addr::get_phys_pointer(newPaddr);
-                                mod::mm::virt::mapPage(pagemap, targetPage, physPtrPage, mod::mm::paging::pageTypes::USER);
+                                mod::mm::virt::map_page(pagemap, targetPage, physPtrPage, mod::mm::paging::page_types::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
@@ -449,10 +449,10 @@ void processRelocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto newPaddr = (uint64_t)mod::mm::phys::pageAlloc();
+                            auto newPaddr = (uint64_t)mod::mm::phys::page_alloc();
                             if (newPaddr != 0) {
                                 auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(newPaddr);
-                                mod::mm::virt::mapPage(pagemap, targetPage, physPtr, mod::mm::paging::pageTypes::USER);
+                                mod::mm::virt::map_page(pagemap, targetPage, physPtr, mod::mm::paging::page_types::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
@@ -533,8 +533,8 @@ void processEhFrameSegment(Elf64_Phdr* segment, ker::mod::mm::virt::PageTable* p
     uint64_t vaddr = segment->p_vaddr;
     uint64_t end = (segment->p_vaddr + segment->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
     for (uint64_t va = vaddr; va < end; va += mod::mm::virt::PAGE_SIZE) {
-        if (mod::mm::virt::isPageMapped(pagemap, va)) {
-            mod::mm::virt::unifyPageFlags(pagemap, va, mod::mm::paging::pageTypes::USER_READONLY);
+        if (mod::mm::virt::is_page_mapped(pagemap, va)) {
+            mod::mm::virt::unify_page_flags(pagemap, va, mod::mm::paging::page_types::USER_READONLY);
         }
     }
 
@@ -557,11 +557,11 @@ void loadSegment(uint8_t* elfBase, ker::mod::mm::virt::PageTable* pagemap, Elf64
     }
 
     // Map the page at a page-aligned virtual address
-    bool already_mapped = mod::mm::virt::isPageMapped(pagemap, pageVA);
+    bool already_mapped = mod::mm::virt::is_page_mapped(pagemap, pageVA);
     // HHDM-mapped pointer to the backing physical page so we can write contents
     uint64_t page_hhdm_ptr = 0;
     if (already_mapped) {
-        mod::mm::virt::unifyPageFlags(pagemap, pageVA, mod::mm::paging::pageTypes::USER);
+        mod::mm::virt::unify_page_flags(pagemap, pageVA, mod::mm::paging::page_types::USER);
         uint64_t paddr = mod::mm::virt::translate(pagemap, pageVA);
         if (paddr == ker::mod::mm::virt::PADDR_INVALID) {
             mod::dbg::log("elf_loader: translate failed for already-mapped pageVA 0x%lx", pageVA);
@@ -570,11 +570,11 @@ void loadSegment(uint8_t* elfBase, ker::mod::mm::virt::PageTable* pagemap, Elf64
         page_hhdm_ptr = (uint64_t)mod::mm::addr::get_virt_pointer(paddr);
     } else {
         // Allocate a new physical page; allocator returns an HHDM pointer to the page memory
-        auto new_page_hhdm_ptr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto new_page_hhdm_ptr = (uint64_t)mod::mm::phys::page_alloc();
         page_hhdm_ptr = new_page_hhdm_ptr;
         // Map using the physical address corresponding to that HHDM pointer
-        mod::mm::virt::mapPage(pagemap, pageVA, (mod::mm::addr::paddr_t)mod::mm::addr::get_phys_pointer(new_page_hhdm_ptr),
-                               mod::mm::paging::pageTypes::USER);
+        mod::mm::virt::map_page(pagemap, pageVA, (mod::mm::addr::paddr_t)mod::mm::addr::get_phys_pointer(new_page_hhdm_ptr),
+                                mod::mm::paging::page_types::USER);
         // Zero freshly mapped page to handle bss/holes
         memset((void*)page_hhdm_ptr, 0, mod::mm::virt::PAGE_SIZE);
     }
@@ -622,11 +622,11 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 
     uint64_t sectionHeadersPhysPtr = 0;  // Make this accessible throughout function
     for (uint64_t i = 0; i < sectionHeadersPages; i++) {
-        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto paddr = (uint64_t)mod::mm::phys::page_alloc();
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
             auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
-            mod::mm::virt::mapPage(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
-                                   mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
+            mod::mm::virt::map_page(pagemap, sectionHeadersVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
+                                    mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
             memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
@@ -651,11 +651,11 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 
     uint64_t stringTablePhysPtr = 0;
     for (uint64_t i = 0; i < stringTablePages; i++) {
-        auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
+        auto paddr = (uint64_t)mod::mm::phys::page_alloc();
         if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
             auto physPtr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
-            mod::mm::virt::mapPage(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
-                                   mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
+            mod::mm::virt::map_page(pagemap, stringTableVaddr + (i * mod::mm::virt::PAGE_SIZE), physPtr,
+                                    mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
             memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
@@ -717,8 +717,8 @@ void loadSectionHeaders(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagem
 }
 }  // namespace
 
-auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName, bool registerSpecialSymbols,
-             uint64_t baseAddress) -> ElfLoadResult {
+auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* processName, bool registerSpecialSymbols,
+              uint64_t baseAddress) -> ElfLoadResult {
     // Validate input pointer
     if (elf == nullptr) {
         mod::dbg::log("ERROR: loadElf called with null ELF pointer (pid=%d)", pid);
@@ -785,13 +785,13 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
         // Allocate physical pages for both ELF and program headers
         std::vector<uint64_t> headerPhysAddrs;
         for (uint64_t i = 0; i < totalHeadersPages; i++) {
-            auto paddr = (uint64_t)mod::mm::phys::pageAlloc();
+            auto paddr = (uint64_t)mod::mm::phys::page_alloc();
             if (paddr == ker::mod::mm::virt::PADDR_INVALID) {
                 mod::dbg::log("ERROR: Failed to allocate physical page for headers");
                 return {.entryPoint = 0, .programHeaderAddr = 0, .elfHeaderAddr = 0};
             }
-            mod::mm::virt::mapPage(pagemap, headerCopyVaddr + (i * mod::mm::virt::PAGE_SIZE),
-                                   (uint64_t)mod::mm::addr::get_phys_pointer(paddr), mod::mm::paging::pageTypes::USER);
+            mod::mm::virt::map_page(pagemap, headerCopyVaddr + (i * mod::mm::virt::PAGE_SIZE),
+                                    (uint64_t)mod::mm::addr::get_phys_pointer(paddr), mod::mm::paging::page_types::USER);
             headerPhysAddrs.push_back(paddr);
         }
 
@@ -933,9 +933,9 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                         // Mark note pages read-only + NX (notes are data, never executed)
                         for (uint64_t va = startPageAddr + elfFile.loadBase; va < endPageAddr + elfFile.loadBase;
                              va += mod::mm::virt::PAGE_SIZE) {
-                            if (mod::mm::virt::isPageMapped(pagemap, va)) {
-                                mod::mm::virt::unifyPageFlags(pagemap, va,
-                                                              mod::mm::paging::pageTypes::USER_READONLY | mod::mm::paging::PAGE_NX);
+                            if (mod::mm::virt::is_page_mapped(pagemap, va)) {
+                                mod::mm::virt::unify_page_flags(pagemap, va,
+                                                                mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
                             }
                         }
                     }
@@ -993,7 +993,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                     continue;
                 }
 
-                uint64_t baseFlags = writable ? mod::mm::paging::pageTypes::USER : mod::mm::paging::pageTypes::USER_READONLY;
+                uint64_t baseFlags = writable ? mod::mm::paging::page_types::USER : mod::mm::paging::page_types::USER_READONLY;
                 if (!executable) {
                     baseFlags |= mod::mm::paging::PAGE_NX;
                 }
@@ -1033,7 +1033,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                     mod::dbg::log("Setting page 0x%x to flags=0x%x (%s %s)", va, baseFlags, writable ? "WRITE" : "READONLY",
                                   executable ? "EXEC" : "NOEXEC");
 #endif
-                    mod::mm::virt::unifyPageFlags(pagemap, va, baseFlags);
+                    mod::mm::virt::unify_page_flags(pagemap, va, baseFlags);
                 }
 #ifdef ELF_DEBUG_EXTRA
                 mod::dbg::log("PT_LOAD perms applied: vaddr=[0x%x, 0x%x) flags=0x%x -> %s%s", start, end, ph->p_flags,
@@ -1064,7 +1064,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
 
                 // Check each page to see if it overlaps with any GOT.PLT sections
                 for (uint64_t va = start; va < end; va += mod::mm::virt::PAGE_SIZE) {
-                    if (!mod::mm::virt::isPageMapped(pagemap, va)) {
+                    if (!mod::mm::virt::is_page_mapped(pagemap, va)) {
                         continue;
                     }
 
@@ -1091,7 +1091,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
                     }
 
                     if (!hasGotPlt) {
-                        mod::mm::virt::unifyPageFlags(pagemap, va, mod::mm::paging::pageTypes::USER_READONLY);
+                        mod::mm::virt::unify_page_flags(pagemap, va, mod::mm::paging::page_types::USER_READONLY);
                     }
                 }
 #ifdef ELF_DEBUG
@@ -1155,7 +1155,7 @@ auto loadElf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid,
 }
 
 // Extract TLS information from ELF without fully loading it
-auto extractTlsInfo(void* elfData) -> TlsModule {
+auto extract_tls_info(void* elf_data) -> TlsModule {
     TlsModule tlsInfo = {.tlsBase = 0, .tlsSize = 0, .tcbOffset = 0};  // Default empty TLS info
 
 #ifdef ELF_DEBUG
@@ -1163,13 +1163,13 @@ auto extractTlsInfo(void* elfData) -> TlsModule {
 #endif
 
     // Validate input pointer
-    if (elfData == nullptr) {
+    if (elf_data == nullptr) {
         mod::dbg::log("ERROR: extractTlsInfo called with null elfData pointer");
         return tlsInfo;
     }
 
     // Parse the ELF to find PT_TLS segment
-    ElfFile elfFile = parseElf((uint8_t*)elfData);
+    ElfFile elfFile = parseElf((uint8_t*)elf_data);
 
     // Check if parsing was successful (parseElf validates magic numbers)
     if (elfFile.elfHead.e_ident[EI_MAG0] != ELFMAG0 || elfFile.elfHead.e_ident[EI_MAG1] != ELFMAG1 ||

@@ -68,7 +68,7 @@ void note_cpu_sample(struct arg* a, int current_cpu) {
 auto generate_image(void* param) -> int {
     auto* a = static_cast<struct arg*>(param);
 #if MANDELBENCH_DEBUG
-    a->cpu_id = (int)ker::multiproc::getCurrentCpu();
+    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
     a->cpu_end_id = a->cpu_id;
     a->cpu_mask = cpu_bit(a->cpu_id);
     a->cpu_changes = 0;
@@ -114,7 +114,7 @@ auto generate_image(void* param) -> int {
             a->preempt_ns += gap;
             if (gap > a->max_gap_ns) a->max_gap_ns = gap;
         }
-        note_cpu_sample(a, (int)ker::multiproc::getCurrentCpu());
+        note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
         a->rows_completed++;
 #endif
         for (col = 0; col < width; col++) {
@@ -139,7 +139,7 @@ auto generate_image(void* param) -> int {
 #endif
     }
 #if MANDELBENCH_DEBUG
-    note_cpu_sample(a, (int)ker::multiproc::getCurrentCpu());
+    note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
     a->thread_end_ns = prev_row_end;
     a->thread_cpu_ns = thread_cpu_ns() - cpu_start;
 #endif

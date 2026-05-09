@@ -3,25 +3,25 @@
 
 namespace ker::abi::sys_log {
 enum class sys_log_ops : uint64_t {
-    log,
-    logLine,
-    logEx,
+    LOG,
+    LOG_LINE,
+    LOG_EX,
 };
 
 enum class sys_log_device : uint64_t {
-    serial,
-    vga,
+    SERIAL,
+    VGA,
 };
 
 enum class sys_log_level : uint64_t {
-    trace = 0,
-    debug = 1,
-    info = 2,
-    notice = 3,
-    warn = 4,
-    error = 5,
-    critical = 6,
-    panic = 7,
+    TRACE = 0,
+    DEBUG = 1,
+    INFO = 2,
+    NOTICE = 3,
+    WARN = 4,
+    ERROR = 5,
+    CRITICAL = 6,
+    PANIC = 7,
 };
 
 constexpr uint32_t JOURNAL_RECORD_MAGIC = 0x4a4f5753;

@@ -41,7 +41,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             if (arg1 == nullptr) {
                 return (uint64_t)-1;
             }
-            uint64_t epoch_ns = ker::mod::rtc::getEpochNs();
+            uint64_t epoch_ns = ker::mod::rtc::get_epoch_ns();
             auto* tv = reinterpret_cast<timeval*>(arg1);
             tv->tv_sec = (long)(epoch_ns / 1000000000ULL);
             tv->tv_usec = (long)((epoch_ns % 1000000000ULL) / 1000ULL);
@@ -57,7 +57,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 static_cast<int>(reinterpret_cast<uint64_t>(arg2));  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC, 3=CLOCK_THREAD_CPUTIME_ID
             if (clock_id == 0) {
                 // CLOCK_REALTIME: RTC wall-clock epoch (includes NTP offset)
-                uint64_t epoch_ns = ker::mod::rtc::getEpochNs();
+                uint64_t epoch_ns = ker::mod::rtc::get_epoch_ns();
                 ts->tv_sec = (long)(epoch_ns / 1000000000ULL);
                 ts->tv_nsec = (long)(epoch_ns % 1000000000ULL);
             } else if (clock_id == 3) {
@@ -74,10 +74,10 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
-                if (ker::mod::tsc::getHz() != 0) {
-                    mono_ns = ker::mod::tsc::getNs();
+                if (ker::mod::tsc::get_hz() != 0) {
+                    mono_ns = ker::mod::tsc::get_ns();
                 } else {
-                    mono_ns = ker::mod::time::getUs() * 1000ULL;
+                    mono_ns = ker::mod::time::get_us() * 1000ULL;
                 }
                 ts->tv_sec = (long)(mono_ns / 1000000000ULL);
                 ts->tv_nsec = (long)(mono_ns % 1000000000ULL);
@@ -94,18 +94,18 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             if (sleep_us > 0) {
                 auto* task = ker::mod::sched::get_current_task();
                 if (task != nullptr) {
-                    // Set wake deadline and use deferredTaskSwitch to properly block
+                    // Set wake deadline and use deferred_task_switch to properly block
                     // (move to wait list). The timer tick wakeup scan will reschedule us
-                    // once wakeAtUs is reached.
-                    task->wakeAtUs = ker::mod::time::getUs() + sleep_us;
+                    // once wake_at_us is reached.
+                    task->wake_at_us = ker::mod::time::get_us() + sleep_us;
                     task->wait_channel = "nanosleep";
-                    task->deferredTaskSwitch = true;
-                    // Return 0 now - syscall exit path sees deferredTaskSwitch=true,
+                    task->deferred_task_switch = true;
+                    // Return 0 now - syscall exit path sees deferred_task_switch=true,
                     // moves task to wait list, switches to next task.
                 } else {
                     // Pre-scheduler fallback: spin-wait
-                    uint64_t start = ker::mod::time::getUs();
-                    while (ker::mod::time::getUs() - start < sleep_us) {
+                    uint64_t start = ker::mod::time::get_us();
+                    while (ker::mod::time::get_us() - start < sleep_us) {
                     }
                 }
             }
@@ -135,7 +135,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             // Return value: elapsed real time in ticks since an arbitrary epoch (system boot)
             if (arg2 != nullptr) {
                 auto* out = (long*)arg2;
-                *out = (long)us_to_ticks(ker::mod::time::getUs());
+                *out = (long)us_to_ticks(ker::mod::time::get_us());
             }
             return 0;
         }
@@ -166,7 +166,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 task->itimer_real_expire_us = 0;
                 task->itimer_real_interval_us = 0;
             } else {
-                task->itimer_real_expire_us = ker::mod::time::getUs() + new_val_us;
+                task->itimer_real_expire_us = ker::mod::time::get_us() + new_val_us;
                 task->itimer_real_interval_us = new_interval_us;
             }
             return 0;
@@ -189,7 +189,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return (uint64_t)-EFAULT;
             }
 
-            uint64_t now_us = ker::mod::time::getUs();
+            uint64_t now_us = ker::mod::time::get_us();
             uint64_t remain_us = 0;
             if (task->itimer_real_expire_us != 0 && task->itimer_real_expire_us > now_us) {
                 remain_us = task->itimer_real_expire_us - now_us;

@@ -38,8 +38,8 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             auto* task = mod::sched::get_current_task();
             if (task != nullptr) {
                 task->wait_channel = "sched_yield";
-                task->yieldSwitch = true;
-                task->deferredTaskSwitch = true;
+                task->yield_switch = true;
+                task->deferred_task_switch = true;
             }
             return 0;
         }
@@ -55,7 +55,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             auto user_sp = (uint64_t)arg2;
             auto enter_va = (uint64_t)arg3;
 
-            auto* t = mod::sched::task::Task::createUserThread(parent, tcb_va, user_sp, enter_va);
+            auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
             if (t == nullptr) {
                 return (uint64_t)-ENOMEM;
             }
@@ -85,21 +85,21 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             if (task == nullptr) {
                 return 0;
             }
-            task->hasExited = true;
-            task->exitStatus = 0;
+            task->has_exited = true;
+            task->exit_status = 0;
             // Record death epoch for GC grace period, then transition to DEAD.
             // Without this, threads stay EXITING forever and GC never reclaims them.
-            task->deathEpoch.store(mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+            task->death_epoch.store(mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
             task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
             // Wake anyone waiting on this thread (e.g. via awaitee list)
-            uint64_t waiter_lock_flags = task->exitWaitersLock.lock_irqsave();
+            uint64_t waiter_lock_flags = task->exit_waiters_lock.lock_irqsave();
             const size_t waiter_count = task->awaitee_on_exit.size();
             uint64_t waiting_pids[16] = {};
             const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
             for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
                 waiting_pids[i] = task->awaitee_on_exit[i];
             }
-            task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+            task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
 
             for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; i++) {
                 auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids[i]);
@@ -139,7 +139,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
                 task->domain_hard = false;
                 task->cpu_pinned = true;
                 task->cpu = target_cpu;
-                if (task->schedQueue != mod::sched::task::Task::SchedQueue::WAITING) {
+                if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
                     mod::sched::reschedule_task_for_cpu(target_cpu, task);
                 }
             } else if (mask == valid_mask) {
@@ -153,7 +153,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
                 task->domain_hard = false;
                 task->cpu_pinned = false;
                 uint64_t target_cpu = mod::sched::get_least_loaded_cpu_in_mask(mask);
-                if (task->schedQueue != mod::sched::task::Task::SchedQueue::WAITING) {
+                if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
                     mod::sched::reschedule_task_for_cpu(target_cpu, task);
                 }
             }
@@ -240,7 +240,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             task->domain_hard = hard || dom->hard;
             task->cpu_pinned = false;
             uint64_t target = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
-            if (task->schedQueue != mod::sched::task::Task::SchedQueue::WAITING) {
+            if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
                 mod::sched::reschedule_task_for_cpu(target, task);
             }
             task->release();

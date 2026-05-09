@@ -18,8 +18,7 @@
 KTEST(VFS, CreateAndStat) {
     ker::vfs::vfs_mkdir("/tmp", 0755);  // idempotent if /tmp already exists
 
-    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_create",
-                                                ker::vfs::O_CREAT | 1, 0644);
+    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_create", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     ker::vfs::tmpfs::tmpfs_fops_close(f);
 
@@ -33,8 +32,7 @@ KTEST(VFS, CreateAndStat) {
 KTEST(VFS, WriteRead) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
-    ker::vfs::File* wf = ker::vfs::vfs_open_file("/tmp/ktest_wr",
-                                                 ker::vfs::O_CREAT | 1, 0644);
+    ker::vfs::File* wf = ker::vfs::vfs_open_file("/tmp/ktest_wr", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(wf, nullptr);
 
     uint8_t wbuf[128];
@@ -68,8 +66,7 @@ KTEST(VFS, WriteRead) {
 KTEST(VFS, Unlink) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
-    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_unlink",
-                                                ker::vfs::O_CREAT | 1, 0644);
+    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_unlink", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     ker::vfs::tmpfs::tmpfs_fops_close(f);
 
@@ -91,8 +88,7 @@ KTEST(VFS, Mkdir) {
 KTEST(VFS, AppendMode) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
-    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_append",
-                                                ker::vfs::O_CREAT | 1, 0644);
+    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_append", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
 
     constexpr char CHUNK1[] = "Hello, ";
@@ -127,15 +123,16 @@ KTEST(VFS, WriteReadAligned4K) {
     constexpr size_t SIZE = 4096;
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
-    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_aligned4k",
-                                                ker::vfs::O_CREAT | 1, 0644);
+    ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_aligned4k", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     KREQUIRE_NE(f->fops, nullptr);
     KREQUIRE_NE(f->fops->vfs_write, nullptr);
     KREQUIRE_NE(f->fops->vfs_read, nullptr);
 
     uint8_t wbuf[SIZE];
-    for (size_t i = 0; i < SIZE; i++) { wbuf[i] = static_cast<uint8_t>(i & 0xFF); }
+    for (size_t i = 0; i < SIZE; i++) {
+        wbuf[i] = static_cast<uint8_t>(i & 0xFF);
+    }
     ssize_t nw = f->fops->vfs_write(f, static_cast<const void*>(wbuf), SIZE, 0);
     KEXPECT_EQ(nw, static_cast<ssize_t>(SIZE));
 
@@ -152,6 +149,8 @@ KTEST(VFS, WriteReadAligned4K) {
     }
     KEXPECT_TRUE(ok);
 
-    if (f->fops->vfs_close != nullptr) { f->fops->vfs_close(f); }
+    if (f->fops->vfs_close != nullptr) {
+        f->fops->vfs_close(f);
+    }
     ker::vfs::vfs_unlink("/tmp/ktest_aligned4k");
 }

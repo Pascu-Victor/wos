@@ -232,9 +232,7 @@ int snprintf(char* str, size_t size, const char* format, ...) {
     return ret;
 }
 
-int vsnprintf(char* str, size_t size, const char* format, va_list args) {
-    return _std::vsnprintf(str, size, format, args);
-}
+int vsnprintf(char* str, size_t size, const char* format, va_list args) { return _std::vsnprintf(str, size, format, args); }
 
 char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }
 

@@ -2,6 +2,7 @@
 
 #include <extern/limine.h>
 
+#include <cstdint>
 #include <platform/acpi/acpi.hpp>
 #include <platform/asm/tlb.hpp>
 #include <platform/mm/addr.hpp>
@@ -9,6 +10,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/sched/task.hpp>
 
+#include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
 
 namespace ker::mod::mm::virt {
@@ -20,48 +22,48 @@ struct Range {
     uint64_t end;
 };
 
-void init(limine_memmap_response* memmapResponse, limine_executable_file_response* kernelFileResponse,
-          limine_executable_address_response* kernelAddressResponse);
+void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
+          limine_executable_address_response* kernel_address_response);
 
-static inline auto getKernelPageTable() -> PageTable* { return (PageTable*)rdcr3(); }
+static inline auto get_kernel_page_table() -> PageTable* { return (PageTable*)rdcr3(); }
 
-void mapPage(PageTable* pageTable, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
-bool isPageMapped(PageTable* pageTable, vaddr_t vaddr);
-void unifyPageFlags(PageTable* pageTable, vaddr_t vaddr, uint64_t flags);
-void mapRange(PageTable* pageTable, Range range, uint64_t flags, uint64_t offset = 0);
-void unmapPage(PageTable* pageTable, vaddr_t vaddr);
+void map_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
+bool is_page_mapped(PageTable* page_table, vaddr_t vaddr);
+void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags);
+void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset = 0);
+void unmap_page(PageTable* page_table, vaddr_t vaddr);
 
-void switchToKernelPagemap(void);
-PageTable* getKernelPagemap(void);
-void initPagemap(void);
-PageTable* createPagemap(void);
-void copyKernelMappings(sched::task::Task* t);
-void switchPagemap(sched::task::Task* t);
+void switch_to_kernel_pagemap();
+PageTable* get_kernel_pagemap();
+void init_pagemap();
+PageTable* create_pagemap();
+void copy_kernel_mappings(sched::task::Task* t);
+void switch_pagemap(sched::task::Task* t);
 bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
-void mapToKernelPageTable(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
-void mapRangeToKernelPageTable(Range range, uint64_t flags, uint64_t offset);
+void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
+void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset
-void mapRangeToKernelPageTable(Range range, uint64_t flags);
+void map_range_to_kernel_page_table(Range range, uint64_t flags);
 // Sentinel returned by translate() when the virtual address is not mapped.
 // Using (paddr_t)-1 so physical address 0 remains valid.
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
-paddr_t translate(PageTable* pageTable, vaddr_t vaddr);
+paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact
-// After calling this, the pagemap itself should be freed with phys::pageFree
-void destroyUserSpace(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr);
+// After calling this, the pagemap itself should be freed with phys::page_free
+void destroy_user_space(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr);
 
 // Deep-copy user-space page tables from src to dst using COW.
 // Both src and dst PML1 entries are marked read-only + COW bit.
 // Physical data page refcounts are incremented.
 // Page table structures (PML3/PML2/PML1) are freshly allocated for dst.
 // Returns true on success, false on OOM.
-bool deepCopyUserPagemapCOW(PageTable* src, PageTable* dst);
+bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
 
 // Debug helper: log active/dead user mappings that still reference a physical page.
 // Intended for targeted fault-path diagnostics only.
-bool debugLogUserPhysMappings(uint64_t target_phys, const char* trigger, uint64_t owner_pid = 0, const char* owner_name = nullptr,
-                              bool log_when_empty = true);
+bool debug_log_user_phys_mappings(uint64_t target_phys, const char* trigger, uint64_t owner_pid = 0, const char* owner_name = nullptr,
+                                  bool log_when_empty = true);
 }  // namespace ker::mod::mm::virt

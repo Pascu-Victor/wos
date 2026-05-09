@@ -46,7 +46,7 @@ enum FIS_TYPE {
 };
 
 // Register FIS – Host to Device
-struct FIS_REG_H2D {
+struct FisRegH2D {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_REG_H2D
 
@@ -80,7 +80,7 @@ struct FIS_REG_H2D {
 } __attribute__((packed));
 
 // Register FIS – Device to Host
-struct FIS_REG_D2H {
+struct FisRegD2H {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_REG_D2H
 
@@ -114,7 +114,7 @@ struct FIS_REG_D2H {
 } __attribute__((packed));
 
 // Data FIS – Bidirectional
-struct FIS_DATA {
+struct FisData {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_DATA
 
@@ -128,7 +128,7 @@ struct FIS_DATA {
 } __attribute__((packed));
 
 // PIO Setup – Device to Host
-struct FIS_PIO_SETUP {
+struct FisPioSetup {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_PIO_SETUP
 
@@ -165,7 +165,7 @@ struct FIS_PIO_SETUP {
 } __attribute__((packed));
 
 // DMA Setup – Device to Host
-struct FIS_DMA_SETUP {
+struct FisDmaSetup {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_DMA_SETUP
 
@@ -178,24 +178,24 @@ struct FIS_DMA_SETUP {
     uint8_t rsved[2];  // Reserved NOLINT
 
     // DWORD 1&2
-    uint64_t DMAbufferID;  // DMA Buffer Identifier. Used to Identify DMA buffer in host memory.
-                           // SATA Spec says host specific and not in Spec. Trying AHCI spec might work.
+    uint64_t dm_abuffer_id;  // DMA Buffer Identifier. Used to Identify DMA buffer in host memory.
+                             // SATA Spec says host specific and not in Spec. Trying AHCI spec might work.
 
     // DWORD 3
     uint32_t rsvd;  // More reserved
 
     // DWORD 4
-    uint32_t DMAbufOffset;  // Byte offset into buffer. First 2 bits must be 0
+    uint32_t dm_abuf_offset;  // Byte offset into buffer. First 2 bits must be 0
 
     // DWORD 5
-    uint32_t TransferCount;  // Number of bytes to transfer. Bit 0 must be 0
+    uint32_t transfer_count;  // Number of bytes to transfer. Bit 0 must be 0
 
     // DWORD 6
     uint32_t resvd;  // Reserved
 } __attribute__((packed));
 
 // HBA Memory Registers
-struct HBA_PORT {
+struct HbaPort {
     uint32_t clb;        // 0x00, command list base address, 1K-byte aligned
     uint32_t clbu;       // 0x04, command list base address upper 32 bits
     uint32_t fb;         // 0x08, FIS base address, 256-byte aligned
@@ -217,7 +217,7 @@ struct HBA_PORT {
     uint32_t vendor[4];  // 0x70 ~ 0x7F, vendor specific NOLINT
 } __attribute__((packed));
 
-struct HBA_MEM {
+struct HbaMem {
     // 0x00 - 0x2B, Generic Host Control
     uint32_t cap;      // 0x00, Host capability
     uint32_t ghc;      // 0x04, Global host control
@@ -238,11 +238,11 @@ struct HBA_MEM {
     uint8_t vendor[0x100 - 0xA0];  // NOLINT
 
     // 0x100 - 0x10FF, Port control registers
-    HBA_PORT ports[1];  // 1 ~ 32 NOLINT
+    HbaPort ports[1];  // 1 ~ 32 NOLINT
 } __attribute__((packed));
 
 // Command header structure
-struct HBA_CMD_HEADER {
+struct HbaCmdHeader {
     // DW0
     uint8_t cfl : 5;  // Command FIS length in DWORDS, 2 ~ 16
     uint8_t a : 1;    // ATAPI
@@ -269,7 +269,7 @@ struct HBA_CMD_HEADER {
 } __attribute__((packed));
 
 // Physical region descriptor table entry
-struct HBA_PRDT_ENTRY {
+struct HbaPrdtEntry {
     uint32_t dba;   // Data base address
     uint32_t dbau;  // Data base address upper 32 bits
     uint32_t rsv0;  // Reserved
@@ -281,7 +281,7 @@ struct HBA_PRDT_ENTRY {
 } __attribute__((packed));
 
 // Command table structure
-struct HBA_CMD_TBL {
+struct HbaCmdTbl {
     // 0x00
     uint8_t cfis[64];  // Command FIS NOLINT
 
@@ -292,21 +292,21 @@ struct HBA_CMD_TBL {
     uint8_t rsv[48];  // Reserved NOLINT
 
     // 0x80
-    HBA_PRDT_ENTRY prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535  NOLINT
+    HbaPrdtEntry prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535  NOLINT
 } __attribute__((packed));
 
 // Received FIS structure
-struct HBA_FIS {
+struct HbaFis {
     // 0x00
-    FIS_DMA_SETUP dsfis;  // DMA Setup FIS
+    FisDmaSetup dsfis;  // DMA Setup FIS
     uint8_t pad0[4];
 
     // 0x20
-    FIS_PIO_SETUP psfis;  // PIO Setup FIS
+    FisPioSetup psfis;  // PIO Setup FIS
     uint8_t pad1[12];
 
     // 0x40
-    FIS_REG_D2H rfis;  // Register – Device to Host FIS
+    FisRegD2H rfis;  // Register – Device to Host FIS
     uint8_t pad2[4];
 
     // 0x58
@@ -322,8 +322,8 @@ struct HBA_FIS {
 // AHCI Device structure
 struct AHCIDevice {
     ker::dev::BlockDevice bdev;
-    uint8_t port_num;
-    uint64_t total_sectors;
+    uint8_t port_num{};
+    uint64_t total_sectors{};
 };
 
 // Function declarations

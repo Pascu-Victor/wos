@@ -1,9 +1,12 @@
 #include "ioapic.hpp"
 
+#include <cstdint>
 #include <platform/acpi/madt/madt.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
+
+#include "platform/mm/paging.hpp"
 
 namespace ker::mod::ioapic {
 
@@ -40,22 +43,22 @@ auto read_redirection(uint8_t index) -> uint64_t {
 }  // namespace
 
 void init() {
-    const auto& apic_info = acpi::madt::getApicInfo();
+    const auto& apic_info = acpi::madt::get_apic_info();
 
-    if (apic_info.usableIOAPICs == 0) {
+    if (apic_info.usable_ioapics == 0) {
         dbg::log("IOAPIC: No IO APICs found in MADT");
         return;
     }
 
     // Use the first IO APIC
-    uint32_t phys_addr = apic_info.ioapics[0].ioApicAddr;
-    gsi_base = apic_info.ioapics[0].globalSysIntBase;
+    uint32_t phys_addr = apic_info.ioapics[0].io_apic_addr;
+    gsi_base = apic_info.ioapics[0].global_sys_int_base;
 
     // Map the IO APIC MMIO page into kernel page table.
     // MMIO regions are not in the Limine memory map, so the HHDM has no
     // page table entry for them after the kernel switches to its own page tables.
     auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(phys_addr));
-    mm::virt::mapToKernelPageTable(virt_addr, phys_addr, mm::paging::pageTypes::MMIO);
+    mm::virt::map_to_kernel_page_table(virt_addr, phys_addr, mm::paging::page_types::MMIO);
 
     ioapic_base = reinterpret_cast<volatile uint32_t*>(virt_addr);
 
@@ -72,9 +75,9 @@ void init() {
 
     // Apply interrupt source overrides from MADT
     // These remap ISA IRQs (e.g., IRQ 0->GSI 2 for timer)
-    for (uint32_t i = 0; i < apic_info.usableIOAPICISOs; i++) {
-        const auto& iso = apic_info.ioapicISOs[i];
-        dbg::log("IOAPIC: ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x", iso.bus, iso.source, iso.globalSysInt, iso.flags);
+    for (uint32_t i = 0; i < apic_info.usable_ioapic_isos; i++) {
+        const auto& iso = apic_info.ioapic_isos[i];
+        dbg::log("IOAPIC: ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x", iso.bus, iso.source, iso.global_sys_int, iso.flags);
     }
 }
 
@@ -96,10 +99,10 @@ void route_irq(uint8_t gsi, uint8_t vector, uint32_t dest_apic_id) {
     entry |= (static_cast<uint64_t>(dest_apic_id) << IOAPIC_REDIR_DEST_SHIFT);
 
     // Check if there's an interrupt source override for this GSI
-    const auto& apic_info = acpi::madt::getApicInfo();
-    for (uint32_t i = 0; i < apic_info.usableIOAPICISOs; i++) {
-        const auto& iso = apic_info.ioapicISOs[i];
-        if (iso.globalSysInt == gsi) {
+    const auto& apic_info = acpi::madt::get_apic_info();
+    for (uint32_t i = 0; i < apic_info.usable_ioapic_isos; i++) {
+        const auto& iso = apic_info.ioapic_isos[i];
+        if (iso.global_sys_int == gsi) {
             // Apply polarity override
             uint8_t polarity = iso.flags & 0x3;
             if (polarity == 0x3) {  // active low

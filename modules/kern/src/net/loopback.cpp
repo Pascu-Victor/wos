@@ -31,7 +31,7 @@ int lo_xmit(NetDevice* dev, PacketBuffer* pkt) {
         pkt->dev = dev;
         dev->rx_packets++;
         dev->rx_bytes += pkt->len;
-        backlog_enqueue(ker::mod::cpu::currentCpu(), pkt);
+        backlog_enqueue(ker::mod::cpu::current_cpu(), pkt);
         return 0;
     }
 

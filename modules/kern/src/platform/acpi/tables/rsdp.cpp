@@ -1,14 +1,18 @@
 #include "rsdp.hpp"
 
+#include <cstddef>
 #include <cstdint>
+
+#include "mod/io/serial/serial.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::mod::acpi::rsdp {
 static bool hasXsdt = false;
 static Rsdp rsdp;
 
-void validateChecksum(const Rsdp* rsdp) {
+void validate_checksum(const Rsdp* rsdp) {
     uint8_t sum = 0;
-    uint8_t* ptr = (uint8_t*)rsdp;
+    auto* ptr = (uint8_t*)rsdp;
 
     for (size_t i = 0; i < 20; i++) {
         sum += *ptr++;
@@ -20,11 +24,11 @@ void validateChecksum(const Rsdp* rsdp) {
     }
 }
 
-bool useXsdt(void) { return hasXsdt; }
+auto use_xsdt() -> bool { return hasXsdt; }
 
-void init(uint64_t rsdpAddr) {
-    rsdp = *(Rsdp*)rsdpAddr;
-    validateChecksum(&rsdp);
+void init(uint64_t rsdp_addr) {
+    rsdp = *(Rsdp*)rsdp_addr;
+    validate_checksum(&rsdp);
     rsdp.oem_id[5] = 0;
     // TODO: log stuff
 
@@ -33,5 +37,5 @@ void init(uint64_t rsdpAddr) {
     }
 }
 
-Rsdp get(void) { return rsdp; }
+auto get() -> Rsdp { return rsdp; }
 }  // namespace ker::mod::acpi::rsdp

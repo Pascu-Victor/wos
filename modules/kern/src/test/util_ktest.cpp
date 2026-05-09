@@ -246,8 +246,12 @@ KTEST(HashTable, Collision) {
     HNode* fb = ht.find(uint64_t{2});
     KEXPECT_NE(fa, nullptr);
     KEXPECT_NE(fb, nullptr);
-    if (fa != nullptr) { KEXPECT_EQ(fa->val, 111ULL); }
-    if (fb != nullptr) { KEXPECT_EQ(fb->val, 222ULL); }
+    if (fa != nullptr) {
+        KEXPECT_EQ(fa->val, 111ULL);
+    }
+    if (fb != nullptr) {
+        KEXPECT_EQ(fb->val, 222ULL);
+    }
 }
 
 // ---------------------------------------------------------------------------

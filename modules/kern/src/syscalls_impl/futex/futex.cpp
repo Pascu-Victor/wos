@@ -3,8 +3,10 @@
 #include <abi/callnums/futex.h>
 #include <errno.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -116,14 +118,14 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
         return -ENOMEM;
     }
 
-    void* previous_waiter = current_task->futexWaiter.exchange(waiter, std::memory_order_acq_rel);
+    void* previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
     if (previous_waiter != nullptr) {
         mod::dbg::log("futex_wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
     }
 
     // Set deferred task switch to move task to wait queue
     current_task->wait_channel = "futex_wait";
-    current_task->deferredTaskSwitch = true;
+    current_task->deferred_task_switch = true;
 
     return 0;
 }
@@ -154,11 +156,11 @@ int64_t futex_wake(int* addr) {  // NOLINT
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
             void* expected_waiter = waiter;
-            if (!waiter_task->futexWaiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
-                                                                  std::memory_order_acquire)) {
+            if (!waiter_task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire)) {
                 own_waiter = false;
             }
-            waiter_task->deferredTaskSwitch = false;
+            waiter_task->deferred_task_switch = false;
             mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
             woken_count++;
             waiter_task->release();
@@ -176,7 +178,7 @@ void futex_wait_cleanup_for_task(mod::sched::task::Task* task) {
         return;
     }
 
-    auto* waiter = static_cast<FutexWaiter*>(task->futexWaiter.exchange(nullptr, std::memory_order_acq_rel));
+    auto* waiter = static_cast<FutexWaiter*>(task->futex_waiter.exchange(nullptr, std::memory_order_acq_rel));
     if (waiter == nullptr) {
         return;
     }
@@ -197,11 +199,11 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
             void* expected_waiter = waiter;
-            if (!waiter_task->futexWaiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
-                                                                  std::memory_order_acquire)) {
+            if (!waiter_task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire)) {
                 own_waiter = false;
             }
-            waiter_task->deferredTaskSwitch = false;
+            waiter_task->deferred_task_switch = false;
             mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
             woken_count++;
             waiter_task->release();

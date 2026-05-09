@@ -47,10 +47,10 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
 
     const uint64_t rip_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rip);
     const uint64_t rsp_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rsp);
-    const bool rip_bad = child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL ||
-                         rip_phys == ker::mod::mm::virt::PADDR_INVALID;
-    const bool rsp_bad = child->context.frame.rsp == 0 || child->context.frame.rsp >= 0x0000800000000000ULL ||
-                         rsp_phys == ker::mod::mm::virt::PADDR_INVALID;
+    const bool rip_bad =
+        child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL || rip_phys == ker::mod::mm::virt::PADDR_INVALID;
+    const bool rsp_bad =
+        child->context.frame.rsp == 0 || child->context.frame.rsp >= 0x0000800000000000ULL || rsp_phys == ker::mod::mm::virt::PADDR_INVALID;
     if (!rip_bad && !rsp_bad) {
         return;
     }
@@ -59,10 +59,9 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
         "fork child resume anomaly: parent=%lu child=%lu pagemap=%p rip=0x%llx rip_phys=0x%llx rsp=0x%llx rsp_phys=0x%llx gs_rip=0x%llx "
         "gs_rsp=0x%llx gs_rflags=0x%llx parent_pagemap=%p",
         parent != nullptr ? parent->pid : 0, child->pid, static_cast<void*>(child->pagemap), (unsigned long long)child->context.frame.rip,
-        (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys),
-        (unsigned long long)child->context.frame.rsp, (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
-        (unsigned long long)saved_rip, (unsigned long long)saved_rsp, (unsigned long long)saved_flags,
-        parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
+        (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys), (unsigned long long)child->context.frame.rsp,
+        (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys), (unsigned long long)saved_rip,
+        (unsigned long long)saved_rsp, (unsigned long long)saved_flags, parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
 }
 }  // namespace
 
@@ -76,14 +75,14 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     parent->context.regs = gpr;
 
     // --- Allocate child kernel stack ---
-    auto kernelStackBase = (uint64_t)mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    auto kernelStackBase = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
     if (kernelStackBase == 0) return static_cast<uint64_t>(-ENOMEM);
     uint64_t kernelRsp = kernelStackBase + KERNEL_STACK_SIZE;
 
     // --- Allocate child Task without the ELF-loading constructor ---
     auto* child = new sched::task::Task{};
     if (child == nullptr) {
-        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
         return static_cast<uint64_t>(-ENOMEM);
     }
 
@@ -96,34 +95,34 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->name = nameCopy;
     }
 
-    child->pid = sched::task::getNextPid();
-    child->parentPid = parent->pid;
+    child->pid = sched::task::get_next_pid();
+    child->parent_pid = parent->pid;
     child->type = sched::task::TaskType::PROCESS;
-    child->cpu = cpu::currentCpu();
-    child->hasRun = false;
-    child->exitStatus = 0;
-    child->hasExited = false;
-    child->waitedOn = false;
-    child->deferredTaskSwitch = false;
-    child->yieldSwitch = false;
-    child->voluntaryBlock = false;
-    child->kthreadEntry = nullptr;
-    child->elfBuffer = nullptr;
-    child->elfBufferSize = 0;
-    child->isElfBufferShared = false;
-    child->waitingForPid = 0;
-    child->waitStatusPhysAddr = 0;
+    child->cpu = cpu::current_cpu();
+    child->has_run = false;
+    child->exit_status = 0;
+    child->has_exited = false;
+    child->waited_on = false;
+    child->deferred_task_switch = false;
+    child->yield_switch = false;
+    child->voluntary_block = false;
+    child->kthread_entry = nullptr;
+    child->elf_buffer = nullptr;
+    child->elf_buffer_size = 0;
+    child->is_elf_buffer_shared = false;
+    child->waiting_for_pid = 0;
+    child->wait_status_phys_addr = 0;
 
     // EEVDF scheduling fields - start fresh
     child->vruntime = 0;
     child->vdeadline = 0;
-    child->schedWeight = parent->schedWeight;
-    child->schedNice = parent->schedNice;
-    child->sliceNs = parent->sliceNs;
-    child->sliceUsedNs = 0;
-    child->heapIndex = -1;
-    child->schedQueue = sched::task::Task::SchedQueue::NONE;
-    child->schedNext = nullptr;
+    child->sched_weight = parent->sched_weight;
+    child->sched_nice = parent->sched_nice;
+    child->slice_ns = parent->slice_ns;
+    child->slice_used_ns = 0;
+    child->heap_index = -1;
+    child->sched_queue = sched::task::Task::sched_queue::NONE;
+    child->sched_next = nullptr;
 
     // Copy CWD
     memcpy(child->cwd, parent->cwd, sched::task::Task::CWD_MAX);
@@ -145,13 +144,12 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
     memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
     child->wki_remote_pid =
-        (child->wki_submitter_hostname[0] != '\0' &&
-         std::strcmp(child->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+        (child->wki_submitter_hostname[0] != '\0' && std::strcmp(child->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
             ? child->pid
             : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
         delete[] child->name;
-        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -172,30 +170,30 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->controlling_tty = parent->controlling_tty;
 
     // Copy signal dispositions from parent (fork inherits signal handlers)
-    child->sigPending = 0;  // Pending signals are NOT inherited
-    child->sigMask = parent->sigMask;
-    child->inSignalHandler = false;
-    child->doSigreturn = false;
-    memcpy(child->sigHandlers, parent->sigHandlers, sizeof(parent->sigHandlers));
+    child->sig_pending = 0;  // Pending signals are NOT inherited
+    child->sig_mask = parent->sig_mask;
+    child->in_signal_handler = false;
+    child->do_sigreturn = false;
+    memcpy(child->sig_handlers, parent->sig_handlers, sizeof(parent->sig_handlers));
 
     // --- Create child pagemap with COW ---
-    child->pagemap = mm::virt::createPagemap();
+    child->pagemap = mm::virt::create_pagemap();
     if (child->pagemap == nullptr) {
         delete[] child->name;
-        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
 
     // Copy kernel mappings
-    mm::virt::copyKernelMappings(child);
+    mm::virt::copy_kernel_mappings(child);
 
     // Deep-copy user pages with COW
-    if (!mm::virt::deepCopyUserPagemapCOW(parent->pagemap, child->pagemap)) {
-        mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-cow-fail");
-        mm::phys::pageFree(child->pagemap);
+    if (!mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap)) {
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-cow-fail");
+        mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -206,10 +204,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     if (parent->thread != nullptr) {
         auto* child_thread = new sched::threading::Thread();
         if (child_thread == nullptr) {
-            mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
-            mm::phys::pageFree(child->pagemap);
+            mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
+            mm::phys::page_free(child->pagemap);
             delete[] child->name;
-            mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+            mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
             delete child;
             return static_cast<uint64_t>(-ENOMEM);
         }
@@ -217,8 +215,8 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         *child_thread = *parent->thread;
         // The physical pointers are now shared via COW so the child shouldn't free them
         // on thread destroy - we zero them to prevent double-free
-        child_thread->tlsPhysPtr = 0;
-        child_thread->stackPhysPtr = 0;
+        child_thread->tls_phys_ptr = 0;
+        child_thread->stack_phys_ptr = 0;
         child->thread = child_thread;
     } else {
         child->thread = nullptr;
@@ -226,17 +224,17 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // --- Set up child context ---
     // Child's kernel stack and per-CPU scratch area
-    child->context.syscallKernelStack = kernelRsp;
+    child->context.syscall_kernel_stack = kernelRsp;
 
     auto* per_cpu = new cpu::PerCpu();
-    per_cpu->syscallStack = kernelRsp;
-    per_cpu->cpuId = cpu::currentCpu();
-    child->context.syscallScratchArea = (uint64_t)per_cpu;
+    per_cpu->syscall_stack = kernelRsp;
+    per_cpu->cpu_id = cpu::current_cpu();
+    child->context.syscall_scratch_area = (uint64_t)per_cpu;
 
     // Copy parent's register context - child will resume at the same RIP
     child->context.regs = parent->context.regs;
-    child->context.intNo = 0;
-    child->context.errorCode = 0;
+    child->context.int_no = 0;
+    child->context.error_code = 0;
 
     // Build the child's interrupt frame from the PerCpu scratch area.
     // parent->context.frame is STALE - it was saved during the last timer
@@ -259,8 +257,8 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->context.frame.flags = return_flags;
         child->context.frame.cs = desc::gdt::GDT_USER_CS;
         child->context.frame.ss = desc::gdt::GDT_USER_DS;
-        child->context.frame.intNum = 0;
-        child->context.frame.errCode = 0;
+        child->context.frame.int_num = 0;
+        child->context.frame.err_code = 0;
     }
 
     log_unmapped_child_resume_state(parent, child, return_rip, user_rsp, return_flags);
@@ -270,10 +268,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // Copy entry and ELF metadata pointers
     child->entry = parent->entry;
-    child->programHeaderAddr = parent->programHeaderAddr;
-    child->elfHeaderAddr = parent->elfHeaderAddr;
-    child->programHeaderCount = parent->programHeaderCount;
-    child->programHeaderEntSize = parent->programHeaderEntSize;
+    child->program_header_addr = parent->program_header_addr;
+    child->elf_header_addr = parent->elf_header_addr;
+    child->program_header_count = parent->program_header_count;
+    child->program_header_ent_size = parent->program_header_ent_size;
 
     // --- Clone file descriptors ---
     parent->fd_table.for_each([&](uint64_t key, void* val) {
@@ -301,11 +299,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         });
 
         delete child->thread;
-        delete (cpu::PerCpu*)child->context.syscallScratchArea;
-        mm::virt::destroyUserSpace(child->pagemap, child->pid, child->name, "fork-post-task-fail");
-        mm::phys::pageFree(child->pagemap);
+        delete (cpu::PerCpu*)child->context.syscall_scratch_area;
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
+        mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::pageFree(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -343,21 +341,21 @@ static auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr
     // Return old handler if requested
     if (oldact_ptr != 0) {
         auto* old = reinterpret_cast<KernelSigaction*>(oldact_ptr);
-        old->handler = task->sigHandlers[idx].handler;
-        old->flags = task->sigHandlers[idx].flags;
-        old->restorer = task->sigHandlers[idx].restorer;
-        old->mask = task->sigHandlers[idx].mask;
+        old->handler = task->sig_handlers[idx].handler;
+        old->flags = task->sig_handlers[idx].flags;
+        old->restorer = task->sig_handlers[idx].restorer;
+        old->mask = task->sig_handlers[idx].mask;
     }
 
     // Set new handler if provided
     if (act_ptr != 0) {
         auto* act = reinterpret_cast<const KernelSigaction*>(act_ptr);
-        task->sigHandlers[idx].handler = act->handler;
-        task->sigHandlers[idx].flags = act->flags;
-        task->sigHandlers[idx].mask = act->mask;
+        task->sig_handlers[idx].handler = act->handler;
+        task->sig_handlers[idx].flags = act->flags;
+        task->sig_handlers[idx].mask = act->mask;
         // Store restorer if SA_RESTORER flag is set
         if (act->flags & WOS_SA_RESTORER) {
-            task->sigHandlers[idx].restorer = act->restorer;
+            task->sig_handlers[idx].restorer = act->restorer;
         }
     }
 
@@ -373,7 +371,7 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
     // Return old mask if requested (sigset_t first word)
     if (oldset_ptr != 0) {
         auto* oldset = reinterpret_cast<uint64_t*>(oldset_ptr);
-        *oldset = task->sigMask;
+        *oldset = task->sig_mask;
     }
 
     // Apply new mask if provided
@@ -387,13 +385,13 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
 
         switch (how) {
             case 0:  // SIG_BLOCK
-                task->sigMask |= set;
+                task->sig_mask |= set;
                 break;
             case 1:  // SIG_UNBLOCK
-                task->sigMask &= ~set;
+                task->sig_mask &= ~set;
                 break;
             case 2:  // SIG_SETMASK
-                task->sigMask = set;
+                task->sig_mask = set;
                 break;
             default:
                 return static_cast<uint64_t>(-EINVAL);
@@ -448,7 +446,7 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     ker::net::wki::wki_proxy_task_forward_signal(target, sig);
 
     // Set the signal pending bit (signal N is bit N-1)
-    target->sigPending |= (1ULL << (sig - 1));
+    target->sig_pending |= (1ULL << (sig - 1));
 
     // Ensure blocked tasks become runnable so pending signals are delivered promptly.
     sched::wake_task_for_signal(target);
@@ -573,7 +571,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             // Signal the asm-level check_pending_signals to restore the saved context
             auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
-                task->doSigreturn = true;
+                task->do_sigreturn = true;
             }
             return 0;
         }
@@ -724,7 +722,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            if (target->parentPid != task->pid || target->session_id != task->session_id) {
+            if (target->parent_pid != task->pid || target->session_id != task->session_id) {
                 target->release();
                 return static_cast<uint64_t>(-EPERM);
             }

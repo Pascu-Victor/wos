@@ -1,6 +1,7 @@
 #include "cdc_ether.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
@@ -10,6 +11,9 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+
+#include "dev/usb/xhci.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::dev::usb {
 
@@ -52,7 +56,7 @@ size_t cdc_count = 0;
 auto virt_to_phys(void* v) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(v);
     if (addr >= 0xffffffff80000000ULL) {
-        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
             ker::mod::dbg::log("cdc_ether: virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
@@ -209,7 +213,7 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
 
     // Allocate transfer ring
     size_t ring_bytes = XFER_RING_SIZE * sizeof(Trb);
-    void* ring_virt = ker::mod::mm::phys::pageAlloc(ring_bytes);
+    void* ring_virt = ker::mod::mm::phys::page_alloc(ring_bytes);
     if (ring_virt == nullptr) {
         return;
     }

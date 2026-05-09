@@ -79,8 +79,8 @@ _wOS_kernel_thread_trampoline:
     hlt
     jmp .kernel_thread_return_halt
 
-global _wOS_startKernelThread
-_wOS_startKernelThread:
+global wos_start_kernel_thread
+wos_start_kernel_thread:
     ; rdi = initial kernel stack top
     ; rsi = kernel thread entry function
     ;
@@ -184,7 +184,7 @@ task_switch_handler:
 
     swapgs
     .no_swapgs_exit:
-    add rsp, 16  ; Skip intNum and errCode
+    add rsp, 16  ; Skip int_num and err_code
     iretq
     .kernel_return:
     build_kernel_return_from_stack
@@ -201,8 +201,8 @@ jump_to_next_task_no_save:
     push 0  ; RFLAGS
     push 0  ; CS
     push 0  ; RIP
-    push 0  ; errCode
-    push 0  ; intNum
+    push 0  ; err_code
+    push 0  ; int_num
 
     ; Push dummy GPRegs structure (will be at lower addresses = RSP after this)
     push 0  ; rax
@@ -253,7 +253,7 @@ jump_to_next_task_no_save:
 
     swapgs
     .no_swapgs_exit_jump:
-    add rsp, 16  ; Skip intNum and errCode
+    add rsp, 16  ; Skip int_num and err_code
     iretq
     .kernel_return_jump:
     build_kernel_return_from_stack
@@ -263,15 +263,15 @@ jump_to_next_task_no_save:
 ; rsi = pointer to interruptFrame structure in memory
 ;
 ; GPRegs layout (120 bytes): r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
-; interruptFrame layout (56 bytes): intNum, errCode, rip, cs, flags, rsp, ss
+; interruptFrame layout (56 bytes): int_num, err_code, rip, cs, flags, rsp, ss
 ;
 ; We need to:
 ; 1. Build a proper stack with interruptFrame for iretq
 ; 2. Restore all GPRegs
 ; 3. Check if we need swapgs (if returning to userspace)
 ; 4. Execute iretq
-global _wOS_deferredTaskSwitchReturn
-_wOS_deferredTaskSwitchReturn:
+global wos_deferred_task_switch_return
+wos_deferred_task_switch_return:
     ; rdi = GPRegs*, rsi = interruptFrame*
 
     ; Returning to a kernel-mode task is a same-CPL iretq. Build the return

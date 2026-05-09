@@ -2,12 +2,12 @@
 
 #include <cstring>
 #include <net/endian.hpp>
+#include <net/net_trace.hpp>
 #include <net/proto/arp.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_roce.hpp>
-#include <net/net_trace.hpp>
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::net::proto {

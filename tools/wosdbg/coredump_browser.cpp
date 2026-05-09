@@ -101,7 +101,7 @@ void CoredumpBrowser::scanDirectory() {
         // Quick-read just the header to get interrupt number and timestamp
         QFile file(full_path);
         if (file.open(QIODevice::ReadOnly)) {
-            QByteArray header_data = file.read(72 + 8);  // Read through intNum field
+            QByteArray header_data = file.read(72 + 8);  // Read through int_num field
             if (header_data.size() >= 72) {
                 auto dump = wosdbg::parseCoreDump(header_data.left(std::min(static_cast<qsizetype>(512), header_data.size())));
                 // We can't fully parse with just the header, so read more
@@ -115,7 +115,7 @@ void CoredumpBrowser::scanDirectory() {
             QByteArray data = full_file.readAll();
             auto dump = wosdbg::parseCoreDump(data);
             if (dump) {
-                interrupt_str = wosdbg::interruptName(dump->intNum);
+                interrupt_str = wosdbg::interruptName(dump->int_num);
                 timestamp_str = QString::number(dump->timestamp);
             }
             full_file.close();

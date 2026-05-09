@@ -94,10 +94,10 @@ static auto try_sync(uint32_t server_ip) -> bool {
     }
 
     int64_t unix_sec = static_cast<int64_t>(ntp_sec) - static_cast<int64_t>(NTP_EPOCH_DELTA);
-    int64_t rtc_now = static_cast<int64_t>(rtc::getEpochSec());
+    int64_t rtc_now = static_cast<int64_t>(rtc::get_epoch_sec());
     int64_t delta = unix_sec - rtc_now;
 
-    rtc::setOffset(delta);
+    rtc::set_offset(delta);
     dbg::log("ntp: synced to %lu.%lu.%lu.%lu - offset %ld s", (unsigned long)((server_ip >> 24) & 0xFF),
              (unsigned long)((server_ip >> 16) & 0xFF), (unsigned long)((server_ip >> 8) & 0xFF), (unsigned long)(server_ip & 0xFF),
              (long)delta);
@@ -137,7 +137,7 @@ static void ntp_sync_thread() {
 // ---------------------------------------------------------------------------
 
 void init() {
-    auto* task = ker::mod::sched::task::Task::createKernelThread("ntp_sync", ntp_sync_thread);
+    auto* task = ker::mod::sched::task::Task::create_kernel_thread("ntp_sync", ntp_sync_thread);
     if (task == nullptr) {
         dbg::log("ntp: failed to create sync thread (OOM)");
         return;

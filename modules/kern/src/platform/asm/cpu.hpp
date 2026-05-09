@@ -15,13 +15,13 @@ struct CpuidContext {
 };
 
 void cpuid(struct CpuidContext* cpuid_context);
-uint64_t currentCpu(void);
-void setCurrentCpuid(uint64_t id);
+auto current_cpu() -> uint64_t;
+void set_current_cpuid(uint64_t id);
 
 // Safe CPU ID getter - falls back to APIC ID during early boot before per-CPU
 // structures are initialized. Call notifyPerCpuReady() to enable the fast path.
-uint64_t getCurrentCpuIdSafe();
-void notifyPerCpuReady();
+auto get_current_cpu_id_safe() -> uint64_t;
+void notify_per_cpu_ready();
 
 struct GPRegs {
     uint64_t r15;
@@ -42,50 +42,50 @@ struct GPRegs {
 } __attribute__((packed));
 
 struct PerCpu {
-    uint64_t syscallStack;     // 0x00
-    uint64_t userRsp;          // 0x08 - saved user RSP at syscall entry
-    uint64_t cpuId;            // 0x10
-    uint64_t savedDs;          // 0x18 - saved DS segment
-    uint64_t savedEs;          // 0x20 - saved ES segment
-    uint64_t syscallRetRip;    // 0x28 - RCX at syscall entry (return RIP)
-    uint64_t syscallRetFlags;  // 0x30 - R11 at syscall entry (RFLAGS)
+    uint64_t syscall_stack;      // 0x00
+    uint64_t user_rsp;           // 0x08 - saved user RSP at syscall entry
+    uint64_t cpu_id;             // 0x10
+    uint64_t saved_ds;           // 0x18 - saved DS segment
+    uint64_t saved_es;           // 0x20 - saved ES segment
+    uint64_t syscall_ret_rip;    // 0x28 - RCX at syscall entry (return RIP)
+    uint64_t syscall_ret_flags;  // 0x30 - R11 at syscall entry (RFLAGS)
 } __attribute__((packed));
 
-static __always_inline uint64_t rdfsbase(void) {
-    uint64_t fsbase;
+static ALWAYS_INLINE uint64_t rdfsbase() {
+    uint64_t fsbase = 0;
 
     asm volatile("rdfsbase %0" : "=r"(fsbase)::"memory");
 
     return fsbase;
 }
 
-static __always_inline uint64_t rdgsbase(void) {
-    uint64_t gsbase;
+static ALWAYS_INLINE uint64_t rdgsbase() {
+    uint64_t gsbase = 0;
 
     asm volatile("rdgsbase %0" : "=r"(gsbase)::"memory");
 
     return gsbase;
 }
 
-static __always_inline void wrfsbase(uint64_t fsbase) { asm volatile("wrfsbase %0" ::"r"(fsbase) : "memory"); }
+static ALWAYS_INLINE void wrfsbase(uint64_t fsbase) { asm volatile("wrfsbase %0" ::"r"(fsbase) : "memory"); }
 
-static __always_inline void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %0" ::"r"(gsbase) : "memory"); }
+static ALWAYS_INLINE void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %0" ::"r"(gsbase) : "memory"); }
 
-static __always_inline void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
+static ALWAYS_INLINE void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
+// NOLINTNEXTLINE(readability-non-const-parameter)
+static ALWAYS_INLINE void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
 
-static __always_inline void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
-
-void enablePAE(void);
-void enablePSE(void);
-void enableSSE(void);
-void enableFSGSBASE(void);
+void enable_pae();
+void enable_pse();
+void enable_sse();
+void enable_fsgsbase();
 
 // Enable XSAVE/XRSTOR and configure XCR0 for x87+SSE+AVX.
 // Must be called after enableSSE(). Called on each CPU.
-void enableXSave(void);
+void enable_xsave();
 
 // Size in bytes of the xsave area (set after enableXSave). 0 = XSAVE not supported, use fxsave.
-extern uint64_t xsaveAreaSize;
+extern uint64_t xsave_area_size;
 
-#define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
+#define SAVESEGMENT(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

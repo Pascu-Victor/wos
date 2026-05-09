@@ -120,7 +120,7 @@ auto Workqueue::create(const char* name) -> Workqueue* {
     pending_launch_wq = wq;
     launch_lock.unlock_irqrestore(irqf);
 
-    wq->thread_ = task::Task::createKernelThread(name, worker_entry);
+    wq->thread_ = task::Task::create_kernel_thread(name, worker_entry);
     if (wq->thread_ == nullptr) {
         mod::dbg::log("[workqueue] failed to create worker thread '%s'\n", name);
         delete wq;

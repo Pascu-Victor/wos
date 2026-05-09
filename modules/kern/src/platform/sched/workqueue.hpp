@@ -53,7 +53,7 @@ class Workqueue {
    private:
     Workqueue() = default;
 
-    // Worker thread body (static, passed to createKernelThread).
+    // Worker thread body (static, passed to create_kernel_thread).
     static void worker_entry();
 
     // The actual drain loop.

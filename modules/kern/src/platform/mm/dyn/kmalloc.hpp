@@ -6,13 +6,13 @@
 
 namespace ker::mod::mm::dyn::kmalloc {
 void init();
-void enablePerCpuAllocations();  // Call after cpuParamInit to enable per-CPU allocators
+void enable_per_cpu_allocations();  // Call after cpuParamInit to enable per-CPU allocators
 
 // Dump tracked large allocations for kmalloc (safe to call from OOM)
-void dumpTrackedAllocations();
+void dump_tracked_allocations();
 
 // Fill outCount and outBytes with totals for tracked large allocations
-void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes);
+void get_tracked_alloc_totals(uint64_t& out_count, uint64_t& out_bytes);
 auto malloc(uint64_t size) -> void*;
 void free(void* ptr);
 auto realloc(void* ptr, size_t size) -> void*;

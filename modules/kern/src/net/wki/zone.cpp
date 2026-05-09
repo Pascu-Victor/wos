@@ -56,7 +56,7 @@ void free_zone_backing(WkiZone* zone) {
             wki_ivshmem_rdma_free(offset, zone->size);
         } else {
             // RoCE-backed or non-RDMA: regular kernel pages
-            ker::mod::mm::phys::pageFree(zone->local_vaddr);
+            ker::mod::mm::phys::page_free(zone->local_vaddr);
         }
     }
     zone->local_vaddr = nullptr;
@@ -67,7 +67,7 @@ void free_zone_backing(WkiZone* zone) {
 
 auto allocate_zone_backing(uint32_t size) -> void* {
     // Allocate physically contiguous pages from buddy allocator
-    return ker::mod::mm::phys::pageAlloc(size);
+    return ker::mod::mm::phys::page_alloc(size);
 }
 
 // Check if a peer has any RDMA-capable transport (ivshmem or RoCE)
@@ -139,14 +139,14 @@ auto allocate_roce_zone_backing(WkiTransport* transport, uint32_t size, uint32_t
     if (transport == nullptr || transport->rdma_register_region == nullptr) {
         return nullptr;
     }
-    void* backing = ker::mod::mm::phys::pageAlloc(size);
+    void* backing = ker::mod::mm::phys::page_alloc(size);
     if (backing == nullptr) {
         return nullptr;
     }
     uint32_t rkey = 0;
     int ret = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(backing), size, &rkey);
     if (ret != 0) {
-        ker::mod::mm::phys::pageFree(backing);
+        ker::mod::mm::phys::page_free(backing);
         return nullptr;
     }
     out_rkey = rkey;

@@ -8,8 +8,8 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sys/spinlock.hpp>
-#include <util/list.hpp>
 #include <util/hcf.hpp>
+#include <util/list.hpp>
 
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -18,16 +18,16 @@ namespace ker::mod::sched::threading {
 std::list<Thread*> activeThreads;
 static sys::Spinlock activeThreadsLock;
 
-void initThreading() {}
+void init_threading() {}
 
-Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable* pageTable, const ker::loader::elf::TlsModule& tlsInfo) {
+Thread* create_thread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable* pageTable, const ker::loader::elf::TlsModule& tlsInfo) {
     auto* thread = new Thread();
     if (thread == nullptr) {
         dbg::log("createThread: Failed to allocate Thread object");
         return nullptr;
     }
-    thread->stackSize = stackSize;
-    thread->tlsSize = tlsSize;
+    thread->stack_size = stackSize;
+    thread->tls_size = tlsSize;
 
     // Use the actual TLS size from PT_TLS segment if available, otherwise use provided size
     uint64_t actualTlsSize = (tlsInfo.tlsSize > 0) ? tlsInfo.tlsSize : tlsSize;
@@ -38,17 +38,17 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     uint64_t safestackSize = 65536;  // 64KB for SafeStack unsafe stack
     uint64_t totalTlsSize = actualTlsSize + tcbSize + safestackSize;
 
-    void* tls = mm::phys::pageAlloc(PAGE_ALIGN_UP(totalTlsSize));
+    void* tls = mm::phys::page_alloc(PAGE_ALIGN_UP(totalTlsSize));
     if (tls == nullptr) {
         dbg::log("createThread: Failed to allocate TLS memory (%d bytes)", PAGE_ALIGN_UP(totalTlsSize));
         delete thread;
         return nullptr;
     }
 
-    void* stack = mm::phys::pageAlloc(stackSize);
+    void* stack = mm::phys::page_alloc(stackSize);
     if (stack == nullptr) {
         dbg::log("createThread: Failed to allocate stack memory (%d bytes)", stackSize);
-        mm::phys::pageFree(tls);
+        mm::phys::page_free(tls);
         delete thread;
         return nullptr;
     }
@@ -62,19 +62,19 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     // Map all pages for TLS
     for (uint64_t offset = 0; offset < alignedTotalSize; offset += mm::paging::PAGE_SIZE) {
         uint64_t tlsPhys = (uint64_t)mm::addr::get_phys_pointer((uint64_t)tls + offset);
-        mm::virt::mapPage(pageTable, tlsVirtAddr + offset, tlsPhys, mm::paging::pageTypes::USER);
+        mm::virt::map_page(pageTable, tlsVirtAddr + offset, tlsPhys, mm::paging::page_types::USER);
     }
 
     // Map all pages for stack
     for (uint64_t offset = 0; offset < stackSize; offset += mm::paging::PAGE_SIZE) {
         uint64_t stackPhys = (uint64_t)mm::addr::get_phys_pointer((uint64_t)stack + offset);
-        mm::virt::mapPage(pageTable, stackVirtAddr + offset, stackPhys, mm::paging::pageTypes::USER);
+        mm::virt::map_page(pageTable, stackVirtAddr + offset, stackPhys, mm::paging::page_types::USER);
     }
 
     // TLS and user stacks are reclaimed one 4 KiB leaf at a time during
     // destroyUserSpace() / COW teardown, so split the bulk allocations into
     // independently freeable pages once the mappings are established.
-    if (!mm::phys::pageSplitToOrder0(tls) || !mm::phys::pageSplitToOrder0(stack)) {
+    if (!mm::phys::page_split_to_order0(tls) || !mm::phys::page_split_to_order0(stack)) {
         dbg::log("createThread: failed to split TLS/stack backing pages");
         hcf();
     }
@@ -148,9 +148,9 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     memset(safestackArea, 0, safestackSize);
 
     // Save TLS mapping info into the Thread object for later initialization
-    thread->tlsSize = alignedTotalSize;
-    thread->tlsBaseVirt = tlsVirtAddr;
-    thread->safestackPtrValue = safestackPtrValue;
+    thread->tls_size = alignedTotalSize;
+    thread->tls_base_virt = tlsVirtAddr;
+    thread->safestack_ptr_value = safestackPtrValue;
 
     // Stack grows downward, so thread->stack points to the TOP of the stack
     // Reserve space at the BOTTOM of stack for PerCpu scratch area (used by syscall handler after swapgs)
@@ -163,12 +163,12 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     // Initialize the scratch area at the bottom of the stack
     auto* scratchArea = reinterpret_cast<cpu::PerCpu*>(stack);
     memset(scratchArea, 0, sizeof(cpu::PerCpu));
-    scratchArea->syscallStack = 0;  // Will be set by task initialization
-    scratchArea->cpuId = 0;         // Will be set by task initialization
+    scratchArea->syscall_stack = 0;  // Will be set by task initialization
+    scratchArea->cpu_id = 0;         // Will be set by task initialization
 
     // Store the physical (HHDM) pointers for cleanup
-    thread->tlsPhysPtr = reinterpret_cast<uint64_t>(tls);
-    thread->stackPhysPtr = reinterpret_cast<uint64_t>(stack);
+    thread->tls_phys_ptr = reinterpret_cast<uint64_t>(tls);
+    thread->stack_phys_ptr = reinterpret_cast<uint64_t>(stack);
 
     activeThreadsLock.lock();
     activeThreads.push_back(thread);
@@ -176,7 +176,7 @@ Thread* createThread(uint64_t stackSize, uint64_t tlsSize, mm::paging::PageTable
     return thread;
 }
 
-void destroyThread(Thread* thread) {
+void destroy_thread(Thread* thread) {
     if (thread == nullptr) {
         return;
     }
@@ -186,17 +186,17 @@ void destroyThread(Thread* thread) {
     activeThreadsLock.unlock();
 
     // Free the actual physical allocations using the stored HHDM pointers
-    if (thread->tlsPhysPtr != 0) {
-        mm::phys::pageFree(reinterpret_cast<void*>(thread->tlsPhysPtr));
+    if (thread->tls_phys_ptr != 0) {
+        mm::phys::page_free(reinterpret_cast<void*>(thread->tls_phys_ptr));
     }
-    if (thread->stackPhysPtr != 0) {
-        mm::phys::pageFree(reinterpret_cast<void*>(thread->stackPhysPtr));
+    if (thread->stack_phys_ptr != 0) {
+        mm::phys::page_free(reinterpret_cast<void*>(thread->stack_phys_ptr));
     }
 
     delete thread;
 }
 
-auto getActiveThreadCount() -> uint64_t {
+auto get_active_thread_count() -> uint64_t {
     activeThreadsLock.lock();
     uint64_t count = activeThreads.size();
     activeThreadsLock.unlock();

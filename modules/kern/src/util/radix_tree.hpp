@@ -23,7 +23,7 @@ template <typename T>
 class RadixTree {
    public:
     static constexpr unsigned BITS_PER_LEVEL = 6;
-    static constexpr unsigned FANOUT = 1u << BITS_PER_LEVEL;  // 64
+    static constexpr unsigned FANOUT = 1U << BITS_PER_LEVEL;  // 64
     static constexpr unsigned MAX_DEPTH = 11;
     static constexpr uint64_t LEVEL_MASK = FANOUT - 1;
 
@@ -57,13 +57,17 @@ class RadixTree {
     [[nodiscard]] bool insert(uint64_t key, T value) {
         // Ensure tree is deep enough for this key
         while (key >= capacity_at_depth(m_depth)) {
-            if (!grow_depth()) return false;
+            if (!grow_depth()) {
+                return false;
+            }
         }
 
         // Lazy-allocate root node (default constructor leaves m_root null)
-        if (!m_root) {
+        if (m_root == nullptr) {
             m_root = alloc_node();
-            if (!m_root) return false;
+            if (m_root == nullptr) {
+                return false;
+            }
         }
 
         Node* node = m_root;
@@ -71,7 +75,9 @@ class RadixTree {
             unsigned idx = slot_index(key, level);
             if (!node->children[idx]) {
                 node->children[idx] = alloc_node();
-                if (!node->children[idx]) return false;
+                if (!node->children[idx]) {
+                    return false;
+                }
                 node->populated++;
             }
             node = node->children[idx];
@@ -93,7 +99,9 @@ class RadixTree {
 
     // Remove value at key. Returns the removed value, or T{} if not present.
     T remove(uint64_t key) {
-        if (!m_root || key >= capacity_at_depth(m_depth)) return T{};
+        if ((m_root == nullptr) || key >= capacity_at_depth(m_depth)) {
+            return T{};
+        }
 
         // Walk down, recording path for cleanup
         struct PathEntry {
@@ -106,14 +114,18 @@ class RadixTree {
         Node* node = m_root;
         for (unsigned level = m_depth; level > 1; --level) {
             unsigned idx = slot_index(key, level);
-            if (!node->children[idx]) return T{};
+            if (!node->children[idx]) {
+                return T{};
+            }
             path[path_len++] = {node, idx};
             node = node->children[idx];
         }
 
         unsigned idx = slot_index(key, 1);
         T old = node->values[idx];
-        if (old == T{}) return T{};
+        if (old == T{}) {
+            return T{};
+        }
 
         node->values[idx] = T{};
         node->populated--;
@@ -138,12 +150,16 @@ class RadixTree {
 
     // Lookup value at key. Returns T{} (nullptr for pointers) if not present.
     [[nodiscard]] T lookup(uint64_t key) const {
-        if (!m_root || key >= capacity_at_depth(m_depth)) return T{};
+        if ((m_root == nullptr) || key >= capacity_at_depth(m_depth)) {
+            return T{};
+        }
 
         const Node* node = m_root;
         for (unsigned level = m_depth; level > 1; --level) {
             unsigned idx = slot_index(key, level);
-            if (!node->children[idx]) return T{};
+            if (!node->children[idx]) {
+                return T{};
+            }
             node = node->children[idx];
         }
 
@@ -155,7 +171,9 @@ class RadixTree {
     [[nodiscard]] uint64_t find_first_unset(uint64_t start_key = 0) const {
         uint64_t cap = capacity_at_depth(m_depth);
         for (uint64_t k = start_key; k < cap; ++k) {
-            if (lookup(k) == T{}) return k;
+            if (lookup(k) == T{}) {
+                return k;
+            }
         }
         return UINT64_MAX;
     }
@@ -175,7 +193,9 @@ class RadixTree {
         m_size = 0;
         m_depth = other.m_depth;
 
-        if (!other.m_root) return true;
+        if (other.m_root == nullptr) {
+            return true;
+        }
 
         bool ok = true;
         other.for_each([&](uint64_t key, T value) {
@@ -207,10 +227,7 @@ class RadixTree {
         };
         uint16_t populated{0};  // count of non-null children or non-null values
 
-        Node() {
-            memset(children, 0, sizeof(children));
-            populated = 0;
-        }
+        Node() : populated(0) { memset(children, 0, sizeof(children)); }
     };
 
     Node* m_root{nullptr};
@@ -220,8 +237,12 @@ class RadixTree {
     static unsigned slot_index(uint64_t key, unsigned level) { return (key >> ((level - 1) * BITS_PER_LEVEL)) & LEVEL_MASK; }
 
     static uint64_t capacity_at_depth(unsigned depth) {
-        if (depth == 0) return 0;
-        if (depth >= 11) return UINT64_MAX;  // overflow guard
+        if (depth == 0) {
+            return 0;
+        }
+        if (depth >= 11) {
+            return UINT64_MAX;  // overflow guard
+        }
         uint64_t cap = 1;
         for (unsigned i = 0; i < depth; ++i) {
             cap *= FANOUT;
@@ -236,7 +257,9 @@ class RadixTree {
     // Grow tree depth by 1: allocate new root, make old root its child[0]
     [[nodiscard]] bool grow_depth() {
         Node* new_root = alloc_node();
-        if (!new_root) return false;
+        if (new_root == nullptr) {
+            return false;
+        }
 
         if (m_root) {
             new_root->children[0] = m_root;
@@ -248,7 +271,9 @@ class RadixTree {
     }
 
     void destroy_node(Node* node, unsigned depth_from_root) {
-        if (!node) return;
+        if (node == nullptr) {
+            return;
+        }
         unsigned level = m_depth - depth_from_root;
         if (level > 1) {
             // Interior node: recurse into children

@@ -28,7 +28,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         // Re-read current CPU each iteration: the scheduler may migrate this
         // handler thread, so we must always drain the queue for whichever CPU
         // we're actually running on right now.
-        cpu_idx = ker::mod::cpu::currentCpu();
+        cpu_idx = ker::mod::cpu::current_cpu();
         if (cpu_idx >= num_cpus) {
             cpu_idx = 0;
         }
@@ -92,7 +92,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 
 [[noreturn]] void backlog_handler_entry() {
     // Starting CPU - passed as initial hint but re-read each iteration in the loop.
-    uint64_t my_cpu = ker::mod::cpu::currentCpu();
+    uint64_t my_cpu = ker::mod::cpu::current_cpu();
     backlog_handler_loop(my_cpu);
     __builtin_unreachable();
 }
@@ -113,7 +113,7 @@ void backlog_init() {
     }
 
     for (uint64_t i = 0; i < num_cpus; i++) {
-        auto* task = ker::mod::sched::task::Task::createKernelThread("net_backlog", backlog_handler_entry);
+        auto* task = ker::mod::sched::task::Task::create_kernel_thread("net_backlog", backlog_handler_entry);
         if (task == nullptr) {
             ker::mod::dbg::log("backlog: failed to create handler for CPU %u", static_cast<unsigned>(i));
             continue;

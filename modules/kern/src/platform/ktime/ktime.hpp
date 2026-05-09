@@ -13,22 +13,22 @@
 
 namespace ker::mod::time {
 
-void init(void);
+void init();
 
 // HPET-backed helpers (use only where HPET precision is required, e.g. early boot calibration)
-inline uint64_t getTicks(void) { return hpet::getTicks(); }
-inline uint64_t getHpetUs(void) { return hpet::getUs(); }
-inline void sleepTicks(uint64_t ticks) { hpet::sleepTicks(ticks); }
-inline void sleepUs(uint64_t us) { hpet::sleepUs(us); }
-inline void sleep(uint64_t ms) { hpet::sleepUs(ms * 1000); }
+inline uint64_t get_ticks() { return hpet::get_ticks(); }
+inline uint64_t get_hpet_us() { return hpet::get_us(); }
+inline void sleep_ticks(uint64_t ticks) { hpet::sleep_ticks(ticks); }
+inline void sleep_us(uint64_t us) { hpet::sleep_us(us); }
+inline void sleep(uint64_t ms) { hpet::sleep_us(ms * 1000); }
 
 // TSC-backed monotonic time - no VM-exits, use for hot paths like the scheduler
-inline uint64_t getMonotonicNs(void) { return tsc::getNs(); }
-inline uint64_t getUs(void) { return tsc::getNs() / 1000; }
-inline uint64_t getMs(void) { return tsc::getNs() / 1000000; }
+inline uint64_t get_monotonic_ns() { return tsc::get_ns(); }
+inline uint64_t get_us() { return tsc::get_ns() / 1000; }
+inline uint64_t get_ms() { return tsc::get_ns() / 1000000; }
 
 // RTC + TSC epoch nanoseconds
-inline uint64_t getEpochNs(void) { return rtc::getEpochNs(); }
+inline uint64_t get_epoch_ns() { return rtc::get_epoch_ns(); }
 
-void pushTask(uint64_t ticks, void (*task)(gates::interruptFrame*), void* arg);
+void push_task(uint64_t ticks, void (*task)(gates::interruptFrame*), void* arg);
 }  // namespace ker::mod::time

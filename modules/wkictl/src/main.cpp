@@ -25,7 +25,8 @@ auto command_basename(const char* path) -> const char* {
 
 auto usage() -> int {
     std::println(stderr,
-                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  homeward <command> [args...]\n  on <hostname> <command> [args...]\n  forward "
+                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  homeward <command> [args...]\n  on <hostname> "
+                 "<command> [args...]\n  forward "
                  "[+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
                  "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl wosid");
     return 1;
@@ -71,8 +72,7 @@ auto print_wosid() -> int {
 
     const char* launcher_text =
         read_trimmed_file("/proc/self/wki_launcher", launcher.data(), launcher.size()) ? launcher.data() : "<unknown>";
-    const char* runner_text =
-        read_trimmed_file("/proc/self/wki_runner", runner.data(), runner.size()) ? runner.data() : "<unknown>";
+    const char* runner_text = read_trimmed_file("/proc/self/wki_runner", runner.data(), runner.size()) ? runner.data() : "<unknown>";
     const char* remote_pid_text =
         read_trimmed_file("/proc/self/wki_remote_pid", remote_pid.data(), remote_pid.size()) ? remote_pid.data() : "0";
 
@@ -131,8 +131,7 @@ auto run_homeward(int argc, char** argv) -> int {
         return 1;
     }
 
-    int64_t rc = ker::process::setwkitarget(launcher.data(), static_cast<uint64_t>(launcher_len),
-                                            ker::process::WKI_TARGET_FLAG_STRICT);
+    int64_t rc = ker::process::setwkitarget(launcher.data(), static_cast<uint64_t>(launcher_len), ker::process::WKI_TARGET_FLAG_STRICT);
     if (rc < 0) {
         std::println(stderr, "homeward: failed to target launcher '{}': {}", launcher.data(), static_cast<long>(rc));
         return 1;

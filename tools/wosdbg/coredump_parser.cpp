@@ -82,9 +82,9 @@ static T readLE(const char* data) {
 
 static InterruptFrame parseInterruptFrame(const char* data, size_t& off) {
     InterruptFrame f;
-    f.intNum = readLE<uint64_t>(data + off);
+    f.int_num = readLE<uint64_t>(data + off);
     off += 8;
-    f.errCode = readLE<uint64_t>(data + off);
+    f.err_code = readLE<uint64_t>(data + off);
     off += 8;
     f.rip = readLE<uint64_t>(data + off);
     off += 8;
@@ -169,16 +169,16 @@ std::optional<CoreDump> parseCoreDump(const QByteArray& data) {
         return std::nullopt;
     }
 
-    // 7 x uint64: timestamp, pid, cpu, intNum, errCode, cr2, cr3
+    // 7 x uint64: timestamp, pid, cpu, int_num, err_code, cr2, cr3
     dump.timestamp = readLE<uint64_t>(d + off);
     off += 8;
     dump.pid = readLE<uint64_t>(d + off);
     off += 8;
     dump.cpu = readLE<uint64_t>(d + off);
     off += 8;
-    dump.intNum = readLE<uint64_t>(d + off);
+    dump.int_num = readLE<uint64_t>(d + off);
     off += 8;
-    dump.errCode = readLE<uint64_t>(d + off);
+    dump.err_code = readLE<uint64_t>(d + off);
     off += 8;
     dump.cr2 = readLE<uint64_t>(d + off);
     off += 8;

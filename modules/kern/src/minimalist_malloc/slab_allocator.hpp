@@ -326,7 +326,7 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
 template <size_t slab_size, size_t memory_size>
 void* Slab<slab_size, memory_size>::request_memory_from_os(size_t size) {
     // system dependent function, returns aligned memory region.
-    void* address = ker::mod::mm::phys::pageAlloc(size);
+    void* address = ker::mod::mm::phys::page_alloc(size);
     if (address == nullptr) {
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
         assert(false);
@@ -338,5 +338,5 @@ template <size_t slab_size, size_t memory_size>
 void Slab<slab_size, memory_size>::free_memory_to_os(void* addrss, size_t size) {
     // system dependent function, returns aligned memory region.
     (void)size;
-    ker::mod::mm::phys::pageFree(addrss);
+    ker::mod::mm::phys::page_free(addrss);
 }

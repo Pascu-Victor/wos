@@ -408,7 +408,7 @@ auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
     uint64_t end = (phys + size + 0xFFF) & ~0xFFFULL;
 
     // Map the MMIO range into the kernel page table (uncacheable for MMIO correctness)
-    ker::mod::mm::virt::mapRangeToKernelPageTable(ker::mod::mm::virt::Range{phys_aligned, end}, ker::mod::mm::paging::pageTypes::MMIO);
+    ker::mod::mm::virt::map_range_to_kernel_page_table(ker::mod::mm::virt::Range{phys_aligned, end}, ker::mod::mm::paging::page_types::MMIO);
 
     return reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(phys));
 }

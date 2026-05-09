@@ -2,11 +2,11 @@
 #include <sys/process.h>
 #include <sys/vfs.h>
 #include <time.h>
-#include <unistd.h>
 
 #include <array>
 #include <cstdint>
-#include <print>
+#include <ctime>
+#include <utility>
 
 #include "fstab.h"
 #include "network.h"
@@ -30,7 +30,7 @@ int simple_atoi(const char* str) {
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
     // Determine our role based on argc:
     // argc == 1: We are the root init - spawn sub-inits
@@ -41,34 +41,34 @@ auto main(int argc, char** argv) -> int {
         // argv[0] = our path
         // argv[1] = number of programs to spawn
         // argv[2] = program path to spawn
-        int spawn_count = simple_atoi(argv[1]);
+        int const SPAWN_COUNT = simple_atoi(argv[1]);
         const char* prog_path = argv[2];
 
-        init_log::info("sub-init[%d]: starting - will spawn %d instances of '%s'", cpuno, spawn_count, prog_path);
+        init_log::info("sub-init[%d]: starting - will spawn %d instances of '%s'", CPUNO, SPAWN_COUNT, prog_path);
 
-        for (int i = 0; i < spawn_count; i++) {
+        for (int i = 0; i < SPAWN_COUNT; i++) {
             std::array<const char*, 4> child_argv = {prog_path, "child-arg1", "child-arg2", nullptr};
             std::array<const char*, 1> child_envp = {nullptr};
 
-            uint64_t child_pid = ker::process::exec(prog_path, child_argv.data(), child_envp.data());
-            if (child_pid == 0) {
-                init_log::error("sub-init[%d]: failed to exec '%s' (instance %d)", cpuno, prog_path, i);
+            uint64_t const CHILD_PID = ker::process::exec(prog_path, child_argv.data(), child_envp.data());
+            if (CHILD_PID == 0) {
+                init_log::error("sub-init[%d]: failed to exec '%s' (instance %d)", CPUNO, prog_path, i);
             } else {
-                init_log::info("sub-init[%d]: spawned '%s' as PID %llu (instance %d/%d)", cpuno, prog_path,
-                               static_cast<unsigned long long>(child_pid), i + 1, spawn_count);
+                init_log::info("sub-init[%d]: spawned '%s' as PID %llu (instance %d/%d)", CPUNO, prog_path,
+                               static_cast<unsigned long long>(CHILD_PID), i + 1, SPAWN_COUNT);
                 int exit_code = 0;
-                ker::process::waitpid((int64_t)child_pid, &exit_code, 0, nullptr);
-                init_log::info("sub-init[%d]: child PID %llu exited with code %d", cpuno, static_cast<unsigned long long>(child_pid),
+                ker::process::waitpid(static_cast<int64_t>(CHILD_PID), &exit_code, 0, nullptr);
+                init_log::info("sub-init[%d]: child PID %llu exited with code %d", CPUNO, static_cast<unsigned long long>(CHILD_PID),
                                exit_code);
             }
         }
 
-        init_log::info("sub-init[%d]: all children completed, exiting", cpuno);
+        init_log::info("sub-init[%d]: all children completed, exiting", CPUNO);
         return 0;
     }
 
     // === ROOT INIT MODE ===
-    init_log::info("init[%d]: root init starting", cpuno);
+    init_log::info("init[%d]: root init starting", CPUNO);
 
     // Pin init itself to the local node. NOINHERIT makes forked children start
     // with automatic WKI placement; service launch code re-pins daemons locally
@@ -81,22 +81,22 @@ auto main(int argc, char** argv) -> int {
     // Pivot root from initramfs to the real rootfs.
     // After mount_filesystems(), the XFS rootfs is mounted at /rootfs.
     // pivot_root makes it appear as "/" for this task and all children.
-    int pivot_ret = ker::abi::vfs::pivot_root_vfs("/rootfs", "/rootfs/oldroot");
-    if (pivot_ret < 0) {
-        init_log::warn("init[%d]: pivot_root failed (ret=%d), continuing with initramfs root", cpuno, pivot_ret);
+    int const PIVOT_RET = ker::abi::vfs::pivot_root_vfs("/rootfs", "/rootfs/oldroot");
+    if (PIVOT_RET < 0) {
+        init_log::warn("init[%d]: pivot_root failed (ret=%d), continuing with initramfs root", CPUNO, PIVOT_RET);
     } else {
-        init_log::info("init[%d]: pivot_root succeeded, root is now /rootfs", cpuno);
+        init_log::info("init[%d]: pivot_root succeeded, root is now /rootfs", CPUNO);
 
         // Recreate /wki on the new root filesystem so WKI remote VFS mounts
         // survive the old initramfs root being unmounted.
         ker::abi::vfs::mkdir("/wki", 0755);
 
         // Unmount the old initramfs root to free its RAM.
-        int umount_ret = ker::abi::vfs::umount("/oldroot");
-        if (umount_ret < 0) {
-            init_log::warn("init[%d]: umount /oldroot failed (ret=%d)", cpuno, umount_ret);
+        int const UMOUNT_RET = ker::abi::vfs::umount("/oldroot");
+        if (UMOUNT_RET < 0) {
+            init_log::warn("init[%d]: umount /oldroot failed (ret=%d)", CPUNO, UMOUNT_RET);
         } else {
-            init_log::info("init[%d]: unmounted old initramfs root", cpuno);
+            init_log::info("init[%d]: unmounted old initramfs root", CPUNO);
         }
     }
 
@@ -115,12 +115,12 @@ auto main(int argc, char** argv) -> int {
     for (;;) {
         int32_t reap_status = 0;
         auto reap_pid = ker::process::waitpid(-1, &reap_status, 0, nullptr);
-        if (reap_pid == static_cast<uint64_t>(-1)) {
-            struct timespec idle_sleep{
+        if (std::cmp_equal(reap_pid, -1)) {
+            struct timespec const IDLE_SLEEP{
                 .tv_sec = 1,
                 .tv_nsec = 0,
             };
-            nanosleep(&idle_sleep, nullptr);
+            nanosleep(&IDLE_SLEEP, nullptr);
         }
     }
 

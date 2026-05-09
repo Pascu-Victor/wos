@@ -10,13 +10,13 @@ void init();
 
 // Returns Unix timestamp seconds (wall clock).
 // Derived from the CMOS reading taken at boot plus the elapsed monotonic time.
-uint64_t getEpochSec();
+uint64_t get_epoch_sec();
 
 // Returns Unix timestamp in nanoseconds.
-uint64_t getEpochNs();
+uint64_t get_epoch_ns();
 
 // Apply an NTP correction.  delta_sec is the signed difference
 // (ntp_unix_sec - rtc_unix_sec) measured at sync time.
-void setOffset(int64_t delta_sec);
+void set_offset(int64_t delta_sec);
 
 }  // namespace ker::mod::rtc

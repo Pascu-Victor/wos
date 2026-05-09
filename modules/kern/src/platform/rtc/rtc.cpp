@@ -86,7 +86,7 @@ static uint64_t ymd_hms_to_epoch(int year, int month, int day, int hour, int min
 void init() {
     // Snapshot the TSC monotonic time first so that epoch_sec_at_boot and
     // tsc_ns_at_boot refer to the same instant.
-    tsc_ns_at_boot = tsc::getNs();
+    tsc_ns_at_boot = tsc::get_ns();
 
     wait_rtc_ready();
 
@@ -136,18 +136,18 @@ void init() {
              (unsigned long)epoch_sec_at_boot);
 }
 
-uint64_t getEpochSec() {
-    uint64_t mono_sec = (tsc::getNs() - tsc_ns_at_boot) / 1000000000ULL;
+uint64_t get_epoch_sec() {
+    uint64_t mono_sec = (tsc::get_ns() - tsc_ns_at_boot) / 1000000000ULL;
     return epoch_sec_at_boot + mono_sec + static_cast<uint64_t>(ntp_delta_sec);
 }
 
-uint64_t getEpochNs() {
-    uint64_t mono_ns = tsc::getNs() - tsc_ns_at_boot;
+uint64_t get_epoch_ns() {
+    uint64_t mono_ns = tsc::get_ns() - tsc_ns_at_boot;
     uint64_t boot_epoch_ns = epoch_sec_at_boot * 1000000000ULL;
     int64_t ntp_ns = ntp_delta_sec * static_cast<int64_t>(1000000000LL);
     return boot_epoch_ns + mono_ns + static_cast<uint64_t>(ntp_ns);
 }
 
-void setOffset(int64_t delta_sec) { ntp_delta_sec = delta_sec; }
+void set_offset(int64_t delta_sec) { ntp_delta_sec = delta_sec; }
 
 }  // namespace ker::mod::rtc

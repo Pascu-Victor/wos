@@ -23,8 +23,6 @@ auto wki_ivshmem_rdma_ptr(int64_t offset) -> void*;
 // D4: Write IRQ forwarding data to the shared-memory mailbox.
 // Called before ringing the doorbell so the peer can decode the IRQ info.
 struct WkiTransport;
-void wki_ivshmem_irq_mailbox_write(WkiTransport* transport,
-                                    uint16_t device_id, uint16_t irq_vector,
-                                    uint32_t irq_status);
+void wki_ivshmem_irq_mailbox_write(WkiTransport* transport, uint16_t device_id, uint16_t irq_vector, uint32_t irq_status);
 
 }  // namespace ker::net::wki

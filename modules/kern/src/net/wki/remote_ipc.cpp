@@ -136,9 +136,9 @@ static void proxy_reschedule_waiters(const uint64_t* waiters, size_t waiter_coun
             continue;
         }
 
-        waiter->deferredTaskSwitch = false;
+        waiter->deferred_task_switch = false;
         uint64_t target_cpu = waiter->cpu;
-        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
             target_cpu = ker::mod::sched::get_least_loaded_cpu();
         }
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
@@ -596,7 +596,7 @@ static void proxy_mark_pipe_closed(ProxyIpcState* proxy, uint32_t resource_id) {
 #endif
 
     if (reader != nullptr) {
-        reader->deferredTaskSwitch = false;
+        reader->deferred_task_switch = false;
         reader->wait_channel = nullptr;
         ker::mod::sched::kern_wake(reader);
     }
@@ -611,7 +611,7 @@ static void wake_proxy_reader(ProxyIpcState* proxy) {
 
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
     if (reader != nullptr) {
-        reader->deferredTaskSwitch = false;
+        reader->deferred_task_switch = false;
         reader->wait_channel = nullptr;
         ker::mod::sched::kern_wake(reader);
     }
@@ -689,7 +689,7 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
         }
 
         task->wait_channel = "wki_proxy_pipe";
-        task->deferredTaskSwitch = true;
+        task->deferred_task_switch = true;
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(irqf);
         s_ipc_lock.unlock_irqrestore(pending_irqf);
@@ -1031,12 +1031,12 @@ static auto consume_deferred_wait_for_daemon() -> bool {
         return false;
     }
 
-    // Blocking file ops set deferredTaskSwitch for the userspace syscall exit
+    // Blocking file ops set deferred_task_switch for the userspace syscall exit
     // path. WKI pump workers park explicitly with kern_block(), so consume the
     // syscall-only marker before entering the scheduler wait path.
-    bool had_deferred_wait = task->deferredTaskSwitch;
-    task->deferredTaskSwitch = false;
-    task->yieldSwitch = false;
+    bool had_deferred_wait = task->deferred_task_switch;
+    task->deferred_task_switch = false;
+    task->yield_switch = false;
     return had_deferred_wait;
 }
 
@@ -1249,7 +1249,7 @@ void start_pipe_pump(WkiIpcExport* exp) {
 
     auto* task = g_pump_args[slot].worker;
     if (task == nullptr) {
-        task = ker::mod::sched::task::Task::createKernelThread("wki_pipe_pump", g_pump_fns[slot]);
+        task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_pump", g_pump_fns[slot]);
         if (task == nullptr) {
             exp->pump_running.store(false, std::memory_order_release);
             exp->pump_task = nullptr;
@@ -1407,13 +1407,13 @@ static auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload
 void wki_ipc_subsystem_init() {
     if (g_ipc_initialized) return;
     g_ipc_initialized = true;
-    g_export_pipe_write_flush_task = ker::mod::sched::task::Task::createKernelThread("wki_pipe_write", export_pipe_write_flush_thread_fn);
+    g_export_pipe_write_flush_task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_write", export_pipe_write_flush_thread_fn);
     if (g_export_pipe_write_flush_task != nullptr) {
         ker::mod::sched::post_task_balanced(g_export_pipe_write_flush_task);
     } else {
         ker::mod::dbg::log("[WKI] IPC export pipe writer thread creation failed");
     }
-    g_ipc_dev_op_worker_task = ker::mod::sched::task::Task::createKernelThread("wki_ipc_devop", ipc_dev_op_worker_thread_fn);
+    g_ipc_dev_op_worker_task = ker::mod::sched::task::Task::create_kernel_thread("wki_ipc_devop", ipc_dev_op_worker_thread_fn);
     if (g_ipc_dev_op_worker_task != nullptr) {
         ker::mod::sched::post_task_balanced(g_ipc_dev_op_worker_task);
     } else {
@@ -1769,7 +1769,7 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
         if (proxy != nullptr) {
             auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
             if (reader != nullptr) {
-                reader->deferredTaskSwitch = false;
+                reader->deferred_task_switch = false;
                 reader->wait_channel = nullptr;
                 ker::mod::sched::kern_wake(reader);
             }
@@ -1867,7 +1867,7 @@ void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
 
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
     if (reader != nullptr) {
-        reader->deferredTaskSwitch = false;
+        reader->deferred_task_switch = false;
         reader->wait_channel = nullptr;
         ker::mod::sched::kern_wake(reader);
     }
@@ -1970,7 +1970,7 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
         auto* proxy = detached_proxies[i];
         auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
         if (reader != nullptr) {
-            reader->deferredTaskSwitch = false;
+            reader->deferred_task_switch = false;
             reader->wait_channel = nullptr;
             ker::mod::sched::kern_wake(reader);
         }
@@ -2096,7 +2096,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             }
 
             if (reader != nullptr) {
-                reader->deferredTaskSwitch = false;
+                reader->deferred_task_switch = false;
                 reader->wait_channel = nullptr;
                 ker::mod::sched::kern_wake(reader);
             }

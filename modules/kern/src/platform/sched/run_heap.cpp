@@ -12,27 +12,27 @@ namespace ker::mod::sched {
 
 void RunHeap::init() { size = 0; }
 
-void RunHeap::swapEntries(uint32_t i, uint32_t j) {
+void RunHeap::swap_entries(uint32_t i, uint32_t j) {
     if (i >= PER_CPU_HEAP_CAP || j >= PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::swapEntries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
-        dbg::panic_handler("RunHeap: swapEntries index out of bounds (size field corrupted?)");
+        dbg::log("RunHeap::swap_entries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
+        dbg::panic_handler("RunHeap: swap_entries index out of bounds (size field corrupted?)");
     }
     task::Task* tmp = entries[i];
     entries[i] = entries[j];
     entries[j] = tmp;
-    entries[i]->heapIndex = static_cast<int32_t>(i);
-    entries[j]->heapIndex = static_cast<int32_t>(j);
+    entries[i]->heap_index = static_cast<int32_t>(i);
+    entries[j]->heap_index = static_cast<int32_t>(j);
 }
 
-void RunHeap::siftUp(uint32_t idx) {
+void RunHeap::sift_up(uint32_t idx) {
     if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::siftUp: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
-        dbg::panic_handler("RunHeap: size field corrupted in siftUp");
+        dbg::log("RunHeap::sift_up: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        dbg::panic_handler("RunHeap: size field corrupted in sift_up");
     }
     while (idx > 0) {
         uint32_t parent = (idx - 1) / 2;
         if (entries[idx]->vdeadline < entries[parent]->vdeadline) {
-            swapEntries(idx, parent);
+            swap_entries(idx, parent);
             idx = parent;
         } else {
             break;
@@ -40,10 +40,10 @@ void RunHeap::siftUp(uint32_t idx) {
     }
 }
 
-void RunHeap::siftDown(uint32_t idx) {
+void RunHeap::sift_down(uint32_t idx) {
     if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::siftDown: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
-        dbg::panic_handler("RunHeap: size field corrupted in siftDown");
+        dbg::log("RunHeap::sift_down: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        dbg::panic_handler("RunHeap: size field corrupted in sift_down");
     }
     while (true) {
         uint32_t smallest = idx;
@@ -52,8 +52,8 @@ void RunHeap::siftDown(uint32_t idx) {
 
         if (left < size) {
             if (left >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::siftDown: left=%u >= cap=%u, size=%u corrupted", left, PER_CPU_HEAP_CAP, size);
-                dbg::panic_handler("RunHeap: siftDown OOB (size corrupted)");
+                dbg::log("RunHeap::sift_down: left=%u >= cap=%u, size=%u corrupted", left, PER_CPU_HEAP_CAP, size);
+                dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
             if (entries[left]->vdeadline < entries[smallest]->vdeadline) {
                 smallest = left;
@@ -61,8 +61,8 @@ void RunHeap::siftDown(uint32_t idx) {
         }
         if (right < size) {
             if (right >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::siftDown: right=%u >= cap=%u, size=%u corrupted", right, PER_CPU_HEAP_CAP, size);
-                dbg::panic_handler("RunHeap: siftDown OOB (size corrupted)");
+                dbg::log("RunHeap::sift_down: right=%u >= cap=%u, size=%u corrupted", right, PER_CPU_HEAP_CAP, size);
+                dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
             if (entries[right]->vdeadline < entries[smallest]->vdeadline) {
                 smallest = right;
@@ -70,7 +70,7 @@ void RunHeap::siftDown(uint32_t idx) {
         }
 
         if (smallest != idx) {
-            swapEntries(idx, smallest);
+            swap_entries(idx, smallest);
             idx = smallest;
         } else {
             break;
@@ -83,8 +83,8 @@ bool RunHeap::insert(task::Task* t) {
         return false;
     }
     // DIAGNOSTIC: Detect double-insertion - task already in some heap
-    if (t->heapIndex >= 0) {
-        dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heapIndex=%d (size=%d, cpu=%d)! Refusing insert.", t->pid, t->heapIndex, size,
+    if (t->heap_index >= 0) {
+        dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heap_index=%d (size=%d, cpu=%d)! Refusing insert.", t->pid, t->heap_index, size,
                  (int)t->cpu);
         // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
@@ -96,22 +96,22 @@ bool RunHeap::insert(task::Task* t) {
     }
     uint32_t idx = size;
     entries[idx] = t;
-    t->heapIndex = static_cast<int32_t>(idx);
+    t->heap_index = static_cast<int32_t>(idx);
     size++;
-    siftUp(idx);
+    sift_up(idx);
     return true;
 }
 
 bool RunHeap::remove(task::Task* t) {
-    if (t->heapIndex < 0 || static_cast<uint32_t>(t->heapIndex) >= size) {
+    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
         return false;
     }
-    uint32_t idx = static_cast<uint32_t>(t->heapIndex);
+    uint32_t idx = static_cast<uint32_t>(t->heap_index);
     if (entries[idx] != t) {
-        return false;  // heapIndex stale / wrong heap
+        return false;  // heap_index stale / wrong heap
     }
 
-    t->heapIndex = -1;
+    t->heap_index = -1;
     size--;
 
     if (idx == size) {
@@ -121,24 +121,24 @@ bool RunHeap::remove(task::Task* t) {
 
     // Move the last element into the gap
     entries[idx] = entries[size];
-    entries[idx]->heapIndex = static_cast<int32_t>(idx);
+    entries[idx]->heap_index = static_cast<int32_t>(idx);
 
     // Re-sift: could go up or down depending on relative vdeadline
-    siftUp(idx);
-    siftDown(idx);
+    sift_up(idx);
+    sift_down(idx);
     return true;
 }
 
 void RunHeap::update(task::Task* t) {
-    if (t->heapIndex < 0 || static_cast<uint32_t>(t->heapIndex) >= size) {
+    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
         return;
     }
-    uint32_t idx = static_cast<uint32_t>(t->heapIndex);
-    siftUp(idx);
-    siftDown(idx);
+    uint32_t idx = static_cast<uint32_t>(t->heap_index);
+    sift_up(idx);
+    sift_down(idx);
 }
 
-task::Task* RunHeap::peekMin() const {
+task::Task* RunHeap::peek_min() const {
     if (size == 0) {
         return nullptr;
     }
@@ -146,13 +146,13 @@ task::Task* RunHeap::peekMin() const {
 }
 
 bool RunHeap::contains(task::Task* t) const {
-    if (t->heapIndex < 0 || static_cast<uint32_t>(t->heapIndex) >= size) {
+    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
         return false;
     }
-    return entries[static_cast<uint32_t>(t->heapIndex)] == t;
+    return entries[static_cast<uint32_t>(t->heap_index)] == t;
 }
 
-task::Task* RunHeap::pickBestEligible(int64_t avgVruntime) {
+task::Task* RunHeap::pick_best_eligible(int64_t avgVruntime) {
     if (size == 0) {
         return nullptr;
     }
@@ -229,13 +229,13 @@ void IntrusiveTaskList::push(task::Task* t) {
         return;
     }
 
-    for (task::Task* cur = head; cur != nullptr; cur = cur->schedNext) {
+    for (task::Task* cur = head; cur != nullptr; cur = cur->sched_next) {
         if (cur == t) {
             return;
         }
     }
 
-    t->schedNext = head;
+    t->sched_next = head;
     head = t;
     count++;
 }
@@ -245,24 +245,24 @@ bool IntrusiveTaskList::remove(task::Task* t) {
     task::Task* cur = head;
     while (cur != nullptr) {
         if (cur == t) {
-            *prev = cur->schedNext;
-            cur->schedNext = nullptr;
+            *prev = cur->sched_next;
+            cur->sched_next = nullptr;
             count--;
             return true;
         }
-        prev = &cur->schedNext;
-        cur = cur->schedNext;
+        prev = &cur->sched_next;
+        cur = cur->sched_next;
     }
     return false;
 }
 
-task::Task* IntrusiveTaskList::findByPid(uint64_t pid) {
+task::Task* IntrusiveTaskList::find_by_pid(uint64_t pid) {
     task::Task* cur = head;
     while (cur != nullptr) {
         if (cur->pid == pid) {
             return cur;
         }
-        cur = cur->schedNext;
+        cur = cur->sched_next;
     }
     return nullptr;
 }
@@ -272,8 +272,8 @@ task::Task* IntrusiveTaskList::pop() {
         return nullptr;
     }
     task::Task* t = head;
-    head = t->schedNext;
-    t->schedNext = nullptr;
+    head = t->sched_next;
+    t->sched_next = nullptr;
     count--;
     return t;
 }

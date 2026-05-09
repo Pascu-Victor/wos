@@ -156,7 +156,7 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     name[name_len] = '\0';
 
     // Create dedicated worker thread
-    napi->worker = ker::mod::sched::task::Task::createKernelThread(name.data(), napi_worker_entry);
+    napi->worker = ker::mod::sched::task::Task::create_kernel_thread(name.data(), napi_worker_entry);
     if (napi->worker == nullptr) {
         ker::mod::dbg::log("netpoll: failed to create worker thread for %s", dev_name);
         unregister_napi(napi);
@@ -225,7 +225,7 @@ auto napi_schedule(NapiStruct* napi) -> bool {
     // Wake the worker thread.
     if (napi->worker != nullptr) {
         ker::mod::sched::kern_wake(napi->worker);
-        if (napi->worker->cpu == ker::mod::cpu::currentCpu()) {
+        if (napi->worker->cpu == ker::mod::cpu::current_cpu()) {
             // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
             // immediate scheduling pass instead of waiting up to 1ms for the
             // next quantum tick.

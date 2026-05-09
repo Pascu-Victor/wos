@@ -1,5 +1,13 @@
 #include "hpet.hpp"
 
+#include <cstdint>
+
+#include "platform/acpi/acpi.hpp"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/mm/virt.hpp"
+#include "util/hcf.hpp"
+
 namespace ker::mod::hpet {
 static volatile Hpet* hpet = nullptr;
 // Intel hpet spec 1-0a: General Capabilities and ID Register Bit Definitions
@@ -14,7 +22,7 @@ void init() {
 
     const char* hpetSig = "HPET";
 
-    acpi::ACPIResult hpetResult = acpi::parseAcpiTables(hpetSig);
+    acpi::ACPIResult hpetResult = acpi::parse_acpi_tables(hpetSig);
 
     if (!hpetResult.success) {
         // Panic!
@@ -26,8 +34,8 @@ void init() {
     auto hpetAddr = mm::addr::get_virt_pointer(hpetPhys);
 
     // Map HPET to the kernel page table so all CPUs can access it
-    mm::virt::mapToKernelPageTable((uint64_t)hpetAddr, (uint64_t)mm::addr::get_phys_pointer((uint64_t)hpetAddr),
-                                   mm::virt::pageTypes::KERNEL);
+    mm::virt::map_to_kernel_page_table((uint64_t)hpetAddr, (uint64_t)mm::addr::get_phys_pointer((uint64_t)hpetAddr),
+                                       mm::virt::page_types::KERNEL);
 
     hpet = (Hpet*)hpetAddr;
     tickPeriod = (hpet->capabilities >> 32) & 0xFFFFFFFF;
@@ -37,21 +45,21 @@ void init() {
     hpet->configuration = 1;  // enable hpet
 }
 
-uint64_t getTicks() { return hpet->counter_value; }
+uint64_t get_ticks() { return hpet->counter_value; }
 
 uint64_t usecToTicks(uint64_t us) { return (us * 1000000000) / tickPeriod; }
 
 uint64_t ticksToUsec(uint64_t ticks) { return (ticks * tickPeriod) / 1000000000; }
 
-uint64_t getUs() { return ticksToUsec(getTicks()); }
+uint64_t get_us() { return ticksToUsec(get_ticks()); }
 
-void sleepTicks(uint64_t ticks) {
-    uint64_t start = getTicks();
-    while (getTicks() - start < ticks) {
+void sleep_ticks(uint64_t ticks) {
+    uint64_t start = get_ticks();
+    while (get_ticks() - start < ticks) {
         asm volatile("pause");
     }
 }
 
-void sleepUs(uint64_t us) { sleepTicks(usecToTicks(us)); }
+void sleep_us(uint64_t us) { sleep_ticks(usecToTicks(us)); }
 
 }  // namespace ker::mod::hpet

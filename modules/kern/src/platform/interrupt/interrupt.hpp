@@ -5,5 +5,5 @@
 #include <platform/ktime/ktime.hpp>
 
 namespace ker::mod::interrupt {
-void init(void);
+void init();
 }

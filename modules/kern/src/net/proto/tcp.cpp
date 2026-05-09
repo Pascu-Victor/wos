@@ -57,7 +57,7 @@ void defer_socket_wait(Socket* sock) {
         sock->owner_pid = current_task->pid;
     }
     current_task->wait_channel = "tcp_wait";
-    current_task->deferredTaskSwitch = true;
+    current_task->deferred_task_switch = true;
 }
 
 // Simple ISS generator.
@@ -664,7 +664,7 @@ SocketProtoOps tcp_ops = {
 
 auto get_tcp_proto_ops() -> SocketProtoOps* { return &tcp_ops; }
 
-auto tcp_now_ms() -> uint64_t { return ker::mod::time::getUs() / 1000; }
+auto tcp_now_ms() -> uint64_t { return ker::mod::time::get_us() / 1000; }
 
 auto tcp_alloc_cb() -> TcpCB* {
     auto* cb = new TcpCB();

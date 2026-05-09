@@ -158,9 +158,9 @@ std::atomic<uint64_t> cpusInitialized{0};
 void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     // Enable CPU features FIRST (must be done on each CPU)
     // FSGSBASE must be enabled before using wrgsbase instruction
-    cpu::enableFSGSBASE();
-    cpu::enableSSE();
-    cpu::enableXSave();
+    cpu::enable_fsgsbase();
+    cpu::enable_sse();
+    cpu::enable_xsave();
 
     // Set up per-CPU data
     // Allocate a dedicated PerCpu structure for this CPU (don't reuse stack bottom
@@ -172,13 +172,13 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     memset((void*)per_cpu_addr, 0, sizeof(cpu::PerCpu));
 
     // Store kernel stack in the PerCpu structure
-    per_cpu_data->syscallStack = stackTop;
+    per_cpu_data->syscall_stack = stackTop;
 
     cpu::wrgsbase(per_cpu_addr);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, per_cpu_addr);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, per_cpu_addr);
 
     // Write cpuId directly to the memory location to verify
-    per_cpu_data->cpuId = cpuNo;
+    per_cpu_data->cpu_id = cpuNo;
 
     // Store the per-CPU PerCpu pointer for later retrieval (e.g., when entering idle loop)
     if (kernelPerCpuPtrs != nullptr) {
@@ -186,10 +186,10 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     }
 
     // Also use setCurrentCpuid for consistency
-    cpu::setCurrentCpuid(cpuNo);
+    cpu::set_current_cpuid(cpuNo);
 
     // Verify the write worked
-    uint64_t readBack = cpu::currentCpu();
+    uint64_t readBack = cpu::current_cpu();
     if (readBack != cpuNo) {
         // Use serial directly since dbg might not be ready
         dbg::log("CPU INIT ERROR: wrote cpuId=%d but read back %d, perCpuAddr=%p\n", cpuNo, readBack, per_cpu_addr);
@@ -197,16 +197,16 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
 
     // Initialize GDT for this CPU (includes per-CPU TSS)
     // NOTE: GDT/IDT asm routines no longer load GS selector to preserve GS.base
-    desc::gdt::initDescriptors((uint64_t*)stackTop, cpuNo);
+    desc::gdt::init_descriptors((uint64_t*)stackTop, cpuNo);
 
     // Initialize IDT for this CPU (loads the shared IDT)
-    desc::idt::idtInit();
+    desc::idt::idt_init();
 
     // Initialize syscall MSRs for this CPU
     sys::init();
 
     // Initialize APIC for this CPU
-    apic::initApicMP();
+    apic::init_apic_mp();
 
     // Initialize scheduler for this CPU
     sched::percpu_init();
@@ -221,8 +221,8 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
     uint64_t initialized_count = cpusInitialized.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (initialized_count == g_cpu_count) {
         dbg::log("CPU %d: Last CPU initialized, enabling per-CPU allocations globally", cpuNo);
-        mm::phys::enablePerCpuAllocations();
-        mm::dyn::kmalloc::enablePerCpuAllocations();
+        mm::phys::enable_per_cpu_allocations();
+        mm::dyn::kmalloc::enable_per_cpu_allocations();
     }
 
     dbg::log("CPU %d initialized and ready (%d/%d CPUs ready)", cpuNo, initialized_count, g_cpu_count);
@@ -233,7 +233,7 @@ void cpuParamInit(uint64_t cpuNo, uint64_t stackTop) {
 
 void non_primary_cpu_init(limine_mp_info* smp_info) {
     // FIRST: Switch to kernel page table before accessing any kernel data
-    mm::virt::switchToKernelPagemap();
+    mm::virt::switch_to_kernel_pagemap();
 
     uint64_t cpu_no = 0;
 
@@ -380,8 +380,8 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
         std::array<uint64_t, 10> auxv_entries = {AT_PAGESZ, (uint64_t)mm::paging::PAGE_SIZE,
                                                  AT_ENTRY,  new_task->entry,
-                                                 AT_PHDR,   new_task->programHeaderAddr,
-                                                 AT_EHDR,   new_task->elfHeaderAddr,
+                                                 AT_PHDR,   new_task->program_header_addr,
+                                                 AT_EHDR,   new_task->elf_header_addr,
                                                  AT_NULL,   0};
 
         // Push auxv in reverse order
@@ -477,14 +477,14 @@ auto try_get_cpu_index_from_apic_id(uint32_t apic_id, uint64_t& cpu_index) -> bo
 
 [[noreturn]] void halt_this_cpu_forever() {
     uint64_t cpu_index = 0;
-    if (try_get_cpu_index_from_apic_id(ker::mod::apic::getApicId(), cpu_index)) {
+    if (try_get_cpu_index_from_apic_id(ker::mod::apic::get_apic_id(), cpu_index)) {
         if (cpu_index < 64) {
             halted_cpu_mask.fetch_or(1ULL << cpu_index, std::memory_order_release);
         }
-        cpuData->that_cpu(cpu_index)->isHaltedForOom.store(true, std::memory_order_release);
+        cpuData->that_cpu(cpu_index)->is_halted_for_oom.store(true, std::memory_order_release);
     }
 
-    ker::mod::apic::oneShotTimer(0);
+    ker::mod::apic::one_shot_timer(0);
     ker::mod::apic::eoi();
     asm volatile("cli" ::: "memory");
     for (;;) {
@@ -495,12 +495,12 @@ auto try_get_cpu_index_from_apic_id(uint32_t apic_id, uint64_t& cpu_index) -> bo
 void send_halt_nmi_to_others() {
     ker::mod::apic::IPIConfig ipi = {};
     ipi.vector = 0;
-    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::NMI;
-    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.delivery_mode = ker::mod::apic::IPIDeliveryMode::NMI;
+    ipi.destination_mode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
     ipi.level = ker::mod::apic::IPILevel::ASSERT;
-    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
-    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
-    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+    ipi.trigger_mode = ker::mod::apic::IPITriggerMode::EDGE;
+    ipi.destination_shorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::send_ipi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
 }
 
 void send_fixed_halt_ipi_to_others() {
@@ -509,23 +509,23 @@ void send_fixed_halt_ipi_to_others() {
     }
     ker::mod::apic::IPIConfig ipi = {};
     ipi.vector = halt_ipi_vector;
-    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::FIXED;
-    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.delivery_mode = ker::mod::apic::IPIDeliveryMode::FIXED;
+    ipi.destination_mode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
     ipi.level = ker::mod::apic::IPILevel::ASSERT;
-    ipi.triggerMode = ker::mod::apic::IPITriggerMode::EDGE;
-    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
-    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+    ipi.trigger_mode = ker::mod::apic::IPITriggerMode::EDGE;
+    ipi.destination_shorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::send_ipi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
 }
 
 void send_init_ipi_to_others() {
     ker::mod::apic::IPIConfig ipi = {};
     ipi.vector = 0;
-    ipi.deliveryMode = ker::mod::apic::IPIDeliveryMode::INIT;
-    ipi.destinationMode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
+    ipi.delivery_mode = ker::mod::apic::IPIDeliveryMode::INIT;
+    ipi.destination_mode = ker::mod::apic::IPIDestinationMode::PHYSICAL;
     ipi.level = ker::mod::apic::IPILevel::ASSERT;
-    ipi.triggerMode = ker::mod::apic::IPITriggerMode::LEVEL;
-    ipi.destinationShorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
-    ker::mod::apic::sendIpi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
+    ipi.trigger_mode = ker::mod::apic::IPITriggerMode::LEVEL;
+    ipi.destination_shorthand = ker::mod::apic::IPIDestinationShorthand::ALL_EXCLUDING_SELF;
+    ker::mod::apic::send_ipi(ipi, ker::mod::apic::IPI_BROADCAST_ID);
 }
 
 auto halt_acknowledged(uint64_t expected_mask) -> bool {
@@ -573,11 +573,11 @@ void init() {
 
     // Dynamically allocate a vector and register the halt IPI handler so we can
     // broadcast a halting IPI in panic/OOM paths.
-    halt_ipi_vector = gates::allocateVector();
+    halt_ipi_vector = gates::allocate_vector();
     assert(halt_ipi_vector != 0);
-    gates::requestIrq(halt_ipi_vector, halt_ipi_handler, nullptr, "halt_ipi");
+    gates::request_irq(halt_ipi_vector, halt_ipi_handler, nullptr, "halt_ipi");
     dbg::log("Registered halt IPI handler for vector 0x%x", (int)halt_ipi_vector);
-    gates::setInterruptHandler(2, halt_nmi_handler);
+    gates::set_interrupt_handler(2, halt_nmi_handler);
 
     // Initialise CPU domain hierarchy (ROOT + GROUP_0; no LEAFs yet)
     init_cpu_domains();
@@ -596,16 +596,16 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     memset((void*)per_cpu_addr, 0, sizeof(cpu::PerCpu));
 
     // Store kernel stack in the PerCpu structure
-    bsp_per_cpu->syscallStack = kernel_rsp;
+    bsp_per_cpu->syscall_stack = kernel_rsp;
 
     cpu::wrgsbase(per_cpu_addr);
-    cpuSetMSR(IA32_KERNEL_GS_BASE, per_cpu_addr);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, per_cpu_addr);
 
     // Write cpuId directly to the memory location
-    bsp_per_cpu->cpuId = 0;
-    cpu::setCurrentCpuid(0);
+    bsp_per_cpu->cpu_id = 0;
+    cpu::set_current_cpuid(0);
 
-    // GS base is now valid - cpu::currentCpu() works, safe to enable CPU ID in serial logs
+    // GS base is now valid - cpu::current_cpu() works, safe to enable CPU ID in serial logs
     io::serial::mark_cpu_id_available();
 
     // Store the BSP's PerCpu pointer for later retrieval
@@ -614,7 +614,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     }
 
     // Verify the write worked
-    uint64_t read_back = cpu::currentCpu();
+    uint64_t read_back = cpu::current_cpu();
     if (read_back != 0) {
         dbg::log("BSP CPU INIT ERROR: wrote cpuId=0 but read back %d, perCpuAddr=%p\n", read_back, per_cpu_addr);
     }
@@ -675,8 +675,8 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     uint64_t initialized_count = cpusInitialized.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (initialized_count == g_cpu_count) {
         dbg::log("BSP: Last CPU initialized, enabling per-CPU allocations globally");
-        mm::phys::enablePerCpuAllocations();
-        mm::dyn::kmalloc::enablePerCpuAllocations();
+        mm::phys::enable_per_cpu_allocations();
+        mm::dyn::kmalloc::enable_per_cpu_allocations();
     }
     dbg::log("BSP ready (%d/%d CPUs ready)", initialized_count, g_cpu_count);
 }
@@ -707,7 +707,7 @@ void halt_other_cores() {
     uint64_t core_count = get_core_count();
 
     uint64_t this_cpu = 0;
-    bool found_this_cpu = try_get_cpu_index_from_apic_id(ker::mod::apic::getApicId(), this_cpu);
+    bool found_this_cpu = try_get_cpu_index_from_apic_id(ker::mod::apic::get_apic_id(), this_cpu);
     bool can_verify_all = found_this_cpu && core_count <= 64;
     uint64_t expected_mask = 0;
     for (uint64_t i = 0; i < core_count && i < 64; ++i) {
@@ -733,7 +733,7 @@ void halt_other_cores() {
     }
 
     // Final one-way stop: INIT leaves APs waiting for a SIPI that we will never
-    // send. This is intentionally destructive and only appropriate because
+    // send. this is intentionally destructive and only appropriate because
     // halt_other_cores() is used by crash/OOM paths.
     send_init_ipi_to_others();
 }

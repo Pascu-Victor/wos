@@ -20,7 +20,7 @@ struct VirtIONetDevice {
     uint8_t irq_vector{};        // Allocated IRQ vector (pair 0 / single-queue)
     uint8_t irq_vector2{};       // Allocated IRQ vector for pair 1 (0 if unused)
     uint8_t num_queue_pairs{1};  // 1 = single-queue, 2 = multi-queue
-    uint8_t hdr_size{};         // sizeof virtio-net header: 10 (legacy) or 12 (modern/VERSION_1)
+    uint8_t hdr_size{};          // sizeof virtio-net header: 10 (legacy) or 12 (modern/VERSION_1)
     uint32_t negotiated_features{};
     bool msix_enabled{};
 

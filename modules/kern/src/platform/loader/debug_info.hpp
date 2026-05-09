@@ -24,9 +24,9 @@ struct DebugSymbol {
     uint64_t size;
     uint8_t bind;
     uint8_t type;
-    bool isTlsOffset;
+    bool is_tls_offset;
     uint16_t shndx;
-    uint64_t rawValue;  // original st_value
+    uint64_t raw_value;  // original st_value
 };
 
 struct ProcessDebugInfo {
@@ -72,9 +72,9 @@ void setStringTable(uint64_t pid, const char* strtab, uint64_t strtabAddr, uint6
 
 ProcessDebugInfo* getProcessDebugInfo(uint64_t pid);
 void printDebugInfo(uint64_t pid);
-DebugSymbol* getProcessSymbol(uint64_t pid, const char* name);
+DebugSymbol* get_process_symbol(uint64_t pid, const char* name);
 
 // Cleanup function - removes all debug info for a process
-void unregisterProcess(uint64_t pid);
+void unregister_process(uint64_t pid);
 
 }  // namespace ker::loader::debug

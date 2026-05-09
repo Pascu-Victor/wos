@@ -37,7 +37,7 @@ void EpochManager::init() {
 }
 
 auto EpochManager::enterCritical() -> uint64_t {
-    uint64_t cpuId = cpu::currentCpu();
+    uint64_t cpuId = cpu::current_cpu();
     enterCriticalForCpu(cpuId);
     return cpuId;
 }
@@ -59,7 +59,7 @@ void EpochManager::enterCriticalForCpu(uint64_t cpuId) {
 }
 
 void EpochManager::enterCriticalAPIC() {
-    uint64_t cpuId = smt::get_cpu_index_from_apic_id(apic::getApicId());
+    uint64_t cpuId = smt::get_cpu_index_from_apic_id(apic::get_apic_id());
 
     if (cpuEpochs == nullptr || cpuId >= smt::get_core_count()) {
         dbg::log("EpochManager::enterCriticalAPIC: cpuEpochs not initialized! CRITICAL FAILURE.");
@@ -69,7 +69,7 @@ void EpochManager::enterCriticalAPIC() {
 }
 
 void EpochManager::exitCritical() {
-    uint64_t cpuId = cpu::currentCpu();
+    uint64_t cpuId = cpu::current_cpu();
     exitCriticalForCpu(cpuId);
 }
 

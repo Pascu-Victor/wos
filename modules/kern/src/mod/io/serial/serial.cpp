@@ -34,7 +34,7 @@ bool enter_panic_mode() {
     uint64_t expected = NO_PANIC_OWNER;
     constexpr uint64_t ADDR_MASK = 0xFFFFU;
     auto fallback = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&expected) & ADDR_MASK);
-    uint64_t cpu_id = cpu_id_available.load(std::memory_order_acquire) ? cpu::currentCpu() : fallback;
+    uint64_t cpu_id = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : fallback;
     return panic_owner_cpu.compare_exchange_strong(expected, cpu_id, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
@@ -52,7 +52,7 @@ bool is_panic_owner() {
         // Very early boot, single CPU — assume this CPU is the owner.
         return true;
     }
-    return cpu::currentCpu() == owner;
+    return cpu::current_cpu() == owner;
 }
 
 void acquire_lock() {
@@ -62,7 +62,7 @@ void acquire_lock() {
         return;
     }
 
-    uint64_t cpu = cpu_id_available.load(std::memory_order_acquire) ? cpu::currentCpu() : 0;
+    uint64_t cpu = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : 0;
 
     // If we already own the lock, just increment depth (reentrant)
     if (lock_owner.load(std::memory_order_relaxed) == cpu) {
@@ -115,7 +115,7 @@ static size_t get_buf_idx() {
     if (!cpu_id_available.load(std::memory_order_acquire)) {
         return 0;  // during early boot all CPUs share buffer 0 (they run serially at that point)
     }
-    return cpu::currentCpu() % MAX_CPUS;
+    return cpu::current_cpu() % MAX_CPUS;
 }
 
 static void flush_buf(size_t idx) {

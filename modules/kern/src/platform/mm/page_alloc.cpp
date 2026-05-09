@@ -252,19 +252,19 @@ void PageAllocator::free(void* ptr) {
     // Must be an allocated head page.
     if ((flags & 0xC0) != 0x80) return;  // not FLAG_ALLOC_HEAD
 
-    // Guard: detect pageFree on a live kmalloc medium allocation.
+    // Guard: detect page_free on a live kmalloc medium allocation.
     // The MediumAllocationHeader layout is: next(8) size(8) magic(8) pad(8).
     // Magic lives at offset +16 from the page base.
     {
         constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
         const auto page_base = reinterpret_cast<uint64_t>(pageToPtr(base, pageIdx));
         if (*reinterpret_cast<const uint64_t*>(page_base + 16) == MEDIUM_ALLOC_MAGIC) {
-            ker::mod::io::serial::write("BUG: pageFree on live medium alloc page=0x");
+            ker::mod::io::serial::write("BUG: page_free on live medium alloc page=0x");
             ker::mod::io::serial::write_hex(page_base);
             ker::mod::io::serial::write(" caller_ptr=0x");
             ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
             ker::mod::io::serial::write("\n");
-            ker::mod::dbg::panic_handler("pageFree called on live kmalloc medium alloc");
+            ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
         }
     }
 

@@ -34,7 +34,7 @@ static constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 
 bool is_ram(uint64_t phys) {
-    for (auto* zone = ker::mod::mm::phys::getZones(); zone != nullptr; zone = zone->next) {
+    for (auto* zone = ker::mod::mm::phys::get_zones(); zone != nullptr; zone = zone->next) {
         // zone->start is virtual (HHDM)
         // zone->len is length in bytes
         uint64_t zoneStartPhys = (uint64_t)ker::mod::mm::addr::get_phys_pointer((ker::mod::mm::addr::vaddr_t)zone->start);
@@ -54,8 +54,8 @@ struct CoreDumpHeader {
     uint64_t pid;
     uint64_t cpu;
 
-    uint64_t intNum;
-    uint64_t errCode;
+    uint64_t int_num;
+    uint64_t err_code;
     uint64_t cr2;
     uint64_t cr3;
 
@@ -92,9 +92,9 @@ struct CoreDumpHeader {
     uint64_t threadFsBase;
     uint64_t threadGsBase;
     uint64_t threadStackBase;
-    uint64_t threadStackSize;
+    uint64_t threadstack_size;
     uint64_t threadTlsBase;
-    uint64_t threadTlsSize;
+    uint64_t threadtls_size;
     uint64_t threadSafeStack;
 
     char exePath[ker::mod::sched::task::Task::EXE_PATH_MAX];
@@ -199,7 +199,7 @@ auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
         return nullptr;
     }
 
-    if (ker::mod::mm::phys::pageRefGet(reinterpret_cast<void*>(virt_raw)) == 0) {
+    if (ker::mod::mm::phys::page_ref_get(reinterpret_cast<void*>(virt_raw)) == 0) {
         return nullptr;
     }
 
@@ -319,7 +319,7 @@ struct CoreDumpRequest {
     uint64_t thread_tls_base;
     uint64_t thread_tls_size;
     uint64_t thread_safe_stack;
-    uint8_t* elf_buffer;  // stolen from task->elfBuffer; retained after write to avoid allocator re-entry during crash handling
+    uint8_t* elf_buffer;  // stolen from task->elf_buffer; retained after write to avoid allocator re-entry during crash handling
     size_t elf_buffer_size;
     bool elf_buffer_shared;
     ker::mod::mm::paging::PageTable* pagemap;
@@ -356,7 +356,7 @@ static void perform_coredump(const CoreDumpRequest& req);
             // Switch to kernel pagemap: VFS I/O and HHDM page reads require it.
             // (The coredump task is a DAEMON so it already uses the kernel pagemap,
             // but this makes the invariant explicit and handles any edge cases.)
-            ker::mod::mm::virt::switchToKernelPagemap();
+            ker::mod::mm::virt::switch_to_kernel_pagemap();
 
             perform_coredump(req);
 
@@ -437,7 +437,7 @@ static void perform_coredump(const CoreDumpRequest& req) {
     uint64_t segTableBytes = segCapacity * sizeof(CoreDumpSegment);
     uint64_t segTableAllocBytes = (segTableBytes + PAGE - 1) & ~(PAGE - 1);
     if (segCapacity != 0) {
-        segs = static_cast<CoreDumpSegment*>(ker::mod::mm::phys::pageAlloc(segTableAllocBytes, "coredump-segments"));
+        segs = static_cast<CoreDumpSegment*>(ker::mod::mm::phys::page_alloc(segTableAllocBytes, "coredump-segments"));
         if (segs == nullptr) {
             ker::vfs::vfs_close(fd);
             ker::mod::dbg::log("coredump: failed to allocate segment table for %s", path);
@@ -484,8 +484,8 @@ static void perform_coredump(const CoreDumpRequest& req) {
     hdr.timestampQuantums = req.timestamp;
     hdr.pid = req.pid;
     hdr.cpu = req.cpu_id;
-    hdr.intNum = req.frame.intNum;
-    hdr.errCode = req.frame.errCode;
+    hdr.int_num = req.frame.int_num;
+    hdr.err_code = req.frame.err_code;
     hdr.cr2 = req.cr2;
     hdr.cr3 = req.cr3;
     hdr.trapFrame = req.frame;
@@ -509,9 +509,9 @@ static void perform_coredump(const CoreDumpRequest& req) {
     hdr.threadFsBase = req.thread_fs_base;
     hdr.threadGsBase = req.thread_gs_base;
     hdr.threadStackBase = req.thread_stack_base;
-    hdr.threadStackSize = req.thread_stack_size;
+    hdr.threadstack_size = req.thread_stack_size;
     hdr.threadTlsBase = req.thread_tls_base;
-    hdr.threadTlsSize = req.thread_tls_size;
+    hdr.threadtls_size = req.thread_tls_size;
     hdr.threadSafeStack = req.thread_safe_stack;
     std::memcpy(hdr.exePath, req.exe_path, sizeof(hdr.exePath));
     std::memcpy(hdr.cwd, req.cwd, sizeof(hdr.cwd));
@@ -575,7 +575,7 @@ static void perform_coredump(const CoreDumpRequest& req) {
 }  // namespace
 
 void init() {
-    g_coredump_task = ker::mod::sched::task::Task::createKernelThread("coredump", coredump_task_fn);
+    g_coredump_task = ker::mod::sched::task::Task::create_kernel_thread("coredump", coredump_task_fn);
     if (g_coredump_task == nullptr) {
         ker::mod::dbg::log("coredump: failed to create coredump task");
         return;
@@ -602,8 +602,8 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
 
     // Take a refcount on the task. This prevents GC from reclaiming it (and its pagemap
     // and user pages) while the coredump task reads them via HHDM. The coredump task
-    // calls task->release() when done. tryAcquire fails if task is already EXITING/DEAD.
-    if (!task->tryAcquire()) {
+    // calls task->release() when done. try_acquire fails if task is already EXITING/DEAD.
+    if (!task->try_acquire()) {
         return;
     }
 
@@ -617,11 +617,11 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
     req.cpu_id = cpuId;
     req.pid = task->pid;
     req.entry = task->entry;
-    req.elf_header_addr = task->elfHeaderAddr;
-    req.program_header_addr = task->programHeaderAddr;
-    req.interp_base = task->interpBase;
-    req.program_header_count = task->programHeaderCount;
-    req.program_header_ent_size = task->programHeaderEntSize;
+    req.elf_header_addr = task->elf_header_addr;
+    req.program_header_addr = task->program_header_addr;
+    req.interp_base = task->interp_base;
+    req.program_header_count = task->program_header_count;
+    req.program_header_ent_size = task->program_header_ent_size;
     req.thread_fs_base = 0;
     req.thread_gs_base = 0;
     req.thread_stack_base = 0;
@@ -633,28 +633,28 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
         req.thread_fs_base = task->thread->fsbase;
         req.thread_gs_base = task->thread->gsbase;
         req.thread_stack_base = task->thread->gsbase;
-        req.thread_stack_size = task->thread->stackSize;
-        req.thread_tls_base = task->thread->tlsBaseVirt;
-        req.thread_tls_size = task->thread->tlsSize;
-        req.thread_safe_stack = task->thread->safestackPtrValue;
+        req.thread_stack_size = task->thread->stack_size;
+        req.thread_tls_base = task->thread->tls_base_virt;
+        req.thread_tls_size = task->thread->tls_size;
+        req.thread_safe_stack = task->thread->safestack_ptr_value;
     }
     req.pagemap = task->pagemap;
     req.user_rsp = frame.rsp;
-    req.timestamp = ker::mod::time::getTicks();
+    req.timestamp = ker::mod::time::get_ticks();
     req.task_ptr = task;
     sanitize_name(task->name, req.name, sizeof(req.name));
     std::memcpy(req.exe_path, task->exe_path, sizeof(req.exe_path));
     std::memcpy(req.cwd, task->cwd, sizeof(req.cwd));
     std::memcpy(req.root, task->root, sizeof(req.root));
 
-    // Steal elfBuffer so exit() won't free it before the coredump task writes it.
+    // Steal elf_buffer so exit() won't free it before the coredump task writes it.
     // Private buffers are intentionally retained after writing; see coredump_task_fn().
-    req.elf_buffer = task->elfBuffer;
-    req.elf_buffer_size = task->elfBufferSize;
-    req.elf_buffer_shared = task->isElfBufferShared;
-    task->elfBuffer = nullptr;
-    task->elfBufferSize = 0;
-    task->isElfBufferShared = false;
+    req.elf_buffer = task->elf_buffer;
+    req.elf_buffer_size = task->elf_buffer_size;
+    req.elf_buffer_shared = task->is_elf_buffer_shared;
+    task->elf_buffer = nullptr;
+    task->elf_buffer_size = 0;
+    task->is_elf_buffer_shared = false;
 
     // Publish the slot and wake the coredump task. Safe from CPL=3 exception context:
     // userspace-fault handlers cannot be holding any kernel spinlock.

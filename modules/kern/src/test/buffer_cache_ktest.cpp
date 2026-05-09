@@ -15,9 +15,7 @@ auto null_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, voi
     return 0;
 }
 
-auto null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int {
-    return 0;
-}
+auto null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
 
 auto make_null_bdev() -> ker::dev::BlockDevice {
     ker::dev::BlockDevice d{};
@@ -155,13 +153,15 @@ KTEST(BufferCache, BgetMultiReadback) {
     ker::dev::BlockDevice dev = make_null_bdev();
     ker::vfs::invalidate_bdev(&dev);
 
-    const uint64_t BLK   = 400;
-    const size_t   RATIO = 8;  // 4096-byte XFS block / 512-byte sector
+    const uint64_t BLK = 400;
+    const size_t RATIO = 8;  // 4096-byte XFS block / 512-byte sector
 
     ker::vfs::BufHead* wp = ker::vfs::bget_multi(&dev, BLK, RATIO);
     KREQUIRE_NE(wp, nullptr);
     KEXPECT_EQ(wp->size, static_cast<size_t>(RATIO * 512));
-    for (size_t i = 0; i < wp->size; i++) { wp->data[i] = static_cast<uint8_t>(i & 0xFF); }
+    for (size_t i = 0; i < wp->size; i++) {
+        wp->data[i] = static_cast<uint8_t>(i & 0xFF);
+    }
     ker::vfs::bdirty(wp);
     ker::vfs::brelse(wp);
 
@@ -195,7 +195,10 @@ KTEST(BufferCache, BdirtyVisibleToBread) {
     KREQUIRE_NE(rp, nullptr);
     bool ok = true;
     for (size_t i = 0; i < rp->size; i++) {
-        if (rp->data[i] != 0xAA) { ok = false; break; }
+        if (rp->data[i] != 0xAA) {
+            ok = false;
+            break;
+        }
     }
     KEXPECT_TRUE(ok);
     ker::vfs::brelse(rp);
@@ -223,7 +226,9 @@ KTEST(BufferCache, SizeMismatchCoexist) {
     ker::vfs::BufHead* mb = ker::vfs::bget_multi(&dev, BLK, 8);
     KREQUIRE_NE(mb, nullptr);
     KEXPECT_EQ(mb->size, static_cast<size_t>(8 * 512));
-    for (size_t i = 0; i < mb->size; i++) { mb->data[i] = static_cast<uint8_t>(i & 0xFF); }
+    for (size_t i = 0; i < mb->size; i++) {
+        mb->data[i] = static_cast<uint8_t>(i & 0xFF);
+    }
     ker::vfs::bdirty(mb);
     ker::vfs::brelse(mb);
 
@@ -233,7 +238,10 @@ KTEST(BufferCache, SizeMismatchCoexist) {
     KEXPECT_EQ(rp->size, static_cast<size_t>(8 * 512));
     bool ok = true;
     for (size_t i = 0; i < rp->size; i++) {
-        if (rp->data[i] != static_cast<uint8_t>(i & 0xFF)) { ok = false; break; }
+        if (rp->data[i] != static_cast<uint8_t>(i & 0xFF)) {
+            ok = false;
+            break;
+        }
     }
     KEXPECT_TRUE(ok);
     ker::vfs::brelse(rp);

@@ -24,7 +24,7 @@ struct alignas(16) FxState {
 std::array<FxState, MAX_FAST_COPY_CPUS> g_fx_state{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 inline void copy_sse(uint8_t* dst, const uint8_t* src, size_t len) {
-    uint64_t cpu = ker::mod::cpu::currentCpu();
+    uint64_t cpu = ker::mod::cpu::current_cpu();
     if (cpu >= MAX_FAST_COPY_CPUS) {
         cpu = 0;
     }

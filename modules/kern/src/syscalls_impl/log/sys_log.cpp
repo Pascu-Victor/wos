@@ -17,7 +17,7 @@ namespace ker::syscall::log {
 static constexpr size_t MAX_SYSLOG_COPY = 4096;
 
 auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, uint64_t device_or_level, const char* module) -> uint64_t {
-    auto* currentPagemap = _wOS_getCurrentPagemap();
+    auto* current_pagemap = wos_get_current_pagemap();
 
     // Helper to safely copy from user/kernel pointer into a kernel buffer.
     auto safe_copy_to_kernel = [&](const char* src, uint64_t requested_len, char* dest, uint64_t& out_len) -> bool {
@@ -39,8 +39,8 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
                     dest[copied] = *(const char*)ker::mod::mm::addr::get_virt_pointer(phys + 0);
                 }
             } else {
-                if (!currentPagemap) return false;
-                phys = ker::mod::mm::virt::translate(currentPagemap, (ker::mod::mm::addr::vaddr_t)(src_addr + copied));
+                if (!current_pagemap) return false;
+                phys = ker::mod::mm::virt::translate(current_pagemap, (ker::mod::mm::addr::vaddr_t)(src_addr + copied));
                 if (phys == ker::mod::mm::virt::PADDR_INVALID) break;  // unmapped - stop copying
                 dest[copied] = *(const char*)ker::mod::mm::addr::get_virt_pointer(phys);
             }
@@ -55,9 +55,9 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
     };
 
     switch (op) {
-        case abi::sys_log::sys_log_ops::log: {
+        case abi::sys_log::sys_log_ops::LOG: {
             auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
-            if (device == abi::sys_log::sys_log_device::serial) {
+            if (device == abi::sys_log::sys_log_device::SERIAL) {
                 if (str == nullptr) {
                     return 1;
                 }
@@ -79,13 +79,13 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
                     mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
                                             copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
-            } else if (device == abi::sys_log::sys_log_device::vga) {
+            } else if (device == abi::sys_log::sys_log_device::VGA) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
                     char buf[MAX_SYSLOG_COPY];
                     uint64_t copied = 0;
                     if (!safe_copy_to_kernel(str, 0, buf, copied)) return 1;
                     buf[(copied >= 1 && buf[copied - 1] == '\0') ? (copied - 1) : copied] = '\0';
-                    mod::dbg::logFbOnly(buf);
+                    mod::dbg::log_fb_only(buf);
                 } else {
                     mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
                     mod::io::serial::write((uint64_t)device);
@@ -99,9 +99,9 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
                 return 1;
             }
         } break;
-        case ker::abi::sys_log::sys_log_ops::logLine: {
+        case ker::abi::sys_log::sys_log_ops::LOG_LINE: {
             auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
-            if (device == abi::sys_log::sys_log_device::serial) {
+            if (device == abi::sys_log::sys_log_device::SERIAL) {
                 if (str == nullptr) {
                     return 1;
                 }
@@ -127,14 +127,14 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
                     mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
                                             copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
-            } else if (device == abi::sys_log::sys_log_device::vga) {
+            } else if (device == abi::sys_log::sys_log_device::VGA) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
                     char buf[MAX_SYSLOG_COPY];
                     uint64_t copied = 0;
                     if (!safe_copy_to_kernel(str, 0, buf, copied)) return 1;
                     buf[(copied >= 1 && buf[copied - 1] == '\0') ? (copied - 1) : copied] = '\0';
-                    mod::dbg::logFbOnly(buf);
-                    mod::dbg::logFbAdvance();
+                    mod::dbg::log_fb_only(buf);
+                    mod::dbg::log_fb_advance();
                 } else {
                     mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
                     mod::io::serial::write((uint64_t)device);
@@ -148,7 +148,7 @@ auto sysLog(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, ui
                 return 1;
             }
         } break;
-        case ker::abi::sys_log::sys_log_ops::logEx: {
+        case ker::abi::sys_log::sys_log_ops::LOG_EX: {
             if (str == nullptr) {
                 return 1;
             }

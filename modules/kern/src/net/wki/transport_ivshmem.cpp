@@ -511,9 +511,9 @@ void wki_ivshmem_transport_init() {
     // VM0: poll for peer_ready with 5s timeout
     if (s_ivshmem_priv.my_vm_id == 0) {
         constexpr uint64_t PEER_READY_TIMEOUT_US = 5'000'000;
-        uint64_t deadline = ker::mod::time::getUs() + PEER_READY_TIMEOUT_US;
+        uint64_t deadline = ker::mod::time::get_us() + PEER_READY_TIMEOUT_US;
         while (hdr->peer_ready == 0) {
-            if (ker::mod::time::getUs() >= deadline) {
+            if (ker::mod::time::get_us() >= deadline) {
                 ker::mod::dbg::log("[WKI] ivshmem: peer_ready timeout - continuing without peer");
                 break;
             }
@@ -556,13 +556,13 @@ void wki_ivshmem_transport_init() {
     s_ivshmem_priv.rdma_bitmap.fill(0);  // all free
 
     // Set up IRQ
-    uint8_t vector = ker::mod::gates::allocateVector();
+    uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector != 0) {
         int msi_ret = dev::pci::pci_enable_msi(found_dev, vector);
         if (msi_ret != 0) {
             vector = found_dev->interrupt_line + 32;
         }
-        ker::mod::gates::requestIrq(vector, ivshmem_wki_irq, &s_ivshmem_priv, "wki-ivshmem");
+        ker::mod::gates::request_irq(vector, ivshmem_wki_irq, &s_ivshmem_priv, "wki-ivshmem");
         regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
     }
 

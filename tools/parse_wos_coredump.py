@@ -9,7 +9,6 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Optional
 
-
 COREDUMP_MAGIC = 0x504D55444F43534F  # "WOSCODMP" little-endian-ish
 
 SEGMENT_TYPES = {
@@ -25,8 +24,8 @@ SEGMENT_SIZE_V2 = SEGMENT_SIZE_V1 + 8 + 8
 
 @dataclass
 class InterruptFrame:
-    intNum: int
-    errCode: int
+    int_num: int
+    err_code: int
     rip: int
     cs: int
     rflags: int
@@ -82,8 +81,8 @@ class CoreDump:
     timestamp: int
     pid: int
     cpu: int
-    intNum: int
-    errCode: int
+    int_num: int
+    err_code: int
     cr2: int
     cr3: int
     trapFrame: InterruptFrame
@@ -243,7 +242,7 @@ def _parse_elf_sections(elf: bytes) -> Optional[SectionMap]:
         return None
 
     (e_shoff,) = struct.unpack_from("<Q", elf, 40)
-    (e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from("<HHH", elf, 58)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", elf, 58)
 
     if e_shoff == 0 or e_shnum == 0 or e_shstrndx >= e_shnum:
         return None
@@ -295,7 +294,7 @@ def _parse_elf_symtab(elf: bytes) -> Optional[SymbolTable]:
         return None
 
     (e_shoff,) = struct.unpack_from("<Q", elf, 40)
-    (e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from("<HHH", elf, 58)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", elf, 58)
 
     if e_shoff == 0 or e_shnum == 0:
         return None
@@ -359,7 +358,7 @@ def _parse_elf_symtab(elf: bytes) -> Optional[SymbolTable]:
     table = SymbolTable()
 
     while sym_off + entsize <= sym_end:
-        (st_name, st_info, st_other, st_shndx, st_value, st_size) = struct.unpack_from(
+        st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from(
             "<IBBHQQ", elf, sym_off
         )
         sym_off += entsize
@@ -472,13 +471,13 @@ def parse_cstr(buf: bytes, off: int, size: int) -> tuple[str, int]:
 
 def parse_coredump(data: bytes) -> CoreDump:
     off = 0
-    (magic, version, headerSize) = struct.unpack_from("<QII", data, off)
+    magic, version, headerSize = struct.unpack_from("<QII", data, off)
     off += 8 + 4 + 4
 
     if magic != COREDUMP_MAGIC:
         raise SystemExit(f"Bad magic: {u64(magic)} (expected {u64(COREDUMP_MAGIC)})")
 
-    (timestamp, pid, cpu, intNum, errCode, cr2, cr3) = struct.unpack_from(
+    timestamp, pid, cpu, int_num, err_code, cr2, cr3 = struct.unpack_from(
         "<7Q", data, off
     )
     off += 7 * 8
@@ -564,8 +563,8 @@ def parse_coredump(data: bytes) -> CoreDump:
         timestamp=timestamp,
         pid=pid,
         cpu=cpu,
-        intNum=intNum,
-        errCode=errCode,
+        int_num=int_num,
+        err_code=err_code,
         cr2=cr2,
         cr3=cr3,
         trapFrame=trapFrame,
@@ -629,7 +628,7 @@ def print_header(
     print(f"timestampQuantums: {dump.timestamp}")
     print(f"pid: {dump.pid} cpu: {dump.cpu}")
     print(
-        f"intNum: {dump.intNum} ({interrupt_name(dump.intNum)}) errCode: {u64(dump.errCode)}"
+        f"int_num: {dump.int_num} ({interrupt_name(dump.int_num)}) err_code: {u64(dump.err_code)}"
     )
     print(f"cr2: {fa(dump.cr2)} cr3: {u64(dump.cr3)}")
 

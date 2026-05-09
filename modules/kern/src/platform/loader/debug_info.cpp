@@ -59,9 +59,9 @@ void addDebugSymbol(uint64_t pid, const char* name, uint64_t vaddr, uint64_t pad
             sym.size = size;
             sym.bind = bind;
             sym.type = type;
-            sym.isTlsOffset = isTlsOffset;
+            sym.is_tls_offset = isTlsOffset;
             sym.shndx = shndx;
-            sym.rawValue = rawValue;
+            sym.raw_value = rawValue;
 
             process.symbols.push_back(sym);
             debugRegistryLock.unlock();
@@ -142,7 +142,7 @@ ProcessDebugInfo* getProcessDebugInfo(uint64_t pid) {
     return nullptr;
 }
 
-DebugSymbol* getProcessSymbol(uint64_t pid, const char* name) {
+DebugSymbol* get_process_symbol(uint64_t pid, const char* name) {
     debugRegistryLock.lock();
     for (auto& process : debugRegistry) {
         if (process.pid == pid) {
@@ -191,7 +191,7 @@ void printDebugInfo(uint64_t pid) {
     debugRegistryLock.unlock();
 }
 
-void unregisterProcess(uint64_t pid) {
+void unregister_process(uint64_t pid) {
     debugRegistryLock.lock();
     // Find and remove the process from the debug registry
     for (auto it = debugRegistry.begin(); it != debugRegistry.end(); ++it) {

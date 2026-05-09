@@ -6,22 +6,19 @@
 #include <platform/mm/virt.hpp>
 
 namespace ker::mod::mm {
-void init(void);
+void init();
 #define KERNEL_STACK_SIZE 0x80000  // 512KB
 #define USER_STACK_SIZE 0x800000   // 8MiB
 #define TLS_STATIC_SIZE 0x16000    // 64KB
 
 template <size_t StackSize = 4096>
 struct Stack {
-    static const size_t size = StackSize;
+    static const size_t SIZE = StackSize;
     uint64_t* sp;
     uint64_t* base;
 
-    Stack() {
-        base = (uint64_t*)phys::pageAlloc(StackSize);
-        sp = base + StackSize / sizeof(uint64_t);
-    }
+    Stack() : base((uint64_t*)phys::page_alloc(StackSize)) { sp = base + (StackSize / sizeof(uint64_t)); }
 
-    void free() { phys::pageFree(base); }
+    void free() { phys::page_free(base); }
 };
 }  // namespace ker::mod::mm

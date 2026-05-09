@@ -27,7 +27,7 @@ struct RunHeap {
     // Eligible = (avgVruntime - task.vruntime) >= 0.
     // Does NOT remove it from the heap.
     // Returns nullptr if heap is empty.
-    auto pickBestEligible(int64_t avgVruntime) -> task::Task*;
+    auto pick_best_eligible(int64_t avg_vruntime) -> task::Task*;
 
     // Remove a specific task using its heapIndex. O(log n).
     // Returns false if task is not in this heap.
@@ -37,15 +37,15 @@ struct RunHeap {
     void update(task::Task* t);
 
     // Peek at the task with the smallest vdeadline. O(1).
-    task::Task* peekMin() const;
+    [[nodiscard]] task::Task* peek_min() const;
 
     // Check if task is in this heap.
     bool contains(task::Task* t) const;
 
    private:
-    void siftUp(uint32_t idx);
-    void siftDown(uint32_t idx);
-    void swapEntries(uint32_t i, uint32_t j);
+    void sift_up(uint32_t idx);
+    void sift_down(uint32_t idx);
+    void swap_entries(uint32_t i, uint32_t j);
 };
 
 // Intrusive singly-linked list for wait queue and dead list.
@@ -66,7 +66,7 @@ struct IntrusiveTaskList {
 
     // Find task by PID. O(n) scan.
     // Returns nullptr if not found.
-    task::Task* findByPid(uint64_t pid);
+    task::Task* find_by_pid(uint64_t pid);
 
     // Pop the head task. O(1).
     // Returns nullptr if empty.

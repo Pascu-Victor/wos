@@ -233,7 +233,7 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("\nPid:\t");
     append_int(task->pid);
     append("\nPPid:\t");
-    append_int(task->parentPid);
+    append_int(task->parent_pid);
     append("\nUid:\t");
     append_int(task->uid);
     append("\t");
@@ -254,11 +254,11 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     // State
     append("\nState:\t");
     auto ts_st = task->state.load(std::memory_order_acquire);
-    if (ts_st == ker::mod::sched::task::TaskState::DEAD || ts_st == ker::mod::sched::task::TaskState::EXITING || task->hasExited) {
+    if (ts_st == ker::mod::sched::task::TaskState::DEAD || ts_st == ker::mod::sched::task::TaskState::EXITING || task->has_exited) {
         append("Z (zombie)");
-    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::RUNNABLE) {
+    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::RUNNABLE) {
         append("R (running)");
-    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING) {
+    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING) {
         append(task->wait_channel != nullptr ? "D (blocked)" : "S (sleeping)");
     } else {
         append("S (sleeping)");
@@ -268,17 +268,17 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("\nCpu:\t");
     append_int(task->cpu);
     append("\nSchedQueue:\t");
-    switch (task->schedQueue) {
-        case ker::mod::sched::task::Task::SchedQueue::NONE:
+    switch (task->sched_queue) {
+        case ker::mod::sched::task::Task::sched_queue::NONE:
             append("NONE");
             break;
-        case ker::mod::sched::task::Task::SchedQueue::RUNNABLE:
+        case ker::mod::sched::task::Task::sched_queue::RUNNABLE:
             append("RUNNABLE");
             break;
-        case ker::mod::sched::task::Task::SchedQueue::WAITING:
+        case ker::mod::sched::task::Task::sched_queue::WAITING:
             append("WAITING");
             break;
-        case ker::mod::sched::task::Task::SchedQueue::DEAD_GC:
+        case ker::mod::sched::task::Task::sched_queue::DEAD_GC:
             append("DEAD_GC");
             break;
     }
@@ -293,19 +293,19 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     // Blocking state flags
     append("\nDeferredSwitch:\t");
-    append(task->deferredTaskSwitch ? "1" : "0");
+    append(task->deferred_task_switch ? "1" : "0");
     append("\nVoluntaryBlock:\t");
-    append(task->voluntaryBlock ? "1" : "0");
+    append(task->voluntary_block ? "1" : "0");
     append("\nWaitingForPid:\t");
-    append_int(task->waitingForPid);
+    append_int(task->waiting_for_pid);
 
     // Signals
     append("\nSigPnd:\t");
-    append_int(task->sigPending);
+    append_int(task->sig_pending);
     append("\nSigBlk:\t");
-    append_int(task->sigMask);
+    append_int(task->sig_mask);
     append("\nInSigHandler:\t");
-    append(task->inSignalHandler ? "1" : "0");
+    append(task->in_signal_handler ? "1" : "0");
 
     // Terminal
     append("\nTTY:\t");
@@ -375,11 +375,11 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     // Determine state character
     char state = 'S';  // Default sleeping
     auto ts = task->state.load(std::memory_order_acquire);
-    if (ts == ker::mod::sched::task::TaskState::DEAD || ts == ker::mod::sched::task::TaskState::EXITING || task->hasExited) {
+    if (ts == ker::mod::sched::task::TaskState::DEAD || ts == ker::mod::sched::task::TaskState::EXITING || task->has_exited) {
         state = 'Z';
-    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::RUNNABLE) {
+    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::RUNNABLE) {
         state = 'R';
-    } else if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING) {
+    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING) {
         state = task->wait_channel != nullptr ? 'D' : 'S';
     }
 
@@ -390,7 +390,7 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append(") ");
     buf[off++] = state;
     append(" ");
-    append_int(task->parentPid);  // ppid
+    append_int(task->parent_pid);  // ppid
     append(" ");
     append_int(task->pgid != 0 ? task->pgid : task->pid);  // pgrp
     append(" ");
@@ -430,10 +430,10 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("0 ");  // rss
 
     // rlim signal blocked sigignore sigcatch wchan nswap cnswap exit_signal processor
-    append("0 ");                  // rlim
-    append_int(task->sigPending);  // signal (pending)
+    append("0 ");                   // rlim
+    append_int(task->sig_pending);  // signal (pending)
     append(" ");
-    append_int(task->sigMask);  // blocked
+    append_int(task->sig_mask);  // blocked
     append(" ");
     append("0 ");  // sigignore
     append("0 ");  // sigcatch
@@ -541,7 +541,7 @@ auto generate_uptime(char* buf, size_t bufsz) -> size_t {
         append(tmp.data());
     };
 
-    uint64_t uptime_us = ker::mod::time::getUs();
+    uint64_t uptime_us = ker::mod::time::get_us();
     uint64_t uptime_sec = uptime_us / 1000000ULL;
     uint64_t uptime_frac = (uptime_us % 1000000ULL) / 10000ULL;  // two decimal places
 

@@ -4,12 +4,12 @@ namespace ker::mod::desc::idt {
 __attribute__((aligned(0x10))) static IdtEntry idt[IDT_ENTRIES];  // at most 256 interrupts
 static IdtPtr idtPtr;
 
-void idtSetEntry(IdtEntry* entry, void* isr, uint8_t gateType, uint8_t dpl) {
+void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gateType, uint8_t dpl) {
     entry->offset0 = (uint64_t)isr & 0xFFFF;
     entry->kernel_cs = gdt::GDT_KERN_CS;
     entry->ist = 0;
     entry->reserved0 = 0;
-    entry->gateType = gateType;
+    entry->gate_type = gateType;
     entry->zero0 = 0;
     entry->dpl = dpl;
     entry->present = 1;
@@ -20,12 +20,12 @@ void idtSetEntry(IdtEntry* entry, void* isr, uint8_t gateType, uint8_t dpl) {
 
 static inline IdtEntry* calcIdtEntry(uint8_t intNumber) { return &idt[intNumber]; }
 
-#define ISR_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 0)
-#define ISR_ENTRY_USER(n) idtSetEntry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 3)
-#define ISR_TRAP_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE, 0)
-#define ISR_EXCEPT_ENTRY(n) idtSetEntry(calcIdtEntry(n), (void*)isr_except##n, IDT_INTERRUPT_GATE, 0)
+#define ISR_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 0)
+#define ISR_ENTRY_USER(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 3)
+#define ISR_TRAP_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE, 0)
+#define ISR_EXCEPT_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr_except##n, IDT_INTERRUPT_GATE, 0)
 
-void mapIsrEntries() {
+static void map_isr_entries() {
     ISR_ENTRY(0);
     ISR_ENTRY(1);
     ISR_ENTRY(2);
@@ -284,16 +284,16 @@ void mapIsrEntries() {
     ISR_ENTRY(255);
 }
 
-void idtInit(void) {
-    mapIsrEntries();
+void idt_init() {
+    map_isr_entries();
 
     idtPtr.limit = (uint16_t)sizeof(idt) - 1;
     idtPtr.base = (uint64_t)&idt;
 
-    loadIdt();
+    load_idt();
 }
 
-void loadIdt(void) {
+void load_idt() {
     __asm__ volatile("lidt %0" : : "m"(idtPtr));  // load the new IDT
 }
 

@@ -22,9 +22,9 @@ struct CpuInfo {
     uint32_t lapic_id;
     CpuGotoAddr* goto_address = nullptr;
     uint64_t* stack_pointer_ref = nullptr;
-    sched::task::Task* currentTask = nullptr;
+    sched::task::Task* current_task = nullptr;
     // Used by panic/OOM to indicate this CPU has entered the halted state for diagnostics.
-    std::atomic<bool> isHaltedForOom{false};
+    std::atomic<bool> is_halted_for_oom{false};
 };
 
 auto get_core_count() -> uint64_t;
@@ -43,7 +43,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp);
 
 void init();
 
-auto thisCpuInfo() -> const CpuInfo&;
+auto this_cpu_info() -> const CpuInfo&;
 
 template <typename T>
 class PerCpuVar {
@@ -51,23 +51,23 @@ class PerCpuVar {
                   "T must have a default constructor or be a primitive type");
 
    private:
-    T* _data;
+    T* data;
 
    public:
-    PerCpuVar(T defaultValue = T()) : _data(new T[get_core_count()]) {
+    PerCpuVar(T default_value = T()) : data(new T[get_core_count()]) {
         for (uint64_t i = 0; i < get_core_count(); ++i) {
-            _data[i] = defaultValue;
+            data[i] = default_value;
         }
     }
 
-    T& get() { return _data[cpu::currentCpu()]; }
+    T& get() { return data[cpu::current_cpu()]; }
 
-    auto operator->() -> T* { return &_data[cpu::currentCpu()]; }
+    auto operator->() -> T* { return &data[cpu::current_cpu()]; }
 
-    void set(const T& data) { _data[cpu::currentCpu()] = data; }
+    void set(const T& data) { data[cpu::current_cpu()] = data; }
 
     auto operator=(const T& data) -> PerCpuVar& {
-        _data[cpu::currentCpu()] = data;
+        data[cpu::current_cpu()] = data;
         return *this;
     }
 };
@@ -75,10 +75,10 @@ class PerCpuVar {
 template <typename T>
 class PerCpuCrossAccess {
    private:
-    T* _data;
+    T* data;
 
     // Per-element spinlocks for fine-grained locking
-    std::atomic<bool>* _locks;
+    std::atomic<bool>* locks;
 
     // IRQ-safe lock: saves RFLAGS and disables interrupts before acquiring.
     // This prevents the timer interrupt (which calls process_tasks ->
@@ -86,9 +86,9 @@ class PerCpuCrossAccess {
     // when non-interrupt code (e.g. reschedule_task_for_cpu, get_run_queue_stats)
     // holds the same per-CPU lock.
     auto lock_cpu(uint64_t cpu) -> uint64_t {
-        uint64_t flags;
+        uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
-        while (_locks[cpu].exchange(true, std::memory_order_acquire)) {
+        while (locks[cpu].exchange(true, std::memory_order_acquire)) {
             // Spin with pause hint
             asm volatile("pause");
         }
@@ -96,29 +96,29 @@ class PerCpuCrossAccess {
     }
 
     void unlock_cpu(uint64_t cpu, uint64_t flags) {
-        _locks[cpu].store(false, std::memory_order_release);
+        locks[cpu].store(false, std::memory_order_release);
         // Restore interrupt state (re-enables interrupts if they were enabled before lock)
         asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
     }
 
    public:
-    PerCpuCrossAccess() : _data(new T[get_core_count()]), _locks(new std::atomic<bool>[get_core_count()]) {
+    PerCpuCrossAccess() : data(new T[get_core_count()]), locks(new std::atomic<bool>[get_core_count()]) {
         for (uint64_t i = 0; i < get_core_count(); ++i) {
-            new (&_data[i]) T();  // Default construct each element (supports non-copyable types like std::atomic)
-            _locks[i].store(false, std::memory_order_relaxed);
+            new (&data[i]) T();  // Default construct each element (supports non-copyable types like std::atomic)
+            locks[i].store(false, std::memory_order_relaxed);
         }
     }
 
     // Access current CPU's data (no locking needed - only this CPU accesses it)
     // WARNING: Use thisCpuLocked() if other CPUs might be modifying via withLock!
-    auto this_cpu() -> T* { return &_data[cpu::currentCpu()]; }
+    auto this_cpu() -> T* { return &data[cpu::current_cpu()]; }
 
     // Locked access to current CPU's data - use when other CPUs might modify via withLock
     template <typename Func>
     auto this_cpu_locked(Func&& func) -> decltype(func(std::declval<T*>())) {
-        uint64_t cpu = cpu::currentCpu();
+        uint64_t cpu = cpu::current_cpu();
         uint64_t flags = lock_cpu(cpu);
-        auto result = func(&_data[cpu]);
+        auto result = func(&data[cpu]);
         unlock_cpu(cpu, flags);
         return result;
     }
@@ -126,20 +126,20 @@ class PerCpuCrossAccess {
     // Locked access to current CPU's data without return value
     template <typename Func>
     void this_cpu_locked_void(Func&& func) {
-        uint64_t cpu = cpu::currentCpu();
+        uint64_t cpu = cpu::current_cpu();
         uint64_t flags = lock_cpu(cpu);
-        func(&_data[cpu]);
+        func(&data[cpu]);
         unlock_cpu(cpu, flags);
     }
 
     // Access another CPU's data with locking
-    auto that_cpu(uint64_t cpu) -> T* { return &_data[cpu]; }
+    auto that_cpu(uint64_t cpu) -> T* { return &data[cpu]; }
 
     // Locked access to another CPU's data - use when modifying cross-CPU
     template <typename Func>
     auto with_lock(uint64_t cpu, Func&& func) -> decltype(func(std::declval<T*>())) {
         uint64_t flags = lock_cpu(cpu);
-        auto result = func(&_data[cpu]);
+        auto result = func(&data[cpu]);
         unlock_cpu(cpu, flags);
         return result;
     }
@@ -148,7 +148,7 @@ class PerCpuCrossAccess {
     template <typename Func>
     void with_lock_void(uint64_t cpu, Func&& func) {
         uint64_t flags = lock_cpu(cpu);
-        func(&_data[cpu]);
+        func(&data[cpu]);
         unlock_cpu(cpu, flags);
     }
 
@@ -156,23 +156,23 @@ class PerCpuCrossAccess {
     // Safe to call from interrupt context and idle paths (no spinning).
     template <typename Func>
     auto try_with_lock(uint64_t cpu, Func&& func) -> bool {
-        uint64_t flags;
+        uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
-        bool acquired = !_locks[cpu].exchange(true, std::memory_order_acquire);
+        bool acquired = !locks[cpu].exchange(true, std::memory_order_acquire);
         if (!acquired) {
             asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
             return false;
         }
-        func(&_data[cpu]);
+        func(&data[cpu]);
         unlock_cpu(cpu, flags);
         return true;
     }
 
-    void set_this_cpu(const T& data) { _data[cpu::currentCpu()] = data; }
+    void set_this_cpu(const T& data) { data[cpu::current_cpu()] = data; }
 
     void set_that_cpu(const T& data, uint64_t cpu) {
         uint64_t flags = lock_cpu(cpu);
-        _data[cpu] = data;
+        data[cpu] = data;
         unlock_cpu(cpu, flags);
     }
 };
@@ -230,7 +230,7 @@ inline void start_cpu_task(uint64_t cpu_no, CpuGotoAddr task, mm::Stack<4096> st
 constexpr void exec_on_all_cpus(CpuGotoAddr func) {
     auto* init_stacks = new mm::Stack<4096>[get_core_count()];
     for (uint64_t i = 0; i < get_core_count(); i++) {
-        if (i == cpu::currentCpu()) {
+        if (i == cpu::current_cpu()) {
             continue;
         }
         start_cpu_task(i, func, init_stacks[i]);
@@ -241,7 +241,7 @@ template <typename... FuncArgs>
 constexpr void exec_on_all_cpus(void (*func)(FuncArgs...), FuncArgs... data) {
     auto* init_stacks = new mm::Stack<4096>[get_core_count()];
     for (uint64_t i = 0; i < get_core_count(); i++) {
-        if (i == cpu::currentCpu()) {
+        if (i == cpu::current_cpu()) {
             continue;
         }
         start_cpu_task(i, reinterpret_cast<CpuGotoAddr>(func), init_stacks[i], data...);

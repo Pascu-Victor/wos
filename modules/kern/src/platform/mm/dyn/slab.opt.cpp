@@ -2,7 +2,7 @@
 
 namespace ker::mod::mm::dyn::slab {
 static Slab* createSlab(SlabCache* cache) {
-    FreeSlab* freeSlab = (FreeSlab*)phys::pageAlloc();
+    FreeSlab* freeSlab = (FreeSlab*)phys::page_alloc();
     if (!freeSlab) {
         return nullptr;
     }

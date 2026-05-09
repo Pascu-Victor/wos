@@ -23,9 +23,9 @@ struct Hpet {
 
 void init();
 
-uint64_t getTicks(void);
-uint64_t getUs(void);
+uint64_t get_ticks();
+uint64_t get_us();
 
-void sleepTicks(uint64_t ticks);
-void sleepUs(uint64_t us);
+void sleep_ticks(uint64_t ticks);
+void sleep_us(uint64_t us);
 }  // namespace ker::mod::hpet

@@ -17,7 +17,7 @@ void initGdbDebugInfo() {
 
 void addGdbDebugInfo(uint64_t pid, const char* name, uint64_t baseAddr, uint64_t entryPoint) {
     // Allocate memory for the debug info structure
-    uint64_t debugInfoPaddr = (uint64_t)ker::mod::mm::phys::pageAlloc();
+    uint64_t debugInfoPaddr = (uint64_t)ker::mod::mm::phys::page_alloc();
     if (debugInfoPaddr == 0) {
         ker::mod::dbg::log("Failed to allocate memory for GDB debug info");
         return;
@@ -115,7 +115,7 @@ void removeGdbDebugInfo(uint64_t pid) {
             }
 
             // Free the page that was allocated for this debug info
-            ker::mod::mm::phys::pageFree(current);
+            ker::mod::mm::phys::page_free(current);
             gdbDebugInfoLock.unlock();
             return;
         }

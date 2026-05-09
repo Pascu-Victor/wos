@@ -180,7 +180,7 @@ auto stream_attachment_pointer_looks_valid(const void* ptr) -> bool {
     return (in_hhdm || in_kernel_static) && ((addr & (alignof(StreamReaderAttachment) - 1)) == 0);
 }
 
-auto stream_now_us() -> uint64_t { return ker::mod::time::getUs(); }
+auto stream_now_us() -> uint64_t { return ker::mod::time::get_us(); }
 
 auto stream_identity_equals(const StreamCacheIdentity& lhs, const StreamCacheIdentity& rhs) -> bool {
     return lhs.scope_key == rhs.scope_key && lhs.fs_type == rhs.fs_type && lhs.ino == rhs.ino;
@@ -4517,12 +4517,12 @@ static void pipe_reschedule_waiters(const uint64_t* waiters, size_t waiter_count
         }
 
         if (sigpipe) {
-            waiter->sigPending |= (1ULL << (13 - 1));
+            waiter->sig_pending |= (1ULL << (13 - 1));
         }
 
-        waiter->deferredTaskSwitch = false;
+        waiter->deferred_task_switch = false;
         uint64_t target_cpu = waiter->cpu;
-        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
             target_cpu = ker::mod::sched::get_least_loaded_cpu();
         }
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
@@ -4607,7 +4607,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
 
         if (pipe_register_waiter(st->readers_waiting, currentTask->pid)) {
             currentTask->wait_channel = "pipe_read";
-            currentTask->deferredTaskSwitch = true;
+            currentTask->deferred_task_switch = true;
             st->lock.unlock_irqrestore(irqf);
             return -PIPE_WOS_ERESTARTSYS;
         }
@@ -4630,7 +4630,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
             st->lock.unlock_irqrestore(irqf);
             // Send SIGPIPE to the writing process (signal 13)
             auto* task = ker::mod::sched::get_current_task();
-            if (task) task->sigPending |= (1ULL << (13 - 1));
+            if (task) task->sig_pending |= (1ULL << (13 - 1));
             return -EPIPE;
         }
 
@@ -4675,7 +4675,7 @@ auto vfs_pipe(int pipefd[2]) -> int {
 
         if (pipe_register_waiter(st->writers_waiting, currentTask->pid)) {
             currentTask->wait_channel = "pipe_write";
-            currentTask->deferredTaskSwitch = true;
+            currentTask->deferred_task_switch = true;
             st->lock.unlock_irqrestore(irqf);
             return -PIPE_WOS_ERESTARTSYS;
         }
@@ -5316,7 +5316,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
             ssize_t write_result = vfs_write(outfd, buffer + chunk_offset, chunk_size - chunk_offset, &bytes_written);
             if (write_result < 0) {
                 auto* current = mod::sched::get_current_task();
-                if (current != nullptr && current->deferredTaskSwitch) {
+                if (current != nullptr && current->deferred_task_switch) {
                     delete[] buffer;
                     if (offset != nullptr) {
                         *offset = source_offset;

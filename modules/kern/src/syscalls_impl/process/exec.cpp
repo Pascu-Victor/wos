@@ -27,6 +27,7 @@
 #include <vfs/vfs.hpp>
 
 #include "platform/asm/cpu.hpp"
+#include "platform/asm/msr.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
@@ -49,7 +50,7 @@ struct ShebangInfo {
 };
 
 auto allocate_kernel_stack() -> uint64_t {
-    auto stack_base = (uint64_t)ker::mod::mm::phys::pageAlloc(KERNEL_STACK_SIZE);
+    auto stack_base = (uint64_t)ker::mod::mm::phys::page_alloc(KERNEL_STACK_SIZE);
     if (stack_base == 0) {
         return 0;
     }
@@ -295,7 +296,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     dbg::log("wos_proc_exec: Entry point = 0x%x, RIP = 0x%x", new_task->entry, new_task->context.frame.rip);
 #endif
 
-    new_task->parentPid = parent_pid;
+    new_task->parent_pid = parent_pid;
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
@@ -315,11 +316,10 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     memcpy(new_task->wki_target_hostname, parent_task->wki_target_hostname, sizeof(new_task->wki_target_hostname));
     new_task->wki_target_flags = parent_task->wki_target_flags;
     memcpy(new_task->wki_submitter_hostname, parent_task->wki_submitter_hostname, sizeof(new_task->wki_submitter_hostname));
-    new_task->wki_remote_pid =
-        (new_task->wki_submitter_hostname[0] != '\0' &&
-         std::strcmp(new_task->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
-            ? new_task->pid
-            : 0;
+    new_task->wki_remote_pid = (new_task->wki_submitter_hostname[0] != '\0' &&
+                                std::strcmp(new_task->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+                                   ? new_task->pid
+                                   : 0;
     [[maybe_unused]] bool cloned_rules = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
 
     // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
@@ -351,9 +351,9 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         }
     }
 
-    new_task->elfBuffer = elf_buffer;
-    new_task->elfBufferSize = file_size;
-    new_task->isElfBufferShared = false;
+    new_task->elf_buffer = elf_buffer;
+    new_task->elf_buffer_size = file_size;
+    new_task->is_elf_buffer_shared = false;
 
     // Store executable path for /proc/self/exe
     {
@@ -381,7 +381,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Task created with PID: %x, parent: %x", new_task->pid, new_task->parentPid);
+    dbg::log("wos_proc_exec: Task created with PID: %x, parent: %x", new_task->pid, new_task->parent_pid);
 #endif
 
     uint64_t user_stack_virt = new_task->thread->stack;
@@ -473,7 +473,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         current_virt_offset += (current_addr - aligned);
 
         constexpr size_t AUXV_QWORDS_BASE = 12;  // 5 core pairs (PAGESZ,ENTRY,PHDR,PHENT,PHNUM) + AT_NULL pair
-        const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interpBase != 0 ? 2 : 0);
+        const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interp_base != 0 ? 2 : 0);
         size_t structured_qwords = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (structured_qwords % 2 != 0) {
             // Add 8 bytes padding so final rsp is 16-byte aligned
@@ -500,14 +500,14 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
         built_correct_auxv &= auxv.push_back(new_task->entry);
         built_correct_auxv &= auxv.push_back(AT_PHDR);
-        built_correct_auxv &= auxv.push_back(new_task->programHeaderAddr);
+        built_correct_auxv &= auxv.push_back(new_task->program_header_addr);
         built_correct_auxv &= auxv.push_back(AT_PHENT);
-        built_correct_auxv &= auxv.push_back(new_task->programHeaderEntSize);
+        built_correct_auxv &= auxv.push_back(new_task->program_header_ent_size);
         built_correct_auxv &= auxv.push_back(AT_PHNUM);
-        built_correct_auxv &= auxv.push_back(new_task->programHeaderCount);
-        if (new_task->interpBase != 0) {
+        built_correct_auxv &= auxv.push_back(new_task->program_header_count);
+        if (new_task->interp_base != 0) {
             built_correct_auxv &= auxv.push_back(AT_BASE);
-            built_correct_auxv &= auxv.push_back(new_task->interpBase);
+            built_correct_auxv &= auxv.push_back(new_task->interp_base);
         }
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
@@ -741,9 +741,9 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
 
     {
-        uint8_t* saved_elf_buffer = task->elfBuffer;
-        size_t saved_elf_buffer_size = task->elfBufferSize;
-        bool saved_is_elf_buffer_shared = task->isElfBufferShared;
+        uint8_t* saved_elf_buffer = task->elf_buffer;
+        size_t saved_elf_buffer_size = task->elf_buffer_size;
+        bool saved_is_elf_buffer_shared = task->is_elf_buffer_shared;
         bool saved_wki_skip_legacy_placement = task->wki_skip_legacy_placement;
         uint64_t saved_wki_remote_pid = task->wki_remote_pid;
         std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
@@ -754,9 +754,9 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
             path_len = sched::task::Task::EXE_PATH_MAX - 1;
         }
 
-        task->elfBuffer = elf_buffer;
-        task->elfBufferSize = static_cast<size_t>(file_size);
-        task->isElfBufferShared = false;
+        task->elf_buffer = elf_buffer;
+        task->elf_buffer_size = static_cast<size_t>(file_size);
+        task->is_elf_buffer_shared = false;
         std::memcpy(task->exe_path, path, path_len);
         task->exe_path[path_len] = '\0';
 
@@ -767,13 +767,13 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         };
         auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);
 
-        task->elfBuffer = saved_elf_buffer;
-        task->elfBufferSize = saved_elf_buffer_size;
-        task->isElfBufferShared = saved_is_elf_buffer_shared;
+        task->elf_buffer = saved_elf_buffer;
+        task->elf_buffer_size = saved_elf_buffer_size;
+        task->is_elf_buffer_shared = saved_is_elf_buffer_shared;
 
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
-            task->deferredTaskSwitch = true;
-            task->yieldSwitch = false;
+            task->deferred_task_switch = true;
+            task->yield_switch = false;
             task->wait_channel = "wki_execve_proxy";
             free_kernel_arg_env_once();
             return 0;
@@ -793,10 +793,10 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // --- Replace the pagemap with a fresh one ---
     // Note: We are executing in kernel context (syscall handler) so our
     // kernel mappings are active. We'll create a new user pagemap.
-    uint8_t* old_elf_buffer = task->elfBuffer;
+    uint8_t* old_elf_buffer = task->elf_buffer;
     auto* old_pagemap = task->pagemap;
     auto* old_thread = task->thread;
-    auto* new_pagemap = mm::virt::createPagemap();
+    auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
         delete[] elf_buffer;
         free_kernel_arg_env_once();
@@ -805,23 +805,23 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     {
         sched::task::Task pagemap_task{};
         pagemap_task.pagemap = new_pagemap;
-        mm::virt::copyKernelMappings(&pagemap_task);
+        mm::virt::copy_kernel_mappings(&pagemap_task);
     }
 
     // --- Create new thread (user stack + TLS) ---
-    ker::loader::elf::TlsModule tls_info = loader::elf::extractTlsInfo((void*)(uint64_t)elf_buffer);
-    auto* new_thread = mod::sched::threading::createThread(USER_STACK_SIZE, tls_info.tlsSize, new_pagemap, tls_info);
+    ker::loader::elf::TlsModule tls_info = loader::elf::extract_tls_info((void*)(uint64_t)elf_buffer);
+    auto* new_thread = mod::sched::threading::create_thread(USER_STACK_SIZE, tls_info.tlsSize, new_pagemap, tls_info);
     char* new_name = nullptr;
     auto cleanup_new_image = [&]() {
         if (new_pagemap != nullptr) {
-            mm::virt::destroyUserSpace(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
-            mm::phys::pageFree(new_pagemap);
+            mm::virt::destroy_user_space(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
+            mm::phys::page_free(new_pagemap);
             new_pagemap = nullptr;
         }
         if (new_thread != nullptr) {
-            new_thread->tlsPhysPtr = 0;
-            new_thread->stackPhysPtr = 0;
-            mod::sched::threading::destroyThread(new_thread);
+            new_thread->tls_phys_ptr = 0;
+            new_thread->stack_phys_ptr = 0;
+            mod::sched::threading::destroy_thread(new_thread);
             new_thread = nullptr;
         }
         if (new_name != nullptr) {
@@ -843,11 +843,11 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // so we must discard the old image's symbol metadata before registering the
     // new ELF or lookups like __safestack_unsafe_stack_ptr can resolve against
     // stale offsets from the previous process image.
-    loader::debug::unregisterProcess(task->pid);
+    loader::debug::unregister_process(task->pid);
 
     // --- Load ELF into new pagemap ---
     loader::elf::ElfLoadResult elf_result =
-        loader::elf::loadElf((loader::elf::ElfFile*)(uint64_t)elf_buffer, new_pagemap, task->pid, task->name);
+        loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)elf_buffer, new_pagemap, task->pid, task->name);
     if (elf_result.entryPoint == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
@@ -899,7 +899,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         loader::elf::ElfLoadResult interp_result =
-            loader::elf::loadElf((loader::elf::ElfFile*)(uint64_t)interp_buf, new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
+            loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)interp_buf, new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
 
         if (interp_result.entryPoint == 0) {
             delete[] interp_buf;
@@ -1123,13 +1123,13 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
 
     task->entry = new_exec_entry;
-    task->programHeaderAddr = new_program_header_addr;
-    task->elfHeaderAddr = new_elf_header_addr;
-    task->programHeaderCount = new_program_header_count;
-    task->programHeaderEntSize = new_program_header_ent_size;
-    task->elfBuffer = elf_buffer;
-    task->elfBufferSize = file_size;
-    task->interpBase = new_interp_base;
+    task->program_header_addr = new_program_header_addr;
+    task->elf_header_addr = new_elf_header_addr;
+    task->program_header_count = new_program_header_count;
+    task->program_header_ent_size = new_program_header_ent_size;
+    task->elf_buffer = elf_buffer;
+    task->elf_buffer_size = file_size;
+    task->interp_base = new_interp_base;
 
     {
         size_t path_len = std::strlen(path);
@@ -1158,10 +1158,10 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
     }
 
-    task->sigPending = 0;
-    task->inSignalHandler = false;
-    task->doSigreturn = false;
-    for (auto& sh : task->sigHandlers) {
+    task->sig_pending = 0;
+    task->in_signal_handler = false;
+    task->do_sigreturn = false;
+    for (auto& sh : task->sig_handlers) {
         sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
     }
 
@@ -1184,8 +1184,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     task->context.frame.ss = 0x1b;
     task->context.frame.cs = 0x23;
     task->context.frame.flags = 0x202;
-    task->context.frame.intNum = 0;
-    task->context.frame.errCode = 0;
+    task->context.frame.int_num = 0;
+    task->context.frame.err_code = 0;
 
     // Match the fresh-process entry contract used by _wOS_asm_enterUsermode:
     // startup code consumes argc/argv/envp from the initial stack, not GPRs.
@@ -1208,13 +1208,13 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
 
     // Initialize SafeStack TLS symbol if present
-    auto* ssym = loader::debug::getProcessSymbol(task->pid, "__safestack_unsafe_stack_ptr");
-    if (new_thread != nullptr && (ssym != nullptr) && ssym->isTlsOffset) {
-        uint64_t dest_vaddr = new_thread->tlsBaseVirt + ssym->rawValue;
+    auto* ssym = loader::debug::get_process_symbol(task->pid, "__safestack_unsafe_stack_ptr");
+    if (new_thread != nullptr && (ssym != nullptr) && ssym->is_tls_offset) {
+        uint64_t dest_vaddr = new_thread->tls_base_virt + ssym->raw_value;
         uint64_t dest_paddr = mm::virt::translate(new_pagemap, dest_vaddr);
         if (dest_paddr != mm::virt::PADDR_INVALID) {
             auto* dest_ptr = (uint64_t*)mm::addr::get_virt_pointer(dest_paddr);
-            *dest_ptr = new_thread->safestackPtrValue;
+            *dest_ptr = new_thread->safestack_ptr_value;
         }
     }
 
@@ -1224,7 +1224,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // immediately fault in the new process when libc touches TLS.
     if (new_thread != nullptr) {
         cpu::wrfsbase(new_thread->fsbase);
-        cpuSetMSR(IA32_KERNEL_GS_BASE, new_thread->gsbase);
+        cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
     }
 
     // execve() replaces the current image in-place, so the old address space
@@ -1232,15 +1232,15 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // task GC. Otherwise each successful exec leaks another user stack/TLS set
     // plus the old pagemap's user pages.
     if (old_pagemap != nullptr && old_pagemap != new_pagemap) {
-        mm::virt::switchToKernelPagemap();
-        mm::virt::destroyUserSpace(old_pagemap, task->pid, task->name, "exec-old-image");
-        mm::phys::pageFree(old_pagemap);
+        mm::virt::switch_to_kernel_pagemap();
+        mm::virt::destroy_user_space(old_pagemap, task->pid, task->name, "exec-old-image");
+        mm::phys::page_free(old_pagemap);
         old_pagemap = nullptr;
     }
     if (old_thread != nullptr && old_thread != new_thread) {
-        old_thread->tlsPhysPtr = 0;
-        old_thread->stackPhysPtr = 0;
-        mod::sched::threading::destroyThread(old_thread);
+        old_thread->tls_phys_ptr = 0;
+        old_thread->stack_phys_ptr = 0;
+        mod::sched::threading::destroy_thread(old_thread);
     }
 
     task->pagemap = new_pagemap;

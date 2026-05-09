@@ -17,24 +17,24 @@ const uint64_t MADT_TYPE_LAPIC_X2APIC = 9;
 struct IOApic {
     uint8_t type;
     uint8_t length;
-    uint8_t ioApicId;
+    uint8_t io_apic_id;
     uint8_t reserved;
-    uint32_t ioApicAddr;
-    uint32_t globalSysIntBase;
+    uint32_t io_apic_addr;
+    uint32_t global_sys_int_base;
 } __attribute__((packed));
 
 struct LAPIC {
     uint8_t type;
     uint8_t length;
-    uint8_t acpiProcessorId;
-    uint8_t apicId;
+    uint8_t acpi_processor_id;
+    uint8_t apic_id;
     uint32_t flags;
 } __attribute__((packed));
 
 struct LAPICNMI {
     uint8_t type;
     uint8_t length;
-    uint8_t acpiProcessorId;
+    uint8_t acpi_processor_id;
     uint16_t flags;
     uint8_t lint;
 } __attribute__((packed));
@@ -44,7 +44,7 @@ struct LAPICIntSrcOverride {
     uint8_t length;
     uint8_t bus;
     uint8_t source;
-    uint32_t globalSysInt;
+    uint32_t global_sys_int;
     uint16_t flags;
 } __attribute__((packed));
 
@@ -52,9 +52,9 @@ struct X2APIC {
     uint8_t type;
     uint8_t length;
     uint16_t reserved;
-    uint32_t x2apicId;
+    uint32_t x2apic_id;
     uint32_t flags;
-    uint32_t acpiProcessorUid;
+    uint32_t acpi_processor_uid;
 } __attribute__((packed));
 
 struct APICRecord {
@@ -64,23 +64,23 @@ struct APICRecord {
 
 struct MultiApicTable {
     Sdt sdt;
-    uint32_t localApicAddr;
-    uint32_t localApicFlags;
+    uint32_t local_apic_addr;
+    uint32_t local_apic_flags;
 } __attribute__((packed));
 struct ApicInfo {
-    uint64_t lapicAddr;
-    uint32_t usableIOAPICs;
+    uint64_t lapic_addr;
+    uint32_t usable_ioapics;
     IOApic ioapics[512];
-    uint32_t usableLAPICs;
+    uint32_t usable_lapics;
     LAPIC lapics[512];
-    uint32_t usableLAPICNMIs;
-    LAPICNMI lapicNMIs[512];
-    uint32_t usableIOAPICISOs;
-    LAPICIntSrcOverride ioapicISOs[512];
-    uint32_t usableX2APICs;
+    uint32_t usable_lapic_nmis;
+    LAPICNMI lapic_nmis[512];
+    uint32_t usable_ioapic_isos;
+    LAPICIntSrcOverride ioapic_isos[512];
+    uint32_t usable_x2_apics;
     X2APIC x2apics[512];
 } __attribute__((packed));
 
-ApicInfo parseMadt(void* madt);
-auto getApicInfo() -> const ApicInfo&;
+ApicInfo parse_madt(void* madt);
+auto get_apic_info() -> const ApicInfo&;
 }  // namespace ker::mod::acpi::madt

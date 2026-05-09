@@ -361,8 +361,7 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
     fill_net_state_payload(*state, snap);
 
     for (size_t i = 0; i < target_count; i++) {
-        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, msg.data(),
-                 static_cast<uint16_t>(msg.size()));
+        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     }
 }
 

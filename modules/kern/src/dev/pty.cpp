@@ -149,7 +149,7 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sigPending & ~task->sigMask) != 0;
+    return (task->sig_pending & ~task->sig_mask) != 0;
 }
 
 void pty_unregister_slave(PtyPair* pair) {
@@ -202,7 +202,7 @@ auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* w
         return false;
     }
     current_task->wait_channel = wchan;
-    current_task->deferredTaskSwitch = true;
+    current_task->deferred_task_switch = true;
     return true;
 }
 
@@ -212,9 +212,9 @@ void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
         if (waiter == nullptr) {
             continue;
         }
-        waiter->deferredTaskSwitch = false;
+        waiter->deferred_task_switch = false;
         uint64_t target_cpu = waiter->cpu;
-        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
             target_cpu = ker::mod::sched::get_least_loaded_cpu();
         }
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);

@@ -61,7 +61,7 @@ size_t device_count = 0;
 auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
     if (addr >= mod::mm::addr::get_hhdm_offset()) {
-        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
             net_log::error("virt_to_phys: failed for kernel address 0x%lx", addr);
             hcf();
@@ -317,7 +317,7 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev) -> bool {
     }
 
     // Allocate a DMA-accessible page: [class][cmd][pairs_lo][pairs_hi][ack]
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::phys::pageAlloc(4096));
+    auto* buf = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(4096));
     if (buf == nullptr) {
         return false;
     }
@@ -355,8 +355,8 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev) -> bool {
     // processing our ctrl-queue kick, creating a self-inflicted timeout.
     // 5 s covers any host scheduler latency during early boot.
     constexpr uint64_t CTRL_ACK_TIMEOUT_MS = 5000;
-    uint64_t deadline_ms = ker::mod::time::getMs() + CTRL_ACK_TIMEOUT_MS;
-    while (ker::mod::time::getMs() < deadline_ms) {
+    uint64_t deadline_ms = ker::mod::time::get_ms() + CTRL_ACK_TIMEOUT_MS;
+    while (ker::mod::time::get_ms() < deadline_ms) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (ctrlq->used->idx != 0) {
             return buf[4] == VIRTIO_NET_OK;  // buf leaked intentionally (init-time, 1 page)
@@ -658,7 +658,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint64_t net_cpu0 = (core_count > 1U) ? (core_count - 1U) : 0U;
     uint64_t net_cpu1 = (core_count >= 2U) ? (core_count - 2U) : net_cpu0;
 
-    uint8_t vector = ker::mod::gates::allocateVector();
+    uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         net_log::error("no free IRQ vector");
         cfg->device_status = VIRTIO_STATUS_FAILED;
@@ -669,7 +669,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     uint8_t vector2 = 0;
     if (want_mq) {
-        vector2 = ker::mod::gates::allocateVector();
+        vector2 = ker::mod::gates::allocate_vector();
         if (vector2 == 0) {
             net_log::warn("no second IRQ vector, disabling MQ");
             want_mq = false;
@@ -739,9 +739,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         }
     }
 
-    ker::mod::gates::requestIrq(vector, virtio_net_irq, dev, "virtio-net");
+    ker::mod::gates::request_irq(vector, virtio_net_irq, dev, "virtio-net");
     if (dev->num_queue_pairs == 2 && dev->irq_vector2 != 0) {
-        ker::mod::gates::requestIrq(dev->irq_vector2, virtio_net_irq2, dev, "virtio-net-1");
+        ker::mod::gates::request_irq(dev->irq_vector2, virtio_net_irq2, dev, "virtio-net-1");
     }
 
     cfg->device_status =
@@ -943,7 +943,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
 
     // Try MSI-X first (needed for per-pair CPU steering), then MSI, then INTx.
-    uint8_t vector = ker::mod::gates::allocateVector();
+    uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         net_log::error("no free IRQ vector");
         write_status(io_base, VIRTIO_STATUS_FAILED);
@@ -959,7 +959,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     // Allocate a second IRQ vector for queue pair 1 if MQ is desired.
     uint8_t vector2 = 0;
     if (want_mq) {
-        vector2 = ker::mod::gates::allocateVector();
+        vector2 = ker::mod::gates::allocate_vector();
         if (vector2 == 0) {
             net_log::warn("no second IRQ vector, disabling MQ");
             want_mq = false;
@@ -1045,9 +1045,9 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         }
     }
 
-    ker::mod::gates::requestIrq(vector, virtio_net_irq, dev, "virtio-net");
+    ker::mod::gates::request_irq(vector, virtio_net_irq, dev, "virtio-net");
     if (dev->num_queue_pairs == 2 && dev->irq_vector2 != 0) {
-        ker::mod::gates::requestIrq(dev->irq_vector2, virtio_net_irq2, dev, "virtio-net-1");
+        ker::mod::gates::request_irq(dev->irq_vector2, virtio_net_irq2, dev, "virtio-net-1");
     }
 
     write_status(io_base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);

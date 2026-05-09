@@ -131,7 +131,7 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     s_shadow_fault_cpus.fetch_or(cpu_bit, std::memory_order_acquire);
 
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
-    void* phys_page = mm::phys::pageAlloc(mm::paging::PAGE_SIZE, SOURCE);
+    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
     if (phys_page == nullptr) {
         dbg::log("[KASan] OOM allocating shadow page for cr2=0x%lx", cr2);
         s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
@@ -149,7 +149,7 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     }
 
     // Another CPU may have already mapped this shadow page while we waited.
-    auto* kernel_pt = mm::virt::getKernelPagemap();
+    auto* kernel_pt = mm::virt::get_kernel_pagemap();
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
         s_shadow_map_lock.clear(std::memory_order_release);
         uint64_t dups = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -164,12 +164,12 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
                 gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
         }
         sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
-        mm::phys::pageFree(phys_page);
+        mm::phys::page_free(phys_page);
         s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
         return true;
     }
 
-    mm::virt::mapToKernelPageTable(shadow_vaddr, shadow_paddr, mm::paging::pageTypes::KERNEL);
+    mm::virt::map_to_kernel_page_table(shadow_vaddr, shadow_paddr, mm::paging::page_types::KERNEL);
     s_shadow_map_lock.clear(std::memory_order_release);
     sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
 

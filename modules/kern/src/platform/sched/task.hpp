@@ -48,13 +48,13 @@ enum class TaskState : uint32_t {
 };
 
 struct Context {
-    uint64_t syscallKernelStack;
-    uint64_t syscallScratchArea;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
+    uint64_t syscall_kernel_stack;
+    uint64_t syscall_scratch_area;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
 
     cpu::GPRegs regs;
 
-    uint64_t intNo;
-    uint64_t errorCode;
+    uint64_t int_no;
+    uint64_t error_code;
 
     gates::interruptFrame frame;
 } __attribute__((packed));
@@ -64,17 +64,17 @@ struct Context {
 // inside the buffer, regardless of the Task allocation's alignment.
 struct FxState {
     uint8_t raw[2688 + 63] = {};
-    bool saved = false;  // true after first saveFpuState - guards xrstor on zeroed buffer
+    bool saved = false;  // true after first save_fpu_state - guards xrstor on zeroed buffer
 
     // Return a pointer to the 64-byte-aligned region within raw[].
     uint8_t* aligned() {
         auto addr = reinterpret_cast<uintptr_t>(raw);
-        addr = (addr + 63) & ~uintptr_t(63);
+        addr = (addr + 63) & ~static_cast<uintptr_t>(63);
         return reinterpret_cast<uint8_t*>(addr);
     }
-    const uint8_t* aligned() const {
+    [[nodiscard]] const uint8_t* aligned() const {
         auto addr = reinterpret_cast<uintptr_t>(raw);
-        addr = (addr + 63) & ~uintptr_t(63);
+        addr = (addr + 63) & ~static_cast<uintptr_t>(63);
         return reinterpret_cast<const uint8_t*>(addr);
     }
 };
@@ -83,17 +83,17 @@ struct Task {
     Task(Task&&) = delete;
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
-    Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type);
+    Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type);
 
     // Factory for kernel threads (DAEMON tasks).
     // entryFunc: [[noreturn]] void func() - the kernel thread body.
-    static auto createKernelThread(const char* name, void (*entryFunc)()) -> Task*;
+    static auto create_kernel_thread(const char* name, void (*entry_func)()) -> Task*;
 
     // Factory for userspace threads (PROCESS tasks that share the parent's pagemap).
     // tcbVaddr: virtual address of the mlibc TCB (becomes FS base / fsbase).
     // userSp:   prepared stack pointer (sys_prepare_stack pushed entry+user_arg below it).
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
-    static auto createUserThread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa) -> Task*;
+    static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) -> Task*;
 
     Task(const Task& task) = delete;
 
@@ -101,15 +101,15 @@ struct Task {
     // Used only by createUserThread; callers must fill in all required fields.
     Task() = default;
 
-    mm::paging::PageTable* pagemap;
-    Context context;
-    FxState fxState;  // FPU/SSE register state (fxsave/fxrstor on context switch)
-    uint64_t entry;
-    void (*kthreadEntry)();  // Kernel thread entry (DAEMON only), nullptr otherwise
+    mm::paging::PageTable* pagemap{};
+    Context context{};
+    FxState fx_state;  // FPU/SSE register state (fxsave/fxrstor on context switch)
+    uint64_t entry{};
+    void (*kthread_entry)(){};  // Kernel thread entry (DAEMON only), nullptr otherwise
 
-    const char* name;
+    const char* name{};
     TaskType type;
-    uint64_t cpu;
+    uint64_t cpu{};
     bool cpu_pinned = false;  // When true, scheduler will not migrate this task to another CPU
     // CPU domain affinity (Phase 1 - CPU domain infrastructure)
     // domain_id: which domain this task belongs to (0 = ROOT, any CPU allowed)
@@ -118,24 +118,24 @@ struct Task {
     uint32_t domain_id = 0;
     uint64_t domain_mask = ~0ULL;
     bool domain_hard = false;
-    threading::Thread* thread;
-    uint64_t pid;
-    uint64_t parentPid;  // Parent process ID (0 for orphaned/init processes)
+    threading::Thread* thread{};
+    uint64_t pid{};
+    uint64_t parent_pid{};  // Parent process ID (0 for orphaned/init processes)
 
     // has the task run at least once
-    bool hasRun;
+    bool has_run{};
 
     // ELF buffer for cleanup
-    uint8_t* elfBuffer;
-    size_t elfBufferSize;
-    bool isElfBufferShared = false;  // True if buffer is from shared cache, don't delete[]
+    uint8_t* elf_buffer{};
+    size_t elf_buffer_size{};
+    bool is_elf_buffer_shared = false;  // True if buffer is from shared cache, don't delete[]
 
     // ELF metadata for auxv setup
-    uint64_t programHeaderAddr;         // Virtual address of program headers (AT_PHDR)
-    uint64_t elfHeaderAddr;             // Virtual address of ELF header (AT_EHDR)
-    uint16_t programHeaderCount = 0;    // Number of program headers (AT_PHNUM)
-    uint16_t programHeaderEntSize = 0;  // Size of each program header entry (AT_PHENT)
-    uint64_t interpBase = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    uint64_t program_header_addr{};        // Virtual address of program headers (AT_PHDR)
+    uint64_t elf_header_addr{};            // Virtual address of ELF header (AT_EHDR)
+    uint16_t program_header_count = 0;     // Number of program headers (AT_PHNUM)
+    uint16_t program_header_ent_size = 0;  // Size of each program header entry (AT_PHENT)
+    uint64_t interp_base = 0;              // Load base of dynamic linker (AT_BASE), 0 if statically linked
 
     // File descriptor table for the task (per-process model).
     // Dynamic radix tree: no fixed upper bound on FD count.
@@ -147,14 +147,20 @@ struct Task {
     // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
     uint64_t fd_cloexec[FD_TABLE_SIZE / 64] = {};
 
-    inline void set_fd_cloexec(unsigned fd) {
-        if (fd < FD_TABLE_SIZE) fd_cloexec[fd / 64] |= (1ULL << (fd % 64));
+    void set_fd_cloexec(unsigned fd) {
+        if (fd < FD_TABLE_SIZE) {
+            fd_cloexec[fd / 64] |= (1ULL << (fd % 64));
+        }
     }
-    inline void clear_fd_cloexec(unsigned fd) {
-        if (fd < FD_TABLE_SIZE) fd_cloexec[fd / 64] &= ~(1ULL << (fd % 64));
+    void clear_fd_cloexec(unsigned fd) {
+        if (fd < FD_TABLE_SIZE) {
+            fd_cloexec[fd / 64] &= ~(1ULL << (fd % 64));
+        }
     }
-    [[nodiscard]] inline bool get_fd_cloexec(unsigned fd) const {
-        if (fd >= FD_TABLE_SIZE) return false;
+    [[nodiscard]] bool get_fd_cloexec(unsigned fd) const {
+        if (fd >= FD_TABLE_SIZE) {
+            return false;
+        }
         return (fd_cloexec[fd / 64] & (1ULL << (fd % 64))) != 0;
     }
 
@@ -172,11 +178,11 @@ struct Task {
 
     // True when this Task is a userspace thread (shares pagemap with owning process).
     // Thread exits must NOT free the pagemap or close shared FDs.
-    bool isThread = false;
+    bool is_thread = false;
 
     // PID of the process that owns this thread (set by createUserThread).
     // 0 for regular processes.
-    uint64_t ownerPid = 0;
+    uint64_t owner_pid = 0;
 
     // WKI: prefer inline delivery for remote compute placement (V2 A6.4)
     bool wki_prefer_inline = false;
@@ -230,56 +236,56 @@ struct Task {
     int controlling_tty = -1;
 
     // Exit status of this process (set when process exits, used by waitpid)
-    int exitStatus;
-    bool hasExited;
-    bool waitedOn;  // Set to true when parent retrieves exit status via waitpid
+    int exit_status{};
+    bool has_exited{};
+    bool waited_on{};  // Set to true when parent retrieves exit status via waitpid
 
     // List of task IDs waiting for this task to exit
     // When this task exits, all tasks in this list will be rescheduled on their respective CPUs
     // Protected by exitWaitersLock because waitpid() and exit paths touch it concurrently.
-    mod::sys::Spinlock exitWaitersLock;
+    mod::sys::Spinlock exit_waiters_lock;
     ker::util::SmallVec<uint64_t, 4> awaitee_on_exit;
 
     // Flag indicating that this task should be moved to wait queue after syscall returns
-    bool deferredTaskSwitch;
-    // When true, deferredTaskSwitch puts task in expired queue (yield) instead of wait queue (block)
-    bool yieldSwitch;
+    bool deferred_task_switch{};
+    // When true, deferred_task_switch puts task in expired queue (yield) instead of wait queue (block)
+    bool yield_switch{};
 
     // Set by reschedule_task_for_cpu when a wakeup fires while this task is
     // still currentTask (about to block via deferred_task_switch).  Checked
     // under the RQ lock in deferred_task_switch to avoid lost wakeups.
-    std::atomic<bool> wakeupPending{false};
+    std::atomic<bool> wakeup_pending{false};
 
     // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
     // in a syscall wait loop).  The scheduler may preempt it as if it were a DAEMON,
     // saving and restoring kernel-mode context.  Set before hlt, cleared after wake.
-    volatile bool voluntaryBlock = false;
+    volatile bool voluntary_block = false;
 
     // Plain spinlocks disable task preemption without masking interrupts.  This
     // keeps preemptible DAEMON/NAPI workers from being switched out while they
     // hold locks that other CPUs may spin on.
-    uint32_t preemptDisableDepth = 0;
-    bool preemptPending = false;
-    uint64_t preemptDisableStartUs = 0;
-    uint64_t preemptDisableMaxUs = 0;
-    uint64_t preemptDisableOwner = 0;
+    uint32_t preempt_disable_depth = 0;
+    bool preempt_pending = false;
+    uint64_t preempt_disable_start_us = 0;
+    uint64_t preempt_disable_max_us = 0;
+    uint64_t preempt_disable_owner = 0;
 
     // Waitpid state: when this task is waiting for another task to exit
-    uint64_t waitingForPid;          // PID we're waiting for (for waitpid return value)
-    uint64_t waitStatusUserAddr;     // Userspace virtual address of status variable (for waitpid)
-    uint64_t waitStatusPhysAddr;     // Last translated physical address (debug; may change after COW)
-    uint64_t waitRusageUserAddr;     // Userspace virtual address of rusage struct (for wait3/wait4)
-    uint64_t waitRusagePhysAddr;     // Last translated physical address (debug; may change after COW)
-    uint64_t waitResumeRipUserAddr;  // Userspace RIP expected when returning from waitpid
-    uint64_t waitResumeRipPhysAddr;  // Last translated physical address for waitResumeRipUserAddr
-    uint64_t waitResumeRspUserAddr;  // Userspace RSP expected when returning from waitpid
-    uint64_t waitResumeRspPhysAddr;  // Last translated physical address for waitResumeRspUserAddr (debug; may change after COW)
+    uint64_t waiting_for_pid{};            // PID we're waiting for (for waitpid return value)
+    uint64_t wait_status_user_addr{};      // Userspace virtual address of status variable (for waitpid)
+    uint64_t wait_status_phys_addr{};      // Last translated physical address (debug; may change after COW)
+    uint64_t wait_rusage_user_addr{};      // Userspace virtual address of rusage struct (for wait3/wait4)
+    uint64_t wait_rusage_phys_addr{};      // Last translated physical address (debug; may change after COW)
+    uint64_t wait_resume_rip_user_addr{};  // Userspace RIP expected when returning from waitpid
+    uint64_t wait_resume_rip_phys_addr{};  // Last translated physical address for wait_resume_rip_user_addr
+    uint64_t wait_resume_rsp_user_addr{};  // Userspace RSP expected when returning from waitpid
+    uint64_t wait_resume_rsp_phys_addr{};  // Last translated physical address for wait_resume_rsp_user_addr (debug; may change after COW)
 
     // --- Signal infrastructure ---
     // Bitmask of pending signals (bit N = signal N+1 is pending, signals 1-64)
-    uint64_t sigPending;
+    uint64_t sig_pending{};
     // Bitmask of blocked signals
-    uint64_t sigMask;
+    uint64_t sig_mask{};
 
     // Signal handler entry (matches Linux ABI struct sigaction layout)
     struct SigHandler {
@@ -289,127 +295,127 @@ struct Task {
         uint64_t mask;      // Additional signals to block during handler
     };
     static constexpr unsigned MAX_SIGNALS = 64;
-    SigHandler sigHandlers[MAX_SIGNALS];
+    SigHandler sig_handlers[MAX_SIGNALS]{};
 
     // Set to true when a signal handler frame is being delivered
-    bool inSignalHandler;
+    bool in_signal_handler{};
 
     // Set to true by sigreturn syscall; check_pending_signals will restore context
-    bool doSigreturn;
+    bool do_sigreturn{};
 
     // === Process time accounting (microseconds) ===
-    uint64_t start_time_us;   // Wall-clock time when task was created
-    uint64_t user_time_us;    // Cumulative user-mode CPU time (microseconds)
-    uint64_t system_time_us;  // Cumulative kernel-mode CPU time (microseconds)
+    uint64_t start_time_us{};   // Wall-clock time when task was created
+    uint64_t user_time_us{};    // Cumulative user-mode CPU time (microseconds)
+    uint64_t system_time_us{};  // Cumulative kernel-mode CPU time (microseconds)
 
     // === ITIMER_REAL (SIGALRM) state (microseconds, 0 = not armed) ===
-    uint64_t itimer_real_expire_us;    // Absolute HPET time when SIGALRM fires (0 = disarmed)
-    uint64_t itimer_real_interval_us;  // Reload interval after expiry (0 = one-shot)
+    uint64_t itimer_real_expire_us{};    // Absolute HPET time when SIGALRM fires (0 = disarmed)
+    uint64_t itimer_real_interval_us{};  // Reload interval after expiry (0 = one-shot)
 
     // === EEVDF scheduling fields ===
     // Virtual runtime: cumulative weighted CPU time consumed.
     // Advances by (actual_ns * 1024 / weight) each tick. Signed for wrap-safe comparison.
-    int64_t vruntime;
+    int64_t vruntime{};
 
     // Virtual deadline: vruntime + (sliceNs * 1024 / weight).
     // Tasks with earlier deadlines are scheduled first among eligible tasks.
-    int64_t vdeadline;
+    int64_t vdeadline{};
 
     // Task weight (nice-level analog). 1024 = default (nice 0).
-    uint32_t schedWeight;
+    uint32_t sched_weight{};
 
-    // POSIX nice value backing schedWeight for PROCESS tasks. Range [-20, 19].
-    int8_t schedNice = 0;
+    // POSIX nice value backing sched_weight for PROCESS tasks. Range [-20, 19].
+    int8_t sched_nice = 0;
 
     // Time slice in nanoseconds. Default 10ms.
-    uint32_t sliceNs;
+    uint32_t slice_ns{};
 
     // Accumulated wall-clock runtime within current slice (ns).
-    uint32_t sliceUsedNs;
+    uint32_t slice_used_ns{};
 
     // Index into the per-CPU RunHeap array. -1 if not in any heap.
-    int32_t heapIndex;
+    int32_t heap_index{};
 
     // Which scheduling queue the task is logically in.
-    enum class SchedQueue : uint8_t { NONE = 0, RUNNABLE = 1, WAITING = 2, DEAD_GC = 3 };
-    SchedQueue schedQueue;
+    enum class sched_queue : uint8_t { NONE = 0, RUNNABLE = 1, WAITING = 2, DEAD_GC = 3 };
+    sched_queue sched_queue;
 
     // Non-zero: task is in wait list sleeping until this absolute time (microseconds).
     // Set by nanosleep; cleared by the timer tick when the deadline is reached.
-    uint64_t wakeAtUs;
+    uint64_t wake_at_us{};
 
     // Absolute deadline for a restarted poll/epoll wait with a finite timeout.
     // Unlike wakeAtUs, this persists across scheduler wakeup so the restarted
     // syscall can return 0 once the original deadline has actually expired.
-    uint64_t pollWaitDeadlineUs = 0;
+    uint64_t poll_wait_deadline_us = 0;
 
     // Set by kern_block() to ask the timer interrupt to move this task to the
     // wait list on the next tick (under the run queue lock). Cleared by scheduler.
-    bool wantsBlock;
+    bool wants_block{};
 
     // Timestamp (us) when the task most recently entered the wait queue.
     // Used to distinguish short-sleep bursty wakeups from long-idle interactive wakes.
-    uint64_t lastSleepStartUs = 0;
+    uint64_t last_sleep_start_us = 0;
 
     // Runtime (us) consumed in the most recent execution burst before blocking.
     // Short-run + short-sleep tasks get a wakeup vruntime tax so they do not
     // rigidly alternate 50/50 with CPU-bound compute threads under contention.
-    uint32_t lastRunUs = 0;
+    uint32_t last_run_us = 0;
 
     // Duration (us) of the most recent sleep before the task woke.
     // Preserved across wakeup so preemption guards can distinguish bursty
     // service wakeups from long-idle interactive or compute tasks.
-    uint32_t lastSleepUs = 0;
+    uint32_t last_sleep_us = 0;
 
     // Timestamp (us) when the task last moved from WAITING to RUNNABLE.
-    // Used with lastRunUs/lastSleepUs to suppress short-sleep wakeups from
+    // Used with last_run_us/last_sleep_us to suppress short-sleep wakeups from
     // repeatedly cutting into a sustained compute slice.
-    uint64_t lastWakeUs = 0;
+    uint64_t last_wake_us = 0;
 
     // Most recent block/yield callsite used for perf wait-churn attribution.
-    uint64_t perfWaitCallsite = 0;
+    uint64_t perf_wait_callsite = 0;
 
     // Wait channel: human-readable string describing why the task is blocked.
-    // Set at every block site (deferredTaskSwitch, kern_block, kern_sleep_us).
+    // Set at every block site (deferred_task_switch, kern_block, kern_sleep_us).
     // Cleared when the task is rescheduled. Visible via /proc/<pid>/stat (wchan).
     const char* wait_channel = nullptr;
 
     // Owned futex waiter node while this task is blocked in futex_wait().
     // Wake and exit cleanup atomically exchange this pointer to guarantee the
     // waiter is detached and freed exactly once.
-    std::atomic<void*> futexWaiter{nullptr};
+    std::atomic<void*> futex_waiter{nullptr};
 
     // Set when a task transitions from the wait list to the runnable heap
     // (timer expiry or kern_wake).  process_tasks uses this to enforce a
     // minimum run-time granularity before a freshly-woken I/O task is allowed
     // to preempt the currently running compute task (wakeup-preemption guard).
     // Cleared on the first timer tick that fires while the task is running.
-    bool justWoke = false;
+    bool just_woke = false;
 
     // Intrusive list pointer for wait queue and dead list (zero allocations).
-    Task* schedNext;
+    Task* sched_next{};
 
     // Lock-free lifecycle management (epoch-based reclamation)
     // These must be aligned for atomic operations
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
-    alignas(4) std::atomic<uint32_t> refCount{1};    // Scheduler owns initial reference
-    alignas(8) std::atomic<uint64_t> deathEpoch{0};  // Epoch when task became DEAD
-    std::atomic<bool> gcQueued{false};               // True once the task has been handed to dead-list GC
+    alignas(4) std::atomic<uint32_t> ref_count{1};    // Scheduler owns initial reference
+    alignas(8) std::atomic<uint64_t> death_epoch{0};  // Epoch when task became DEAD
+    std::atomic<bool> gc_queued{false};               // True once the task has been handed to dead-list GC
 
-    void loadContext(cpu::GPRegs* gpr);
-    void saveContext(cpu::GPRegs* gpr);
+    void load_context(cpu::GPRegs* gpr);
+    void save_context(cpu::GPRegs* gpr);
 
     // Try to acquire a reference to this task.
     // Returns false if task is EXITING or DEAD.
     // Caller MUST call release() when done with the task pointer.
-    bool tryAcquire() {
-        uint32_t count = refCount.load(std::memory_order_acquire);
+    bool try_acquire() {
+        uint32_t count = ref_count.load(std::memory_order_acquire);
         while (count > 0) {
-            if (refCount.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (ref_count.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 // Double-check state after acquiring
-                TaskState s = state.load(std::memory_order_acquire);
+                TaskState const s = state.load(std::memory_order_acquire);
                 if (s == TaskState::DEAD || s == TaskState::EXITING) {
-                    refCount.fetch_sub(1, std::memory_order_release);
+                    ref_count.fetch_sub(1, std::memory_order_release);
                     return false;
                 }
                 return true;
@@ -419,13 +425,13 @@ struct Task {
     }
 
     // Release a reference to this task
-    void release() { refCount.fetch_sub(1, std::memory_order_acq_rel); }
+    void release() { ref_count.fetch_sub(1, std::memory_order_acq_rel); }
 
     // Atomically transition task state. Returns true if transition succeeded.
-    bool transitionState(TaskState from, TaskState to) {
+    bool transition_state(TaskState from, TaskState to) {
         return state.compare_exchange_strong(from, to, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 };  // Removed __attribute__((packed)) - was causing misalignment of atomic fields and potential corruption
 
-auto getNextPid() -> uint64_t;
+auto get_next_pid() -> uint64_t;
 }  // namespace ker::mod::sched::task

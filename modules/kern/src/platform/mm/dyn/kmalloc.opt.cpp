@@ -45,10 +45,10 @@ static std::atomic<bool> perCpuReady{false};  // Set after per-CPU structures ar
 // Safe CPU ID getter - falls back to APIC ID during early boot
 static inline uint64_t getCurrentCpuId() {
     if (perCpuReady.load(std::memory_order_acquire)) {
-        return cpu::currentCpu();
+        return cpu::current_cpu();
     }
     // Early boot: use APIC ID
-    uint32_t apicId = apic::getApicId();
+    uint32_t apicId = apic::get_apic_id();
     if (numCpus > 0) {
         uint64_t cpuIdx = smt::get_cpu_index_from_apic_id(apicId);
         return cpuIdx;
@@ -144,9 +144,9 @@ void init() {
     }
 }
 
-void enablePerCpuAllocations() { perCpuReady.store(true, std::memory_order_release); }
+void enable_per_cpu_allocations() { perCpuReady.store(true, std::memory_order_release); }
 
-void dumpTrackedAllocations() {
+void dump_tracked_allocations() {
     uint64_t mediumLockFlags = mediumAllocLock.lock_irqsave();
     uint64_t mediumTotalBytes = 0;
     uint64_t mediumCount = 0;
@@ -246,7 +246,7 @@ void dumpTrackedAllocations() {
 #endif
 }
 
-void getTrackedAllocTotals(uint64_t& outCount, uint64_t& outBytes) {
+void get_tracked_alloc_totals(uint64_t& outCount, uint64_t& outBytes) {
     outCount = 0;
     outBytes = 0;
 
@@ -378,7 +378,7 @@ static auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> voi
         ker::mod::io::serial::write(" bytes)\n");
 #endif
 
-        void* alloc_ptr = phys::pageAlloc(alloc_size);
+        void* alloc_ptr = phys::page_alloc(alloc_size);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
             ker::mod::io::serial::write("kmalloc: pageAlloc failed for medium allocation\n");
@@ -428,10 +428,10 @@ static auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> voi
 #endif
 
     // Allocate from huge page zone
-    void* alloc_ptr = phys::pageAllocHuge(alloc_size);
+    void* alloc_ptr = phys::page_alloc_huge(alloc_size);
     if (alloc_ptr == nullptr) {
         // Fallback to regular pageAlloc if huge zone is full
-        alloc_ptr = phys::pageAlloc(alloc_size);
+        alloc_ptr = phys::page_alloc(alloc_size);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
             ker::mod::io::serial::write("kmalloc: pageAlloc failed for large allocation\n");
@@ -675,9 +675,9 @@ auto realloc(void* ptr, int sz) -> void* {
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* newAlloc = phys::pageAllocHuge(newAllocSize);
+            void* newAlloc = phys::page_alloc_huge(newAllocSize);
             if (newAlloc == nullptr) {
-                newAlloc = phys::pageAlloc(newAllocSize);
+                newAlloc = phys::page_alloc(newAllocSize);
                 if (newAlloc == nullptr) {
                     return nullptr;
                 }
@@ -709,7 +709,7 @@ auto realloc(void* ptr, int sz) -> void* {
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
             newHeader->debug_idx = ALLOC_DEBUG_NONE;
 #endif
-            phys::pageFree(potentialLargeHeader);
+            phys::page_free(potentialLargeHeader);
             return static_cast<void*>(newHeader + 1);
         }
 
@@ -738,7 +738,7 @@ auto realloc(void* ptr, int sz) -> void* {
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* newAlloc = phys::pageAlloc(newAllocSize);
+            void* newAlloc = phys::page_alloc(newAllocSize);
             if (newAlloc == nullptr) {
                 return nullptr;
             }
@@ -769,7 +769,7 @@ auto realloc(void* ptr, int sz) -> void* {
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
             newHeader->debug_idx = ALLOC_DEBUG_NONE;
 #endif
-            phys::pageFree(potentialMediumHeader);
+            phys::page_free(potentialMediumHeader);
             return static_cast<void*>(newHeader + 1);
         }
 
@@ -872,7 +872,7 @@ void free(void* ptr) {
             // Poison entire allocation (header + user data) as freed.
             kasan::poison_range(static_cast<void*>(potential_large_header), size, kasan::SHADOW_HEAP_FREED);
 #endif
-            phys::pageFree(potential_large_header);  // Free from header, not data ptr
+            phys::page_free(potential_large_header);  // Free from header, not data ptr
             return;
         }
         if (r == TrackedFreeResult::DoubleFree) {
@@ -896,7 +896,7 @@ void free(void* ptr) {
 #ifdef WOS_KASAN
             kasan::poison_range(static_cast<void*>(potentialMediumHeader), size, kasan::SHADOW_HEAP_FREED);
 #endif
-            phys::pageFree(potentialMediumHeader);  // Free from header, not data ptr
+            phys::page_free(potentialMediumHeader);  // Free from header, not data ptr
             return;
         }
         if (r == TrackedFreeResult::DoubleFree) {

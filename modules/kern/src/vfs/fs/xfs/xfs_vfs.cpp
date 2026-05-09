@@ -216,11 +216,11 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 
         XfsBmapResult bmap{};
 #ifdef XFS_BENCH
-        uint64_t t0 = ker::mod::tsc::getNs();
+        uint64_t t0 = ker::mod::tsc::get_ns();
 #endif
         int ret = xfs_bmap_lookup(ip, file_block, &bmap);
 #ifdef XFS_BENCH
-        acc_bmap += ker::mod::tsc::getNs() - t0;
+        acc_bmap += ker::mod::tsc::get_ns() - t0;
 #endif
         if (ret < 0) {
             return (total_read > 0) ? static_cast<ssize_t>(total_read) : ret;
@@ -244,7 +244,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         size_t chunk = std::min(extent_bytes, remaining);
 
 #ifdef XFS_BENCH
-        t0 = ker::mod::tsc::getNs();
+        t0 = ker::mod::tsc::get_ns();
 #endif
         bool dma_safe_dst = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
         if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0 && dma_safe_dst) {
@@ -255,7 +255,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             size_t dev_count = chunk / ctx->device->block_size;
             BufHead* cache_bp = (dev_count <= 1) ? bread(ctx->device, dev_block) : bread_multi(ctx->device, dev_block, dev_count);
 #ifdef XFS_BENCH
-            acc_io += ker::mod::tsc::getNs() - t0;
+            acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             if (cache_bp != nullptr) {
                 std::memcpy(dst + total_read, cache_bp->data, chunk);
@@ -271,7 +271,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             chunk = std::min(ctx->block_size - block_off, remaining);
             BufHead* bp = xfs_buf_read(ctx, disk_block);
 #ifdef XFS_BENCH
-            acc_io += ker::mod::tsc::getNs() - t0;
+            acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             if (bp == nullptr) {
                 return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
@@ -403,11 +403,11 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
         XfsBmapResult bmap{};
 #ifdef XFS_BENCH
-        t0 = ker::mod::tsc::getNs();
+        t0 = ker::mod::tsc::get_ns();
 #endif
         int ret = xfs_bmap_lookup(ip, file_block, &bmap);
 #ifdef XFS_BENCH
-        acc_bmap += ker::mod::tsc::getNs() - t0;
+        acc_bmap += ker::mod::tsc::get_ns() - t0;
 #endif
         if (ret < 0) {
             break;
@@ -435,7 +435,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             }
 
 #ifdef XFS_BENCH
-            t0 = ker::mod::tsc::getNs();
+            t0 = ker::mod::tsc::get_ns();
 #endif
             XfsTransaction* tp = xfs_trans_alloc(ctx);
             if (tp == nullptr) {
@@ -482,7 +482,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
             ret = xfs_trans_commit(tp);
 #ifdef XFS_BENCH
-            acc_alloc += ker::mod::tsc::getNs() - t0;
+            acc_alloc += ker::mod::tsc::get_ns() - t0;
 #endif
             if (ret != 0) {
                 break;
@@ -502,20 +502,20 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 size_t slice_bytes = (slice_end > slice_start) ? (slice_end - slice_start) : 0;
 
 #ifdef XFS_BENCH
-                t0 = ker::mod::tsc::getNs();
+                t0 = ker::mod::tsc::get_ns();
 #endif
                 if (slice_bytes > 0) {
                     size_t slice_block_off = slice_start - extent_start;
                     if (!buffered_write(disk_block, slice_block_off, slice_bytes, slice_start - offset)) {
 #ifdef XFS_BENCH
-                        acc_io += ker::mod::tsc::getNs() - t0;
+                        acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
                         goto write_done;
                     }
                     total_written += slice_bytes;
                 }
 #ifdef XFS_BENCH
-                acc_io += ker::mod::tsc::getNs() - t0;
+                acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             }
         } else {
@@ -529,16 +529,16 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             size_t chunk = std::min(extent_bytes, count - total_written);
 
 #ifdef XFS_BENCH
-            t0 = ker::mod::tsc::getNs();
+            t0 = ker::mod::tsc::get_ns();
 #endif
             if (!buffered_write(disk_block, block_off, chunk, total_written)) {
 #ifdef XFS_BENCH
-                acc_io += ker::mod::tsc::getNs() - t0;
+                acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
                 break;
             }
 #ifdef XFS_BENCH
-            acc_io += ker::mod::tsc::getNs() - t0;
+            acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
 
             total_written += chunk;
@@ -558,7 +558,7 @@ write_done:
 
     if (ip->dirty) {
 #ifdef XFS_BENCH
-        t0 = ker::mod::tsc::getNs();
+        t0 = ker::mod::tsc::get_ns();
 #endif
         XfsTransaction* tp = xfs_trans_alloc(ctx);
         if (tp != nullptr) {
@@ -566,7 +566,7 @@ write_done:
             xfs_trans_commit(tp);
         }
 #ifdef XFS_BENCH
-        acc_ilog = ker::mod::tsc::getNs() - t0;
+        acc_ilog = ker::mod::tsc::get_ns() - t0;
 #endif
     }
 

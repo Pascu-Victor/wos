@@ -49,9 +49,7 @@ auto write_all(int fd, const void* buf, size_t count) -> bool {
     return true;
 }
 
-auto get_testprog_path() -> const char* {
-    return "/bin/testprog";
-}
+auto get_testprog_path() -> const char* { return "/bin/testprog"; }
 
 struct WorkerThreadArg {
     unsigned char* image;

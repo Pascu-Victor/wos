@@ -77,18 +77,16 @@ KTEST(Net, PseudoHeaderAllZero) {
 KTEST(Net, PseudoHeaderRoundTrip) {
     constexpr uint32_t SRC = 0x0A000001;  // 10.0.0.1
     constexpr uint32_t DST = 0x0A000002;  // 10.0.0.2
-    constexpr uint8_t  PROTO = 6;         // TCP
-    constexpr uint16_t LEN   = 2;         // 2 bytes of payload
+    constexpr uint8_t PROTO = 6;          // TCP
+    constexpr uint16_t LEN = 2;           // 2 bytes of payload
 
     static uint8_t segment[2] = {0x00, 0x00};  // 2-byte payload (all zero)
-    uint16_t cs = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN,
-                                                 static_cast<const void*>(segment), 2);
+    uint16_t cs = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(segment), 2);
     // Build a second segment where the first 2 bytes ARE the checksum:
     static uint8_t seg2[2];
     seg2[0] = static_cast<uint8_t>(cs & 0xFF);
     seg2[1] = static_cast<uint8_t>((cs >> 8) & 0xFF);
-    uint16_t verify = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN,
-                                                     static_cast<const void*>(seg2), 2);
+    uint16_t verify = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(seg2), 2);
     // After embedding the complement the sum must fold to 0x0000
     KEXPECT_EQ(verify, static_cast<uint16_t>(0x0000));
 }
@@ -103,7 +101,7 @@ static ker::net::PacketBuffer g_ktest_pkt;  // NOLINT
 KTEST(Net, PacketBufferPushPull) {
     // Reset to initial state
     g_ktest_pkt.data = &g_ktest_pkt.storage[ker::net::PKT_HEADROOM];
-    g_ktest_pkt.len  = 0;
+    g_ktest_pkt.len = 0;
 
     KEXPECT_EQ(g_ktest_pkt.headroom(), static_cast<size_t>(ker::net::PKT_HEADROOM));
     KEXPECT_EQ(g_ktest_pkt.len, static_cast<size_t>(0));
@@ -124,7 +122,7 @@ KTEST(Net, PacketBufferPushPull) {
 KTEST(Net, PacketBufferPut) {
     // Reset
     g_ktest_pkt.data = &g_ktest_pkt.storage[ker::net::PKT_HEADROOM];
-    g_ktest_pkt.len  = 0;
+    g_ktest_pkt.len = 0;
 
     // put 20 bytes (append IP header at tail)
     uint8_t* ip = g_ktest_pkt.put(20);

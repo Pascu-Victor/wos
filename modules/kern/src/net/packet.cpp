@@ -244,7 +244,7 @@ auto pkt_alloc() -> PacketBuffer* {
     pkt->dev = nullptr;
     pkt->protocol = 0;
     pkt->debug_in_use = true;
-    pkt->debug_alloc_cpu = static_cast<uint16_t>(ker::mod::cpu::currentCpu());
+    pkt->debug_alloc_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
     pkt->debug_alloc_seq = alloc_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     pkt->debug_alloc_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     pkt->debug_free_cpu = 0;
@@ -283,7 +283,7 @@ void pkt_free(PacketBuffer* pkt) {
     }
 
     pkt->debug_in_use = false;
-    pkt->debug_free_cpu = static_cast<uint16_t>(ker::mod::cpu::currentCpu());
+    pkt->debug_free_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
     pkt->debug_free_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     pkt_global_free(pkt);
     free_count.fetch_add(1, std::memory_order_relaxed);

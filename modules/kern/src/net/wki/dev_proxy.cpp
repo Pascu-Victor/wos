@@ -1544,7 +1544,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 
 #ifdef DEBUG_WKI_TRANSPORT
     ker::mod::dbg::log("[WKI-DBG] attach_block: starting attach to node=0x%04x res_id=%u cpu=%u proxies=%u", owner_node, resource_id,
-                       static_cast<unsigned>(ker::mod::cpu::currentCpu()), static_cast<unsigned>(g_proxies.size()));
+                       static_cast<unsigned>(ker::mod::cpu::current_cpu()), static_cast<unsigned>(g_proxies.size()));
 #endif
 
     constexpr int MAX_ATTACH_RETRIES = 3;
@@ -2391,7 +2391,7 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     // Find the pending attach for this owner node
     ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: searching %u proxies for node 0x%04x (cpu=%u)",
-                       static_cast<unsigned>(g_proxies.size()), hdr->src_node, static_cast<unsigned>(ker::mod::cpu::currentCpu()));
+                       static_cast<unsigned>(g_proxies.size()), hdr->src_node, static_cast<unsigned>(ker::mod::cpu::current_cpu()));
     for (size_t i = 0; i < g_proxies.size(); i++) {
         auto& p = g_proxies[i];
         ker::mod::dbg::log("[WKI-DBG]   proxy[%u]: owner=0x%04x attach_pending=%d active=%d", static_cast<unsigned>(i), p->owner_node,

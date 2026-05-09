@@ -66,8 +66,8 @@ auto send_socket_op(ProxyIpcState* proxy, uint16_t op_id) -> int {
 auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max)
     -> int;
 
-auto send_socket_op_sync(
-    ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max, uint16_t* resp_len_out) -> int {
+auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max,
+                         uint16_t* resp_len_out) -> int {
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
         return -EBADF;
     }
@@ -140,7 +140,8 @@ auto send_socket_op_sync(
     return status;
 }
 
-auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max) -> int {
+auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max)
+    -> int {
     return send_socket_op_sync(proxy, op_id, extra, extra_len, resp_buf, resp_max, nullptr);
 }
 
@@ -192,7 +193,7 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
             return 0;
         }
         task->wait_channel = "wki_proxy_sock";
-        task->deferredTaskSwitch = true;
+        task->deferred_task_switch = true;
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(irqf);
         return -512;  // ERESTARTSYS
@@ -315,8 +316,8 @@ auto wki_ipc_socket_getsockopt(ker::vfs::File* file, int level, int optname, voi
         static_cast<int32_t>(optname),
     };
     uint16_t resp_len = 0;
-    uint16_t resp_cap =
-        *optlen < static_cast<size_t>(std::numeric_limits<uint16_t>::max()) ? static_cast<uint16_t>(*optlen) : std::numeric_limits<uint16_t>::max();
+    uint16_t resp_cap = *optlen < static_cast<size_t>(std::numeric_limits<uint16_t>::max()) ? static_cast<uint16_t>(*optlen)
+                                                                                            : std::numeric_limits<uint16_t>::max();
     int rc = send_socket_op_sync(proxy, OP_SOCK_GETSOCKOPT, req.data(), static_cast<uint16_t>(sizeof(req)), optval, resp_cap, &resp_len);
     if (rc != 0) {
         return rc;

@@ -42,7 +42,7 @@ void init(void) {
         std::strcpy(__currentFont.name, "default");
         __currentFont.height = 16;
         __currentFont.width = 16;
-        __currentFont.loadFont();
+        __currentFont.load_font();
 
         clear(TERM_BG_COLOR);
     } else {

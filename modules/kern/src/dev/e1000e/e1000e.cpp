@@ -75,7 +75,7 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
 
     // Kernel virtual address (static data, BSS, etc.): use page table walk
     if (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL) {
-        auto* kernel_pt = ker::mod::mm::virt::getKernelPageTable();
+        auto* kernel_pt = ker::mod::mm::virt::get_kernel_page_table();
         uint64_t phys = ker::mod::mm::virt::translate(kernel_pt, addr);
         if (phys == ker::mod::mm::virt::PADDR_INVALID) {
             ker::mod::dbg::log("e1000e: virt_to_phys failed for kernel address 0x%lx", addr);
@@ -139,7 +139,7 @@ void read_mac(E1000Device* dev) {
 void init_rx(E1000Device* dev) {
     // Allocate descriptor ring (physically contiguous, 16-byte aligned)
     size_t ring_size = NUM_RX_DESC * sizeof(E1000RxDesc);
-    auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::pageAlloc(ring_size));
+    auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::page_alloc(ring_size));
     memset(descs, 0, ring_size);
     dev->rx_descs = descs;
 
@@ -175,7 +175,7 @@ void init_rx(E1000Device* dev) {
 // -- Initialize TX ring --------------------------------------------------
 void init_tx(E1000Device* dev) {
     size_t ring_size = NUM_TX_DESC * sizeof(E1000TxDesc);
-    auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::pageAlloc(ring_size));
+    auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::page_alloc(ring_size));
     memset(descs, 0, ring_size);
     dev->tx_descs = descs;
 
@@ -453,7 +453,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     init_tx(dev);
 
     // Set up interrupt
-    uint8_t vector = ker::mod::gates::allocateVector();
+    uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         ker::mod::dbg::log("e1000e: Failed to allocate IRQ vector");
         delete dev;
@@ -471,7 +471,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
         dev->irq_vector = vector;
     }
 
-    ker::mod::gates::requestIrq(vector, e1000_irq_handler, dev, "e1000e");
+    ker::mod::gates::request_irq(vector, e1000_irq_handler, dev, "e1000e");
 
     // Set up NetDevice
     dev->netdev.mtu = 1500;

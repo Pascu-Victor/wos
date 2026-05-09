@@ -31,9 +31,9 @@ void wake_socket(Socket* sock) {
         ker::mod::dbg::log("[tcp] wake_socket: pid=%lu task=%p", pid, static_cast<void*>(task));
 #endif
         if (task != nullptr) {
-            task->deferredTaskSwitch = false;
+            task->deferred_task_switch = false;
             uint64_t target_cpu = task->cpu;
-            if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
+            if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || task->voluntary_block) {
                 target_cpu = ker::mod::sched::get_least_loaded_cpu();
             }
 #ifdef TCP_DEBUG

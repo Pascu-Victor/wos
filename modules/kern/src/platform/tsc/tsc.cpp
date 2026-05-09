@@ -26,11 +26,11 @@ void init() {
     // Calibrate TSC frequency against HPET over a 10 ms window.
     // hpet::sleepUs uses the HPET counter directly so it is accurate
     // regardless of CPU frequency.
-    uint64_t hpet_start = hpet::getUs();
+    uint64_t hpet_start = hpet::get_us();
     uint64_t tsc_start = rdtsc();
-    hpet::sleepUs(10000);  // 10 ms
+    hpet::sleep_us(10000);  // 10 ms
     uint64_t tsc_delta = rdtsc() - tsc_start;
-    uint64_t elapsed_us = hpet::getUs() - hpet_start;
+    uint64_t elapsed_us = hpet::get_us() - hpet_start;
 
     if (elapsed_us == 0) {
         dbg::log("tsc: HPET calibration window returned 0 us; defaulting to 1 GHz");
@@ -43,9 +43,9 @@ void init() {
     dbg::log("tsc: calibrated at %lu MHz", (unsigned long)(tsc_hz / 1000000ULL));
 }
 
-uint64_t getHz() { return tsc_hz; }
+uint64_t get_hz() { return tsc_hz; }
 
-uint64_t ticksToNs(uint64_t delta) {
+uint64_t ticks_to_ns(uint64_t delta) {
     if (tsc_hz == 0) {
         return 0;
     }
@@ -55,6 +55,6 @@ uint64_t ticksToNs(uint64_t delta) {
     return (secs * 1000000000ULL) + ((rem * 1000000000ULL) / tsc_hz);
 }
 
-uint64_t getNs() { return ticksToNs(rdtsc() - tsc_base); }
+uint64_t get_ns() { return ticks_to_ns(rdtsc() - tsc_base); }
 
 }  // namespace ker::mod::tsc

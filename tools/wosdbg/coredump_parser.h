@@ -25,8 +25,8 @@ QString segmentTypeName(uint32_t type);
 
 // x86-64 interrupt frame - matches WOS kernel InterruptFrame layout
 struct InterruptFrame {
-    uint64_t intNum;
-    uint64_t errCode;
+    uint64_t int_num;
+    uint64_t err_code;
     uint64_t rip;
     uint64_t cs;
     uint64_t rflags;
@@ -78,8 +78,8 @@ struct CoreDump {
     uint64_t timestamp;
     uint64_t pid;
     uint64_t cpu;
-    uint64_t intNum;
-    uint64_t errCode;
+    uint64_t int_num;
+    uint64_t err_code;
     uint64_t cr2;
     uint64_t cr3;
 

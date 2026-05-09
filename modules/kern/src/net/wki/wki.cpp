@@ -138,7 +138,7 @@ void perf_record_transport_rtt(uint16_t peer, uint16_t channel, uint32_t correla
 // Time source
 // -----------------------------------------------------------------------------
 
-auto wki_now_us() -> uint64_t { return mod::time::getUs(); }
+auto wki_now_us() -> uint64_t { return mod::time::get_us(); }
 
 void wki_spin_yield() {
     // Drive inline NAPI poll so the NIC's RX queue is drained even when
@@ -392,7 +392,7 @@ void wki_init() {
 
     // Generate a random-ish node ID from lower bits of timestamp
     // Collision handled during HELLO handshake
-    uint64_t seed = ker::mod::time::getTicks();
+    uint64_t seed = ker::mod::time::get_ticks();
     auto id = static_cast<uint16_t>(seed ^ (seed >> 16) ^ (seed >> 32));
     if (id == WKI_NODE_INVALID || id == WKI_NODE_BROADCAST) {
         id = 0x0001;

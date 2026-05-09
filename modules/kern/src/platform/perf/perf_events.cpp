@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <platform/ktime/ktime.hpp>
 #include <platform/smt/smt.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::mod::perf {
 
@@ -448,7 +451,7 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
     ring.stats.samples++;  // always counted
     if (do_record) {
         PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::getMonotonicNs();
+        evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
         evt.data = rip;
         evt.lag_v = lag_v;
@@ -478,7 +481,7 @@ void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t f
     if (flags & PERF_FLAG_BLOCK) s.sleeps++;
     if (do_record) {
         PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::getMonotonicNs();
+        evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = prev_pid;
         evt.data = next_pid;
         evt.callsite = callsite;
@@ -506,7 +509,7 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
     ring.stats.wakes++;  // always counted
     if (do_record) {
         PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::getMonotonicNs();
+        evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
         evt.data = wake_at_us;
         evt.callsite = callsite;
@@ -534,7 +537,7 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
     ring.stats.sleeps++;  // always counted
     if (do_record) {
         PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::getMonotonicNs();
+        evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
         evt.data = wake_at_us;
         evt.callsite = callsite;
@@ -598,7 +601,7 @@ void record_container_stat(uint32_t cpu, uint64_t pid, PerfSubsystem subsystem, 
     auto saved = ring.lock.lock_irqsave();
 
     PerfEvent evt{};
-    evt.ts_ns = ker::mod::time::getMonotonicNs();
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = pid;
     // Pack subsystem (upper 32b) + instance_id (lower 32b) into data
     evt.data = (static_cast<uint64_t>(static_cast<uint8_t>(subsystem)) << 32) | static_cast<uint64_t>(instance_id);
@@ -662,7 +665,7 @@ void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op
     auto saved = ring.lock.lock_irqsave();
 
     PerfEvent evt{};
-    evt.ts_ns = ker::mod::time::getMonotonicNs();
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = pid;
     evt.data = wki_pack_event_data(scope, op, phase, peer, channel);
     evt.callsite = callsite;

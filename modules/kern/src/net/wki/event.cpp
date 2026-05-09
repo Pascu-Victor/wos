@@ -40,11 +40,11 @@ void perf_record_event_point(ker::mod::perf::WkiPerfEventOp op, uint16_t peer, i
     }
 
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
-                                     static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::POINT, peer, WKI_CHAN_EVENT_BUS,
-                                     correlation, status, aux, callsite);
+                                     static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::POINT, peer, WKI_CHAN_EVENT_BUS, correlation,
+                                     status, aux, callsite);
     uint32_t latency_us = (op == ker::mod::perf::WkiPerfEventOp::REPLAY) ? aux : 0U;
-    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS, static_cast<uint8_t>(op), peer, WKI_CHAN_EVENT_BUS,
-                                       status, latency_us, op == ker::mod::perf::WkiPerfEventOp::REPLAY,
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS, static_cast<uint8_t>(op), peer, WKI_CHAN_EVENT_BUS, status,
+                                       latency_us, op == ker::mod::perf::WkiPerfEventOp::REPLAY,
                                        op == ker::mod::perf::WkiPerfEventOp::RETRY ? 1U : 0U, 0);
 }
 
@@ -202,8 +202,8 @@ void wki_event_unsubscribe(uint16_t peer_node, uint16_t event_class, uint16_t ev
     unsub.event_id = event_id;
 
     wki_send(peer_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_UNSUBSCRIBE, &unsub, sizeof(unsub));
-    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, peer_node, 0, 0,
-                            ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, peer_node, 0, 0, ker::mod::perf::next_wki_trace_correlation(),
+                            WOS_PERF_CALLSITE());
 }
 
 // -----------------------------------------------------------------------------
@@ -434,8 +434,8 @@ void handle_event_unsubscribe(const WkiHeader* hdr, const uint8_t* payload, uint
     });
     s_event_lock.unlock();
 
-    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, hdr->src_node, 0, 0,
-                            ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, hdr->src_node, 0, 0, ker::mod::perf::next_wki_trace_correlation(),
+                            WOS_PERF_CALLSITE());
 
     ker::mod::dbg::log("[WKI] Event unsubscription: node=0x%04x class=0x%04x id=0x%04x", hdr->src_node, unsub->event_class,
                        unsub->event_id);
@@ -512,12 +512,11 @@ void handle_event_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 
     if (correlation != 0) {
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
-                                         static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK),
-                                         ker::mod::perf::WkiPerfPhase::END, hdr->src_node, WKI_CHAN_EVENT_BUS, correlation, 0,
-                                         latency_us, WOS_PERF_CALLSITE());
+                                         static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK), ker::mod::perf::WkiPerfPhase::END,
+                                         hdr->src_node, WKI_CHAN_EVENT_BUS, correlation, 0, latency_us, WOS_PERF_CALLSITE());
         ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS,
-                                           static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK), hdr->src_node,
-                                           WKI_CHAN_EVENT_BUS, 0, latency_us, true, 0, 0);
+                                           static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK), hdr->src_node, WKI_CHAN_EVENT_BUS, 0,
+                                           latency_us, true, 0, 0);
     }
 }
 

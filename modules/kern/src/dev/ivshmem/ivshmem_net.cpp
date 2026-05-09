@@ -255,7 +255,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     }
 
     // Set up IRQ
-    uint8_t vector = ker::mod::gates::allocateVector();
+    uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector != 0) {
         idev->irq_vector = vector;
         int msi_ret = pci::pci_enable_msi(pci_dev, vector);
@@ -263,7 +263,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
             vector = pci_dev->interrupt_line + 32;
             idev->irq_vector = vector;
         }
-        ker::mod::gates::requestIrq(vector, ivshmem_irq, idev, "ivshmem-net");
+        ker::mod::gates::request_irq(vector, ivshmem_irq, idev, "ivshmem-net");
         // Enable interrupts
         regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
     }

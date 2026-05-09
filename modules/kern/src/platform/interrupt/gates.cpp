@@ -77,7 +77,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // (especially COW resolution) are normal concurrent events. If two CPUs
     // hit a COW fault at the same time the old code would make the second CPU
     // think it was a nested panic and halt.
-    if (frame.intNum == 14) {
+    if (frame.int_num == 14) {
         uint64_t cr2 = cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
 
@@ -110,23 +110,23 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         auto* current_task_for_dump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
-        uint32_t apic_id = apic::getApicId();
+        uint32_t apic_id = apic::get_apic_id();
         uint64_t cpu_id_from_apic = smt::get_cpu_index_from_apic_id(apic_id);
         journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apic_id, cpu_id_from_apic,
                       current_task_for_dump, (current_task_for_dump != nullptr) ? current_task_for_dump->pid : 0xDEAD, cr3,
                       (current_task_for_dump != nullptr) ? (void*)current_task_for_dump->pagemap : nullptr);
 
-        ker::mod::dbg::coredump::tryWriteForTask(current_task_for_dump, gpr, frame, cr2, cr3, apic::getApicId());
+        ker::mod::dbg::coredump::tryWriteForTask(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
 
-        if (frame.intNum == 14) {
-            journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.errCode, frame.rip, frame.rsp,
+        if (frame.int_num == 14) {
+            journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.err_code, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
             if (current_task_for_dump != nullptr) {
                 bool ret_slot_matches_rip = false;
                 journal::warn(" task_ctx: saved_rip=0x%lx saved_rsp=0x%lx entry=0x%lx thread=%p scratch=%p",
                               current_task_for_dump->context.frame.rip, current_task_for_dump->context.frame.rsp,
                               current_task_for_dump->entry, current_task_for_dump->thread,
-                              reinterpret_cast<void*>(current_task_for_dump->context.syscallScratchArea));
+                              reinterpret_cast<void*>(current_task_for_dump->context.syscall_scratch_area));
                 if (current_task_for_dump->pagemap != nullptr) {
                     const uint64_t RSP_PHYS = ker::mod::mm::virt::translate(current_task_for_dump->pagemap, frame.rsp);
                     const uint64_t RET_SLOT_VA = (frame.rsp >= sizeof(uint64_t)) ? (frame.rsp - sizeof(uint64_t)) : frame.rsp;
@@ -161,16 +161,16 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
                         uint64_t stack_pte_raw = 0;
                         __builtin_memcpy(&stack_pte_raw, stack_pte, sizeof(stack_pte_raw));
                         const bool STACK_COW = (stack_pte_raw & ker::mod::mm::paging::PAGE_COW) != 0U;
-                        const auto STACK_REF =
-                            ker::mod::mm::phys::pageRefGet(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(STACK_PAGE_PHYS)));
+                        const auto STACK_REF = ker::mod::mm::phys::page_ref_get(
+                            reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(STACK_PAGE_PHYS)));
                         journal::warn(" stack_pte: vaddr=0x%lx phys=0x%lx user=%u rw=%u nx=%u cow=%u ref=%llu",
                                       frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1), STACK_PAGE_PHYS, stack_pte->user,
-                                      stack_pte->writable, stack_pte->noExecute, STACK_COW ? 1U : 0U,
+                                      stack_pte->writable, stack_pte->no_execute, STACK_COW ? 1U : 0U,
                                       static_cast<unsigned long long>(STACK_REF));
 
                         if (ret_slot_matches_rip) {
-                            ker::mod::mm::virt::debugLogUserPhysMappings(STACK_PAGE_PHYS, "userfault-stack-ret", current_task_for_dump->pid,
-                                                                         current_task_for_dump->name, true);
+                            ker::mod::mm::virt::debug_log_user_phys_mappings(STACK_PAGE_PHYS, "userfault-stack-ret",
+                                                                             current_task_for_dump->pid, current_task_for_dump->name, true);
                         }
                     } else {
                         journal::warn(" stack_pte: vaddr=0x%lx unmapped", frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
@@ -196,7 +196,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
                             (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << 12);
                         journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1->entries[IDX1].present,
                                       pml1->entries[IDX1].frame, pml1->entries[IDX1].user, pml1->entries[IDX1].writable,
-                                      pml1->entries[IDX1].noExecute);
+                                      pml1->entries[IDX1].no_execute);
                     }
                 }
             }
@@ -206,7 +206,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             __builtin_unreachable();
         }
 
-        if (frame.intNum == 1) {
+        if (frame.int_num == 1) {
             // Debug exception (hardware breakpoint or TF single-step).
             const uint64_t DR7_CLEAR = 0x400;       // bit 10 reserved=1, all enable bits=0
             const uint64_t DR6_CLEAR = 0xFFFF0FF0;  // reserved bits set, all status bits cleared
@@ -218,9 +218,9 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             __builtin_unreachable();
         }
 
-        journal::warn("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.intNum, frame.errCode, frame.rip,
+        journal::warn("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.int_num, frame.err_code, frame.rip,
                       (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
-        ker::syscall::process::wos_proc_exit(128 + (int)(frame.intNum & 0x7f));
+        ker::syscall::process::wos_proc_exit(128 + (int)(frame.int_num & 0x7f));
         __builtin_unreachable();
     }
 
@@ -229,13 +229,13 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // faulted while holding a spinlock (e.g., in pageAlloc).
     // Coredumps are only for userspace crashes, handled above.
     asm volatile("cli" ::: "memory");
-    apic::oneShotTimer(0);
+    apic::one_shot_timer(0);
 
     // Serialize all panicking CPUs: the first CPU owns the dump and halts the
     // rest.  If this CPU already owns the lock, this is a nested fault during
     // panic reporting; halt immediately.
     {
-        auto my_apic_id = static_cast<int64_t>(apic::getApicId());
+        auto my_apic_id = static_cast<int64_t>(apic::get_apic_id());
         if (panic_lock_owner.load(std::memory_order_acquire) == my_apic_id) {
             hcf();
         }
@@ -279,7 +279,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // Dump current task information - use getCurrentTask() instead of hardcoded address
     // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
-    uint64_t cpu_id = apic::getApicId();
+    uint64_t cpu_id = apic::get_apic_id();
     sched::task::Task* current_task = nullptr;
 
     if (!sched::has_run_queues()) {
@@ -335,7 +335,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         journal::panic("PID: 0x%x", current_task->pid);
         journal::panic("Type: 0x%x", (uint64_t)current_task->type);
         journal::panic("Entry: 0x%lx", current_task->entry);
-        journal::panic("KthreadEntry: 0x%lx", (uint64_t)current_task->kthreadEntry);
+        journal::panic("kthread_entry: 0x%lx", (uint64_t)current_task->kthread_entry);
         journal::panic("Pagemap: 0x%lx", (uint64_t)current_task->pagemap);
         journal::panic("Thread: 0x%lx", (uint64_t)current_task->thread);
 
@@ -347,14 +347,15 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
         journal::panic("  frame.flags: 0x%lx", current_task->context.frame.flags);
 
         journal::panic("Task Context:");
-        journal::panic("  syscallKernelStack: 0x%lx", current_task->context.syscallKernelStack);
-        journal::panic("  syscallScratchArea: 0x%lx", current_task->context.syscallScratchArea);
+        journal::panic("  syscall_kernel_stack: 0x%lx", current_task->context.syscall_kernel_stack);
+        journal::panic("  syscall_scratch_area: 0x%lx", current_task->context.syscall_scratch_area);
         journal::panic("Task Scheduler State:");
-        journal::panic("  cpu=%lu queue=%u voluntary=%u wantsBlock=%u deferred=%u yield=%u", current_task->cpu,
-                       static_cast<unsigned>(current_task->schedQueue), current_task->voluntaryBlock ? 1U : 0U,
-                       current_task->wantsBlock ? 1U : 0U, current_task->deferredTaskSwitch ? 1U : 0U, current_task->yieldSwitch ? 1U : 0U);
-        journal::panic("  preemptDepth=%u preemptPending=%u preemptMaxUs=%lu", current_task->preemptDisableDepth,
-                       current_task->preemptPending ? 1U : 0U, current_task->preemptDisableMaxUs);
+        journal::panic("  cpu=%lu queue=%u voluntary=%u wants_block=%u deferred=%u yield=%u", current_task->cpu,
+                       static_cast<unsigned>(current_task->sched_queue), current_task->voluntary_block ? 1U : 0U,
+                       current_task->wants_block ? 1U : 0U, current_task->deferred_task_switch ? 1U : 0U,
+                       current_task->yield_switch ? 1U : 0U);
+        journal::panic("  preemptDepth=%u preempt_pending=%u preemptMaxUs=%lu", current_task->preempt_disable_depth,
+                       current_task->preempt_pending ? 1U : 0U, current_task->preempt_disable_max_us);
     } else {
         journal::panic("WARNING: currentTask is NULL!");
     }
@@ -372,8 +373,8 @@ skip_task_dump:
 
     // print frame info
     journal::panic("CPU: %d", cpu_id);
-    journal::panic("Interrupt number: %d", frame.intNum);
-    journal::panic("Error code: %d", frame.errCode);
+    journal::panic("Interrupt number: %d", frame.int_num);
+    journal::panic("Error code: %d", frame.err_code);
     journal::panic("RIP: 0x%lx", frame.rip);
     journal::panic("CS: 0x%x", frame.cs);
     journal::panic("CALCULATED PRIVILEGE LEVEL: %d", frame.cs & 0x3);
@@ -534,29 +535,29 @@ skip_task_dump:
     }
 
     journal::panic("Halting");
-    apic::oneShotTimer(0);
+    apic::one_shot_timer(0);
     hcf();
 }
 
 extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
-    if (frame.errCode != UINT64_MAX) {
+    if (frame.err_code != UINT64_MAX) {
         exception_handler(gpr, frame);
         return;
     }
 
     // Check context-based handler first (for device drivers)
-    if (irq_contexts[frame.intNum].handler != nullptr) {
-        irq_contexts[frame.intNum].handler(static_cast<uint8_t>(frame.intNum), irq_contexts[frame.intNum].data);
+    if (irq_contexts[frame.int_num].handler != nullptr) {
+        irq_contexts[frame.int_num].handler(static_cast<uint8_t>(frame.int_num), irq_contexts[frame.int_num].data);
         ker::mod::apic::eoi();
         return;
     }
 
-    if (interrupt_handlers[frame.intNum] != nullptr) {
-        interrupt_handlers[frame.intNum](gpr, frame);
-    } else if (isIrq(frame.intNum)) {
+    if (interrupt_handlers[frame.int_num] != nullptr) {
+        interrupt_handlers[frame.int_num](gpr, frame);
+    } else if (IS_IRQ(frame.int_num)) {
         // Unexpected hardware IRQ with no handler - log and ignore.
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
-        ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.intNum));
+        ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.int_num));
         ker::mod::io::serial::write("\n");
     } else {
         // CPU exception with no registered handler - route to exception_handler
@@ -571,7 +572,7 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
 // It must NEVER be assigned to any other handler.
 static constexpr uint8_t TIMER_VECTOR = 32;
 
-void setInterruptHandler(uint8_t int_num, interruptHandler_t handler) {
+void set_interrupt_handler(uint8_t int_num, interruptHandler_t handler) {
     if (int_num == TIMER_VECTOR) {
         ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
         return;
@@ -583,11 +584,11 @@ void setInterruptHandler(uint8_t int_num, interruptHandler_t handler) {
     interrupt_handlers[int_num] = handler;
 }
 
-void removeInterruptHandler(uint8_t int_num) { interrupt_handlers[int_num] = nullptr; }
+void remove_interrupt_handler(uint8_t int_num) { interrupt_handlers[int_num] = nullptr; }
 
-auto isInterruptHandlerSet(uint8_t int_num) -> bool { return interrupt_handlers[int_num] != nullptr; }
+auto is_interrupt_handler_set(uint8_t int_num) -> bool { return interrupt_handlers[int_num] != nullptr; }
 
-auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
+auto request_irq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
     if (vector == TIMER_VECTOR) {
         journal::error("requestIrq: vector 32 is reserved for timer");
         return -1;
@@ -604,13 +605,13 @@ auto requestIrq(uint8_t vector, irq_handler_fn handler, void* data, const char* 
     return 0;
 }
 
-void freeIrq(uint8_t vector) {
+void free_irq(uint8_t vector) {
     irq_contexts[vector].handler = nullptr;
     irq_contexts[vector].data = nullptr;
     irq_contexts[vector].name = nullptr;
 }
 
-auto allocateVector() -> uint8_t {
+auto allocate_vector() -> uint8_t {
     // Find a free vector starting from 48 (above legacy IRQ range).
     // Vectors 0-31 are CPU exceptions.
     // Vector 32 (0x20) is the timer interrupt - hardcoded in gates.asm

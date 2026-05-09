@@ -17,8 +17,8 @@ void handle_pit(sched::task::Context ctx, gates::interruptFrame* frame) {
         task(frame);
     }
     apic::eoi();
-    auto c = apic::calibrateTimer(2000);
-    apic::oneShotTimer(c);
+    auto c = apic::calibrate_timer(2000);
+    apic::one_shot_timer(c);
     dbg::log("PIT tick!");
     asm volatile("iretq");
 }

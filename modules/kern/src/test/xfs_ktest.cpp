@@ -26,16 +26,13 @@ auto xfs_null_read(ker::dev::BlockDevice* dev, uint64_t /*blk*/, size_t count, v
     return 0;
 }
 
-auto xfs_null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*blk*/, size_t /*count*/,
-                    const void* /*buf*/) -> int {
-    return 0;
-}
+auto xfs_null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*blk*/, size_t /*count*/, const void* /*buf*/) -> int { return 0; }
 
 auto make_xfs_null_bdev() -> ker::dev::BlockDevice {
     ker::dev::BlockDevice d{};
-    d.block_size   = 512;
+    d.block_size = 512;
     d.total_blocks = 1024;
-    d.read_blocks  = xfs_null_read;
+    d.read_blocks = xfs_null_read;
     d.write_blocks = xfs_null_write;
     return d;
 }
@@ -51,21 +48,13 @@ KTEST(XFS, MagicConstant) {
     KEXPECT_EQ(ker::vfs::xfs::XFS_SB_MAGIC, 0x58465342U);
 }
 
-KTEST(XFS, SuperblockStructSize) {
-    KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDsb), static_cast<size_t>(264));
-}
+KTEST(XFS, SuperblockStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDsb), static_cast<size_t>(264)); }
 
-KTEST(XFS, InodeStructSize) {
-    KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), static_cast<size_t>(176));
-}
+KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), static_cast<size_t>(176)); }
 
-KTEST(XFS, AgfStructSize) {
-    KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224));
-}
+KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }
 
-KTEST(XFS, BmbtRecSize) {
-    KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsBmbtRec), static_cast<size_t>(16));
-}
+KTEST(XFS, BmbtRecSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsBmbtRec), static_cast<size_t>(16)); }
 
 // ---------------------------------------------------------------------------
 // xfs_mount() error path: corrupt magic (all zeros) must return != 0

@@ -259,9 +259,9 @@ void wake_waiters() {
         if (waiter == nullptr) {
             continue;
         }
-        waiter->deferredTaskSwitch = false;
+        waiter->deferred_task_switch = false;
         uint64_t target_cpu = waiter->cpu;
-        if (waiter->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || waiter->voluntaryBlock) {
+        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
             target_cpu = ker::mod::sched::get_least_loaded_cpu();
         }
         ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
@@ -388,8 +388,8 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         rec.version = JOURNAL_RECORD_VERSION;
         rec.header_size = sizeof(JournalRecord) - JOURNAL_MESSAGE_MAX;
         rec.boot_id = s_boot_id;
-        rec.monotonic_us = s_time_available.load(std::memory_order_acquire) ? ker::mod::time::getUs() : 0;
-        rec.cpu = static_cast<uint32_t>(ker::mod::cpu::getCurrentCpuIdSafe());
+        rec.monotonic_us = s_time_available.load(std::memory_order_acquire) ? ker::mod::time::get_us() : 0;
+        rec.cpu = static_cast<uint32_t>(ker::mod::cpu::get_current_cpu_id_safe());
         rec.level = static_cast<uint8_t>(level);
         rec.flags = rec_flags;
         std::memcpy(rec.module, module_buf, sizeof(rec.module));
@@ -412,15 +412,15 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     rec.version = JOURNAL_RECORD_VERSION;
     rec.header_size = sizeof(JournalRecord) - JOURNAL_MESSAGE_MAX;
     rec.boot_id = s_boot_id;
-    rec.monotonic_us = s_time_available.load(std::memory_order_acquire) ? ker::mod::time::getUs() : 0;
-    rec.cpu = static_cast<uint32_t>(ker::mod::cpu::getCurrentCpuIdSafe());
+    rec.monotonic_us = s_time_available.load(std::memory_order_acquire) ? ker::mod::time::get_us() : 0;
+    rec.cpu = static_cast<uint32_t>(ker::mod::cpu::get_current_cpu_id_safe());
     rec.level = static_cast<uint8_t>(level);
     rec.flags = rec_flags;
     std::memcpy(rec.module, module_buf, sizeof(rec.module));
 
     if (ker::mod::sched::can_query_current_task()) {
         if (auto* task = ker::mod::sched::get_current_task(); task != nullptr) {
-            rec.pid = task->ownerPid != 0 ? task->ownerPid : task->pid;
+            rec.pid = task->owner_pid != 0 ? task->owner_pid : task->pid;
             rec.tid = task->pid;
         }
     }

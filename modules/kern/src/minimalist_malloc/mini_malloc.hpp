@@ -19,6 +19,4 @@ size_t mini_get_slab_size(void* ptr);
 // fn receives: userdata, pointer to user data, block size, and the debug_idx stored in
 // _align_pad (lower 32 bits).  Safe to call without locks when other CPUs are halted
 // (e.g. during OOM dump).  Only compiled/linked when called.
-void mini_iter_live_debug_slots(
-    void* userdata,
-    void (*fn)(void* ud, const void* user_ptr, size_t block_size, uint32_t debug_idx));
+void mini_iter_live_debug_slots(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size, uint32_t debug_idx));

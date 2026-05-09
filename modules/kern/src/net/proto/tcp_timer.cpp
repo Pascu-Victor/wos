@@ -96,9 +96,9 @@ void wake_socket_timer(Socket* sock) {
     if (pid != 0) {
         auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
         if (task != nullptr) {
-            task->deferredTaskSwitch = false;
+            task->deferred_task_switch = false;
             uint64_t target_cpu = task->cpu;
-            if (task->schedQueue == ker::mod::sched::task::Task::SchedQueue::WAITING || task->voluntaryBlock) {
+            if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || task->voluntary_block) {
                 target_cpu = ker::mod::sched::get_least_loaded_cpu();
             }
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
@@ -487,7 +487,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 
 [[noreturn]] void tcp_timer_thread() {
     for (;;) {
-        uint64_t now_ms = ker::mod::time::getUs() / TCP_TIMER_MS_TO_US;
+        uint64_t now_ms = ker::mod::time::get_us() / TCP_TIMER_MS_TO_US;
         uint64_t earliest = timer_earliest.load(std::memory_order_relaxed);
 
         if (now_ms >= earliest) {
@@ -495,7 +495,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         uint64_t sleep_us = TCP_TIMER_IDLE_SLEEP_US;
-        now_ms = ker::mod::time::getUs() / TCP_TIMER_MS_TO_US;
+        now_ms = ker::mod::time::get_us() / TCP_TIMER_MS_TO_US;
         earliest = timer_earliest.load(std::memory_order_relaxed);
         if (earliest != UINT64_MAX) {
             if (earliest <= now_ms) {
@@ -512,7 +512,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 }
 
 void tcp_timer_thread_start() {
-    auto* task = ker::mod::sched::task::Task::createKernelThread("tcp_timer", tcp_timer_thread);
+    auto* task = ker::mod::sched::task::Task::create_kernel_thread("tcp_timer", tcp_timer_thread);
     if (task == nullptr) {
         ker::mod::dbg::log("FATAL: Failed to create TCP timer kernel thread");
         return;

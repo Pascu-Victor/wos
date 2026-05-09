@@ -38,8 +38,12 @@ auto get_kernel_rsp() -> uint64_t { return g_kernel_rsp; }
 void set_kernel_rsp(uint64_t rsp) { g_kernel_rsp = rsp; }
 
 auto get_kernel_cmdline() -> const char* {
-    if (g_kernel_cmdline_request.response == nullptr) { return ""; }
-    if (g_kernel_cmdline_request.response->cmdline == nullptr) { return ""; }
+    if (g_kernel_cmdline_request.response == nullptr) {
+        return "";
+    }
+    if (g_kernel_cmdline_request.response->cmdline == nullptr) {
+        return "";
+    }
     return g_kernel_cmdline_request.response->cmdline;
 }
 

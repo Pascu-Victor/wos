@@ -49,7 +49,7 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
 
     mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u", size, total, pages_needed);
 
-    auto* mem = ker::mod::mm::phys::pageAlloc(pages_needed);
+    auto* mem = ker::mod::mm::phys::page_alloc(pages_needed);
     if (mem == nullptr) {
         mod::dbg::log("virtq_alloc: pageAlloc(%u) failed", pages_needed);
         delete vq;

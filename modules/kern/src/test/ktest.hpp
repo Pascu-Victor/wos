@@ -89,27 +89,33 @@ extern const ker::test::KTest __stop_ktests[];
 // Declare + register a test.  The function body follows the macro.
 // S = suite identifier, N = test identifier (no spaces, used as C names).
 // E = enabled flag (true/false).
-#define _KTEST_IMPL(S, N, E)                                                                  \
-    static void _kt_##S##_##N();                                                              \
-    [[gnu::section(".ktests"), gnu::used]]                                                    \
-    static constexpr ker::test::KTest _ktrec_##S##_##N = {#S, #N, &_kt_##S##_##N, (E)};     \
+#define _KTEST_IMPL(S, N, E)                                                            \
+    static void _kt_##S##_##N();                                                        \
+    [[gnu::section(".ktests"), gnu::used]]                                              \
+    static constexpr ker::test::KTest _ktrec_##S##_##N = {#S, #N, &_kt_##S##_##N, (E)}; \
     static void _kt_##S##_##N()
 
-#define KTEST(S, N)     _KTEST_IMPL(S, N, true)
+#define KTEST(S, N) _KTEST_IMPL(S, N, true)
 #define KTEST_OFF(S, N) _KTEST_IMPL(S, N, false)
 
 // Assertion helpers.
 // KEXPECT_*: log failure and continue.
 // KREQUIRE_*: log failure and return from the test function.
-#define KEXPECT_EQ(a, b)  ker::test::check_eq(__FILE__, __LINE__, (a), (b), #a, #b)
-#define KEXPECT_NE(a, b)  ker::test::check_ne(__FILE__, __LINE__, (a), (b), #a, #b)
-#define KEXPECT_TRUE(c)   ker::test::check_true(__FILE__, __LINE__, static_cast<bool>(c), #c)
-#define KEXPECT_FALSE(c)  ker::test::check_true(__FILE__, __LINE__, !static_cast<bool>(c), "!" #c)
-#define KEXPECT_NULL(p)   ker::test::check_null(__FILE__, __LINE__, static_cast<const void*>(p), #p)
+#define KEXPECT_EQ(a, b) ker::test::check_eq(__FILE__, __LINE__, (a), (b), #a, #b)
+#define KEXPECT_NE(a, b) ker::test::check_ne(__FILE__, __LINE__, (a), (b), #a, #b)
+#define KEXPECT_TRUE(c) ker::test::check_true(__FILE__, __LINE__, static_cast<bool>(c), #c)
+#define KEXPECT_FALSE(c) ker::test::check_true(__FILE__, __LINE__, !static_cast<bool>(c), "!" #c)
+#define KEXPECT_NULL(p) ker::test::check_null(__FILE__, __LINE__, static_cast<const void*>(p), #p)
 
-#define KREQUIRE_TRUE(c) \
-    do { if (!ker::test::check_true(__FILE__, __LINE__, static_cast<bool>(c), #c)) return; } while (0)
-#define KREQUIRE_EQ(a, b) \
-    do { if (!ker::test::check_eq(__FILE__, __LINE__, (a), (b), #a, #b)) return; } while (0)
-#define KREQUIRE_NE(a, b) \
-    do { if (!ker::test::check_ne(__FILE__, __LINE__, (a), (b), #a, #b)) return; } while (0)
+#define KREQUIRE_TRUE(c)                                                                  \
+    do {                                                                                  \
+        if (!ker::test::check_true(__FILE__, __LINE__, static_cast<bool>(c), #c)) return; \
+    } while (0)
+#define KREQUIRE_EQ(a, b)                                                       \
+    do {                                                                        \
+        if (!ker::test::check_eq(__FILE__, __LINE__, (a), (b), #a, #b)) return; \
+    } while (0)
+#define KREQUIRE_NE(a, b)                                                       \
+    do {                                                                        \
+        if (!ker::test::check_ne(__FILE__, __LINE__, (a), (b), #a, #b)) return; \
+    } while (0)

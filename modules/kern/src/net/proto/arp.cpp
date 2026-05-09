@@ -221,7 +221,7 @@ auto arp_resolve(NetDevice* dev, uint32_t ip, std::array<uint8_t, 6>& dst_mac, P
         entry->request_time_ms = 0;
     }
 
-    uint64_t now = ker::mod::time::getUs() / 1000ULL;
+    uint64_t now = ker::mod::time::get_us() / 1000ULL;
     constexpr uint64_t ARP_TIMEOUT_MS = 5000;
 
     if (entry->request_time_ms != 0 && (now - entry->request_time_ms) > ARP_TIMEOUT_MS) {

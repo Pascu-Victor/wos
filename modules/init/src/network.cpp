@@ -1,8 +1,10 @@
 #include "network.h"
 
+#include <abi-bits/in.h>
+#include <abi-bits/ioctls.h>
+#include <abi-bits/socket.h>
 #include <arpa/inet.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/logging.h>
@@ -12,8 +14,9 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
-#include <print>
+#include <ctime>
 
 #include "sys/multiproc.h"
 
@@ -22,21 +25,21 @@ using init_log = wos::journal<"init">;
 }
 
 void start_network() {
-    int cpuno = ker::multiproc::currentThreadId();
+    int const CPUNO = ker::multiproc::currentThreadId();
 
-    init_log::info("init[%d]: spawning netd (DHCP daemon)", cpuno);
+    init_log::info("init[%d]: spawning netd (DHCP daemon)", CPUNO);
     std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
     std::array<const char*, 1> netd_envp = {nullptr};
-    uint64_t netd_pid = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
-    if (netd_pid == 0) {
-        init_log::error("init[%d]: failed to spawn netd", cpuno);
+    uint64_t const NETD_PID = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
+    if (NETD_PID == 0) {
+        init_log::error("init[%d]: failed to spawn netd", CPUNO);
     } else {
-        init_log::info("init[%d]: netd spawned as PID %llu", cpuno, static_cast<unsigned long long>(netd_pid));
+        init_log::info("init[%d]: netd spawned as PID %llu", CPUNO, static_cast<unsigned long long>(NETD_PID));
     }
 
     // Poll eth0 for IP address readiness (wait for DHCP to complete)
-    int poll_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (poll_sock >= 0) {
+    int const POLL_SOCK = socket(AF_INET, SOCK_DGRAM, 0);
+    if (POLL_SOCK >= 0) {
         struct ifreq ifr{};
         strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
 
@@ -45,12 +48,12 @@ void start_network() {
         clock_gettime(CLOCK_MONOTONIC, &poll_start);
         bool net_ready = false;
         for (;;) {
-            if (ioctl(poll_sock, SIOCGIFADDR, &ifr) == 0) {
+            if (ioctl(POLL_SOCK, SIOCGIFADDR, &ifr) == 0) {
                 auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
                 if (addr->sin_addr.s_addr != 0) {
                     std::array<char, INET_ADDRSTRLEN> ip_str{};
                     inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-                    init_log::info("init[%d]: eth0 configured with IP %s", cpuno, ip_str.data());
+                    init_log::info("init[%d]: eth0 configured with IP %s", CPUNO, ip_str.data());
                     net_ready = true;
                     break;
                 }
@@ -62,9 +65,9 @@ void start_network() {
             }
             sched_yield();
         }
-        close(poll_sock);
+        close(POLL_SOCK);
         if (!net_ready) {
-            init_log::warn("init[%d]: eth0 not configured after polling, continuing anyway", cpuno);
+            init_log::warn("init[%d]: eth0 not configured after polling, continuing anyway", CPUNO);
         }
     }
 }

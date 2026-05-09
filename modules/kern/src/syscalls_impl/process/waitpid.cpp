@@ -1,5 +1,7 @@
 #include "waitpid.hpp"
 
+#include <cerrno>
+#include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
@@ -7,6 +9,8 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
+
+#include "platform/asm/cpu.hpp"
 
 namespace ker::syscall::process {
 
@@ -31,7 +35,7 @@ static auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::
     uint32_t count = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < count; i++) {
         auto* t = ker::mod::sched::get_active_task_at(i);
-        if (t != nullptr && t->parentPid == parent->pid && t->hasExited && !t->waitedOn) {
+        if (t != nullptr && t->parent_pid == parent->pid && t->has_exited && !t->waited_on) {
             return t;
         }
     }
@@ -48,10 +52,10 @@ static void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
     if (task == nullptr) {
         return;
     }
-    task->waitResumeRipUserAddr = 0;
-    task->waitResumeRipPhysAddr = 0;
-    task->waitResumeRspUserAddr = 0;
-    task->waitResumeRspPhysAddr = 0;
+    task->wait_resume_rip_user_addr = 0;
+    task->wait_resume_rip_phys_addr = 0;
+    task->wait_resume_rsp_user_addr = 0;
+    task->wait_resume_rsp_phys_addr = 0;
 }
 
 static auto current_syscall_user_rsp() -> uint64_t {
@@ -66,16 +70,16 @@ static void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mo
         return;
     }
 
-    task->waitResumeRipUserAddr = gpr.rcx;
+    task->wait_resume_rip_user_addr = gpr.rcx;
     uint64_t rip_phys = ker::mod::mm::virt::translate(task->pagemap, gpr.rcx);
-    task->waitResumeRipPhysAddr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
+    task->wait_resume_rip_phys_addr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
 
-    task->waitResumeRspUserAddr = current_syscall_user_rsp();
-    if (task->waitResumeRspUserAddr != 0) {
-        uint64_t rsp_phys = ker::mod::mm::virt::translate(task->pagemap, task->waitResumeRspUserAddr);
-        task->waitResumeRspPhysAddr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
+    task->wait_resume_rsp_user_addr = current_syscall_user_rsp();
+    if (task->wait_resume_rsp_user_addr != 0) {
+        uint64_t rsp_phys = ker::mod::mm::virt::translate(task->pagemap, task->wait_resume_rsp_user_addr);
+        task->wait_resume_rsp_phys_addr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
     } else {
-        task->waitResumeRspPhysAddr = 0;
+        task->wait_resume_rsp_phys_addr = 0;
     }
 }
 
@@ -99,18 +103,18 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         auto* exited = find_exited_child(currentTask);
         if (exited != nullptr) {
             if (status != nullptr) {
-                *status = exited->exitStatus;
+                *status = exited->exit_status;
             }
             if (rusage_vaddr != 0) {
                 uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
                 fill_rusage(phys, exited);
             }
-            currentTask->waitStatusUserAddr = 0;
-            currentTask->waitStatusPhysAddr = 0;
-            currentTask->waitRusageUserAddr = 0;
-            currentTask->waitRusagePhysAddr = 0;
+            currentTask->wait_status_user_addr = 0;
+            currentTask->wait_status_phys_addr = 0;
+            currentTask->wait_rusage_user_addr = 0;
+            currentTask->wait_rusage_phys_addr = 0;
             clear_wait_resume_debug(currentTask);
-            exited->waitedOn = true;
+            exited->waited_on = true;
             return exited->pid;
         }
 
@@ -120,27 +124,27 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         }
 
         // No exited child yet - block until SIGCHLD wakes us
-        currentTask->waitingForPid = WAIT_ANY_CHILD;
+        currentTask->waiting_for_pid = WAIT_ANY_CHILD;
         if (status != nullptr) {
-            currentTask->waitStatusUserAddr = reinterpret_cast<uint64_t>(status);
+            currentTask->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
             uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
-            currentTask->waitStatusPhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+            currentTask->wait_status_phys_addr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
         } else {
-            currentTask->waitStatusUserAddr = 0;
-            currentTask->waitStatusPhysAddr = 0;
+            currentTask->wait_status_user_addr = 0;
+            currentTask->wait_status_phys_addr = 0;
         }
         if (rusage_vaddr != 0) {
-            currentTask->waitRusageUserAddr = rusage_vaddr;
+            currentTask->wait_rusage_user_addr = rusage_vaddr;
             uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
-            currentTask->waitRusagePhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+            currentTask->wait_rusage_phys_addr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
         } else {
-            currentTask->waitRusageUserAddr = 0;
-            currentTask->waitRusagePhysAddr = 0;
+            currentTask->wait_rusage_user_addr = 0;
+            currentTask->wait_rusage_phys_addr = 0;
         }
         capture_wait_resume_debug(currentTask, gpr);
 
         currentTask->wait_channel = "waitpid";
-        currentTask->deferredTaskSwitch = true;
+        currentTask->deferred_task_switch = true;
         return 0;
     }
 
@@ -159,98 +163,98 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         return static_cast<uint64_t>(-1);  // Task not found
     }
 
-    if (target_task->parentPid != currentTask->pid || target_task->waitedOn) {
+    if (target_task->parent_pid != currentTask->pid || target_task->waited_on) {
         return static_cast<uint64_t>(-ECHILD);
     }
 
     // Check if the target task has already exited
-    if (target_task->hasExited) {
+    if (target_task->has_exited) {
 #ifdef WAITPID_DEBUG
-        ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x has already exited with status %d", pid, target_task->exitStatus);
+        ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x has already exited with status %d", pid, target_task->exit_status);
 #endif
         if (status != nullptr) {
-            *status = target_task->exitStatus;
+            *status = target_task->exit_status;
         }
         if (rusage_vaddr != 0) {
             uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
             fill_rusage(phys, target_task);
         }
-        currentTask->waitStatusUserAddr = 0;
-        currentTask->waitStatusPhysAddr = 0;
-        currentTask->waitRusageUserAddr = 0;
-        currentTask->waitRusagePhysAddr = 0;
+        currentTask->wait_status_user_addr = 0;
+        currentTask->wait_status_phys_addr = 0;
+        currentTask->wait_rusage_user_addr = 0;
+        currentTask->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(currentTask);
         // Mark that the parent has retrieved the exit status (zombie can now be reaped)
-        target_task->waitedOn = true;
+        target_task->waited_on = true;
         return pid;  // Return the PID of the exited process
     }
 
     // Prepare the current task's wait state before publishing ourselves on the child's
     // waiter list. Once the child can see our PID, it may wake us immediately.
-    currentTask->waitingForPid = pid;
+    currentTask->waiting_for_pid = pid;
     if (status != nullptr) {
-        currentTask->waitStatusUserAddr = reinterpret_cast<uint64_t>(status);
+        currentTask->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
         uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, reinterpret_cast<uint64_t>(status));
-        currentTask->waitStatusPhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+        currentTask->wait_status_phys_addr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
     } else {
-        currentTask->waitStatusUserAddr = 0;
-        currentTask->waitStatusPhysAddr = 0;
+        currentTask->wait_status_user_addr = 0;
+        currentTask->wait_status_phys_addr = 0;
     }
     if (rusage_vaddr != 0) {
-        currentTask->waitRusageUserAddr = rusage_vaddr;
+        currentTask->wait_rusage_user_addr = rusage_vaddr;
         uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
-        currentTask->waitRusagePhysAddr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
+        currentTask->wait_rusage_phys_addr = (phys != ker::mod::mm::virt::PADDR_INVALID) ? phys : 0;
     } else {
-        currentTask->waitRusageUserAddr = 0;
-        currentTask->waitRusagePhysAddr = 0;
+        currentTask->wait_rusage_user_addr = 0;
+        currentTask->wait_rusage_phys_addr = 0;
     }
     capture_wait_resume_debug(currentTask, gpr);
     currentTask->wait_channel = "waitpid";
 
     // Serialize with exit: recheck hasExited while holding the waiter-list lock so we
     // cannot miss a child that exits while we're registering as a waiter.
-    uint64_t waiter_lock_flags = target_task->exitWaitersLock.lock_irqsave();
-    if (target_task->hasExited) {
-        target_task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+    uint64_t waiter_lock_flags = target_task->exit_waiters_lock.lock_irqsave();
+    if (target_task->has_exited) {
+        target_task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
         if (status != nullptr) {
-            *status = target_task->exitStatus;
+            *status = target_task->exit_status;
         }
         if (rusage_vaddr != 0) {
             uint64_t phys = ker::mod::mm::virt::translate(currentTask->pagemap, rusage_vaddr);
             fill_rusage(phys, target_task);
         }
-        currentTask->waitingForPid = 0;
-        currentTask->waitStatusUserAddr = 0;
-        currentTask->waitStatusPhysAddr = 0;
-        currentTask->waitRusageUserAddr = 0;
-        currentTask->waitRusagePhysAddr = 0;
+        currentTask->waiting_for_pid = 0;
+        currentTask->wait_status_user_addr = 0;
+        currentTask->wait_status_phys_addr = 0;
+        currentTask->wait_rusage_user_addr = 0;
+        currentTask->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(currentTask);
-        target_task->waitedOn = true;
+        target_task->waited_on = true;
         return pid;
     }
 
     // Add the current task's PID to the target task's awaitee list
     if (!target_task->awaitee_on_exit.push_back(currentTask->pid)) {
-        target_task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
-        currentTask->waitingForPid = 0;
-        currentTask->waitStatusUserAddr = 0;
-        currentTask->waitStatusPhysAddr = 0;
-        currentTask->waitRusageUserAddr = 0;
-        currentTask->waitRusagePhysAddr = 0;
+        target_task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
+        currentTask->waiting_for_pid = 0;
+        currentTask->wait_status_user_addr = 0;
+        currentTask->wait_status_phys_addr = 0;
+        currentTask->wait_rusage_user_addr = 0;
+        currentTask->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(currentTask);
 #ifdef WAITPID_DEBUG
         ker::mod::dbg::log("wos_proc_waitpid: Awaitee list full for PID %x", pid);
 #endif
         return static_cast<uint64_t>(-1);  // OOM
     }
-    currentTask->deferredTaskSwitch = true;
-    target_task->exitWaitersLock.unlock_irqrestore(waiter_lock_flags);
+    currentTask->deferred_task_switch = true;
+    target_task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
 #ifdef WAITPID_DEBUG
     ker::mod::dbg::log("wos_proc_waitpid: Added PID %x to awaitee list of PID %x", currentTask->pid, pid);
 #endif
 #ifdef WAITPID_DEBUG
     ker::mod::dbg::log("wos_proc_waitpid: Setting deferred task switch for PID %x, flag at %p = %d", currentTask->pid,
-                       &(currentTask->deferredTaskSwitch), currentTask->deferredTaskSwitch);
+                       &(currentTask->deferred_task_switch), currentTask->deferred_task_switch);
     ker::mod::dbg::log("wos_proc_waitpid: Task pointer = %p", currentTask);
 #endif
 

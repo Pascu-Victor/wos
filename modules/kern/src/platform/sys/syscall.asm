@@ -43,15 +43,15 @@ _wOS_asm_syscallHandler:
 
     ; Check if we need to perform a deferred task switch
     ; Get current task from scheduler
-    extern _wOS_getCurrentTask
-    extern _wOS_DEFERRED_TASK_SWITCH_OFFSET
+    extern wos_get_current_task
+    extern WOS_DEFERRED_TASK_SWITCH_OFFSET
     sub rsp, 8  ; Align stack for call
-    call _wOS_getCurrentTask
+    call wos_get_current_task
     add rsp, 8  ; Restore stack
 
     ; rax now contains current task pointer
     ; Check if deferred_task_switch flag is set at the calculated offset
-    mov r8, [rel _wOS_DEFERRED_TASK_SWITCH_OFFSET]  ; Load offset value
+    mov r8, [rel WOS_DEFERRED_TASK_SWITCH_OFFSET]  ; Load offset value
     movzx edx, byte [rax + r8]                      ; Load flag from task at offset
     cmp edx, 0
     je .no_deferred_switch
@@ -97,12 +97,12 @@ _wOS_asm_syscallHandler:
     ; Call C diagnostic function. Stack is at kernel stack top, safe for calls.
     ; Save rax (syscall return value) so the panic handler can report it.
     push rax
-    extern _wOS_sysret_corrupt_panic
+    extern wos_sysret_corrupt_panic
     mov rdi, rcx         ; arg1 = actual RCX (corrupted value)
     mov rsi, [gs:0x28]   ; arg2 = expected RCX (saved at entry)
     mov rdx, [gs:0x08]   ; arg3 = user RSP
     sub rsp, 8           ; align stack for call
-    call _wOS_sysret_corrupt_panic
+    call wos_sysret_corrupt_panic
     ; should not return, but halt just in case
 .sysret_halt:
     hlt

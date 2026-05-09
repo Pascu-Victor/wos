@@ -23,7 +23,7 @@ FbFont::FbFont() {
     std::strcpy(name, "default");
     height = 16;
     width = 16;
-    loadFont();
+    load_font();
 }
 
 FbFont& FbFont::operator=(const FbFont& other) {
@@ -57,7 +57,7 @@ uint8_t FbFont::get_height() const { return height; }
 
 const uint64_t* FbFont::get_data(char c) const { return data[(uint64_t)c]; }
 
-void FbFont::loadFont() {
+void FbFont::load_font() {
     this->data[' '][0] = 0b0000000000000000;
     this->data[' '][1] = 0b0000000000000000;
     this->data[' '][2] = 0b0000000000000000;

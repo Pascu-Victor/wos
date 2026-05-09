@@ -175,7 +175,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
         int cmp = memcmp(&hello->mac_addr, &g_wki.my_mac, 6);
         if (cmp < 0) {
             // Remote has lower MAC -> remote keeps, we regenerate
-            uint64_t seed = mod::time::getTicks();
+            uint64_t seed = mod::time::get_ticks();
             auto new_id = static_cast<uint16_t>((seed ^ (seed >> 16)) & 0xFFFF);
             if (new_id == WKI_NODE_INVALID || new_id == WKI_NODE_BROADCAST) {
                 new_id = 0x0001;
@@ -471,7 +471,7 @@ void wki_peer_send_heartbeats() {
     }
 
     HeartbeatPayload hb = {};
-    hb.send_timestamp = mod::time::getUs() * 1000;  // convert to nanoseconds
+    hb.send_timestamp = mod::time::get_us() * 1000;  // convert to nanoseconds
     hb.sender_load = total_runnable;
     hb.sender_mem_free = mod::mm::phys::get_free_mem_bytes();
     hb.reserved = 0;
@@ -787,7 +787,7 @@ static void wki_send_heartbeat_probe(WkiPeer* peer) {
     }
 
     HeartbeatPayload probe = {};
-    probe.send_timestamp = mod::time::getUs() * 1000;
+    probe.send_timestamp = mod::time::get_us() * 1000;
     probe.sender_load = 0;
     probe.sender_mem_free = 0;
     probe.reserved = 0;
@@ -1006,10 +1006,10 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
 
 [[noreturn]] void wki_timer_thread() {
     for (;;) {
-        uint64_t now_us = mod::time::getUs();
+        uint64_t now_us = mod::time::get_us();
         wki_peer_timer_tick(now_us);
 
-        now_us = mod::time::getUs();
+        now_us = mod::time::get_us();
         uint64_t next_deadline = std::min(wki_next_fast_timer_deadline_us(now_us), wki_next_periodic_deadline_us(now_us));
         uint64_t sleep_us = WKI_TIMER_IDLE_SLEEP_US;
         if (next_deadline != UINT64_MAX) {
@@ -1029,7 +1029,7 @@ static auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
 }
 
 void wki_timer_thread_start() {
-    auto* task = mod::sched::task::Task::createKernelThread("wki_timer", wki_timer_thread);
+    auto* task = mod::sched::task::Task::create_kernel_thread("wki_timer", wki_timer_thread);
     if (task == nullptr) {
         mod::dbg::log("[WKI] Failed to create WKI timer kernel thread");
         return;

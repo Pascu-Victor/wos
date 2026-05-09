@@ -34,7 +34,7 @@ void write64(volatile uint8_t* base, uint32_t offset, uint64_t val) { *reinterpr
 auto virt_to_phys(void* v) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(v);
     if (addr >= 0xffffffff80000000ULL) {
-        uint64_t phys = mod::mm::virt::translate(mod::mm::virt::getKernelPagemap(), addr);
+        uint64_t phys = mod::mm::virt::translate(mod::mm::virt::get_kernel_pagemap(), addr);
         if (phys == mod::mm::virt::PADDR_INVALID) {
             mod::dbg::log("xhci: virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
@@ -51,7 +51,7 @@ struct Alloc {
 };
 
 auto alloc_page() -> Alloc {
-    void* v = mod::mm::phys::pageAlloc(4096);
+    void* v = mod::mm::phys::page_alloc(4096);
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
@@ -62,7 +62,7 @@ auto alloc_page() -> Alloc {
 auto alloc_pages(size_t bytes) -> Alloc {
     // Round up to page
     size_t pages = (bytes + 4095) / 4096;
-    void* v = mod::mm::phys::pageAlloc(pages * 4096);
+    void* v = mod::mm::phys::page_alloc(pages * 4096);
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
@@ -505,7 +505,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     }
 
     // Allocate controller state
-    auto* hc = static_cast<XhciController*>(mod::mm::phys::pageAlloc(sizeof(XhciController)));
+    auto* hc = static_cast<XhciController*>(mod::mm::phys::page_alloc(sizeof(XhciController)));
     if (hc == nullptr) {
         return -1;
     }
@@ -588,7 +588,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     write32(rt, XHCI_RT_IMAN, XHCI_IMAN_IE);
 
     // 8. Set up IRQ
-    uint8_t vector = mod::gates::allocateVector();
+    uint8_t vector = mod::gates::allocate_vector();
     if (vector == 0) {
         log::error("no free IRQ vector");
         return -1;
@@ -600,7 +600,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
         vector = pci_dev->interrupt_line + 32;
         hc->irq_vector = vector;
     }
-    mod::gates::requestIrq(vector, xhci_irq, hc, "xhci");
+    mod::gates::request_irq(vector, xhci_irq, hc, "xhci");
 
     // 9. Start controller
     cmd = read32(op, XHCI_OP_USBCMD);

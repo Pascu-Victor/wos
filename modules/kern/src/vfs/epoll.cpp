@@ -41,15 +41,15 @@ auto begin_poll_timeout(ker::mod::sched::task::Task* task, int timeout_ms) -> ui
     if (task == nullptr || timeout_ms <= 0) {
         return 0;
     }
-    if (task->pollWaitDeadlineUs == 0) {
-        task->pollWaitDeadlineUs = ker::mod::time::getUs() + (static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC);
+    if (task->poll_wait_deadline_us == 0) {
+        task->poll_wait_deadline_us = ker::mod::time::get_us() + (static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC);
     }
-    return task->pollWaitDeadlineUs;
+    return task->poll_wait_deadline_us;
 }
 
 void clear_poll_timeout(ker::mod::sched::task::Task* task) {
     if (task != nullptr) {
-        task->pollWaitDeadlineUs = 0;
+        task->poll_wait_deadline_us = 0;
     }
 }
 
@@ -307,7 +307,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return ready;
     }
 
-    if (deadline_us != 0 && ker::mod::time::getUs() >= deadline_us) {
+    if (deadline_us != 0 && ker::mod::time::get_us() >= deadline_us) {
         clear_poll_timeout(task);
         vfs_put_file(epfile);
         return 0;
@@ -317,7 +317,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
     // This lets pselect/poll return -EINTR so signal handlers run promptly.
     // (task was already fetched at the top of this function)
     {
-        uint64_t deliverable = task->sigPending & ~task->sigMask;
+        uint64_t deliverable = task->sig_pending & ~task->sig_mask;
         if (deliverable != 0) {
             clear_poll_timeout(task);
             vfs_put_file(epfile);
@@ -344,13 +344,13 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
     }
 
     if (can_block) {
-        task->wakeAtUs = deadline_us;
+        task->wake_at_us = deadline_us;
         task->wait_channel = "epoll_wait";
-        task->deferredTaskSwitch = true;
+        task->deferred_task_switch = true;
 
         // Re-check interests after registration + deferred mark to close
         // the race window where an event fires between the initial scan
-        // and waiter registration.  With deferredTaskSwitch already set,
+        // and waiter registration.  With deferred_task_switch already set,
         // any concurrent wake_waiters will clear it, preventing a block.
         int recheck = 0;
         for (size_t i = 0; i < EPOLL_MAX_INTEREST && recheck < maxevents; i++) {
@@ -373,8 +373,8 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             }
         }
         if (recheck > 0) {
-            task->deferredTaskSwitch = false;
-            task->wakeAtUs = 0;
+            task->deferred_task_switch = false;
+            task->wake_at_us = 0;
             task->wait_channel = nullptr;
             clear_poll_timeout(task);
             vfs_put_file(epfile);
