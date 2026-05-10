@@ -20,6 +20,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
+#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 
@@ -58,39 +59,39 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
     }
 
     // Read head and tail from the first valid log record
-    uint32_t head_cycle = hdr->h_cycle.to_cpu();
-    uint64_t tail_lsn = hdr->h_tail_lsn.to_cpu();
-    auto tail_cycle = static_cast<uint32_t>(tail_lsn >> 32);
-    auto tail_block = static_cast<uint32_t>(tail_lsn);
+    uint32_t const HEAD_CYCLE = hdr->h_cycle.to_cpu();
+    uint64_t const TAIL_LSN = hdr->h_tail_lsn.to_cpu();
+    auto tail_cycle = static_cast<uint32_t>(TAIL_LSN >> 32);
+    auto tail_block = static_cast<uint32_t>(TAIL_LSN);
 
     brelse(bh);
 
     // Scan forward to find the actual log head (last valid record)
     // For now, do a simplified scan: check if the last block has the same cycle
-    uint32_t last_block = log->log_blocks - 1;
-    BufHead* last_bh = xfs_buf_read(ctx, log->log_start + last_block);
+    uint32_t const LAST_BLOCK = log->log_blocks - 1;
+    BufHead* last_bh = xfs_buf_read(ctx, log->log_start + LAST_BLOCK);
     if (last_bh == nullptr) {
         mod::dbg::log("[xfs log] failed to read last log block\n");
         return -EIO;
     }
 
     // The first 4 bytes of each log block contain the cycle number
-    __be32 last_cycle_be{};
-    __builtin_memcpy(&last_cycle_be, last_bh->data, sizeof(__be32));
-    uint32_t last_cycle = last_cycle_be.to_cpu();
+    Be32 last_cycle_be{};
+    __builtin_memcpy(&last_cycle_be, last_bh->data, sizeof(Be32));
+    uint32_t const LAST_CYCLE = last_cycle_be.to_cpu();
     brelse(last_bh);
 
-    if (last_cycle == head_cycle) {
+    if (LAST_CYCLE == HEAD_CYCLE) {
         // Log wraps but head is somewhere; for simplicity, treat as needing
         // a more thorough scan.
-        log->head_cycle = head_cycle;
+        log->head_cycle = HEAD_CYCLE;
         log->head_block = 0;
         log->tail_cycle = tail_cycle;
         log->tail_block = tail_block;
-        log->clean = (head_cycle == tail_cycle && tail_block == 0);
+        log->clean = (HEAD_CYCLE == tail_cycle && tail_block == 0);
     } else {
         // Head and last block have different cycles - log has wrapped
-        log->head_cycle = last_cycle;
+        log->head_cycle = LAST_CYCLE;
         log->head_block = 0;
         log->tail_cycle = tail_cycle;
         log->tail_block = tail_block;
@@ -108,10 +109,10 @@ XfsLog* active_log = nullptr;
 // Returns the block number after this record (next record start), or -1 on error.
 auto replay_log_record(XfsLog* log, uint32_t block) -> int {
     XfsMountContext* ctx = log->mount;
-    uint32_t block_size = ctx->block_size;
+    uint32_t const BLOCK_SIZE = ctx->block_size;
 
-    uint64_t disk_block = log->log_start + block;
-    BufHead* hdr_bh = xfs_buf_read(ctx, disk_block);
+    uint64_t const DISK_BLOCK = log->log_start + block;
+    BufHead* hdr_bh = xfs_buf_read(ctx, DISK_BLOCK);
     if (hdr_bh == nullptr) {
         mod::dbg::log("[xfs log recover] failed to read log block %u", block);
         return -1;
@@ -123,18 +124,18 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
         return -1;
     }
 
-    uint32_t body_size = hdr->h_len.to_cpu();
-    uint32_t num_logops = hdr->h_num_logops.to_cpu();
+    uint32_t const BODY_SIZE = hdr->h_len.to_cpu();
+    uint32_t const NUM_LOGOPS = hdr->h_num_logops.to_cpu();
     brelse(hdr_bh);
 
-    if (body_size == 0 || num_logops == 0) {
+    if (BODY_SIZE == 0 || NUM_LOGOPS == 0) {
         // Empty record - advance past header
         return static_cast<int>((block + 1) % log->log_blocks);
     }
 
     // Read body data
-    uint32_t data_blocks = (body_size + block_size - 1) / block_size;
-    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(data_blocks) * block_size];
+    uint32_t const DATA_BLOCKS = (BODY_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE];
     if (body_buf == nullptr) {
         return -1;
     }
@@ -142,16 +143,16 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
     uint32_t cur_block = (block + 1) % log->log_blocks;
     uint32_t body_offset = 0;
 
-    for (uint32_t b = 0; b < data_blocks; b++) {
-        uint64_t data_disk_block = log->log_start + cur_block;
-        BufHead* data_bh = xfs_buf_read(ctx, data_disk_block);
+    for (uint32_t b = 0; b < DATA_BLOCKS; b++) {
+        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
+        BufHead* data_bh = xfs_buf_read(ctx, DATA_DISK_BLOCK);
         if (data_bh == nullptr) {
             delete[] body_buf;
             return -1;
         }
 
-        uint32_t chunk = body_size - body_offset;
-        chunk = std::min(chunk, block_size);
+        uint32_t chunk = BODY_SIZE - body_offset;
+        chunk = std::min(chunk, BLOCK_SIZE);
         __builtin_memcpy(body_buf + body_offset, data_bh->data, chunk);
         brelse(data_bh);
 
@@ -165,11 +166,11 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
     uint32_t pos = 0;
     uint32_t replayed = 0;
 
-    while (pos < body_size && replayed < num_logops) {
+    while (pos < BODY_SIZE && replayed < NUM_LOGOPS) {
         // Peek ahead to determine item type
         // Buffer items: need at least 16B header (8+4+4)
         // Inode items: need at least 8B
-        if (pos + 16 <= body_size) {
+        if (pos + 16 <= BODY_SIZE) {
             // Try as buffer item
             uint64_t blk_no = 0;
             uint32_t off = 0;
@@ -179,15 +180,15 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
             __builtin_memcpy(&len, body_buf + pos + 12, 4);
 
             // Sanity check: len should be reasonable
-            if (len > 0 && len <= block_size * 4 && pos + 16 + len <= body_size) {
+            if (len > 0 && len <= BLOCK_SIZE * 4 && pos + 16 + len <= BODY_SIZE) {
                 // Replay this buffer modification
                 BufHead* target_bh = bread(ctx->device, blk_no);
                 if (target_bh != nullptr) {
                     if (off + len <= target_bh->size) {
                         __builtin_memcpy(target_bh->data + off, body_buf + pos + 16, len);
                         bdirty(target_bh);
-                        int wrc = bwrite(target_bh);
-                        if (wrc == 0) {
+                        int const WRC = bwrite(target_bh);
+                        if (WRC == 0) {
                             replayed++;
                         }
                     }
@@ -198,7 +199,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
         }
 
         // Otherwise, treat as inode item (8 bytes) or skip
-        if (pos + 8 <= body_size) {
+        if (pos + 8 <= BODY_SIZE) {
             pos += 8;
             replayed++;
         } else {
@@ -208,7 +209,7 @@ auto replay_log_record(XfsLog* log, uint32_t block) -> int {
 
     delete[] body_buf;
 
-    mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u", replayed, num_logops, block);
+    mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u", replayed, NUM_LOGOPS, block);
 
     return static_cast<int>(cur_block);
 }
@@ -223,21 +224,21 @@ auto xfs_log_recover(XfsLog* log) -> int {
     int records = 0;
 
     while (cur_cycle < log->head_cycle || (cur_cycle == log->head_cycle && cur_block < log->head_block)) {
-        int next = replay_log_record(log, cur_block);
-        if (next < 0) {
+        int const NEXT = replay_log_record(log, cur_block);
+        if (NEXT < 0) {
             mod::dbg::log("[xfs log recover] failed at block %u, stopping", cur_block);
             break;
         }
         records++;
 
-        auto next_block = static_cast<uint32_t>(next);
+        auto next_block = static_cast<uint32_t>(NEXT);
         if (next_block < cur_block) {
             cur_cycle++;  // wrapped around
         }
         cur_block = next_block;
 
         // Safety: don't loop forever
-        if (records > static_cast<int>(log->log_blocks)) {
+        if (std::cmp_greater(records, log->log_blocks)) {
             mod::dbg::log("[xfs log recover] too many records, aborting");
             break;
         }
@@ -272,10 +273,10 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
     log->clean = true;
     log->active = false;
 
-    int rc = xfs_log_find_head_tail(log);
-    if (rc != 0) {
+    int const RC = xfs_log_find_head_tail(log);
+    if (RC != 0) {
         delete log;
-        return rc;
+        return RC;
     }
 
     if (!log->clean) {
@@ -283,11 +284,11 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
             mod::dbg::log("[xfs log] log is dirty but mount is read-only - recovery deferred");
         } else {
             mod::dbg::log("[xfs log] log is dirty - recovery needed");
-            int rrc = xfs_log_recover(log);
-            if (rrc != 0) {
-                mod::dbg::log("[xfs log] recovery failed: %d", rrc);
+            int const RRC = xfs_log_recover(log);
+            if (RRC != 0) {
+                mod::dbg::log("[xfs log] recovery failed: %d", RRC);
                 delete log;
-                return rrc;
+                return RRC;
             }
         }
     } else {
@@ -333,10 +334,10 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t body_size = 0;
     uint32_t num_logops = 0;
     for (int i = 0; i < item_count; i++) {
-        if (items[i].type == XfsLogItemType::Buffer && items[i].buf.dirty) {
+        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
             body_size += 8 + 4 + 4 + items[i].buf.len;
             num_logops++;
-        } else if (items[i].type == XfsLogItemType::Inode) {
+        } else if (items[i].type == XfsLogItemType::INODE) {
             body_size += 8;
             num_logops++;
         }
@@ -347,51 +348,51 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     }
 
     // Number of blocks needed: header (1) + data blocks
-    uint32_t block_size = mount->block_size;
-    uint32_t data_blocks = (body_size + block_size - 1) / block_size;
-    uint32_t total_blocks = 1 + data_blocks;  // header block + data
+    uint32_t const BLOCK_SIZE = mount->block_size;
+    uint32_t const DATA_BLOCKS = (body_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint32_t const TOTAL_BLOCKS = 1 + DATA_BLOCKS;  // header block + data
 
-    if (total_blocks > log->log_blocks) {
-        mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)", total_blocks, log->log_blocks);
+    if (TOTAL_BLOCKS > log->log_blocks) {
+        mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)", TOTAL_BLOCKS, log->log_blocks);
         return -ENOSPC;
     }
 
     // Check if we have enough space before wrapping
-    uint32_t head = log->head_block;
+    uint32_t const HEAD = log->head_block;
     uint32_t avail = 0;
-    if (head >= log->tail_block) {
-        avail = log->log_blocks - head + log->tail_block;
+    if (HEAD >= log->tail_block) {
+        avail = log->log_blocks - HEAD + log->tail_block;
     } else {
-        avail = log->tail_block - head;
+        avail = log->tail_block - HEAD;
     }
-    if (total_blocks >= avail) {
-        mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)", total_blocks, avail);
+    if (TOTAL_BLOCKS >= avail) {
+        mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)", TOTAL_BLOCKS, avail);
         return -ENOSPC;
     }
 
     // Build the log record header
     XlogRecHeader hdr{};
-    hdr.h_magicno = __be32::from_cpu(XLOG_HEADER_MAGIC_NUM);
-    hdr.h_cycle = __be32::from_cpu(log->head_cycle);
-    hdr.h_version = __be32::from_cpu(2);
-    hdr.h_len = __be32::from_cpu(body_size);
+    hdr.h_magicno = Be32::from_cpu(XLOG_HEADER_MAGIC_NUM);
+    hdr.h_cycle = Be32::from_cpu(log->head_cycle);
+    hdr.h_version = Be32::from_cpu(2);
+    hdr.h_len = Be32::from_cpu(body_size);
 
-    uint64_t lsn = (static_cast<uint64_t>(log->head_cycle) << 32) | head;
-    hdr.h_lsn = __be64::from_cpu(lsn);
+    uint64_t const LSN = (static_cast<uint64_t>(log->head_cycle) << 32) | HEAD;
+    hdr.h_lsn = Be64::from_cpu(LSN);
 
-    uint64_t tail_lsn = (static_cast<uint64_t>(log->tail_cycle) << 32) | log->tail_block;
-    hdr.h_tail_lsn = __be64::from_cpu(tail_lsn);
-    hdr.h_num_logops = __be32::from_cpu(num_logops);
-    hdr.h_fmt = __be32::from_cpu(1);  // XLOG_FMT_LINUX_LE
+    uint64_t const TAIL_LSN = (static_cast<uint64_t>(log->tail_cycle) << 32) | log->tail_block;
+    hdr.h_tail_lsn = Be64::from_cpu(TAIL_LSN);
+    hdr.h_num_logops = Be32::from_cpu(num_logops);
+    hdr.h_fmt = Be32::from_cpu(1);  // XLOG_FMT_LINUX_LE
 
     // Copy filesystem UUID
     hdr.h_fs_uuid = mount->uuid;
-    hdr.h_size = __be32::from_cpu(block_size);
+    hdr.h_size = Be32::from_cpu(BLOCK_SIZE);
 
     // Write header block - use xfs_buf_get (not xfs_buf_read) since we
     // immediately zero and overwrite the entire block; no need to read from disk.
-    uint64_t hdr_disk_block = log->log_start + head;
-    BufHead* hdr_bh = xfs_buf_get(mount, hdr_disk_block);
+    uint64_t const HDR_DISK_BLOCK = log->log_start + HEAD;
+    BufHead* hdr_bh = xfs_buf_get(mount, HDR_DISK_BLOCK);
     if (hdr_bh == nullptr) {
         return -EIO;
     }
@@ -399,26 +400,26 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     // Zero the block and write the header (header is 1052B, but we write
     // just the first XLOG_HEADER_SIZE=512 bytes per the on-disk format;
     // the h_cycle_data array extends beyond but is part of the same struct)
-    __builtin_memset(hdr_bh->data, 0, block_size);
+    __builtin_memset(hdr_bh->data, 0, BLOCK_SIZE);
     size_t write_len = sizeof(XlogRecHeader);
-    write_len = std::min<size_t>(write_len, block_size);
+    write_len = std::min<size_t>(write_len, BLOCK_SIZE);
     __builtin_memcpy(hdr_bh->data, &hdr, write_len);
 
     // Compute CRC over the header
     auto* on_disk_hdr = reinterpret_cast<XlogRecHeader*>(hdr_bh->data);
     on_disk_hdr->h_crc = 0;
-    uint32_t hdr_crc = util::crc32c_compute(hdr_bh->data, write_len);
-    on_disk_hdr->h_crc = hdr_crc;  // little-endian on disk
+    uint32_t const HDR_CRC = util::crc32c_compute(hdr_bh->data, write_len);
+    on_disk_hdr->h_crc = HDR_CRC;  // little-endian on disk
 
     bdirty(hdr_bh);
     brelse(hdr_bh);
 
     // Write body data blocks
-    uint32_t cur_block = (head + 1) % log->log_blocks;
+    uint32_t cur_block = (HEAD + 1) % log->log_blocks;
     uint32_t body_offset = 0;
 
     // Temporary buffer for assembling body data
-    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(data_blocks) * block_size];
+    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE];
     if (body_buf == nullptr) {
         return -ENOMEM;
     }
@@ -426,7 +427,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     // Serialize log items into body buffer
     uint32_t pos = 0;
     for (int i = 0; i < item_count; i++) {
-        if (items[i].type == XfsLogItemType::Buffer && items[i].buf.dirty) {
+        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
             uint64_t blk = items[i].buf.bp->block_no;
             uint32_t off = items[i].buf.offset;
             uint32_t len = items[i].buf.len;
@@ -438,7 +439,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
             pos += 4;
             __builtin_memcpy(body_buf + pos, items[i].buf.bp->data + off, len);
             pos += len;
-        } else if (items[i].type == XfsLogItemType::Inode && items[i].inode.ip != nullptr) {
+        } else if (items[i].type == XfsLogItemType::INODE && items[i].inode.ip != nullptr) {
             uint64_t ino = items[i].inode.ip->ino;
             __builtin_memcpy(body_buf + pos, &ino, 8);
             pos += 8;
@@ -447,17 +448,17 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
 
     // Write body data block by block
     while (body_offset < body_size) {
-        uint64_t data_disk_block = log->log_start + cur_block;
+        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
         // Use xfs_buf_get - we zero+overwrite the full block, no read needed.
-        BufHead* data_bh = xfs_buf_get(mount, data_disk_block);
+        BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
         if (data_bh == nullptr) {
             delete[] body_buf;
             return -EIO;
         }
 
         uint32_t chunk = body_size - body_offset;
-        chunk = std::min(chunk, block_size);
-        __builtin_memset(data_bh->data, 0, block_size);
+        chunk = std::min(chunk, BLOCK_SIZE);
+        __builtin_memset(data_bh->data, 0, BLOCK_SIZE);
         __builtin_memcpy(data_bh->data, body_buf + body_offset, chunk);
 
         bdirty(data_bh);
@@ -470,10 +471,10 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     delete[] body_buf;
 
     // Advance the log head
-    log->tail_block = head;
+    log->tail_block = HEAD;
     log->tail_cycle = log->head_cycle;
     log->head_block = cur_block;
-    if (cur_block < head) {
+    if (cur_block < HEAD) {
         log->head_cycle++;
     }
     log->clean = false;

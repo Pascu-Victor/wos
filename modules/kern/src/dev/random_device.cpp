@@ -1,8 +1,9 @@
 #include "random_device.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <vfs/file.hpp>
 
 #include "dev/device.hpp"
@@ -19,27 +20,37 @@ bool rdrand_fill(uint8_t* buf, size_t count) {
 
     // Fill 8 bytes at a time
     while (offset + 8 <= count) {
-        uint64_t val;
-        int ok;
+        uint64_t val = 0;
+        // NOLINTNEXTLINE(misc-const-correctness)
+        int ok = 0;
         // Try RDRAND up to 10 times (Intel recommends retries)
         for (int attempt = 0; attempt < 10; attempt++) {
             asm volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-            if (ok) break;
+            if (ok != 0) {
+                break;
+            }
         }
-        if (!ok) return false;
+        if (ok == 0) {
+            return false;
+        }
         std::memcpy(buf + offset, &val, 8);
         offset += 8;
     }
 
     // Fill remaining bytes
     if (offset < count) {
-        uint64_t val;
-        int ok;
+        uint64_t val = 0;
+        // NOLINTNEXTLINE(misc-const-correctness)
+        int ok = 0;
         for (int attempt = 0; attempt < 10; attempt++) {
             asm volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-            if (ok) break;
+            if (ok != 0) {
+                break;
+            }
         }
-        if (!ok) return false;
+        if (ok == 0) {
+            return false;
+        }
         std::memcpy(buf + offset, &val, count - offset);
     }
 
@@ -52,8 +63,12 @@ int urandom_open(ker::vfs::File* /*file*/) { return 0; }
 int urandom_close(ker::vfs::File* /*file*/) { return 0; }
 
 ssize_t urandom_read(ker::vfs::File* /*file*/, void* buf, size_t count) {
-    if (buf == nullptr) return -1;
-    if (count == 0) return 0;
+    if (buf == nullptr) {
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
 
     if (!rdrand_fill(static_cast<uint8_t*>(buf), count)) {
         // RDRAND failed - should not normally happen on modern CPUs
@@ -93,10 +108,13 @@ Device urandom_dev = {
 
 void random_device_init() {
     // Check RDRAND support via CPUID (leaf 1, ECX bit 30)
+    // Written by inline asm output constraints.
+    // NOLINTBEGIN(misc-const-correctness)
     uint32_t eax = 0;
     uint32_t ebx = 0;
     uint32_t ecx = 0;
     uint32_t edx = 0;
+    // NOLINTEND(misc-const-correctness)
     asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
     if ((ecx & (1U << 30)) == 0U) {
         ker::mod::dbg::logger<"random_device">::warn("RDRAND not supported, /dev/urandom unavailable\n");

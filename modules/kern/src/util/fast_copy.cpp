@@ -1,6 +1,7 @@
 #include "fast_copy.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
 
@@ -28,14 +29,15 @@ inline void copy_sse(uint8_t* dst, const uint8_t* src, size_t len) {
     if (cpu >= MAX_FAST_COPY_CPUS) {
         cpu = 0;
     }
+    // NOLINTBEGIN(misc-const-correctness)
     FxState& state = g_fx_state[cpu];
-
     uint64_t rflags = 0;
+    size_t chunks = len / 16;
+    // NOLINTEND(misc-const-correctness)
     // Prevent IRQ/preemption interleaving while owning SIMD state.
     asm volatile("pushfq; pop %0; cli" : "=r"(rflags) : : "memory", "cc");
     asm volatile("fxsave64 %0" : "=m"(state) : : "memory");
 
-    size_t chunks = len / 16;
     if (chunks != 0) {
         asm volatile(
             "1:\n\t"
@@ -50,9 +52,9 @@ inline void copy_sse(uint8_t* dst, const uint8_t* src, size_t len) {
             : "xmm0", "memory", "cc");
     }
 
-    size_t tail = len & 0x0F;
-    if (tail != 0) {
-        copy_scalar(dst, src, tail);
+    size_t const TAIL = len & 0x0F;
+    if (TAIL != 0) {
+        copy_scalar(dst, src, TAIL);
     }
 
     asm volatile("fxrstor64 %0" : : "m"(state) : "memory");

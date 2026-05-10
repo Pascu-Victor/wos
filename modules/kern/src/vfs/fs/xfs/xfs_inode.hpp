@@ -129,16 +129,16 @@ void xfs_icache_purge(XfsMountContext* mount);
 
 // Helper: compute the filesystem block containing a given inode
 inline auto xfs_inode_block(const XfsMountContext* ctx, xfs_ino_t ino) -> xfs_fsblock_t {
-    xfs_agnumber_t agno = xfs_ino_ag(ino, ctx->agino_log);
-    xfs_agino_t agino = xfs_ag_ino(ino, ctx->agino_log);
-    xfs_agblock_t agbno = agino / ctx->inodes_per_block;
-    return xfs_agbno_to_fsbno(agno, agbno, ctx->ag_blk_log);
+    xfs_agnumber_t const AGNO = xfs_ino_ag(ino, ctx->agino_log);
+    xfs_agino_t const AGINO = xfs_ag_ino(ino, ctx->agino_log);
+    xfs_agblock_t const AGBNO = AGINO / ctx->inodes_per_block;
+    return xfs_agbno_to_fsbno(AGNO, AGBNO, ctx->ag_blk_log);
 }
 
 // Helper: compute the byte offset within the block for the inode
 inline auto xfs_inode_offset(const XfsMountContext* ctx, xfs_ino_t ino) -> size_t {
-    xfs_agino_t agino = xfs_ag_ino(ino, ctx->agino_log);
-    return static_cast<size_t>(agino % ctx->inodes_per_block) * ctx->inode_size;
+    xfs_agino_t const AGINO = xfs_ag_ino(ino, ctx->agino_log);
+    return static_cast<size_t>(AGINO % ctx->inodes_per_block) * ctx->inode_size;
 }
 
 // Check if inode is a directory

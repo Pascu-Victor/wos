@@ -146,15 +146,15 @@ void start_cmd(volatile HbaPort* port) {
 
 // Check device type on a port
 auto check_type(volatile HbaPort* port) -> int {
-    uint32_t const ssts = mmio_read32(port->ssts);
+    uint32_t const SSTS = mmio_read32(port->ssts);
 
-    uint8_t const ipm = (ssts >> 8) & 0x0F;
-    uint8_t const det = ssts & 0x0F;
+    uint8_t const IPM = (SSTS >> 8) & 0x0F;
+    uint8_t const DET = SSTS & 0x0F;
 
-    if (det != HBA_PORT_DET_PRESENT) {  // Check drive status
+    if (DET != HBA_PORT_DET_PRESENT) {  // Check drive status
         return AHCI_DEV_NULL;
     }
-    if (ipm != HBA_PORT_IPM_ACTIVE) {
+    if (IPM != HBA_PORT_IPM_ACTIVE) {
         return AHCI_DEV_NULL;
     }
 
@@ -187,13 +187,13 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
         hcf();
     }
     std::memset(clb_virt, 0, 1024);
-    uint64_t const clb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(clb_virt));
-    if (clb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+    uint64_t const CLB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(clb_virt));
+    if (CLB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
         ker::mod::dbg::log("ahci: failed to translate CLB kernel allocation");
         hcf();
     }
-    mmio_write32(port->clb, static_cast<uint32_t>(clb_phys & UINT32_MAX));
-    mmio_write32(port->clbu, static_cast<uint32_t>((clb_phys >> 32) & UINT32_MAX));
+    mmio_write32(port->clb, static_cast<uint32_t>(CLB_PHYS & UINT32_MAX));
+    mmio_write32(port->clbu, static_cast<uint32_t>((CLB_PHYS >> 32) & UINT32_MAX));
 
     // Store virtual address for later use
     port_memory[portno].clb_virt = reinterpret_cast<HbaCmdHeader*>(clb_virt);
@@ -206,13 +206,13 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
         hcf();
     }
     std::memset(fb_virt, 0, 256);
-    uint64_t const fb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(fb_virt));
-    if (fb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+    uint64_t const FB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(fb_virt));
+    if (FB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
         ker::mod::dbg::log("ahci: failed to translate FIS buffer kernel allocation");
         hcf();
     }
-    mmio_write32(port->fb, static_cast<uint32_t>(fb_phys & UINT32_MAX));
-    mmio_write32(port->fbu, static_cast<uint32_t>((fb_phys >> 32) & UINT32_MAX));
+    mmio_write32(port->fb, static_cast<uint32_t>(FB_PHYS & UINT32_MAX));
+    mmio_write32(port->fbu, static_cast<uint32_t>((FB_PHYS >> 32) & UINT32_MAX));
 
     // Store virtual address for later use
     port_memory[portno].fb_virt = fb_virt;
@@ -231,13 +231,13 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
             hcf();
         }
         std::memset(ctb_virt, 0, CTB_SIZE);
-        uint64_t const ctb_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(ctb_virt));
-        if (ctb_phys == ker::mod::mm::virt::PADDR_INVALID) {
+        uint64_t const CTB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(ctb_virt));
+        if (CTB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
             ker::mod::dbg::log("ahci: failed to translate CTB kernel allocation");
             hcf();
         }
-        cmdheader[i].ctba = static_cast<uint32_t>(ctb_phys & UINT32_MAX);
-        cmdheader[i].ctbau = static_cast<uint32_t>((ctb_phys >> 32) & UINT32_MAX);
+        cmdheader[i].ctba = static_cast<uint32_t>(CTB_PHYS & UINT32_MAX);
+        cmdheader[i].ctbau = static_cast<uint32_t>((CTB_PHYS >> 32) & UINT32_MAX);
 
         // Store virtual address for later use
         port_memory[portno].ctb_virt[i] = ctb_virt;
@@ -250,12 +250,12 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
 auto find_cmdslot(volatile HbaPort* port, int portno) -> uint32_t {
     // Check both hardware registers AND software tracking for busy slots
     // The software tracking handles the race where we've issued a command but hardware hasn't updated ci yet
-    uint32_t const hw_slots = (mmio_read32(port->sact) | mmio_read32(port->ci));
-    uint32_t const sw_slots =
+    uint32_t const HW_SLOTS = (mmio_read32(port->sact) | mmio_read32(port->ci));
+    uint32_t const SW_SLOTS =
         (portno >= 0 && std::cmp_less(portno, MAX_PORTS)) ? port_slots_in_use[portno].load(std::memory_order_acquire) : 0;
-    uint32_t slots = hw_slots | sw_slots;
-    uint32_t const cmdslots = (mmio_read32(hba_mem->cap) & 0x1F00) >> 8;  // Number of command slots
-    for (uint32_t i = 0; i < cmdslots; i++) {
+    uint32_t slots = HW_SLOTS | SW_SLOTS;
+    uint32_t const CMDSLOTS = (mmio_read32(hba_mem->cap) & 0x1F00) >> 8;  // Number of command slots
+    for (uint32_t i = 0; i < CMDSLOTS; i++) {
         if ((slots & 1) == 0) {
             return i;
         }
@@ -297,10 +297,10 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
     // Userspace buffers (below HHDM) need the current task's pagemap.
     ker::mod::mm::paging::PageTable* active_pt = nullptr;
     {
-        uint64_t const hhdm = ker::mod::mm::addr::get_hhdm_offset();
-        bool const is_kernel_buf = (reinterpret_cast<uint64_t>(buf) >= hhdm);
+        uint64_t const HHDM = ker::mod::mm::addr::get_hhdm_offset();
+        bool const IS_KERNEL_BUF = (reinterpret_cast<uint64_t>(buf) >= HHDM);
 
-        if (is_kernel_buf) {
+        if (IS_KERNEL_BUF) {
             active_pt = ker::mod::mm::virt::get_kernel_pagemap();
         } else {
             ker::mod::sched::task::Task const* cur_task = nullptr;
@@ -324,21 +324,21 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
     constexpr uint32_t SECTOR_SIZE = 512;
     constexpr size_t MAX_PRDT = 8192;
 
-    uint64_t const total_bytes = static_cast<uint64_t>(count) * SECTOR_SIZE;
+    uint64_t const TOTAL_BYTES = static_cast<uint64_t>(count) * SECTOR_SIZE;
     auto buf_virt = reinterpret_cast<uint64_t>(buf);
-    uint64_t const first_page_off = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
+    uint64_t const FIRST_PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
     auto prdt_entries =
-        static_cast<size_t>((first_page_off + total_bytes + ker::mod::mm::paging::PAGE_SIZE - 1) / ker::mod::mm::paging::PAGE_SIZE);
+        static_cast<size_t>((FIRST_PAGE_OFF + TOTAL_BYTES + ker::mod::mm::paging::PAGE_SIZE - 1) / ker::mod::mm::paging::PAGE_SIZE);
     prdt_entries = std::min(prdt_entries, MAX_PRDT);
 
     auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(port_memory[portno].ctb_virt[slot]);
     std::memset(cmdtbl, 0, sizeof(HbaCmdTbl) + ((prdt_entries - 1) * sizeof(HbaPrdtEntry)));
 
-    uint64_t remaining_bytes = total_bytes;
+    uint64_t remaining_bytes = TOTAL_BYTES;
     size_t actual_prdt_entries = 0;
     while (remaining_bytes > 0 && actual_prdt_entries < prdt_entries) {
-        uint64_t const phys = ker::mod::mm::virt::translate(active_pt, buf_virt);
-        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(active_pt, buf_virt);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
             if (portno >= 0 && std::cmp_less(portno, MAX_PORTS)) {
                 port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
                 port_locks[portno].unlock();
@@ -346,16 +346,16 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
             return false;
         }
 
-        uint64_t const page_off = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t const bytes_this_entry = std::min<uint64_t>(remaining_bytes, ker::mod::mm::paging::PAGE_SIZE - page_off);
+        uint64_t const PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t const BYTES_THIS_ENTRY = std::min<uint64_t>(remaining_bytes, ker::mod::mm::paging::PAGE_SIZE - PAGE_OFF);
 
-        cmdtbl->prdt_entry[actual_prdt_entries].dba = static_cast<uint32_t>(phys & UINT32_MAX);
-        cmdtbl->prdt_entry[actual_prdt_entries].dbau = static_cast<uint32_t>((phys >> 32) & UINT32_MAX);
-        cmdtbl->prdt_entry[actual_prdt_entries].dbc = static_cast<uint32_t>(bytes_this_entry - 1);
+        cmdtbl->prdt_entry[actual_prdt_entries].dba = static_cast<uint32_t>(PHYS & UINT32_MAX);
+        cmdtbl->prdt_entry[actual_prdt_entries].dbau = static_cast<uint32_t>((PHYS >> 32) & UINT32_MAX);
+        cmdtbl->prdt_entry[actual_prdt_entries].dbc = static_cast<uint32_t>(BYTES_THIS_ENTRY - 1);
         cmdtbl->prdt_entry[actual_prdt_entries].i = 1;
 
-        buf_virt += bytes_this_entry;
-        remaining_bytes -= bytes_this_entry;
+        buf_virt += BYTES_THIS_ENTRY;
+        remaining_bytes -= BYTES_THIS_ENTRY;
         actual_prdt_entries++;
     }
 
@@ -420,12 +420,12 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
     constexpr uint64_t COMPLETION_TIMEOUT = 50000000ULL;  // ~50M iterations
     uint64_t wait_iter = 0;
     while (true) {
-        uint32_t const ci_val = mmio_read32(port->ci);
-        if ((ci_val & (1 << slot)) == 0) {
+        uint32_t const CI_VAL = mmio_read32(port->ci);
+        if ((CI_VAL & (1 << slot)) == 0) {
             break;
         }
-        uint32_t const is_val = mmio_read32(port->is);
-        if ((is_val & HBA_PX_IS_TFES) != 0U) {  // Task file error
+        uint32_t const IS_VAL = mmio_read32(port->is);
+        if ((IS_VAL & HBA_PX_IS_TFES) != 0U) {  // Task file error
             if (write_op) {
                 ahci_log("Write disk error\n");
             } else {
@@ -438,12 +438,12 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
             return false;
         }
         if (++wait_iter >= COMPLETION_TIMEOUT) {
-            uint32_t const tfd_val = mmio_read32(port->tfd);
-            uint32_t const serr_val = mmio_read32(port->serr);
-            uint32_t const cmd_val = mmio_read32(port->cmd);
-            uint32_t const ssts_val = mmio_read32(port->ssts);
+            uint32_t const TFD_VAL = mmio_read32(port->tfd);
+            uint32_t const SERR_VAL = mmio_read32(port->serr);
+            uint32_t const CMD_VAL = mmio_read32(port->cmd);
+            uint32_t const SSTS_VAL = mmio_read32(port->ssts);
             ker::mod::dbg::log("AHCI TIMEOUT: slot=%u ci=0x%x is=0x%x tfd=0x%x serr=0x%x cmd=0x%x ssts=0x%x %s lba=%u:%u cnt=%u", slot,
-                               ci_val, is_val, tfd_val, serr_val, cmd_val, ssts_val, write_op ? "WRITE" : "READ", starth, startl, count);
+                               CI_VAL, IS_VAL, TFD_VAL, SERR_VAL, CMD_VAL, SSTS_VAL, write_op ? "WRITE" : "READ", starth, startl, count);
             if (portno >= 0 && std::cmp_less(portno, MAX_PORTS)) {
                 port_slots_in_use[portno].fetch_and(~(1U << slot), std::memory_order_release);
             }
@@ -650,8 +650,8 @@ auto ahci_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* buf
     auto startl = static_cast<uint32_t>(block & UINT32_MAX);
     auto starth = static_cast<uint32_t>((block >> 32) & UINT32_MAX);
 
-    bool const result = read_disk(port, dev->port_num, startl, starth, static_cast<uint32_t>(count), static_cast<uint8_t*>(buffer));
-    return result ? 0 : -1;
+    bool const RESULT = read_disk(port, dev->port_num, startl, starth, static_cast<uint32_t>(count), static_cast<uint8_t*>(buffer));
+    return RESULT ? 0 : -1;
 }
 
 // Wrapper for block device write
@@ -671,9 +671,9 @@ auto ahci_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const vo
     auto starth = static_cast<uint32_t>((block >> 32) & UINT32_MAX);
 
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-    bool const result =
+    bool const RESULT =
         write_disk(port, dev->port_num, startl, starth, static_cast<uint32_t>(count), static_cast<uint8_t*>(const_cast<void*>(buffer)));
-    return result ? 0 : -1;
+    return RESULT ? 0 : -1;
 }
 
 // Send ATA IDENTIFY command and return the actual total number of LBA sectors.
@@ -710,8 +710,8 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
     std::memset(id_buf, 0, 512);
 
     auto* kernel_pt = ker::mod::mm::virt::get_kernel_pagemap();
-    uint64_t const buf_phys = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(id_buf));
-    if (buf_phys == ker::mod::mm::virt::PADDR_INVALID) {
+    uint64_t const BUF_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(id_buf));
+    if (BUF_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
         ker::mod::dbg::log("ahci: failed to translate identify buffer");
         hcf();
     }
@@ -725,8 +725,8 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
     std::memset(cmdtbl, 0, sizeof(HbaCmdTbl));
 
     // Single PRDT entry for 512 bytes
-    cmdtbl->prdt_entry[0].dba = static_cast<uint32_t>(buf_phys & UINT32_MAX);
-    cmdtbl->prdt_entry[0].dbau = static_cast<uint32_t>((buf_phys >> 32) & UINT32_MAX);
+    cmdtbl->prdt_entry[0].dba = static_cast<uint32_t>(BUF_PHYS & UINT32_MAX);
+    cmdtbl->prdt_entry[0].dbau = static_cast<uint32_t>((BUF_PHYS >> 32) & UINT32_MAX);
     cmdtbl->prdt_entry[0].dbc = 512 - 1;  // 512 bytes
     cmdtbl->prdt_entry[0].i = 1;
 
@@ -819,8 +819,8 @@ void probe_port(volatile HbaMem* abar) {
     int i = 0;
     while (i < 32) {
         if ((port_implemented & 1) != 0U) {
-            int const dt = check_type(&abar->ports[i]);
-            if (dt == AHCI_DEV_SATA) {
+            int const DT = check_type(&abar->ports[i]);
+            if (DT == AHCI_DEV_SATA) {
                 ahci_log("SATA drive found at port ");
                 ahci_log_hex(i);
                 ahci_log("\n");
@@ -831,8 +831,8 @@ void probe_port(volatile HbaMem* abar) {
                     dev->port_num = i;
 
                     // Issue ATA IDENTIFY to get real disk capacity
-                    uint64_t const sectors = identify_disk(&abar->ports[i], i);
-                    dev->total_sectors = (sectors > 0) ? sectors : 131072;  // Fallback 64MB
+                    uint64_t const SECTORS = identify_disk(&abar->ports[i], i);
+                    dev->total_sectors = (SECTORS > 0) ? SECTORS : 131072;  // Fallback 64MB
 
                     // Set up block device
                     dev->bdev.major = 8;
@@ -856,11 +856,11 @@ void probe_port(volatile HbaMem* abar) {
                     block_device_register(&dev->bdev);
                     device_count++;
                 }
-            } else if (dt == AHCI_DEV_SATAPI) {
+            } else if (DT == AHCI_DEV_SATAPI) {
                 ahci_log("SATAPI drive found at port ");
                 ahci_log_hex(i);
                 ahci_log("\n");
-            } else if (dt != AHCI_DEV_NULL) {
+            } else if (DT != AHCI_DEV_NULL) {
                 ahci_log("Other device found at port ");
                 ahci_log_hex(i);
                 ahci_log("\n");
@@ -892,9 +892,9 @@ auto ahci_init() -> int {
     ahci_log("\n");
 
     // Probe and initialize ports
-    uint32_t const port_implemented = mmio_read32(hba_mem->pi);
+    uint32_t const PORT_IMPLEMENTED = mmio_read32(hba_mem->pi);
     for (size_t i = 0; i < MAX_PORTS; i++) {
-        if (((port_implemented & (1 << i)) != 0U)) {
+        if (((PORT_IMPLEMENTED & (1 << i)) != 0U)) {
             ahci_log("ahci_init: Rebasing port ");
             ahci_log_hex(i);
             ahci_log("\n");

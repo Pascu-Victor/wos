@@ -1,6 +1,6 @@
 #include "mandelbench.hpp"
 
-#include <sched.h>
+#include <bits/timeval.h>
 
 #include <algorithm>
 #include <string>
@@ -15,12 +15,9 @@
 #ifdef WOS
 #include <sys/multiproc.h>
 #endif
-#include <sys/select.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -54,7 +51,7 @@ auto cpu_bit(int cpu_id) -> uint64_t {
     return 1ULL << static_cast<unsigned>(cpu_id);
 }
 
-void note_cpu_sample(struct arg* a, int current_cpu) {
+void note_cpu_sample(Arg* a, int current_cpu) {
     a->cpu_mask |= cpu_bit(current_cpu);
     if (current_cpu != a->cpu_end_id) {
         if (a->cpu_end_id >= 0) {
@@ -66,7 +63,7 @@ void note_cpu_sample(struct arg* a, int current_cpu) {
 #endif
 
 auto generate_image(void* param) -> int {
-    auto* a = static_cast<struct arg*>(param);
+    auto* a = static_cast<Arg*>(param);
 #if MANDELBENCH_DEBUG
     a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
     a->cpu_end_id = a->cpu_id;
@@ -92,10 +89,10 @@ auto generate_image(void* param) -> int {
     double x_new = 0.0;
 
     unsigned char* image = a->image;
-    unsigned char* colormap = a->colormap;
-    int width = a->width;
-    int height = a->height;
-    int max = a->max;
+    unsigned char const* colormap = a->colormap;
+    int const WIDTH = a->width;
+    int const HEIGHT = a->height;
+    int const MAX = a->max;
 
 #if MANDELBENCH_DEBUG
     // Gaps between row completions larger than this threshold are counted as
@@ -105,7 +102,7 @@ auto generate_image(void* param) -> int {
     uint64_t prev_row_end = a->thread_start_ns;
 #endif
 
-    for (row = a->id; row < height; row += a->threads) {
+    for (row = a->id; row < HEIGHT; row += a->threads) {
 #if MANDELBENCH_DEBUG
         uint64_t row_start = now_ns();
         uint64_t gap = row_start - prev_row_end;
@@ -117,12 +114,12 @@ auto generate_image(void* param) -> int {
         note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
         a->rows_completed++;
 #endif
-        for (col = 0; col < width; col++) {
-            c_re = (col - (width / 2.0)) * 4.0 / width;
-            c_im = (row - (height / 2.0)) * 4.0 / width;
+        for (col = 0; col < WIDTH; col++) {
+            c_re = (col - (WIDTH / 2.0)) * 4.0 / WIDTH;
+            c_im = (row - (HEIGHT / 2.0)) * 4.0 / WIDTH;
             x = 0, y = 0;
             iteration = 0;
-            while ((x * x) + (y * y) <= 4 && iteration < max) {
+            while ((x * x) + (y * y) <= 4 && iteration < MAX) {
                 x_new = (x * x) - (y * y) + c_re;
                 y = (2 * x * y) + c_im;
                 x = x_new;
@@ -131,8 +128,8 @@ auto generate_image(void* param) -> int {
 #if MANDELBENCH_DEBUG
             a->total_iterations += static_cast<uint64_t>(iteration);
 #endif
-            iteration = std::min(iteration, max);
-            set_pixel(image, width, col, row, &colormap[static_cast<ptrdiff_t>(iteration * 3)]);
+            iteration = std::min(iteration, MAX);
+            set_pixel(image, WIDTH, col, row, &colormap[static_cast<ptrdiff_t>(iteration * 3)]);
         }
 #if MANDELBENCH_DEBUG
         prev_row_end = now_ns();
@@ -155,7 +152,7 @@ auto get_time() -> uint64_t {
 constexpr auto DEVICE_NAME = "cpu";
 
 #if MANDELBENCH_DEBUG
-auto count_threads_on_cpu(const std::vector<struct arg>& args, int cpu_id) -> int {
+auto count_threads_on_cpu(const std::vector<Arg>& args, int cpu_id) -> int {
     int count = 0;
     for (const auto& thread_arg : args) {
         if (thread_arg.cpu_id == cpu_id) {
@@ -167,7 +164,7 @@ auto count_threads_on_cpu(const std::vector<struct arg>& args, int cpu_id) -> in
 #endif
 }  // namespace
 auto mandelbench(int width, int height, int max_iteration, int threads, int repeat, unsigned char* image, unsigned char* colormap) -> int {
-    std::vector<struct arg> a(threads);
+    std::vector<Arg> a(threads);
     std::vector<thrd_t> t(threads);
     std::vector<double> times(repeat);
     uint64_t start_time = 0;
@@ -205,7 +202,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
 #endif
 
             int create_result = thrd_create(&t[i], generate_image, &a[i]);
-            if (create_result != thrd_success) {
+            if (create_result != THRD_SUCCESS) {
                 std::println(stderr, "  error: thrd_create failed for worker {} on repeat {} (rc={})", i, r, create_result);
                 break;
             }
@@ -229,7 +226,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
 
         for (i = 0; i < threads; i++) {
             int join_result = thrd_join(t[i], nullptr);
-            if (join_result != thrd_success) {
+            if (join_result != THRD_SUCCESS) {
                 std::println(stderr, "  error: thrd_join failed for worker {} on repeat {} (rc={})", i, r, join_result);
                 return 1;
             }
@@ -239,7 +236,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
         uint64_t all_joined = now_ns();
 #endif
         end_time = get_time();
-        times[r] = (double)(end_time - start_time) / 1000.0;
+        times[r] = static_cast<double>(end_time - start_time) / 1000.0;
 
 #if MANDELBENCH_DEBUG
         // find earliest/latest thread start and latest thread end
@@ -322,8 +319,8 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
             ((double)a[worst_thread].thread_cpu_ns / (double)(a[worst_thread].thread_end_ns - a[worst_thread].thread_start_ns)) * 100.0);
 #endif
 
-        std::string path = std::format(IMAGE, DEVICE_NAME, r);
-        save_image(path.c_str(), image, width, height);
+        std::string const PATH = std::format(IMAGE, DEVICE_NAME, r);
+        save_image(PATH.c_str(), image, width, height);
         progress(DEVICE_NAME, width, height, max_iteration, threads, repeat, r, times[r]);
     }
     report(DEVICE_NAME, width, height, max_iteration, threads, repeat, times);

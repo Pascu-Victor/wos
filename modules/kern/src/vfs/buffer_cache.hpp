@@ -13,27 +13,27 @@
 namespace ker::vfs {
 
 // Buffer flags
-constexpr uint32_t BH_DIRTY = (1u << 0);      // Buffer has been modified
-constexpr uint32_t BH_VALID = (1u << 1);      // Buffer contains valid data from disk
-constexpr uint32_t BH_LOCKED = (1u << 2);     // Buffer is locked for I/O
-constexpr uint32_t BH_WRITEBACK = (1u << 3);  // Buffer is being written back
+constexpr uint32_t BH_DIRTY = (1U << 0);      // Buffer has been modified
+constexpr uint32_t BH_VALID = (1U << 1);      // Buffer contains valid data from disk
+constexpr uint32_t BH_LOCKED = (1U << 2);     // Buffer is locked for I/O
+constexpr uint32_t BH_WRITEBACK = (1U << 3);  // Buffer is being written back
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
 struct BufHead {
-    uint8_t* data;                  // Pointer to cached block data
-    uint64_t block_no;              // Block number on the device
-    dev::BlockDevice* bdev;         // Owning block device
+    uint8_t* data{};                // Pointer to cached block data
+    uint64_t block_no{};            // Block number on the device
+    dev::BlockDevice* bdev{};       // Owning block device
     std::atomic<int32_t> refcount;  // Reference count (0 = reclaimable)
-    uint32_t flags;                 // BH_DIRTY, BH_VALID, etc.
-    size_t size;                    // Size of buffer in bytes (== bdev->block_size)
+    uint32_t flags{};               // BH_DIRTY, BH_VALID, etc.
+    size_t size{};                  // Size of buffer in bytes (== bdev->block_size)
 
     // LRU doubly-linked list pointers (protected by cache lock)
-    BufHead* lru_prev;
-    BufHead* lru_next;
+    BufHead* lru_prev{};
+    BufHead* lru_next{};
 
     // Hash chain pointers (protected by cache lock)
-    BufHead* hash_next;
+    BufHead* hash_next{};
 };
 
 // Buffer cache configuration

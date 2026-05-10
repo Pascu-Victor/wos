@@ -19,13 +19,13 @@ constexpr size_t PKT_POOL_PER_NIC = 1024;
 constexpr size_t PKT_POOL_GROW_CHUNK = 256;
 
 struct PacketBuffer {
-    std::array<uint8_t, PKT_BUF_SIZE> storage;
-    uint8_t* data;                   // current data pointer
-    size_t len;                      // current data length
-    PacketBuffer* next;              // freelist / queue linkage
-    NetDevice* dev;                  // source/dest device
-    uint16_t protocol;               // EtherType (host byte order)
-    std::array<uint8_t, 6> src_mac;  // incoming source MAC (for reply use)
+    std::array<uint8_t, PKT_BUF_SIZE> storage{};
+    uint8_t* data{};                   // current data pointer
+    size_t len{};                      // current data length
+    PacketBuffer* next{};              // freelist / queue linkage
+    NetDevice* dev{};                  // source/dest device
+    uint16_t protocol{};               // EtherType (host byte order)
+    std::array<uint8_t, 6> src_mac{};  // incoming source MAC (for reply use)
     bool debug_in_use = false;
     uint16_t debug_alloc_cpu = 0;
     uint16_t debug_free_cpu = 0;

@@ -3,35 +3,35 @@
 
 namespace ker::abi::process {
 enum class procmgmt_ops : uint64_t {
-    exit,          // 0
-    exec,          // 1
-    waitpid,       // 2
-    getpid,        // 3
-    getppid,       // 4
-    fork,          // 5
-    sigaction,     // 6
-    sigprocmask,   // 7
-    kill,          // 8
-    sigreturn,     // 9
-    getuid,        // 10
-    geteuid,       // 11
-    getgid,        // 12
-    getegid,       // 13
-    setuid,        // 14
-    setgid,        // 15
-    seteuid,       // 16
-    setegid,       // 17
-    getumask,      // 18
-    setumask,      // 19
-    setsid,        // 20
-    getsid,        // 21
-    setpgid,       // 22
-    getpgid,       // 23
-    execve,        // 24 - POSIX replace-process execve
-    gethostname,   // 25
-    sethostname,   // 26
-    setpriority,   // 27
-    setwkitarget,  // 28
-    getwkitarget,  // 29
+    EXIT,          // 0
+    EXEC,          // 1
+    WAITPID,       // 2
+    GETPID,        // 3
+    GETPPID,       // 4
+    FORK,          // 5
+    SIGACTION,     // 6
+    SIGPROCMASK,   // 7
+    KILL,          // 8
+    SIGRETURN,     // 9
+    GETUID,        // 10
+    GETEUID,       // 11
+    GETGID,        // 12
+    GETEGID,       // 13
+    SETUID,        // 14
+    SETGID,        // 15
+    SETEUID,       // 16
+    SETEGID,       // 17
+    GETUMASK,      // 18
+    SETUMASK,      // 19
+    SETSID,        // 20
+    GETSID,        // 21
+    SETPGID,       // 22
+    GETPGID,       // 23
+    EXECVE,        // 24 - POSIX replace-process execve
+    GETHOSTNAME,   // 25
+    SETHOSTNAME,   // 26
+    SETPRIORITY,   // 27
+    SETWKITARGET,  // 28
+    GETWKITARGET,  // 29
 };
 }  // namespace ker::abi::process

@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
-#include <mod/io/serial/serial.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 
 #include "net/packet.hpp"
@@ -24,13 +22,13 @@ auto virtq_avail_size(uint16_t qsz) -> size_t {
 }
 
 auto virtq_used_size(uint16_t qsz) -> size_t {
-    return sizeof(uint16_t) * 3 + sizeof(VirtqUsedElem) * qsz;  // flags + idx + ring[qsz] + avail_event
+    return (sizeof(uint16_t) * 3) + (sizeof(VirtqUsedElem) * qsz);  // flags + idx + ring[qsz] + avail_event
 }
 
 auto virtq_total_size(uint16_t qsz) -> size_t {
     // Descriptor table, then available ring (aligned to 2), then used ring (aligned to 4096)
-    size_t desc_avail = align_up(virtq_desc_size(qsz) + virtq_avail_size(qsz), 4096);
-    return desc_avail + align_up(virtq_used_size(qsz), 4096);
+    size_t const DESC_AVAIL = align_up(virtq_desc_size(qsz) + virtq_avail_size(qsz), 4096);
+    return DESC_AVAIL + align_up(virtq_used_size(qsz), 4096);
 }
 
 auto virtq_alloc(uint16_t size) -> Virtqueue* {
@@ -44,18 +42,18 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     auto* vq = new Virtqueue{};
 
     // Allocate physically contiguous memory for descriptor table + rings
-    size_t total = virtq_total_size(size);
-    size_t pages_needed = align_up(total, 4096);
+    size_t const TOTAL = virtq_total_size(size);
+    size_t const PAGES_NEEDED = align_up(TOTAL, 4096);
 
-    mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u", size, total, pages_needed);
+    mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u", size, TOTAL, PAGES_NEEDED);
 
-    auto* mem = ker::mod::mm::phys::page_alloc(pages_needed);
+    auto* mem = ker::mod::mm::phys::page_alloc(PAGES_NEEDED);
     if (mem == nullptr) {
-        mod::dbg::log("virtq_alloc: pageAlloc(%u) failed", pages_needed);
+        mod::dbg::log("virtq_alloc: pageAlloc(%u) failed", PAGES_NEEDED);
         delete vq;
         return nullptr;
     }
-    std::memset(mem, 0, pages_needed);
+    std::memset(mem, 0, PAGES_NEEDED);
 
     auto* base = reinterpret_cast<uint8_t*>(mem);
 
@@ -68,8 +66,8 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     vq->desc = reinterpret_cast<VirtqDesc*>(base);
     vq->avail = reinterpret_cast<VirtqAvail*>(base + virtq_desc_size(size));
 
-    size_t used_offset = align_up(virtq_desc_size(size) + virtq_avail_size(size), 4096);
-    vq->used = reinterpret_cast<VirtqUsed*>(base + used_offset);
+    size_t const USED_OFFSET = align_up(virtq_desc_size(size) + virtq_avail_size(size), 4096);
+    vq->used = reinterpret_cast<VirtqUsed*>(base + USED_OFFSET);
 
     // Initialize free list: each descriptor points to the next
     for (uint16_t i = 0; i < size - 1; i++) {
@@ -88,25 +86,25 @@ auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, k
         return -1;
     }
 
-    uint16_t idx = vq->free_head;
-    vq->free_head = vq->desc[idx].next;
+    uint16_t const IDX = vq->free_head;
+    vq->free_head = vq->desc[IDX].next;
     vq->num_free--;
 
-    vq->desc[idx].addr = phys;
-    vq->desc[idx].len = len;
-    vq->desc[idx].flags = flags;
-    vq->desc[idx].next = 0;
+    vq->desc[IDX].addr = phys;
+    vq->desc[IDX].len = len;
+    vq->desc[IDX].flags = flags;
+    vq->desc[IDX].next = 0;
 
-    vq->pkt_map[idx] = pkt;
+    vq->pkt_map[IDX] = pkt;
 
     // Add to available ring
-    uint16_t avail_idx = vq->avail->idx;
-    vq->avail->ring[avail_idx % vq->size] = idx;
+    uint16_t const AVAIL_IDX = vq->avail->idx;
+    vq->avail->ring[AVAIL_IDX % vq->size] = IDX;
     // Memory barrier: ensure descriptor and ring entries are written before idx update
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    vq->avail->idx = avail_idx + 1;
+    vq->avail->idx = AVAIL_IDX + 1;
 
-    return static_cast<int>(idx);
+    return static_cast<int>(IDX);
 }
 
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
@@ -117,8 +115,8 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
 
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
-    uint16_t used_idx = vq->last_used_idx % vq->size;
-    auto& elem = vq->used->ring[used_idx];
+    uint16_t const USED_IDX = vq->last_used_idx % vq->size;
+    auto& elem = vq->used->ring[USED_IDX];
 
     auto desc_idx = static_cast<uint16_t>(elem.id);
     if (out_len != nullptr) {

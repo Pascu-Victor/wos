@@ -6,10 +6,10 @@ namespace ker::mod::gfx::fb {
 class FbFont {
    public:
     void load_font();
-    char name[256];
+    char name[256]{};
     uint8_t height;  // max 64
     uint8_t width;   // max 64
-    uint64_t data[256][64];
+    uint64_t data[256][64]{};
 
     FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]);
     FbFont();

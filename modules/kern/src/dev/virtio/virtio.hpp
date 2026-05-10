@@ -43,20 +43,20 @@ constexpr uint8_t VIRTIO_STATUS_FEATURES_OK = 8;
 constexpr uint8_t VIRTIO_STATUS_FAILED = 128;
 
 // Feature bits
-constexpr uint32_t VIRTIO_NET_F_MAC = (1u << 5);
-constexpr uint32_t VIRTIO_NET_F_STATUS = (1u << 16);
-constexpr uint32_t VIRTIO_NET_F_CTRL_VQ = (1u << 17);  // Control queue present
-constexpr uint32_t VIRTIO_NET_F_MRG_RXBUF = (1u << 15);
-constexpr uint32_t VIRTIO_NET_F_CSUM = (1u << 0);
-constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1u << 1);
-constexpr uint32_t VIRTIO_NET_F_MQ = (1u << 22);  // Multi-queue (requires CTRL_VQ)
+constexpr uint32_t VIRTIO_NET_F_MAC = (1U << 5);
+constexpr uint32_t VIRTIO_NET_F_STATUS = (1U << 16);
+constexpr uint32_t VIRTIO_NET_F_CTRL_VQ = (1U << 17);  // Control queue present
+constexpr uint32_t VIRTIO_NET_F_MRG_RXBUF = (1U << 15);
+constexpr uint32_t VIRTIO_NET_F_CSUM = (1U << 0);
+constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1U << 1);
+constexpr uint32_t VIRTIO_NET_F_MQ = (1U << 22);  // Multi-queue (requires CTRL_VQ)
 
 // Modern virtio PCI capabilities (virtio 1.0  4.1.4)
 constexpr uint8_t VIRTIO_PCI_CAP_VNDR = 0x09;  // PCI vendor cap ID
 constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
 constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
 constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
-constexpr uint32_t VIRTIO_F_VERSION_1 = (1u << 0);  // bit 0 of upper features word
+constexpr uint32_t VIRTIO_F_VERSION_1 = (1U << 0);  // bit 0 of upper features word
 
 // Modern virtio common configuration MMIO layout (virtio 1.0  4.1.4.3)
 struct VirtioModernCfg {

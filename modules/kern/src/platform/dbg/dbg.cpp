@@ -2,10 +2,8 @@
 
 #include <cstdarg>
 #include <cstdint>
-#include <cstdio>
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
-#include <util/string.hpp>
 
 #include "mod/gfx/fb.hpp"
 #include "mod/io/serial/serial.hpp"
@@ -16,30 +14,30 @@
 
 namespace ker::mod::dbg {
 namespace {
-sys::Spinlock logLock{};
-bool isInit = false;
-bool isTimeAvailable = false;
-bool isKmallocAvailable = false;
-uint64_t linesLogged = 0;
+sys::Spinlock log_lock{};
+bool is_init = false;
+bool is_time_available = false;
+bool is_kmalloc_available = false;
+uint64_t lines_logged = 0;
 }  // namespace
 
 using namespace ker::mod;
 
 void init() {
-    if (isInit) {
+    if (is_init) {
         return;
     }
     io::serial::init();
     journal::init();
-    isInit = true;
+    is_init = true;
 }
 
 void enable_time() {
-    if (isTimeAvailable) {
+    if (is_time_available) {
         // Panic! should only be called once when ktime is initialized
         panic_handler("Kernel time was already initialized");
     }
-    isTimeAvailable = true;
+    is_time_available = true;
     journal::enable_time();
     log("Kernel time is now available");
 }
@@ -47,11 +45,11 @@ void enable_time() {
 void break_into_debugger() { __asm__ volatile("int $3"); }
 
 void enable_kmalloc() {
-    if (isKmallocAvailable) {
+    if (is_kmalloc_available) {
         // Panic! should only be called once when kmalloc is initialized
         panic_handler("Kernel kmalloc already initialized");
     }
-    isKmallocAvailable = true;
+    is_kmalloc_available = true;
     log("Kernel memory allocator is now available");
 }
 
@@ -60,17 +58,17 @@ void enable_kmalloc() {
 // entire dump, so we must NOT re-acquire (that would deadlock).  We write
 // directly with the unlocked variants instead.
 // Outside panic mode we take ScopedLock to prevent per-line interleaving.
-inline void serialLogLine(const char* str) {
+static inline void serial_log_line(const char* str) {
     // Helper: write timestamp + str + newline using only unlocked writes.
     // Called both in panic mode (no lock) and in normal mode (lock already held
     // via ScopedLock below).
-    auto writeLineUnlocked = [&]() {
-        if (isTimeAvailable) [[likely]] {
-            char timeSec[10] = {0};
-            char timeMs[5] = {0};
-            int logTime = time::get_ms();
-            int logTimeMsPart = logTime % 1000;
-            int logTimeSecPart = logTime / 1000;
+    auto write_line_unlocked = [&]() {
+        if (is_time_available) [[likely]] {
+            char time_sec[10] = {0};
+            char time_ms[5] = {0};
+            int const LOG_TIME = time::get_ms();
+            int const LOG_TIME_MS_PART = LOG_TIME % 1000;
+            int const LOG_TIME_SEC_PART = LOG_TIME / 1000;
             auto u64toa_local = [](uint64_t n, char* s, int base) -> int {
                 if (n == 0) {
                     s[0] = '0';
@@ -80,8 +78,8 @@ inline void serialLogLine(const char* str) {
                 char buf[32];
                 int i = 0;
                 while (n > 0) {
-                    int digit = n % base;
-                    buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                    int const DIGIT = n % base;
+                    buf[i++] = (DIGIT < 10) ? ('0' + DIGIT) : ('a' + DIGIT - 10);
                     n /= base;
                 }
                 int j = 0;
@@ -91,12 +89,12 @@ inline void serialLogLine(const char* str) {
                 s[j] = '\0';
                 return j;
             };
-            u64toa_local(static_cast<uint64_t>(logTimeMsPart), timeMs, 10);
-            u64toa_local(static_cast<uint64_t>(logTimeSecPart), timeSec, 10);
+            u64toa_local(static_cast<uint64_t>(LOG_TIME_MS_PART), time_ms, 10);
+            u64toa_local(static_cast<uint64_t>(LOG_TIME_SEC_PART), time_sec, 10);
             io::serial::write_unlocked('[');
-            io::serial::write_unlocked(timeSec);
+            io::serial::write_unlocked(time_sec);
             io::serial::write_unlocked('.');
-            io::serial::write_unlocked(timeMs);
+            io::serial::write_unlocked(time_ms);
             io::serial::write_unlocked("]:");
         }
         io::serial::write_unlocked(str);
@@ -105,17 +103,17 @@ inline void serialLogLine(const char* str) {
 
     // In panic mode the caller already holds the panic lock for the whole dump.
     if (io::serial::is_panic_mode()) {
-        writeLineUnlocked();
+        write_line_unlocked();
         return;
     }
-    io::serial::ScopedLock lock;
-    writeLineUnlocked();
+    io::serial::ScopedLock const LOCK;
+    write_line_unlocked();
 }
 
-inline void fbLog(const char* str) {
+static inline void fb_log(const char* str) {
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
-        uint64_t line = linesLogged;
-        if (linesLogged >= gfx::fb::viewport_height_chars()) {
+        uint64_t line = lines_logged;
+        if (lines_logged >= gfx::fb::viewport_height_chars()) {
             gfx::fb::scroll();
             line = gfx::fb::viewport_height_chars() - 1;
         }
@@ -123,12 +121,12 @@ inline void fbLog(const char* str) {
         gfx::fb::draw_char(0, line, '[');
         // todo maybe print cpu id
         int stamp_len = 1;
-        if (isTimeAvailable) [[likely]] {
-            char timeSec[10] = {0};  // good enough for 30 years of uptime
-            char timeMs[5] = {0};
-            int logTime = time::get_ms();
-            int logTimeMsPart = logTime % 1000;
-            int logTimeSecPart = logTime / 1000;
+        if (is_time_available) [[likely]] {
+            char time_sec[10] = {0};  // good enough for 30 years of uptime
+            char time_ms[5] = {0};
+            int const LOG_TIME = time::get_ms();
+            int const LOG_TIME_MS_PART = LOG_TIME % 1000;
+            int const LOG_TIME_SEC_PART = LOG_TIME / 1000;
             auto u64toa_local2 = [](uint64_t n, char* s, int base) -> int {
                 if (n == 0) {
                     s[0] = '0';
@@ -138,8 +136,8 @@ inline void fbLog(const char* str) {
                 char buf[32];
                 int i = 0;
                 while (n > 0) {
-                    int digit = n % base;
-                    buf[i++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+                    int const DIGIT = n % base;
+                    buf[i++] = (DIGIT < 10) ? ('0' + DIGIT) : ('a' + DIGIT - 10);
                     n /= base;
                 }
                 int j = 0;
@@ -149,20 +147,20 @@ inline void fbLog(const char* str) {
                 s[j] = '\0';
                 return j;
             };
-            int msLen = u64toa_local2(logTimeMsPart, timeMs, 10);
-            int secLen = u64toa_local2(logTimeSecPart, timeSec, 10);
-            gfx::fb::draw_string(stamp_len, line, timeSec);
-            stamp_len += secLen;
+            int const MS_LEN = u64toa_local2(LOG_TIME_MS_PART, time_ms, 10);
+            int const SEC_LEN = u64toa_local2(LOG_TIME_SEC_PART, time_sec, 10);
+            gfx::fb::draw_string(stamp_len, line, time_sec);
+            stamp_len += SEC_LEN;
             gfx::fb::draw_char(stamp_len, line, '.');
             stamp_len++;
-            gfx::fb::draw_string(stamp_len, line, timeMs);
-            stamp_len += msLen;
+            gfx::fb::draw_string(stamp_len, line, time_ms);
+            stamp_len += MS_LEN;
         }
         gfx::fb::draw_char(stamp_len, line, ']');
         stamp_len++;
         gfx::fb::draw_char(stamp_len, line, ':');
         stamp_len++;
-        linesLogged += gfx::fb::draw_string(stamp_len, line, str);
+        lines_logged += gfx::fb::draw_string(stamp_len, line, str);
     } else {
         mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
     }
@@ -171,15 +169,17 @@ inline void fbLog(const char* str) {
 void log_string(const char* str) {
     journal::emit(LogLevel::INFO, "kernel", str, journal::JOURNAL_FLAG_KERNEL);
     // logLock only protects the framebuffer state and linesLogged counter.
-    logLock.lock();
+    log_lock.lock();
     if constexpr (gfx::fb::WOS_HAS_GFX_FB) {
-        fbLog(str);
+        fb_log(str);
     }
-    linesLogged++;
-    logLock.unlock();
+    lines_logged++;
+    log_lock.unlock();
 }
 
-static void log_va(const char* format, va_list& args) { journal::emit_v(LogLevel::INFO, "kernel", format, args, journal::JOURNAL_FLAG_KERNEL); }
+static void log_va(const char* format, va_list& args) {
+    journal::emit_v(LogLevel::INFO, "kernel", format, args, journal::JOURNAL_FLAG_KERNEL);
+}
 
 void log_var(const char* format, ...) {
     va_list args;
@@ -189,15 +189,15 @@ void log_var(const char* format, ...) {
 }
 
 void log_fb_only(const char* str) {
-    logLock.lock();
-    fbLog(str);
-    logLock.unlock();
+    log_lock.lock();
+    fb_log(str);
+    log_lock.unlock();
 }
 
 void log_fb_advance() {
-    logLock.lock();
-    linesLogged++;
-    logLock.unlock();
+    log_lock.lock();
+    lines_logged++;
+    log_lock.unlock();
 }
 
 void error(const char* str) {
@@ -222,8 +222,8 @@ namespace {
 void panic_write_hex(uint64_t val) {
     char hex[17];
     for (int i = 15; i >= 0; --i) {
-        uint8_t nibble = (val >> (i * 4)) & 0xF;
-        hex[15 - i] = nibble < 10 ? static_cast<char>('0' + nibble) : static_cast<char>('a' + nibble - 10);
+        uint8_t const NIBBLE = (val >> (i * 4)) & 0xF;
+        hex[15 - i] = NIBBLE < 10 ? static_cast<char>('0' + NIBBLE) : static_cast<char>('a' + NIBBLE - 10);
     }
     hex[16] = '\0';
     io::serial::write_unlocked(hex);
@@ -298,6 +298,7 @@ void panic_handler(const char* msg) {
     io::serial::write_unlocked("\n");
 
     // Capture general-purpose registers via inline asm.
+    // NOLINTBEGIN(misc-const-correctness)
     uint64_t rax = 0;
     uint64_t rbx = 0;
     uint64_t rcx = 0;
@@ -317,6 +318,7 @@ void panic_handler(const char* msg) {
     uint64_t rflags = 0;
     uint64_t cr2 = 0;
     uint64_t cr3 = 0;
+    // NOLINTEND(misc-const-correctness)
     asm volatile("movq %%rax, %0" : "=m"(rax));
     asm volatile("movq %%rbx, %0" : "=m"(rbx));
     asm volatile("movq %%rcx, %0" : "=m"(rcx));
@@ -359,7 +361,7 @@ void panic_handler(const char* msg) {
     panic_write_reg("CR3", cr3);
 
     // RIP via return address of this function
-    void* rip = __builtin_return_address(0);
+    void const* rip = __builtin_return_address(0);
     panic_write_reg("RIP (caller)", reinterpret_cast<uint64_t>(rip));
 
     // Stack trace via RBP chain
@@ -383,9 +385,9 @@ void panic_handler(const char* msg) {
     io::serial::write_unlocked("\n--- Raw Stack (top 64 qwords) ---\n");
     auto* rsp_ptr = reinterpret_cast<uint64_t*>(rsp);
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp_ptr);
-    bool rsp_valid = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
-                     (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
-    if (rsp_valid) {
+    bool const RSP_VALID = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
+                           (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
+    if (RSP_VALID) {
         for (int i = 0; i < 64; i++) {
             io::serial::write_unlocked("  [RSP+0x");
             panic_write_hex(static_cast<uint64_t>(i * 8));

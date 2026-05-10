@@ -160,8 +160,8 @@ auto memcmp(const void* __a, const void* __b, size_t __size) -> int {
     const auto* rhs = static_cast<const unsigned char*>(__b);
 
     while (__size >= WORD64_BYTES) {
-        const uint64_t left = load_unaligned<uint64_t>(lhs);
-        const uint64_t right = load_unaligned<uint64_t>(rhs);
+        const auto left = load_unaligned<uint64_t>(lhs);
+        const auto right = load_unaligned<uint64_t>(rhs);
         if (left != right) {
             const uint64_t diff = left ^ right;
             const auto byte_index = static_cast<unsigned>(__builtin_ctzll(diff) >> BYTE_INDEX_SHIFT);

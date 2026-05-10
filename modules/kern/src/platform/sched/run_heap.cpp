@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/task.hpp>
+#include <utility>
 
 namespace ker::mod::sched {
 
@@ -30,10 +31,10 @@ void RunHeap::sift_up(uint32_t idx) {
         dbg::panic_handler("RunHeap: size field corrupted in sift_up");
     }
     while (idx > 0) {
-        uint32_t parent = (idx - 1) / 2;
-        if (entries[idx]->vdeadline < entries[parent]->vdeadline) {
-            swap_entries(idx, parent);
-            idx = parent;
+        uint32_t const PARENT = (idx - 1) / 2;
+        if (entries[idx]->vdeadline < entries[PARENT]->vdeadline) {
+            swap_entries(idx, PARENT);
+            idx = PARENT;
         } else {
             break;
         }
@@ -47,25 +48,25 @@ void RunHeap::sift_down(uint32_t idx) {
     }
     while (true) {
         uint32_t smallest = idx;
-        uint32_t left = 2 * idx + 1;
-        uint32_t right = 2 * idx + 2;
+        uint32_t const LEFT = (2 * idx) + 1;
+        uint32_t const RIGHT = (2 * idx) + 2;
 
-        if (left < size) {
-            if (left >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::sift_down: left=%u >= cap=%u, size=%u corrupted", left, PER_CPU_HEAP_CAP, size);
+        if (LEFT < size) {
+            if (LEFT >= PER_CPU_HEAP_CAP) [[unlikely]] {
+                dbg::log("RunHeap::sift_down: left=%u >= cap=%u, size=%u corrupted", LEFT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries[left]->vdeadline < entries[smallest]->vdeadline) {
-                smallest = left;
+            if (entries[LEFT]->vdeadline < entries[smallest]->vdeadline) {
+                smallest = LEFT;
             }
         }
-        if (right < size) {
-            if (right >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::sift_down: right=%u >= cap=%u, size=%u corrupted", right, PER_CPU_HEAP_CAP, size);
+        if (RIGHT < size) {
+            if (RIGHT >= PER_CPU_HEAP_CAP) [[unlikely]] {
+                dbg::log("RunHeap::sift_down: right=%u >= cap=%u, size=%u corrupted", RIGHT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries[right]->vdeadline < entries[smallest]->vdeadline) {
-                smallest = right;
+            if (entries[RIGHT]->vdeadline < entries[smallest]->vdeadline) {
+                smallest = RIGHT;
             }
         }
 
@@ -85,7 +86,7 @@ bool RunHeap::insert(task::Task* t) {
     // DIAGNOSTIC: Detect double-insertion - task already in some heap
     if (t->heap_index >= 0) {
         dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heap_index=%d (size=%d, cpu=%d)! Refusing insert.", t->pid, t->heap_index, size,
-                 (int)t->cpu);
+                 static_cast<int>(t->cpu));
         // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
             if (entries[i] == t) {
@@ -94,48 +95,48 @@ bool RunHeap::insert(task::Task* t) {
         }
         return false;
     }
-    uint32_t idx = size;
-    entries[idx] = t;
-    t->heap_index = static_cast<int32_t>(idx);
+    uint32_t const IDX = size;
+    entries[IDX] = t;
+    t->heap_index = static_cast<int32_t>(IDX);
     size++;
-    sift_up(idx);
+    sift_up(IDX);
     return true;
 }
 
 bool RunHeap::remove(task::Task* t) {
-    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
+    if (t->heap_index < 0 || std::cmp_greater_equal(t->heap_index, size)) {
         return false;
     }
-    uint32_t idx = static_cast<uint32_t>(t->heap_index);
-    if (entries[idx] != t) {
+    auto const IDX = static_cast<uint32_t>(t->heap_index);
+    if (entries[IDX] != t) {
         return false;  // heap_index stale / wrong heap
     }
 
     t->heap_index = -1;
     size--;
 
-    if (idx == size) {
+    if (IDX == size) {
         // Was the last element, nothing to fix
         return true;
     }
 
     // Move the last element into the gap
-    entries[idx] = entries[size];
-    entries[idx]->heap_index = static_cast<int32_t>(idx);
+    entries[IDX] = entries[size];
+    entries[IDX]->heap_index = static_cast<int32_t>(IDX);
 
     // Re-sift: could go up or down depending on relative vdeadline
-    sift_up(idx);
-    sift_down(idx);
+    sift_up(IDX);
+    sift_down(IDX);
     return true;
 }
 
 void RunHeap::update(task::Task* t) {
-    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
+    if (t->heap_index < 0 || std::cmp_greater_equal(t->heap_index, size)) {
         return;
     }
-    uint32_t idx = static_cast<uint32_t>(t->heap_index);
-    sift_up(idx);
-    sift_down(idx);
+    auto const IDX = static_cast<uint32_t>(t->heap_index);
+    sift_up(IDX);
+    sift_down(IDX);
 }
 
 task::Task* RunHeap::peek_min() const {
@@ -146,13 +147,13 @@ task::Task* RunHeap::peek_min() const {
 }
 
 bool RunHeap::contains(task::Task* t) const {
-    if (t->heap_index < 0 || static_cast<uint32_t>(t->heap_index) >= size) {
+    if (t->heap_index < 0 || std::cmp_greater_equal(t->heap_index, size)) {
         return false;
     }
     return entries[static_cast<uint32_t>(t->heap_index)] == t;
 }
 
-task::Task* RunHeap::pick_best_eligible(int64_t avgVruntime) {
+task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
     if (size == 0) {
         return nullptr;
     }
@@ -168,26 +169,28 @@ task::Task* RunHeap::pick_best_eligible(int64_t avgVruntime) {
     // just return the root anyway (prevents starvation).
 
     task::Task* best = nullptr;
-    int64_t bestDeadline = 0;
+    int64_t best_deadline = 0;
 
     // Stack-based bounded BFS (no allocations)
     uint32_t stack[32];
-    uint32_t stackSize = 0;
+    uint32_t stack_size = 0;
 
-    stack[stackSize++] = 0;  // Start at root
+    stack[stack_size++] = 0;  // Start at root
 
-    while (stackSize > 0) {
-        uint32_t idx = stack[--stackSize];
-        if (idx >= size) continue;
+    while (stack_size > 0) {
+        uint32_t const IDX = stack[--stack_size];
+        if (IDX >= size) {
+            continue;
+        }
 
-        task::Task* t = entries[idx];
-        int64_t lag = avgVruntime - t->vruntime;
+        task::Task* t = entries[IDX];
+        int64_t const LAG = avg_vruntime - t->vruntime;
 
-        if (lag >= 0) {
+        if (LAG >= 0) {
             // Eligible - check if it has the best (smallest) vdeadline
-            if (best == nullptr || t->vdeadline < bestDeadline) {
+            if (best == nullptr || t->vdeadline < best_deadline) {
                 best = t;
-                bestDeadline = t->vdeadline;
+                best_deadline = t->vdeadline;
             }
             // Don't explore children of eligible nodes with larger deadlines -
             // children have >= vdeadline so they can't beat this one.
@@ -197,11 +200,15 @@ task::Task* RunHeap::pick_best_eligible(int64_t avgVruntime) {
             // if they recently woke up, though they'd have larger vdeadline).
             // Only explore if we haven't found a candidate yet and haven't
             // exceeded our scan budget.
-            if (stackSize < 30) {
-                uint32_t left = 2 * idx + 1;
-                uint32_t right = 2 * idx + 2;
-                if (left < size) stack[stackSize++] = left;
-                if (right < size) stack[stackSize++] = right;
+            if (stack_size < 30) {
+                uint32_t const LEFT = (2 * IDX) + 1;
+                uint32_t const RIGHT = (2 * IDX) + 2;
+                if (LEFT < size) {
+                    stack[stack_size++] = LEFT;
+                }
+                if (RIGHT < size) {
+                    stack[stack_size++] = RIGHT;
+                }
             }
         }
     }
@@ -229,7 +236,7 @@ void IntrusiveTaskList::push(task::Task* t) {
         return;
     }
 
-    for (task::Task* cur = head; cur != nullptr; cur = cur->sched_next) {
+    for (task::Task const* cur = head; cur != nullptr; cur = cur->sched_next) {
         if (cur == t) {
             return;
         }
@@ -256,7 +263,7 @@ bool IntrusiveTaskList::remove(task::Task* t) {
     return false;
 }
 
-task::Task* IntrusiveTaskList::find_by_pid(uint64_t pid) {
+task::Task* IntrusiveTaskList::find_by_pid(uint64_t pid) const {
     task::Task* cur = head;
     while (cur != nullptr) {
         if (cur->pid == pid) {

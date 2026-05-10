@@ -85,16 +85,16 @@ auto sf_get(const XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t f
     }
 
     const auto* base = reinterpret_cast<const uint8_t*>(hdr);
-    size_t total = hdr->totsize.to_cpu();
+    size_t const TOTAL = hdr->totsize.to_cpu();
     size_t pos = sizeof(XfsAttrSfHdr);
 
     for (uint8_t i = 0; i < hdr->count; i++) {
-        if (pos + sizeof(XfsAttrSfEntry) > total) {
+        if (pos + sizeof(XfsAttrSfEntry) > TOTAL) {
             break;
         }
         const auto* entry = reinterpret_cast<const XfsAttrSfEntry*>(base + pos);
-        size_t entry_size = xfs_attr_sf_entry_size(entry);
-        if (pos + entry_size > total) {
+        size_t const ENTRY_SIZE = xfs_attr_sf_entry_size(entry);
+        if (pos + ENTRY_SIZE > TOTAL) {
             break;
         }
 
@@ -110,7 +110,7 @@ auto sf_get(const XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t f
             return static_cast<int>(entry->valuelen);
         }
 
-        pos += entry_size;
+        pos += ENTRY_SIZE;
     }
 
     return -ENOATTR;
@@ -127,16 +127,16 @@ auto sf_list(const XfsInode* ip, XfsAttrIterFn fn, void* priv) -> int {
     }
 
     const auto* base = reinterpret_cast<const uint8_t*>(hdr);
-    size_t total = hdr->totsize.to_cpu();
+    size_t const TOTAL = hdr->totsize.to_cpu();
     size_t pos = sizeof(XfsAttrSfHdr);
 
     for (uint8_t i = 0; i < hdr->count; i++) {
-        if (pos + sizeof(XfsAttrSfEntry) > total) {
+        if (pos + sizeof(XfsAttrSfEntry) > TOTAL) {
             break;
         }
         const auto* entry = reinterpret_cast<const XfsAttrSfEntry*>(base + pos);
-        size_t entry_size = xfs_attr_sf_entry_size(entry);
-        if (pos + entry_size > total) {
+        size_t const ENTRY_SIZE = xfs_attr_sf_entry_size(entry);
+        if (pos + ENTRY_SIZE > TOTAL) {
             break;
         }
 
@@ -147,12 +147,12 @@ auto sf_list(const XfsInode* ip, XfsAttrIterFn fn, void* priv) -> int {
         ae.valuelen = entry->valuelen;
         ae.flags = entry->flags;
 
-        int rc = fn(&ae, priv);
-        if (rc != 0) {
-            return rc;
+        int const RC = fn(&ae, priv);
+        if (RC != 0) {
+            return RC;
         }
 
-        pos += entry_size;
+        pos += ENTRY_SIZE;
     }
 
     return 0;
@@ -174,17 +174,17 @@ auto btree_attr_list_extents(XfsInode* ip, uint32_t* out_count) -> XfsBmbtIrec* 
     }
 
     const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(bt.root);
-    uint16_t level = bmdr->bb_level.to_cpu();
-    uint16_t numrecs = bmdr->bb_numrecs.to_cpu();
-    if (numrecs == 0) {
+    uint16_t const LEVEL = bmdr->bb_level.to_cpu();
+    uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
+    if (NUMRECS == 0) {
         return nullptr;
     }
 
     // Leftmost child pointer (first ptr in the root)
-    const uint8_t* ptrs_base = bt.root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(numrecs) * sizeof(XfsBmbtKey));
-    __be64 ptr_val{};
-    __builtin_memcpy(&ptr_val, ptrs_base, sizeof(__be64));
-    uint64_t child_block = ptr_val.to_cpu();
+    const uint8_t* ptrs_base = bt.root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey));
+    Be64 ptr_val{};
+    __builtin_memcpy(&ptr_val, ptrs_base, sizeof(Be64));
+    uint64_t const CHILD_BLOCK = ptr_val.to_cpu();
 
     XfsBtreeCursor<XfsBmbtTraits> cur;
     cur.mount = ip->mount;
@@ -192,8 +192,8 @@ auto btree_attr_list_extents(XfsInode* ip, uint32_t* out_count) -> XfsBmbtIrec* 
     XfsBmbtIrec target{};
     target.br_startoff = 0;
 
-    int rc = xfs_btree_lookup(&cur, child_block, level, target, XfsBtreeLookup::GE);
-    if (rc != 0) {
+    int const RC = xfs_btree_lookup(&cur, CHILD_BLOCK, LEVEL, target, XfsBtreeLookup::GE);
+    if (RC != 0) {
         return nullptr;
     }
 
@@ -223,10 +223,10 @@ auto btree_attr_list_extents(XfsInode* ip, uint32_t* out_count) -> XfsBmbtIrec* 
 // a pre-enumerated extent list.  Returns NULLFSBLOCK if not found.
 auto attr_extents_map_logblk(const XfsBmbtIrec* extents, uint32_t count, xfs_dablk_t logblk) -> xfs_fsblock_t {
     for (uint32_t i = 0; i < count; i++) {
-        xfs_fileoff_t start = extents[i].br_startoff;
-        xfs_fileoff_t end = start + extents[i].br_blockcount;
-        if (logblk >= start && logblk < end) {
-            return extents[i].br_startblock + (logblk - start);
+        xfs_fileoff_t const START = extents[i].br_startoff;
+        xfs_fileoff_t const END = START + extents[i].br_blockcount;
+        if (logblk >= START && logblk < END) {
+            return extents[i].br_startblock + (logblk - START);
         }
     }
     return NULLFSBLOCK;
@@ -250,21 +250,21 @@ auto attr_read_remote_value(XfsMountContext* mount, const XfsBmbtIrec* extents, 
         return -ERANGE;
     }
 
-    const size_t blk_size = mount->block_size;
-    const size_t hdr_size = sizeof(XfsAttr3RmtHdr);
-    const size_t data_per_blk = blk_size - hdr_size;
+    const size_t BLK_SIZE = mount->block_size;
+    const size_t HDR_SIZE = sizeof(XfsAttr3RmtHdr);
+    const size_t DATA_PER_BLK = BLK_SIZE - HDR_SIZE;
 
     uint32_t bytes_read = 0;
     xfs_dablk_t cur_logblk = valueblk;
 
     while (bytes_read < valuelen) {
-        xfs_fsblock_t phys = attr_extents_map_logblk(extents, ext_count, cur_logblk);
-        if (phys == NULLFSBLOCK) {
+        xfs_fsblock_t const PHYS = attr_extents_map_logblk(extents, ext_count, cur_logblk);
+        if (PHYS == NULLFSBLOCK) {
             log("[xfs attr] remote value: no extent for logical block %u\n", cur_logblk);
             return -EIO;
         }
 
-        BufHead* bh = xfs_buf_read(mount, phys);
+        BufHead* bh = xfs_buf_read(mount, PHYS);
         if (bh == nullptr) {
             return -EIO;
         }
@@ -276,18 +276,18 @@ auto attr_read_remote_value(XfsMountContext* mount, const XfsBmbtIrec* extents, 
             return -EIO;
         }
 
-        uint32_t offset = rmt->rm_offset.to_cpu();
-        uint32_t nbytes = rmt->rm_bytes.to_cpu();
+        uint32_t const OFFSET = rmt->rm_offset.to_cpu();
+        uint32_t const NBYTES = rmt->rm_bytes.to_cpu();
 
-        if (offset != bytes_read || nbytes == 0 || nbytes > data_per_blk) {
-            log("[xfs attr] remote value block corrupt: offset=%u expected=%u bytes=%u\n", offset, bytes_read, nbytes);
+        if (OFFSET != bytes_read || NBYTES == 0 || NBYTES > DATA_PER_BLK) {
+            log("[xfs attr] remote value block corrupt: offset=%u expected=%u bytes=%u\n", OFFSET, bytes_read, NBYTES);
             brelse(bh);
             return -EIO;
         }
 
-        uint32_t copy_len = std::min(nbytes, valuelen - bytes_read);
-        __builtin_memcpy(static_cast<uint8_t*>(buf) + bytes_read, bh->data + hdr_size, copy_len);
-        bytes_read += copy_len;
+        uint32_t const COPY_LEN = std::min(NBYTES, valuelen - bytes_read);
+        __builtin_memcpy(static_cast<uint8_t*>(buf) + bytes_read, bh->data + HDR_SIZE, COPY_LEN);
+        bytes_read += COPY_LEN;
         brelse(bh);
         cur_logblk++;
     }
@@ -316,46 +316,46 @@ auto leaf_block_iterate(XfsInode* ip, xfs_fsblock_t blkno, XfsAttrIterFn fn, voi
         return 0;
     }
 
-    uint16_t count = leaf->count.to_cpu();
+    uint16_t const COUNT = leaf->count.to_cpu();
     const auto* entries = reinterpret_cast<const XfsAttrLeafEntry*>(bh->data + sizeof(XfsAttr3LeafHdr));
 
-    for (uint16_t i = 0; i < count; i++) {
-        uint16_t nameidx = entries[i].nameidx.to_cpu();
-        uint8_t eflags = entries[i].flags;
+    for (uint16_t i = 0; i < COUNT; i++) {
+        uint16_t const NAMEIDX = entries[i].nameidx.to_cpu();
+        uint8_t const EFLAGS = entries[i].flags;
 
-        if ((eflags & XFS_ATTR_INCOMPLETE) != 0) {
+        if ((EFLAGS & XFS_ATTR_INCOMPLETE) != 0) {
             continue;  // skip incomplete entries
         }
 
-        if ((eflags & XFS_ATTR_LOCAL) != 0) {
+        if ((EFLAGS & XFS_ATTR_LOCAL) != 0) {
             // Local attribute - name and value are in the leaf block
-            const auto* local = reinterpret_cast<const XfsAttrLeafNameLocal*>(bh->data + nameidx);
+            const auto* local = reinterpret_cast<const XfsAttrLeafNameLocal*>(bh->data + NAMEIDX);
             XfsAttrEntry ae{};
             ae.name = local->nameval;
             ae.namelen = local->namelen;
             ae.value = local->nameval + local->namelen;
             ae.valuelen = local->valuelen.to_cpu();
-            ae.flags = eflags;
+            ae.flags = EFLAGS;
 
-            int rc = fn(&ae, priv);
-            if (rc != 0) {
+            int const RC = fn(&ae, priv);
+            if (RC != 0) {
                 brelse(bh);
-                return rc;
+                return RC;
             }
         } else {
             // Remote attribute - report name and size; value must be fetched separately
-            const auto* remote = reinterpret_cast<const XfsAttrLeafNameRemote*>(bh->data + nameidx);
+            const auto* remote = reinterpret_cast<const XfsAttrLeafNameRemote*>(bh->data + NAMEIDX);
             XfsAttrEntry ae{};
             ae.name = remote->name;
             ae.namelen = remote->namelen;
             ae.value = nullptr;
             ae.valuelen = remote->valuelen.to_cpu();
-            ae.flags = eflags;
+            ae.flags = EFLAGS;
 
-            int rc = fn(&ae, priv);
-            if (rc != 0) {
+            int const RC = fn(&ae, priv);
+            if (RC != 0) {
                 brelse(bh);
-                return rc;
+                return RC;
             }
         }
     }
@@ -383,43 +383,43 @@ auto leaf_block_get(XfsInode* ip, xfs_fsblock_t blkno, const XfsBmbtIrec* extent
         return -ENOATTR;
     }
 
-    uint16_t count = leaf->count.to_cpu();
+    uint16_t const COUNT = leaf->count.to_cpu();
     const auto* entries = reinterpret_cast<const XfsAttrLeafEntry*>(bh->data + sizeof(XfsAttr3LeafHdr));
 
-    for (uint16_t i = 0; i < count; i++) {
-        uint16_t nameidx = entries[i].nameidx.to_cpu();
-        uint8_t eflags = entries[i].flags;
+    for (uint16_t i = 0; i < COUNT; i++) {
+        uint16_t const NAMEIDX = entries[i].nameidx.to_cpu();
+        uint8_t const EFLAGS = entries[i].flags;
 
-        if ((eflags & XFS_ATTR_INCOMPLETE) != 0) {
+        if ((EFLAGS & XFS_ATTR_INCOMPLETE) != 0) {
             continue;
         }
-        if ((eflags & XFS_ATTR_NSP_ONDISK_MASK) != (flags & XFS_ATTR_NSP_ONDISK_MASK)) {
+        if ((EFLAGS & XFS_ATTR_NSP_ONDISK_MASK) != (flags & XFS_ATTR_NSP_ONDISK_MASK)) {
             continue;
         }
 
-        if ((eflags & XFS_ATTR_LOCAL) != 0) {
-            const auto* local = reinterpret_cast<const XfsAttrLeafNameLocal*>(bh->data + nameidx);
+        if ((EFLAGS & XFS_ATTR_LOCAL) != 0) {
+            const auto* local = reinterpret_cast<const XfsAttrLeafNameLocal*>(bh->data + NAMEIDX);
             if (local->namelen == namelen && __builtin_memcmp(local->nameval, name, namelen) == 0) {
-                uint32_t vlen = local->valuelen.to_cpu();
+                uint32_t const VLEN = local->valuelen.to_cpu();
                 if (value == nullptr) {
                     brelse(bh);
-                    return static_cast<int>(vlen);
+                    return static_cast<int>(VLEN);
                 }
-                if (valuelen < vlen) {
+                if (valuelen < VLEN) {
                     brelse(bh);
                     return -ERANGE;
                 }
-                __builtin_memcpy(value, local->nameval + local->namelen, vlen);
+                __builtin_memcpy(value, local->nameval + local->namelen, VLEN);
                 brelse(bh);
-                return static_cast<int>(vlen);
+                return static_cast<int>(VLEN);
             }
         } else {
-            const auto* remote = reinterpret_cast<const XfsAttrLeafNameRemote*>(bh->data + nameidx);
+            const auto* remote = reinterpret_cast<const XfsAttrLeafNameRemote*>(bh->data + NAMEIDX);
             if (remote->namelen == namelen && __builtin_memcmp(remote->name, name, namelen) == 0) {
-                uint32_t vlen = remote->valuelen.to_cpu();
-                xfs_dablk_t vblk = remote->valueblk.to_cpu();
+                uint32_t const VLEN = remote->valuelen.to_cpu();
+                xfs_dablk_t const VBLK = remote->valueblk.to_cpu();
                 brelse(bh);
-                return attr_read_remote_value(mount, extents, ext_count, vblk, vlen, value, valuelen);
+                return attr_read_remote_value(mount, extents, ext_count, VBLK, VLEN, value, valuelen);
             }
         }
     }
@@ -439,9 +439,9 @@ auto extents_iterate(XfsInode* ip, XfsAttrIterFn fn, void* priv) -> int {
     for (uint32_t i = 0; i < ip->attr_fork.extents.count; i++) {
         const XfsBmbtIrec& ext = ip->attr_fork.extents.list[i];
         for (xfs_extlen_t b = 0; b < ext.br_blockcount; b++) {
-            int rc = leaf_block_iterate(ip, ext.br_startblock + b, fn, priv);
-            if (rc != 0) {
-                return rc;
+            int const RC = leaf_block_iterate(ip, ext.br_startblock + b, fn, priv);
+            if (RC != 0) {
+                return RC;
             }
         }
     }
@@ -453,14 +453,14 @@ auto extents_get(XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t fl
         return -ENOATTR;
     }
     const XfsBmbtIrec* extents = ip->attr_fork.extents.list;
-    uint32_t ext_count = ip->attr_fork.extents.count;
+    uint32_t const EXT_COUNT = ip->attr_fork.extents.count;
 
-    for (uint32_t i = 0; i < ext_count; i++) {
+    for (uint32_t i = 0; i < EXT_COUNT; i++) {
         const XfsBmbtIrec& ext = extents[i];
         for (xfs_extlen_t b = 0; b < ext.br_blockcount; b++) {
-            int rc = leaf_block_get(ip, ext.br_startblock + b, extents, ext_count, name, namelen, flags, value, valuelen);
-            if (rc != -ENOATTR) {
-                return rc;
+            int const RC = leaf_block_get(ip, ext.br_startblock + b, extents, EXT_COUNT, name, namelen, flags, value, valuelen);
+            if (RC != -ENOATTR) {
+                return RC;
             }
         }
     }
@@ -473,7 +473,7 @@ auto extents_get(XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t fl
 
 auto btree_iterate(XfsInode* ip, XfsAttrIterFn fn, void* priv) -> int {
     uint32_t ext_count = 0;
-    XfsBmbtIrec* extents = btree_attr_list_extents(ip, &ext_count);
+    XfsBmbtIrec const* extents = btree_attr_list_extents(ip, &ext_count);
     if (extents == nullptr || ext_count == 0) {
         delete[] extents;
         return 0;
@@ -492,7 +492,7 @@ auto btree_iterate(XfsInode* ip, XfsAttrIterFn fn, void* priv) -> int {
 
 auto btree_get(XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t flags, void* value, uint32_t valuelen) -> int {
     uint32_t ext_count = 0;
-    XfsBmbtIrec* extents = btree_attr_list_extents(ip, &ext_count);
+    XfsBmbtIrec const* extents = btree_attr_list_extents(ip, &ext_count);
     if (extents == nullptr || ext_count == 0) {
         delete[] extents;
         return -ENOATTR;
@@ -517,8 +517,8 @@ auto btree_get(XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t flag
 void attr_leaf_compute_crc(uint8_t* block, size_t block_size) {
     // Zero the CRC field before computing
     __builtin_memset(block + XFS_ATTR3_LEAF_CRC_OFF, 0, 4);
-    uint32_t crc = util::crc32c_block_with_cksum(block, block_size, XFS_ATTR3_LEAF_CRC_OFF);
-    __be32 crc_be = __be32::from_cpu(crc);
+    uint32_t const CRC = util::crc32c_block_with_cksum(block, block_size, XFS_ATTR3_LEAF_CRC_OFF);
+    Be32 crc_be = Be32::from_cpu(CRC);
     __builtin_memcpy(block + XFS_ATTR3_LEAF_CRC_OFF, &crc_be, 4);
 }
 
@@ -530,16 +530,16 @@ void attr_leaf_compute_crc(uint8_t* block, size_t block_size) {
 auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* val, uint32_t valuelen,
                         uint8_t flags) -> int {
     XfsMountContext* ctx = ip->mount;
-    const size_t blk_size = ctx->block_size;
+    const size_t BLK_SIZE = ctx->block_size;
 
     // ── 1. Snapshot existing shortform entries ──────────────────────────────
     const auto* sf_base = ip->attr_fork.local.data;
     const auto* sf_hdrp = reinterpret_cast<const XfsAttrSfHdr*>(sf_base);
-    uint8_t sf_count = (sf_hdrp != nullptr) ? sf_hdrp->count : 0;
-    size_t sf_total = (sf_hdrp != nullptr) ? sf_hdrp->totsize.to_cpu() : 0;
+    uint8_t const SF_COUNT = (sf_hdrp != nullptr) ? sf_hdrp->count : 0;
+    size_t const SF_TOTAL = (sf_hdrp != nullptr) ? sf_hdrp->totsize.to_cpu() : 0;
 
     // Upper bound on total entries: existing + new.
-    uint32_t total_entries = static_cast<uint32_t>(sf_count) + 1;
+    uint32_t const TOTAL_ENTRIES = static_cast<uint32_t>(SF_COUNT) + 1;
 
     // Structures for sort-by-hash.
     struct AttrRec {
@@ -551,22 +551,22 @@ auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, u
         uint8_t flags;
     };
 
-    auto* recs = new (std::nothrow) AttrRec[total_entries];
+    auto* recs = new (std::nothrow) AttrRec[TOTAL_ENTRIES];
     if (recs == nullptr) {
         return -ENOMEM;
     }
 
     // Collect existing sf entries.
     uint32_t n = 0;
-    if (sf_hdrp != nullptr && sf_total >= sizeof(XfsAttrSfHdr)) {
+    if (sf_hdrp != nullptr && SF_TOTAL >= sizeof(XfsAttrSfHdr)) {
         size_t pos = sizeof(XfsAttrSfHdr);
-        for (uint8_t i = 0; i < sf_count && n < total_entries - 1; i++) {
-            if (pos + sizeof(XfsAttrSfEntry) > sf_total) {
+        for (uint8_t i = 0; i < SF_COUNT && n < TOTAL_ENTRIES - 1; i++) {
+            if (pos + sizeof(XfsAttrSfEntry) > SF_TOTAL) {
                 break;
             }
             const auto* entry = reinterpret_cast<const XfsAttrSfEntry*>(sf_base + pos);
-            size_t entry_size = xfs_attr_sf_entry_size(entry);
-            if (pos + entry_size > sf_total) {
+            size_t const ENTRY_SIZE = xfs_attr_sf_entry_size(entry);
+            if (pos + ENTRY_SIZE > SF_TOTAL) {
                 break;
             }
             recs[n].name_ptr = entry->nameval;
@@ -576,7 +576,7 @@ auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, u
             recs[n].flags = entry->flags;
             recs[n].hash = xfs_da_hashname(entry->nameval, entry->namelen);
             n++;
-            pos += entry_size;
+            pos += ENTRY_SIZE;
         }
     }
 
@@ -591,116 +591,116 @@ auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, u
 
     // Sort by hash (simple insertion sort – n is small).
     for (uint32_t i = 1; i < n; i++) {
-        AttrRec tmp = recs[i];
+        AttrRec const TMP = recs[i];
         int j = static_cast<int>(i) - 1;
-        while (j >= 0 && recs[j].hash > tmp.hash) {
+        while (j >= 0 && recs[j].hash > TMP.hash) {
             recs[j + 1] = recs[j];
             j--;
         }
-        recs[j + 1] = tmp;
+        recs[j + 1] = TMP;
     }
 
     // ── 2. Validate fit in a single leaf block ──────────────────────────────
     // All sf attrs have valuelen ≤ 255 (uint8_t field), so they are always
     // stored locally.  The new entry may be larger but still has to fit locally
     // for this implementation (remote support requires additional block alloc).
-    size_t header_bytes = sizeof(XfsAttr3LeafHdr);
-    size_t entries_bytes = static_cast<size_t>(n) * sizeof(XfsAttrLeafEntry);
+    size_t const HEADER_BYTES = sizeof(XfsAttr3LeafHdr);
+    size_t const ENTRIES_BYTES = static_cast<size_t>(n) * sizeof(XfsAttrLeafEntry);
     size_t payload_bytes = 0;
     for (uint32_t i = 0; i < n; i++) {
         payload_bytes += sizeof(XfsAttrLeafNameLocal) + recs[i].namelen + recs[i].valuelen;
     }
-    size_t total_bytes = header_bytes + entries_bytes + payload_bytes;
+    size_t const TOTAL_BYTES = HEADER_BYTES + ENTRIES_BYTES + payload_bytes;
 
-    if (total_bytes > blk_size) {
+    if (TOTAL_BYTES > BLK_SIZE) {
         // Would not fit in a single leaf block.
         delete[] recs;
-        log("[xfs attr] sf→leaf: total %zu > blk_size %zu, cannot convert\n", total_bytes, blk_size);
+        log("[xfs attr] sf→leaf: total %zu > blk_size %zu, cannot convert\n", TOTAL_BYTES, BLK_SIZE);
         return -ENOSPC;
     }
 
     // ── 3. Allocate a filesystem block ──────────────────────────────────────
-    xfs_agnumber_t pref_ag = xfs_ino_ag(ip->ino, ctx->agino_log);
+    xfs_agnumber_t const PREF_AG = xfs_ino_ag(ip->ino, ctx->agino_log);
     XfsAllocReq req{};
-    req.agno = pref_ag;
+    req.agno = PREF_AG;
     req.agbno = 0;
     req.minlen = 1;
     req.maxlen = 1;
     req.alignment = 0;
 
     XfsAllocResult alloc{};
-    int rc = xfs_alloc_extent(ctx, tp, req, &alloc);
-    if (rc != 0) {
+    int const RC = xfs_alloc_extent(ctx, tp, req, &alloc);
+    if (RC != 0) {
         delete[] recs;
-        return rc;
+        return RC;
     }
 
-    xfs_fsblock_t disk_block = xfs_agbno_to_fsbno(alloc.agno, alloc.agbno, ctx->ag_blk_log);
+    xfs_fsblock_t const DISK_BLOCK = xfs_agbno_to_fsbno(alloc.agno, alloc.agbno, ctx->ag_blk_log);
 
     // ── 4. Build the leaf block ─────────────────────────────────────────────
-    BufHead* bh = xfs_buf_get(ctx, disk_block);
+    BufHead* bh = xfs_buf_get(ctx, DISK_BLOCK);
     if (bh == nullptr) {
         delete[] recs;
         return -EIO;
     }
 
     uint8_t* block = bh->data;
-    __builtin_memset(block, 0, blk_size);
+    __builtin_memset(block, 0, BLK_SIZE);
 
     // 4a. Header
     auto* lhdr = reinterpret_cast<XfsAttr3LeafHdr*>(block);
-    lhdr->info.hdr.magic = __be16::from_cpu(XFS_ATTR3_LEAF_MAGIC);
-    lhdr->info.hdr.forw = __be32::from_cpu(0);
-    lhdr->info.hdr.back = __be32::from_cpu(0);
-    lhdr->info.owner = __be64::from_cpu(ip->ino);
+    lhdr->info.hdr.magic = Be16::from_cpu(XFS_ATTR3_LEAF_MAGIC);
+    lhdr->info.hdr.forw = Be32::from_cpu(0);
+    lhdr->info.hdr.back = Be32::from_cpu(0);
+    lhdr->info.owner = Be64::from_cpu(ip->ino);
     __builtin_memcpy(&lhdr->info.uuid, &ctx->uuid, sizeof(XfsUuidT));
     {
         // Compute device block number for blkno field
-        uint64_t linear = (static_cast<uint64_t>(alloc.agno) * ctx->ag_blocks) + alloc.agbno;
-        size_t ratio = blk_size / ctx->device->block_size;
-        lhdr->info.blkno = __be64::from_cpu(linear * ratio);
+        uint64_t const LINEAR = (static_cast<uint64_t>(alloc.agno) * ctx->ag_blocks) + alloc.agbno;
+        size_t const RATIO = BLK_SIZE / ctx->device->block_size;
+        lhdr->info.blkno = Be64::from_cpu(LINEAR * RATIO);
     }
 
     // 4b. Build entries + name/value area from end of block backward.
     auto* leaf_entries = reinterpret_cast<XfsAttrLeafEntry*>(block + sizeof(XfsAttr3LeafHdr));
-    uint16_t firstused = static_cast<uint16_t>(blk_size);
+    auto firstused = static_cast<uint16_t>(BLK_SIZE);
     uint16_t usedbytes = 0;
 
     for (uint32_t i = 0; i < n; i++) {
-        uint16_t payload = static_cast<uint16_t>(sizeof(XfsAttrLeafNameLocal) + recs[i].namelen + recs[i].valuelen);
-        firstused -= payload;
+        auto const PAYLOAD = static_cast<uint16_t>(sizeof(XfsAttrLeafNameLocal) + recs[i].namelen + recs[i].valuelen);
+        firstused -= PAYLOAD;
 
         auto* local = reinterpret_cast<XfsAttrLeafNameLocal*>(block + firstused);
-        local->valuelen = __be16::from_cpu(static_cast<uint16_t>(recs[i].valuelen));
+        local->valuelen = Be16::from_cpu(static_cast<uint16_t>(recs[i].valuelen));
         local->namelen = static_cast<uint8_t>(recs[i].namelen);
         __builtin_memcpy(local->nameval, recs[i].name_ptr, recs[i].namelen);
         __builtin_memcpy(local->nameval + recs[i].namelen, recs[i].val_ptr, recs[i].valuelen);
 
-        leaf_entries[i].hashval = __be32::from_cpu(recs[i].hash);
-        leaf_entries[i].nameidx = __be16::from_cpu(firstused);
+        leaf_entries[i].hashval = Be32::from_cpu(recs[i].hash);
+        leaf_entries[i].nameidx = Be16::from_cpu(firstused);
         leaf_entries[i].flags = recs[i].flags | XFS_ATTR_LOCAL;
         leaf_entries[i].pad2 = 0;
 
-        usedbytes += payload;
+        usedbytes += PAYLOAD;
     }
 
-    lhdr->count = __be16::from_cpu(static_cast<uint16_t>(n));
-    lhdr->usedbytes = __be16::from_cpu(usedbytes);
-    lhdr->firstused = __be16::from_cpu(firstused);
+    lhdr->count = Be16::from_cpu(static_cast<uint16_t>(n));
+    lhdr->usedbytes = Be16::from_cpu(usedbytes);
+    lhdr->firstused = Be16::from_cpu(firstused);
     lhdr->holes = 0;
 
     // Freemap: single free region between end of entry array and firstused.
-    uint16_t free_base = static_cast<uint16_t>(sizeof(XfsAttr3LeafHdr) + n * sizeof(XfsAttrLeafEntry));
-    uint16_t free_size = (firstused > free_base) ? static_cast<uint16_t>(firstused - free_base) : 0;
-    lhdr->freemap[0].base = __be16::from_cpu(free_base);
-    lhdr->freemap[0].size = __be16::from_cpu(free_size);
-    lhdr->freemap[1].base = __be16::from_cpu(0);
-    lhdr->freemap[1].size = __be16::from_cpu(0);
-    lhdr->freemap[2].base = __be16::from_cpu(0);
-    lhdr->freemap[2].size = __be16::from_cpu(0);
+    auto const FREE_BASE = static_cast<uint16_t>(sizeof(XfsAttr3LeafHdr) + (n * sizeof(XfsAttrLeafEntry)));
+    uint16_t const FREE_SIZE = (firstused > FREE_BASE) ? static_cast<uint16_t>(firstused - FREE_BASE) : 0;
+    lhdr->freemap[0].base = Be16::from_cpu(FREE_BASE);
+    lhdr->freemap[0].size = Be16::from_cpu(FREE_SIZE);
+    lhdr->freemap[1].base = Be16::from_cpu(0);
+    lhdr->freemap[1].size = Be16::from_cpu(0);
+    lhdr->freemap[2].base = Be16::from_cpu(0);
+    lhdr->freemap[2].size = Be16::from_cpu(0);
 
     // 4c. Compute and write CRC.
-    attr_leaf_compute_crc(block, blk_size);
+    attr_leaf_compute_crc(block, BLK_SIZE);
 
     bwrite(bh);
     brelse(bh);
@@ -713,7 +713,7 @@ auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, u
     ip->attr_fork.format = XFS_DINODE_FMT_EXTENTS;
     ip->attr_fork.extents.list = new XfsBmbtIrec[1];
     ip->attr_fork.extents.list[0].br_startoff = 0;
-    ip->attr_fork.extents.list[0].br_startblock = disk_block;
+    ip->attr_fork.extents.list[0].br_startblock = DISK_BLOCK;
     ip->attr_fork.extents.list[0].br_blockcount = 1;
     ip->attr_fork.extents.list[0].br_unwritten = false;
     ip->attr_fork.extents.count = 1;
@@ -732,20 +732,20 @@ auto sf_to_leaf_convert(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, u
 
 auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* val, uint32_t valuelen, uint8_t flags)
     -> int {
-    size_t new_entry_size = sizeof(XfsAttrSfEntry) + namelen + valuelen;
+    size_t const NEW_ENTRY_SIZE = sizeof(XfsAttrSfEntry) + namelen + valuelen;
 
     // If there is no attr fork yet, create one (shortform with 0 entries)
     if (!ip->has_attr_fork || ip->attr_fork.format != XFS_DINODE_FMT_LOCAL || ip->attr_fork.local.data == nullptr) {
         // Allocate initial shortform: header + new entry
-        size_t alloc_size = sizeof(XfsAttrSfHdr) + new_entry_size;
-        auto* buf = new (std::nothrow) uint8_t[alloc_size];
+        size_t const ALLOC_SIZE = sizeof(XfsAttrSfHdr) + NEW_ENTRY_SIZE;
+        auto* buf = new (std::nothrow) uint8_t[ALLOC_SIZE];
         if (buf == nullptr) {
             return -ENOMEM;
         }
-        __builtin_memset(buf, 0, alloc_size);
+        __builtin_memset(buf, 0, ALLOC_SIZE);
 
         auto* new_hdr = reinterpret_cast<XfsAttrSfHdr*>(buf);
-        new_hdr->totsize = __be16::from_cpu(static_cast<uint16_t>(alloc_size));
+        new_hdr->totsize = Be16::from_cpu(static_cast<uint16_t>(ALLOC_SIZE));
         new_hdr->count = 1;
         new_hdr->padding = 0;
 
@@ -762,23 +762,23 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
         }
         ip->attr_fork.format = XFS_DINODE_FMT_LOCAL;
         ip->attr_fork.local.data = buf;
-        ip->attr_fork.local.size = alloc_size;
+        ip->attr_fork.local.size = ALLOC_SIZE;
         ip->has_attr_fork = true;
         ip->anextents = 0;
 
         // Set forkoff if not already set - place attr fork after data fork.
         // Default: split inode literal area in half if data fork permits it.
         if (ip->forkoff == 0) {
-            size_t inode_core = 176;  // v3 core (XfsDinode size)
-            size_t literal_area = ip->mount->inode_size - inode_core;
+            size_t const INODE_CORE = 176;  // v3 core (XfsDinode size)
+            size_t const LITERAL_AREA = ip->mount->inode_size - INODE_CORE;
             // Attr fork starts at forkoff * 8 bytes from data fork start.
             // Set forkoff so attr fork gets the minimum needed space.
-            size_t attr_needed = alloc_size;
-            if (attr_needed > literal_area) {
+            size_t const ATTR_NEEDED = ALLOC_SIZE;
+            if (ATTR_NEEDED > LITERAL_AREA) {
                 return -ENOSPC;
             }
             // forkoff is in 8-byte units from inode core end (data fork start)
-            size_t data_fork_bytes = literal_area - attr_needed;
+            size_t data_fork_bytes = LITERAL_AREA - ATTR_NEEDED;
             // Round down to 8-byte boundary
             data_fork_bytes &= ~7ULL;
             ip->forkoff = static_cast<uint8_t>(data_fork_bytes >> 3);
@@ -803,8 +803,8 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
             break;
         }
         auto* entry = reinterpret_cast<XfsAttrSfEntry*>(base + pos);
-        size_t entry_size = xfs_attr_sf_entry_size(entry);
-        if (pos + entry_size > total) {
+        size_t const ENTRY_SIZE = xfs_attr_sf_entry_size(entry);
+        if (pos + ENTRY_SIZE > total) {
             break;
         }
 
@@ -817,34 +817,34 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
             }
 
             // Different size - remove old entry, then fall through to insert
-            size_t tail_start = pos + entry_size;
-            size_t tail_len = total - tail_start;
-            if (tail_len > 0) {
-                __builtin_memmove(base + pos, base + tail_start, tail_len);
+            size_t const TAIL_START = pos + ENTRY_SIZE;
+            size_t const TAIL_LEN = total - TAIL_START;
+            if (TAIL_LEN > 0) {
+                __builtin_memmove(base + pos, base + TAIL_START, TAIL_LEN);
             }
-            total -= entry_size;
+            total -= ENTRY_SIZE;
             hdr->count--;
-            hdr->totsize = __be16::from_cpu(static_cast<uint16_t>(total));
+            hdr->totsize = Be16::from_cpu(static_cast<uint16_t>(total));
             break;
         }
 
-        pos += entry_size;
+        pos += ENTRY_SIZE;
     }
 
     // Insert new entry at end
-    size_t new_total = total + new_entry_size;
+    size_t const NEW_TOTAL = total + NEW_ENTRY_SIZE;
 
     // Check if it fits in the attr fork space
-    size_t inode_core = 176;  // v3 core size
-    size_t data_fork_bytes = static_cast<size_t>(ip->forkoff) << 3;
-    size_t attr_fork_space = ip->mount->inode_size - inode_core - data_fork_bytes;
-    if (new_total > attr_fork_space) {
+    size_t const INODE_CORE = 176;  // v3 core size
+    size_t const DATA_FORK_BYTES = static_cast<size_t>(ip->forkoff) << 3;
+    size_t const ATTR_FORK_SPACE = ip->mount->inode_size - INODE_CORE - DATA_FORK_BYTES;
+    if (NEW_TOTAL > ATTR_FORK_SPACE) {
         // Convert shortform to leaf block format
         return sf_to_leaf_convert(ip, tp, name, namelen, val, valuelen, flags);
     }
 
     // Reallocate the buffer
-    auto* new_buf = new uint8_t[new_total];
+    auto* new_buf = new uint8_t[NEW_TOTAL];
     if (new_buf == nullptr) {
         return -ENOMEM;
     }
@@ -861,12 +861,12 @@ auto sf_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t name
     // Update header
     auto* new_hdr = reinterpret_cast<XfsAttrSfHdr*>(new_buf);
     new_hdr->count++;
-    new_hdr->totsize = __be16::from_cpu(static_cast<uint16_t>(new_total));
+    new_hdr->totsize = Be16::from_cpu(static_cast<uint16_t>(NEW_TOTAL));
 
     // Replace buffer in inode
     delete[] ip->attr_fork.local.data;
     ip->attr_fork.local.data = new_buf;
-    ip->attr_fork.local.size = new_total;
+    ip->attr_fork.local.size = NEW_TOTAL;
     ip->dirty = true;
 
     return 0;
@@ -893,27 +893,27 @@ auto sf_remove(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t n
             break;
         }
         auto* entry = reinterpret_cast<XfsAttrSfEntry*>(base + pos);
-        size_t entry_size = xfs_attr_sf_entry_size(entry);
-        if (pos + entry_size > total) {
+        size_t const ENTRY_SIZE = xfs_attr_sf_entry_size(entry);
+        if (pos + ENTRY_SIZE > total) {
             break;
         }
 
         if (name_match(entry, name, namelen, flags)) {
             // Found it - remove by shifting tail data
-            size_t tail_start = pos + entry_size;
-            size_t tail_len = total - tail_start;
-            if (tail_len > 0) {
-                __builtin_memmove(base + pos, base + tail_start, tail_len);
+            size_t const TAIL_START = pos + ENTRY_SIZE;
+            size_t const TAIL_LEN = total - TAIL_START;
+            if (TAIL_LEN > 0) {
+                __builtin_memmove(base + pos, base + TAIL_START, TAIL_LEN);
             }
-            total -= entry_size;
+            total -= ENTRY_SIZE;
             hdr->count--;
-            hdr->totsize = __be16::from_cpu(static_cast<uint16_t>(total));
+            hdr->totsize = Be16::from_cpu(static_cast<uint16_t>(total));
             ip->attr_fork.local.size = total;
             ip->dirty = true;
             return 0;
         }
 
-        pos += entry_size;
+        pos += ENTRY_SIZE;
     }
 
     return -ENOATTR;

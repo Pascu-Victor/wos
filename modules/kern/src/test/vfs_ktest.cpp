@@ -1,3 +1,5 @@
+#include <bits/ssize_t.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -22,7 +24,7 @@ KTEST(VFS, CreateAndStat) {
     KREQUIRE_NE(f, nullptr);
     ker::vfs::tmpfs::tmpfs_fops_close(f);
 
-    ker::vfs::stat st{};
+    ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat("/tmp/ktest_create", &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFREG) != 0U);
 
@@ -39,16 +41,16 @@ KTEST(VFS, WriteRead) {
     for (int i = 0; i < 128; ++i) {
         wbuf[i] = static_cast<uint8_t>(i);
     }
-    ssize_t nw = ker::vfs::tmpfs::tmpfs_write(wf, static_cast<const void*>(wbuf), 128, 0);
-    KEXPECT_EQ(nw, static_cast<ssize_t>(128));
+    ssize_t const NW = ker::vfs::tmpfs::tmpfs_write(wf, static_cast<const void*>(wbuf), 128, 0);
+    KEXPECT_EQ(NW, static_cast<ssize_t>(128));
     ker::vfs::tmpfs::tmpfs_fops_close(wf);
 
     ker::vfs::File* rf = ker::vfs::vfs_open_file("/tmp/ktest_wr", 0, 0);
     KREQUIRE_NE(rf, nullptr);
 
     uint8_t rbuf[128] = {};
-    ssize_t nr = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), 128, 0);
-    KEXPECT_EQ(nr, static_cast<ssize_t>(128));
+    ssize_t const NR = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), 128, 0);
+    KEXPECT_EQ(NR, static_cast<ssize_t>(128));
     ker::vfs::tmpfs::tmpfs_fops_close(rf);
 
     bool match = true;
@@ -80,7 +82,7 @@ KTEST(VFS, Unlink) {
 KTEST(VFS, Mkdir) {
     KEXPECT_EQ(ker::vfs::vfs_mkdir("/tmp/ktest_dir", 0755), 0);
 
-    ker::vfs::stat st{};
+    ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat("/tmp/ktest_dir", &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFDIR) != 0U);
 }
@@ -96,18 +98,18 @@ KTEST(VFS, AppendMode) {
     constexpr size_t L1 = sizeof(CHUNK1) - 1;
     constexpr size_t L2 = sizeof(CHUNK2) - 1;
 
-    ssize_t nw1 = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(CHUNK1), L1, 0);
-    KEXPECT_EQ(nw1, static_cast<ssize_t>(L1));
-    ssize_t nw2 = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(CHUNK2), L2, L1);
-    KEXPECT_EQ(nw2, static_cast<ssize_t>(L2));
+    ssize_t const NW1 = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(CHUNK1), L1, 0);
+    KEXPECT_EQ(NW1, static_cast<ssize_t>(L1));
+    ssize_t const NW2 = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(CHUNK2), L2, L1);
+    KEXPECT_EQ(NW2, static_cast<ssize_t>(L2));
     ker::vfs::tmpfs::tmpfs_fops_close(f);
 
     ker::vfs::File* rf = ker::vfs::vfs_open_file("/tmp/ktest_append", 0, 0);
     KREQUIRE_NE(rf, nullptr);
 
     char rbuf[32] = {};
-    ssize_t nr = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), L1 + L2, 0);
-    KEXPECT_EQ(nr, static_cast<ssize_t>(L1 + L2));
+    ssize_t const NR = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), L1 + L2, 0);
+    KEXPECT_EQ(NR, static_cast<ssize_t>(L1 + L2));
     ker::vfs::tmpfs::tmpfs_fops_close(rf);
 
     KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), "Hello, World!", L1 + L2) == 0);
@@ -133,12 +135,12 @@ KTEST(VFS, WriteReadAligned4K) {
     for (size_t i = 0; i < SIZE; i++) {
         wbuf[i] = static_cast<uint8_t>(i & 0xFF);
     }
-    ssize_t nw = f->fops->vfs_write(f, static_cast<const void*>(wbuf), SIZE, 0);
-    KEXPECT_EQ(nw, static_cast<ssize_t>(SIZE));
+    ssize_t const NW = f->fops->vfs_write(f, static_cast<const void*>(wbuf), SIZE, 0);
+    KEXPECT_EQ(NW, static_cast<ssize_t>(SIZE));
 
     uint8_t rbuf[SIZE] = {};
-    ssize_t nr = f->fops->vfs_read(f, static_cast<void*>(rbuf), SIZE, 0);
-    KEXPECT_EQ(nr, static_cast<ssize_t>(SIZE));
+    ssize_t const NR = f->fops->vfs_read(f, static_cast<void*>(rbuf), SIZE, 0);
+    KEXPECT_EQ(NR, static_cast<ssize_t>(SIZE));
 
     bool ok = true;
     for (size_t i = 0; i < SIZE; i++) {

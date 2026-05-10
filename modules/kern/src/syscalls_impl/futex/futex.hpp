@@ -16,7 +16,7 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3);
 
 // Wait on a futex address until woken or timeout
 // Returns 0 on success (woken), -EAGAIN if value mismatch, -ETIMEDOUT on timeout
-int64_t futex_wait(int* addr, int expected, const void* timeout);
+int64_t futex_wait(const int* addr, int expected, const void* timeout);
 
 // Wake threads waiting on a futex address
 // Returns the number of threads woken

@@ -4,11 +4,15 @@
 // to the XFS native implementation.  It implements open, read, write, seek,
 // readdir, readlink, truncate, close, and stat for XFS.
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <vfs/buffer_cache.hpp>
@@ -58,16 +62,16 @@ namespace {
 
 auto pointer_looks_like_kernel_object(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uint64_t>(ptr);
-    bool in_hhdm = addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL;
-    bool in_kernel_static = addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL;
-    return (in_hhdm || in_kernel_static) && ((addr & 0x7ULL) == 0);
+    bool const IN_HHDM = addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL;
+    bool const IN_KERNEL_STATIC = addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL;
+    return (IN_HHDM || IN_KERNEL_STATIC) && ((addr & 0x7ULL) == 0);
 }
 
 auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
     auto agno = xfs_ag_number(fsbno, ctx->ag_blk_log);
     auto agbno = xfs_ag_block(fsbno, ctx->ag_blk_log);
-    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
-    return linear_block * (ctx->block_size / ctx->device->block_size);
+    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+    return LINEAR_BLOCK * (ctx->block_size / ctx->device->block_size);
 }
 
 auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
@@ -117,8 +121,8 @@ auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
 
         // Look up the component
         XfsDirEntry de{};
-        int ret = xfs_dir_lookup(ip, comp_start, namelen, &de);
-        if (ret != 0) {
+        int const RET = xfs_dir_lookup(ip, comp_start, namelen, &de);
+        if (RET != 0) {
             xfs_inode_release(ip);
             return nullptr;
         }
@@ -147,9 +151,9 @@ auto xfs_vfs_close(File* f) -> int {
         // Remote VFS executable loads open files read-only; syncing the whole
         // filesystem on every close stalls those fetches and can trip WKI fencing.
         constexpr int XFS_O_TRUNC_FLAG = 01000;
-        int accmode = f->open_flags & 3;
-        bool write_like_close = (accmode == 1 || accmode == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0);
-        if (write_like_close && pointer_looks_like_kernel_object(xfd->mount)) {
+        int const ACCMODE = f->open_flags & 3;
+        bool const WRITE_LIKE_CLOSE = (ACCMODE == 1 || ACCMODE == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0);
+        if (WRITE_LIKE_CLOSE && pointer_looks_like_kernel_object(xfd->mount)) {
             auto* mount = xfd->mount;
             if (pointer_looks_like_kernel_object(mount->device)) {
                 sync_blockdev(mount->device);
@@ -186,18 +190,18 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         if (offset >= ip->size) {
             return 0;
         }
-        size_t avail = ip->size - offset;
-        size_t to_copy = count < avail ? count : avail;
-        std::memcpy(buf, ip->data_fork.local.data + offset, to_copy);
-        return static_cast<ssize_t>(to_copy);
+        size_t const AVAIL = ip->size - offset;
+        size_t const TO_COPY = count < AVAIL ? count : AVAIL;
+        std::memcpy(buf, ip->data_fork.local.data + offset, TO_COPY);
+        return static_cast<ssize_t>(TO_COPY);
     }
 
     // EXTENTS or BTREE - block-based read
     if (offset >= ip->size) {
         return 0;
     }
-    size_t avail = ip->size - offset;
-    size_t remaining = count < avail ? count : avail;
+    size_t const AVAIL = ip->size - offset;
+    size_t remaining = count < AVAIL ? count : AVAIL;
     size_t total_read = 0;
     auto* dst = static_cast<uint8_t*>(buf);
 
@@ -212,23 +216,23 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     while (remaining > 0) {
         // Compute the logical file block and byte offset within the block
         auto file_block = static_cast<xfs_fileoff_t>((offset + total_read) >> ctx->block_log);
-        size_t block_off = (offset + total_read) & (ctx->block_size - 1);
+        size_t const BLOCK_OFF = (offset + total_read) & (ctx->block_size - 1);
 
         XfsBmapResult bmap{};
 #ifdef XFS_BENCH
         uint64_t t0 = ker::mod::tsc::get_ns();
 #endif
-        int ret = xfs_bmap_lookup(ip, file_block, &bmap);
+        int const RET = xfs_bmap_lookup(ip, file_block, &bmap);
 #ifdef XFS_BENCH
         acc_bmap += ker::mod::tsc::get_ns() - t0;
 #endif
-        if (ret < 0) {
-            return (total_read > 0) ? static_cast<ssize_t>(total_read) : ret;
+        if (RET < 0) {
+            return (total_read > 0) ? static_cast<ssize_t>(total_read) : RET;
         }
 
         if (bmap.is_hole || bmap.startblock == NULLFSBLOCK) {
             // Hole - return zeros
-            size_t hole_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - block_off;
+            size_t hole_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
             hole_bytes = std::min(hole_bytes, remaining);
             std::memset(dst + total_read, 0, hole_bytes);
             total_read += hole_bytes;
@@ -237,23 +241,23 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         }
 
         // Read contiguous blocks in bulk, bypassing the buffer cache.
-        xfs_fsblock_t disk_block = bmap.startblock;
+        xfs_fsblock_t const DISK_BLOCK = bmap.startblock;
 
         // How many bytes does this extent cover from our current position?
-        size_t extent_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - block_off;
-        size_t chunk = std::min(extent_bytes, remaining);
+        size_t const EXTENT_BYTES = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
+        size_t chunk = std::min(EXTENT_BYTES, remaining);
 
 #ifdef XFS_BENCH
         t0 = ker::mod::tsc::get_ns();
 #endif
-        bool dma_safe_dst = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
-        if (block_off == 0 && (chunk & (ctx->block_size - 1)) == 0 && dma_safe_dst) {
+        bool const DMA_SAFE_DST = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
+        if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0 && DMA_SAFE_DST) {
             // Aligned, full-block read.  Check the buffer cache first: a dirty
             // buffer contains data not yet flushed to disk, so a direct read
             // would return stale on-disk bytes instead of the intended content.
-            uint64_t dev_block = xfs_fsblock_to_dev_block(ctx, disk_block);
-            size_t dev_count = chunk / ctx->device->block_size;
-            BufHead* cache_bp = (dev_count <= 1) ? bread(ctx->device, dev_block) : bread_multi(ctx->device, dev_block, dev_count);
+            uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
+            size_t const DEV_COUNT = chunk / ctx->device->block_size;
+            BufHead* cache_bp = (DEV_COUNT <= 1) ? bread(ctx->device, DEV_BLOCK) : bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
@@ -261,22 +265,22 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 std::memcpy(dst + total_read, cache_bp->data, chunk);
                 brelse(cache_bp);
             } else {
-                int rc = dev::block_read(ctx->device, dev_block, dev_count, dst + total_read);
-                if (rc != 0) {
+                int const RC = dev::block_read(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read);
+                if (RC != 0) {
                     return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
                 }
             }
         } else {
             // Partial or unaligned - fall back to single cached block.
-            chunk = std::min(ctx->block_size - block_off, remaining);
-            BufHead* bp = xfs_buf_read(ctx, disk_block);
+            chunk = std::min(ctx->block_size - BLOCK_OFF, remaining);
+            BufHead* bp = xfs_buf_read(ctx, DISK_BLOCK);
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             if (bp == nullptr) {
                 return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
             }
-            std::memcpy(dst + total_read, bp->data + block_off, chunk);
+            std::memcpy(dst + total_read, bp->data + BLOCK_OFF, chunk);
             brelse(bp);
         }
 
@@ -301,7 +305,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 
     // Diagnostic: detect all-zero reads and dump bmap details
     if (total_read > 0 && offset == 0) {
-        auto* dbg_dst = static_cast<const uint8_t*>(buf);
+        const auto* dbg_dst = static_cast<const uint8_t*>(buf);
         bool all_zero = true;
         for (size_t i = 0; i < std::min(total_read, static_cast<size_t>(64)); i++) {
             if (dbg_dst[i] != 0) {
@@ -311,12 +315,13 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         }
         if (all_zero) {
             XfsBmapResult dbg_bmap{};
-            int dbg_rc = xfs_bmap_lookup(ip, 0, &dbg_bmap);
+            int const DBG_RC = xfs_bmap_lookup(ip, 0, &dbg_bmap);
             ker::mod::dbg::log(
                 "[XFS-DIAG] ZERO READ: ino=%lu size=%lu nextents=%u fmt=%d nblocks=%lu"
                 " bmap_rc=%d hole=%d startblk=%lu blkcnt=%lu unwritten=%d",
-                (unsigned long)ip->ino, (unsigned long)ip->size, ip->nextents, ip->data_fork.format, (unsigned long)ip->nblocks, dbg_rc,
-                dbg_bmap.is_hole, (unsigned long)dbg_bmap.startblock, (unsigned long)dbg_bmap.blockcount, dbg_bmap.unwritten);
+                static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(ip->size), ip->nextents, ip->data_fork.format,
+                static_cast<unsigned long>(ip->nblocks), DBG_RC, dbg_bmap.is_hole, static_cast<unsigned long>(dbg_bmap.startblock),
+                static_cast<unsigned long>(dbg_bmap.blockcount), dbg_bmap.unwritten);
         }
     }
 
@@ -362,19 +367,19 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
         size_t current_src_offset = src_offset;
 
         while (remaining_bytes > 0) {
-            size_t chunk = std::min(ctx->block_size - block_off, remaining_bytes);
+            size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
             BufHead* bp =
-                (block_off == 0 && chunk == ctx->block_size) ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
+                (block_off == 0 && CHUNK == ctx->block_size) ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
             if (bp == nullptr) {
                 return false;
             }
 
-            std::memcpy(bp->data + block_off, src + current_src_offset, chunk);
+            std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
             bdirty(bp);
             brelse(bp);
 
-            remaining_bytes -= chunk;
-            current_src_offset += chunk;
+            remaining_bytes -= CHUNK;
+            current_src_offset += CHUNK;
             current_disk_block++;
             block_off = 0;
         }
@@ -397,9 +402,9 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #endif
 
     while (total_written < count) {
-        size_t write_pos = offset + total_written;
-        auto file_block = static_cast<xfs_fileoff_t>(write_pos >> ctx->block_log);
-        size_t block_off = write_pos & (ctx->block_size - 1);
+        size_t const WRITE_POS = offset + total_written;
+        auto file_block = static_cast<xfs_fileoff_t>(WRITE_POS >> ctx->block_log);
+        size_t const BLOCK_OFF = WRITE_POS & (ctx->block_size - 1);
 
         XfsBmapResult bmap{};
 #ifdef XFS_BENCH
@@ -419,9 +424,9 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #endif
             // Hole: batch-allocate as many contiguous blocks as we can.
             // bmap.blockcount tells us how many blocks remain in this hole.
-            size_t remaining_bytes = count - total_written;
+            size_t const REMAINING_BYTES = count - total_written;
             // Blocks needed to cover remaining write (may start mid-block)
-            size_t blocks_needed = (block_off + remaining_bytes + ctx->block_size - 1) >> ctx->block_log;
+            size_t blocks_needed = (BLOCK_OFF + REMAINING_BYTES + ctx->block_size - 1) >> ctx->block_log;
             // Always allocate at least 1024 blocks (4MB) to amortise per-transaction overhead
             // across many small write() syscalls. The extra blocks become pre-allocated extent
             // that subsequent writes find already mapped, skipping allocation entirely.
@@ -442,10 +447,10 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 break;
             }
 
-            xfs_agnumber_t pref_ag = xfs_ino_ag(ip->ino, ctx->agino_log);
+            xfs_agnumber_t const PREF_AG = xfs_ino_ag(ip->ino, ctx->agino_log);
 
             XfsAllocReq req{};
-            req.agno = pref_ag;
+            req.agno = PREF_AG;
             req.agbno = 0;
             req.minlen = 1;
             req.maxlen = hole_blocks;
@@ -458,11 +463,11 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
                 break;
             }
 
-            xfs_fsblock_t disk_block = xfs_agbno_to_fsbno(alloc_result.agno, alloc_result.agbno, ctx->ag_blk_log);
+            xfs_fsblock_t const DISK_BLOCK = xfs_agbno_to_fsbno(alloc_result.agno, alloc_result.agbno, ctx->ag_blk_log);
 
             XfsBmbtIrec new_ext{};
             new_ext.br_startoff = file_block;
-            new_ext.br_startblock = disk_block;
+            new_ext.br_startblock = DISK_BLOCK;
             new_ext.br_blockcount = alloc_result.len;
             new_ext.br_unwritten = false;
 
@@ -491,28 +496,28 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             // Write the data blocks covered by this allocation through the
             // buffer cache so subsequent cached reads observe the new contents.
             {
-                size_t extent_bytes = static_cast<size_t>(alloc_result.len) << ctx->block_log;
-                size_t write_end = offset + count;
-                size_t extent_start = static_cast<size_t>(file_block) << ctx->block_log;
-                size_t extent_end = extent_start + extent_bytes;
+                size_t const EXTENT_BYTES = static_cast<size_t>(alloc_result.len) << ctx->block_log;
+                size_t const WRITE_END = offset + count;
+                size_t const EXTENT_START = static_cast<size_t>(file_block) << ctx->block_log;
+                size_t const EXTENT_END = EXTENT_START + EXTENT_BYTES;
 
                 // Compute the slice of this extent actually covered by [offset, offset+count)
-                size_t slice_start = std::max(extent_start, offset + total_written);
-                size_t slice_end = std::min(extent_end, write_end);
-                size_t slice_bytes = (slice_end > slice_start) ? (slice_end - slice_start) : 0;
+                size_t const SLICE_START = std::max(EXTENT_START, offset + total_written);
+                size_t const SLICE_END = std::min(EXTENT_END, WRITE_END);
+                size_t const SLICE_BYTES = (SLICE_END > SLICE_START) ? (SLICE_END - SLICE_START) : 0;
 
 #ifdef XFS_BENCH
                 t0 = ker::mod::tsc::get_ns();
 #endif
-                if (slice_bytes > 0) {
-                    size_t slice_block_off = slice_start - extent_start;
-                    if (!buffered_write(disk_block, slice_block_off, slice_bytes, slice_start - offset)) {
+                if (SLICE_BYTES > 0) {
+                    size_t const SLICE_BLOCK_OFF = SLICE_START - EXTENT_START;
+                    if (!buffered_write(DISK_BLOCK, SLICE_BLOCK_OFF, SLICE_BYTES, SLICE_START - offset)) {
 #ifdef XFS_BENCH
                         acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
                         goto write_done;
                     }
-                    total_written += slice_bytes;
+                    total_written += SLICE_BYTES;
                 }
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
@@ -523,15 +528,15 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             loc_map++;
 #endif
             // Block already mapped - write the contiguous extent in bulk.
-            xfs_fsblock_t disk_block = bmap.startblock;
+            xfs_fsblock_t const DISK_BLOCK = bmap.startblock;
 
-            size_t extent_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - block_off;
-            size_t chunk = std::min(extent_bytes, count - total_written);
+            size_t const EXTENT_BYTES = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
+            size_t const CHUNK = std::min(EXTENT_BYTES, count - total_written);
 
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
 #endif
-            if (!buffered_write(disk_block, block_off, chunk, total_written)) {
+            if (!buffered_write(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written)) {
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
@@ -541,7 +546,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
 
-            total_written += chunk;
+            total_written += CHUNK;
         }
     }
 
@@ -680,9 +685,9 @@ auto readdir_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
         }
 
         // Copy name
-        size_t copy_len = xde->namelen < DIRENT_NAME_MAX - 1 ? xde->namelen : DIRENT_NAME_MAX - 1;
-        std::memcpy(rctx->entry->d_name.data(), xde->name.data(), copy_len);
-        rctx->entry->d_name[copy_len] = '\0';
+        size_t const COPY_LEN = xde->namelen < DIRENT_NAME_MAX - 1 ? xde->namelen : DIRENT_NAME_MAX - 1;
+        std::memcpy(rctx->entry->d_name.data(), xde->name.data(), COPY_LEN);
+        rctx->entry->d_name[COPY_LEN] = '\0';
 
         rctx->found = true;
         return 1;  // stop iteration
@@ -710,9 +715,9 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     ctx.current_index = 0;
     ctx.found = false;
 
-    int ret = xfs_dir_iterate(xfd->inode, readdir_callback, &ctx);
-    if (ret < 0) {
-        return ret;
+    int const RET = xfs_dir_iterate(xfd->inode, readdir_callback, &ctx);
+    if (RET < 0) {
+        return RET;
     }
 
     return ctx.found ? 0 : -1;  // -1 = no more entries
@@ -735,11 +740,11 @@ auto xfs_vfs_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
-    int ret = xfs_readlink(xfd->inode, buf, bufsize);
-    if (ret < 0) {
-        return ret;
+    int const RET = xfs_readlink(xfd->inode, buf, bufsize);
+    if (RET < 0) {
+        return RET;
     }
-    return static_cast<ssize_t>(ret);
+    return static_cast<ssize_t>(RET);
 }
 
 // ============================================================================
@@ -783,8 +788,8 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
         return -ENOMEM;
     }
     xfs_trans_log_inode(tp, ip);
-    int ret = xfs_trans_commit(tp);
-    return (ret == 0) ? 0 : -EIO;
+    int const RET = xfs_trans_commit(tp);
+    return (RET == 0) ? 0 : -EIO;
 }
 
 // ============================================================================
@@ -842,13 +847,13 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
         } else {
             // Extract parent path
-            size_t parent_len = static_cast<size_t>(last_slash - fs_path);
+            auto const PARENT_LEN = static_cast<size_t>(last_slash - fs_path);
             char parent_path[512] = {};  // NOLINT
-            if (parent_len >= sizeof(parent_path)) {
+            if (PARENT_LEN >= sizeof(parent_path)) {
                 return nullptr;
             }
-            std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
-            parent_path[parent_len] = '\0';
+            std::memcpy(static_cast<char*>(parent_path), fs_path, PARENT_LEN);
+            parent_path[PARENT_LEN] = '\0';
             parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
             filename = last_slash + 1;
         }
@@ -877,17 +882,17 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         }
 
         // Apply default mode if not specified (standard POSIX: 0666 for files)
-        int file_mode = (mode == 0) ? 0666 : mode;
-        uint16_t inode_mode = static_cast<uint16_t>(file_mode & 0xFFF) | 0100000;  // S_IFREG | mode
-        xfs_ino_t new_ino = xfs_ialloc(ctx, tp, inode_mode);
-        if (new_ino == NULLFSINO) {
+        int const FILE_MODE = (mode == 0) ? 0666 : mode;
+        uint16_t const INODE_MODE = static_cast<uint16_t>(FILE_MODE & 0xFFF) | 0100000;  // S_IFREG | mode
+        xfs_ino_t const NEW_INO = xfs_ialloc(ctx, tp, INODE_MODE);
+        if (NEW_INO == NULLFSINO) {
             xfs_trans_cancel(tp);
             xfs_inode_release(parent_ip);
             return nullptr;
         }
 
         // Add directory entry
-        int rc = xfs_dir_addname(parent_ip, filename, filename_len, new_ino, XFS_DIR3_FT_REG_FILE, tp);
+        int rc = xfs_dir_addname(parent_ip, filename, filename_len, NEW_INO, XFS_DIR3_FT_REG_FILE, tp);
         if (rc != 0) {
             xfs_trans_cancel(tp);
             xfs_inode_release(parent_ip);
@@ -901,13 +906,13 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         }
 
         // Now read the newly created inode
-        ip = xfs_inode_read(ctx, new_ino);
+        ip = xfs_inode_read(ctx, NEW_INO);
         if (ip == nullptr) {
             return nullptr;
         }
 
         // Initialize the new inode's in-memory state
-        ip->mode = inode_mode;
+        ip->mode = INODE_MODE;
         ip->size = 0;
         ip->nlink = 1;
         ip->nblocks = 0;
@@ -930,8 +935,8 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     }
 
     // Check for O_WRONLY/O_RDWR on a read-only mount
-    int accmode = flags & 3;
-    if (accmode == 1 || accmode == 2) {
+    int const ACCMODE = flags & 3;
+    if (ACCMODE == 1 || ACCMODE == 2) {
         // Write access on read-only filesystem
         if (ctx->read_only) {
             xfs_inode_release(ip);
@@ -949,11 +954,11 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         XfsTransaction* tp = xfs_trans_alloc(ctx);
         if (tp != nullptr) {
             xfs_trans_log_inode(tp, ip);
-            int trc = xfs_trans_commit(tp);
+            int const TRC = xfs_trans_commit(tp);
 #ifdef XFS_DEBUG
             mod::dbg::log("[xfs] O_TRUNC: commit rc=%d", trc);
 #endif
-            if (trc != 0) {
+            if (TRC != 0) {
                 xfs_inode_release(ip);
                 return nullptr;
             }
@@ -991,14 +996,14 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
 namespace {
 
-void fill_stat(XfsInode* ip, ker::vfs::stat* st) {
+void fill_stat(XfsInode* ip, ker::vfs::Stat* st) {
     st->st_dev = 0;
     st->st_ino = ip->ino;
     st->st_nlink = ip->nlink;
     st->st_mode = ip->mode;
     st->st_uid = ip->uid;
     st->st_gid = ip->gid;
-    st->__pad0 = 0;
+    st->pad0 = 0;
     st->st_rdev = 0;
     st->st_size = static_cast<off_t>(ip->size);
     st->st_blksize = static_cast<blksize_t>(ip->mount->block_size);
@@ -1006,13 +1011,13 @@ void fill_stat(XfsInode* ip, ker::vfs::stat* st) {
 
     // Timestamps: bigtime uses nanoseconds since Dec 13, 1901 packed into
     // a uint64; legacy uses upper-32 = seconds, lower-32 = nanoseconds.
-    bool bigtime = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
-    if (bigtime) {
+    bool const BIGTIME = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    if (BIGTIME) {
         // XFS bigtime epoch: nanoseconds offset from the legacy min timestamp.
         // Linux: XFS_BIGTIME_EPOCH_OFFSET = -(int64_t)S32_MIN = 2^31 = 2147483648
         constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
         constexpr uint64_t NSEC_PER_SEC = 1000000000ULL;
-        auto decode = [&](uint64_t raw, struct timespec& ts) {
+        auto decode = [&](uint64_t raw, struct Timespec& ts) {
             ts.tv_sec = static_cast<int64_t>(raw / NSEC_PER_SEC) - XFS_BIGTIME_EPOCH_OFFSET;
             ts.tv_nsec = static_cast<int64_t>(raw % NSEC_PER_SEC);
         };
@@ -1031,7 +1036,7 @@ void fill_stat(XfsInode* ip, ker::vfs::stat* st) {
 
 }  // anonymous namespace
 
-auto xfs_stat(const char* fs_path, ker::vfs::stat* statbuf, XfsMountContext* ctx) -> int {
+auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx) -> int {
     if (statbuf == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -1041,13 +1046,13 @@ auto xfs_stat(const char* fs_path, ker::vfs::stat* statbuf, XfsMountContext* ctx
         return -ENOENT;
     }
 
-    std::memset(statbuf, 0, sizeof(ker::vfs::stat));
+    std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
     fill_stat(ip, statbuf);
     xfs_inode_release(ip);
     return 0;
 }
 
-auto xfs_fstat(File* f, ker::vfs::stat* statbuf) -> int {
+auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (f == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
@@ -1056,17 +1061,17 @@ auto xfs_fstat(File* f, ker::vfs::stat* statbuf) -> int {
         return -EBADF;
     }
 
-    std::memset(statbuf, 0, sizeof(ker::vfs::stat));
+    std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
     fill_stat(xfd->inode, statbuf);
     return 0;
 }
 
-auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::statvfs* buf) -> int {
+auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     if (ctx == nullptr || buf == nullptr) {
         return -EINVAL;
     }
 
-    std::memset(buf, 0, sizeof(ker::vfs::statvfs));
+    std::memset(buf, 0, sizeof(ker::vfs::Statvfs));
 
     uint64_t free_blocks = 0;
     uint64_t total_inodes = 0;
@@ -1127,9 +1132,9 @@ auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         return -ENOMEM;
     }
     xfs_trans_log_inode(tp, ip);
-    int ret = xfs_trans_commit(tp);
+    int const RET = xfs_trans_commit(tp);
     xfs_inode_release(ip);
-    return (ret == 0) ? 0 : -EIO;
+    return (RET == 0) ? 0 : -EIO;
 }
 
 auto xfs_fchmod(File* f, int mode) -> int {
@@ -1155,8 +1160,8 @@ auto xfs_fchmod(File* f, int mode) -> int {
         return -ENOMEM;
     }
     xfs_trans_log_inode(tp, ip);
-    int ret = xfs_trans_commit(tp);
-    return (ret == 0) ? 0 : -EIO;
+    int const RET = xfs_trans_commit(tp);
+    return (RET == 0) ? 0 : -EIO;
 }
 
 // ============================================================================
@@ -1174,9 +1179,9 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     // Already exists?
     XfsInode* existing = walk_path(ctx, fs_path);
     if (existing != nullptr) {
-        bool is_dir = xfs_inode_isdir(existing);
+        bool const IS_DIR = xfs_inode_isdir(existing);
         xfs_inode_release(existing);
-        return is_dir ? -EEXIST : -ENOTDIR;
+        return IS_DIR ? -EEXIST : -ENOTDIR;
     }
 
     // Find parent directory and new name
@@ -1222,7 +1227,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     }
 
     // Save before parent_ip is released
-    xfs_ino_t parent_ino = parent_ip->ino;
+    xfs_ino_t const PARENT_INO = parent_ip->ino;
 
     // Allocate new inode
     XfsTransaction* tp = xfs_trans_alloc(ctx);
@@ -1231,17 +1236,17 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         return -ENOMEM;
     }
 
-    int dir_mode = (mode == 0) ? 0755 : mode;
-    uint16_t inode_mode = static_cast<uint16_t>(dir_mode & 0xFFF) | 0040000;  // S_IFDIR
-    xfs_ino_t new_ino = xfs_ialloc(ctx, tp, inode_mode);
-    if (new_ino == NULLFSINO) {
+    int const DIR_MODE = (mode == 0) ? 0755 : mode;
+    uint16_t const INODE_MODE = static_cast<uint16_t>(DIR_MODE & 0xFFF) | 0040000;  // S_IFDIR
+    xfs_ino_t const NEW_INO = xfs_ialloc(ctx, tp, INODE_MODE);
+    if (NEW_INO == NULLFSINO) {
         xfs_trans_cancel(tp);
         xfs_inode_release(parent_ip);
         return -ENOSPC;
     }
 
     // Add entry in parent
-    int rc = xfs_dir_addname(parent_ip, dirname, dirname_len, new_ino, XFS_DIR3_FT_DIR, tp);
+    int rc = xfs_dir_addname(parent_ip, dirname, dirname_len, NEW_INO, XFS_DIR3_FT_DIR, tp);
     if (rc != 0) {
         xfs_trans_cancel(tp);
         xfs_inode_release(parent_ip);
@@ -1255,34 +1260,34 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     }
 
     // Initialize the new directory inode with a minimal shortform header
-    XfsInode* new_ip = xfs_inode_read(ctx, new_ino);
+    XfsInode* new_ip = xfs_inode_read(ctx, NEW_INO);
     if (new_ip == nullptr) {
         return -EIO;
     }
 
-    new_ip->mode = inode_mode;
+    new_ip->mode = INODE_MODE;
     new_ip->size = 0;
     new_ip->nlink = 2;  // . and parent ref
     new_ip->nblocks = 0;
     new_ip->nextents = 0;
 
     // Build minimal shortform directory: count=0, parent=parent_ino
-    bool use_i8 = (parent_ino > 0xFFFFFFFFULL);
-    size_t ino_bytes = use_i8 ? 8 : 4;
-    size_t sf_size = 2 + ino_bytes;
-    auto* sf_data = new (std::nothrow) uint8_t[sf_size];
+    bool const USE_I8 = (PARENT_INO > 0xFFFFFFFFULL);
+    size_t const INO_BYTES = USE_I8 ? 8 : 4;
+    size_t const SF_SIZE = 2 + INO_BYTES;
+    auto* sf_data = new (std::nothrow) uint8_t[SF_SIZE];
     if (sf_data == nullptr) {
         xfs_inode_release(new_ip);
         return -ENOMEM;
     }
     sf_data[0] = 0;               // count
-    sf_data[1] = use_i8 ? 1 : 0;  // i8count
-    if (use_i8) {
+    sf_data[1] = USE_I8 ? 1 : 0;  // i8count
+    if (USE_I8) {
         for (int i = 7; i >= 0; i--) {
-            sf_data[2 + (7 - i)] = static_cast<uint8_t>((parent_ino >> (i * 8)) & 0xFF);
+            sf_data[2 + (7 - i)] = static_cast<uint8_t>((PARENT_INO >> (i * 8)) & 0xFF);
         }
     } else {
-        auto p32 = static_cast<uint32_t>(parent_ino);
+        auto p32 = static_cast<uint32_t>(PARENT_INO);
         for (int i = 3; i >= 0; i--) {
             sf_data[2 + (3 - i)] = static_cast<uint8_t>((p32 >> (i * 8)) & 0xFF);
         }
@@ -1290,7 +1295,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
 
     new_ip->data_fork.format = XFS_DINODE_FMT_LOCAL;
     new_ip->data_fork.local.data = sf_data;
-    new_ip->data_fork.local.size = static_cast<uint32_t>(sf_size);
+    new_ip->data_fork.local.size = static_cast<uint32_t>(SF_SIZE);
     new_ip->dirty = true;
 
     XfsTransaction* tp2 = xfs_trans_alloc(ctx);
@@ -1580,13 +1585,13 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
         filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
     } else {
         // Extract parent path
-        size_t parent_len = static_cast<size_t>(last_slash - fs_path);
+        auto const PARENT_LEN = static_cast<size_t>(last_slash - fs_path);
         char parent_path[512] = {};  // NOLINT
-        if (parent_len >= sizeof(parent_path)) {
+        if (PARENT_LEN >= sizeof(parent_path)) {
             return -ENAMETOOLONG;
         }
-        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
-        parent_path[parent_len] = '\0';
+        std::memcpy(static_cast<char*>(parent_path), fs_path, PARENT_LEN);
+        parent_path[PARENT_LEN] = '\0';
         parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
         filename = last_slash + 1;
     }

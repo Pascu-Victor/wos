@@ -14,7 +14,7 @@
 #include "abi/callnums/time.h"
 #include "platform/dbg/dbg.hpp"
 
-struct itimerval {
+struct Itimerval {
     struct timeval it_interval;
     struct timeval it_value;
 };
@@ -35,32 +35,32 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
     // op 2 => nanosleep: arg1 is const struct timespec* (requested), arg2 is struct timespec* (remaining, may be null)
     // op 3 => times: arg1 is struct tms*, arg2 is clock_t* (return value)
 
-    switch ((ker::abi::sys_time_ops)op) {
-        case ker::abi::sys_time_ops::gettimeofday: {
+    switch (static_cast<ker::abi::sys_time_ops>(op)) {
+        case ker::abi::sys_time_ops::GETTIMEOFDAY: {
             // CLOCK_REALTIME: RTC wall-clock epoch + TSC monotonic offset
             if (arg1 == nullptr) {
-                return (uint64_t)-1;
+                return static_cast<uint64_t>(-1);
             }
-            uint64_t epoch_ns = ker::mod::rtc::get_epoch_ns();
+            uint64_t const EPOCH_NS = ker::mod::rtc::get_epoch_ns();
             auto* tv = reinterpret_cast<timeval*>(arg1);
-            tv->tv_sec = (long)(epoch_ns / 1000000000ULL);
-            tv->tv_usec = (long)((epoch_ns % 1000000000ULL) / 1000ULL);
+            tv->tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
+            tv->tv_usec = static_cast<long>((EPOCH_NS % 1000000000ULL) / 1000ULL);
             return 0;
         }
 
-        case ker::abi::sys_time_ops::clock_gettime: {
+        case ker::abi::sys_time_ops::CLOCK_GETTIME: {
             if (arg1 == nullptr) {
-                return (uint64_t)-1;
+                return static_cast<uint64_t>(-1);
             }
             auto* ts = reinterpret_cast<struct timespec*>(arg1);
-            int clock_id =
+            int const CLOCK_ID =
                 static_cast<int>(reinterpret_cast<uint64_t>(arg2));  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC, 3=CLOCK_THREAD_CPUTIME_ID
-            if (clock_id == 0) {
+            if (CLOCK_ID == 0) {
                 // CLOCK_REALTIME: RTC wall-clock epoch (includes NTP offset)
-                uint64_t epoch_ns = ker::mod::rtc::get_epoch_ns();
-                ts->tv_sec = (long)(epoch_ns / 1000000000ULL);
-                ts->tv_nsec = (long)(epoch_ns % 1000000000ULL);
-            } else if (clock_id == 3) {
+                uint64_t const EPOCH_NS = ker::mod::rtc::get_epoch_ns();
+                ts->tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
+                ts->tv_nsec = static_cast<long>(EPOCH_NS % 1000000000ULL);
+            } else if (CLOCK_ID == 3) {
                 // CLOCK_THREAD_CPUTIME_ID: kernel-tracked on-CPU time for this task.
                 // user_time_us + system_time_us are accumulated by the scheduler's
                 // timer tick handler (process_tasks) each time this task is current.
@@ -69,8 +69,8 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 if (task != nullptr) {
                     cpu_ns = (task->user_time_us + task->system_time_us) * 1000ULL;
                 }
-                ts->tv_sec = (long)(cpu_ns / 1000000000ULL);
-                ts->tv_nsec = (long)(cpu_ns % 1000000000ULL);
+                ts->tv_sec = static_cast<long>(cpu_ns / 1000000000ULL);
+                ts->tv_nsec = static_cast<long>(cpu_ns % 1000000000ULL);
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
@@ -79,33 +79,33 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 } else {
                     mono_ns = ker::mod::time::get_us() * 1000ULL;
                 }
-                ts->tv_sec = (long)(mono_ns / 1000000000ULL);
-                ts->tv_nsec = (long)(mono_ns % 1000000000ULL);
+                ts->tv_sec = static_cast<long>(mono_ns / 1000000000ULL);
+                ts->tv_nsec = static_cast<long>(mono_ns % 1000000000ULL);
             }
             return 0;
         }
 
-        case ker::abi::sys_time_ops::nanosleep: {
+        case ker::abi::sys_time_ops::NANOSLEEP: {
             if (arg1 == nullptr) {
-                return (uint64_t)-1;
+                return static_cast<uint64_t>(-1);
             }
             const auto* req = reinterpret_cast<const struct timespec*>(arg1);
-            uint64_t sleep_us = ((uint64_t)req->tv_sec * 1000000ULL) + ((uint64_t)req->tv_nsec / 1000ULL);
-            if (sleep_us > 0) {
+            uint64_t const SLEEP_US = (static_cast<uint64_t>(req->tv_sec) * 1000000ULL) + (static_cast<uint64_t>(req->tv_nsec) / 1000ULL);
+            if (SLEEP_US > 0) {
                 auto* task = ker::mod::sched::get_current_task();
                 if (task != nullptr) {
                     // Set wake deadline and use deferred_task_switch to properly block
                     // (move to wait list). The timer tick wakeup scan will reschedule us
                     // once wake_at_us is reached.
-                    task->wake_at_us = ker::mod::time::get_us() + sleep_us;
+                    task->wake_at_us = ker::mod::time::get_us() + SLEEP_US;
                     task->wait_channel = "nanosleep";
                     task->deferred_task_switch = true;
                     // Return 0 now - syscall exit path sees deferred_task_switch=true,
                     // moves task to wait list, switches to next task.
                 } else {
                     // Pre-scheduler fallback: spin-wait
-                    uint64_t start = ker::mod::time::get_us();
-                    while (ker::mod::time::get_us() - start < sleep_us) {
+                    uint64_t const START = ker::mod::time::get_us();
+                    while (ker::mod::time::get_us() - START < SLEEP_US) {
                     }
                 }
             }
@@ -118,93 +118,95 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             return 0;
         }
 
-        case ker::abi::sys_time_ops::times: {
+        case ker::abi::sys_time_ops::TIMES: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
-                return (uint64_t)-1;
+                return static_cast<uint64_t>(-1);
             }
 
             if (arg1 != nullptr) {
                 auto* tms = reinterpret_cast<struct tms*>(arg1);
-                tms->tms_utime = (long)us_to_ticks(task->user_time_us);
-                tms->tms_stime = (long)us_to_ticks(task->system_time_us);
+                tms->tms_utime = static_cast<long>(us_to_ticks(task->user_time_us));
+                tms->tms_stime = static_cast<long>(us_to_ticks(task->system_time_us));
                 tms->tms_cutime = 0;  // TODO: accumulate children's times on waitpid
                 tms->tms_cstime = 0;
             }
 
             // Return value: elapsed real time in ticks since an arbitrary epoch (system boot)
             if (arg2 != nullptr) {
-                auto* out = (long*)arg2;
-                *out = (long)us_to_ticks(ker::mod::time::get_us());
+                auto* out = static_cast<long*>(arg2);
+                *out = static_cast<long>(us_to_ticks(ker::mod::time::get_us()));
             }
             return 0;
         }
 
-        case ker::abi::sys_time_ops::setitimer: {
+        case ker::abi::sys_time_ops::SETITIMER: {
             // arg1 = which (as uintptr_t), arg2 = const itimerval* new_value
             // old_value is not passed through this 2-arg path; mlibc reads it
             // via getitimer before calling setitimer if it needs the old value.
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
-                return (uint64_t)-ESRCH;
+                return static_cast<uint64_t>(-ESRCH);
             }
 
-            int which = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
-            if (which != 0 /* ITIMER_REAL */) {
-                return (uint64_t)-EINVAL;
+            int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            if (WHICH != 0 /* ITIMER_REAL */) {
+                return static_cast<uint64_t>(-EINVAL);
             }
 
-            const auto* nv = reinterpret_cast<const itimerval*>(arg2);
+            const auto* nv = reinterpret_cast<const Itimerval*>(arg2);
             if (nv == nullptr) {
-                return (uint64_t)-EFAULT;
+                return static_cast<uint64_t>(-EFAULT);
             }
 
-            uint64_t new_val_us = ((uint64_t)nv->it_value.tv_sec * 1000000ULL) + (uint64_t)nv->it_value.tv_usec;
-            uint64_t new_interval_us = ((uint64_t)nv->it_interval.tv_sec * 1000000ULL) + (uint64_t)nv->it_interval.tv_usec;
+            uint64_t const NEW_VAL_US =
+                (static_cast<uint64_t>(nv->it_value.tv_sec) * 1000000ULL) + static_cast<uint64_t>(nv->it_value.tv_usec);
+            uint64_t const NEW_INTERVAL_US =
+                (static_cast<uint64_t>(nv->it_interval.tv_sec) * 1000000ULL) + static_cast<uint64_t>(nv->it_interval.tv_usec);
 
-            if (new_val_us == 0) {
+            if (NEW_VAL_US == 0) {
                 task->itimer_real_expire_us = 0;
                 task->itimer_real_interval_us = 0;
             } else {
-                task->itimer_real_expire_us = ker::mod::time::get_us() + new_val_us;
-                task->itimer_real_interval_us = new_interval_us;
+                task->itimer_real_expire_us = ker::mod::time::get_us() + NEW_VAL_US;
+                task->itimer_real_interval_us = NEW_INTERVAL_US;
             }
             return 0;
         }
 
-        case ker::abi::sys_time_ops::getitimer: {
+        case ker::abi::sys_time_ops::GETITIMER: {
             // arg1 = which (as uintptr_t), arg2 = itimerval* curr_value
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
-                return (uint64_t)-ESRCH;
+                return static_cast<uint64_t>(-ESRCH);
             }
 
-            int which = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
-            if (which != 0 /* ITIMER_REAL */) {
-                return (uint64_t)-EINVAL;
+            int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            if (WHICH != 0 /* ITIMER_REAL */) {
+                return static_cast<uint64_t>(-EINVAL);
             }
 
-            auto* cv = reinterpret_cast<itimerval*>(arg2);
+            auto* cv = reinterpret_cast<Itimerval*>(arg2);
             if (cv == nullptr) {
-                return (uint64_t)-EFAULT;
+                return static_cast<uint64_t>(-EFAULT);
             }
 
-            uint64_t now_us = ker::mod::time::get_us();
+            uint64_t const NOW_US = ker::mod::time::get_us();
             uint64_t remain_us = 0;
-            if (task->itimer_real_expire_us != 0 && task->itimer_real_expire_us > now_us) {
-                remain_us = task->itimer_real_expire_us - now_us;
+            if (task->itimer_real_expire_us != 0 && task->itimer_real_expire_us > NOW_US) {
+                remain_us = task->itimer_real_expire_us - NOW_US;
             }
 
-            cv->it_value.tv_sec = (long)(remain_us / 1000000ULL);
-            cv->it_value.tv_usec = (long)(remain_us % 1000000ULL);
-            cv->it_interval.tv_sec = (long)(task->itimer_real_interval_us / 1000000ULL);
-            cv->it_interval.tv_usec = (long)(task->itimer_real_interval_us % 1000000ULL);
+            cv->it_value.tv_sec = static_cast<long>(remain_us / 1000000ULL);
+            cv->it_value.tv_usec = static_cast<long>(remain_us % 1000000ULL);
+            cv->it_interval.tv_sec = static_cast<long>(task->itimer_real_interval_us / 1000000ULL);
+            cv->it_interval.tv_usec = static_cast<long>(task->itimer_real_interval_us % 1000000ULL);
             return 0;
         }
 
         default:
             ker::mod::dbg::error("Invalid op in syscall time");
-            return (uint64_t)-1;
+            return static_cast<uint64_t>(-1);
     }
 }
 

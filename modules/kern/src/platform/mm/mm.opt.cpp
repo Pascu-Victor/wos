@@ -9,25 +9,25 @@
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
 
-__attribute__((used, section(".requests"))) static volatile limine_memmap_request memmapRequest = {
+__attribute__((used, section(".requests"))) static volatile limine_memmap_request memmap_request = {
     .id = LIMINE_MEMMAP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-__attribute__((used, section(".requests"))) static volatile limine_executable_file_request kernelFileRequest = {
+__attribute__((used, section(".requests"))) static volatile limine_executable_file_request kernel_file_request = {
     .id = LIMINE_EXECUTABLE_FILE_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-__attribute__((used, section(".requests"))) static volatile limine_executable_address_request kernelAddressRequest = {
+__attribute__((used, section(".requests"))) static volatile limine_executable_address_request kernel_address_request = {
     .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-__attribute__((used, section(".requests"))) static volatile limine_hhdm_request hhdmRequest = {
+__attribute__((used, section(".requests"))) static volatile limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
@@ -35,11 +35,11 @@ __attribute__((used, section(".requests"))) static volatile limine_hhdm_request 
 
 namespace ker::mod::mm {
 void init() {
-    addr::init(hhdmRequest.response);
+    addr::init(hhdm_request.response);
     dbg::log("Memory manager initialized");
-    phys::init(memmapRequest.response);
+    phys::init(memmap_request.response);
     dbg::log("Physical memory manager initialized");
-    virt::init(memmapRequest.response, kernelFileRequest.response, kernelAddressRequest.response);
+    virt::init(memmap_request.response, kernel_file_request.response, kernel_address_request.response);
     dbg::log("Virtual memory manager initialized");
     virt::init_pagemap();
     dbg::log("Kernel page map initialized");

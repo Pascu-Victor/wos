@@ -47,7 +47,9 @@ class IntrHashTable {
     // Deferred initialization — call after memory allocator is available.
     // Returns false on OOM.
     [[nodiscard]] bool init(size_t initial_buckets = 64) {
-        if (m_buckets) return true;  // already initialized
+        if (m_buckets) {
+            return true;  // already initialized
+        }
         m_bucket_count = next_pow2(initial_buckets);
         m_mask = m_bucket_count - 1;
         m_buckets = new (std::nothrow) Bucket[m_bucket_count];
@@ -61,10 +63,7 @@ class IntrHashTable {
     IntrHashTable& operator=(const IntrHashTable&) = delete;
 
     // Move
-    IntrHashTable(IntrHashTable&& other) noexcept {
-        m_buckets = other.m_buckets;
-        m_bucket_count = other.m_bucket_count;
-        m_mask = other.m_mask;
+    IntrHashTable(IntrHashTable&& other) noexcept : m_buckets(other.m_buckets), m_bucket_count(other.m_bucket_count), m_mask(other.m_mask) {
         m_size.store(other.m_size.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.m_buckets = nullptr;
         other.m_bucket_count = 0;
@@ -77,11 +76,13 @@ class IntrHashTable {
     // Insert element into table. Element must not already be present.
     // Returns false if table is invalid (OOM at construction).
     bool insert(T* elem) {
-        if (!m_buckets || !elem) return false;
+        if ((m_buckets == nullptr) || (elem == nullptr)) {
+            return false;
+        }
 
         auto key = m_key_extract(*elem);
-        size_t idx = m_hash(key) & m_mask;
-        auto& bucket = m_buckets[idx];
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
 
         auto saved = bucket.lock.lock_irqsave();
         elem->hash_next = bucket.head;
@@ -95,11 +96,13 @@ class IntrHashTable {
 
     // Remove element from table. Returns true if found and removed.
     bool remove(T* elem) {
-        if (!m_buckets || !elem) return false;
+        if ((m_buckets == nullptr) || (elem == nullptr)) {
+            return false;
+        }
 
         auto key = m_key_extract(*elem);
-        size_t idx = m_hash(key) & m_mask;
-        auto& bucket = m_buckets[idx];
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
 
         auto saved = bucket.lock.lock_irqsave();
         T** pp = &bucket.head;
@@ -122,10 +125,12 @@ class IntrHashTable {
     // chain_len is set to the number of links traversed (for perf monitoring).
     template <typename Key>
     T* find(const Key& key, uint32_t* chain_len = nullptr) {
-        if (!m_buckets) return nullptr;
+        if (!m_buckets) {
+            return nullptr;
+        }
 
-        size_t idx = m_hash(key) & m_mask;
-        auto& bucket = m_buckets[idx];
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
         uint32_t traversed = 0;
 
         auto saved = bucket.lock.lock_irqsave();
@@ -134,20 +139,26 @@ class IntrHashTable {
             traversed++;
             if (m_key_equal(m_key_extract(*cur), key)) {
                 bucket.lock.unlock_irqrestore(saved);
-                if (chain_len) *chain_len = traversed;
+                if (chain_len) {
+                    *chain_len = traversed;
+                }
                 return cur;
             }
             cur = cur->hash_next;
         }
         bucket.lock.unlock_irqrestore(saved);
-        if (chain_len) *chain_len = traversed;
+        if (chain_len) {
+            *chain_len = traversed;
+        }
         return nullptr;
     }
 
     // Remove by key. Returns pointer to removed element, or nullptr.
     template <typename Key>
     T* remove_by_key(const Key& key) {
-        if (!m_buckets) return nullptr;
+        if (!m_buckets) {
+            return nullptr;
+        }
 
         size_t idx = m_hash(key) & m_mask;
         auto& bucket = m_buckets[idx];
@@ -174,10 +185,12 @@ class IntrHashTable {
     // Returns count of removed elements.
     template <typename Key, typename Fn>
     size_t remove_all_by_key(const Key& key, Fn&& fn) {
-        if (!m_buckets) return 0;
+        if (!m_buckets) {
+            return 0;
+        }
 
-        size_t idx = m_hash(key) & m_mask;
-        auto& bucket = m_buckets[idx];
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
         size_t removed = 0;
 
         auto saved = bucket.lock.lock_irqsave();
@@ -205,7 +218,9 @@ class IntrHashTable {
     // NOT safe to insert/remove during iteration.
     template <typename Fn>
     void for_each(Fn&& fn) {
-        if (!m_buckets) return;
+        if (!m_buckets) {
+            return;
+        }
         for (size_t i = 0; i < m_bucket_count; ++i) {
             auto& bucket = m_buckets[i];
             auto saved = bucket.lock.lock_irqsave();
@@ -225,7 +240,9 @@ class IntrHashTable {
     // Compute max chain length across all buckets (diagnostic)
     [[nodiscard]] uint32_t max_chain_length() const {
         uint32_t max_len = 0;
-        if (!m_buckets) return 0;
+        if (m_buckets == nullptr) {
+            return 0;
+        }
         for (size_t i = 0; i < m_bucket_count; ++i) {
             if (m_buckets[i].count > max_len) {
                 max_len = m_buckets[i].count;
@@ -245,7 +262,9 @@ class IntrHashTable {
     KeyEqual m_key_equal{};
 
     static size_t next_pow2(size_t v) {
-        if (v == 0) return 1;
+        if (v == 0) {
+            return 1;
+        }
         v--;
         v |= v >> 1;
         v |= v >> 2;
@@ -270,7 +289,7 @@ struct IntEqual {
 struct StrHash {
     uint64_t operator()(const char* key) const {
         uint64_t h = 0xcbf29ce484222325ULL;
-        while (*key) {
+        while ((*key) != 0) {
             h ^= static_cast<uint8_t>(*key++);
             h *= 0x100000001b3ULL;
         }

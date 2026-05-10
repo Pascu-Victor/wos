@@ -1,5 +1,6 @@
 #include "exec.hpp"
 
+#include <bits/ssize_t.h>
 #include <extern/elf.h>
 
 // #define EXEC_DEBUG
@@ -19,13 +20,13 @@
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
-#include <span>
 #include <string_view>
 #include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
 
+#include "net/wki/wki.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/mm/addr.hpp"
@@ -36,9 +37,9 @@
 #include "vfs/stat.hpp"
 namespace ker::syscall::process {
 
-auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* const envp[], int shebang_depth) -> uint64_t;
-auto wos_proc_execve_impl(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr,
-                          int shebang_depth) -> uint64_t;
+static auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* const envp[], int shebang_depth) -> uint64_t;
+static auto wos_proc_execve_impl(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr,
+                                 int shebang_depth) -> uint64_t;
 
 namespace {
 constexpr int MAX_SHEBANG_DEPTH = 4;
@@ -68,41 +69,41 @@ auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo*
         pos++;
     }
 
-    size_t interp_begin = pos;
+    size_t const INTERP_BEGIN = pos;
     while (pos < file_size && file_data[pos] != '\n' && file_data[pos] != '\r' && file_data[pos] != ' ' && file_data[pos] != '\t') {
         pos++;
     }
 
-    size_t interp_len = pos - interp_begin;
-    if (interp_len == 0 || interp_len >= out->interpreter.size()) {
+    size_t const INTERP_LEN = pos - INTERP_BEGIN;
+    if (INTERP_LEN == 0 || INTERP_LEN >= out->interpreter.size()) {
         return false;
     }
-    std::memcpy(out->interpreter.data(), file_data + interp_begin, interp_len);
-    out->interpreter[interp_len] = '\0';
+    std::memcpy(out->interpreter.data(), file_data + INTERP_BEGIN, INTERP_LEN);
+    out->interpreter[INTERP_LEN] = '\0';
 
     while (pos < file_size && (file_data[pos] == ' ' || file_data[pos] == '\t')) {
         pos++;
     }
 
-    size_t arg_begin = pos;
+    size_t const ARG_BEGIN = pos;
     while (pos < file_size && file_data[pos] != '\n' && file_data[pos] != '\r') {
         pos++;
     }
 
-    while (pos > arg_begin && (file_data[pos - 1] == ' ' || file_data[pos - 1] == '\t')) {
+    while (pos > ARG_BEGIN && (file_data[pos - 1] == ' ' || file_data[pos - 1] == '\t')) {
         pos--;
     }
 
-    size_t arg_len = pos - arg_begin;
-    if (arg_len == 0) {
+    size_t const ARG_LEN = pos - ARG_BEGIN;
+    if (ARG_LEN == 0) {
         return true;
     }
-    if (arg_len >= out->argument.size()) {
+    if (ARG_LEN >= out->argument.size()) {
         return false;
     }
 
-    std::memcpy(out->argument.data(), file_data + arg_begin, arg_len);
-    out->argument[arg_len] = '\0';
+    std::memcpy(out->argument.data(), file_data + ARG_BEGIN, ARG_LEN);
+    out->argument[ARG_LEN] = '\0';
     out->has_argument = true;
     return true;
 }
@@ -110,9 +111,9 @@ auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo*
 template <typename ExecFn>
 auto exec_shebang_script(const char* script_path, const char* const argv[], const char* const envp[], size_t argv_count,
                          const ShebangInfo& shebang, int shebang_depth, ExecFn&& exec_fn) -> uint64_t {
-    size_t forwarded_args = argv_count > 0 ? (argv_count - 1) : 0;
-    size_t new_argc = 2 + forwarded_args + (shebang.has_argument ? 1 : 0);
-    auto** shebang_argv = new const char*[new_argc + 1];
+    size_t const FORWARDED_ARGS = argv_count > 0 ? (argv_count - 1) : 0;
+    size_t const NEW_ARGC = 2 + FORWARDED_ARGS + (shebang.has_argument ? 1 : 0);
+    auto** shebang_argv = new const char*[NEW_ARGC + 1];
     if (shebang_argv == nullptr) {
         return 0;
     }
@@ -128,9 +129,9 @@ auto exec_shebang_script(const char* script_path, const char* const argv[], cons
     }
     shebang_argv[idx] = nullptr;
 
-    uint64_t rc = exec_fn(shebang.interpreter.data(), shebang_argv, envp, shebang_depth + 1);
+    uint64_t const RC = exec_fn(shebang.interpreter.data(), shebang_argv, envp, shebang_depth + 1);
     delete[] shebang_argv;
-    return rc;
+    return RC;
 }
 
 }  // namespace
@@ -140,7 +141,7 @@ auto wos_proc_exec(const char* path, const char* const argv[], const char* const
 }
 
 auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* const envp[], int shebang_depth) -> uint64_t {
-    std::string_view str(path, std::strlen(path));
+    std::string_view const STR(path, std::strlen(path));
     size_t argv_count = 0;
     if (argv != nullptr) {
         while (argv[argv_count] != nullptr) {
@@ -162,46 +163,46 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         dbg::log("wos_proc_exec: No current task");
         return 0;
     }
-    uint64_t parent_pid = parent_task->pid;
+    uint64_t const PARENT_PID = parent_task->pid;
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Loading '%.*s'", (int)str.size(), str.data());
 #endif
 
-    int fd = vfs::vfs_open(str, 0, 0);
-    if (fd < 0) {
-        dbg::log("wos_proc_exec: Failed to open file '%.*s'", (int)str.size(), str.data());
+    int const FD = vfs::vfs_open(STR, 0, 0);
+    if (FD < 0) {
+        dbg::log("wos_proc_exec: Failed to open file '%.*s'", static_cast<int>(STR.size()), STR.data());
         return 0;
     }
 
     // Check execute permission
-    int access_ret = vfs::vfs_access(path, 1 /* X_OK */);
-    if (access_ret < 0) {
-        dbg::log("wos_proc_exec: Execute permission denied for '%.*s'", (int)str.size(), str.data());
-        vfs::vfs_close(fd);
+    int const ACCESS_RET = vfs::vfs_access(path, 1 /* X_OK */);
+    if (ACCESS_RET < 0) {
+        dbg::log("wos_proc_exec: Execute permission denied for '%.*s'", static_cast<int>(STR.size()), STR.data());
+        vfs::vfs_close(FD);
         return 0;
     }
 
-    ssize_t file_size = vfs::vfs_lseek(fd, 0, 2);
-    if (file_size <= 0) {
-        dbg::log("wos_proc_exec: Invalid file size: %d", file_size);
-        vfs::vfs_close(fd);
+    ssize_t const FILE_SIZE = vfs::vfs_lseek(FD, 0, 2);
+    if (FILE_SIZE <= 0) {
+        dbg::log("wos_proc_exec: Invalid file size: %d", FILE_SIZE);
+        vfs::vfs_close(FD);
         return 0;
     }
-    vfs::vfs_lseek(fd, 0, 0);
+    vfs::vfs_lseek(FD, 0, 0);
 
-    auto* elf_buffer = new uint8_t[file_size];
+    auto* elf_buffer = new uint8_t[FILE_SIZE];
     if (elf_buffer == nullptr) {
         dbg::log("wos_proc_exec: Failed to allocate buffer");
-        vfs::vfs_close(fd);
+        vfs::vfs_close(FD);
         return 0;
     }
 
     ssize_t bytes_read = 0;
-    vfs::vfs_read(fd, elf_buffer, file_size, (size_t*)&bytes_read);
-    vfs::vfs_close(fd);
+    vfs::vfs_read(FD, elf_buffer, FILE_SIZE, reinterpret_cast<size_t*>(&bytes_read));
+    vfs::vfs_close(FD);
 
-    if (bytes_read != file_size) {
+    if (bytes_read != FILE_SIZE) {
         dbg::log("wos_proc_exec: Failed to read file completely");
         delete[] elf_buffer;
         return 0;
@@ -211,7 +212,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     __asm__ volatile("mfence" ::: "memory");
 
     ShebangInfo shebang = {};
-    if (parse_shebang_line(elf_buffer, static_cast<size_t>(file_size), &shebang)) {
+    if (parse_shebang_line(elf_buffer, static_cast<size_t>(FILE_SIZE), &shebang)) {
         delete[] elf_buffer;
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return 0;
@@ -237,10 +238,10 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         return 0;
     }
 
-    const char* process_name = str.data();
-    for (size_t i = 0; i < str.size(); i++) {
-        if (str[i] == '/') {
-            process_name = str.data() + i + 1;
+    const char* process_name = STR.data();
+    for (size_t i = 0; i < STR.size(); i++) {
+        if (STR[i] == '/') {
+            process_name = STR.data() + i + 1;
         }
     }
 
@@ -248,8 +249,8 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     dbg::log("wos_proc_exec: Creating task for '%s', parent PID: %x", process_name, parent_pid);
 #endif
 
-    uint64_t kernel_rsp = allocate_kernel_stack();
-    if (kernel_rsp == 0) {
+    uint64_t const KERNEL_RSP = allocate_kernel_stack();
+    if (KERNEL_RSP == 0) {
         dbg::log("wos_proc_exec: Failed to allocate kernel stack");
         delete[] elf_buffer;
         return 0;
@@ -260,7 +261,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     volatile uint64_t canary1 = 0xDEAD'BEEF'CAFE'BABEULL;  // NOLINT
     volatile uint64_t canary2 = 0x1234'5678'9ABC'DEF0ULL;  // NOLINT
 
-    auto* new_task = new sched::task::Task(process_name, (uint64_t)elf_buffer, kernel_rsp, sched::task::TaskType::PROCESS);
+    auto* new_task = new sched::task::Task(process_name, (uint64_t)elf_buffer, KERNEL_RSP, sched::task::TaskType::PROCESS);
 
     // Check canaries for stack corruption
     if (canary1 != 0xDEAD'BEEF'CAFE'BABEULL || canary2 != 0x1234'5678'9ABC'DEF0ULL) {  // NOLINT
@@ -268,7 +269,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         dbg::log("  canary1=%lx (expect DEADBEEFCAFEBABE)", canary1);
         dbg::log("  canary2=%lx (expect 123456789ABCDEF0)", canary2);
         dbg::log("  newTask=%p, &canary1=%p, &canary2=%p", new_task, &canary1, &canary2);
-        dbg::log("  stack RSP approx %p, kernelRsp=%lx", &new_task, kernel_rsp);
+        dbg::log("  stack RSP approx %p, kernelRsp=%lx", &new_task, KERNEL_RSP);
     }
 
     // Also check if newTask is suspiciously not in HHDM range
@@ -276,16 +277,16 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     if (task_addr != 0 && (task_addr < 0xffff800000000000ULL || task_addr >= 0xffff900000000000ULL)) {
         dbg::log("EXEC BUG: operator new returned non-HHDM ptr: %p", new_task);
         dbg::log("  expected range: 0xffff800000000000 - 0xffff900000000000");
-        dbg::log("  &newTask on stack = %p, kernelRsp = %lx", &new_task, kernel_rsp);
+        dbg::log("  &newTask on stack = %p, kernelRsp = %lx", &new_task, KERNEL_RSP);
         delete[] elf_buffer;
         return 0;
     }
 
     if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
         dbg::log("wos_proc_exec: Failed to create task (OOM during thread/pagemap allocation)");
-        if (new_task != nullptr) {
-            delete new_task;
-        }
+
+        delete new_task;
+
         // TODO: Free kernel stack pages
         delete[] elf_buffer;
         return 0;
@@ -296,7 +297,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     dbg::log("wos_proc_exec: Entry point = 0x%x, RIP = 0x%x", new_task->entry, new_task->context.frame.rip);
 #endif
 
-    new_task->parent_pid = parent_pid;
+    new_task->parent_pid = PARENT_PID;
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
@@ -320,7 +321,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
                                 std::strcmp(new_task->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
                                    ? new_task->pid
                                    : 0;
-    [[maybe_unused]] bool cloned_rules = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
+    [[maybe_unused]] bool const CLONED_RULES = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
 
     // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
     // FDs with FD_CLOEXEC set are NOT inherited (closed on exec).
@@ -335,7 +336,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
             return;  // FD_CLOEXEC is set - do NOT inherit
         }
         parent_file->refcount.fetch_add(1, std::memory_order_acq_rel);
-        [[maybe_unused]] bool inserted = new_task->fd_table.insert(key, parent_file);
+        [[maybe_unused]] bool const INSERTED = new_task->fd_table.insert(key, parent_file);
     });
 
     // Ensure fds 0/1/2 are always set (open /dev/console if not inherited)
@@ -346,13 +347,13 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
                 new_file->fops = vfs::devfs::get_devfs_fops();
                 new_file->fd = static_cast<int>(i);
                 new_file->refcount = 1;
-                [[maybe_unused]] bool inserted = new_task->fd_table.insert(i, new_file);
+                [[maybe_unused]] bool const INSERTED = new_task->fd_table.insert(i, new_file);
             }
         }
     }
 
     new_task->elf_buffer = elf_buffer;
-    new_task->elf_buffer_size = file_size;
+    new_task->elf_buffer_size = FILE_SIZE;
     new_task->is_elf_buffer_shared = false;
 
     // Store executable path for /proc/self/exe
@@ -367,13 +368,13 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
     // Handle setuid/setgid bits from the executable
     {
-        vfs::stat exec_st{};
+        vfs::Stat exec_st{};
         if (vfs::vfs_stat(path, &exec_st) == 0) {
-            if (exec_st.st_mode & 04000) {  // S_ISUID
+            if ((exec_st.st_mode & 04000) != 0U) {  // S_ISUID
                 new_task->euid = exec_st.st_uid;
                 new_task->suid = exec_st.st_uid;
             }
-            if (exec_st.st_mode & 02000) {  // S_ISGID
+            if ((exec_st.st_mode & 02000) != 0U) {  // S_ISGID
                 new_task->egid = exec_st.st_gid;
                 new_task->sgid = exec_st.st_gid;
             }
@@ -393,45 +394,45 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
             return 0;  // Stack overflow
         }
         current_virt_offset += size;
-        uint64_t virt_addr = user_stack_virt - current_virt_offset;
+        uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
 
-        uint64_t page_virt = virt_addr & ~(mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t page_offset = virt_addr & (mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mod::mm::paging::PAGE_SIZE - 1);
 
-        uint64_t page_phys = mod::mm::virt::translate(new_task->pagemap, page_virt);
-        if (page_phys == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x - stack page not mapped", page_virt);
+        uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
+        if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
+            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
             hcf();
         }
 
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(page_phys)) + page_offset;
+        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
         std::memcpy(dest_ptr, data, size);
 
-        return virt_addr;
+        return VIRT_ADDR;
     };
 
     auto push_string = [&](std::string_view str) -> uint64_t {
-        size_t len = str.size() + 1;  // Include null terminator
-        if (current_virt_offset + len > USER_STACK_SIZE) {
+        size_t const LEN = str.size() + 1;  // Include null terminator
+        if (current_virt_offset + LEN > USER_STACK_SIZE) {
             return 0;
         }
-        current_virt_offset += len;
-        uint64_t virt_addr = user_stack_virt - current_virt_offset;
+        current_virt_offset += LEN;
+        uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
 
-        uint64_t page_virt = virt_addr & ~(mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t page_offset = virt_addr & (mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mod::mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mod::mm::paging::PAGE_SIZE - 1);
 
-        uint64_t page_phys = mod::mm::virt::translate(new_task->pagemap, page_virt);
-        if (page_phys == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x - stack page not mapped", page_virt);
+        uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
+        if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
+            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
             hcf();
         }
 
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(page_phys)) + page_offset;
+        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
         std::memcpy(dest_ptr, str.data(), str.size());
         dest_ptr[str.size()] = '\0';
 
-        return virt_addr;
+        return VIRT_ADDR;
     };
 
     // Push argv strings first (highest addresses on stack)
@@ -468,14 +469,14 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     // auxv: 4 core pairs (8 qwords) + optional AT_BASE pair (2 qwords) + AT_NULL pair (2 qwords)
     {
         constexpr uint64_t ALIGNMENT = 16;
-        uint64_t current_addr = user_stack_virt - current_virt_offset;
-        uint64_t aligned = current_addr & ~(ALIGNMENT - 1);
-        current_virt_offset += (current_addr - aligned);
+        uint64_t const CURRENT_ADDR = user_stack_virt - current_virt_offset;
+        uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
+        current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
         constexpr size_t AUXV_QWORDS_BASE = 12;  // 5 core pairs (PAGESZ,ENTRY,PHDR,PHENT,PHNUM) + AT_NULL pair
         const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interp_base != 0 ? 2 : 0);
-        size_t structured_qwords = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
-        if (structured_qwords % 2 != 0) {
+        size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
+        if (STRUCTURED_QWORDS % 2 != 0) {
             // Add 8 bytes padding so final rsp is 16-byte aligned
             uint64_t pad = 0;
             push_to_stack(&pad, sizeof(uint64_t));
@@ -496,7 +497,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         bool built_correct_auxv = true;
         ker::util::SmallVec<uint64_t, 16> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
-        built_correct_auxv &= auxv.push_back((uint64_t)mod::mm::paging::PAGE_SIZE);
+        built_correct_auxv &= auxv.push_back(mod::mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
         built_correct_auxv &= auxv.push_back(new_task->entry);
         built_correct_auxv &= auxv.push_back(AT_PHDR);
@@ -528,11 +529,11 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     }
 
     // Push envp pointer array (with NULL terminator)
-    uint64_t envp_ptr = push_to_stack(envp_addrs, (envp_count + 1) * sizeof(uint64_t));
+    uint64_t const ENVP_PTR = push_to_stack(envp_addrs, (envp_count + 1) * sizeof(uint64_t));
     delete[] envp_addrs;
 
     // Push argv pointer array (with NULL terminator)
-    uint64_t argv_ptr = push_to_stack(argv_addrs, (argv_count + 1) * sizeof(uint64_t));
+    uint64_t const ARGV_PTR = push_to_stack(argv_addrs, (argv_count + 1) * sizeof(uint64_t));
     delete[] argv_addrs;
 
     // Push argc last (rsp will point here)
@@ -542,15 +543,15 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     new_task->context.frame.rsp = user_stack_virt - current_virt_offset;
 
     new_task->context.regs.rdi = argc;
-    new_task->context.regs.rsi = argv_ptr;
-    new_task->context.regs.rdx = envp_ptr;
+    new_task->context.regs.rsi = ARGV_PTR;
+    new_task->context.regs.rdx = ENVP_PTR;
 
-    ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
+    ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
         .argv = argv,
         .envp = envp,
         .cwd = parent_task->cwd,
     };
-    auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, remote_spawn);
+    auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, REMOTE_SPAWN);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
         return new_task->pid;
     }
@@ -621,17 +622,17 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // Deep-copy strings to kernel heap
     auto** k_argv = new char*[argv_count + 1];
     for (size_t i = 0; i < argv_count; i++) {
-        size_t len = std::strlen(argv[i]);
-        k_argv[i] = new char[len + 1];
-        std::memcpy(k_argv[i], argv[i], len + 1);
+        size_t const LEN = std::strlen(argv[i]);
+        k_argv[i] = new char[LEN + 1];
+        std::memcpy(k_argv[i], argv[i], LEN + 1);
     }
     k_argv[argv_count] = nullptr;
 
     auto** k_envp = new char*[envp_count + 1];
     for (size_t i = 0; i < envp_count; i++) {
-        size_t len = std::strlen(envp[i]);
-        k_envp[i] = new char[len + 1];
-        std::memcpy(k_envp[i], envp[i], len + 1);
+        size_t const LEN = std::strlen(envp[i]);
+        k_envp[i] = new char[LEN + 1];
+        std::memcpy(k_envp[i], envp[i], LEN + 1);
     }
     k_envp[envp_count] = nullptr;
 
@@ -654,8 +655,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     };
 
     // --- Read the ELF file ---
-    int fd = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
-    if (fd < 0) {
+    int const FD = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
+    if (FD < 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", path, fd);
 #endif
@@ -663,48 +664,48 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         return static_cast<uint64_t>(-ENOENT);
     }
 
-    int access_ret = vfs::vfs_access(path, 1 /* X_OK */);
-    if (access_ret < 0) {
+    int const ACCESS_RET = vfs::vfs_access(path, 1 /* X_OK */);
+    if (ACCESS_RET < 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", path, access_ret);
 #endif
-        vfs::vfs_close(fd);
+        vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EACCES);
     }
 
-    ssize_t file_size = vfs::vfs_lseek(fd, 0, 2);
-    if (file_size < 0) {
+    ssize_t const FILE_SIZE = vfs::vfs_lseek(FD, 0, 2);
+    if (FILE_SIZE < 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, file_size);
 #endif
-        vfs::vfs_close(fd);
+        vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EIO);
     }
-    if (file_size == 0) {
+    if (FILE_SIZE == 0) {
         dbg::log("wos_proc_execve: empty file '%s'", path);
-        vfs::vfs_close(fd);
+        vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
     }
-    vfs::vfs_lseek(fd, 0, 0);
+    vfs::vfs_lseek(FD, 0, 0);
 
-    auto* elf_buffer = new uint8_t[file_size];
+    auto* elf_buffer = new uint8_t[FILE_SIZE];
     if (elf_buffer == nullptr) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", path, file_size);
 #endif
-        vfs::vfs_close(fd);
+        vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOMEM);
     }
 
     ssize_t bytes_read = 0;
-    vfs::vfs_read(fd, elf_buffer, file_size, (size_t*)&bytes_read);
-    vfs::vfs_close(fd);
+    vfs::vfs_read(FD, elf_buffer, FILE_SIZE, reinterpret_cast<size_t*>(&bytes_read));
+    vfs::vfs_close(FD);
 
-    if (bytes_read != file_size) {
+    if (bytes_read != FILE_SIZE) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, bytes_read, file_size);
 #endif
@@ -716,7 +717,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     __asm__ volatile("mfence" ::: "memory");
 
     ShebangInfo shebang = {};
-    if (parse_shebang_line(elf_buffer, static_cast<size_t>(file_size), &shebang)) {
+    if (parse_shebang_line(elf_buffer, static_cast<size_t>(FILE_SIZE), &shebang)) {
         delete[] elf_buffer;
         free_kernel_arg_env_once();
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
@@ -742,10 +743,10 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     {
         uint8_t* saved_elf_buffer = task->elf_buffer;
-        size_t saved_elf_buffer_size = task->elf_buffer_size;
-        bool saved_is_elf_buffer_shared = task->is_elf_buffer_shared;
-        bool saved_wki_skip_legacy_placement = task->wki_skip_legacy_placement;
-        uint64_t saved_wki_remote_pid = task->wki_remote_pid;
+        size_t const SAVED_ELF_BUFFER_SIZE = task->elf_buffer_size;
+        bool const SAVED_IS_ELF_BUFFER_SHARED = task->is_elf_buffer_shared;
+        bool const SAVED_WKI_SKIP_LEGACY_PLACEMENT = task->wki_skip_legacy_placement;
+        uint64_t const SAVED_WKI_REMOTE_PID = task->wki_remote_pid;
         std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
         std::memcpy(saved_exe_path.data(), task->exe_path, saved_exe_path.size());
 
@@ -755,21 +756,21 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         task->elf_buffer = elf_buffer;
-        task->elf_buffer_size = static_cast<size_t>(file_size);
+        task->elf_buffer_size = static_cast<size_t>(FILE_SIZE);
         task->is_elf_buffer_shared = false;
         std::memcpy(task->exe_path, path, path_len);
         task->exe_path[path_len] = '\0';
 
-        ker::net::wki::WkiRemoteSpawnSpec remote_spawn = {
+        ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
             .argv = k_argv,
             .envp = k_envp,
             .cwd = task->cwd,
         };
-        auto remote_result = ker::net::wki::wki_try_remote_spawn(task, remote_spawn);
+        auto remote_result = ker::net::wki::wki_try_remote_spawn(task, REMOTE_SPAWN);
 
         task->elf_buffer = saved_elf_buffer;
-        task->elf_buffer_size = saved_elf_buffer_size;
-        task->is_elf_buffer_shared = saved_is_elf_buffer_shared;
+        task->elf_buffer_size = SAVED_ELF_BUFFER_SIZE;
+        task->is_elf_buffer_shared = SAVED_IS_ELF_BUFFER_SHARED;
 
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
             task->deferred_task_switch = true;
@@ -780,8 +781,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         std::memcpy(task->exe_path, saved_exe_path.data(), saved_exe_path.size());
-        task->wki_skip_legacy_placement = saved_wki_skip_legacy_placement;
-        task->wki_remote_pid = saved_wki_remote_pid;
+        task->wki_skip_legacy_placement = SAVED_WKI_SKIP_LEGACY_PLACEMENT;
+        task->wki_remote_pid = SAVED_WKI_REMOTE_PID;
 
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
             delete[] elf_buffer;
@@ -809,8 +810,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
 
     // --- Create new thread (user stack + TLS) ---
-    ker::loader::elf::TlsModule tls_info = loader::elf::extract_tls_info((void*)(uint64_t)elf_buffer);
-    auto* new_thread = mod::sched::threading::create_thread(USER_STACK_SIZE, tls_info.tlsSize, new_pagemap, tls_info);
+    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info((void*)(uint64_t)elf_buffer);
+    auto* new_thread = mod::sched::threading::create_thread(USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, TLS_INFO);
     char* new_name = nullptr;
     auto cleanup_new_image = [&]() {
         if (new_pagemap != nullptr) {
@@ -848,7 +849,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // --- Load ELF into new pagemap ---
     loader::elf::ElfLoadResult elf_result =
         loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)elf_buffer, new_pagemap, task->pid, task->name);
-    if (elf_result.entryPoint == 0) {
+    if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
 #endif
@@ -857,51 +858,51 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         return static_cast<uint64_t>(-ENOEXEC);
     }
 
-    uint64_t new_exec_entry = elf_result.entryPoint;
-    uint64_t new_initial_rip = elf_result.entryPoint;
-    uint64_t new_program_header_addr = elf_result.programHeaderAddr;
-    uint64_t new_elf_header_addr = elf_result.elfHeaderAddr;
-    uint16_t new_program_header_count = elf_result.programHeaderCount;
-    uint16_t new_program_header_ent_size = elf_result.programHeaderEntSize;
+    uint64_t const NEW_EXEC_ENTRY = elf_result.entry_point;
+    uint64_t new_initial_rip = elf_result.entry_point;
+    uint64_t const NEW_PROGRAM_HEADER_ADDR = elf_result.program_header_addr;
+    uint64_t const NEW_ELF_HEADER_ADDR = elf_result.elf_header_addr;
+    uint16_t const NEW_PROGRAM_HEADER_COUNT = elf_result.program_header_count;
+    uint16_t const NEW_PROGRAM_HEADER_ENT_SIZE = elf_result.program_header_ent_size;
     uint64_t new_interp_base = 0;
 
     // If the binary requests a dynamic linker (PT_INTERP), load it.
-    if (elf_result.hasInterp) {
+    if (elf_result.has_interp) {
         constexpr uint64_t INTERP_BASE = 0x40000000ULL;
 
-        int interp_fd = vfs::vfs_open(std::string_view(elf_result.interpPath, std::strlen(elf_result.interpPath)), 0, 0);
-        if (interp_fd < 0) {
-            dbg::log("wos_proc_execve: Failed to open interpreter '%s'", elf_result.interpPath);
+        int const INTERP_FD = vfs::vfs_open(std::string_view(elf_result.interp_path, std::strlen(elf_result.interp_path)), 0, 0);
+        if (INTERP_FD < 0) {
+            dbg::log("wos_proc_execve: Failed to open interpreter '%s'", elf_result.interp_path);
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
-        ssize_t interp_size = vfs::vfs_lseek(interp_fd, 0, 2);
-        vfs::vfs_lseek(interp_fd, 0, 0);
-        if (interp_size <= 0) {
-            vfs::vfs_close(interp_fd);
+        ssize_t const INTERP_SIZE = vfs::vfs_lseek(INTERP_FD, 0, 2);
+        vfs::vfs_lseek(INTERP_FD, 0, 0);
+        if (INTERP_SIZE <= 0) {
+            vfs::vfs_close(INTERP_FD);
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
-        auto* interp_buf = new uint8_t[interp_size];
+        auto* interp_buf = new uint8_t[INTERP_SIZE];
         ssize_t interp_read = 0;
-        vfs::vfs_read(interp_fd, interp_buf, interp_size, (size_t*)&interp_read);
-        vfs::vfs_close(interp_fd);
+        vfs::vfs_read(INTERP_FD, interp_buf, INTERP_SIZE, reinterpret_cast<size_t*>(&interp_read));
+        vfs::vfs_close(INTERP_FD);
 
-        if (interp_read != interp_size) {
+        if (interp_read != INTERP_SIZE) {
             delete[] interp_buf;
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-EIO);
         }
 
-        loader::elf::ElfLoadResult interp_result =
+        loader::elf::ElfLoadResult const INTERP_RESULT =
             loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)interp_buf, new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
 
-        if (interp_result.entryPoint == 0) {
+        if (INTERP_RESULT.entry_point == 0) {
             delete[] interp_buf;
             cleanup_new_image();
             free_kernel_arg_env_once();
@@ -909,28 +910,28 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         // Override entry point to the interpreter — ld.so reads AT_ENTRY from auxv
-        new_initial_rip = interp_result.entryPoint;
+        new_initial_rip = INTERP_RESULT.entry_point;
         new_interp_base = INTERP_BASE;
 
         delete[] interp_buf;
     }
 
-    std::string_view path_str(path, std::strlen(path));
-    const char* base_name = path_str.data();
-    for (size_t i = 0; i < path_str.size(); i++) {
-        if (path_str[i] == '/') {
-            base_name = path_str.data() + i + 1;
+    std::string_view const PATH_STR(path, std::strlen(path));
+    const char* base_name = PATH_STR.data();
+    for (size_t i = 0; i < PATH_STR.size(); i++) {
+        if (PATH_STR[i] == '/') {
+            base_name = PATH_STR.data() + i + 1;
         }
     }
     {
-        size_t base_len = std::strlen(base_name);
-        new_name = new char[base_len + 1];
+        size_t const BASE_LEN = std::strlen(base_name);
+        new_name = new char[BASE_LEN + 1];
         if (new_name == nullptr) {
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOMEM);
         }
-        std::memcpy(new_name, base_name, base_len + 1);
+        std::memcpy(new_name, base_name, BASE_LEN + 1);
     }
 
     // --- Set up the user stack with argv/envp/auxv ---
@@ -938,38 +939,40 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     uint64_t current_virt_offset = 0;
 
     auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
-        if (current_virt_offset + size > USER_STACK_SIZE) return 0;
+        if (current_virt_offset + size > USER_STACK_SIZE) {
+            return 0;
+        }
         current_virt_offset += size;
-        uint64_t virt_addr = user_stack_virt - current_virt_offset;
-        uint64_t page_virt = virt_addr & ~(mm::paging::PAGE_SIZE - 1);
-        uint64_t page_offset = virt_addr & (mm::paging::PAGE_SIZE - 1);
-        uint64_t page_phys = mm::virt::translate(new_pagemap, page_virt);
-        if (page_phys == mm::virt::PADDR_INVALID) {
-            dbg::log("exec pushData: translate failed for stack vaddr 0x%x", page_virt);
+        uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
+        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
+        if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
+            dbg::log("exec pushData: translate failed for stack vaddr 0x%x", PAGE_VIRT);
             hcf();
         }
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(page_phys)) + page_offset;
+        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
         std::memcpy(dest_ptr, data, size);
-        return virt_addr;
+        return VIRT_ADDR;
     };
 
     auto push_string = [&](const char* str) -> uint64_t {
-        size_t len = std::strlen(str) + 1;
-        if (current_virt_offset + len > USER_STACK_SIZE) {
+        size_t const LEN = std::strlen(str) + 1;
+        if (current_virt_offset + LEN > USER_STACK_SIZE) {
             return 0;
         }
-        current_virt_offset += len;
-        uint64_t virt_addr = user_stack_virt - current_virt_offset;
-        uint64_t page_virt = virt_addr & ~(mm::paging::PAGE_SIZE - 1);
-        uint64_t page_offset = virt_addr & (mm::paging::PAGE_SIZE - 1);
-        uint64_t page_phys = mm::virt::translate(new_pagemap, page_virt);
-        if (page_phys == mm::virt::PADDR_INVALID) {
-            dbg::log("exec pushString: translate failed for stack vaddr 0x%x", page_virt);
+        current_virt_offset += LEN;
+        uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
+        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
+        uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
+        if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
+            dbg::log("exec pushString: translate failed for stack vaddr 0x%x", PAGE_VIRT);
             hcf();
         }
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(page_phys)) + page_offset;
-        std::memcpy(dest_ptr, str, len);
-        return virt_addr;
+        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
+        std::memcpy(dest_ptr, str, LEN);
+        return VIRT_ADDR;
     };
 
     auto* argv_addrs = new uint64_t[argv_count + 1];
@@ -1014,14 +1017,14 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // Alignment
     {
         constexpr uint64_t ALIGNMENT = 16;
-        uint64_t current_addr = user_stack_virt - current_virt_offset;
-        uint64_t aligned = current_addr & ~(ALIGNMENT - 1);
-        current_virt_offset += (current_addr - aligned);
+        uint64_t const CURRENT_ADDR = user_stack_virt - current_virt_offset;
+        uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
+        current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
         constexpr size_t AUXV_BASE_QWORDS = 12;  // 5 core pairs (PAGESZ,ENTRY,PHDR,PHENT,PHNUM) + AT_NULL pair
-        size_t auxv_qwords = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
-        size_t structured_qwords = auxv_qwords + (envp_count + 1) + (argv_count + 1) + 1;
-        if (structured_qwords % 2 != 0) {
+        size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
+        size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
+        if (STRUCTURED_QWORDS % 2 != 0) {
             uint64_t pad = 0;
             push_to_stack(&pad, sizeof(uint64_t));
         }
@@ -1039,15 +1042,15 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         bool built_correct_auxv = true;
         ker::util::SmallVec<uint64_t, 16> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
-        built_correct_auxv &= auxv.push_back((uint64_t)mm::paging::PAGE_SIZE);
+        built_correct_auxv &= auxv.push_back(mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
-        built_correct_auxv &= auxv.push_back(new_exec_entry);
+        built_correct_auxv &= auxv.push_back(NEW_EXEC_ENTRY);
         built_correct_auxv &= auxv.push_back(AT_PHDR);
-        built_correct_auxv &= auxv.push_back(new_program_header_addr);
+        built_correct_auxv &= auxv.push_back(NEW_PROGRAM_HEADER_ADDR);
         built_correct_auxv &= auxv.push_back(AT_PHENT);
-        built_correct_auxv &= auxv.push_back(new_program_header_ent_size);
+        built_correct_auxv &= auxv.push_back(NEW_PROGRAM_HEADER_ENT_SIZE);
         built_correct_auxv &= auxv.push_back(AT_PHNUM);
-        built_correct_auxv &= auxv.push_back(new_program_header_count);
+        built_correct_auxv &= auxv.push_back(NEW_PROGRAM_HEADER_COUNT);
         if (new_interp_base != 0) {
             built_correct_auxv &= auxv.push_back(AT_BASE);
             built_correct_auxv &= auxv.push_back(new_interp_base);
@@ -1069,8 +1072,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
     }
 
-    uint64_t envp_ptr = push_to_stack(envp_addrs, (envp_count + 1) * sizeof(uint64_t));
-    if (envp_ptr == 0) {
+    uint64_t const ENVP_PTR = push_to_stack(envp_addrs, (envp_count + 1) * sizeof(uint64_t));
+    if (ENVP_PTR == 0) {
         delete[] envp_addrs;
         delete[] argv_addrs;
         cleanup_new_image();
@@ -1078,8 +1081,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
     delete[] envp_addrs;
 
-    uint64_t argv_ptr = push_to_stack(argv_addrs, (argv_count + 1) * sizeof(uint64_t));
-    if (argv_ptr == 0) {
+    uint64_t const ARGV_PTR = push_to_stack(argv_addrs, (argv_count + 1) * sizeof(uint64_t));
+    if (ARGV_PTR == 0) {
         delete[] argv_addrs;
         cleanup_new_image();
         return static_cast<uint64_t>(-E2BIG);
@@ -1122,18 +1125,20 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
     }
 
-    task->entry = new_exec_entry;
-    task->program_header_addr = new_program_header_addr;
-    task->elf_header_addr = new_elf_header_addr;
-    task->program_header_count = new_program_header_count;
-    task->program_header_ent_size = new_program_header_ent_size;
+    task->entry = NEW_EXEC_ENTRY;
+    task->program_header_addr = NEW_PROGRAM_HEADER_ADDR;
+    task->elf_header_addr = NEW_ELF_HEADER_ADDR;
+    task->program_header_count = NEW_PROGRAM_HEADER_COUNT;
+    task->program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE;
     task->elf_buffer = elf_buffer;
-    task->elf_buffer_size = file_size;
+    task->elf_buffer_size = FILE_SIZE;
     task->interp_base = new_interp_base;
 
     {
         size_t path_len = std::strlen(path);
-        if (path_len >= sched::task::Task::EXE_PATH_MAX) path_len = sched::task::Task::EXE_PATH_MAX - 1;
+        if (path_len >= sched::task::Task::EXE_PATH_MAX) {
+            path_len = sched::task::Task::EXE_PATH_MAX - 1;
+        }
         std::memcpy(task->exe_path, path, path_len);
         task->exe_path[path_len] = '\0';
     }
@@ -1145,13 +1150,13 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     new_name = nullptr;
 
     {
-        vfs::stat exec_st{};
+        vfs::Stat exec_st{};
         if (vfs::vfs_stat(path, &exec_st) == 0) {
-            if (exec_st.st_mode & 04000) {
+            if ((exec_st.st_mode & 04000) != 0U) {
                 task->euid = exec_st.st_uid;
                 task->suid = exec_st.st_uid;
             }
-            if (exec_st.st_mode & 02000) {
+            if ((exec_st.st_mode & 02000) != 0U) {
                 task->egid = exec_st.st_gid;
                 task->sgid = exec_st.st_gid;
             }
@@ -1167,42 +1172,42 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     for (unsigned i = 0; i < 3; ++i) {
         if (task->fd_table.lookup(i) == nullptr) {
-            vfs::File* newFile = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
-            if (newFile != nullptr) {
-                newFile->fops = vfs::devfs::get_devfs_fops();
-                newFile->fd = static_cast<int>(i);
-                newFile->refcount = 1;
-                [[maybe_unused]] bool inserted = task->fd_table.insert(i, newFile);
+            vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+            if (new_file != nullptr) {
+                new_file->fops = vfs::devfs::get_devfs_fops();
+                new_file->fd = static_cast<int>(i);
+                new_file->refcount = 1;
+                [[maybe_unused]] bool const INSERTED = task->fd_table.insert(i, new_file);
             }
         }
     }
 
     // --- Set up the task context to jump to the new binary ---
-    uint64_t new_rsp = user_stack_virt - current_virt_offset;
+    uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;
     task->context.frame.rip = new_initial_rip;
-    task->context.frame.rsp = new_rsp;
+    task->context.frame.rsp = NEW_RSP;
     task->context.frame.ss = 0x1b;
     task->context.frame.cs = 0x23;
     task->context.frame.flags = 0x202;
     task->context.frame.int_num = 0;
     task->context.frame.err_code = 0;
 
-    // Match the fresh-process entry contract used by _wOS_asm_enterUsermode:
+    // Match the fresh-process entry contract used by wos_asm_enter_usermode:
     // startup code consumes argc/argv/envp from the initial stack, not GPRs.
     task->context.regs = cpu::GPRegs();
     task->context.regs.rdi = new_initial_rip;
-    task->context.regs.rsi = new_rsp;
+    task->context.regs.rsi = NEW_RSP;
     (void)argc;
-    (void)argv_ptr;
-    (void)envp_ptr;
+    (void)ARGV_PTR;
+    (void)ENVP_PTR;
 
     // Freshly spawned processes rewrite fs:[0] just before the first usermode
     // entry. execve() bypasses that path, so repair the initial TCB self-pointer
     // here before any TLS access in ld.so / libc.
     if (new_thread != nullptr) {
-        uint64_t tcb_paddr = mm::virt::translate(new_pagemap, new_thread->fsbase);
-        if (tcb_paddr != mm::virt::PADDR_INVALID) {
-            auto* tcb_self = reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(tcb_paddr));
+        uint64_t const TCB_PADDR = mm::virt::translate(new_pagemap, new_thread->fsbase);
+        if (TCB_PADDR != mm::virt::PADDR_INVALID) {
+            auto* tcb_self = reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(TCB_PADDR));
             *tcb_self = new_thread->fsbase;
         }
     }
@@ -1210,10 +1215,10 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // Initialize SafeStack TLS symbol if present
     auto* ssym = loader::debug::get_process_symbol(task->pid, "__safestack_unsafe_stack_ptr");
     if (new_thread != nullptr && (ssym != nullptr) && ssym->is_tls_offset) {
-        uint64_t dest_vaddr = new_thread->tls_base_virt + ssym->raw_value;
-        uint64_t dest_paddr = mm::virt::translate(new_pagemap, dest_vaddr);
-        if (dest_paddr != mm::virt::PADDR_INVALID) {
-            auto* dest_ptr = (uint64_t*)mm::addr::get_virt_pointer(dest_paddr);
+        uint64_t const DEST_VADDR = new_thread->tls_base_virt + ssym->raw_value;
+        uint64_t const DEST_PADDR = mm::virt::translate(new_pagemap, DEST_VADDR);
+        if (DEST_PADDR != mm::virt::PADDR_INVALID) {
+            auto* dest_ptr = static_cast<uint64_t*>(mm::addr::get_virt_pointer(DEST_PADDR));
             *dest_ptr = new_thread->safestack_ptr_value;
         }
     }
@@ -1257,7 +1262,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     //   - CR3 = page table base
     //
     // We must update ALL of these to point at the new binary. The `gpr`
-    // reference only modifies a local copy in syscallHandler (passed by
+    // reference only modifies a local copy in syscall_handler (passed by
     // value), so it has no effect on the actual stack-saved registers.
 
     // 1. Compute the base of the pushq-saved register block on the kernel stack.
@@ -1266,6 +1271,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     //    The GPRegs struct maps directly to K-128 (r15 at offset 0, rax at 0x70).
     //    The compiler accesses this as a stack-passed MEMORY-class parameter at
     //    the callee's rbp+0x10 = K-128.
+    // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t kern_stack_top = 0;
     asm volatile("movq %%gs:0x0, %0" : "=r"(kern_stack_top));
     auto* stack_base = reinterpret_cast<uint8_t*>(kern_stack_top - 128);
@@ -1293,8 +1299,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // 3. Update PerCpu scratch area so sysret diagnostic check passes and
     //    the correct user RSP is restored.
     asm volatile("movq %0, %%gs:0x28" : : "r"(new_initial_rip) : "memory");
-    asm volatile("movq %0, %%gs:0x30" : : "r"((uint64_t)0x202) : "memory");
-    asm volatile("movq %0, %%gs:0x08" : : "r"(new_rsp) : "memory");
+    asm volatile("movq %0, %%gs:0x30" : : "r"(static_cast<uint64_t>(0x202)) : "memory");
+    asm volatile("movq %0, %%gs:0x08" : : "r"(NEW_RSP) : "memory");
 
     // 4. Switch CR3 to the new pagemap so user-space sees the new mappings.
     asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");

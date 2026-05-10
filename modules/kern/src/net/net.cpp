@@ -2,7 +2,6 @@
 
 #include <net/loopback.hpp>
 #include <net/packet.hpp>
-#include <platform/dbg/dbg.hpp>
 
 namespace ker::net {
 

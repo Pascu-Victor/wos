@@ -31,7 +31,7 @@ struct SlabHeader {
 template <size_t size>
 struct alignas(16) MemoryBlock {
     uintptr_t slab_ptr;
-    uintptr_t _align_pad;  // padding so data starts at offset 16 (16-byte aligned)
+    uintptr_t align_pad;  // padding so data starts at offset 16 (16-byte aligned)
     std::array<char, size> data;
 
     // Offset from block start to user data (must match actual layout)
@@ -113,8 +113,8 @@ void* Slab<slab_size, memory_size>::alloc_unlocked() {
         auto next_addr = reinterpret_cast<uintptr_t>(header.next);
         if ((next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
                                           (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL))) {
-            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u", (unsigned long long)next_addr,
-                               this, header.free_blocks, header.magic, header.size);
+            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u",
+                               static_cast<unsigned long long>(next_addr), this, header.free_blocks, header.magic, header.size);
             ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
         }
         return header.next->alloc_unlocked();
@@ -153,7 +153,7 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
         if (found == BITMAP_NO_BITS_LEFT) {
             // Not found: this is an invalid free or double free. Dump diagnostics to help root cause.
             ker::mod::dbg::log("slab: invalid free or double free detected for addr %p (slab=%p, computed_index=%d)", address, this,
-                               (unsigned long)block_index);
+                               static_cast<unsigned long>(block_index));
             ker::mod::dbg::log("slab header: magic=0x%x size=%d free_blocks=%d next_fit=%d prev=%p next=%p", header.magic,
                                (unsigned long)header.size, (unsigned long)header.free_blocks, (unsigned long)header.next_fit_block,
                                header.prev, header.next);
@@ -164,8 +164,8 @@ void Slab<slab_size, memory_size>::free_unlocked(void* address) {
                 // Read a prefix of the data to help diagnose buffer overrun corruption
                 uint64_t prefix = 0;
                 memcpy(&prefix, &blocks[i].data, sizeof(prefix));
-                ker::mod::dbg::log("  block[%d]=%p slab_ptr=%p used=%d prefix=0x%x", (unsigned long)i, &blocks[i].data,
-                                   (void*)blocks[i].slab_ptr, (int)header.mem_map.check_used(i), (unsigned long long)prefix);
+                ker::mod::dbg::log("  block[%d]=%p slab_ptr=%p used=%d prefix=0x%x", static_cast<unsigned long>(i), &blocks[i].data,
+                                   (void*)blocks[i].slab_ptr, (int)header.mem_map.check_used(i), static_cast<unsigned long long>(prefix));
                 if (header.free_count[i] > 0) {
                     ker::mod::dbg::log("    last_free: caller=%p count=%d", (void*)header.last_free_caller[i], (int)header.free_count[i]);
                 }
@@ -231,8 +231,8 @@ void Slab<slab_size, memory_size>::iter_live_blocks_unlocked(void* userdata, voi
             }
             // debug_idx is stored in the lower 32 bits of _align_pad, which sits
             // sizeof(uintptr_t) bytes before the user data pointer.
-            uint32_t debug_idx = *reinterpret_cast<const uint32_t*>(s->blocks[i].data.data() - sizeof(uintptr_t));
-            fn(userdata, s->blocks[i].data.data(), slab_size, debug_idx);
+            uint32_t const DEBUG_IDX = *reinterpret_cast<const uint32_t*>(s->blocks[i].data.data() - sizeof(uintptr_t));
+            fn(userdata, s->blocks[i].data.data(), slab_size, DEBUG_IDX);
         }
         s = s->header.next;
     }

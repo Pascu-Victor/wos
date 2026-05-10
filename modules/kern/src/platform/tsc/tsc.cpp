@@ -1,5 +1,6 @@
 #include "tsc.hpp"
 
+#include <cstdint>
 #include <platform/acpi/hpet/hpet.hpp>
 #include <platform/asm/msr.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -26,21 +27,21 @@ void init() {
     // Calibrate TSC frequency against HPET over a 10 ms window.
     // hpet::sleepUs uses the HPET counter directly so it is accurate
     // regardless of CPU frequency.
-    uint64_t hpet_start = hpet::get_us();
-    uint64_t tsc_start = rdtsc();
+    uint64_t const HPET_START = hpet::get_us();
+    uint64_t const TSC_START = rdtsc();
     hpet::sleep_us(10000);  // 10 ms
-    uint64_t tsc_delta = rdtsc() - tsc_start;
-    uint64_t elapsed_us = hpet::get_us() - hpet_start;
+    uint64_t const TSC_DELTA = rdtsc() - TSC_START;
+    uint64_t const ELAPSED_US = hpet::get_us() - HPET_START;
 
-    if (elapsed_us == 0) {
+    if (ELAPSED_US == 0) {
         dbg::log("tsc: HPET calibration window returned 0 us; defaulting to 1 GHz");
         tsc_hz = 1000000000ULL;
     } else {
-        tsc_hz = (tsc_delta * 1000000ULL) / elapsed_us;
+        tsc_hz = (TSC_DELTA * 1000000ULL) / ELAPSED_US;
     }
 
     tsc_base = rdtsc();
-    dbg::log("tsc: calibrated at %lu MHz", (unsigned long)(tsc_hz / 1000000ULL));
+    dbg::log("tsc: calibrated at %lu MHz", static_cast<unsigned long>(tsc_hz / 1000000ULL));
 }
 
 uint64_t get_hz() { return tsc_hz; }
@@ -50,9 +51,9 @@ uint64_t ticks_to_ns(uint64_t delta) {
         return 0;
     }
 
-    uint64_t secs = delta / tsc_hz;
-    uint64_t rem = delta % tsc_hz;
-    return (secs * 1000000000ULL) + ((rem * 1000000000ULL) / tsc_hz);
+    uint64_t const SECS = delta / tsc_hz;
+    uint64_t const REM = delta % tsc_hz;
+    return (SECS * 1000000000ULL) + ((REM * 1000000000ULL) / tsc_hz);
 }
 
 uint64_t get_ns() { return ticks_to_ns(rdtsc() - tsc_base); }

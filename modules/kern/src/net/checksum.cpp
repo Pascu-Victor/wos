@@ -9,7 +9,7 @@ namespace ker::net {
 
 namespace {
 auto fold_checksum(uint32_t sum) -> uint16_t {
-    while (sum >> 16) {
+    while ((sum >> 16) != 0U) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     return static_cast<uint16_t>(~sum);
@@ -22,8 +22,8 @@ auto checksum_compute(const void* data, size_t len) -> uint16_t {
 
     // Sum 16-bit words
     while (len > 1) {
-        uint16_t word = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += word;
+        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
+        sum += WORD;
         buf += 2;
         len -= 2;
     }
@@ -41,12 +41,12 @@ auto checksum_pseudo_ipv4(uint32_t src, uint32_t dst, uint8_t proto, uint16_t le
 
     // Pseudo header: src(32) + dst(32) + zero(8) + proto(8) + length(16)
     // All in network byte order
-    uint32_t src_n = htonl(src);
-    uint32_t dst_n = htonl(dst);
-    sum += (src_n >> 16) & 0xFFFF;
-    sum += src_n & 0xFFFF;
-    sum += (dst_n >> 16) & 0xFFFF;
-    sum += dst_n & 0xFFFF;
+    uint32_t const SRC_N = htonl(src);
+    uint32_t const DST_N = htonl(dst);
+    sum += (SRC_N >> 16) & 0xFFFF;
+    sum += SRC_N & 0xFFFF;
+    sum += (DST_N >> 16) & 0xFFFF;
+    sum += DST_N & 0xFFFF;
     sum += htons(proto);
     sum += htons(len);
 
@@ -54,8 +54,8 @@ auto checksum_pseudo_ipv4(uint32_t src, uint32_t dst, uint8_t proto, uint16_t le
     const auto* buf = static_cast<const uint8_t*>(data);
     size_t remaining = data_len;
     while (remaining > 1) {
-        uint16_t word = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += word;
+        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
+        sum += WORD;
         buf += 2;
         remaining -= 2;
     }
@@ -78,17 +78,17 @@ auto checksum_pseudo_ipv6(const std::array<uint8_t, 16>& src, const std::array<u
         sum += (static_cast<uint16_t>(dst[i]) << 8) | dst[i + 1];
     }
 
-    uint32_t len_n = htonl(payload_len);
-    sum += (len_n >> 16) & 0xFFFF;
-    sum += len_n & 0xFFFF;
+    uint32_t const LEN_N = htonl(payload_len);
+    sum += (LEN_N >> 16) & 0xFFFF;
+    sum += LEN_N & 0xFFFF;
     sum += htons(static_cast<uint16_t>(next_header));
 
     // Add data
     const auto* buf = static_cast<const uint8_t*>(data);
     size_t remaining = data_len;
     while (remaining > 1) {
-        uint16_t word = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += word;
+        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
+        sum += WORD;
         buf += 2;
         remaining -= 2;
     }

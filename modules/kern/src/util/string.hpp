@@ -3,7 +3,8 @@
 #include <cstdarg>
 #include <cstring>
 #include <span>
-
+#include <utility>
+// NOLINTNEXTLINE
 namespace _std {
 
 auto itoa(int n, std::span<char> s, int base = 10) -> int;
@@ -58,20 +59,20 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             }
                             // count up to precision chars without calling strlen
                             size_t slen = 0;
-                            while (slen < (size_t)precision && s[slen] != '\0') {
+                            while (std::cmp_less(slen, precision) && s[slen] != '\0') {
                                 slen++;
                             }
-                            size_t copy_len = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
-                            if (copy_len > 0) {
-                                strncpy(str + j, s, copy_len);
-                                j += copy_len;
+                            size_t const COPY_LEN = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            if (COPY_LEN > 0) {
+                                strncpy(str + j, s, COPY_LEN);
+                                j += COPY_LEN;
                             }
                             break;
                         }
                     } else if (format[i] >= '0' && format[i] <= '9') {
                         // parse numeric precision  e.g. %.11s
                         while (format[i] >= '0' && format[i] <= '9') {
-                            precision = precision * 10 + (format[i] - '0');
+                            precision = (precision * 10) + (format[i] - '0');
                             i++;
                         }
                         if (format[i] == 's') {
@@ -81,13 +82,13 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                                 break;
                             }
                             size_t slen = 0;
-                            while (slen < (size_t)precision && s[slen] != '\0') {
+                            while (std::cmp_less(slen, precision) && s[slen] != '\0') {
                                 slen++;
                             }
-                            size_t copy_len = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
-                            if (copy_len > 0) {
-                                strncpy(str + j, s, copy_len);
-                                j += copy_len;
+                            size_t const COPY_LEN = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            if (COPY_LEN > 0) {
+                                strncpy(str + j, s, COPY_LEN);
+                                j += COPY_LEN;
                             }
                             break;
                         }
@@ -104,19 +105,19 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     if (width_from_arg) {
                         width = va_arg(args, int);
                     }
-                    int n = va_arg(args, int);
-                    int len = itoa(n, std::span(buf.data(), buf.size()));
+                    int const N = va_arg(args, int);
+                    int const LEN = itoa(N, std::span(buf.data(), buf.size()));
 
                     // Apply padding
-                    int pad_len = width - len;
-                    if (pad_len > 0 && j + pad_len < size) {
-                        for (int k = 0; k < pad_len; k++) {
+                    int const PAD_LEN = width - LEN;
+                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                        for (int k = 0; k < PAD_LEN; k++) {
                             str[j++] = pad_char;
                         }
                     }
 
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 case 'l': {
@@ -132,7 +133,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         if (n == 0) {
                             buf[len++] = '0';
                         } else {
-                            std::array<char, 64> temp;
+                            std::array<char, 64> temp{};
                             int temp_len = 0;
                             while (n > 0) {
                                 temp[temp_len++] = static_cast<char>('0' + (n % 10));
@@ -145,9 +146,9 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         }
                         buf[len] = '\0';
 
-                        int pad_len = width - len;
-                        if (pad_len > 0 && j + pad_len < size) {
-                            for (int k = 0; k < pad_len; k++) {
+                        int const PAD_LEN = width - len;
+                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                            for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
                             }
                         }
@@ -159,32 +160,32 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
-                        uint64_t n = va_arg(args, uint64_t);
-                        int len = u64toh(n, std::span(buf.data(), buf.size()));
+                        uint64_t const N = va_arg(args, uint64_t);
+                        int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
 
-                        int pad_len = width - len;
-                        if (pad_len > 0 && j + pad_len < size) {
-                            for (int k = 0; k < pad_len; k++) {
+                        int const PAD_LEN = width - LEN;
+                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                            for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
                             }
                         }
 
                         strncpy(str + j, buf.data(), size - j);
-                        j += len;
+                        j += LEN;
                     } else if (format[i] == 'd') {
                         // %ld - signed long (64-bit on x86_64)
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
-                        int64_t sn = va_arg(args, int64_t);
-                        bool negative = sn < 0;
-                        uint64_t n = negative ? static_cast<uint64_t>(-sn) : static_cast<uint64_t>(sn);
+                        int64_t const SN = va_arg(args, int64_t);
+                        bool const NEGATIVE = SN < 0;
+                        uint64_t n = NEGATIVE ? static_cast<uint64_t>(-SN) : static_cast<uint64_t>(SN);
 
                         int len = 0;
                         if (n == 0) {
                             buf[len++] = '0';
                         } else {
-                            std::array<char, 64> temp;
+                            std::array<char, 64> temp{};
                             int temp_len = 0;
                             while (n > 0) {
                                 temp[temp_len++] = static_cast<char>('0' + (n % 10));
@@ -195,17 +196,19 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             }
                             len = temp_len;
                         }
-                        if (negative) {
+                        if (NEGATIVE) {
                             // Shift right and prepend '-'
-                            for (int k = len; k > 0; k--) buf[k] = buf[k - 1];
+                            for (int k = len; k > 0; k--) {
+                                buf[k] = buf[k - 1];
+                            }
                             buf[0] = '-';
                             len++;
                         }
                         buf[len] = '\0';
 
-                        int pad_len = width - len;
-                        if (pad_len > 0 && j + pad_len < size) {
-                            for (int k = 0; k < pad_len; k++) {
+                        int const PAD_LEN = width - len;
+                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                            for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
                             }
                         }
@@ -225,7 +228,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             if (n == 0) {
                                 buf[len++] = '0';
                             } else {
-                                std::array<char, 64> temp;
+                                std::array<char, 64> temp{};
                                 int temp_len = 0;
                                 while (n > 0) {
                                     temp[temp_len++] = static_cast<char>('0' + (n % 10));
@@ -240,9 +243,9 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             buf[len] = '\0';
 
                             // Apply padding
-                            int pad_len = width - len;
-                            if (pad_len > 0 && j + pad_len < size) {
-                                for (int k = 0; k < pad_len; k++) {
+                            int const PAD_LEN = width - len;
+                            if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                                for (int k = 0; k < PAD_LEN; k++) {
                                     str[j++] = pad_char;
                                 }
                             }
@@ -253,19 +256,19 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             if (width_from_arg) {
                                 width = va_arg(args, int);
                             }
-                            uint64_t n = va_arg(args, uint64_t);
-                            int len = u64toh(n, std::span(buf.data(), buf.size()));
+                            uint64_t const N = va_arg(args, uint64_t);
+                            int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
 
                             // Apply padding
-                            int pad_len = width - len;
-                            if (pad_len > 0 && j + pad_len < size) {
-                                for (int k = 0; k < pad_len; k++) {
+                            int const PAD_LEN = width - LEN;
+                            if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                                for (int k = 0; k < PAD_LEN; k++) {
                                     str[j++] = pad_char;
                                 }
                             }
 
                             strncpy(str + j, buf.data(), size - j);
-                            j += len;
+                            j += LEN;
                         }
                     }
                     break;
@@ -274,19 +277,19 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     if (width_from_arg) {
                         width = va_arg(args, int);
                     }
-                    unsigned int n = va_arg(args, unsigned int);
-                    int len = u64toh(n, std::span(buf.data(), buf.size()));
+                    unsigned int const N = va_arg(args, unsigned int);
+                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
 
                     // Apply padding
-                    int pad_len = width - len;
-                    if (pad_len > 0 && j + pad_len < size) {
-                        for (int k = 0; k < pad_len; k++) {
+                    int const PAD_LEN = width - LEN;
+                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                        for (int k = 0; k < PAD_LEN; k++) {
                             str[j++] = pad_char;
                         }
                     }
 
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 case 'z': {
@@ -303,7 +306,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         if (n == 0) {
                             buf[len++] = '0';
                         } else {
-                            std::array<char, 64> temp;
+                            std::array<char, 64> temp{};
                             int temp_len = 0;
                             while (n > 0) {
                                 temp[temp_len++] = static_cast<char>('0' + (n % 10));
@@ -318,9 +321,9 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         buf[len] = '\0';
 
                         // Apply padding
-                        int pad_len = width - len;
-                        if (pad_len > 0 && j + pad_len < size) {
-                            for (int k = 0; k < pad_len; k++) {
+                        int const PAD_LEN = width - len;
+                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                            for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
                             }
                         }
@@ -346,7 +349,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     if (n == 0) {
                         buf[len++] = '0';
                     } else {
-                        std::array<char, 64> temp;
+                        std::array<char, 64> temp{};
                         int temp_len = 0;
                         while (n > 0) {
                             temp[temp_len++] = static_cast<char>('0' + (n % 10));
@@ -361,9 +364,9 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     buf[len] = '\0';
 
                     // Apply padding
-                    int pad_len = width - len;
-                    if (pad_len > 0 && j + pad_len < size) {
-                        for (int k = 0; k < pad_len; k++) {
+                    int const PAD_LEN = width - len;
+                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
+                        for (int k = 0; k < PAD_LEN; k++) {
                             str[j++] = pad_char;
                         }
                     }
@@ -377,54 +380,54 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     if (s == nullptr) {
                         // Print "(null)" like standard printf
                         const char* null_str = "(null)";
-                        size_t null_len = 6;
-                        size_t space_left = (j < size) ? (size - j - 1) : 0;
-                        size_t to_copy = (null_len < space_left) ? null_len : space_left;
-                        if (to_copy > 0) {
-                            strncpy(str + j, null_str, to_copy);
-                            j += to_copy;
+                        size_t const NULL_LEN = 6;
+                        size_t const SPACE_LEFT = (j < size) ? (size - j - 1) : 0;
+                        size_t const TO_COPY = (NULL_LEN < SPACE_LEFT) ? NULL_LEN : SPACE_LEFT;
+                        if (TO_COPY > 0) {
+                            strncpy(str + j, null_str, TO_COPY);
+                            j += TO_COPY;
                         }
                         break;
                     }
-                    size_t src_len = strlen(s);
-                    size_t space_left = (j < size) ? (size - j - 1) : 0;
-                    size_t to_copy = (src_len < space_left) ? src_len : space_left;
-                    if (to_copy > 0) {
-                        strncpy(str + j, s, to_copy);
-                        j += to_copy;
+                    size_t const SRC_LEN = strlen(s);
+                    size_t const SPACE_LEFT = (j < size) ? (size - j - 1) : 0;
+                    size_t const TO_COPY = (SRC_LEN < SPACE_LEFT) ? SRC_LEN : SPACE_LEFT;
+                    if (TO_COPY > 0) {
+                        strncpy(str + j, s, TO_COPY);
+                        j += TO_COPY;
                     }
                     break;
                 }
                 case 'c': {
-                    char c = va_arg(args, int);
-                    str[j++] = c;
+                    char const C = va_arg(args, int);
+                    str[j++] = C;
                     break;
                 }
                 case 'b': {
-                    int n = va_arg(args, int);
-                    int len = itoa(n, std::span(buf.data(), buf.size()), 2);
+                    int const N = va_arg(args, int);
+                    int const LEN = itoa(N, std::span(buf.data(), buf.size()), 2);
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 case 'p': {
-                    uint64_t n = va_arg(args, uint64_t);
+                    uint64_t const N = va_arg(args, uint64_t);
                     str[j++] = '0';
                     str[j++] = 'x';
-                    int len = u64toh(n, std::span(buf.data(), buf.size()));
+                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 case 'h': {
                     // padded hex byte
-                    uint8_t n = va_arg(args, int);
-                    int len = u64toh(n, std::span(buf.data(), buf.size()));
-                    if (len == 1) {
+                    uint8_t const N = va_arg(args, int);
+                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
+                    if (LEN == 1) {
                         str[j++] = '0';
                     }
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 default:
@@ -444,7 +447,6 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
 
 }  // namespace _std
 
-//
 namespace std {
 using _std::itoa;
 // using std_ext::reverse;

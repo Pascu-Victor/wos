@@ -1,5 +1,7 @@
 #include "kmem.hpp"
 
+#include "extern/limine.h"
+
 // ask limine for core count
 //  __attribute__((used, section(".requests")))
 //  static volatile limine_bootloader_info_request bootloader_info_request = {
@@ -16,17 +18,17 @@
 // };
 
 namespace ker::mod::mem {
-limine_bootloader_info_response* bootloader_info;
+static limine_bootloader_info_response* bootloader_info;
 
-bool isInit = false;
-void init(void) {
-    if (isInit) {
+static bool is_init = false;
+void init() {
+    if (is_init) {
         return;
     }
 
     // desc::gdt::initDescriptors();
 
-    isInit = true;
+    is_init = true;
 }
 
 }  // namespace ker::mod::mem

@@ -18,27 +18,27 @@ using gid_t = uint32_t;
 using blksize_t = int64_t;
 using blkcnt_t = int64_t;
 
-struct timespec {
+struct Timespec {
     int64_t tv_sec;
     int64_t tv_nsec;
 };
 
-struct stat {
+struct Stat {
     dev_t st_dev;
     ino_t st_ino;
     nlink_t st_nlink;
     mode_t st_mode;
     uid_t st_uid;
     gid_t st_gid;
-    unsigned int __pad0;
+    unsigned int pad0;
     dev_t st_rdev;
     off_t st_size;
     blksize_t st_blksize;
     blkcnt_t st_blocks;
-    struct timespec st_atim;
-    struct timespec st_mtim;
-    struct timespec st_ctim;
-    long __unused[3];
+    struct Timespec st_atim;
+    struct Timespec st_mtim;
+    struct Timespec st_ctim;
+    long unused[3];
 };
 
 // File type mode flags (matching mlibc/POSIX)
@@ -57,12 +57,12 @@ constexpr mode_t S_IFSOCK = 0x0C000;
 // OR'd with S_IFDIR in st_mode; S_ISDIR() still returns true.
 constexpr mode_t S_WOSLINK = 0x10000;
 
-inline constexpr bool S_ISWLNK(mode_t m) { return (m & S_WOSLINK) != 0; }
+constexpr bool s_iswlnk(mode_t m) { return (m & S_WOSLINK) != 0; }
 
 // Kernel-side statvfs structure matching the mlibc ABI.
 // On x86_64, unsigned long == uint64_t, so this is ABI-compatible with
 // the userspace struct statvfs from <sys/statvfs.h>.
-struct statvfs {
+struct Statvfs {
     uint64_t f_bsize;    // preferred I/O block size
     uint64_t f_frsize;   // fundamental block size (= f_bsize for most FSes)
     uint64_t f_blocks;   // total blocks in filesystem (in f_frsize units)

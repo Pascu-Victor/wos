@@ -33,8 +33,8 @@ KTEST(Slab, AllocFreeLarge) {
 
 KTEST(Slab, SizeClasses) {
     constexpr size_t SIZES[] = {0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x300, 0x400, 0x800};
-    for (size_t sz : SIZES) {
-        void* p = km::malloc(sz);
+    for (size_t const SZ : SIZES) {
+        void* p = km::malloc(SZ);
         KEXPECT_NE(p, nullptr);
         if (p != nullptr) {
             km::free(p);
@@ -64,6 +64,7 @@ KTEST(Slab, WriteReadback) {
 
 KTEST(Slab, MultipleAllocFree) {
     constexpr int N = 32;
+    // NOLINTNEXTLINE(misc-const-correctness)
     void* ptrs[N] = {};
     for (int i = 0; i < N; ++i) {
         ptrs[i] = km::malloc(64);
@@ -104,6 +105,7 @@ KTEST(Slab, SlabExpansion) {
     // A 4096-byte slab page for size=0x80 holds roughly 40 objects.
     // Allocate 64 to guarantee crossing into a second slab.
     constexpr int N = 64;
+    // NOLINTNEXTLINE(misc-const-correctness)
     void* ptrs[N] = {};
     for (int i = 0; i < N; ++i) {
         ptrs[i] = km::malloc(0x80);

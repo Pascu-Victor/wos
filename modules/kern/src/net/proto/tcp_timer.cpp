@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <net/net_trace.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -92,9 +91,9 @@ void wake_socket_timer(Socket* sock) {
     if (sock == nullptr) {
         return;
     }
-    uint64_t pid = sock->owner_pid;
-    if (pid != 0) {
-        auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    uint64_t const PID = sock->owner_pid;
+    if (PID != 0) {
+        auto* task = ker::mod::sched::find_task_by_pid_safe(PID);
         if (task != nullptr) {
             task->deferred_task_switch = false;
             uint64_t target_cpu = task->cpu;
@@ -145,8 +144,8 @@ void tcp_timer_arm(TcpCB* cb) {
         cb->on_timer_list = true;
     }
     // Conservatively early is fine.
-    uint64_t cur = timer_earliest.load(std::memory_order_relaxed);
-    if (deadline < cur) {
+    uint64_t const CUR = timer_earliest.load(std::memory_order_relaxed);
+    if (deadline < CUR) {
         timer_earliest.store(deadline, std::memory_order_relaxed);
         wake_timer = true;
     }
@@ -293,8 +292,9 @@ void tcp_timer_tick(uint64_t now_ms) {
         auto* next_free = to_free->timer_next;
         to_free->timer_next = nullptr;
         // hash_next still has the original bucket chain.
-        uint32_t idx = tcp_hash_4tuple(to_free->local_ip, to_free->local_port, to_free->remote_ip, to_free->remote_port) % TCB_HASH_SIZE;
-        auto& bucket = tcb_hash[idx];
+        uint32_t const IDX =
+            tcp_hash_4tuple(to_free->local_ip, to_free->local_port, to_free->remote_ip, to_free->remote_port) % TCB_HASH_SIZE;
+        auto& bucket = tcb_hash[IDX];
         bool removed_from_hash = false;
         bucket.lock.lock();
         TcpCB** hp = &bucket.head;
@@ -319,7 +319,7 @@ void tcp_timer_tick(uint64_t now_ms) {
     constexpr size_t MAX_TIMER_BATCH_ENTRIES = 4;
     for (size_t i = 0; i < batch_count; i++) {
         TcpCB* rcb = batch[i];
-        uint64_t rcb_lock_flags = rcb->lock.lock_irqsave();
+        uint64_t const RCB_LOCK_FLAGS = rcb->lock.lock_irqsave();
 
         if (rcb->delayed_ack_deadline != 0 && now_ms >= rcb->delayed_ack_deadline && rcb->state == TcpState::ESTABLISHED &&
             deferred_count < MAX_DEFERRED_RETRANSMITS) {
@@ -435,14 +435,14 @@ void tcp_timer_tick(uint64_t now_ms) {
             }
         }
 
-        bool still_active = rcb->retransmit_head != nullptr || rcb->ack_pending || rcb->delayed_ack_deadline != 0 ||
-                            rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
-                            (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
-        if (!still_active) {
+        bool const STILL_ACTIVE = rcb->retransmit_head != nullptr || rcb->ack_pending || rcb->delayed_ack_deadline != 0 ||
+                                  rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
+                                  (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
+        if (!STILL_ACTIVE) {
             tcp_timer_disarm(rcb);
         }
 
-        rcb->lock.unlock_irqrestore(rcb_lock_flags);
+        rcb->lock.unlock_irqrestore(RCB_LOCK_FLAGS);
         tcp_cb_release(rcb);
     }
 
@@ -450,8 +450,8 @@ void tcp_timer_tick(uint64_t now_ms) {
     for (size_t i = 0; i < deferred_count; i++) {
         int tx_res = 0;
         if (deferred[i].seq_end != 0 && deferred[i].cb != nullptr) {
-            uint32_t una = deferred[i].cb->snd_una;
-            if (!tcp_seq_after(deferred[i].seq_end, una)) {
+            uint32_t const UNA = deferred[i].cb->snd_una;
+            if (!tcp_seq_after(deferred[i].seq_end, UNA)) {
                 pkt_free(deferred[i].pkt);
                 tcp_cb_release(deferred[i].cb);
                 if (deferred[i].ack_cb != nullptr) {
@@ -468,14 +468,14 @@ void tcp_timer_tick(uint64_t now_ms) {
 
         if (deferred[i].ack_cb != nullptr) {
             TcpCB* ack_cb = deferred[i].ack_cb;
-            uint64_t ack_cb_flags = ack_cb->lock.lock_irqsave();
+            uint64_t const ACK_CB_FLAGS = ack_cb->lock.lock_irqsave();
             if (tx_res >= 0) {
                 ack_cb->ack_pending = false;
             } else {
                 ack_cb->ack_pending = true;
                 tcp_timer_arm(ack_cb);
             }
-            ack_cb->lock.unlock_irqrestore(ack_cb_flags);
+            ack_cb->lock.unlock_irqrestore(ACK_CB_FLAGS);
             tcp_cb_release(ack_cb);
         }
     }

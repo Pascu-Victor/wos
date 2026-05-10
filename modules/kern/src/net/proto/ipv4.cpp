@@ -12,7 +12,6 @@
 #include <net/proto/tcp.hpp>
 #include <net/proto/udp.hpp>
 #include <net/route.hpp>
-#include <platform/dbg/dbg.hpp>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
@@ -36,57 +35,57 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     const auto* hdr = reinterpret_cast<const IPv4Header*>(pkt->data);
 
     // Validate version
-    uint8_t version = (hdr->ihl_version >> 4) & 0xF;
-    if (version != 4) {
+    uint8_t const VERSION = (hdr->ihl_version >> 4) & 0xF;
+    if (VERSION != 4) {
         pkt_free(pkt);
         return;
     }
 
     // Validate header length
-    uint8_t ihl = hdr->ihl_version & 0xF;
-    size_t hdr_len = static_cast<size_t>(ihl) * 4;
-    if (hdr_len < sizeof(IPv4Header) || hdr_len > pkt->len) {
+    uint8_t const IHL = hdr->ihl_version & 0xF;
+    size_t const HDR_LEN = static_cast<size_t>(IHL) * 4;
+    if (HDR_LEN < sizeof(IPv4Header) || HDR_LEN > pkt->len) {
         pkt_free(pkt);
         return;
     }
 
     // Validate total length
-    uint16_t total_len = ntohs(hdr->total_len);
-    if (total_len < hdr_len || total_len > pkt->len) {
+    uint16_t const TOTAL_LEN = ntohs(hdr->total_len);
+    if (TOTAL_LEN < HDR_LEN || TOTAL_LEN > pkt->len) {
         pkt_free(pkt);
         return;
     }
 
     // Verify header checksum
-    uint16_t cksum = checksum_compute(hdr, hdr_len);
-    if (cksum != 0) {
+    uint16_t const CKSUM = checksum_compute(hdr, HDR_LEN);
+    if (CKSUM != 0) {
         pkt_free(pkt);
         return;
     }
 
-    uint32_t dst = ntohl(hdr->dst_addr);
-    uint32_t src = ntohl(hdr->src_addr);
-    uint8_t proto = hdr->protocol;
+    uint32_t const DST = ntohl(hdr->dst_addr);
+    uint32_t const SRC = ntohl(hdr->src_addr);
+    uint8_t const PROTO = hdr->protocol;
 
     // Learn sender's MAC via ARP (dynamic learning from incoming packets)
-    arp_learn(src, pkt->src_mac);
+    arp_learn(SRC, pkt->src_mac);
 
     // Check if this packet is for us
     bool for_us = false;
 
     // Check all local addresses
-    auto* nif = netif_find_by_ipv4(dst);
+    auto* nif = netif_find_by_ipv4(DST);
     if (nif != nullptr) {
         for_us = true;
     }
 
     // Check for broadcast (limited)
-    if (dst == 0xFFFFFFFF) {
+    if (DST == 0xFFFFFFFF) {
         for_us = true;
     }
 
     // Check for loopback range
-    if ((dst >> 24) == 127) {
+    if ((DST >> 24) == 127) {
         for_us = true;
     }
 
@@ -97,25 +96,25 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
     // Strip IP header, keep only payload
-    pkt->pull(hdr_len);
+    pkt->pull(HDR_LEN);
 
     // Trim to actual payload length
-    size_t payload_len = total_len - hdr_len;
-    pkt->len = payload_len;
+    size_t const PAYLOAD_LEN = TOTAL_LEN - HDR_LEN;
+    pkt->len = PAYLOAD_LEN;
 
-    switch (proto) {
+    switch (PROTO) {
         case IPPROTO_ICMP:
 #ifdef DEBUG_IPV4
             ker::mod::dbg::log("ipv4_rx: ICMP packet from %u.%u.%u.%u to %u.%u.%u.%u\n", (src >> 24) & 0xFF, (src >> 16) & 0xFF,
                                (src >> 8) & 0xFF, src & 0xFF, (dst >> 24) & 0xFF, (dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF);
 #endif
-            icmp_rx(dev, pkt, src, dst, hdr->ttl);
+            icmp_rx(dev, pkt, SRC, DST, hdr->ttl);
             break;
         case IPPROTO_UDP:
-            udp_rx(dev, pkt, src, dst);
+            udp_rx(dev, pkt, SRC, DST);
             break;
         case IPPROTO_TCP:
-            tcp_rx(dev, pkt, src, dst);
+            tcp_rx(dev, pkt, SRC, DST);
             break;
         default:
             pkt_free(pkt);
@@ -190,8 +189,8 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
 
     // Resolve MAC address via ARP
     std::array<uint8_t, 6> dst_mac{};
-    int arp_result = arp_resolve(out_dev, next_hop, dst_mac, pkt);
-    if (arp_result < 0) {
+    int const ARP_RESULT = arp_resolve(out_dev, next_hop, dst_mac, pkt);
+    if (ARP_RESULT < 0) {
         // Packet queued in ARP pending list or dropped on timeout
         // Packet ownership transferred to ARP subsystem
         return 0;

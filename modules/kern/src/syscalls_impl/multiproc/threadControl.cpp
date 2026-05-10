@@ -1,9 +1,10 @@
+#include "threadControl.hpp"
+
 #include <atomic>
 #include <bit>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -16,25 +17,25 @@
 namespace ker::syscall::multiproc {
 namespace {
 auto online_cpu_mask() -> uint64_t {
-    uint64_t cpu_count = mod::smt::get_core_count();
-    if (cpu_count == 0) {
+    uint64_t const CPU_COUNT = mod::smt::get_core_count();
+    if (CPU_COUNT == 0) {
         return 0;
     }
-    if (cpu_count >= 64) {
+    if (CPU_COUNT >= 64) {
         return UINT64_MAX;
     }
-    return (1ULL << cpu_count) - 1ULL;
+    return (1ULL << CPU_COUNT) - 1ULL;
 }
 }  // namespace
 
-auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t {
+auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t {
     switch (op) {
-        case abi::multiproc::threadControlOps::setTCB: {
+        case abi::multiproc::threadControlOps::SET_TCB: {
             void* tcb = arg1;
             return mod::smt::set_tcb(tcb);
         }
 
-        case abi::multiproc::threadControlOps::yield: {
+        case abi::multiproc::threadControlOps::YIELD: {
             auto* task = mod::sched::get_current_task();
             if (task != nullptr) {
                 task->wait_channel = "sched_yield";
@@ -44,7 +45,7 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             return 0;
         }
 
-        case abi::multiproc::threadControlOps::threadCreate: {
+        case abi::multiproc::threadControlOps::THREAD_CREATE: {
             // arg1 = tcb vaddr (mlibc Tcb*, becomes fsbase / FS register)
             // arg2 = prepared stack pointer (entry + user_arg pushed below it)
             // arg3 = virtual address of __mlibc_enter_thread in the process image
@@ -57,28 +58,28 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
 
             auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
             if (t == nullptr) {
-                return (uint64_t)-ENOMEM;
+                return static_cast<uint64_t>(-ENOMEM);
             }
 
             bool posted = false;
-            uint64_t cpu_count = mod::smt::get_core_count();
+            uint64_t const cpu_count = mod::smt::get_core_count();
             if (cpu_count > 0) {
                 static std::atomic<uint64_t> next_thread_cpu{0};
-                uint64_t target_cpu = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % cpu_count;
-                posted = mod::sched::post_task_for_cpu(target_cpu, t);
+                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+                posted = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             }
             if (!posted) {
                 posted = mod::sched::post_task_balanced(t);
             }
             if (!posted) {
-                return (uint64_t)-ENOMEM;
+                return static_cast<uint64_t>(-ENOMEM);
             }
 
             // Return the new thread's PID as the TID; mlibc stores this in tcb->tid
             return t->pid;
         }
 
-        case abi::multiproc::threadControlOps::threadExit: {
+        case abi::multiproc::threadControlOps::THREAD_EXIT: {
             // Exit the current thread without tearing down the process.
             // The pagemap, FDs, and ELF are shared - do NOT free them.
             auto* task = mod::sched::get_current_task();
@@ -89,19 +90,19 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             task->exit_status = 0;
             // Record death epoch for GC grace period, then transition to DEAD.
             // Without this, threads stay EXITING forever and GC never reclaims them.
-            task->death_epoch.store(mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+            task->death_epoch.store(mod::sched::EpochManager::current_epoch(), std::memory_order_release);
             task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
             // Wake anyone waiting on this thread (e.g. via awaitee list)
-            uint64_t waiter_lock_flags = task->exit_waiters_lock.lock_irqsave();
-            const size_t waiter_count = task->awaitee_on_exit.size();
+            uint64_t const WAITER_LOCK_FLAGS = task->exit_waiters_lock.lock_irqsave();
+            const size_t WAITER_COUNT = task->awaitee_on_exit.size();
             uint64_t waiting_pids[16] = {};
-            const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
-            for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
+            const size_t WAITING_PIDS_CAP = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+            for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
                 waiting_pids[i] = task->awaitee_on_exit[i];
             }
-            task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
+            task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 
-            for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; i++) {
+            for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; i++) {
                 auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids[i]);
                 if (waiter != nullptr) {
                     mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
@@ -113,48 +114,48 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             __builtin_unreachable();
         }
 
-        case abi::multiproc::threadControlOps::setAffinity: {
-            uint64_t tid = (uint64_t)arg1;
-            uint64_t mask = (uint64_t)arg2;
+        case abi::multiproc::threadControlOps::SET_AFFINITY: {
+            auto const TID = (uint64_t)arg1;
+            auto const MASK = (uint64_t)arg2;
 
-            auto* task = mod::sched::find_task_by_pid_safe(tid);
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
-                return (uint64_t)-ESRCH;
+                return static_cast<uint64_t>(-ESRCH);
             }
 
-            uint64_t valid_mask = online_cpu_mask();
-            if (valid_mask == 0) {
+            uint64_t const VALID_MASK = online_cpu_mask();
+            if (VALID_MASK == 0) {
                 task->release();
-                return (uint64_t)-ENODEV;
+                return static_cast<uint64_t>(-ENODEV);
             }
-            if ((mask & valid_mask) == 0 || (mask & ~valid_mask) != 0) {
+            if ((MASK & VALID_MASK) == 0 || (MASK & ~VALID_MASK) != 0) {
                 task->release();
-                return (uint64_t)-EINVAL;
+                return static_cast<uint64_t>(-EINVAL);
             }
 
-            if (std::has_single_bit(mask)) {
+            if (std::has_single_bit(MASK)) {
                 // Single-CPU pin
-                uint64_t target_cpu = std::countr_zero(mask);
-                task->domain_mask = mask;
+                uint64_t const TARGET_CPU = std::countr_zero(MASK);
+                task->domain_mask = MASK;
                 task->domain_hard = false;
                 task->cpu_pinned = true;
-                task->cpu = target_cpu;
+                task->cpu = TARGET_CPU;
                 if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
-                    mod::sched::reschedule_task_for_cpu(target_cpu, task);
+                    mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
                 }
-            } else if (mask == valid_mask) {
+            } else if (MASK == VALID_MASK) {
                 // Full mask: remove all affinity restrictions
                 task->domain_mask = ~0ULL;
                 task->domain_hard = false;
                 task->cpu_pinned = false;
             } else {
                 // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
-                task->domain_mask = mask;
+                task->domain_mask = MASK;
                 task->domain_hard = false;
                 task->cpu_pinned = false;
-                uint64_t target_cpu = mod::sched::get_least_loaded_cpu_in_mask(mask);
+                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
                 if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
-                    mod::sched::reschedule_task_for_cpu(target_cpu, task);
+                    mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
                 }
             }
 
@@ -162,23 +163,23 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             return 0;
         }
 
-        case abi::multiproc::threadControlOps::getAffinity: {
-            uint64_t tid = (uint64_t)arg1;
+        case abi::multiproc::threadControlOps::GET_AFFINITY: {
+            auto const TID = (uint64_t)arg1;
 
-            auto* task = mod::sched::find_task_by_pid_safe(tid);
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
-                return (uint64_t)-ESRCH;
+                return static_cast<uint64_t>(-ESRCH);
             }
 
             uint64_t mask = online_cpu_mask();
             if (mask == 0) {
                 task->release();
-                return (uint64_t)-ENODEV;
+                return static_cast<uint64_t>(-ENODEV);
             }
             if (task->cpu_pinned) {
                 if (task->cpu >= 64) {
                     task->release();
-                    return (uint64_t)-ERANGE;
+                    return static_cast<uint64_t>(-ERANGE);
                 }
                 mask = 1ULL << task->cpu;
             } else if (task->domain_mask != ~0ULL) {
@@ -189,26 +190,32 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             return mask;
         }
 
-        case abi::multiproc::threadControlOps::createDomain: {
+        case abi::multiproc::threadControlOps::CREATE_DOMAIN: {
             // arg1 = ptr to struct { char name[32]; uint64_t cpu_mask; uint8_t soft_exclusive; uint8_t hard; }
             auto* req = reinterpret_cast<uint8_t*>(arg1);
-            if (req == nullptr) return (uint64_t)-EINVAL;
+            if (req == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
             char name[32];
             __builtin_memcpy(name, req, 31);
             name[31] = '\0';
             uint64_t cpu_mask = *reinterpret_cast<uint64_t*>(req + 32);
-            bool soft_exclusive = req[40] != 0;
-            bool hard = req[41] != 0;
-            uint64_t valid = online_cpu_mask();
-            if ((cpu_mask & valid) == 0) return (uint64_t)-EINVAL;
-            cpu_mask &= valid;
-            uint32_t domain_id = mod::smt::create_leaf_domain(name, cpu_mask, soft_exclusive, hard);
-            if (domain_id == mod::smt::DOMAIN_ID_INVALID) return (uint64_t)-ENOMEM;
+            bool const SOFT_EXCLUSIVE = req[40] != 0;
+            bool const HARD = req[41] != 0;
+            uint64_t const VALID = online_cpu_mask();
+            if ((cpu_mask & VALID) == 0) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            cpu_mask &= VALID;
+            uint32_t const DOMAIN_ID = mod::smt::create_leaf_domain(name, cpu_mask, SOFT_EXCLUSIVE, HARD);
+            if (DOMAIN_ID == mod::smt::DOMAIN_ID_INVALID) {
+                return static_cast<uint64_t>(-ENOMEM);
+            }
             // Apply daemon_load_penalty to each CPU in the new domain if soft_exclusive
-            if (soft_exclusive) {
-                uint64_t cpu_count = mod::smt::get_core_count();
+            if (SOFT_EXCLUSIVE) {
+                uint64_t const cpu_count = mod::smt::get_core_count();
                 for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
-                    if (cpu_mask & (1ULL << cpu)) {
+                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
                         mod::sched::set_cpu_daemon_penalty(cpu, 56);
                     }
                 }
@@ -216,56 +223,64 @@ auto threadControl(abi::multiproc::threadControlOps op, void* arg1, void* arg2, 
             // Phase 8: stamp domain_id on each CPU's RunQueue so work-stealing
             // checks can enforce hard-domain boundaries without a separate registry lookup.
             {
-                uint64_t cpu_count = mod::smt::get_core_count();
+                uint64_t const cpu_count = mod::smt::get_core_count();
                 for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
-                    if (cpu_mask & (1ULL << cpu)) {
-                        mod::sched::set_cpu_domain_id(cpu, domain_id);
+                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
+                        mod::sched::set_cpu_domain_id(cpu, DOMAIN_ID);
                     }
                 }
             }
-            return domain_id;
+            return DOMAIN_ID;
         }
 
-        case abi::multiproc::threadControlOps::setDomain: {
+        case abi::multiproc::threadControlOps::SET_DOMAIN: {
             // arg1=tid, arg2=domain_id, arg3=hard (0=soft, 1=hard)
-            uint64_t tid = (uint64_t)arg1;
-            uint32_t domain_id = (uint32_t)(uint64_t)arg2;
-            bool hard = ((uint64_t)arg3) != 0;
-            auto* dom = mod::smt::get_cpu_domain(domain_id);
-            if (dom == nullptr) return (uint64_t)-EINVAL;
-            auto* task = mod::sched::find_task_by_pid_safe(tid);
-            if (task == nullptr) return (uint64_t)-ESRCH;
-            task->domain_id = domain_id;
+            auto const TID = (uint64_t)arg1;
+            auto const DOMAIN_ID = static_cast<uint32_t>((uint64_t)arg2);
+            bool const HARD = ((uint64_t)arg3) != 0;
+            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
+            if (dom == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            task->domain_id = DOMAIN_ID;
             task->domain_mask = dom->cpu_mask;
-            task->domain_hard = hard || dom->hard;
+            task->domain_hard = HARD || dom->hard;
             task->cpu_pinned = false;
-            uint64_t target = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
+            uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
             if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
-                mod::sched::reschedule_task_for_cpu(target, task);
+                mod::sched::reschedule_task_for_cpu(TARGET, task);
             }
             task->release();
             return 0;
         }
 
-        case abi::multiproc::threadControlOps::queryDomain: {
+        case abi::multiproc::threadControlOps::QUERY_DOMAIN: {
             // arg1=domain_id, arg2=ptr to struct { uint64_t cpu_mask; uint32_t cpu_loads[64]; }
-            uint32_t domain_id = (uint32_t)(uint64_t)arg1;
+            auto const DOMAIN_ID = static_cast<uint32_t>((uint64_t)arg1);
             auto* out = reinterpret_cast<uint8_t*>(arg2);
-            if (out == nullptr) return (uint64_t)-EINVAL;
-            auto* dom = mod::smt::get_cpu_domain(domain_id);
-            if (dom == nullptr) return (uint64_t)-EINVAL;
+            if (out == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
+            if (dom == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
             *reinterpret_cast<uint64_t*>(out) = dom->cpu_mask;
             auto* loads = reinterpret_cast<uint32_t*>(out + 8);
-            uint64_t cpu_count = mod::smt::get_core_count();
+            uint64_t const cpu_count = mod::smt::get_core_count();
             for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
-                loads[cpu] = (dom->cpu_mask & (1ULL << cpu)) ? mod::sched::get_cpu_load(cpu) : 0;
+                loads[cpu] = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
             }
             return 0;
         }
 
         default:
             mod::dbg::error("Invalid op in syscall thread control");
-            return (uint64_t)-EINVAL;
+            return static_cast<uint64_t>(-EINVAL);
     }
 }
 }  // namespace ker::syscall::multiproc

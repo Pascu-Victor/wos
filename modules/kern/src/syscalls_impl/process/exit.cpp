@@ -7,14 +7,10 @@
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/mm.hpp>
-#include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
-#include <platform/sched/threading.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <vfs/vfs.hpp>
 
@@ -36,18 +32,18 @@ static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod
         waiter->wait_rusage_phys_addr = 0;
         return;
     }
-    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
-    if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
+    uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
+    if (PHYS == ker::mod::mm::virt::PADDR_INVALID || PHYS == 0) {
         waiter->wait_rusage_user_addr = 0;
         waiter->wait_rusage_phys_addr = 0;
         return;
     }
-    waiter->wait_rusage_phys_addr = phys;
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(phys));
-    ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
-    ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-    ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
-    ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+    waiter->wait_rusage_phys_addr = PHYS;
+    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+    ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
+    ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
+    ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
+    ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
     waiter->wait_rusage_user_addr = 0;
     waiter->wait_rusage_phys_addr = 0;
 }
@@ -58,14 +54,14 @@ static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, in
         waiter->wait_status_phys_addr = 0;
         return;
     }
-    uint64_t phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
-    if (phys == ker::mod::mm::virt::PADDR_INVALID || phys == 0) {
+    uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
+    if (PHYS == ker::mod::mm::virt::PADDR_INVALID || PHYS == 0) {
         waiter->wait_status_user_addr = 0;
         waiter->wait_status_phys_addr = 0;
         return;
     }
-    waiter->wait_status_phys_addr = phys;
-    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(phys));
+    waiter->wait_status_phys_addr = PHYS;
+    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
     *status_ptr = status;
     waiter->wait_status_user_addr = 0;
     waiter->wait_status_phys_addr = 0;
@@ -77,31 +73,33 @@ static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter,
     }
 
     if (waiter->wait_resume_rip_user_addr != 0) {
-        uint64_t rip_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rip_user_addr);
-        if (rip_phys == ker::mod::mm::virt::PADDR_INVALID || rip_phys == 0 ||
-            (waiter->wait_resume_rip_phys_addr != 0 && waiter->wait_resume_rip_phys_addr != rip_phys)) {
+        uint64_t const RIP_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rip_user_addr);
+        if (RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID || RIP_PHYS == 0 ||
+            (waiter->wait_resume_rip_phys_addr != 0 && waiter->wait_resume_rip_phys_addr != RIP_PHYS)) {
             log::warn(
                 "waitpid-resume drift: waiter=%lu child=%lu path=%s rip_va=0x%llx old_phys=0x%llx new_phys=0x%llx rsp_va=0x%llx pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
-                (unsigned long long)waiter->wait_resume_rip_user_addr, (unsigned long long)waiter->wait_resume_rip_phys_addr,
-                (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys),
-                (unsigned long long)waiter->wait_resume_rsp_user_addr, static_cast<void*>(waiter->pagemap));
+                static_cast<unsigned long long>(waiter->wait_resume_rip_user_addr),
+                static_cast<unsigned long long>(waiter->wait_resume_rip_phys_addr),
+                static_cast<unsigned long long>((RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID) ? 0 : RIP_PHYS),
+                static_cast<unsigned long long>(waiter->wait_resume_rsp_user_addr), static_cast<void*>(waiter->pagemap));
         }
-        waiter->wait_resume_rip_phys_addr = (rip_phys != ker::mod::mm::virt::PADDR_INVALID) ? rip_phys : 0;
+        waiter->wait_resume_rip_phys_addr = (RIP_PHYS != ker::mod::mm::virt::PADDR_INVALID) ? RIP_PHYS : 0;
     }
 
     if (waiter->wait_resume_rsp_user_addr != 0) {
-        uint64_t rsp_phys = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rsp_user_addr);
-        if (rsp_phys == ker::mod::mm::virt::PADDR_INVALID || rsp_phys == 0) {
+        uint64_t const RSP_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rsp_user_addr);
+        if (RSP_PHYS == ker::mod::mm::virt::PADDR_INVALID || RSP_PHYS == 0) {
             log::warn(
                 "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx "
                 "pagemap=%p",
                 waiter->pid, child != nullptr ? child->pid : 0, path != nullptr ? path : "?",
-                (unsigned long long)waiter->wait_resume_rsp_user_addr, (unsigned long long)waiter->wait_resume_rsp_phys_addr,
-                (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys),
-                (unsigned long long)waiter->wait_resume_rip_user_addr, static_cast<void*>(waiter->pagemap));
+                static_cast<unsigned long long>(waiter->wait_resume_rsp_user_addr),
+                static_cast<unsigned long long>(waiter->wait_resume_rsp_phys_addr),
+                static_cast<unsigned long long>((RSP_PHYS == ker::mod::mm::virt::PADDR_INVALID) ? 0 : RSP_PHYS),
+                static_cast<unsigned long long>(waiter->wait_resume_rip_user_addr), static_cast<void*>(waiter->pagemap));
         }
-        waiter->wait_resume_rsp_phys_addr = (rsp_phys != ker::mod::mm::virt::PADDR_INVALID) ? rsp_phys : 0;
+        waiter->wait_resume_rsp_phys_addr = (RSP_PHYS != ker::mod::mm::virt::PADDR_INVALID) ? RSP_PHYS : 0;
     }
 }
 
@@ -181,8 +179,8 @@ void wos_proc_exit(int status) {
     // Reparent all children of this process to init (PID 1), so init can reap them.
     // Threads do not own children directly - skip reparenting for thread exits.
     if (!current_task->is_thread) {
-        uint32_t count = ker::mod::sched::get_active_task_count();
-        for (uint32_t i = 0; i < count; i++) {
+        uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+        for (uint32_t i = 0; i < COUNT; i++) {
             auto* child = ker::mod::sched::get_active_task_at(i);
             if (child != nullptr && child->parent_pid == current_task->pid && child != current_task) {
                 child->parent_pid = 1;  // Reparent to init
@@ -228,23 +226,23 @@ void wos_proc_exit(int status) {
     // This happens AFTER reparenting + FD cleanup so that any files written
     // by the exiting process are fully committed to the VFS before waitpid
     // returns to the waiter.
-    uint64_t waiter_lock_flags = current_task->exit_waiters_lock.lock_irqsave();
-    const size_t waiter_count = current_task->awaitee_on_exit.size();
+    uint64_t const WAITER_LOCK_FLAGS = current_task->exit_waiters_lock.lock_irqsave();
+    const size_t WAITER_COUNT = current_task->awaitee_on_exit.size();
     uint64_t waiting_pids[16] = {};
-    const size_t waiting_pids_cap = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
-    for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
+    const size_t WAITING_PIDS_CAP = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
         waiting_pids[i] = current_task->awaitee_on_exit[i];
     }
-    current_task->exit_waiters_lock.unlock_irqrestore(waiter_lock_flags);
+    current_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 
-    for (size_t i = 0; i < waiter_count && i < waiting_pids_cap; ++i) {
-        uint64_t waiting_pid = waiting_pids[i];
+    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
+        uint64_t const WAITING_PID = waiting_pids[i];
 #ifdef EXIT_DEBUG
         ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waiting_pid);
 #endif
 
         // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
-        auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(waiting_pid);
+        auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
         if (waiting_task != nullptr) {
             // Only modify the waiting task's saved context when it's safely in waitQueue
             // (deferred_task_switch is false). When deferred_task_switch is true, the task is
@@ -334,7 +332,7 @@ void wos_proc_exit(int status) {
 
     // Transition to DEAD state and record death epoch for garbage collection.
     // The task will be reclaimed once all CPUs have passed through the grace period.
-    current_task->death_epoch.store(ker::mod::sched::EpochManager::currentEpoch(), std::memory_order_release);
+    current_task->death_epoch.store(ker::mod::sched::EpochManager::current_epoch(), std::memory_order_release);
     current_task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
 
 #ifdef EXIT_DEBUG

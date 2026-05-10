@@ -3,6 +3,7 @@
 
 #include <extern/limine.h>
 
+#include <cstdint>
 #include <platform/init/init_executor.hpp>
 
 #include "platform/init/limine_requests.hpp"
@@ -73,6 +74,7 @@ extern "C" [[noreturn]] void _start(void) {  // NOLINT
     // With WOS_KASAN enabled, instrumented global constructors access shadow
     // memory, which requires the page-fault handler (IDT) to demand-page shadow
     // pages.  Global ctors are deferred to after IDT init via the init registry.
+    // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t rsp = 0;
     asm volatile("mov %%rsp, %0" : "=r"(rsp));
     ker::init::set_kernel_rsp(rsp);

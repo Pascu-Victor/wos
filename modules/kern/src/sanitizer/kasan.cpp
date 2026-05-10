@@ -14,6 +14,7 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
+#include "util/hcf.hpp"
 #ifdef WOS_KASAN
 
 #include <atomic>
@@ -26,6 +27,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
+#include <utility>
 
 #include "kasan.hpp"
 #include "platform/asm/tlb.hpp"
@@ -83,15 +85,19 @@ static std::atomic_flag s_recent_lock = ATOMIC_FLAG_INIT;  // NOLINT
 // so returning 0 is safe. We detect this by checking IA32_APIC_BASE (MSR 0x1B)
 // bit 10 (x2APIC enable).
 static inline auto shadow_cpu_index() -> uint64_t {
+    // NOLINTBEGIN(misc-const-correctness)
     uint32_t apic_base_lo = 0;
     uint32_t apic_base_hi = 0;
-    asm volatile("rdmsr" : "=a"(apic_base_lo), "=d"(apic_base_hi) : "c"(0x1Bu));
+    // NOLINTEND(misc-const-correctness)
+    asm volatile("rdmsr" : "=a"(apic_base_lo), "=d"(apic_base_hi) : "c"(0x1BU));
     if ((apic_base_lo & (1 << 10)) == 0) {
         return 0;  // x2APIC not yet enabled — single-threaded BSP
     }
+    // NOLINTBEGIN(misc-const-correctness)
     uint32_t lo = 0;
     uint32_t hi = 0;
-    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x802u));
+    // NOLINTEND(misc-const-correctness)
+    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x802U));
     return lo & 63;
 }
 
@@ -105,36 +111,36 @@ static inline auto shadow_cpu_index() -> uint64_t {
 // the task pagemap does not. We must propagate the slot here so the CPU can
 // walk the page tables correctly.
 static void sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) {
-    uint64_t kphys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::vaddr_t)kernel_pml4);
-    uint64_t cur_cr3 = rdcr3();
-    if (cur_cr3 != kphys) {
-        auto* cur_pml4 = (mm::paging::PageTable*)mm::addr::get_virt_pointer((mm::addr::paddr_t)cur_cr3);
-        size_t pml4_idx = (shadow_vaddr >> 39) & 0x1FF;
-        cur_pml4->entries[pml4_idx] = kernel_pml4->entries[pml4_idx];
+    auto const KPHYS = (uint64_t)mm::addr::get_phys_pointer((mm::addr::vaddr_t)kernel_pml4);
+    uint64_t const CUR_CR3 = rdcr3();
+    if (CUR_CR3 != KPHYS) {
+        auto* cur_pml4 = reinterpret_cast<mm::paging::PageTable*>(mm::addr::get_virt_pointer(static_cast<mm::addr::paddr_t>(CUR_CR3)));
+        size_t const PML4_IDX = (shadow_vaddr >> 39) & 0x1FF;
+        cur_pml4->entries[PML4_IDX] = kernel_pml4->entries[PML4_IDX];
     }
     invlpg(shadow_vaddr);
 }
 
-auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gates::interruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
+auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gates::InterruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
     -> bool {
     if (cr2 < SHADOW_REGION_BASE || cr2 >= SHADOW_REGION_END) {
         return false;  // Not our fault
     }
 
-    uint64_t cpu = shadow_cpu_index();
-    uint64_t cpu_bit = 1ULL << (cpu & 63);
+    uint64_t const CPU = shadow_cpu_index();
+    uint64_t const CPU_BIT = 1ULL << (CPU & 63);
 
     // Check for re-entrancy on THIS cpu
-    if ((s_shadow_fault_cpus.load(std::memory_order_relaxed) & cpu_bit) != 0) {
+    if ((s_shadow_fault_cpus.load(std::memory_order_relaxed) & CPU_BIT) != 0) {
         return false;  // Recursive shadow fault on same CPU — let it panic
     }
-    s_shadow_fault_cpus.fetch_or(cpu_bit, std::memory_order_acquire);
+    s_shadow_fault_cpus.fetch_or(CPU_BIT, std::memory_order_acquire);
 
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
     void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
     if (phys_page == nullptr) {
         dbg::log("[KASan] OOM allocating shadow page for cr2=0x%lx", cr2);
-        s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
+        s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return false;
     }
     memset(phys_page, 0x00, mm::paging::PAGE_SIZE);
@@ -152,20 +158,20 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     auto* kernel_pt = mm::virt::get_kernel_pagemap();
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
         s_shadow_map_lock.clear(std::memory_order_release);
-        uint64_t dups = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((dups % 1000) == 0) {
+        uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((DUPS % 1000) == 0) {
             dbg::log(
                 "[KASan] already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
                 "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
                 "gpr info: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx "
                 "r13=0x%lx r14=0x%lx r15=0x%lx",
-                dups, shadow_vaddr, cr2, (int)SOURCE.size(), SOURCE.data(), frame.rip, frame.rsp, frame.flags,
+                DUPS, shadow_vaddr, cr2, static_cast<int>(SOURCE.size()), SOURCE.data(), frame.rip, frame.rsp, frame.flags,
                 s_shadow_dup_count.load(std::memory_order_relaxed), gpr.rax, gpr.rbx, gpr.rcx, gpr.rdx, gpr.rsi, gpr.rdi, gpr.r8, gpr.r9,
                 gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
         }
         sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
         mm::phys::page_free(phys_page);
-        s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
+        s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return true;
     }
 
@@ -173,33 +179,33 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     s_shadow_map_lock.clear(std::memory_order_release);
     sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
 
-    uint64_t n = s_shadow_fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t const N = s_shadow_fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
     // Check if this shadow_vaddr was recently mapped — if so, the mapping isn't sticking.
     bool repeat = false;
     while (s_recent_lock.test_and_set(std::memory_order_acquire)) {
         asm volatile("pause");
     }
-    for (size_t i = 0; i < SFAULT_RECENT; i++) {
-        if (s_recent_shadow_vaddr[i] == shadow_vaddr) {
+    for (unsigned long const I : s_recent_shadow_vaddr) {
+        if (I == shadow_vaddr) {
             repeat = true;
             break;
         }
     }
-    uint32_t head = s_recent_head.load(std::memory_order_relaxed);
-    s_recent_shadow_vaddr[head % SFAULT_RECENT] = shadow_vaddr;
-    s_recent_head.store((head + 1) % SFAULT_RECENT, std::memory_order_relaxed);
+    uint32_t const HEAD = s_recent_head.load(std::memory_order_relaxed);
+    s_recent_shadow_vaddr[HEAD % SFAULT_RECENT] = shadow_vaddr;
+    s_recent_head.store((HEAD + 1) % SFAULT_RECENT, std::memory_order_relaxed);
     s_recent_lock.clear(std::memory_order_release);
 
     if (repeat) {
-        dbg::log("[KASan] REPEAT shadow fault #%lu: shadow_vaddr=0x%lx — mapping not sticking!", n, shadow_vaddr);
+        dbg::log("[KASan] REPEAT shadow fault #%lu: shadow_vaddr=0x%lx — mapping not sticking!", N, shadow_vaddr);
     }
-    if ((n % 100000) == 0) {
-        dbg::log("[KASan] shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", n, cr2, shadow_vaddr,
+    if ((N % 100000) == 0) {
+        dbg::log("[KASan] shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", N, cr2, shadow_vaddr,
                  s_shadow_dup_count.load(std::memory_order_relaxed));
     }
 
-    s_shadow_fault_cpus.fetch_and(~cpu_bit, std::memory_order_release);
+    s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
     return true;
 }
 
@@ -211,20 +217,20 @@ void poison_range(const void* ptr, size_t size, int8_t value) {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
 
     // Poison whole-granule (8-byte) units first
-    size_t full_units = size / 8;
+    size_t const FULL_UNITS = size / 8;
     int8_t* shadow = addr_to_shadow(addr);
-    if (full_units > 0) {
-        memset(shadow, value, full_units);
+    if (FULL_UNITS > 0) {
+        memset(shadow, value, FULL_UNITS);
     }
 
     // Partial last granule: if poisoning, mark as partially accessible
     // (only the leading bytes are valid — same as ASan partial poisoning).
-    size_t remainder = size % 8;
-    if (remainder != 0) {
+    size_t const REMAINDER = size % 8;
+    if (REMAINDER != 0) {
         // For partial poisoning we store the count of accessible bytes
         // (ASan convention: shadow byte = N means first N bytes accessible).
         // When unpoisoning (value == 0) we clear it fully.
-        shadow[full_units] = (value == SHADOW_ACCESSIBLE) ? 0 : static_cast<int8_t>(remainder);
+        shadow[FULL_UNITS] = (value == SHADOW_ACCESSIBLE) ? 0 : static_cast<int8_t>(REMAINDER);
     }
 }
 
@@ -255,9 +261,9 @@ bool is_enabled() {
 }
 
 bool in_shadow_fault() {
-    uint64_t cpu = shadow_cpu_index();
-    uint64_t cpu_bit = 1ULL << (cpu & 63);
-    return (s_shadow_fault_cpus.load(std::memory_order_relaxed) & cpu_bit) != 0;
+    uint64_t const CPU = shadow_cpu_index();
+    uint64_t const CPU_BIT = 1ULL << (CPU & 63);
+    return (s_shadow_fault_cpus.load(std::memory_order_relaxed) & CPU_BIT) != 0;
 }
 
 }  // namespace ker::mod::kasan
@@ -281,9 +287,9 @@ void kasan_write_hex(uint64_t val) {
     char buf[19];
     buf[0] = '0';
     buf[1] = 'x';
-    constexpr const char* hex = "0123456789abcdef";
+    constexpr const char* HEX = "0123456789abcdef";
     for (int i = 15; i >= 0; i--) {
-        buf[2 + (15 - i)] = hex[(val >> (i * 4)) & 0xf];
+        buf[2 + (15 - i)] = HEX[(val >> (i * 4)) & 0xf];
     }
     buf[18] = '\0';
     ser::write_unlocked(buf);
@@ -306,8 +312,12 @@ void kasan_write_dec(uint64_t val) {
 
 // Describe a shadow byte value (ASan convention)
 const char* kasan_shadow_desc(int8_t val) {
-    if (val == 0x00) return "accessible";
-    if (val >= 0x01 && val <= 0x07) return "partial";
+    if (val == 0x00) {
+        return "accessible";
+    }
+    if (val >= 0x01 && val <= 0x07) {
+        return "partial";
+    }
     switch (static_cast<uint8_t>(val)) {
         case 0xf1:
             return "heap-left-redzone";
@@ -340,16 +350,18 @@ const char* kasan_shadow_desc(int8_t val) {
 
 // Print hex dump of memory around the faulting address (8 rows of 16 bytes)
 void kasan_hexdump(uintptr_t addr, size_t size) {
-    uintptr_t start = (addr - 64) & ~0xFULL;
-    uintptr_t end = start + 128;
-    if (start < 0xffff000000000000ULL) return;
+    uintptr_t const START = (addr - 64) & ~0xFULL;
+    uintptr_t const END = START + 128;
+    if (START < 0xffff000000000000ULL) {
+        return;
+    }
 
     ser::write_unlocked("\n--- Memory around ");
     kasan_write_hex(addr);
     ser::write_unlocked(" ---\n");
 
-    constexpr const char* hex = "0123456789abcdef";
-    for (uintptr_t row = start; row < end; row += 16) {
+    constexpr const char* HEX = "0123456789abcdef";
+    for (uintptr_t row = START; row < END; row += 16) {
         if (addr >= row && addr < row + 16) {
             ser::write_unlocked("=>");
         } else {
@@ -358,27 +370,31 @@ void kasan_hexdump(uintptr_t addr, size_t size) {
         kasan_write_hex(row);
         ser::write_unlocked(": ");
 
-        auto* p = reinterpret_cast<const uint8_t*>(row);
+        const auto* p = reinterpret_cast<const uint8_t*>(row);
         for (int i = 0; i < 16; i++) {
-            bool is_target = ((row + static_cast<uintptr_t>(i)) >= addr && (row + static_cast<uintptr_t>(i)) < addr + size);
-            if (is_target) ser::write_unlocked("[");
+            bool const IS_TARGET = ((row + static_cast<uintptr_t>(i)) >= addr && (row + static_cast<uintptr_t>(i)) < addr + size);
+            if (IS_TARGET) {
+                ser::write_unlocked("[");
+            }
             char h[3];
-            h[0] = hex[p[i] >> 4];
-            h[1] = hex[p[i] & 0xf];
+            h[0] = HEX[p[i] >> 4];
+            h[1] = HEX[p[i] & 0xf];
             h[2] = '\0';
             ser::write_unlocked(h);
-            if (is_target) {
+            if (IS_TARGET) {
                 ser::write_unlocked("]");
             } else {
                 ser::write_unlocked(" ");
             }
-            if (i == 7) ser::write_unlocked(" ");
+            if (i == 7) {
+                ser::write_unlocked(" ");
+            }
         }
 
         ser::write_unlocked(" |");
         for (int i = 0; i < 16; i++) {
-            char c = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
-            ser::write_unlocked(c);
+            char const C = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
+            ser::write_unlocked(C);
         }
         ser::write_unlocked("|\n");
     }
@@ -386,20 +402,20 @@ void kasan_hexdump(uintptr_t addr, size_t size) {
 
 // Print ASan-style shadow memory map around the faulting shadow byte
 void kasan_shadow_map(uintptr_t addr) {
-    int8_t* shadow = ker::mod::kasan::addr_to_shadow(addr);
+    int8_t const* shadow = ker::mod::kasan::addr_to_shadow(addr);
     auto shadow_addr = reinterpret_cast<uintptr_t>(shadow);
 
     // Print 9 rows of 16 shadow bytes = 144 bytes of shadow
     // Each shadow byte covers 8 application bytes, so 144*8 = 1152 bytes of app memory
-    uintptr_t start = (shadow_addr - 64) & ~0xFULL;  // align to 16 bytes
-    uintptr_t end = start + 144;
+    uintptr_t const START = (shadow_addr - 64) & ~0xFULL;  // align to 16 bytes
+    uintptr_t const END = START + 144;
 
     ser::write_unlocked("\n--- Shadow memory around ");
     kasan_write_hex(shadow_addr);
     ser::write_unlocked(" (each byte covers 8 app bytes) ---\n");
 
-    constexpr const char* hex = "0123456789abcdef";
-    for (uintptr_t row = start; row < end; row += 16) {
+    constexpr const char* HEX = "0123456789abcdef";
+    for (uintptr_t row = START; row < END; row += 16) {
         // Arrow on the row containing the faulting shadow byte
         if (shadow_addr >= row && shadow_addr < row + 16) {
             ser::write_unlocked("=>");
@@ -409,22 +425,26 @@ void kasan_shadow_map(uintptr_t addr) {
         kasan_write_hex(row);
         ser::write_unlocked(": ");
 
-        auto* p = reinterpret_cast<const int8_t*>(row);
+        const auto* p = reinterpret_cast<const int8_t*>(row);
         for (int i = 0; i < 16; i++) {
-            bool is_target = (row + static_cast<uintptr_t>(i) == shadow_addr);
-            if (is_target) ser::write_unlocked("[");
+            bool const IS_TARGET = (row + static_cast<uintptr_t>(i) == shadow_addr);
+            if (IS_TARGET) {
+                ser::write_unlocked("[");
+            }
             char h[3];
             auto byte = static_cast<uint8_t>(p[i]);
-            h[0] = hex[byte >> 4];
-            h[1] = hex[byte & 0xf];
+            h[0] = HEX[byte >> 4];
+            h[1] = HEX[byte & 0xf];
             h[2] = '\0';
             ser::write_unlocked(h);
-            if (is_target) {
+            if (IS_TARGET) {
                 ser::write_unlocked("]");
             } else {
                 ser::write_unlocked(" ");
             }
-            if (i == 7) ser::write_unlocked(" ");
+            if (i == 7) {
+                ser::write_unlocked(" ");
+            }
         }
         ser::write_unlocked("\n");
     }
@@ -447,14 +467,14 @@ void kasan_shadow_map(uintptr_t addr) {
     }
     ker::mod::smt::halt_other_cores();
 
-    int8_t* shadow = ker::mod::kasan::addr_to_shadow(addr);
-    int8_t s = *shadow;
+    int8_t const* shadow = ker::mod::kasan::addr_to_shadow(addr);
+    int8_t const S = *shadow;
     auto shadow_addr = reinterpret_cast<uintptr_t>(shadow);
 
     // Header — mimic LLVM ASan format
     ser::write_unlocked("\n==================================================================\n");
     ser::write_unlocked("ERROR: KernelAddressSanitizer: ");
-    ser::write_unlocked(kasan_shadow_desc(s));
+    ser::write_unlocked(kasan_shadow_desc(S));
     ser::write_unlocked(" on address ");
     kasan_write_hex(addr);
     ser::write_unlocked("\n");
@@ -472,28 +492,28 @@ void kasan_shadow_map(uintptr_t addr) {
     kasan_write_hex(shadow_addr);
     ser::write_unlocked("  Shadow byte: ");
     {
-        constexpr const char* hex = "0123456789abcdef";
+        constexpr const char* HEX = "0123456789abcdef";
         char h[5];
         h[0] = '0';
         h[1] = 'x';
-        h[2] = hex[(static_cast<uint8_t>(s)) >> 4];
-        h[3] = hex[(static_cast<uint8_t>(s)) & 0xf];
+        h[2] = HEX[(static_cast<uint8_t>(S)) >> 4];
+        h[3] = HEX[(static_cast<uint8_t>(S)) & 0xf];
         h[4] = '\0';
         ser::write_unlocked(h);
     }
     ser::write_unlocked(" (");
-    ser::write_unlocked(kasan_shadow_desc(s));
+    ser::write_unlocked(kasan_shadow_desc(S));
     ser::write_unlocked(")\n");
 
     // Adjacent shadow bytes
     ser::write_unlocked("  Adjacent: prev=");
     {
-        constexpr const char* hex = "0123456789abcdef";
+        constexpr const char* HEX = "0123456789abcdef";
         char h[5];
         h[0] = '0';
         h[1] = 'x';
-        h[2] = hex[(static_cast<uint8_t>(shadow[-1])) >> 4];
-        h[3] = hex[(static_cast<uint8_t>(shadow[-1])) & 0xf];
+        h[2] = HEX[(static_cast<uint8_t>(shadow[-1])) >> 4];
+        h[3] = HEX[(static_cast<uint8_t>(shadow[-1])) & 0xf];
         h[4] = '\0';
         ser::write_unlocked(h);
     }
@@ -501,12 +521,12 @@ void kasan_shadow_map(uintptr_t addr) {
     ser::write_unlocked(kasan_shadow_desc(shadow[-1]));
     ser::write_unlocked(")  next=");
     {
-        constexpr const char* hex = "0123456789abcdef";
+        constexpr const char* HEX = "0123456789abcdef";
         char h[5];
         h[0] = '0';
         h[1] = 'x';
-        h[2] = hex[(static_cast<uint8_t>(shadow[1])) >> 4];
-        h[3] = hex[(static_cast<uint8_t>(shadow[1])) & 0xf];
+        h[2] = HEX[(static_cast<uint8_t>(shadow[1])) >> 4];
+        h[3] = HEX[(static_cast<uint8_t>(shadow[1])) & 0xf];
         h[4] = '\0';
         ser::write_unlocked(h);
     }
@@ -565,27 +585,39 @@ static inline auto check_shadow(uintptr_t addr, size_t size) -> bool {
     }
 
     // Skip userspace addresses — their shadow falls in the non-canonical hole
-    if (__builtin_expect(addr < 0xffff800000000000ULL, 0)) return true;
-
-    if (__builtin_expect(addr >= reinterpret_cast<uint64_t>(__kernel_end), 0)) return true;
-
-    int8_t* shadow = ker::mod::kasan::addr_to_shadow(addr);
-    int8_t s = *shadow;
-
-    if (__builtin_expect(s == 0, 1)) {
-        // First granule fully accessible.
-        // If the access fits within one granule we're done.
-        if (size <= 8 - (addr & 7)) return true;
-        // Crosses into next granule — check it.
-        int8_t s2 = shadow[1];
-        if (__builtin_expect(s2 == 0, 1)) return true;
-        if (s2 < 0) return false;
-        // Partial second granule: remaining bytes must fit.
-        size_t remaining = (addr & 7) + size - 8;
-        return remaining <= static_cast<size_t>(s2);
+    if (__builtin_expect(static_cast<long>(addr < 0xffff800000000000ULL), 0) != 0) {
+        return true;
     }
 
-    if (s < 0) return false;  // Sentinel (redzone / freed / poisoned)
+    if (__builtin_expect(static_cast<long>(addr >= reinterpret_cast<uint64_t>(__kernel_end)), 0) != 0) {
+        return true;
+    }
+
+    int8_t const* shadow = ker::mod::kasan::addr_to_shadow(addr);
+    int8_t const s = *shadow;
+
+    if (__builtin_expect(static_cast<long>(s == 0), 1) != 0) {
+        // First granule fully accessible.
+        // If the access fits within one granule we're done.
+        if (size <= 8 - (addr & 7)) {
+            return true;
+        }
+        // Crosses into next granule — check it.
+        int8_t const s2 = shadow[1];
+        if (__builtin_expect(static_cast<long>(s2 == 0), 1) != 0) {
+            return true;
+        }
+        if (s2 < 0) {
+            return false;
+        }
+        // Partial second granule: remaining bytes must fit.
+        size_t const remaining = (addr & 7) + size - 8;
+        return std::cmp_less_equal(remaining, s2);
+    }
+
+    if (s < 0) {
+        return false;  // Sentinel (redzone / freed / poisoned)
+    }
 
     // Partial granule: first s bytes accessible from granule start.
     return (addr & 7) + size <= static_cast<size_t>(s);
@@ -661,74 +693,96 @@ void __asan_store_n(uintptr_t addr, size_t n) {
 // Noabort variants — emitted when -fsanitize-recover=address is in effect.
 // We still treat violations as fatal in the kernel.
 void __asan_load1_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 1)) kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 1)) {
+        kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load2_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 2)) kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 2)) {
+        kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load4_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 4)) kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 4)) {
+        kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load8_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 8)) kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 8)) {
+        kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_load16_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 16)) kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 16)) {
+        kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_loadN_noabort(uintptr_t addr, size_t n) {
-    if (!check_shadow(addr, n)) kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, n)) {
+        kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+    }
 }
 
 void __asan_store1_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 1)) kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 1)) {
+        kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store2_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 2)) kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 2)) {
+        kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store4_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 4)) kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 4)) {
+        kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store8_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 8)) kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 8)) {
+        kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_store16_noabort(uintptr_t addr) {
-    if (!check_shadow(addr, 16)) kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, 16)) {
+        kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 void __asan_storeN_noabort(uintptr_t addr, size_t n) {
-    if (!check_shadow(addr, n)) kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+    if (!check_shadow(addr, n)) {
+        kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+    }
 }
 
 // ---- Stack / scope helpers ------------------------------------------------
-void __asan_stack_malloc_0(size_t) {}
-void __asan_stack_malloc_1(size_t) {}
-void __asan_stack_malloc_2(size_t) {}
-void __asan_stack_malloc_3(size_t) {}
-void __asan_stack_malloc_4(size_t) {}
-void __asan_stack_malloc_5(size_t) {}
-void __asan_stack_malloc_6(size_t) {}
-void __asan_stack_malloc_7(size_t) {}
-void __asan_stack_malloc_8(size_t) {}
-void __asan_stack_malloc_9(size_t) {}
-void __asan_stack_malloc_10(size_t) {}
+void __asan_stack_malloc_0(size_t /*unused*/) {}
+void __asan_stack_malloc_1(size_t /*unused*/) {}
+void __asan_stack_malloc_2(size_t /*unused*/) {}
+void __asan_stack_malloc_3(size_t /*unused*/) {}
+void __asan_stack_malloc_4(size_t /*unused*/) {}
+void __asan_stack_malloc_5(size_t /*unused*/) {}
+void __asan_stack_malloc_6(size_t /*unused*/) {}
+void __asan_stack_malloc_7(size_t /*unused*/) {}
+void __asan_stack_malloc_8(size_t /*unused*/) {}
+void __asan_stack_malloc_9(size_t /*unused*/) {}
+void __asan_stack_malloc_10(size_t /*unused*/) {}
 
-void __asan_stack_free_0(uintptr_t, size_t) {}
-void __asan_stack_free_1(uintptr_t, size_t) {}
-void __asan_stack_free_2(uintptr_t, size_t) {}
-void __asan_stack_free_3(uintptr_t, size_t) {}
-void __asan_stack_free_4(uintptr_t, size_t) {}
-void __asan_stack_free_5(uintptr_t, size_t) {}
-void __asan_stack_free_6(uintptr_t, size_t) {}
-void __asan_stack_free_7(uintptr_t, size_t) {}
-void __asan_stack_free_8(uintptr_t, size_t) {}
-void __asan_stack_free_9(uintptr_t, size_t) {}
-void __asan_stack_free_10(uintptr_t, size_t) {}
+void __asan_stack_free_0(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_1(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_2(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_3(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_4(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_5(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_6(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_7(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_8(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_9(uintptr_t /*unused*/, size_t /*unused*/) {}
+void __asan_stack_free_10(uintptr_t /*unused*/, size_t /*unused*/) {}
 
 void __asan_poison_stack_memory(uintptr_t addr, size_t size) {
     ker::mod::kasan::poison_range(reinterpret_cast<void*>(addr), size, ker::mod::kasan::SHADOW_POISONED);
 }
 void __asan_unpoison_stack_memory(uintptr_t addr, size_t size) { ker::mod::kasan::unpoison_range(reinterpret_cast<void*>(addr), size); }
-
-// NOLINTEND(readability-identifier-naming)
 
 // ---- Global variable registration -----------------------------------------
 // -asan-globals=1 causes the compiler to emit descriptors for each global and
@@ -752,7 +806,7 @@ void __asan_register_globals(AsanGlobalDescriptor* globals, size_t n) {
         // but an earlier registration may have poisoned a shared shadow granule.
         ker::mod::kasan::unpoison_range(reinterpret_cast<void*>(globals[i].beg), globals[i].size);
         // Poison the trailing redzone (bytes after the object up to size_with_redzone).
-        size_t redzone = globals[i].size_with_redzone - globals[i].size;
+        size_t const redzone = globals[i].size_with_redzone - globals[i].size;
         if (redzone > 0) {
             ker::mod::kasan::poison_range(reinterpret_cast<void*>(globals[i].beg + globals[i].size), redzone,
                                           ker::mod::kasan::SHADOW_GLOBAL_REDZONE);
@@ -760,11 +814,11 @@ void __asan_register_globals(AsanGlobalDescriptor* globals, size_t n) {
     }
 }
 
-void __asan_unregister_globals(AsanGlobalDescriptor*, size_t) {}
-void __asan_register_image_globals(uintptr_t) {}
-void __asan_unregister_image_globals(uintptr_t) {}
-void __asan_register_elf_globals(uintptr_t, void*, void*) {}
-void __asan_unregister_elf_globals(uintptr_t, void*, void*) {}
+void __asan_unregister_globals(AsanGlobalDescriptor* /*unused*/, size_t /*unused*/) {}
+void __asan_register_image_globals(uintptr_t /*unused*/) {}
+void __asan_unregister_image_globals(uintptr_t /*unused*/) {}
+void __asan_register_elf_globals(uintptr_t /*unused*/, void* /*unused*/, void* /*unused*/) {}
+void __asan_unregister_elf_globals(uintptr_t /*unused*/, void* /*unused*/, void* /*unused*/) {}
 
 // ---- Shadow bulk-set helpers ----------------------------------------------
 // Emitted by the compiler to fill shadow memory with a constant byte value
@@ -820,17 +874,19 @@ void __asan_unpoison_memory_region(void const volatile* addr, size_t size) {
 
 auto __asan_address_is_poisoned(void const volatile* addr) -> int {
     auto a = (uintptr_t)addr;  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
-    int8_t* shadow = ker::mod::kasan::addr_to_shadow(a);
-    int8_t shadow_val = *shadow;
-    if (shadow_val == 0) return 0;
+    int8_t const* shadow = ker::mod::kasan::addr_to_shadow(a);
+    int8_t const shadow_val = *shadow;
+    if (shadow_val == 0) {
+        return 0;
+    }
     // Partial poisoning: check if the specific byte within the granule is bad
-    size_t offset = a & 7;
-    return (shadow_val < 0) || (static_cast<size_t>(shadow_val) <= offset) ? 1 : 0;
+    size_t const offset = a & 7;
+    return (shadow_val < 0) || (std::cmp_less_equal(shadow_val, offset)) ? 1 : 0;
 }
 
 uintptr_t __asan_region_is_poisoned(uintptr_t beg, size_t size) {
     for (uintptr_t addr = beg; addr < beg + size; addr += 8) {
-        if (__asan_address_is_poisoned(reinterpret_cast<void*>(addr))) {
+        if (__asan_address_is_poisoned(reinterpret_cast<void*>(addr)) != 0) {
             return addr;
         }
     }
@@ -838,5 +894,5 @@ uintptr_t __asan_region_is_poisoned(uintptr_t beg, size_t size) {
 }
 
 }  // extern "C"
-
+// NOLINTEND(readability-identifier-naming)
 #endif  // WOS_KASAN

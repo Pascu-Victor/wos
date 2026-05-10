@@ -1,3 +1,5 @@
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <utility>
 
 #include "net/socket.hpp"
 #include "tcp.hpp"
@@ -21,12 +24,12 @@ void wake_socket(Socket* sock) {
     if (sock == nullptr) {
         return;
     }
-    uint64_t pid = sock->owner_pid;
+    uint64_t const PID = sock->owner_pid;
 #ifdef TCP_DEBUG
     ker::mod::dbg::log("[tcp] wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), pid);
 #endif
-    if (pid != 0) {
-        auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (PID != 0) {
+        auto* task = ker::mod::sched::find_task_by_pid_safe(PID);
 #ifdef TCP_DEBUG
         ker::mod::dbg::log("[tcp] wake_socket: pid=%lu task=%p", pid, static_cast<void*>(task));
 #endif
@@ -65,12 +68,12 @@ void drain_retransmit_queue(TcpCB* cb) {
 
 // Handle SYN on a listening socket.
 void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, uint32_t dst_ip) {
-    Socket* listen_sock = listener->socket;
+    Socket const* listen_sock = listener->socket;
     if (listen_sock == nullptr) {
         return;
     }
 
-    if (listen_sock->aq_count >= static_cast<size_t>(listen_sock->backlog)) {
+    if (std::cmp_greater_equal(listen_sock->aq_count, listen_sock->backlog)) {
         ker::mod::dbg::log("[net] ACCEPT QUEUE FULL port=%u aq=%zu backlog=%d", listener->local_port, listen_sock->aq_count,
                            listen_sock->backlog);
         return;
@@ -115,26 +118,32 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, u
     child_cb->snd_wnd = ntohs(hdr->window);
 
     // Parse MSS and WSCALE options.
-    uint8_t hdr_len = (hdr->data_offset >> 4) * 4;
-    if (hdr_len > sizeof(TcpHeader)) {
+    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
+    if (HDR_LEN > sizeof(TcpHeader)) {
         const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
-        size_t opts_len = hdr_len - sizeof(TcpHeader);
-        for (size_t i = 0; i < opts_len;) {
-            if (opts[i] == 0) break;
+        size_t const OPTS_LEN = HDR_LEN - sizeof(TcpHeader);
+        for (size_t i = 0; i < OPTS_LEN;) {
+            if (opts[i] == 0) {
+                break;
+            }
             if (opts[i] == 1) {
                 i++;
                 continue;
             }
-            if (i + 1 >= opts_len) break;
-            uint8_t opt_len = opts[i + 1];
-            if (opt_len < 2 || i + opt_len > opts_len) break;
-            if (opts[i] == 2 && opt_len == 4) {
+            if (i + 1 >= OPTS_LEN) {
+                break;
+            }
+            uint8_t const OPT_LEN = opts[i + 1];
+            if (OPT_LEN < 2 || i + OPT_LEN > OPTS_LEN) {
+                break;
+            }
+            if (opts[i] == 2 && OPT_LEN == 4) {
                 child_cb->snd_mss = ntohs(*reinterpret_cast<const uint16_t*>(opts + i + 2));
-            } else if (opts[i] == 3 && opt_len == 3) {
+            } else if (opts[i] == 3 && OPT_LEN == 3) {
                 child_cb->snd_wscale = opts[i + 2];
                 child_cb->ws_enabled = true;
             }
-            i += opt_len;
+            i += OPT_LEN;
         }
     }
 
@@ -150,7 +159,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, u
 void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, uint32_t src_ip, uint32_t dst_ip) {
     NET_TRACE_SPAN(SPAN_TCP_PROCESS);
     uint8_t flags = hdr->flags;
-    uint32_t seg_seq = ntohl(hdr->seq);
+    uint32_t const SEG_SEQ = ntohl(hdr->seq);
     uint32_t seg_ack = ntohl(hdr->ack);
     uint16_t seg_wnd = ntohs(hdr->window);
 
@@ -178,25 +187,25 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             return;
         }
 
-        bool valid_ack = !tcp_seq_after(seg_ack, cb->snd_nxt);
-        bool ack_advances = tcp_seq_after(seg_ack, cb->snd_una);
-        if (valid_ack && (ack_advances || seg_wnd != cb->snd_wnd)) {
+        bool const VALID_ACK = !tcp_seq_after(seg_ack, cb->snd_nxt);
+        bool const ACK_ADVANCES = tcp_seq_after(seg_ack, cb->snd_una);
+        if (VALID_ACK && (ACK_ADVANCES || seg_wnd != cb->snd_wnd)) {
             cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
-            if (!ack_advances) {
+            if (!ACK_ADVANCES) {
                 deferred_wake = true;
             }
         }
-        if (ack_advances && valid_ack) {
+        if (ACK_ADVANCES && VALID_ACK) {
             cb->snd_una = seg_ack;
 
             bool rtt_sampled = false;
-            uint64_t now = tcp_now_ms();
+            uint64_t const NOW = tcp_now_ms();
             while (cb->retransmit_head != nullptr) {
                 auto* entry = cb->retransmit_head;
-                uint32_t entry_end = entry->seq + static_cast<uint32_t>(entry->len);
-                if (!tcp_seq_after(entry_end, seg_ack)) {
+                uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
+                if (!tcp_seq_after(ENTRY_END, seg_ack)) {
                     if (!rtt_sampled && entry->retries == 0) {
-                        uint64_t rtt = now - entry->send_time_ms;
+                        uint64_t rtt = NOW - entry->send_time_ms;
                         if (rtt == 0) {
                             rtt = 1;
                         }
@@ -204,10 +213,10 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                             cb->srtt_ms = rtt;
                             cb->rttvar_ms = rtt / 2;
                         } else {
-                            int64_t delta = static_cast<int64_t>(rtt) - static_cast<int64_t>(cb->srtt_ms);
-                            cb->srtt_ms = cb->srtt_ms + (delta / 8);
-                            int64_t abs_delta = delta < 0 ? -delta : delta;
-                            cb->rttvar_ms = cb->rttvar_ms + ((abs_delta - static_cast<int64_t>(cb->rttvar_ms)) / 4);
+                            int64_t const DELTA = static_cast<int64_t>(rtt) - static_cast<int64_t>(cb->srtt_ms);
+                            cb->srtt_ms = cb->srtt_ms + (DELTA / 8);
+                            int64_t const ABS_DELTA = DELTA < 0 ? -DELTA : DELTA;
+                            cb->rttvar_ms = cb->rttvar_ms + ((ABS_DELTA - static_cast<int64_t>(cb->rttvar_ms)) / 4);
                         }
                         cb->rto_ms = cb->srtt_ms + (4 * cb->rttvar_ms);
                         cb->rto_ms = std::max<uint64_t>(cb->rto_ms, 50ULL);
@@ -229,7 +238,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             }
 
             if (cb->retransmit_head != nullptr) {
-                cb->retransmit_deadline = now + cb->rto_ms;
+                cb->retransmit_deadline = NOW + cb->rto_ms;
             }
 
             cb->ack_pending = false;
@@ -243,18 +252,18 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         case TcpState::SYN_SENT: {
             if ((flags & TCP_ACK) != 0 && (flags & TCP_SYN) != 0) {
                 if (seg_ack == cb->snd_nxt) {
-                    cb->irs = seg_seq;
-                    cb->rcv_nxt = seg_seq + 1;
+                    cb->irs = SEG_SEQ;
+                    cb->rcv_nxt = SEG_SEQ + 1;
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = seg_wnd;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
                     // Parse MSS and WSCALE options.
-                    uint8_t hdr_len = (hdr->data_offset >> 4) * 4;
-                    if (hdr_len > sizeof(TcpHeader)) {
+                    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
+                    if (HDR_LEN > sizeof(TcpHeader)) {
                         const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
-                        size_t opts_len = hdr_len - sizeof(TcpHeader);
-                        for (size_t i = 0; i < opts_len;) {
+                        size_t const OPTS_LEN = HDR_LEN - sizeof(TcpHeader);
+                        for (size_t i = 0; i < OPTS_LEN;) {
                             if (opts[i] == 0) {
                                 break;
                             }
@@ -262,23 +271,23 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                                 i++;
                                 continue;
                             }
-                            if (i + 1 >= opts_len) {
+                            if (i + 1 >= OPTS_LEN) {
                                 break;
                             }
-                            uint8_t opt_len = opts[i + 1];
-                            if (opt_len < 2 || i + opt_len > opts_len) {
+                            uint8_t const OPT_LEN = opts[i + 1];
+                            if (OPT_LEN < 2 || i + OPT_LEN > OPTS_LEN) {
                                 break;
                             }
-                            if (opts[i] == 2 && opt_len == 4) {
+                            if (opts[i] == 2 && OPT_LEN == 4) {
                                 cb->snd_mss = ntohs(*reinterpret_cast<const uint16_t*>(opts + i + 2));
-                            } else if (opts[i] == 3 && opt_len == 3) {
+                            } else if (opts[i] == 3 && OPT_LEN == 3) {
                                 cb->snd_wscale = opts[i + 2];
                                 cb->ws_enabled = true;
                                 if (cb->socket != nullptr) {
                                     cb->rcv_wscale = tcp_wscale_for_buf(cb->socket->rcvbuf.capacity);
                                 }
                             }
-                            i += opt_len;
+                            i += OPT_LEN;
                         }
                     }
 
@@ -320,8 +329,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     // Drop SYN-ACK retransmit entries after handshake.
                     while (cb->retransmit_head != nullptr) {
                         auto* entry = cb->retransmit_head;
-                        uint32_t entry_end = entry->seq + static_cast<uint32_t>(entry->len);
-                        if (!tcp_seq_after(entry_end, seg_ack)) {
+                        uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
+                        if (!tcp_seq_after(ENTRY_END, seg_ack)) {
                             cb->retransmit_head = entry->next;
                             if (cb->retransmit_head == nullptr) {
                                 cb->retransmit_tail = nullptr;
@@ -338,13 +347,13 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
                     // Release cb->lock before tcp_find_listener (takes tcb_list_lock).
                     Socket* child_sock = cb->socket;
-                    uint32_t saved_local_ip = cb->local_ip;
-                    uint16_t saved_local_port = cb->local_port;
+                    uint32_t const SAVED_LOCAL_IP = cb->local_ip;
+                    uint16_t const SAVED_LOCAL_PORT = cb->local_port;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
                     if (child_sock != nullptr) {
                         child_sock->state = SocketState::CONNECTED;
-                        TcpCB* listener = tcp_find_listener(saved_local_ip, saved_local_port);
+                        TcpCB* listener = tcp_find_listener(SAVED_LOCAL_IP, SAVED_LOCAL_PORT);
 #ifdef TCP_DEBUG
                         ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", saved_local_port,
                                            static_cast<void*>(listener),
@@ -352,8 +361,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 #endif
                         if (listener != nullptr && listener->socket != nullptr) {
                             Socket* lsock = listener->socket;
-                            uint64_t lsock_flags = lsock->lock.lock_irqsave();
-                            if (lsock->aq_count < static_cast<size_t>(lsock->backlog)) {
+                            uint64_t const LSOCK_FLAGS = lsock->lock.lock_irqsave();
+                            if (std::cmp_less(lsock->aq_count, lsock->backlog)) {
                                 child_sock->accept_next = nullptr;
                                 if (lsock->aq_tail != nullptr) {
                                     lsock->aq_tail->accept_next = child_sock;
@@ -366,7 +375,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 #ifdef TCP_DEBUG
                             ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: enqueued child, aq_count=%zu", lsock->aq_count);
 #endif
-                            lsock->lock.unlock_irqrestore(lsock_flags);
+                            lsock->lock.unlock_irqrestore(LSOCK_FLAGS);
                             wake_socket(lsock);
                         } else {
 #ifdef TCP_DEBUG
@@ -380,10 +389,10 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
                     if (payload_len > 0 && child_sock != nullptr) {
                         cb_lock_flags = cb->lock.lock_irqsave();
-                        if (seg_seq == cb->rcv_nxt) {
-                            ssize_t written = child_sock->rcvbuf.write(payload, payload_len);
-                            if (written > 0) {
-                                cb->rcv_nxt += static_cast<uint32_t>(written);
+                        if (SEG_SEQ == cb->rcv_nxt) {
+                            ssize_t const WRITTEN = child_sock->rcvbuf.write(payload, payload_len);
+                            if (WRITTEN > 0) {
+                                cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                                 cb->rcv_wnd = child_sock->rcvbuf.free_space();
                             }
                             build_deferred_ack();
@@ -439,11 +448,11 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             process_stream_ack();
 
-            if (payload_len > 0 && seg_seq == cb->rcv_nxt) {
+            if (payload_len > 0 && SEG_SEQ == cb->rcv_nxt) {
                 if (cb->socket != nullptr) {
-                    ssize_t written = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (written > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(written);
+                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
+                    if (WRITTEN > 0) {
+                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         deferred_wake = true;
                     } else {
                         ker::mod::dbg::log("[net] RCVBUF FULL port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port,
@@ -456,8 +465,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 // records during key exchange. ACK those immediately; relying
                 // on the delayed-ACK timer here can stall the peer if the timer
                 // worker is not scheduled quickly enough under early boot/load.
-                const bool ack_immediately = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
-                if (ack_immediately) {
+                const bool ACK_IMMEDIATELY = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
+                if (ACK_IMMEDIATELY) {
                     cb->segs_pending_ack = 0;
                     cb->delayed_ack_deadline = 0;
                     build_deferred_ack();
@@ -487,14 +496,14 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 cb->segs_pending_ack = 0;
                 cb->delayed_ack_deadline = 0;
                 build_deferred_ack();
-            } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(seg_seq, cb->rcv_nxt)) {
+            } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(SEG_SEQ, cb->rcv_nxt)) {
                 // Keepalive probe
                 build_deferred_ack();
             }
 
             // FIN: ACK immediately and cancel delayed ACK.
             if ((flags & TCP_FIN) != 0) {
-                cb->rcv_nxt = seg_seq + static_cast<uint32_t>(payload_len) + 1;
+                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
                 cb->segs_pending_ack = 0;
                 cb->delayed_ack_deadline = 0;
                 cb->keepalive_deadline = 0;
@@ -538,8 +547,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
                     while (cb->retransmit_head != nullptr) {
                         auto* entry = cb->retransmit_head;
-                        uint32_t entry_end = entry->seq + static_cast<uint32_t>(entry->len);
-                        if (!tcp_seq_after(entry_end, seg_ack)) {
+                        uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
+                        if (!tcp_seq_after(ENTRY_END, seg_ack)) {
                             cb->retransmit_head = entry->next;
                             if (cb->retransmit_head == nullptr) {
                                 cb->retransmit_tail = nullptr;
@@ -560,7 +569,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     // Full ACK includes our FIN.
                     if (seg_ack == cb->snd_nxt) {
                         if ((flags & TCP_FIN) != 0) {
-                            cb->rcv_nxt = seg_seq + static_cast<uint32_t>(payload_len) + 1;
+                            cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
                             build_deferred_ack();
                             drain_retransmit_queue(cb);
                             cb->state = TcpState::TIME_WAIT;
@@ -575,16 +584,16 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 }
             }
             if ((flags & TCP_FIN) != 0 && cb->state == TcpState::FIN_WAIT_1) {
-                cb->rcv_nxt = seg_seq + static_cast<uint32_t>(payload_len) + 1;
+                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
                 build_deferred_ack();
                 cb->state = TcpState::CLOSING;
                 deferred_wake = true;
             }
             if (payload_len > 0 && cb->socket != nullptr) {
-                if (seg_seq == cb->rcv_nxt) {
-                    ssize_t written = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (written > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(written);
+                if (SEG_SEQ == cb->rcv_nxt) {
+                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
+                    if (WRITTEN > 0) {
+                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                     }
                     build_deferred_ack();
@@ -609,8 +618,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 tcp_free_cb(cb);
                 tcp_cb_release(cb);
 
-                uint16_t l_port = ntohs(hdr->dst_port);
-                TcpCB* listener = tcp_find_listener(dst_ip, l_port);
+                uint16_t const L_PORT = ntohs(hdr->dst_port);
+                TcpCB* listener = tcp_find_listener(dst_ip, L_PORT);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, src_ip, dst_ip);
                     tcp_cb_release(listener);
@@ -619,17 +628,17 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             }
 
             if (payload_len > 0 && cb->socket != nullptr) {
-                if (seg_seq == cb->rcv_nxt) {
-                    ssize_t written = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (written > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(written);
+                if (SEG_SEQ == cb->rcv_nxt) {
+                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
+                    if (WRITTEN > 0) {
+                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                     }
                     build_deferred_ack();
                 }
             }
             if ((flags & TCP_FIN) != 0) {
-                cb->rcv_nxt = seg_seq + static_cast<uint32_t>(payload_len) + 1;
+                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
                 build_deferred_ack();
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::TIME_WAIT;
@@ -674,8 +683,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 tcp_free_cb(cb);
                 tcp_cb_release(cb);
 
-                uint16_t l_port = ntohs(hdr->dst_port);
-                TcpCB* listener = tcp_find_listener(dst_ip, l_port);
+                uint16_t const L_PORT = ntohs(hdr->dst_port);
+                TcpCB* listener = tcp_find_listener(dst_ip, L_PORT);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, src_ip, dst_ip);
                     tcp_cb_release(listener);
@@ -727,36 +736,36 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     }
 
     const auto* hdr = reinterpret_cast<const TcpHeader*>(pkt->data);
-    uint8_t hdr_len = (hdr->data_offset >> 4) * 4;
-    if (hdr_len < sizeof(TcpHeader) || hdr_len > pkt->len) {
+    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
+    if (HDR_LEN < sizeof(TcpHeader) || HDR_LEN > pkt->len) {
         pkt_free(pkt);
         return;
     }
 
-    uint16_t stored_csum = hdr->checksum;
-    if (stored_csum != 0) {
-        uint16_t computed = pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len);
-        if (computed != 0 && computed != 0xFFFF) {
+    uint16_t const STORED_CSUM = hdr->checksum;
+    if (STORED_CSUM != 0) {
+        uint16_t const COMPUTED = pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len);
+        if (COMPUTED != 0 && COMPUTED != 0xFFFF) {
             pkt_free(pkt);
             return;
         }
     }
 
-    uint16_t dst_port = ntohs(hdr->dst_port);
-    uint16_t src_port = ntohs(hdr->src_port);
+    uint16_t const DST_PORT = ntohs(hdr->dst_port);
+    uint16_t const SRC_PORT = ntohs(hdr->src_port);
 
-    const uint8_t* payload = pkt->data + hdr_len;
-    size_t payload_len = pkt->len - hdr_len;
+    const uint8_t* payload = pkt->data + HDR_LEN;
+    size_t const PAYLOAD_LEN = pkt->len - HDR_LEN;
 
-    TcpCB* cb = tcp_find_cb(dst_ip, dst_port, src_ip, src_port);
+    TcpCB* cb = tcp_find_cb(dst_ip, DST_PORT, src_ip, SRC_PORT);
     if (cb != nullptr) {
-        tcp_process_segment(cb, hdr, payload, payload_len, src_ip, dst_ip);
+        tcp_process_segment(cb, hdr, payload, PAYLOAD_LEN, src_ip, dst_ip);
         pkt_free(pkt);
         return;
     }
 
     if ((hdr->flags & TCP_SYN) != 0 && (hdr->flags & TCP_ACK) == 0) {
-        TcpCB* listener = tcp_find_listener(dst_ip, dst_port);
+        TcpCB* listener = tcp_find_listener(dst_ip, DST_PORT);
         if (listener != nullptr) {
             handle_listen_syn(listener, hdr, src_ip, dst_ip);
             tcp_cb_release(listener);
@@ -768,16 +777,16 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     // No match: send RST.
     if ((hdr->flags & TCP_RST) == 0) {
         if ((hdr->flags & TCP_ACK) != 0) {
-            tcp_send_rst(dst_ip, src_ip, dst_port, src_port, ntohl(hdr->ack), 0, 0);
+            tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, ntohl(hdr->ack), 0, 0);
         } else {
-            uint32_t ack_seq = ntohl(hdr->seq) + static_cast<uint32_t>(payload_len);
+            uint32_t ack_seq = ntohl(hdr->seq) + static_cast<uint32_t>(PAYLOAD_LEN);
             if ((hdr->flags & TCP_SYN) != 0) {
                 ack_seq++;
             }
             if ((hdr->flags & TCP_FIN) != 0) {
                 ack_seq++;
             }
-            tcp_send_rst(dst_ip, src_ip, dst_port, src_port, 0, ack_seq, TCP_ACK);
+            tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, 0, ack_seq, TCP_ACK);
         }
     }
 

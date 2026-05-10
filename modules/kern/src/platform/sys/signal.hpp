@@ -23,6 +23,6 @@ struct SignalFrame {
 
 // Deliver one pending signal when an interrupt/scheduler path is about to
 // return directly to userspace via iretq.
-void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::interruptFrame& frame);
+void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 
 }  // namespace ker::mod::sys::signal

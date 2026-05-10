@@ -60,20 +60,20 @@ bits 64
 
 ; Kernel-mode idle loop - used when there are no user tasks to run
 ; This runs in ring 0 and just halts, waiting for interrupts
-global _wOS_kernel_idle_loop
-_wOS_kernel_idle_loop:
+global wos_kernel_idle_loop
+wos_kernel_idle_loop:
     sti         ; Enable interrupts
     hlt         ; Halt until interrupt
-    jmp _wOS_kernel_idle_loop  ; Loop forever
+    jmp wos_kernel_idle_loop  ; Loop forever
 
-extern _wOS_kernel_thread_returned
-global _wOS_kernel_thread_trampoline
-_wOS_kernel_thread_trampoline:
+extern wos_kernel_thread_returned
+global wos_kernel_thread_trampoline
+wos_kernel_thread_trampoline:
     ; Kernel thread tasks enter here via iretq with rdi = entry function and
     ; rsp 16-byte aligned. Calling the entry gives C++ the normal SysV stack
     ; shape: callee entry sees rsp % 16 == 8 and has a real return address.
     call rdi
-    call _wOS_kernel_thread_returned
+    call wos_kernel_thread_returned
 .kernel_thread_return_halt:
     cli
     hlt
@@ -90,20 +90,20 @@ wos_start_kernel_thread:
     mov rsp, rdi
     mov rdi, rsi
     sti
-    jmp _wOS_kernel_thread_trampoline
+    jmp wos_kernel_thread_trampoline
 
-global _wOS_enterIdleStack
-_wOS_enterIdleStack:
+global wos_enterIdleStack
+wos_enterIdleStack:
     ; rdi = idle kernel stack top
     ;
     ; Idle has no meaningful continuation. Re-entering it directly avoids
     ; constructing a same-CPL iret frame at the very top of the idle stack.
     mov rsp, rdi
     sti
-    jmp _wOS_kernel_idle_loop
+    jmp wos_kernel_idle_loop
 
-global _wOS_asm_enterUsermode
-_wOS_asm_enterUsermode:
+global wos_asm_enter_usermode
+wos_asm_enter_usermode:
     ;clear registers
     xor rax, rax
     xor rdx, rdx
@@ -149,11 +149,11 @@ _wOS_asm_enterUsermode:
     mov r11, 0x202 ; RFLAGS IF=1 and RESERVED=1
     o64 sysret
 
-extern _wOS_schedTimer
+extern wos_sched_timer
 global task_switch_handler
 task_switch_handler:
     mov rdi, rsp
-    call _wOS_schedTimer
+    call wos_sched_timer
 
     ; Same-CPL iretq does not pop SS:RSP, so kernel-mode task switches
     ; must explicitly move to the target kernel stack first.
@@ -191,11 +191,11 @@ task_switch_handler:
 
 ; Jump to next task without saving current task state
 ; Used when a task is exiting and doesn't need its context preserved
-extern _wOS_jumpToNextTaskNoSave
+extern wos_jump_to_next_task_no_save
 global jump_to_next_task_no_save
 jump_to_next_task_no_save:
     ; Push dummy interrupt frame FIRST (will be at higher addresses)
-    ; Layout expected by C++: GPRegs at stack_ptr, interruptFrame at stack_ptr + sizeof(GPRegs)
+    ; Layout expected by C++: GPRegs at stack_ptr, InterruptFrame at stack_ptr + sizeof(GPRegs)
     push 0  ; SS
     push 0  ; RSP
     push 0  ; RFLAGS
@@ -222,7 +222,7 @@ jump_to_next_task_no_save:
     push 0  ; r15
 
     mov rdi, rsp
-    call _wOS_jumpToNextTaskNoSave
+    call wos_jump_to_next_task_no_save
 
     ; Same-CPL iretq does not restore RSP; kernel targets need a frame on
     ; their own stack.
@@ -260,19 +260,19 @@ jump_to_next_task_no_save:
 
 ; Return from deferred task switch
 ; rdi = pointer to GPRegs structure in memory
-; rsi = pointer to interruptFrame structure in memory
+; rsi = pointer to InterruptFrame structure in memory
 ;
 ; GPRegs layout (120 bytes): r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
-; interruptFrame layout (56 bytes): int_num, err_code, rip, cs, flags, rsp, ss
+; InterruptFrame layout (56 bytes): int_num, err_code, rip, cs, flags, rsp, ss
 ;
 ; We need to:
-; 1. Build a proper stack with interruptFrame for iretq
+; 1. Build a proper stack with InterruptFrame for iretq
 ; 2. Restore all GPRegs
 ; 3. Check if we need swapgs (if returning to userspace)
 ; 4. Execute iretq
 global wos_deferred_task_switch_return
 wos_deferred_task_switch_return:
-    ; rdi = GPRegs*, rsi = interruptFrame*
+    ; rdi = GPRegs*, rsi = InterruptFrame*
 
     ; Returning to a kernel-mode task is a same-CPL iretq. Build the return
     ; frame on the saved kernel stack so RSP is restored correctly.

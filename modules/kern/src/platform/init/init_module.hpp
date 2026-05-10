@@ -108,8 +108,8 @@ constexpr auto make_meta(const char* name, BootPhase phase) { return ModuleMeta{
 // Helper for creating module metadata with dependencies (variadic)
 template <typename... Deps>
 constexpr auto make_meta(const char* name, BootPhase phase, Deps... deps) {
-    std::array<Dependency, sizeof...(Deps)> dep_array{deps...};
-    return ModuleMeta{name, phase, dep_array};
+    std::array<Dependency, sizeof...(Deps)> const DEP_ARRAY{deps...};
+    return ModuleMeta{name, phase, DEP_ARRAY};
 }
 
 // Runtime module descriptor (includes function pointer)

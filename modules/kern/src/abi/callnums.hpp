@@ -5,5 +5,5 @@
 // the underlying enum storage instead of a typedef like uint64_t.
 #include <cstdint>
 namespace ker::abi {
-enum class callnums : uint64_t { sys_log, futex, threading, process, time, vfs, net, vmem, vmem_map, debug };
+enum class callnums : uint64_t { SYS_LOG, FUTEX, THREADING, PROCESS, TIME, VFS, NET, VMEM, VMEM_MAP, DEBUG };
 }  // namespace ker::abi

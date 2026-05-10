@@ -48,7 +48,7 @@ class Workqueue {
     void destroy();
 
     // Get the name of the workqueue.
-    auto name() const -> const char* { return name_; }
+    auto name() const -> const char* { return wk_name; }
 
    private:
     Workqueue() = default;
@@ -59,21 +59,21 @@ class Workqueue {
     // The actual drain loop.
     void drain_loop();
 
-    const char* name_ = nullptr;
-    task::Task* thread_ = nullptr;
+    const char* wk_name = nullptr;
+    task::Task* thread = nullptr;
 
     // FIFO of pending work items (spinlock-protected).
-    sys::Spinlock lock_;
-    WorkItem* head_ = nullptr;
-    WorkItem* tail_ = nullptr;
-    std::atomic<uint32_t> pending_count_{0};
+    sys::Spinlock lock;
+    WorkItem* head = nullptr;
+    WorkItem* tail = nullptr;
+    std::atomic<uint32_t> pending_count{0};
 
     // Flush synchronization - incremented after completing each work item.
     // flush() snapshots pending_count_ and spins until completed >= snapshot.
-    std::atomic<uint64_t> completed_count_{0};
+    std::atomic<uint64_t> completed_count{0};
 
     // Shutdown flag
-    std::atomic<bool> stopping_{false};
+    std::atomic<bool> stopping{false};
 
     // Thread-local pointer to the Workqueue that owns the current worker
     // thread (set inside worker_entry so the static entry can find the wq).

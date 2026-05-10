@@ -27,7 +27,8 @@
 namespace ker::vfs::xfs {
 
 #ifdef WOS_KASAN
-extern "C" uintptr_t __asan_region_is_poisoned(uintptr_t beg, size_t size);
+// NOLINTNEXTLINE(readability-identifier-naming)
+extern "C" auto __asan_region_is_poisoned(uintptr_t beg, size_t size) -> uintptr_t;
 #endif
 
 // ============================================================================
@@ -128,20 +129,22 @@ void inactivate_unlinked_inode(XfsInode* ip) {
     auto* tp = xfs_trans_alloc(ip->mount);
     if (tp == nullptr) {
         mod::dbg::logger<"xfs">::error("xfs_inode_release: failed to allocate inactivation transaction for inode %lu",
-                                       (unsigned long)ip->ino);
+                                       static_cast<unsigned long>(ip->ino));
         return;
     }
 
     int rc = xfs_ifree(ip->mount, tp, ip->ino);
     if (rc != 0) {
         xfs_trans_cancel(tp);
-        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree failed for inode %lu rc=%d", (unsigned long)ip->ino, rc);
+        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree failed for inode %lu rc=%d", static_cast<unsigned long>(ip->ino),
+                                       rc);
         return;
     }
 
     rc = xfs_trans_commit(tp);
     if (rc != 0) {
-        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree commit failed for inode %lu rc=%d", (unsigned long)ip->ino, rc);
+        mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree commit failed for inode %lu rc=%d",
+                                       static_cast<unsigned long>(ip->ino), rc);
     }
 }
 
@@ -235,7 +238,7 @@ void xfs_icache_init() {
 
 void xfs_icache_purge(XfsMountContext* mount) {
     for (auto& i : icache) {
-        uint64_t flags = i.lock.lock_irqsave();
+        uint64_t const FLAGS = i.lock.lock_irqsave();
         XfsInode** pp = &i.head;
         while (*pp != nullptr) {
             XfsInode* ip = *pp;
@@ -247,7 +250,7 @@ void xfs_icache_purge(XfsMountContext* mount) {
                 pp = &ip->hash_next;
             }
         }
-        i.lock.unlock_irqrestore(flags);
+        i.lock.unlock_irqrestore(FLAGS);
     }
 }
 
@@ -258,63 +261,65 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
 
     xfs_icache_init();
 
-    size_t bucket = icache_hash(ino);
+    size_t const BUCKET = icache_hash(ino);
 
     // Check cache first
-    uint64_t flags = icache[bucket].lock.lock_irqsave();
-    XfsInode* ip = icache_lookup_locked(ino, bucket);
+    uint64_t flags = icache[BUCKET].lock.lock_irqsave();
+    XfsInode* ip = icache_lookup_locked(ino, BUCKET);
     if (ip != nullptr) {
-        icache[bucket].lock.unlock_irqrestore(flags);
+        icache[BUCKET].lock.unlock_irqrestore(flags);
         return ip;
     }
-    icache[bucket].lock.unlock_irqrestore(flags);
+    icache[BUCKET].lock.unlock_irqrestore(flags);
 
     // Not in cache - read from disk
-    xfs_fsblock_t block = xfs_inode_block(mount, ino);
-    size_t offset = xfs_inode_offset(mount, ino);
+    xfs_fsblock_t const BLOCK = xfs_inode_block(mount, ino);
+    size_t const OFFSET = xfs_inode_offset(mount, ino);
 
-    BufHead* bh = xfs_buf_read(mount, block);
+    BufHead* bh = xfs_buf_read(mount, BLOCK);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] failed to read inode %lu block %lu", (unsigned long)ino, (unsigned long)block);
+        mod::dbg::log("[xfs] failed to read inode %lu block %lu", static_cast<unsigned long>(ino), static_cast<unsigned long>(BLOCK));
         return nullptr;
     }
 
-    if (offset + mount->inode_size > bh->size) {
-        mod::dbg::log("[xfs] inode %lu: offset %lu + size %u exceeds block size %lu", (unsigned long)ino, (unsigned long)offset,
-                      mount->inode_size, (unsigned long)bh->size);
+    if (OFFSET + mount->inode_size > bh->size) {
+        mod::dbg::log("[xfs] inode %lu: offset %lu + size %u exceeds block size %lu", static_cast<unsigned long>(ino),
+                      static_cast<unsigned long>(OFFSET), mount->inode_size, static_cast<unsigned long>(bh->size));
         brelse(bh);
         return nullptr;
     }
 
-    const auto* dip = reinterpret_cast<const XfsDinode*>(bh->data + offset);
+    const auto* dip = reinterpret_cast<const XfsDinode*>(bh->data + OFFSET);
 
     // Validate magic
     if (dip->di_magic.to_cpu() != XFS_DINODE_MAGIC) {
-        mod::dbg::log("[xfs] inode %lu: bad magic 0x%x", (unsigned long)ino, dip->di_magic.to_cpu());
+        mod::dbg::log("[xfs] inode %lu: bad magic 0x%x", static_cast<unsigned long>(ino), dip->di_magic.to_cpu());
         brelse(bh);
         return nullptr;
     }
 
     // Verify version
     if (dip->di_version != 3) {
-        mod::dbg::log("[xfs] inode %lu: unsupported version %u", (unsigned long)ino, dip->di_version);
+        mod::dbg::log("[xfs] inode %lu: unsupported version %u", static_cast<unsigned long>(ino), dip->di_version);
         brelse(bh);
         return nullptr;
     }
 
 #ifdef WOS_KASAN
-    if (uintptr_t poisoned = __asan_region_is_poisoned(reinterpret_cast<uintptr_t>(dip), mount->inode_size); poisoned != 0) {
-        mod::dbg::log("[xfs] inode %lu: poisoned inode buffer bh=%p data=%p size=%lu block=%lu offset=%lu bad=0x%lx", (unsigned long)ino,
-                      (void*)bh, (void*)bh->data, (unsigned long)bh->size, (unsigned long)block, (unsigned long)offset,
-                      (unsigned long)poisoned);
+    if (uintptr_t const POISONED = __asan_region_is_poisoned(reinterpret_cast<uintptr_t>(dip), mount->inode_size); POISONED != 0) {
+        mod::dbg::log("[xfs] inode %lu: poisoned inode buffer bh=%p data=%p size=%lu block=%lu offset=%lu bad=0x%lx",
+                      static_cast<unsigned long>(ino), reinterpret_cast<void*>(bh), reinterpret_cast<void*>(bh->data),
+                      static_cast<unsigned long>(bh->size), static_cast<unsigned long>(BLOCK), static_cast<unsigned long>(OFFSET),
+                      static_cast<unsigned long>(POISONED));
         brelse(bh);
         return nullptr;
     }
 #endif
     // Verify CRC
-    uint32_t computed = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
-    if (computed != dip->di_crc) {
-        mod::dbg::log("[xfs] inode %lu: CRC mismatch (computed 0x%x, on-disk 0x%x)", (unsigned long)ino, computed, dip->di_crc);
+    uint32_t const COMPUTED = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
+    if (COMPUTED != dip->di_crc) {
+        mod::dbg::log("[xfs] inode %lu: CRC mismatch (computed 0x%x, on-disk 0x%x)", static_cast<unsigned long>(ino), COMPUTED,
+                      dip->di_crc);
         brelse(bh);
         return nullptr;
     }
@@ -344,11 +349,11 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
 
     // NREXT64: extent counts are stored in different fields
     if (xfs_has_nrext64(mount)) {
-        // Data extent count in di_pad[0..7] as __be64 (di_big_nextents)
-        __be64 big_nextents_be{};
-        __builtin_memcpy(&big_nextents_be, dip->di_pad.data(), sizeof(__be64));
+        // Data extent count in di_pad[0..7] as Be64 (di_big_nextents)
+        Be64 big_nextents_be{};
+        __builtin_memcpy(&big_nextents_be, dip->di_pad.data(), sizeof(Be64));
         ip->nextents = static_cast<uint32_t>(big_nextents_be.to_cpu());
-        // Attr extent count in di_nextents as __be32 (di_big_anextents)
+        // Attr extent count in di_nextents as Be32 (di_big_anextents)
         ip->anextents = dip->di_nextents.to_cpu();
     } else {
         ip->nextents = dip->di_nextents.to_cpu();
@@ -357,19 +362,19 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     ip->forkoff = dip->di_forkoff;
 
     // Compute fork sizes
-    size_t inode_core_size = xfs_dinode_size(dip->di_version);
-    size_t inode_total = mount->inode_size;
-    size_t data_fork_start = inode_core_size;
-    size_t attr_fork_start = (dip->di_forkoff != 0) ? xfs_dinode_attr_fork_off(dip) : inode_total;
-    size_t data_fork_size = attr_fork_start - data_fork_start;
-    size_t attr_fork_size = inode_total - attr_fork_start;
+    size_t const INODE_CORE_SIZE = xfs_dinode_size(dip->di_version);
+    size_t const INODE_TOTAL = mount->inode_size;
+    size_t const DATA_FORK_START = INODE_CORE_SIZE;
+    size_t const ATTR_FORK_START = (dip->di_forkoff != 0) ? xfs_dinode_attr_fork_off(dip) : INODE_TOTAL;
+    size_t const DATA_FORK_SIZE = ATTR_FORK_START - DATA_FORK_START;
+    size_t const ATTR_FORK_SIZE = INODE_TOTAL - ATTR_FORK_START;
 
-    const uint8_t* inode_data = bh->data + offset;
+    const uint8_t* inode_data = bh->data + OFFSET;
 
     // Parse data fork
-    int rc = parse_ifork(&ip->data_fork, dip->di_format, inode_data + data_fork_start, data_fork_size, ip->nextents);
+    int rc = parse_ifork(&ip->data_fork, dip->di_format, inode_data + DATA_FORK_START, DATA_FORK_SIZE, ip->nextents);
     if (rc != 0) {
-        mod::dbg::log("[xfs] inode %lu: failed to parse data fork (%d)", (unsigned long)ino, rc);
+        mod::dbg::log("[xfs] inode %lu: failed to parse data fork (%d)", static_cast<unsigned long>(ino), rc);
         brelse(bh);
         delete ip;
         return nullptr;
@@ -377,11 +382,11 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
 
     // Parse attribute fork (if present)
     ip->has_attr_fork = (dip->di_forkoff != 0);
-    if (ip->has_attr_fork && attr_fork_size > 0) {
+    if (ip->has_attr_fork && ATTR_FORK_SIZE > 0) {
         rc =
-            parse_ifork(&ip->attr_fork, static_cast<uint8_t>(dip->di_aformat), inode_data + attr_fork_start, attr_fork_size, ip->anextents);
+            parse_ifork(&ip->attr_fork, static_cast<uint8_t>(dip->di_aformat), inode_data + ATTR_FORK_START, ATTR_FORK_SIZE, ip->anextents);
         if (rc != 0) {
-            mod::dbg::log("[xfs] inode %lu: failed to parse attr fork (%d)", (unsigned long)ino, rc);
+            mod::dbg::log("[xfs] inode %lu: failed to parse attr fork (%d)", static_cast<unsigned long>(ino), rc);
             free_ifork(&ip->data_fork);
             brelse(bh);
             delete ip;
@@ -400,16 +405,16 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     ip->hash_next = nullptr;
     ip->dirty = false;
 
-    flags = icache[bucket].lock.lock_irqsave();
+    flags = icache[BUCKET].lock.lock_irqsave();
     // Check for a race - another thread might have loaded the same inode
-    XfsInode* existing = icache_lookup_locked(ino, bucket);
+    XfsInode* existing = icache_lookup_locked(ino, BUCKET);
     if (existing != nullptr) {
-        icache[bucket].lock.unlock_irqrestore(flags);
+        icache[BUCKET].lock.unlock_irqrestore(flags);
         free_inode(ip);
         return existing;
     }
-    icache_insert_locked(ip, bucket);
-    icache[bucket].lock.unlock_irqrestore(flags);
+    icache_insert_locked(ip, BUCKET);
+    icache[BUCKET].lock.unlock_irqrestore(flags);
 
     return ip;
 }
@@ -419,23 +424,23 @@ void xfs_inode_release(XfsInode* ip) {
         return;
     }
 
-    size_t bucket = icache_hash(ip->ino);
-    uint64_t flags = icache[bucket].lock.lock_irqsave();
+    size_t const BUCKET = icache_hash(ip->ino);
+    uint64_t const FLAGS = icache[BUCKET].lock.lock_irqsave();
 
     ip->refcount--;
     if (ip->refcount <= 0) {
         // Inode is no longer referenced - remove from cache and free
-        bool needs_inactivation = (ip->nlink == 0);
-        icache_remove_locked(ip, bucket);
-        icache[bucket].lock.unlock_irqrestore(flags);
-        if (needs_inactivation) {
+        bool const NEEDS_INACTIVATION = (ip->nlink == 0);
+        icache_remove_locked(ip, BUCKET);
+        icache[BUCKET].lock.unlock_irqrestore(FLAGS);
+        if (NEEDS_INACTIVATION) {
             inactivate_unlinked_inode(ip);
         }
         free_inode(ip);
         return;
     }
 
-    icache[bucket].lock.unlock_irqrestore(flags);
+    icache[BUCKET].lock.unlock_irqrestore(FLAGS);
 }
 
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
@@ -444,32 +449,32 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     }
 
     XfsMountContext* mount = ip->mount;
-    xfs_fsblock_t block = xfs_inode_block(mount, ip->ino);
-    size_t offset = xfs_inode_offset(mount, ip->ino);
+    xfs_fsblock_t const BLOCK = xfs_inode_block(mount, ip->ino);
+    size_t const OFFSET = xfs_inode_offset(mount, ip->ino);
 
-    BufHead* bh = xfs_buf_read(mount, block);
+    BufHead* bh = xfs_buf_read(mount, BLOCK);
     if (bh == nullptr) {
-        mod::dbg::log("[xfs] inode write: failed to read block %lu", (unsigned long)block);
+        mod::dbg::log("[xfs] inode write: failed to read block %lu", static_cast<unsigned long>(BLOCK));
         return -EIO;
     }
 
-    if (offset + mount->inode_size > bh->size) {
+    if (OFFSET + mount->inode_size > bh->size) {
         brelse(bh);
         return -EIO;
     }
 
-    auto* dip = reinterpret_cast<XfsDinode*>(bh->data + offset);
+    auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
 
     // Serialize core fields back to on-disk format
-    dip->di_mode = __be16::from_cpu(ip->mode);
-    dip->di_uid = __be32::from_cpu(ip->uid);
-    dip->di_gid = __be32::from_cpu(ip->gid);
-    dip->di_nlink = __be32::from_cpu(ip->nlink);
-    dip->di_size = __be64::from_cpu(ip->size);
-    dip->di_nblocks = __be64::from_cpu(ip->nblocks);
-    dip->di_gen = __be32::from_cpu(ip->gen);
-    dip->di_flags = __be16::from_cpu(ip->flags);
-    dip->di_flags2 = __be64::from_cpu(ip->flags2);
+    dip->di_mode = Be16::from_cpu(ip->mode);
+    dip->di_uid = Be32::from_cpu(ip->uid);
+    dip->di_gid = Be32::from_cpu(ip->gid);
+    dip->di_nlink = Be32::from_cpu(ip->nlink);
+    dip->di_size = Be64::from_cpu(ip->size);
+    dip->di_nblocks = Be64::from_cpu(ip->nblocks);
+    dip->di_gen = Be32::from_cpu(ip->gen);
+    dip->di_flags = Be16::from_cpu(ip->flags);
+    dip->di_flags2 = Be64::from_cpu(ip->flags2);
 
     dip->di_atime = xfs_timestamp_t::from_cpu(ip->atime);
     dip->di_mtime = xfs_timestamp_t::from_cpu(ip->mtime);
@@ -478,21 +483,21 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
     // NREXT64: extent counts are stored in different fields (mirrors read path)
     if (xfs_has_nrext64(mount)) {
-        // Data extent count => di_pad[0..7] as __be64
-        __be64 big_nextents_be = __be64::from_cpu(static_cast<uint64_t>(ip->nextents));
-        __builtin_memcpy(dip->di_pad.data(), &big_nextents_be, sizeof(__be64));
-        // Attr extent count => di_nextents as __be32
-        dip->di_nextents = __be32::from_cpu(static_cast<uint32_t>(ip->anextents));
+        // Data extent count => di_pad[0..7] as Be64
+        Be64 big_nextents_be = Be64::from_cpu(static_cast<uint64_t>(ip->nextents));
+        __builtin_memcpy(dip->di_pad.data(), &big_nextents_be, sizeof(Be64));
+        // Attr extent count => di_nextents as Be32
+        dip->di_nextents = Be32::from_cpu(static_cast<uint32_t>(ip->anextents));
     } else {
-        dip->di_nextents = __be32::from_cpu(ip->nextents);
-        dip->di_anextents = __be16::from_cpu(ip->anextents);
+        dip->di_nextents = Be32::from_cpu(ip->nextents);
+        dip->di_anextents = Be16::from_cpu(ip->anextents);
     }
     dip->di_forkoff = ip->forkoff;
     dip->di_format = static_cast<uint8_t>(ip->data_fork.format);
 
     // Serialize data fork
-    size_t inode_core_size = xfs_dinode_size(dip->di_version);
-    uint8_t* fork_data = bh->data + offset + inode_core_size;
+    size_t const INODE_CORE_SIZE = xfs_dinode_size(dip->di_version);
+    uint8_t* fork_data = bh->data + OFFSET + INODE_CORE_SIZE;
 
     switch (ip->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
@@ -523,8 +528,8 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     // Serialize attribute fork (if present)
     if (ip->has_attr_fork && ip->forkoff > 0) {
         dip->di_aformat = static_cast<int8_t>(ip->attr_fork.format);
-        size_t attr_fork_offset = static_cast<size_t>(ip->forkoff) << 3;
-        uint8_t* attr_data = fork_data + attr_fork_offset;
+        size_t const ATTR_FORK_OFFSET = static_cast<size_t>(ip->forkoff) << 3;
+        uint8_t* attr_data = fork_data + ATTR_FORK_OFFSET;
 
         switch (ip->attr_fork.format) {
             case XFS_DINODE_FMT_LOCAL:
@@ -554,12 +559,12 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
     // Recompute the CRC over the entire inode
     dip->di_crc = 0;
-    uint32_t crc = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
-    dip->di_crc = crc;  // di_crc is stored little-endian on disk
+    uint32_t const CRC = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
+    dip->di_crc = CRC;  // di_crc is stored little-endian on disk
 
     // Log the inode buffer through the transaction
     if (tp != nullptr) {
-        xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(offset), static_cast<uint32_t>(mount->inode_size));
+        xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(OFFSET), static_cast<uint32_t>(mount->inode_size));
     }
     brelse(bh);
 

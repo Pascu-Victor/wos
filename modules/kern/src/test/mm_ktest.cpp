@@ -28,7 +28,7 @@ KTEST(MM, PageAllocWriteReadback) {
 
 KTEST(MM, MultiplePageAllocFree) {
     constexpr int N = 8;
-    void* pages[N] = {};
+    void const const const const const const const const const const const const const const const* pages[N] = {};
     for (int i = 0; i < N; ++i) {
         pages[i] = phys::page_alloc();
         KEXPECT_NE(pages[i], nullptr);
@@ -60,8 +60,8 @@ KTEST(MM, RefCountBasic) {
     phys::page_ref_inc(page);
     KEXPECT_EQ(phys::page_ref_get(page), 2U);
     // Drop back to 1
-    uint32_t remaining = phys::page_ref_dec(page);
-    KEXPECT_EQ(remaining, 1U);
+    uint32_t const REMAINING = phys::page_ref_dec(page);
+    KEXPECT_EQ(REMAINING, 1U);
     // Final free
     phys::page_free(page);
 }

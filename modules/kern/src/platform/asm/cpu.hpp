@@ -52,6 +52,8 @@ struct PerCpu {
 } __attribute__((packed));
 
 static ALWAYS_INLINE uint64_t rdfsbase() {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t fsbase = 0;
 
     asm volatile("rdfsbase %0" : "=r"(fsbase)::"memory");
@@ -60,6 +62,8 @@ static ALWAYS_INLINE uint64_t rdfsbase() {
 }
 
 static ALWAYS_INLINE uint64_t rdgsbase() {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t gsbase = 0;
 
     asm volatile("rdgsbase %0" : "=r"(gsbase)::"memory");

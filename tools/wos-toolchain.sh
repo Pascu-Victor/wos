@@ -5,14 +5,36 @@
 # Layout:
 #   toolchain/host/    - host LLVM binaries (clang, lld, llvm-ar, etc.)
 #   toolchain/sysroot/ - WOS target libraries and headers only
-set -e
+set -euo pipefail
 
-B=$(pwd)/toolchain
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$WORKSPACE_ROOT"
+
+B="$WORKSPACE_ROOT/toolchain"
 OLD_PATH=$PATH
 TARGET_ARCH=x86_64-pc-wos
 HOST=$B/host
 SYSROOT=$B/sysroot
 export NINJA_STATUS="[%f/%t %e] "
+
+meson_setup_rerunnable() {
+    local build_dir="$1"
+    shift
+
+    if [ -d "$build_dir/meson-private" ] || [ -f "$build_dir/build.ninja" ]; then
+        if meson setup --reconfigure "$build_dir" "$@"; then
+            return 0
+        fi
+
+        echo "Meson reconfigure failed for $build_dir, retrying with --wipe..."
+        meson setup --wipe "$build_dir" "$@"
+        return 0
+    fi
+
+    meson setup "$build_dir" "$@"
+}
 
 if [ ! -x "$HOST/bin/clang" ]; then
     echo "ERROR: Host toolchain not found at $HOST/bin/clang"
@@ -50,8 +72,7 @@ EOF
 
 # Build mlibc headers
 mkdir -p $B/mlibc-headers
-cd $B/mlibc-headers
-meson setup --prefix=$SYSROOT \
+meson_setup_rerunnable "$B/mlibc-headers" --prefix=$SYSROOT \
     --libdir=lib \
     --includedir=include \
     -Dheaders_only=true \
@@ -62,6 +83,7 @@ meson setup --prefix=$SYSROOT \
     -Dglibc_option=enabled \
     -Db_staticpic=disabled \
     $B/src/mlibc
+cd $B/mlibc-headers
 ninja install
 
 # Create minimal CRT files for compiler-rt build (these will be replaced by mlibc later)
@@ -202,9 +224,7 @@ export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 export LDFLAGS="--sysroot=$SYSROOT"
 
 mkdir -p $B/mlibc-build
-cd $B/mlibc-build
-
-meson setup --prefix=$SYSROOT \
+meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   --sysconfdir=etc \
   --buildtype=release \
   --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
@@ -218,7 +238,7 @@ meson setup --prefix=$SYSROOT \
   -Dbsd_option=enabled \
   -Db_sanitize=none \
   $B/src/mlibc
-
+cd $B/mlibc-build
 ninja && ninja install
 
 # 5. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)

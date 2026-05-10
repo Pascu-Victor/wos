@@ -2,10 +2,10 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
-#include <platform/dbg/dbg.hpp>
 
 namespace ker::net {
 

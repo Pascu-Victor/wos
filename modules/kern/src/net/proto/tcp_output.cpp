@@ -17,11 +17,11 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         return false;
     }
 
-    const size_t seq_len = len + (((flags & TCP_SYN) != 0) ? 1U : 0U) + (((flags & TCP_FIN) != 0) ? 1U : 0U);
+    const size_t SEQ_LEN = len + (((flags & TCP_SYN) != 0) ? 1U : 0U) + (((flags & TCP_FIN) != 0) ? 1U : 0U);
     PacketBuffer* rtx_pkt = nullptr;
     RetransmitEntry* rtx_entry = nullptr;
 
-    if (seq_len > 0) {
+    if (SEQ_LEN > 0) {
         rtx_pkt = pkt_alloc_tx();
         if (rtx_pkt == nullptr) {
             ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu)", ker::net::pkt_pool_free_count());
@@ -47,7 +47,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     local_ip = cb->local_ip;
     remote_ip = cb->remote_ip;
 
-    const uint32_t seq = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
+    const uint32_t SEQ = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
 
     // SYN options: MSS + WSCALE.
     uint8_t options[8] = {};
@@ -63,12 +63,12 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         opts_len = 8;
     }
 
-    size_t hdr_len = sizeof(TcpHeader) + opts_len;
-    size_t total = hdr_len + len;
+    size_t const HDR_LEN = sizeof(TcpHeader) + opts_len;
+    size_t const TOTAL = HDR_LEN + len;
 
-    auto* payload = pkt->put(total);
+    auto* payload = pkt->put(TOTAL);
     if (len > 0 && data != nullptr) {
-        std::memcpy(payload + hdr_len, data, len);
+        std::memcpy(payload + HDR_LEN, data, len);
     }
 
     if (opts_len > 0) {
@@ -78,13 +78,13 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     auto* hdr = reinterpret_cast<TcpHeader*>(payload);
     hdr->src_port = htons(cb->local_port);
     hdr->dst_port = htons(cb->remote_port);
-    hdr->seq = htonl(seq);
+    hdr->seq = htonl(SEQ);
     if ((flags & TCP_ACK) != 0) {
         hdr->ack = htonl(cb->rcv_nxt);
     } else {
         hdr->ack = 0;
     }
-    hdr->data_offset = static_cast<uint8_t>((hdr_len / 4) << 4);
+    hdr->data_offset = static_cast<uint8_t>((HDR_LEN / 4) << 4);
     hdr->flags = flags;
     // SYN window is not scaled (RFC 1323).
     if ((flags & TCP_SYN) != 0 || !cb->ws_enabled) {
@@ -118,8 +118,8 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
 
     if (rtx_pkt != nullptr && rtx_entry != nullptr) {
         rtx_entry->pkt = rtx_pkt;
-        rtx_entry->seq = seq;
-        rtx_entry->len = seq_len;
+        rtx_entry->seq = SEQ;
+        rtx_entry->len = SEQ_LEN;
         rtx_entry->send_time_ms = tcp_now_ms();
         rtx_entry->retries = 0;
         rtx_entry->next = nullptr;

@@ -144,8 +144,8 @@ constexpr auto blk_ring_data_size(uint32_t slot_count, uint32_t slot_size) -> ui
 
 // Total zone size (page-aligned upward, 4KB pages)
 constexpr auto blk_ring_zone_size(uint32_t sq_depth, uint32_t cq_depth, uint32_t slot_count, uint32_t slot_size) -> uint32_t {
-    uint32_t raw = blk_ring_data_offset(sq_depth, cq_depth) + blk_ring_data_size(slot_count, slot_size);
-    return (raw + 0xFFFU) & ~0xFFFU;
+    uint32_t const RAW = blk_ring_data_offset(sq_depth, cq_depth) + blk_ring_data_size(slot_count, slot_size);
+    return (RAW + 0xFFFU) & ~0xFFFU;
 }
 
 // Default zone size with default parameters

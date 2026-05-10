@@ -1,7 +1,8 @@
 #include "null_device.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <vfs/file.hpp>
 
 #include "dev/device.hpp"
@@ -42,7 +43,9 @@ int zero_open(ker::vfs::File* /*file*/) { return 0; }
 int zero_close(ker::vfs::File* /*file*/) { return 0; }
 
 ssize_t zero_read(ker::vfs::File* /*file*/, void* buf, size_t count) {
-    if (buf == nullptr) return -1;
+    if (buf == nullptr) {
+        return -1;
+    }
     std::memset(buf, 0, count);
     return static_cast<ssize_t>(count);
 }

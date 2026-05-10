@@ -1,9 +1,9 @@
 #include "futex.hpp"
 
 #include <abi/callnums/futex.h>
-#include <errno.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -13,7 +13,6 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
-#include <platform/sys/spinlock.hpp>
 #include <util/hashtable.hpp>
 
 namespace ker::syscall::futex {
@@ -23,9 +22,9 @@ namespace ker::syscall::futex {
 // ============================================================================
 
 struct FutexWaiter {
-    uint64_t phys_addr;                // Physical address of the futex (for uniqueness across processes)
-    uint64_t task_pid;                 // PID of the waiting task
-    uint64_t task_cpu;                 // CPU the task was running on
+    uint64_t phys_addr{};              // Physical address of the futex (for uniqueness across processes)
+    uint64_t task_pid{};               // PID of the waiting task
+    uint64_t task_cpu{};               // CPU the task was running on
     FutexWaiter* hash_next = nullptr;  // intrusive chain for hash table
 };
 
@@ -39,7 +38,7 @@ static ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash
 static bool futex_table_initialized = false;
 
 static void ensure_futex_table() {
-    if (__builtin_expect(!futex_table_initialized, false)) {
+    if (__builtin_expect(static_cast<long>(!futex_table_initialized), 0) != 0) {
         futex_table.init(256);
         futex_table_initialized = true;
     }
@@ -50,13 +49,13 @@ static void ensure_futex_table() {
 // ============================================================================
 
 uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
-    auto futexOp = static_cast<abi::futex::futex_ops>(op);
+    auto futex_op = static_cast<abi::futex::futex_ops>(op);
 
-    switch (futexOp) {
-        case abi::futex::futex_ops::futex_wait:
+    switch (futex_op) {
+        case abi::futex::futex_ops::FUTEX_WAIT:
             return static_cast<uint64_t>(futex_wait(reinterpret_cast<int*>(a1), static_cast<int>(a2), reinterpret_cast<const void*>(a3)));
 
-        case abi::futex::futex_ops::futex_wake:
+        case abi::futex::futex_ops::FUTEX_WAKE:
             return static_cast<uint64_t>(futex_wake(reinterpret_cast<int*>(a1)));
 
         default:
@@ -68,7 +67,7 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
 // futex_wait - Block until woken or value changes
 // ============================================================================
 
-int64_t futex_wait(int* addr, int expected, const void* timeout) {
+int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     (void)timeout;  // TODO: Implement timeout support
     ensure_futex_table();
 
@@ -79,22 +78,22 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
 
     // Translate user virtual address to physical address for cross-process uniqueness
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
-    uint64_t phys_addr = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
+    uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
+    if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address
     }
 
     // Read the current value at the address via HHDM
-    uint64_t phys_page = phys_addr & ~0xFFFULL;
-    uint64_t offset = phys_addr & 0xFFF;
-    int* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(phys_page) + offset);
+    uint64_t const PHYS_PAGE = PHYS_ADDR & ~0xFFFULL;
+    uint64_t const OFFSET = PHYS_ADDR & 0xFFF;
+    int const* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(PHYS_PAGE) + OFFSET);
 
     // Allocate a waiter node
     auto* waiter = new (std::nothrow) FutexWaiter{};
     if (waiter == nullptr) {
         return -ENOMEM;
     }
-    waiter->phys_addr = phys_addr;
+    waiter->phys_addr = PHYS_ADDR;
     waiter->task_pid = current_task->pid;
     waiter->task_cpu = current_task->cpu;
     waiter->hash_next = nullptr;
@@ -106,8 +105,8 @@ int64_t futex_wait(int* addr, int expected, const void* timeout) {
     // Actually, we can rely on the hash table's bucket lock since insert acquires it.
     // But the value check must happen before insert returns. Since the hash table
     // insert is unconditional, we check first, then insert.
-    int current_value = *kernel_addr;
-    if (current_value != expected) {
+    int const CURRENT_VALUE = *kernel_addr;
+    if (CURRENT_VALUE != expected) {
         delete waiter;
         return -EAGAIN;  // Value changed, don't wait
     }
@@ -143,15 +142,15 @@ int64_t futex_wake(int* addr) {  // NOLINT
 
     // Translate user virtual address to physical address
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
-    uint64_t phys_addr = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
+    uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
+    if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address
     }
 
     int woken_count = 0;
 
     // Remove all waiters on this address and wake them
-    futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
+    futex_table.remove_all_by_key(PHYS_ADDR, [&](FutexWaiter* waiter) {
         bool own_waiter = true;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {

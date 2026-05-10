@@ -2,10 +2,9 @@
 
 #include <defines/defines.hpp>
 
-namespace std {
+namespace ker::util {
 template <typename T>
-// NOLINTNEXTLINE(readability-identifier-naming)
-class list {
+class List {
    public:
     struct Node {
         T data;
@@ -13,20 +12,20 @@ class list {
         Node* prev;
     };
 
-    list() : head(nullptr), tail(nullptr), m_size(0) {}
+    List() : head(nullptr), tail(nullptr) {}
 
-    ~list() { clear(); }
+    ~List() { clear(); }
 
-    list(const list&) = delete;
-    auto operator=(const list&) -> list& = delete;
+    List(const List&) = delete;
+    auto operator=(const List&) -> List& = delete;
 
-    list(list&& other) noexcept : head(other.head), tail(other.tail), m_size(other.m_size) {
+    List(List&& other) noexcept : head(other.head), tail(other.tail), m_size(other.m_size) {
         other.head = nullptr;
         other.tail = nullptr;
         other.m_size = 0;
     }
 
-    auto operator=(list&& other) noexcept -> list& {
+    auto operator=(List&& other) noexcept -> List& {
         if (this == &other) {
             return *this;
         }
@@ -135,9 +134,9 @@ class list {
     T* end() { return tail ? &tail->data : nullptr; }
 
     void remove(const T& data) {
-        Node* current = head;
+        Node const* current = head;
         while (current) {
-            Node* next_node = current->next;  // Save next before potentially deleting current
+            Node const* next_node = current->next;  // Save next before potentially deleting current
             if (current->data == data) {
                 if (current->prev) {
                     current->prev->next = current->next;
@@ -171,12 +170,12 @@ class list {
         m_size = 0;
     }
 
-    Node* get_head() const { return head; }
-    Node* get_tail() const { return tail; }
+    [[nodiscard]] Node* get_head() const { return head; }
+    [[nodiscard]] Node* get_tail() const { return tail; }
 
    private:
     Node* head;
     Node* tail;
-    uint64_t m_size;
+    uint64_t m_size{0};
 };
-}  // namespace std
+}  // namespace ker::util

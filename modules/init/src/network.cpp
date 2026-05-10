@@ -10,7 +10,6 @@
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <array>

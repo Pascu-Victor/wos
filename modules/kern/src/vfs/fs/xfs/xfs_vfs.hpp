@@ -27,13 +27,13 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext*;
 auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File*;
 
 // Stat a file by filesystem-relative path.
-auto xfs_stat(const char* fs_path, ker::vfs::stat* statbuf, XfsMountContext* ctx) -> int;
+auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx) -> int;
 
 // Fstat an open file descriptor.
-auto xfs_fstat(File* f, ker::vfs::stat* statbuf) -> int;
+auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 
 // Filesystem statistics (statvfs).
-auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::statvfs* buf) -> int;
+auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 
 // Change the permission bits of a file by filesystem-relative path.
 auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;

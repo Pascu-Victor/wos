@@ -11,8 +11,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
-#include <platform/dbg/dbg.hpp>
 #include <vfs/fs/xfs/xfs_attr.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_inode.hpp>
@@ -78,13 +78,13 @@ auto xfs_parent_get(XfsInode* ip, xfs_ino_t* parent_ino, uint32_t* parent_gen, u
     ctx.result = 0;
     ctx.found = false;
 
-    int rc = xfs_attr_list(ip, parent_get_cb, &ctx);
+    int const RC = xfs_attr_list(ip, parent_get_cb, &ctx);
     // xfs_attr_list returns the callback's non-zero return (1) on early stop
     if (ctx.found) {
         return ctx.result;
     }
-    if (rc < 0) {
-        return rc;
+    if (RC < 0) {
+        return RC;
     }
     return -61;  // ENOATTR / ENODATA
 }
@@ -100,8 +100,8 @@ auto xfs_parent_add(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino, u
     }
 
     XfsParentRec prec{};
-    prec.p_ino = __be64::from_cpu(parent_ino);
-    prec.p_gen = __be32::from_cpu(parent_gen);
+    prec.p_ino = Be64::from_cpu(parent_ino);
+    prec.p_gen = Be32::from_cpu(parent_gen);
 
     return xfs_attr_set(child, tp, reinterpret_cast<const uint8_t*>(&prec), sizeof(XfsParentRec), name, namelen, XFS_ATTR_PARENT);
 }
@@ -120,8 +120,8 @@ auto xfs_parent_remove(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino
     }
 
     XfsParentRec prec{};
-    prec.p_ino = __be64::from_cpu(parent_ino);
-    prec.p_gen = __be32::from_cpu(parent_gen);
+    prec.p_ino = Be64::from_cpu(parent_ino);
+    prec.p_gen = Be32::from_cpu(parent_gen);
 
     return xfs_attr_remove(child, tp, reinterpret_cast<const uint8_t*>(&prec), sizeof(XfsParentRec), XFS_ATTR_PARENT);
 }
@@ -132,9 +132,9 @@ auto xfs_parent_remove(XfsInode* child, XfsTransaction* tp, xfs_ino_t parent_ino
 
 auto xfs_parent_replace(XfsInode* child, XfsTransaction* tp, xfs_ino_t old_pino, uint32_t old_pgen, const uint8_t* old_name,
                         uint16_t old_namelen, xfs_ino_t new_pino, uint32_t new_pgen, const uint8_t* new_name, uint16_t new_namelen) -> int {
-    int rc = xfs_parent_remove(child, tp, old_pino, old_pgen, old_name, old_namelen);
-    if (rc < 0 && rc != -61 /* ENOATTR */) {
-        return rc;
+    int const RC = xfs_parent_remove(child, tp, old_pino, old_pgen, old_name, old_namelen);
+    if (RC < 0 && RC != -61 /* ENOATTR */) {
+        return RC;
     }
 
     return xfs_parent_add(child, tp, new_pino, new_pgen, new_name, new_namelen);

@@ -1,7 +1,7 @@
 #include "backlog.hpp"
 
-#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
@@ -68,13 +68,13 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             if (reversed->dev != nullptr && reversed->dev->name[0] == 'l' && reversed->dev->name[1] == 'o' &&
                 reversed->dev->name[2] == '\0') {
                 if (reversed->len > 0) {
-                    uint8_t version = (reversed->data[0] >> 4) & 0xF;
-                    if (version == 4) {
+                    uint8_t const VERSION = (reversed->data[0] >> 4) & 0xF;
+                    if (VERSION == 4) {
                         proto::ipv4_rx(reversed->dev, reversed);
                         reversed = next;
                         continue;
                     }
-                    if (version == 6) {
+                    if (VERSION == 6) {
                         proto::ipv6_rx(reversed->dev, reversed);
                         reversed = next;
                         continue;
@@ -92,8 +92,8 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 
 [[noreturn]] void backlog_handler_entry() {
     // Starting CPU - passed as initial hint but re-read each iteration in the loop.
-    uint64_t my_cpu = ker::mod::cpu::current_cpu();
-    backlog_handler_loop(my_cpu);
+    uint64_t const MY_CPU = ker::mod::cpu::current_cpu();
+    backlog_handler_loop(MY_CPU);
     __builtin_unreachable();
 }
 
@@ -151,10 +151,10 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
         return 0;
     }
     const auto* eth = reinterpret_cast<const proto::EthernetHeader*>(pkt->data);
-    uint16_t ethertype = ntohs(eth->ethertype);
+    uint16_t const ETHERTYPE = ntohs(eth->ethertype);
 
     // IPv4: hash 5-tuple
-    if (ethertype == 0x0800) {
+    if (ETHERTYPE == 0x0800) {
         constexpr size_t ETH_HDR_SIZE = sizeof(proto::EthernetHeader);
         if (pkt->len < ETH_HDR_SIZE + sizeof(proto::IPv4Header)) {
             return 0;
@@ -163,9 +163,9 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
         uint32_t h = ip->src_addr ^ ip->dst_addr ^ static_cast<uint32_t>(ip->protocol);
 
         // For TCP/UDP, include port numbers
-        uint8_t ihl = (ip->ihl_version & 0x0F) * 4;
-        if ((ip->protocol == 6 || ip->protocol == 17) && pkt->len >= ETH_HDR_SIZE + ihl + 4) {
-            const auto* ports = reinterpret_cast<const uint16_t*>(pkt->data + ETH_HDR_SIZE + ihl);
+        uint8_t const IHL = (ip->ihl_version & 0x0F) * 4;
+        if ((ip->protocol == 6 || ip->protocol == 17) && pkt->len >= ETH_HDR_SIZE + IHL + 4) {
+            const auto* ports = reinterpret_cast<const uint16_t*>(pkt->data + ETH_HDR_SIZE + IHL);
             h ^= static_cast<uint32_t>(ports[0]) << 16 | static_cast<uint32_t>(ports[1]);
         }
 

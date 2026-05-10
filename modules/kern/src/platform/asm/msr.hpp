@@ -66,8 +66,11 @@ static inline void cpu_get_msr(uint32_t msr, uint64_t* out) {
 }
 
 static inline uint64_t rdtsc() {
+    // Written by inline asm output constraints.
+    // NOLINTBEGIN(misc-const-correctness)
     uint32_t lo = 0;
     uint32_t hi = 0;
+    // NOLINTEND(misc-const-correctness)
     asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return (static_cast<uint64_t>(hi) << 32) | lo;
 }

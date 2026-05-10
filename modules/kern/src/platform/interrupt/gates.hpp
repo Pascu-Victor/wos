@@ -7,7 +7,7 @@
 #include <platform/interrupt/idt.hpp>
 
 namespace ker::mod::gates {
-struct interruptFrame {
+struct InterruptFrame {
     // all registers stored in stack as well maybe usefull in the future
     uint64_t int_num;
     uint64_t err_code;
@@ -37,10 +37,10 @@ enum : uint64_t {
     IRQ15 = 47
 };
 
-using interruptHandler_t = void (*)(cpu::GPRegs gpr, interruptFrame frame);
+using interruptHandler_t = void (*)(cpu::GPRegs gpr, InterruptFrame frame);
 
 extern "C" {
-void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame);
+void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame);
 }
 
 #define IS_IRQ(vector) ((vector) >= IRQ0 && (vector) <= IRQ15)

@@ -1,8 +1,8 @@
 #include "transport_eth.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
-#include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>

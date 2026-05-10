@@ -1,5 +1,7 @@
 #include "console.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -157,9 +159,9 @@ int tty_open(ker::vfs::File* file) {
     dff->device = &pair->slave_dev;
 
     // Increment slave open refcount so the matching close is balanced
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     pair->slave_opened++;
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
 
     return 0;
 }

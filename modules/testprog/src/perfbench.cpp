@@ -1,3 +1,5 @@
+#include "perfbench.hpp"
+
 #include <sys/multiproc.h>
 #include <time.h>
 
@@ -8,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <print>
 #include <vector>
 
@@ -24,7 +27,10 @@ static auto now_ns() -> uint64_t {
 }
 
 static auto rdtsc() -> uint64_t {
-    uint32_t lo, hi;
+    // NOLINTBEGIN(misc-const-correctness)
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    // NOLINTEND(misc-const-correctness)
     asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return (static_cast<uint64_t>(hi) << 32) | lo;
 }
@@ -61,7 +67,7 @@ static auto count_threads_on_cpu(const std::vector<SpawnArg>& args, int cpu_id) 
 static auto spawn_thread(void* param) -> int {
     auto* a = static_cast<SpawnArg*>(param);
     a->start_ns = now_ns();
-    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
+    a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     return 0;
 }
 
@@ -80,42 +86,50 @@ static void test_spawn_and_placement(int n) {
             args[i].spawn_ns = now_ns();
             thrd_create(&threads[i], spawn_thread, &args[i]);
         }
-        for (int i = 0; i < n; ++i) thrd_join(threads[i], nullptr);
+        for (int i = 0; i < n; ++i) {
+            thrd_join(threads[i], nullptr);
+        }
 
-        uint64_t sum = 0, mn = UINT64_MAX, mx = 0;
+        uint64_t sum = 0;
+        uint64_t mn = UINT64_MAX;
+        uint64_t mx = 0;
         int min_idx = 0;
         int max_idx = 0;
         for (int i = 0; i < n; ++i) {
-            uint64_t lat = args[i].start_ns - args[i].spawn_ns;
-            sum += lat;
-            if (lat < mn) {
-                mn = lat;
+            uint64_t const LAT = args[i].start_ns - args[i].spawn_ns;
+            sum += LAT;
+            if (LAT < mn) {
+                mn = LAT;
                 min_idx = i;
             }
-            if (lat > mx) {
-                mx = lat;
+            if (LAT > mx) {
+                mx = LAT;
                 max_idx = i;
             }
         }
-        double mean_ms = (double)sum / n / 1e6;
-        double min_ms = (double)mn / 1e6;
-        double max_ms = (double)mx / 1e6;
+        double mean_ms = static_cast<double>(sum) / n / 1e6;
+        double min_ms = static_cast<double>(mn) / 1e6;
+        double max_ms = static_cast<double>(mx) / 1e6;
 
         // CPU placement
         bool seen[256] = {};
         int unique = 0;
         for (int i = 0; i < n; ++i) {
-            int c = args[i].cpu_id;
-            if (c >= 0 && c < 256 && !seen[c]) {
-                seen[c] = true;
+            int const C = args[i].cpu_id;
+            if (C >= 0 && C < 256 && !seen[C]) {
+                seen[C] = true;
                 ++unique;
             }
         }
 
         std::print(stderr, "[perf] spawn_latency[{}]:  min={:.2f}ms max={:.2f}ms mean={:.2f}ms  cpus:", repeat, min_ms, max_ms, mean_ms);
-        for (int i = 0; i < n; ++i) std::print(stderr, " t{}->c{}", i, args[i].cpu_id);
+        for (int i = 0; i < n; ++i) {
+            std::print(stderr, " t{}->c{}", i, args[i].cpu_id);
+        }
         std::print(stderr, "  [{}/{} unique CPUs", unique, n);
-        if (unique < n) std::print(stderr, " *** CO-LOCATION DETECTED ***");
+        if (unique < n) {
+            std::print(stderr, " *** CO-LOCATION DETECTED ***");
+        }
         std::println(stderr, "]");
         std::println(stderr, "[perf]   spawn_outliers[{}]: best=t{} c{} lat={:.2f}ms same_cpu={}  worst=t{} c{} lat={:.2f}ms same_cpu={}",
                      repeat, min_idx, args[min_idx].cpu_id, min_ms, count_threads_on_cpu(args, args[min_idx].cpu_id), max_idx,
@@ -160,24 +174,25 @@ static void test_context_switch() {
 
     mtx_t mtx;
     volatile int counter = 0;
-    mtx_init(&mtx, mtx_plain);
+    mtx_init(&mtx, MTX_PLAIN);
 
-    PingPongArg a0{&mtx, &counter, ITERS * 2, 0};
-    PingPongArg a1{&mtx, &counter, ITERS * 2, 1};
+    PingPongArg a0{.mtx = &mtx, .counter = &counter, .target = ITERS * 2, .role = 0};
+    PingPongArg a1{.mtx = &mtx, .counter = &counter, .target = ITERS * 2, .role = 1};
 
     double best_us = 1e18;
     for (int repeat = 0; repeat < 3; ++repeat) {
         counter = 0;
-        thrd_t t0, t1;
-        uint64_t t_start = now_ns();
+        thrd_t t0 = nullptr;
+        thrd_t t1 = nullptr;
+        uint64_t const T_START = now_ns();
         thrd_create(&t0, pingpong_thread, &a0);
         thrd_create(&t1, pingpong_thread, &a1);
         thrd_join(t0, nullptr);
         thrd_join(t1, nullptr);
-        uint64_t elapsed = now_ns() - t_start;
+        uint64_t const ELAPSED = now_ns() - T_START;
         // elapsed covers 2*ITERS lock/unlock pairs split across 2 threads
-        double us = (double)elapsed / (2.0 * ITERS * 1000.0);
-        if (us < best_us) best_us = us;
+        double const US = static_cast<double>(ELAPSED) / (2.0 * ITERS * 1000.0);
+        best_us = std::min(US, best_us);
     }
 
     mtx_destroy(&mtx);
@@ -228,47 +243,47 @@ static auto par_eff_thread(void* param) -> int {
     while (!a->go->load(std::memory_order_acquire)) {
         thrd_yield();
     }
-    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
+    a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     a->cpu_end_id = a->cpu_id;
     a->cpu_mask = cpu_bit(a->cpu_id);
     a->cpu_changes = 0;
     a->start_ns = now_ns();
-    uint64_t cpu_start = rdtsc();
+    uint64_t const CPU_START = rdtsc();
     uint64_t sum = 0x123456789abcdef0ULL ^ static_cast<uint64_t>(a->id);
-    int chunk = a->iters / a->threads;
-    int start = a->id * chunk;
-    int end = (a->id == a->threads - 1) ? a->iters : start + chunk;
+    int const CHUNK = a->iters / a->threads;
+    int const START = a->id * CHUNK;
+    int const END = (a->id == a->threads - 1) ? a->iters : START + CHUNK;
     constexpr int SAMPLE_STRIDE = 1 << 20;
-    for (int i = start; i < end; ++i) {
-        if (((i - start) % SAMPLE_STRIDE) == 0) {
-            note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
+    for (int i = START; i < END; ++i) {
+        if (((i - START) % SAMPLE_STRIDE) == 0) {
+            note_cpu_sample(a, static_cast<int>(ker::multiproc::getcurrent_cpu()));
         }
         sum = scramble_work(sum, static_cast<uint64_t>(i));
     }
-    note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
+    note_cpu_sample(a, static_cast<int>(ker::multiproc::getcurrent_cpu()));
     a->result = sum;
     a->end_ns = now_ns();
-    a->cpu_ns = rdtsc() - cpu_start;
+    a->cpu_ns = rdtsc() - CPU_START;
     return 0;
 }
 
 static void print_parallel_outliers(int n, const std::vector<ParEffArg>& args) {
     int min_idx = 0;
     int max_idx = 0;
-    double min_dur_ms = (double)(args[0].end_ns - args[0].start_ns) / 1e6;
+    double min_dur_ms = static_cast<double>(args[0].end_ns - args[0].start_ns) / 1e6;
     double max_dur_ms = min_dur_ms;
     uint64_t earliest_start_ns = args[0].start_ns;
     uint64_t latest_start_ns = args[0].start_ns;
     uint64_t latest_end_ns = args[0].end_ns;
 
     for (int i = 1; i < n; ++i) {
-        double dur_ms = (double)(args[i].end_ns - args[i].start_ns) / 1e6;
-        if (dur_ms < min_dur_ms) {
-            min_dur_ms = dur_ms;
+        double const DUR_MS = static_cast<double>(args[i].end_ns - args[i].start_ns) / 1e6;
+        if (DUR_MS < min_dur_ms) {
+            min_dur_ms = DUR_MS;
             min_idx = i;
         }
-        if (dur_ms > max_dur_ms) {
-            max_dur_ms = dur_ms;
+        if (DUR_MS > max_dur_ms) {
+            max_dur_ms = DUR_MS;
             max_idx = i;
         }
         earliest_start_ns = std::min(earliest_start_ns, args[i].start_ns);
@@ -290,8 +305,9 @@ static void print_parallel_outliers(int n, const std::vector<ParEffArg>& args) {
     std::println(stderr, "[perf]   parallel_workers[{}]: best=t{} c{} dur={:.2f}ms same_cpu={}  worst=t{} c{} dur={:.2f}ms same_cpu={}", n,
                  min_idx, args[min_idx].cpu_id, min_dur_ms, best_same_cpu, max_idx, args[max_idx].cpu_id, max_dur_ms, worst_same_cpu);
     std::println(stderr, "[perf]   parallel_span[{}]:    start_skew={:.2f}ms total_span={:.2f}ms best_res={:#x} worst_res={:#x}", n,
-                 (double)(latest_start_ns - earliest_start_ns) / 1e6, (double)(latest_end_ns - earliest_start_ns) / 1e6,
-                 (unsigned long long)args[min_idx].result, (unsigned long long)args[max_idx].result);
+                 static_cast<double>(latest_start_ns - earliest_start_ns) / 1e6,
+                 static_cast<double>(latest_end_ns - earliest_start_ns) / 1e6, static_cast<unsigned long long>(args[min_idx].result),
+                 static_cast<unsigned long long>(args[max_idx].result));
     std::println(
         stderr,
         "[perf]   parallel_migrate[{}]: best=t{} cpus={} first=c{} last=c{} changes={}  worst=t{} cpus={} first=c{} last=c{} changes={}", n,
@@ -305,7 +321,7 @@ struct PhaseProbeArg {
 
 static auto phase_probe_thread(void* param) -> int {
     auto* probe = static_cast<PhaseProbeArg*>(param);
-    probe->cpu_id = (int)ker::multiproc::getcurrent_cpu();
+    probe->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     return 0;
 }
 
@@ -316,7 +332,7 @@ static void align_thread_create_phase(int cpu_count) {
 
     PhaseProbeArg probe{.cpu_id = -1};
     thrd_t probe_thread{};
-    if (thrd_create(&probe_thread, phase_probe_thread, &probe) != thrd_success) {
+    if (thrd_create(&probe_thread, phase_probe_thread, &probe) != THRD_SUCCESS) {
         return;
     }
     thrd_join(probe_thread, nullptr);
@@ -325,12 +341,12 @@ static void align_thread_create_phase(int cpu_count) {
         return;
     }
 
-    int next_cpu = (probe.cpu_id + 1) % cpu_count;
-    int advance = (cpu_count - next_cpu) % cpu_count;
-    for (int i = 0; i < advance; ++i) {
+    int const NEXT_CPU = (probe.cpu_id + 1) % cpu_count;
+    int const ADVANCE = (cpu_count - NEXT_CPU) % cpu_count;
+    for (int i = 0; i < ADVANCE; ++i) {
         PhaseProbeArg dummy{.cpu_id = -1};
         thrd_t dummy_thread{};
-        if (thrd_create(&dummy_thread, phase_probe_thread, &dummy) != thrd_success) {
+        if (thrd_create(&dummy_thread, phase_probe_thread, &dummy) != THRD_SUCCESS) {
             break;
         }
         thrd_join(dummy_thread, nullptr);
@@ -358,10 +374,10 @@ static auto choose_spread_targets(int cpu_count, int worker_count) -> std::vecto
 static void test_parallel_efficiency() {
     constexpr int ITERS = 250000000;
     constexpr int REPEATS = 5;
-    int thread_counts[] = {1, 2, 4, 8};
+    int const THREAD_COUNTS[] = {1, 2, 4, 8};
     double time_1 = 0;
     double speedups[4] = {};
-    int cpu_count = (int)ker::multiproc::nativeThreadCount();
+    int const cpu_count = static_cast<int>(ker::multiproc::nativeThreadCount());
 
     if (cpu_count <= 0) {
         std::println(stderr, "[perf] parallel_eff:       FAILED (no CPUs reported)");
@@ -369,7 +385,7 @@ static void test_parallel_efficiency() {
     }
 
     for (int ti = 0; ti < 4; ++ti) {
-        int n = thread_counts[ti];
+        int n = THREAD_COUNTS[ti];
         std::vector<ParEffArg> args(n);
         std::vector<thrd_t> threads(n);
         std::vector<std::vector<ParEffArg>> repeat_args;
@@ -383,7 +399,19 @@ static void test_parallel_efficiency() {
             std::atomic<bool> go{false};
             auto target_cpus = choose_spread_targets(cpu_count, n);
             for (int i = 0; i < n; ++i) {
-                args[i] = {i, n, ITERS, 0, 0, 0, 0, -1, -1, 0, 0, &ready_count, &go};
+                args[i] = {.id = i,
+                           .threads = n,
+                           .iters = ITERS,
+                           .result = 0,
+                           .start_ns = 0,
+                           .end_ns = 0,
+                           .cpu_ns = 0,
+                           .cpu_id = -1,
+                           .cpu_end_id = -1,
+                           .cpu_mask = 0,
+                           .cpu_changes = 0,
+                           .ready_count = &ready_count,
+                           .go = &go};
             }
             align_thread_create_phase(cpu_count);
             bool create_failed = false;
@@ -392,7 +420,7 @@ static void test_parallel_efficiency() {
                 while (next_cpu != target_cpus[i]) {
                     PhaseProbeArg dummy{.cpu_id = -1};
                     thrd_t dummy_thread{};
-                    if (thrd_create(&dummy_thread, phase_probe_thread, &dummy) != thrd_success) {
+                    if (thrd_create(&dummy_thread, phase_probe_thread, &dummy) != THRD_SUCCESS) {
                         create_failed = true;
                         break;
                     }
@@ -402,7 +430,7 @@ static void test_parallel_efficiency() {
                 if (create_failed) {
                     break;
                 }
-                if (thrd_create(&threads[i], par_eff_thread, &args[i]) != thrd_success) {
+                if (thrd_create(&threads[i], par_eff_thread, &args[i]) != THRD_SUCCESS) {
                     std::println(stderr, "[perf] parallel_eff[{}]: FAILED (thrd_create t{})", n, i);
                     create_failed = true;
                     break;
@@ -411,7 +439,7 @@ static void test_parallel_efficiency() {
             }
             if (create_failed) {
                 for (int i = 0; i < n; ++i) {
-                    if (threads[i] != 0) {
+                    if (threads[i] != nullptr) {
                         thrd_join(threads[i], nullptr);
                     }
                 }
@@ -420,17 +448,19 @@ static void test_parallel_efficiency() {
             while (ready_count.load(std::memory_order_acquire) != n) {
                 thrd_yield();
             }
-            uint64_t t0 = now_ns();
+            uint64_t const T0 = now_ns();
             go.store(true, std::memory_order_release);
-            for (int i = 0; i < n; ++i) thrd_join(threads[i], nullptr);
+            for (int i = 0; i < n; ++i) {
+                thrd_join(threads[i], nullptr);
+            }
 
             double worst_thread_s = 0.0;
             for (int i = 0; i < n; ++i) {
-                double worker_s = (double)(args[i].end_ns - args[i].start_ns) / 1e9;
-                worst_thread_s = std::max(worst_thread_s, worker_s);
+                double const WORKER_S = static_cast<double>(args[i].end_ns - args[i].start_ns) / 1e9;
+                worst_thread_s = std::max(worst_thread_s, WORKER_S);
             }
 
-            (void)t0;
+            (void)T0;
             repeat_seconds.push_back(worst_thread_s);
             repeat_args.push_back(args);
         }
@@ -439,24 +469,24 @@ static void test_parallel_efficiency() {
         for (int i = 0; i < REPEATS; ++i) {
             order[i] = i;
         }
-        std::sort(order.begin(), order.end(), [&repeat_seconds](int lhs, int rhs) { return repeat_seconds[lhs] < repeat_seconds[rhs]; });
+        std::ranges::sort(order, [&repeat_seconds](int lhs, int rhs) { return repeat_seconds[lhs] < repeat_seconds[rhs]; });
 
-        int median_index = order[REPEATS / 2];
-        double median_s = repeat_seconds[median_index];
-        double min_s = repeat_seconds[order.front()];
-        double max_s = repeat_seconds[order.back()];
+        int const MEDIAN_INDEX = order[REPEATS / 2];
+        double const MEDIAN_S = repeat_seconds[MEDIAN_INDEX];
+        double const MIN_S = repeat_seconds[order.front()];
+        double const MAX_S = repeat_seconds[order.back()];
 
         if (n == 1) {
-            time_1 = median_s;
+            time_1 = MEDIAN_S;
             speedups[ti] = 1.0;
-            std::println(stderr, "[perf]   parallel_base[1]: median={:.2f}ms min={:.2f}ms max={:.2f}ms", median_s * 1e3, min_s * 1e3,
-                         max_s * 1e3);
+            std::println(stderr, "[perf]   parallel_base[1]: median={:.2f}ms min={:.2f}ms max={:.2f}ms", MEDIAN_S * 1e3, MIN_S * 1e3,
+                         MAX_S * 1e3);
         } else {
-            speedups[ti] = time_1 / median_s;
+            speedups[ti] = time_1 / MEDIAN_S;
         }
 
         if (n > 1 && !repeat_args.empty()) {
-            print_parallel_outliers(n, repeat_args[median_index]);
+            print_parallel_outliers(n, repeat_args[MEDIAN_INDEX]);
         }
     }
 
@@ -471,28 +501,34 @@ static void test_parallel_efficiency() {
 static void test_mem_bandwidth() {
     constexpr size_t BUF_SIZE = 64ULL * 1024 * 1024;  // 64 MB
     auto* buf = static_cast<uint64_t*>(malloc(BUF_SIZE));
-    if (!buf) {
+    if (buf == nullptr) {
         std::println(stderr, "[perf] mem_bandwidth:      FAILED (malloc)");
         return;
     }
 
-    size_t n = BUF_SIZE / sizeof(uint64_t);
+    size_t const N = BUF_SIZE / sizeof(uint64_t);
 
     // Cold write
     uint64_t t0 = now_ns();
-    for (size_t i = 0; i < n; ++i) buf[i] = i;
-    double cold_write_gbs = (double)BUF_SIZE / (double)(now_ns() - t0);
+    for (size_t i = 0; i < N; ++i) {
+        buf[i] = i;
+    }
+    double cold_write_gbs = static_cast<double>(BUF_SIZE) / static_cast<double>(now_ns() - t0);
 
     // Warm write
     t0 = now_ns();
-    for (size_t i = 0; i < n; ++i) buf[i] = i;
-    double warm_write_gbs = (double)BUF_SIZE / (double)(now_ns() - t0);
+    for (size_t i = 0; i < N; ++i) {
+        buf[i] = i;
+    }
+    double warm_write_gbs = static_cast<double>(BUF_SIZE) / static_cast<double>(now_ns() - t0);
 
     // Warm read
     volatile uint64_t sink = 0;
     t0 = now_ns();
-    for (size_t i = 0; i < n; ++i) sink += buf[i];
-    double warm_read_gbs = (double)BUF_SIZE / (double)(now_ns() - t0);
+    for (size_t i = 0; i < N; ++i) {
+        sink += buf[i];
+    }
+    double warm_read_gbs = static_cast<double>(BUF_SIZE) / static_cast<double>(now_ns() - t0);
     (void)sink;
 
     free(buf);
@@ -507,36 +543,38 @@ static void test_mem_bandwidth() {
 
 static void test_timer_overhead() {
     // Calibrate: measure rdtsc ticks per second using CLOCK_MONOTONIC
-    uint64_t cal_start_ns = now_ns();
-    uint64_t cal_start_tsc = rdtsc();
+    uint64_t const CAL_START_NS = now_ns();
+    uint64_t const CAL_START_TSC = rdtsc();
     // Spin for ~100ms
-    while (now_ns() - cal_start_ns < 100000000ULL) {
+    while (now_ns() - CAL_START_NS < 100000000ULL) {
     }
-    uint64_t cal_end_ns = now_ns();
-    uint64_t cal_end_tsc = rdtsc();
-    double tsc_hz = (double)(cal_end_tsc - cal_start_tsc) / ((double)(cal_end_ns - cal_start_ns) / 1e9);
+    uint64_t const CAL_END_NS = now_ns();
+    uint64_t const CAL_END_TSC = rdtsc();
+    double const TSC_HZ = static_cast<double>(CAL_END_TSC - CAL_START_TSC) / (static_cast<double>(CAL_END_NS - CAL_START_NS) / 1e9);
 
     // Now run a tight rdtsc loop for 1 second and count iterations
     constexpr int LOOP_ITERS = 10000000;
-    uint64_t wall_start = now_ns();
-    uint64_t tsc_start = rdtsc();
+    uint64_t const WALL_START = now_ns();
+    uint64_t const TSC_START = rdtsc();
     // Run for ~1 second of wall time
-    while (now_ns() - wall_start < 1000000000ULL) {
+    while (now_ns() - WALL_START < 1000000000ULL) {
         // Tight inner loop
         volatile uint64_t x = 0;
-        for (int i = 0; i < LOOP_ITERS; ++i) x = rdtsc();
+        for (int i = 0; i < LOOP_ITERS; ++i) {
+            x = rdtsc();
+        }
         (void)x;
     }
-    uint64_t wall_elapsed = now_ns() - wall_start;
-    uint64_t tsc_elapsed = rdtsc() - tsc_start;
+    uint64_t const WALL_ELAPSED = now_ns() - WALL_START;
+    uint64_t const TSC_ELAPSED = rdtsc() - TSC_START;
 
     // Expected tsc cycles if we ran continuously
-    double expected_tsc = tsc_hz * ((double)wall_elapsed / 1e9);
+    double const EXPECTED_TSC = TSC_HZ * (static_cast<double>(WALL_ELAPSED) / 1e9);
     // % cycles lost = (1 - actual_tsc / expected_tsc) * 100
-    double pct_lost = (1.0 - (double)tsc_elapsed / expected_tsc) * 100.0;
-    if (pct_lost < 0.0) pct_lost = 0.0;
+    double pct_lost = (1.0 - (static_cast<double>(TSC_ELAPSED) / EXPECTED_TSC)) * 100.0;
+    pct_lost = std::max(pct_lost, 0.0);
 
-    std::println(stderr, "[perf] timer_overhead:     {:.1f}% cycles lost to interrupts  (tsc_hz={:.0f}MHz)", pct_lost, tsc_hz / 1e6);
+    std::println(stderr, "[perf] timer_overhead:     {:.1f}% cycles lost to interrupts  (tsc_hz={:.0f}MHz)", pct_lost, TSC_HZ / 1e6);
 }
 
 // ---------------------------------------------------------------------------

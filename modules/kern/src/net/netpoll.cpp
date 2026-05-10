@@ -1,6 +1,7 @@
 #include "netpoll.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -87,10 +88,10 @@ void unregister_napi(NapiStruct* napi) {
 
         // Poll while work remains.
         for (;;) {
-            int processed = napi->poll(napi, napi->weight);
+            int const PROCESSED = napi->poll(napi, napi->weight);
             napi->poll_count++;
 
-            if (processed < napi->weight) {
+            if (PROCESSED < napi->weight) {
                 // Driver called napi_complete().
                 break;
             }
@@ -147,9 +148,9 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     // Build thread name: "netpoll_eth0"
     std::array<char, 32> name{};
     const char* dev_name = napi->dev->name.data();
-    std::string_view prefix = "netpoll_";
-    size_t name_len = prefix.size();
-    std::ranges::copy(prefix, name.begin());
+    std::string_view const PREFIX = "netpoll_";
+    size_t name_len = PREFIX.size();
+    std::ranges::copy(PREFIX, name.begin());
     for (size_t i = 0; dev_name[i] != '\0' && name_len < name.size() - 1; ++i) {
         name[name_len++] = dev_name[i];
     }
@@ -277,11 +278,11 @@ auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
     // napi_complete() and ours could schedule the worker (IDLE->SCHEDULED->
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.
-    int effective_budget = budget > 0 ? budget : napi->weight;
-    int processed = napi->poll(napi, effective_budget);
+    int const EFFECTIVE_BUDGET = budget > 0 ? budget : napi->weight;
+    int const PROCESSED = napi->poll(napi, EFFECTIVE_BUDGET);
     napi->poll_count++;
 
-    if (processed >= effective_budget) {
+    if (PROCESSED >= EFFECTIVE_BUDGET) {
         // Driver did NOT call napi_complete() (more work pending).
         // Transition back to SCHEDULED so the worker can pick up the
         // remaining work and re-enable IRQs when it's done.
@@ -302,7 +303,7 @@ auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
         }
     }
 
-    return processed;
+    return PROCESSED;
 }
 
 auto napi_poll_inline(NetDevice* dev) -> int { return napi_poll_inline_budget(dev, 0); }
@@ -314,7 +315,7 @@ auto napi_poll_all_pending() -> int {
     g_registry_lock.lock();
     size_t count = g_napi_registry.size();
     NapiStruct* snapshot[16];
-    if (count > 16) count = 16;
+    count = std::min<size_t>(count, 16);
     for (size_t i = 0; i < count; ++i) {
         snapshot[i] = g_napi_registry[i];
     }

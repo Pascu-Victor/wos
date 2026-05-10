@@ -1,12 +1,12 @@
 #include "loopback.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/backlog.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
 #include <platform/asm/cpu.hpp>
-#include <platform/dbg/dbg.hpp>
 
 #include "net/route.hpp"
 
@@ -15,8 +15,8 @@ namespace ker::net {
 namespace {
 NetDevice lo_dev;
 
-int lo_open(NetDevice*) { return 0; }
-void lo_close(NetDevice*) {}
+int lo_open(NetDevice* /*unused*/) { return 0; }
+void lo_close(NetDevice* /*unused*/) {}
 
 int lo_xmit(NetDevice* dev, PacketBuffer* pkt) {
     // Loopback packets must not recurse directly back into TCP RX because
@@ -39,7 +39,7 @@ int lo_xmit(NetDevice* dev, PacketBuffer* pkt) {
     return 0;
 }
 
-void lo_set_mac(NetDevice*, const uint8_t*) {}
+void lo_set_mac(NetDevice* /*unused*/, const uint8_t* /*unused*/) {}
 
 NetDeviceOps lo_ops = {
     .open = lo_open,
@@ -60,13 +60,13 @@ void loopback_init() {
     netdev_register(&lo_dev);
 
     // Assign 127.0.0.1/8
-    uint32_t lo_ip = (127 << 24) | 1;  // 127.0.0.1
-    uint32_t lo_mask = (255 << 24);    // 255.0.0.0
-    netif_add_ipv4(&lo_dev, lo_ip, lo_mask);
+    uint32_t const LO_IP = (127 << 24) | 1;  // 127.0.0.1
+    uint32_t const LO_MASK = (255 << 24);    // 255.0.0.0
+    netif_add_ipv4(&lo_dev, LO_IP, LO_MASK);
 
     // Add route for 127.0.0.0/8 via loopback
-    uint32_t lo_net = (127 << 24);              // 127.0.0.0
-    route_add(lo_net, lo_mask, 0, 0, &lo_dev);  // 0 gateway, 0 metric
+    uint32_t const LO_NET = (127 << 24);        // 127.0.0.0
+    route_add(LO_NET, LO_MASK, 0, 0, &lo_dev);  // 0 gateway, 0 metric
 
     // Assign ::1/128
     std::array<uint8_t, 16> lo_ipv6 = {};

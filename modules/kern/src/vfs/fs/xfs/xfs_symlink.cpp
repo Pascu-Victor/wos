@@ -12,22 +12,28 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 
+#include "net/endian.hpp"
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_inode.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
+
 namespace ker::vfs::xfs {
 
 // Remote symlink header (v5/CRC)
 struct XfsDsymlinkHdr {
-    __be32 sl_magic;   // 0x58534C4D ('XSLM')
-    __be32 sl_offset;  // offset of this data in the symlink
-    __be32 sl_bytes;   // bytes of link data in this block
-    __be32 sl_crc;     // CRC32c
-    __be64 sl_owner;   // owning inode number
-    __be64 sl_blkno;   // disk address
-    __be64 sl_lsn;     // log sequence
+    Be32 sl_magic;     // 0x58534C4D ('XSLM')
+    Be32 sl_offset;    // offset of this data in the symlink
+    Be32 sl_bytes;     // bytes of link data in this block
+    Be32 sl_crc;       // CRC32c
+    Be64 sl_owner;     // owning inode number
+    Be64 sl_blkno;     // disk address
+    Be64 sl_lsn;       // log sequence
     XfsUuidT sl_uuid;  // filesystem UUID
 } __attribute__((packed));
 
@@ -70,9 +76,9 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
     xfs_fileoff_t fblock = 0;
     while (copied < target_len) {
         XfsBmapResult bmap{};
-        int rc = xfs_bmap_lookup(ip, fblock, &bmap);
-        if (rc != 0 || bmap.is_hole) {
-            mod::dbg::log("[xfs symlink] bmap failed or hole at block %lu\n", (unsigned long)fblock);
+        int const RC = xfs_bmap_lookup(ip, fblock, &bmap);
+        if (RC != 0 || bmap.is_hole) {
+            mod::dbg::log("[xfs symlink] bmap failed or hole at block %lu\n", static_cast<unsigned long>(fblock));
             buf[copied] = '\0';
             return (copied > 0) ? static_cast<int>(copied) : -EIO;
         }
@@ -91,8 +97,8 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
         const auto* hdr = reinterpret_cast<const XfsDsymlinkHdr*>(data);
         if (hdr->sl_magic.to_cpu() == XFS_SYMLINK_MAGIC) {
             data_off = sizeof(XfsDsymlinkHdr);
-            uint32_t sl_bytes = hdr->sl_bytes.to_cpu();
-            avail = (sl_bytes < avail - data_off) ? sl_bytes : avail - data_off;
+            uint32_t const SL_BYTES = hdr->sl_bytes.to_cpu();
+            avail = (SL_BYTES < avail - data_off) ? SL_BYTES : avail - data_off;
         }
 
         size_t to_copy = target_len - copied;

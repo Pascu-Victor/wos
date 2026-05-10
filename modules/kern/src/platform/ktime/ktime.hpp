@@ -9,7 +9,6 @@
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/tsc/tsc.hpp>
-#include <util/list.hpp>
 
 namespace ker::mod::time {
 
@@ -30,5 +29,5 @@ inline uint64_t get_ms() { return tsc::get_ns() / 1000000; }
 // RTC + TSC epoch nanoseconds
 inline uint64_t get_epoch_ns() { return rtc::get_epoch_ns(); }
 
-void push_task(uint64_t ticks, void (*task)(gates::interruptFrame*), void* arg);
+void push_task(uint64_t ticks, void (*task)(gates::InterruptFrame*), void* arg);
 }  // namespace ker::mod::time

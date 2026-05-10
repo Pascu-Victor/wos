@@ -1,6 +1,6 @@
+#include <__config>
 #include <cstdarg>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -40,7 +40,7 @@ void run_atexit_handlers() {
     // Run in reverse order like atexit
     for (size_t i = atExitCount; i > 0; --i) {
         auto& e = atExitTable[i - 1];
-        if (e.func) {
+        if (e.func != nullptr) {
             e.func(e.arg);
         }
     }
@@ -54,14 +54,14 @@ void run_atexit_handlers() {
 // linker finds the symbol regardless of the toolchain's inline-namespace use.
 namespace std {
 _LIBCPP_WEAK void __libcpp_verbose_abort(char const* format, ...) noexcept {
-    ker::mod::dbg::log_string(format ? format : "__libcpp_verbose_abort");
+    ker::mod::dbg::log_string((format != nullptr) ? format : "__libcpp_verbose_abort");
     hcf();
 }
 }  // namespace std
 
 namespace std::inline __1 {
 _LIBCPP_WEAK void __libcpp_verbose_abort(char const* format, ...) noexcept {
-    ker::mod::dbg::log_string(format ? format : "__libcpp_verbose_abort");
+    ker::mod::dbg::log_string((format != nullptr) ? format : "__libcpp_verbose_abort");
     hcf();
 }
 

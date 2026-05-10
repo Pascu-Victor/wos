@@ -12,10 +12,15 @@
 
 #include "workqueue.hpp"
 
+#include <atomic>
+#include <cstdint>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::mod::sched {
 
@@ -34,10 +39,10 @@ sys::Spinlock launch_lock;
 // Static worker entry point - called by the scheduler as a kernel thread.
 void Workqueue::worker_entry() {
     // Grab the Workqueue that launched this thread.
-    uint64_t irqf = launch_lock.lock_irqsave();
+    uint64_t const IRQF = launch_lock.lock_irqsave();
     Workqueue* wq = pending_launch_wq;
     pending_launch_wq = nullptr;
-    launch_lock.unlock_irqrestore(irqf);
+    launch_lock.unlock_irqrestore(IRQF);
 
     if (wq == nullptr) {
         mod::dbg::log("[workqueue] worker_entry: no pending wq!\n");
@@ -51,26 +56,26 @@ void Workqueue::worker_entry() {
 }
 
 void Workqueue::drain_loop() {
-    while (!stopping_.load(std::memory_order_acquire)) {
+    while (!stopping.load(std::memory_order_acquire)) {
         // Try to dequeue one item
-        WorkItem* item = nullptr;
+        WorkItem const* item = nullptr;
         {
-            uint64_t irqf = lock_.lock_irqsave();
-            if (head_ != nullptr) {
-                item = head_;
-                head_ = head_->next;
-                if (head_ == nullptr) {
-                    tail_ = nullptr;
+            uint64_t const IRQF = lock.lock_irqsave();
+            if (head != nullptr) {
+                item = head;
+                head = head->next;
+                if (head == nullptr) {
+                    tail = nullptr;
                 }
-                pending_count_.fetch_sub(1, std::memory_order_relaxed);
+                pending_count.fetch_sub(1, std::memory_order_relaxed);
             }
-            lock_.unlock_irqrestore(irqf);
+            lock.unlock_irqrestore(IRQF);
         }
 
         if (item != nullptr) {
             // Execute outside the lock
             item->fn(item->arg);
-            completed_count_.fetch_add(1, std::memory_order_release);
+            completed_count.fetch_add(1, std::memory_order_release);
         } else {
             // Nothing to do - truly block until enqueue() wakes us.
             kern_block();
@@ -79,23 +84,23 @@ void Workqueue::drain_loop() {
 
     // Drain remaining items before exiting
     while (true) {
-        WorkItem* item = nullptr;
-        uint64_t irqf = lock_.lock_irqsave();
-        if (head_ != nullptr) {
-            item = head_;
-            head_ = head_->next;
-            if (head_ == nullptr) {
-                tail_ = nullptr;
+        WorkItem const* item = nullptr;
+        uint64_t const IRQF = lock.lock_irqsave();
+        if (head != nullptr) {
+            item = head;
+            head = head->next;
+            if (head == nullptr) {
+                tail = nullptr;
             }
-            pending_count_.fetch_sub(1, std::memory_order_relaxed);
+            pending_count.fetch_sub(1, std::memory_order_relaxed);
         }
-        lock_.unlock_irqrestore(irqf);
+        lock.unlock_irqrestore(IRQF);
 
         if (item == nullptr) {
             break;
         }
         item->fn(item->arg);
-        completed_count_.fetch_add(1, std::memory_order_release);
+        completed_count.fetch_add(1, std::memory_order_release);
     }
 
     // Worker thread done - loop forever in yield (the scheduler will GC it
@@ -105,30 +110,30 @@ void Workqueue::drain_loop() {
     }
 }
 
-auto Workqueue::create(const char* name) -> Workqueue* {
+auto Workqueue::create(const char* wk_name) -> Workqueue* {
     auto* wq = new (std::nothrow) Workqueue();
     if (wq == nullptr) {
         return nullptr;
     }
 
-    wq->name_ = name;
-    wq->head_ = nullptr;
-    wq->tail_ = nullptr;
+    wq->wk_name = wk_name;
+    wq->head = nullptr;
+    wq->tail = nullptr;
 
     // Set up the pending launch wq and create the kernel thread.
-    uint64_t irqf = launch_lock.lock_irqsave();
+    uint64_t const IRQF = launch_lock.lock_irqsave();
     pending_launch_wq = wq;
-    launch_lock.unlock_irqrestore(irqf);
+    launch_lock.unlock_irqrestore(IRQF);
 
-    wq->thread_ = task::Task::create_kernel_thread(name, worker_entry);
-    if (wq->thread_ == nullptr) {
-        mod::dbg::log("[workqueue] failed to create worker thread '%s'\n", name);
+    wq->thread = task::Task::create_kernel_thread(wk_name, worker_entry);
+    if (wq->thread == nullptr) {
+        mod::dbg::log("[workqueue] failed to create worker thread '%s'\n", wk_name);
         delete wq;
         return nullptr;
     }
 
-    post_task_balanced(wq->thread_);
-    mod::dbg::log("[workqueue] created '%s'\n", name);
+    post_task_balanced(wq->thread);
+    mod::dbg::log("[workqueue] created '%s'\n", wk_name);
     return wq;
 }
 
@@ -138,49 +143,49 @@ void Workqueue::enqueue(WorkItem* item) {
     }
     item->next = nullptr;
 
-    uint64_t irqf = lock_.lock_irqsave();
-    if (tail_ != nullptr) {
-        tail_->next = item;
+    uint64_t const IRQF = lock.lock_irqsave();
+    if (tail != nullptr) {
+        tail->next = item;
     } else {
-        head_ = item;
+        head = item;
     }
-    tail_ = item;
-    pending_count_.fetch_add(1, std::memory_order_relaxed);
-    lock_.unlock_irqrestore(irqf);
+    tail = item;
+    pending_count.fetch_add(1, std::memory_order_relaxed);
+    lock.unlock_irqrestore(IRQF);
 
-    if (thread_ != nullptr) {
-        kern_wake(thread_);
+    if (thread != nullptr) {
+        kern_wake(thread);
     }
 }
 
 void Workqueue::flush() {
     // Snapshot the total items ever submitted, then wait for the completed
     // counter to reach that value.
-    uint64_t target = completed_count_.load(std::memory_order_acquire) + pending_count_.load(std::memory_order_acquire);
+    uint64_t const TARGET = completed_count.load(std::memory_order_acquire) + pending_count.load(std::memory_order_acquire);
 
-    while (completed_count_.load(std::memory_order_acquire) < target) {
+    while (completed_count.load(std::memory_order_acquire) < TARGET) {
         kern_yield();
     }
 }
 
 void Workqueue::destroy() {
-    stopping_.store(true, std::memory_order_release);
+    stopping.store(true, std::memory_order_release);
 
     // Wake the worker so it notices the stop flag
-    if (thread_ != nullptr) {
-        kern_wake(thread_);
+    if (thread != nullptr) {
+        kern_wake(thread);
     }
 
     // Wait for the worker to finish draining (best effort - we busy-wait
     // a bounded number of times).
     for (int i = 0; i < 1000; i++) {
-        if (pending_count_.load(std::memory_order_acquire) == 0) {
+        if (pending_count.load(std::memory_order_acquire) == 0) {
             break;
         }
         kern_yield();
     }
 
-    mod::dbg::log("[workqueue] destroyed '%s'\n", name_);
+    mod::dbg::log("[workqueue] destroyed '%s'\n", wk_name);
     // Note: the Task itself will be GC'd by the scheduler's epoch-based
     // reclamation.  We do not free it here.
 }

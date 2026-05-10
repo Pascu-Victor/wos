@@ -1,10 +1,10 @@
 bits 64
 
-global _wOS_enableSSE_asm
-global _wOS_enableXSave_asm
-global _wOS_xsave_area_size
+global wos_enable_sse_asm
+global wos_enable_xsave_asm
+global wos_xsave_area_size
 
-_wOS_enableSSE_asm:
+wos_enable_sse_asm:
     mov rax, cr0
     and ax, 0xFFFB		;clear coprocessor emulation CR0.EM
     or ax, 0x2			;set coprocessor monitoring  CR0.MP
@@ -17,7 +17,7 @@ _wOS_enableSSE_asm:
 ; Enable XSAVE and set XCR0 to save x87 + SSE + AVX (if supported).
 ; Returns: rax = required xsave area size (bytes), 0 if XSAVE not supported.
 ; Note: CR4.OSXSAVE is set here after verifying XSAVE support via CPUID.
-_wOS_enableXSave_asm:
+wos_enable_xsave_asm:
     push rbx             ; RBX is callee-saved; cpuid clobbers it
 
     ; Check CPUID.1:ECX bit 26 (XSAVE support)

@@ -22,11 +22,11 @@ struct Slab {
 
 struct SlabCache {
     uint64_t size;
-    uint64_t objectSize;
+    uint64_t object_size;
     const char* name;
     Slab* slabs;
 };
 
-bool cacheGrow(SlabCache* cache, uint64_t count);
-SlabCache* newCache(uint64_t objectSize, const char* name, uint64_t align);
+bool cache_grow(SlabCache* cache, uint64_t count);
+SlabCache* new_cache(uint64_t object_size, const char* name, uint64_t align);
 }  // namespace ker::mod::mm::dyn::slab

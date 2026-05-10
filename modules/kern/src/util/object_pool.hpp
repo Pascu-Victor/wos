@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -34,9 +35,9 @@ class ObjectPool {
         // Note: does NOT free live objects - caller is responsible for draining
         // before destruction. We only free the free-list entries.
         auto saved = m_lock.lock_irqsave();
-        PoolEntry* cur = m_free_list;
+        PoolEntry const* cur = m_free_list;
         while (cur) {
-            PoolEntry* next = cur->free_next;
+            PoolEntry const* next = cur->free_next;
             delete cur;
             cur = next;
         }
@@ -63,7 +64,7 @@ class ObjectPool {
         } else {
             // Allocate new
             entry = new (std::nothrow) PoolEntry;
-            if (!entry) {
+            if (entry == nullptr) {
                 m_lock.unlock_irqrestore(saved);
                 return nullptr;
             }
@@ -75,11 +76,11 @@ class ObjectPool {
         memset(&entry->object, 0, sizeof(T));
         m_live_count++;
 
-        if (m_live_count > m_peak_count) {
-            m_peak_count = m_live_count;
-        }
+        m_peak_count = std::max(m_live_count, m_peak_count);
 
-        if (out_id) *out_id = entry->id;
+        if (out_id != nullptr) {
+            *out_id = entry->id;
+        }
 
         m_lock.unlock_irqrestore(saved);
         return &entry->object;
@@ -88,7 +89,9 @@ class ObjectPool {
     // Free an object previously returned by alloc().
     // The pointer must point to the T within a PoolEntry (i.e., from alloc()).
     void free(T* obj) {
-        if (!obj) return;
+        if (obj == nullptr) {
+            return;
+        }
         // Recover PoolEntry from T* (T is first member)
         auto* entry = reinterpret_cast<PoolEntry*>(obj);
 

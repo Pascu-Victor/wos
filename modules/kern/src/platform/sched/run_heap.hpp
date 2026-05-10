@@ -66,7 +66,7 @@ struct IntrusiveTaskList {
 
     // Find task by PID. O(n) scan.
     // Returns nullptr if not found.
-    task::Task* find_by_pid(uint64_t pid);
+    [[nodiscard]] task::Task* find_by_pid(uint64_t pid) const;
 
     // Pop the head task. O(1).
     // Returns nullptr if empty.

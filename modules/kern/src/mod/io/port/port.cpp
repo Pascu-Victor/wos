@@ -1,5 +1,7 @@
 #include "port.hpp"
 
+#include <cstdint>
+
 void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %b0, %w1" : : "a"(val), "Nd"(port) : "memory");
     /* There's an outb %al, $imm8 encoding, for compile-time constant port numbers that fit in 8b. (N constraint).
@@ -9,9 +11,10 @@ void outb(uint16_t port, uint8_t val) {
 }
 
 uint8_t inb(uint16_t port) {
-    uint8_t ret;
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint8_t ret = 0;
     __asm__ volatile("inb %w1, %b0" : "=a"(ret) : "Nd"(port) : "memory");
     return ret;
 }
 
-void io_wait(void) { outb(0x80, 0); }
+void io_wait() { outb(0x80, 0); }

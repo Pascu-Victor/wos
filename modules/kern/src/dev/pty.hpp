@@ -122,8 +122,8 @@ struct PtyRingBuf {
 
     auto write(const void* src, size_t len) -> size_t;
     auto read(void* dst, size_t len) -> size_t;
-    auto available() const -> size_t { return count; }
-    auto space() const -> size_t { return PTY_BUF_SIZE - count; }
+    [[nodiscard]] auto available() const -> size_t { return count; }
+    [[nodiscard]] auto space() const -> size_t { return PTY_BUF_SIZE - count; }
     void flush() { head = tail = count = 0; }
 };
 

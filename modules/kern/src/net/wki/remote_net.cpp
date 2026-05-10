@@ -8,17 +8,13 @@
 #include <deque>
 #include <memory>
 #include <net/netdevice.hpp>
-#include <net/netif.hpp>
 #include <net/packet.hpp>
-#include <net/route.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
-#include <platform/sched/scheduler.hpp>
 
 #include "platform/sys/spinlock.hpp"
 
@@ -125,16 +121,16 @@ auto proxy_net_open(ker::net::NetDevice* dev) -> int {
     state->op_status = 0;
     state->lock.unlock();
 
-    int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
-    if (send_ret != WKI_OK) {
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
+    if (SEND_RET != WKI_OK) {
         state->op_wait_entry = nullptr;
         state->op_pending.store(false, std::memory_order_relaxed);
         return -1;
     }
 
-    int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     state->op_wait_entry = nullptr;
-    if (wait_rc == WKI_ERR_TIMEOUT) {
+    if (WAIT_RC == WKI_ERR_TIMEOUT) {
         state->op_pending.store(false, std::memory_order_relaxed);
         ker::mod::dbg::log("[WKI] proxy_net_open timeout: node=0x%04x", state->owner_node);
         return -1;
@@ -179,17 +175,17 @@ void proxy_net_close(ker::net::NetDevice* dev) {
     state->op_status = 0;
     state->lock.unlock();
 
-    int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
-    if (send_ret != WKI_OK) {
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
+    if (SEND_RET != WKI_OK) {
         state->op_wait_entry = nullptr;
         state->op_pending.store(false, std::memory_order_relaxed);
         dev->state = 0;
         return;
     }
 
-    int wait_rc = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     state->op_wait_entry = nullptr;
-    if (wait_rc == WKI_ERR_TIMEOUT) {
+    if (WAIT_RC == WKI_ERR_TIMEOUT) {
         state->op_pending.store(false, std::memory_order_relaxed);
         ker::mod::dbg::log("[WKI] proxy_net_close timeout: node=0x%04x", state->owner_node);
     }
@@ -226,10 +222,10 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
     req->data_len = static_cast<uint16_t>(pkt->len);
     memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt->len);
 
-    int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
 
-    if (send_ret == WKI_OK) {
+    if (SEND_RET == WKI_OK) {
         dev->tx_packets++;
         dev->tx_bytes += pkt->len;
     } else {
@@ -238,7 +234,7 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
 
     // Free the packet buffer (we've copied the data into the WKI message)
     ker::net::pkt_free(pkt);
-    return (send_ret == WKI_OK) ? 0 : -1;
+    return (SEND_RET == WKI_OK) ? 0 : -1;
 }
 
 void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
@@ -267,17 +263,17 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
     state->op_status = 0;
     state->lock.unlock();
 
-    int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(), req_total);
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(), req_total);
 
-    if (send_ret != WKI_OK) {
+    if (SEND_RET != WKI_OK) {
         state->op_wait_entry = nullptr;
         state->op_pending.store(false, std::memory_order_relaxed);
         return;
     }
 
-    int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
     state->op_wait_entry = nullptr;
-    if (wait_rc == WKI_ERR_TIMEOUT) {
+    if (WAIT_RC == WKI_ERR_TIMEOUT) {
         state->op_pending.store(false, std::memory_order_relaxed);
         ker::mod::dbg::log("[WKI] proxy_net_set_mac timeout: node=0x%04x", state->owner_node);
         return;
@@ -290,7 +286,7 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
 }
 
 // Static NetDeviceOps for proxy NIC
-const ker::net::NetDeviceOps g_proxy_net_ops = {
+const ker::net::NetDeviceOps G_PROXY_NET_OPS = {
     .open = proxy_net_open,
     .close = proxy_net_close,
     .start_xmit = proxy_net_xmit,
@@ -342,8 +338,8 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             pkt->len = copy_len;
             pkt->dev = net_dev;
 
-            int ret = net_dev->ops->start_xmit(net_dev, pkt);
-            if (ret != 0) {
+            int const RET = net_dev->ops->start_xmit(net_dev, pkt);
+            if (RET != 0) {
                 ker::net::pkt_free(pkt);
             }
             // No response for fire-and-forget XMIT
@@ -530,8 +526,8 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->attach_pending.store(true, std::memory_order_release);
     state->attach_status = 0;
 
-    int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
-    if (send_ret != WKI_OK) {
+    int const SEND_RET = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+    if (SEND_RET != WKI_OK) {
         state->attach_wait_entry = nullptr;
         if (reserved_channel != nullptr) {
             wki_channel_close(reserved_channel);
@@ -542,11 +538,11 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         return nullptr;
     }
 
-    int wait_rc = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
     state->attach_wait_entry = nullptr;
-    if (wait_rc != 0) {
+    if (WAIT_RC != 0) {
         state->attach_pending.store(false, std::memory_order_relaxed);
-        if (wait_rc == WKI_ERR_TIMEOUT) {
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
             send_best_effort_net_detach(owner_node, resource_id);
         }
         if (reserved_channel != nullptr) {
@@ -555,10 +551,10 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         s_net_proxy_lock.lock();
         g_net_proxies.pop_back();
         s_net_proxy_lock.unlock();
-        if (wait_rc == WKI_ERR_TIMEOUT) {
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
             ker::mod::dbg::log("[WKI] Remote NIC attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
         } else {
-            ker::mod::dbg::log("[WKI] Remote NIC attach aborted: node=0x%04x res_id=%u err=%d", owner_node, resource_id, wait_rc);
+            ker::mod::dbg::log("[WKI] Remote NIC attach aborted: node=0x%04x res_id=%u err=%d", owner_node, resource_id, WAIT_RC);
         }
         return nullptr;
     }
@@ -627,7 +623,7 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->netdev.mac[4] = static_cast<uint8_t>(g_wki.my_node_id & 0xFF);
     state->netdev.mac[5] = g_wki.proxy_nic_index++;
 
-    state->netdev.ops = &g_proxy_net_ops;
+    state->netdev.ops = &G_PROXY_NET_OPS;
     state->netdev.private_data = state;
     state->netdev.mtu = state->owner_mtu != 0 ? state->owner_mtu : 1500;
     state->netdev.state = static_cast<uint8_t>(state->owner_link_state != 0 ? 1 : 0);
@@ -661,9 +657,9 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
 auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool {
     s_net_proxy_lock.lock();
-    bool found = find_net_proxy_by_resource(owner_node, resource_id) != nullptr;
+    bool const FOUND = find_net_proxy_by_resource(owner_node, resource_id) != nullptr;
     s_net_proxy_lock.unlock();
-    return found;
+    return FOUND;
 }
 
 void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
@@ -755,9 +751,9 @@ void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     const auto* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
     const uint8_t* resp_data = payload + sizeof(DevOpRespPayload);
-    uint16_t resp_data_len = resp->data_len;
+    uint16_t const RESP_DATA_LEN = resp->data_len;
 
-    if (sizeof(DevOpRespPayload) + resp_data_len > payload_len) {
+    if (sizeof(DevOpRespPayload) + RESP_DATA_LEN > payload_len) {
         return;
     }
 
@@ -774,18 +770,18 @@ void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     // D13: For GET_STATS, update proxy NIC counters directly (no caller waiting)
     constexpr uint16_t STATS_RESP_LEN = 48;
-    if (resp->op_id == OP_NET_GET_STATS && resp->status == 0 && resp_data_len >= STATS_RESP_LEN) {
+    if (resp->op_id == OP_NET_GET_STATS && resp->status == 0 && RESP_DATA_LEN >= STATS_RESP_LEN) {
         memcpy(&state->netdev.rx_packets, resp_data, sizeof(uint64_t));
         memcpy(&state->netdev.tx_packets, resp_data + 8, sizeof(uint64_t));
         memcpy(&state->netdev.rx_bytes, resp_data + 16, sizeof(uint64_t));
         memcpy(&state->netdev.tx_bytes, resp_data + 24, sizeof(uint64_t));
         memcpy(&state->netdev.rx_dropped, resp_data + 32, sizeof(uint64_t));
         memcpy(&state->netdev.tx_dropped, resp_data + 40, sizeof(uint64_t));
-    } else if (resp_data_len > 0 && state->op_resp_buf != nullptr) {
+    } else if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
         // Copy response data for other synchronous ops (e.g. SET_MAC)
-        uint16_t copy_len = (resp_data_len > state->op_resp_max) ? state->op_resp_max : resp_data_len;
-        memcpy(state->op_resp_buf, resp_data, copy_len);
-        state->op_resp_len = copy_len;
+        uint16_t const COPY_LEN = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN;
+        memcpy(state->op_resp_buf, resp_data, COPY_LEN);
+        state->op_resp_len = COPY_LEN;
     } else {
         state->op_resp_len = 0;
     }
@@ -817,9 +813,9 @@ void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t da
         return;
     }
 
-    size_t copy_len = std::min<size_t>(data_len, ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM);
-    memcpy(pkt->data, data, copy_len);
-    pkt->len = copy_len;
+    size_t const COPY_LEN = std::min<size_t>(data_len, ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM);
+    memcpy(pkt->data, data, COPY_LEN);
+    pkt->len = COPY_LEN;
     pkt->dev = &state->netdev;
 
     // Feed into the local network stack
@@ -885,7 +881,7 @@ void wki_remote_net_poll_stats() {
             continue;
         }
         if (target_count < MAX_POLL_TARGETS) {
-            targets[target_count++] = {p.get(), p->owner_node, p->assigned_channel};
+            targets[target_count++] = {.state = p.get(), .owner_node = p->owner_node, .channel = p->assigned_channel};
         }
     }
     s_net_proxy_lock.unlock();
@@ -903,8 +899,8 @@ void wki_remote_net_poll_stats() {
         st->op_resp_buf = nullptr;
         st->op_resp_len = 0;
 
-        int send_ret = wki_send(targets[i].owner_node, targets[i].channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
-        if (send_ret != WKI_OK) {
+        int const SEND_RET = wki_send(targets[i].owner_node, targets[i].channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
+        if (SEND_RET != WKI_OK) {
             st->op_pending = false;
         }
     }
@@ -945,10 +941,10 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
             }
         }
 
-        uint16_t channel = p->assigned_channel != 0 ? p->assigned_channel : p->attach_channel;
+        uint16_t const CHANNEL = p->assigned_channel != 0 ? p->assigned_channel : p->attach_channel;
 
-        if (channel != 0 && close_count < MAX_CLEANUP) {
-            to_close[close_count++] = {p->owner_node, channel};
+        if (CHANNEL != 0 && close_count < MAX_CLEANUP) {
+            to_close[close_count++] = {.owner_node = p->owner_node, .channel = CHANNEL};
         }
 
         if (p->active) {

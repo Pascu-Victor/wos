@@ -23,7 +23,7 @@ namespace ker::vfs::xfs {
 // ============================================================================
 
 constexpr uint32_t XFS_DIR2_DATA_ALIGN_LOG = 3;
-constexpr uint32_t XFS_DIR2_DATA_ALIGN = (1u << XFS_DIR2_DATA_ALIGN_LOG);
+constexpr uint32_t XFS_DIR2_DATA_ALIGN = (1U << XFS_DIR2_DATA_ALIGN_LOG);
 constexpr uint64_t XFS_DIR2_SPACE_SIZE = (1ULL << 35);          // 32 GB per space
 constexpr uint64_t XFS_DIR2_DATA_OFFSET = 0;                    // data space start
 constexpr uint64_t XFS_DIR2_LEAF_OFFSET = XFS_DIR2_SPACE_SIZE;  // leaf space

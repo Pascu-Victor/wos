@@ -1,9 +1,10 @@
 #pragma once
 
+#include <abi/callnums/sys_log.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <abi/callnums/sys_log.h>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -21,16 +22,13 @@ enum class LogLevel : uint8_t {
     PANIC = 7,
 };
 
-struct fixed_string {
+struct FixedString {
     size_t size{};
     char value[abi::sys_log::JOURNAL_MODULE_MAX + 1]{};
 
     template <size_t N>
-    consteval fixed_string(const char (&str)[N]) : size(N - 1) {
-        static_assert(
-            N <= (abi::sys_log::JOURNAL_MODULE_MAX + 1),
-            "logger tag exceeds JOURNAL_MODULE_MAX"
-        );
+    consteval FixedString(const char (&str)[N]) : size(N - 1) {
+        static_assert(N <= (abi::sys_log::JOURNAL_MODULE_MAX + 1), "logger tag exceeds JOURNAL_MODULE_MAX");
         for (size_t i = 0; i < N; i++) {
             value[i] = str[i];
         }
@@ -43,7 +41,7 @@ void emit_log(const char* module, LogLevel level, const char* format, ...);
 void set_serial_threshold(LogLevel level);
 auto get_serial_threshold() -> LogLevel;
 
-template <fixed_string Tag>
+template <FixedString Tag>
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct logger {
     template <typename... Args>

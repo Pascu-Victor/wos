@@ -18,8 +18,8 @@ constexpr bool validate_hard_deps_exist(const std::array<ModuleMeta, N>& registr
                 continue;
             }
 
-            int dep_idx = find_module_index(registry, dep.target);
-            if (dep_idx < 0) {
+            int const DEP_IDX = find_module_index(registry, dep.target);
+            if (DEP_IDX < 0) {
                 // Hard dependency not found in registry
                 return false;
             }
@@ -40,13 +40,13 @@ constexpr bool validate_phase_ordering(const std::array<ModuleMeta, N>& registry
                 continue;
             }
 
-            int dep_idx = find_module_index(registry, dep.target);
-            if (dep_idx < 0) {
+            int const DEP_IDX = find_module_index(registry, dep.target);
+            if (DEP_IDX < 0) {
                 continue;  // Will be caught by validate_hard_deps_exist
             }
 
             // Module's phase must be >= dependency's phase
-            if (static_cast<int>(mod.phase) < static_cast<int>(registry[dep_idx].phase)) {
+            if (static_cast<int>(mod.phase) < static_cast<int>(registry[DEP_IDX].phase)) {
                 // Invalid: depending on a module in a later phase
                 return false;
             }

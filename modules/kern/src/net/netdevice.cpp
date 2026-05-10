@@ -1,15 +1,19 @@
 #include "netdevice.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/backlog.hpp>
 #include <net/net_trace.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
+
+#include "net/packet.hpp"
+#include "platform/asm/cpu.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net {
 
@@ -41,14 +45,14 @@ auto netdev_register(NetDevice* dev) -> int {
         buf[0] = 'e';
         buf[1] = 't';
         buf[2] = 'h';
-        uint32_t idx = next_eth_index++;
+        uint32_t const IDX = next_eth_index++;
         // Simple integer-to-string for index
-        if (idx < 10) {
-            buf[3] = static_cast<char>('0' + static_cast<char>(idx));
+        if (IDX < 10) {
+            buf[3] = static_cast<char>('0' + static_cast<char>(IDX));
             buf[4] = '\0';
         } else {
-            buf[3] = static_cast<char>('0' + static_cast<char>(idx / 10));
-            buf[4] = static_cast<char>('0' + static_cast<char>(idx % 10));
+            buf[3] = static_cast<char>('0' + static_cast<char>(IDX / 10));
+            buf[4] = static_cast<char>('0' + static_cast<char>(IDX % 10));
             buf[5] = '\0';
         }
         dev->name = buf;
@@ -118,9 +122,9 @@ auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
 
 auto netdev_count() -> size_t {
     devices_lock.lock();
-    size_t count = device_count;
+    size_t const COUNT = device_count;
     devices_lock.unlock();
-    return count;
+    return COUNT;
 }
 
 auto netdev_at(size_t i) -> NetDevice* {
@@ -163,15 +167,15 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
 #endif
         // Determine protocol from IP version in first byte
         if (pkt->len > 0) {
-            uint8_t version = (pkt->data[0] >> 4) & 0xF;
+            uint8_t const VERSION = (pkt->data[0] >> 4) & 0xF;
 #ifdef DEBUG_NETDEV
             ker::mod::dbg::log("netdev_rx: IP version = %u\n", version);
 #endif
-            if (version == 4) {
+            if (VERSION == 4) {
                 proto::ipv4_rx(dev, pkt);
                 return;
             }
-            if (version == 6) {
+            if (VERSION == 6) {
                 proto::ipv6_rx(dev, pkt);
                 return;
             }
@@ -184,10 +188,10 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     // Steer to per-CPU handler thread for parallel protocol processing.
     // Loopback is already handled above; only real NICs go through backlog.
     if (backlog_ready()) {
-        uint64_t target = backlog_flow_hash(pkt, ker::mod::smt::get_core_count());
+        uint64_t const TARGET = backlog_flow_hash(pkt, ker::mod::smt::get_core_count());
         // If the flow hashes to THIS CPU, process inline to avoid expensive reschedule
-        if (target != ker::mod::cpu::current_cpu()) {
-            backlog_enqueue(target, pkt);
+        if (TARGET != ker::mod::cpu::current_cpu()) {
+            backlog_enqueue(TARGET, pkt);
             return;
         }
     }

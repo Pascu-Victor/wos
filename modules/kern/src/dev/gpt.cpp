@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <new>
 
 #include "dev/block_device.hpp"
@@ -23,8 +22,8 @@ auto guid_compare(const uint8_t* guid1, const uint8_t* guid2) -> bool {
 
 // Check if a GPT partition entry is empty (all-zero type GUID)
 auto is_entry_empty(const GPTPartitionEntry* entry) -> bool {
-    for (size_t j = 0; j < GUID_SIZE; ++j) {
-        if (entry->partition_type_guid[j] != 0) {
+    for (unsigned char const J : entry->partition_type_guid) {
+        if (J != 0) {
             return false;
         }
     }
@@ -105,30 +104,30 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
         disk_info->disk_guid[i] = hdr->disk_guid[i];
     }
 
-    uint64_t entries_lba = hdr->partition_entries_lba;
-    uint32_t num_entries = hdr->num_partition_entries;
-    uint32_t entry_size = hdr->partition_entry_size;
-    uint32_t entries_per_sector = device->block_size / entry_size;
-    uint32_t num_sectors = (num_entries + entries_per_sector - 1) / entries_per_sector;
+    uint64_t const ENTRIES_LBA = hdr->partition_entries_lba;
+    uint32_t const NUM_ENTRIES = hdr->num_partition_entries;
+    uint32_t const ENTRY_SIZE = hdr->partition_entry_size;
+    uint32_t const ENTRIES_PER_SECTOR = device->block_size / ENTRY_SIZE;
+    uint32_t const NUM_SECTORS = (NUM_ENTRIES + ENTRIES_PER_SECTOR - 1) / ENTRIES_PER_SECTOR;
 
     gpt_log("gpt_enumerate: scanning ");
-    gpt_log_hex(num_entries);
+    gpt_log_hex(NUM_ENTRIES);
     gpt_log(" partition entries\n");
 
-    for (uint32_t sector = 0; sector < num_sectors; ++sector) {
-        if (ker::dev::block_read(device, entries_lba + sector, 1, sector_buf) != 0) {
+    for (uint32_t sector = 0; sector < NUM_SECTORS; ++sector) {
+        if (ker::dev::block_read(device, ENTRIES_LBA + sector, 1, sector_buf) != 0) {
             gpt_log("gpt_enumerate: failed to read partition entries sector\n");
             return -1;
         }
 
-        uint32_t entries_in_sector = entries_per_sector;
-        if (sector == num_sectors - 1) {
-            uint32_t remaining = num_entries - (sector * entries_per_sector);
-            entries_in_sector = remaining < entries_per_sector ? remaining : entries_per_sector;
+        uint32_t entries_in_sector = ENTRIES_PER_SECTOR;
+        if (sector == NUM_SECTORS - 1) {
+            uint32_t const REMAINING = NUM_ENTRIES - (sector * ENTRIES_PER_SECTOR);
+            entries_in_sector = REMAINING < ENTRIES_PER_SECTOR ? REMAINING : ENTRIES_PER_SECTOR;
         }
 
         for (uint32_t i = 0; i < entries_in_sector; ++i) {
-            auto* entry = reinterpret_cast<GPTPartitionEntry*>(sector_buf + (static_cast<size_t>(i) * entry_size));
+            auto* entry = reinterpret_cast<GPTPartitionEntry*>(sector_buf + (static_cast<size_t>(i) * ENTRY_SIZE));
 
             if (is_entry_empty(entry)) {
                 continue;
@@ -139,8 +138,8 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
                 break;
             }
 
-            uint32_t idx = disk_info->partition_count;
-            auto& part = disk_info->partitions[idx];
+            uint32_t const IDX = disk_info->partition_count;
+            auto& part = disk_info->partitions[IDX];
 
             for (size_t b = 0; b < GUID_SIZE; ++b) {
                 part.partition_type_guid[b] = entry->partition_type_guid[b];
@@ -148,7 +147,7 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
             }
             part.starting_lba = entry->starting_lba;
             part.ending_lba = entry->ending_lba;
-            part.partition_index = (sector * entries_per_sector) + i;
+            part.partition_index = (sector * ENTRIES_PER_SECTOR) + i;
 
             disk_info->partition_count++;
         }
@@ -209,18 +208,18 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
     gpt_log("\n");
 
     // Read partition entries one sector at a time to avoid large allocations
-    uint32_t entries_per_sector = device->block_size / gpt_header->partition_entry_size;
-    uint32_t num_sectors_needed = (gpt_header->num_partition_entries + entries_per_sector - 1) / entries_per_sector;
+    uint32_t const ENTRIES_PER_SECTOR = device->block_size / gpt_header->partition_entry_size;
+    uint32_t const NUM_SECTORS_NEEDED = (gpt_header->num_partition_entries + ENTRIES_PER_SECTOR - 1) / ENTRIES_PER_SECTOR;
 
     gpt_log("gpt_find_fat32_partition: Reading ");
-    gpt_log_hex(num_sectors_needed);
+    gpt_log_hex(NUM_SECTORS_NEEDED);
     gpt_log(" sectors of partition entries\n");
 
     // Reuse sector_buf to read one sector at a time
     uint64_t fat32_start_lba = 0;
     bool found = false;
 
-    for (uint32_t sector = 0; sector < num_sectors_needed && !found; ++sector) {
+    for (uint32_t sector = 0; sector < NUM_SECTORS_NEEDED && !found; ++sector) {
         // Read one sector of partition entries
         if (ker::dev::block_read(device, gpt_header->partition_entries_lba + sector, 1, sector_buf) != 0) {
             gpt_log("gpt_find_fat32_partition: Failed to read partition entries sector ");
@@ -231,11 +230,11 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
         }
 
         // Check entries in this sector
-        uint32_t entries_in_sector = entries_per_sector;
-        if (sector == num_sectors_needed - 1) {
+        uint32_t entries_in_sector = ENTRIES_PER_SECTOR;
+        if (sector == NUM_SECTORS_NEEDED - 1) {
             // Last sector might have fewer entries
-            uint32_t remaining = gpt_header->num_partition_entries - (sector * entries_per_sector);
-            entries_in_sector = remaining < entries_per_sector ? remaining : entries_per_sector;
+            uint32_t const REMAINING = gpt_header->num_partition_entries - (sector * ENTRIES_PER_SECTOR);
+            entries_in_sector = REMAINING < ENTRIES_PER_SECTOR ? REMAINING : ENTRIES_PER_SECTOR;
         }
 
         for (uint32_t i = 0; i < entries_in_sector && !found; i++) {
@@ -247,7 +246,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
 
             // Print the GUID we found
             gpt_log("gpt: Partition ");
-            gpt_log_hex((sector * entries_per_sector) + i);
+            gpt_log_hex((sector * ENTRIES_PER_SECTOR) + i);
             gpt_log(" GUID: ");
             for (size_t j = 0; j < GUID_SIZE; ++j) {
                 gpt_log_hex(entry->partition_type_guid[j]);

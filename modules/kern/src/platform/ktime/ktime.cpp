@@ -1,20 +1,26 @@
 #include "ktime.hpp"
 
+#include <cstdint>
 #include <platform/rtc/rtc.hpp>
 #include <platform/tsc/tsc.hpp>
+#include <util/list.hpp>
 
+#include "platform/acpi/apic/apic.hpp"
+#include "platform/acpi/hpet/hpet.hpp"
+#include "platform/dbg/dbg.hpp"
+#include "platform/interrupt/gates.hpp"
+#include "platform/sched/task.hpp"
 namespace ker::mod::time {
-bool isInit = false;
+static bool is_init = false;
+static util::List<void (*)(gates::InterruptFrame*)> tasks;
 
-std::list<void (*)(gates::interruptFrame*)> tasks;
+static uint64_t ktime_pit_tick = 0;
 
-static uint64_t ktimePITTick = 0;
-
-void handle_pit(sched::task::Context ctx, gates::interruptFrame* frame) {
+static void handle_pit(sched::task::Context ctx, gates::InterruptFrame* frame) {
     (void)ctx;
-    ktimePITTick++;
-    for (auto& task : tasks) {
-        task(frame);
+    ktime_pit_tick++;
+    for (auto* task = tasks.get_head(); task != nullptr; task = task->next) {
+        task->data(frame);
     }
     apic::eoi();
     auto c = apic::calibrate_timer(2000);
@@ -24,7 +30,7 @@ void handle_pit(sched::task::Context ctx, gates::interruptFrame* frame) {
 }
 
 void init() {
-    if (isInit) {
+    if (is_init) {
         return;
     }
 
@@ -37,10 +43,10 @@ void init() {
     // Read the CMOS real-time clock for wall-clock initialisation.
     rtc::init();
 
-    isInit = true;
+    is_init = true;
 }
 
-void pushTask(uint64_t ticks, void (*task)(gates::interruptFrame*), void* arg) {
+void push_task(uint64_t ticks, void (*task)(gates::InterruptFrame*), void* arg) {
     (void)ticks;
     (void)arg;
     tasks.push_back(task);

@@ -40,7 +40,7 @@ void remotable_on_fault(uint16_t node_id) {
     (void)node_id;
     ker::mod::io::serial::write("cdc-ether: remote fault\n");
 }
-const ker::net::wki::RemotableOps s_remotable_ops = {
+const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
     .can_passthrough = remotable_can_passthrough,
@@ -56,12 +56,12 @@ size_t cdc_count = 0;
 auto virt_to_phys(void* v) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(v);
     if (addr >= 0xffffffff80000000ULL) {
-        uint64_t phys = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
-        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
             ker::mod::dbg::log("cdc_ether: virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
         }
-        return phys;
+        return PHYS;
     }
     return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(addr));
 }
@@ -84,8 +84,8 @@ int cdc_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
     }
 
     // Submit bulk OUT transfer
-    int ret = xhci_bulk_transfer(cdc->hc, cdc->usb_dev->slot_id, &cdc->bulk_out, pkt->data, pkt->len);
-    if (ret == 0) {
+    int const RET = xhci_bulk_transfer(cdc->hc, cdc->usb_dev->slot_id, &cdc->bulk_out, pkt->data, pkt->len);
+    if (RET == 0) {
         netdev->tx_packets++;
         netdev->tx_bytes += pkt->len;
     } else {
@@ -93,14 +93,14 @@ int cdc_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
     }
 
     ker::net::pkt_free(pkt);
-    return ret;
+    return RET;
 }
 
-void cdc_set_mac(ker::net::NetDevice*, const uint8_t*) {
+void cdc_set_mac(ker::net::NetDevice* /*unused*/, const uint8_t* /*unused*/) {
     // MAC is read from device descriptor
 }
 
-ker::net::NetDeviceOps const cdc_ops = {
+ker::net::NetDeviceOps const CDC_OPS = {
     .open = cdc_open,
     .close = cdc_close,
     .start_xmit = cdc_start_xmit,
@@ -117,23 +117,23 @@ bool find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_i
     size_t offset = 0;
 
     while (offset + 2 <= config_len) {
-        uint8_t len = config_data[offset];
-        uint8_t type = config_data[offset + 1];
-        if (len == 0) {
+        uint8_t const LEN = config_data[offset];
+        uint8_t const TYPE = config_data[offset + 1];
+        if (LEN == 0) {
             break;
         }
-        if (offset + len > config_len) {
+        if (offset + LEN > config_len) {
             break;
         }
 
-        if (type == USB_DESC_INTERFACE) {
+        if (TYPE == USB_DESC_INTERFACE) {
             auto* iface = reinterpret_cast<UsbInterfaceDescriptor*>(config_data + offset);
-            in_target_iface = (iface->bInterfaceNumber == data_iface);
-        } else if (type == USB_DESC_ENDPOINT && in_target_iface) {
+            in_target_iface = (iface->b_interface_number == data_iface);
+        } else if (TYPE == USB_DESC_ENDPOINT && in_target_iface) {
             auto* ep = reinterpret_cast<UsbEndpointDescriptor*>(config_data + offset);
-            uint8_t ep_type = ep->bmAttributes & USB_EP_TYPE_MASK;
-            if (ep_type == USB_EP_TYPE_BULK) {
-                if ((ep->bEndpointAddress & USB_EP_DIR_IN) != 0) {
+            uint8_t const EP_TYPE = ep->bm_attributes & USB_EP_TYPE_MASK;
+            if (EP_TYPE == USB_EP_TYPE_BULK) {
+                if ((ep->b_endpoint_address & USB_EP_DIR_IN) != 0) {
                     *ep_in = ep;
                 } else {
                     *ep_out = ep;
@@ -141,7 +141,7 @@ bool find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_i
             }
         }
 
-        offset += len;
+        offset += LEN;
     }
 
     return (*ep_in != nullptr) && (*ep_out != nullptr);
@@ -151,25 +151,25 @@ bool find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_i
 bool find_cdc_ether_desc(const uint8_t* config_data, size_t config_len, uint8_t* mac_string_idx) {
     size_t offset = 0;
     while (offset + 2 <= config_len) {
-        uint8_t len = config_data[offset];
-        uint8_t type = config_data[offset + 1];
-        if (len == 0) {
+        uint8_t const LEN = config_data[offset];
+        uint8_t const TYPE = config_data[offset + 1];
+        if (LEN == 0) {
             break;
         }
-        if (offset + len > config_len) {
+        if (offset + LEN > config_len) {
             break;
         }
 
-        if (type == CDC_CS_INTERFACE && len >= 4) {
-            uint8_t subtype = config_data[offset + 2];
-            if (subtype == CDC_ETHERNET_TYPE && len >= 6) {
+        if (TYPE == CDC_CS_INTERFACE && LEN >= 4) {
+            uint8_t const SUBTYPE = config_data[offset + 2];
+            if (SUBTYPE == CDC_ETHERNET_TYPE && LEN >= 6) {
                 // iMACAddress is at offset+3
                 *mac_string_idx = config_data[offset + 3];
                 return true;
             }
         }
 
-        offset += len;
+        offset += LEN;
     }
     return false;
 }
@@ -178,27 +178,27 @@ bool find_cdc_ether_desc(const uint8_t* config_data, size_t config_len, uint8_t*
 uint8_t find_data_interface(const uint8_t* config_data, size_t config_len, uint8_t control_iface) {
     size_t offset = 0;
     while (offset + 2 <= config_len) {
-        uint8_t len = config_data[offset];
-        uint8_t type = config_data[offset + 1];
-        if (len == 0) {
+        uint8_t const LEN = config_data[offset];
+        uint8_t const TYPE = config_data[offset + 1];
+        if (LEN == 0) {
             break;
         }
-        if (offset + len > config_len) {
+        if (offset + LEN > config_len) {
             break;
         }
 
-        if (type == CDC_CS_INTERFACE && len >= 5) {
-            uint8_t subtype = config_data[offset + 2];
-            if (subtype == CDC_UNION_TYPE) {
-                uint8_t master = config_data[offset + 3];
-                uint8_t slave = config_data[offset + 4];
-                if (master == control_iface) {
-                    return slave;
+        if (TYPE == CDC_CS_INTERFACE && LEN >= 5) {
+            uint8_t const SUBTYPE = config_data[offset + 2];
+            if (SUBTYPE == CDC_UNION_TYPE) {
+                uint8_t const MASTER = config_data[offset + 3];
+                uint8_t const SLAVE = config_data[offset + 4];
+                if (MASTER == control_iface) {
+                    return SLAVE;
                 }
             }
         }
 
-        offset += len;
+        offset += LEN;
     }
     // Fallback: data interface is typically control + 1
     return control_iface + 1;
@@ -206,18 +206,18 @@ uint8_t find_data_interface(const uint8_t* config_data, size_t config_len, uint8
 
 // Set up xHCI transfer ring for a bulk endpoint
 void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpointDescriptor* ep_desc) {
-    ep->address = ep_desc->bEndpointAddress;
+    ep->address = ep_desc->b_endpoint_address;
     ep->type = USB_EP_TYPE_BULK;
-    ep->max_packet = ep_desc->wMaxPacketSize;
-    ep->interval = ep_desc->bInterval;
+    ep->max_packet = ep_desc->w_max_packet_size;
+    ep->interval = ep_desc->b_interval;
 
     // Allocate transfer ring
-    size_t ring_bytes = XFER_RING_SIZE * sizeof(Trb);
-    void* ring_virt = ker::mod::mm::phys::page_alloc(ring_bytes);
+    size_t const RING_BYTES = XFER_RING_SIZE * sizeof(Trb);
+    void* ring_virt = ker::mod::mm::phys::page_alloc(RING_BYTES);
     if (ring_virt == nullptr) {
         return;
     }
-    std::memset(ring_virt, 0, ring_bytes);
+    std::memset(ring_virt, 0, RING_BYTES);
 
     ep->ring = static_cast<Trb*>(ring_virt);
     ep->ring_phys = virt_to_phys(ring_virt);
@@ -225,27 +225,27 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
     ep->ring_cycle = true;
 
     // Configure endpoint in xHCI input context
-    uint8_t dci = ((ep->address & 0x80) != 0) ? ((2 * (ep->address & 0x0F)) + 1) : (2 * (ep->address & 0x0F));
+    uint8_t const DCI = ((ep->address & 0x80) != 0) ? ((2 * (ep->address & 0x0F)) + 1) : (2 * (ep->address & 0x0F));
 
     auto* ictx = dev->input_ctx;
     std::memset(ictx, 0, sizeof(InputContext));
-    ictx->add_flags = (1 << 0) | (1U << dci);  // Slot + this EP
+    ictx->add_flags = (1 << 0) | (1U << DCI);  // Slot + this EP
     ictx->drop_flags = 0;
 
     // Copy current slot context
     std::memcpy(&ictx->slot, &dev->dev_ctx->slot, sizeof(SlotContext));
     // Update context entries to include this DCI
-    uint32_t ctx_entries = (ictx->slot.data[0] >> 27) & 0x1F;
-    if (dci > ctx_entries) {
+    uint32_t const CTX_ENTRIES = (ictx->slot.data[0] >> 27) & 0x1F;
+    if (DCI > CTX_ENTRIES) {
         ictx->slot.data[0] &= ~(0x1FU << 27);
-        ictx->slot.data[0] |= (static_cast<uint32_t>(dci) << 27);
+        ictx->slot.data[0] |= (static_cast<uint32_t>(DCI) << 27);
     }
 
     // Set up endpoint context
-    auto* ep_ctx = &ictx->ep[dci - 1];
+    auto* ep_ctx = &ictx->ep[DCI - 1];
     // EP Type: Bulk OUT = 2, Bulk IN = 6
-    uint32_t ep_type = ((ep->address & 0x80) != 0) ? 6U : 2U;
-    ep_ctx->data[1] = (ep_type << 3) | (static_cast<uint32_t>(ep->max_packet) << 16);
+    uint32_t const EP_TYPE = ((ep->address & 0x80) != 0) ? 6U : 2U;
+    ep_ctx->data[1] = (EP_TYPE << 3) | (static_cast<uint32_t>(ep->max_packet) << 16);
     ep_ctx->data[2] = static_cast<uint32_t>(ep->ring_phys) | 1;  // DCS=1
     ep_ctx->data[3] = static_cast<uint32_t>(ep->ring_phys >> 32);
     ep_ctx->data[4] = ep->max_packet;  // Average TRB length
@@ -256,8 +256,8 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
 // CDC Ethernet class driver probe
 bool cdc_probe(UsbDevice* dev, UsbInterfaceDescriptor* iface) {
     // Match CDC Communications class with ECM/NCM subclass
-    if (iface->bInterfaceClass == USB_CLASS_CDC &&
-        (iface->bInterfaceSubClass == CDC_SUBCLASS_ECM || iface->bInterfaceSubClass == CDC_SUBCLASS_NCM)) {
+    if (iface->b_interface_class == USB_CLASS_CDC &&
+        (iface->b_interface_sub_class == CDC_SUBCLASS_ECM || iface->b_interface_sub_class == CDC_SUBCLASS_NCM)) {
         return true;
     }
     // Also match CDC Data class (some devices present data interface first)
@@ -290,21 +290,21 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     cdc->hc = hc;
 
     // Find data interface
-    uint8_t data_iface = find_data_interface(config_data, config_len, iface->bInterfaceNumber);
-    cdc->data_iface = data_iface;
+    uint8_t const DATA_IFACE = find_data_interface(config_data, config_len, iface->b_interface_number);
+    cdc->data_iface = DATA_IFACE;
 
     // Find bulk endpoints on the data interface
     UsbEndpointDescriptor* ep_in = nullptr;
     UsbEndpointDescriptor* ep_out = nullptr;
-    if (!find_bulk_endpoints(config_data, config_len, data_iface, &ep_in, &ep_out)) {
+    if (!find_bulk_endpoints(config_data, config_len, DATA_IFACE, &ep_in, &ep_out)) {
         ker::mod::io::serial::write("cdc-ether: no bulk endpoints found\n");
         return -1;
     }
 
     ker::mod::io::serial::write("cdc-ether: bulk_in=");
-    ker::mod::io::serial::write_hex(ep_in->bEndpointAddress);
+    ker::mod::io::serial::write_hex(ep_in->b_endpoint_address);
     ker::mod::io::serial::write(" bulk_out=");
-    ker::mod::io::serial::write_hex(ep_out->bEndpointAddress);
+    ker::mod::io::serial::write_hex(ep_out->b_endpoint_address);
     ker::mod::io::serial::write("\n");
 
     // Set up bulk endpoints
@@ -320,12 +320,12 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     cdc->netdev.mac[5] = static_cast<uint8_t>(cdc_count);
 
     // Register as network device
-    cdc->netdev.ops = &cdc_ops;
+    cdc->netdev.ops = &CDC_OPS;
     cdc->netdev.mtu = 1500;
     cdc->netdev.state = 1;
     cdc->netdev.private_data = cdc;
     cdc->netdev.name[0] = '\0';  // Auto-assign
-    cdc->netdev.remotable = &s_remotable_ops;
+    cdc->netdev.remotable = &S_REMOTABLE_OPS;
     cdc->active = true;
 
     ker::net::netdev_register(&cdc->netdev);
@@ -334,7 +334,9 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     ker::mod::io::serial::write(cdc->netdev.name.data());
     ker::mod::io::serial::write(" MAC=");
     for (int i = 0; i < 6; i++) {
-        if (i > 0) ker::mod::io::serial::write(":");
+        if (i > 0) {
+            ker::mod::io::serial::write(":");
+        }
         ker::mod::io::serial::write_hex(cdc->netdev.mac[i]);
     }
     ker::mod::io::serial::write(" ready\n");
@@ -343,7 +345,7 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     return 0;
 }
 
-void cdc_detach(UsbDevice*) {
+void cdc_detach(UsbDevice* /*unused*/) {
     // TODO: tear down
 }
 

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
+#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 
@@ -76,8 +77,8 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
     // on finobt blocks causes a magic-validation failure.  Scanning the
     // inobt is slightly slower but correct; the update path below still
     // maintains both trees when finobt is present.
-    xfs_agblock_t root = pag->agi_root;
-    uint32_t level = pag->agi_level;
+    xfs_agblock_t const ROOT = pag->agi_root;
+    uint32_t const LEVEL = pag->agi_level;
 
     // Set up cursor and search for any record (start from the beginning)
     XfsBtreeCursor<XfsInobtTraits> cur;
@@ -87,7 +88,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
     XfsInobtTraits::IRec target{};
     target.startino = 0;  // start from smallest inode number
 
-    int rc = xfs_btree_lookup(&cur, root, level, target, XfsBtreeLookup::GE);
+    int rc = xfs_btree_lookup(&cur, ROOT, LEVEL, target, XfsBtreeLookup::GE);
     if (rc != 0) {
         return NULLFSINO;
     }
@@ -98,13 +99,13 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
         if (rec.freecount > 0 && rec.free_mask != 0) {
             // Found a chunk with free inodes
-            int bit = ffs64(rec.free_mask);
-            if (bit >= 0 && bit < static_cast<int>(XFS_INODES_PER_CHUNK)) {
-                xfs_agino_t agino = rec.startino + static_cast<xfs_agino_t>(bit);
-                xfs_ino_t ino = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | agino;
+            int const BIT = ffs64(rec.free_mask);
+            if (BIT >= 0 && std::cmp_less(BIT, XFS_INODES_PER_CHUNK)) {
+                xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
+                xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
 
                 // 1. Clear the bit in ir_free and decrement ir_freecount
-                rec.free_mask &= ~(static_cast<uint64_t>(1) << bit);
+                rec.free_mask &= ~(static_cast<uint64_t>(1) << BIT);
                 rec.freecount--;
 
                 // 2-3. Update the inobt record on disk
@@ -144,15 +145,15 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                 // 5. Update AGI counters
                 pag->agi_freecount--;
 
-                uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-                BufHead* agi_bh = xfs_buf_read(mount, ag_start_block);
+                uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
+                BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
                 if (agi_bh != nullptr) {
                     auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
                     auto* agi = reinterpret_cast<XfsAgi*>(agi_bh->data + agi_offset);
-                    agi->agi_freecount = __be32::from_cpu(pag->agi_freecount);
-                    agi->agi_newino = __be32::from_cpu(agino);
+                    agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
+                    agi->agi_newino = Be32::from_cpu(AGINO);
                     // Recompute CRC
-                    agi->agi_crc = __be32{0};
+                    agi->agi_crc = Be32{0};
                     uint32_t crc = util::crc32c_block_with_cksum(agi, sizeof(XfsAgi), XFS_AGI_CRC_OFF);
                     __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
                     xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
@@ -163,7 +164,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 #ifdef XFS_DEBUG
                 mod::dbg::log("[xfs ialloc] allocated inode %lu (AG %u agino %u)\n", (unsigned long)ino, agno, agino);
 #endif
-                return ino;
+                return INO;
             }
         }
 
@@ -185,9 +186,9 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
 
     // Try each AG in round-robin order
     for (xfs_agnumber_t ag = 0; ag < mount->ag_count; ag++) {
-        xfs_ino_t ino = ialloc_ag(mount, tp, ag);
-        if (ino != NULLFSINO) {
-            return ino;
+        xfs_ino_t const INO = ialloc_ag(mount, tp, ag);
+        if (INO != NULLFSINO) {
+            return INO;
         }
     }
 
@@ -201,26 +202,26 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     }
 
     // Decompose inode number into AG + agino
-    xfs_agnumber_t agno = static_cast<xfs_agnumber_t>(ino >> mount->agino_log);
-    xfs_agino_t agino = static_cast<xfs_agino_t>(ino & ((1ULL << mount->agino_log) - 1));
+    auto const AGNO = static_cast<xfs_agnumber_t>(ino >> mount->agino_log);
+    auto const AGINO = static_cast<xfs_agino_t>(ino & ((1ULL << mount->agino_log) - 1));
 
-    if (agno >= mount->ag_count) {
+    if (AGNO >= mount->ag_count) {
         return -EINVAL;
     }
 
-    XfsPerAG* pag = &mount->per_ag[agno];
+    XfsPerAG* pag = &mount->per_ag[AGNO];
 
     // Compute the chunk start inode (aligned to 64-inode boundary)
-    xfs_agino_t chunk_start = agino & ~static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK - 1);
-    uint32_t bit = agino - chunk_start;
+    xfs_agino_t const CHUNK_START = AGINO & ~static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK - 1);
+    uint32_t const BIT = AGINO - CHUNK_START;
 
     // 1. Find the inobt record for this inode's chunk
     XfsBtreeCursor<XfsInobtTraits> cur;
     cur.mount = mount;
-    cur.agno = agno;
+    cur.agno = AGNO;
 
     XfsInobtTraits::IRec target{};
-    target.startino = chunk_start;
+    target.startino = CHUNK_START;
 
     int rc = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
     if (rc != 0) {
@@ -228,21 +229,21 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     }
 
     XfsInobtTraits::IRec rec = xfs_btree_get_rec(&cur);
-    if (rec.startino != chunk_start) {
-        mod::dbg::log("[xfs ifree] inobt record mismatch: expected startino %u, got %u\n", chunk_start, rec.startino);
+    if (rec.startino != CHUNK_START) {
+        mod::dbg::log("[xfs ifree] inobt record mismatch: expected startino %u, got %u\n", CHUNK_START, rec.startino);
         return -EIO;
     }
 
-    const uint64_t inode_bit = static_cast<uint64_t>(1) << bit;
-    if ((rec.free_mask & inode_bit) != 0) {
-        mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)", (unsigned long)ino,
-                                      agno, agino, chunk_start, rec.freecount);
+    const uint64_t INODE_BIT = static_cast<uint64_t>(1) << BIT;
+    if ((rec.free_mask & INODE_BIT) != 0) {
+        mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)",
+                                      static_cast<unsigned long>(ino), AGNO, AGINO, CHUNK_START, rec.freecount);
         return -EEXIST;
     }
 
     // 2-3. Set the free bit and increment freecount
-    bool was_fully_allocated = (rec.freecount == 0);
-    rec.free_mask |= inode_bit;
+    bool const WAS_FULLY_ALLOCATED = (rec.freecount == 0);
+    rec.free_mask |= INODE_BIT;
     rec.freecount++;
 
     // 4. Update inobt on disk
@@ -255,14 +256,14 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     if (xfs_has_finobt(mount) && pag->agi_free_root != 0) {
         XfsBtreeCursor<XfsFinobtTraits> fi_cur;
         fi_cur.mount = mount;
-        fi_cur.agno = agno;
+        fi_cur.agno = AGNO;
 
         XfsFinobtTraits::IRec fi_target{};
-        fi_target.startino = chunk_start;
+        fi_target.startino = CHUNK_START;
 
-        int frc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
+        int const FRC = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
 
-        if (was_fully_allocated || frc != 0) {
+        if (WAS_FULLY_ALLOCATED || FRC != 0) {
             // Chunk wasn't in finobt - insert it
             xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, nullptr, nullptr);
         } else {
@@ -274,14 +275,14 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     // 6. Update AGI counters
     pag->agi_freecount++;
 
-    uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-    BufHead* agi_bh = xfs_buf_read(mount, ag_start_block);
+    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(AGNO, 0, mount->ag_blk_log);
+    BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
     if (agi_bh != nullptr) {
         auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
         auto* agi = reinterpret_cast<XfsAgi*>(agi_bh->data + agi_offset);
-        agi->agi_freecount = __be32::from_cpu(pag->agi_freecount);
+        agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
         // Recompute CRC
-        agi->agi_crc = __be32{0};
+        agi->agi_crc = Be32{0};
         uint32_t crc = util::crc32c_block_with_cksum(agi, sizeof(XfsAgi), XFS_AGI_CRC_OFF);
         __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
         xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));

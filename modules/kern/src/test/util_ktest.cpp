@@ -148,17 +148,17 @@ KTEST(RadixTree, Remove) {
     ker::util::RadixTree<uint64_t> tree;
     KREQUIRE_TRUE(tree.insert(5, 555ULL));
     KEXPECT_EQ(tree.lookup(5), 555ULL);
-    uint64_t removed = tree.remove(5);
-    KEXPECT_EQ(removed, 555ULL);
+    uint64_t const REMOVED = tree.remove(5);
+    KEXPECT_EQ(REMOVED, 555ULL);
     KEXPECT_EQ(tree.lookup(5), 0ULL);
 }
 
 KTEST(RadixTree, LargeKey) {
     ker::util::RadixTree<uint64_t> tree;
-    uint64_t big_key = 0x00FF'FFFF'FFFF'FFFFULL;
-    KREQUIRE_TRUE(tree.insert(big_key, 42ULL));
-    KEXPECT_EQ(tree.lookup(big_key), 42ULL);
-    KEXPECT_EQ(tree.lookup(big_key - 1), 0ULL);
+    uint64_t const BIG_KEY = 0x00FF'FFFF'FFFF'FFFFULL;
+    KREQUIRE_TRUE(tree.insert(BIG_KEY, 42ULL));
+    KEXPECT_EQ(tree.lookup(BIG_KEY), 42ULL);
+    KEXPECT_EQ(tree.lookup(BIG_KEY - 1), 0ULL);
 }
 
 KTEST(RadixTree, FindFirstUnset) {
@@ -292,6 +292,7 @@ KTEST(ObjectPool, AllocFree) {
 KTEST(ObjectPool, MultipleObjects) {
     ker::util::ObjectPool<PoolObj> pool;
     constexpr int N = 8;
+    // NOLINTNEXTLINE(misc-const-correctness)
     PoolObj* ptrs[N] = {};
     for (int i = 0; i < N; ++i) {
         ptrs[i] = pool.alloc();

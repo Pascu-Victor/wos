@@ -34,7 +34,7 @@ freely, subject to the following restrictions:
 #include <vector>
 #endif /*__cplusplus*/
 
-extern const char* LODEPNG_VERSION_STRING;
+extern const char* lodepng_version_string;
 
 /*
 The following #defines are used to create code sections. They can be disabled
@@ -89,13 +89,13 @@ source files with custom allocators.*/
 
 #ifdef LODEPNG_COMPILE_PNG
 /*The PNG color types (also used for raw).*/
-typedef enum LodePNGColorType {
+using LodePNGColorType = enum LodePNGColorType {
     LCT_GREY = 0,       /*greyscale: 1,2,4,8,16 bit*/
     LCT_RGB = 2,        /*RGB: 8,16 bit*/
     LCT_PALETTE = 3,    /*palette: 1,2,4,8 bit*/
     LCT_GREY_ALPHA = 4, /*greyscale with alpha: 8,16 bit*/
     LCT_RGBA = 6        /*RGB with alpha: 8,16 bit*/
-} LodePNGColorType;
+};
 
 #ifdef LODEPNG_COMPILE_DECODER
 /*
@@ -230,7 +230,7 @@ const char* lodepng_error_text(unsigned code);
 
 #ifdef LODEPNG_COMPILE_DECODER
 /*Settings for zlib decompression*/
-typedef struct LodePNGDecompressSettings LodePNGDecompressSettings;
+using LodePNGDecompressSettings = struct LodePNGDecompressSettings;
 struct LodePNGDecompressSettings {
     unsigned ignore_adler32; /*if 1, continue and don't give an error message if the Adler32 checksum is corrupted*/
 
@@ -244,7 +244,7 @@ struct LodePNGDecompressSettings {
     const void* custom_context; /*optional custom settings for custom functions*/
 };
 
-extern const LodePNGDecompressSettings lodepng_default_decompress_settings;
+extern const LodePNGDecompressSettings LODEPNG_DEFAULT_DECOMPRESS_SETTINGS;
 void lodepng_decompress_settings_init(LodePNGDecompressSettings* settings);
 #endif /*LODEPNG_COMPILE_DECODER*/
 
@@ -253,7 +253,7 @@ void lodepng_decompress_settings_init(LodePNGDecompressSettings* settings);
 Settings for zlib compression. Tweaking these settings tweaks the balance
 between speed and compression ratio.
 */
-typedef struct LodePNGCompressSettings LodePNGCompressSettings;
+using LodePNGCompressSettings = struct LodePNGCompressSettings;
 struct LodePNGCompressSettings /*deflate = compress*/
 {
     /*LZ77 related settings*/
@@ -274,7 +274,7 @@ struct LodePNGCompressSettings /*deflate = compress*/
     const void* custom_context; /*optional custom settings for custom functions*/
 };
 
-extern const LodePNGCompressSettings lodepng_default_compress_settings;
+extern const LodePNGCompressSettings LODEPNG_DEFAULT_COMPRESS_SETTINGS;
 void lodepng_compress_settings_init(LodePNGCompressSettings* settings);
 #endif /*LODEPNG_COMPILE_ENCODER*/
 
@@ -284,7 +284,7 @@ Color mode of an image. Contains all information required to decode the pixel
 bits to RGBA colors. This information is the same as used in the PNG file
 format, and is used both for PNG and raw image data in LodePNG.
 */
-typedef struct LodePNGColorMode {
+using LodePNGColorMode = struct LodePNGColorMode {
     /*header (IHDR)*/
     LodePNGColorType colortype; /*color type, see PNG standard or documentation further in this header file*/
     unsigned bitdepth;          /*bits per sample, see PNG standard or documentation further in this header file*/
@@ -320,7 +320,7 @@ typedef struct LodePNGColorMode {
     unsigned key_r;       /*red/greyscale component of color key*/
     unsigned key_g;       /*green component of color key*/
     unsigned key_b;       /*blue component of color key*/
-} LodePNGColorMode;
+};
 
 /*init, cleanup and copy functions to use with this struct*/
 void lodepng_color_mode_init(LodePNGColorMode* info);
@@ -359,18 +359,18 @@ size_t lodepng_get_raw_size(unsigned w, unsigned h, const LodePNGColorMode* colo
 
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
 /*The information of a Time chunk in PNG.*/
-typedef struct LodePNGTime {
+using LodePNGTime = struct LodePNGTime {
     unsigned year;   /*2 bytes used (0-65535)*/
     unsigned month;  /*1-12*/
     unsigned day;    /*1-31*/
     unsigned hour;   /*0-23*/
     unsigned minute; /*0-59*/
     unsigned second; /*0-60 (to allow for leap seconds)*/
-} LodePNGTime;
+};
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
 /*Information about the PNG image, except pixels, width and height.*/
-typedef struct LodePNGInfo {
+using LodePNGInfo = struct LodePNGInfo {
     /*header (IHDR), palette (PLTE) and transparency (tRNS) chunks*/
     unsigned compression_method; /*compression method of the original file. Always 0.*/
     unsigned filter_method;      /*filter method of the original file*/
@@ -444,7 +444,7 @@ typedef struct LodePNGInfo {
     unsigned char* unknown_chunks_data[3];
     size_t unknown_chunks_size[3]; /*size in bytes of the unknown chunks, given for protection*/
 #endif                             /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-} LodePNGInfo;
+};
 
 /*init, cleanup and copy functions to use with this struct*/
 void lodepng_info_init(LodePNGInfo* info);
@@ -480,7 +480,7 @@ unsigned lodepng_convert(unsigned char* out, const unsigned char* in, LodePNGCol
 Settings for the decoder. This contains settings for the PNG and the Zlib
 decoder, but not the Info settings from the Info structs.
 */
-typedef struct LodePNGDecoderSettings {
+using LodePNGDecoderSettings = struct LodePNGDecoderSettings {
     LodePNGDecompressSettings zlibsettings; /*in here is the setting to ignore Adler32 checksums*/
 
     unsigned ignore_crc; /*ignore CRC checksums*/
@@ -492,14 +492,14 @@ typedef struct LodePNGDecoderSettings {
     /*store all bytes from unknown chunks in the LodePNGInfo (off by default, useful for a png editor)*/
     unsigned remember_unknown_chunks;
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-} LodePNGDecoderSettings;
+};
 
 void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings);
 #endif /*LODEPNG_COMPILE_DECODER*/
 
 #ifdef LODEPNG_COMPILE_ENCODER
 /*automatically use color type with less bits per pixel if losslessly possible. Default: AUTO*/
-typedef enum LodePNGFilterStrategy {
+using LodePNGFilterStrategy = enum LodePNGFilterStrategy {
     /*every filter at zero*/
     LFS_ZERO,
     /*Use filter that gives minumum sum, as described in the official PNG filter heuristic.*/
@@ -514,11 +514,11 @@ typedef enum LodePNGFilterStrategy {
     LFS_BRUTE_FORCE,
     /*use predefined_filters buffer: you specify the filter type for each scanline*/
     LFS_PREDEFINED
-} LodePNGFilterStrategy;
+};
 
 /*Gives characteristics about the colors of the image, which helps decide which color model to use for encoding.
 Used internally by default if "auto_convert" is enabled. Public because it's useful for custom algorithms.*/
-typedef struct LodePNGColorProfile {
+using LodePNGColorProfile = struct LodePNGColorProfile {
     unsigned colored;     /*not greyscale*/
     unsigned key;         /*if true, image is not opaque. Only if true and alpha is false, color key is possible.*/
     unsigned short key_r; /*these values are always in 16-bit bitdepth in the profile*/
@@ -528,7 +528,7 @@ typedef struct LodePNGColorProfile {
     unsigned numcolors;          /*amount of colors, up to 257. Not valid if bits == 16.*/
     unsigned char palette[1024]; /*Remembers up to the first 256 RGBA colors, in no particular order*/
     unsigned bits;               /*bits per channel (not for palette). 1,2 or 4 for greyscale only. 16 if 16-bit per channel required.*/
-} LodePNGColorProfile;
+};
 
 void lodepng_color_profile_init(LodePNGColorProfile* profile);
 
@@ -541,7 +541,7 @@ unsigned lodepng_auto_choose_color(LodePNGColorMode* mode_out, const unsigned ch
                                    const LodePNGColorMode* mode_in);
 
 /*Settings for the encoder.*/
-typedef struct LodePNGEncoderSettings {
+using LodePNGEncoderSettings = struct LodePNGEncoderSettings {
     LodePNGCompressSettings zlibsettings; /*settings for the zlib encoder, such as window size, ...*/
 
     unsigned auto_convert; /*automatically choose output PNG color type. Default: true*/
@@ -569,28 +569,28 @@ typedef struct LodePNGEncoderSettings {
     /*encode text chunks as zTXt chunks instead of tEXt chunks, and use compression in iTXt chunks*/
     unsigned text_compression;
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-} LodePNGEncoderSettings;
+};
 
 void lodepng_encoder_settings_init(LodePNGEncoderSettings* settings);
 #endif /*LODEPNG_COMPILE_ENCODER*/
 
 #if defined(LODEPNG_COMPILE_DECODER) || defined(LODEPNG_COMPILE_ENCODER)
 /*The settings, state and information for extended encoding and decoding.*/
-typedef struct LodePNGState {
+using LodePNGState = struct LodePNGState {
 #ifdef LODEPNG_COMPILE_DECODER
-    LodePNGDecoderSettings decoder; /*the decoding settings*/
-#endif                              /*LODEPNG_COMPILE_DECODER*/
+    LodePNGDecoderSettings decoder{}; /*the decoding settings*/
+#endif                                /*LODEPNG_COMPILE_DECODER*/
 #ifdef LODEPNG_COMPILE_ENCODER
-    LodePNGEncoderSettings encoder; /*the encoding settings*/
-#endif                              /*LODEPNG_COMPILE_ENCODER*/
-    LodePNGColorMode info_raw;      /*specifies the format in which you would like to get the raw pixel buffer*/
-    LodePNGInfo info_png;           /*info of the PNG image obtained after decoding*/
-    unsigned error;
+    LodePNGEncoderSettings encoder{}; /*the encoding settings*/
+#endif                                /*LODEPNG_COMPILE_ENCODER*/
+    LodePNGColorMode info_raw{};      /*specifies the format in which you would like to get the raw pixel buffer*/
+    LodePNGInfo info_png{};           /*info of the PNG image obtained after decoding*/
+    unsigned error{};
 #ifdef LODEPNG_COMPILE_CPP
     /* For the lodepng::State subclass. */
     virtual ~LodePNGState() {}
 #endif
-} LodePNGState;
+};
 
 /*init, cleanup and copy functions to use with this struct*/
 void lodepng_state_init(LodePNGState* state);
@@ -761,7 +761,7 @@ class State : public LodePNGState {
    public:
     State();
     State(const State& other);
-    virtual ~State();
+    ~State() override;
     State& operator=(const State& other);
 };
 
@@ -796,21 +796,21 @@ unsigned save_file(const std::vector<unsigned char>& buffer, const std::string& 
 #ifdef LODEPNG_COMPILE_DECODER
 /* Zlib-decompress an unsigned char buffer */
 unsigned decompress(std::vector<unsigned char>& out, const unsigned char* in, size_t insize,
-                    const LodePNGDecompressSettings& settings = lodepng_default_decompress_settings);
+                    const LodePNGDecompressSettings& settings = LODEPNG_DEFAULT_DECOMPRESS_SETTINGS);
 
 /* Zlib-decompress an std::vector */
 unsigned decompress(std::vector<unsigned char>& out, const std::vector<unsigned char>& in,
-                    const LodePNGDecompressSettings& settings = lodepng_default_decompress_settings);
+                    const LodePNGDecompressSettings& settings = LODEPNG_DEFAULT_DECOMPRESS_SETTINGS);
 #endif /* LODEPNG_COMPILE_DECODER */
 
 #ifdef LODEPNG_COMPILE_ENCODER
 /* Zlib-compress an unsigned char buffer */
 unsigned compress(std::vector<unsigned char>& out, const unsigned char* in, size_t insize,
-                  const LodePNGCompressSettings& settings = lodepng_default_compress_settings);
+                  const LodePNGCompressSettings& settings = LODEPNG_DEFAULT_COMPRESS_SETTINGS);
 
 /* Zlib-compress an std::vector */
 unsigned compress(std::vector<unsigned char>& out, const std::vector<unsigned char>& in,
-                  const LodePNGCompressSettings& settings = lodepng_default_compress_settings);
+                  const LodePNGCompressSettings& settings = LODEPNG_DEFAULT_COMPRESS_SETTINGS);
 #endif /* LODEPNG_COMPILE_ENCODER */
 #endif /* LODEPNG_COMPILE_ZLIB */
 } /* namespace lodepng */

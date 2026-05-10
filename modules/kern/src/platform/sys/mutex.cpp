@@ -23,20 +23,20 @@ namespace ker::mod::sys {
 void Mutex::lock() {
     // Fast path - try to acquire immediately
     bool expected = false;
-    if (held_.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+    if (held.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
         return;
     }
 
     // Slow path - contended
-    waiters_.fetch_add(1, std::memory_order_relaxed);
+    waiters.fetch_add(1, std::memory_order_relaxed);
 
     // Brief spin before yielding (avoids a full context switch for very short
     // critical sections).
     constexpr int SPIN_LIMIT = 64;
     for (int i = 0; i < SPIN_LIMIT; i++) {
         expected = false;
-        if (held_.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
-            waiters_.fetch_sub(1, std::memory_order_relaxed);
+        if (held.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+            waiters.fetch_sub(1, std::memory_order_relaxed);
             return;
         }
         asm volatile("pause");
@@ -47,8 +47,8 @@ void Mutex::lock() {
         sched::kern_yield();
 
         expected = false;
-        if (held_.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
-            waiters_.fetch_sub(1, std::memory_order_relaxed);
+        if (held.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+            waiters.fetch_sub(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -56,11 +56,11 @@ void Mutex::lock() {
 
 auto Mutex::try_lock() -> bool {
     bool expected = false;
-    return held_.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+    return held.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed);
 }
 
 void Mutex::unlock() {
-    held_.store(false, std::memory_order_release);
+    held.store(false, std::memory_order_release);
 
     // If there are waiters, the next timer tick / kern_yield() wakeup will
     // let them retry.  For latency-sensitive paths we could send an IPI here,

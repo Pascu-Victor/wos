@@ -4,8 +4,8 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 
-#define CHECK_BIT(value, bit) ((value >> bit) & 1)
-#define BITMAP_NO_BITS_LEFT 0xFFFFFFFF
+#define CHECK_BIT(value, bit) (((value) >> (bit)) & 1)
+enum { BITMAP_NO_BITS_LEFT = 0xFFFFFFFF };
 
 template <size_t SIZE>
 class Bitmap {
@@ -18,8 +18,8 @@ class Bitmap {
     void set_unused(unsigned position);
     unsigned find_unused(unsigned search_start = 0);
     unsigned find_used(unsigned search_start = 0);
-    bool check_used(unsigned position) const;
-    bool check_unused(unsigned position) const;
+    [[nodiscard]] bool check_used(unsigned position) const;
+    [[nodiscard]] bool check_unused(unsigned position) const;
 
     // Diagnostic accessors for debugging only
     [[nodiscard]] unsigned word_count() const { return SIZE; }
@@ -53,7 +53,9 @@ unsigned Bitmap<SIZE>::find_unused(unsigned search_start) {
             bit_index += 32;
             continue;
         }
-        if (!CHECK_BIT(m_bitmap_data[bit_index / 32], bit_index % 32)) return bit_index;
+        if (!CHECK_BIT(m_bitmap_data[bit_index / 32], bit_index % 32)) {
+            return bit_index;
+        }
 
         bit_index++;
     }

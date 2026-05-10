@@ -8,7 +8,7 @@
 
 namespace ker::mod::interrupt {
 
-void init(void) {
+void init() {
     pic::remap();
     // Init ACPI.
     ker::mod::acpi::init();

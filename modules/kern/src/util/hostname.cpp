@@ -1,5 +1,7 @@
 #include "hostname.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cerrno>
 #include <cstring>
 #include <platform/fw/qemu_fw_cfg.hpp>
@@ -51,10 +53,10 @@ static auto try_set_hostname(const char* src, size_t max_len, const char* source
 void init() {
     // Priority 1: QEMU fw_cfg (opt/wos/hostname) — per-VM override
     char fw_buf[HOSTNAME_MAX] = {};
-    int fw_len = ker::platform::fw::fw_cfg_read_file("opt/wos/hostname", fw_buf, sizeof(fw_buf) - 1);
-    if (fw_len > 0) {
-        fw_buf[fw_len] = '\0';
-        if (try_set_hostname(fw_buf, static_cast<size_t>(fw_len), "fw_cfg")) {
+    int const FW_LEN = ker::platform::fw::fw_cfg_read_file("opt/wos/hostname", fw_buf, sizeof(fw_buf) - 1);
+    if (FW_LEN > 0) {
+        fw_buf[FW_LEN] = '\0';
+        if (try_set_hostname(fw_buf, static_cast<size_t>(FW_LEN), "fw_cfg")) {
             return;
         }
     }
@@ -70,16 +72,16 @@ void init() {
     }
 
     char buf[HOSTNAME_MAX + 16] = {};
-    ssize_t n = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
+    ssize_t const N = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
     if (f->fops->vfs_close != nullptr) {
         f->fops->vfs_close(f);
     }
-    if (n <= 0) {
+    if (N <= 0) {
         return;
     }
-    buf[n] = '\0';
+    buf[N] = '\0';
 
-    if (!try_set_hostname(buf, static_cast<size_t>(n), "/etc/hostname")) {
+    if (!try_set_hostname(buf, static_cast<size_t>(N), "/etc/hostname")) {
         ker::mod::dbg::log("[hostname] Invalid /etc/hostname content, using default '%s'", s_hostname);
     }
 }

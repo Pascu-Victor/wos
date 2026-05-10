@@ -1,8 +1,9 @@
 #include "ntp.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cstdint>
 #include <cstring>
-#include <net/endian.hpp>
 #include <net/socket.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -10,6 +11,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <syscalls_impl/process/exit.hpp>
+#include <utility>
 
 namespace ker::mod::ntp {
 
@@ -61,8 +63,8 @@ static auto try_sync(uint32_t server_ip) -> bool {
         return false;
     }
 
-    ssize_t sent = sock->proto_ops->sendto(sock, req, NTP_PACKET_LEN, 0, remote, sizeof(remote));
-    if (sent != static_cast<ssize_t>(NTP_PACKET_LEN)) {
+    ssize_t const SENT = sock->proto_ops->sendto(sock, req, NTP_PACKET_LEN, 0, remote, sizeof(remote));
+    if (std::cmp_not_equal(SENT, NTP_PACKET_LEN)) {
         ker::net::socket_destroy(sock);
         return false;
     }
@@ -71,8 +73,8 @@ static auto try_sync(uint32_t server_ip) -> bool {
     uint8_t resp[NTP_PACKET_LEN] = {};
     bool got = false;
     for (int r = 0; r < 200 && !got; ++r) {
-        ssize_t n = sock->proto_ops->recv(sock, resp, NTP_PACKET_LEN, 0);
-        if (n == static_cast<ssize_t>(NTP_PACKET_LEN)) {
+        ssize_t const N = sock->proto_ops->recv(sock, resp, NTP_PACKET_LEN, 0);
+        if (std::cmp_equal(N, NTP_PACKET_LEN)) {
             got = true;
         } else {
             ker::mod::sched::kern_yield();
@@ -86,21 +88,21 @@ static auto try_sync(uint32_t server_ip) -> bool {
     }
 
     // Transmit Timestamp is at bytes 40–47 (big-endian seconds + fraction).
-    uint32_t ntp_sec = (static_cast<uint32_t>(resp[40]) << 24) | (static_cast<uint32_t>(resp[41]) << 16) |
-                       (static_cast<uint32_t>(resp[42]) << 8) | static_cast<uint32_t>(resp[43]);
+    uint32_t const NTP_SEC = (static_cast<uint32_t>(resp[40]) << 24) | (static_cast<uint32_t>(resp[41]) << 16) |
+                             (static_cast<uint32_t>(resp[42]) << 8) | static_cast<uint32_t>(resp[43]);
 
-    if (ntp_sec == 0) {
+    if (NTP_SEC == 0) {
         return false;  // server didn't fill in the transmit timestamp
     }
 
-    int64_t unix_sec = static_cast<int64_t>(ntp_sec) - static_cast<int64_t>(NTP_EPOCH_DELTA);
-    int64_t rtc_now = static_cast<int64_t>(rtc::get_epoch_sec());
-    int64_t delta = unix_sec - rtc_now;
+    int64_t const UNIX_SEC = static_cast<int64_t>(NTP_SEC) - static_cast<int64_t>(NTP_EPOCH_DELTA);
+    auto const RTC_NOW = static_cast<int64_t>(rtc::get_epoch_sec());
+    int64_t const DELTA = UNIX_SEC - RTC_NOW;
 
-    rtc::set_offset(delta);
-    dbg::log("ntp: synced to %lu.%lu.%lu.%lu - offset %ld s", (unsigned long)((server_ip >> 24) & 0xFF),
-             (unsigned long)((server_ip >> 16) & 0xFF), (unsigned long)((server_ip >> 8) & 0xFF), (unsigned long)(server_ip & 0xFF),
-             (long)delta);
+    rtc::set_offset(DELTA);
+    dbg::log("ntp: synced to %lu.%lu.%lu.%lu - offset %ld s", static_cast<unsigned long>((server_ip >> 24) & 0xFF),
+             static_cast<unsigned long>((server_ip >> 16) & 0xFF), static_cast<unsigned long>((server_ip >> 8) & 0xFF),
+             static_cast<unsigned long>(server_ip & 0xFF), static_cast<long>(DELTA));
     return true;
 }
 
@@ -118,8 +120,8 @@ static void ntp_sync_thread() {
         // (On the first pass this also lets drivers finish their init.)
         time::sleep(5000);
 
-        for (unsigned int i : NTP_SERVERS) {
-            if (try_sync(i)) {
+        for (unsigned int const I : NTP_SERVERS) {
+            if (try_sync(I)) {
                 dbg::log("ntp: sync successful on attempt %d", attempt + 1);
                 terminate_ntp_thread();
             }
@@ -143,7 +145,7 @@ void init() {
         return;
     }
     ker::mod::sched::post_task_balanced(task);
-    dbg::log("ntp: sync thread started (PID %d)", (int)task->pid);
+    dbg::log("ntp: sync thread started (PID %d)", static_cast<int>(task->pid));
 }
 
 }  // namespace ker::mod::ntp

@@ -137,17 +137,17 @@ auto epoll_create(int flags) -> int {
     file->vfs_path = nullptr;
     file->dir_fs_count = 0;
 
-    int fd = vfs_alloc_fd(task, file);
-    if (fd < 0) {
+    int const FD = vfs_alloc_fd(task, file);
+    if (FD < 0) {
         delete inst;
         delete file;
-        return fd;
+        return FD;
     }
-    file->fd = fd;
+    file->fd = FD;
     if ((flags & EPOLL_CLOEXEC_FLAG) != 0) {
-        task->set_fd_cloexec(static_cast<unsigned>(fd));
+        task->set_fd_cloexec(static_cast<unsigned>(FD));
     }
-    return fd;
+    return FD;
 }
 
 // -- epoll_ctl ----------------------------------------------------------------
@@ -171,12 +171,12 @@ auto epoll_ctl(int epfd, int op, int fd, EpollEvent* event) -> int {
 
     // IPC_EPOLL proxy fd: forward control op to home node.
     {
-        uint32_t ev = (event != nullptr) ? event->events : 0;
-        uint64_t user_data = (event != nullptr) ? event->data.u64 : 0;
-        int remote_rc = ker::net::wki::wki_ipc_epoll_ctl_forward(epfile, op, fd, ev, user_data);
-        if (remote_rc != -EOPNOTSUPP) {
+        uint32_t const EV = (event != nullptr) ? event->events : 0;
+        uint64_t const USER_DATA = (event != nullptr) ? event->data.u64 : 0;
+        int const REMOTE_RC = ker::net::wki::wki_ipc_epoll_ctl_forward(epfile, op, fd, EV, USER_DATA);
+        if (REMOTE_RC != -EOPNOTSUPP) {
             vfs_put_file(epfile);
-            return remote_rc;
+            return REMOTE_RC;
         }
     }
 
@@ -270,7 +270,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return -EINVAL;
     }
 
-    uint64_t deadline_us = begin_poll_timeout(task, timeout_ms);
+    uint64_t const DEADLINE_US = begin_poll_timeout(task, timeout_ms);
 
     // Scan all interest entries and collect ready events
     int ready = 0;
@@ -287,10 +287,10 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             continue;
         }
 
-        uint32_t revents = poll_fd(target, inst->interests[i].events);
+        uint32_t const REVENTS = poll_fd(target, inst->interests[i].events);
         vfs_put_file(target);
-        if (revents != 0) {
-            events[ready].events = revents;
+        if (REVENTS != 0) {
+            events[ready].events = REVENTS;
             events[ready].data.u64 = inst->interests[i].data;
             ready++;
 
@@ -307,7 +307,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return ready;
     }
 
-    if (deadline_us != 0 && ker::mod::time::get_us() >= deadline_us) {
+    if (DEADLINE_US != 0 && ker::mod::time::get_us() >= DEADLINE_US) {
         clear_poll_timeout(task);
         vfs_put_file(epfile);
         return 0;
@@ -317,8 +317,8 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
     // This lets pselect/poll return -EINTR so signal handlers run promptly.
     // (task was already fetched at the top of this function)
     {
-        uint64_t deliverable = task->sig_pending & ~task->sig_mask;
-        if (deliverable != 0) {
+        uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+        if (DELIVERABLE != 0) {
             clear_poll_timeout(task);
             vfs_put_file(epfile);
             return -EINTR;
@@ -332,11 +332,11 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
                 continue;
             }
             auto* f = vfs_get_file_retain(task, interest.fd);
-            bool ok = (f != nullptr) && register_poll_waiter(f, task->pid);
+            bool const OK = (f != nullptr) && register_poll_waiter(f, task->pid);
             if (f != nullptr) {
                 vfs_put_file(f);
             }
-            if (!ok) {
+            if (!OK) {
                 can_block = false;
                 break;
             }
@@ -344,7 +344,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
     }
 
     if (can_block) {
-        task->wake_at_us = deadline_us;
+        task->wake_at_us = DEADLINE_US;
         task->wait_channel = "epoll_wait";
         task->deferred_task_switch = true;
 
@@ -361,10 +361,10 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             if (target == nullptr) {
                 continue;
             }
-            uint32_t revents = poll_fd(target, inst->interests[i].events);
+            uint32_t const REVENTS = poll_fd(target, inst->interests[i].events);
             vfs_put_file(target);
-            if (revents != 0) {
-                events[recheck].events = revents;
+            if (REVENTS != 0) {
+                events[recheck].events = REVENTS;
                 events[recheck].data.u64 = inst->interests[i].data;
                 recheck++;
                 if ((inst->interests[i].events & EPOLLONESHOT) != 0U) {

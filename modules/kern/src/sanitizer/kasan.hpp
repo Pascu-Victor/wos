@@ -46,7 +46,7 @@ static inline auto addr_to_shadow(uintptr_t addr) -> int8_t* { return reinterpre
 // Called from the page-fault handler in gates.cpp / pagefault_handler().
 // Allocates a zeroed (accessible) page for the shadow on demand.
 // Returns true if the fault was handled (shadow page allocated), false otherwise.
-auto handle_shadow_fault(uint64_t cr2, std::string_view source, const gates::interruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
+auto handle_shadow_fault(uint64_t cr2, std::string_view source, const gates::InterruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
     -> bool;
 
 // Poison/unpoison a byte range in the shadow map.

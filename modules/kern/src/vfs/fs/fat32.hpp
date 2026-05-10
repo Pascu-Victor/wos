@@ -116,9 +116,9 @@ auto fat32_close(File* f) -> int;
 constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
 
 // FAT32 stat operations
-auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ctx) -> int;
-auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int;
-auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::statvfs* buf) -> int;
+auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ctx) -> int;
+auto fat32_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 
 // FAT32 directory modification operations
 auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int;

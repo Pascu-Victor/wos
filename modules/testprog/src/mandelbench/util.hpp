@@ -9,9 +9,9 @@
 #include "config.hpp"
 
 #ifndef _UTIL_H
-#define _UTIL_H
+#define UTIL_H
 
-struct arg {
+struct Arg {
     unsigned char* image;
     unsigned char* colormap;
     int width;
@@ -45,7 +45,7 @@ void hsv2rgb(float h, float s, float v, unsigned char* rgb);
 
 void init_colormap(int len, unsigned char* map);
 
-void set_pixel(unsigned char* image, int width, int x, int y, unsigned char* c);
+void set_pixel(unsigned char* image, int width, int x, int y, const unsigned char* c);
 
 void save_image(const char* filename, const unsigned char* image, unsigned width, unsigned height);
 

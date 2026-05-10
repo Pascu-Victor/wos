@@ -1,10 +1,10 @@
 bits 64
 section .text
 %include "platform/asm/helpers.asm"
-extern syscallHandler
-global _wOS_asm_syscallHandler
+extern syscall_handler
+global wos_asm_syscall_handler
 
-_wOS_asm_syscallHandler:
+wos_asm_syscall_handler:
     swapgs
     ; Save RCX and R11 IMMEDIATELY - they hold return RIP and RFLAGS
     ; These must be saved before any code can clobber them
@@ -37,7 +37,7 @@ _wOS_asm_syscallHandler:
     lea rdi, [rsp+8]
     xor rbp, rbp
 
-    call syscallHandler
+    call syscall_handler
     ; save return value
     mov [rsp+0x78], rax
 

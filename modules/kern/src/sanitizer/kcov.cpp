@@ -11,9 +11,11 @@
 //
 // Gated behind cmake -DWOS_KCOV=ON.
 
+#include <cstddef>
+#include <cstdint>
+#include <new>
 #ifdef WOS_KCOV
 
-#include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <sanitizer/kcov.hpp>
 
@@ -34,10 +36,12 @@ int alloc_buffer(size_t num_entries) {
     }
 
     auto* buf = new (std::nothrow) KcovBuffer{};
-    if (!buf) return -1;  // ENOMEM
+    if (buf == nullptr) {
+        return -1;  // ENOMEM
+    }
 
     buf->pcs = new (std::nothrow) uint64_t[num_entries];
-    if (!buf->pcs) {
+    if (buf->pcs == nullptr) {
         delete buf;
         return -1;
     }
@@ -50,19 +54,19 @@ int alloc_buffer(size_t num_entries) {
 }
 
 void enable() {
-    if (s_current_buffer) {
+    if (s_current_buffer != nullptr) {
         s_current_buffer->enabled = true;
     }
 }
 
 void disable() {
-    if (s_current_buffer) {
+    if (s_current_buffer != nullptr) {
         s_current_buffer->enabled = false;
     }
 }
 
 void reset() {
-    if (s_current_buffer) {
+    if (s_current_buffer != nullptr) {
         s_current_buffer->count = 0;
     }
 }
@@ -74,19 +78,21 @@ KcovBuffer* current_buffer() { return s_current_buffer; }
 // --------------------------------------------------------------------------
 // Compiler callback — called at every basic-block entry
 // --------------------------------------------------------------------------
-
+// NOLINTNEXTLINE(readability-identifier-naming)
 extern "C" void __sanitizer_cov_trace_pc() {
     auto* buf = s_current_buffer;
-    if (!buf || !buf->enabled) return;
+    if ((buf == nullptr) || !buf->enabled) {
+        return;
+    }
 
     // __builtin_return_address(0) gives us the PC of the call site,
     // which is the instrumented basic block.
     auto pc = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
-    uint64_t idx = buf->count;
-    if (idx < buf->capacity) {
-        buf->pcs[idx] = pc;
-        buf->count = idx + 1;
+    uint64_t const IDX = buf->count;
+    if (IDX < buf->capacity) {
+        buf->pcs[IDX] = pc;
+        buf->count = IDX + 1;
     }
     // If buffer is full, silently drop (Syzkaller handles partial coverage)
 }

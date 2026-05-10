@@ -45,14 +45,14 @@ inline auto socket_fill_sockaddr_v4(void* addr_out, size_t max_len, size_t* addr
     }
 
     uint8_t encoded[SOCKADDR_V4_LEN] = {};
-    const uint16_t family = SOCKADDR_V4_FAMILY;
-    const uint16_t port_be = htons(port);
-    const uint32_t ip_be = htonl(ip);
-    std::memcpy(encoded, &family, sizeof(family));
-    std::memcpy(encoded + 2, &port_be, sizeof(port_be));
-    std::memcpy(encoded + 4, &ip_be, sizeof(ip_be));
-    const size_t copy_len = max_len < SOCKADDR_V4_LEN ? max_len : SOCKADDR_V4_LEN;
-    std::memcpy(addr_out, encoded, copy_len);
+    const uint16_t FAMILY = SOCKADDR_V4_FAMILY;
+    const uint16_t PORT_BE = htons(port);
+    const uint32_t IP_BE = htonl(ip);
+    std::memcpy(encoded, &FAMILY, sizeof(FAMILY));
+    std::memcpy(encoded + 2, &PORT_BE, sizeof(PORT_BE));
+    std::memcpy(encoded + 4, &IP_BE, sizeof(IP_BE));
+    const size_t COPY_LEN = max_len < SOCKADDR_V4_LEN ? max_len : SOCKADDR_V4_LEN;
+    std::memcpy(addr_out, encoded, COPY_LEN);
     return true;
 }
 

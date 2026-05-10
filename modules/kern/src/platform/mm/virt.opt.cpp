@@ -2,7 +2,6 @@
 
 #include <extern/limine.h>
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -11,11 +10,13 @@
 #include <platform/smt/smt.hpp>
 #include <string_view>
 
+#include "platform/sched/task.hpp"
+#include "platform/sys/spinlock.hpp"
+
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
 #endif
 
-#include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/tlb.hpp"
 #include "platform/dbg/coredump.hpp"
@@ -49,7 +50,7 @@ void switch_to_kernel_pagemap() { wrcr3((uint64_t)addr::get_phys_pointer((paddr_
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
 auto create_pagemap() -> PageTable* {
-    auto* page_table = (PageTable*)phys::page_alloc();
+    auto* page_table = static_cast<PageTable*>(phys::page_alloc());
     if (page_table != nullptr) {
         memset(page_table, 0, paging::PAGE_SIZE);
     }
@@ -65,7 +66,7 @@ void copy_kernel_mappings(sched::task::Task* t) {
 void switch_pagemap(sched::task::Task* t) {
     if (t->pagemap == nullptr) {
         [[unlikely]]
-        if (t->name) {
+        if (t->name != nullptr) {
             dbg::log("Task %s has no pagemap\n", t->name);
         } else {
             dbg::log("Task has no pagemap\n Halting.");
@@ -102,8 +103,8 @@ static inline auto pte_from_raw(uint64_t raw) -> paging::PageTableEntry {
     return e;
 }
 
-auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr) -> bool {
-    PageFault pagefault = paging::create_page_fault(frame.err_code, true);
+auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr) -> bool {
+    PageFault const PAGEFAULT = paging::create_page_fault(frame.err_code, true);
 
 #ifdef WOS_KASAN
     // KASan shadow-region demand paging.  Shadow pages are zeroed (accessible)
@@ -120,7 +121,7 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
     // (e.g. syscall read() copying data into a user buffer via memcpy).
     // Guard: only handle addresses in the user-space half of the canonical
     // address space to ensure we never touch kernel page-table entries.
-    if ((pagefault.writable != 0U) && (control_register < 0x0000800000000000ULL)) {
+    if ((PAGEFAULT.writable != 0U) && (control_register < 0x0000800000000000ULL)) {
         // Walk page tables to find the faulting PTE
         auto* current_task = sched::get_current_task();
         if (current_task == nullptr || current_task->pagemap == nullptr) {
@@ -129,28 +130,28 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             return false;
         }
 
-        paging::PageTable* pml4 = current_task->pagemap;
-        uint64_t vaddr = control_register;
+        paging::PageTable const* pml4 = current_task->pagemap;
+        uint64_t const VADDR = control_register;
 
         // Walk the 4 levels to find the PML1 entry
-        const uint64_t IDX4 = (vaddr >> 39) & 0x1FF;
-        const uint64_t IDX3 = (vaddr >> 30) & 0x1FF;
-        const uint64_t IDX2 = (vaddr >> 21) & 0x1FF;
-        const uint64_t IDX1 = (vaddr >> 12) & 0x1FF;
+        const uint64_t IDX4 = (VADDR >> 39) & 0x1FF;
+        const uint64_t IDX3 = (VADDR >> 30) & 0x1FF;
+        const uint64_t IDX2 = (VADDR >> 21) & 0x1FF;
+        const uint64_t IDX1 = (VADDR >> 12) & 0x1FF;
 
         if (!pml4->entries[IDX4].present) {
             goto not_cow;
         }
         {
-            auto* pml3 = (paging::PageTable*)addr::get_virt_pointer(pml4->entries[IDX4].frame << paging::PAGE_SHIFT);
+            auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4->entries[IDX4].frame << paging::PAGE_SHIFT));
             if (!pml3->entries[IDX3].present) {
                 goto not_cow;
             }
-            auto* pml2 = (paging::PageTable*)addr::get_virt_pointer(pml3->entries[IDX3].frame << paging::PAGE_SHIFT);
+            auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3->entries[IDX3].frame << paging::PAGE_SHIFT));
             if (!pml2->entries[IDX2].present) {
                 goto not_cow;
             }
-            auto* pml1 = (paging::PageTable*)addr::get_virt_pointer(pml2->entries[IDX2].frame << paging::PAGE_SHIFT);
+            auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2->entries[IDX2].frame << paging::PAGE_SHIFT));
 
             paging::PageTableEntry& pte = pml1->entries[IDX1];
             if (!pte.present) {
@@ -163,17 +164,17 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             }
 
             // This is a COW page - handle it
-            paddr_t old_phys = pte.frame << paging::PAGE_SHIFT;
-            void* old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(old_phys));
+            paddr_t const OLD_PHYS = pte.frame << paging::PAGE_SHIFT;
+            void* old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(OLD_PHYS));
 
-            uint32_t refcount = phys::page_ref_get(old_virt);
+            uint32_t const REFCOUNT = phys::page_ref_get(old_virt);
 
-            if (refcount <= 1) {
+            if (REFCOUNT <= 1) {
                 // We're the sole owner - just make it writable and clear COW
                 raw &= ~paging::PAGE_COW;
                 raw |= paging::PAGE_WRITE;
                 pte = pte_from_raw(raw);
-                invlpg(vaddr);
+                invlpg(VADDR);
                 return true;
             }
 
@@ -188,7 +189,7 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             void* new_page = phys::page_alloc(paging::PAGE_SIZE);
             if (new_page == nullptr) {
                 phys::page_ref_dec(old_virt);  // release pin
-                dbg::log("COW fault: OOM allocating new page for vaddr 0x%x", vaddr);
+                dbg::log("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
                 hcf();
                 return false;
             }
@@ -198,8 +199,8 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             // Re-read the PTE: if PAGE_COW is already gone, another CPU handled
             // this fault while we were copying.  Discard our copy; the other
             // handler's mapping is already live.
-            uint64_t raw_now = pte_raw(pte);
-            if ((raw_now & paging::PAGE_COW) == 0U) {
+            uint64_t const RAW_NOW = pte_raw(pte);
+            if ((RAW_NOW & paging::PAGE_COW) == 0U) {
                 phys::page_ref_dec(new_page);  // discard unused allocation
                 phys::page_ref_dec(old_virt);  // release pin only (PTE ref transferred by the other handler)
                 return true;
@@ -213,7 +214,7 @@ auto pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, 
             raw &= ~(0xFFFFFFFFFFULL << 12);  // clear frame field
             raw |= (new_phys & ~0xFFFULL);    // set new frame
             pte = pte_from_raw(raw);
-            invlpg(vaddr);
+            invlpg(VADDR);
 
             // Release pin and our PTE reference to old_virt (two decrements).
             phys::page_ref_dec(old_virt);  // release pin (paired with pageRefInc above)
@@ -235,27 +236,27 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
         hcf();
     }
 
-    PageTable* table = page_table;
+    PageTable const* table = page_table;
     for (int i = 4; i > 1; i--) {
         const auto& entry = table->entries[index_of(vaddr, i)];
         if (!entry.present) {
             return PADDR_INVALID;
         }
-        uint64_t phys = entry.frame << paging::PAGE_SHIFT;
-        table = (PageTable*)(phys + 0xffff800000000000ULL);  // Use HHDM for page table walk
+        uint64_t const PHYS = entry.frame << paging::PAGE_SHIFT;
+        table = (PageTable*)(PHYS + 0xffff800000000000ULL);  // Use HHDM for page table walk
     }
 
     const auto& pte = table->entries[index_of(vaddr, 1)];
     if (!pte.present) {
         return PADDR_INVALID;
     }
-    uint64_t phys = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
-    return phys;  // Return physical address only
+    uint64_t const PHYS = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
+    return PHYS;  // Return physical address only
 }
 void init_pagemap() {
     cpu::enable_pae();
     cpu::enable_pse();
-    kernel_pagemap = (PageTable*)phys::page_alloc();
+    kernel_pagemap = static_cast<PageTable*>(phys::page_alloc());
     if (kernel_pagemap == nullptr) {
         // PANIC!
         dbg::log("init: failed to allocate kernel pagemap\n function: initPagemap");
@@ -292,9 +293,9 @@ void init_pagemap() {
     size_t total_pages_mapped = 0;
     for (size_t i = 0; i < memmap_response->entry_count; i++) {
         auto* entry = memmap_response->entries[i];
-        size_t num_pages = entry->length / paging::PAGE_SIZE;
+        size_t const NUM_PAGES = entry->length / paging::PAGE_SIZE;
 
-        for (size_t j = 0; j < num_pages; j++) {
+        for (size_t j = 0; j < NUM_PAGES; j++) {
             auto vaddr = (paddr_t)addr::get_virt_pointer(entry->base + (j * paging::PAGE_SIZE));
             map_page(kernel_pagemap,
                      vaddr,                                                          // virtual address
@@ -311,9 +312,9 @@ void init_pagemap() {
     mod::dbg::log("Mapped total of %zu pages from memory map", total_pages_mapped);
 
     for (size_t i = 0; i <= kernel_file_response->executable_file->size; i++) {
-        vaddr_t vaddr = kernel_address_response->virtual_base + (i * paging::PAGE_SIZE);
+        vaddr_t const VADDR = kernel_address_response->virtual_base + (i * paging::PAGE_SIZE);
         map_page(kernel_pagemap,
-                 vaddr,                                                             // virtual address
+                 VADDR,                                                             // virtual address
                  kernel_address_response->physical_base + (i * paging::PAGE_SIZE),  // physical address
                  paging::page_types::KERNEL                                         // kernel memory
         );
@@ -333,15 +334,15 @@ void init_pagemap() {
         iteration++;
         size_t mapped_this_round = 0;
         for (size_t pml4i = KERNEL_PML4_START; pml4i < KERNEL_PML4_END; pml4i++) {  // Only kernel half
-            PageTableEntry& pml4e = kernel_pagemap->entries[pml4i];
+            PageTableEntry const& pml4e = kernel_pagemap->entries[pml4i];
             if (!pml4e.present) {
                 continue;
             }
 
-            paddr_t pml3_phys = pml4e.frame << paging::PAGE_SHIFT;
-            auto pml3_virt = (vaddr_t)addr::get_virt_pointer(pml3_phys);
+            paddr_t const PML3_PHYS = pml4e.frame << paging::PAGE_SHIFT;
+            auto pml3_virt = (vaddr_t)addr::get_virt_pointer(PML3_PHYS);
             if (!is_page_mapped(kernel_pagemap, pml3_virt)) {
-                map_page(kernel_pagemap, pml3_virt, pml3_phys, paging::page_types::KERNEL);
+                map_page(kernel_pagemap, pml3_virt, PML3_PHYS, paging::page_types::KERNEL);
                 pt_pages_mappped++;
                 mapped_this_round++;
                 made_progress = true;
@@ -353,10 +354,10 @@ void init_pagemap() {
                     continue;
                 }
 
-                paddr_t pml2_phys = pml3e.frame << paging::PAGE_SHIFT;
-                auto pml2_virt = (vaddr_t)addr::get_virt_pointer(pml2_phys);
+                paddr_t const PML2_PHYS = pml3e.frame << paging::PAGE_SHIFT;
+                auto pml2_virt = (vaddr_t)addr::get_virt_pointer(PML2_PHYS);
                 if (!is_page_mapped(kernel_pagemap, pml2_virt)) {
-                    map_page(kernel_pagemap, pml2_virt, pml2_phys, paging::page_types::KERNEL);
+                    map_page(kernel_pagemap, pml2_virt, PML2_PHYS, paging::page_types::KERNEL);
                     pt_pages_mappped++;
                     mapped_this_round++;
                     made_progress = true;
@@ -368,11 +369,11 @@ void init_pagemap() {
                         continue;
                     }
 
-                    paddr_t pml1_phys = pml2e.frame << paging::PAGE_SHIFT;
+                    paddr_t const PML1_PHYS = pml2e.frame << paging::PAGE_SHIFT;
 
-                    auto pml1_virt = (vaddr_t)addr::get_virt_pointer(pml1_phys);
+                    auto pml1_virt = (vaddr_t)addr::get_virt_pointer(PML1_PHYS);
                     if (!is_page_mapped(kernel_pagemap, pml1_virt)) {
-                        map_page(kernel_pagemap, pml1_virt, pml1_phys, paging::page_types::KERNEL);
+                        map_page(kernel_pagemap, pml1_virt, PML1_PHYS, paging::page_types::KERNEL);
                         pt_pages_mappped++;
                         mapped_this_round++;
                         made_progress = true;
@@ -413,7 +414,7 @@ static auto advance_page_table(paging::PageTable* page_table, size_t level, uint
         // Never set NX bit on intermediate entries as it affects all children.
         if (((flags & paging::PAGE_NX) == 0U) && entry.no_execute) {
             entry.no_execute = 0;
-            auto* raw_entry = (uint64_t*)&entry;
+            auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
             constexpr uint64_t NX_MASK = ~(1ULL << 63);
             *raw_entry &= NX_MASK;  // Clear NX bit
             changed = true;
@@ -425,7 +426,7 @@ static auto advance_page_table(paging::PageTable* page_table, size_t level, uint
             wrcr3(rdcr3());
         }
 
-        return (PageTable*)addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT);
+        return reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
     }
 
     void* page_virt = phys::page_alloc();
@@ -440,7 +441,7 @@ static auto advance_page_table(paging::PageTable* page_table, size_t level, uint
     memset(page_virt, 0, paging::PAGE_SIZE);
 
     page_table->entries[level] = paging::create_page_table_entry(page_phys, flags);
-    return (PageTable*)page_virt;
+    return static_cast<PageTable*>(page_virt);
 }
 /*
  * Map a page in the page table
@@ -480,13 +481,13 @@ auto is_page_mapped(PageTable* page_table, vaddr_t vaddr) -> bool {
         hcf();
     }
 
-    PageTable* table = page_table;
+    PageTable const* table = page_table;
     for (int i = 4; i > 1; i--) {
         // Check if the entry is present before following the pointer
         if (!table->entries[index_of(vaddr, i)].present) {
             return false;
         }
-        table = (PageTable*)addr::get_virt_pointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT);
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(table->entries[index_of(vaddr, i)].frame << paging::PAGE_SHIFT));
     }
 
     return table->entries[index_of(vaddr, 1)].present;
@@ -505,8 +506,8 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     }
 
     // Get the current page table entry by computing the index first
-    uint64_t idx = index_of(vaddr, 1);
-    PageTableEntry& entry = table->entries[idx];
+    uint64_t const IDX = index_of(vaddr, 1);
+    PageTableEntry& entry = table->entries[IDX];
 
     if (entry.present == 0) {
         // Page doesn't exist, nothing to modify
@@ -519,7 +520,7 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     entry.user = (flags & paging::PAGE_USER) != 0U ? 1 : 0;
     entry.no_execute = (flags & paging::PAGE_NX) != 0U ? 1 : 0;
 
-    auto* raw_entry = (uint64_t*)&entry;
+    auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
     constexpr uint64_t NX_BIT_POSITION = 63ULL;
     if ((flags & paging::PAGE_NX) != 0U) {
         *raw_entry |= (1ULL << NX_BIT_POSITION);  // Set NX bit
@@ -549,15 +550,15 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
         table = advance_page_table(table, index_of(vaddr, i), 0);
     }
 
-    uint64_t frame = table->entries[index_of(vaddr, 1)].frame;
+    uint64_t const FRAME = table->entries[index_of(vaddr, 1)].frame;
     table->entries[index_of(vaddr, 1)] = paging::purge_page_table_entry();
 
     invlpg(vaddr);
 
     // Convert frame number to physical address, then to HHDM pointer for refcount-aware free
-    if (frame != 0) {
-        uint64_t phys_addr = frame << paging::PAGE_SHIFT;
-        void* virt_ptr = reinterpret_cast<void*>(addr::get_virt_pointer(phys_addr));
+    if (FRAME != 0) {
+        uint64_t const PHYS_ADDR = FRAME << paging::PAGE_SHIFT;
+        void* virt_ptr = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS_ADDR));
         phys::page_ref_dec(virt_ptr);
     }
 }
@@ -601,24 +602,24 @@ static auto phys_is_in_ram(uint64_t phys_addr) -> bool {
 }
 
 static auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
-    const uint64_t page_base = phys_addr & ~(paging::PAGE_SIZE - 1);
-    if (!phys_is_in_ram(page_base)) {
+    const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
+    if (!phys_is_in_ram(PAGE_BASE)) {
         return nullptr;
     }
 
-    const uint64_t virt_raw = page_base + addr::get_hhdm_offset();
-    if ((virt_raw >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+    const uint64_t VIRT_RAW = PAGE_BASE + addr::get_hhdm_offset();
+    if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
         return nullptr;
     }
 
-    if (phys::page_ref_get(reinterpret_cast<void*>(virt_raw)) == 0) {
+    if (phys::page_ref_get(reinterpret_cast<void*>(VIRT_RAW)) == 0) {
         return nullptr;
     }
 
-    return reinterpret_cast<void*>(virt_raw);
+    return reinterpret_cast<void*>(VIRT_RAW);
 }
 
-static auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys, uint64_t owner_pid = 0, const char* owner_name = nullptr,
+static auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys, const char* owner_name = nullptr,
                                            const char* reason = nullptr) -> bool {
     if (root == nullptr) {
         return false;
@@ -681,8 +682,8 @@ static auto frame_is_live_medium_alloc(uint64_t phys_addr) -> bool {
     if (page_ptr == nullptr) {
         return false;
     }
-    const uint64_t page_base = reinterpret_cast<uint64_t>(page_ptr);
-    return *reinterpret_cast<const uint64_t*>(page_base + 16) == MEDIUM_ALLOC_MAGIC;
+    const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_ptr);
+    return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC;
 }
 
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
@@ -696,25 +697,25 @@ static auto collect_user_vaddrs_for_phys(PageTable* table, int level, uint64_t v
         return 0;
     }
 
-    const size_t max_entry = (level == 4) ? 256 : 512;
-    const int level_shift = 12 + (9 * (level - 1));
+    const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
+    const int LEVEL_SHIFT = 12 + (9 * (level - 1));
     size_t hits = 0;
 
-    for (size_t i = 0; i < max_entry && hits < max_hits; ++i) {
+    for (size_t i = 0; i < MAX_ENTRY && hits < max_hits; ++i) {
         const auto& entry = table->entries[i];
         if (!entry.present) {
             continue;
         }
 
-        const uint64_t entry_vaddr = vaddr_base | (static_cast<uint64_t>(i) << level_shift);
-        const uint64_t entry_phys = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
-        if (entry_phys == 0) {
+        const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
+        const uint64_t ENTRY_PHYS = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (ENTRY_PHYS == 0) {
             continue;
         }
 
         if (level == 1) {
-            if ((entry_phys & ~(paging::PAGE_SIZE - 1)) == target_phys) {
-                out_vaddrs[hits++] = entry_vaddr;
+            if ((ENTRY_PHYS & ~(paging::PAGE_SIZE - 1)) == target_phys) {
+                out_vaddrs[hits++] = ENTRY_VADDR;
             }
             continue;
         }
@@ -723,12 +724,12 @@ static auto collect_user_vaddrs_for_phys(PageTable* table, int level, uint64_t v
             continue;
         }
 
-        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(entry_phys));
+        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(ENTRY_PHYS));
         if (next_level == nullptr) {
             continue;
         }
 
-        hits += collect_user_vaddrs_for_phys(next_level, level - 1, entry_vaddr, target_phys, out_vaddrs + hits, max_hits - hits);
+        hits += collect_user_vaddrs_for_phys(next_level, level - 1, ENTRY_VADDR, target_phys, out_vaddrs + hits, max_hits - hits);
     }
 
     return hits;
@@ -739,22 +740,22 @@ static auto mark_phys_rmap_reported(uint64_t target_phys) -> bool {
     static std::array<uint64_t, 64> reported_phys = {};
 
     target_phys &= ~(paging::PAGE_SIZE - 1);
-    const uint64_t flags = lock.lock_irqsave();
-    for (uint64_t phys : reported_phys) {
-        if (phys == target_phys) {
-            lock.unlock_irqrestore(flags);
+    const uint64_t FLAGS = lock.lock_irqsave();
+    for (uint64_t const PHYS : reported_phys) {
+        if (PHYS == target_phys) {
+            lock.unlock_irqrestore(FLAGS);
             return false;
         }
     }
     for (auto& phys : reported_phys) {
         if (phys == 0) {
             phys = target_phys;
-            lock.unlock_irqrestore(flags);
+            lock.unlock_irqrestore(FLAGS);
             return true;
         }
     }
     reported_phys[target_phys % reported_phys.size()] = target_phys;
-    lock.unlock_irqrestore(flags);
+    lock.unlock_irqrestore(FLAGS);
     return true;
 }
 
@@ -766,14 +767,14 @@ static auto log_user_phys_mappings(uint64_t target_phys, const char* trigger, ui
 
     constexpr size_t MAX_HITS_PER_TASK = 4;
     constexpr size_t MAX_LOGGED_TASKS = 12;
-    uint32_t active_count = sched::get_active_task_count();
+    uint32_t const ACTIVE_COUNT = sched::get_active_task_count();
     size_t logged_tasks = 0;
     size_t total_hits = 0;
 
-    log::warn("phys-rmap: scanning tasks for phys=0x%llx trigger=%s pid=%lu name=%s", (unsigned long long)target_phys,
+    log::warn("phys-rmap: scanning tasks for phys=0x%llx trigger=%s pid=%lu name=%s", static_cast<unsigned long long>(target_phys),
               trigger != nullptr ? trigger : "?", owner_pid, owner_name != nullptr ? owner_name : "?");
 
-    for (uint32_t i = 0; i < active_count && logged_tasks < MAX_LOGGED_TASKS; ++i) {
+    for (uint32_t i = 0; i < ACTIVE_COUNT && logged_tasks < MAX_LOGGED_TASKS; ++i) {
         auto* task = sched::get_active_task_at_safe(i);
         if (task == nullptr) {
             continue;
@@ -781,15 +782,16 @@ static auto log_user_phys_mappings(uint64_t target_phys, const char* trigger, ui
 
         if (task->pagemap != nullptr && task->type != sched::task::TaskType::DAEMON) {
             uint64_t hits[MAX_HITS_PER_TASK] = {};
-            const size_t found =
+            const size_t FOUND =
                 collect_user_vaddrs_for_phys(task->pagemap, 4, 0, target_phys & ~(paging::PAGE_SIZE - 1), hits, MAX_HITS_PER_TASK);
-            if (found > 0) {
-                total_hits += found;
+            if (FOUND > 0) {
+                total_hits += FOUND;
                 ++logged_tasks;
                 log::warn("phys-rmap: phys=0x%llx pid=%lu name=%s pagemap=%p hit0=0x%llx hit1=0x%llx hit2=0x%llx hit3=0x%llx",
-                          (unsigned long long)target_phys, task->pid, task->name != nullptr ? task->name : "?",
-                          static_cast<void*>(task->pagemap), (unsigned long long)hits[0], (unsigned long long)hits[1],
-                          (unsigned long long)hits[2], (unsigned long long)hits[3]);
+                          static_cast<unsigned long long>(target_phys), task->pid, task->name != nullptr ? task->name : "?",
+                          static_cast<void*>(task->pagemap), static_cast<unsigned long long>(hits[0]),
+                          static_cast<unsigned long long>(hits[1]), static_cast<unsigned long long>(hits[2]),
+                          static_cast<unsigned long long>(hits[3]));
             }
         }
 
@@ -797,8 +799,8 @@ static auto log_user_phys_mappings(uint64_t target_phys, const char* trigger, ui
     }
 
     for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && logged_tasks < MAX_LOGGED_TASKS; ++cpu_no) {
-        const size_t dead_count = sched::get_dead_task_count(cpu_no);
-        for (size_t idx = 0; idx < dead_count && logged_tasks < MAX_LOGGED_TASKS; ++idx) {
+        const size_t DEAD_COUNT = sched::get_dead_task_count(cpu_no);
+        for (size_t idx = 0; idx < DEAD_COUNT && logged_tasks < MAX_LOGGED_TASKS; ++idx) {
             auto* task = sched::get_dead_task_at_safe(cpu_no, idx);
             if (task == nullptr) {
                 continue;
@@ -806,16 +808,17 @@ static auto log_user_phys_mappings(uint64_t target_phys, const char* trigger, ui
 
             if (task->pagemap != nullptr && task->type != sched::task::TaskType::DAEMON) {
                 uint64_t hits[MAX_HITS_PER_TASK] = {};
-                const size_t found =
+                const size_t FOUND =
                     collect_user_vaddrs_for_phys(task->pagemap, 4, 0, target_phys & ~(paging::PAGE_SIZE - 1), hits, MAX_HITS_PER_TASK);
-                if (found > 0) {
-                    total_hits += found;
+                if (FOUND > 0) {
+                    total_hits += FOUND;
                     ++logged_tasks;
                     log::warn(
                         "phys-rmap: phys=0x%llx dead_cpu=%llu pid=%lu name=%s pagemap=%p hit0=0x%llx hit1=0x%llx hit2=0x%llx hit3=0x%llx",
-                        (unsigned long long)target_phys, (unsigned long long)cpu_no, task->pid, task->name != nullptr ? task->name : "?",
-                        static_cast<void*>(task->pagemap), (unsigned long long)hits[0], (unsigned long long)hits[1],
-                        (unsigned long long)hits[2], (unsigned long long)hits[3]);
+                        static_cast<unsigned long long>(target_phys), static_cast<unsigned long long>(cpu_no), task->pid,
+                        task->name != nullptr ? task->name : "?", static_cast<void*>(task->pagemap),
+                        static_cast<unsigned long long>(hits[0]), static_cast<unsigned long long>(hits[1]),
+                        static_cast<unsigned long long>(hits[2]), static_cast<unsigned long long>(hits[3]));
                 }
             }
 
@@ -825,12 +828,13 @@ static auto log_user_phys_mappings(uint64_t target_phys, const char* trigger, ui
 
     if (logged_tasks == 0) {
         if (log_when_empty) {
-            log::warn("phys-rmap: phys=0x%llx has no other active or dead user mappings", (unsigned long long)target_phys);
+            log::warn("phys-rmap: phys=0x%llx has no other active or dead user mappings", static_cast<unsigned long long>(target_phys));
         }
         return false;
     }
 
-    log::warn("phys-rmap: phys=0x%llx logged_tasks=%zu total_hits=%zu", (unsigned long long)target_phys, logged_tasks, total_hits);
+    log::warn("phys-rmap: phys=0x%llx logged_tasks=%zu total_hits=%zu", static_cast<unsigned long long>(target_phys), logged_tasks,
+              total_hits);
     return true;
 }
 
@@ -849,42 +853,42 @@ static void free_user_data_pages(PageTable* table, int level, PageTable* root, u
     const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
 
     // Number of VA bits contributed by this level's index field
-    const int level_shift = 12 + (9 * (level - 1));
+    const int LEVEL_SHIFT = 12 + (9 * (level - 1));
 
     for (size_t i = 0; i < MAX_ENTRY; i++) {
         if (table->entries[i].present == 0) {
             continue;
         }
 
-        uint64_t phys_addr = static_cast<uint64_t>(table->entries[i].frame) << paging::PAGE_SHIFT;
-        if (phys_addr == 0) {
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(table->entries[i].frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0) {
             continue;
         }
 
         // Reconstruct virtual address for diagnostic output.
-        const uint64_t entry_vaddr = vaddr_base | (static_cast<uint64_t>(i) << level_shift);
+        const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
 
         if (level > 1) {
             // Check for huge pages (2MB at level 2, 1GB at level 3)
             if (table->entries[i].pagesize != 0) {
                 // Preserve existing behavior: huge user mappings are not currently reclaimed here.
-            } else if (frame_is_live_medium_alloc(phys_addr)) {
+            } else if (frame_is_live_medium_alloc(PHYS_ADDR)) {
                 table->entries[i] = paging::purge_page_table_entry();
             } else {
-                uint64_t virt_raw = phys_addr + addr::get_hhdm_offset();
-                if ((virt_raw >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+                uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+                if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
                     log::warn(
                         "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx "
                         "virt=0x%llx "
                         "corrupt non-canonical next-level pointer",
                         owner_pid, owner_name != nullptr ? owner_name : "?", reason != nullptr ? reason : "?", static_cast<void*>(root),
-                        level, i, (unsigned long long)entry_vaddr, (unsigned long long)table->entries[i].frame,
-                        (unsigned long long)phys_addr, (unsigned long long)virt_raw);
+                        level, i, static_cast<unsigned long long>(ENTRY_VADDR), static_cast<unsigned long long>(table->entries[i].frame),
+                        static_cast<unsigned long long>(PHYS_ADDR), static_cast<unsigned long long>(VIRT_RAW));
                     table->entries[i] = paging::purge_page_table_entry();
                     continue;
                 }
-                auto* next_level = reinterpret_cast<PageTable*>(virt_raw);
-                free_user_data_pages(next_level, level - 1, root, entry_vaddr, owner_pid, owner_name, reason);
+                auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
+                free_user_data_pages(next_level, level - 1, root, ENTRY_VADDR, owner_pid, owner_name, reason);
             }
         } else {
             // Level 1 (PML1) - entries point to actual data pages
@@ -895,23 +899,23 @@ static void free_user_data_pages(PageTable* table, int level, PageTable* root, u
             // cleanup reaches the same frame, which turns into a page_free()
             // of a live kmalloc page. Keep page-table frames owned by the
             // page-table cleanup phase below.
-            if (!page_table_tree_contains_frame(root, phys_addr, owner_pid, owner_name, reason) && !frame_is_live_medium_alloc(phys_addr)) {
-                uint64_t virt_raw = phys_addr + addr::get_hhdm_offset();
-                if ((virt_raw >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
-                    void* page_virt = reinterpret_cast<void*>(virt_raw);
+            if (!page_table_tree_contains_frame(root, PHYS_ADDR, owner_name, reason) && !frame_is_live_medium_alloc(PHYS_ADDR)) {
+                uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+                if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
+                    void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
                     // Root-cause sentinel: a corrupt PTE whose frame happens to land on a live
                     // slab page is the chain that causes the slab UAF crash.  Detect and skip
                     // the refDec here so the slab page is never freed out from under the chain.
                     constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
-                    if (*reinterpret_cast<const uint32_t*>(virt_raw) == SLAB_MAGIC) {
+                    if (*reinterpret_cast<const uint32_t*>(VIRT_RAW) == SLAB_MAGIC) {
                         log::warn(
                             "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx "
                             "phys=0x%llx hits live slab; "
                             "skipping refDec",
                             owner_pid, owner_name != nullptr ? owner_name : "?", reason != nullptr ? reason : "?", static_cast<void*>(root),
-                            level, i, (unsigned long long)entry_vaddr, (unsigned long long)table->entries[i].frame,
-                            (unsigned long long)phys_addr);
-                        log_user_phys_mappings(phys_addr, reason, owner_pid, owner_name, true);
+                            level, i, static_cast<unsigned long long>(ENTRY_VADDR),
+                            static_cast<unsigned long long>(table->entries[i].frame), static_cast<unsigned long long>(PHYS_ADDR));
+                        log_user_phys_mappings(PHYS_ADDR, reason, owner_pid, owner_name, true);
                         table->entries[i] = paging::purge_page_table_entry();
                         continue;
                     }
@@ -922,8 +926,8 @@ static void free_user_data_pages(PageTable* table, int level, PageTable* root, u
                         "virt=0x%llx "
                         "non-canonical leaf frame; skipping refDec",
                         owner_pid, owner_name != nullptr ? owner_name : "?", reason != nullptr ? reason : "?", static_cast<void*>(root),
-                        level, i, (unsigned long long)entry_vaddr, (unsigned long long)table->entries[i].frame,
-                        (unsigned long long)phys_addr, (unsigned long long)virt_raw);
+                        level, i, static_cast<unsigned long long>(ENTRY_VADDR), static_cast<unsigned long long>(table->entries[i].frame),
+                        static_cast<unsigned long long>(PHYS_ADDR), static_cast<unsigned long long>(VIRT_RAW));
                 }
             }
             table->entries[i] = paging::purge_page_table_entry();
@@ -943,34 +947,34 @@ static void free_page_table_pages(PageTable* table, int level, uint64_t vaddr_ba
     const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
 
     // Number of VA bits contributed by this level's index field
-    const int level_shift = 12 + (9 * (level - 1));
+    const int LEVEL_SHIFT = 12 + (9 * (level - 1));
 
     for (size_t i = 0; i < MAX_ENTRY; i++) {
         if (table->entries[i].present == 0) {
             continue;
         }
 
-        uint64_t phys_addr = static_cast<uint64_t>(table->entries[i].frame) << paging::PAGE_SHIFT;
-        if (phys_addr == 0) {
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(table->entries[i].frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0) {
             continue;
         }
 
         // Reconstruct virtual address for diagnostic output.
-        const uint64_t entry_vaddr = vaddr_base | (static_cast<uint64_t>(i) << level_shift);
+        const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
 
-        if (level > 1 && table->entries[i].pagesize == 0 && !frame_is_live_medium_alloc(phys_addr)) {
-            uint64_t virt_raw = phys_addr + addr::get_hhdm_offset();
-            if ((virt_raw >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+        if (level > 1 && table->entries[i].pagesize == 0 && !frame_is_live_medium_alloc(PHYS_ADDR)) {
+            uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+            if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
                 mod::dbg::log(
                     "virt: corrupt PTE in free_page_table_pages: level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx virt=0x%llx, "
                     "clearing",
-                    level, i, (unsigned long long)entry_vaddr, (unsigned long long)table->entries[i].frame, (unsigned long long)phys_addr,
-                    (unsigned long long)virt_raw);
+                    level, i, static_cast<unsigned long long>(ENTRY_VADDR), static_cast<unsigned long long>(table->entries[i].frame),
+                    static_cast<unsigned long long>(PHYS_ADDR), static_cast<unsigned long long>(VIRT_RAW));
                 table->entries[i] = paging::purge_page_table_entry();
                 continue;
             }
-            auto* next_level = reinterpret_cast<PageTable*>(virt_raw);
-            free_page_table_pages(next_level, level - 1, entry_vaddr);
+            auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
+            free_page_table_pages(next_level, level - 1, ENTRY_VADDR);
             phys::page_ref_dec(next_level);
         }
 
@@ -1019,11 +1023,11 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
             continue;
         }
 
-        paddr_t src_pml3_phys = src->entries[i4].frame << paging::PAGE_SHIFT;
-        auto* src_pml3 = (PageTable*)addr::get_virt_pointer(src_pml3_phys);
+        paddr_t const SRC_PML3_PHYS = src->entries[i4].frame << paging::PAGE_SHIFT;
+        auto* src_pml3 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML3_PHYS));
 
         // Allocate a new PML3 for dst
-        auto* dst_pml3 = (PageTable*)phys::page_alloc();
+        auto* dst_pml3 = static_cast<PageTable*>(phys::page_alloc());
         if (dst_pml3 == nullptr) {
             return false;
         }
@@ -1038,10 +1042,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                 continue;
             }
 
-            paddr_t src_pml2_phys = src_pml3->entries[i3].frame << paging::PAGE_SHIFT;
-            auto* src_pml2 = (PageTable*)addr::get_virt_pointer(src_pml2_phys);
+            paddr_t const SRC_PML2_PHYS = src_pml3->entries[i3].frame << paging::PAGE_SHIFT;
+            auto* src_pml2 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML2_PHYS));
 
-            auto* dst_pml2 = (PageTable*)phys::page_alloc();
+            auto* dst_pml2 = static_cast<PageTable*>(phys::page_alloc());
             if (dst_pml2 == nullptr) {
                 return false;
             }
@@ -1061,10 +1065,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     // Each sub-page must be an independent pageAlloc so free_user_data_pages
                     // can page_ref_dec each PTE individually — a multi-page buddy block has only
                     // one head page and the CONT pages cannot be freed individually.
-                    paddr_t src_phys = src_pml2->entries[i2].frame << paging::PAGE_SHIFT;
-                    auto* src_virt = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(src_phys));
+                    paddr_t const SRC_PHYS = src_pml2->entries[i2].frame << paging::PAGE_SHIFT;
+                    auto* src_virt = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(SRC_PHYS));
 
-                    auto* dst_pml1 = (PageTable*)phys::page_alloc();
+                    auto* dst_pml1 = static_cast<PageTable*>(phys::page_alloc());
                     if (dst_pml1 == nullptr) {
                         return false;
                     }
@@ -1074,23 +1078,23 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     // clear PS bit (bit 7) and frame bits; preserve present/write/user/NX.
                     constexpr uint64_t PS_BIT = (1ULL << 7);
                     constexpr uint64_t FRAME_MASK = 0x000FFFFFFFFFF000ULL;
-                    uint64_t pde_raw_val = pte_raw(src_pml2->entries[i2]);
-                    uint64_t pte_flags = pde_raw_val & ~(FRAME_MASK | PS_BIT);
+                    uint64_t const PDE_RAW_VAL = pte_raw(src_pml2->entries[i2]);
+                    uint64_t const PTE_FLAGS = PDE_RAW_VAL & ~(FRAME_MASK | PS_BIT);
 
                     for (size_t i1 = 0; i1 < PML2_ENTRY_NUMBER; i1++) {
                         auto* sub = phys::page_alloc(paging::PAGE_SIZE, "cow_huge_sub");
                         if (sub == nullptr) {
                             // OOM: free already-allocated sub-pages and pml1
                             for (size_t j = 0; j < i1; j++) {
-                                paddr_t sub_pa = static_cast<paddr_t>(dst_pml1->entries[j].frame) << paging::PAGE_SHIFT;
-                                phys::page_free(reinterpret_cast<void*>(addr::get_virt_pointer(sub_pa)));
+                                paddr_t const SUB_PA = static_cast<paddr_t>(dst_pml1->entries[j].frame) << paging::PAGE_SHIFT;
+                                phys::page_free(reinterpret_cast<void*>(addr::get_virt_pointer(SUB_PA)));
                             }
                             phys::page_free(dst_pml1);
                             return false;
                         }
                         memcpy(sub, src_virt + (i1 * paging::PAGE_SIZE), paging::PAGE_SIZE);
-                        paddr_t sub_phys = (paddr_t)addr::get_phys_pointer((vaddr_t)sub);
-                        dst_pml1->entries[i1] = pte_from_raw(pte_flags | sub_phys);
+                        auto const SUB_PHYS = (paddr_t)addr::get_phys_pointer((vaddr_t)sub);
+                        dst_pml1->entries[i1] = pte_from_raw(PTE_FLAGS | SUB_PHYS);
                     }
 
                     dst_pml2->entries[i2] = src_pml2->entries[i2];
@@ -1099,10 +1103,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     continue;
                 }
 
-                paddr_t src_pml1_phys = src_pml2->entries[i2].frame << paging::PAGE_SHIFT;
-                auto* src_pml1 = (PageTable*)addr::get_virt_pointer(src_pml1_phys);
+                paddr_t const SRC_PML1_PHYS = src_pml2->entries[i2].frame << paging::PAGE_SHIFT;
+                auto* src_pml1 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML1_PHYS));
 
-                auto* dst_pml1 = (PageTable*)phys::page_alloc();
+                auto* dst_pml1 = static_cast<PageTable*>(phys::page_alloc());
                 if (dst_pml1 == nullptr) {
                     return false;
                 }
@@ -1116,15 +1120,15 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                         continue;
                     }
 
-                    const uint64_t vaddr = (static_cast<uint64_t>(i4) << 39) | (static_cast<uint64_t>(i3) << 30) |
+                    const uint64_t VADDR = (static_cast<uint64_t>(i4) << 39) | (static_cast<uint64_t>(i3) << 30) |
                                            (static_cast<uint64_t>(i2) << 21) | (static_cast<uint64_t>(i1) << 12);
                     uint64_t raw = pte_raw(src_pml1->entries[i1]);
-                    const bool was_writable = (raw & paging::PAGE_WRITE) != 0U;
+                    const bool WAS_WRITABLE = (raw & paging::PAGE_WRITE) != 0U;
 
                     // Only writable mappings need COW. Shared read-only mappings
                     // (text/debug metadata) can stay read-only in both address
                     // spaces and simply share the backing page.
-                    if (was_writable) {
+                    if (WAS_WRITABLE) {
                         raw &= ~paging::PAGE_WRITE;
                         raw |= paging::PAGE_COW;
                         src_pml1->entries[i1] = pte_from_raw(raw);
@@ -1134,14 +1138,14 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     }
 
                     // Increment refcount on the shared data page
-                    paddr_t data_phys = src_pml1->entries[i1].frame << paging::PAGE_SHIFT;
-                    void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(data_phys));
+                    paddr_t const DATA_PHYS = src_pml1->entries[i1].frame << paging::PAGE_SHIFT;
+                    void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
                     phys::page_ref_inc(data_virt);
-                    if (is_watched_mmap_vaddr(vaddr)) {
+                    if (is_watched_mmap_vaddr(VADDR)) {
                         log::warn("watch mmap-cow: src=%p dst=%p vaddr=0x%llx phys=0x%llx writable=%u cow=%u ref=%llu",
-                                  static_cast<void*>(src), static_cast<void*>(dst), (unsigned long long)vaddr,
-                                  (unsigned long long)data_phys, was_writable ? 1U : 0U, (raw & paging::PAGE_COW) != 0U ? 1U : 0U,
-                                  (unsigned long long)phys::page_ref_get(data_virt));
+                                  static_cast<void*>(src), static_cast<void*>(dst), static_cast<unsigned long long>(VADDR),
+                                  static_cast<unsigned long long>(DATA_PHYS), WAS_WRITABLE ? 1U : 0U,
+                                  (raw & paging::PAGE_COW) != 0U ? 1U : 0U, static_cast<unsigned long long>(phys::page_ref_get(data_virt)));
                     }
                 }
             }

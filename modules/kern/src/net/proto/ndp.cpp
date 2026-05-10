@@ -1,6 +1,7 @@
 #include "ndp.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
@@ -8,8 +9,10 @@
 #include <net/proto/ethernet.hpp>
 #include <net/proto/icmpv6.hpp>
 #include <net/proto/ipv6.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
@@ -58,21 +61,21 @@ auto alloc_entry() -> NdpEntry* {
 bool parse_link_addr_option(const uint8_t* opts, size_t opts_len, uint8_t type, std::array<uint8_t, 6>& out_mac) {
     size_t offset = 0;
     while (offset + 2 <= opts_len) {
-        uint8_t opt_type = opts[offset];
-        uint8_t opt_len = opts[offset + 1];
-        if (opt_len == 0) {
+        uint8_t const OPT_TYPE = opts[offset];
+        uint8_t const OPT_LEN = opts[offset + 1];
+        if (OPT_LEN == 0) {
             break;
         }
-        size_t opt_bytes = static_cast<size_t>(opt_len) * 8;
-        if (offset + opt_bytes > opts_len) {
+        size_t const OPT_BYTES = static_cast<size_t>(OPT_LEN) * 8;
+        if (offset + OPT_BYTES > opts_len) {
             break;
         }
-        if (opt_type == type && opt_bytes >= 8) {
+        if (OPT_TYPE == type && OPT_BYTES >= 8) {
             // Link-layer address starts at offset+2
             std::memcpy(out_mac.data(), opts + offset + 2, 6);
             return true;
         }
-        offset += opt_bytes;
+        offset += OPT_BYTES;
     }
     return false;
 }
@@ -169,12 +172,12 @@ void ndp_handle_ns(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 
 
     // Extract source link-layer address option (if present)
     const uint8_t* opts = pkt->data + sizeof(ICMPv6Header) + sizeof(NdpNeighborSolicit);
-    size_t opts_len = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborSolicit);
+    size_t const OPTS_LEN = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborSolicit);
     std::array<uint8_t, 6> src_mac = {};
-    bool has_src_mac = parse_link_addr_option(opts, opts_len, NDP_OPT_SRC_LINK_ADDR, src_mac);
+    bool const HAS_SRC_MAC = parse_link_addr_option(opts, OPTS_LEN, NDP_OPT_SRC_LINK_ADDR, src_mac);
 
     // Update neighbor cache with source
-    if (has_src_mac && src != IPV6_UNSPECIFIED) {
+    if (HAS_SRC_MAC && src != IPV6_UNSPECIFIED) {
         ndp_lock.lock();
         auto* entry = find_entry(src);
         if (entry == nullptr) {
@@ -209,11 +212,11 @@ void ndp_handle_na(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 
 
     // Extract target link-layer address option
     const uint8_t* opts = pkt->data + sizeof(ICMPv6Header) + sizeof(NdpNeighborAdvert);
-    size_t opts_len = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborAdvert);
+    size_t const OPTS_LEN = pkt->len - sizeof(ICMPv6Header) - sizeof(NdpNeighborAdvert);
     std::array<uint8_t, 6> target_mac = {};
-    bool has_mac = parse_link_addr_option(opts, opts_len, NDP_OPT_TGT_LINK_ADDR, target_mac);
+    bool const HAS_MAC = parse_link_addr_option(opts, OPTS_LEN, NDP_OPT_TGT_LINK_ADDR, target_mac);
 
-    if (!has_mac) {
+    if (!HAS_MAC) {
         pkt_free(pkt);
         return;
     }

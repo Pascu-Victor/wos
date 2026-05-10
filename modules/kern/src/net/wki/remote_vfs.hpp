@@ -188,7 +188,7 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File*;
 
 // Consumer side: called from vfs_stat() for FSType::REMOTE mounts
-auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::stat* statbuf) -> int;
+auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int;
 
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;

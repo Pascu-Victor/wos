@@ -1,9 +1,7 @@
 #include "spinlock.hpp"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #if SPINLOCK_DEBUG
@@ -79,7 +77,7 @@ void print_stack(void** frames, int depth, const char* label) {
 
 void lock_ticket(Spinlock* lock) {
     // Take a ticket - this is our position in the FIFO queue.
-    uint32_t my_ticket = lock->next_ticket.fetch_add(1, std::memory_order_relaxed);
+    uint32_t const MY_TICKET = lock->next_ticket.fetch_add(1, std::memory_order_relaxed);
 
 #if SPINLOCK_DEBUG
     uint64_t spins = 0;
@@ -87,7 +85,7 @@ void lock_ticket(Spinlock* lock) {
 #endif
 
     // Spin until the lock is "serving" our ticket.
-    while (lock->now_serving.load(std::memory_order_acquire) != my_ticket) {
+    while (lock->now_serving.load(std::memory_order_acquire) != MY_TICKET) {
         asm volatile("pause");
 #if SPINLOCK_DEBUG
         if (!warned && ++spins >= SPINLOCK_DEBUG_THRESHOLD) {
@@ -164,6 +162,7 @@ void Spinlock::unlock() {
 }
 
 auto Spinlock::lock_irqsave() -> uint64_t {
+    // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t flags = 0;
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli");

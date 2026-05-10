@@ -1,5 +1,8 @@
 #include "journal.hpp"
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -118,11 +121,11 @@ auto extract_prefix_module(const char* message, char* out_module, size_t out_mod
         return false;
     }
 
-    size_t module_len = std::min(i - 1, out_module_size - 1);
-    for (size_t j = 0; j < module_len; j++) {
+    size_t const MODULE_LEN = std::min(i - 1, out_module_size - 1);
+    for (size_t j = 0; j < MODULE_LEN; j++) {
         out_module[j] = to_lower_ascii(message[j + 1]);
     }
-    out_module[module_len] = '\0';
+    out_module[MODULE_LEN] = '\0';
 
     const char* body = message + i + 1;
     if (*body == ' ') {
@@ -153,14 +156,14 @@ auto alloc_module_locked(const char* module) -> ModuleDevice* {
         entry.used = true;
         copy_lower_module(entry.module, sizeof(entry.module), module);
         const char* prefix = "journal/modules/";
-        size_t prefix_len = std::strlen(prefix);
-        std::memcpy(entry.dev_name, prefix, prefix_len);
+        size_t const PREFIX_LEN = std::strlen(prefix);
+        std::memcpy(entry.dev_name, prefix, PREFIX_LEN);
         size_t module_len = std::strlen(entry.module);
-        if (prefix_len + module_len >= sizeof(entry.dev_name)) {
-            module_len = sizeof(entry.dev_name) - prefix_len - 1;
+        if (PREFIX_LEN + module_len >= sizeof(entry.dev_name)) {
+            module_len = sizeof(entry.dev_name) - PREFIX_LEN - 1;
         }
-        std::memcpy(entry.dev_name + prefix_len, entry.module, module_len);
-        entry.dev_name[prefix_len + module_len] = '\0';
+        std::memcpy(entry.dev_name + PREFIX_LEN, entry.module, module_len);
+        entry.dev_name[PREFIX_LEN + module_len] = '\0';
         entry.device = {
             .major = 10,
             .minor = static_cast<unsigned>(200 + (&entry - s_modules.data())),
@@ -190,12 +193,12 @@ auto record_matches(const JournalRecord& rec, const char* module_filter) -> bool
 }
 
 auto oldest_sequence_locked() -> uint64_t {
-    uint64_t latest = s_latest_sequence.load(std::memory_order_relaxed);
-    if (latest == 0) {
+    uint64_t const LATEST = s_latest_sequence.load(std::memory_order_relaxed);
+    if (LATEST == 0) {
         return 1;
     }
-    if (latest >= JOURNAL_RING_SIZE) {
-        return latest - JOURNAL_RING_SIZE + 1;
+    if (LATEST >= JOURNAL_RING_SIZE) {
+        return LATEST - JOURNAL_RING_SIZE + 1;
     }
     return 1;
 }
@@ -223,7 +226,7 @@ void serial_write_record(const JournalRecord& rec) {
         return;
     }
 
-    mod::io::serial::ScopedLock lock;
+    mod::io::serial::ScopedLock const LOCK;
     mod::io::serial::write_unlocked('[');
     mod::io::serial::write_unlocked(static_cast<uint64_t>(rec.monotonic_us / 1000000ULL));
     mod::io::serial::write_unlocked('.');
@@ -246,13 +249,13 @@ void serial_write_record(const JournalRecord& rec) {
 void wake_waiters() {
     uint64_t pending[64]{};
     size_t pending_count = 0;
-    uint64_t flags = s_lock.lock_irqsave();
+    uint64_t const FLAGS = s_lock.lock_irqsave();
     pending_count = std::min(s_poll_waiters.size(), size_t{64});
     for (size_t i = 0; i < pending_count; i++) {
         pending[i] = s_poll_waiters[i];
     }
     s_poll_waiters.clear();
-    s_lock.unlock_irqrestore(flags);
+    s_lock.unlock_irqrestore(FLAGS);
 
     for (size_t i = 0; i < pending_count; i++) {
         auto* waiter = ker::mod::sched::find_task_by_pid_safe(pending[i]);
@@ -285,9 +288,9 @@ ssize_t journal_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
         return -EINVAL;
     }
     char message[JOURNAL_MESSAGE_MAX]{};
-    size_t copy_len = std::min(count, JOURNAL_MESSAGE_MAX - 1);
-    std::memcpy(message, buf, copy_len);
-    message[copy_len] = '\0';
+    size_t const COPY_LEN = std::min(count, JOURNAL_MESSAGE_MAX - 1);
+    std::memcpy(message, buf, COPY_LEN);
+    message[COPY_LEN] = '\0';
     emit(LogLevel::INFO, "userspace", message, (count >= JOURNAL_MESSAGE_MAX) ? JOURNAL_FLAG_TRUNCATED : 0);
     return static_cast<ssize_t>(count);
 }
@@ -346,25 +349,25 @@ void register_devices() {
     }
     ker::dev::dev_register(&s_journal_device);
 
-    uint64_t flags = s_lock.lock_irqsave();
+    uint64_t const FLAGS = s_lock.lock_irqsave();
     for (auto& entry : s_modules) {
         if (entry.used) {
             maybe_register_module_device(entry);
         }
     }
-    s_lock.unlock_irqrestore(flags);
+    s_lock.unlock_irqrestore(FLAGS);
 }
 
 void mark_devfs_ready() {
     s_devfs_ready.store(true, std::memory_order_release);
     ker::vfs::devfs::devfs_create_directory("journal/modules");
-    uint64_t flags = s_lock.lock_irqsave();
+    uint64_t const FLAGS = s_lock.lock_irqsave();
     for (auto& entry : s_modules) {
         if (entry.used && entry.device_registered) {
             ker::vfs::devfs::devfs_add_device_node(entry.dev_name, &entry.device);
         }
     }
-    s_lock.unlock_irqrestore(flags);
+    s_lock.unlock_irqrestore(FLAGS);
 }
 
 void set_serial_threshold(LogLevel level) { s_serial_threshold.store(static_cast<uint8_t>(level), std::memory_order_release); }
@@ -434,7 +437,7 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     rec.message[msg_len] = '\0';
     rec.message_len = static_cast<uint16_t>(msg_len);
 
-    uint64_t irq_flags = s_lock.lock_irqsave();
+    uint64_t const IRQ_FLAGS = s_lock.lock_irqsave();
     auto* module_entry = alloc_module_locked(rec.module);
     if (module_entry != nullptr) {
         maybe_register_module_device(*module_entry);
@@ -443,7 +446,7 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     s_ring[(rec.sequence - 1) % JOURNAL_RING_SIZE] = rec;
     s_latest_sequence.store(rec.sequence, std::memory_order_release);
     s_oldest_sequence.store(oldest_sequence_locked(), std::memory_order_release);
-    s_lock.unlock_irqrestore(irq_flags);
+    s_lock.unlock_irqrestore(IRQ_FLAGS);
 
     if (rec.level >= s_serial_threshold.load(std::memory_order_acquire)) {
         serial_write_record(rec);
@@ -457,13 +460,13 @@ void emit_v(LogLevel level, const char* module, const char* format, va_list args
         emit(level, module, "(null)", flags);
         return;
     }
-    int written = std::vsnprintf(buf, sizeof(buf), format, args);
+    int const WRITTEN = std::vsnprintf(buf, sizeof(buf), format, args);
     uint32_t rec_flags = flags;
-    if (written < 0) {
+    if (WRITTEN < 0) {
         emit(level, module, "log formatting failed", rec_flags);
         return;
     }
-    if (static_cast<size_t>(written) >= sizeof(buf)) {
+    if (static_cast<size_t>(WRITTEN) >= sizeof(buf)) {
         rec_flags |= JOURNAL_FLAG_TRUNCATED;
     }
     emit(level, module, buf, rec_flags);
@@ -473,27 +476,27 @@ auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* mod
     if (file == nullptr || buf == nullptr) {
         return -EINVAL;
     }
-    size_t record_count = count / sizeof(JournalRecord);
-    if (record_count == 0) {
+    size_t const RECORD_COUNT = count / sizeof(JournalRecord);
+    if (RECORD_COUNT == 0) {
         return 0;
     }
 
     auto* out = static_cast<JournalRecord*>(buf);
     size_t copied = 0;
-    uint64_t flags = s_lock.lock_irqsave();
-    uint64_t latest = s_latest_sequence.load(std::memory_order_acquire);
-    if (latest == 0) {
-        s_lock.unlock_irqrestore(flags);
+    uint64_t const FLAGS = s_lock.lock_irqsave();
+    uint64_t const LATEST = s_latest_sequence.load(std::memory_order_acquire);
+    if (LATEST == 0) {
+        s_lock.unlock_irqrestore(FLAGS);
         return 0;
     }
 
-    uint64_t oldest = oldest_sequence_locked();
+    uint64_t const OLDEST = oldest_sequence_locked();
     auto cursor = static_cast<uint64_t>(file->pos);
-    if (cursor == NO_SEQUENCE || cursor < oldest) {
-        cursor = oldest;
+    if (cursor == NO_SEQUENCE || cursor < OLDEST) {
+        cursor = OLDEST;
     }
 
-    for (uint64_t seq = cursor; seq <= latest && copied < record_count; seq++) {
+    for (uint64_t seq = cursor; seq <= LATEST && copied < RECORD_COUNT; seq++) {
         const auto& rec = s_ring[(seq - 1) % JOURNAL_RING_SIZE];
         if (rec.sequence != seq || !record_matches(rec, module_filter)) {
             continue;
@@ -502,9 +505,9 @@ auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* mod
         file->pos = static_cast<off_t>(seq + 1);
     }
     if (copied == 0) {
-        file->pos = static_cast<off_t>(latest + 1);
+        file->pos = static_cast<off_t>(LATEST + 1);
     }
-    s_lock.unlock_irqrestore(flags);
+    s_lock.unlock_irqrestore(FLAGS);
     return static_cast<ssize_t>(copied * sizeof(JournalRecord));
 }
 
@@ -515,35 +518,35 @@ auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> 
     if (file == nullptr) {
         return events & EPOLLIN_VALUE;
     }
-    uint64_t flags = s_lock.lock_irqsave();
-    uint64_t latest = s_latest_sequence.load(std::memory_order_acquire);
-    uint64_t oldest = oldest_sequence_locked();
+    uint64_t const FLAGS = s_lock.lock_irqsave();
+    uint64_t const LATEST = s_latest_sequence.load(std::memory_order_acquire);
+    uint64_t const OLDEST = oldest_sequence_locked();
     auto cursor = static_cast<uint64_t>(file->pos);
-    if (cursor == NO_SEQUENCE || cursor < oldest) {
-        cursor = oldest;
+    if (cursor == NO_SEQUENCE || cursor < OLDEST) {
+        cursor = OLDEST;
     }
-    for (uint64_t seq = cursor; seq <= latest; seq++) {
+    for (uint64_t seq = cursor; seq <= LATEST; seq++) {
         const auto& rec = s_ring[(seq - 1) % JOURNAL_RING_SIZE];
         if (rec.sequence == seq && record_matches(rec, module_filter)) {
-            s_lock.unlock_irqrestore(flags);
+            s_lock.unlock_irqrestore(FLAGS);
             return events & EPOLLIN_VALUE;
         }
     }
-    s_lock.unlock_irqrestore(flags);
+    s_lock.unlock_irqrestore(FLAGS);
     return 0;
 }
 
 auto poll_register_waiter(ker::vfs::File* /*file*/, uint64_t pid) -> bool {
-    uint64_t flags = s_lock.lock_irqsave();
+    uint64_t const FLAGS = s_lock.lock_irqsave();
     for (size_t i = 0; i < s_poll_waiters.size(); i++) {
         if (s_poll_waiters[i] == pid) {
-            s_lock.unlock_irqrestore(flags);
+            s_lock.unlock_irqrestore(FLAGS);
             return true;
         }
     }
-    bool ok = s_poll_waiters.push_back(pid);
-    s_lock.unlock_irqrestore(flags);
-    return ok;
+    bool const OK = s_poll_waiters.push_back(pid);
+    s_lock.unlock_irqrestore(FLAGS);
+    return OK;
 }
 
 }  // namespace ker::mod::dbg::journal

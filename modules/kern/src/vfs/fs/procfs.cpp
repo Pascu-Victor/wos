@@ -1,5 +1,8 @@
 #include "procfs.hpp"
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -12,9 +15,9 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/mount.hpp>
-#include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
 #include "net/wki/wki.hpp"
@@ -42,11 +45,11 @@ void int_to_str(uint64_t val, char* buf, size_t bufsz) {
         }
     }
     // reverse
-    int len = pos;
-    for (int i = 0; i < len && static_cast<size_t>(i) < bufsz - 1; ++i) {
-        buf[i] = tmp[len - 1 - i];
+    int const LEN = pos;
+    for (int i = 0; i < LEN && static_cast<size_t>(i) < bufsz - 1; ++i) {
+        buf[i] = tmp[LEN - 1 - i];
     }
-    buf[len < static_cast<int>(bufsz) ? len : static_cast<int>(bufsz - 1)] = '\0';
+    buf[std::cmp_less(LEN, bufsz) ? LEN : static_cast<int>(bufsz - 1)] = '\0';
 }
 
 auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
@@ -112,12 +115,12 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             return 0;
         }
         // PID directories from active task list
-        size_t pid_index = count - 6;
-        uint32_t task_count = ker::mod::sched::get_active_task_count();
-        if (pid_index >= task_count) {
+        size_t const PID_INDEX = count - 6;
+        uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+        if (PID_INDEX >= TASK_COUNT) {
             return -1;  // No more entries
         }
-        auto* task = ker::mod::sched::get_active_task_at(static_cast<uint32_t>(pid_index));
+        auto* task = ker::mod::sched::get_active_task_at(static_cast<uint32_t>(PID_INDEX));
         if (task == nullptr) {
             return -1;
         }
@@ -541,17 +544,17 @@ auto generate_uptime(char* buf, size_t bufsz) -> size_t {
         append(tmp.data());
     };
 
-    uint64_t uptime_us = ker::mod::time::get_us();
-    uint64_t uptime_sec = uptime_us / 1000000ULL;
-    uint64_t uptime_frac = (uptime_us % 1000000ULL) / 10000ULL;  // two decimal places
+    uint64_t const UPTIME_US = ker::mod::time::get_us();
+    uint64_t const UPTIME_SEC = UPTIME_US / 1000000ULL;
+    uint64_t const UPTIME_FRAC = (UPTIME_US % 1000000ULL) / 10000ULL;  // two decimal places
 
-    append_int(uptime_sec);
+    append_int(UPTIME_SEC);
     append(".");
     // Zero-pad the fractional part to two digits
-    if (uptime_frac < 10) {
+    if (UPTIME_FRAC < 10) {
         append("0");
     }
-    append_int(uptime_frac);
+    append_int(UPTIME_FRAC);
 
     // Idle time: sum idle across all CPUs, divide by CPU count for average
     // For now, report 0.00 as idle tracking is not yet implemented
@@ -576,7 +579,9 @@ auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         hostname = "local";
     }
     size_t len = strlen(hostname);
-    if (len + 2 > bufsz) len = bufsz - 2;
+    if (len + 2 > bufsz) {
+        len = bufsz - 2;
+    }
     memcpy(buf, hostname, len);
     buf[len] = '\n';
     buf[len + 1] = '\0';
@@ -591,7 +596,9 @@ auto generate_wki_runner(char* buf, size_t bufsz) -> size_t {
         hostname = "local";
     }
     size_t len = strlen(hostname);
-    if (len + 2 > bufsz) len = bufsz - 2;
+    if (len + 2 > bufsz) {
+        len = bufsz - 2;
+    }
     memcpy(buf, hostname, len);
     buf[len] = '\n';
     buf[len + 1] = '\0';
@@ -615,17 +622,17 @@ auto task_wki_remote_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
 
 auto generate_wki_remote_pid(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     auto* task = ker::mod::sched::find_task_by_pid(pid);
-    int len = std::snprintf(buf, bufsz, "%llu\n", static_cast<unsigned long long>(task_wki_remote_pid(task)));
-    if (len < 0) {
+    int const LEN = std::snprintf(buf, bufsz, "%llu\n", static_cast<unsigned long long>(task_wki_remote_pid(task)));
+    if (LEN < 0) {
         if (bufsz != 0) {
             buf[0] = '\0';
         }
         return 0;
     }
-    if (static_cast<size_t>(len) >= bufsz) {
+    if (std::cmp_greater_equal(LEN, bufsz)) {
         return bufsz != 0 ? bufsz - 1 : 0;
     }
-    return static_cast<size_t>(len);
+    return static_cast<size_t>(LEN);
 }
 
 // Generate content for /proc/version
@@ -635,49 +642,55 @@ auto generate_version(char* buf, size_t bufsz) -> size_t;
 auto generate_kperfctl(char* buf, size_t bufsz) -> size_t {
     const char* state = ker::mod::perf::is_enabled() ? "enabled\n" : "disabled\n";
     size_t len = strlen(state);
-    if (len >= bufsz) len = bufsz - 1;
+    if (len >= bufsz) {
+        len = bufsz - 1;
+    }
     memcpy(buf, state, len);
     buf[len] = '\0';
     return len;
 }
 
 // Forward declarations for helpers defined below
-static void append_dec64(char*& p, char* end, uint64_t v);
-static void append_sconst(char*& p, char* end, const char* s);
+static void append_dec64(char*& p, const char* end, uint64_t v);
+static void append_sconst(char*& p, const char* end, const char* s);
 
 // Generate content for /proc/kcontstat
 // Shows per-subsystem container aggregate statistics (non-destructive).
 auto generate_kcontstat(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
-    char* end = buf + bufsz - 1;
+    char const* end = buf + bufsz - 1;
 
     for (size_t i = 1; i < ker::mod::perf::PERF_SUBSYSTEM_COUNT; ++i) {
         auto s = ker::mod::perf::get_subsystem_stats(static_cast<ker::mod::perf::PerfSubsystem>(i));
-        uint64_t ins = s.inserts;
-        uint64_t rem = s.removes;
-        uint64_t res = s.resizes;
-        uint64_t oom = s.oom_failures;
-        uint64_t peak = s.peak_count;
-        uint64_t cur = s.current_count;
+        uint64_t const INS = s.inserts;
+        uint64_t const REM = s.removes;
+        uint64_t const RES = s.resizes;
+        uint64_t const OOM = s.oom_failures;
+        uint64_t const PEAK = s.peak_count;
+        uint64_t const CUR = s.current_count;
 
         // Skip subsystems with no activity
-        if (ins == 0 && rem == 0 && res == 0 && oom == 0) continue;
+        if (INS == 0 && REM == 0 && RES == 0 && OOM == 0) {
+            continue;
+        }
 
         append_sconst(p, end, "subsys=");
         append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(i)));
         append_sconst(p, end, " inserts=");
-        append_dec64(p, end, ins);
+        append_dec64(p, end, INS);
         append_sconst(p, end, " removes=");
-        append_dec64(p, end, rem);
+        append_dec64(p, end, REM);
         append_sconst(p, end, " resizes=");
-        append_dec64(p, end, res);
+        append_dec64(p, end, RES);
         append_sconst(p, end, " oom=");
-        append_dec64(p, end, oom);
+        append_dec64(p, end, OOM);
         append_sconst(p, end, " peak=");
-        append_dec64(p, end, peak);
+        append_dec64(p, end, PEAK);
         append_sconst(p, end, " current=");
-        append_dec64(p, end, cur);
-        if (p + 1 < end) *p++ = '\n';
+        append_dec64(p, end, CUR);
+        if (p + 1 < end) {
+            *p++ = '\n';
+        }
     }
     *p = '\0';
     return static_cast<size_t>(p - buf);
@@ -685,18 +698,18 @@ auto generate_kcontstat(char* buf, size_t bufsz) -> size_t {
 
 auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
-    char* end = buf + bufsz - 1;
+    char const* end = buf + bufsz - 1;
 
     std::array<ker::mod::perf::WkiPerfSummarySnapshot, ker::mod::perf::WKI_PERF_SUMMARY_BUCKETS> rows{};
-    size_t row_count = ker::mod::perf::get_wki_summary_snapshots(rows.data(), rows.size());
+    size_t const ROW_COUNT = ker::mod::perf::get_wki_summary_snapshots(rows.data(), rows.size());
 
-    for (size_t i = 0; i < row_count; ++i) {
+    for (size_t i = 0; i < ROW_COUNT; ++i) {
         const auto& row = rows[i];
         if (row.calls == 0) {
             continue;
         }
 
-        uint64_t avg = row.calls != 0 ? (row.total_latency_us / row.calls) : 0;
+        uint64_t const AVG = row.calls != 0 ? (row.total_latency_us / row.calls) : 0;
         append_sconst(p, end, "scope=");
         append_sconst(p, end, ker::mod::perf::wki_scope_name(static_cast<ker::mod::perf::WkiPerfScope>(row.scope)));
         append_sconst(p, end, " op=");
@@ -714,7 +727,7 @@ auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
         append_sconst(p, end, " bytes=");
         append_dec64(p, end, row.bytes);
         append_sconst(p, end, " avg_us=");
-        append_dec64(p, end, avg);
+        append_dec64(p, end, AVG);
         append_sconst(p, end, " max_us=");
         append_dec64(p, end, row.max_latency_us);
         append_sconst(p, end, " p95_us=");
@@ -737,22 +750,26 @@ auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
 }
 
 // Hex helper
-static void append_hex64(char*& p, char* end, uint64_t v) {
-    static const char hx[] = "0123456789abcdef";
-    if (p + 18 >= end) return;
+void append_hex64(char*& p, const char* end, uint64_t v) {
+    static const char HX[] = "0123456789abcdef";
+    if (p + 18 >= end) {
+        return;
+    }
     *p++ = '0';
     *p++ = 'x';
-    for (int i = 60; i >= 0; i -= 4) *p++ = hx[(v >> i) & 0xf];
+    for (int i = 60; i >= 0; i -= 4) {
+        *p++ = HX[(v >> i) & 0xf];
+    }
 }
 
-static void append_dec64(char*& p, char* end, uint64_t v) {
+void append_dec64(char*& p, const char* end, uint64_t v) {
     char tmp[22];
     int n = 0;
     if (v == 0) {
         tmp[n++] = '0';
     } else {
         while (v > 0 && n < 21) {
-            tmp[n++] = static_cast<char>('0' + v % 10);
+            tmp[n++] = static_cast<char>('0' + (v % 10));
             v /= 10;
         }
     }
@@ -760,16 +777,18 @@ static void append_dec64(char*& p, char* end, uint64_t v) {
     if (p + n >= end) {
         return;
     }
-    for (int i = n - 1; i >= 0; --i) *p++ = tmp[i];
+    for (int i = n - 1; i >= 0; --i) {
+        *p++ = tmp[i];
+    }
 }
 
-static void append_sconst(char*& p, char* end, const char* s) {
+void append_sconst(char*& p, const char* end, const char* s) {
     while (((*s) != 0) && p + 1 < end) {
         *p++ = *s++;
     }
 }
 
-static void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
+void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
     if (callsite == 0) {
         append_sconst(p, end, "?");
         return;
@@ -809,7 +828,7 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
     char* end = buf + bufsz - 1;
 
     ker::mod::perf::PerfEvent batch[64];
-    size_t n;
+    size_t n = 0;
     while ((n = ker::mod::perf::drain_events(batch, 64, UINT32_MAX)) > 0) {
         for (size_t i = 0; i < n; ++i) {
             const auto& ev = batch[i];
@@ -835,7 +854,9 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                     letter = 'K';
                     break;
             }
-            if (p + 2 >= end) break;
+            if (p + 2 >= end) {
+                break;
+            }
             *p++ = letter;
             *p++ = ' ';
             append_dec64(p, end, ev.ts_ns);
@@ -859,7 +880,7 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 *p++ = ' ';
                 append_dec64(p, end, ev.data);  // next
                 *p++ = ' ';
-                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0u));
+                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0U));
                 *p++ = ' ';
                 append_dec64(p, end, ev.flags);
                 *p++ = ' ';
@@ -868,14 +889,16 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 append_perf_callsite(p, end, ev.callsite);
             } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::CONTAINER_STAT) {
                 // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
-                uint8_t subsys_id = static_cast<uint8_t>(ev.data >> 32);
+                auto const SUBSYS_ID = static_cast<uint8_t>(ev.data >> 32);
                 append_dec64(p, end, ev.pid);
                 *p++ = ' ';
-                append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(subsys_id)));
+                append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(SUBSYS_ID)));
                 *p++ = ' ';
                 append_dec64(p, end, ev.flags);
                 *p++ = ' ';
-                if (ev.lag_v < 0 && p + 1 < end) *p++ = '-';
+                if (ev.lag_v < 0 && p + 1 < end) {
+                    *p++ = '-';
+                }
                 append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
                 *p++ = ' ';
                 append_dec64(p, end, ev.aux);
@@ -926,9 +949,13 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 *p++ = ' ';
                 append_perf_callsite(p, end, ev.callsite);
             }
-            if (p + 1 < end) *p++ = '\n';
+            if (p + 1 < end) {
+                *p++ = '\n';
+            }
         }
-        if (n < 64) break;  // ring drained
+        if (n < 64) {
+            break;  // ring drained
+        }
     }
     *p = '\0';
     return static_cast<size_t>(p - buf);
@@ -938,7 +965,7 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
 // Shows per-CPU aggregate scheduler counters (non-destructive).
 auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
-    char* end = buf + bufsz - 1;
+    char const* end = buf + bufsz - 1;
 
     uint64_t cpu_count = ker::mod::smt::get_core_count();
     if (cpu_count == 0) {
@@ -962,7 +989,9 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, s.wakes);
         append_sconst(p, end, " sample=");
         append_dec64(p, end, s.samples);
-        if (p + 1 < end) *p++ = '\n';
+        if (p + 1 < end) {
+            *p++ = '\n';
+        }
     }
     *p = '\0';
     return static_cast<size_t>(p - buf);
@@ -1006,10 +1035,10 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
-        bool is_kperf = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
-                         pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
-        size_t alloc_sz = is_kperf ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
-        pfd->content = new (std::nothrow) char[alloc_sz];
+        bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
+                               pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
+        size_t const ALLOC_SZ = IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
+        pfd->content = new (std::nothrow) char[ALLOC_SZ];
         if (pfd->content == nullptr) {
             return -ENOMEM;
         }
@@ -1060,10 +1089,10 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
-                    size_t len = strlen(static_cast<const char*>(task->exe_path));
-                    memcpy(pfd->content, static_cast<const char*>(task->exe_path), len);
-                    pfd->content[len] = '\0';
-                    pfd->content_len = len;
+                    size_t const LEN = strlen(static_cast<const char*>(task->exe_path));
+                    memcpy(pfd->content, static_cast<const char*>(task->exe_path), LEN);
+                    pfd->content[LEN] = '\0';
+                    pfd->content_len = LEN;
                 } else {
                     pfd->content[0] = '\0';
                     pfd->content_len = 0;
@@ -1080,26 +1109,34 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (offset >= pfd->content_len) {
         return 0;
     }
-    size_t avail = pfd->content_len - offset;
-    count = std::min(count, avail);
+    size_t const AVAIL = pfd->content_len - offset;
+    count = std::min(count, AVAIL);
     memcpy(buf, pfd->content + offset, count);
     return static_cast<ssize_t>(count);
 }
 
 auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr || buf == nullptr) return -EINVAL;
+    if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) return -EPERM;
-    if (count == 0) return 0;
+    if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) {
+        return -EPERM;
+    }
+    if (count == 0) {
+        return 0;
+    }
 
     // Accept "enable", "enable <filter>", "mask <filter>", or "disable"
     const char* s = static_cast<const char*>(buf);
     if (count >= 6 && memcmp(s, "enable", 6) == 0) {
         // Check for optional filter: "enable switch,wake,container"
         if (count > 7 && s[6] == ' ') {
-            uint8_t mask = ker::mod::perf::parse_event_mask(s + 7, count - 7);
-            if (mask == 0) return -EINVAL;
-            ker::mod::perf::set_event_mask(mask);
+            uint8_t const MASK = ker::mod::perf::parse_event_mask(s + 7, count - 7);
+            if (MASK == 0) {
+                return -EINVAL;
+            }
+            ker::mod::perf::set_event_mask(MASK);
         } else {
             ker::mod::perf::set_event_mask(ker::mod::perf::PERF_MASK_ALL);
         }
@@ -1109,9 +1146,11 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
     } else if (count >= 4 && memcmp(s, "mask", 4) == 0) {
         // Change mask without resetting rings or toggling enable: "mask switch,container"
         if (count > 5 && s[4] == ' ') {
-            uint8_t mask = ker::mod::perf::parse_event_mask(s + 5, count - 5);
-            if (mask == 0) return -EINVAL;
-            ker::mod::perf::set_event_mask(mask);
+            uint8_t const MASK = ker::mod::perf::parse_event_mask(s + 5, count - 5);
+            if (MASK == 0) {
+                return -EINVAL;
+            }
+            ker::mod::perf::set_event_mask(MASK);
         } else {
             return -EINVAL;
         }
@@ -1238,7 +1277,7 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
 
     auto* task = ker::mod::sched::get_current_task();
-    uint64_t self_pid = (task != nullptr) ? task->pid : 0;
+    uint64_t const SELF_PID = (task != nullptr) ? task->pid : 0;
 
     auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir) -> File* {
         auto* pfd = new ProcFileData;
@@ -1305,35 +1344,35 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
 
     // /proc/self -> symlink to /proc/<pid>
     if (strcmp(path, "self") == 0) {
-        return make_file(ProcNodeType::SELF_LINK, self_pid, false);
+        return make_file(ProcNodeType::SELF_LINK, SELF_PID, false);
     }
     // /proc/self/exe
     if (strcmp(path, "self/exe") == 0) {
-        return make_file(ProcNodeType::EXE_LINK, self_pid, false);
+        return make_file(ProcNodeType::EXE_LINK, SELF_PID, false);
     }
     // /proc/self/status
     if (strcmp(path, "self/status") == 0) {
-        return make_file(ProcNodeType::STATUS_FILE, self_pid, false);
+        return make_file(ProcNodeType::STATUS_FILE, SELF_PID, false);
     }
     // /proc/self/stat
     if (strcmp(path, "self/stat") == 0) {
-        return make_file(ProcNodeType::STAT_FILE, self_pid, false);
+        return make_file(ProcNodeType::STAT_FILE, SELF_PID, false);
     }
     // /proc/self/cmdline
     if (strcmp(path, "self/cmdline") == 0) {
-        return make_file(ProcNodeType::CMDLINE_FILE, self_pid, false);
+        return make_file(ProcNodeType::CMDLINE_FILE, SELF_PID, false);
     }
     // /proc/self/wki_launcher
     if (strcmp(path, "self/wki_launcher") == 0) {
-        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, self_pid, false);
+        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, SELF_PID, false);
     }
     // /proc/self/wki_runner
     if (strcmp(path, "self/wki_runner") == 0) {
-        return make_file(ProcNodeType::WKI_RUNNER_FILE, self_pid, false);
+        return make_file(ProcNodeType::WKI_RUNNER_FILE, SELF_PID, false);
     }
     // /proc/self/wki_remote_pid
     if (strcmp(path, "self/wki_remote_pid") == 0) {
-        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, self_pid, false);
+        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, SELF_PID, false);
     }
 
     // /proc/<pid>
@@ -1348,15 +1387,15 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
 
     if (slash == nullptr) {
         // Just /proc/<pid>
-        int64_t pid = parse_pid(path);
-        if (pid < 0) {
+        int64_t const PID = parse_pid(path);
+        if (PID < 0) {
             return nullptr;
         }
         // Check if task exists
-        if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) {
+        if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(PID)) == nullptr) {
             return nullptr;
         }
-        return make_file(ProcNodeType::PID_DIR, static_cast<uint64_t>(pid), true);
+        return make_file(ProcNodeType::PID_DIR, static_cast<uint64_t>(PID), true);
     }
 
     // /proc/<pid>/<subpath>
@@ -1367,35 +1406,35 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     memcpy(pid_str.data(), path, pid_len);
     pid_str[pid_len] = '\0';
-    int64_t pid = parse_pid(pid_str.data());
-    if (pid < 0) {
+    int64_t const PID = parse_pid(pid_str.data());
+    if (PID < 0) {
         return nullptr;
     }
-    if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(pid)) == nullptr) {
+    if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(PID)) == nullptr) {
         return nullptr;
     }
 
     const char* sub = slash + 1;
     if (strcmp(sub, "exe") == 0) {
-        return make_file(ProcNodeType::EXE_LINK, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::EXE_LINK, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "status") == 0) {
-        return make_file(ProcNodeType::STATUS_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::STATUS_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "stat") == 0) {
-        return make_file(ProcNodeType::STAT_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::STAT_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "cmdline") == 0) {
-        return make_file(ProcNodeType::CMDLINE_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::CMDLINE_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "wki_launcher") == 0) {
-        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::WKI_LAUNCHER_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "wki_runner") == 0) {
-        return make_file(ProcNodeType::WKI_RUNNER_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::WKI_RUNNER_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "wki_remote_pid") == 0) {
-        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, static_cast<uint64_t>(pid), false);
+        return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, static_cast<uint64_t>(PID), false);
     }
 
     return nullptr;  // Unknown procfs path

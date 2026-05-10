@@ -18,8 +18,8 @@ namespace ker::mod::smt {
 using CpuGotoAddr = void (*)(struct limine_mp_info*);
 
 struct CpuInfo {
-    uint32_t processor_id;
-    uint32_t lapic_id;
+    uint32_t processor_id{};
+    uint32_t lapic_id{};
     CpuGotoAddr* goto_address = nullptr;
     uint64_t* stack_pointer_ref = nullptr;
     sched::task::Task* current_task = nullptr;
@@ -86,6 +86,8 @@ class PerCpuCrossAccess {
     // when non-interrupt code (e.g. reschedule_task_for_cpu, get_run_queue_stats)
     // holds the same per-CPU lock.
     auto lock_cpu(uint64_t cpu) -> uint64_t {
+        // Written by inline asm output constraints.
+        // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
         while (locks[cpu].exchange(true, std::memory_order_acquire)) {
@@ -116,20 +118,20 @@ class PerCpuCrossAccess {
     // Locked access to current CPU's data - use when other CPUs might modify via withLock
     template <typename Func>
     auto this_cpu_locked(Func&& func) -> decltype(func(std::declval<T*>())) {
-        uint64_t cpu = cpu::current_cpu();
-        uint64_t flags = lock_cpu(cpu);
-        auto result = func(&data[cpu]);
-        unlock_cpu(cpu, flags);
+        uint64_t const CPU = cpu::current_cpu();
+        uint64_t const FLAGS = lock_cpu(CPU);
+        auto result = func(&data[CPU]);
+        unlock_cpu(CPU, FLAGS);
         return result;
     }
 
     // Locked access to current CPU's data without return value
     template <typename Func>
     void this_cpu_locked_void(Func&& func) {
-        uint64_t cpu = cpu::current_cpu();
-        uint64_t flags = lock_cpu(cpu);
-        func(&data[cpu]);
-        unlock_cpu(cpu, flags);
+        uint64_t const CPU = cpu::current_cpu();
+        uint64_t const FLAGS = lock_cpu(CPU);
+        func(&data[CPU]);
+        unlock_cpu(CPU, FLAGS);
     }
 
     // Access another CPU's data with locking
@@ -138,28 +140,29 @@ class PerCpuCrossAccess {
     // Locked access to another CPU's data - use when modifying cross-CPU
     template <typename Func>
     auto with_lock(uint64_t cpu, Func&& func) -> decltype(func(std::declval<T*>())) {
-        uint64_t flags = lock_cpu(cpu);
+        uint64_t const FLAGS = lock_cpu(cpu);
         auto result = func(&data[cpu]);
-        unlock_cpu(cpu, flags);
+        unlock_cpu(cpu, FLAGS);
         return result;
     }
 
     // Locked access without return value
     template <typename Func>
     void with_lock_void(uint64_t cpu, Func&& func) {
-        uint64_t flags = lock_cpu(cpu);
+        uint64_t const FLAGS = lock_cpu(cpu);
         func(&data[cpu]);
-        unlock_cpu(cpu, flags);
+        unlock_cpu(cpu, FLAGS);
     }
 
     // Non-blocking try-lock: returns false immediately if lock is held.
     // Safe to call from interrupt context and idle paths (no spinning).
     template <typename Func>
     auto try_with_lock(uint64_t cpu, Func&& func) -> bool {
+        // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
-        bool acquired = !locks[cpu].exchange(true, std::memory_order_acquire);
-        if (!acquired) {
+        bool const ACQUIRED = !locks[cpu].exchange(true, std::memory_order_acquire);
+        if (!ACQUIRED) {
             asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
             return false;
         }

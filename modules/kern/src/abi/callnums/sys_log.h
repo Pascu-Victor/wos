@@ -2,6 +2,7 @@
 #include <cstdint>
 
 namespace ker::abi::sys_log {
+// NOLINTBEGIN(performance-enum-size)
 enum class sys_log_ops : uint64_t {
     LOG,
     LOG_LINE,
@@ -23,7 +24,7 @@ enum class sys_log_level : uint64_t {
     CRITICAL = 6,
     PANIC = 7,
 };
-
+// NOLINTEND(performance-enum-size)
 constexpr uint32_t JOURNAL_RECORD_MAGIC = 0x4a4f5753;
 constexpr uint16_t JOURNAL_RECORD_VERSION = 1;
 constexpr uint64_t JOURNAL_MODULE_MAX = 32;

@@ -1,5 +1,8 @@
 #include "devfs.hpp"
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -7,7 +10,6 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
-#include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
 #include <net/wki/dev_proxy.hpp>
@@ -17,6 +19,7 @@
 #include <platform/dbg/journal.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
+#include <utility>
 
 #include "net/wki/wire.hpp"
 #include "vfs/file.hpp"
@@ -31,9 +34,9 @@ constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
-    bool in_hhdm = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
-    bool in_kernel_static = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
-    return in_hhdm || in_kernel_static;
+    bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
+    bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    return IN_HHDM || IN_KERNEL_STATIC;
 }
 
 // -- DevFSNode tree root ----------------------------------------------
@@ -48,8 +51,8 @@ void ensure_children_capacity(DevFSNode* node) {
     if (node->children_count < node->children_capacity) {
         return;
     }
-    size_t new_cap = (node->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : node->children_capacity * 2;
-    auto** new_arr = new DevFSNode*[new_cap];
+    size_t const NEW_CAP = (node->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : node->children_capacity * 2;
+    auto** new_arr = new DevFSNode*[NEW_CAP];
     if (new_arr == nullptr) {
         return;
     }
@@ -57,7 +60,7 @@ void ensure_children_capacity(DevFSNode* node) {
         std::memcpy(static_cast<void*>(new_arr), static_cast<const void*>(node->children), node->children_count * sizeof(DevFSNode*));
     }
     node->children = new_arr;
-    node->children_capacity = new_cap;
+    node->children_capacity = NEW_CAP;
 }
 
 auto find_child(DevFSNode* dir, const char* name) -> DevFSNode* {
@@ -241,9 +244,9 @@ auto devfs_close(File* f) -> int {
 
     // Validate pointer is in valid kernel memory range
     auto df_addr = reinterpret_cast<uintptr_t>(devfs_file);
-    bool in_hhdm = (df_addr >= 0xffff800000000000ULL && df_addr < 0xffff900000000000ULL);
-    bool in_kernel_static = (df_addr >= 0xffffffff80000000ULL && df_addr < 0xffffffffc0000000ULL);
-    if (!in_hhdm && !in_kernel_static) {
+    bool const IN_HHDM = (df_addr >= 0xffff800000000000ULL && df_addr < 0xffff900000000000ULL);
+    bool const IN_KERNEL_STATIC = (df_addr >= 0xffffffff80000000ULL && df_addr < 0xffffffffc0000000ULL);
+    if (!IN_HHDM && !IN_KERNEL_STATIC) {
         ker::mod::dbg::log(
             "devfs_close: devfs_file %p out of valid kernel range; "
             "skipping delete\n",
@@ -345,12 +348,12 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
         return 0;
     }
 
-    size_t child_index = index - 2;
-    if (child_index >= dir_node->children_count) {
+    size_t const CHILD_INDEX = index - 2;
+    if (CHILD_INDEX >= dir_node->children_count) {
         return -1;
     }
 
-    auto* child = dir_node->children[child_index];
+    auto* child = dir_node->children[CHILD_INDEX];
 
     entry->d_ino = index + 1;
     entry->d_off = index;
@@ -396,10 +399,10 @@ auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
-    size_t target_len = std::strlen(node->symlink_target.data());
-    size_t copy_len = (target_len < bufsize) ? target_len : bufsize;
-    std::memcpy(buf, node->symlink_target.data(), copy_len);
-    return static_cast<ssize_t>(copy_len);
+    size_t const TARGET_LEN = std::strlen(node->symlink_target.data());
+    size_t const COPY_LEN = (TARGET_LEN < bufsize) ? TARGET_LEN : bufsize;
+    std::memcpy(buf, node->symlink_target.data(), COPY_LEN);
+    return static_cast<ssize_t>(COPY_LEN);
 }
 
 auto devfs_poll_check(File* f, int events) -> int {
@@ -607,9 +610,11 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
 
     if (slash != nullptr) {
         // Extract the directory portion and walk/create it
-        size_t dir_len = static_cast<size_t>(slash - name);
+        auto dir_len = static_cast<size_t>(slash - name);
         char dir_path[DEVFS_NAME_MAX]{};
-        if (dir_len >= DEVFS_NAME_MAX) dir_len = DEVFS_NAME_MAX - 1;
+        if (dir_len >= DEVFS_NAME_MAX) {
+            dir_len = DEVFS_NAME_MAX - 1;
+        }
         std::memcpy(dir_path, name, dir_len);
         dir_path[dir_len] = '\0';
 
@@ -654,8 +659,8 @@ void devfs_populate_partition_symlinks() {
     // Create /dev/disk/by-partuuid/ directory hierarchy
     walk_path("disk/by-partuuid", true);
 
-    size_t count = ker::dev::block_device_count();
-    for (size_t i = 0; i < count; i++) {
+    size_t const COUNT = ker::dev::block_device_count();
+    for (size_t i = 0; i < COUNT; i++) {
         auto* bdev = ker::dev::block_device_at(i);
         if (bdev == nullptr) {
             continue;
@@ -675,20 +680,20 @@ void devfs_populate_partition_symlinks() {
             // symlink path: disk/by-partuuid/<UUID>
             std::array<char, DEVFS_SYMLINK_MAX> symlink_path{};
             const char* prefix = "disk/by-partuuid/";
-            size_t prefix_len = std::strlen(prefix);
-            std::memcpy(symlink_path.data(), prefix, prefix_len);
-            size_t uuid_len = std::strlen(bdev->partuuid_str.data());
-            std::memcpy(symlink_path.data() + prefix_len, bdev->partuuid_str.data(), uuid_len);
-            symlink_path[prefix_len + uuid_len] = '\0';
+            size_t const PREFIX_LEN = std::strlen(prefix);
+            std::memcpy(symlink_path.data(), prefix, PREFIX_LEN);
+            size_t const UUID_LEN = std::strlen(bdev->partuuid_str.data());
+            std::memcpy(symlink_path.data() + PREFIX_LEN, bdev->partuuid_str.data(), UUID_LEN);
+            symlink_path[PREFIX_LEN + UUID_LEN] = '\0';
 
             // target: /dev/<name>
             std::array<char, DEVFS_SYMLINK_MAX> target_path{};
             const char* dev_prefix = "/dev/";
-            size_t dev_prefix_len = std::strlen(dev_prefix);
-            std::memcpy(target_path.data(), dev_prefix, dev_prefix_len);
-            size_t name_len = std::strlen(bdev->name.data());
-            std::memcpy(target_path.data() + dev_prefix_len, bdev->name.data(), name_len);
-            target_path[dev_prefix_len + name_len] = '\0';
+            size_t const DEV_PREFIX_LEN = std::strlen(dev_prefix);
+            std::memcpy(target_path.data(), dev_prefix, DEV_PREFIX_LEN);
+            size_t const NAME_LEN = std::strlen(bdev->name.data());
+            std::memcpy(target_path.data() + DEV_PREFIX_LEN, bdev->name.data(), NAME_LEN);
+            target_path[DEV_PREFIX_LEN + NAME_LEN] = '\0';
 
             devfs_create_symlink(symlink_path.data(), target_path.data());
         }
@@ -707,8 +712,8 @@ void devfs_init() {
     root_node.type = DevFSNodeType::DIRECTORY;
 
     // Populate with registered character devices
-    size_t dev_count = ker::dev::dev_get_count();
-    for (size_t i = 0; i < dev_count; i++) {
+    size_t const DEV_COUNT = ker::dev::dev_get_count();
+    for (size_t i = 0; i < DEV_COUNT; i++) {
         auto* dev = ker::dev::dev_get_at_index(i);
         if (dev != nullptr) {
             devfs_add_device_node(dev->name, dev);
@@ -730,8 +735,8 @@ void devfs_populate_net_nodes() {
         return;
     }
 
-    size_t count = ker::net::netdev_count();
-    for (size_t i = 0; i < count; i++) {
+    size_t const COUNT = ker::net::netdev_count();
+    for (size_t i = 0; i < COUNT; i++) {
         auto* netdev = ker::net::netdev_at(i);
         if (netdev == nullptr) {
             continue;
@@ -781,7 +786,9 @@ void devfs_populate_net_nodes() {
                 // Helper to append uint64 as decimal
                 auto append_u64 = [&](uint64_t val) {
                     if (val == 0) {
-                        if (pos < sizeof(stats) - 1) stats[pos++] = '0';
+                        if (pos < sizeof(stats) - 1) {
+                            stats[pos++] = '0';
+                        }
                         return;
                     }
                     char tmp[21];
@@ -796,10 +803,10 @@ void devfs_populate_net_nodes() {
                 };
                 // Helper to append hex byte
                 auto append_hex_byte = [&](uint8_t b) {
-                    const char hex[] = "0123456789abcdef";
+                    const char HEX[] = "0123456789abcdef";
                     if (pos < sizeof(stats) - 2) {
-                        stats[pos++] = hex[b >> 4];
-                        stats[pos++] = hex[b & 0xF];
+                        stats[pos++] = HEX[b >> 4];
+                        stats[pos++] = HEX[b & 0xF];
                     }
                 };
 
@@ -809,7 +816,9 @@ void devfs_populate_net_nodes() {
                 append_str(nd->state != 0 ? "up" : "down");
                 append_str("\nmac: ");
                 for (int m = 0; m < 6; m++) {
-                    if (m > 0) append_str(":");
+                    if (m > 0) {
+                        append_str(":");
+                    }
                     append_hex_byte(nd->mac[m]);
                 }
                 append_str("\nmtu: ");
@@ -819,20 +828,20 @@ void devfs_populate_net_nodes() {
                 auto* nif = ker::net::netif_get(nd);
                 if (nif != nullptr && nif->ipv4_addr_count > 0) {
                     append_str("\nipv4: ");
-                    uint32_t addr = nif->ipv4_addrs[0].addr;
-                    append_u64((addr >> 24) & 0xFF);
+                    uint32_t const ADDR = nif->ipv4_addrs[0].addr;
+                    append_u64((ADDR >> 24) & 0xFF);
                     append_str(".");
-                    append_u64((addr >> 16) & 0xFF);
+                    append_u64((ADDR >> 16) & 0xFF);
                     append_str(".");
-                    append_u64((addr >> 8) & 0xFF);
+                    append_u64((ADDR >> 8) & 0xFF);
                     append_str(".");
-                    append_u64(addr & 0xFF);
+                    append_u64(ADDR & 0xFF);
                     append_str("/");
                     // Count prefix length from netmask
-                    uint32_t mask = nif->ipv4_addrs[0].netmask;
+                    uint32_t const MASK = nif->ipv4_addrs[0].netmask;
                     int prefix = 0;
                     for (int b = 31; b >= 0; b--) {
-                        if ((mask >> b) & 1) {
+                        if ((MASK >> b) & 1) {
                             prefix++;
                         } else {
                             break;
@@ -857,11 +866,11 @@ void devfs_populate_net_nodes() {
                 if (offset >= pos) {
                     return 0;  // EOF
                 }
-                size_t available = pos - offset;
-                size_t to_copy = (count < available) ? count : available;
-                std::memcpy(buf, stats + offset, to_copy);
-                f->pos += static_cast<off_t>(to_copy);
-                return static_cast<ssize_t>(to_copy);
+                size_t const AVAILABLE = pos - offset;
+                size_t const TO_COPY = (count < AVAILABLE) ? count : AVAILABLE;
+                std::memcpy(buf, stats + offset, TO_COPY);
+                f->pos += static_cast<off_t>(TO_COPY);
+                return static_cast<ssize_t>(TO_COPY);
             },
             .write = nullptr,
             .isatty = nullptr,
@@ -879,7 +888,7 @@ void devfs_populate_net_nodes() {
     }
 
     vfs_debug_log("devfs: net nodes populated (");
-    vfs_debug_log_hex(count);
+    vfs_debug_log_hex(COUNT);
     vfs_debug_log(" devices)\n");
 }
 
@@ -1009,7 +1018,9 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         };
         auto append_u64 = [&](uint64_t val) {
             if (val == 0) {
-                if (pos < sizeof(stats) - 1) stats[pos++] = '0';
+                if (pos < sizeof(stats) - 1) {
+                    stats[pos++] = '0';
+                }
                 return;
             }
             char tmp[21];
@@ -1050,11 +1061,11 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         if (offset >= pos) {
             return 0;
         }
-        size_t available = pos - offset;
-        size_t to_copy = (count < available) ? count : available;
-        std::memcpy(buf, stats + offset, to_copy);
-        f->pos += static_cast<off_t>(to_copy);
-        return static_cast<ssize_t>(to_copy);
+        size_t const AVAILABLE = pos - offset;
+        size_t const TO_COPY = (count < AVAILABLE) ? count : AVAILABLE;
+        std::memcpy(buf, stats + offset, TO_COPY);
+        f->pos += static_cast<off_t>(TO_COPY);
+        return static_cast<ssize_t>(TO_COPY);
     },
     .write = nullptr,
     .isatty = nullptr,
@@ -1085,14 +1096,14 @@ auto fmt_u32(char* buf, size_t cap, uint32_t val) -> size_t {
 
 // Format a uint16 as 4-character lowercase hex into buf, returns 4
 auto fmt_u16_hex4(char* buf, size_t cap, uint16_t val) -> size_t {
-    constexpr char hex[] = "0123456789abcdef";
+    constexpr char HEX[] = "0123456789abcdef";
     if (cap < 4) {
         return 0;
     }
-    buf[0] = hex[(val >> 12) & 0xF];
-    buf[1] = hex[(val >> 8) & 0xF];
-    buf[2] = hex[(val >> 4) & 0xF];
-    buf[3] = hex[val & 0xF];
+    buf[0] = HEX[(val >> 12) & 0xF];
+    buf[1] = HEX[(val >> 8) & 0xF];
+    buf[2] = HEX[(val >> 4) & 0xF];
+    buf[3] = HEX[val & 0xF];
     return 4;
 }
 
@@ -1135,17 +1146,17 @@ auto wki_ensure_dirs() -> bool {
 // Add a symlink named `name` under `parent_dir`, pointing to `target`.
 void wki_add_symlink(DevFSNode* parent_dir, std::string_view name, std::string_view target) {
     std::array<char, DEVFS_NAME_MAX> name_buf{};
-    size_t nlen = (name.size() < DEVFS_NAME_MAX - 1) ? name.size() : DEVFS_NAME_MAX - 1;
-    std::memcpy(name_buf.data(), name.data(), nlen);
-    name_buf[nlen] = '\0';
+    size_t const NLEN = (name.size() < DEVFS_NAME_MAX - 1) ? name.size() : DEVFS_NAME_MAX - 1;
+    std::memcpy(name_buf.data(), name.data(), NLEN);
+    name_buf[NLEN] = '\0';
 
     auto* link = create_node(name_buf.data(), DevFSNodeType::SYMLINK);
     if (link == nullptr) {
         return;
     }
-    size_t tlen = (target.size() < DEVFS_SYMLINK_MAX - 1) ? target.size() : DEVFS_SYMLINK_MAX - 1;
-    std::memcpy(link->symlink_target.data(), target.data(), tlen);
-    link->symlink_target[tlen] = '\0';
+    size_t const TLEN = (target.size() < DEVFS_SYMLINK_MAX - 1) ? target.size() : DEVFS_SYMLINK_MAX - 1;
+    std::memcpy(link->symlink_target.data(), target.data(), TLEN);
+    link->symlink_target[TLEN] = '\0';
     add_child(parent_dir, link);
 }
 
@@ -1247,7 +1258,7 @@ void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node,
 }  // namespace
 
 void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name) {
-    WkiAutoLock guard;
+    WkiAutoLock const GUARD;
     if (!wki_ensure_dirs()) {
         return;
     }
@@ -1260,10 +1271,10 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
 
     // Look up peer to get rdma_zone_id
     auto* peer = ker::net::wki::wki_peer_find(node_id);
-    uint16_t zone_id = (peer != nullptr) ? peer->rdma_zone_id : 0;
+    uint16_t const ZONE_ID = (peer != nullptr) ? peer->rdma_zone_id : 0;
 
     // Assign local counter
-    uint32_t local_num = g_wki_type_counters[type_idx]++;
+    uint32_t const LOCAL_NUM = g_wki_type_counters[type_idx]++;
 
     // Ensure type subdirectory exists under wki/
     const char* type_dir_name = wki_type_dir(type);
@@ -1283,7 +1294,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     }
     rctx->resource_type = type;
     rctx->peer_node_id = node_id;
-    rctx->rdma_zone_id = zone_id;
+    rctx->rdma_zone_id = ZONE_ID;
     rctx->resource_id = resource_id;
     rctx->flags = flags;
     {
@@ -1294,7 +1305,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         std::memcpy(rctx->remote_name, name, nlen);
         rctx->remote_name[nlen] = '\0';
     }
-    wki_build_dev_name(rctx->dev_name, sizeof(rctx->dev_name), zone_id, node_id, type, local_num);
+    wki_build_dev_name(rctx->dev_name, sizeof(rctx->dev_name), ZONE_ID, node_id, type, LOCAL_NUM);
 
     // Allocate Device struct
     auto* dev = new ker::dev::Device();
@@ -1321,9 +1332,9 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     {
         size_t p = 0;
         auto app = [&](std::string_view sv) {
-            size_t n = (sv.size() < target.size() - 1 - p) ? sv.size() : target.size() - 1 - p;
-            std::memcpy(target.data() + p, sv.data(), n);
-            p += n;
+            size_t const N = (sv.size() < target.size() - 1 - p) ? sv.size() : target.size() - 1 - p;
+            std::memcpy(target.data() + p, sv.data(), N);
+            p += N;
         };
         app("/dev/wki/");
         app(type_dir_name);
@@ -1332,26 +1343,26 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         target[p] = '\0';
     }
 
-    std::string_view dev_name_sv{static_cast<const char*>(rctx->dev_name)};
-    std::string_view target_sv{target.data()};
+    std::string_view const DEV_NAME_SV{static_cast<const char*>(rctx->dev_name)};
+    std::string_view const TARGET_SV{target.data()};
 
     // Symlink in by-zone/{zone_id}/
-    DevFSNode* zone_sub = wki_ensure_hex_subdir(g_wki_by_zone, zone_id);
+    DevFSNode* zone_sub = wki_ensure_hex_subdir(g_wki_by_zone, ZONE_ID);
     if (zone_sub != nullptr) {
-        wki_add_symlink(zone_sub, dev_name_sv, target_sv);
+        wki_add_symlink(zone_sub, DEV_NAME_SV, TARGET_SV);
     }
 
     // Symlink in by-peer/{peer_id}/
     DevFSNode* peer_sub = wki_ensure_hex_subdir(g_wki_by_peer, node_id);
     if (peer_sub != nullptr) {
-        wki_add_symlink(peer_sub, dev_name_sv, target_sv);
+        wki_add_symlink(peer_sub, DEV_NAME_SV, TARGET_SV);
     }
 
     g_wki_total++;
 }
 
 void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id) {
-    WkiAutoLock guard;
+    WkiAutoLock const GUARD;
     if (g_wki_dir == nullptr) {
         return;
     }
@@ -1373,7 +1384,7 @@ void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_
 }
 
 void devfs_wki_remove_peer_resources(uint16_t node_id) {
-    WkiAutoLock guard;
+    WkiAutoLock const GUARD;
     if (g_wki_dir == nullptr) {
         return;
     }
@@ -1473,7 +1484,7 @@ struct NodeDevfsCtx {
 };
 
 // Separate CharDeviceOps for id, state, and load files
-static ker::dev::CharDeviceOps s_node_id_ops = {
+ker::dev::CharDeviceOps s_node_id_ops = {
     .open = nullptr,
     .close = nullptr,
     .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
@@ -1484,17 +1495,17 @@ static ker::dev::CharDeviceOps s_node_id_ops = {
         auto* ctx = static_cast<NodeDevfsCtx*>(df->device->private_data);
 
         std::array<char, 16> data = {};
-        int len = snprintf(data.data(), data.size(), "0x%04x\n", ctx->node_id);
+        int const LEN = snprintf(data.data(), data.size(), "0x%04x\n", ctx->node_id);
 
         auto offset = static_cast<size_t>(f->pos);
-        if (offset >= static_cast<size_t>(len)) {
+        if (std::cmp_greater_equal(offset, LEN)) {
             return 0;
         }
-        size_t avail = static_cast<size_t>(len) - offset;
-        size_t to_copy = (count < avail) ? count : avail;
-        std::memcpy(buf, data.data() + offset, to_copy);
-        f->pos += static_cast<off_t>(to_copy);
-        return static_cast<ssize_t>(to_copy);
+        size_t const AVAIL = static_cast<size_t>(LEN) - offset;
+        size_t const TO_COPY = (count < AVAIL) ? count : AVAIL;
+        std::memcpy(buf, data.data() + offset, TO_COPY);
+        f->pos += static_cast<off_t>(TO_COPY);
+        return static_cast<ssize_t>(TO_COPY);
     },
     .write = nullptr,
     .isatty = nullptr,
@@ -1502,7 +1513,7 @@ static ker::dev::CharDeviceOps s_node_id_ops = {
     .poll_check = nullptr,
 };
 
-static ker::dev::CharDeviceOps s_node_state_ops = {
+ker::dev::CharDeviceOps s_node_state_ops = {
     .open = nullptr,
     .close = nullptr,
     .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
@@ -1539,16 +1550,16 @@ static ker::dev::CharDeviceOps s_node_state_ops = {
             }
         }
 
-        size_t len = std::strlen(state_str);
+        size_t const LEN = std::strlen(state_str);
         auto offset = static_cast<size_t>(f->pos);
-        if (offset >= len) {
+        if (offset >= LEN) {
             return 0;
         }
-        size_t avail = len - offset;
-        size_t to_copy = (count < avail) ? count : avail;
-        std::memcpy(buf, state_str + offset, to_copy);
-        f->pos += static_cast<off_t>(to_copy);
-        return static_cast<ssize_t>(to_copy);
+        size_t const AVAIL = LEN - offset;
+        size_t const TO_COPY = (count < AVAIL) ? count : AVAIL;
+        std::memcpy(buf, state_str + offset, TO_COPY);
+        f->pos += static_cast<off_t>(TO_COPY);
+        return static_cast<ssize_t>(TO_COPY);
     },
     .write = nullptr,
     .isatty = nullptr,
@@ -1558,7 +1569,7 @@ static ker::dev::CharDeviceOps s_node_state_ops = {
     .ioctl = nullptr,
 };
 
-static ker::dev::CharDeviceOps s_node_load_ops = {
+ker::dev::CharDeviceOps s_node_load_ops = {
     .open = nullptr,
     .close = nullptr,
     .read = [](ker::vfs::File* f, void* buf, size_t count) -> ssize_t {
@@ -1583,14 +1594,14 @@ static ker::dev::CharDeviceOps s_node_load_ops = {
         }
 
         auto offset = static_cast<size_t>(f->pos);
-        if (offset >= static_cast<size_t>(len)) {
+        if (std::cmp_greater_equal(offset, len)) {
             return 0;
         }
-        size_t avail = static_cast<size_t>(len) - offset;
-        size_t to_copy = (count < avail) ? count : avail;
-        std::memcpy(buf, data.data() + offset, to_copy);
-        f->pos += static_cast<off_t>(to_copy);
-        return static_cast<ssize_t>(to_copy);
+        size_t const AVAIL = static_cast<size_t>(len) - offset;
+        size_t const TO_COPY = (count < AVAIL) ? count : AVAIL;
+        std::memcpy(buf, data.data() + offset, TO_COPY);
+        f->pos += static_cast<off_t>(TO_COPY);
+        return static_cast<ssize_t>(TO_COPY);
     },
     .write = nullptr,
     .isatty = nullptr,
@@ -1598,7 +1609,7 @@ static ker::dev::CharDeviceOps s_node_load_ops = {
     .poll_check = nullptr,
 };
 
-static unsigned s_node_minor_counter = 0;
+unsigned s_node_minor_counter = 0;
 
 auto make_node_device(const char* hostname, uint16_t node_id, uint8_t file_type, ker::dev::CharDeviceOps* ops) -> ker::dev::Device* {
     auto* dev = new ker::dev::Device();

@@ -49,5 +49,5 @@ void operator delete[](void* ptr, size_t size) noexcept;
 void operator delete(void* ptr) noexcept;
 void operator delete[](void* ptr) noexcept;
 
-auto operator new(unsigned long size, std::nothrow_t const&) noexcept -> void*;
-auto operator new[](unsigned long size, std::nothrow_t const&) noexcept -> void*;
+auto operator new(unsigned long size, std::nothrow_t const& /*unused*/) noexcept -> void*;
+auto operator new[](unsigned long size, std::nothrow_t const& /*unused*/) noexcept -> void*;

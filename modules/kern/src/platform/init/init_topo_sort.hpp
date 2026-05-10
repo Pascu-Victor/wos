@@ -36,10 +36,10 @@ constexpr auto build_adj_matrix(const std::array<ModuleMeta, N>& registry) {
         const auto& mod = registry[i];
         for (size_t d = 0; d < mod.dep_count; ++d) {
             const auto& dep = mod.deps[d];
-            int dep_idx = find_module_index(registry, dep.target);
-            if (dep_idx >= 0) {
+            int const DEP_IDX = find_module_index(registry, dep.target);
+            if (DEP_IDX >= 0) {
                 // dep_idx must run before i
-                adj.add_edge(static_cast<size_t>(dep_idx), i);
+                adj.add_edge(static_cast<size_t>(DEP_IDX), i);
             }
             // If dep_idx < 0 and HARD dep, validation will catch it
         }
@@ -117,11 +117,11 @@ constexpr auto topological_sort(const AdjMatrix<N>& adj) {
 
     // Process queue
     while (q_front < q_back) {
-        size_t node = queue[q_front++];
-        result[result_idx++] = node;
+        size_t const NODE = queue[q_front++];
+        result[result_idx++] = NODE;
 
         for (size_t i = 0; i < N; ++i) {
-            if (adj.has_edge(node, i)) {
+            if (adj.has_edge(NODE, i)) {
                 in_degree[i]--;
                 if (in_degree[i] == 0) {
                     queue[q_back++] = i;
@@ -145,9 +145,9 @@ constexpr auto phase_aware_sort(const std::array<ModuleMeta, N>& registry, const
     for (int phase = 0; phase < BOOT_PHASE_COUNT; ++phase) {
         // Within each phase, preserve topological order
         for (size_t i = 0; i < N; ++i) {
-            size_t mod_idx = topo_order[i];
-            if (static_cast<int>(registry[mod_idx].phase) == phase) {
-                result[result_idx++] = mod_idx;
+            size_t const MOD_IDX = topo_order[i];
+            if (static_cast<int>(registry[MOD_IDX].phase) == phase) {
+                result[result_idx++] = MOD_IDX;
             }
         }
     }

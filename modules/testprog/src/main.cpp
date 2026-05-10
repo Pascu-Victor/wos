@@ -1,21 +1,24 @@
-#include <abi/callnums/sys_log.h>
+#include <abi-bits/access.h>
+#include <abi-bits/in.h>
+#include <abi-bits/ioctls.h>
+#include <abi-bits/socket.h>
+#include <abi-bits/socklen_t.h>
+#include <abi-bits/stat.h>
 #include <arpa/inet.h>
-#include <dirent.h>
+#include <bits/ssize_t.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/logging.h>
-#include <sys/mman.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,16 +27,14 @@
 
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
-#include "mandelbench/mandelbench.hpp"
 #include "mandelbench/mandelbench_wki.hpp"
-#include "mandelbench/util.hpp"
 #include "netbench.hpp"
 #include "perfbench.hpp"
 
 using tprog_log = wos::journal<"tprog">;
 
 // ICMP Echo Request structure
-struct icmp_header {
+struct IcmpHeader {
     uint8_t type;
     uint8_t code;
     uint16_t checksum;
@@ -42,7 +43,7 @@ struct icmp_header {
 };
 
 // Calculate checksum for ICMP
-auto icmp_checksum(void* data, size_t len) -> uint16_t {
+static auto icmp_checksum(void* data, size_t len) -> uint16_t {
     uint32_t sum = 0;
     auto* ptr = static_cast<uint16_t*>(data);
 
@@ -62,16 +63,16 @@ auto icmp_checksum(void* data, size_t len) -> uint16_t {
 }
 
 // Ping a specific IP address
-auto ping(const char* ip_str) -> bool {
-    int pid = ker::process::getpid();
-    int tid = ker::multiproc::currentThreadId();
+static auto ping(const char* ip_str) -> bool {
+    int const PID = ker::process::getpid();
+    int const TID = ker::multiproc::currentThreadId();
 
     // std::println("testprog[t:{},p:{}]: Pinging {}...", tid, pid, ip_str);
 
     // Create raw socket for ICMP
-    int sock = socket(AF_INET, SOCK_RAW, 1);  // 1 = IPPROTO_ICMP
-    if (sock < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket: %d", tid, pid, sock);
+    int const SOCK = socket(AF_INET, SOCK_RAW, 1);  // 1 = IPPROTO_ICMP
+    if (SOCK < 0) {
+        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket: %d", TID, PID, SOCK);
         return false;
     }
 
@@ -81,30 +82,30 @@ auto ping(const char* ip_str) -> bool {
     inet_pton(AF_INET, ip_str, &dest_addr.sin_addr);
 
     // Prepare ICMP packet
-    constexpr size_t packet_size = sizeof(icmp_header) + 32;  // 32 bytes of data
-    std::array<uint8_t, packet_size> packet{};
-    auto* icmp = reinterpret_cast<icmp_header*>(packet.data());
+    constexpr size_t PACKET_SIZE = sizeof(IcmpHeader) + 32;  // 32 bytes of data
+    std::array<uint8_t, PACKET_SIZE> packet{};
+    auto* icmp = reinterpret_cast<IcmpHeader*>(packet.data());
 
     icmp->type = 8;  // Echo Request
     icmp->code = 0;
-    icmp->id = htons(static_cast<uint16_t>(pid));
+    icmp->id = htons(static_cast<uint16_t>(PID));
     icmp->sequence = htons(1);
     icmp->checksum = 0;
 
     // Fill data with pattern
-    for (size_t i = sizeof(icmp_header); i < packet_size; i++) {
+    for (size_t i = sizeof(IcmpHeader); i < PACKET_SIZE; i++) {
         packet[i] = static_cast<uint8_t>(i);
     }
 
     // Calculate checksum
-    icmp->checksum = icmp_checksum(packet.data(), packet_size);
+    icmp->checksum = icmp_checksum(packet.data(), PACKET_SIZE);
 
     // Send packet
-    ssize_t sent = sendto(sock, packet.data(), packet_size, 0, reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
+    ssize_t const SENT = sendto(SOCK, packet.data(), PACKET_SIZE, 0, reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
 
-    if (sent < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to send ping: %lld", tid, pid, static_cast<long long>(sent));
-        close(sock);
+    if (SENT < 0) {
+        tprog_log::error("testprog[t:%d,p:%d]: failed to send ping: %lld", TID, PID, static_cast<long long>(SENT));
+        close(SOCK);
         return false;
     }
 
@@ -116,33 +117,33 @@ auto ping(const char* ip_str) -> bool {
     socklen_t from_len = sizeof(from_addr);
 
     ssize_t received = -1;
-    constexpr int max_retries = 4;
-    for (int retry = 0; retry < max_retries; ++retry) {
-        received = recvfrom(sock, recv_buf.data(), recv_buf.size(), 0, reinterpret_cast<struct sockaddr*>(&from_addr), &from_len);
+    constexpr int MAX_RETRIES = 4;
+    for (int retry = 0; retry < MAX_RETRIES; ++retry) {
+        received = recvfrom(SOCK, recv_buf.data(), recv_buf.size(), 0, reinterpret_cast<struct sockaddr*>(&from_addr), &from_len);
         if (received != -11) {  // -11 is EAGAIN
             break;
         }
     }
 
-    close(sock);
+    close(SOCK);
 
     if (received > 0) {
         return true;
     }
-    tprog_log::warn("testprog[t:%d,p:%d]: no response from %s (received=%lld)", tid, pid, ip_str, static_cast<long long>(received));
+    tprog_log::warn("testprog[t:%d,p:%d]: no response from %s (received=%lld)", TID, PID, ip_str, static_cast<long long>(received));
     return false;
 }
 
 // Get network interface information
-auto get_interface_info(const char* ifname) -> bool {
-    int pid = ker::process::getpid();
-    int tid = ker::multiproc::currentThreadId();
+static auto get_interface_info(const char* ifname) -> bool {
+    int const PID = ker::process::getpid();
+    int const TID = ker::multiproc::currentThreadId();
 
     // std::println("testprog[t:{},p:{}]: Getting info for interface {}...", tid, pid, ifname);
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket for ioctl", tid, pid);
+    int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
+    if (SOCK < 0) {
+        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket for ioctl", TID, PID);
         return false;
     }
 
@@ -151,37 +152,37 @@ auto get_interface_info(const char* ifname) -> bool {
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
 
     uint32_t ip_addr = 0;
-    if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) {
+    if (ioctl(SOCK, SIOCGIFADDR, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         ip_addr = ntohl(addr->sin_addr.s_addr);
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
         // std::println("testprog[t:{},p:{}]:   IP address: {}", tid, pid, ip_str);
     } else {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to get IP address", tid, pid);
-        close(sock);
+        tprog_log::error("testprog[t:%d,p:%d]: failed to get IP address", TID, PID);
+        close(SOCK);
         return false;
     }
 
     // Get netmask and calculate gateway
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-    if (ioctl(sock, SIOCGIFNETMASK, &ifr) == 0) {
+    if (ioctl(SOCK, SIOCGIFNETMASK, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         char mask_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr->sin_addr, mask_str, sizeof(mask_str));
         // std::println("testprog[t:{},p:{}]:   Netmask: {}", tid, pid, mask_str);
 
         // Calculate gateway (QEMU user-mode uses .2 as gateway, not .1)
-        uint32_t mask = ntohl(addr->sin_addr.s_addr);
-        uint32_t gateway = (ip_addr & mask) | 0x00000001;  // Set last byte to .2 for QEMU
+        uint32_t const MASK = ntohl(addr->sin_addr.s_addr);
+        uint32_t const GATEWAY = (ip_addr & MASK) | 0x00000001;  // Set last byte to .2 for QEMU
 
         struct in_addr gw_addr{};
-        gw_addr.s_addr = htonl(gateway);
+        gw_addr.s_addr = htonl(GATEWAY);
         char gw_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &gw_addr, gw_str, sizeof(gw_str));
         // std::println("testprog[t:{},p:{}]:   Gateway (assumed): {}", tid, pid, gw_str);
 
-        close(sock);
+        close(SOCK);
 
         // Now ping the gateway
         for (int i = 0; i < 100; i++) {
@@ -190,11 +191,11 @@ auto get_interface_info(const char* ifname) -> bool {
         return true;
     }
 
-    close(sock);
+    close(SOCK);
     return false;
 }
 
-auto print_wki_target_state() -> int {
+static auto print_wki_target_state() -> int {
     char hostname[64] = {};
     uint32_t flags = 0;
     int64_t result = ker::process::getwkitarget(hostname, sizeof(hostname), &flags);
@@ -212,7 +213,7 @@ auto print_wki_target_state() -> int {
     return 0;
 }
 
-auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
+static auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
     if (text == nullptr || flags_out == nullptr) {
         return false;
     }
@@ -227,7 +228,7 @@ auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
     return false;
 }
 
-auto handle_wki_target_command(int argc, char** argv) -> int {
+static auto handle_wki_target_command(int argc, char** argv) -> int {
     if (argc < 3) {
         std::println("usage: testprog --wki-target <show|clear|set>");
         return 1;
@@ -272,7 +273,7 @@ auto handle_wki_target_command(int argc, char** argv) -> int {
     return 1;
 }
 
-auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
+static auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
     if (text == nullptr || route_out == nullptr) {
         return false;
     }
@@ -287,7 +288,7 @@ auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
     return false;
 }
 
-auto print_vfs_route(uint32_t route) -> const char* {
+static auto print_vfs_route(uint32_t route) -> const char* {
     switch (route) {
         case ker::abi::vfs::WKI_VFS_ROUTE_LOCAL:
             return "local";
@@ -298,7 +299,7 @@ auto print_vfs_route(uint32_t route) -> const char* {
     }
 }
 
-auto list_wki_vfs_rules() -> int {
+static auto list_wki_vfs_rules() -> int {
     char prefix[128] = {};
     uint32_t route = 0;
     bool any = false;
@@ -321,7 +322,7 @@ auto list_wki_vfs_rules() -> int {
     return 0;
 }
 
-auto probe_wki_path(const char* path) -> int {
+static auto probe_wki_path(const char* path) -> int {
     char cwd_before[512] = {};
     char cwd_after[512] = {};
     if (getcwd(cwd_before, sizeof(cwd_before)) == nullptr) {
@@ -333,7 +334,8 @@ auto probe_wki_path(const char* path) -> int {
     int stat_rc = stat(path, &st);
     std::println("wki-vfs-probe: path='{}' stat={} errno={}", path, stat_rc, errno);
     if (stat_rc == 0) {
-        std::println("wki-vfs-probe: mode=0{:o} size={} ino={}", st.st_mode, (long long)st.st_size, (long long)st.st_ino);
+        std::println("wki-vfs-probe: mode=0{:o} size={} ino={}", st.st_mode, static_cast<long long>(st.st_size),
+                     static_cast<long long>(st.st_ino));
     }
 
     errno = 0;
@@ -346,7 +348,7 @@ auto probe_wki_path(const char* path) -> int {
         cwd_after[link_len] = '\0';
         std::println("wki-vfs-probe: readlink='{}'", cwd_after);
     } else {
-        std::println("wki-vfs-probe: readlink={} errno={}", (int)link_len, errno);
+        std::println("wki-vfs-probe: readlink={} errno={}", static_cast<int>(link_len), errno);
     }
 
     errno = 0;
@@ -364,7 +366,7 @@ auto probe_wki_path(const char* path) -> int {
     return 0;
 }
 
-auto handle_wki_vfs_command(int argc, char** argv) -> int {
+static auto handle_wki_vfs_command(int argc, char** argv) -> int {
     if (argc < 3) {
         std::println("usage: testprog --wki-vfs <list|clear|add|probe>");
         return 1;
@@ -494,7 +496,7 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     // // Test 2: Get eth0 info and ping gateway
     // std::println("testprog[t:{},p:{}]: === Test 2: Get eth0 info ===", tid, pid);
-    // get_interface_info("eth0");
+    (void)get_interface_info;
 
     std::println("testprog[t:{},p:{},launcher:{},runner:{}]: Network tests complete", tid, pid, launcher, runner);
 

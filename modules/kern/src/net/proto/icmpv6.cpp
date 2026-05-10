@@ -1,18 +1,21 @@
 #include "icmpv6.hpp"
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
-#include <net/endian.hpp>
 #include <net/proto/ipv6.hpp>
 #include <net/proto/ndp.hpp>
-#include <platform/dbg/dbg.hpp>
+
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
 namespace {
 void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst) {
     // Build echo reply with same payload
-    size_t payload_len = pkt->len;  // includes ICMPv6 header + echo header + data
+    size_t const PAYLOAD_LEN = pkt->len;  // includes ICMPv6 header + echo header + data
 
     auto* reply = pkt_alloc_tx();
     if (reply == nullptr) {
@@ -21,8 +24,8 @@ void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uin
     }
 
     // Copy the full ICMPv6 packet (header + payload)
-    auto* out = reply->put(payload_len);
-    std::memcpy(out, pkt->data, payload_len);
+    auto* out = reply->put(PAYLOAD_LEN);
+    std::memcpy(out, pkt->data, PAYLOAD_LEN);
 
     // Change type to Echo Reply
     auto* icmp = reinterpret_cast<ICMPv6Header*>(reply->data);
@@ -50,10 +53,10 @@ void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>&
     const auto* hdr = reinterpret_cast<const ICMPv6Header*>(pkt->data);
 
     // Verify checksum
-    uint16_t stored = hdr->checksum;
-    if (stored != 0) {
-        uint16_t computed = checksum_pseudo_ipv6(src, dst, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len);
-        if (computed != 0 && computed != 0xFFFF) {
+    uint16_t const STORED = hdr->checksum;
+    if (STORED != 0) {
+        uint16_t const COMPUTED = checksum_pseudo_ipv6(src, dst, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len);
+        if (COMPUTED != 0 && COMPUTED != 0xFFFF) {
             pkt_free(pkt);
             return;
         }

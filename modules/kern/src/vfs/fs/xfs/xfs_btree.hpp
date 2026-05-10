@@ -48,8 +48,8 @@ enum class XfsBtreeLookup : uint8_t {
 
 // B+tree type - determines pointer format
 enum class XfsBtreeType : uint8_t {
-    SHORT = 0,  // AG btrees (bnobt, cntbt, inobt) - __be32 pointers
-    LONG = 1,   // inode btrees (bmbt) - __be64 pointers
+    SHORT = 0,  // AG btrees (bnobt, cntbt, inobt) - Be32 pointers
+    LONG = 1,   // inode btrees (bmbt) - Be64 pointers
 };
 
 // ============================================================================
@@ -102,11 +102,11 @@ struct XfsBnobtTraits {
     static constexpr size_t HDR_LEN = XFS_BTREE_SBLOCK_CRC_LEN;
 
     static auto cmp_key(const Key* key, const IRec& target) -> int {
-        uint32_t k = key->ar_startblock.to_cpu();
-        if (k < target.startblock) {
+        uint32_t const K = key->ar_startblock.to_cpu();
+        if (K < target.startblock) {
             return -1;
         }
-        if (k > target.startblock) {
+        if (K > target.startblock) {
             return 1;
         }
         return 0;
@@ -117,11 +117,13 @@ struct XfsBnobtTraits {
         key->ar_blockcount = rec->ar_blockcount;
     }
 
-    static auto decode_rec(const Rec* rec) -> IRec { return {rec->ar_startblock.to_cpu(), rec->ar_blockcount.to_cpu()}; }
+    static auto decode_rec(const Rec* rec) -> IRec {
+        return {.startblock = rec->ar_startblock.to_cpu(), .blockcount = rec->ar_blockcount.to_cpu()};
+    }
 
     static void encode_rec(Rec* rec, const IRec& irec) {
-        rec->ar_startblock = __be32::from_cpu(irec.startblock);
-        rec->ar_blockcount = __be32::from_cpu(irec.blockcount);
+        rec->ar_startblock = Be32::from_cpu(irec.startblock);
+        rec->ar_blockcount = Be32::from_cpu(irec.blockcount);
     }
 };
 
@@ -143,18 +145,18 @@ struct XfsCntbtTraits {
 
     // cntbt is sorted by (blockcount, startblock)
     static auto cmp_key(const Key* key, const IRec& target) -> int {
-        uint32_t kcount = key->ar_blockcount.to_cpu();
-        if (kcount < target.blockcount) {
+        uint32_t const KCOUNT = key->ar_blockcount.to_cpu();
+        if (KCOUNT < target.blockcount) {
             return -1;
         }
-        if (kcount > target.blockcount) {
+        if (KCOUNT > target.blockcount) {
             return 1;
         }
-        uint32_t kblock = key->ar_startblock.to_cpu();
-        if (kblock < target.startblock) {
+        uint32_t const KBLOCK = key->ar_startblock.to_cpu();
+        if (KBLOCK < target.startblock) {
             return -1;
         }
-        if (kblock > target.startblock) {
+        if (KBLOCK > target.startblock) {
             return 1;
         }
         return 0;
@@ -170,8 +172,8 @@ struct XfsCntbtTraits {
     }
 
     static void encode_rec(Rec* rec, const IRec& irec) {
-        rec->ar_startblock = __be32::from_cpu(irec.startblock);
-        rec->ar_blockcount = __be32::from_cpu(irec.blockcount);
+        rec->ar_startblock = Be32::from_cpu(irec.startblock);
+        rec->ar_blockcount = Be32::from_cpu(irec.blockcount);
     }
 };
 
@@ -193,11 +195,11 @@ struct XfsInobtTraits {
     static constexpr size_t HDR_LEN = XFS_BTREE_SBLOCK_CRC_LEN;
 
     static auto cmp_key(const Key* key, const IRec& target) -> int {
-        uint32_t k = key->ir_startino.to_cpu();
-        if (k < target.startino) {
+        uint32_t const K = key->ir_startino.to_cpu();
+        if (K < target.startino) {
             return -1;
         }
-        if (k > target.startino) {
+        if (K > target.startino) {
             return 1;
         }
         return 0;
@@ -214,9 +216,9 @@ struct XfsInobtTraits {
     }
 
     static void encode_rec(Rec* rec, const IRec& irec) {
-        rec->ir_startino = __be32::from_cpu(irec.startino);
-        rec->ir_u.f.ir_freecount = __be32::from_cpu(irec.freecount);
-        rec->ir_free = __be64::from_cpu(irec.free_mask);
+        rec->ir_startino = Be32::from_cpu(irec.startino);
+        rec->ir_u.f.ir_freecount = Be32::from_cpu(irec.freecount);
+        rec->ir_free = Be64::from_cpu(irec.free_mask);
     }
 };
 
@@ -239,11 +241,11 @@ struct XfsBmbtTraits {
     static constexpr size_t HDR_LEN = XFS_BTREE_LBLOCK_CRC_LEN;
 
     static auto cmp_key(const Key* key, const IRec& target) -> int {
-        uint64_t k = key->br_startoff.to_cpu();
-        if (k < target.br_startoff) {
+        uint64_t const K = key->br_startoff.to_cpu();
+        if (K < target.br_startoff) {
             return -1;
         }
-        if (k > target.br_startoff) {
+        if (K > target.br_startoff) {
             return 1;
         }
         return 0;
@@ -251,9 +253,9 @@ struct XfsBmbtTraits {
 
     static void init_key_from_rec(Key* key, const Rec* rec) {
         // Extract startoff from the packed record
-        uint64_t l0 = rec->l0.to_cpu();
-        uint64_t startoff = (l0 >> 9) & 0x3FFFFFFFFFFFFFULL;
-        key->br_startoff = __be64::from_cpu(startoff);
+        uint64_t const L0 = rec->l0.to_cpu();
+        uint64_t const STARTOFF = (L0 >> 9) & 0x3FFFFFFFFFFFFFULL;
+        key->br_startoff = Be64::from_cpu(STARTOFF);
     }
 
     static auto decode_rec(const Rec* rec) -> IRec { return xfs_bmbt_rec_unpack(rec); }
@@ -268,9 +270,9 @@ struct XfsBmbtTraits {
 template <typename Traits>
 class XfsBtreeCursor {
    public:
-    using Key = typename Traits::Key;
-    using Rec = typename Traits::Rec;
-    using IRec = typename Traits::IRec;
+    using Key = Traits::Key;
+    using Rec = Traits::Rec;
+    using IRec = Traits::IRec;
 
     XfsMountContext* mount{};
     uint8_t nlevels{};  // actual depth of tree
@@ -304,16 +306,16 @@ class XfsBtreeCursor {
     auto operator=(const XfsBtreeCursor&) -> XfsBtreeCursor& = delete;
 
     // Get number of records in the block at a given level
-    auto numrecs(int level) const -> int;
+    [[nodiscard]] auto numrecs(int level) const -> int;
 
     // Get pointer to the i-th key at a given level (1-based)
-    auto key_at(int level, int idx) const -> const Key*;
+    [[nodiscard]] auto key_at(int level, int idx) const -> const Key*;
 
     // Get pointer to the i-th record at leaf level (1-based)
-    auto rec_at(int idx) const -> const Rec*;
+    [[nodiscard]] auto rec_at(int idx) const -> const Rec*;
 
     // Get child pointer at an internal level (1-based)
-    auto ptr_at(int level, int idx) const -> uint64_t;
+    [[nodiscard]] auto ptr_at(int level, int idx) const -> uint64_t;
 
     // Mutable access to leaf record at 1-based index
     auto rec_at_mut(int idx) -> Rec*;
@@ -335,8 +337,8 @@ class XfsBtreeCursor {
 
     // Get the left/right sibling block number at a given level.
     // Returns NULLFSBLOCK / NULLAGBLOCK if no sibling.
-    auto left_sibling(int level) const -> uint64_t;
-    auto right_sibling(int level) const -> uint64_t;
+    [[nodiscard]] auto left_sibling(int level) const -> uint64_t;
+    [[nodiscard]] auto right_sibling(int level) const -> uint64_t;
 };
 
 // ============================================================================
@@ -364,7 +366,7 @@ auto xfs_btree_decrement(XfsBtreeCursor<Traits>* cur) -> int;
 
 // Get the record at the current cursor position.
 template <typename Traits>
-auto xfs_btree_get_rec(const XfsBtreeCursor<Traits>* cur) -> typename Traits::IRec;
+auto xfs_btree_get_rec(const XfsBtreeCursor<Traits>* cur) -> Traits::IRec;
 
 // ============================================================================
 // B+tree mutation operations (write path)

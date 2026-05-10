@@ -1,21 +1,25 @@
 #include "pic.hpp"
 
+#include "mod/io/port/port.hpp"
+
 namespace ker::mod::pic {
-static bool picEnabled = true;
+static bool pic_enabled = true;
 void eoi(int isr_nr) {
-    if (isr_nr > 40) outb(0xA0, 0x20);
+    if (isr_nr > 40) {
+        outb(0xA0, 0x20);
+    }
     outb(0x20, 0x20);
 }
 
-bool enabled(void) { return picEnabled; }
+bool enabled() { return pic_enabled; }
 
-void disable(void) {
+void disable() {
     outb(0xA1, 0xFF);
     outb(0x21, 0xFF);
-    picEnabled = false;
+    pic_enabled = false;
 }
 
-void remap(void) {
+void remap() {
     outb(0x20, 0x11);
     outb(0xA0, 0x11);
     io_wait();

@@ -1,5 +1,7 @@
 #include "coredump.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,14 +23,14 @@ namespace ker::mod::dbg::coredump {
 namespace {
 using log = ker::mod::dbg::logger<"cdmp">;
 
-constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534full;  // "WOSCODMP" little-endian-ish identifier
+constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534fULL;  // "WOSCODMP" little-endian-ish identifier
 constexpr uint32_t COREDUMP_VERSION = 2;
 constexpr size_t MAX_WALK_WARNINGS_PER_LEVEL = 8;
 
 // x86-64 canonical address check: bits[63:47] must all be the same.
 // For kernel HHDM addresses (bit 47 set) the upper 17 bits are all 1s.
-static constexpr int CANONICAL_SIGN_BIT = 47;
-static constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
+constexpr int CANONICAL_SIGN_BIT = 47;
+constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 
 // Keep this in sync with tmpfs' internal flag.
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
@@ -37,8 +39,8 @@ bool is_ram(uint64_t phys) {
     for (auto* zone = ker::mod::mm::phys::get_zones(); zone != nullptr; zone = zone->next) {
         // zone->start is virtual (HHDM)
         // zone->len is length in bytes
-        uint64_t zoneStartPhys = (uint64_t)ker::mod::mm::addr::get_phys_pointer((ker::mod::mm::addr::vaddr_t)zone->start);
-        if (phys >= zoneStartPhys && phys < zoneStartPhys + zone->len) {
+        auto const ZONE_START_PHYS = (uint64_t)ker::mod::mm::addr::get_phys_pointer(static_cast<ker::mod::mm::addr::vaddr_t>(zone->start));
+        if (phys >= ZONE_START_PHYS && phys < ZONE_START_PHYS + zone->len) {
             return true;
         }
     }
@@ -48,9 +50,9 @@ bool is_ram(uint64_t phys) {
 struct CoreDumpHeader {
     uint64_t magic;
     uint32_t version;
-    uint32_t headerSize;
+    uint32_t header_size;
 
-    uint64_t timestampQuantums;
+    uint64_t timestamp_quantums;
     uint64_t pid;
     uint64_t cpu;
 
@@ -60,66 +62,66 @@ struct CoreDumpHeader {
     uint64_t cr3;
 
     // Trap/exception frame at the time of fault.
-    ker::mod::gates::interruptFrame trapFrame;
-    ker::mod::cpu::GPRegs trapRegs;
+    ker::mod::gates::InterruptFrame trap_frame;
+    ker::mod::cpu::GPRegs trap_regs;
 
     // Saved user context frame/regs (if available).
-    ker::mod::gates::interruptFrame savedFrame;
-    ker::mod::cpu::GPRegs savedRegs;
+    ker::mod::gates::InterruptFrame saved_frame;
+    ker::mod::cpu::GPRegs saved_regs;
 
-    uint64_t taskEntry;
-    uint64_t taskPagemap;
+    uint64_t task_entry;
+    uint64_t task_pagemap;
 
-    uint64_t elfHeaderAddr;
-    uint64_t programHeaderAddr;
+    uint64_t elf_header_addr;
+    uint64_t program_header_addr;
 
-    uint64_t segmentCount;
-    uint64_t segmentTableOffset;
+    uint64_t segment_count;
+    uint64_t segment_table_offset;
 
-    uint64_t elfSize;
-    uint64_t elfOffset;
+    uint64_t elf_size;
+    uint64_t elf_offset;
 
     // Version 2 restart/snapshot metadata. The dump now contains all present
     // user pages, not just the faulting stack window.
-    uint64_t segmentEntrySize;
-    uint64_t pageSize;
-    uint64_t snapshotFlags;
+    uint64_t segment_entry_size;
+    uint64_t page_size;
+    uint64_t snapshot_flags;
 
-    uint64_t interpBase;
-    uint64_t programHeaderCount;
-    uint64_t programHeaderEntSize;
+    uint64_t interp_base;
+    uint64_t program_header_count;
+    uint64_t program_header_ent_size;
 
-    uint64_t threadFsBase;
-    uint64_t threadGsBase;
-    uint64_t threadStackBase;
+    uint64_t thread_fs_base;
+    uint64_t thread_gs_base;
+    uint64_t thread_stack_base;
     uint64_t threadstack_size;
-    uint64_t threadTlsBase;
+    uint64_t thread_tls_base;
     uint64_t threadtls_size;
-    uint64_t threadSafeStack;
+    uint64_t thread_safe_stack;
 
-    char exePath[ker::mod::sched::task::Task::EXE_PATH_MAX];
+    char exe_path[ker::mod::sched::task::Task::EXE_PATH_MAX];
     char cwd[ker::mod::sched::task::Task::CWD_MAX];
     char root[ker::mod::sched::task::Task::CWD_MAX];
 } __attribute__((packed));
 
 enum class SegmentType : uint32_t {
-    StackPage = 1,
-    FaultPage = 2,
-    MemoryPage = 3,
+    STACK_PAGE = 1,
+    FAULT_PAGE = 2,
+    MEMORY_PAGE = 3,
 };
 
 struct CoreDumpSegment {
     uint64_t vaddr;
     uint64_t size;
-    uint64_t fileOffset;
+    uint64_t file_offset;
     uint32_t type;
     uint32_t present;
-    uint64_t pteFlags;
-    uint64_t physAddr;
+    uint64_t pte_flags;
+    uint64_t phys_addr;
 } __attribute__((packed));
 
-auto u64_to_dec(char* out, size_t outSize, uint64_t v) -> size_t {
-    if (outSize == 0) {
+auto u64_to_dec(char* out, size_t out_size, uint64_t v) -> size_t {
+    if (out_size == 0) {
         return 0;
     }
     char tmp[32];
@@ -130,43 +132,43 @@ auto u64_to_dec(char* out, size_t outSize, uint64_t v) -> size_t {
     } while (v != 0 && n < sizeof(tmp));
 
     size_t w = 0;
-    while (w + 1 < outSize && n > 0) {
+    while (w + 1 < out_size && n > 0) {
         out[w++] = tmp[--n];
     }
     out[w] = '\0';
     return w;
 }
 
-auto sanitize_name(const char* in, char* out, size_t outSize) -> void {
-    if (outSize == 0) {
+auto sanitize_name(const char* in, char* out, size_t out_size) -> void {
+    if (out_size == 0) {
         return;
     }
     if (in == nullptr || in[0] == '\0') {
-        const char fallback[] = "unknown";
+        const char FALLBACK[] = "unknown";
         size_t i = 0;
-        for (; i + 1 < outSize && fallback[i] != '\0'; ++i) {
-            out[i] = fallback[i];
+        for (; i + 1 < out_size && FALLBACK[i] != '\0'; ++i) {
+            out[i] = FALLBACK[i];
         }
         out[i] = '\0';
         return;
     }
 
     size_t w = 0;
-    for (size_t r = 0; in[r] != '\0' && w + 1 < outSize; ++r) {
-        char c = in[r];
-        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c == '_');
-        out[w++] = ok ? c : '_';
+    for (size_t r = 0; in[r] != '\0' && w + 1 < out_size; ++r) {
+        char const C = in[r];
+        bool const OK = (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9') || (C == '_');
+        out[w++] = OK ? C : '_';
     }
     out[w] = '\0';
 }
 
 auto write_all(int fd, const void* buf, size_t count) -> bool {
-    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    const auto* p = static_cast<const uint8_t*>(buf);
     size_t remaining = count;
     while (remaining > 0) {
         size_t wrote = 0;
-        ssize_t rc = ker::vfs::vfs_write(fd, p, remaining, &wrote);
-        if (rc < 0 || wrote == 0) {
+        ssize_t const RC = ker::vfs::vfs_write(fd, p, remaining, &wrote);
+        if (RC < 0 || wrote == 0) {
             return false;
         }
         p += wrote;
@@ -182,28 +184,28 @@ auto pte_raw(const ker::mod::mm::paging::PageTableEntry& e) -> uint64_t {
 }
 
 struct UserPageWalkStats {
-    uint64_t invalidPml3Frames = 0;
-    uint64_t invalidPml2Frames = 0;
-    uint64_t invalidPml1Frames = 0;
-    uint64_t skippedDataPages = 0;
+    uint64_t invalid_pml3_frames = 0;
+    uint64_t invalid_pml2_frames = 0;
+    uint64_t invalid_pml1_frames = 0;
+    uint64_t skipped_data_pages = 0;
 };
 
 auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
-    const uint64_t page_base = phys_addr & ~(ker::mod::mm::paging::PAGE_SIZE - 1);
-    if (!is_ram(page_base)) {
+    const uint64_t PAGE_BASE = phys_addr & ~(ker::mod::mm::paging::PAGE_SIZE - 1);
+    if (!is_ram(PAGE_BASE)) {
         return nullptr;
     }
 
-    const uint64_t virt_raw = page_base + ker::mod::mm::addr::get_hhdm_offset();
-    if ((virt_raw >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+    const uint64_t VIRT_RAW = PAGE_BASE + ker::mod::mm::addr::get_hhdm_offset();
+    if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
         return nullptr;
     }
 
-    if (ker::mod::mm::phys::page_ref_get(reinterpret_cast<void*>(virt_raw)) == 0) {
+    if (ker::mod::mm::phys::page_ref_get(reinterpret_cast<void*>(VIRT_RAW)) == 0) {
         return nullptr;
     }
 
-    return reinterpret_cast<void*>(virt_raw);
+    return reinterpret_cast<void*>(VIRT_RAW);
 }
 
 template <typename Fn>
@@ -221,12 +223,12 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
             continue;
         }
 
-        const uint64_t pml3_phys = static_cast<uint64_t>(pml4e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
-        auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(pml3_phys));
+        const uint64_t PML3_PHYS = static_cast<uint64_t>(pml4e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
+        auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(PML3_PHYS));
         if (pml3 == nullptr) {
-            if (stats != nullptr && stats->invalidPml3Frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
+            if (stats != nullptr && stats->invalid_pml3_frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
                 log::warn("coredump: pid=%lu name=%s invalid PML3 frame=0x%llx under PML4[%zu]", pid, name != nullptr ? name : "?",
-                          (unsigned long long)pml3_phys, i4);
+                          static_cast<unsigned long long>(PML3_PHYS), i4);
             }
             continue;
         }
@@ -236,12 +238,12 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
                 continue;
             }
 
-            const uint64_t pml2_phys = static_cast<uint64_t>(pml3e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
-            auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(pml2_phys));
+            const uint64_t PML2_PHYS = static_cast<uint64_t>(pml3e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
+            auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(PML2_PHYS));
             if (pml2 == nullptr) {
-                if (stats != nullptr && stats->invalidPml2Frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
+                if (stats != nullptr && stats->invalid_pml2_frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
                     log::warn("coredump: pid=%lu name=%s invalid PML2 frame=0x%llx under PML4[%zu]/PML3[%zu]", pid,
-                              name != nullptr ? name : "?", (unsigned long long)pml2_phys, i4, i3);
+                              name != nullptr ? name : "?", static_cast<unsigned long long>(PML2_PHYS), i4, i3);
                 }
                 continue;
             }
@@ -251,28 +253,28 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
                     continue;
                 }
 
-                uint64_t base = (i4 << 39) | (i3 << 30) | (i2 << 21);
+                uint64_t const BASE = (i4 << 39) | (i3 << 30) | (i2 << 21);
                 if (pml2e.pagesize) {
-                    uint64_t raw = pte_raw(pml2e);
-                    uint64_t physBase = pml2e.frame << ker::mod::mm::paging::PAGE_SHIFT;
+                    uint64_t const RAW = pte_raw(pml2e);
+                    uint64_t const PHYS_BASE = pml2e.frame << ker::mod::mm::paging::PAGE_SHIFT;
                     for (size_t part = 0; part < 512; ++part) {
-                        uint64_t vaddr = base + part * PAGE;
-                        uint64_t phys = physBase + part * PAGE;
-                        if (phys_to_hhdm_checked(phys) != nullptr) {
-                            fn(vaddr, phys, raw);
+                        uint64_t const VADDR = BASE + (part * PAGE);
+                        uint64_t const PHYS = PHYS_BASE + (part * PAGE);
+                        if (phys_to_hhdm_checked(PHYS) != nullptr) {
+                            fn(VADDR, PHYS, RAW);
                         } else if (stats != nullptr) {
-                            ++stats->skippedDataPages;
+                            ++stats->skipped_data_pages;
                         }
                     }
                     continue;
                 }
 
-                const uint64_t pml1_phys = static_cast<uint64_t>(pml2e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
-                auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(pml1_phys));
+                const uint64_t PML1_PHYS = static_cast<uint64_t>(pml2e.frame) << ker::mod::mm::paging::PAGE_SHIFT;
+                auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(phys_to_hhdm_checked(PML1_PHYS));
                 if (pml1 == nullptr) {
-                    if (stats != nullptr && stats->invalidPml1Frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
+                    if (stats != nullptr && stats->invalid_pml1_frames++ < MAX_WALK_WARNINGS_PER_LEVEL) {
                         log::warn("coredump: pid=%lu name=%s invalid PML1 frame=0x%llx under PML4[%zu]/PML3[%zu]/PML2[%zu]", pid,
-                                  name != nullptr ? name : "?", (unsigned long long)pml1_phys, i4, i3, i2);
+                                  name != nullptr ? name : "?", static_cast<unsigned long long>(PML1_PHYS), i4, i3, i2);
                     }
                     continue;
                 }
@@ -282,12 +284,12 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
                         continue;
                     }
 
-                    uint64_t vaddr = base | (i1 << 12);
-                    uint64_t phys = pte.frame << ker::mod::mm::paging::PAGE_SHIFT;
-                    if (phys_to_hhdm_checked(phys) != nullptr) {
-                        fn(vaddr, phys, pte_raw(pte));
+                    uint64_t const VADDR = BASE | (i1 << 12);
+                    uint64_t const PHYS = pte.frame << ker::mod::mm::paging::PAGE_SHIFT;
+                    if (phys_to_hhdm_checked(PHYS) != nullptr) {
+                        fn(VADDR, PHYS, pte_raw(pte));
                     } else if (stats != nullptr) {
-                        ++stats->skippedDataPages;
+                        ++stats->skipped_data_pages;
                     }
                 }
             }
@@ -299,8 +301,8 @@ void for_each_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t pid, 
 // No heap allocation, no locks. Physical page reads happen via HHDM in the coredump task.
 struct CoreDumpRequest {
     ker::mod::cpu::GPRegs gpr;
-    ker::mod::gates::interruptFrame frame;
-    ker::mod::gates::interruptFrame saved_frame;
+    ker::mod::gates::InterruptFrame frame;
+    ker::mod::gates::InterruptFrame saved_frame;
     ker::mod::cpu::GPRegs saved_regs;
     uint64_t cr2;
     uint64_t cr3;
@@ -335,7 +337,7 @@ struct CoreDumpRequest {
 constexpr uint32_t RING_SIZE = 4;
 
 struct CoreDumpSlot {
-    CoreDumpRequest req;
+    CoreDumpRequest req{};
     std::atomic<bool> ready{false};
 };
 
@@ -346,12 +348,12 @@ static ker::mod::sched::task::Task* g_coredump_task{nullptr};  // NOLINT
 
 static void perform_coredump(const CoreDumpRequest& req);
 
-[[noreturn]] static void coredump_task_fn() {
+[[noreturn]] void coredump_task_fn() {
     while (true) {
-        uint32_t idx = g_read_seq % RING_SIZE;
+        uint32_t const IDX = g_read_seq % RING_SIZE;
 
-        if (g_ring[idx].ready.load(std::memory_order_acquire)) {
-            CoreDumpRequest& req = g_ring[idx].req;
+        if (g_ring[IDX].ready.load(std::memory_order_acquire)) {
+            CoreDumpRequest& req = g_ring[IDX].req;
 
             // Switch to kernel pagemap: VFS I/O and HHDM page reads require it.
             // (The coredump task is a DAEMON so it already uses the kernel pagemap,
@@ -379,7 +381,7 @@ static void perform_coredump(const CoreDumpRequest& req);
                 req.task_ptr = nullptr;
             }
 
-            g_ring[idx].ready.store(false, std::memory_order_release);
+            g_ring[IDX].ready.store(false, std::memory_order_release);
             g_read_seq++;
         } else {
             ker::mod::sched::kern_block();
@@ -387,7 +389,7 @@ static void perform_coredump(const CoreDumpRequest& req);
     }
 }
 
-static void perform_coredump(const CoreDumpRequest& req) {
+void perform_coredump(const CoreDumpRequest& req) {
     char prog[48];
     sanitize_name(req.name, prog, sizeof(prog));
 
@@ -395,14 +397,14 @@ static void perform_coredump(const CoreDumpRequest& req) {
     u64_to_dec(ts, sizeof(ts), req.timestamp);
 
     char path[160];
-    const char suffix[] = "_coredump.bin";
+    const char SUFFIX[] = "_coredump.bin";
     size_t pos = 0;
     // Keep crash-path dumps off the persistent rootfs for now. Writing large
     // coredumps through XFS/buffer-cache is currently triggering allocator
     // corruption, which obscures the original userspace mapping bug.
-    const char prefix[] = "/tmp/";
-    for (size_t i = 0; prefix[i] != '\0' && pos + 1 < sizeof(path); ++i) {
-        path[pos++] = prefix[i];
+    const char PREFIX[] = "/tmp/";
+    for (size_t i = 0; PREFIX[i] != '\0' && pos + 1 < sizeof(path); ++i) {
+        path[pos++] = PREFIX[i];
     }
     for (size_t i = 0; prog[i] != '\0' && pos + 1 < sizeof(path); ++i) {
         path[pos++] = prog[i];
@@ -413,161 +415,161 @@ static void perform_coredump(const CoreDumpRequest& req) {
     for (size_t i = 0; ts[i] != '\0' && pos + 1 < sizeof(path); ++i) {
         path[pos++] = ts[i];
     }
-    for (size_t i = 0; suffix[i] != '\0' && pos + 1 < sizeof(path); ++i) {
-        path[pos++] = suffix[i];
+    for (size_t i = 0; SUFFIX[i] != '\0' && pos + 1 < sizeof(path); ++i) {
+        path[pos++] = SUFFIX[i];
     }
     path[pos] = '\0';
 
-    int fd = ker::vfs::vfs_open(path, O_CREAT, 0);
-    if (fd < 0) {
+    int const FD = ker::vfs::vfs_open(path, O_CREAT, 0);
+    if (FD < 0) {
         ker::mod::dbg::log("coredump: failed to open %s", path);
         return;
     }
 
     constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
-    uint64_t stackPage = req.user_rsp & ~(PAGE - 1);
-    uint64_t faultPage = req.cr2 & ~(PAGE - 1);
+    uint64_t stack_page = req.user_rsp & ~(PAGE - 1);
+    uint64_t fault_page = req.cr2 & ~(PAGE - 1);
 
-    UserPageWalkStats walkStats{};
-    uint64_t segCapacity = 0;
-    for_each_user_page(req.pagemap, req.pid, req.name, &walkStats,
-                       [&](uint64_t /*vaddr*/, uint64_t /*phys*/, uint64_t /*pte*/) { ++segCapacity; });
+    UserPageWalkStats walk_stats{};
+    uint64_t seg_capacity = 0;
+    for_each_user_page(req.pagemap, req.pid, req.name, &walk_stats,
+                       [&](uint64_t /*vaddr*/, uint64_t /*phys*/, uint64_t /*pte*/) { ++seg_capacity; });
 
     CoreDumpSegment* segs = nullptr;
-    uint64_t segTableBytes = segCapacity * sizeof(CoreDumpSegment);
-    uint64_t segTableAllocBytes = (segTableBytes + PAGE - 1) & ~(PAGE - 1);
-    if (segCapacity != 0) {
-        segs = static_cast<CoreDumpSegment*>(ker::mod::mm::phys::page_alloc(segTableAllocBytes, "coredump-segments"));
+    uint64_t const SEG_TABLE_BYTES = seg_capacity * sizeof(CoreDumpSegment);
+    uint64_t const SEG_TABLE_ALLOC_BYTES = (SEG_TABLE_BYTES + PAGE - 1) & ~(PAGE - 1);
+    if (seg_capacity != 0) {
+        segs = static_cast<CoreDumpSegment*>(ker::mod::mm::phys::page_alloc(SEG_TABLE_ALLOC_BYTES, "coredump-segments"));
         if (segs == nullptr) {
-            ker::vfs::vfs_close(fd);
+            ker::vfs::vfs_close(FD);
             ker::mod::dbg::log("coredump: failed to allocate segment table for %s", path);
             return;
         }
-        std::memset(segs, 0, segTableBytes);
+        std::memset(segs, 0, SEG_TABLE_BYTES);
     }
 
-    uint64_t nextOffset = sizeof(CoreDumpHeader) + segCapacity * sizeof(CoreDumpSegment);
-    uint64_t segIndex = 0;
-    uint64_t droppedSegments = 0;
+    uint64_t next_offset = sizeof(CoreDumpHeader) + (seg_capacity * sizeof(CoreDumpSegment));
+    uint64_t seg_index = 0;
+    uint64_t dropped_segments = 0;
     if (segs != nullptr) {
-        for_each_user_page(req.pagemap, req.pid, req.name, &walkStats, [&](uint64_t vaddr, uint64_t phys, uint64_t pteFlags) {
-            if (segIndex >= segCapacity) {
-                ++droppedSegments;
+        for_each_user_page(req.pagemap, req.pid, req.name, &walk_stats, [&](uint64_t vaddr, uint64_t phys, uint64_t pte_flags) {
+            if (seg_index >= seg_capacity) {
+                ++dropped_segments;
                 return;
             }
 
             CoreDumpSegment s{};
             s.vaddr = vaddr;
             s.size = PAGE;
-            s.fileOffset = nextOffset;
+            s.file_offset = next_offset;
             s.present = 1;
-            s.pteFlags = pteFlags;
-            s.physAddr = phys;
-            s.type = static_cast<uint32_t>(SegmentType::MemoryPage);
-            if (vaddr == faultPage) {
-                s.type = static_cast<uint32_t>(SegmentType::FaultPage);
+            s.pte_flags = pte_flags;
+            s.phys_addr = phys;
+            s.type = static_cast<uint32_t>(SegmentType::MEMORY_PAGE);
+            if (vaddr == fault_page) {
+                s.type = static_cast<uint32_t>(SegmentType::FAULT_PAGE);
             } else if (req.thread_stack_base != 0 && vaddr >= req.thread_stack_base &&
                        vaddr < req.thread_stack_base + req.thread_stack_size) {
-                s.type = static_cast<uint32_t>(SegmentType::StackPage);
-            } else if (vaddr <= stackPage && stackPage < vaddr + PAGE) {
-                s.type = static_cast<uint32_t>(SegmentType::StackPage);
+                s.type = static_cast<uint32_t>(SegmentType::STACK_PAGE);
+            } else if (vaddr <= stack_page && stack_page < vaddr + PAGE) {
+                s.type = static_cast<uint32_t>(SegmentType::STACK_PAGE);
             }
-            segs[segIndex++] = s;
-            nextOffset += PAGE;
+            segs[seg_index++] = s;
+            next_offset += PAGE;
         });
     }
 
     CoreDumpHeader hdr{};
     hdr.magic = COREDUMP_MAGIC;
     hdr.version = COREDUMP_VERSION;
-    hdr.headerSize = sizeof(CoreDumpHeader);
-    hdr.timestampQuantums = req.timestamp;
+    hdr.header_size = sizeof(CoreDumpHeader);
+    hdr.timestamp_quantums = req.timestamp;
     hdr.pid = req.pid;
     hdr.cpu = req.cpu_id;
     hdr.int_num = req.frame.int_num;
     hdr.err_code = req.frame.err_code;
     hdr.cr2 = req.cr2;
     hdr.cr3 = req.cr3;
-    hdr.trapFrame = req.frame;
-    hdr.trapRegs = req.gpr;
-    hdr.savedFrame = req.saved_frame;
-    hdr.savedRegs = req.saved_regs;
-    hdr.taskEntry = req.entry;
-    hdr.taskPagemap = reinterpret_cast<uint64_t>(req.pagemap);
-    hdr.elfHeaderAddr = req.elf_header_addr;
-    hdr.programHeaderAddr = req.program_header_addr;
-    hdr.segmentCount = segCapacity;
-    hdr.segmentTableOffset = sizeof(CoreDumpHeader);
-    hdr.elfSize = req.elf_buffer != nullptr ? req.elf_buffer_size : 0;
-    hdr.elfOffset = nextOffset;
-    hdr.segmentEntrySize = sizeof(CoreDumpSegment);
-    hdr.pageSize = PAGE;
-    hdr.snapshotFlags = 1;  // Full present-user-page snapshot.
-    hdr.interpBase = req.interp_base;
-    hdr.programHeaderCount = req.program_header_count;
-    hdr.programHeaderEntSize = req.program_header_ent_size;
-    hdr.threadFsBase = req.thread_fs_base;
-    hdr.threadGsBase = req.thread_gs_base;
-    hdr.threadStackBase = req.thread_stack_base;
+    hdr.trap_frame = req.frame;
+    hdr.trap_regs = req.gpr;
+    hdr.saved_frame = req.saved_frame;
+    hdr.saved_regs = req.saved_regs;
+    hdr.task_entry = req.entry;
+    hdr.task_pagemap = reinterpret_cast<uint64_t>(req.pagemap);
+    hdr.elf_header_addr = req.elf_header_addr;
+    hdr.program_header_addr = req.program_header_addr;
+    hdr.segment_count = seg_capacity;
+    hdr.segment_table_offset = sizeof(CoreDumpHeader);
+    hdr.elf_size = req.elf_buffer != nullptr ? req.elf_buffer_size : 0;
+    hdr.elf_offset = next_offset;
+    hdr.segment_entry_size = sizeof(CoreDumpSegment);
+    hdr.page_size = PAGE;
+    hdr.snapshot_flags = 1;  // Full present-user-page snapshot.
+    hdr.interp_base = req.interp_base;
+    hdr.program_header_count = req.program_header_count;
+    hdr.program_header_ent_size = req.program_header_ent_size;
+    hdr.thread_fs_base = req.thread_fs_base;
+    hdr.thread_gs_base = req.thread_gs_base;
+    hdr.thread_stack_base = req.thread_stack_base;
     hdr.threadstack_size = req.thread_stack_size;
-    hdr.threadTlsBase = req.thread_tls_base;
+    hdr.thread_tls_base = req.thread_tls_base;
     hdr.threadtls_size = req.thread_tls_size;
-    hdr.threadSafeStack = req.thread_safe_stack;
-    std::memcpy(hdr.exePath, req.exe_path, sizeof(hdr.exePath));
+    hdr.thread_safe_stack = req.thread_safe_stack;
+    std::memcpy(hdr.exe_path, req.exe_path, sizeof(hdr.exe_path));
     std::memcpy(hdr.cwd, req.cwd, sizeof(hdr.cwd));
     std::memcpy(hdr.root, req.root, sizeof(hdr.root));
 
-    bool ok = write_all(fd, &hdr, sizeof(hdr));
-    ok = ok && (segCapacity == 0 || write_all(fd, segs, segCapacity * sizeof(CoreDumpSegment)));
+    bool ok = write_all(FD, &hdr, sizeof(hdr));
+    ok = ok && (seg_capacity == 0 || write_all(FD, segs, seg_capacity * sizeof(CoreDumpSegment)));
 
-    for (uint64_t i = 0; ok && i < segCapacity; ++i) {
+    for (uint64_t i = 0; ok && i < seg_capacity; ++i) {
         if (segs[i].present == 0) {
             continue;
         }
-        void* pagePtr = phys_to_hhdm_checked(segs[i].physAddr);
-        if (pagePtr == nullptr) {
+        void const* page_ptr = phys_to_hhdm_checked(segs[i].phys_addr);
+        if (page_ptr == nullptr) {
             ok = false;
             continue;
         }
-        ok = write_all(fd, pagePtr, PAGE);
+        ok = write_all(FD, page_ptr, PAGE);
     }
 
     if (ok && req.elf_buffer != nullptr && req.elf_buffer_size != 0) {
         const uint8_t* elf = req.elf_buffer;
         size_t remaining = req.elf_buffer_size;
         while (ok && remaining > 0) {
-            size_t chunk = remaining > 4096 ? 4096 : remaining;
-            ok = write_all(fd, elf, chunk);
-            elf += chunk;
-            remaining -= chunk;
+            size_t const CHUNK = remaining > 4096 ? 4096 : remaining;
+            ok = write_all(FD, elf, CHUNK);
+            elf += CHUNK;
+            remaining -= CHUNK;
         }
     }
 
-    ker::vfs::vfs_close(fd);
+    ker::vfs::vfs_close(FD);
     // Intentionally retain the emergency segment table. It is allocated only
     // when a process is already crashing, and freeing multi-page buffers from
     // this path has caused allocator metadata failures before GC finishes.
 
     if (ok) {
         ker::mod::dbg::log("coredump: wrote %s", path);
-        if (droppedSegments != 0) {
-            ker::mod::dbg::log("coredump: skipped %d pages because pagemap grew while dumping %s", droppedSegments, path);
+        if (dropped_segments != 0) {
+            ker::mod::dbg::log("coredump: skipped %d pages because pagemap grew while dumping %s", dropped_segments, path);
         }
-        if (walkStats.invalidPml3Frames != 0 || walkStats.invalidPml2Frames != 0 || walkStats.invalidPml1Frames != 0 ||
-            walkStats.skippedDataPages != 0) {
+        if (walk_stats.invalid_pml3_frames != 0 || walk_stats.invalid_pml2_frames != 0 || walk_stats.invalid_pml1_frames != 0 ||
+            walk_stats.skipped_data_pages != 0) {
             log::warn(
                 "coredump: pid=%lu name=%s pagemap=%p dump completed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
-                req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
-                walkStats.invalidPml1Frames, walkStats.skippedDataPages);
+                req.pid, req.name, static_cast<void*>(req.pagemap), walk_stats.invalid_pml3_frames, walk_stats.invalid_pml2_frames,
+                walk_stats.invalid_pml1_frames, walk_stats.skipped_data_pages);
         }
     } else {
         ker::mod::dbg::log("coredump: failed while writing %s", path);
-        if (walkStats.invalidPml3Frames != 0 || walkStats.invalidPml2Frames != 0 || walkStats.invalidPml1Frames != 0 ||
-            walkStats.skippedDataPages != 0) {
+        if (walk_stats.invalid_pml3_frames != 0 || walk_stats.invalid_pml2_frames != 0 || walk_stats.invalid_pml1_frames != 0 ||
+            walk_stats.skipped_data_pages != 0) {
             log::warn(
                 "coredump: pid=%lu name=%s pagemap=%p dump failed with invalidPml3=%lu invalidPml2=%lu invalidPml1=%lu skippedPages=%lu",
-                req.pid, req.name, static_cast<void*>(req.pagemap), walkStats.invalidPml3Frames, walkStats.invalidPml2Frames,
-                walkStats.invalidPml1Frames, walkStats.skippedDataPages);
+                req.pid, req.name, static_cast<void*>(req.pagemap), walk_stats.invalid_pml3_frames, walk_stats.invalid_pml2_frames,
+                walk_stats.invalid_pml1_frames, walk_stats.skipped_data_pages);
         }
     }
 }
@@ -584,16 +586,16 @@ void init() {
     ker::mod::dbg::log("coredump: task started");
 }
 
-void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::interruptFrame& frame,
-                     uint64_t cr2, uint64_t cr3, uint64_t cpuId) {
+void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::InterruptFrame& frame,
+                        uint64_t cr2, uint64_t cr3, uint64_t cpu_id) {
     if (task == nullptr || g_coredump_task == nullptr) {
         return;
     }
 
     // Claim a ring slot. Wrap around; drop if the consumer hasn't cleared this slot yet.
-    uint32_t seq = g_write_seq.fetch_add(1, std::memory_order_relaxed);
-    uint32_t idx = seq % RING_SIZE;
-    CoreDumpSlot& slot = g_ring[idx];
+    uint32_t const SEQ = g_write_seq.fetch_add(1, std::memory_order_relaxed);
+    uint32_t const IDX = SEQ % RING_SIZE;
+    CoreDumpSlot& slot = g_ring[IDX];
 
     if (slot.ready.load(std::memory_order_acquire)) {
         ker::mod::dbg::log("coredump: ring full, dropping coredump for PID %x", task->pid);
@@ -614,7 +616,7 @@ void tryWriteForTask(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPR
     req.saved_regs = task->context.regs;
     req.cr2 = cr2;
     req.cr3 = cr3;
-    req.cpu_id = cpuId;
+    req.cpu_id = cpu_id;
     req.pid = task->pid;
     req.entry = task->entry;
     req.elf_header_addr = task->elf_header_addr;

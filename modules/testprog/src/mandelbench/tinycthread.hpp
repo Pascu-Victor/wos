@@ -22,8 +22,8 @@ freely, subject to the following restrictions:
     distribution.
 */
 
-#ifndef _TINYCTHREAD_H_
-#define _TINYCTHREAD_H_
+#ifndef TINYCTHREAD_H
+#define TINYCTHREAD_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,7 +53,7 @@ extern "C" {
  */
 
 /* Which platform are we on? */
-#if !defined(_TTHREAD_PLATFORM_DEFINED_)
+#ifndef _TTHREAD_PLATFORM_DEFINED_
 #if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
 #define _TTHREAD_WIN32_
 #else
@@ -63,9 +63,9 @@ extern "C" {
 #endif
 
 /* Activate some POSIX functionality (e.g. clock_gettime and recursive mutexes) */
-#if defined(_TTHREAD_POSIX_)
+#ifdef _TTHREAD_POSIX_
 #undef _FEATURES_H
-#if !defined(_GNU_SOURCE)
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #if !defined(_POSIX_C_SOURCE) || ((_POSIX_C_SOURCE - 0) < 199309L)
@@ -82,9 +82,9 @@ extern "C" {
 #include <time.h>
 
 /* Platform specific includes */
-#if defined(_TTHREAD_POSIX_)
+#ifdef _TTHREAD_POSIX_
 #include <pthread.h>
-#elif defined(_TTHREAD_WIN32_)
+#elifdef _TTHREAD_WIN32_
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #define __UNDEF_LEAN_AND_MEAN
@@ -99,7 +99,7 @@ extern "C" {
 /* Compiler-specific information */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define TTHREAD_NORETURN _Noreturn
-#elif defined(__GNUC__)
+#elifdef __GNUC__
 #define TTHREAD_NORETURN __attribute__((__noreturn__))
 #else
 #define TTHREAD_NORETURN
@@ -151,7 +151,7 @@ int _tthread_timespec_get(struct timespec* ts, int base);
 
 #if !(defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201102L)) && !defined(_Thread_local)
 #if defined(__GNUC__) || defined(__INTEL_COMPILER) || defined(__SUNPRO_CC) || defined(__IBMCPP__)
-#define _Thread_local __thread
+#define THREAD_LOCAL __thread
 #else
 #define _Thread_local __declspec(thread)
 #endif
@@ -160,26 +160,26 @@ int _tthread_timespec_get(struct timespec* ts, int base);
 #endif
 
 /* Macros */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 #define TSS_DTOR_ITERATIONS (4)
 #else
 #define TSS_DTOR_ITERATIONS PTHREAD_DESTRUCTOR_ITERATIONS
 #endif
 
 /* Function return values */
-#define thrd_error 0    /**< The requested operation failed */
-#define thrd_success 1  /**< The requested operation succeeded */
-#define thrd_timedout 2 /**< The time specified in the call was reached without acquiring the requested resource */
-#define thrd_busy 3     /**< The requested operation failed because a tesource requested by a test and return function is already in use */
-#define thrd_nomem 4    /**< The requested operation failed because it was unable to allocate memory */
+#define THRD_ERROR 0    /**< The requested operation failed */
+#define THRD_SUCCESS 1  /**< The requested operation succeeded */
+#define THRD_TIMEDOUT 2 /**< The time specified in the call was reached without acquiring the requested resource */
+#define THRD_BUSY 3     /**< The requested operation failed because a tesource requested by a test and return function is already in use */
+#define THRD_NOMEM 4    /**< The requested operation failed because it was unable to allocate memory */
 
 /* Mutex types */
-#define mtx_plain 0
-#define mtx_timed 1
-#define mtx_recursive 2
+#define MTX_PLAIN 0
+#define MTX_TIMED 1
+#define MTX_RECURSIVE 2
 
 /* Mutex */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 typedef struct {
     union {
         CRITICAL_SECTION cs; /* Critical section handle (used for non-timed mutexes) */
@@ -190,7 +190,7 @@ typedef struct {
     int mTimed;              /* TRUE if the mutex is timed */
 } mtx_t;
 #else
-typedef pthread_mutex_t mtx_t;
+using mtx_t = pthread_mutex_t;
 #endif
 
 /** Create a mutex object.
@@ -242,14 +242,14 @@ int mtx_trylock(mtx_t* mtx);
 int mtx_unlock(mtx_t* mtx);
 
 /* Condition variable */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 typedef struct {
     HANDLE mEvents[2];                  /* Signal and broadcast event HANDLEs. */
     unsigned int mWaitersCount;         /* Count of the number of waiters. */
     CRITICAL_SECTION mWaitersCountLock; /* Serialize access to mWaitersCount. */
 } cnd_t;
 #else
-typedef pthread_cond_t cnd_t;
+using cnd_t = pthread_cond_t;
 #endif
 
 /** Create a condition variable object.
@@ -311,10 +311,10 @@ int cnd_wait(cnd_t* cond, mtx_t* mtx);
 int cnd_timedwait(cnd_t* cond, mtx_t* mtx, const struct timespec* ts);
 
 /* Thread */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 typedef HANDLE thrd_t;
 #else
-typedef pthread_t thrd_t;
+using thrd_t = pthread_t;
 #endif
 
 /** Thread start function.
@@ -325,7 +325,7 @@ typedef pthread_t thrd_t;
  * @return The thread return value, which can be obtained by another thread
  * by using the @ref thrd_join() function.
  */
-typedef int (*thrd_start_t)(void* arg);
+using thrd_start_t = int (*)(void* arg);
 
 /** Create a new thread.
  * @param thr Identifier of the newly created thread.
@@ -394,16 +394,16 @@ int thrd_sleep(const struct timespec* duration, struct timespec* remaining);
 void thrd_yield(void);
 
 /* Thread local storage */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 typedef DWORD tss_t;
 #else
-typedef pthread_key_t tss_t;
+using tss_t = pthread_key_t;
 #endif
 
 /** Destructor function for a thread-specific storage.
  * @param val The value of the destructed thread-specific storage.
  */
-typedef void (*tss_dtor_t)(void* val);
+using tss_dtor_t = void (*)(void* val);
 
 /** Create a thread-specific storage.
  * @param key The unique key identifier that will be set if the function is
@@ -442,7 +442,7 @@ void* tss_get(tss_t key);
  */
 int tss_set(tss_t key, void* val);
 
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 typedef struct {
     LONG volatile status;
     CRITICAL_SECTION lock;
@@ -452,7 +452,7 @@ typedef struct {
         0,             \
     }
 #else
-#define once_flag pthread_once_t
+#define ONCE_FLAG pthread_once_t
 #define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
 #endif
 
@@ -461,14 +461,14 @@ typedef struct {
  *        once.
  * @param func Callback to invoke.
  */
-#if defined(_TTHREAD_WIN32_)
+#ifdef _TTHREAD_WIN32_
 void call_once(once_flag* flag, void (*func)(void));
 #else
-#define call_once(flag, func) pthread_once(flag, func)
+#define CALL_ONCE(flag, func) pthread_once(flag, func)
 #endif
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* _TINYTHREAD_H_ */
+#endif /* TINYTHREAD_H */

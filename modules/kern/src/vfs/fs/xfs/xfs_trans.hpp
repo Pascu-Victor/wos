@@ -23,8 +23,8 @@ constexpr int XFS_TRANS_MAX_ITEMS = 64;  // max logged items per transaction
 
 // Log item types
 enum class XfsLogItemType : uint8_t {
-    Buffer = 1,
-    Inode = 2,
+    BUFFER = 1,
+    INODE = 2,
 };
 
 // A logged buffer region - records which part of a buffer was modified

@@ -1,5 +1,7 @@
 #include "ethernet.hpp"
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
@@ -8,7 +10,8 @@
 #include <net/proto/ipv6.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_roce.hpp>
-#include <platform/dbg/dbg.hpp>
+
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
@@ -24,17 +27,17 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     const auto* hdr = reinterpret_cast<const EthernetHeader*>(pkt->data);
 
     // MAC filtering: accept only packets destined to us, broadcast, or multicast
-    bool is_our_mac = std::memcmp(hdr->dst.data(), dev->mac.data(), ETH_ALEN) == 0;
-    bool is_broadcast = std::memcmp(hdr->dst.data(), ETH_BROADCAST.data(), ETH_ALEN) == 0;
-    bool is_multicast = (hdr->dst[0] & 0x01) != 0;  // LSB of first byte set = multicast
+    bool const IS_OUR_MAC = std::memcmp(hdr->dst.data(), dev->mac.data(), ETH_ALEN) == 0;
+    bool const IS_BROADCAST = std::memcmp(hdr->dst.data(), ETH_BROADCAST.data(), ETH_ALEN) == 0;
+    bool const IS_MULTICAST = (hdr->dst[0] & 0x01) != 0;  // LSB of first byte set = multicast
 
-    if (!is_our_mac && !is_broadcast && !is_multicast) {
+    if (!IS_OUR_MAC && !IS_BROADCAST && !IS_MULTICAST) {
         pkt_free(pkt);
         return;
     }
 
-    uint16_t ethertype = ntohs(hdr->ethertype);
-    pkt->protocol = ethertype;
+    uint16_t const ETHERTYPE = ntohs(hdr->ethertype);
+    pkt->protocol = ETHERTYPE;
 
     // Preserve source MAC for reply use
     std::memcpy(pkt->src_mac.data(), hdr->src.data(), ETH_ALEN);
@@ -42,7 +45,7 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     // Strip ethernet header
     pkt->pull(ETH_HLEN);
 
-    switch (ethertype) {
+    switch (ETHERTYPE) {
         case ETH_TYPE_ARP:
             arp_rx(dev, pkt);
             break;

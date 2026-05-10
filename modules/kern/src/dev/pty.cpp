@@ -1,14 +1,17 @@
 #include "pty.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <util/radix_tree.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 
@@ -56,7 +59,7 @@ KTermios default_termios() {
 // --- Ring buffer implementation ---
 
 auto PtyRingBuf::write(const void* src, size_t len) -> size_t {
-    auto* bytes = static_cast<const uint8_t*>(src);
+    const auto* bytes = static_cast<const uint8_t*>(src);
     size_t written = 0;
     while (written < len && count < PTY_BUF_SIZE) {
         data[head] = bytes[written];
@@ -87,9 +90,9 @@ constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
-    bool in_hhdm = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
-    bool in_kernel_static = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
-    return in_hhdm || in_kernel_static;
+    bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
+    bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    return IN_HHDM || IN_KERNEL_STATIC;
 }
 
 struct DevFSFileHack {
@@ -158,7 +161,7 @@ void pty_unregister_slave(PtyPair* pair) {
     }
 
     char pts_path[16]{};
-    std::memcpy(pts_path, "pts/", 4);
+    strcpy(pts_path, "pts/");
     std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
     ker::vfs::devfs::devfs_remove_node(pts_path);
     ker::dev::dev_unregister(&pair->slave_dev);
@@ -224,14 +227,14 @@ void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
 
 void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, ker::util::SmallVec<uint64_t, 2>& waiters) {
     uint64_t pending[32]{};
-    uint64_t irqf = lock.lock_irqsave();
-    size_t pending_count = std::min(waiters.size(), size_t{32});
-    for (size_t i = 0; i < pending_count; i++) {
+    uint64_t const IRQF = lock.lock_irqsave();
+    size_t const PENDING_COUNT = std::min(waiters.size(), size_t{32});
+    for (size_t i = 0; i < PENDING_COUNT; i++) {
         pending[i] = waiters[i];
     }
     waiters.clear();
-    lock.unlock_irqrestore(irqf);
-    wake_waiters(pending, pending_count);
+    lock.unlock_irqrestore(IRQF);
+    wake_waiters(pending, PENDING_COUNT);
 }
 
 void wake_master_pollers(PtyPair* pair) {
@@ -282,21 +285,21 @@ void wake_both_pollers(PtyPair* pair) {
     }
     uint64_t master_pending[32]{};
     uint64_t slave_pending[32]{};
-    uint64_t irqf = pair->lock.lock_irqsave();
-    size_t master_pending_count = std::min(pair->master_poll_waiters.size(), size_t{32});
-    for (size_t i = 0; i < master_pending_count; i++) {
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    size_t const MASTER_PENDING_COUNT = std::min(pair->master_poll_waiters.size(), size_t{32});
+    for (size_t i = 0; i < MASTER_PENDING_COUNT; i++) {
         master_pending[i] = pair->master_poll_waiters[i];
     }
     pair->master_poll_waiters.clear();
 
-    size_t slave_pending_count = std::min(pair->slave_poll_waiters.size(), size_t{32});
-    for (size_t i = 0; i < slave_pending_count; i++) {
+    size_t const SLAVE_PENDING_COUNT = std::min(pair->slave_poll_waiters.size(), size_t{32});
+    for (size_t i = 0; i < SLAVE_PENDING_COUNT; i++) {
         slave_pending[i] = pair->slave_poll_waiters[i];
     }
     pair->slave_poll_waiters.clear();
-    pair->lock.unlock_irqrestore(irqf);
-    wake_waiters(master_pending, master_pending_count);
-    wake_waiters(slave_pending, slave_pending_count);
+    pair->lock.unlock_irqrestore(IRQF);
+    wake_waiters(master_pending, MASTER_PENDING_COUNT);
+    wake_waiters(slave_pending, SLAVE_PENDING_COUNT);
 }
 
 auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
@@ -306,14 +309,14 @@ auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
         return false;
     }
 
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     bool ok = false;
     if (device == &pair->master_dev) {
         ok = register_waiter(pair->master_poll_waiters, pid);
     } else if (device == &pair->slave_dev) {
         ok = register_waiter(pair->slave_poll_waiters, pid);
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
     return ok;
 }
 
@@ -445,18 +448,18 @@ bool pty_initialized = false;
 
 int ptmx_open(ker::vfs::File* file) {
     // Allocate a new PTY pair
-    int idx = pty_alloc();
-    if (idx < 0) {
+    int const IDX = pty_alloc();
+    if (IDX < 0) {
         return -ENOMEM;
     }
 
-    auto* pair = pty_get(idx);
+    auto* pair = pty_get(IDX);
     if (pair == nullptr) {
         return -ENOMEM;
     }
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     pair->master_opened++;
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
 
     // Store the PtyPair pointer in the device's private_data so master
     // read/write/ioctl can find it.
@@ -472,9 +475,9 @@ int ptmx_open(ker::vfs::File* file) {
         return 0;
     }
 
-    uint64_t close_irqf = pair->lock.lock_irqsave();
+    uint64_t const CLOSE_IRQF = pair->lock.lock_irqsave();
     pair->master_opened--;
-    pair->lock.unlock_irqrestore(close_irqf);
+    pair->lock.unlock_irqrestore(CLOSE_IRQF);
     pty_put(pair);
     return -ENOMEM;
 }
@@ -484,15 +487,21 @@ int master_close(ker::vfs::File* file) {
     // devfs wraps file->private_data as DevFSFile which has device ptr
     // We look at the device that is associated through devfs
     // The device's private_data points to our PtyPair
-    if (file == nullptr || file->private_data == nullptr) return 0;
+    if (file == nullptr || file->private_data == nullptr) {
+        return 0;
+    }
 
     // Walk through devfs wrapper to get device
     auto* dff = static_cast<DevFSFileHack*>(file->private_data);
-    if (dff->device == nullptr) return 0;
+    if (dff->device == nullptr) {
+        return 0;
+    }
     auto* pair = static_cast<PtyPair*>(dff->device->private_data);
-    if (pair == nullptr) return 0;
+    if (pair == nullptr) {
+        return 0;
+    }
 
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     pair->master_opened--;
 
     bool should_free = false;
@@ -503,7 +512,7 @@ int master_close(ker::vfs::File* file) {
         pty_detach_devices(pair);
         should_free = true;
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
 
     wake_slave_readers(pair);
     wake_slave_writers(pair);
@@ -511,12 +520,12 @@ int master_close(ker::vfs::File* file) {
 
     if (should_free) {
         pty_unregister_slave(pair);
-        uint64_t tree_irqf = pty_tree_lock.lock_irqsave();
+        uint64_t const TREE_IRQF = pty_tree_lock.lock_irqsave();
         pty_tree.remove(static_cast<uint64_t>(pair->index));
-        size_t pty_count = pty_tree.size();
-        pty_tree_lock.unlock_irqrestore(tree_irqf);
+        size_t const PTY_COUNT = pty_tree.size();
+        pty_tree_lock.unlock_irqrestore(TREE_IRQF);
         ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(pair->index),
-                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(pty_count), 0, 0);
+                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(PTY_COUNT), 0, 0);
         pty_pair_release(pair);
     }
 
@@ -536,52 +545,66 @@ auto pair_from_file(ker::vfs::File* f) -> PtyPair* {
 
 ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -EBADF;
+    if (pair == nullptr) {
+        return -EBADF;
+    }
     pty_pair_acquire(pair);
     auto finish = [&](ssize_t rc) -> ssize_t {
         pty_pair_release(pair);
         return rc;
     };
-    const int open_flags = file->open_flags;
+    const int OPEN_FLAGS = file->open_flags;
 
     // Master reads from slave->master buffer
-    uint64_t irqf = pair->lock.lock_irqsave();
-    size_t rd = pair->s2m.read(buf, count);
-    bool slave_opened = pair->slave_opened > 0;
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    size_t const RD = pair->s2m.read(buf, count);
+    bool const SLAVE_OPENED = pair->slave_opened > 0;
     bool should_block = false;
-    if (rd == 0 && slave_opened && (open_flags & 04000) == 0) {
+    if (RD == 0 && SLAVE_OPENED && (OPEN_FLAGS & 04000) == 0) {
         should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
     }
-    pair->lock.unlock_irqrestore(irqf);
-    if (rd == 0) {
+    pair->lock.unlock_irqrestore(IRQF);
+    if (RD == 0) {
         // If slave is closed, return EOF
-        if (!slave_opened) return finish(0);
+        if (!SLAVE_OPENED) {
+            return finish(0);
+        }
         // Non-blocking fd: return EAGAIN immediately (propagates to application)
-        if (open_flags & 04000) return finish(-EAGAIN);  // O_NONBLOCK = 04000
-        if (should_block) return finish(-WOS_ERESTARTSYS);
-        if (current_task_has_deliverable_signal()) return finish(-EINTR);
+        if ((OPEN_FLAGS & 04000) != 0) {
+            return finish(-EAGAIN);  // O_NONBLOCK = 04000
+        }
+        if (should_block) {
+            return finish(-WOS_ERESTARTSYS);
+        }
+        if (current_task_has_deliverable_signal()) {
+            return finish(-EINTR);
+        }
         ker::mod::sched::kern_yield();
-        if (current_task_has_deliverable_signal()) return finish(-EINTR);
+        if (current_task_has_deliverable_signal()) {
+            return finish(-EINTR);
+        }
         return finish(-WOS_ERESTARTSYS);
     }
-    if (rd > 0) {
+    if (RD > 0) {
         wake_slave_writers(pair);
         wake_slave_pollers(pair);
     }
-    return finish(static_cast<ssize_t>(rd));
+    return finish(static_cast<ssize_t>(RD));
 }
 
 // --- Line discipline helpers ---
 
 // Send signal to the foreground process group
-static void pty_signal_fg(PtyPair* pair, int sig) {
-    if (pair->foreground_pgrp <= 0) return;
+void pty_signal_fg(PtyPair* pair, int sig) {
+    if (pair->foreground_pgrp <= 0) {
+        return;
+    }
     ker::mod::sched::signal_process_group(static_cast<uint64_t>(pair->foreground_pgrp), sig);
 }
 
 // Echo a single byte to s2m, applying output post-processing
-static void pty_echo_byte(PtyPair* pair, uint8_t ch) {
-    if ((pair->termios.c_oflag & TIOS_OPOST) && (pair->termios.c_oflag & TIOS_ONLCR) && ch == '\n') {
+void pty_echo_byte(PtyPair* pair, uint8_t ch) {
+    if (((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n') {
         uint8_t cr = '\r';
         pair->s2m.write(&cr, 1);
     }
@@ -589,7 +612,7 @@ static void pty_echo_byte(PtyPair* pair, uint8_t ch) {
 }
 
 // Echo a control character as ^X
-static void pty_echo_ctrl(PtyPair* pair, uint8_t ch) {
+void pty_echo_ctrl(PtyPair* pair, uint8_t ch) {
     uint8_t hat = '^';
     uint8_t letter = (ch < 32) ? static_cast<uint8_t>(ch + '@') : static_cast<uint8_t>('?');
     pair->s2m.write(&hat, 1);
@@ -598,23 +621,29 @@ static void pty_echo_ctrl(PtyPair* pair, uint8_t ch) {
 
 ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -EBADF;
+    if (pair == nullptr) {
+        return -EBADF;
+    }
     pty_pair_acquire(pair);
     auto finish = [&](ssize_t rc) -> ssize_t {
         pty_pair_release(pair);
         return rc;
     };
-    const int open_flags = file->open_flags;
-    if (count == 0) return finish(0);
-
-    {
-        uint64_t irqf = pair->lock.lock_irqsave();
-        bool slave_opened = pair->slave_opened > 0;
-        pair->lock.unlock_irqrestore(irqf);
-        if (!slave_opened) return finish(-EIO);
+    const int OPEN_FLAGS = file->open_flags;
+    if (count == 0) {
+        return finish(0);
     }
 
-    auto* bytes = static_cast<const uint8_t*>(buf);
+    {
+        uint64_t const IRQF = pair->lock.lock_irqsave();
+        bool const SLAVE_OPENED = pair->slave_opened > 0;
+        pair->lock.unlock_irqrestore(IRQF);
+        if (!SLAVE_OPENED) {
+            return finish(-EIO);
+        }
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(buf);
     size_t processed = 0;
 
     uint8_t replay_buf[CPR_FILTER_BUF_SIZE]{};
@@ -637,20 +666,20 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
 
         // Input processing (c_iflag)
-        uint64_t irqf = pair->lock.lock_irqsave();
+        uint64_t const IRQF = pair->lock.lock_irqsave();
 
         if (!from_replay) {
             uint8_t filter_replay[CPR_FILTER_BUF_SIZE]{};
             size_t filter_replay_len = 0;
-            CprFeedAction filter_action = cpr_filter_feed(pair, ch, filter_replay, &filter_replay_len);
+            CprFeedAction const FILTER_ACTION = cpr_filter_feed(pair, ch, filter_replay, &filter_replay_len);
 
-            if (filter_action == CprFeedAction::HOLD || filter_action == CprFeedAction::DROP) {
-                pair->lock.unlock_irqrestore(irqf);
+            if (FILTER_ACTION == CprFeedAction::HOLD || FILTER_ACTION == CprFeedAction::DROP) {
+                pair->lock.unlock_irqrestore(IRQF);
                 processed++;
                 continue;
             }
-            if (filter_action == CprFeedAction::REPLAY) {
-                pair->lock.unlock_irqrestore(irqf);
+            if (FILTER_ACTION == CprFeedAction::REPLAY) {
+                pair->lock.unlock_irqrestore(IRQF);
                 processed++;
                 if (filter_replay_len > 0) {
                     for (size_t j = 0; j < filter_replay_len; j++) {
@@ -663,8 +692,8 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
         }
 
-        if ((pair->termios.c_iflag & TIOS_IGNCR) && ch == '\r') {
-            pair->lock.unlock_irqrestore(irqf);
+        if (((pair->termios.c_iflag & TIOS_IGNCR) != 0U) && ch == '\r') {
+            pair->lock.unlock_irqrestore(IRQF);
             if (!from_replay) {
                 processed++;
             }
@@ -692,7 +721,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->m2s.flush();
                     pair->canon_len = 0;
                 }
-                pair->lock.unlock_irqrestore(irqf);
+                pair->lock.unlock_irqrestore(IRQF);
                 if (!from_replay) {
                     processed++;
                 }
@@ -708,7 +737,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->m2s.flush();
                     pair->canon_len = 0;
                 }
-                pair->lock.unlock_irqrestore(irqf);
+                pair->lock.unlock_irqrestore(IRQF);
                 if (!from_replay) {
                     processed++;
                 }
@@ -716,18 +745,20 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
                 pty_signal_fg(pair, SIG_TSTP);
-                if (pair->termios.c_lflag & TIOS_ECHO) {
+                if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
-                pair->lock.unlock_irqrestore(irqf);
-                if (!from_replay) processed++;
+                pair->lock.unlock_irqrestore(IRQF);
+                if (!from_replay) {
+                    processed++;
+                }
                 continue;
             }
         }
 
         // Canonical mode (ICANON)
-        if (pair->termios.c_lflag & TIOS_ICANON) {
+        if ((pair->termios.c_lflag & TIOS_ICANON) != 0U) {
             bool is_erase = (ch == pair->termios.c_cc[CC_VERASE] && pair->termios.c_cc[CC_VERASE] != 0);
             if (!is_erase && (ch == '\b' || ch == 127)) {
                 is_erase = true;
@@ -735,18 +766,20 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             if (is_erase) {
                 if (pair->canon_len > 0) {
                     pair->canon_len--;
-                    if (pair->termios.c_lflag & TIOS_ECHOE) {
+                    if ((pair->termios.c_lflag & TIOS_ECHOE) != 0U) {
                         uint8_t erase[] = {'\b', ' ', '\b'};
                         pair->s2m.write(erase, 3);
                     }
                 }
-                pair->lock.unlock_irqrestore(irqf);
-                if (!from_replay) processed++;
+                pair->lock.unlock_irqrestore(IRQF);
+                if (!from_replay) {
+                    processed++;
+                }
                 continue;
             }
 
             if (ch == pair->termios.c_cc[CC_VKILL] && pair->termios.c_cc[CC_VKILL] != 0) {
-                if (pair->termios.c_lflag & (TIOS_ECHOK | TIOS_ECHOE)) {
+                if ((pair->termios.c_lflag & (TIOS_ECHOK | TIOS_ECHOE)) != 0U) {
                     while (pair->canon_len > 0) {
                         uint8_t erase[] = {'\b', ' ', '\b'};
                         pair->s2m.write(erase, 3);
@@ -754,8 +787,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
                 pair->canon_len = 0;
-                pair->lock.unlock_irqrestore(irqf);
-                if (!from_replay) processed++;
+                pair->lock.unlock_irqrestore(IRQF);
+                if (!from_replay) {
+                    processed++;
+                }
                 continue;
             }
 
@@ -764,8 +799,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->m2s.write(pair->canon_buf, pair->canon_len);
                     pair->canon_len = 0;
                 }
-                pair->lock.unlock_irqrestore(irqf);
-                if (!from_replay) processed++;
+                pair->lock.unlock_irqrestore(IRQF);
+                if (!from_replay) {
+                    processed++;
+                }
                 continue;
             }
 
@@ -773,7 +810,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 pair->canon_buf[pair->canon_len++] = ch;
             }
 
-            if ((pair->termios.c_lflag & TIOS_ECHO) || ((pair->termios.c_lflag & TIOS_ECHONL) && ch == '\n')) {
+            if (((pair->termios.c_lflag & TIOS_ECHO) != 0U) || (((pair->termios.c_lflag & TIOS_ECHONL) != 0U) && ch == '\n')) {
                 if (ch < 32 && ch != '\n' && ch != '\t') {
                     pty_echo_ctrl(pair, ch);
                 } else {
@@ -786,40 +823,44 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 pair->canon_len = 0;
             }
 
-            pair->lock.unlock_irqrestore(irqf);
-            if (!from_replay) processed++;
+            pair->lock.unlock_irqrestore(IRQF);
+            if (!from_replay) {
+                processed++;
+            }
         } else {
-            if (pair->termios.c_lflag & TIOS_ECHO) {
+            if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                 pty_echo_byte(pair, ch);
             }
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
 
-            if (open_flags & 04000) {
-                uint64_t wr_irqf = pair->lock.lock_irqsave();
-                size_t wr = pair->m2s.write(&ch, 1);
-                bool slave_opened = pair->slave_opened > 0;
-                pair->lock.unlock_irqrestore(wr_irqf);
-                if (!slave_opened) {
+            if ((OPEN_FLAGS & 04000) != 0) {
+                uint64_t const WR_IRQF = pair->lock.lock_irqsave();
+                size_t const WR = pair->m2s.write(&ch, 1);
+                bool const SLAVE_OPENED = pair->slave_opened > 0;
+                pair->lock.unlock_irqrestore(WR_IRQF);
+                if (!SLAVE_OPENED) {
                     return finish(processed > 0 ? static_cast<ssize_t>(processed) : -EIO);
                 }
-                if (wr == 0) {
-                    if (processed == 0) return finish(-EAGAIN);
+                if (WR == 0) {
+                    if (processed == 0) {
+                        return finish(-EAGAIN);
+                    }
                     break;
                 }
             } else {
                 while (true) {
-                    uint64_t wr_irqf = pair->lock.lock_irqsave();
-                    size_t wr = pair->m2s.write(&ch, 1);
-                    bool slave_opened = pair->slave_opened > 0;
+                    uint64_t const WR_IRQF = pair->lock.lock_irqsave();
+                    size_t const WR = pair->m2s.write(&ch, 1);
+                    bool const SLAVE_OPENED = pair->slave_opened > 0;
                     bool should_block = false;
-                    if (wr == 0 && slave_opened && processed == 0) {
+                    if (WR == 0 && SLAVE_OPENED && processed == 0) {
                         should_block = block_current_task(pair->master_write_waiters, "pty_master_write");
                     }
-                    pair->lock.unlock_irqrestore(wr_irqf);
-                    if (wr != 0) {
+                    pair->lock.unlock_irqrestore(WR_IRQF);
+                    if (WR != 0) {
                         break;
                     }
-                    if (!slave_opened) {
+                    if (!SLAVE_OPENED) {
                         return finish(processed > 0 ? static_cast<ssize_t>(processed) : -EIO);
                     }
                     if (processed != 0) {
@@ -837,7 +878,9 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
             }
-            if (!from_replay) processed++;
+            if (!from_replay) {
+                processed++;
+            }
         }
 
         if ((processed != 0) && ((processed % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0)) {
@@ -851,7 +894,9 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
     }
 
-    if (processed == 0) return finish(-EAGAIN);
+    if (processed == 0) {
+        return finish(-EAGAIN);
+    }
     wake_slave_readers(pair);
     wake_both_pollers(pair);
     return finish(static_cast<ssize_t>(processed));
@@ -861,74 +906,88 @@ bool master_isatty(ker::vfs::File* /*file*/) { return false; }
 
 int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -EBADF;
+    if (pair == nullptr) {
+        return -EBADF;
+    }
 
     switch (cmd) {
         case TIOCGPTN: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* out = reinterpret_cast<int*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *out = pair->index;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCSPTLCK: {
-            if (arg == 0) return -EFAULT;
-            auto* lock_val = reinterpret_cast<const int*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            if (arg == 0) {
+                return -EFAULT;
+            }
+            const auto* lock_val = reinterpret_cast<const int*>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             pair->slave_locked = (*lock_val != 0);
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCGWINSZ: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* ws = reinterpret_cast<Winsize*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *ws = pair->winsize;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCSWINSZ: {
-            if (arg == 0) return -EFAULT;
-            auto* ws = reinterpret_cast<const Winsize*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            if (arg == 0) {
+                return -EFAULT;
+            }
+            const auto* ws = reinterpret_cast<const Winsize*>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             pair->winsize = *ws;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCGETS: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* out = reinterpret_cast<KTermios*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *out = pair->termios;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCSETS:
         case TCSETSW:
         case TCSETSF: {
-            if (arg == 0) return -EFAULT;
-            auto* in = reinterpret_cast<const KTermios*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            if (arg == 0) {
+                return -EFAULT;
+            }
+            const auto* in = reinterpret_cast<const KTermios*>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             if (cmd == TCSETSF) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
             pair->termios = *in;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCFLSH: {
-            int queue = static_cast<int>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
-            if (queue == 0 || queue == 2) {
+            int const QUEUE = static_cast<int>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
+            if (QUEUE == 0 || QUEUE == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
-            if (queue == 1 || queue == 2) {
+            if (QUEUE == 1 || QUEUE == 2) {
                 pair->s2m.flush();
             }
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         default:
@@ -938,14 +997,16 @@ int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
 
 int master_poll_check(ker::vfs::File* file, int events) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return 0;
+    if (pair == nullptr) {
+        return 0;
+    }
 
     int ready = 0;
-    uint64_t irqf = pair->lock.lock_irqsave();
-    if ((events & POLLIN) && pair->s2m.available() > 0) {
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    if (((events & POLLIN) != 0) && pair->s2m.available() > 0) {
         ready |= POLLIN;
     }
-    if ((events & POLLOUT) && pair->m2s.space() > 0) {
+    if (((events & POLLOUT) != 0) && pair->m2s.space() > 0) {
         ready |= POLLOUT;
     }
     // When the slave side is closed, report POLLHUP so readers (e.g. dropbear)
@@ -953,7 +1014,7 @@ int master_poll_check(ker::vfs::File* file, int events) {
     if (pair->slave_opened <= 0) {
         ready |= POLLHUP;
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
     return ready;
 }
 
@@ -972,12 +1033,14 @@ CharDeviceOps master_ops = {
 
 int slave_open(ker::vfs::File* file) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -ENODEV;
+    if (pair == nullptr) {
+        return -ENODEV;
+    }
 
     uint64_t irqf = pair->lock.lock_irqsave();
-    bool slave_locked = pair->slave_locked;
+    bool const SLAVE_LOCKED = pair->slave_locked;
     pair->lock.unlock_irqrestore(irqf);
-    if (slave_locked) {
+    if (SLAVE_LOCKED) {
         return -EIO;  // Slave is locked, cannot open
     }
 
@@ -1001,9 +1064,11 @@ int slave_open(ker::vfs::File* file) {
 
 int slave_close(ker::vfs::File* file) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return 0;
+    if (pair == nullptr) {
+        return 0;
+    }
 
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     pair->slave_opened--;
 
     bool should_free = false;
@@ -1014,7 +1079,7 @@ int slave_close(ker::vfs::File* file) {
         pty_detach_devices(pair);
         should_free = true;
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
 
     wake_master_readers(pair);
     wake_master_writers(pair);
@@ -1022,12 +1087,12 @@ int slave_close(ker::vfs::File* file) {
 
     if (should_free) {
         pty_unregister_slave(pair);
-        uint64_t tree_irqf = pty_tree_lock.lock_irqsave();
+        uint64_t const TREE_IRQF = pty_tree_lock.lock_irqsave();
         pty_tree.remove(static_cast<uint64_t>(pair->index));
-        size_t pty_count = pty_tree.size();
-        pty_tree_lock.unlock_irqrestore(tree_irqf);
+        size_t const PTY_COUNT = pty_tree.size();
+        pty_tree_lock.unlock_irqrestore(TREE_IRQF);
         ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(pair->index),
-                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(pty_count), 0, 0);
+                                              ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(PTY_COUNT), 0, 0);
         pty_pair_release(pair);
     }
 
@@ -1038,92 +1103,114 @@ int slave_close(ker::vfs::File* file) {
 
 ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -EBADF;
+    if (pair == nullptr) {
+        return -EBADF;
+    }
     pty_pair_acquire(pair);
     auto finish = [&](ssize_t rc) -> ssize_t {
         pty_pair_release(pair);
         return rc;
     };
-    const int open_flags = file->open_flags;
+    const int OPEN_FLAGS = file->open_flags;
 
     // Slave reads from master->slave buffer
-    uint64_t irqf = pair->lock.lock_irqsave();
-    size_t rd = pair->m2s.read(buf, count);
-    bool master_opened = pair->master_opened > 0;
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    size_t const RD = pair->m2s.read(buf, count);
+    bool const MASTER_OPENED = pair->master_opened > 0;
     bool should_block = false;
-    if (rd == 0 && master_opened && (open_flags & 04000) == 0) {
+    if (RD == 0 && MASTER_OPENED && (OPEN_FLAGS & 04000) == 0) {
         should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
     }
-    pair->lock.unlock_irqrestore(irqf);
-    if (rd == 0) {
+    pair->lock.unlock_irqrestore(IRQF);
+    if (RD == 0) {
         // If master is closed, return EOF
-        if (!master_opened) return finish(0);
+        if (!MASTER_OPENED) {
+            return finish(0);
+        }
         // Non-blocking fd: return EAGAIN immediately
-        if (open_flags & 04000) return finish(-EAGAIN);  // O_NONBLOCK = 04000
-        if (should_block) return finish(-WOS_ERESTARTSYS);
-        if (current_task_has_deliverable_signal()) return finish(-EINTR);
+        if ((OPEN_FLAGS & 04000) != 0) {
+            return finish(-EAGAIN);  // O_NONBLOCK = 04000
+        }
+        if (should_block) {
+            return finish(-WOS_ERESTARTSYS);
+        }
+        if (current_task_has_deliverable_signal()) {
+            return finish(-EINTR);
+        }
         ker::mod::sched::kern_yield();
-        if (current_task_has_deliverable_signal()) return finish(-EINTR);
+        if (current_task_has_deliverable_signal()) {
+            return finish(-EINTR);
+        }
         return finish(-WOS_ERESTARTSYS);
     }
-    if (rd > 0) {
+    if (RD > 0) {
         wake_master_writers(pair);
         wake_master_pollers(pair);
     }
-    return finish(static_cast<ssize_t>(rd));
+    return finish(static_cast<ssize_t>(RD));
 }
 
 ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
-    if (pair == nullptr) return -EBADF;
+    if (pair == nullptr) {
+        return -EBADF;
+    }
     pty_pair_acquire(pair);
     auto finish = [&](ssize_t rc) -> ssize_t {
         pty_pair_release(pair);
         return rc;
     };
-    const int open_flags = file->open_flags;
-    if (count == 0) return finish(0);
+    const int OPEN_FLAGS = file->open_flags;
+    if (count == 0) {
+        return finish(0);
+    }
 
     // If master is closed, writes should fail (Linux returns EIO)
     {
-        uint64_t irqf = pair->lock.lock_irqsave();
-        bool master_opened = pair->master_opened > 0;
-        pair->lock.unlock_irqrestore(irqf);
-        if (!master_opened) return finish(-EIO);
+        uint64_t const IRQF = pair->lock.lock_irqsave();
+        bool const MASTER_OPENED = pair->master_opened > 0;
+        pair->lock.unlock_irqrestore(IRQF);
+        if (!MASTER_OPENED) {
+            return finish(-EIO);
+        }
     }
 
-    auto* bytes = static_cast<const uint8_t*>(buf);
+    const auto* bytes = static_cast<const uint8_t*>(buf);
     size_t written = 0;
 
     for (size_t i = 0; i < count; i++) {
         uint8_t ch = bytes[i];
 
         // Output post-processing (OPOST)
-        if ((pair->termios.c_oflag & TIOS_OPOST) && (pair->termios.c_oflag & TIOS_ONLCR) && ch == '\n') {
-            if (open_flags & 04000) {
-                uint64_t irqf = pair->lock.lock_irqsave();
-                bool has_space = pair->s2m.space() >= 2;
-                pair->lock.unlock_irqrestore(irqf);
-                if (!has_space) {
-                    if (written == 0) return finish(-EAGAIN);
+        if (((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n') {
+            if ((OPEN_FLAGS & 04000) != 0) {
+                uint64_t const IRQF = pair->lock.lock_irqsave();
+                bool const HAS_SPACE = pair->s2m.space() >= 2;
+                pair->lock.unlock_irqrestore(IRQF);
+                if (!HAS_SPACE) {
+                    if (written == 0) {
+                        return finish(-EAGAIN);
+                    }
                     break;
                 }
             } else {
                 while (true) {
-                    uint64_t irqf = pair->lock.lock_irqsave();
-                    bool has_space = pair->s2m.space() >= 2;
-                    bool master_opened = pair->master_opened > 0;
+                    uint64_t const IRQF = pair->lock.lock_irqsave();
+                    bool const HAS_SPACE = pair->s2m.space() >= 2;
+                    bool const MASTER_OPENED = pair->master_opened > 0;
                     bool should_block = false;
-                    if (has_space) {
-                        pair->lock.unlock_irqrestore(irqf);
+                    if (HAS_SPACE) {
+                        pair->lock.unlock_irqrestore(IRQF);
                         break;
                     }
-                    if (master_opened && written == 0) {
+                    if (MASTER_OPENED && written == 0) {
                         should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
                     }
-                    pair->lock.unlock_irqrestore(irqf);
-                    if (!master_opened) {
-                        if (written > 0) goto wake_and_return;
+                    pair->lock.unlock_irqrestore(IRQF);
+                    if (!MASTER_OPENED) {
+                        if (written > 0) {
+                            goto wake_and_return;
+                        }
                         return finish(-EIO);
                     }
                     if (written != 0) {
@@ -1144,34 +1231,38 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
             }
             uint8_t cr = '\r';
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             pair->s2m.write(&cr, 1);
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
         }
 
-        if (open_flags & 04000) {
-            uint64_t irqf = pair->lock.lock_irqsave();
-            size_t wr = pair->s2m.write(&ch, 1);
-            pair->lock.unlock_irqrestore(irqf);
-            if (wr == 0) {
-                if (written == 0) return finish(-EAGAIN);
+        if ((OPEN_FLAGS & 04000) != 0) {
+            uint64_t const IRQF = pair->lock.lock_irqsave();
+            size_t const WR = pair->s2m.write(&ch, 1);
+            pair->lock.unlock_irqrestore(IRQF);
+            if (WR == 0) {
+                if (written == 0) {
+                    return finish(-EAGAIN);
+                }
                 break;
             }
         } else {
             while (true) {
-                uint64_t irqf = pair->lock.lock_irqsave();
-                size_t wr = pair->s2m.write(&ch, 1);
-                bool master_opened = pair->master_opened > 0;
+                uint64_t const IRQF = pair->lock.lock_irqsave();
+                size_t const WR = pair->s2m.write(&ch, 1);
+                bool const MASTER_OPENED = pair->master_opened > 0;
                 bool should_block = false;
-                if (wr == 0 && master_opened && written == 0) {
+                if (WR == 0 && MASTER_OPENED && written == 0) {
                     should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
                 }
-                pair->lock.unlock_irqrestore(irqf);
-                if (wr != 0) {
+                pair->lock.unlock_irqrestore(IRQF);
+                if (WR != 0) {
                     break;
                 }
-                if (!master_opened) {
-                    if (written > 0) goto wake_and_return;
+                if (!MASTER_OPENED) {
+                    if (written > 0) {
+                        goto wake_and_return;
+                    }
                     return finish(-EIO);
                 }
                 if (written != 0) {
@@ -1206,7 +1297,9 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
     }
 
-    if (written == 0) return finish(-EAGAIN);
+    if (written == 0) {
+        return finish(-EAGAIN);
+    }
 wake_and_return:
     wake_master_readers(pair);
     wake_both_pollers(pair);
@@ -1223,27 +1316,33 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
 
     switch (cmd) {
         case TIOCGPTN: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* out = reinterpret_cast<int*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *out = pair->index;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCGWINSZ: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* ws = reinterpret_cast<Winsize*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *ws = pair->winsize;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCSWINSZ: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             const auto* ws = reinterpret_cast<const Winsize*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             pair->winsize = *ws;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCSCTTY: {
@@ -1262,54 +1361,62 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             return 0;
         }
         case TIOCGPGRP: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* out = reinterpret_cast<int*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
-            *out = static_cast<int>(pair->foreground_pgrp);
-            pair->lock.unlock_irqrestore(irqf);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
+            *out = pair->foreground_pgrp;
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TIOCSPGRP: {
-            if (arg == 0) return -EFAULT;
-            auto* in = reinterpret_cast<const int*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            if (arg == 0) {
+                return -EFAULT;
+            }
+            const auto* in = reinterpret_cast<const int*>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             pair->foreground_pgrp = *in;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCGETS: {
-            if (arg == 0) return -EFAULT;
+            if (arg == 0) {
+                return -EFAULT;
+            }
             auto* out = reinterpret_cast<KTermios*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             *out = pair->termios;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCSETS:
         case TCSETSW:
         case TCSETSF: {
-            if (arg == 0) return -EFAULT;
-            auto* in = reinterpret_cast<const KTermios*>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
+            if (arg == 0) {
+                return -EFAULT;
+            }
+            const auto* in = reinterpret_cast<const KTermios*>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
             if (cmd == TCSETSF) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
             pair->termios = *in;
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         case TCFLSH: {
-            int queue = static_cast<int>(arg);
-            uint64_t irqf = pair->lock.lock_irqsave();
-            if (queue == 0 || queue == 2) {
+            int const QUEUE = static_cast<int>(arg);
+            uint64_t const IRQF = pair->lock.lock_irqsave();
+            if (QUEUE == 0 || QUEUE == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
             }
-            if (queue == 1 || queue == 2) {
+            if (QUEUE == 1 || QUEUE == 2) {
                 pair->s2m.flush();
             }
-            pair->lock.unlock_irqrestore(irqf);
+            pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
         default:
@@ -1324,7 +1431,7 @@ int slave_poll_check(ker::vfs::File* file, int events) {
     }
 
     int ready = 0;
-    uint64_t irqf = pair->lock.lock_irqsave();
+    uint64_t const IRQF = pair->lock.lock_irqsave();
     if (((events & POLLIN) != 0) && pair->m2s.available() > 0) {
         ready |= POLLIN;
     }
@@ -1335,7 +1442,7 @@ int slave_poll_check(ker::vfs::File* file, int events) {
     if (pair->master_opened <= 0) {
         ready |= POLLHUP;
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
     return ready;
 }
 
@@ -1385,20 +1492,20 @@ void pty_init() {
 auto pty_alloc() -> int {
     // Find next available PTY index
     uint64_t irqf = pty_tree_lock.lock_irqsave();
-    uint64_t slot = pty_tree.find_first_unset(0);
+    uint64_t const SLOT = pty_tree.find_first_unset(0);
     pty_tree_lock.unlock_irqrestore(irqf);
-    if (slot == UINT64_MAX || slot >= PTY_MAX) {
+    if (SLOT == UINT64_MAX || SLOT >= PTY_MAX) {
         return -1;  // No free PTY pairs
     }
 
-    int n = static_cast<int>(slot);
+    int const N = static_cast<int>(SLOT);
 
     auto* pair = new PtyPair{};
     if (pair == nullptr) {
         return -1;
     }
 
-    pair->index = n;
+    pair->index = N;
     pair->allocated = true;
     pair->slave_locked = true;
     pair->slave_opened = 0;
@@ -1413,24 +1520,24 @@ auto pty_alloc() -> int {
     pair->foreground_pgrp = 0;
 
     // Build the slave name: "N" (e.g., "0", "12")
-    if (n < 10) {
-        pair->slave_name[0] = '0' + static_cast<char>(n);
+    if (N < 10) {
+        pair->slave_name[0] = '0' + static_cast<char>(N);
         pair->slave_name[1] = '\0';
-    } else if (n < 100) {
-        pair->slave_name[0] = '0' + static_cast<char>(n / 10);
-        pair->slave_name[1] = '0' + static_cast<char>(n % 10);
+    } else if (N < 100) {
+        pair->slave_name[0] = '0' + static_cast<char>(N / 10);
+        pair->slave_name[1] = '0' + static_cast<char>(N % 10);
         pair->slave_name[2] = '\0';
     } else {
-        pair->slave_name[0] = '0' + static_cast<char>(n / 100);
-        pair->slave_name[1] = '0' + static_cast<char>((n / 10) % 10);
-        pair->slave_name[2] = '0' + static_cast<char>(n % 10);
+        pair->slave_name[0] = '0' + static_cast<char>(N / 100);
+        pair->slave_name[1] = '0' + static_cast<char>((N / 10) % 10);
+        pair->slave_name[2] = '0' + static_cast<char>(N % 10);
         pair->slave_name[3] = '\0';
     }
 
     // Set up the slave Device struct
     pair->slave_dev = Device{
         .major = 136,
-        .minor = static_cast<unsigned>(n),
+        .minor = static_cast<unsigned>(N),
         .name = pair->slave_name,
         .type = DeviceType::CHAR,
         .private_data = pair,
@@ -1440,7 +1547,7 @@ auto pty_alloc() -> int {
     // Set up the master Device struct
     pair->master_dev = Device{
         .major = 5,
-        .minor = static_cast<unsigned>(2 + n),
+        .minor = static_cast<unsigned>(2 + N),
         .name = "ptmx",
         .type = DeviceType::CHAR,
         .private_data = pair,
@@ -1449,44 +1556,46 @@ auto pty_alloc() -> int {
 
     // Insert into radix tree
     irqf = pty_tree_lock.lock_irqsave();
-    bool inserted = pty_tree.insert(slot, pair);
-    size_t pty_count = pty_tree.size();
+    bool const INSERTED = pty_tree.insert(SLOT, pair);
+    size_t const PTY_COUNT = pty_tree.size();
     pty_tree_lock.unlock_irqrestore(irqf);
-    if (!inserted) {
+    if (!INSERTED) {
         delete pair;
         return -1;
     }
 
     // Register slave device into devfs as /dev/pts/<N>
     char pts_path[16]{};
-    std::memcpy(pts_path, "pts/", 4);
+    strcpy(pts_path, "pts/");
     std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
 
     dev_register(&pair->slave_dev);
     if (vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev) == nullptr) {
         dev_unregister(&pair->slave_dev);
         irqf = pty_tree_lock.lock_irqsave();
-        pty_tree.remove(slot);
+        pty_tree.remove(SLOT);
         pty_tree_lock.unlock_irqrestore(irqf);
         pty_pair_release(pair);
         return -1;
     }
-    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(n),
-                                          ker::mod::perf::PERF_FLAG_CT_INSERT, static_cast<int64_t>(pty_count), 0, 0);
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(N),
+                                          ker::mod::perf::PERF_FLAG_CT_INSERT, static_cast<int64_t>(PTY_COUNT), 0, 0);
 #ifdef DEBUG_PTY
     ker::mod::dbg::log("pty: allocated pair %d", n);
 #endif
-    return n;
+    return N;
 }
 
 auto pty_get(int index) -> PtyPair* {
-    if (index < 0 || index >= static_cast<int>(PTY_MAX)) return nullptr;
-    uint64_t irqf = pty_tree_lock.lock_irqsave();
+    if (index < 0 || std::cmp_greater_equal(index, PTY_MAX)) {
+        return nullptr;
+    }
+    uint64_t const IRQF = pty_tree_lock.lock_irqsave();
     auto* ptr = pty_tree.lookup(static_cast<uint64_t>(index));
     if (ptr != nullptr) {
         pty_pair_acquire(ptr);
     }
-    pty_tree_lock.unlock_irqrestore(irqf);
+    pty_tree_lock.unlock_irqrestore(IRQF);
     return ptr;
 }
 

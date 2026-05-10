@@ -72,25 +72,25 @@ class RadixTree {
 
         Node* node = m_root;
         for (unsigned level = m_depth; level > 1; --level) {
-            unsigned idx = slot_index(key, level);
-            if (!node->children[idx]) {
-                node->children[idx] = alloc_node();
-                if (!node->children[idx]) {
+            unsigned const IDX = slot_index(key, level);
+            if (!node->children[IDX]) {
+                node->children[IDX] = alloc_node();
+                if (!node->children[IDX]) {
                     return false;
                 }
                 node->populated++;
             }
-            node = node->children[idx];
+            node = node->children[IDX];
         }
 
         // Leaf level: store value
-        unsigned idx = slot_index(key, 1);
-        bool was_empty = (node->values[idx] == T{});
-        node->values[idx] = value;
-        if (was_empty && value != T{}) {
+        unsigned const IDX = slot_index(key, 1);
+        bool const WAS_EMPTY = (node->values[IDX] == T{});
+        node->values[IDX] = value;
+        if (WAS_EMPTY && value != T{}) {
             node->populated++;
             m_size++;
-        } else if (!was_empty && value == T{}) {
+        } else if (!WAS_EMPTY && value == T{}) {
             node->populated--;
             m_size--;
         }
@@ -113,21 +113,21 @@ class RadixTree {
 
         Node* node = m_root;
         for (unsigned level = m_depth; level > 1; --level) {
-            unsigned idx = slot_index(key, level);
-            if (!node->children[idx]) {
+            unsigned const IDX = slot_index(key, level);
+            if (!node->children[IDX]) {
                 return T{};
             }
-            path[path_len++] = {node, idx};
-            node = node->children[idx];
+            path[path_len++] = {node, IDX};
+            node = node->children[IDX];
         }
 
-        unsigned idx = slot_index(key, 1);
-        T old = node->values[idx];
+        unsigned const IDX = slot_index(key, 1);
+        T old = node->values[IDX];
         if (old == T{}) {
             return T{};
         }
 
-        node->values[idx] = T{};
+        node->values[IDX] = T{};
         node->populated--;
         m_size--;
 
@@ -156,11 +156,11 @@ class RadixTree {
 
         const Node* node = m_root;
         for (unsigned level = m_depth; level > 1; --level) {
-            unsigned idx = slot_index(key, level);
-            if (!node->children[idx]) {
+            unsigned const IDX = slot_index(key, level);
+            if (!node->children[IDX]) {
                 return T{};
             }
-            node = node->children[idx];
+            node = node->children[IDX];
         }
 
         return node->values[slot_index(key, 1)];
@@ -169,8 +169,8 @@ class RadixTree {
     // Find first key >= start_key where value == T{} (unset).
     // Returns the key, or UINT64_MAX if none found within current capacity.
     [[nodiscard]] uint64_t find_first_unset(uint64_t start_key = 0) const {
-        uint64_t cap = capacity_at_depth(m_depth);
-        for (uint64_t k = start_key; k < cap; ++k) {
+        uint64_t const CAP = capacity_at_depth(m_depth);
+        for (uint64_t k = start_key; k < CAP; ++k) {
             if (lookup(k) == T{}) {
                 return k;
             }
@@ -180,7 +180,7 @@ class RadixTree {
 
     // Iterate all set entries. Callback: void(uint64_t key, T value)
     template <typename Fn>
-    void for_each(Fn&& fn) const {
+    void for_each(const Fn& fn) const {
         if (m_root) {
             iterate_node(m_root, m_depth, 0, fn);
         }
@@ -227,7 +227,7 @@ class RadixTree {
         };
         uint16_t populated{0};  // count of non-null children or non-null values
 
-        Node() : populated(0) { memset(children, 0, sizeof(children)); }
+        Node() { memset(children, 0, sizeof(children)); }
     };
 
     Node* m_root{nullptr};
@@ -274,8 +274,8 @@ class RadixTree {
         if (node == nullptr) {
             return;
         }
-        unsigned level = m_depth - depth_from_root;
-        if (level > 1) {
+        unsigned const LEVEL = m_depth - depth_from_root;
+        if (LEVEL > 1) {
             // Interior node: recurse into children
             for (unsigned i = 0; i < FANOUT; ++i) {
                 if (node->children[i]) {
@@ -287,7 +287,7 @@ class RadixTree {
     }
 
     template <typename Fn>
-    void iterate_node(const Node* node, unsigned level, uint64_t prefix, Fn&& fn) const {
+    void iterate_node(const Node* node, unsigned level, uint64_t prefix, const Fn& fn) const {
         if (level == 1) {
             // Leaf: iterate values
             for (unsigned i = 0; i < FANOUT; ++i) {
@@ -299,8 +299,8 @@ class RadixTree {
             // Interior: recurse
             for (unsigned i = 0; i < FANOUT; ++i) {
                 if (node->children[i]) {
-                    uint64_t child_prefix = prefix | (static_cast<uint64_t>(i) << ((level - 1) * BITS_PER_LEVEL));
-                    iterate_node(node->children[i], level - 1, child_prefix, fn);
+                    uint64_t const CHILD_PREFIX = prefix | (static_cast<uint64_t>(i) << ((level - 1) * BITS_PER_LEVEL));
+                    iterate_node(node->children[i], level - 1, CHILD_PREFIX, fn);
                 }
             }
         }

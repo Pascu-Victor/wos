@@ -176,20 +176,20 @@ class SmallVec {
     }
 
     [[nodiscard]] auto grow() -> bool {
-        size_t new_cap = m_capacity == 0 ? InlineN : m_capacity * 2;
-        auto* new_buf = new (std::nothrow) T[new_cap];
+        size_t const NEW_CAP = m_capacity == 0 ? InlineN : m_capacity * 2;
+        auto* new_buf = new (std::nothrow) T[NEW_CAP];
         if (new_buf == nullptr) {
             return false;  // OOM
         }
 
         // Copy existing heap elements
         if (m_heap && m_capacity > 0) {
-            size_t heap_used = m_size - InlineN;
-            memcpy(new_buf, m_heap, heap_used * sizeof(T));
+            size_t const HEAP_USED = m_size - InlineN;
+            memcpy(new_buf, m_heap, HEAP_USED * sizeof(T));
             delete[] m_heap;
         }
         m_heap = new_buf;
-        m_capacity = new_cap;
+        m_capacity = NEW_CAP;
         return true;
     }
 

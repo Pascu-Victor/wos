@@ -26,16 +26,16 @@ auto ramdisk_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* 
     }
 
     // Calculate byte offset
-    uint64_t byte_offset = block * bdev->block_size;
-    size_t read_size = count * bdev->block_size;
+    uint64_t const BYTE_OFFSET = block * bdev->block_size;
+    size_t const READ_SIZE = count * bdev->block_size;
 
     // Bounds check
-    if (byte_offset + read_size > priv->size_bytes) {
+    if (BYTE_OFFSET + READ_SIZE > priv->size_bytes) {
         return -1;
     }
 
     // Copy from ramdisk buffer
-    std::memcpy(buffer, priv->buffer + byte_offset, read_size);
+    std::memcpy(buffer, priv->buffer + BYTE_OFFSET, READ_SIZE);
     return 0;
 }
 
@@ -50,16 +50,16 @@ auto ramdisk_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const
     }
 
     // Calculate byte offset
-    uint64_t byte_offset = block * bdev->block_size;
-    size_t write_size = count * bdev->block_size;
+    uint64_t const BYTE_OFFSET = block * bdev->block_size;
+    size_t const WRITE_SIZE = count * bdev->block_size;
 
     // Bounds check
-    if (byte_offset + write_size > priv->size_bytes) {
+    if (BYTE_OFFSET + WRITE_SIZE > priv->size_bytes) {
         return -1;
     }
 
     // Copy to ramdisk buffer
-    std::memcpy(priv->buffer + byte_offset, buffer, write_size);
+    std::memcpy(priv->buffer + BYTE_OFFSET, buffer, WRITE_SIZE);
     return 0;
 }
 
@@ -132,9 +132,8 @@ auto ramdisk_destroy(BlockDevice* disk) -> int {
 
     auto* priv = static_cast<RamdiskPrivate*>(disk->private_data);
     if (priv != nullptr) {
-        if (priv->buffer != nullptr) {
-            delete[] priv->buffer;
-        }
+        delete[] priv->buffer;
+
         delete priv;
     }
 

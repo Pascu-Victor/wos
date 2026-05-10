@@ -1,12 +1,12 @@
 #include "udp.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/proto/ipv4.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #include "net/netdevice.hpp"
@@ -86,8 +86,8 @@ int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     return 0;
 }
 
-int udp_listen(Socket*, int) { return -1; }  // UDP doesn't listen
-int udp_accept(Socket*, Socket**, void*, size_t*) { return -1; }
+int udp_listen(Socket* /*unused*/, int /*unused*/) { return -1; }  // UDP doesn't listen
+int udp_accept(Socket* /*unused*/, Socket** /*unused*/, void* /*unused*/, size_t* /*unused*/) { return -1; }
 int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     uint16_t port = 0;
     uint32_t ip = 0;
@@ -115,7 +115,7 @@ int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     return 0;
 }
 
-auto udp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
+auto udp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssize_t {
     if (sock->state != SocketState::CONNECTED) {
         return -1;
     }
@@ -140,7 +140,7 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
                                                                                          : static_cast<ssize_t>(-1);
 }
 
-auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
+auto udp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
     if (sock->rcvbuf.available() == 0) {
         if (!sock->nonblock) {
             socket_defer_wait(sock, "udp_wait");
@@ -150,7 +150,7 @@ auto udp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
     return sock->rcvbuf.read(buf, len);
 }
 
-auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
+auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const void* addr_raw, size_t addr_len) -> ssize_t {
     uint16_t port = 0;
     uint32_t ip = 0;
     if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
@@ -184,17 +184,17 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + len));
     udp->checksum = 0;
 
-    uint32_t src = sock->local_v4.addr;
+    uint32_t const SRC = sock->local_v4.addr;
     int tx_ret = -1;
-    if (src == 0) {
+    if (SRC == 0) {
         tx_ret = ipv4_tx_auto(pkt, ip, IPPROTO_UDP);
     } else {
-        tx_ret = ipv4_tx(pkt, src, ip, IPPROTO_UDP, 64);
+        tx_ret = ipv4_tx(pkt, SRC, ip, IPPROTO_UDP, 64);
     }
     return tx_ret == 0 ? static_cast<ssize_t>(len) : static_cast<ssize_t>(-1);
 }
 
-auto udp_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_raw, size_t* addr_len) -> ssize_t {
+auto udp_recvfrom(Socket* sock, void* buf, size_t len, int /*unused*/, void* addr_raw, size_t* addr_len) -> ssize_t {
     if (sock->rcvbuf.available() == 0) {
         if (!sock->nonblock) {
             socket_defer_wait(sock, "udp_wait");
@@ -225,8 +225,8 @@ void udp_close(Socket* sock) {
     sock->state = SocketState::CLOSED;
 }
 
-int udp_shutdown(Socket*, int) { return 0; }
-int udp_setsockopt(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+int udp_shutdown(Socket* /*unused*/, int /*unused*/) { return 0; }
+int udp_setsockopt(Socket* sock, int /*unused*/, int optname, const void* optval, size_t optlen) {
     int optint = 0;
     if (optval != nullptr && optlen >= sizeof(optint)) {
         std::memcpy(&optint, optval, sizeof(optint));
@@ -244,7 +244,7 @@ int udp_setsockopt(Socket* sock, int, int optname, const void* optval, size_t op
     // SO_SNDBUF (7): UDP has no kernel send buffer - accept silently
     return 0;
 }
-int udp_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
+int udp_getsockopt(Socket* sock, int /*unused*/, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
         int value = static_cast<int>(sock->rcvbuf.capacity);
         std::memcpy(optval, &value, sizeof(value));
@@ -288,32 +288,32 @@ void udp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
         return;
     }
 
-    auto* hdr = reinterpret_cast<const UdpHeader*>(pkt->data);
-    uint16_t dst_port = ntohs(hdr->dst_port);
-    uint16_t payload_len = ntohs(hdr->length);
+    const auto* hdr = reinterpret_cast<const UdpHeader*>(pkt->data);
+    uint16_t const DST_PORT = ntohs(hdr->dst_port);
+    uint16_t const PAYLOAD_LEN = ntohs(hdr->length);
 
-    if (payload_len < sizeof(UdpHeader) || payload_len > pkt->len) {
+    if (PAYLOAD_LEN < sizeof(UdpHeader) || PAYLOAD_LEN > pkt->len) {
         pkt_free(pkt);
         return;
     }
 
     // Strip UDP header
     pkt->pull(sizeof(UdpHeader));
-    size_t data_len = payload_len - sizeof(UdpHeader);
-    pkt->len = data_len;
+    size_t const DATA_LEN = PAYLOAD_LEN - sizeof(UdpHeader);
+    pkt->len = DATA_LEN;
 
     Socket* wake_sock = nullptr;
     udp_lock.lock();
-    auto* binding = find_binding(dst_ip, dst_port);
+    auto* binding = find_binding(dst_ip, DST_PORT);
     if (binding == nullptr) {
         // Try INADDR_ANY
-        binding = find_binding(0, dst_port);
+        binding = find_binding(0, DST_PORT);
     }
 
     if (binding != nullptr && binding->sock != nullptr) {
         // Deliver to socket receive buffer
-        ssize_t written = binding->sock->rcvbuf.write(pkt->data, pkt->len);
-        if (written > 0) {
+        ssize_t const WRITTEN = binding->sock->rcvbuf.write(pkt->data, pkt->len);
+        if (WRITTEN > 0) {
             wake_sock = binding->sock;
         }
 

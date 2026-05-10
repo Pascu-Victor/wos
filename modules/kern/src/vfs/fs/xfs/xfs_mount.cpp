@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <util/crc32c.hpp>
@@ -29,8 +30,8 @@ namespace {
 // Verify the superblock CRC.  The CRC field itself is stored in little-endian
 // (unusual for XFS), and the check must treat it as zero during computation.
 auto verify_sb_crc(const XfsDsb* sb, size_t len) -> bool {
-    uint32_t computed = util::crc32c_block_with_cksum(sb, len, XFS_SB_CRC_OFF);
-    return computed == sb->sb_crc;  // sb_crc is already little-endian
+    uint32_t const COMPUTED = util::crc32c_block_with_cksum(sb, len, XFS_SB_CRC_OFF);
+    return COMPUTED == sb->sb_crc;  // sb_crc is already little-endian
 }
 
 // Verify an AG header CRC (AGF or AGI).
@@ -38,8 +39,8 @@ auto verify_ag_crc(const void* buf, size_t len, size_t crc_off) -> bool {
     const auto* bytes = static_cast<const uint8_t*>(buf);
     uint32_t on_disk_crc = 0;
     __builtin_memcpy(&on_disk_crc, bytes + crc_off, sizeof(uint32_t));
-    uint32_t computed = util::crc32c_block_with_cksum(buf, len, crc_off);
-    return computed == on_disk_crc;
+    uint32_t const COMPUTED = util::crc32c_block_with_cksum(buf, len, crc_off);
+    return COMPUTED == on_disk_crc;
 }
 
 }  // namespace
@@ -54,15 +55,15 @@ auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
     // Decode encoded FSB -> linear block
     auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
     auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
 
-    size_t dev_blk_size = ctx->device->block_size;
-    size_t ratio = ctx->block_size / dev_blk_size;  // e.g. 4096/512 = 8
-    uint64_t dev_block = linear_block * ratio;
-    if (ratio <= 1) {
-        return bread(ctx->device, dev_block);
+    size_t const DEV_BLK_SIZE = ctx->device->block_size;
+    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;  // e.g. 4096/512 = 8
+    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
+    if (RATIO <= 1) {
+        return bread(ctx->device, DEV_BLOCK);
     }
-    return bread_multi(ctx->device, dev_block, ratio);
+    return bread_multi(ctx->device, DEV_BLOCK, RATIO);
 }
 
 // Read multiple contiguous XFS filesystem blocks.
@@ -70,30 +71,30 @@ auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) 
     // Decode encoded FSB -> linear block
     auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
     auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
 
-    size_t dev_blk_size = ctx->device->block_size;
-    size_t ratio = ctx->block_size / dev_blk_size;
-    uint64_t dev_block = linear_block * ratio;
-    size_t dev_count = count * ratio;
-    if (dev_count <= 1) {
-        return bread(ctx->device, dev_block);
+    size_t const DEV_BLK_SIZE = ctx->device->block_size;
+    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
+    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
+    size_t const DEV_COUNT = count * RATIO;
+    if (DEV_COUNT <= 1) {
+        return bread(ctx->device, DEV_BLOCK);
     }
-    return bread_multi(ctx->device, dev_block, dev_count);
+    return bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
 }
 
 auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
     auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
     auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t linear_block = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
 
-    size_t dev_blk_size = ctx->device->block_size;
-    size_t ratio = ctx->block_size / dev_blk_size;
-    uint64_t dev_block = linear_block * ratio;
-    if (ratio <= 1) {
-        return bget(ctx->device, dev_block);
+    size_t const DEV_BLK_SIZE = ctx->device->block_size;
+    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
+    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
+    if (RATIO <= 1) {
+        return bget(ctx->device, DEV_BLOCK);
     }
-    return bget_multi(ctx->device, dev_block, ratio);
+    return bget_multi(ctx->device, DEV_BLOCK, RATIO);
 }
 
 namespace {
@@ -103,22 +104,23 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     // AGF lives at sector 1 of the AG (second sector).
     // All four AG headers (SB copy, AGF, AGI, AGFL) fit within the first
     // XFS filesystem block of each AG.  Read that full block and index in.
-    uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
-    BufHead* bh = xfs_buf_read(ctx, ag_start_block);
+    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
+    BufHead* bh = xfs_buf_read(ctx, AG_START_BLOCK);
     if (bh == nullptr) {
         mod::dbg::log("[xfs] failed to read AG %u block 0 for AGF", agno);
         return -EIO;
     }
 
     // AGF is at sector 1 within the first block
-    size_t agf_offset = ctx->sect_size;  // sector 1
-    if (agf_offset + sizeof(XfsAgf) > bh->size) {
+    size_t const AGF_OFFSET = ctx->sect_size;  // sector 1
+    if (AGF_OFFSET + sizeof(XfsAgf) > bh->size) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGF offset %lu exceeds block size %lu", agno, (unsigned long)agf_offset, (unsigned long)bh->size);
+        mod::dbg::log("[xfs] AG %u: AGF offset %lu exceeds block size %lu", agno, static_cast<unsigned long>(AGF_OFFSET),
+                      static_cast<unsigned long>(bh->size));
         return -EINVAL;
     }
 
-    const auto* agf = reinterpret_cast<const XfsAgf*>(bh->data + agf_offset);
+    const auto* agf = reinterpret_cast<const XfsAgf*>(bh->data + AGF_OFFSET);
 
     // Validate magic
     if (agf->agf_magicnum.to_cpu() != XFS_AGF_MAGIC) {
@@ -128,7 +130,7 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     }
 
     // Verify CRC - covers the full sector, not just the struct
-    if (!verify_ag_crc(bh->data + agf_offset, ctx->sect_size, XFS_AGF_CRC_OFF)) {
+    if (!verify_ag_crc(bh->data + AGF_OFFSET, ctx->sect_size, XFS_AGF_CRC_OFF)) {
         brelse(bh);
         mod::dbg::log("[xfs] AG %u: AGF CRC mismatch", agno);
         return -EINVAL;
@@ -156,8 +158,8 @@ auto read_agf(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
 
 // Read the AGI for a given AG and populate per_ag fields.
 auto read_agi(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
-    uint64_t ag_start_block = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
-    BufHead* bh = xfs_buf_read(ctx, ag_start_block);
+    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, ctx->ag_blk_log);
+    BufHead* bh = xfs_buf_read(ctx, AG_START_BLOCK);
     if (bh == nullptr) {
         mod::dbg::log("[xfs] failed to read AG %u block 0 for AGI", agno);
         return -EIO;
@@ -167,7 +169,8 @@ auto read_agi(XfsMountContext* ctx, xfs_agnumber_t agno) -> int {
     auto agi_offset = static_cast<size_t>(ctx->sect_size * 2);
     if (agi_offset + sizeof(XfsAgi) > bh->size) {
         brelse(bh);
-        mod::dbg::log("[xfs] AG %u: AGI offset %lu exceeds block size %lu", agno, (unsigned long)agi_offset, (unsigned long)bh->size);
+        mod::dbg::log("[xfs] AG %u: AGI offset %lu exceeds block size %lu", agno, static_cast<unsigned long>(agi_offset),
+                      static_cast<unsigned long>(bh->size));
         return -EINVAL;
     }
 
@@ -228,9 +231,9 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     }
 
     // Version: we only support v5
-    uint16_t version = dsb->sb_versionnum.to_cpu();
-    if ((version & 0xF) != XFS_SB_VERSION_5) {
-        mod::dbg::log("[xfs] unsupported version %u (only v5 supported)", version);
+    uint16_t const VERSION = dsb->sb_versionnum.to_cpu();
+    if ((VERSION & 0xF) != XFS_SB_VERSION_5) {
+        mod::dbg::log("[xfs] unsupported version %u (only v5 supported)", VERSION);
         brelse(bh);
         return -EINVAL;
     }
@@ -312,9 +315,9 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     // Check for unsupported incompat features (reflink, rmap, etc.)
     constexpr uint32_t SUPPORTED_INCOMPAT = XFS_SB_FEAT_INCOMPAT_FTYPE | XFS_SB_FEAT_INCOMPAT_SPINODES | XFS_SB_FEAT_INCOMPAT_BIGTIME |
                                             XFS_SB_FEAT_INCOMPAT_NREXT64 | XFS_SB_FEAT_INCOMPAT_EXCHRANGE | XFS_SB_FEAT_INCOMPAT_PARENT;
-    uint32_t unsupported = ctx->feat_incompat & ~SUPPORTED_INCOMPAT;
-    if (unsupported != 0) {
-        mod::dbg::log("[xfs] unsupported incompat features: 0x%x", unsupported);
+    uint32_t const UNSUPPORTED = ctx->feat_incompat & ~SUPPORTED_INCOMPAT;
+    if (UNSUPPORTED != 0) {
+        mod::dbg::log("[xfs] unsupported incompat features: 0x%x", UNSUPPORTED);
         if (!read_only) {
             delete ctx;
             return -EINVAL;
@@ -323,7 +326,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     }
 
     // --- Allocate per-AG state and read AGF/AGI headers ---
-    size_t pag_size = sizeof(XfsPerAG) * ctx->ag_count;
+    size_t const PAG_SIZE = sizeof(XfsPerAG) * ctx->ag_count;
     ctx->per_ag = new (std::nothrow) XfsPerAG[ctx->ag_count]{};
     if (ctx->per_ag == nullptr) {
         mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)", ctx->ag_count);
@@ -361,8 +364,8 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         total_inodes += ctx->per_ag[ag].agi_count;
         free_inodes += ctx->per_ag[ag].agi_freecount;
     }
-    mod::dbg::log("[xfs] mounted: %lu free blocks, %lu/%lu inodes free", (unsigned long)total_free, (unsigned long)free_inodes,
-                  (unsigned long)total_inodes);
+    mod::dbg::log("[xfs] mounted: %lu free blocks, %lu/%lu inodes free", static_cast<unsigned long>(total_free),
+                  static_cast<unsigned long>(free_inodes), static_cast<unsigned long>(total_inodes));
 
     return 0;
 }

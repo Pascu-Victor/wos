@@ -1,6 +1,6 @@
 /* Host shim for linux/types.h
  *
- * Provides the standard Linux integer types but OMITS the __be16/__be32/__be64
+ * Provides the standard Linux integer types but OMITS the Be16/Be32/Be64
  * typedefs that conflict with the WOS kernel's struct-based endian wrappers
  * defined in net/endian.hpp.
  */
@@ -18,7 +18,7 @@ typedef __signed__ __int128 __s128 __attribute__((aligned(16)));
 typedef unsigned __int128 __u128 __attribute__((aligned(16)));
 #endif
 
-/* Intentionally omitted: __be16, __be32, __be64, __le16, __le32, __le64
+/* Intentionally omitted: Be16, Be32, Be64, __le16, __le32, __le64
  * These conflict with WOS kernel's struct __be{16,32,64} in net/endian.hpp. */
 
 typedef __u16 __sum16;

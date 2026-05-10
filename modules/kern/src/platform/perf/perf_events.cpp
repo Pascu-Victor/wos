@@ -55,8 +55,8 @@ static ker::mod::sys::Spinlock g_wki_summary_lock;
 namespace {
 
 void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
-    uint64_t slot = ring.head & PERF_RING_MASK;
-    ring.events[slot] = evt;
+    uint64_t const SLOT = ring.head & PERF_RING_MASK;
+    ring.events[SLOT] = evt;
     ring.head++;
     if ((ring.head - ring.drain) > PERF_RING_ENTRIES) {
         ring.drain = ring.head - PERF_RING_ENTRIES;
@@ -64,7 +64,7 @@ void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
 }
 
 auto wki_scope_hash(uint8_t scope, uint8_t op, uint16_t peer, uint16_t channel) -> size_t {
-    uint32_t mixed = static_cast<uint32_t>(scope);
+    auto mixed = static_cast<uint32_t>(scope);
     mixed = (mixed * 131U) ^ static_cast<uint32_t>(op);
     mixed = (mixed * 65537U) ^ static_cast<uint32_t>(peer);
     mixed = (mixed * 65537U) ^ static_cast<uint32_t>(channel);
@@ -72,9 +72,9 @@ auto wki_scope_hash(uint8_t scope, uint8_t op, uint16_t peer, uint16_t channel) 
 }
 
 auto wki_get_or_create_summary_bucket(uint8_t scope, uint8_t op, uint16_t peer, uint16_t channel) -> WkiPerfSummaryBucket* {
-    size_t slot = wki_scope_hash(scope, op, peer, channel);
+    size_t const SLOT = wki_scope_hash(scope, op, peer, channel);
     for (size_t probe = 0; probe < WKI_PERF_SUMMARY_BUCKETS; ++probe) {
-        auto& bucket = g_wki_summary[(slot + probe) % WKI_PERF_SUMMARY_BUCKETS];
+        auto& bucket = g_wki_summary[(SLOT + probe) % WKI_PERF_SUMMARY_BUCKETS];
         if (!bucket.used) {
             bucket.used = true;
             bucket.scope = scope;
@@ -361,7 +361,9 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
 
 void init() {
     g_num_cpus = ker::mod::smt::get_core_count();
-    if (g_num_cpus == 0) g_num_cpus = 1;
+    if (g_num_cpus == 0) {
+        g_num_cpus = 1;
+    }
     g_rings = new PerfCpuRing[g_num_cpus]{};
     g_tick_count = new uint64_t[g_num_cpus]{};
     for (size_t i = 0; i < g_num_cpus; ++i) {
@@ -373,13 +375,13 @@ void init() {
     g_enabled.store(false, std::memory_order_release);  // Off by default; enabled via perf record
     g_event_mask.store(PERF_MASK_ALL, std::memory_order_release);
     g_wki_trace_correlation.store(1, std::memory_order_release);
-    for (size_t i = 0; i < PERF_SUBSYSTEM_COUNT; ++i) {
-        g_subsys_stats[i].inserts.store(0, std::memory_order_relaxed);
-        g_subsys_stats[i].removes.store(0, std::memory_order_relaxed);
-        g_subsys_stats[i].resizes.store(0, std::memory_order_relaxed);
-        g_subsys_stats[i].oom_failures.store(0, std::memory_order_relaxed);
-        g_subsys_stats[i].peak_count.store(0, std::memory_order_relaxed);
-        g_subsys_stats[i].current_count.store(0, std::memory_order_relaxed);
+    for (auto& g_subsys_stat : g_subsys_stats) {
+        g_subsys_stat.inserts.store(0, std::memory_order_relaxed);
+        g_subsys_stat.removes.store(0, std::memory_order_relaxed);
+        g_subsys_stat.resizes.store(0, std::memory_order_relaxed);
+        g_subsys_stat.oom_failures.store(0, std::memory_order_relaxed);
+        g_subsys_stat.peak_count.store(0, std::memory_order_relaxed);
+        g_subsys_stat.current_count.store(0, std::memory_order_relaxed);
     }
     for (auto& bucket : g_wki_summary) {
         bucket.used = false;
@@ -439,17 +441,20 @@ void reset_rings() {
 // record_sample
 // ---------------------------------------------------------------------------
 void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int64_t lag_v) {
-    if (cpu >= g_num_cpus) return;
+    if (cpu >= g_num_cpus) {
+        return;
+    }
 
     // Sub-sample to ~100 Hz (tick count advances even when recording is off
     // so the phase is stable when recording is enabled mid-run).
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool do_record = g_enabled.load(std::memory_order_acquire) && (mask & PERF_MASK_SAMPLE) && ((++g_tick_count[cpu] % 10) == 0);
+    bool const DO_RECORD =
+        g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SAMPLE) != 0) && ((++g_tick_count[cpu] % 10) == 0);
 
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
     ring.stats.samples++;  // always counted
-    if (do_record) {
+    if (DO_RECORD) {
         PerfEvent evt{};
         evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
@@ -457,7 +462,7 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
         evt.lag_v = lag_v;
         evt.cpu = static_cast<uint16_t>(cpu);
         evt.type = static_cast<uint8_t>(PerfEventType::SAMPLE);
-        evt.flags = user_mode ? PERF_FLAG_USER_MODE : 0u;
+        evt.flags = user_mode ? PERF_FLAG_USER_MODE : 0U;
         perf_push_event(ring, evt);
     }
     ring.lock.unlock_irqrestore(saved);
@@ -467,19 +472,27 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
 // record_switch
 // ---------------------------------------------------------------------------
 void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t flags, int64_t lag_v, uint32_t run_us, uint64_t callsite) {
-    if (cpu >= g_num_cpus) return;
+    if (cpu >= g_num_cpus) {
+        return;
+    }
 
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool do_record = g_enabled.load(std::memory_order_acquire) && (mask & PERF_MASK_SWITCH);
+    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SWITCH) != 0);
 
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
     auto& s = ring.stats;
     s.ctx_switches++;  // always counted
-    if (flags & PERF_FLAG_PREEMPT) s.preemptions++;
-    if (flags & PERF_FLAG_YIELD) s.yields++;
-    if (flags & PERF_FLAG_BLOCK) s.sleeps++;
-    if (do_record) {
+    if ((flags & PERF_FLAG_PREEMPT) != 0) {
+        s.preemptions++;
+    }
+    if ((flags & PERF_FLAG_YIELD) != 0) {
+        s.yields++;
+    }
+    if ((flags & PERF_FLAG_BLOCK) != 0) {
+        s.sleeps++;
+    }
+    if (DO_RECORD) {
         PerfEvent evt{};
         evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = prev_pid;
@@ -499,15 +512,17 @@ void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t f
 // record_wake
 // ---------------------------------------------------------------------------
 void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t sleep_us, uint64_t callsite) {
-    if (cpu >= g_num_cpus) return;
+    if (cpu >= g_num_cpus) {
+        return;
+    }
 
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool do_record = g_enabled.load(std::memory_order_acquire) && (mask & PERF_MASK_WAKE);
+    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_WAKE) != 0);
 
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
     ring.stats.wakes++;  // always counted
-    if (do_record) {
+    if (DO_RECORD) {
         PerfEvent evt{};
         evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
@@ -527,15 +542,17 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
 // record_sleep
 // ---------------------------------------------------------------------------
 void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t run_us, uint64_t callsite) {
-    if (cpu >= g_num_cpus) return;
+    if (cpu >= g_num_cpus) {
+        return;
+    }
 
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool do_record = g_enabled.load(std::memory_order_acquire) && (mask & PERF_MASK_SLEEP);
+    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SLEEP) != 0);
 
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
     ring.stats.sleeps++;  // always counted
-    if (do_record) {
+    if (DO_RECORD) {
         PerfEvent evt{};
         evt.ts_ns = ker::mod::time::get_monotonic_ns();
         evt.pid = pid;
@@ -557,7 +574,9 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
 size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter) {
     size_t total = 0;
     for (uint32_t c = 0; c < g_num_cpus && total < max_events; ++c) {
-        if (cpu_filter < g_num_cpus && c != cpu_filter) continue;
+        if (cpu_filter < g_num_cpus && c != cpu_filter) {
+            continue;
+        }
 
         auto& ring = g_rings[c];
         auto saved = ring.lock.lock_irqsave();
@@ -574,7 +593,9 @@ size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter) {
 // get_cpu_stats - non-destructive snapshot
 // ---------------------------------------------------------------------------
 PerfCpuStats get_cpu_stats(uint32_t cpu) {
-    if (cpu >= g_num_cpus) return {};
+    if (cpu >= g_num_cpus) {
+        return {};
+    }
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
     auto s = ring.stats;
@@ -590,12 +611,16 @@ void record_container_stat(uint32_t cpu, uint64_t pid, PerfSubsystem subsystem, 
     // Always update subsystem atomic stats
     update_subsystem_stat(subsystem, flags, static_cast<uint64_t>(element_count >= 0 ? element_count : 0));
 
-    if (cpu >= g_num_cpus) return;
+    if (cpu >= g_num_cpus) {
+        return;
+    }
 
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool do_record = g_enabled.load(std::memory_order_acquire) && (mask & PERF_MASK_CONTAINER);
+    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_CONTAINER) != 0);
 
-    if (!do_record) return;
+    if (!DO_RECORD) {
+        return;
+    }
 
     auto& ring = g_rings[cpu];
     auto saved = ring.lock.lock_irqsave();
@@ -749,21 +774,33 @@ size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max) {
 // ---------------------------------------------------------------------------
 void update_subsystem_stat(PerfSubsystem subsystem, uint8_t flags, uint64_t current_count) {
     auto idx = static_cast<size_t>(subsystem);
-    if (idx == 0 || idx >= PERF_SUBSYSTEM_COUNT) return;
+    if (idx == 0 || idx >= PERF_SUBSYSTEM_COUNT) {
+        return;
+    }
 
     auto& s = g_subsys_stats[idx];
 
-    if (flags & PERF_FLAG_CT_INSERT) s.inserts.fetch_add(1, std::memory_order_relaxed);
-    if (flags & PERF_FLAG_CT_REMOVE) s.removes.fetch_add(1, std::memory_order_relaxed);
-    if (flags & PERF_FLAG_CT_RESIZE) s.resizes.fetch_add(1, std::memory_order_relaxed);
-    if (flags & PERF_FLAG_CT_OOM) s.oom_failures.fetch_add(1, std::memory_order_relaxed);
+    if ((flags & PERF_FLAG_CT_INSERT) != 0) {
+        s.inserts.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((flags & PERF_FLAG_CT_REMOVE) != 0) {
+        s.removes.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((flags & PERF_FLAG_CT_RESIZE) != 0) {
+        s.resizes.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((flags & PERF_FLAG_CT_OOM) != 0) {
+        s.oom_failures.fetch_add(1, std::memory_order_relaxed);
+    }
 
     s.current_count.store(current_count, std::memory_order_relaxed);
 
     // Update peak (lock-free CAS loop)
     uint64_t old_peak = s.peak_count.load(std::memory_order_relaxed);
     while (current_count > old_peak) {
-        if (s.peak_count.compare_exchange_weak(old_peak, current_count, std::memory_order_relaxed)) break;
+        if (s.peak_count.compare_exchange_weak(old_peak, current_count, std::memory_order_relaxed)) {
+            break;
+        }
     }
 }
 
@@ -772,7 +809,9 @@ void update_subsystem_stat(PerfSubsystem subsystem, uint8_t flags, uint64_t curr
 // ---------------------------------------------------------------------------
 PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem) {
     auto idx = static_cast<size_t>(subsystem);
-    if (idx == 0 || idx >= PERF_SUBSYSTEM_COUNT) return {};
+    if (idx == 0 || idx >= PERF_SUBSYSTEM_COUNT) {
+        return {};
+    }
 
     auto& s = g_subsys_stats[idx];
     return PerfSubsystemSnapshot{
@@ -801,32 +840,39 @@ uint8_t parse_event_mask(const char* str, size_t len) {
 
     while (i < len) {
         // Skip whitespace and commas
-        while (i < len && (str[i] == ',' || str[i] == ' ' || str[i] == '\n')) i++;
-        if (i >= len) break;
+        while (i < len && (str[i] == ',' || str[i] == ' ' || str[i] == '\n')) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
 
         // Find end of token
-        size_t start = i;
-        while (i < len && str[i] != ',' && str[i] != ' ' && str[i] != '\n') i++;
-        size_t tok_len = i - start;
+        size_t const START = i;
+        while (i < len && str[i] != ',' && str[i] != ' ' && str[i] != '\n') {
+            i++;
+        }
+        size_t const TOK_LEN = i - START;
 
-        if (tok_len == 6 && memcmp(str + start, "sample", 6) == 0)
+        if (TOK_LEN == 6 && memcmp(str + START, "sample", 6) == 0) {
             mask |= PERF_MASK_SAMPLE;
-        else if (tok_len == 6 && memcmp(str + start, "switch", 6) == 0)
+        } else if (TOK_LEN == 6 && memcmp(str + START, "switch", 6) == 0) {
             mask |= PERF_MASK_SWITCH;
-        else if (tok_len == 4 && memcmp(str + start, "wake", 4) == 0)
+        } else if (TOK_LEN == 4 && memcmp(str + START, "wake", 4) == 0) {
             mask |= PERF_MASK_WAKE;
-        else if (tok_len == 5 && memcmp(str + start, "sleep", 5) == 0)
+        } else if (TOK_LEN == 5 && memcmp(str + START, "sleep", 5) == 0) {
             mask |= PERF_MASK_SLEEP;
-        else if (tok_len == 9 && memcmp(str + start, "container", 9) == 0)
+        } else if (TOK_LEN == 9 && memcmp(str + START, "container", 9) == 0) {
             mask |= PERF_MASK_CONTAINER;
-        else if (tok_len == 3 && memcmp(str + start, "wki", 3) == 0)
+        } else if (TOK_LEN == 3 && memcmp(str + START, "wki", 3) == 0) {
             mask |= PERF_MASK_WKI;
-        else if (tok_len == 10 && memcmp(str + start, "wki_launch", 10) == 0)
+        } else if (TOK_LEN == 10 && memcmp(str + START, "wki_launch", 10) == 0) {
             mask |= PERF_MASK_WKI_LAUNCH;
-        else if (tok_len == 3 && memcmp(str + start, "all", 3) == 0)
+        } else if (TOK_LEN == 3 && memcmp(str + START, "all", 3) == 0) {
             mask = PERF_MASK_ALL;
-        else
+        } else {
             return 0;  // unknown token
+        }
     }
     return mask;
 }

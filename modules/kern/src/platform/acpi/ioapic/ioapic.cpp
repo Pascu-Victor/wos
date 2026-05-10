@@ -27,18 +27,18 @@ uint32_t max_redirection_entries = 0;
 }
 
 void write_redirection(uint8_t index, uint64_t value) {
-    uint32_t reg_lo = IOAPIC_REG_REDTBL_BASE + (index * 2);
-    uint32_t reg_hi = reg_lo + 1;
-    ioapic_write(reg_lo, static_cast<uint32_t>(value & 0xFFFFFFFF));
-    ioapic_write(reg_hi, static_cast<uint32_t>(value >> 32));
+    uint32_t const REG_LO = IOAPIC_REG_REDTBL_BASE + (index * 2);
+    uint32_t const REG_HI = REG_LO + 1;
+    ioapic_write(REG_LO, static_cast<uint32_t>(value & 0xFFFFFFFF));
+    ioapic_write(REG_HI, static_cast<uint32_t>(value >> 32));
 }
 
 auto read_redirection(uint8_t index) -> uint64_t {
-    uint32_t reg_lo = IOAPIC_REG_REDTBL_BASE + (index * 2);
-    uint32_t reg_hi = reg_lo + 1;
-    uint64_t lo = ioapic_read(reg_lo);
-    uint64_t hi = ioapic_read(reg_hi);
-    return lo | (hi << 32);
+    uint32_t const REG_LO = IOAPIC_REG_REDTBL_BASE + (index * 2);
+    uint32_t const REG_HI = REG_LO + 1;
+    uint64_t const LO = ioapic_read(REG_LO);
+    uint64_t const HI = ioapic_read(REG_HI);
+    return LO | (HI << 32);
 }
 }  // namespace
 
@@ -51,22 +51,22 @@ void init() {
     }
 
     // Use the first IO APIC
-    uint32_t phys_addr = apic_info.ioapics[0].io_apic_addr;
+    uint32_t const PHYS_ADDR = apic_info.ioapics[0].io_apic_addr;
     gsi_base = apic_info.ioapics[0].global_sys_int_base;
 
     // Map the IO APIC MMIO page into kernel page table.
     // MMIO regions are not in the Limine memory map, so the HHDM has no
     // page table entry for them after the kernel switches to its own page tables.
-    auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(phys_addr));
-    mm::virt::map_to_kernel_page_table(virt_addr, phys_addr, mm::paging::page_types::MMIO);
+    auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(PHYS_ADDR));
+    mm::virt::map_to_kernel_page_table(virt_addr, PHYS_ADDR, mm::paging::page_types::MMIO);
 
     ioapic_base = reinterpret_cast<volatile uint32_t*>(virt_addr);
 
     // Read version register to get max redirection entries
-    uint32_t ver = ioapic_read(IOAPIC_REG_VER);
-    max_redirection_entries = ((ver >> 16) & 0xFF) + 1;
+    uint32_t const VER = ioapic_read(IOAPIC_REG_VER);
+    max_redirection_entries = ((VER >> 16) & 0xFF) + 1;
 
-    dbg::log("IOAPIC: addr=0x%x gsi_base=%d max_entries=%d", phys_addr, gsi_base, max_redirection_entries);
+    dbg::log("IOAPIC: addr=0x%x gsi_base=%d max_entries=%d", PHYS_ADDR, gsi_base, max_redirection_entries);
 
     // Mask all entries initially
     for (uint32_t i = 0; i < max_redirection_entries; i++) {
@@ -86,8 +86,8 @@ void route_irq(uint8_t gsi, uint8_t vector, uint32_t dest_apic_id) {
         return;
     }
 
-    uint8_t index = gsi - gsi_base;
-    if (index >= max_redirection_entries) {
+    uint8_t const INDEX = gsi - gsi_base;
+    if (INDEX >= max_redirection_entries) {
         return;
     }
 
@@ -104,20 +104,20 @@ void route_irq(uint8_t gsi, uint8_t vector, uint32_t dest_apic_id) {
         const auto& iso = apic_info.ioapic_isos[i];
         if (iso.global_sys_int == gsi) {
             // Apply polarity override
-            uint8_t polarity = iso.flags & 0x3;
-            if (polarity == 0x3) {  // active low
+            uint8_t const POLARITY = iso.flags & 0x3;
+            if (POLARITY == 0x3) {  // active low
                 entry |= IOAPIC_REDIR_ACTIVE_LOW;
             }
             // Apply trigger mode override
-            uint8_t trigger = (iso.flags >> 2) & 0x3;
-            if (trigger == 0x3) {  // level triggered
+            uint8_t const TRIGGER = (iso.flags >> 2) & 0x3;
+            if (TRIGGER == 0x3) {  // level triggered
                 entry |= IOAPIC_REDIR_LEVEL;
             }
             break;
         }
     }
 
-    write_redirection(index, entry);
+    write_redirection(INDEX, entry);
     dbg::log("IOAPIC: Routed GSI %d -> vector %d (dest APIC %d)", gsi, vector, dest_apic_id);
 }
 
@@ -126,14 +126,14 @@ void mask_irq(uint8_t gsi) {
         return;
     }
 
-    uint8_t index = gsi - gsi_base;
-    if (index >= max_redirection_entries) {
+    uint8_t const INDEX = gsi - gsi_base;
+    if (INDEX >= max_redirection_entries) {
         return;
     }
 
-    uint64_t entry = read_redirection(index);
+    uint64_t entry = read_redirection(INDEX);
     entry |= IOAPIC_REDIR_MASK;
-    write_redirection(index, entry);
+    write_redirection(INDEX, entry);
 }
 
 void unmask_irq(uint8_t gsi) {
@@ -141,14 +141,14 @@ void unmask_irq(uint8_t gsi) {
         return;
     }
 
-    uint8_t index = gsi - gsi_base;
-    if (index >= max_redirection_entries) {
+    uint8_t const INDEX = gsi - gsi_base;
+    if (INDEX >= max_redirection_entries) {
         return;
     }
 
-    uint64_t entry = read_redirection(index);
+    uint64_t entry = read_redirection(INDEX);
     entry &= ~IOAPIC_REDIR_MASK;
-    write_redirection(index, entry);
+    write_redirection(INDEX, entry);
 }
 
 }  // namespace ker::mod::ioapic

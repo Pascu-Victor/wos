@@ -1,5 +1,8 @@
 #include "fsbench.hpp"
 
+#include <abi-bits/fcntl.h>
+#include <abi-bits/stat.h>
+#include <bits/ssize_t.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -8,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <print>
 
 namespace {
@@ -34,11 +38,11 @@ auto parse_u32(const char* value, uint32_t* out) -> bool {
         return false;
     }
     char* end = nullptr;
-    unsigned long parsed = std::strtoul(value, &end, 10);
+    unsigned long const PARSED = std::strtoul(value, &end, 10);
     if (end == value || *end != '\0') {
         return false;
     }
-    *out = static_cast<uint32_t>(parsed);
+    *out = static_cast<uint32_t>(PARSED);
     return true;
 }
 
@@ -96,38 +100,38 @@ auto run_read(int argc, char** argv) -> int {
 
     uint64_t checksum = 0;
     uint64_t total_bytes = 0;
-    uint64_t started_ns = monotonic_ns();
+    uint64_t const STARTED_NS = monotonic_ns();
 
     for (uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
-        int fd = open(options.path, O_RDONLY);
-        if (fd < 0) {
+        int const FD = open(options.path, O_RDONLY);
+        if (FD < 0) {
             std::free(buffer);
             std::println("vfsbench-read: failed to open '{}'", options.path);
             return 1;
         }
 
         for (;;) {
-            ssize_t bytes_read = read(fd, buffer, options.read_size);
-            if (bytes_read < 0) {
-                close(fd);
+            ssize_t const BYTES_READ = read(FD, buffer, options.read_size);
+            if (BYTES_READ < 0) {
+                close(FD);
                 std::free(buffer);
                 std::println("vfsbench-read: read failed for '{}'", options.path);
                 return 1;
             }
-            if (bytes_read == 0) {
+            if (BYTES_READ == 0) {
                 break;
             }
-            checksum = fnv1a_update(checksum, buffer, static_cast<size_t>(bytes_read));
-            total_bytes += static_cast<uint64_t>(bytes_read);
+            checksum = fnv1a_update(checksum, buffer, static_cast<size_t>(BYTES_READ));
+            total_bytes += static_cast<uint64_t>(BYTES_READ);
         }
 
-        close(fd);
+        close(FD);
     }
 
-    uint64_t elapsed_ns = monotonic_ns() - started_ns;
+    uint64_t const ELAPSED_NS = monotonic_ns() - STARTED_NS;
     std::free(buffer);
 
-    const double ELAPSED_S = static_cast<double>(elapsed_ns) / 1000000000.0;
+    const double ELAPSED_S = static_cast<double>(ELAPSED_NS) / 1000000000.0;
     const double THROUGHPUT_MIB_PER_S = (static_cast<double>(total_bytes) / (1024.0 * 1024.0)) / (ELAPSED_S > 0.0 ? ELAPSED_S : 1.0);
 
     std::println(
@@ -158,16 +162,16 @@ auto run_stat(int argc, char** argv) -> int {
     }
 
     struct stat path_stat{};
-    uint64_t started_ns = monotonic_ns();
+    uint64_t const STARTED_NS = monotonic_ns();
     for (uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
         if (stat(options.path, &path_stat) != 0) {
             std::println("vfsbench-stat: stat failed for '{}'", options.path);
             return 1;
         }
     }
-    uint64_t elapsed_ns = monotonic_ns() - started_ns;
+    uint64_t const ELAPSED_NS = monotonic_ns() - STARTED_NS;
 
-    const double AVERAGE_LATENCY_US = (static_cast<double>(elapsed_ns) / 1000.0) / static_cast<double>(options.iterations);
+    const double AVERAGE_LATENCY_US = (static_cast<double>(ELAPSED_NS) / 1000.0) / static_cast<double>(options.iterations);
 
     std::println(R"({{"benchmark":"wos_vfsbench_stat","path":"{}","iterations":{},"size":{},"avg_latency_us":{}}})", options.path,
                  options.iterations, static_cast<uint64_t>(path_stat.st_size), AVERAGE_LATENCY_US);

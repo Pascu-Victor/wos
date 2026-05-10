@@ -5,7 +5,9 @@
 // Return the symbolic name for a (possibly negative) errno value.
 // Unknown values return "E?".
 inline const char* errno_name(int err) noexcept {
-    if (err < 0) err = -err;
+    if (err < 0) {
+        err = -err;
+    }
     switch (err) {
         case 0:
             return "0";

@@ -39,7 +39,7 @@ void init_pagemap();
 PageTable* create_pagemap();
 void copy_kernel_mappings(sched::task::Task* t);
 void switch_pagemap(sched::task::Task* t);
-bool pagefault_handler(uint64_t control_register, gates::interruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
+bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
 void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset

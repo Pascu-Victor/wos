@@ -33,7 +33,7 @@ inline void vfs_debug_log_hex(uint64_t value) {
 #endif
 }
 
-enum class vfs_node_type : uint8_t { file, directory, device, socket, symlink };
+enum class vfs_node_type : uint8_t { FILE, DIRECTORY, DEVICE, SOCKET, SYMLINK };
 
 struct File;
 
@@ -67,13 +67,13 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
 
 // Stat operations
-auto vfs_stat(const char* path, stat* statbuf) -> int;
-auto vfs_stat_resolved(const char* path, stat* statbuf) -> int;
-auto vfs_fstat(int fd, stat* statbuf) -> int;
+auto vfs_stat(const char* path, Stat* statbuf) -> int;
+auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
+auto vfs_fstat(int fd, Stat* statbuf) -> int;
 
 // Filesystem statistics
-auto vfs_statvfs(const char* path, statvfs* buf) -> int;
-auto vfs_fstatvfs(int fd, statvfs* buf) -> int;
+auto vfs_statvfs(const char* path, Statvfs* buf) -> int;
+auto vfs_fstatvfs(int fd, Statvfs* buf) -> int;
 
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;

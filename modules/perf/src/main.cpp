@@ -10,6 +10,10 @@
 //   perf run      <cmd> [args] Trace cmd+descendants, save to perf.data
 //   perf show-map             Show PID->name/cmdline map from perf.data
 
+#include <abi-bits/access.h>
+#include <abi-bits/fcntl.h>
+#include <abi-bits/mode_t.h>
+#include <bits/ssize_t.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/process.h>
@@ -29,8 +33,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-extern char** environ;
 
 namespace {
 constexpr uint8_t FLAG_USER_MODE = 0x01;
@@ -119,9 +121,9 @@ class ScopedFd {
 
     ~ScopedFd() { reset(); }
 
-    auto get() const -> int { return fd; }
+    [[nodiscard]] auto get() const -> int { return fd; }
 
-    auto valid() const -> bool { return fd >= 0; }
+    [[nodiscard]] auto valid() const -> bool { return fd >= 0; }
 
     void reset(int new_fd = -1) {
         if (fd >= 0) {
@@ -152,9 +154,9 @@ class ScopedDir {
 
     ~ScopedDir() { reset(); }
 
-    auto get() const -> DIR* { return dir; }
+    [[nodiscard]] auto get() const -> DIR* { return dir; }
 
-    auto valid() const -> bool { return dir != nullptr; }
+    [[nodiscard]] auto valid() const -> bool { return dir != nullptr; }
 
     void reset(DIR* new_dir = nullptr) {
         if (dir != nullptr) {
@@ -317,55 +319,55 @@ auto now_ms() -> int64_t {
 }
 
 void wall_sleep_ms(int target_ms) {
-    int64_t deadline = now_ms() + target_ms;
+    int64_t const DEADLINE = now_ms() + target_ms;
     while (true) {
-        int64_t remaining = deadline - now_ms();
-        if (remaining <= 0) {
+        int64_t const REMAINING = DEADLINE - now_ms();
+        if (REMAINING <= 0) {
             break;
         }
 
-        int64_t slice_us = std::min<int64_t>(remaining, SLEEP_SLICE_MS) * MICROSECONDS_PER_MILLISECOND;
-        timespec req{
-            .tv_sec = static_cast<time_t>(slice_us / (MILLISECONDS_PER_SECOND * MICROSECONDS_PER_MILLISECOND)),
+        int64_t const SLICE_US = std::min<int64_t>(REMAINING, SLEEP_SLICE_MS) * MICROSECONDS_PER_MILLISECOND;
+        timespec const REQ{
+            .tv_sec = static_cast<time_t>(SLICE_US / (MILLISECONDS_PER_SECOND * MICROSECONDS_PER_MILLISECOND)),
             .tv_nsec =
-                static_cast<long>((slice_us % (MILLISECONDS_PER_SECOND * MICROSECONDS_PER_MILLISECOND)) * NANOSECONDS_PER_MICROSECOND),
+                static_cast<long>((SLICE_US % (MILLISECONDS_PER_SECOND * MICROSECONDS_PER_MILLISECOND)) * NANOSECONDS_PER_MICROSECOND),
         };
-        nanosleep(&req, nullptr);
+        nanosleep(&REQ, nullptr);
     }
 }
 
 auto open_readonly(std::string_view path) -> ScopedFd {
-    std::string owned_path(path);
+    std::string const OWNED_PATH(path);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-    return ScopedFd(open(owned_path.c_str(), O_RDONLY, 0));
+    return ScopedFd(open(OWNED_PATH.c_str(), O_RDONLY, 0));
 }
 
 auto open_writeonly(std::string_view path) -> ScopedFd {
-    std::string owned_path(path);
+    std::string const OWNED_PATH(path);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-    return ScopedFd(open(owned_path.c_str(), O_WRONLY, 0));
+    return ScopedFd(open(OWNED_PATH.c_str(), O_WRONLY, 0));
 }
 
 auto open_write_trunc(std::string_view path, mode_t mode = PERF_DATA_MODE) -> ScopedFd {
-    std::string owned_path(path);
+    std::string const OWNED_PATH(path);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-    return ScopedFd(open(owned_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode));
+    return ScopedFd(open(OWNED_PATH.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode));
 }
 
 void write_all(int fd, std::string_view text) {
     std::size_t written = 0;
     while (written < text.size()) {
-        ssize_t rc = write(fd, text.data() + written, text.size() - written);
-        if (rc <= 0) {
+        ssize_t const RC = write(fd, text.data() + written, text.size() - written);
+        if (RC <= 0) {
             break;
         }
-        written += static_cast<std::size_t>(rc);
+        written += static_cast<std::size_t>(RC);
     }
 }
 
 auto read_fd(ScopedFd& fd, std::size_t initial_capacity = INITIAL_FILE_CAPACITY) -> std::string {
-    std::size_t capacity = std::max<std::size_t>(initial_capacity, 1);
-    std::string buffer(capacity, '\0');
+    std::size_t const CAPACITY = std::max<std::size_t>(initial_capacity, 1);
+    std::string buffer(CAPACITY, '\0');
     std::size_t total = 0;
 
     for (;;) {
@@ -373,11 +375,11 @@ auto read_fd(ScopedFd& fd, std::size_t initial_capacity = INITIAL_FILE_CAPACITY)
             buffer.resize(buffer.size() * 2);
         }
 
-        ssize_t count = read(fd.get(), buffer.data() + total, buffer.size() - total);
-        if (count <= 0) {
+        ssize_t const COUNT = read(fd.get(), buffer.data() + total, buffer.size() - total);
+        if (COUNT <= 0) {
             break;
         }
-        total += static_cast<std::size_t>(count);
+        total += static_cast<std::size_t>(COUNT);
     }
 
     buffer.resize(total);
@@ -412,23 +414,23 @@ auto build_dev_nodes_path(std::string_view hostname, std::string_view suffix = {
 }
 
 auto parse_u64(std::string_view text, int base = PARSE_BASE_DECIMAL) -> uint64_t {
-    std::string owned(text);
-    return static_cast<uint64_t>(strtoull(owned.c_str(), nullptr, base));
+    std::string const OWNED(text);
+    return static_cast<uint64_t>(strtoull(OWNED.c_str(), nullptr, base));
 }
 
 auto parse_i64(std::string_view text, int base = PARSE_BASE_DECIMAL) -> int64_t {
-    std::string owned(text);
-    return static_cast<int64_t>(strtoll(owned.c_str(), nullptr, base));
+    std::string const OWNED(text);
+    return static_cast<int64_t>(strtoll(OWNED.c_str(), nullptr, base));
 }
 
 auto parse_u32(std::string_view text, int base = PARSE_BASE_DECIMAL) -> uint32_t {
-    std::string owned(text);
-    return static_cast<uint32_t>(strtoul(owned.c_str(), nullptr, base));
+    std::string const OWNED(text);
+    return static_cast<uint32_t>(strtoul(OWNED.c_str(), nullptr, base));
 }
 
 auto parse_u8(std::string_view text, int base = PARSE_BASE_DECIMAL) -> uint8_t {
-    std::string owned(text);
-    return static_cast<uint8_t>(strtoul(owned.c_str(), nullptr, base));
+    std::string const OWNED(text);
+    return static_cast<uint8_t>(strtoul(OWNED.c_str(), nullptr, base));
 }
 
 auto trim_left(std::string_view text) -> std::string_view {
@@ -451,9 +453,9 @@ auto next_token(std::string_view text, std::size_t& pos) -> std::string_view {
         ++end;
     }
 
-    std::string_view token = text.substr(pos, end - pos);
+    std::string_view const TOKEN = text.substr(pos, end - pos);
     pos = end;
-    return token;
+    return TOKEN;
 }
 
 auto next_line(std::string_view text, std::size_t& pos) -> std::string_view {
@@ -461,16 +463,16 @@ auto next_line(std::string_view text, std::size_t& pos) -> std::string_view {
         return {};
     }
 
-    std::size_t end = text.find('\n', pos);
-    if (end == std::string_view::npos) {
-        std::string_view line = text.substr(pos);
+    std::size_t const END = text.find('\n', pos);
+    if (END == std::string_view::npos) {
+        std::string_view const LINE = text.substr(pos);
         pos = text.size();
-        return line;
+        return LINE;
     }
 
-    std::string_view line = text.substr(pos, end - pos);
-    pos = end + 1;
-    return line;
+    std::string_view const LINE = text.substr(pos, END - pos);
+    pos = END + 1;
+    return LINE;
 }
 
 auto is_all_digits(std::string_view text) -> bool {
@@ -484,66 +486,66 @@ auto is_all_digits(std::string_view text) -> bool {
 auto is_dot_entry(std::string_view text) -> bool { return text == "." || text == ".."; }
 
 auto parse_stat(std::string_view buf, StatInfo& out) -> bool {
-    std::size_t paren = buf.find('(');
-    std::size_t paren_end = buf.rfind(')');
-    if (paren == std::string_view::npos || paren_end == std::string_view::npos || paren_end <= paren) {
+    std::size_t const PAREN = buf.find('(');
+    std::size_t const PAREN_END = buf.rfind(')');
+    if (PAREN == std::string_view::npos || PAREN_END == std::string_view::npos || PAREN_END <= PAREN) {
         return false;
     }
 
-    out.pid = parse_u64(trim_left(buf.substr(0, paren)));
-    out.comm = std::string(buf.substr(paren + 1, paren_end - paren - 1));
+    out.pid = parse_u64(trim_left(buf.substr(0, PAREN)));
+    out.comm = std::string(buf.substr(PAREN + 1, PAREN_END - PAREN - 1));
 
-    std::string_view tail = trim_left(buf.substr(paren_end + 1));
+    std::string_view const TAIL = trim_left(buf.substr(PAREN_END + 1));
     std::size_t pos = 0;
 
-    std::string_view state_token = next_token(tail, pos);
-    if (state_token.empty()) {
+    std::string_view const STATE_TOKEN = next_token(TAIL, pos);
+    if (STATE_TOKEN.empty()) {
         return false;
     }
-    out.state = state_token.front();
+    out.state = STATE_TOKEN.front();
 
-    if (next_token(tail, pos).empty()) {
+    if (next_token(TAIL, pos).empty()) {
         return false;
     }
 
-    std::string_view pgid_token = next_token(tail, pos);
-    if (pgid_token.empty()) {
+    std::string_view const PGID_TOKEN = next_token(TAIL, pos);
+    if (PGID_TOKEN.empty()) {
         return false;
     }
-    out.pgid = parse_u64(pgid_token);
+    out.pgid = parse_u64(PGID_TOKEN);
 
     for (int index = 0; index < PROC_STAT_SKIP_FIELDS; ++index) {
-        if (next_token(tail, pos).empty()) {
+        if (next_token(TAIL, pos).empty()) {
             return false;
         }
     }
 
-    std::string_view utime_token = next_token(tail, pos);
-    std::string_view stime_token = next_token(tail, pos);
-    if (utime_token.empty() || stime_token.empty()) {
+    std::string_view const UTIME_TOKEN = next_token(TAIL, pos);
+    std::string_view const STIME_TOKEN = next_token(TAIL, pos);
+    if (UTIME_TOKEN.empty() || STIME_TOKEN.empty()) {
         return false;
     }
 
-    out.utime = parse_u64(utime_token);
-    out.stime = parse_u64(stime_token);
+    out.utime = parse_u64(UTIME_TOKEN);
+    out.stime = parse_u64(STIME_TOKEN);
     return true;
 }
 
 template <typename Func>
 void for_each_process_stat(Func func) {
-    ScopedDir dir(opendir("/proc"));
-    if (!dir.valid()) {
+    ScopedDir const DIR(opendir("/proc"));
+    if (!DIR.valid()) {
         return;
     }
 
-    dirent* entry = nullptr;
-    while ((entry = readdir(dir.get())) != nullptr) {
-        std::string_view name{&entry->d_name[0]};
-        if (!is_all_digits(name)) {
+    dirent const* entry = nullptr;
+    while ((entry = readdir(DIR.get())) != nullptr) {
+        std::string_view const NAME{&entry->d_name[0]};
+        if (!is_all_digits(NAME)) {
             continue;
         }
 
-        auto stat_text = read_file(build_proc_path(name, PROC_STAT_SUFFIX), PROC_READ_CAPACITY);
+        auto stat_text = read_file(build_proc_path(NAME, PROC_STAT_SUFFIX), PROC_READ_CAPACITY);
         if (!stat_text.has_value()) {
             continue;
         }
@@ -553,7 +555,7 @@ void for_each_process_stat(Func func) {
             continue;
         }
 
-        func(info, name);
+        func(info, NAME);
     }
 }
 
@@ -603,26 +605,26 @@ auto peer_map_line(uint64_t peer, std::string_view hostname) -> std::string {
 
 auto collect_live_wki_peer_map() -> std::vector<WkiPeerMapEntry> {
     std::vector<WkiPeerMapEntry> entries;
-    ScopedDir dir(opendir(std::string(DEV_NODES_ROOT).c_str()));
-    if (!dir.valid()) {
+    ScopedDir const DIR(opendir(std::string(DEV_NODES_ROOT).c_str()));
+    if (!DIR.valid()) {
         return entries;
     }
 
-    dirent* entry = nullptr;
-    while ((entry = readdir(dir.get())) != nullptr) {
-        std::string_view hostname{&entry->d_name[0]};
-        if (hostname.empty() || is_dot_entry(hostname)) {
+    dirent const* entry = nullptr;
+    while ((entry = readdir(DIR.get())) != nullptr) {
+        std::string_view const HOSTNAME{&entry->d_name[0]};
+        if (HOSTNAME.empty() || is_dot_entry(HOSTNAME)) {
             continue;
         }
 
-        auto id_text = read_file(build_dev_nodes_path(hostname, "/id"), PROC_READ_CAPACITY);
+        auto id_text = read_file(build_dev_nodes_path(HOSTNAME, "/id"), PROC_READ_CAPACITY);
         if (!id_text.has_value() || id_text->empty()) {
             continue;
         }
 
         entries.push_back(WkiPeerMapEntry{
             .peer = parse_u64(*id_text, 0),
-            .hostname = std::string(hostname),
+            .hostname = std::string(HOSTNAME),
         });
     }
 
@@ -680,16 +682,16 @@ void write_section_peer_map(int fd) {
 }
 
 void save_perf_data() {
-    ScopedFd fd = open_write_trunc(PERF_DATA_FILE);
-    if (!fd.valid()) {
+    ScopedFd const FD = open_write_trunc(PERF_DATA_FILE);
+    if (!FD.valid()) {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
         return;
     }
 
-    write_section_proc_map(fd.get());
-    write_section_peer_map(fd.get());
-    ssize_t event_bytes = write_section_events(fd.get());
-    write_section_wki_summary(fd.get());
+    write_section_proc_map(FD.get());
+    write_section_peer_map(FD.get());
+    ssize_t event_bytes = write_section_events(FD.get());
+    write_section_wki_summary(FD.get());
 
     if (event_bytes <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
@@ -699,15 +701,15 @@ void save_perf_data() {
 }
 
 void set_recording_enabled(bool enabled, const char* filter = nullptr) {
-    ScopedFd fd = open_writeonly(KPERFCTL_PATH);
-    if (!fd.valid()) {
+    ScopedFd const FD = open_writeonly(KPERFCTL_PATH);
+    if (!FD.valid()) {
         return;
     }
     if (enabled && filter != nullptr) {
-        std::string cmd = std::string("enable ") + filter;
-        write_all(fd.get(), cmd);
+        std::string const CMD = std::string("enable ") + filter;
+        write_all(FD.get(), CMD);
     } else {
-        write_all(fd.get(), enabled ? "enable" : "disable");
+        write_all(FD.get(), enabled ? "enable" : "disable");
     }
 }
 
@@ -717,9 +719,9 @@ void cmd_stat(int ms) {
     }
 
     auto before = collect_stats();
-    int64_t start_ms = now_ms();
+    int64_t const START_MS = now_ms();
     wall_sleep_ms(ms);
-    int64_t elapsed_ms = now_ms() - start_ms;
+    int64_t elapsed_ms = now_ms() - START_MS;
     if (elapsed_ms < 1) {
         elapsed_ms = ms;
     }
@@ -734,14 +736,15 @@ void cmd_stat(int ms) {
                 continue;
             }
 
-            uint64_t delta_ticks = (current.utime + current.stime) - (prior.utime + prior.stime);
-            double cpu = static_cast<double>(delta_ticks) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
+            uint64_t const DELTA_TICKS = (current.utime + current.stime) - (prior.utime + prior.stime);
+            double const CPU =
+                static_cast<double>(DELTA_TICKS) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
 
             rows.push_back(CpuRow{
                 .pid = current.pid,
                 .comm = current.comm,
                 .state = current.state,
-                .cpu_pct = cpu,
+                .cpu_pct = CPU,
                 .in_group = false,
             });
             break;
@@ -766,18 +769,18 @@ void cmd_record(int ms, const char* filter = nullptr) {
         ms = DEFAULT_SAMPLE_MS;
     }
 
-    ScopedFd control_fd = open_writeonly(KPERFCTL_PATH);
-    if (!control_fd.valid()) {
+    ScopedFd const CONTROL_FD = open_writeonly(KPERFCTL_PATH);
+    if (!CONTROL_FD.valid()) {
         std::println("perf: cannot open /proc/kperfctl");
         return;
     }
 
     if (filter != nullptr) {
-        std::string cmd = std::string("enable ") + filter;
-        write_all(control_fd.get(), cmd.c_str());
+        std::string const CMD = std::string("enable ") + filter;
+        write_all(CONTROL_FD.get(), CMD);
         std::println("perf: recording with filter '{}' for {} ms...", filter, ms);
     } else {
-        write_all(control_fd.get(), "enable");
+        write_all(CONTROL_FD.get(), "enable");
         std::println("perf: recording for {} ms...", ms);
     }
 
@@ -806,17 +809,17 @@ void cmd_record(int ms, const char* filter = nullptr) {
     // Initial snapshot of all running processes.
     for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
 
-    int64_t deadline_ms = now_ms() + ms;
+    int64_t const DEADLINE_MS = now_ms() + ms;
     int64_t last_drain_ms = now_ms();
     ssize_t total_event_bytes = 0;
 
     while (true) {
-        int64_t remaining_ms = deadline_ms - now_ms();
-        if (remaining_ms <= 0) {
+        int64_t const REMAINING_MS = DEADLINE_MS - now_ms();
+        if (REMAINING_MS <= 0) {
             break;
         }
 
-        wall_sleep_ms(static_cast<int>(std::min<int64_t>(remaining_ms, SLEEP_SLICE_MS)));
+        wall_sleep_ms(static_cast<int>(std::min<int64_t>(REMAINING_MS, SLEEP_SLICE_MS)));
         if (!data_fd.valid() || (now_ms() - last_drain_ms) < DRAIN_INTERVAL_MS) {
             continue;
         }
@@ -833,7 +836,7 @@ void cmd_record(int ms, const char* filter = nullptr) {
         last_drain_ms = now_ms();
     }
 
-    write_all(control_fd.get(), "disable");
+    write_all(CONTROL_FD.get(), "disable");
     std::println("perf: recording stopped.");
 
     if (!data_fd.valid()) {
@@ -880,39 +883,39 @@ void cmd_record(int ms, const char* filter = nullptr) {
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry> {
     std::vector<ProcMapEntry> entries;
-    std::size_t header_pos = buffer.find(SECTION_PROC_MAP);
-    if (header_pos == std::string_view::npos) {
+    std::size_t const HEADER_POS = buffer.find(SECTION_PROC_MAP);
+    if (HEADER_POS == std::string_view::npos) {
         return entries;
     }
 
-    std::size_t pos = buffer.find('\n', header_pos);
+    std::size_t pos = buffer.find('\n', HEADER_POS);
     if (pos == std::string_view::npos) {
         return entries;
     }
     ++pos;
 
     while (pos < buffer.size()) {
-        std::string_view line = next_line(buffer, pos);
-        if (line.starts_with(END_PREFIX)) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (LINE.starts_with(END_PREFIX)) {
             break;
         }
-        if (line.empty()) {
+        if (LINE.empty()) {
             continue;
         }
 
-        std::size_t pid_pos = line.find("pid=");
-        std::size_t comm_pos = line.find(" comm=");
-        if (pid_pos == std::string_view::npos || comm_pos == std::string_view::npos) {
+        std::size_t const PID_POS = LINE.find("pid=");
+        std::size_t const COMM_POS = LINE.find(" comm=");
+        if (PID_POS == std::string_view::npos || COMM_POS == std::string_view::npos) {
             continue;
         }
 
-        std::size_t cmd_pos = line.find(CMD_FIELD_PREFIX, comm_pos + 1);
-        std::string_view pid_text = line.substr(pid_pos + PID_PREFIX_SIZE, comm_pos - (pid_pos + PID_PREFIX_SIZE));
-        std::string_view comm_text = cmd_pos == std::string_view::npos
-                                         ? line.substr(comm_pos + COMM_PREFIX_SIZE)
-                                         : line.substr(comm_pos + COMM_PREFIX_SIZE, cmd_pos - (comm_pos + COMM_PREFIX_SIZE));
+        std::size_t const CMD_POS = LINE.find(CMD_FIELD_PREFIX, COMM_POS + 1);
+        std::string_view const PID_TEXT = LINE.substr(PID_POS + PID_PREFIX_SIZE, COMM_POS - (PID_POS + PID_PREFIX_SIZE));
+        std::string_view const COMM_TEXT = CMD_POS == std::string_view::npos
+                                               ? LINE.substr(COMM_POS + COMM_PREFIX_SIZE)
+                                               : LINE.substr(COMM_POS + COMM_PREFIX_SIZE, CMD_POS - (COMM_POS + COMM_PREFIX_SIZE));
 
-        entries.push_back(ProcMapEntry{.pid = parse_u64(pid_text), .comm = std::string(comm_text)});
+        entries.push_back(ProcMapEntry{.pid = parse_u64(PID_TEXT), .comm = std::string(COMM_TEXT)});
     }
 
     return entries;
@@ -939,28 +942,28 @@ auto parse_peer_map_line(std::string_view line, WkiPeerMapEntry& out) -> bool {
 
 auto parse_peer_map_section(std::string_view buffer) -> std::vector<WkiPeerMapEntry> {
     std::vector<WkiPeerMapEntry> entries;
-    std::size_t header_pos = buffer.find(SECTION_PEER_MAP);
-    if (header_pos == std::string_view::npos) {
+    std::size_t const HEADER_POS = buffer.find(SECTION_PEER_MAP);
+    if (HEADER_POS == std::string_view::npos) {
         return entries;
     }
 
-    std::size_t pos = buffer.find('\n', header_pos);
+    std::size_t pos = buffer.find('\n', HEADER_POS);
     if (pos == std::string_view::npos) {
         return entries;
     }
     ++pos;
 
     while (pos < buffer.size()) {
-        std::string_view line = next_line(buffer, pos);
-        if (line.starts_with(END_PREFIX)) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (LINE.starts_with(END_PREFIX)) {
             break;
         }
-        if (line.empty()) {
+        if (LINE.empty()) {
             continue;
         }
 
         WkiPeerMapEntry entry{};
-        if (parse_peer_map_line(line, entry)) {
+        if (parse_peer_map_line(LINE, entry)) {
             entries.push_back(std::move(entry));
         }
     }
@@ -974,8 +977,8 @@ auto extract_value(std::string_view line, std::string_view key) -> std::string_v
         return {};
     }
     key_pos += key.size();
-    std::size_t end = line.find(' ', key_pos);
-    return line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos);
+    std::size_t const END = line.find(' ', key_pos);
+    return line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos);
 }
 
 auto parse_wki_summary_line(std::string_view line, WkiSummaryRow& out) -> bool {
@@ -1016,12 +1019,12 @@ auto parse_wki_summary_section(std::string_view buffer, bool sectioned) -> std::
     std::size_t pos = 0;
 
     if (sectioned) {
-        std::size_t header_pos = buffer.find(SECTION_WKI_SUMMARY);
-        if (header_pos == std::string_view::npos) {
+        std::size_t const HEADER_POS = buffer.find(SECTION_WKI_SUMMARY);
+        if (HEADER_POS == std::string_view::npos) {
             return rows;
         }
 
-        pos = buffer.find('\n', header_pos);
+        pos = buffer.find('\n', HEADER_POS);
         if (pos == std::string_view::npos) {
             return rows;
         }
@@ -1029,12 +1032,12 @@ auto parse_wki_summary_section(std::string_view buffer, bool sectioned) -> std::
     }
 
     while (pos < buffer.size()) {
-        std::string_view line = next_line(buffer, pos);
-        if (sectioned && line.starts_with(END_PREFIX)) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (sectioned && LINE.starts_with(END_PREFIX)) {
             break;
         }
         WkiSummaryRow row{};
-        if (parse_wki_summary_line(line, row)) {
+        if (parse_wki_summary_line(LINE, row)) {
             rows.push_back(std::move(row));
         }
     }
@@ -1069,12 +1072,12 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     std::array<std::string_view, MAX_EVENT_TOKENS> tokens{};
     int token_count = 0;
     std::size_t pos = 2;
-    while (token_count < static_cast<int>(tokens.size())) {
-        std::string_view token = next_token(line, pos);
-        if (token.empty()) {
+    while (std::cmp_less(token_count, tokens.size())) {
+        std::string_view const TOKEN = next_token(line, pos);
+        if (TOKEN.empty()) {
             break;
         }
-        tokens[static_cast<std::size_t>(token_count)] = token;
+        tokens[static_cast<std::size_t>(token_count)] = TOKEN;
         ++token_count;
     }
 
@@ -1170,15 +1173,15 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
 
 auto next_event(std::string_view text, std::size_t& pos, bool sectioned, EventInfo& out) -> bool {
     while (pos < text.size()) {
-        std::size_t line_start = pos;
-        std::string_view line = next_line(text, pos);
-        if (sectioned && text.substr(line_start).starts_with(END_PREFIX)) {
+        std::size_t const LINE_START = pos;
+        std::string_view const LINE = next_line(text, pos);
+        if (sectioned && text.substr(LINE_START).starts_with(END_PREFIX)) {
             return false;
         }
-        if (line.empty()) {
+        if (LINE.empty()) {
             continue;
         }
-        if (parse_event_line(line, out)) {
+        if (parse_event_line(LINE, out)) {
             return true;
         }
     }
@@ -1195,11 +1198,11 @@ auto comm_of_pid(const std::vector<ProcMapEntry>& proc_map, uint64_t pid) -> std
 }
 
 auto format_pid_name(uint64_t pid, const std::vector<ProcMapEntry>& proc_map) -> std::string {
-    std::string_view comm = comm_of_pid(proc_map, pid);
-    if (!comm.empty()) {
+    std::string_view const COMM = comm_of_pid(proc_map, pid);
+    if (!COMM.empty()) {
         std::string name = std::to_string(pid);
         name += '(';
-        name += comm;
+        name += COMM;
         name += ')';
         return name;
     }
@@ -1247,16 +1250,16 @@ auto wki_peer_label(uint64_t peer, WkiPeerResolver& resolver) -> const std::stri
 
 auto hotspot_for(std::vector<HotspotStats>& rows, uint64_t pid, std::string_view callsite, const std::vector<ProcMapEntry>& proc_map)
     -> HotspotStats& {
-    std::string_view display_site = display_callsite(callsite);
+    std::string_view const DISPLAY_SITE = display_callsite(callsite);
     for (auto& row : rows) {
-        if (row.pid == pid && row.callsite == display_site) {
+        if (row.pid == pid && row.callsite == DISPLAY_SITE) {
             return row;
         }
     }
 
     HotspotStats row{};
     row.pid = pid;
-    row.callsite = std::string(display_site);
+    row.callsite = std::string(DISPLAY_SITE);
     row.comm = std::string(comm_of_pid(proc_map, pid));
     rows.push_back(std::move(row));
     return rows.back();
@@ -1400,10 +1403,10 @@ void print_hotspot_tables(const std::vector<HotspotStats>& rows) {
         std::ranges::remove_if(wake_churn, [](const HotspotStats& row) { return row.wake_count == 0 && row.sleep_count == 0; });
     wake_churn.erase(removed_churn.begin(), removed_churn.end());
     std::ranges::sort(wake_churn, [](const HotspotStats& lhs, const HotspotStats& rhs) {
-        uint64_t lhs_score = (lhs.short_wake_count * 3U) + (lhs.explicit_wake_count * 2U) + lhs.short_sleep_count;
-        uint64_t rhs_score = (rhs.short_wake_count * 3U) + (rhs.explicit_wake_count * 2U) + rhs.short_sleep_count;
-        if (lhs_score != rhs_score) {
-            return lhs_score > rhs_score;
+        uint64_t const LHS_SCORE = (lhs.short_wake_count * 3U) + (lhs.explicit_wake_count * 2U) + lhs.short_sleep_count;
+        uint64_t const RHS_SCORE = (rhs.short_wake_count * 3U) + (rhs.explicit_wake_count * 2U) + rhs.short_sleep_count;
+        if (LHS_SCORE != RHS_SCORE) {
+            return LHS_SCORE > RHS_SCORE;
         }
         if (lhs.wake_count != rhs.wake_count) {
             return lhs.wake_count > rhs.wake_count;
@@ -1443,19 +1446,19 @@ void cmd_sched(int max_events, const WkiDisplayOptions& display_options) {
         return;
     }
 
-    std::string_view view(*buffer);
-    bool sectioned = view.starts_with(SECTION_HEADER);
+    std::string_view const VIEW(*buffer);
+    bool const SECTIONED = VIEW.starts_with(SECTION_HEADER);
     std::vector<ProcMapEntry> proc_map;
     std::size_t section_start = 0;
 
-    if (sectioned) {
-        proc_map = parse_proc_map_section(view);
-        std::size_t events_hdr = view.find(SECTION_EVENTS);
-        if (events_hdr == std::string_view::npos) {
+    if (SECTIONED) {
+        proc_map = parse_proc_map_section(VIEW);
+        std::size_t const EVENTS_HDR = VIEW.find(SECTION_EVENTS);
+        if (EVENTS_HDR == std::string_view::npos) {
             std::println("perf: perf.data has no EVENTS section");
             return;
         }
-        section_start = view.find('\n', events_hdr);
+        section_start = VIEW.find('\n', EVENTS_HDR);
         if (section_start == std::string_view::npos) {
             return;
         }
@@ -1466,9 +1469,9 @@ void cmd_sched(int max_events, const WkiDisplayOptions& display_options) {
         }
     }
 
-    std::string_view event_view = view.substr(section_start);
-    auto peer_resolver = make_wki_peer_resolver(view, sectioned, display_options);
-    auto hotspot_rows = summarize_hotspots(event_view, sectioned, proc_map);
+    std::string_view const EVENT_VIEW = VIEW.substr(section_start);
+    auto peer_resolver = make_wki_peer_resolver(VIEW, SECTIONED, display_options);
+    auto hotspot_rows = summarize_hotspots(EVENT_VIEW, SECTIONED, proc_map);
     print_hotspot_tables(hotspot_rows);
 
     std::println("=== perf report [{}] (up to {} events) ============================", src, max_events);
@@ -1478,7 +1481,7 @@ void cmd_sched(int max_events, const WkiDisplayOptions& display_options) {
     int count = 0;
     EventInfo event{};
     std::size_t event_pos = 0;
-    while (count < max_events && next_event(event_view, event_pos, sectioned, event)) {
+    while (count < max_events && next_event(EVENT_VIEW, event_pos, SECTIONED, event)) {
         if (event.type == 'S') {
             std::print("SMP  {:>18}  {:>3}  {:<24} rip={:#016x} lag={:>10}  ", event.ts_ns, event.cpu, format_pid_name(event.pid, proc_map),
                        event.data, event.lag);
@@ -1540,8 +1543,8 @@ void cmd_cpustat() {
                 return uint64_t{0};
             }
             key_pos += key.size();
-            std::size_t end = line.find(' ', key_pos);
-            return parse_u64(line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos));
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
         std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("ctx="), get_val("preempt="),
@@ -1574,8 +1577,8 @@ void cmd_contstat() {
                 return 0;
             }
             key_pos += key.size();
-            std::size_t end = line.find(' ', key_pos);
-            return parse_u64(line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos));
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
         auto get_str = [&](std::string_view key) -> std::string_view {
@@ -1584,8 +1587,8 @@ void cmd_contstat() {
                 return "?";
             }
             key_pos += key.size();
-            std::size_t end = line.find(' ', key_pos);
-            return line.substr(key_pos, end == std::string_view::npos ? line.size() - key_pos : end - key_pos);
+            std::size_t const END = line.find(' ', key_pos);
+            return line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos);
         };
 
         std::println("{:<14}  {:>10}  {:>10}  {:>10}  {:>6}  {:>10}  {:>10}", get_str("subsys="), get_val("inserts="), get_val("removes="),
@@ -1612,24 +1615,24 @@ auto event_section_view(std::string_view view, bool sectioned) -> std::string_vi
         return view;
     }
 
-    std::size_t events_hdr = view.find(SECTION_EVENTS);
-    if (events_hdr == std::string_view::npos) {
+    std::size_t const EVENTS_HDR = view.find(SECTION_EVENTS);
+    if (EVENTS_HDR == std::string_view::npos) {
         return {};
     }
 
-    std::size_t section_start = view.find('\n', events_hdr);
-    if (section_start == std::string_view::npos) {
+    std::size_t const SECTION_START = view.find('\n', EVENTS_HDR);
+    if (SECTION_START == std::string_view::npos) {
         return {};
     }
-    return view.substr(section_start + 1);
+    return view.substr(SECTION_START + 1);
 }
 
 auto collect_wki_events(std::string_view view, bool sectioned) -> std::vector<EventInfo> {
     std::vector<EventInfo> events;
-    std::string_view event_view = event_section_view(view, sectioned);
+    std::string_view const EVENT_VIEW = event_section_view(view, sectioned);
     std::size_t pos = 0;
     EventInfo event{};
-    while (next_event(event_view, pos, sectioned, event)) {
+    while (next_event(EVENT_VIEW, pos, sectioned, event)) {
         if (event.type == 'K') {
             events.push_back(event);
         }
@@ -1902,7 +1905,7 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
                  "HANDLE(us)", "LOAD(us)", "SETUP(us)", "QUEUE(us)", "RUN(us)", "READY(us)", "HOLD(us)", "WAIT(us)", "RESULT");
     std::println("{:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "",
                  "", "", "", "", "", "", "", "", "");
-    for (int i = 0; i < static_cast<int>(launch_rows.size()) && i < limit; ++i) {
+    for (int i = 0; std::cmp_less(i, launch_rows.size()) && i < limit; ++i) {
         const auto& row = launch_rows[static_cast<std::size_t>(i)];
         std::optional<uint32_t> setup_us;
         if (row.handle_submit_us.has_value() && row.load_elf_us.has_value() && *row.handle_submit_us >= *row.load_elf_us) {
@@ -1981,7 +1984,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
             std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS",
                          "P999(us)", "P9999(us)", "P99999(us)", "MAX(us)");
             std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "");
-            for (int i = 0; i < static_cast<int>(rows.size()) && i < limit; ++i) {
+            for (int i = 0; std::cmp_less(i, rows.size()) && i < limit; ++i) {
                 const auto& row = rows[static_cast<std::size_t>(i)];
                 std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
                              wki_peer_label(row.peer, summary_peer_resolver), row.channel, row.calls, row.p999_us, row.p9999_us,
@@ -2030,7 +2033,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
     std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS",
                  "CORR");
     std::println("{:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}", "", "", "", "", "", "", "", "");
-    for (int i = 0; i < static_cast<int>(slow_events.size()) && i < limit; ++i) {
+    for (int i = 0; std::cmp_less(i, slow_events.size()) && i < limit; ++i) {
         const auto& event = slow_events[static_cast<std::size_t>(i)];
         std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}", event.scope_name, event.op_name, event.phase_name,
                      wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation);
@@ -2078,7 +2081,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
     std::println("=== largest WKI inter-call gaps ====================================");
     std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", "SCOPE", "OP", "PEER", "CH", "GAP(us)");
     std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}", "", "", "", "", "");
-    for (int i = 0; i < static_cast<int>(gaps.size()) && i < limit; ++i) {
+    for (int i = 0; std::cmp_less(i, gaps.size()) && i < limit; ++i) {
         const auto& gap = gaps[static_cast<std::size_t>(i)];
         std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", gap.scope, gap.op, wki_peer_label(gap.peer, event_peer_resolver), gap.channel,
                      gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
@@ -2140,7 +2143,9 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
 // If cmd already contains '/', returns it as-is (if accessible).
 // Returns empty string if not found.
 auto resolve_command(const char* cmd) -> std::string {
-    if (cmd == nullptr || cmd[0] == '\0') return {};
+    if (cmd == nullptr || cmd[0] == '\0') {
+        return {};
+    }
 
     // If cmd contains '/', treat as a path (absolute or relative)
     if (std::strchr(cmd, '/') != nullptr) {
@@ -2156,11 +2161,11 @@ auto resolve_command(const char* cmd) -> std::string {
         path_env = "/bin";
     }
 
-    std::string_view path_sv(path_env);
+    std::string_view const PATH_SV(path_env);
     std::size_t start = 0;
-    while (start <= path_sv.size()) {
-        auto colon = path_sv.find(':', start);
-        auto dir = path_sv.substr(start, colon == std::string_view::npos ? std::string_view::npos : colon - start);
+    while (start <= PATH_SV.size()) {
+        auto colon = PATH_SV.find(':', start);
+        auto dir = PATH_SV.substr(start, colon == std::string_view::npos ? std::string_view::npos : colon - start);
         if (dir.empty()) {
             dir = ".";
         }
@@ -2175,7 +2180,9 @@ auto resolve_command(const char* cmd) -> std::string {
             return candidate;
         }
 
-        if (colon == std::string_view::npos) break;
+        if (colon == std::string_view::npos) {
+            break;
+        }
         start = colon + 1;
     }
     return {};
@@ -2184,17 +2191,17 @@ auto resolve_command(const char* cmd) -> std::string {
 // Read the shebang line from a script file. Returns the interpreter path,
 // or empty string if the file is not a script.
 auto read_shebang(const char* path) -> std::string {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
+    int const FD = open(path, O_RDONLY);
+    if (FD < 0) {
         return {};
     }
     char hdr[256];
-    ssize_t n = read(fd, hdr, sizeof(hdr) - 1);
-    close(fd);
-    if (n < 3 || hdr[0] != '#' || hdr[1] != '!') {
+    ssize_t const N = read(FD, hdr, sizeof(hdr) - 1);
+    close(FD);
+    if (N < 3 || hdr[0] != '#' || hdr[1] != '!') {
         return {};
     }
-    hdr[n] = '\0';
+    hdr[N] = '\0';
     // Find end of first line
     char* nl = std::strchr(hdr + 2, '\n');
     if (nl != nullptr) {
@@ -2226,8 +2233,8 @@ void cmd_run(int argc, char** argv) {
     const char* filter = "switch,wake,sleep";  // default: no container spam
     std::vector<char*> cmd_argv;
     for (int i = 0; i < argc; i++) {
-        std::string_view arg(argv[i]);
-        if (arg.starts_with("--filter=")) {
+        std::string_view const ARG(argv[i]);
+        if (ARG.starts_with("--filter=")) {
             filter = argv[i] + 9;
         } else {
             cmd_argv.push_back(argv[i]);
@@ -2276,11 +2283,11 @@ void cmd_run(int argc, char** argv) {
         new_argv.push_back(nullptr);
     }
 
-    char** exec_argv = new_argv.data();
+    char* const* exec_argv = new_argv.data();
     const char* exec_path = exec_argv[0];
 
     auto before = collect_stats();
-    int64_t start_ms = now_ms();
+    int64_t const START_MS = now_ms();
     set_recording_enabled(true, filter);
 
     int64_t child_pid = ker::process::fork();
@@ -2338,7 +2345,7 @@ void cmd_run(int argc, char** argv) {
 
         bool any_alive = false;
         for_each_process_stat([&](const StatInfo& stat, std::string_view) {
-            if (static_cast<int64_t>(stat.pgid) == target_pgid) {
+            if (std::cmp_equal(stat.pgid, target_pgid)) {
                 any_alive = true;
                 upsert_tracked(stat);
             }
@@ -2362,7 +2369,7 @@ void cmd_run(int argc, char** argv) {
     while (ker::process::waitpid(-1, &status, 1, nullptr) > 0) {
     }
 
-    int64_t elapsed_ms = now_ms() - start_ms;
+    int64_t elapsed_ms = now_ms() - START_MS;
     elapsed_ms = std::max<int64_t>(elapsed_ms, 1);
 
     set_recording_enabled(false);
@@ -2370,7 +2377,7 @@ void cmd_run(int argc, char** argv) {
     std::vector<CpuRow> rows;
 
     for (const auto& proc : tracked) {
-        uint64_t ticks_after = proc.last_utime + proc.last_stime;
+        uint64_t const TICKS_AFTER = proc.last_utime + proc.last_stime;
         uint64_t ticks_before = 0;
         for (const auto& prior : before) {
             if (prior.pid == proc.pid) {
@@ -2379,9 +2386,9 @@ void cmd_run(int argc, char** argv) {
             }
         }
 
-        uint64_t delta = ticks_after >= ticks_before ? ticks_after - ticks_before : ticks_after;
-        double cpu = static_cast<double>(delta) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
-        if (cpu < MIN_CPU_PCT) {
+        uint64_t const DELTA = TICKS_AFTER >= ticks_before ? TICKS_AFTER - ticks_before : TICKS_AFTER;
+        double const CPU = static_cast<double>(DELTA) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
+        if (CPU < MIN_CPU_PCT) {
             continue;
         }
 
@@ -2397,7 +2404,7 @@ void cmd_run(int argc, char** argv) {
             .pid = proc.pid,
             .comm = proc.comm,
             .state = state,
-            .cpu_pct = cpu,
+            .cpu_pct = CPU,
             .in_group = true,
         });
     }
@@ -2419,14 +2426,14 @@ void cmd_run(int argc, char** argv) {
                 continue;
             }
 
-            uint64_t delta = (current.utime + current.stime) - (prior.utime + prior.stime);
-            double cpu = static_cast<double>(delta) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
-            if (cpu >= MIN_CPU_PCT) {
+            uint64_t const DELTA = (current.utime + current.stime) - (prior.utime + prior.stime);
+            double const CPU = static_cast<double>(DELTA) * static_cast<double>(MILLISECONDS_PER_SECOND) / static_cast<double>(elapsed_ms);
+            if (CPU >= MIN_CPU_PCT) {
                 rows.push_back(CpuRow{
                     .pid = current.pid,
                     .comm = current.comm,
                     .state = current.state,
-                    .cpu_pct = cpu,
+                    .cpu_pct = CPU,
                     .in_group = false,
                 });
             }
@@ -2498,14 +2505,14 @@ void cmd_show_map() {
         return;
     }
 
-    std::string_view view(*buffer);
-    std::size_t header_pos = view.find(SECTION_PROC_MAP);
-    if (header_pos == std::string_view::npos) {
+    std::string_view const VIEW(*buffer);
+    std::size_t const HEADER_POS = VIEW.find(SECTION_PROC_MAP);
+    if (HEADER_POS == std::string_view::npos) {
         std::println("perf: perf.data has no PROC_MAP section");
         return;
     }
 
-    std::size_t pos = view.find('\n', header_pos);
+    std::size_t pos = VIEW.find('\n', HEADER_POS);
     if (pos == std::string_view::npos) {
         return;
     }
@@ -2515,29 +2522,29 @@ void cmd_show_map() {
     std::println("{:>6}  {:<20}  {}", "PID", "COMM", "CMDLINE");
     std::println("{:->6}  {:->20}  {:->40}", "", "", "");
 
-    while (pos < view.size()) {
-        std::string_view line = next_line(view, pos);
-        if (line.starts_with(END_PREFIX)) {
+    while (pos < VIEW.size()) {
+        std::string_view const LINE = next_line(VIEW, pos);
+        if (LINE.starts_with(END_PREFIX)) {
             break;
         }
-        if (line.empty()) {
+        if (LINE.empty()) {
             continue;
         }
 
-        std::size_t pid_pos = line.find("pid=");
-        std::size_t comm_pos = line.find(COMM_FIELD_PREFIX);
-        std::size_t cmd_pos = line.find(CMD_FIELD_PREFIX);
-        if (pid_pos == std::string_view::npos || comm_pos == std::string_view::npos) {
+        std::size_t const PID_POS = LINE.find("pid=");
+        std::size_t const COMM_POS = LINE.find(COMM_FIELD_PREFIX);
+        std::size_t const CMD_POS = LINE.find(CMD_FIELD_PREFIX);
+        if (PID_POS == std::string_view::npos || COMM_POS == std::string_view::npos) {
             continue;
         }
 
-        std::string_view pid_text = line.substr(pid_pos + PID_PREFIX_SIZE, comm_pos - (pid_pos + PID_PREFIX_SIZE));
-        std::string_view comm_text = cmd_pos == std::string_view::npos
-                                         ? line.substr(comm_pos + COMM_PREFIX_SIZE)
-                                         : line.substr(comm_pos + COMM_PREFIX_SIZE, cmd_pos - (comm_pos + COMM_PREFIX_SIZE));
-        std::string_view cmd_text = cmd_pos == std::string_view::npos ? std::string_view{} : line.substr(cmd_pos + CMD_PREFIX_SIZE);
+        std::string_view const PID_TEXT = LINE.substr(PID_POS + PID_PREFIX_SIZE, COMM_POS - (PID_POS + PID_PREFIX_SIZE));
+        std::string_view comm_text = CMD_POS == std::string_view::npos
+                                         ? LINE.substr(COMM_POS + COMM_PREFIX_SIZE)
+                                         : LINE.substr(COMM_POS + COMM_PREFIX_SIZE, CMD_POS - (COMM_POS + COMM_PREFIX_SIZE));
+        std::string_view cmd_text = CMD_POS == std::string_view::npos ? std::string_view{} : LINE.substr(CMD_POS + CMD_PREFIX_SIZE);
 
-        std::println("{:>6}  {:<20}  {}", parse_u64(pid_text), comm_text, cmd_text);
+        std::println("{:>6}  {:<20}  {}", parse_u64(PID_TEXT), comm_text, cmd_text);
     }
 }
 
@@ -2577,40 +2584,40 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string_view cmd(argv[1]);
+    std::string_view const CMD(argv[1]);
 
-    if (cmd == "stat") {
-        int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-        cmd_stat(ms);
-    } else if (cmd == "record") {
+    if (CMD == "stat") {
+        int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
+        cmd_stat(MS);
+    } else if (CMD == "record") {
         int ms = DEFAULT_SAMPLE_MS;
         const char* filter = nullptr;
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg(argv[i]);
-            if (arg.starts_with("--filter=")) {
+            std::string_view const ARG(argv[i]);
+            if (ARG.starts_with("--filter=")) {
                 filter = argv[i] + 9;
             } else {
                 ms = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
             }
         }
         cmd_record(ms, filter);
-    } else if (cmd == "report" || cmd == "sched") {
+    } else if (CMD == "report" || CMD == "sched") {
         int max_events = DEFAULT_MAX_EVENTS;
         WkiDisplayOptions display_options{};
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg(argv[i]);
-            if (arg == "--peer-ids") {
+            std::string_view const ARG(argv[i]);
+            if (ARG == "--peer-ids") {
                 display_options.show_peer_ids = true;
             } else {
                 max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
             }
         }
         cmd_sched(max_events, display_options);
-    } else if (cmd == "cpustat") {
+    } else if (CMD == "cpustat") {
         cmd_cpustat();
-    } else if (cmd == "contstat") {
+    } else if (CMD == "contstat") {
         cmd_contstat();
-    } else if (cmd == "wki-report") {
+    } else if (CMD == "wki-report") {
         WkiDisplayOptions display_options{};
         for (int i = 2; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--peer-ids") {
@@ -2618,65 +2625,65 @@ int main(int argc, char* argv[]) {
             }
         }
         cmd_wki_report(display_options);
-    } else if (cmd == "wki-launch") {
+    } else if (CMD == "wki-launch") {
         int rows = DEFAULT_WKI_LAUNCH_ROWS;
         WkiDisplayOptions display_options{};
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg(argv[i]);
-            if (arg == "--peer-ids") {
+            std::string_view const ARG(argv[i]);
+            if (ARG == "--peer-ids") {
                 display_options.show_peer_ids = true;
             } else {
                 rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
             }
         }
         cmd_wki_launch(rows, display_options);
-    } else if (cmd == "wki-tail") {
+    } else if (CMD == "wki-tail") {
         int rows = DEFAULT_WKI_TAIL_ROWS;
         WkiDisplayOptions display_options{};
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg(argv[i]);
-            if (arg == "--peer-ids") {
+            std::string_view const ARG(argv[i]);
+            if (ARG == "--peer-ids") {
                 display_options.show_peer_ids = true;
             } else {
                 rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
             }
         }
         cmd_wki_tail(rows, display_options);
-    } else if (cmd == "wki-trace") {
+    } else if (CMD == "wki-trace") {
         int max_events = DEFAULT_WKI_TRACE_EVENTS;
         WkiTraceFilter filter{};
         WkiDisplayOptions display_options{};
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg(argv[i]);
-            if (arg.starts_with("--scope=")) {
-                filter.scope = std::string(arg.substr(8));
-            } else if (arg.starts_with("--op=")) {
-                filter.op = std::string(arg.substr(5));
-            } else if (arg.starts_with("--peer=")) {
-                filter.peer = parse_u64(arg.substr(7), 0);
-            } else if (arg.starts_with("--channel=")) {
-                filter.channel = parse_u64(arg.substr(10), 0);
-            } else if (arg.starts_with("--pid=")) {
-                filter.pid = parse_u64(arg.substr(6), 0);
-            } else if (arg.starts_with("--min-us=")) {
-                filter.min_us = parse_u64(arg.substr(9), 0);
-            } else if (arg == "--peer-ids") {
+            std::string_view const ARG(argv[i]);
+            if (ARG.starts_with("--scope=")) {
+                filter.scope = std::string(ARG.substr(8));
+            } else if (ARG.starts_with("--op=")) {
+                filter.op = std::string(ARG.substr(5));
+            } else if (ARG.starts_with("--peer=")) {
+                filter.peer = parse_u64(ARG.substr(7), 0);
+            } else if (ARG.starts_with("--channel=")) {
+                filter.channel = parse_u64(ARG.substr(10), 0);
+            } else if (ARG.starts_with("--pid=")) {
+                filter.pid = parse_u64(ARG.substr(6), 0);
+            } else if (ARG.starts_with("--min-us=")) {
+                filter.min_us = parse_u64(ARG.substr(9), 0);
+            } else if (ARG == "--peer-ids") {
                 display_options.show_peer_ids = true;
             } else {
                 max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
             }
         }
         cmd_wki_trace(max_events, filter, display_options);
-    } else if (cmd == "top") {
-        int ms = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-        cmd_top(ms);
-    } else if (cmd == "run") {
+    } else if (CMD == "top") {
+        int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
+        cmd_top(MS);
+    } else if (CMD == "run") {
         if (argc < 3) {
             std::println("perf run: usage: perf run <program> [args...]");
             return 1;
         }
         cmd_run(argc - 2, argv + 2);
-    } else if (cmd == "show-map") {
+    } else if (CMD == "show-map") {
         cmd_show_map();
     } else {
         usage();

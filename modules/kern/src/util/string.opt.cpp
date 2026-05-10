@@ -8,7 +8,7 @@
 #include <span>
 
 namespace _std {
-__attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
+static __attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
     size_t len = 0;
     while (str[len] != '\0') {
         len++;
@@ -16,7 +16,7 @@ __attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> siz
     return len;
 }
 
-__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) {
+static __attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) {
     size_t i = 0;
     for (; src[i] != '\0'; i++) {
         dest[i] = src[i];
@@ -26,7 +26,7 @@ __attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) 
     return dest;
 }
 
-__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
+static __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
     size_t i = 0;
     for (; src[i] != '\0' && i < n; i++) {
         dest[i] = src[i];
@@ -36,8 +36,10 @@ __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src
     return dest;
 }
 
-__attribute__((no_builtin("strlen"))) void reverse(char s[]) {
-    int c, i, j;
+static __attribute__((no_builtin("strlen"))) void reverse(char s[]) {
+    int c = 0;
+    int i = 0;
+    int j = 0;
 
     for (i = 0, j = strlen(s) - 1; i < j; i++, j--) {
         c = s[i];
@@ -61,8 +63,8 @@ auto itoa(int n, std::span<char> s, int base) -> int {
     }
 
     while (n != 0) {
-        int rem = n % base;
-        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
+        int const REM = n % base;
+        s[i++] = (REM > 9) ? static_cast<char>((REM - 10) + 'a') : static_cast<char>(REM + '0');
         n = n / base;
     }
 
@@ -76,7 +78,7 @@ auto itoa(int n, std::span<char> s, int base) -> int {
     return i;
 }
 
-auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int {
+static auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int {
     int i = 0;
 
     if (n == 0) {
@@ -86,8 +88,8 @@ auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int {
     }
 
     while (n != 0) {
-        int rem = static_cast<int>(n % base);
-        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
+        int const REM = static_cast<int>(n % base);
+        s[i++] = (REM > 9) ? static_cast<char>((REM - 10) + 'a') : static_cast<char>(REM + '0');
         n = n / base;
     }
 
@@ -108,8 +110,8 @@ auto u64toh(uint64_t n, std::span<char> s) -> int {
     }
 
     while (n != 0) {
-        int rem = static_cast<int>(n % 16);
-        s[i++] = (rem > 9) ? static_cast<char>((rem - 10) + 'a') : static_cast<char>(rem + '0');
+        int const REM = static_cast<int>(n % 16);
+        s[i++] = (REM > 9) ? static_cast<char>((REM - 10) + 'a') : static_cast<char>(REM + '0');
         n = n / 16;
     }
 
@@ -120,7 +122,7 @@ auto u64toh(uint64_t n, std::span<char> s) -> int {
     return i;
 }
 
-int u64toh(uint64_t n, char s[]) {
+static int u64toh(uint64_t n, char s[]) {
     int i = 0;
 
     if (n == 0) {
@@ -130,8 +132,8 @@ int u64toh(uint64_t n, char s[]) {
     }
 
     while (n != 0) {
-        int rem = n % 16;
-        s[i++] = (rem > 9) ? (rem - 10) + 'a' : rem + '0';
+        int const REM = n % 16;
+        s[i++] = (REM > 9) ? (REM - 10) + 'a' : REM + '0';
         n = n / 16;
     }
 
@@ -142,48 +144,46 @@ int u64toh(uint64_t n, char s[]) {
     return i;
 }
 
-namespace std = _std;
-
-auto snprintf(char* str, size_t size, const char* format, ...) -> int {
+static auto snprintf(char* str, size_t size, const char* format, ...) -> int {
     va_list args;
     va_start(args, format);
-    int ret = _std::vsnprintf(str, size, format, args);
+    int const RET = _std::vsnprintf(str, size, format, args);
     va_end(args);
-    return ret;
+    return RET;
 }
 
-auto strcat(char* dest, const char* src) -> char* {
-    size_t dest_len = _std::strlen(dest);
-    size_t i;
+static auto strcat(char* dest, const char* src) -> char* {
+    size_t const DEST_LEN = _std::strlen(dest);
+    size_t i = 0;
 
     for (i = 0; src[i] != '\0'; i++) {
-        dest[dest_len + i] = src[i];
+        dest[DEST_LEN + i] = src[i];
     }
 
-    dest[dest_len + i] = '\0';
+    dest[DEST_LEN + i] = '\0';
 
     return dest;
 }
 
-auto strlcat(char* dest, const char* src, size_t size) -> size_t {
-    size_t dest_len = _std::strlen(dest);
-    size_t src_len = _std::strlen(src);
-    size_t i;
+static auto strlcat(char* dest, const char* src, size_t size) -> size_t {
+    size_t const DEST_LEN = _std::strlen(dest);
+    size_t const SRC_LEN = _std::strlen(src);
+    size_t i = 0;
 
-    if (size <= dest_len) {
-        return size + src_len;
+    if (size <= DEST_LEN) {
+        return size + SRC_LEN;
     }
 
-    for (i = 0; i < size - dest_len - 1 && src[i] != '\0'; i++) {
-        dest[dest_len + i] = src[i];
+    for (i = 0; i < size - DEST_LEN - 1 && src[i] != '\0'; i++) {
+        dest[DEST_LEN + i] = src[i];
     }
 
-    dest[dest_len + i] = '\0';
+    dest[DEST_LEN + i] = '\0';
 
-    return dest_len + src_len;
+    return DEST_LEN + SRC_LEN;
 }
 
-int strcmp(const char* str1, const char* str2) {
+static int strcmp(const char* str1, const char* str2) {
     while (*str1 != '\0' && *str1 == *str2) {
         str1++;
         str2++;
@@ -191,7 +191,7 @@ int strcmp(const char* str1, const char* str2) {
     return static_cast<unsigned char>(*str1) - static_cast<unsigned char>(*str2);
 }
 
-int strncmp(const char* str1, const char* str2, size_t n) {
+static int strncmp(const char* str1, const char* str2, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (str1[i] != str2[i]) {
             return str1[i] - str2[i];
@@ -200,10 +200,10 @@ int strncmp(const char* str1, const char* str2, size_t n) {
     return 0;
 }
 
-char* strdup(const char* str) {
-    size_t len = _std::strlen(str);
-    char* new_str = new char[len + 1];
-    strncpy(new_str, str, len);
+static char* strdup(const char* str) {
+    size_t const LEN = _std::strlen(str);
+    char* new_str = new char[LEN + 1];
+    strncpy(new_str, str, LEN);
     return new_str;
 }
 }  // namespace _std
@@ -227,9 +227,9 @@ int u64toh(uint64_t n, std::span<char> s) { return _std::u64toh(n, s); }
 int snprintf(char* str, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    int ret = _std::vsnprintf(str, size, format, args);
+    int const RET = _std::vsnprintf(str, size, format, args);
     va_end(args);
-    return ret;
+    return RET;
 }
 
 int vsnprintf(char* str, size_t size, const char* format, va_list args) { return _std::vsnprintf(str, size, format, args); }
@@ -246,7 +246,9 @@ char* strdup(const char* str) { return _std::strdup(str); }
 
 size_t strnlen(const char* s, size_t n) {
     size_t len = 0;
-    while (len < n && s[len]) ++len;
+    while (len < n && (s[len] != 0)) {
+        ++len;
+    }
     return len;
 }
 }

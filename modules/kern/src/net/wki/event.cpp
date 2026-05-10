@@ -2,14 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -42,9 +44,9 @@ void perf_record_event_point(ker::mod::perf::WkiPerfEventOp op, uint16_t peer, i
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
                                      static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::POINT, peer, WKI_CHAN_EVENT_BUS, correlation,
                                      status, aux, callsite);
-    uint32_t latency_us = (op == ker::mod::perf::WkiPerfEventOp::REPLAY) ? aux : 0U;
+    uint32_t const LATENCY_US = (op == ker::mod::perf::WkiPerfEventOp::REPLAY) ? aux : 0U;
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS, static_cast<uint8_t>(op), peer, WKI_CHAN_EVENT_BUS, status,
-                                       latency_us, op == ker::mod::perf::WkiPerfEventOp::REPLAY,
+                                       LATENCY_US, op == ker::mod::perf::WkiPerfEventOp::REPLAY,
                                        op == ker::mod::perf::WkiPerfEventOp::RETRY ? 1U : 0U, 0);
 }
 
@@ -79,7 +81,7 @@ struct PendingReliableEvent {
 
 std::deque<PendingReliableEvent> g_pending_reliable;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-static ker::mod::sys::Spinlock s_event_lock;
+ker::mod::sys::Spinlock s_event_lock;
 
 // -----------------------------------------------------------------------------
 // D2: Event log ring buffer - replay matching events to new subscribers
@@ -122,7 +124,7 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
         return;
     }
 
-    uint64_t replay_start_us = wki_now_us();
+    uint64_t const REPLAY_START_US = wki_now_us();
 
     // Determine the start index in the ring buffer
     uint32_t start = 0;
@@ -131,8 +133,8 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
     }
 
     for (uint32_t i = 0; i < g_event_log_count; i++) {
-        uint32_t idx = (start + i) % EVENT_LOG_MAX;
-        const auto& entry = g_event_log[idx];
+        uint32_t const IDX = (start + i) % EVENT_LOG_MAX;
+        const auto& entry = g_event_log[IDX];
 
         if (!event_matches(sub_class, sub_id, entry.event_class, entry.event_id)) {
             continue;
@@ -156,7 +158,7 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
     }
 
     perf_record_event_point(ker::mod::perf::WkiPerfEventOp::REPLAY, subscriber_node, 0,
-                            static_cast<uint32_t>(wki_now_us() - replay_start_us), 0, WOS_PERF_CALLSITE());
+                            static_cast<uint32_t>(wki_now_us() - REPLAY_START_US), 0, WOS_PERF_CALLSITE());
 }
 
 }  // namespace
@@ -500,13 +502,13 @@ void handle_event_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
     // D1: Remove the matching pending reliable event for this subscriber
     s_event_lock.lock();
     std::erase_if(g_pending_reliable, [&](const PendingReliableEvent& p) {
-        bool match = p.subscriber_node == hdr->src_node && p.event_class == ack->event_class && p.event_id == ack->event_id &&
-                     p.origin_node == ack->origin_node;
-        if (match) {
+        bool const MATCH = p.subscriber_node == hdr->src_node && p.event_class == ack->event_class && p.event_id == ack->event_id &&
+                           p.origin_node == ack->origin_node;
+        if (MATCH) {
             correlation = p.correlation;
             latency_us = static_cast<uint32_t>(wki_now_us() - p.send_time_us);
         }
-        return match;
+        return MATCH;
     });
     s_event_lock.unlock();
 

@@ -1,10 +1,13 @@
 #include "irq_fwd.hpp"
 
+#include <cstdint>
 #include <deque>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -15,7 +18,7 @@ namespace ker::net::wki {
 namespace {
 std::deque<IrqFwdBinding> g_irq_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_irq_fwd_initialized = false;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-static ker::mod::sys::Spinlock s_irq_fwd_lock;
+ker::mod::sys::Spinlock s_irq_fwd_lock;
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -66,7 +69,7 @@ auto wki_irq_fwd_register(uint16_t remote_node, uint16_t device_id, uint16_t rem
     binding.handler_data = data;
 
     // D4: Check if the peer is reachable via an RDMA-capable transport with doorbell support
-    WkiPeer* peer = wki_peer_find(remote_node);
+    WkiPeer const* peer = wki_peer_find(remote_node);
     if (peer != nullptr && peer->transport != nullptr && peer->transport->rdma_capable && peer->transport->doorbell != nullptr) {
         binding.use_doorbell = true;
         binding.doorbell_transport = peer->transport;

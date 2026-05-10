@@ -1,13 +1,16 @@
 #include "fb_font.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 namespace ker::mod::gfx::fb {
-FbFont::FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]) {
+FbFont::FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]) : height(height), width(width) {
     std::strncpy(this->name, name, 256);
-    this->height = height;
-    this->width = width;
+
     if (data == nullptr) {
-        for (size_t i = 0; i < 256; i++) {
-            for (size_t j = 0; j < 64; j++) {
-                this->data[i][j] = 0;
+        for (auto& i : this->data) {
+            for (unsigned long& j : i) {
+                j = 0;
             }
         }
         return;
@@ -19,10 +22,9 @@ FbFont::FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t d
     }
 }
 
-FbFont::FbFont() {
+FbFont::FbFont() : height(16), width(16) {
     std::strcpy(name, "default");
-    height = 16;
-    width = 16;
+
     load_font();
 }
 
@@ -40,10 +42,9 @@ FbFont& FbFont::operator=(const FbFont& other) {
     return *this;
 }
 
-FbFont::FbFont(const FbFont& other) {
+FbFont::FbFont(const FbFont& other) : height(other.height), width(other.width) {
     // std::strcpy(this->name, other.name);
-    this->height = other.height;
-    this->width = other.width;
+
     for (size_t i = 0; i < 256; ++i) {
         for (size_t j = 0; j < 64; ++j) {
             this->data[i][j] = other.data[i][j];
@@ -55,7 +56,7 @@ uint8_t FbFont::get_width() const { return width; }
 
 uint8_t FbFont::get_height() const { return height; }
 
-const uint64_t* FbFont::get_data(char c) const { return data[(uint64_t)c]; }
+const uint64_t* FbFont::get_data(char c) const { return data[static_cast<uint64_t>(c)]; }
 
 void FbFont::load_font() {
     this->data[' '][0] = 0b0000000000000000;

@@ -142,7 +142,7 @@ isr32:
     cld
 
     ; Same-CPL kernel interrupts only push RIP, CS, and RFLAGS. The scheduler
-    ; consumes a uniform interruptFrame with RSP and SS as well, so build that
+    ; consumes a uniform InterruptFrame with RSP and SS as well, so build that
     ; full frame explicitly below the hardware frame instead of letting C++
     ; write synthetic RSP/SS into stack slots that do not exist.
     cmp qword [rsp + 8], qword 0x08

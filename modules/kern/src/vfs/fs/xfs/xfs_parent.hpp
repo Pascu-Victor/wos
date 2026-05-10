@@ -5,7 +5,7 @@
 // Parent pointers are stored as extended attributes on each non-directory inode
 // (and on sub-directories).  The xattr namespace flag is XFS_ATTR_PARENT.
 //
-//   xattr name:  XfsParentRec { __be64 p_ino; __be32 p_gen }  (12 bytes)
+//   xattr name:  XfsParentRec { Be64 p_ino; Be32 p_gen }  (12 bytes)
 //   xattr value: directory entry name (variable length, NOT NUL-terminated)
 //
 // This allows reverse-mapping: given an inode, discover which directory(/ies)

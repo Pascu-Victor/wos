@@ -1,9 +1,9 @@
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <net/wki/routing.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
@@ -54,7 +54,7 @@ auto lsdb_alloc(uint16_t origin_node) -> LsdbEntry* {
 
 void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node) {
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
-        WkiPeer* peer = &g_wki.peers[i];
+        WkiPeer const* peer = &g_wki.peers[i];
 
         if (peer->node_id == WKI_NODE_INVALID) {
             continue;
@@ -105,9 +105,9 @@ void wki_lsa_generate_and_flood() {
     }
 
     // Rate limit LSA generation to prevent flooding during rapid state changes
-    uint64_t now_us = wki_now_us();
-    uint64_t min_interval_us = static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000;
-    if (s_last_own_lsa_time != 0 && now_us - s_last_own_lsa_time < min_interval_us) {
+    uint64_t const NOW_US = wki_now_us();
+    uint64_t const MIN_INTERVAL_US = static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000;
+    if (s_last_own_lsa_time != 0 && NOW_US - s_last_own_lsa_time < MIN_INTERVAL_US) {
         // Mark that an LSA should be generated when the rate limit expires
         s_lsa_pending = true;
         return;
@@ -117,7 +117,7 @@ void wki_lsa_generate_and_flood() {
     // Count direct CONNECTED neighbors
     uint16_t num_nbrs = 0;
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
-        WkiPeer* peer = &g_wki.peers[i];
+        WkiPeer const* peer = &g_wki.peers[i];
         if (peer->node_id == WKI_NODE_INVALID) {
             continue;
         }
@@ -148,7 +148,7 @@ void wki_lsa_generate_and_flood() {
     auto* nbrs = lsa_neighbors(lsa);
     uint16_t idx = 0;
     for (size_t i = 0; i < WKI_MAX_PEERS && idx < num_nbrs; i++) {
-        WkiPeer* peer = &g_wki.peers[i];
+        WkiPeer const* peer = &g_wki.peers[i];
         if (peer->node_id == WKI_NODE_INVALID) {
             continue;
         }
@@ -208,8 +208,8 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
     const auto* lsa = reinterpret_cast<const LsaPayload*>(payload);
 
     // Validate: neighbor entries must fit in payload
-    size_t expected = sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry));
-    if (payload_len < expected) {
+    size_t const EXPECTED = sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry));
+    if (payload_len < EXPECTED) {
         return;
     }
 
@@ -369,23 +369,23 @@ void wki_routing_recompute() {
 
         // Relax edges
         for (uint16_t n = 0; n < u_lsdb->num_neighbors; n++) {
-            uint16_t v_node = u_lsdb->neighbors[n].node_id;
+            uint16_t const V_NODE = u_lsdb->neighbors[n].node_id;
             uint16_t v_cost = u_lsdb->neighbors[n].link_cost;
             if (v_cost == 0) {
                 v_cost = WKI_DEFAULT_LINK_COST;
             }
 
-            uint16_t v_idx = find_idx(v_node);
-            if (v_idx == 0xFFFF || visited[v_idx]) {
+            uint16_t const V_IDX = find_idx(V_NODE);
+            if (V_IDX == 0xFFFF || visited[V_IDX]) {
                 continue;
             }
 
-            uint32_t alt = dist[u] + v_cost;
-            if (alt < dist[v_idx]) {
-                dist[v_idx] = alt;
-                hops[v_idx] = hops[u] + 1;
+            uint32_t const ALT = dist[u] + v_cost;
+            if (ALT < dist[V_IDX]) {
+                dist[V_IDX] = ALT;
+                hops[V_IDX] = hops[u] + 1;
                 // Track first hop on the shortest path
-                next_hop[v_idx] = (u == my_idx) ? v_node : next_hop[u];
+                next_hop[V_IDX] = (u == my_idx) ? V_NODE : next_hop[u];
             }
         }
     }
@@ -475,20 +475,20 @@ void wki_routing_timer_tick(uint64_t now_us) {
     }
 
     // Check if we have a pending LSA that was rate-limited
-    uint64_t min_interval_us = static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000;
-    if (s_lsa_pending && now_us - s_last_own_lsa_time >= min_interval_us) {
+    uint64_t const MIN_INTERVAL_US = static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000;
+    if (s_lsa_pending && now_us - s_last_own_lsa_time >= MIN_INTERVAL_US) {
         wki_lsa_generate_and_flood();
     }
 
     // Periodic LSA refresh
-    uint64_t lsa_refresh_us = static_cast<uint64_t>(WKI_LSA_REFRESH_MS) * 1000;
-    if (now_us - s_last_own_lsa_time >= lsa_refresh_us) {
+    uint64_t const LSA_REFRESH_US = static_cast<uint64_t>(WKI_LSA_REFRESH_MS) * 1000;
+    if (now_us - s_last_own_lsa_time >= LSA_REFRESH_US) {
         wki_lsa_generate_and_flood();
     }
 
     // LSDB aging: remove entries that haven't been refreshed in time
-    uint64_t max_age_us = lsa_refresh_us * WKI_LSDB_AGE_FACTOR;
-    bool topology_changed = false;
+    uint64_t const MAX_AGE_US = LSA_REFRESH_US * WKI_LSDB_AGE_FACTOR;
+    bool const TOPOLOGY_CHANGED = false;
 
     s_routing_lock.lock();
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
@@ -508,7 +508,7 @@ void wki_routing_timer_tick(uint64_t now_us) {
     }
     s_routing_lock.unlock();
 
-    if (topology_changed) {
+    if (TOPOLOGY_CHANGED) {
         wki_routing_recompute();
     }
 }

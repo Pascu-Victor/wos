@@ -63,21 +63,21 @@ KTEST(XFS, BmbtRecSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsBmbtRec), static_c
 KTEST(XFS, NullMagicReturnsError) {
     ker::dev::BlockDevice dev = make_xfs_null_bdev();
     ker::vfs::xfs::XfsMountContext* ctx = nullptr;
-    int ret = ker::vfs::xfs::xfs_mount(&dev, true, &ctx);
-    KEXPECT_NE(ret, 0);
+    int const RET = ker::vfs::xfs::xfs_mount(&dev, true, &ctx);
+    KEXPECT_NE(RET, 0);
     // ctx must not have been allocated on error
     KEXPECT_EQ(ctx, nullptr);
 }
 
 KTEST(XFS, NullDeviceReturnsEINVAL) {
     ker::vfs::xfs::XfsMountContext* ctx = nullptr;
-    int ret = ker::vfs::xfs::xfs_mount(nullptr, true, &ctx);
-    KEXPECT_EQ(ret, -EINVAL);
+    int const RET = ker::vfs::xfs::xfs_mount(nullptr, true, &ctx);
+    KEXPECT_EQ(RET, -EINVAL);
     KEXPECT_EQ(ctx, nullptr);
 }
 
 KTEST(XFS, NullCtxOutReturnsEINVAL) {
     ker::dev::BlockDevice dev = make_xfs_null_bdev();
-    int ret = ker::vfs::xfs::xfs_mount(&dev, true, nullptr);
-    KEXPECT_EQ(ret, -EINVAL);
+    int const RET = ker::vfs::xfs::xfs_mount(&dev, true, nullptr);
+    KEXPECT_EQ(RET, -EINVAL);
 }

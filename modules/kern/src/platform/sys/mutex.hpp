@@ -39,20 +39,20 @@ class Mutex {
     void unlock();
 
     // Check whether the mutex is currently held (non-authoritative, racy).
-    auto is_locked() const -> bool { return held_.load(std::memory_order_relaxed); }
+    auto is_locked() const -> bool { return held.load(std::memory_order_relaxed); }
 
    private:
-    std::atomic<bool> held_{false};
+    std::atomic<bool> held{false};
     // Number of tasks waiting to acquire.  Used to decide whether to yield
     // aggressively or just retry.
-    std::atomic<uint32_t> waiters_{0};
+    std::atomic<uint32_t> waiters{0};
 };
 
 // RAII lock guard for Mutex (analogous to std::lock_guard).
 class MutexGuard {
    public:
-    explicit MutexGuard(Mutex& mtx) : mtx_(mtx) { mtx_.lock(); }
-    ~MutexGuard() { mtx_.unlock(); }
+    explicit MutexGuard(Mutex& mtx) : mtx(mtx) { mtx.lock(); }
+    ~MutexGuard() { mtx.unlock(); }
 
     MutexGuard(const MutexGuard&) = delete;
     MutexGuard(MutexGuard&&) = delete;
@@ -60,7 +60,7 @@ class MutexGuard {
     auto operator=(MutexGuard&&) -> MutexGuard& = delete;
 
    private:
-    Mutex& mtx_;
+    Mutex& mtx;
 };
 
 }  // namespace ker::mod::sys

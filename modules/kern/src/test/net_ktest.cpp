@@ -13,8 +13,8 @@
 
 KTEST(Net, ChecksumAllZero) {
     static uint8_t zeros[8] = {};
-    uint16_t cs = ker::net::checksum_compute(static_cast<const void*>(zeros), 8);
-    KEXPECT_EQ(cs, static_cast<uint16_t>(0xFFFF));
+    uint16_t const CS = ker::net::checksum_compute(static_cast<const void*>(zeros), 8);
+    KEXPECT_EQ(CS, static_cast<uint16_t>(0xFFFF));
 }
 
 // ---------------------------------------------------------------------------
@@ -25,11 +25,11 @@ KTEST(Net, ChecksumAllZero) {
 KTEST(Net, ChecksumRoundTrip) {
     static uint8_t buf[8] = {0x45, 0x00, 0x00, 0x28, 0x12, 0x34, 0x00, 0x00};
     // compute over first 6 bytes (checksum slot = last 2)
-    uint16_t cs = ker::net::checksum_compute(static_cast<const void*>(buf), 6);
-    buf[6] = static_cast<uint8_t>(cs & 0xFF);
-    buf[7] = static_cast<uint8_t>((cs >> 8) & 0xFF);
-    uint16_t verify = ker::net::checksum_compute(static_cast<const void*>(buf), 8);
-    KEXPECT_EQ(verify, static_cast<uint16_t>(0x0000));
+    uint16_t const CS = ker::net::checksum_compute(static_cast<const void*>(buf), 6);
+    buf[6] = static_cast<uint8_t>(CS & 0xFF);
+    buf[7] = static_cast<uint8_t>((CS >> 8) & 0xFF);
+    uint16_t const VERIFY = ker::net::checksum_compute(static_cast<const void*>(buf), 8);
+    KEXPECT_EQ(VERIFY, static_cast<uint16_t>(0x0000));
 }
 
 // ---------------------------------------------------------------------------
@@ -40,12 +40,12 @@ KTEST(Net, ChecksumSymmetric) {
     // buf = {0xAB, 0xCD, 0xAB, 0xCD}
     // Each LE word = 0xCDAB; sum = 2 * 0xCDAB = 0x19B56; fold → 0x9B57; ~0x9B57 = 0x64A8
     static uint8_t buf[4] = {0xAB, 0xCD, 0xAB, 0xCD};
-    uint16_t cs = ker::net::checksum_compute(static_cast<const void*>(buf), 4);
+    uint16_t const CS = ker::net::checksum_compute(static_cast<const void*>(buf), 4);
     // Just verify it matches recomputing manually: the interesting property is
     // that a single-byte tweak changes the result.
     static uint8_t buf2[4] = {0xAB, 0xCE, 0xAB, 0xCD};  // second byte changed
-    uint16_t cs2 = ker::net::checksum_compute(static_cast<const void*>(buf2), 4);
-    KEXPECT_NE(cs, cs2);
+    uint16_t const CS2 = ker::net::checksum_compute(static_cast<const void*>(buf2), 4);
+    KEXPECT_NE(CS, CS2);
 }
 
 // ---------------------------------------------------------------------------
@@ -55,8 +55,8 @@ KTEST(Net, ChecksumSymmetric) {
 
 KTEST(Net, ChecksumOddLength) {
     static uint8_t single[1] = {0xFF};
-    uint16_t cs = ker::net::checksum_compute(static_cast<const void*>(single), 1);
-    KEXPECT_EQ(cs, static_cast<uint16_t>(0xFF00));
+    uint16_t const CS = ker::net::checksum_compute(static_cast<const void*>(single), 1);
+    KEXPECT_EQ(CS, static_cast<uint16_t>(0xFF00));
 }
 
 // ---------------------------------------------------------------------------
@@ -65,8 +65,8 @@ KTEST(Net, ChecksumOddLength) {
 // ---------------------------------------------------------------------------
 
 KTEST(Net, PseudoHeaderAllZero) {
-    uint16_t cs = ker::net::checksum_pseudo_ipv4(0, 0, 0, 0, nullptr, 0);
-    KEXPECT_EQ(cs, static_cast<uint16_t>(0xFFFF));
+    uint16_t const CS = ker::net::checksum_pseudo_ipv4(0, 0, 0, 0, nullptr, 0);
+    KEXPECT_EQ(CS, static_cast<uint16_t>(0xFFFF));
 }
 
 // ---------------------------------------------------------------------------
@@ -81,14 +81,14 @@ KTEST(Net, PseudoHeaderRoundTrip) {
     constexpr uint16_t LEN = 2;           // 2 bytes of payload
 
     static uint8_t segment[2] = {0x00, 0x00};  // 2-byte payload (all zero)
-    uint16_t cs = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(segment), 2);
+    uint16_t const CS = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(segment), 2);
     // Build a second segment where the first 2 bytes ARE the checksum:
     static uint8_t seg2[2];
-    seg2[0] = static_cast<uint8_t>(cs & 0xFF);
-    seg2[1] = static_cast<uint8_t>((cs >> 8) & 0xFF);
-    uint16_t verify = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(seg2), 2);
+    seg2[0] = static_cast<uint8_t>(CS & 0xFF);
+    seg2[1] = static_cast<uint8_t>((CS >> 8) & 0xFF);
+    uint16_t const VERIFY = ker::net::checksum_pseudo_ipv4(SRC, DST, PROTO, LEN, static_cast<const void*>(seg2), 2);
     // After embedding the complement the sum must fold to 0x0000
-    KEXPECT_EQ(verify, static_cast<uint16_t>(0x0000));
+    KEXPECT_EQ(VERIFY, static_cast<uint16_t>(0x0000));
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +130,6 @@ KTEST(Net, PacketBufferPut) {
     KEXPECT_EQ(g_ktest_pkt.len, static_cast<size_t>(20));
 
     // tailroom should have shrunk
-    size_t expected_tailroom = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM - 20;
-    KEXPECT_EQ(g_ktest_pkt.tailroom(), expected_tailroom);
+    size_t const EXPECTED_TAILROOM = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM - 20;
+    KEXPECT_EQ(g_ktest_pkt.tailroom(), EXPECTED_TAILROOM);
 }

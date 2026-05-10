@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
-#include <mod/io/serial/serial.hpp>
 #include <net/wki/event.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -54,20 +53,22 @@ auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t n
 // in the same namespace that find_mount_point receives from resolve_task_path_raw.
 // After pivot_root("/rootfs", ...), "/wki/node-xxx" -> "/rootfs/wki/node-xxx".
 auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
-    size_t path_len = std::strlen(path);
-    if (path_len + 1 > outsize) {
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN + 1 > outsize) {
         return -1;
     }
-    std::memcpy(out, path, path_len + 1);
+    std::memcpy(out, path, PATH_LEN + 1);
 
     if (ker::mod::sched::has_run_queues()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
-            size_t root_len = std::strlen(task->root);
-            if (root_len > 1) {  // root != "/"
-                if (root_len + path_len + 1 > outsize) return -1;
-                std::memmove(out + root_len, out, path_len + 1);
-                std::memcpy(out, task->root, root_len);
+            size_t const ROOT_LEN = std::strlen(task->root);
+            if (ROOT_LEN > 1) {  // root != "/"
+                if (ROOT_LEN + PATH_LEN + 1 > outsize) {
+                    return -1;
+                }
+                std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);
+                std::memcpy(out, task->root, ROOT_LEN);
             }
         }
     }
@@ -113,23 +114,23 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     auto* mount = new MountPoint;
 
     // Copy resolved path and fstype into kernel heap.
-    size_t path_len = std::strlen(resolved);
-    auto* path_copy = new char[path_len + 1];
+    size_t const PATH_LEN = std::strlen(resolved);
+    auto* path_copy = new char[PATH_LEN + 1];
     if (path_copy == nullptr) {
         delete mount;
         return -1;
     }
-    std::memcpy(path_copy, resolved, path_len + 1);
+    std::memcpy(path_copy, resolved, PATH_LEN + 1);
     mount->path = path_copy;
 
-    size_t fstype_len = std::strlen(fstype);
-    auto* fstype_copy = new char[fstype_len + 1];
+    size_t const FSTYPE_LEN = std::strlen(fstype);
+    auto* fstype_copy = new char[FSTYPE_LEN + 1];
     if (fstype_copy == nullptr) {
         delete[] mount->path;
         delete mount;
         return -1;
     }
-    std::memcpy(fstype_copy, fstype, fstype_len + 1);
+    std::memcpy(fstype_copy, fstype, FSTYPE_LEN + 1);
     mount->fstype = fstype_copy;
 
     mount->fs_type = fstype_to_enum(fstype);
@@ -283,7 +284,9 @@ auto unmount_filesystem(const char* path) -> int {
 }
 
 auto find_mount_point(const char* path) -> MountPoint* {
-    if (path == nullptr) return nullptr;
+    if (path == nullptr) {
+        return nullptr;
+    }
 
     // Find the longest matching mount point
     MountPoint* best_match = nullptr;
@@ -291,12 +294,16 @@ auto find_mount_point(const char* path) -> MountPoint* {
 
     mount_lock.lock();
     for (size_t i = 0; i < mounts.size(); ++i) {
-        if (mounts[i] == nullptr || mounts[i]->path == nullptr) continue;
+        if (mounts[i] == nullptr || mounts[i]->path == nullptr) {
+            continue;
+        }
 
         // Check if path starts with this mount point
         size_t j = 0;
         while (mounts[i]->path[j] != '\0' && path[j] != '\0') {
-            if (mounts[i]->path[j] != path[j]) break;
+            if (mounts[i]->path[j] != path[j]) {
+                break;
+            }
             j++;
         }
 
@@ -351,12 +358,12 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         return -EINVAL;
     }
 
-    size_t new_root_len = std::strlen(new_root);
-    size_t put_old_len = std::strlen(put_old);
+    size_t const NEW_ROOT_LEN = std::strlen(new_root);
+    size_t const PUT_OLD_LEN = std::strlen(put_old);
 
     mount_lock.lock();
 
-    MountPoint* new_mount = nullptr;
+    MountPoint const* new_mount = nullptr;
     MountPoint* old_root_mount = nullptr;
     for (size_t i = 0; i < mounts.size(); ++i) {
         MountPoint* mp = mounts[i];
@@ -376,7 +383,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         return -EINVAL;
     }
 
-    if (old_root_mount != nullptr && !replace_mount_path_locked(old_root_mount, put_old, put_old_len)) {
+    if (old_root_mount != nullptr && !replace_mount_path_locked(old_root_mount, put_old, PUT_OLD_LEN)) {
         mount_lock.unlock();
         return -ENOMEM;
     }
@@ -386,18 +393,18 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         if (mp == nullptr || mp->path == nullptr || mp == new_mount) {
             continue;
         }
-        if (path_is_under_root(mp->path, new_root, new_root_len)) {
+        if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
             continue;
         }
 
-        size_t mp_len = std::strlen(mp->path);
-        auto* remapped = new char[new_root_len + mp_len + 1];
+        size_t const MP_LEN = std::strlen(mp->path);
+        auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
         if (remapped == nullptr) {
             continue;
         }
 
-        std::memcpy(remapped, new_root, new_root_len);
-        std::memcpy(remapped + new_root_len, mp->path, mp_len + 1);
+        strcpy(remapped, new_root);
+        std::memcpy(remapped + NEW_ROOT_LEN, mp->path, MP_LEN + 1);
         ker::mod::dbg::log("pivot_root: remapped mount '%s' -> '%s'", mp->path, remapped);
         delete[] mp->path;
         mp->path = remapped;
@@ -412,7 +419,7 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         return;
     }
 
-    size_t new_root_len = std::strlen(new_root);
+    size_t const NEW_ROOT_LEN = std::strlen(new_root);
 
     mount_lock.lock();
     for (size_t i = 0; i < mounts.size(); ++i) {
@@ -423,18 +430,18 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         if (std::strcmp(mp->path, "/wki") != 0 && std::strncmp(mp->path, "/wki/", 5) != 0) {
             continue;
         }
-        if (path_is_under_root(mp->path, new_root, new_root_len)) {
+        if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
             continue;
         }
 
-        size_t mp_len = std::strlen(mp->path);
-        auto* remapped = new char[new_root_len + mp_len + 1];
+        size_t const MP_LEN = std::strlen(mp->path);
+        auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
         if (remapped == nullptr) {
             continue;
         }
 
-        std::memcpy(remapped, new_root, new_root_len);
-        std::memcpy(remapped + new_root_len, mp->path, mp_len + 1);
+        strcpy(remapped, new_root);
+        std::memcpy(remapped + NEW_ROOT_LEN, mp->path, MP_LEN + 1);
         ker::mod::dbg::log("pivot_root: rebased late WKI mount '%s' -> '%s'", mp->path, remapped);
         delete[] mp->path;
         mp->path = remapped;
@@ -444,9 +451,9 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
 
 auto get_mount_count() -> size_t {
     mount_lock.lock();
-    size_t count = mounts.size();
+    size_t const COUNT = mounts.size();
     mount_lock.unlock();
-    return count;
+    return COUNT;
 }
 
 auto get_mount_at(size_t index) -> MountPoint* {
@@ -471,19 +478,19 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
         return false;
     }
 
-    MountPoint* mp = mounts[index];
+    MountPoint const* mp = mounts[index];
     if (mp == nullptr || mp->path == nullptr) {
         mount_lock.unlock();
         return false;
     }
 
-    size_t path_len = std::strlen(mp->path);
-    if (path_len >= MOUNT_PATH_MAX) {
+    size_t const PATH_LEN = std::strlen(mp->path);
+    if (PATH_LEN >= MOUNT_PATH_MAX) {
         mount_lock.unlock();
         return false;
     }
 
-    std::memcpy(out->path, mp->path, path_len + 1);
+    std::memcpy(out->path, mp->path, PATH_LEN + 1);
     out->fs_type = mp->fs_type;
     out->dev_id = mp->dev_id;
 

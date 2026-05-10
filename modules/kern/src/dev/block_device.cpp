@@ -120,8 +120,9 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
     }
 
     if (block + count > bdev->total_blocks) {
-        log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p", (unsigned long)block,
-                  (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0), __builtin_return_address(1));
+        log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p",
+                  static_cast<unsigned long>(block), static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks),
+                  __builtin_return_address(0), __builtin_return_address(1));
         return -1;
     }
 
@@ -139,8 +140,9 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
     }
 
     if (block + count > bdev->total_blocks) {
-        log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p", (unsigned long)block,
-                  (unsigned long)count, (unsigned long)bdev->total_blocks, __builtin_return_address(0), __builtin_return_address(1));
+        log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p",
+                  static_cast<unsigned long>(block), static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks),
+                  __builtin_return_address(0), __builtin_return_address(1));
         return -1;
     }
 
@@ -245,13 +247,13 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
         part->name[i] = parent_disk->name[i];
     }
     // Append 1-based partition number (simple: single digit for index < 9, two digits otherwise)
-    uint32_t part_num = partition_index + 1;
-    if (part_num < 10) {
-        part->name[parent_name_len] = static_cast<char>('0' + part_num);
+    uint32_t const PART_NUM = partition_index + 1;
+    if (PART_NUM < 10) {
+        part->name[parent_name_len] = static_cast<char>('0' + PART_NUM);
         part->name[parent_name_len + 1] = '\0';
     } else {
-        part->name[parent_name_len] = static_cast<char>('0' + (part_num / 10));
-        part->name[parent_name_len + 1] = static_cast<char>('0' + (part_num % 10));
+        part->name[parent_name_len] = static_cast<char>('0' + (PART_NUM / 10));
+        part->name[parent_name_len + 1] = static_cast<char>('0' + (PART_NUM % 10));
         part->name[parent_name_len + 2] = '\0';
     }
 
@@ -285,8 +287,8 @@ auto block_device_init() -> void {
 
     // Enumerate GPT partitions on all registered whole-disk block devices
     // We snapshot the current count since enumeration will register new partition devices
-    size_t disk_count = block_devices.size();
-    for (size_t i = 0; i < disk_count; ++i) {
+    size_t const DISK_COUNT = block_devices.size();
+    for (size_t i = 0; i < DISK_COUNT; ++i) {
         BlockDevice* disk = block_devices[i];
         if (disk == nullptr || disk->is_partition) {
             continue;

@@ -57,20 +57,20 @@ auto round_up_growth(size_t count) -> size_t {
     if (count == 0) {
         return 0;
     }
-    size_t rem = count % PKT_POOL_GROW_CHUNK;
-    if (rem == 0) {
+    size_t const REM = count % PKT_POOL_GROW_CHUNK;
+    if (REM == 0) {
         return count;
     }
-    return count + (PKT_POOL_GROW_CHUNK - rem);
+    return count + (PKT_POOL_GROW_CHUNK - REM);
 }
 
 void pkt_debug_dump_in_use(size_t avail) {
     std::array<SiteSummary, DEBUG_SITE_TRACK_SLOTS> site_counts{};
     size_t outstanding = 0;
 
-    for (PacketChunk* chunk = chunk_list; chunk != nullptr; chunk = chunk->next) {
+    for (PacketChunk const* chunk = chunk_list; chunk != nullptr; chunk = chunk->next) {
         for (size_t i = 0; i < chunk->count; i++) {
-            PacketBuffer* pkt = &chunk->base[i];
+            PacketBuffer const* pkt = &chunk->base[i];
             if (!pkt->debug_in_use) {
                 continue;
             }
@@ -168,11 +168,11 @@ auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
 
     free_now = free_count.load(std::memory_order_relaxed);
     if (free_now < min_free) {
-        size_t deficit = min_free - free_now;
-        size_t grow_by = round_up_growth(std::max(deficit, PKT_POOL_GROW_CHUNK));
-        log::debug("Growing packet pool by %zu buffers for %s (free=%zu target=%zu capacity=%zu)", grow_by, reason, free_now, min_free,
+        size_t const DEFICIT = min_free - free_now;
+        size_t const GROW_BY = round_up_growth(std::max(DEFICIT, PKT_POOL_GROW_CHUNK));
+        log::debug("Growing packet pool by %zu buffers for %s (free=%zu target=%zu capacity=%zu)", GROW_BY, reason, free_now, min_free,
                    pool_capacity);
-        add_buffers_to_pool(grow_by);
+        add_buffers_to_pool(GROW_BY);
     }
 
     expand_in_progress.store(false, std::memory_order_release);
@@ -181,23 +181,23 @@ auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
 
 // Allocate from global pool
 auto pkt_global_alloc() -> PacketBuffer* {
-    uint64_t flags = pool_lock.lock_irqsave();
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
     if (free_list == nullptr) {
-        pool_lock.unlock_irqrestore(flags);
+        pool_lock.unlock_irqrestore(FLAGS);
         return nullptr;
     }
     auto* pkt = free_list;
     free_list = pkt->next;
-    pool_lock.unlock_irqrestore(flags);
+    pool_lock.unlock_irqrestore(FLAGS);
     return pkt;
 }
 
 // Return to global pool (IRQ-safe - see pkt_global_alloc comment).
 void pkt_global_free(PacketBuffer* pkt) {
-    uint64_t flags = pool_lock.lock_irqsave();
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
     pkt->next = free_list;
     free_list = pkt;
-    pool_lock.unlock_irqrestore(flags);
+    pool_lock.unlock_irqrestore(FLAGS);
 }
 
 }  // namespace
@@ -214,14 +214,14 @@ void pkt_pool_init() {
 
 void pkt_pool_expand_for_nics() {
     // Calculate required size: 1024 buffers per NIC, minimum 1024 total
-    size_t nic_count = netdev_count();
-    size_t required = nic_count * PKT_POOL_PER_NIC;
+    size_t const NIC_COUNT = netdev_count();
+    size_t required = NIC_COUNT * PKT_POOL_PER_NIC;
     required = std::max(required, PKT_POOL_MIN_SIZE);
 
     // Add more buffers if needed
     if (required > pool_capacity) {
-        size_t to_add = required - pool_capacity;
-        add_buffers_to_pool(to_add);
+        size_t const TO_ADD = required - pool_capacity;
+        add_buffers_to_pool(TO_ADD);
     }
 }
 
@@ -262,9 +262,9 @@ auto pkt_alloc_tx() -> PacketBuffer* {
         avail = free_count.load(std::memory_order_relaxed);
     }
     if (avail <= RX_RESERVE) {
-        uint32_t count = refuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        log::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu refused=%u)", avail, RX_RESERVE, count);
-        if ((count % REFUSE_DUMP_STRIDE) == 1) {
+        uint32_t const COUNT = refuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        log::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu refused=%u)", avail, RX_RESERVE, COUNT);
+        if ((COUNT % REFUSE_DUMP_STRIDE) == 1) {
             pkt_debug_dump_in_use(avail);
         }
         return nullptr;  // Pool too low, reserve for RX

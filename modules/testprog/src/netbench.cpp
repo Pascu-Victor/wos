@@ -1,6 +1,10 @@
 #include "netbench.hpp"
 
+#include <abi-bits/in.h>
+#include <abi-bits/socket.h>
 #include <arpa/inet.h>
+#include <bits/ssize_t.h>
+#include <bits/timeval.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -53,11 +57,11 @@ auto parse_u32(const char* value, uint32_t* out) -> bool {
         return false;
     }
     char* end = nullptr;
-    unsigned long parsed = std::strtoul(value, &end, 10);
+    unsigned long const PARSED = std::strtoul(value, &end, 10);
     if (end == value || *end != '\0') {
         return false;
     }
-    *out = static_cast<uint32_t>(parsed);
+    *out = static_cast<uint32_t>(PARSED);
     return true;
 }
 
@@ -66,11 +70,11 @@ auto parse_u64(const char* value, uint64_t* out) -> bool {
         return false;
     }
     char* end = nullptr;
-    unsigned long long parsed = std::strtoull(value, &end, 10);
+    unsigned long long const PARSED = std::strtoull(value, &end, 10);
     if (end == value || *end != '\0') {
         return false;
     }
-    *out = static_cast<uint64_t>(parsed);
+    *out = static_cast<uint64_t>(PARSED);
     return true;
 }
 
@@ -86,11 +90,11 @@ auto recv_all(int fd, void* buf, size_t len) -> bool {
     auto* dst = static_cast<uint8_t*>(buf);
     size_t offset = 0;
     while (offset < len) {
-        ssize_t ret = recv(fd, dst + offset, len - offset, 0);
-        if (ret <= 0) {
+        ssize_t const RET = recv(fd, dst + offset, len - offset, 0);
+        if (RET <= 0) {
             return false;
         }
-        offset += static_cast<size_t>(ret);
+        offset += static_cast<size_t>(RET);
     }
     return true;
 }
@@ -99,11 +103,11 @@ auto send_all(int fd, const void* buf, size_t len) -> bool {
     const auto* src = static_cast<const uint8_t*>(buf);
     size_t offset = 0;
     while (offset < len) {
-        ssize_t ret = send(fd, src + offset, len - offset, 0);
-        if (ret <= 0) {
+        ssize_t const RET = send(fd, src + offset, len - offset, 0);
+        if (RET <= 0) {
             return false;
         }
-        offset += static_cast<size_t>(ret);
+        offset += static_cast<size_t>(RET);
     }
     return true;
 }
@@ -120,54 +124,54 @@ auto wallclock_us() -> uint64_t {
 }
 
 auto open_server_socket(uint16_t port) -> int {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    int const FD = socket(AF_INET, SOCK_STREAM, 0);
+    if (FD < 0) {
         return -1;
     }
 
     int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(FD, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close(fd);
+    if (bind(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(FD);
         return -1;
     }
 
-    if (listen(fd, 4) != 0) {
-        close(fd);
+    if (listen(FD, 4) != 0) {
+        close(FD);
         return -1;
     }
 
-    return fd;
+    return FD;
 }
 
 auto connect_to_host(const char* host, uint16_t port) -> int {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    int const FD = socket(AF_INET, SOCK_STREAM, 0);
+    if (FD < 0) {
         return -1;
     }
 
-    tune_tcp_low_latency(fd);
+    tune_tcp_low_latency(FD);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        close(fd);
+        close(FD);
         return -1;
     }
 
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close(fd);
+    if (connect(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(FD);
         return -1;
     }
 
-    return fd;
+    return FD;
 }
 
 void fill_payload(uint8_t* buf, uint32_t len) {
@@ -248,8 +252,8 @@ auto run_server(int argc, char** argv) -> int {
         }
     }
 
-    int server_fd = open_server_socket(options.port);
-    if (server_fd < 0) {
+    int const SERVER_FD = open_server_socket(options.port);
+    if (SERVER_FD < 0) {
         std::println("netbench-server: failed to bind/listen on port {}", options.port);
         return 1;
     }
@@ -258,40 +262,40 @@ auto run_server(int argc, char** argv) -> int {
 
     uint32_t completed = 0;
     while (completed < options.sessions) {
-        int client_fd = accept(server_fd, nullptr, nullptr);
-        if (client_fd < 0) {
-            close(server_fd);
+        int const CLIENT_FD = accept(SERVER_FD, nullptr, nullptr);
+        if (CLIENT_FD < 0) {
+            close(SERVER_FD);
             return 1;
         }
-        tune_tcp_low_latency(client_fd);
+        tune_tcp_low_latency(CLIENT_FD);
 
         BenchHeader header{};
-        bool ok = recv_all(client_fd, &header, sizeof(header));
+        bool ok = recv_all(CLIENT_FD, &header, sizeof(header));
         if (!ok || header.magic != BENCH_MAGIC || header.version != BENCH_VERSION || header.payload_size == 0) {
             std::println("netbench-server: invalid session header");
-            close(client_fd);
-            close(server_fd);
+            close(CLIENT_FD);
+            close(SERVER_FD);
             return 1;
         }
 
         if (header.mode == static_cast<uint32_t>(BenchMode::K_PINGPONG)) {
-            ok = handle_pingpong_server(client_fd, header);
+            ok = handle_pingpong_server(CLIENT_FD, header);
         } else if (header.mode == static_cast<uint32_t>(BenchMode::K_STREAM)) {
-            ok = handle_stream_server(client_fd, header);
+            ok = handle_stream_server(CLIENT_FD, header);
         } else {
             ok = false;
         }
 
-        close(client_fd);
+        close(CLIENT_FD);
         if (!ok) {
             std::println("netbench-server: session {} failed", completed);
-            close(server_fd);
+            close(SERVER_FD);
             return 1;
         }
         completed++;
     }
 
-    close(server_fd);
+    close(SERVER_FD);
     return 0;
 }
 
@@ -347,8 +351,8 @@ auto run_client(int argc, char** argv) -> int {
         options.total_bytes = std::max<uint64_t>(options.total_bytes, options.payload_size);
     }
 
-    int fd = connect_to_host(options.host, options.port);
-    if (fd < 0) {
+    int const FD = connect_to_host(options.host, options.port);
+    if (FD < 0) {
         std::println("netbench-client: failed to connect to {}:{}", options.host, options.port);
         return 1;
     }
@@ -361,27 +365,27 @@ auto run_client(int argc, char** argv) -> int {
     header.iterations = options.iterations;
     header.total_bytes = options.total_bytes;
 
-    if (!send_all(fd, &header, sizeof(header))) {
-        close(fd);
+    if (!send_all(FD, &header, sizeof(header))) {
+        close(FD);
         return 1;
     }
 
     auto* payload = static_cast<uint8_t*>(std::malloc(options.payload_size));
     if (payload == nullptr) {
-        close(fd);
+        close(FD);
         return 1;
     }
     fill_payload(payload, options.payload_size);
 
-    uint64_t start_us = wallclock_us();
+    uint64_t const START_US = wallclock_us();
     bool ok = true;
     if (options.mode == BenchMode::K_PINGPONG) {
         for (uint32_t i = 0; i < options.iterations; ++i) {
-            ok = send_all(fd, payload, options.payload_size);
+            ok = send_all(FD, payload, options.payload_size);
             if (!ok) {
                 break;
             }
-            ok = recv_all(fd, payload, options.payload_size);
+            ok = recv_all(FD, payload, options.payload_size);
             if (!ok) {
                 break;
             }
@@ -393,7 +397,7 @@ auto run_client(int argc, char** argv) -> int {
             if (remaining < chunk) {
                 chunk = static_cast<uint32_t>(remaining);
             }
-            ok = send_all(fd, payload, chunk);
+            ok = send_all(FD, payload, chunk);
             if (!ok) {
                 break;
             }
@@ -401,13 +405,13 @@ auto run_client(int argc, char** argv) -> int {
         }
         uint64_t ack = 0;
         if (ok) {
-            ok = recv_all(fd, &ack, sizeof(ack)) && ack == options.total_bytes;
+            ok = recv_all(FD, &ack, sizeof(ack)) && ack == options.total_bytes;
         }
     }
-    uint64_t elapsed_us = wallclock_us() - start_us;
+    uint64_t const ELAPSED_US = wallclock_us() - START_US;
 
     std::free(payload);
-    close(fd);
+    close(FD);
 
     if (!ok) {
         std::println("netbench-client: benchmark failed");
@@ -418,15 +422,15 @@ auto run_client(int argc, char** argv) -> int {
                                      ? (static_cast<uint64_t>(options.payload_size) * options.iterations * 2ULL)
                                      : options.total_bytes;
     const uint64_t THROUGHPUT_MIB_PER_S_X1000 =
-        elapsed_us > 0 ? (BYTES_MOVED * 1000ULL * 1000000ULL) / (1024ULL * 1024ULL * elapsed_us) : 0;
+        ELAPSED_US > 0 ? (BYTES_MOVED * 1000ULL * 1000000ULL) / (1024ULL * 1024ULL * ELAPSED_US) : 0;
     const uint64_t THROUGHPUT_WHOLE = THROUGHPUT_MIB_PER_S_X1000 / 1000ULL;
     const uint64_t THROUGHPUT_FRAC = THROUGHPUT_MIB_PER_S_X1000 % 1000ULL;
 
     std::print(R"({{"benchmark":"wos_netbench","mode":"{}",)", options.mode == BenchMode::K_PINGPONG ? "pingpong" : "stream");
     std::print(R"("host":"{}","port":{},"payload_bytes":{},)", options.host, options.port, options.payload_size);
     if (options.mode == BenchMode::K_PINGPONG) {
-        const uint64_t AVG_LATENCY_US = options.iterations > 0 ? (elapsed_us / static_cast<uint64_t>(options.iterations)) : 0;
-        std::print("\"iterations\":{},\"latency_us\":{},", options.iterations, AVG_LATENCY_US);
+        const uint64_t AVG_LATENCY_US = options.iterations > 0 ? (ELAPSED_US / static_cast<uint64_t>(options.iterations)) : 0;
+        std::print(R"("iterations":{},"latency_us":{},)", options.iterations, AVG_LATENCY_US);
     } else {
         std::print("\"total_bytes\":{},", options.total_bytes);
     }

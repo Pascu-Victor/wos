@@ -5,7 +5,6 @@
 #include <net/checksum.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/raw.hpp>
-#include <platform/dbg/dbg.hpp>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
@@ -23,8 +22,8 @@ void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip
     auto* hdr = reinterpret_cast<IcmpHeader*>(pkt->data);
 
     // Verify checksum (over entire ICMP message including payload)
-    uint16_t cksum = checksum_compute(pkt->data, pkt->len);
-    if (cksum != 0) {
+    uint16_t const CKSUM = checksum_compute(pkt->data, pkt->len);
+    if (CKSUM != 0) {
         pkt_free(pkt);
         return;
     }

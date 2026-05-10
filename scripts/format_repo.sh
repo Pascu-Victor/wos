@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$WOS_ROOT/build"
+FORMAT_JOBS="${WOS_FORMAT_JOBS:-4}"
+EXCLUDED_PATHS=()
+TIDY_EXCLUDED_PATHS=(
+    "$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread.cpp"
+)
 
 usage() {
     cat <<'EOF'
@@ -31,6 +36,10 @@ Options:
   --format-only   Run only clang-format
   --tidy-only     Run only clang-tidy
   --build-dir DIR Use a different compilation database directory
+  --format-jobs N Run up to N clang-format workers in parallel (default: 4)
+
+Environment:
+  WOS_TIDY_CACHE=0   Disable clang-tidy-cache auto-detection
 EOF
 }
 
@@ -64,6 +73,10 @@ while (($# > 0)); do
             BUILD_DIR="$2"
             shift
             ;;
+        --format-jobs)
+            FORMAT_JOBS="$2"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -77,6 +90,11 @@ done
 
 if [ "${#TARGETS[@]}" -eq 0 ]; then
     TARGETS=("modules")
+fi
+
+if ! [[ "$FORMAT_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --format-jobs must be a positive integer" >&2
+    exit 1
 fi
 
 resolve_path() {
@@ -104,6 +122,32 @@ path_is_in_targets() {
 
     for target in "${TARGET_ABS[@]}"; do
         if [ "$candidate" = "$target" ] || [[ "$candidate" == "$target/"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+path_is_excluded() {
+    local candidate
+    candidate="$(resolve_path "$1")"
+
+    for excluded in "${EXCLUDED_PATHS[@]}"; do
+        if [ "$candidate" = "$excluded" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+path_is_tidy_excluded() {
+    local candidate
+    candidate="$(resolve_path "$1")"
+
+    for excluded in "${TIDY_EXCLUDED_PATHS[@]}"; do
+        if [ "$candidate" = "$excluded" ]; then
             return 0
         fi
     done
@@ -141,13 +185,22 @@ cd "$WOS_ROOT"
 if [ "$RUN_FORMAT" -eq 1 ]; then
     mapfile -d '' FILES < <(find "${TARGETS[@]}" "${FIND_ARGS[@]}" -print0)
 
+    FILTERED_FILES=()
+    for file in "${FILES[@]}"; do
+        if path_is_excluded "$file"; then
+            continue
+        fi
+        FILTERED_FILES+=("$file")
+    done
+    FILES=("${FILTERED_FILES[@]}")
+
     if [ "${#FILES[@]}" -eq 0 ]; then
         echo "No clang-format-supported files found."
         exit 0
     fi
 
-    echo "Running clang-format ($FORMAT_MODE) on ${#FILES[@]} files..."
-    printf '%s\0' "${FILES[@]}" | xargs -0 clang-format "${CLANG_FORMAT_ARGS[@]}"
+    echo "Running clang-format ($FORMAT_MODE) on ${#FILES[@]} files with $FORMAT_JOBS workers..."
+    printf '%s\0' "${FILES[@]}" | xargs -0 -n 1 -P "$FORMAT_JOBS" clang-format "${CLANG_FORMAT_ARGS[@]}"
     echo "clang-format $FORMAT_MODE completed successfully."
 fi
 
@@ -155,6 +208,16 @@ if [ "$RUN_TIDY" -eq 1 ]; then
     if ! command -v clang-tidy >/dev/null 2>&1; then
         echo "error: clang-tidy is not installed or not in PATH" >&2
         exit 1
+    fi
+
+    TIDY_RUNNER=(clang-tidy)
+    TIDY_BINARY="$(command -v clang-tidy)"
+    if [ "${WOS_TIDY_CACHE:-1}" != "0" ]; then
+        if command -v clang-tidy-cache >/dev/null 2>&1; then
+            TIDY_RUNNER=(clang-tidy-cache)
+        elif command -v clang_tidy_cache >/dev/null 2>&1; then
+            TIDY_RUNNER=(clang_tidy_cache)
+        fi
     fi
 
     COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
@@ -182,6 +245,10 @@ if [ "$RUN_TIDY" -eq 1 ]; then
                 ;;
         esac
 
+        if path_is_tidy_excluded "$file"; then
+            continue
+        fi
+
         if path_is_in_targets "$file"; then
             TIDY_FILES+=("$file")
         fi
@@ -195,23 +262,34 @@ if [ "$RUN_TIDY" -eq 1 ]; then
     TIDY_ARGS=(
         -p "$BUILD_DIR"
         -quiet
+        --use-color
         --header-filter="^$WOS_ROOT/modules/.*"
-        --exclude-header-filter="^($WOS_ROOT/modules/extern/.*|$WOS_ROOT/toolchain/.*)"
+        --exclude-header-filter="^($WOS_ROOT/modules/extern/.*|$WOS_ROOT/toolchain/.*|$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread\\.hpp|$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread\\.cpp)"
         --extra-arg=-D_GLIBCXX_HOSTED
         --extra-arg=-D_DEFAULT_SOURCE
         --extra-arg=-D__WOS__=1
         --extra-arg=-D_GNU_SOURCE=1
+        --extra-arg=-DCLANG_TIDY
     )
     if [ "$TIDY_FIX" -eq 1 ]; then
-        TIDY_ARGS+=(-fix)
+        TIDY_ARGS+=(-fix --checks=-portability-avoid-pragma-once)
         echo "Running clang-tidy with fixes on ${#TIDY_FILES[@]} files..."
     else
+        TIDY_ARGS+=(--checks=-portability-avoid-pragma-once)
         echo "Running clang-tidy on ${#TIDY_FILES[@]} files..."
+    fi
+
+    if [ "${TIDY_RUNNER[0]}" != "clang-tidy" ]; then
+        echo "Using clang-tidy-cache wrapper."
     fi
 
     for file in "${TIDY_FILES[@]}"; do
         echo "clang-tidy: $file"
-        clang-tidy "${TIDY_ARGS[@]}" "$file"
+        if [ "${TIDY_RUNNER[0]}" != "clang-tidy" ]; then
+            CLANG_TIDY_CACHE_BINARY="$TIDY_BINARY" "${TIDY_RUNNER[@]}" "${TIDY_ARGS[@]}" "$file"
+        else
+            "${TIDY_RUNNER[@]}" "${TIDY_ARGS[@]}" "$file"
+        fi
     done
     echo "clang-tidy completed successfully."
 fi

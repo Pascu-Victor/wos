@@ -2,7 +2,6 @@
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 #include <fcntl.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>

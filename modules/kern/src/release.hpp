@@ -8,7 +8,7 @@ constexpr const char* SMP = "SMP";
 
 #ifdef __clang__
 constexpr const char* COMPILER = "clang " __clang_version__;
-#elif defined(__GNUC__)
+#elifdef __GNUC__
 constexpr const char* COMPILER = "gcc " __VERSION__;
 #else
 constexpr const char* COMPILER = "unknown";

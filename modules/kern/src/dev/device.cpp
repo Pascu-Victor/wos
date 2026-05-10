@@ -1,9 +1,13 @@
 #include "device.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/journal.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <util/smallvec.hpp>
+
+#include "platform/dbg/dbg.hpp"
 
 namespace ker::dev {
 

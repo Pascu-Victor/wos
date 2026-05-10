@@ -55,19 +55,19 @@ class RwLock {
     //   bit  31      - writer-active flag
     // A separate `write_waiters_` counter prevents reader starvation of writers:
     // when a writer is waiting, new readers block until the writer is served.
-    static constexpr uint32_t WRITER_BIT = 1u << 31;
+    static constexpr uint32_t WRITER_BIT = 1U << 31;
     static constexpr uint32_t READER_MASK = ~WRITER_BIT;
 
-    std::atomic<uint32_t> state_{0};
-    std::atomic<uint32_t> write_waiters_{0};
+    std::atomic<uint32_t> state{0};
+    std::atomic<uint32_t> write_waiters{0};
 };
 
 // RAII guards
 
 class ReadGuard {
    public:
-    explicit ReadGuard(RwLock& lk) : lk_(lk) { lk_.read_lock(); }
-    ~ReadGuard() { lk_.read_unlock(); }
+    explicit ReadGuard(RwLock& lk) : lk(lk) { lk.read_lock(); }
+    ~ReadGuard() { lk.read_unlock(); }
 
     ReadGuard(const ReadGuard&) = delete;
     ReadGuard(ReadGuard&&) = delete;
@@ -75,13 +75,13 @@ class ReadGuard {
     auto operator=(ReadGuard&&) -> ReadGuard& = delete;
 
    private:
-    RwLock& lk_;
+    RwLock& lk;
 };
 
 class WriteGuard {
    public:
-    explicit WriteGuard(RwLock& lk) : lk_(lk) { lk_.write_lock(); }
-    ~WriteGuard() { lk_.write_unlock(); }
+    explicit WriteGuard(RwLock& lk) : lk(lk) { lk.write_lock(); }
+    ~WriteGuard() { lk.write_unlock(); }
 
     WriteGuard(const WriteGuard&) = delete;
     WriteGuard(WriteGuard&&) = delete;
@@ -89,7 +89,7 @@ class WriteGuard {
     auto operator=(WriteGuard&&) -> WriteGuard& = delete;
 
    private:
-    RwLock& lk_;
+    RwLock& lk;
 };
 
 }  // namespace ker::mod::sys

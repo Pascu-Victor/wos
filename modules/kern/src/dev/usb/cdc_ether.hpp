@@ -19,12 +19,12 @@ constexpr uint8_t CDC_ETHERNET_TYPE = 0x0F;
 
 struct CdcEtherDevice {
     ker::net::NetDevice netdev;
-    UsbDevice* usb_dev;
-    XhciController* hc;
-    UsbEndpoint bulk_in;
-    UsbEndpoint bulk_out;
-    uint8_t data_iface;
-    bool active;
+    UsbDevice* usb_dev{};
+    XhciController* hc{};
+    UsbEndpoint bulk_in{};
+    UsbEndpoint bulk_out{};
+    uint8_t data_iface{};
+    bool active{};
 };
 
 void cdc_ether_init();

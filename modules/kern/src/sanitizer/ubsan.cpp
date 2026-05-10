@@ -8,6 +8,9 @@
 // file is still compiled but contributes nothing (all symbols are extern "C"
 // weak, so the linker drops them if unreferenced).
 
+#include <cstddef>
+
+#include "util/hcf.hpp"
 #ifdef WOS_KUBSAN
 
 #include <cstdint>
@@ -111,9 +114,9 @@ void ubsan_write_hex(uint64_t val) {
     char buf[19];  // "0x" + 16 hex digits + NUL
     buf[0] = '0';
     buf[1] = 'x';
-    constexpr const char* hex = "0123456789abcdef";
+    constexpr const char* HEX = "0123456789abcdef";
     for (int i = 15; i >= 0; i--) {
-        buf[2 + (15 - i)] = hex[(val >> (i * 4)) & 0xf];
+        buf[2 + (15 - i)] = HEX[(val >> (i * 4)) & 0xf];
     }
     buf[18] = '\0';
     ser::write_unlocked(buf);
@@ -147,11 +150,11 @@ void ubsan_write_type(const UbsanTypeDescriptor* type) {
     ser::write_unlocked(" (kind=");
     if (type->type_kind == 0x0000) {
         ser::write_unlocked("integer");
-        bool is_signed = (type->type_info & 1) != 0;
-        uint16_t bit_width = 1u << (type->type_info >> 1);
-        ser::write_unlocked(is_signed ? ", signed" : ", unsigned");
+        bool const IS_SIGNED = (type->type_info & 1) != 0;
+        uint16_t const BIT_WIDTH = 1U << (type->type_info >> 1);
+        ser::write_unlocked(IS_SIGNED ? ", signed" : ", unsigned");
         ser::write_unlocked(", ");
-        ubsan_write_dec(bit_width);
+        ubsan_write_dec(BIT_WIDTH);
         ser::write_unlocked("-bit");
     } else if (type->type_kind == 0x0001) {
         ser::write_unlocked("float");
@@ -164,11 +167,13 @@ void ubsan_write_type(const UbsanTypeDescriptor* type) {
 // Hex dump of memory around an address (8 rows of 16 bytes = 128 bytes)
 void ubsan_hexdump(uintptr_t addr, size_t size) {
     // Center the dump around the address
-    uintptr_t start = (addr - 64) & ~0xFULL;  // align to 16 bytes
-    uintptr_t end = start + 128;
+    uintptr_t const START = (addr - 64) & ~0xFULL;  // align to 16 bytes
+    uintptr_t const END = START + 128;
 
     // Bounds check: only dump kernel-space memory
-    if (start < 0xffff000000000000ULL) return;
+    if (START < 0xffff000000000000ULL) {
+        return;
+    }
 
     ser::write_unlocked("\n--- Memory around ");
     ubsan_write_hex(addr);
@@ -176,8 +181,8 @@ void ubsan_hexdump(uintptr_t addr, size_t size) {
     ubsan_write_dec(size);
     ser::write_unlocked(" bytes) ---\n");
 
-    constexpr const char* hex = "0123456789abcdef";
-    for (uintptr_t row = start; row < end; row += 16) {
+    constexpr const char* HEX = "0123456789abcdef";
+    for (uintptr_t row = START; row < END; row += 16) {
         // Indicator arrow
         if (addr >= row && addr < row + 16) {
             ser::write_unlocked("=>");
@@ -189,31 +194,35 @@ void ubsan_hexdump(uintptr_t addr, size_t size) {
         ser::write_unlocked(": ");
 
         // 16 hex bytes with markers
-        auto* p = reinterpret_cast<const uint8_t*>(row);
+        const auto* p = reinterpret_cast<const uint8_t*>(row);
         for (int i = 0; i < 16; i++) {
             // Mark the faulting byte(s)
-            bool is_target = ((row + i) >= addr && (row + i) < addr + size);
-            if (is_target) ser::write_unlocked("[");
+            bool const IS_TARGET = ((row + i) >= addr && (row + i) < addr + size);
+            if (IS_TARGET) {
+                ser::write_unlocked("[");
+            }
 
             char h[3];
-            h[0] = hex[p[i] >> 4];
-            h[1] = hex[p[i] & 0xf];
+            h[0] = HEX[p[i] >> 4];
+            h[1] = HEX[p[i] & 0xf];
             h[2] = '\0';
             ser::write_unlocked(h);
 
-            if (is_target) {
+            if (IS_TARGET) {
                 ser::write_unlocked("]");
             } else {
                 ser::write_unlocked(" ");
             }
-            if (i == 7) ser::write_unlocked(" ");
+            if (i == 7) {
+                ser::write_unlocked(" ");
+            }
         }
 
         // ASCII
         ser::write_unlocked(" |");
         for (int i = 0; i < 16; i++) {
-            char c = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
-            ser::write_unlocked(c);
+            char const C = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
+            ser::write_unlocked(C);
         }
         ser::write_unlocked("|\n");
     }
@@ -222,7 +231,7 @@ void ubsan_hexdump(uintptr_t addr, size_t size) {
 }  // namespace
 
 static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
-    ker::mod::dbg::log("[UBSAN] %s at %s:%u:%u", kind, loc->file ? loc->file : "?", loc->line, loc->column);
+    ker::mod::dbg::log("[UBSAN] %s at %s:%u:%u", kind, (loc->file != nullptr) ? loc->file : "?", loc->line, loc->column);
 }
 
 // Enhanced abort: prints detailed info before calling panic_handler
@@ -243,7 +252,7 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
     ser::write_unlocked("\n[UBSAN] ");
     ser::write_unlocked(kind);
     ser::write_unlocked(" at ");
-    ser::write_unlocked(loc->file ? loc->file : "?");
+    ser::write_unlocked((loc->file != nullptr) ? loc->file : "?");
     ser::write_unlocked(":");
     ubsan_write_dec(loc->line);
     ser::write_unlocked(":");
@@ -286,7 +295,7 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
     ser::write_unlocked("\n[UBSAN] ");
     ser::write_unlocked(kind);
     ser::write_unlocked(" at ");
-    ser::write_unlocked(loc->file ? loc->file : "?");
+    ser::write_unlocked((loc->file != nullptr) ? loc->file : "?");
     ser::write_unlocked(":");
     ubsan_write_dec(loc->line);
     ser::write_unlocked(":");
@@ -312,7 +321,7 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
 // --------------------------------------------------------------------------
 // Handlers - called by compiler-generated instrumentation
 // --------------------------------------------------------------------------
-
+// NOLINTBEGIN(readability-identifier-naming)
 void __ubsan_handle_type_mismatch(UbsanTypeMismatchData* data, uintptr_t ptr) {
     ubsan_abort_with_val("type-mismatch", &data->loc, data->type, ptr);
 }
@@ -327,7 +336,7 @@ void __ubsan_handle_type_mismatch_v1(UbsanTypeMismatchDataV1* data, uintptr_t pt
             hcf();
         }
         ser::write_unlocked("\n[UBSAN] misaligned-access at ");
-        ser::write_unlocked(data->loc.file ? data->loc.file : "?");
+        ser::write_unlocked((data->loc.file != nullptr) ? data->loc.file : "?");
         ser::write_unlocked(":");
         ubsan_write_dec(data->loc.line);
         ser::write_unlocked(":");
@@ -401,7 +410,7 @@ void __ubsan_handle_implicit_conversion(UbsanImplicitConversionData* data, uintp
         hcf();
     }
     ser::write_unlocked("\n[UBSAN] implicit-conversion at ");
-    ser::write_unlocked(data->loc.file ? data->loc.file : "?");
+    ser::write_unlocked((data->loc.file != nullptr) ? data->loc.file : "?");
     ser::write_unlocked(":");
     ubsan_write_dec(data->loc.line);
     ser::write_unlocked(":");
@@ -460,7 +469,7 @@ void __ubsan_handle_invalid_builtin_abort(UbsanInvalidBuiltinData* data) { __ubs
 
 void __ubsan_handle_nonnull_return_v1(UbsanNonnullReturnData* data) { ubsan_abort("nonnull-return", &data->loc); }
 void __ubsan_handle_nonnull_return_v1_abort(UbsanNonnullReturnData* data) { __ubsan_handle_nonnull_return_v1(data); }
-
+// NOLINTEND(readability-identifier-naming)
 }  // extern "C"
 
 #endif  // WOS_KUBSAN

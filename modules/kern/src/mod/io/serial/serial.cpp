@@ -8,7 +8,7 @@
 #include "mod/io/port/port.hpp"
 
 namespace ker::mod::io::serial {
-bool isInit = false;
+static bool is_init = false;
 
 namespace {
 // Reentrant spinlock: tracks owner CPU and recursion depth
@@ -34,8 +34,8 @@ bool enter_panic_mode() {
     uint64_t expected = NO_PANIC_OWNER;
     constexpr uint64_t ADDR_MASK = 0xFFFFU;
     auto fallback = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&expected) & ADDR_MASK);
-    uint64_t cpu_id = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : fallback;
-    return panic_owner_cpu.compare_exchange_strong(expected, cpu_id, std::memory_order_acq_rel, std::memory_order_acquire);
+    uint64_t const CPU_ID = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : fallback;
+    return panic_owner_cpu.compare_exchange_strong(expected, CPU_ID, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 bool is_panic_mode() { return in_panic_mode.load(std::memory_order_acquire); }
@@ -44,15 +44,15 @@ bool is_panic_owner() {
     if (!in_panic_mode.load(std::memory_order_acquire)) {
         return false;
     }
-    uint64_t owner = panic_owner_cpu.load(std::memory_order_acquire);
-    if (owner == NO_PANIC_OWNER) {
+    uint64_t const OWNER = panic_owner_cpu.load(std::memory_order_acquire);
+    if (OWNER == NO_PANIC_OWNER) {
         return false;
     }
     if (!cpu_id_available.load(std::memory_order_acquire)) {
         // Very early boot, single CPU — assume this CPU is the owner.
         return true;
     }
-    return cpu::current_cpu() == owner;
+    return cpu::current_cpu() == OWNER;
 }
 
 void acquire_lock() {
@@ -62,17 +62,17 @@ void acquire_lock() {
         return;
     }
 
-    uint64_t cpu = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : 0;
+    uint64_t const CPU = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : 0;
 
     // If we already own the lock, just increment depth (reentrant)
-    if (lock_owner.load(std::memory_order_relaxed) == cpu) {
+    if (lock_owner.load(std::memory_order_relaxed) == CPU) {
         lock_depth.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     // Spin until we can acquire
     uint64_t expected = NO_OWNER;
-    while (!lock_owner.compare_exchange_weak(expected, cpu, std::memory_order_acquire, std::memory_order_relaxed)) {
+    while (!lock_owner.compare_exchange_weak(expected, CPU, std::memory_order_acquire, std::memory_order_relaxed)) {
         expected = NO_OWNER;
         asm volatile("pause");
     }
@@ -85,15 +85,17 @@ void release_lock() {
         return;
     }
 
-    uint64_t depth = lock_depth.fetch_sub(1, std::memory_order_relaxed);
-    if (depth == 1) {
+    uint64_t const DEPTH = lock_depth.fetch_sub(1, std::memory_order_relaxed);
+    if (DEPTH == 1) {
         lock_owner.store(NO_OWNER, std::memory_order_release);
     }
 }
 
 // Internal unlocked character write
 static void write_char_unlocked(char c) {
-    while ((inb(0x3F8 + 5) & 0x20) == 0);
+    while ((inb(0x3F8 + 5) & 0x20) == 0) {
+        ;
+    }
     outb(0x3F8, c);
 }
 
@@ -132,16 +134,16 @@ static void flush_buf(size_t idx) {
 }
 
 static void buf_char(char c) {
-    size_t idx = get_buf_idx();
-    CpuSerialBuf& buf = cpu_bufs[idx];
+    size_t const IDX = get_buf_idx();
+    CpuSerialBuf& buf = cpu_bufs[IDX];
     buf.data[buf.len++] = c;
     if (c == '\n' || buf.len >= BUF_DATA_SIZE) {
-        flush_buf(idx);
+        flush_buf(IDX);
     }
 }
 
 void init() {
-    if (isInit) {
+    if (is_init) {
         return;
     }
     outb(0x3F8 + 1, 0x00);  // Disable all interrupts
@@ -151,7 +153,7 @@ void init() {
     outb(0x3F8 + 3, 0x03);  // 8 bits, no parity, one stop bit
     outb(0x3F8 + 2, 0xC7);  // Enable FIFO, clear them, with 14-byte threshold
     outb(0x3F8 + 4, 0x0B);  // IRQs enabled, RTS/DSR set
-    isInit = true;
+    is_init = true;
 }
 
 void write(const char* str) {
@@ -166,7 +168,7 @@ void write(const char* str, uint64_t len) {
     }
 }
 
-void write(const char c) { buf_char(c); }
+void write(const char C) { buf_char(C); }
 
 void write(uint64_t num) {
     char str[21];
@@ -220,7 +222,7 @@ void write_unlocked(const char* str, uint64_t len) {
     }
 }
 
-void write_unlocked(const char c) { write_char_unlocked(c); }
+void write_unlocked(const char C) { write_char_unlocked(C); }
 
 void write_unlocked(uint64_t num) {
     char str[21];
@@ -234,11 +236,11 @@ void write_unlocked(uint64_t num) {
             num /= 10;
         }
     }
-    int len = 20 - pos;
-    for (int i = 0; i < len; ++i) {
+    int const LEN = 20 - pos;
+    for (int i = 0; i < LEN; ++i) {
         str[i] = str[pos + i];
     }
-    str[len] = '\0';
+    str[LEN] = '\0';
     write_unlocked(str);
 }
 
@@ -254,11 +256,11 @@ void write_hex_unlocked(uint64_t num) {
     while (start < 15 && str[start] == '0') {
         ++start;
     }
-    int len = 16 - start;
-    for (int i = 0; i < len; ++i) {
+    int const LEN = 16 - start;
+    for (int i = 0; i < LEN; ++i) {
         str[i] = str[start + i];
     }
-    str[len] = '\0';
+    str[LEN] = '\0';
     write_unlocked(str);
 }
 

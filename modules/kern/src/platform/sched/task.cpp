@@ -1,5 +1,7 @@
 #include "task.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -19,18 +21,18 @@
 #include "platform/sched/threading.hpp"
 #include "util/hcf.hpp"
 
-extern "C" void _wOS_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
+extern "C" void wos_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
 
 namespace ker::mod::sched::task {
-Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType type) {
+Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
     // The passed 'name' might point to Limine boot memory or user memory
     // which won't be mapped when we switch pagemaps.
     if (name != nullptr) {
-        size_t nameLen = strlen(name);
-        char* nameCopy = new char[nameLen + 1];
-        memcpy(nameCopy, name, nameLen + 1);
-        this->name = nameCopy;
+        size_t const NAME_LEN = strlen(name);
+        char* name_copy = new char[NAME_LEN + 1];
+        memcpy(name_copy, name, NAME_LEN + 1);
+        this->name = name_copy;
     } else {
         this->name = nullptr;
     }
@@ -92,13 +94,13 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         this->pagemap = mm::virt::get_kernel_pagemap();
         this->type = type;
         this->cpu = cpu::current_cpu();
-        this->context.syscall_kernel_stack = kernelRsp;
+        this->context.syscall_kernel_stack = kernel_rsp;
 
         // Initialize syscall scratch area even for idle tasks
         // This is needed because switchTo() sets GS_BASE from this field
         this->context.syscall_scratch_area = (uint64_t)(new cpu::PerCpu());
         auto* scratch_area = (cpu::PerCpu*)this->context.syscall_scratch_area;
-        scratch_area->syscall_stack = kernelRsp;
+        scratch_area->syscall_stack = kernel_rsp;
         scratch_area->cpu_id = cpu::current_cpu();
 
         // Idle tasks get PID 0 (kernel/swapper convention) - they don't consume real PIDs
@@ -121,13 +123,13 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         this->sched_weight = 128;
         this->sched_nice = 10;
         this->slice_ns = 2'000'000;
-        this->context.syscall_kernel_stack = kernelRsp;
+        this->context.syscall_kernel_stack = kernel_rsp;
         this->thread = nullptr;
 
-        auto* perCpu = new cpu::PerCpu();
-        perCpu->syscall_stack = kernelRsp;
-        perCpu->cpu_id = cpu::current_cpu();
-        this->context.syscall_scratch_area = (uint64_t)perCpu;
+        auto* per_cpu = new cpu::PerCpu();
+        per_cpu->syscall_stack = kernel_rsp;
+        per_cpu->cpu_id = cpu::current_cpu();
+        this->context.syscall_scratch_area = (uint64_t)per_cpu;
 
         this->pid = sched::task::get_next_pid();
         this->entry = 0;
@@ -137,7 +139,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
         this->context.frame.cs = 0x08;      // GDT_KERN_CS
         this->context.frame.ss = 0x10;      // GDT_KERN_DS
         this->context.frame.flags = 0x202;  // IF=1, reserved bit 1
-        this->context.frame.rsp = kernelRsp;
+        this->context.frame.rsp = kernel_rsp;
         this->context.frame.int_num = 0;
         this->context.frame.err_code = 0;
         this->context.regs = cpu::GPRegs();
@@ -147,7 +149,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     // this->entry = entry;
     // this->regs.ip = entry;
     this->pagemap = mm::virt::create_pagemap();
-    if (!this->pagemap) {
+    if (this->pagemap == nullptr) {
         dbg::log("Failed to create pagemap for task %s", name);
         hcf();
     }
@@ -155,7 +157,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->context.regs = cpu::GPRegs();
     this->type = type;
     this->cpu = cpu::current_cpu();
-    this->context.syscall_kernel_stack = kernelRsp;
+    this->context.syscall_kernel_stack = kernel_rsp;
 
     this->pid = sched::task::get_next_pid();
     // POSIX: default process group = own pid (processes start in their own group)
@@ -168,7 +170,7 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     mm::virt::copy_kernel_mappings(this);
 
     // Validate ELF pointer before any operations
-    if (elfStart == 0) {
+    if (elf_start == 0) {
         dbg::log("ERROR: Task created with null ELF pointer");
         hcf();
     }
@@ -177,18 +179,18 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     __asm__ volatile("mfence" ::: "memory");
 
     // Validate ELF magic bytes before proceeding
-    auto* elfHeader = (uint8_t*)elfStart;
+    auto* elf_header = (uint8_t*)elf_start;
 
-    if (elfHeader[0] != 0x7F || elfHeader[1] != 'E' || elfHeader[2] != 'L' || elfHeader[3] != 'F') {
-        dbg::log("ERROR: Invalid ELF magic at 0x%p: [0x%x 0x%x 0x%x 0x%x]", (void*)elfStart, elfHeader[0], elfHeader[1], elfHeader[2],
-                 elfHeader[3]);
+    if (elf_header[0] != 0x7F || elf_header[1] != 'E' || elf_header[2] != 'L' || elf_header[3] != 'F') {
+        dbg::log("ERROR: Invalid ELF magic at 0x%p: [0x%x 0x%x 0x%x 0x%x]", (void*)elf_start, elf_header[0], elf_header[1], elf_header[2],
+                 elf_header[3]);
         dbg::log("Expected ELF magic: [0x7F 'E' 'L' 'F'] = [0x7F 0x45 0x4C 0x46]");
         hcf();
     }
 
     // FIXED: Parse ELF first to get actual TLS size, then create thread
-    ker::loader::elf::TlsModule actualTlsInfo = loader::elf::extract_tls_info((void*)elfStart);
-    this->thread = threading::create_thread(USER_STACK_SIZE, actualTlsInfo.tlsSize, this->pagemap, actualTlsInfo);
+    ker::loader::elf::TlsModule const ACTUAL_TLS_INFO = loader::elf::extract_tls_info((void*)elf_start);
+    this->thread = threading::create_thread(USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, ACTUAL_TLS_INFO);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Can't continue without a thread - this is a fatal error for the task
@@ -201,73 +203,73 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     // Allocate a KERNEL-space PerCpu structure for syscall scratch area
     // This must be in kernel memory, not user memory! The user's gsbase/TLS is separate.
     // After swapgs in syscall entry: GS_BASE will point to this kernel scratch area.
-    auto* perCpu = new cpu::PerCpu();
-    perCpu->syscall_stack = kernelRsp;
-    perCpu->cpu_id = cpu::current_cpu();
-    this->context.syscall_scratch_area = (uint64_t)perCpu;
+    auto* per_cpu = new cpu::PerCpu();
+    per_cpu->syscall_stack = kernel_rsp;
+    per_cpu->cpu_id = cpu::current_cpu();
+    this->context.syscall_scratch_area = (uint64_t)per_cpu;
 
     this->context.frame.rsp = this->thread->stack;
 
-    loader::elf::ElfLoadResult elfResult = loader::elf::load_elf((loader::elf::ElfFile*)elfStart, this->pagemap, this->pid, this->name);
-    if (elfResult.entryPoint == 0) {
+    loader::elf::ElfLoadResult elf_result = loader::elf::load_elf((loader::elf::ElfFile*)elf_start, this->pagemap, this->pid, this->name);
+    if (elf_result.entry_point == 0) {
         dbg::log("Failed to load ELF for task %s", name);
         hcf();
     }
-    this->entry = elfResult.entryPoint;
-    this->context.frame.rip = elfResult.entryPoint;
-    this->program_header_addr = elfResult.programHeaderAddr;
-    this->elf_header_addr = elfResult.elfHeaderAddr;
-    this->program_header_count = elfResult.programHeaderCount;
-    this->program_header_ent_size = elfResult.programHeaderEntSize;
+    this->entry = elf_result.entry_point;
+    this->context.frame.rip = elf_result.entry_point;
+    this->program_header_addr = elf_result.program_header_addr;
+    this->elf_header_addr = elf_result.elf_header_addr;
+    this->program_header_count = elf_result.program_header_count;
+    this->program_header_ent_size = elf_result.program_header_ent_size;
 
     // If the binary requests a dynamic linker (PT_INTERP), load it now.
     // The interpreter (ld.so) is loaded at a high base address to avoid
     // conflicting with the main binary's address space.
-    if (elfResult.hasInterp) {
+    if (elf_result.has_interp) {
         constexpr uint64_t INTERP_BASE = 0x40000000ULL;
 
-        int interpFd = ker::vfs::vfs_open(std::string_view(elfResult.interpPath, __builtin_strlen(elfResult.interpPath)), 0, 0);
-        if (interpFd < 0) {
-            dbg::log("Failed to open interpreter '%s' for task %s", elfResult.interpPath, name);
+        int const INTERP_FD = ker::vfs::vfs_open(std::string_view(elf_result.interp_path, __builtin_strlen(elf_result.interp_path)), 0, 0);
+        if (INTERP_FD < 0) {
+            dbg::log("Failed to open interpreter '%s' for task %s", elf_result.interp_path, name);
             hcf();
         }
 
-        ssize_t interpSize = ker::vfs::vfs_lseek(interpFd, 0, 2);
-        ker::vfs::vfs_lseek(interpFd, 0, 0);
-        if (interpSize <= 0) {
-            ker::vfs::vfs_close(interpFd);
-            dbg::log("Invalid interpreter file size for '%s'", elfResult.interpPath);
+        ssize_t const INTERP_SIZE = ker::vfs::vfs_lseek(INTERP_FD, 0, 2);
+        ker::vfs::vfs_lseek(INTERP_FD, 0, 0);
+        if (INTERP_SIZE <= 0) {
+            ker::vfs::vfs_close(INTERP_FD);
+            dbg::log("Invalid interpreter file size for '%s'", elf_result.interp_path);
             hcf();
         }
 
-        auto* interpBuf = new uint8_t[interpSize];
-        ssize_t interpRead = 0;
-        ker::vfs::vfs_read(interpFd, interpBuf, interpSize, (size_t*)&interpRead);
-        ker::vfs::vfs_close(interpFd);
+        auto* interp_buf = new uint8_t[INTERP_SIZE];
+        ssize_t interp_read = 0;
+        ker::vfs::vfs_read(INTERP_FD, interp_buf, INTERP_SIZE, reinterpret_cast<size_t*>(&interp_read));
+        ker::vfs::vfs_close(INTERP_FD);
 
-        if (interpRead != interpSize) {
-            delete[] interpBuf;
-            dbg::log("Short read loading interpreter '%s'", elfResult.interpPath);
+        if (interp_read != INTERP_SIZE) {
+            delete[] interp_buf;
+            dbg::log("Short read loading interpreter '%s'", elf_result.interp_path);
             hcf();
         }
 
-        loader::elf::ElfLoadResult interpResult =
-            loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)interpBuf, this->pagemap, this->pid, "ld.so",
+        loader::elf::ElfLoadResult const INTERP_RESULT =
+            loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)interp_buf, this->pagemap, this->pid, "ld.so",
                                   false /* don't register debug symbols for interp */, INTERP_BASE);
 
-        if (interpResult.entryPoint == 0) {
-            delete[] interpBuf;
-            dbg::log("Failed to load interpreter ELF '%s'", elfResult.interpPath);
+        if (INTERP_RESULT.entry_point == 0) {
+            delete[] interp_buf;
+            dbg::log("Failed to load interpreter ELF '%s'", elf_result.interp_path);
             hcf();
         }
 
         // Entry point becomes the interpreter's entry (ld.so _start).
         // ld.so reads AT_ENTRY and AT_PHDR from auxv to find the real binary.
-        this->context.frame.rip = interpResult.entryPoint;
+        this->context.frame.rip = INTERP_RESULT.entry_point;
         // Store interp_base for AT_BASE in auxv (set by exec.cpp)
         this->interp_base = INTERP_BASE;
 
-        delete[] interpBuf;
+        delete[] interp_buf;
     }
 
     // Initialize interrupt frame fields for usermode
@@ -278,44 +280,44 @@ Task::Task(const char* name, uint64_t elfStart, uint64_t kernelRsp, TaskType typ
     this->context.frame.flags = 0x202;  // IF (interrupts enabled) + reserved bit 1 NOLINT
 
     // Initialize important TLS symbols (e.g. SafeStack pointer) now that ELF is loaded and relocations processed
-    ker::loader::debug::DebugSymbol* ssym = ker::loader::debug::get_process_symbol(this->pid, "__safestack_unsafe_stack_ptr");
-    if (ssym && ssym->is_tls_offset) {
-        uint64_t destVaddr = this->thread->tls_base_virt + ssym->raw_value;  // rawValue stores st_value (TLS offset)
-        uint64_t destPaddr = mm::virt::translate(this->pagemap, destVaddr);
-        if (destPaddr != mm::virt::PADDR_INVALID) {
-            auto* destPtr = (uint64_t*)mm::addr::get_virt_pointer(destPaddr);
-            *destPtr = this->thread->safestack_ptr_value;
-            dbg::log("Wrote SafeStack ptr for PID %x at vaddr=%x (phys=%x) value=%x", this->pid, destVaddr, destPaddr,
+    ker::loader::debug::DebugSymbol const* ssym = ker::loader::debug::get_process_symbol(this->pid, "__safestack_unsafe_stack_ptr");
+    if ((ssym != nullptr) && ssym->is_tls_offset) {
+        uint64_t const DEST_VADDR = this->thread->tls_base_virt + ssym->raw_value;  // rawValue stores st_value (TLS offset)
+        uint64_t const DEST_PADDR = mm::virt::translate(this->pagemap, DEST_VADDR);
+        if (DEST_PADDR != mm::virt::PADDR_INVALID) {
+            auto* dest_ptr = static_cast<uint64_t*>(mm::addr::get_virt_pointer(DEST_PADDR));
+            *dest_ptr = this->thread->safestack_ptr_value;
+            dbg::log("Wrote SafeStack ptr for PID %x at vaddr=%x (phys=%x) value=%x", this->pid, DEST_VADDR, DEST_PADDR,
                      this->thread->safestack_ptr_value);
         } else {
-            dbg::log("Failed to translate SafeStack TLS vaddr %x for PID %x", destVaddr, this->pid);
+            dbg::log("Failed to translate SafeStack TLS vaddr %x for PID %x", DEST_VADDR, this->pid);
         }
     }
 }
 
-Task* Task::create_user_thread(Task* parent, uint64_t tcbVaddr, uint64_t userSp, uint64_t enterThreadVa) {
-    uint64_t kstackBase = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
-    if (kstackBase == 0) {
+Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) {
+    auto const KSTACK_BASE = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
+    if (KSTACK_BASE == 0) {
         dbg::log("createUserThread: OOM allocating kernel stack");
         return nullptr;
     }
-    uint64_t kRsp = kstackBase + KERNEL_STACK_SIZE;
+    uint64_t const K_RSP = KSTACK_BASE + KERNEL_STACK_SIZE;
 
     auto* t = new Task{};  // default-constructed; all fields set explicitly below
 
     // Copy name from parent
     if (parent->name != nullptr) {
-        size_t nameLen = strlen(parent->name);
-        char* nameCopy = new char[nameLen + 1];
-        memcpy(nameCopy, parent->name, nameLen + 1);
-        t->name = nameCopy;
+        size_t const NAME_LEN = strlen(parent->name);
+        char* name_copy = new char[NAME_LEN + 1];
+        memcpy(name_copy, parent->name, NAME_LEN + 1);
+        t->name = name_copy;
     } else {
         t->name = nullptr;
     }
 
     // Identity
     t->pid = sched::task::get_next_pid();
-    t->parent_pid = parent->parent_pid ? parent->parent_pid : parent->pid;
+    t->parent_pid = (parent->parent_pid != 0U) ? parent->parent_pid : parent->pid;
     t->type = TaskType::PROCESS;
     t->is_thread = true;
     t->owner_pid = parent->pid;
@@ -327,9 +329,9 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcbVaddr, uint64_t userSp,
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
     auto* thr = new threading::Thread{};
     thr->magic = 0xDEADBEEF;
-    thr->fsbase = tcbVaddr;
+    thr->fsbase = tcb_vaddr;
     thr->gsbase = 0;
-    thr->stack = userSp;
+    thr->stack = user_sp;
     thr->stack_size = 0;
     thr->tls_size = 0;
     thr->tls_base_virt = 0;
@@ -340,12 +342,12 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcbVaddr, uint64_t userSp,
     // Kernel-space PerCpu scratch area for syscall entry.
     // gsbase must also point here: after swapgs on syscall entry, GS_BASE becomes
     // gsbase, so it must be the PerCpu scratch area - not 0.
-    auto* perCpu = new cpu::PerCpu();
-    perCpu->syscall_stack = kRsp;
-    perCpu->cpu_id = cpu::current_cpu();
-    t->context.syscall_kernel_stack = kRsp;
-    t->context.syscall_scratch_area = (uint64_t)perCpu;
-    thr->gsbase = (uint64_t)perCpu;
+    auto* per_cpu = new cpu::PerCpu();
+    per_cpu->syscall_stack = K_RSP;
+    per_cpu->cpu_id = cpu::current_cpu();
+    t->context.syscall_kernel_stack = K_RSP;
+    t->context.syscall_scratch_area = (uint64_t)per_cpu;
+    thr->gsbase = (uint64_t)per_cpu;
 
     // User-mode interrupt frame: jump straight into __mlibc_enter_thread.
     // sys_prepare_stack pushed [ user_arg, entry ] below userSp (i.e. at userSp and userSp+8).
@@ -354,21 +356,21 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcbVaddr, uint64_t userSp,
     uint64_t user_arg_va = 0;
     {
         // Translate the two words on the prepared stack via the parent pagemap
-        uint64_t pa_entry = mm::virt::translate(parent->pagemap, userSp);
-        if (pa_entry != mm::virt::PADDR_INVALID) {
-            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(pa_entry));
+        uint64_t const PA_ENTRY = mm::virt::translate(parent->pagemap, user_sp);
+        if (PA_ENTRY != mm::virt::PADDR_INVALID) {
+            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(PA_ENTRY));
         }
-        uint64_t pa_arg = mm::virt::translate(parent->pagemap, userSp + 8);
-        if (pa_arg != mm::virt::PADDR_INVALID) {
-            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(pa_arg));
+        uint64_t const PA_ARG = mm::virt::translate(parent->pagemap, user_sp + 8);
+        if (PA_ARG != mm::virt::PADDR_INVALID) {
+            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(PA_ARG));
         }
     }
 
-    t->context.frame.rip = enterThreadVa;  // __mlibc_enter_thread
-    t->context.frame.rsp = userSp + 16;    // skip the two pushed words
-    t->context.frame.cs = 0x23;            // user code segment
-    t->context.frame.ss = 0x1b;            // user stack segment
-    t->context.frame.flags = 0x202;        // IF=1, reserved=1
+    t->context.frame.rip = enter_thread_va;  // __mlibc_enter_thread
+    t->context.frame.rsp = user_sp + 16;     // skip the two pushed words
+    t->context.frame.cs = 0x23;              // user code segment
+    t->context.frame.ss = 0x1b;              // user stack segment
+    t->context.frame.flags = 0x202;          // IF=1, reserved=1
     t->context.regs = cpu::GPRegs{};
     t->context.regs.rdi = entry_va;     // arg1: entry function
     t->context.regs.rsi = user_arg_va;  // arg2: user_arg
@@ -450,29 +452,29 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcbVaddr, uint64_t userSp,
     return t;
 }
 
-Task* Task::create_kernel_thread(const char* name, void (*entryFunc)()) {
-    if (entryFunc == nullptr) {
+Task* Task::create_kernel_thread(const char* name, void (*entry_func)()) {
+    if (entry_func == nullptr) {
         dbg::log("create_kernel_thread: null entry for '%s'", name != nullptr ? name : "?");
         return nullptr;
     }
 
-    auto stackBase = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
-    if (stackBase == 0) {
+    auto stack_base = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
+    if (stack_base == 0) {
         dbg::log("create_kernel_thread: OOM allocating kernel stack for '%s'", name);
         return nullptr;
     }
-    uint64_t kernelRsp = stackBase + KERNEL_STACK_SIZE;
+    uint64_t const KERNEL_RSP = stack_base + KERNEL_STACK_SIZE;
 
-    auto* task = new Task(name, 0, kernelRsp, TaskType::DAEMON);
-    task->kthread_entry = entryFunc;
-    task->context.frame.rip = reinterpret_cast<uint64_t>(_wOS_kernel_thread_trampoline);
-    task->context.regs.rdi = reinterpret_cast<uint64_t>(entryFunc);
+    auto* task = new Task(name, 0, KERNEL_RSP, TaskType::DAEMON);
+    task->kthread_entry = entry_func;
+    task->context.frame.rip = reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline);
+    task->context.regs.rdi = reinterpret_cast<uint64_t>(entry_func);
     return task;
 }
 
 void Task::load_context(cpu::GPRegs* gpr) { this->context.regs = *gpr; }
 
-void Task::save_context(cpu::GPRegs* gpr) {
+void Task::save_context(cpu::GPRegs* gpr) const {
     cpu_set_msr(IA32_KERNEL_GS_BASE, this->context.syscall_scratch_area);
     *gpr = context.regs;
 }

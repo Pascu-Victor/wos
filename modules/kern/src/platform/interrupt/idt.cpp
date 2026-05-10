@@ -1,15 +1,19 @@
 #include "idt.hpp"
 
+#include <cstdint>
+
+#include "platform/interrupt/gdt.hpp"
+
 namespace ker::mod::desc::idt {
 __attribute__((aligned(0x10))) static IdtEntry idt[IDT_ENTRIES];  // at most 256 interrupts
-static IdtPtr idtPtr;
+static IdtPtr idt_ptr;
 
-void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gateType, uint8_t dpl) {
+void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gate_type, uint8_t dpl) {
     entry->offset0 = (uint64_t)isr & 0xFFFF;
     entry->kernel_cs = gdt::GDT_KERN_CS;
     entry->ist = 0;
     entry->reserved0 = 0;
-    entry->gate_type = gateType;
+    entry->gate_type = gate_type;
     entry->zero0 = 0;
     entry->dpl = dpl;
     entry->present = 1;
@@ -18,7 +22,7 @@ void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gateType, uint8_t dpl) {
     entry->reserved1 = 0;
 }
 
-static inline IdtEntry* calcIdtEntry(uint8_t intNumber) { return &idt[intNumber]; }
+static inline IdtEntry* calcIdtEntry(uint8_t int_number) { return &idt[int_number]; }
 
 #define ISR_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 0)
 #define ISR_ENTRY_USER(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 3)
@@ -287,14 +291,14 @@ static void map_isr_entries() {
 void idt_init() {
     map_isr_entries();
 
-    idtPtr.limit = (uint16_t)sizeof(idt) - 1;
-    idtPtr.base = (uint64_t)&idt;
+    idt_ptr.limit = static_cast<uint16_t>(sizeof(idt)) - 1;
+    idt_ptr.base = (uint64_t)&idt;
 
     load_idt();
 }
 
 void load_idt() {
-    __asm__ volatile("lidt %0" : : "m"(idtPtr));  // load the new IDT
+    __asm__ volatile("lidt %0" : : "m"(idt_ptr));  // load the new IDT
 }
 
 }  // namespace ker::mod::desc::idt

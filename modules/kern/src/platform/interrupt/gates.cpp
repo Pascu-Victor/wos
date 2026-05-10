@@ -19,6 +19,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sched/scheduler.hpp"
+#include "util/hcf.hpp"
 
 namespace ker::mod::gates {
 namespace {
@@ -38,7 +39,7 @@ IrqContext irq_contexts[256] = {};
 // Next vector to try for allocation (48+ to avoid legacy ISA range)
 uint8_t next_alloc_vector = 48;
 
-static auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
+auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
     if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return nullptr;
     }
@@ -71,13 +72,14 @@ static auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t v
 }
 }  // namespace
 
-void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
+static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
     // Page fault handler - handles COW faults and user-space segfaults.
     // This MUST run before the panic ownership CAS below, because page faults
     // (especially COW resolution) are normal concurrent events. If two CPUs
     // hit a COW fault at the same time the old code would make the second CPU
     // think it was a nested panic and halt.
     if (frame.int_num == 14) {
+        // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t cr2 = cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
 
@@ -88,12 +90,13 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             return;
         }
     }
-
+    // NOLINTBEGIN(misc-const-correctness)
     uint64_t cr0{};
     uint64_t cr2{};
     uint64_t cr3{};
     uint64_t cr4{};
     uint64_t cr8{};
+    // NOLINTEND(misc-const-correctness)
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     asm volatile("mov %%cr2, %0" : "=r"(cr2));
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -105,18 +108,18 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     // NOTE: userspace faults are handled BEFORE the panic-ownership CAS below
     // because they are normal concurrent events (multiple threads can crash
     // simultaneously) and must never be mistaken for nested kernel panics.
-    uint64_t cpl = frame.cs & 0x3;
-    if (cpl == 3) {
+    uint64_t const CPL = frame.cs & 0x3;
+    if (CPL == 3) {
         auto* current_task_for_dump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
-        uint32_t apic_id = apic::get_apic_id();
-        uint64_t cpu_id_from_apic = smt::get_cpu_index_from_apic_id(apic_id);
-        journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", apic_id, cpu_id_from_apic,
+        uint32_t const APIC_ID = apic::get_apic_id();
+        uint64_t const CPU_ID_FROM_APIC = smt::get_cpu_index_from_apic_id(APIC_ID);
+        journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", APIC_ID, CPU_ID_FROM_APIC,
                       current_task_for_dump, (current_task_for_dump != nullptr) ? current_task_for_dump->pid : 0xDEAD, cr3,
-                      (current_task_for_dump != nullptr) ? (void*)current_task_for_dump->pagemap : nullptr);
+                      (current_task_for_dump != nullptr) ? reinterpret_cast<void*>(current_task_for_dump->pagemap) : nullptr);
 
-        ker::mod::dbg::coredump::tryWriteForTask(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
+        ker::mod::dbg::coredump::try_write_for_task(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
 
         if (frame.int_num == 14) {
             journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.err_code, frame.rip, frame.rsp,
@@ -178,7 +181,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
                 }
             }
 
-            auto* pml4 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF);
+            auto* pml4 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF));
             const uint64_t IDX4 = (cr2 >> 39) & 0x1FF;
             const uint64_t IDX3 = (cr2 >> 30) & 0x1FF;
             const uint64_t IDX2 = (cr2 >> 21) & 0x1FF;
@@ -186,14 +189,16 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
             journal::warn("PML4[%d]: present=%d frame=0x%lx", IDX4, pml4->entries[IDX4].present, pml4->entries[IDX4].frame);
             if (pml4->entries[IDX4].present) {
-                auto* pml3 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml4->entries[IDX4].frame << 12);
+                auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+                    ker::mod::mm::addr::get_virt_pointer(pml4->entries[IDX4].frame << 12));
                 journal::warn(" PML3[%d]: present=%d frame=0x%lx", IDX3, pml3->entries[IDX3].present, pml3->entries[IDX3].frame);
                 if (pml3->entries[IDX3].present) {
-                    auto* pml2 = (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << 12);
+                    auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+                        ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << 12));
                     journal::warn("  PML2[%d]: present=%d frame=0x%lx", IDX2, pml2->entries[IDX2].present, pml2->entries[IDX2].frame);
                     if (pml2->entries[IDX2].present) {
-                        auto* pml1 =
-                            (ker::mod::mm::paging::PageTable*)ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << 12);
+                        auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+                            ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << 12));
                         journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1->entries[IDX1].present,
                                       pml1->entries[IDX1].frame, pml1->entries[IDX1].user, pml1->entries[IDX1].writable,
                                       pml1->entries[IDX1].no_execute);
@@ -220,7 +225,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
         journal::warn("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.int_num, frame.err_code, frame.rip,
                       (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
-        ker::syscall::process::wos_proc_exit(128 + (int)(frame.int_num & 0x7f));
+        ker::syscall::process::wos_proc_exit(128 + static_cast<int>(frame.int_num & 0x7f));
         __builtin_unreachable();
     }
 
@@ -249,7 +254,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // CRITICAL: Enter epoch critical section to prevent GC from freeing currentTask
     // or its fields while we're printing panic info.
-    ker::mod::sched::EpochManager::enterCriticalAPIC();
+    ker::mod::sched::EpochManager::enter_critical_apic();
 
     // Acquire the serial lock BEFORE entering panic mode so other CPUs still
     // respect it. Once enterPanicMode() is called, all serial locking becomes
@@ -279,8 +284,8 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
     // Dump current task information - use getCurrentTask() instead of hardcoded address
     // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
-    uint64_t cpu_id = apic::get_apic_id();
-    sched::task::Task* current_task = nullptr;
+    uint64_t const CPU_ID = apic::get_apic_id();
+    sched::task::Task const* current_task = nullptr;
 
     if (!sched::has_run_queues()) {
         journal::panic("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
@@ -290,7 +295,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
     current_task = sched::get_current_task();
 
     journal::panic("=== Current Task Info ===");
-    journal::panic("debug_task_ptrs[%d] = 0x%lx", cpu_id, (uint64_t)current_task);
+    journal::panic("debug_task_ptrs[%d] = 0x%lx", CPU_ID, (uint64_t)current_task);
 
     if (current_task != nullptr) {
         // CRITICAL: Validate task pointer is in valid memory range before dereferencing
@@ -318,11 +323,11 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
             if (NAME_IN_HHDM || NAME_IN_KERNEL_STATIC) {
                 // Check first byte without assuming string is valid
                 volatile const char* volatile_name_ptr = name_ptr;
-                volatile char first_char = volatile_name_ptr[0];
-                if (first_char >= 0x20 && first_char <= 0x7e) {
+                volatile char const FIRST_CHAR = volatile_name_ptr[0];
+                if (FIRST_CHAR >= 0x20 && FIRST_CHAR <= 0x7e) {
                     journal::panic("Task name: %s", name_ptr);
                 } else {
-                    journal::panic("Task name: <invalid: first byte 0x%x>", (unsigned char)first_char);
+                    journal::panic("Task name: <invalid: first byte 0x%x>", static_cast<unsigned char>(FIRST_CHAR));
                 }
             } else {
                 journal::panic("Task name ptr: 0x%lx <out of range>", name_addr);
@@ -333,7 +338,7 @@ void exception_handler(cpu::GPRegs& gpr, interruptFrame& frame) {
 
         // Print primitive fields (safe - no pointer dereference)
         journal::panic("PID: 0x%x", current_task->pid);
-        journal::panic("Type: 0x%x", (uint64_t)current_task->type);
+        journal::panic("Type: 0x%x", static_cast<uint64_t>(current_task->type));
         journal::panic("Entry: 0x%lx", current_task->entry);
         journal::panic("kthread_entry: 0x%lx", (uint64_t)current_task->kthread_entry);
         journal::panic("Pagemap: 0x%lx", (uint64_t)current_task->pagemap);
@@ -365,14 +370,14 @@ skip_task_dump:
 
     // Check if page 0 is mapped (it should NOT be - null derefs should crash)
     auto* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
-    uint64_t pml4e = pml4[0];                               // Entry for VA 0x0
-    journal::panic("Page 0 check: PML4[0] = 0x%lx (Present=%d)", pml4e, (pml4e & 1) ? 1 : 0);
-    if ((pml4e & 1) != 0U) {
+    uint64_t const PML4E = pml4[0];                         // Entry for VA 0x0
+    journal::panic("Page 0 check: PML4[0] = 0x%lx (Present=%d)", PML4E, ((PML4E & 1) != 0U) ? 1 : 0);
+    if ((PML4E & 1) != 0U) {
         journal::panic("WARNING: Page 0 is mapped! NULL derefs won't crash!");
     }
 
     // print frame info
-    journal::panic("CPU: %d", cpu_id);
+    journal::panic("CPU: %d", CPU_ID);
     journal::panic("Interrupt number: %d", frame.int_num);
     journal::panic("Error code: %d", frame.err_code);
     journal::panic("RIP: 0x%lx", frame.rip);
@@ -410,20 +415,14 @@ skip_task_dump:
     struct GDTR {
         uint16_t limit;
         uint64_t base;
-    } __attribute__((packed)) gdtr;
+    } __attribute__((packed)) gdtr{};
     asm volatile("sgdt %0" : "=m"(gdtr));
 
     // Validate GDTR before using it
     bool gdtr_valid = (gdtr.base >= 0xffff800000000000ULL || gdtr.base >= 0xffffffff80000000ULL);
     journal::panic("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
 
-    auto rdmsr = [](uint32_t msr) -> uint64_t {
-        uint32_t lo = 0;
-        uint32_t hi = 0;
-        asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
-        return ((uint64_t)hi << 32) | lo;
-    };
-
+    // NOLINTBEGIN(misc-const-correctness)
     uint16_t sel_cs = sel_cs;
     uint16_t sel_ds = sel_ds;
     uint16_t sel_es = sel_es;
@@ -431,6 +430,7 @@ skip_task_dump:
     uint16_t sel_gs = sel_gs;
     uint16_t sel_ss = sel_ss;
     uint16_t sel_tr = sel_tr;
+    // NOLINTEND(misc-const-correctness)
     asm volatile("mov %%cs, %0" : "=r"(sel_cs));
     asm volatile("mov %%ds, %0" : "=r"(sel_ds));
     asm volatile("mov %%es, %0" : "=r"(sel_es));
@@ -440,7 +440,7 @@ skip_task_dump:
     asm volatile("str %0" : "=r"(sel_tr));
 
     auto print_selector = [&](const char* name, uint16_t sel) -> void {
-        journal::panic("%s: 0x%x (index=%d, rpl=%d)", name, sel, (uint64_t)(sel >> 3), (uint64_t)(sel & 0x3));
+        journal::panic("%s: 0x%x (index=%d, rpl=%d)", name, sel, static_cast<uint64_t>(sel >> 3), static_cast<uint64_t>(sel & 0x3));
 
         if (sel == 0) {
             journal::panic("  NULL selector");
@@ -452,48 +452,48 @@ skip_task_dump:
             return;
         }
 
-        uint64_t gdt_base = gdtr.base;
-        uint64_t index = (sel >> 3);
-        uint64_t desc_addr = gdt_base + (index * 8);
+        uint64_t const GDT_BASE = gdtr.base;
+        uint64_t const INDEX = (sel >> 3);
+        uint64_t const DESC_ADDR = GDT_BASE + (INDEX * 8);
 
         // Validate descriptor address is in valid kernel memory
-        const bool DESC_ADDR_VALID = (desc_addr >= 0xffff800000000000ULL && desc_addr < 0xffff900000000000ULL) ||
-                                     (desc_addr >= 0xffffffff80000000ULL && desc_addr < 0xffffffffc0000000ULL);
+        const bool DESC_ADDR_VALID = (DESC_ADDR >= 0xffff800000000000ULL && DESC_ADDR < 0xffff900000000000ULL) ||
+                                     (DESC_ADDR >= 0xffffffff80000000ULL && DESC_ADDR < 0xffffffffc0000000ULL);
 
         if (!DESC_ADDR_VALID) {
-            journal::panic("  Invalid descriptor address: 0x%lx", desc_addr);
+            journal::panic("  Invalid descriptor address: 0x%lx", DESC_ADDR);
             return;
         }
 
-        uint64_t desc = *(uint64_t*)(desc_addr);
+        uint64_t const DESC = *(uint64_t*)DESC_ADDR;
 
-        journal::panic("  Raw descriptor: 0x%lx", desc);
+        journal::panic("  Raw descriptor: 0x%lx", DESC);
 
-        const uint64_t LIMIT_LOW = desc & 0xFFFF;
-        const uint64_t BASE_0_15 = (desc >> 16) & 0xFFFF;
-        const uint64_t BASE_16_23 = (desc >> 32) & 0xFF;
-        const uint64_t ACCESS = (desc >> 40) & 0xFF;
-        const uint64_t LIMIT_16_19 = (desc >> 48) & 0xF;
-        const uint64_t FLAGS = (desc >> 52) & 0xF;
-        const uint64_t BASE_24_31 = (desc >> 56) & 0xFF;
+        const uint64_t LIMIT_LOW = DESC & 0xFFFF;
+        const uint64_t BASE_0_15 = (DESC >> 16) & 0xFFFF;
+        const uint64_t BASE_16_23 = (DESC >> 32) & 0xFF;
+        const uint64_t ACCESS = (DESC >> 40) & 0xFF;
+        const uint64_t LIMIT_16_19 = (DESC >> 48) & 0xF;
+        const uint64_t FLAGS = (DESC >> 52) & 0xF;
+        const uint64_t BASE_24_31 = (DESC >> 56) & 0xFF;
 
         uint64_t limit = LIMIT_LOW | (LIMIT_16_19 << 16);
-        bool gran = (FLAGS >> 3) & 1;
-        if (gran) {
+        bool const GRAN = (FLAGS >> 3) & 1;
+        if (GRAN) {
             limit = (limit << 12) | 0xFFF;
         }
 
         const uint64_t BASE = BASE_0_15 | (BASE_16_23 << 16) | (BASE_24_31 << 24);
 
-        bool s_bit = (ACCESS >> 4) & 1;  // 0 = system, 1 = code/data
-        if (!s_bit) {
+        bool const S_BIT = (ACCESS >> 4) & 1;  // 0 = system, 1 = code/data
+        if (!S_BIT) {
             // system descriptor (e.g., TSS) -- read second qword for full base
-            const uint64_t DESC_ADDR_HIGH = desc_addr + 8;
+            const uint64_t DESC_ADDR_HIGH = DESC_ADDR + 8;
             const bool DESC_ADDR_HIGH_VALID = (DESC_ADDR_HIGH >= 0xffff800000000000ULL && DESC_ADDR_HIGH < 0xffff900000000000ULL) ||
                                               (DESC_ADDR_HIGH >= 0xffffffff80000000ULL && DESC_ADDR_HIGH < 0xffffffffc0000000ULL);
 
             if (DESC_ADDR_HIGH_VALID) {
-                const uint64_t DESC_HIGH = *(uint64_t*)(DESC_ADDR_HIGH);
+                const uint64_t DESC_HIGH = *(uint64_t*)DESC_ADDR_HIGH;
                 const uint64_t BASE_HIGH = DESC_HIGH & 0xFFFFFFFF;
                 const uint64_t FULL_BASE = BASE | (BASE_HIGH << 32);
                 journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", FULL_BASE, limit);
@@ -530,7 +530,8 @@ skip_task_dump:
                             {.name = "IA32_MISC_ENABLE", .id = 0x1A0},    {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
                             {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
     for (const auto& m : MSRS) {
-        uint64_t val = rdmsr(m.id);
+        uint64_t val = val;
+        cpu_get_msr(m.id, &val);
         journal::panic("%s: 0x%lx", m.name, val);
     }
 
@@ -539,7 +540,7 @@ skip_task_dump:
     hcf();
 }
 
-extern "C" void iterrupt_handler(cpu::GPRegs gpr, interruptFrame frame) {
+extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
     if (frame.err_code != UINT64_MAX) {
         exception_handler(gpr, frame);
         return;

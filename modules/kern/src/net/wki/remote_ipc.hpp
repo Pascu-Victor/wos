@@ -41,7 +41,7 @@ struct WkiPipeSharedRegion {
     std::atomic<uint32_t> credits;  // sender's credit view
     uint32_t capacity;
     uint32_t flags;  // WRITE_CLOSED | READ_CLOSED
-    uint32_t _pad[3];
+    uint32_t pad[3];
     // Followed by `capacity` bytes of ring data (power of 2, page-aligned)
 };
 
@@ -52,7 +52,7 @@ constexpr uint32_t WKI_PIPE_FLAG_READ_CLOSED = 0x02;
 
 struct WkiEventfdSharedRegion {
     std::atomic<uint64_t> counter;
-    uint64_t _pad[7];
+    uint64_t pad[7];
 };
 
 static_assert(sizeof(WkiEventfdSharedRegion) == 64, "WkiEventfdSharedRegion must be 64 bytes");
@@ -63,7 +63,7 @@ struct WkiFutexWaiterBlock {
     uint32_t waiter_pid;
     std::atomic<uint32_t> woken;
     uint32_t seqlock;
-    uint64_t _pad[2];
+    uint64_t pad[2];
 };
 
 static_assert(sizeof(WkiFutexWaiterBlock) == 40, "WkiFutexWaiterBlock must be 40 bytes");
@@ -72,7 +72,7 @@ struct WkiEpollSharedRegion {
     uint64_t readiness[8];  // 512-bit bitmap
     uint64_t last_seen[8];  // shadow bitmap for edge-triggered
     uint64_t generation;    // incremented by waker
-    uint64_t _pad[7];
+    uint64_t pad[7];
 };
 
 static_assert(sizeof(WkiEpollSharedRegion) == 192, "WkiEpollSharedRegion must be 192 bytes");
@@ -80,7 +80,7 @@ static_assert(sizeof(WkiEpollSharedRegion) == 192, "WkiEpollSharedRegion must be
 struct WkiSockControlRegion {
     std::atomic<size_t> consumer_ptr;
     uint32_t flags;  // SHUTDOWN_RD | SHUTDOWN_WR | CLOSED
-    uint32_t _pad[1];
+    uint32_t pad[1];
 };
 
 constexpr uint32_t WKI_SOCK_FLAG_SHUTDOWN_RD = 0x01;

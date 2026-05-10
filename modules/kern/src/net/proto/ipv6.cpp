@@ -8,7 +8,6 @@
 #include <net/proto/ethernet.hpp>
 #include <net/proto/icmpv6.hpp>
 #include <net/proto/ndp.hpp>
-#include <platform/dbg/dbg.hpp>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
@@ -102,17 +101,17 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt) {
     const auto* hdr = reinterpret_cast<const IPv6Header*>(pkt->data);
 
     // Verify version == 6
-    uint8_t version = (ntohl(hdr->version_tc_flow) >> 28) & 0x0F;
-    if (version != 6) {
+    uint8_t const VERSION = (ntohl(hdr->version_tc_flow) >> 28) & 0x0F;
+    if (VERSION != 6) {
         pkt_free(pkt);
         return;
     }
 
-    uint16_t payload_len = ntohs(hdr->payload_length);
-    uint8_t next_header = hdr->next_header;
+    uint16_t const PAYLOAD_LEN = ntohs(hdr->payload_length);
+    uint8_t const NEXT_HEADER = hdr->next_header;
 
     // Verify packet is long enough
-    if (pkt->len < IPV6_HLEN + payload_len) {
+    if (pkt->len < IPV6_HLEN + PAYLOAD_LEN) {
         pkt_free(pkt);
         return;
     }
@@ -132,7 +131,7 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt) {
     // Strip IPv6 header
     pkt->pull(IPV6_HLEN);
 
-    switch (next_header) {
+    switch (NEXT_HEADER) {
         case IPV6_PROTO_ICMPV6:
             icmpv6_rx(dev, pkt, src, dst);
             break;

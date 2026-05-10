@@ -6,13 +6,22 @@
 namespace ker::mod::mm {
 struct PageAllocator;
 }  // namespace ker::mod::mm
-
-#define PAGE_ALIGN_UP(addr) (((addr) + ker::mod::mm::paging::PAGE_SIZE - 1) & (~(ker::mod::mm::paging::PAGE_SIZE - 1)))
-#define PAGE_ALIGN_DOWN(addr) ((addr) & ~(ker::mod::mm::paging::PAGE_SIZE - 1))
-
 namespace ker::mod::mm::paging {
 const static uint64_t PAGE_SHIFT = 12;
 const static uint64_t PAGE_SIZE = 0x1000;
+}  // namespace ker::mod::mm::paging
+
+template <typename T>
+constexpr auto page_align_down(T addr) -> T {
+    return static_cast<T>((addr & ~(ker::mod::mm::paging::PAGE_SIZE - 1)));
+}
+
+template <typename T>
+constexpr auto page_align_up(T addr) -> T {
+    return static_cast<T>((addr + ker::mod::mm::paging::PAGE_SIZE - 1) & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
+}
+
+namespace ker::mod::mm::paging {
 struct PageZone {
     PageZone* next;
     mm::PageAllocator* allocator;

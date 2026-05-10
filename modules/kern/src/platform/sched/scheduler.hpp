@@ -129,13 +129,13 @@ void wake_cpu(uint64_t cpu_no);                                   // Send wake I
 void insert_into_dead_list(task::Task* task);                     // Place a task into CPU 0's dead list for GC
 void gc_expired_tasks();                                          // Garbage collect dead tasks from dead lists
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr,
-                              ker::mod::gates::interruptFrame& frame);  // Move current task to wait queue with context saved
+                              ker::mod::gates::InterruptFrame& frame);  // Move current task to wait queue with context saved
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr,
-                                     ker::mod::gates::interruptFrame* frame_ptr);  // Called from syscall.asm to switch tasks after syscall
+                                     ker::mod::gates::InterruptFrame* frame_ptr);  // Called from syscall.asm to switch tasks after syscall
 void start_scheduler();
 void percpu_init();
-void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);
-void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::interruptFrame& frame);
+void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame);
+void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame);
 void arm_idle_timer_for_this_cpu();
 void note_scheduler_timer_interrupt();
 bool has_run_queues();
@@ -331,5 +331,5 @@ constexpr auto kern_sleep_us(uint64_t sleep_us) { ker::mod::sched::kern_sleep_us
 }  // namespace ker::mod::sched
 extern "C" auto wos_get_current_task() -> ker::mod::sched::task::Task*;
 extern "C" const uint64_t WOS_DEFERRED_TASK_SWITCH_OFFSET;
-extern "C" void wos_deferred_task_switch_return(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::interruptFrame* frame_ptr);
+extern "C" void wos_deferred_task_switch_return(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::InterruptFrame* frame_ptr);
 extern "C" [[noreturn]] void wos_start_kernel_thread(uint64_t stack_top, void (*entry)());

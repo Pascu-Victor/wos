@@ -1,7 +1,6 @@
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
-#include <time.h>
 
 #include <array>
 #include <cstdint>

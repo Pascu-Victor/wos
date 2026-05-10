@@ -1,14 +1,8 @@
-#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/paging.hpp>
-#include <platform/mm/phys.hpp>
-#include <platform/mm/virt.hpp>
-#include <platform/sys/spinlock.hpp>
 
 #include "slab_allocator.hpp"
 
@@ -226,22 +220,22 @@ size_t mini_get_slab_size(void* ptr) {
         return 0;
     }
     auto addr = reinterpret_cast<uintptr_t>(ptr);
-    bool valid =
+    bool const VALID =
         (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL) || (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
-    if (!valid) {
+    if (!VALID) {
         return 0;
     }
     auto* block = reinterpret_cast<MemoryBlock<0>*>(addr - MemoryBlock<0>::DATA_OFFSET);
     if (block->slab_ptr == 0) {
         return 0;
     }
-    uintptr_t sp = block->slab_ptr;
-    bool sp_valid =
-        (sp >= 0xffff800000000000ULL && sp < 0xffff900000000000ULL) || (sp >= 0xffffffff80000000ULL && sp < 0xffffffffc0000000ULL);
-    if (!sp_valid) {
+    uintptr_t const SP = block->slab_ptr;
+    bool const SP_VALID =
+        (SP >= 0xffff800000000000ULL && SP < 0xffff900000000000ULL) || (SP >= 0xffffffff80000000ULL && SP < 0xffffffffc0000000ULL);
+    if (!SP_VALID) {
         return 0;
     }
-    auto* hdr = reinterpret_cast<SlabHeader<1, 1>*>(sp);
+    auto* hdr = reinterpret_cast<SlabHeader<1, 1>*>(SP);
     if (hdr->magic != MAGIC) {
         return 0;
     }
@@ -256,9 +250,9 @@ void mini_free(void* address) {
     // Defensive: ensure address is in valid kernel memory range before touching it.
     // Valid ranges: HHDM (0xffff800000000000-0xffff900000000000) or kernel static (0xffffffff80000000-0xffffffffc0000000)
     auto addr_val = reinterpret_cast<uintptr_t>(address);
-    bool in_hhdm = (addr_val >= 0xffff800000000000ULL && addr_val < 0xffff900000000000ULL);
-    bool in_kernel_static = (addr_val >= 0xffffffff80000000ULL && addr_val < 0xffffffffc0000000ULL);
-    if (!in_hhdm && !in_kernel_static) {
+    bool const IN_HHDM = (addr_val >= 0xffff800000000000ULL && addr_val < 0xffff900000000000ULL);
+    bool const IN_KERNEL_STATIC = (addr_val >= 0xffffffff80000000ULL && addr_val < 0xffffffffc0000000ULL);
+    if (!IN_HHDM && !IN_KERNEL_STATIC) {
         ker::mod::dbg::log("mini_free: address %p outside valid kernel range (caller=%p); skipping free\n", address,
                            __builtin_return_address(0));
         return;
@@ -285,14 +279,14 @@ void mini_free(void* address) {
     }
 
     // Validate slab_ptr is in valid kernel memory range before dereferencing
-    uintptr_t slab_ptr_val = block->slab_ptr;
-    bool slab_in_hhdm = (slab_ptr_val >= 0xffff800000000000ULL && slab_ptr_val < 0xffff900000000000ULL);
-    bool slab_in_kernel_static = (slab_ptr_val >= 0xffffffff80000000ULL && slab_ptr_val < 0xffffffffc0000000ULL);
-    if (!slab_in_hhdm && !slab_in_kernel_static) {
+    uintptr_t const SLAB_PTR_VAL = block->slab_ptr;
+    bool const SLAB_IN_HHDM = (SLAB_PTR_VAL >= 0xffff800000000000ULL && SLAB_PTR_VAL < 0xffff900000000000ULL);
+    bool const SLAB_IN_KERNEL_STATIC = (SLAB_PTR_VAL >= 0xffffffff80000000ULL && SLAB_PTR_VAL < 0xffffffffc0000000ULL);
+    if (!SLAB_IN_HHDM && !SLAB_IN_KERNEL_STATIC) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wframe-address"
         ker::mod::dbg::log("mini_free: block %p (addr=%p) has invalid slab_ptr %p (caller=%p, caller2=%p). Skipping free", block, address,
-                           reinterpret_cast<void*>(slab_ptr_val), __builtin_return_address(0), __builtin_return_address(1));
+                           reinterpret_cast<void*>(SLAB_PTR_VAL), __builtin_return_address(0), __builtin_return_address(1));
 #pragma clang diagnostic pop
         return;
     }
@@ -312,7 +306,7 @@ void mini_free(void* address) {
         // Attempt to read first 8 bytes at the address if readable
         prefix = *(reinterpret_cast<uint64_t*>(address));
         ker::mod::dbg::log("mini_free: invalid slab magic at slab_ptr=%p magic=0x%x addr=%p caller=%p prefix=0x%llx", generic_slab,
-                           generic_slab->magic, address, __builtin_return_address(0), (unsigned long long)prefix);
+                           generic_slab->magic, address, __builtin_return_address(0), static_cast<unsigned long long>(prefix));
         return;
     }
 

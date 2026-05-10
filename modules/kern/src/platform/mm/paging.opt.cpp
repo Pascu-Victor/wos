@@ -23,7 +23,7 @@ auto create_page_table_entry(uint64_t frame, uint64_t flags) -> PageTableEntry {
     return entry;
 }
 
-auto purge_page_table_entry(void) -> PageTableEntry { return create_page_table_entry(0, 0); }
+auto purge_page_table_entry() -> PageTableEntry { return create_page_table_entry(0, 0); }
 
 auto create_page_fault(uint64_t flags, bool is_critical) -> PageFault {
     PageFault fault{};

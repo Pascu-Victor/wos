@@ -1,3 +1,6 @@
+#include <abi-bits/access.h>
+#include <abi-bits/fcntl.h>
+#include <bits/ssize_t.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <sys/process.h>
@@ -11,7 +14,6 @@
 #include <cstdio>
 #include <cstring>
 #include <print>
-#include <string>
 
 namespace {
 
@@ -43,16 +45,16 @@ auto read_trimmed_file(const char* path, char* out, size_t out_size) -> bool {
         return false;
     }
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
+    int const FD = open(path, O_RDONLY);
+    if (FD < 0) {
         out[0] = '\0';
         return false;
     }
 
-    ssize_t n = read(fd, out, out_size - 1);
-    int saved_errno = errno;
-    close(fd);
-    errno = saved_errno;
+    ssize_t n = read(FD, out, out_size - 1);
+    int const SAVED_ERRNO = errno;
+    close(FD);
+    errno = SAVED_ERRNO;
     if (n <= 0) {
         out[0] = '\0';
         return false;
@@ -125,13 +127,13 @@ auto run_homeward(int argc, char** argv) -> int {
     }
 
     std::array<char, 64> launcher = {};
-    int64_t launcher_len = ker::process::wki_launcher_node(launcher.data(), launcher.size());
-    if (launcher_len <= 0 || launcher[0] == '\0') {
+    int64_t const LAUNCHER_LEN = ker::process::wki_launcher_node(launcher.data(), launcher.size());
+    if (LAUNCHER_LEN <= 0 || launcher[0] == '\0') {
         std::println(stderr, "homeward: failed to resolve launcher node");
         return 1;
     }
 
-    int64_t rc = ker::process::setwkitarget(launcher.data(), static_cast<uint64_t>(launcher_len), ker::process::WKI_TARGET_FLAG_STRICT);
+    int64_t rc = ker::process::setwkitarget(launcher.data(), static_cast<uint64_t>(LAUNCHER_LEN), ker::process::WKI_TARGET_FLAG_STRICT);
     if (rc < 0) {
         std::println(stderr, "homeward: failed to target launcher '{}': {}", launcher.data(), static_cast<long>(rc));
         return 1;
@@ -171,8 +173,8 @@ auto add_forward_operand(const char* operand, uint32_t route) -> bool {
     }
 
     glob_t matches{};
-    int glob_rc = glob(operand, 0, nullptr, &matches);
-    if (glob_rc != 0) {
+    int const GLOB_RC = glob(operand, 0, nullptr, &matches);
+    if (GLOB_RC != 0) {
         globfree(&matches);
         std::println(stderr, "forward: no matches for '{}'", operand);
         return false;
@@ -201,8 +203,8 @@ auto run_forward(int argc, char** argv) -> int {
             break;
         }
 
-        uint32_t route = arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL;
-        if (!add_forward_operand(arg + 1, route)) {
+        uint32_t const ROUTE = arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL;
+        if (!add_forward_operand(arg + 1, ROUTE)) {
             return 1;
         }
     }

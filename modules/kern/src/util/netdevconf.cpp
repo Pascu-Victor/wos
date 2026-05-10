@@ -1,5 +1,7 @@
 #include "netdevconf.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <vfs/file.hpp>
@@ -23,14 +25,14 @@ auto find_device(const char* driver) -> net::NetDevice* {
     }
 
     char buf[BUF_SIZE] = {};
-    ssize_t n = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
+    ssize_t const N = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
     if (f->fops->vfs_close != nullptr) {
         f->fops->vfs_close(f);
     }
-    if (n <= 0) {
+    if (N <= 0) {
         return nullptr;
     }
-    buf[n] = '\0';
+    buf[N] = '\0';
 
     // Parse line by line: "<ifname> <driver>"
     const char* pos = buf;
@@ -55,7 +57,7 @@ auto find_device(const char* driver) -> net::NetDevice* {
         while (*pos != '\0' && *pos != ' ' && *pos != '\t' && *pos != '\n') {
             pos++;
         }
-        size_t ifname_len = static_cast<size_t>(pos - ifname_start);
+        auto const IFNAME_LEN = static_cast<size_t>(pos - ifname_start);
 
         // Skip whitespace between tokens
         while (*pos == ' ' || *pos == '\t') {
@@ -67,24 +69,24 @@ auto find_device(const char* driver) -> net::NetDevice* {
         while (*pos != '\0' && *pos != ' ' && *pos != '\t' && *pos != '\n' && *pos != '\r') {
             pos++;
         }
-        size_t driver_len = static_cast<size_t>(pos - driver_start);
+        auto const DRIVER_LEN = static_cast<size_t>(pos - driver_start);
 
         // Skip to end of line
         while (*pos != '\0' && *pos != '\n') {
             pos++;
         }
 
-        if (ifname_len == 0 || driver_len == 0) {
+        if (IFNAME_LEN == 0 || DRIVER_LEN == 0) {
             continue;
         }
 
         // Compare driver token
-        if (driver_len == std::strlen(driver) && std::strncmp(driver_start, driver, driver_len) == 0) {
+        if (DRIVER_LEN == std::strlen(driver) && std::strncmp(driver_start, driver, DRIVER_LEN) == 0) {
             // Null-terminate ifname for lookup
             char ifname[32] = {};
-            size_t copy_len = ifname_len < sizeof(ifname) - 1 ? ifname_len : sizeof(ifname) - 1;
-            std::memcpy(ifname, ifname_start, copy_len);
-            ifname[copy_len] = '\0';
+            size_t const COPY_LEN = IFNAME_LEN < sizeof(ifname) - 1 ? IFNAME_LEN : sizeof(ifname) - 1;
+            std::memcpy(ifname, ifname_start, COPY_LEN);
+            ifname[COPY_LEN] = '\0';
 
             auto* dev = net::netdev_find_by_name(ifname);
             if (dev != nullptr) {

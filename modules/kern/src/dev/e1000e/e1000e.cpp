@@ -7,6 +7,7 @@
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/wki/remotable.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
@@ -30,7 +31,7 @@ auto remotable_on_attach(uint16_t node_id) -> int {
 }
 void remotable_on_detach(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote detach from 0x%04x", node_id); }
 void remotable_on_fault(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote fault for 0x%04x", node_id); }
-const ker::net::wki::RemotableOps s_remotable_ops = {
+const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
     .can_passthrough = remotable_can_passthrough,
@@ -76,12 +77,12 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     // Kernel virtual address (static data, BSS, etc.): use page table walk
     if (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL) {
         auto* kernel_pt = ker::mod::mm::virt::get_kernel_page_table();
-        uint64_t phys = ker::mod::mm::virt::translate(kernel_pt, addr);
-        if (phys == ker::mod::mm::virt::PADDR_INVALID) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(kernel_pt, addr);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
             ker::mod::dbg::log("e1000e: virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
         }
-        return phys;
+        return PHYS;
     }
 
     ker::mod::dbg::log("e1000e: virt_to_phys called with unrecognized address 0x%lx", addr);
@@ -109,38 +110,38 @@ auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
 // -- Read MAC address ----------------------------------------------------
 void read_mac(E1000Device* dev) {
     // Try reading from RAL/RAH first (already programmed by EEPROM autoload)
-    uint32_t ral = reg_read(dev, REG_RAL);
-    uint32_t rah = reg_read(dev, REG_RAH);
+    uint32_t const RAL = reg_read(dev, REG_RAL);
+    uint32_t const RAH = reg_read(dev, REG_RAH);
 
-    if (ral != 0 || (rah & 0xFFFF) != 0) {
-        dev->netdev.mac[0] = static_cast<uint8_t>(ral);
-        dev->netdev.mac[1] = static_cast<uint8_t>(ral >> 8);
-        dev->netdev.mac[2] = static_cast<uint8_t>(ral >> 16);
-        dev->netdev.mac[3] = static_cast<uint8_t>(ral >> 24);
-        dev->netdev.mac[4] = static_cast<uint8_t>(rah);
-        dev->netdev.mac[5] = static_cast<uint8_t>(rah >> 8);
+    if (RAL != 0 || (RAH & 0xFFFF) != 0) {
+        dev->netdev.mac[0] = static_cast<uint8_t>(RAL);
+        dev->netdev.mac[1] = static_cast<uint8_t>(RAL >> 8);
+        dev->netdev.mac[2] = static_cast<uint8_t>(RAL >> 16);
+        dev->netdev.mac[3] = static_cast<uint8_t>(RAL >> 24);
+        dev->netdev.mac[4] = static_cast<uint8_t>(RAH);
+        dev->netdev.mac[5] = static_cast<uint8_t>(RAH >> 8);
         return;
     }
 
     // Fallback: read from EEPROM
-    uint16_t w0 = eeprom_read(dev, 0);
-    uint16_t w1 = eeprom_read(dev, 1);
-    uint16_t w2 = eeprom_read(dev, 2);
+    uint16_t const W0 = eeprom_read(dev, 0);
+    uint16_t const W1 = eeprom_read(dev, 1);
+    uint16_t const W2 = eeprom_read(dev, 2);
 
-    dev->netdev.mac[0] = static_cast<uint8_t>(w0);
-    dev->netdev.mac[1] = static_cast<uint8_t>(w0 >> 8);
-    dev->netdev.mac[2] = static_cast<uint8_t>(w1);
-    dev->netdev.mac[3] = static_cast<uint8_t>(w1 >> 8);
-    dev->netdev.mac[4] = static_cast<uint8_t>(w2);
-    dev->netdev.mac[5] = static_cast<uint8_t>(w2 >> 8);
+    dev->netdev.mac[0] = static_cast<uint8_t>(W0);
+    dev->netdev.mac[1] = static_cast<uint8_t>(W0 >> 8);
+    dev->netdev.mac[2] = static_cast<uint8_t>(W1);
+    dev->netdev.mac[3] = static_cast<uint8_t>(W1 >> 8);
+    dev->netdev.mac[4] = static_cast<uint8_t>(W2);
+    dev->netdev.mac[5] = static_cast<uint8_t>(W2 >> 8);
 }
 
 // -- Initialize RX ring --------------------------------------------------
 void init_rx(E1000Device* dev) {
     // Allocate descriptor ring (physically contiguous, 16-byte aligned)
-    size_t ring_size = NUM_RX_DESC * sizeof(E1000RxDesc);
-    auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::page_alloc(ring_size));
-    memset(descs, 0, ring_size);
+    size_t const RING_SIZE = NUM_RX_DESC * sizeof(E1000RxDesc);
+    auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
+    memset(descs, 0, RING_SIZE);
     dev->rx_descs = descs;
 
     // Allocate packet buffers and fill descriptors
@@ -158,32 +159,32 @@ void init_rx(E1000Device* dev) {
     }
 
     // Program descriptor ring registers
-    uint64_t ring_phys = virt_to_phys(descs);
-    reg_write(dev, REG_RDBAL, static_cast<uint32_t>(ring_phys));
-    reg_write(dev, REG_RDBAH, static_cast<uint32_t>(ring_phys >> 32));
-    reg_write(dev, REG_RDLEN, static_cast<uint32_t>(ring_size));
+    uint64_t const RING_PHYS = virt_to_phys(descs);
+    reg_write(dev, REG_RDBAL, static_cast<uint32_t>(RING_PHYS));
+    reg_write(dev, REG_RDBAH, static_cast<uint32_t>(RING_PHYS >> 32));
+    reg_write(dev, REG_RDLEN, static_cast<uint32_t>(RING_SIZE));
     reg_write(dev, REG_RDH, 0);
     reg_write(dev, REG_RDT, NUM_RX_DESC - 1);
 
     dev->rx_tail = 0;
 
     // Enable receiver
-    uint32_t rctl = RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC;
-    reg_write(dev, REG_RCTL, rctl);
+    uint32_t const RCTL = RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC;
+    reg_write(dev, REG_RCTL, RCTL);
 }
 
 // -- Initialize TX ring --------------------------------------------------
 void init_tx(E1000Device* dev) {
-    size_t ring_size = NUM_TX_DESC * sizeof(E1000TxDesc);
-    auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::page_alloc(ring_size));
-    memset(descs, 0, ring_size);
+    size_t const RING_SIZE = NUM_TX_DESC * sizeof(E1000TxDesc);
+    auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
+    memset(descs, 0, RING_SIZE);
     dev->tx_descs = descs;
 
     // Program descriptor ring registers
-    uint64_t ring_phys = virt_to_phys(descs);
-    reg_write(dev, REG_TDBAL, static_cast<uint32_t>(ring_phys));
-    reg_write(dev, REG_TDBAH, static_cast<uint32_t>(ring_phys >> 32));
-    reg_write(dev, REG_TDLEN, static_cast<uint32_t>(ring_size));
+    uint64_t const RING_PHYS = virt_to_phys(descs);
+    reg_write(dev, REG_TDBAL, static_cast<uint32_t>(RING_PHYS));
+    reg_write(dev, REG_TDBAH, static_cast<uint32_t>(RING_PHYS >> 32));
+    reg_write(dev, REG_TDLEN, static_cast<uint32_t>(RING_SIZE));
     reg_write(dev, REG_TDH, 0);
     reg_write(dev, REG_TDT, 0);
 
@@ -194,9 +195,9 @@ void init_tx(E1000Device* dev) {
     reg_write(dev, REG_TIPG, (6U << 20) | (8U << 10) | 10U);
 
     // Enable transmitter
-    uint32_t tctl = TCTL_EN | TCTL_PSP | (15U << TCTL_CT_SHIFT) |  // Collision Threshold
-                    (64U << TCTL_COLD_SHIFT);                      // Collision Distance (full duplex)
-    reg_write(dev, REG_TCTL, tctl);
+    uint32_t const TCTL = TCTL_EN | TCTL_PSP | (15U << TCTL_CT_SHIFT) |  // Collision Threshold
+                          (64U << TCTL_COLD_SHIFT);                      // Collision Distance (full duplex)
+    reg_write(dev, REG_TCTL, TCTL);
 }
 
 // -- Process received packets (budget-limited for NAPI) ------------------
@@ -204,15 +205,15 @@ int process_rx_budget(E1000Device* dev, int budget) {
     int processed = 0;
 
     while (processed < budget) {
-        uint16_t idx = dev->rx_tail;
-        auto* desc = &dev->rx_descs[idx];
+        uint16_t const IDX = dev->rx_tail;
+        auto* desc = &dev->rx_descs[IDX];
 
         if ((desc->status & RX_STATUS_DD) == 0) {
             break;  // No more completed descriptors
         }
 
         if ((desc->status & RX_STATUS_EOP) != 0 && desc->errors == 0) {
-            auto* pkt = dev->rx_bufs[idx];
+            auto* pkt = dev->rx_bufs[IDX];
             if (pkt != nullptr) {
                 pkt->data = pkt->storage.data();
                 pkt->len = desc->length;
@@ -227,19 +228,19 @@ int process_rx_budget(E1000Device* dev, int budget) {
                 if (new_pkt != nullptr) {
                     new_pkt->data = new_pkt->storage.data();
                     new_pkt->len = 0;
-                    dev->rx_bufs[idx] = new_pkt;
+                    dev->rx_bufs[IDX] = new_pkt;
                     desc->addr = virt_to_phys(new_pkt->storage.data());
                 } else {
                     // No buffer available - mark slot as empty
-                    dev->rx_bufs[idx] = nullptr;
+                    dev->rx_bufs[IDX] = nullptr;
                     desc->addr = 0;
                 }
             }
         }
 
         desc->status = 0;
-        reg_write(dev, REG_RDT, idx);
-        dev->rx_tail = (idx + 1) % NUM_RX_DESC;
+        reg_write(dev, REG_RDT, IDX);
+        dev->rx_tail = (IDX + 1) % NUM_RX_DESC;
     }
 
     return processed;
@@ -284,15 +285,15 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     }
 
     // Read and acknowledge interrupt cause (auto-clears on read)
-    uint32_t icr = reg_read(dev, REG_ICR);
-    if (icr == 0) {
+    uint32_t const ICR = reg_read(dev, REG_ICR);
+    if (ICR == 0) {
         return;  // Not our interrupt
     }
 
     // Handle link status change immediately (doesn't need deferral)
-    if ((icr & ICR_LSC) != 0) {
-        uint32_t status = reg_read(dev, REG_STATUS);
-        if ((status & 0x02) != 0) {
+    if ((ICR & ICR_LSC) != 0) {
+        uint32_t const STATUS = reg_read(dev, REG_STATUS);
+        if ((STATUS & 0x02) != 0) {
             ker::mod::dbg::log("e1000e: Link up");
         } else {
             ker::mod::dbg::log("e1000e: Link down");
@@ -300,7 +301,7 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     }
 
     // For RX/TX, disable interrupts and schedule NAPI poll
-    if ((icr & (ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_TXDW | ICR_TXQE)) != 0) {
+    if ((ICR & (ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_TXDW | ICR_TXQE)) != 0) {
         // Disable interrupts until poll completes
         reg_write(dev, REG_IMC, 0xFFFFFFFF);
 
@@ -320,17 +321,17 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     // Use lock_irqsave to prevent preemption while holding the lock.
     // Without this, a DAEMON task holding the plain lock can be preempted,
     // and a non-preemptible PROCESS task on the same CPU will spin forever.
-    uint64_t txflags = dev->tx_lock.lock_irqsave();
+    uint64_t const TXFLAGS = dev->tx_lock.lock_irqsave();
 
-    uint16_t idx = dev->tx_tail;
-    auto* desc = &dev->tx_descs[idx];
+    uint16_t const IDX = dev->tx_tail;
+    auto* desc = &dev->tx_descs[IDX];
 
     // Check if descriptor is available
-    if (dev->tx_bufs[idx] != nullptr) {
+    if (dev->tx_bufs[IDX] != nullptr) {
         // TX ring full - try to reclaim
         process_tx(dev);
-        if (dev->tx_bufs[idx] != nullptr) {
-            dev->tx_lock.unlock_irqrestore(txflags);
+        if (dev->tx_bufs[IDX] != nullptr) {
+            dev->tx_lock.unlock_irqrestore(TXFLAGS);
             ker::net::pkt_free(pkt);
             return -1;  // Drop packet
         }
@@ -345,8 +346,8 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     desc->css = 0;
     desc->special = 0;
 
-    dev->tx_bufs[idx] = pkt;
-    dev->tx_tail = (idx + 1) % NUM_TX_DESC;
+    dev->tx_bufs[IDX] = pkt;
+    dev->tx_tail = (IDX + 1) % NUM_TX_DESC;
 
     // Notify hardware
     reg_write(dev, REG_TDT, dev->tx_tail);
@@ -354,7 +355,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     ndev->tx_packets++;
     ndev->tx_bytes += pkt->len;
 
-    dev->tx_lock.unlock_irqrestore(txflags);
+    dev->tx_lock.unlock_irqrestore(TXFLAGS);
     return 0;
 }
 
@@ -442,11 +443,11 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     }
 
     // Program MAC into RAL/RAH
-    uint32_t ral = static_cast<uint32_t>(dev->netdev.mac[0]) | (static_cast<uint32_t>(dev->netdev.mac[1]) << 8) |
-                   (static_cast<uint32_t>(dev->netdev.mac[2]) << 16) | (static_cast<uint32_t>(dev->netdev.mac[3]) << 24);
-    uint32_t rah = static_cast<uint32_t>(dev->netdev.mac[4]) | (static_cast<uint32_t>(dev->netdev.mac[5]) << 8) | RAH_AV;
-    reg_write(dev, REG_RAL, ral);
-    reg_write(dev, REG_RAH, rah);
+    uint32_t const RAL = static_cast<uint32_t>(dev->netdev.mac[0]) | (static_cast<uint32_t>(dev->netdev.mac[1]) << 8) |
+                         (static_cast<uint32_t>(dev->netdev.mac[2]) << 16) | (static_cast<uint32_t>(dev->netdev.mac[3]) << 24);
+    uint32_t const RAH = static_cast<uint32_t>(dev->netdev.mac[4]) | (static_cast<uint32_t>(dev->netdev.mac[5]) << 8) | RAH_AV;
+    reg_write(dev, REG_RAL, RAL);
+    reg_write(dev, REG_RAH, RAH);
 
     // Initialize RX and TX rings
     init_rx(dev);
@@ -463,8 +464,8 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     dev->irq_vector = vector;
 
     // Try MSI first, fall back to legacy interrupt
-    int msi_result = pci::pci_enable_msi(pci_dev, vector);
-    if (msi_result != 0) {
+    int const MSI_RESULT = pci::pci_enable_msi(pci_dev, vector);
+    if (MSI_RESULT != 0) {
         // Use legacy IRQ
         ker::mod::dbg::log("e1000e: MSI not available, using legacy IRQ %d", pci_dev->interrupt_line);
         vector = pci_dev->interrupt_line + 32;  // IRQ line + ISA offset
@@ -478,7 +479,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     dev->netdev.state = 1;  // UP
     dev->netdev.ops = &e1000_netdev_ops;
     dev->netdev.private_data = dev;
-    dev->netdev.remotable = &s_remotable_ops;
+    dev->netdev.remotable = &S_REMOTABLE_OPS;
 
     // Register with network stack
     ker::net::netdev_register(&dev->netdev);
@@ -498,14 +499,14 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
 
     ker::mod::dbg::log("e1000e: %s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s) napi", name, dev->netdev.mac[0],
                        dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5], dev->irq_vector,
-                       msi_result == 0 ? "MSI" : "legacy");
+                       MSI_RESULT == 0 ? "MSI" : "legacy");
 }
 }  // namespace
 
 void e1000e_init() {
     // Scan all PCI devices for supported Intel NICs
-    size_t count = pci::pci_device_count();
-    for (size_t i = 0; i < count; i++) {
+    size_t const COUNT = pci::pci_device_count();
+    for (size_t i = 0; i < COUNT; i++) {
         auto* dev = pci::pci_get_device(i);
         if (dev == nullptr) {
             continue;

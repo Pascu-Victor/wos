@@ -1,15 +1,19 @@
 #include "process.hpp"
 
+#include <bits/posix/posix_string.h>
+
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <string_view>
+#include <utility>
 
 #include "abi/callnums/process.h"
 #include "mod/io/serial/serial.hpp"
 #include "net/wki/remote_compute.hpp"
+#include "net/wki/wki.hpp"
 #include "platform/asm/cpu.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/interrupt/gdt.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/phys.hpp"
@@ -45,23 +49,26 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
         return;
     }
 
-    const uint64_t rip_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rip);
-    const uint64_t rsp_phys = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rsp);
-    const bool rip_bad =
-        child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL || rip_phys == ker::mod::mm::virt::PADDR_INVALID;
-    const bool rsp_bad =
-        child->context.frame.rsp == 0 || child->context.frame.rsp >= 0x0000800000000000ULL || rsp_phys == ker::mod::mm::virt::PADDR_INVALID;
-    if (!rip_bad && !rsp_bad) {
+    const uint64_t RIP_PHYS = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rip);
+    const uint64_t RSP_PHYS = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rsp);
+    const bool RIP_BAD =
+        child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL || RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID;
+    const bool RSP_BAD =
+        child->context.frame.rsp == 0 || child->context.frame.rsp >= 0x0000800000000000ULL || RSP_PHYS == ker::mod::mm::virt::PADDR_INVALID;
+    if (!RIP_BAD && !RSP_BAD) {
         return;
     }
 
     fork_log::warn(
         "fork child resume anomaly: parent=%lu child=%lu pagemap=%p rip=0x%llx rip_phys=0x%llx rsp=0x%llx rsp_phys=0x%llx gs_rip=0x%llx "
         "gs_rsp=0x%llx gs_rflags=0x%llx parent_pagemap=%p",
-        parent != nullptr ? parent->pid : 0, child->pid, static_cast<void*>(child->pagemap), (unsigned long long)child->context.frame.rip,
-        (unsigned long long)((rip_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rip_phys), (unsigned long long)child->context.frame.rsp,
-        (unsigned long long)((rsp_phys == ker::mod::mm::virt::PADDR_INVALID) ? 0 : rsp_phys), (unsigned long long)saved_rip,
-        (unsigned long long)saved_rsp, (unsigned long long)saved_flags, parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
+        parent != nullptr ? parent->pid : 0, child->pid, static_cast<void*>(child->pagemap),
+        static_cast<unsigned long long>(child->context.frame.rip),
+        static_cast<unsigned long long>((RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID) ? 0 : RIP_PHYS),
+        static_cast<unsigned long long>(child->context.frame.rsp),
+        static_cast<unsigned long long>((RSP_PHYS == ker::mod::mm::virt::PADDR_INVALID) ? 0 : RSP_PHYS),
+        static_cast<unsigned long long>(saved_rip), static_cast<unsigned long long>(saved_rsp),
+        static_cast<unsigned long long>(saved_flags), parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
 }
 }  // namespace
 
@@ -69,30 +76,34 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
     auto* parent = sched::get_current_task();
-    if (parent == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (parent == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     // Save parent's register context (will be copied to child)
     parent->context.regs = gpr;
 
     // --- Allocate child kernel stack ---
-    auto kernelStackBase = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
-    if (kernelStackBase == 0) return static_cast<uint64_t>(-ENOMEM);
-    uint64_t kernelRsp = kernelStackBase + KERNEL_STACK_SIZE;
+    auto kernel_stack_base = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
+    if (kernel_stack_base == 0) {
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    uint64_t const KERNEL_RSP = kernel_stack_base + KERNEL_STACK_SIZE;
 
     // --- Allocate child Task without the ELF-loading constructor ---
     auto* child = new sched::task::Task{};
     if (child == nullptr) {
-        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         return static_cast<uint64_t>(-ENOMEM);
     }
 
     // --- Initialize child task fields ---
     // Copy name
     if (parent->name != nullptr) {
-        size_t nameLen = strlen(parent->name);
-        char* nameCopy = new char[nameLen + 1];
-        memcpy(nameCopy, parent->name, nameLen + 1);
-        child->name = nameCopy;
+        size_t const NAME_LEN = strlen(parent->name);
+        char* name_copy = new char[NAME_LEN + 1];
+        memcpy(name_copy, parent->name, NAME_LEN + 1);
+        child->name = name_copy;
     }
 
     child->pid = sched::task::get_next_pid();
@@ -149,7 +160,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -180,7 +191,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->pagemap = mm::virt::create_pagemap();
     if (child->pagemap == nullptr) {
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -193,7 +204,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-cow-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -207,7 +218,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
             mm::phys::page_free(child->pagemap);
             delete[] child->name;
-            mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+            mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
             delete child;
             return static_cast<uint64_t>(-ENOMEM);
         }
@@ -224,10 +235,10 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // --- Set up child context ---
     // Child's kernel stack and per-CPU scratch area
-    child->context.syscall_kernel_stack = kernelRsp;
+    child->context.syscall_kernel_stack = KERNEL_RSP;
 
     auto* per_cpu = new cpu::PerCpu();
-    per_cpu->syscall_stack = kernelRsp;
+    per_cpu->syscall_stack = KERNEL_RSP;
     per_cpu->cpu_id = cpu::current_cpu();
     child->context.syscall_scratch_area = (uint64_t)per_cpu;
 
@@ -244,9 +255,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     //   gs:0x28 = RCX at entry = user return RIP
     //   gs:0x30 = R11 at entry = user RFLAGS
     //   gs:0x08 = user RSP at entry
+    // NOLINTBEGIN(misc-const-correctness)
     uint64_t return_rip = 0;
     uint64_t return_flags = 0;
     uint64_t user_rsp = 0;
+    // NOLINTEND(misc-const-correctness)
     {
         asm volatile("movq %%gs:0x28, %0" : "=r"(return_rip));
         asm volatile("movq %%gs:0x30, %0" : "=r"(return_flags));
@@ -303,7 +316,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernelStackBase));
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -328,34 +341,40 @@ static auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr
     using namespace ker::mod;
 
     auto* task = sched::get_current_task();
-    if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     // Signal numbers are 1-based, array is 0-based
-    if (signum < 1 || signum > static_cast<int>(sched::task::Task::MAX_SIGNALS)) return static_cast<uint64_t>(-EINVAL);
+    if (signum < 1 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS)) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
 
     // SIGKILL and SIGSTOP cannot have their handlers changed
-    if (signum == WOS_SIGKILL || signum == WOS_SIGSTOP) return static_cast<uint64_t>(-EINVAL);
+    if (signum == WOS_SIGKILL || signum == WOS_SIGSTOP) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
 
-    unsigned idx = static_cast<unsigned>(signum - 1);
+    auto const IDX = static_cast<unsigned>(signum - 1);
 
     // Return old handler if requested
     if (oldact_ptr != 0) {
         auto* old = reinterpret_cast<KernelSigaction*>(oldact_ptr);
-        old->handler = task->sig_handlers[idx].handler;
-        old->flags = task->sig_handlers[idx].flags;
-        old->restorer = task->sig_handlers[idx].restorer;
-        old->mask = task->sig_handlers[idx].mask;
+        old->handler = task->sig_handlers[IDX].handler;
+        old->flags = task->sig_handlers[IDX].flags;
+        old->restorer = task->sig_handlers[IDX].restorer;
+        old->mask = task->sig_handlers[IDX].mask;
     }
 
     // Set new handler if provided
     if (act_ptr != 0) {
-        auto* act = reinterpret_cast<const KernelSigaction*>(act_ptr);
-        task->sig_handlers[idx].handler = act->handler;
-        task->sig_handlers[idx].flags = act->flags;
-        task->sig_handlers[idx].mask = act->mask;
+        const auto* act = reinterpret_cast<const KernelSigaction*>(act_ptr);
+        task->sig_handlers[IDX].handler = act->handler;
+        task->sig_handlers[IDX].flags = act->flags;
+        task->sig_handlers[IDX].mask = act->mask;
         // Store restorer if SA_RESTORER flag is set
-        if (act->flags & WOS_SA_RESTORER) {
-            task->sig_handlers[idx].restorer = act->restorer;
+        if ((act->flags & WOS_SA_RESTORER) != 0U) {
+            task->sig_handlers[IDX].restorer = act->restorer;
         }
     }
 
@@ -366,7 +385,9 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
     using namespace ker::mod;
 
     auto* task = sched::get_current_task();
-    if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     // Return old mask if requested (sigset_t first word)
     if (oldset_ptr != 0) {
@@ -376,12 +397,12 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
 
     // Apply new mask if provided
     if (set_ptr != 0) {
-        auto* setp = reinterpret_cast<const uint64_t*>(set_ptr);
+        const auto* setp = reinterpret_cast<const uint64_t*>(set_ptr);
         uint64_t set = *setp;
 
         // SIGKILL and SIGSTOP can never be blocked
-        uint64_t unblockable = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
-        set &= ~unblockable;
+        uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
+        set &= ~UNBLOCKABLE;
 
         switch (how) {
             case 0:  // SIG_BLOCK
@@ -404,13 +425,19 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
 static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     using namespace ker::mod;
 
-    if (sig < 0 || sig > static_cast<int>(sched::task::Task::MAX_SIGNALS)) return static_cast<uint64_t>(-EINVAL);
+    if (sig < 0 || std::cmp_greater(sig, sched::task::Task::MAX_SIGNALS)) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
 
     // sig == 0 is used to check if process exists (no signal sent)
     if (sig == 0) {
-        if (pid <= 0) return 0;  // simplified
+        if (pid <= 0) {
+            return 0;  // simplified
+        }
         auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
-        if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+        if (target == nullptr) {
+            return static_cast<uint64_t>(-ESRCH);
+        }
         target->release();
         return 0;
     }
@@ -418,18 +445,22 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     if (pid == 0) {
         // pid==0: send signal to all processes in caller's process group
         auto* self = sched::get_current_task();
-        if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
-        uint64_t pgrp = (self->pgid != 0) ? self->pgid : self->pid;
-        sched::signal_process_group(pgrp, sig);
+        if (self == nullptr) {
+            return static_cast<uint64_t>(-ESRCH);
+        }
+        uint64_t const PGRP = (self->pgid != 0) ? self->pgid : self->pid;
+        sched::signal_process_group(PGRP, sig);
         return 0;
     }
     if (pid < 0) {
         // pid < -1: send signal to process group -pid
         // pid == -1: send to all processes (simplified: send to caller's pgrp)
-        uint64_t pgrp;
+        uint64_t pgrp = 0;
         if (pid == -1) {
             auto* self = sched::get_current_task();
-            if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if (self == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
             pgrp = (self->pgid != 0) ? self->pgid : self->pid;
         } else {
             pgrp = static_cast<uint64_t>(-pid);
@@ -439,7 +470,9 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     }
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
-    if (target == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (target == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
 
     // Forward interrupt/termination signals to the remote node if target is a
     // WKI proxy task.
@@ -456,14 +489,18 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
 }
 
 static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
-    if (which != WOS_PRIO_PROCESS) return static_cast<uint64_t>(-EINVAL);
+    if (which != WOS_PRIO_PROCESS) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
 
     auto* self = mod::sched::get_current_task();
     if (self == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    if (who == 0) who = static_cast<int64_t>(self->pid);
+    if (who == 0) {
+        who = static_cast<int64_t>(self->pid);
+    }
     if (who < 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
@@ -522,52 +559,52 @@ static auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, 
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    size_t len = strnlen(task->wki_target_hostname, sizeof(task->wki_target_hostname));
+    size_t const LEN = strnlen(task->wki_target_hostname, sizeof(task->wki_target_hostname));
     if (hostname_out != nullptr) {
-        if (hostname_out_size == 0 || len + 1 > hostname_out_size) {
+        if (hostname_out_size == 0 || LEN + 1 > hostname_out_size) {
             return static_cast<uint64_t>(-ENAMETOOLONG);
         }
-        memcpy(hostname_out, task->wki_target_hostname, len + 1);
+        memcpy(hostname_out, task->wki_target_hostname, LEN + 1);
     }
 
     if (flags_out != nullptr) {
         *flags_out = task->wki_target_flags;
     }
 
-    return len;
+    return LEN;
 }
 
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     switch (op) {
-        case abi::process::procmgmt_ops::exit:
+        case abi::process::procmgmt_ops::EXIT:
             wos_proc_exit(static_cast<int>(a2));
             return 0;  // Should not reach here
-        case abi::process::procmgmt_ops::exec: {
+        case abi::process::procmgmt_ops::EXEC: {
             return wos_proc_exec(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
                                  reinterpret_cast<const char* const*>(a4));
         }
-        case abi::process::procmgmt_ops::waitpid: {
+        case abi::process::procmgmt_ops::WAITPID: {
             return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), a5, gpr);
         }
-        case abi::process::procmgmt_ops::getpid: {
+        case abi::process::procmgmt_ops::GETPID: {
             return wos_proc_getpid();
         }
-        case abi::process::procmgmt_ops::getppid: {
+        case abi::process::procmgmt_ops::GETPPID: {
             return wos_proc_getppid();
         }
-        case abi::process::procmgmt_ops::fork: {
+        case abi::process::procmgmt_ops::FORK: {
             return wos_proc_fork(gpr);
         }
-        case abi::process::procmgmt_ops::sigaction: {
+        case abi::process::procmgmt_ops::SIGACTION: {
             return wos_proc_sigaction(static_cast<int>(a2), a3, a4);
         }
-        case abi::process::procmgmt_ops::sigprocmask: {
+        case abi::process::procmgmt_ops::SIGPROCMASK: {
             return wos_proc_sigprocmask(static_cast<int>(a2), a3, a4);
         }
-        case abi::process::procmgmt_ops::kill: {
+        case abi::process::procmgmt_ops::KILL: {
             return wos_proc_kill(static_cast<int64_t>(a2), static_cast<int>(a3));
         }
-        case abi::process::procmgmt_ops::sigreturn: {
+        case abi::process::procmgmt_ops::SIGRETURN: {
             // Signal the asm-level check_pending_signals to restore the saved context
             auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
@@ -577,23 +614,23 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
 
         // --- POSIX credential syscalls ---
-        case abi::process::procmgmt_ops::getuid: {
+        case abi::process::procmgmt_ops::GETUID: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->uid : 0;
         }
-        case abi::process::procmgmt_ops::geteuid: {
+        case abi::process::procmgmt_ops::GETEUID: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->euid : 0;
         }
-        case abi::process::procmgmt_ops::getgid: {
+        case abi::process::procmgmt_ops::GETGID: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->gid : 0;
         }
-        case abi::process::procmgmt_ops::getegid: {
+        case abi::process::procmgmt_ops::GETEGID: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->egid : 0;
         }
-        case abi::process::procmgmt_ops::setuid: {
+        case abi::process::procmgmt_ops::SETUID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -611,7 +648,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             }
             return 0;
         }
-        case abi::process::procmgmt_ops::setgid: {
+        case abi::process::procmgmt_ops::SETGID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -628,7 +665,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             }
             return 0;
         }
-        case abi::process::procmgmt_ops::seteuid: {
+        case abi::process::procmgmt_ops::SETEUID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -640,7 +677,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             }
             return static_cast<uint64_t>(-EPERM);
         }
-        case abi::process::procmgmt_ops::setegid: {
+        case abi::process::procmgmt_ops::SETEGID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -652,11 +689,11 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             }
             return static_cast<uint64_t>(-EPERM);
         }
-        case abi::process::procmgmt_ops::getumask: {
+        case abi::process::procmgmt_ops::GETUMASK: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->umask : 022;
         }
-        case abi::process::procmgmt_ops::setumask: {
+        case abi::process::procmgmt_ops::SETUMASK: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -666,7 +703,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return old_umask;
         }
 
-        case abi::process::procmgmt_ops::setsid: {
+        case abi::process::procmgmt_ops::SETSID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -680,7 +717,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             task->controlling_tty = -1;  // POSIX: setsid detaches from controlling terminal
             return task->pid;
         }
-        case abi::process::procmgmt_ops::getsid: {
+        case abi::process::procmgmt_ops::GETSID: {
             auto pid = static_cast<int64_t>(a2);
             if (pid == 0) {
                 auto* task = ker::mod::sched::get_current_task();
@@ -698,7 +735,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             target->release();
             return sid;
         }
-        case abi::process::procmgmt_ops::setpgid: {
+        case abi::process::procmgmt_ops::SETPGID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -730,7 +767,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             target->release();
             return 0;
         }
-        case abi::process::procmgmt_ops::getpgid: {
+        case abi::process::procmgmt_ops::GETPGID: {
             auto pid = static_cast<int64_t>(a2);
             if (pid == 0) {
                 auto* task = ker::mod::sched::get_current_task();
@@ -747,41 +784,41 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             target->release();
             return pgid;
         }
-        case abi::process::procmgmt_ops::execve: {
+        case abi::process::procmgmt_ops::EXECVE: {
             // POSIX replace-process execve
             return wos_proc_execve(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
                                    reinterpret_cast<const char* const*>(a4), gpr);
         }
-        case abi::process::procmgmt_ops::gethostname: {
+        case abi::process::procmgmt_ops::GETHOSTNAME: {
             auto* buf = reinterpret_cast<char*>(a2);
             auto bufsize = static_cast<size_t>(a3);
             if (buf == nullptr) {
                 return static_cast<uint64_t>(-EFAULT);
             }
             const char* name = ker::util::hostname::get();
-            size_t len = strlen(name);
-            if (len + 1 > bufsize) {
+            size_t const LEN = strlen(name);
+            if (LEN + 1 > bufsize) {
                 return static_cast<uint64_t>(-ENAMETOOLONG);
             }
-            memcpy(buf, name, len + 1);
+            memcpy(buf, name, LEN + 1);
             return 0;
         }
-        case abi::process::procmgmt_ops::sethostname: {
+        case abi::process::procmgmt_ops::SETHOSTNAME: {
             const auto* name = reinterpret_cast<const char*>(a2);
             auto len = static_cast<size_t>(a3);
             if (name == nullptr) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            int r = ker::util::hostname::set(name, len);
-            return (r < 0) ? static_cast<uint64_t>(r) : 0;
+            int const R = ker::util::hostname::set(name, len);
+            return (R < 0) ? static_cast<uint64_t>(R) : 0;
         }
-        case abi::process::procmgmt_ops::setpriority: {
+        case abi::process::procmgmt_ops::SETPRIORITY: {
             return wos_proc_setpriority(static_cast<int>(a2), static_cast<int64_t>(a3), static_cast<int>(a4));
         }
-        case abi::process::procmgmt_ops::setwkitarget: {
+        case abi::process::procmgmt_ops::SETWKITARGET: {
             return wos_proc_setwkitarget(reinterpret_cast<const char*>(a2), static_cast<size_t>(a3), static_cast<uint32_t>(a4));
         }
-        case abi::process::procmgmt_ops::getwkitarget: {
+        case abi::process::procmgmt_ops::GETWKITARGET: {
             return wos_proc_getwkitarget(reinterpret_cast<char*>(a2), static_cast<size_t>(a3), reinterpret_cast<uint32_t*>(a4));
         }
 

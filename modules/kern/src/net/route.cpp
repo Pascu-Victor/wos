@@ -1,6 +1,9 @@
 #include "route.hpp"
 
-#include <platform/dbg/dbg.hpp>
+#include <cstddef>
+#include <cstdint>
+
+#include "net/netdevice.hpp"
 
 namespace ker::net {
 
@@ -11,7 +14,7 @@ size_t route_count = 0;
 // Count leading 1-bits in netmask (for prefix length comparison)
 auto mask_prefix_len(uint32_t mask) -> int {
     int n = 0;
-    while (mask & 0x80000000) {
+    while ((mask & 0x80000000) != 0U) {
         n++;
         mask <<= 1;
     }
@@ -35,10 +38,10 @@ auto route_lookup(uint32_t dst) -> RouteEntry* {
             continue;
         }
         if ((dst & routes[i].netmask) == (routes[i].dest & routes[i].netmask)) {
-            int prefix = mask_prefix_len(routes[i].netmask);
-            if (prefix > best_prefix || (prefix == best_prefix && best != nullptr && routes[i].metric < best->metric)) {
+            int const PREFIX = mask_prefix_len(routes[i].netmask);
+            if (PREFIX > best_prefix || (PREFIX == best_prefix && best != nullptr && routes[i].metric < best->metric)) {
                 best = &routes[i];
-                best_prefix = prefix;
+                best_prefix = PREFIX;
             }
         }
     }

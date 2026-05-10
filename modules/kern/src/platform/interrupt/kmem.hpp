@@ -9,7 +9,7 @@ const static uint64_t NUM_MMAP_ENTRIES = 256;
 
 const static constexpr uint64_t PAGE_SIZE = 4096;
 
-struct page_table_entry {
+struct PageTableEntry {
     uint64_t present : 1;
     uint64_t writable : 1;
     uint64_t user : 1;
@@ -25,11 +25,11 @@ struct page_table_entry {
     uint64_t no_execute : 1;
 } __attribute__((packed));
 
-void init(void);
+void init();
 
 uint64_t mmap_read(uint64_t addr, uint64_t offset);
 
-uint64_t allocate_frame(void);
+uint64_t allocate_frame();
 
 void free_frame(uint64_t addr);
 

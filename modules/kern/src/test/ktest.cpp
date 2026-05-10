@@ -8,20 +8,20 @@
 static void kcov_heapify(uint64_t* a, uint64_t n, uint64_t root) {
     while (true) {
         uint64_t largest = root;
-        uint64_t l = (2 * root) + 1;
-        uint64_t r = (2 * root) + 2;
-        if (l < n && a[l] > a[largest]) {
-            largest = l;
+        uint64_t const L = (2 * root) + 1;
+        uint64_t const R = (2 * root) + 2;
+        if (L < n && a[L] > a[largest]) {
+            largest = L;
         }
-        if (r < n && a[r] > a[largest]) {
-            largest = r;
+        if (R < n && a[R] > a[largest]) {
+            largest = R;
         }
         if (largest == root) {
             break;
         }
-        uint64_t tmp = a[root];
+        uint64_t const TMP = a[root];
         a[root] = a[largest];
-        a[largest] = tmp;
+        a[largest] = TMP;
         root = largest;
     }
 }
@@ -34,9 +34,9 @@ static auto kcov_sort_dedup(uint64_t* pcs, uint64_t count) -> uint64_t {
         kcov_heapify(pcs, count, i);
     }
     for (uint64_t i = count - 1; i > 0; --i) {
-        uint64_t tmp = pcs[0];
+        uint64_t const TMP = pcs[0];
         pcs[0] = pcs[i];
-        pcs[i] = tmp;
+        pcs[i] = TMP;
         kcov_heapify(pcs, i, 0);
     }
     uint64_t out = 1;
@@ -54,21 +54,22 @@ namespace ker::test {
 int g_pass = 0;
 int g_fail = 0;
 
-void _check_eq_log(const char* file, int line, uint64_t a, uint64_t b, const char* as, const char* bs) {
-    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected %s == %s  (0x%llx != 0x%llx)", file, line, as, bs, (unsigned long long)a,
-                       (unsigned long long)b);
+void check_eq_log(const char* file, int line, uint64_t a, uint64_t b, const char* as, const char* bs) {
+    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected %s == %s  (0x%llx != 0x%llx)", file, line, as, bs, static_cast<unsigned long long>(a),
+                       static_cast<unsigned long long>(b));
 }
 
-void _check_ne_log(const char* file, int line, uint64_t a, uint64_t /*b*/, const char* as, const char* bs) {
-    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected %s != %s  (both 0x%llx)", file, line, as, bs, (unsigned long long)a);
+void check_ne_log(const char* file, int line, uint64_t a, uint64_t /*b*/, const char* as, const char* bs) {
+    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected %s != %s  (both 0x%llx)", file, line, as, bs, static_cast<unsigned long long>(a));
 }
 
-void _check_true_log(const char* file, int line, const char* cexpr) {
+void check_true_log(const char* file, int line, const char* cexpr) {
     ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected true: %s", file, line, cexpr);
 }
 
-void _check_null_log(const char* file, int line, const void* ptr, const char* pexpr) {
-    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected null: %s (got 0x%llx)", file, line, pexpr, (unsigned long long)(uintptr_t)ptr);
+void check_null_log(const char* file, int line, const void* ptr, const char* pexpr) {
+    ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected null: %s (got 0x%llx)", file, line, pexpr,
+                       static_cast<unsigned long long>((uintptr_t)ptr));
 }
 
 void run_all() {
@@ -91,10 +92,10 @@ void run_all() {
             ker::mod::dbg::log("[KTEST] SKIP  %s/%s", t->suite, t->name);
             continue;
         }
-        int fail_before = g_fail;
+        int const FAIL_BEFORE = g_fail;
         ker::mod::dbg::log("[KTEST] RUN   %s/%s", t->suite, t->name);
         t->fn();
-        if (g_fail == fail_before) {
+        if (g_fail == FAIL_BEFORE) {
             ker::mod::dbg::log("[KTEST] PASS  %s/%s", t->suite, t->name);
         }
     }
@@ -103,18 +104,18 @@ void run_all() {
     ker::sanitizer::kcov::disable();
     auto* buf = ker::sanitizer::kcov::current_buffer();
     if (buf != nullptr && buf->count > 0) {
-        uint64_t unique = kcov_sort_dedup(buf->pcs, buf->count);
-        ker::mod::dbg::log("[KCOV_BEGIN] %llu", (unsigned long long)unique);
+        uint64_t const UNIQUE = kcov_sort_dedup(buf->pcs, buf->count);
+        ker::mod::dbg::log("[KCOV_BEGIN] %llu", static_cast<unsigned long long>(UNIQUE));
         uint64_t i = 0;
-        for (; i + 8 <= unique; i += 8) {
-            ker::mod::dbg::log("[KCOV] 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx", (unsigned long long)buf->pcs[i],
-                               (unsigned long long)buf->pcs[i + 1], (unsigned long long)buf->pcs[i + 2],
-                               (unsigned long long)buf->pcs[i + 3], (unsigned long long)buf->pcs[i + 4],
-                               (unsigned long long)buf->pcs[i + 5], (unsigned long long)buf->pcs[i + 6],
-                               (unsigned long long)buf->pcs[i + 7]);
+        for (; i + 8 <= UNIQUE; i += 8) {
+            ker::mod::dbg::log("[KCOV] 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx",
+                               static_cast<unsigned long long>(buf->pcs[i]), static_cast<unsigned long long>(buf->pcs[i + 1]),
+                               static_cast<unsigned long long>(buf->pcs[i + 2]), static_cast<unsigned long long>(buf->pcs[i + 3]),
+                               static_cast<unsigned long long>(buf->pcs[i + 4]), static_cast<unsigned long long>(buf->pcs[i + 5]),
+                               static_cast<unsigned long long>(buf->pcs[i + 6]), static_cast<unsigned long long>(buf->pcs[i + 7]));
         }
-        for (; i < unique; ++i) {
-            ker::mod::dbg::log("[KCOV] 0x%llx", (unsigned long long)buf->pcs[i]);
+        for (; i < UNIQUE; ++i) {
+            ker::mod::dbg::log("[KCOV] 0x%llx", static_cast<unsigned long long>(buf->pcs[i]));
         }
         ker::mod::dbg::log("[KCOV_END]");
     }

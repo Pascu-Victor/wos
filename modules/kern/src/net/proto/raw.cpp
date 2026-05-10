@@ -1,5 +1,7 @@
 #include "raw.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -7,19 +9,18 @@
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/packet.hpp>
-#include <net/proto/icmp.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/socket.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <utility>
 
 namespace ker::net::proto {
 
 namespace {
 struct RawRecvRecord {
-    uint16_t packet_len;  // bytes following this record
+    uint16_t packet_len{};  // bytes following this record
     uint16_t reserved = 0;
-    uint32_t src_ip;  // host byte order
+    uint32_t src_ip{};  // host byte order
 } __attribute__((packed));
 static_assert(sizeof(RawRecvRecord) == 8);
 
@@ -53,7 +54,7 @@ void unregister_raw_socket(Socket* sock) {
 }
 
 // Raw socket sendto - for ICMP and other raw IP protocols
-auto raw_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr_raw, size_t addr_len) -> ssize_t {
+auto raw_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const void* addr_raw, size_t addr_len) -> ssize_t {
     if (buf == nullptr) {
         return -EINVAL;
     }
@@ -86,21 +87,21 @@ auto raw_sendto(Socket* sock, const void* buf, size_t len, int, const void* addr
     ker::mod::dbg::log("raw_sendto: sending %zu bytes proto=%u to %u.%u.%u.%u\n", len, sock->protocol, (dst_ip >> 24) & 0xFF,
                        (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF);
 #endif
-    int result = ipv4_tx_auto(pkt, dst_ip, sock->protocol);
+    int const RESULT = ipv4_tx_auto(pkt, dst_ip, sock->protocol);
 
-    if (result < 0) {
+    if (RESULT < 0) {
 #ifdef DEBUG_RAW
         ker::mod::dbg::log("raw_sendto: ipv4_tx_auto failed with %d\n", result);
 #endif
         pkt_free(pkt);
-        return result;
+        return RESULT;
     }
 
     return static_cast<ssize_t>(len);
 }
 
 // Raw socket recvfrom - receive ICMP and other raw IP packets
-auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size_t* addr_len) -> ssize_t {
+auto raw_recvfrom(Socket* sock, void* buf, size_t len, int /*unused*/, void* addr_out, size_t* addr_len) -> ssize_t {
     if (buf == nullptr) {
         return -EINVAL;
     }
@@ -117,35 +118,35 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
 #endif
 
     RawRecvRecord record{};
-    ssize_t hdr_n = sock->rcvbuf.read(&record, sizeof(record));
-    if (hdr_n != static_cast<ssize_t>(sizeof(record))) {
+    ssize_t const HDR_N = sock->rcvbuf.read(&record, sizeof(record));
+    if (std::cmp_not_equal(HDR_N, sizeof(record))) {
         return -EIO;
     }
 
-    size_t packet_len = record.packet_len;
-    if (packet_len == 0 || packet_len > sock->rcvbuf.capacity) {
+    size_t const PACKET_LEN = record.packet_len;
+    if (PACKET_LEN == 0 || PACKET_LEN > sock->rcvbuf.capacity) {
         return -EIO;
     }
 
-    if (sock->rcvbuf.available() < packet_len) {
+    if (sock->rcvbuf.available() < PACKET_LEN) {
         return -EIO;
     }
 
-    size_t to_copy = len < packet_len ? len : packet_len;
-    ssize_t n = sock->rcvbuf.read(buf, to_copy);
-    if (n != static_cast<ssize_t>(to_copy)) {
+    size_t const TO_COPY = len < PACKET_LEN ? len : PACKET_LEN;
+    ssize_t const N = sock->rcvbuf.read(buf, TO_COPY);
+    if (std::cmp_not_equal(N, TO_COPY)) {
         return -EIO;
     }
 
     std::array<uint8_t, 256> discard{};
-    size_t remaining = packet_len - to_copy;
+    size_t remaining = PACKET_LEN - TO_COPY;
     while (remaining > 0) {
-        size_t chunk = remaining < discard.size() ? remaining : discard.size();
-        ssize_t discarded = sock->rcvbuf.read(discard.data(), chunk);
-        if (discarded <= 0) {
+        size_t const CHUNK = remaining < discard.size() ? remaining : discard.size();
+        ssize_t const DISCARDED = sock->rcvbuf.read(discard.data(), CHUNK);
+        if (DISCARDED <= 0) {
             return -EIO;
         }
-        remaining -= static_cast<size_t>(discarded);
+        remaining -= static_cast<size_t>(DISCARDED);
     }
 
     if (addr_out != nullptr && addr_len != nullptr) {
@@ -156,10 +157,10 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int, void* addr_out, size
         *addr_len = SOCKADDR_V4_LEN;
     }
 
-    return n;
+    return N;
 }
 
-auto raw_bind(Socket* sock, const void*, size_t) -> int {
+auto raw_bind(Socket* sock, const void* /*unused*/, size_t /*unused*/) -> int {
     // Register this socket to receive packets
     register_raw_socket(sock);
     return 0;
@@ -180,8 +181,8 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t 
     if (protocol == 1 && pkt->len >= 8) {  // IPPROTO_ICMP
         // ICMP header: type(1) code(1) checksum(2) id(2) sequence(2)
         auto* icmp_hdr = pkt->data;
-        uint8_t icmp_type = icmp_hdr[0];
-        if (icmp_type == 0 || icmp_type == 8) {  // Echo reply or request
+        uint8_t const ICMP_TYPE = icmp_hdr[0];
+        if (ICMP_TYPE == 0 || ICMP_TYPE == 8) {  // Echo reply or request
             icmp_id = (static_cast<uint16_t>(icmp_hdr[4]) << 8) | icmp_hdr[5];
             has_icmp_id = true;
 #ifdef DEBUG_RAW
@@ -194,18 +195,18 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t 
     ker::mod::dbg::log("raw_deliver: proto=%u len=%zu has_icmp_id=%d icmp_id=%u\n", protocol, pkt->len, has_icmp_id, icmp_id);
 #endif
 
-    size_t payload_len = pkt->len;
-    constexpr size_t prepend_len = sizeof(RawRecvRecord) + sizeof(IPv4Header);
-    if (pkt->headroom() < prepend_len) {
+    size_t const PAYLOAD_LEN = pkt->len;
+    constexpr size_t PREPEND_LEN = sizeof(RawRecvRecord) + sizeof(IPv4Header);
+    if (pkt->headroom() < PREPEND_LEN) {
         pkt_free(pkt);
         return;
     }
 
-    auto* frame = pkt->push(prepend_len);
+    auto* frame = pkt->push(PREPEND_LEN);
     auto* record = reinterpret_cast<RawRecvRecord*>(frame);
     auto* ip = reinterpret_cast<IPv4Header*>(frame + sizeof(RawRecvRecord));
 
-    record->packet_len = static_cast<uint16_t>(sizeof(IPv4Header) + payload_len);
+    record->packet_len = static_cast<uint16_t>(sizeof(IPv4Header) + PAYLOAD_LEN);
     record->reserved = 0;
     record->src_ip = src_ip;
 
@@ -224,7 +225,7 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t 
     size_t wake_count = 0;
 
     for (auto* sock : raw_sockets) {
-        if (sock != nullptr && sock->protocol == protocol) {
+        if (sock != nullptr && std::cmp_equal(sock->protocol, protocol)) {
 #ifdef DEBUG_RAW
             ker::mod::dbg::log("raw_deliver: checking socket owner_pid=%zu\n", sock->owner_pid);
 #endif
@@ -268,7 +269,7 @@ void raw_deliver(PacketBuffer* pkt, uint8_t protocol, uint32_t src_ip, uint32_t 
 
 namespace {
 
-int raw_setsockopt(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+int raw_setsockopt(Socket* sock, int /*unused*/, int optname, const void* optval, size_t optlen) {
     int optint = 0;
     if (optval != nullptr && optlen >= sizeof(optint)) {
         std::memcpy(&optint, optval, sizeof(optint));
@@ -280,7 +281,7 @@ int raw_setsockopt(Socket* sock, int, int optname, const void* optval, size_t op
     return 0;
 }
 
-int raw_getsockopt(Socket* sock, int, int optname, void* optval, size_t* optlen) {
+int raw_getsockopt(Socket* sock, int /*unused*/, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
         int value = static_cast<int>(sock->rcvbuf.capacity);
         std::memcpy(optval, &value, sizeof(value));

@@ -7,10 +7,10 @@
 #include "util/hcf.hpp"
 
 namespace ker::mod::acpi::rsdp {
-static bool hasXsdt = false;
+static bool has_xsdt = false;
 static Rsdp rsdp;
 
-void validate_checksum(const Rsdp* rsdp) {
+static void validate_checksum(const Rsdp* rsdp) {
     uint8_t sum = 0;
     auto* ptr = (uint8_t*)rsdp;
 
@@ -24,7 +24,7 @@ void validate_checksum(const Rsdp* rsdp) {
     }
 }
 
-auto use_xsdt() -> bool { return hasXsdt; }
+auto use_xsdt() -> bool { return has_xsdt; }
 
 void init(uint64_t rsdp_addr) {
     rsdp = *(Rsdp*)rsdp_addr;
@@ -33,7 +33,7 @@ void init(uint64_t rsdp_addr) {
     // TODO: log stuff
 
     if (rsdp.revision >= 2) {
-        hasXsdt = true;
+        has_xsdt = true;
     }
 }
 

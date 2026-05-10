@@ -23,12 +23,14 @@ static bool hw_checked = false;
 
 auto crc32c_has_hw() -> bool {
     if (!hw_checked) {
+        // NOLINTBEGIN(misc-const-correctness)
         uint32_t eax = 0;
         uint32_t ebx = 0;
         uint32_t ecx = 0;
         uint32_t edx = 0;
+        // NOLINTEND(misc-const-correctness)
         asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-        hw_crc32_available = (ecx & (1u << 20)) != 0;
+        hw_crc32_available = (ecx & (1U << 20)) != 0;
         hw_checked = true;
     }
     return hw_crc32_available;
@@ -42,7 +44,7 @@ __attribute__((target("sse4.2"))) static auto crc32c_hw(uint32_t crc, const uint
     // Process 8 bytes at a time using the 64-bit CRC32 instruction
     uint64_t crc64 = crc;
     while (length >= 8) {
-        uint64_t val;
+        uint64_t val = 0;
         __builtin_memcpy(&val, data, 8);
         crc64 = __builtin_ia32_crc32di(crc64, val);
         data += 8;
@@ -67,11 +69,11 @@ static uint32_t sw_table[256];  // NOLINT
 static bool sw_table_built = false;
 
 static void build_sw_table() {
-    constexpr uint32_t POLY = 0x82F63B78u;  // Reflected CRC32C polynomial
+    constexpr uint32_t POLY = 0x82F63B78U;  // Reflected CRC32C polynomial
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
         for (int j = 0; j < 8; j++) {
-            if ((crc & 1u) != 0) {
+            if ((crc & 1U) != 0) {
                 crc = (crc >> 1) ^ POLY;
             } else {
                 crc >>= 1;
@@ -119,8 +121,8 @@ auto crc32c_block_with_cksum(const void* buffer, size_t length, size_t cksum_off
     crc = crc32c(crc, &zero, sizeof(uint32_t));
 
     // CRC the remainder after the checksum field
-    size_t after_offset = cksum_offset + sizeof(uint32_t);
-    crc = crc32c(crc, buf + after_offset, length - after_offset);
+    size_t const AFTER_OFFSET = cksum_offset + sizeof(uint32_t);
+    crc = crc32c(crc, buf + AFTER_OFFSET, length - AFTER_OFFSET);
 
     return crc32c_final(crc);
 }

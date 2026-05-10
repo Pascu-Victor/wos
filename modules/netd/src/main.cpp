@@ -1,4 +1,10 @@
+#include <abi-bits/in.h>
+#include <abi-bits/ioctls.h>
+#include <abi-bits/poll.h>
+#include <abi-bits/socket.h>
+#include <abi-bits/socklen_t.h>
 #include <arpa/inet.h>
+#include <bits/ssize_t.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
@@ -10,7 +16,6 @@
 
 #include <array>
 #include <cerrno>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -131,8 +136,8 @@ auto build_discover(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid) -> size_t
     *opt++ = OPT_END;
 
     // RFC 2131: DHCP messages MUST be at least 300 bytes (padding is already zeroed)
-    size_t used = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
-    return used < 300 ? 300 : used;
+    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    return USED < 300 ? 300 : USED;
 }
 
 auto build_request(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t requested_ip_net, uint32_t server_ip_net) -> size_t {
@@ -171,8 +176,8 @@ auto build_request(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t r
     // End
     *opt++ = OPT_END;
 
-    size_t used = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
-    return used < 300 ? 300 : used;
+    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    return USED < 300 ? 300 : USED;
 }
 
 auto build_renewal(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t client_ip_host) -> size_t {
@@ -192,8 +197,8 @@ auto build_renewal(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t c
     *opt++ = DHCPREQUEST;
     *opt++ = OPT_END;
 
-    size_t used = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
-    return used < 300 ? 300 : used;
+    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    return USED < 300 ? 300 : USED;
 }
 
 auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLease* lease) -> uint8_t {
@@ -227,58 +232,58 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
             opt++;  // pad
             continue;
         }
-        uint8_t code = *opt++;
+        uint8_t const CODE = *opt++;
         if (opt >= end) {
             break;
         }
-        uint8_t olen = *opt++;
-        if (opt + olen > end) {
+        uint8_t const OLEN = *opt++;
+        if (opt + OLEN > end) {
             break;
         }
 
-        switch (code) {
+        switch (CODE) {
             case OPT_MSG_TYPE:
-                if (olen >= 1) {
+                if (OLEN >= 1) {
                     msg_type = opt[0];
                 }
                 break;
             case OPT_SUBNET_MASK:
-                if (olen >= 4) {
+                if (OLEN >= 4) {
                     lease->subnet_mask = ntohl(*reinterpret_cast<const uint32_t*>(opt));
                 }
                 break;
             case OPT_ROUTER:
-                if (olen >= 4) {
+                if (OLEN >= 4) {
                     lease->router = ntohl(*reinterpret_cast<const uint32_t*>(opt));
                 }
                 break;
             case OPT_DNS:
-                if (olen >= 4) {
+                if (OLEN >= 4) {
                     lease->dns = ntohl(*reinterpret_cast<const uint32_t*>(opt));
                 }
                 break;
             case OPT_SERVER_ID:
-                if (olen >= 4) {
+                if (OLEN >= 4) {
                     lease->server_ip = ntohl(*reinterpret_cast<const uint32_t*>(opt));
                 }
                 break;
             case OPT_LEASE_TIME:
-                if (olen >= 4) {
+                if (OLEN >= 4) {
                     lease->lease_time = ntohl(*reinterpret_cast<const uint32_t*>(opt));
                 }
                 break;
             default:
                 break;
         }
-        opt += olen;
+        opt += OLEN;
     }
 
     return msg_type;
 }
 
 void apply_lease(const char* ifname, const DhcpLease& lease) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
+    int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
+    if (SOCK < 0) {
         return;
     }
 
@@ -289,7 +294,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.your_ip);
-        ioctl(sock, SIOCSIFADDR, &ifr);
+        ioctl(SOCK, SIOCSIFADDR, &ifr);
     }
 
     // Set netmask
@@ -299,7 +304,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.subnet_mask);
-        ioctl(sock, SIOCSIFNETMASK, &ifr);
+        ioctl(SOCK, SIOCSIFNETMASK, &ifr);
     }
 
     // Add local subnet route (direct, no gateway) so on-subnet traffic is
@@ -309,7 +314,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         rt.rt_flags = RTF_UP;
         *reinterpret_cast<uint32_t*>(&rt.rt_dst) = htonl(lease.your_ip & lease.subnet_mask);
         *reinterpret_cast<uint32_t*>(&rt.rt_genmask) = htonl(lease.subnet_mask);
-        ioctl(sock, SIOCADDRT, &rt);
+        ioctl(SOCK, SIOCADDRT, &rt);
     }
 
     // Add default route via router
@@ -317,10 +322,10 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         rtentry rt{};
         rt.rt_flags = RTF_UP | RTF_GATEWAY;
         *reinterpret_cast<uint32_t*>(&rt.rt_gateway) = htonl(lease.router);
-        ioctl(sock, SIOCADDRT, &rt);
+        ioctl(SOCK, SIOCADDRT, &rt);
     }
 
-    close(sock);
+    close(SOCK);
 }
 
 auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> ssize_t {
@@ -329,11 +334,11 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
         pfd.fd = sock;
         pfd.events = POLLIN;
 
-        int ready = poll(&pfd, 1, timeout_secs * 1000);
-        if (ready == 0) {
+        int const READY = poll(&pfd, 1, timeout_secs * 1000);
+        if (READY == 0) {
             return -1;  // timeout
         }
-        if (ready < 0) {
+        if (READY < 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -341,17 +346,17 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
             return -1;
         }
 
-        ssize_t n = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
-        if (n > 0) {
-            return n;  // got data
+        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
+        if (N > 0) {
+            return N;  // got data
         }
 
-        if (n == -EINTR || n == -EAGAIN) {
+        if (N == -EINTR || N == -EAGAIN) {
             continue;
         }
 
-        if (n < 0) {
-            logger::warn("netd: recvfrom returned %zd, retrying...", n);
+        if (N < 0) {
+            logger::warn("netd: recvfrom returned %zd, retrying...", N);
         }
     }
 }
@@ -359,20 +364,20 @@ auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> 
 auto monotonic_now_us() -> uint64_t {
     struct timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
-    return static_cast<uint64_t>(now.tv_sec) * USEC_PER_SEC + static_cast<uint64_t>(now.tv_nsec / 1000);
+    return (static_cast<uint64_t>(now.tv_sec) * USEC_PER_SEC) + static_cast<uint64_t>(now.tv_nsec / 1000);
 }
 
 void sleep_until_us(uint64_t deadline_us) {
     for (;;) {
-        uint64_t now_us = monotonic_now_us();
-        if (now_us >= deadline_us) {
+        uint64_t const NOW_US = monotonic_now_us();
+        if (NOW_US >= deadline_us) {
             return;
         }
 
-        uint64_t remaining_us = deadline_us - now_us;
+        uint64_t const REMAINING_US = deadline_us - NOW_US;
         struct timespec ts{};
-        ts.tv_sec = static_cast<time_t>(remaining_us / USEC_PER_SEC);
-        ts.tv_nsec = static_cast<long>((remaining_us % USEC_PER_SEC) * 1000);
+        ts.tv_sec = static_cast<time_t>(REMAINING_US / USEC_PER_SEC);
+        ts.tv_nsec = static_cast<long>((REMAINING_US % USEC_PER_SEC) * 1000);
 
         if (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
             continue;
@@ -384,12 +389,12 @@ void sleep_for_seconds(uint32_t seconds) { sleep_until_us(monotonic_now_us() + (
 
 auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t expected_xid, int timeout_secs, DhcpLease* lease)
     -> uint8_t {
-    uint64_t deadline_us = monotonic_now_us() + (static_cast<uint64_t>(timeout_secs) * USEC_PER_SEC);
+    uint64_t const DEADLINE_US = monotonic_now_us() + (static_cast<uint64_t>(timeout_secs) * USEC_PER_SEC);
 
-    while (monotonic_now_us() < deadline_us) {
-        uint64_t now_us = monotonic_now_us();
-        uint64_t remaining_us = deadline_us - now_us;
-        int timeout_ms = static_cast<int>((remaining_us + 999) / 1000);
+    while (monotonic_now_us() < DEADLINE_US) {
+        uint64_t const NOW_US = monotonic_now_us();
+        uint64_t const REMAINING_US = DEADLINE_US - NOW_US;
+        int timeout_ms = static_cast<int>((REMAINING_US + 999) / 1000);
         if (timeout_ms <= 0) {
             timeout_ms = 1;
         }
@@ -398,11 +403,11 @@ auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t 
         pfd.fd = sock;
         pfd.events = POLLIN;
 
-        int ready = poll(&pfd, 1, timeout_ms);
-        if (ready == 0) {
+        int const READY = poll(&pfd, 1, timeout_ms);
+        if (READY == 0) {
             return 0;
         }
-        if (ready < 0) {
+        if (READY < 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -410,18 +415,18 @@ auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t 
             return 0;
         }
 
-        ssize_t n = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
-        if (n == -EINTR || n == -EAGAIN) {
+        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
+        if (N == -EINTR || N == -EAGAIN) {
             continue;
         }
-        if (n < 0) {
-            logger::warn("netd: recvfrom returned %zd, retrying...", n);
+        if (N < 0) {
+            logger::warn("netd: recvfrom returned %zd, retrying...", N);
             continue;
         }
 
-        uint8_t msg = parse_reply(buf, static_cast<size_t>(n), expected_xid, lease);
-        if (msg != 0) {
-            return msg;
+        uint8_t const MSG = parse_reply(buf, static_cast<size_t>(N), expected_xid, lease);
+        if (MSG != 0) {
+            return MSG;
         }
     }
 
@@ -443,7 +448,7 @@ static auto netdevs_find_ifname(const char* driver, const char* fallback) -> con
     char line[128];
     while (fgets(line, sizeof(line), f) != nullptr) {
         // Skip comments and blank lines
-        char* p = line;
+        char const* p = line;
         while (*p == ' ' || *p == '\t') {
             p++;
         }
@@ -477,9 +482,9 @@ auto main(int argc, char** argv) -> int {
     logger::info("netd: starting DHCP client for %s", ifname);
 
     // Create UDP socket for DHCP
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        logger::error("netd: failed to create socket: %d", sock);
+    int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
+    if (SOCK < 0) {
+        logger::error("netd: failed to create socket: %d", SOCK);
         return 1;
     }
 
@@ -488,19 +493,19 @@ auto main(int argc, char** argv) -> int {
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_port = htons(68);
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(sock, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+    if (bind(SOCK, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
         logger::error("netd: failed to bind to port 68");
-        close(sock);
+        close(SOCK);
         return 1;
     }
 
     // Get our MAC address
     std::array<uint8_t, 6> mac{};
     {
-        int tmp = socket(AF_INET, SOCK_DGRAM, 0);
-        if (tmp >= 0) {
-            get_mac(tmp, ifname, mac);
-            close(tmp);
+        int const TMP = socket(AF_INET, SOCK_DGRAM, 0);
+        if (TMP >= 0) {
+            get_mac(TMP, ifname, mac);
+            close(TMP);
         }
     }
     logger::info("netd: MAC = %02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -525,19 +530,21 @@ nak_restart:
     lease = {};  // reset lease on restart
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
         logger::debug("netd: sending DISCOVER (attempt %d/%d)", attempt + 1, MAX_DISCOVER_RETRIES);
-        size_t pkt_len = build_discover(&pkt, mac.data(), xid);
-        sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        size_t const PKT_LEN = build_discover(&pkt, mac.data(), xid);
+        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
         // Keep receiving until timeout, draining stale packets with wrong xid
         while (!got_offer) {
-            ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
-            if (n <= 0) {
+            ssize_t const N = recv_with_timeout(SOCK, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
+            if (N <= 0) {
                 break;  // timeout, try next attempt
             }
-            uint8_t msg = parse_reply(recv_buf.data(), static_cast<size_t>(n), xid, &lease);
-            if (msg == DHCPOFFER) {
+            uint8_t const MSG = parse_reply(recv_buf.data(), static_cast<size_t>(N), xid, &lease);
+            if (MSG == DHCPOFFER) {
                 got_offer = true;
-                char ip_str[16], mask_str[16], gw_str[16];
+                char ip_str[16];
+                char mask_str[16];
+                char gw_str[16];
                 ip_to_str(lease.your_ip, ip_str, sizeof(ip_str));
                 ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
                 ip_to_str(lease.router, gw_str, sizeof(gw_str));
@@ -549,7 +556,7 @@ nak_restart:
 
     if (!got_offer) {
         logger::error("netd: no DHCP offer received, exiting");
-        close(sock);
+        close(SOCK);
         return 1;
     }
 
@@ -557,26 +564,36 @@ nak_restart:
     bool got_ack = false;
     for (int attempt = 0; attempt < MAX_REQUEST_RETRIES && !got_ack; attempt++) {
         logger::debug("netd: sending REQUEST (attempt %d/%d)", attempt + 1, MAX_REQUEST_RETRIES);
-        size_t pkt_len = build_request(&pkt, mac.data(), xid, htonl(lease.your_ip), htonl(lease.server_ip));
-        sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        size_t const PKT_LEN = build_request(&pkt, mac.data(), xid, htonl(lease.your_ip), htonl(lease.server_ip));
+        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
         // Keep receiving until timeout, draining stale packets with wrong xid
         while (!got_ack) {
-            ssize_t n = recv_with_timeout(sock, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
-            if (n <= 0) {
+            ssize_t const N = recv_with_timeout(SOCK, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
+            if (N <= 0) {
                 break;  // timeout, try next attempt
             }
             DhcpLease ack_lease{};
-            uint8_t msg = parse_reply(recv_buf.data(), static_cast<size_t>(n), xid, &ack_lease);
-            if (msg == DHCPACK) {
+            uint8_t const MSG = parse_reply(recv_buf.data(), static_cast<size_t>(N), xid, &ack_lease);
+            if (MSG == DHCPACK) {
                 // ACK may refine lease parameters
-                if (ack_lease.subnet_mask != 0) lease.subnet_mask = ack_lease.subnet_mask;
-                if (ack_lease.router != 0) lease.router = ack_lease.router;
-                if (ack_lease.dns != 0) lease.dns = ack_lease.dns;
-                if (ack_lease.lease_time != 0) lease.lease_time = ack_lease.lease_time;
-                if (ack_lease.your_ip != 0) lease.your_ip = ack_lease.your_ip;
+                if (ack_lease.subnet_mask != 0) {
+                    lease.subnet_mask = ack_lease.subnet_mask;
+                }
+                if (ack_lease.router != 0) {
+                    lease.router = ack_lease.router;
+                }
+                if (ack_lease.dns != 0) {
+                    lease.dns = ack_lease.dns;
+                }
+                if (ack_lease.lease_time != 0) {
+                    lease.lease_time = ack_lease.lease_time;
+                }
+                if (ack_lease.your_ip != 0) {
+                    lease.your_ip = ack_lease.your_ip;
+                }
                 got_ack = true;
-            } else if (msg == DHCPNAK) {
+            } else if (MSG == DHCPNAK) {
                 nak_restarts++;
                 if (nak_restarts < MAX_NAK_RESTARTS) {
                     logger::warn("netd: received NAK, restarting from DISCOVER (attempt %d/%d)", nak_restarts, MAX_NAK_RESTARTS);
@@ -593,7 +610,7 @@ request_failed:
 
     if (!got_ack) {
         logger::error("netd: DHCP failed - no ACK received");
-        close(sock);
+        close(SOCK);
         return 1;
     }
 
@@ -602,7 +619,10 @@ request_failed:
     apply_lease(ifname, lease);
 
     {
-        char ip_str[16], mask_str[16], gw_str[16], dns_str[16];
+        char ip_str[16];
+        char mask_str[16];
+        char gw_str[16];
+        char dns_str[16];
         ip_to_str(lease.your_ip, ip_str, sizeof(ip_str));
         ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
         ip_to_str(lease.router, gw_str, sizeof(gw_str));
@@ -635,7 +655,7 @@ request_failed:
         }
         ++xid;
 
-        size_t pkt_len = build_renewal(&pkt, mac.data(), xid, lease.your_ip);
+        size_t const PKT_LEN = build_renewal(&pkt, mac.data(), xid, lease.your_ip);
 
         // Renewal: unicast to DHCP server
         struct sockaddr_in server{};
@@ -643,11 +663,11 @@ request_failed:
         server.sin_port = htons(67);
         server.sin_addr.s_addr = htonl(lease.server_ip);
 
-        sendto(sock, &pkt, pkt_len, 0, reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
+        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
 
         DhcpLease renew_lease{};
-        uint8_t msg = recv_dhcp_reply_until_timeout(sock, recv_buf.data(), recv_buf.size(), xid, RECV_TIMEOUT_SECS, &renew_lease);
-        if (msg == DHCPACK) {
+        uint8_t const MSG = recv_dhcp_reply_until_timeout(SOCK, recv_buf.data(), recv_buf.size(), xid, RECV_TIMEOUT_SECS, &renew_lease);
+        if (MSG == DHCPACK) {
             if (renew_lease.lease_time != 0) {
                 lease.lease_time = renew_lease.lease_time;
             }
@@ -659,9 +679,9 @@ request_failed:
             } else {
                 logger::debug("netd: lease renewed, next renewal in ~%us", t1_seconds);
             }
-        } else if (msg == DHCPNAK) {
+        } else if (MSG == DHCPNAK) {
             logger::warn("netd: renewal received NAK, restarting from DISCOVER");
-            close(sock);
+            close(SOCK);
             return 1;
         } else {
             ++consecutive_renewal_failures;
@@ -673,6 +693,6 @@ request_failed:
         }
     }
 
-    close(sock);
+    close(SOCK);
     return 0;
 }

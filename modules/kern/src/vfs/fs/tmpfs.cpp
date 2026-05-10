@@ -1,5 +1,8 @@
 #include "tmpfs.hpp"
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -7,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
 
@@ -15,7 +17,7 @@
 #include "vfs/vfs.hpp"
 
 namespace {
-auto _kstrcmp(const char* a, const char* b) -> int {
+auto kstrcmp(const char* a, const char* b) -> int {
     if ((a == nullptr) || (b == nullptr)) {
         if (a == b) {
             return 0;
@@ -27,12 +29,12 @@ auto _kstrcmp(const char* a, const char* b) -> int {
     }
     while ((*a != 0) && (*b != 0)) {
         if (*a != *b) {
-            return (unsigned char)*a - (unsigned char)*b;
+            return static_cast<unsigned char>(*a) - static_cast<unsigned char>(*b);
         }
         ++a;
         ++b;
     }
-    return (unsigned char)*a - (unsigned char)*b;
+    return static_cast<unsigned char>(*a) - static_cast<unsigned char>(*b);
 }
 
 // Copy a string into a fixed-size array, ensuring null termination
@@ -67,17 +69,17 @@ void ensure_children_capacity(TmpNode* dir) {
     if (dir->children_count < dir->children_capacity) {
         return;
     }
-    size_t new_cap = (dir->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : dir->children_capacity * 2;
-    auto** new_arr = new TmpNode*[new_cap];
+    size_t const NEW_CAP = (dir->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : dir->children_capacity * 2;
+    auto** new_arr = new TmpNode*[NEW_CAP];
     for (size_t i = 0; i < dir->children_count; ++i) {
         new_arr[i] = dir->children[i];
     }
-    for (size_t i = dir->children_count; i < new_cap; ++i) {
+    for (size_t i = dir->children_count; i < NEW_CAP; ++i) {
         new_arr[i] = nullptr;
     }
     delete[] dir->children;
     dir->children = new_arr;
-    dir->children_capacity = new_cap;
+    dir->children_capacity = NEW_CAP;
 }
 
 void add_child(TmpNode* parent, TmpNode* child) {
@@ -89,7 +91,9 @@ void add_child(TmpNode* parent, TmpNode* child) {
 }  // namespace
 
 void tmpfs_free_node(TmpNode* node) {
-    if (node == nullptr) return;
+    if (node == nullptr) {
+        return;
+    }
     delete[] node->data;
     delete[] node->symlink_target;
     delete[] node->children;
@@ -106,7 +110,7 @@ auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode* {
         return nullptr;
     }
     for (size_t i = 0; i < dir->children_count; ++i) {
-        if (dir->children[i] != nullptr && _kstrcmp(dir->children[i]->name.data(), name) == 0) {
+        if (dir->children[i] != nullptr && kstrcmp(dir->children[i]->name.data(), name) == 0) {
             return dir->children[i];
         }
     }
@@ -153,7 +157,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     if (parent == nullptr || name == nullptr || target == nullptr || parent->type != TmpNodeType::DIRECTORY) {
         return nullptr;
     }
-    TmpNode* existing = tmpfs_lookup(parent, name);
+    TmpNode const* existing = tmpfs_lookup(parent, name);
     if (existing != nullptr) {
         return nullptr;  // Already exists
     }
@@ -207,10 +211,10 @@ static auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate)
         path += comp_len;
 
         // Handle "." and ".."
-        if (_kstrcmp(component.data(), ".") == 0) {
+        if (kstrcmp(component.data(), ".") == 0) {
             continue;
         }
-        if (_kstrcmp(component.data(), "..") == 0) {
+        if (kstrcmp(component.data(), "..") == 0) {
             if (current->parent != nullptr) {
                 current = current->parent;
             }
@@ -385,10 +389,10 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
         return -1;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
-    size_t need = offset + count;
-    if (need > n->capacity) {
+    size_t const NEED = offset + count;
+    if (NEED > n->capacity) {
         size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
-        while (newcap < need) {
+        while (newcap < NEED) {
             newcap *= 2;
         }
         char* nd = new char[newcap];
@@ -400,7 +404,7 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
         n->capacity = newcap;
     }
     memcpy(n->data + offset, buf, count);
-    n->size = std::max(need, n->size);
+    n->size = std::max(NEED, n->size);
     return static_cast<ssize_t>(count);
 }
 
@@ -425,8 +429,8 @@ auto tmpfs_fops_close(ker::vfs::File* f) -> int {
         return 0;
     }
     auto* node = static_cast<TmpNode*>(f->private_data);
-    uint32_t prev = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
-    if (prev == 1 && node->unlinked) {
+    uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREV == 1 && node->unlinked) {
         // Last close of an unlinked node — free it now
         tmpfs_free_node(node);
     }
@@ -439,7 +443,7 @@ auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
         return -1;
     }
 
-    size_t file_size = tmpfs_get_size(f);
+    size_t const FILE_SIZE = tmpfs_get_size(f);
     off_t newpos = f->pos;
 
     switch (whence) {
@@ -450,7 +454,7 @@ auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             newpos = f->pos + offset;
             break;
         case 2:  // SEEK_END
-            newpos = static_cast<off_t>(file_size) + offset;
+            newpos = static_cast<off_t>(FILE_SIZE) + offset;
             break;
         default:
             return -1;
@@ -491,7 +495,7 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
         return 0;
     }
     if (index == 1) {
-        TmpNode* parent = (n->parent != nullptr) ? n->parent : n;
+        TmpNode const* parent = (n->parent != nullptr) ? n->parent : n;
         entry->d_ino = reinterpret_cast<uint64_t>(parent);
         entry->d_off = 2;
         entry->d_reclen = sizeof(DirEntry);
@@ -503,13 +507,13 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
     }
 
     // Real children start at index 2
-    size_t child_index = index - 2;
+    size_t const CHILD_INDEX = index - 2;
 
-    if (child_index >= n->children_count) {
+    if (CHILD_INDEX >= n->children_count) {
         return -1;
     }
 
-    TmpNode* child = n->children[child_index];
+    TmpNode* child = n->children[CHILD_INDEX];
     if (child == nullptr) {
         return -1;
     }
@@ -552,21 +556,27 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
     while (n->symlink_target[len] != '\0') {
         len++;
     }
-    size_t to_copy = (len < bufsize) ? len : bufsize;
-    memcpy(buf, n->symlink_target, to_copy);
-    return static_cast<ssize_t>(to_copy);
+    size_t const TO_COPY = (len < bufsize) ? len : bufsize;
+    memcpy(buf, n->symlink_target, TO_COPY);
+    return static_cast<ssize_t>(TO_COPY);
 }
 
 // --- FileOperations instance ---
 
 auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
-    if (f == nullptr || f->private_data == nullptr) return -1;
+    if (f == nullptr || f->private_data == nullptr) {
+        return -1;
+    }
     auto* n = static_cast<TmpNode*>(f->private_data);
-    if (n->type != TmpNodeType::FILE) return -EISDIR;
+    if (n->type != TmpNodeType::FILE) {
+        return -EISDIR;
+    }
     auto new_size = static_cast<size_t>(length);
     if (new_size > n->capacity) {
         size_t newcap = (n->capacity == 0) ? 4096 : n->capacity;
-        while (newcap < new_size) newcap *= 2;
+        while (newcap < new_size) {
+            newcap *= 2;
+        }
         char* nd = new char[newcap];
         if (n->data != nullptr) {
             std::memcpy(nd, n->data, n->size);

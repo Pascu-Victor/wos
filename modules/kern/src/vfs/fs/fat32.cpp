@@ -1,5 +1,8 @@
 #include "fat32.hpp"
 
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -13,12 +16,14 @@
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
 
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::vfs::fat32 {
 
 using log = ker::mod::dbg::logger<"fat32">;
 
 // Forward declarations for helpers defined later in this translation unit.
-auto flush_fat_table(const FAT32MountContext* ctx) -> int;
+static auto flush_fat_table(const FAT32MountContext* ctx) -> int;
 
 // FAT32 filesystem context
 namespace {
@@ -28,15 +33,15 @@ constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 
 // Simple file node for FAT32
 struct FAT32Node {
-    FAT32MountContext* context;  // Pointer to mount context - place first to avoid alignment issues
-    uint32_t start_cluster;
-    uint32_t file_size;
-    char* name;
-    uint8_t attributes;
-    bool is_directory;
+    FAT32MountContext* context{};  // Pointer to mount context - place first to avoid alignment issues
+    uint32_t start_cluster{};
+    uint32_t file_size{};
+    char* name{};
+    uint8_t attributes{};
+    bool is_directory{};
     // Track directory entry location for updating on write
-    uint32_t dir_entry_cluster;  // Which cluster contains the directory entry
-    uint32_t dir_entry_offset;   // Offset within that cluster (in bytes)
+    uint32_t dir_entry_cluster{};  // Which cluster contains the directory entry
+    uint32_t dir_entry_offset{};   // Offset within that cluster (in bytes)
 
     // POSIX permission model (runtime-only, not persisted to FAT32 disk)
     uint32_t mode = 0;  // Permission bits (synthesized from FAT32 attributes)
@@ -58,10 +63,10 @@ struct __attribute__((packed)) FAT32LongNameEntry {
 
 constexpr uint8_t FAT32_LFN_ATTR = 0x0F;
 
-auto lfn_checksum_83(const char shortName[11]) -> uint8_t {
+auto lfn_checksum_83(const char short_name[11]) -> uint8_t {
     uint8_t sum = 0;
     for (int i = 0; i < 11; ++i) {
-        sum = static_cast<uint8_t>(((sum & 1) ? 0x80 : 0) + (sum >> 1) + static_cast<uint8_t>(shortName[i]));
+        sum = static_cast<uint8_t>((((sum & 1) != 0) ? 0x80 : 0) + (sum >> 1) + static_cast<uint8_t>(short_name[i]));
     }
     return sum;
 }
@@ -93,7 +98,7 @@ auto strcasecmp_local(const char* s1, const char* s2) -> int {
 }
 
 auto hash32_djb2(const char* s) -> uint32_t {
-    uint32_t h = 5381u;
+    uint32_t h = 5381U;
     if (s == nullptr) {
         return h;
     }
@@ -104,46 +109,46 @@ auto hash32_djb2(const char* s) -> uint32_t {
 }
 
 inline auto decode_dirent_cluster(const FAT32DirectoryEntry& e) -> uint32_t {
-    uint32_t raw = (static_cast<uint32_t>(e.cluster_high) << 16) | e.cluster_low;
-    return raw & FAT32_CLUSTER_MASK;
+    uint32_t const RAW = (static_cast<uint32_t>(e.cluster_high) << 16) | e.cluster_low;
+    return RAW & FAT32_CLUSTER_MASK;
 }
 
-auto make_short_alias_83(const char* longName, char out11[11]) -> void {
+auto make_short_alias_83(const char* long_name, char out11[11]) -> void {
     // Deterministic alias: "CD" + 6 hex digits, extension "BIN".
     // This is sufficient for our coredump use-case and avoids needing full collision handling.
-    uint32_t h = hash32_djb2(longName);
-    uint32_t v = h & 0xFFFFFFu;
+    uint32_t const H = hash32_djb2(long_name);
+    uint32_t const V = H & 0xFFFFFFU;
 
     out11[0] = 'C';
     out11[1] = 'D';
-    out11[2] = hex_digit((v >> 20) & 0xF);
-    out11[3] = hex_digit((v >> 16) & 0xF);
-    out11[4] = hex_digit((v >> 12) & 0xF);
-    out11[5] = hex_digit((v >> 8) & 0xF);
-    out11[6] = hex_digit((v >> 4) & 0xF);
-    out11[7] = hex_digit(v & 0xF);
+    out11[2] = hex_digit((V >> 20) & 0xF);
+    out11[3] = hex_digit((V >> 16) & 0xF);
+    out11[4] = hex_digit((V >> 12) & 0xF);
+    out11[5] = hex_digit((V >> 8) & 0xF);
+    out11[6] = hex_digit((V >> 4) & 0xF);
+    out11[7] = hex_digit(V & 0xF);
     out11[8] = 'B';
     out11[9] = 'I';
     out11[10] = 'N';
 }
 
-auto write_lfn_entries(FAT32DirectoryEntry* entryTable, size_t startIndex, size_t lfnCount, const char* longName, uint8_t checksum)
+auto write_lfn_entries(FAT32DirectoryEntry* entry_table, size_t start_index, size_t lfn_count, const char* long_name, uint8_t checksum)
     -> void {
     // Writes entries in on-disk order: (lfnCount|0x40), ..., 1.
     // Each LFN entry stores up to 13 UTF-16 code units. We only support ASCII here.
-    size_t nameLen = 0;
-    while (longName[nameLen] != '\0') {
-        ++nameLen;
+    size_t name_len = 0;
+    while (long_name[name_len] != '\0') {
+        ++name_len;
     }
 
     // Emit from the end of the name backward in 13-char chunks.
-    for (size_t idx = 0; idx < lfnCount; ++idx) {
-        size_t seq = lfnCount - idx;  // lfnCount..1
-        auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(&entryTable[startIndex + idx]);
+    for (size_t idx = 0; idx < lfn_count; ++idx) {
+        size_t const SEQ = lfn_count - idx;  // lfnCount..1
+        auto* lfn = reinterpret_cast<FAT32LongNameEntry*>(&entry_table[start_index + idx]);
 
         memset(lfn, 0, sizeof(FAT32LongNameEntry));
-        uint8_t order = static_cast<uint8_t>(seq);
-        if (seq == lfnCount) {
+        auto order = static_cast<uint8_t>(SEQ);
+        if (SEQ == lfn_count) {
             order |= 0x40;  // last entry flag
         }
         lfn->order = order;
@@ -153,27 +158,33 @@ auto write_lfn_entries(FAT32DirectoryEntry* entryTable, size_t startIndex, size_
         lfn->first_cluster_low = 0;
 
         // Fill all chars with 0xFFFF by default.
-        for (int i = 0; i < 5; ++i) lfn->name1[i] = 0xFFFF;
-        for (int i = 0; i < 6; ++i) lfn->name2[i] = 0xFFFF;
-        for (int i = 0; i < 2; ++i) lfn->name3[i] = 0xFFFF;
+        for (unsigned short& i : lfn->name1) {
+            i = 0xFFFF;
+        }
+        for (unsigned short& i : lfn->name2) {
+            i = 0xFFFF;
+        }
+        for (unsigned short& i : lfn->name3) {
+            i = 0xFFFF;
+        }
 
         // Determine the slice for this entry.
-        size_t chunkStart = (seq - 1) * 13;
-        auto put = [&](size_t posInChunk, uint16_t val) {
-            if (posInChunk < 5) {
-                lfn->name1[posInChunk] = val;
-            } else if (posInChunk < 11) {
-                lfn->name2[posInChunk - 5] = val;
+        size_t const CHUNK_START = (SEQ - 1) * 13;
+        auto put = [&](size_t pos_in_chunk, uint16_t val) {
+            if (pos_in_chunk < 5) {
+                lfn->name1[pos_in_chunk] = val;
+            } else if (pos_in_chunk < 11) {
+                lfn->name2[pos_in_chunk - 5] = val;
             } else {
-                lfn->name3[posInChunk - 11] = val;
+                lfn->name3[pos_in_chunk - 11] = val;
             }
         };
 
         for (size_t p = 0; p < 13; ++p) {
-            size_t srcIndex = chunkStart + p;
-            if (srcIndex < nameLen) {
-                put(p, static_cast<uint16_t>(static_cast<uint8_t>(longName[srcIndex])));
-            } else if (srcIndex == nameLen) {
+            size_t const SRC_INDEX = CHUNK_START + p;
+            if (SRC_INDEX < name_len) {
+                put(p, static_cast<uint16_t>(static_cast<uint8_t>(long_name[SRC_INDEX])));
+            } else if (SRC_INDEX == name_len) {
                 put(p, 0x0000);  // terminator
                 break;
             } else {
@@ -286,7 +297,7 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
 
     auto* boot_sector = reinterpret_cast<FAT32BootSector*>(boot_buf);
 
-    uint32_t* spt_ptr = reinterpret_cast<uint32_t*>(boot_buf + 0x24);
+    auto const* spt_ptr = reinterpret_cast<uint32_t*>(boot_buf + 0x24);
 #ifdef FAT32_DEBUG
     log::trace("Boot sector signature: 0x%x", *reinterpret_cast<uint16_t*>(boot_buf + 510));
     log::trace("Raw bytes at offset 0x24 (sectors_per_fat_32): 0x%x", *spt_ptr);
@@ -305,7 +316,7 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
     context->data_start_sector = context->reserved_sectors + (static_cast<uint32_t>(context->sectors_per_fat * context->num_fats));
 
     // Allocate and read FAT table
-    size_t fat_size = static_cast<size_t>(context->sectors_per_fat) * context->bytes_per_sector;
+    size_t const FAT_SIZE = static_cast<size_t>(context->sectors_per_fat) * context->bytes_per_sector;
 #ifdef FAT32_DEBUG
     log::trace("bytes_per_sector: 0x%x", context->bytes_per_sector);
     log::trace("sectors_per_cluster: 0x%x", context->sectors_per_cluster);
@@ -317,12 +328,12 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
 
     // Validate boot sector values before allocation
     if (context->bytes_per_sector == 0 || context->bytes_per_sector > 4096 || context->sectors_per_fat == 0 ||
-        context->sectors_per_fat > 0xFFFF || fat_size == 0 || fat_size > 64 * 1024 * 1024) {  // Sanity check: max 64MB FAT
+        context->sectors_per_fat > 0xFFFF || FAT_SIZE == 0 || FAT_SIZE > 64 * 1024 * 1024) {  // Sanity check: max 64MB FAT
         log::warn("fat32_init_device: invalid boot sector values");
         return nullptr;
     }
 
-    context->fat_table = new uint32_t[fat_size / sizeof(uint32_t)];
+    context->fat_table = new uint32_t[FAT_SIZE / sizeof(uint32_t)];
 
     if (context->fat_table == nullptr) {
         log::warn("fat32_init_device: failed to allocate FAT table");
@@ -330,8 +341,8 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
     }
 
     // Read FAT from device (adjusted for partition offset)
-    size_t fat_sectors_to_read = (fat_size + device->block_size - 1) / device->block_size;
-    if (ker::dev::block_read(device, partition_start_lba + context->reserved_sectors, fat_sectors_to_read, context->fat_table) != 0) {
+    size_t const FAT_SECTORS_TO_READ = (FAT_SIZE + device->block_size - 1) / device->block_size;
+    if (ker::dev::block_read(device, partition_start_lba + context->reserved_sectors, FAT_SECTORS_TO_READ, context->fat_table) != 0) {
         log::warn("fat32_init_device: failed to read FAT");
         context->fat_table = nullptr;
         return nullptr;
@@ -344,7 +355,7 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
 }
 
 // Helper to get next cluster in chain
-auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> uint32_t {
+static auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> uint32_t {
     if (ctx == nullptr || ctx->fat_table == nullptr) {
         log::warn("get_next_cluster: context or fat_table is null");
         return 0;
@@ -356,24 +367,24 @@ auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> uint32_
         return 0;
     }
 
-    uint32_t fat_entries = (ctx->sectors_per_fat * ctx->bytes_per_sector) / sizeof(uint32_t);
-    if (cluster >= fat_entries) {
+    uint32_t const FAT_ENTRIES = (ctx->sectors_per_fat * ctx->bytes_per_sector) / sizeof(uint32_t);
+    if (cluster >= FAT_ENTRIES) {
         return 0;
     }
 
-    uint32_t next = ctx->fat_table[cluster] & FAT32_CLUSTER_MASK;
+    uint32_t const NEXT = ctx->fat_table[cluster] & FAT32_CLUSTER_MASK;
 
-    if (next < 2 || next >= FAT32_EOC_MIN) {
+    if (NEXT < 2 || NEXT >= FAT32_EOC_MIN) {
         return 0;
     }
-    if (next >= fat_entries) {
+    if (NEXT >= FAT_ENTRIES) {
         return 0;
     }
-    return next;
+    return NEXT;
 }
 
 // Helper function to read a cluster from the block device
-auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* buffer) -> int {
+static auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* buffer) -> int {
     if (ctx == nullptr || ctx->device == nullptr || buffer == nullptr) {
         return -1;
     }
@@ -395,19 +406,19 @@ auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* buffer) 
     }
 
     // Calculate the LBA of the cluster
-    uint64_t cluster_lba =
+    uint64_t const CLUSTER_LBA =
         ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(cluster) - 2) * ctx->sectors_per_cluster);
-    uint64_t partition_end_lba = ctx->partition_offset + ctx->total_sectors;
-    if (cluster_lba + ctx->sectors_per_cluster > partition_end_lba) {
+    uint64_t const PARTITION_END_LBA = ctx->partition_offset + ctx->total_sectors;
+    if (CLUSTER_LBA + ctx->sectors_per_cluster > PARTITION_END_LBA) {
         return -1;
     }
 
     // Read the cluster
-    return ker::dev::block_read(ctx->device, cluster_lba, ctx->sectors_per_cluster, buffer);
+    return ker::dev::block_read(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer);
 }
 
 // Helper function to compare FAT32 filenames (8.3 format with spaces)
-auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
+static auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
     // dir_name is from directory entry (11 chars, space-padded, no dot)
     // search_name is the filename we're looking for (e.g., "testprog" or "hello.txt")
 
@@ -420,7 +431,7 @@ auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
 
     // Split search_name into name and extension
     const char* dot = nullptr;
-    for (const char* p = search_name; *p; ++p) {
+    for (const char* p = search_name; (*p) != 0; ++p) {
         if (*p == '.') {
             dot = p;
             break;
@@ -436,28 +447,28 @@ auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
         }
 
         size_t ext_len = 0;
-        for (const char* p = dot + 1; *p && ext_len < 3; ++p, ++ext_len) {
+        for (const char* p = dot + 1; ((*p) != 0) && ext_len < 3; ++p, ++ext_len) {
             ext_part[ext_len] = *p >= 'a' && *p <= 'z' ? *p - 32 : *p;
         }
     } else {
         // No extension
         size_t name_len = 0;
-        for (const char* p = search_name; *p && name_len < 8; ++p, ++name_len) {
+        for (const char* p = search_name; ((*p) != 0) && name_len < 8; ++p, ++name_len) {
             name_part[name_len] = *p >= 'a' && *p <= 'z' ? *p - 32 : *p;
         }
     }
 
     // Compare with directory entry name (space-padded)
     for (int i = 0; i < 8; ++i) {
-        char expected = name_part[i] ? name_part[i] : ' ';
-        if (dir_name[i] != expected) {
+        char const EXPECTED = (name_part[i] != 0) ? name_part[i] : ' ';
+        if (dir_name[i] != EXPECTED) {
             return false;
         }
     }
 
     for (int i = 0; i < 3; ++i) {
-        char expected = ext_part[i] ? ext_part[i] : ' ';
-        if (dir_name[8 + i] != expected) {
+        char const EXPECTED = (ext_part[i] != 0) ? ext_part[i] : ' ';
+        if (dir_name[8 + i] != EXPECTED) {
             return false;
         }
     }
@@ -468,7 +479,7 @@ auto compare_fat32_name(const char* dir_name, const char* search_name) -> bool {
 // Helper function to create a new file in a directory
 // Returns a File* with start_cluster=0 (first write will allocate)
 // parent_cluster is the cluster of the directory to create the file in
-auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename) -> ker::vfs::File* {
+static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename) -> ker::vfs::File* {
     if (ctx == nullptr || filename == nullptr || filename[0] == '\0') {
         log::warn("create_file_in_directory: invalid arguments");
         return nullptr;
@@ -478,8 +489,8 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     log::debug("create_file_in_directory: creating '%s' in cluster 0x%x", filename, parent_cluster);
 #endif
 
-    size_t cluster_size = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
-    auto* cluster_buf = new uint8_t[cluster_size];
+    size_t const CLUSTER_SIZE = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         log::warn("create_file_in_directory: failed to allocate cluster buffer");
         return nullptr;
@@ -490,12 +501,12 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     while (filename[name_len] != '\0') {
         ++name_len;
     }
-    size_t lfn_count = (name_len + 12) / 13;      // Ceil division for 13 chars per LFN entry
-    size_t total_entries_needed = lfn_count + 1;  // LFN entries + 1 SFN entry
+    size_t const LFN_COUNT = (name_len + 12) / 13;      // Ceil division for 13 chars per LFN entry
+    size_t const TOTAL_ENTRIES_NEEDED = LFN_COUNT + 1;  // LFN entries + 1 SFN entry
 
     // Search for a contiguous block of free entries
     uint32_t current_cluster = parent_cluster;
-    size_t entries_per_cluster = cluster_size / sizeof(FAT32DirectoryEntry);
+    size_t const ENTRIES_PER_CLUSTER = CLUSTER_SIZE / sizeof(FAT32DirectoryEntry);
 
     uint32_t found_cluster = 0;
     uint32_t found_start_index = 0;
@@ -514,17 +525,17 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
         size_t consecutive_free = 0;
         size_t free_start = 0;
 
-        for (size_t i = 0; i < entries_per_cluster; ++i) {
-            bool is_free = (entries[i].name[0] == 0x00) || (static_cast<uint8_t>(entries[i].name[0]) == 0xE5);
-            bool is_end = (entries[i].name[0] == 0x00);
+        for (size_t i = 0; i < ENTRIES_PER_CLUSTER; ++i) {
+            bool const IS_FREE = (entries[i].name[0] == 0x00) || (static_cast<uint8_t>(entries[i].name[0]) == 0xE5);
+            bool const IS_END = (entries[i].name[0] == 0x00);
 
-            if (is_free) {
+            if (IS_FREE) {
                 if (consecutive_free == 0) {
                     free_start = i;
                 }
                 consecutive_free++;
 
-                if (consecutive_free >= total_entries_needed) {
+                if (consecutive_free >= TOTAL_ENTRIES_NEEDED) {
                     found_cluster = current_cluster;
                     found_start_index = free_start;
                     found_slot = true;
@@ -532,7 +543,7 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
                 }
 
                 // If we hit end of directory, we can use it
-                if (is_end && consecutive_free >= total_entries_needed) {
+                if (IS_END && consecutive_free >= TOTAL_ENTRIES_NEEDED) {
                     found_cluster = current_cluster;
                     found_start_index = free_start;
                     found_slot = true;
@@ -568,13 +579,13 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     // Create short name (8.3 format)
     char short_name[11];
     make_short_alias_83(filename, short_name);
-    uint8_t checksum = lfn_checksum_83(short_name);
+    uint8_t const CHECKSUM = lfn_checksum_83(short_name);
 
     // Write LFN entries
-    write_lfn_entries(entries, found_start_index, lfn_count, filename, checksum);
+    write_lfn_entries(entries, found_start_index, LFN_COUNT, filename, CHECKSUM);
 
     // Write the short name entry
-    auto* sfn_entry = &entries[found_start_index + lfn_count];
+    auto* sfn_entry = &entries[found_start_index + LFN_COUNT];
     memset(sfn_entry, 0, sizeof(FAT32DirectoryEntry));
     memcpy(sfn_entry->name, short_name, 11);
     sfn_entry->attributes = 0x20;  // Archive bit set
@@ -584,21 +595,21 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     // Time/date fields left as 0
 
     // Mark the next entry as end-of-directory if needed
-    size_t next_entry_idx = found_start_index + lfn_count + 1;
-    if (next_entry_idx < entries_per_cluster) {
+    size_t const NEXT_ENTRY_IDX = found_start_index + LFN_COUNT + 1;
+    if (NEXT_ENTRY_IDX < ENTRIES_PER_CLUSTER) {
         // Check if original was end-of-directory
-        if (entries[next_entry_idx].name[0] != 0x00 && static_cast<uint8_t>(entries[next_entry_idx].name[0]) != 0xE5) {
+        if (entries[NEXT_ENTRY_IDX].name[0] != 0x00 && static_cast<uint8_t>(entries[NEXT_ENTRY_IDX].name[0]) != 0xE5) {
             // There's already an entry here, don't overwrite
-        } else if (entries[found_start_index + lfn_count].name[0] == 0x00) {
+        } else if (entries[found_start_index + LFN_COUNT].name[0] == 0x00) {
             // We're extending into unused space, mark next as end
-            entries[next_entry_idx].name[0] = 0x00;
+            entries[NEXT_ENTRY_IDX].name[0] = 0x00;
         }
     }
 
     // Write the cluster back to disk
-    uint64_t cluster_lba =
+    uint64_t const CLUSTER_LBA =
         ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(found_cluster) - 2) * ctx->sectors_per_cluster);
-    if (ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, cluster_buf) != 0) {
+    if (ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, cluster_buf) != 0) {
         log::warn("create_file_in_directory: failed to write cluster");
         delete[] cluster_buf;
         return nullptr;
@@ -620,7 +631,7 @@ auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, c
     node->is_directory = false;
     node->context = ctx;
     node->dir_entry_cluster = found_cluster;
-    node->dir_entry_offset = static_cast<uint32_t>((found_start_index + lfn_count) * sizeof(FAT32DirectoryEntry));
+    node->dir_entry_offset = static_cast<uint32_t>((found_start_index + LFN_COUNT) * sizeof(FAT32DirectoryEntry));
     node->mode = 0644;  // Default mode for new files
     node->uid = 0;
     node->gid = 0;
@@ -701,8 +712,8 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 
     // Walk the path component by component
     uint32_t current_cluster = ctx->root_cluster;
-    size_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    auto* cluster_buf = new uint8_t[cluster_size];
+    size_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         log::warn("fat32_open_path: failed to allocate cluster buffer");
         return nullptr;
@@ -760,13 +771,13 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
             }
 
             auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
-            size_t num_entries = cluster_size / sizeof(FAT32DirectoryEntry);
+            size_t const NUM_ENTRIES = CLUSTER_SIZE / sizeof(FAT32DirectoryEntry);
 
             // LFN collection: max 20 entries (260 chars / 13 chars per entry)
             FAT32LongNameEntry lfn_buffer[20];
             size_t lfn_count = 0;
 
-            for (size_t i = 0; i < num_entries; ++i) {
+            for (size_t i = 0; i < NUM_ENTRIES; ++i) {
                 auto* entry = &entries[i];
 
                 // End of directory
@@ -775,14 +786,14 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
                 }
 
                 // Deleted entry - reset LFN collection
-                if (entry->name[0] == (char)0xE5) {
+                if (entry->name[0] == static_cast<char>(0xE5)) {
                     lfn_count = 0;
                     continue;
                 }
 
                 // Long filename entry - collect it
                 if ((entry->attributes & FAT32_ATTR_LONG_NAME) == FAT32_ATTR_LONG_NAME) {
-                    auto* lfn = reinterpret_cast<const FAT32LongNameEntry*>(entry);
+                    const auto* lfn = reinterpret_cast<const FAT32LongNameEntry*>(entry);
                     if (lfn_count < 20) {
                         lfn_buffer[lfn_count++] = *lfn;
                     }
@@ -893,7 +904,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     if (node->is_directory) {
         node->mode = 0755;
     } else {
-        node->mode = (final_entry.attributes & 0x01) != 0 ? 0444u : 0644u;  // read-only attr -> no write
+        node->mode = (final_entry.attributes & 0x01) != 0 ? 0444U : 0644U;  // read-only attr -> no write
     }
     node->uid = 0;
     node->gid = 0;
@@ -951,28 +962,28 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     }
 
     // Simple read implementation: traverse cluster chain
-    uint32_t bytes_available = node->file_size - std::min(offset, (size_t)node->file_size);
-    size_t to_read = std::min(count, (size_t)bytes_available);
+    uint32_t const BYTES_AVAILABLE = node->file_size - std::min(offset, static_cast<size_t>(node->file_size));
+    size_t const TO_READ = std::min(count, static_cast<size_t>(BYTES_AVAILABLE));
 
 #ifdef FAT32_DEBUG
     log::trace("fat32_read: to_read=0x%zx", to_read);
 #endif
 
-    if (to_read == 0) {
+    if (TO_READ == 0) {
         ctx->lock.unlock();
         return 0;
     }
 
     // Calculate starting cluster and offset within cluster
 
-    size_t cluster_size = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    size_t const CLUSTER_SIZE = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
 #ifdef FAT32_DEBUG
     log::trace("fat32_read: cluster_size=0x%zx", cluster_size);
 #endif
 
-    uint32_t cluster_offset = offset / cluster_size;
-    uint32_t byte_offset = offset % cluster_size;
+    uint32_t const CLUSTER_OFFSET = offset / CLUSTER_SIZE;
+    uint32_t byte_offset = offset % CLUSTER_SIZE;
     uint32_t current_cluster = node->start_cluster;
 
 #ifdef FAT32_DEBUG
@@ -980,7 +991,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 #endif
 
     // Skip to the correct cluster
-    for (uint32_t i = 0; i < cluster_offset; ++i) {
+    for (uint32_t i = 0; i < CLUSTER_OFFSET; ++i) {
         current_cluster = get_next_cluster(ctx, current_cluster);
         if (current_cluster == 0) {
             ctx->lock.unlock();
@@ -989,7 +1000,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     }
 
     // Allocate buffer for reading clusters
-    auto* cluster_buf = new uint8_t[cluster_size];
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
 
     if (cluster_buf == nullptr) {
         log::warn("fat32_read: failed to allocate cluster buffer");
@@ -1005,49 +1016,49 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     // If so, we detect contiguous cluster chains and issue a single bulk_read()
     // for large extents (> BLK_RING_BULK_THRESHOLD bytes), which bypasses the
     // per-slot SQ/CQ pipeline and transfers data via direct RDMA.
-    bool bulk_capable = (ctx->device != nullptr) && ((ctx->device->capabilities & ker::dev::BDEV_CAP_BULK_RDMA) != 0);
+    bool const BULK_CAPABLE = (ctx->device != nullptr) && ((ctx->device->capabilities & ker::dev::BDEV_CAP_BULK_RDMA) != 0);
 
-    while (bytes_read < to_read && current_cluster >= 2 && current_cluster < FAT32_EOC) {
+    while (bytes_read < TO_READ && current_cluster >= 2 && current_cluster < FAT32_EOC) {
         // -- Contiguous extent detection -------------------------------------
         // Walk the FAT chain to find the longest run of physically contiguous
         // clusters starting at current_cluster.
-        uint32_t extent_start = current_cluster;
+        uint32_t const EXTENT_START = current_cluster;
         uint32_t extent_len = 1;  // cluster count in the contiguous run
-        if (bulk_capable && byte_offset == 0) {
+        if (BULK_CAPABLE && byte_offset == 0) {
             uint32_t probe = current_cluster;
             while (extent_len < 4096) {  // safety cap
-                uint32_t next = get_next_cluster(ctx, probe);
-                if (next != probe + 1) {
+                uint32_t const NEXT = get_next_cluster(ctx, probe);
+                if (NEXT != probe + 1) {
                     break;  // chain is not contiguous
                 }
                 extent_len++;
-                probe = next;
+                probe = NEXT;
             }
         }
 
         // Calculate how many bytes the contiguous extent covers
-        size_t extent_bytes = static_cast<size_t>(extent_len) * cluster_size;
-        size_t remaining = to_read - bytes_read;
+        size_t const EXTENT_BYTES = static_cast<size_t>(extent_len) * CLUSTER_SIZE;
+        size_t const REMAINING = TO_READ - bytes_read;
 
         // -- Bulk path: contiguous extent exceeds threshold ------------------
-        if (bulk_capable && byte_offset == 0 && extent_bytes >= ker::net::wki::BLK_RING_BULK_THRESHOLD && remaining >= extent_bytes) {
+        if (BULK_CAPABLE && byte_offset == 0 && EXTENT_BYTES >= ker::net::wki::BLK_RING_BULK_THRESHOLD && REMAINING >= EXTENT_BYTES) {
             // Compute the LBA range for the contiguous cluster run
-            uint64_t extent_lba =
-                ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(extent_start - 2) * ctx->sectors_per_cluster);
-            uint32_t extent_sectors = extent_len * ctx->sectors_per_cluster;
+            uint64_t const EXTENT_LBA =
+                ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(EXTENT_START - 2) * ctx->sectors_per_cluster);
+            uint32_t const EXTENT_SECTORS = extent_len * ctx->sectors_per_cluster;
 
-            int ret = ker::net::wki::wki_dev_proxy_bulk_read(ctx->device, extent_lba, extent_sectors, dest);
-            if (ret == 0) {
-                size_t bulk_bytes = std::min(remaining, extent_bytes);
-                bytes_read += bulk_bytes;
-                dest += bulk_bytes;
+            int const RET = ker::net::wki::wki_dev_proxy_bulk_read(ctx->device, EXTENT_LBA, EXTENT_SECTORS, dest);
+            if (RET == 0) {
+                size_t const BULK_BYTES = std::min(REMAINING, EXTENT_BYTES);
+                bytes_read += BULK_BYTES;
+                dest += BULK_BYTES;
 
                 // Advance cluster chain past the extent we just read
-                current_cluster = extent_start + extent_len;
+                current_cluster = EXTENT_START + extent_len;
                 // Verify that we land on a valid cluster (the next one after extent)
-                uint32_t next_after = get_next_cluster(ctx, extent_start + extent_len - 1);
-                if (next_after >= 2 && next_after < FAT32_EOC) {
-                    current_cluster = next_after;
+                uint32_t const NEXT_AFTER = get_next_cluster(ctx, EXTENT_START + extent_len - 1);
+                if (NEXT_AFTER >= 2 && NEXT_AFTER < FAT32_EOC) {
+                    current_cluster = NEXT_AFTER;
                 } else {
                     current_cluster = 0;  // end of chain
                 }
@@ -1063,14 +1074,14 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
             break;
         }
 
-        size_t bytes_in_cluster = std::min(to_read - bytes_read, cluster_size - byte_offset);
+        size_t const BYTES_IN_CLUSTER = std::min(TO_READ - bytes_read, CLUSTER_SIZE - byte_offset);
 #ifdef FAT32_DEBUG
         log::trace("fat32_read: copying 0x%zx bytes", bytes_in_cluster);
 #endif
-        memcpy(dest, cluster_buf + byte_offset, bytes_in_cluster);
+        memcpy(dest, cluster_buf + byte_offset, BYTES_IN_CLUSTER);
 
-        bytes_read += bytes_in_cluster;
-        dest += bytes_in_cluster;
+        bytes_read += BYTES_IN_CLUSTER;
+        dest += BYTES_IN_CLUSTER;
         byte_offset = 0;
         current_cluster = get_next_cluster(ctx, current_cluster);
     }
@@ -1079,7 +1090,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     delete[] cluster_buf;
 
     ctx->lock.unlock();
-    return (ssize_t)bytes_read;
+    return static_cast<ssize_t>(bytes_read);
 }
 
 // Flush FAT table to disk
@@ -1090,15 +1101,15 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
     }
 
     // Calculate how many sectors to write
-    size_t fat_size_bytes = static_cast<size_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector;
-    size_t fat_sectors = (fat_size_bytes + ctx->bytes_per_sector - 1) / ctx->bytes_per_sector;
+    size_t const FAT_SIZE_BYTES = static_cast<size_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector;
+    size_t const FAT_SECTORS = (FAT_SIZE_BYTES + ctx->bytes_per_sector - 1) / ctx->bytes_per_sector;
 
 #ifdef FAT32_DEBUG
     log::trace("flush_fat_table: writing FAT table, %zu sectors", fat_sectors);
 #endif
 
     // Write FAT table to both FAT1 and FAT2
-    int result = ker::dev::block_write(ctx->device, ctx->partition_offset + ctx->reserved_sectors, static_cast<uint32_t>(fat_sectors),
+    int result = ker::dev::block_write(ctx->device, ctx->partition_offset + ctx->reserved_sectors, static_cast<uint32_t>(FAT_SECTORS),
                                        ctx->fat_table);
 
     if (result != 0) {
@@ -1108,7 +1119,7 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
 
     // Write to FAT2 as well (backup FAT)
     result = ker::dev::block_write(ctx->device, ctx->partition_offset + ctx->reserved_sectors + ctx->sectors_per_fat,
-                                   static_cast<uint32_t>(fat_sectors), ctx->fat_table);
+                                   static_cast<uint32_t>(FAT_SECTORS), ctx->fat_table);
 
     if (result != 0) {
         log::warn("flush_fat_table: failed to write FAT2");
@@ -1141,14 +1152,14 @@ auto fat32_fsync(File* f) -> int {
 }
 
 // Update file's directory entry on disk
-auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
+static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     if (node == nullptr || node->context == nullptr || node->context->device == nullptr) {
         log::warn("update_directory_entry: invalid node or context");
         return -1;
     }
 
     const FAT32MountContext* ctx = node->context;
-    uint32_t cluster_size = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    uint32_t const CLUSTER_SIZE = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
 #ifdef FAT32_DEBUG
     log::trace("update_directory_entry: updating entry at cluster 0x%x, offset 0x%x, new size 0x%x", node->dir_entry_cluster,
@@ -1156,16 +1167,16 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
 #endif
 
     // Allocate buffer for the cluster
-    auto* cluster_buf = new uint8_t[cluster_size];
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         log::warn("update_directory_entry: failed to allocate cluster buffer");
         return -1;
     }
 
     // Read the cluster containing the directory entry
-    uint64_t cluster_lba =
+    uint64_t const CLUSTER_LBA =
         ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(node->dir_entry_cluster) - 2) * ctx->sectors_per_cluster);
-    if (ker::dev::block_read(ctx->device, cluster_lba, ctx->sectors_per_cluster, cluster_buf) != 0) {
+    if (ker::dev::block_read(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, cluster_buf) != 0) {
         log::warn("update_directory_entry: failed to read directory cluster");
         delete[] cluster_buf;
         return -1;
@@ -1180,15 +1191,15 @@ auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     // Also persist the file's start cluster. Newly created files are emitted with
     // cluster_low/high = 0 and the first cluster is allocated on first write.
     // If we don't write it back, the file will not be readable after reboot.
-    entry->cluster_low = static_cast<uint16_t>(node->start_cluster & 0xFFFFu);
-    entry->cluster_high = static_cast<uint16_t>((node->start_cluster >> 16) & 0xFFFFu);
+    entry->cluster_low = static_cast<uint16_t>(node->start_cluster & 0xFFFFU);
+    entry->cluster_high = static_cast<uint16_t>((node->start_cluster >> 16) & 0xFFFFU);
 
 #ifdef FAT32_DEBUG
     log::trace("update_directory_entry: writing cluster back");
 #endif
 
     // Write the cluster back to disk
-    if (ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, cluster_buf) != 0) {
+    if (ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, cluster_buf) != 0) {
         log::warn("update_directory_entry: failed to write directory cluster");
         return -1;
     }
@@ -1218,9 +1229,9 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
     }
 
     // Calculate starting cluster and offset within cluster
-    size_t cluster_size = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
-    uint32_t cluster_offset = offset / cluster_size;
-    uint32_t byte_offset = offset % cluster_size;
+    size_t const CLUSTER_SIZE = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
+    uint32_t cluster_offset = offset / CLUSTER_SIZE;
+    uint32_t byte_offset = offset % CLUSTER_SIZE;
     uint32_t current_cluster = node->start_cluster;
 
     // If starting from cluster 0 (new file), allocate first cluster
@@ -1245,8 +1256,8 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
 
     // Skip to the correct cluster
     for (uint32_t i = 0; i < cluster_offset; ++i) {
-        uint32_t next = ctx->fat_table[current_cluster] & FAT32_EOC;
-        if (next >= FAT32_EOC) {
+        uint32_t const NEXT = ctx->fat_table[current_cluster] & FAT32_EOC;
+        if (NEXT >= FAT32_EOC) {
             // Need to allocate new cluster
             for (uint32_t j = 2; j < FAT32_EOC; ++j) {
                 if ((ctx->fat_table[j] & FAT32_EOC) == 0) {
@@ -1257,46 +1268,46 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
                 }
             }
         } else {
-            current_cluster = next;
+            current_cluster = NEXT;
         }
     }
 
     // Write data
     size_t bytes_written = 0;
     const auto* src = reinterpret_cast<const uint8_t*>(buf);
-    auto* cluster_buf = new uint8_t[cluster_size];
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
 
     while (bytes_written < count && current_cluster != 0) {
         // Read current cluster first
-        uint64_t cluster_sector =
+        uint64_t const CLUSTER_SECTOR =
             ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(current_cluster) - 2) * ctx->sectors_per_cluster);
-        if (ker::dev::block_read(ctx->device, cluster_sector, ctx->sectors_per_cluster, cluster_buf) != 0) {
+        if (ker::dev::block_read(ctx->device, CLUSTER_SECTOR, ctx->sectors_per_cluster, cluster_buf) != 0) {
             log::warn("fat32_write: failed to read cluster");
             delete[] cluster_buf;
             return -1;
         }
 
         // Write data into cluster buffer
-        size_t bytes_in_cluster = std::min(count - bytes_written, cluster_size - byte_offset);
-        memcpy(cluster_buf + byte_offset, src, bytes_in_cluster);
+        size_t const BYTES_IN_CLUSTER = std::min(count - bytes_written, CLUSTER_SIZE - byte_offset);
+        memcpy(cluster_buf + byte_offset, src, BYTES_IN_CLUSTER);
 
         // Write cluster back to device
-        if (ker::dev::block_write(ctx->device, cluster_sector, ctx->sectors_per_cluster, cluster_buf) != 0) {
+        if (ker::dev::block_write(ctx->device, CLUSTER_SECTOR, ctx->sectors_per_cluster, cluster_buf) != 0) {
             log::warn("fat32_write: failed to write cluster");
             delete[] cluster_buf;
             return -1;
         }
 
-        bytes_written += bytes_in_cluster;
-        src += bytes_in_cluster;
+        bytes_written += BYTES_IN_CLUSTER;
+        src += BYTES_IN_CLUSTER;
         byte_offset = 0;
 
         // Update file size
         node->file_size = std::max<size_t>(offset + bytes_written, node->file_size);
 
         // Get next cluster
-        uint32_t next = ctx->fat_table[current_cluster] & FAT32_EOC;
-        if (next >= FAT32_EOC) {
+        uint32_t const NEXT = ctx->fat_table[current_cluster] & FAT32_EOC;
+        if (NEXT >= FAT32_EOC) {
             if (bytes_written < count) {
                 // Allocate new cluster
                 for (uint32_t j = 2; j < FAT32_EOC; ++j) {
@@ -1309,7 +1320,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
                 }
             }
         } else {
-            current_cluster = next;
+            current_cluster = NEXT;
         }
     }
 
@@ -1340,7 +1351,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
     log::debug("fat32_write: wrote %zu bytes, new file size: 0x%x", bytes_written, node->file_size);
 #endif
 
-    return (ssize_t)bytes_written;
+    return static_cast<ssize_t>(bytes_written);
 }
 
 // Seek in a FAT32 file
@@ -1360,7 +1371,7 @@ auto fat32_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             newpos = f->pos + offset;
             break;
         case 2:  // SEEK_END
-            newpos = (off_t)node->file_size + offset;
+            newpos = static_cast<off_t>(node->file_size) + offset;
             break;
         default:
             return -1;
@@ -1394,7 +1405,7 @@ constexpr auto fat32_isatty(ker::vfs::File* f) -> bool {
 }
 
 // Read directory entry at given index
-auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
+static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
         return -1;
     }
@@ -1437,13 +1448,13 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     }
 
     // Real entries start at index 2
-    size_t real_index = index - 2;
+    size_t const REAL_INDEX = index - 2;
 
     // Lock the mount context for the duration of the readdir
     ctx->lock.lock();
 
-    size_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    auto* cluster_buf = new uint8_t[cluster_size];
+    size_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         ctx->lock.unlock();
         return -1;
@@ -1468,10 +1479,10 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
         }
 
         // Parse directory entries
-        size_t num_entries = cluster_size / sizeof(FAT32DirectoryEntry);
+        size_t const NUM_ENTRIES = CLUSTER_SIZE / sizeof(FAT32DirectoryEntry);
         auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
 
-        for (size_t i = 0; i < num_entries; ++i) {
+        for (size_t i = 0; i < NUM_ENTRIES; ++i) {
             auto* dir_entry = &entries[i];
 
             // End of directory
@@ -1512,9 +1523,9 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
             }
 
             // Check if this is the entry we're looking for (offset by 2 for synthetic . and ..)
-            if (entries_seen == real_index) {
+            if (entries_seen == REAL_INDEX) {
                 // Fill in the dirent structure
-                entry->d_ino = ((uint32_t)dir_entry->cluster_high << 16) | dir_entry->cluster_low;
+                entry->d_ino = (static_cast<uint32_t>(dir_entry->cluster_high) << 16) | dir_entry->cluster_low;
                 entry->d_off = index + 1;
                 entry->d_reclen = sizeof(DirEntry);
                 entry->d_type = (dir_entry->attributes & FAT32_ATTR_DIRECTORY) != 0 ? DT_DIR : DT_REG;
@@ -1564,7 +1575,7 @@ auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     return found ? 0 : -1;
 }
 
-auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ctx) -> int {
+auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ctx) -> int {
     if (path == nullptr || statbuf == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -1614,8 +1625,8 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
         }
 
         // Search directory for component
-        uint32_t bytes_per_cluster = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-        auto* cluster_buf = new uint8_t[bytes_per_cluster];
+        uint32_t const BYTES_PER_CLUSTER = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+        auto* cluster_buf = new uint8_t[BYTES_PER_CLUSTER];
         bool found = false;
         uint32_t found_cluster = 0;
         uint32_t found_size = 0;
@@ -1633,9 +1644,9 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
             }
 
             auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
-            size_t entries_count = bytes_per_cluster / sizeof(FAT32DirectoryEntry);
+            size_t const ENTRIES_COUNT = BYTES_PER_CLUSTER / sizeof(FAT32DirectoryEntry);
 
-            for (size_t i = 0; i < entries_count; ++i) {
+            for (size_t i = 0; i < ENTRIES_COUNT; ++i) {
                 if (entries[i].name[0] == 0x00) {
                     break;  // End of directory
                 }
@@ -1741,7 +1752,7 @@ auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ct
     return -ENOENT;
 }
 
-auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int {
+auto fat32_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (f == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
@@ -1774,33 +1785,33 @@ auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int {
     return 0;
 }
 
-auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::statvfs* buf) -> int {
+auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     if (ctx == nullptr || buf == nullptr) {
         return -EINVAL;
     }
 
-    std::memset(buf, 0, sizeof(ker::vfs::statvfs));
+    std::memset(buf, 0, sizeof(ker::vfs::Statvfs));
 
-    uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    uint32_t fat_entry_count =
+    uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    auto const FAT_ENTRY_COUNT =
         static_cast<uint32_t>((static_cast<uint64_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector) / sizeof(uint32_t));
-    uint32_t data_clusters =
+    uint32_t const DATA_CLUSTERS =
         (ctx->total_sectors > ctx->data_start_sector) ? (ctx->total_sectors - ctx->data_start_sector) / ctx->sectors_per_cluster : 0;
     // Valid cluster indices are [2, 2 + data_clusters); clamp to FAT table size
-    uint32_t max_cluster = (fat_entry_count < 2 + data_clusters) ? fat_entry_count : 2 + data_clusters;
+    uint32_t const MAX_CLUSTER = (FAT_ENTRY_COUNT < 2 + DATA_CLUSTERS) ? FAT_ENTRY_COUNT : 2 + DATA_CLUSTERS;
 
     uint32_t free_clusters = 0;
     if (ctx->fat_table != nullptr) {
-        for (uint32_t i = 2; i < max_cluster; i++) {
+        for (uint32_t i = 2; i < MAX_CLUSTER; i++) {
             if ((ctx->fat_table[i] & FAT32_CLUSTER_MASK) == 0) {
                 free_clusters++;
             }
         }
     }
 
-    buf->f_bsize = cluster_size;
-    buf->f_frsize = cluster_size;
-    buf->f_blocks = data_clusters;
+    buf->f_bsize = CLUSTER_SIZE;
+    buf->f_frsize = CLUSTER_SIZE;
+    buf->f_blocks = DATA_CLUSTERS;
     buf->f_bfree = free_clusters;
     buf->f_bavail = free_clusters;
     buf->f_files = 0;  // FAT32 has no fixed inode table
@@ -1817,24 +1828,25 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::statvfs* buf) -> int {
 // ============================================================================
 
 // Write a cluster to disk
-auto write_cluster(const FAT32MountContext* ctx, uint32_t cluster, const void* buffer) -> int {
+static auto write_cluster(const FAT32MountContext* ctx, uint32_t cluster, const void* buffer) -> int {
     if (ctx == nullptr || ctx->device == nullptr || cluster < 2) {
         return -1;
     }
-    uint64_t cluster_lba = ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(cluster - 2) * ctx->sectors_per_cluster);
-    return ker::dev::block_write(ctx->device, cluster_lba, ctx->sectors_per_cluster, buffer);
+    uint64_t const CLUSTER_LBA =
+        ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(cluster - 2) * ctx->sectors_per_cluster);
+    return ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer);
 }
 
 // Calculate total data clusters for bounds checking FAT scans
-auto total_data_clusters(const FAT32MountContext* ctx) -> uint32_t {
-    uint32_t data_sectors = ctx->total_sectors - ctx->data_start_sector;
-    return data_sectors / ctx->sectors_per_cluster + 2;
+static auto total_data_clusters(const FAT32MountContext* ctx) -> uint32_t {
+    uint32_t const DATA_SECTORS = ctx->total_sectors - ctx->data_start_sector;
+    return (DATA_SECTORS / ctx->sectors_per_cluster) + 2;
 }
 
 // Allocate a single cluster - find first free FAT entry, mark EOC
-auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
-    uint32_t max_cluster = total_data_clusters(ctx);
-    for (uint32_t i = 2; i < max_cluster; ++i) {
+static auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
+    uint32_t const MAX_CLUSTER = total_data_clusters(ctx);
+    for (uint32_t i = 2; i < MAX_CLUSTER; ++i) {
         if ((ctx->fat_table[i] & FAT32_EOC) == 0) {
             ctx->fat_table[i] = FAT32_EOC;
             return i;
@@ -1844,20 +1856,24 @@ auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
 }
 
 // Free an entire cluster chain starting at start_cluster
-auto free_cluster_chain(FAT32MountContext* ctx, uint32_t start_cluster) -> int {
-    if (start_cluster < 2) return 0;
+static auto free_cluster_chain(FAT32MountContext* ctx, uint32_t start_cluster) -> int {
+    if (start_cluster < 2) {
+        return 0;
+    }
     uint32_t cluster = start_cluster;
     while (cluster >= 2 && cluster < FAT32_EOC) {
-        uint32_t next = ctx->fat_table[cluster] & FAT32_EOC;
+        uint32_t const NEXT = ctx->fat_table[cluster] & FAT32_EOC;
         ctx->fat_table[cluster] = 0;  // free the entry
-        if (next >= FAT32_EOC) break;
-        cluster = next;
+        if (NEXT >= FAT32_EOC) {
+            break;
+        }
+        cluster = NEXT;
     }
     return 0;
 }
 
 // Truncate/extend a FAT32 file
-auto fat32_truncate(File* f, off_t length) -> int {
+static auto fat32_truncate(File* f, off_t length) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EINVAL;
     }
@@ -1867,7 +1883,7 @@ auto fat32_truncate(File* f, off_t length) -> int {
         return -EIO;
     }
 
-    uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
     auto new_size = static_cast<uint32_t>(length);
 
     if (new_size == node->file_size) {
@@ -1897,62 +1913,64 @@ auto fat32_truncate(File* f, off_t length) -> int {
             return 0;
         }
 
-        uint32_t clusters_needed = (new_size + cluster_size - 1) / cluster_size;
+        uint32_t const CLUSTERS_NEEDED = (new_size + CLUSTER_SIZE - 1) / CLUSTER_SIZE;
         uint32_t current = node->start_cluster;
-        for (uint32_t i = 1; i < clusters_needed; ++i) {
-            uint32_t next = ctx->fat_table[current] & FAT32_EOC;
-            if (next >= FAT32_EOC || next < 2) break;
-            current = next;
+        for (uint32_t i = 1; i < CLUSTERS_NEEDED; ++i) {
+            uint32_t const NEXT = ctx->fat_table[current] & FAT32_EOC;
+            if (NEXT >= FAT32_EOC || NEXT < 2) {
+                break;
+            }
+            current = NEXT;
         }
         // 'current' is the last cluster we need to keep
-        uint32_t next_to_free = ctx->fat_table[current] & FAT32_EOC;
+        uint32_t const NEXT_TO_FREE = ctx->fat_table[current] & FAT32_EOC;
         ctx->fat_table[current] = FAT32_EOC;  // terminate chain here
-        if (next_to_free >= 2 && next_to_free < FAT32_EOC) {
-            free_cluster_chain(ctx, next_to_free);
+        if (NEXT_TO_FREE >= 2 && NEXT_TO_FREE < FAT32_EOC) {
+            free_cluster_chain(ctx, NEXT_TO_FREE);
         }
     } else {
         // Extending - allocate clusters and zero-fill
         if (node->start_cluster < 2) {
-            uint32_t first = allocate_cluster(ctx);
-            if (first == 0) {
+            uint32_t const FIRST = allocate_cluster(ctx);
+            if (FIRST == 0) {
                 return -ENOSPC;
             }
-            node->start_cluster = first;
+            node->start_cluster = FIRST;
             // Zero-fill the new cluster
-            auto* zbuf = new uint8_t[cluster_size];
+            auto* zbuf = new uint8_t[CLUSTER_SIZE];
             if (zbuf != nullptr) {
-                memset(zbuf, 0, cluster_size);
-                write_cluster(ctx, first, zbuf);
+                memset(zbuf, 0, CLUSTER_SIZE);
+                write_cluster(ctx, FIRST, zbuf);
                 delete[] zbuf;
             }
         }
-        uint32_t clusters_needed = (new_size + cluster_size - 1) / cluster_size;
+        uint32_t const CLUSTERS_NEEDED = (new_size + CLUSTER_SIZE - 1) / CLUSTER_SIZE;
         // Walk to the end of the existing chain
         uint32_t current = node->start_cluster;
         uint32_t current_count = 1;
         while (true) {
-            uint32_t next = ctx->fat_table[current] & FAT32_EOC;
-            if (next >= FAT32_EOC || next < 2) {
+            uint32_t const NEXT = ctx->fat_table[current] & FAT32_EOC;
+            if (NEXT >= FAT32_EOC || NEXT < 2) {
                 break;
             }
-            current = next;
+            current = NEXT;
             current_count++;
         }
         // Allocate additional clusters
-        while (current_count < clusters_needed) {
-            uint32_t nc = allocate_cluster(ctx);
-            if (nc == 0) {
+        while (current_count < CLUSTERS_NEEDED) {
+            uint32_t const NC = allocate_cluster(ctx);
+            if (NC == 0) {
                 break;  // out of space
             }
-            ctx->fat_table[current] = nc;
+            ctx->fat_table[current] = NC;
             // Zero-fill
-            auto* zbuf = new uint8_t[cluster_size];
+            auto* zbuf = new uint8_t[CLUSTER_SIZE];
             if (zbuf != nullptr) {
-                memset(zbuf, 0, cluster_size);
-                write_cluster(ctx, nc, zbuf);
+                memset(zbuf, 0, CLUSTER_SIZE);
+                write_cluster(ctx, NC, zbuf);
                 delete[] zbuf;
             }
-            current = nc;
+            current = NC;
             current_count++;
         }
     }
@@ -1966,14 +1984,14 @@ auto fat32_truncate(File* f, off_t length) -> int {
 
 // Walk a path to find the parent directory node and final component name.
 // Returns nullptr if parent not found. Sets *out_name to final component.
-auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char** out_name) -> FAT32Node* {
+static auto fat32_walk_to_parent(FAT32MountContext* ctx, const char* path, const char** out_name) -> FAT32Node* {
     if (path == nullptr || *path == '\0') {
         return nullptr;
     }
 
     // Find last '/'
     const char* last_slash = nullptr;
-    for (const char* p = path; *p; ++p) {
+    for (const char* p = path; (*p) != 0; ++p) {
         if (*p == '/') {
             last_slash = p;
         }
@@ -2054,15 +2072,15 @@ struct DirEntryLocation {
     FAT32DirectoryEntry sfn;     // copy of the SFN entry
 };
 
-auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const char* name, DirEntryLocation* loc) -> int {
+static auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const char* name, DirEntryLocation* loc) -> int {
     if (ctx == nullptr || name == nullptr || loc == nullptr) {
         return -EINVAL;
     }
 
-    uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    uint32_t entries_per_cluster = cluster_size / 32;
+    uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    uint32_t const ENTRIES_PER_CLUSTER = CLUSTER_SIZE / 32;
 
-    auto* cluster_buf = new uint8_t[cluster_size];
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         return -ENOMEM;
     }
@@ -2082,7 +2100,7 @@ auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const ch
         }
 
         auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
-        for (uint32_t i = 0; i < entries_per_cluster; ++i) {
+        for (uint32_t i = 0; i < ENTRIES_PER_CLUSTER; ++i) {
             if (static_cast<uint8_t>(entries[i].name[0]) == 0x00) {
                 // End of directory
                 delete[] cluster_buf;
@@ -2124,17 +2142,19 @@ auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const ch
                 const char* a = lfn_name;
                 const char* b = name;
                 bool eq = true;
-                while (*a && *b) {
-                    char ca = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a;
-                    char cb = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
-                    if (ca != cb) {
+                while (((*a) != 0) && ((*b) != 0)) {
+                    char const CA = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a;
+                    char const CB = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
+                    if (CA != CB) {
                         eq = false;
                         break;
                     }
                     a++;
                     b++;
                 }
-                if (eq && *a == '\0' && *b == '\0') matched = true;
+                if (eq && *a == '\0' && *b == '\0') {
+                    matched = true;
+                }
             }
 
             // Also check SFN match
@@ -2170,11 +2190,11 @@ auto fat32_find_dir_entry(FAT32MountContext* ctx, uint32_t dir_cluster, const ch
 }
 
 // Check if a directory is empty (only . and .. entries)
-auto fat32_dir_is_empty(FAT32MountContext* ctx, uint32_t dir_cluster) -> bool {
-    uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    uint32_t entries_per_cluster = cluster_size / 32;
+static auto fat32_dir_is_empty(FAT32MountContext* ctx, uint32_t dir_cluster) -> bool {
+    uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    uint32_t const ENTRIES_PER_CLUSTER = CLUSTER_SIZE / 32;
 
-    auto* cluster_buf = new uint8_t[cluster_size];
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         return false;
     }
@@ -2185,7 +2205,7 @@ auto fat32_dir_is_empty(FAT32MountContext* ctx, uint32_t dir_cluster) -> bool {
             break;
         }
         auto* entries = reinterpret_cast<FAT32DirectoryEntry*>(cluster_buf);
-        for (uint32_t i = 0; i < entries_per_cluster; ++i) {
+        for (uint32_t i = 0; i < ENTRIES_PER_CLUSTER; ++i) {
             if (static_cast<uint8_t>(entries[i].name[0]) == 0x00) {
                 delete[] cluster_buf;
                 return true;  // End of directory - it's empty
@@ -2218,13 +2238,13 @@ auto fat32_dir_is_empty(FAT32MountContext* ctx, uint32_t dir_cluster) -> bool {
 }
 
 // Mark directory entries as deleted (0xE5) - handles LFN + SFN
-auto fat32_delete_dir_entries(FAT32MountContext* ctx, const DirEntryLocation* loc) -> int {
+static auto fat32_delete_dir_entries(FAT32MountContext* ctx, const DirEntryLocation* loc) -> int {
     // For simplicity, we handle the case where all entries are in the same cluster
     // (which is how create_file_in_dir creates them - contiguous in one cluster).
     // A more robust implementation would handle cross-cluster LFN entries.
 
-    uint32_t cluster_size = ctx->bytes_per_sector * ctx->sectors_per_cluster;
-    auto* cluster_buf = new uint8_t[cluster_size];
+    uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
+    auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         return -ENOMEM;
     }
@@ -2269,10 +2289,10 @@ auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int {
     }
 
     DirEntryLocation loc{};
-    int ret = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
+    int const RET = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
     delete parent;
-    if (ret < 0) {
-        return ret;
+    if (RET < 0) {
+        return RET;
     }
 
     // Can't unlink a directory with unlink
@@ -2281,9 +2301,9 @@ auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int {
     }
 
     // Free the file's cluster chain
-    uint32_t start = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
-    if (start >= 2) {
-        free_cluster_chain(ctx, start);
+    uint32_t const START = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
+    if (START >= 2) {
+        free_cluster_chain(ctx, START);
         flush_fat_table(ctx);
     }
 
@@ -2299,24 +2319,24 @@ auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int {
     }
 
     DirEntryLocation loc{};
-    int ret = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
+    int const RET = fat32_find_dir_entry(ctx, parent->start_cluster, entry_name, &loc);
     delete parent;
-    if (ret < 0) {
-        return ret;
+    if (RET < 0) {
+        return RET;
     }
 
     if ((loc.sfn.attributes & FAT32_ATTR_DIRECTORY) == 0) {
         return -ENOTDIR;
     }
 
-    uint32_t dir_start = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
-    if (!fat32_dir_is_empty(ctx, dir_start)) {
+    uint32_t const DIR_START = (static_cast<uint32_t>(loc.sfn.cluster_high) << 16) | loc.sfn.cluster_low;
+    if (!fat32_dir_is_empty(ctx, DIR_START)) {
         return -ENOTEMPTY;
     }
 
     // Free directory cluster chain
-    if (dir_start >= 2) {
-        free_cluster_chain(ctx, dir_start);
+    if (DIR_START >= 2) {
+        free_cluster_chain(ctx, DIR_START);
         flush_fat_table(ctx);
     }
 
@@ -2332,10 +2352,10 @@ auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* 
     }
 
     DirEntryLocation old_loc{};
-    int ret = fat32_find_dir_entry(ctx, old_parent->start_cluster, old_name, &old_loc);
-    if (ret < 0) {
+    int const RET = fat32_find_dir_entry(ctx, old_parent->start_cluster, old_name, &old_loc);
+    if (RET < 0) {
         delete old_parent;
-        return ret;
+        return RET;
     }
 
     // Step 2: Find new parent directory
@@ -2349,17 +2369,17 @@ auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* 
     // Step 3: If destination already exists, remove it
     DirEntryLocation dest_loc{};
     if (fat32_find_dir_entry(ctx, new_parent->start_cluster, new_name, &dest_loc) == 0) {
-        uint32_t dest_start = (static_cast<uint32_t>(dest_loc.sfn.cluster_high) << 16) | dest_loc.sfn.cluster_low;
-        if (dest_start >= 2) {
-            free_cluster_chain(ctx, dest_start);
+        uint32_t const DEST_START = (static_cast<uint32_t>(dest_loc.sfn.cluster_high) << 16) | dest_loc.sfn.cluster_low;
+        if (DEST_START >= 2) {
+            free_cluster_chain(ctx, DEST_START);
         }
         fat32_delete_dir_entries(ctx, &dest_loc);
     }
 
     // Step 4: Create new directory entry in destination, pointing to old file's clusters
-    uint32_t file_start = (static_cast<uint32_t>(old_loc.sfn.cluster_high) << 16) | old_loc.sfn.cluster_low;
-    uint32_t file_size = old_loc.sfn.file_size;
-    uint8_t attrs = old_loc.sfn.attributes;
+    uint32_t const FILE_START = (static_cast<uint32_t>(old_loc.sfn.cluster_high) << 16) | old_loc.sfn.cluster_low;
+    uint32_t const FILE_SIZE = old_loc.sfn.file_size;
+    uint8_t const ATTRS = old_loc.sfn.attributes;
 
     // Use create_file_in_dir to create entry, then update it
     auto* new_file = create_file_in_directory(ctx, new_parent->start_cluster, new_name);
@@ -2371,24 +2391,24 @@ auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* 
 
     // Update the new entry to point to the original file's clusters
     auto* new_node = static_cast<FAT32Node*>(new_file->private_data);
-    new_node->start_cluster = file_start;
-    new_node->file_size = file_size;
-    new_node->attributes = attrs;
+    new_node->start_cluster = FILE_START;
+    new_node->file_size = FILE_SIZE;
+    new_node->attributes = ATTRS;
 
     // Persist these to the directory entry on disk
-    update_directory_entry(new_node, file_size);
+    update_directory_entry(new_node, FILE_SIZE);
 
     // Also update attributes in the dir entry
     {
-        uint32_t cs = new_node->context->bytes_per_sector * new_node->context->sectors_per_cluster;
-        auto* cbuf = new uint8_t[cs];
+        uint32_t const CS = new_node->context->bytes_per_sector * new_node->context->sectors_per_cluster;
+        auto* cbuf = new uint8_t[CS];
         if (cbuf != nullptr) {
-            uint64_t lba = ctx->partition_offset + ctx->data_start_sector +
-                           (static_cast<uint64_t>(new_node->dir_entry_cluster - 2) * ctx->sectors_per_cluster);
-            if (ker::dev::block_read(ctx->device, lba, ctx->sectors_per_cluster, cbuf) == 0) {
+            uint64_t const LBA = ctx->partition_offset + ctx->data_start_sector +
+                                 (static_cast<uint64_t>(new_node->dir_entry_cluster - 2) * ctx->sectors_per_cluster);
+            if (ker::dev::block_read(ctx->device, LBA, ctx->sectors_per_cluster, cbuf) == 0) {
                 auto* entry = reinterpret_cast<FAT32DirectoryEntry*>(cbuf + new_node->dir_entry_offset);
-                entry->attributes = attrs;
-                ker::dev::block_write(ctx->device, lba, ctx->sectors_per_cluster, cbuf);
+                entry->attributes = ATTRS;
+                ker::dev::block_write(ctx->device, LBA, ctx->sectors_per_cluster, cbuf);
             }
             delete[] cbuf;
         }

@@ -1,5 +1,6 @@
 #include "rtc.hpp"
 
+#include <cstdint>
 #include <mod/io/port/port.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/tsc/tsc.hpp>
@@ -76,7 +77,7 @@ static uint64_t ymd_hms_to_epoch(int year, int month, int day, int hour, int min
 
     days += static_cast<uint64_t>(day - 1);
 
-    return days * 86400ULL + static_cast<uint64_t>(hour) * 3600ULL + static_cast<uint64_t>(min) * 60ULL + static_cast<uint64_t>(sec);
+    return (days * 86400ULL) + (static_cast<uint64_t>(hour) * 3600ULL) + (static_cast<uint64_t>(min) * 60ULL) + static_cast<uint64_t>(sec);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,62 +91,62 @@ void init() {
 
     wait_rtc_ready();
 
-    uint8_t sec_raw = cmos_read(RTC_SEC);
-    uint8_t min_raw = cmos_read(RTC_MIN);
-    uint8_t hour_raw = cmos_read(RTC_HOUR);
-    uint8_t day_raw = cmos_read(RTC_DAY);
-    uint8_t month_raw = cmos_read(RTC_MONTH);
-    uint8_t year_raw = cmos_read(RTC_YEAR);
-    uint8_t century_raw = cmos_read(RTC_CENTURY);
-    uint8_t stb = cmos_read(RTC_STB);
+    uint8_t const SEC_RAW = cmos_read(RTC_SEC);
+    uint8_t const MIN_RAW = cmos_read(RTC_MIN);
+    uint8_t const HOUR_RAW = cmos_read(RTC_HOUR);
+    uint8_t const DAY_RAW = cmos_read(RTC_DAY);
+    uint8_t const MONTH_RAW = cmos_read(RTC_MONTH);
+    uint8_t const YEAR_RAW = cmos_read(RTC_YEAR);
+    uint8_t const CENTURY_RAW = cmos_read(RTC_CENTURY);
+    uint8_t const STB = cmos_read(RTC_STB);
 
     // Decode BCD if Status Register B bit 2 is 0.
-    bool binary_mode = (stb & 0x04U) != 0;
-    auto bcd = [&](uint8_t v) -> int { return binary_mode ? v : static_cast<int>((v & 0x0FU) + (v >> 4) * 10); };
+    bool binary_mode = (STB & 0x04U) != 0;
+    auto bcd = [&](uint8_t v) -> int { return binary_mode ? v : static_cast<int>((v & 0x0FU) + ((v >> 4) * 10)); };
 
-    int sec = bcd(sec_raw);
-    int min = bcd(min_raw);
-    int hour = bcd(hour_raw & 0x7FU);  // strip 12/24 PM bit before BCD decode
-    int day = bcd(day_raw);
-    int month = bcd(month_raw);
-    int year = bcd(year_raw);
-    int cent = bcd(century_raw);
+    int const SEC = bcd(SEC_RAW);
+    int const MIN = bcd(MIN_RAW);
+    int hour = bcd(HOUR_RAW & 0x7FU);  // strip 12/24 PM bit before BCD decode
+    int const DAY = bcd(DAY_RAW);
+    int const MONTH = bcd(MONTH_RAW);
+    int year = bcd(YEAR_RAW);
+    int const CENT = bcd(CENTURY_RAW);
 
     // Handle 12-hour mode: bit 7 of hour register indicates PM.
-    bool mode_24h = (stb & 0x02U) != 0;
-    if (!mode_24h) {
-        bool pm = (hour_raw & 0x80U) != 0;
+    bool const MODE_24H = (STB & 0x02U) != 0;
+    if (!MODE_24H) {
+        bool const PM = (HOUR_RAW & 0x80U) != 0;
         if (hour == 12) {
-            hour = pm ? 12 : 0;
-        } else if (pm) {
+            hour = PM ? 12 : 0;
+        } else if (PM) {
             hour += 12;
         }
     }
 
     // Determine century.
-    if (cent >= 20 && cent <= 21) {
-        year += cent * 100;
+    if (CENT >= 20 && CENT <= 21) {
+        year += CENT * 100;
     } else {
         // Century register absent or unreliable; assume 21st century.
         year += (year < 70) ? 2000 : 1900;
     }
 
-    epoch_sec_at_boot = ymd_hms_to_epoch(year, month, day, hour, min, sec);
+    epoch_sec_at_boot = ymd_hms_to_epoch(year, MONTH, DAY, hour, MIN, SEC);
 
-    dbg::log("rtc: wall clock %d-%02d-%02d %02d:%02d:%02d UTC (epoch %lu)", year, month, day, hour, min, sec,
-             (unsigned long)epoch_sec_at_boot);
+    dbg::log("rtc: wall clock %d-%02d-%02d %02d:%02d:%02d UTC (epoch %lu)", year, MONTH, DAY, hour, MIN, SEC,
+             static_cast<unsigned long>(epoch_sec_at_boot));
 }
 
 uint64_t get_epoch_sec() {
-    uint64_t mono_sec = (tsc::get_ns() - tsc_ns_at_boot) / 1000000000ULL;
-    return epoch_sec_at_boot + mono_sec + static_cast<uint64_t>(ntp_delta_sec);
+    uint64_t const MONO_SEC = (tsc::get_ns() - tsc_ns_at_boot) / 1000000000ULL;
+    return epoch_sec_at_boot + MONO_SEC + static_cast<uint64_t>(ntp_delta_sec);
 }
 
 uint64_t get_epoch_ns() {
-    uint64_t mono_ns = tsc::get_ns() - tsc_ns_at_boot;
-    uint64_t boot_epoch_ns = epoch_sec_at_boot * 1000000000ULL;
-    int64_t ntp_ns = ntp_delta_sec * static_cast<int64_t>(1000000000LL);
-    return boot_epoch_ns + mono_ns + static_cast<uint64_t>(ntp_ns);
+    uint64_t const MONO_NS = tsc::get_ns() - tsc_ns_at_boot;
+    uint64_t const BOOT_EPOCH_NS = epoch_sec_at_boot * 1000000000ULL;
+    int64_t const NTP_NS = ntp_delta_sec * static_cast<int64_t>(1000000000LL);
+    return BOOT_EPOCH_NS + MONO_NS + static_cast<uint64_t>(NTP_NS);
 }
 
 void set_offset(int64_t delta_sec) { ntp_delta_sec = delta_sec; }

@@ -7,13 +7,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <platform/mm/virt.hpp>
 
 #include "mod/gfx/fb_font.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
-__attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebufferRequest = {
+__attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebuffer_request = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
@@ -21,28 +20,28 @@ __attribute__((used, section(".requests"))) static volatile limine_framebuffer_r
 
 namespace ker::mod::gfx::fb {
 namespace {
-FbFont __currentFont;
-limine_framebuffer* __framebuffer;
+FbFont current_font;
+limine_framebuffer* framebuffer;
 [[maybe_unused]]
-uint32_t backBuffer[3840 * 2160];
+uint32_t back_buffer[3840 * 2160];
 }  // namespace
 
-void init(void) {
+void init() {
     if constexpr (WOS_HAS_GFX_FB) {
-        if (framebufferRequest.response == nullptr || framebufferRequest.response->framebuffer_count < 1) {
+        if (framebuffer_request.response == nullptr || framebuffer_request.response->framebuffer_count < 1) {
             hcf();
         }
 
-        __framebuffer = framebufferRequest.response->framebuffers[0];
+        framebuffer = framebuffer_request.response->framebuffers[0];
 
-        __framebuffer->width = std::min<uint64_t>(__framebuffer->width, (uint64_t)3840);
-        __framebuffer->height = std::min<uint64_t>(__framebuffer->height, (uint64_t)2160);
+        framebuffer->width = std::min<uint64_t>(framebuffer->width, static_cast<uint64_t>(3840));
+        framebuffer->height = std::min<uint64_t>(framebuffer->height, static_cast<uint64_t>(2160));
 
         // manual constructor calling since we can't use new for now
-        std::strcpy(__currentFont.name, "default");
-        __currentFont.height = 16;
-        __currentFont.width = 16;
-        __currentFont.load_font();
+        std::strcpy(current_font.name, "default");
+        current_font.height = 16;
+        current_font.width = 16;
+        current_font.load_font();
 
         clear(TERM_BG_COLOR);
     } else {
@@ -54,11 +53,11 @@ void init(void) {
     }
 }
 
-inline void swapBuffers(void) {
+static inline void swap_buffers() {
     if constexpr (WOS_HAS_GFX_FB) {
-        uint32_t* fb = (uint32_t*)__framebuffer->address;
-        for (size_t i = 0; i < __framebuffer->width * __framebuffer->height; i++) {
-            fb[i] = backBuffer[i];
+        auto* fb = static_cast<uint32_t*>(framebuffer->address);
+        for (size_t i = 0; i < framebuffer->width * framebuffer->height; i++) {
+            fb[i] = back_buffer[i];
         }
     } else {
         hcf();
@@ -67,7 +66,7 @@ inline void swapBuffers(void) {
 
 inline void write_pixel(uint16_t x, uint16_t y, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
-        backBuffer[x + y * __framebuffer->width] = color;
+        back_buffer[x + (y * framebuffer->width)] = color;
     } else {
         hcf();
     }
@@ -75,10 +74,10 @@ inline void write_pixel(uint16_t x, uint16_t y, uint32_t color) {
 
 void clear(uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
-        for (size_t i = 0; i < __framebuffer->width * __framebuffer->height; i++) {
-            backBuffer[i] = color;
+        for (size_t i = 0; i < framebuffer->width * framebuffer->height; i++) {
+            back_buffer[i] = color;
         }
-        swapBuffers();
+        swap_buffers();
     } else {
         hcf();
     }
@@ -102,25 +101,25 @@ void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color, F
                 write_pixel(x + w, y + i, color);
             }
         }
-        swapBuffers();
+        swap_buffers();
     } else {
         hcf();
     }
 }
 
-inline void drawCharNoSwap(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
+static inline void draw_char_no_swap(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
         if (mode == OffsetMode::OFFSET_CHAR) {
-            x *= __currentFont.width;
-            y *= __currentFont.height;
+            x *= current_font.width;
+            y *= current_font.height;
         }
-        const uint64_t* data = __currentFont.get_data(c);
-        for (size_t i = 0; i < __currentFont.height; i++) {
-            for (size_t j = 0; j < __currentFont.width; j++) {
-                if (data[i] & (1ULL << j)) {
-                    write_pixel(x + __currentFont.width - j, y + i, color);
+        const uint64_t* data = current_font.get_data(c);
+        for (size_t i = 0; i < current_font.height; i++) {
+            for (size_t j = 0; j < current_font.width; j++) {
+                if ((data[i] & (1ULL << j)) != 0U) {
+                    write_pixel(x + current_font.width - j, y + i, color);
                 } else {
-                    write_pixel(x + __currentFont.width - j, y + i, bg_color);
+                    write_pixel(x + current_font.width - j, y + i, bg_color);
                 }
             }
         }
@@ -131,8 +130,8 @@ inline void drawCharNoSwap(uint16_t x, uint16_t y, char c, uint32_t color, uint3
 
 void draw_char(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
-        drawCharNoSwap(x, y, c, color, bg_color, mode);
-        swapBuffers();
+        draw_char_no_swap(x, y, c, color, bg_color, mode);
+        swap_buffers();
     } else {
         hcf();
     }
@@ -146,53 +145,56 @@ uint64_t draw_string(uint16_t x, uint16_t y, const char* str, uint32_t color, ui
                 if (mode == OffsetMode::OFFSET_CHAR) {
                     y++;
                 } else {
-                    y += __currentFont.height;
+                    y += current_font.height;
                 }
                 lines++;
                 x = 0;
                 continue;
             }
             if (mode == OffsetMode::OFFSET_CHAR) {
-                drawCharNoSwap((x + i) * __currentFont.width, y * __currentFont.height, str[i], color, bg_color, OffsetMode::OFFSET_PIXEL);
+                draw_char_no_swap((x + i) * current_font.width, y * current_font.height, str[i], color, bg_color, OffsetMode::OFFSET_PIXEL);
             } else {
-                drawCharNoSwap(x + i * __currentFont.width, y, str[i], color, bg_color, OffsetMode::OFFSET_PIXEL);
+                draw_char_no_swap(x + (i * current_font.width), y, str[i], color, bg_color, OffsetMode::OFFSET_PIXEL);
             }
         }
-        swapBuffers();
+        swap_buffers();
         return lines;
     } else {
         hcf();
     }
 }
 
-void drawLineNoSwap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
+static void draw_line_no_swap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
-        int dx = x2 - x1;
-        int dy = y2 - y1;
-        int dx1 = 0, dy1 = 0, dx2 = 0, dy2 = 0;
-        if (dx < 0) {
+        int const DX = x2 - x1;
+        int const DY = y2 - y1;
+        int dx1 = 0;
+        int dy1 = 0;
+        int dx2 = 0;
+        int dy2 = 0;
+        if (DX < 0) {
             dx1 = -1;
-        } else if (dx > 0) {
+        } else if (DX > 0) {
             dx1 = 1;
         }
-        if (dy < 0) {
+        if (DY < 0) {
             dy1 = -1;
-        } else if (dy > 0) {
+        } else if (DY > 0) {
             dy1 = 1;
         }
-        if (dx < 0) {
+        if (DX < 0) {
             dx2 = -1;
-        } else if (dx > 0) {
+        } else if (DX > 0) {
             dx2 = 1;
         }
-        int longest = std::abs(dx);
-        int shortest = std::abs(dy);
+        int longest = std::abs(DX);
+        int shortest = std::abs(DY);
         if (!(longest > shortest)) {
-            longest = std::abs(dy);
-            shortest = std::abs(dx);
-            if (dy < 0) {
+            longest = std::abs(DY);
+            shortest = std::abs(DX);
+            if (DY < 0) {
                 dy2 = -1;
-            } else if (dy > 0) {
+            } else if (DY > 0) {
                 dy2 = 1;
             }
             dx2 = 0;
@@ -217,8 +219,8 @@ void drawLineNoSwap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t
 
 void draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
-        drawLineNoSwap(x1, y1, x2, y2, color);
-        swapBuffers();
+        draw_line_no_swap(x1, y1, x2, y2, color);
+        swap_buffers();
     } else {
         hcf();
     }
@@ -227,13 +229,13 @@ void draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t colo
 void draw_circle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMode fill) {
     if constexpr (WOS_HAS_GFX_FB) {
         int f = 1 - radius;
-        int ddF_x = 1;
-        int ddF_y = -2 * radius;
+        int dd_f_x = 1;
+        int dd_f_y = -2 * radius;
         int x1 = 0;
         int y1 = radius;
 
         if (fill == FillMode::FILL) {
-            drawLineNoSwap(x, y - radius, x, y + radius, color);
+            draw_line_no_swap(x, y - radius, x, y + radius, color);
         } else {
             write_pixel(x, y + radius, color);
             write_pixel(x, y - radius, color);
@@ -244,17 +246,17 @@ void draw_circle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMo
         while (x1 < y1) {
             if (f >= 0) {
                 y1--;
-                ddF_y += 2;
-                f += ddF_y;
+                dd_f_y += 2;
+                f += dd_f_y;
             }
             x1++;
-            ddF_x += 2;
-            f += ddF_x;
+            dd_f_x += 2;
+            f += dd_f_x;
             if (fill == FillMode::FILL) {
-                drawLineNoSwap(x - x1, y + y1, x + x1, y + y1, color);
-                drawLineNoSwap(x - x1, y - y1, x + x1, y - y1, color);
-                drawLineNoSwap(x - y1, y + x1, x + y1, y + x1, color);
-                drawLineNoSwap(x - y1, y - x1, x + y1, y - x1, color);
+                draw_line_no_swap(x - x1, y + y1, x + x1, y + y1, color);
+                draw_line_no_swap(x - x1, y - y1, x + x1, y - y1, color);
+                draw_line_no_swap(x - y1, y + x1, x + y1, y + x1, color);
+                draw_line_no_swap(x - y1, y - x1, x + y1, y - x1, color);
             } else {
                 write_pixel(x + x1, y + y1, color);
                 write_pixel(x - x1, y + y1, color);
@@ -266,39 +268,38 @@ void draw_circle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color, FillMo
                 write_pixel(x - y1, y - x1, color);
             }
         }
-        swapBuffers();
+        swap_buffers();
     } else {
         hcf();
     }
 }
 
-uint64_t viewport_width(void) {
+uint64_t viewport_width() {
     if (WOS_HAS_GFX_FB) {
-        return __framebuffer->width;
+        return framebuffer->width;
+    }
+    hcf();
+}
+
+uint64_t viewport_height() {
+    if constexpr (WOS_HAS_GFX_FB) {
+        return framebuffer->height;
     } else {
         hcf();
     }
 }
 
-uint64_t viewport_height(void) {
+uint64_t viewport_width_chars() {
     if constexpr (WOS_HAS_GFX_FB) {
-        return __framebuffer->height;
+        return framebuffer->width / current_font.width;
     } else {
         hcf();
     }
 }
 
-uint64_t viewport_width_chars(void) {
+uint64_t viewport_height_chars() {
     if constexpr (WOS_HAS_GFX_FB) {
-        return __framebuffer->width / __currentFont.width;
-    } else {
-        hcf();
-    }
-}
-
-uint64_t viewport_height_chars(void) {
-    if constexpr (WOS_HAS_GFX_FB) {
-        return __framebuffer->height / __currentFont.height;
+        return framebuffer->height / current_font.height;
     } else {
         hcf();
     }
@@ -306,12 +307,12 @@ uint64_t viewport_height_chars(void) {
 
 void scroll() {
     if constexpr (WOS_HAS_GFX_FB) {
-        for (size_t i = 0; i < (__framebuffer->height - __currentFont.height) * __framebuffer->width; i++) {
-            backBuffer[i] = backBuffer[i + __framebuffer->width * __currentFont.height];
+        for (size_t i = 0; i < (framebuffer->height - current_font.height) * framebuffer->width; i++) {
+            back_buffer[i] = back_buffer[i + (framebuffer->width * current_font.height)];
         }
-        for (size_t i = (__framebuffer->height - __currentFont.height) * __framebuffer->width;
-             i < __framebuffer->width * __framebuffer->height; i++) {
-            backBuffer[i] = TERM_BG_COLOR;
+        for (size_t i = (framebuffer->height - current_font.height) * framebuffer->width; i < framebuffer->width * framebuffer->height;
+             i++) {
+            back_buffer[i] = TERM_BG_COLOR;
         }
     } else {
         hcf();
@@ -326,27 +327,27 @@ void scroll() {
 //     return 0;
 // }
 
-void map_framebuffer(void) {
+void map_framebuffer() {
     if constexpr (WOS_HAS_GFX_FB) {
-        auto fbPhys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::paddr_t)(__framebuffer->address));
+        auto fb_phys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::paddr_t)(framebuffer->address));
 
         ker::mod::io::serial::write("Mapping framebuffer\n");
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Width: ");
-        ker::mod::io::serial::write(__framebuffer->width);
+        ker::mod::io::serial::write(framebuffer->width);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Height: ");
-        ker::mod::io::serial::write(__framebuffer->height);
+        ker::mod::io::serial::write(framebuffer->height);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Start physical address: ");
-        ker::mod::io::serial::write_hex(fbPhys);
-        uint64_t framebufferSize = __framebuffer->width * __framebuffer->height * __framebuffer->bpp / 8;
+        ker::mod::io::serial::write_hex(fb_phys);
+        uint64_t const FRAMEBUFFER_SIZE = framebuffer->width * framebuffer->height * framebuffer->bpp / 8;
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Theoretical end physical address: ");
-        ker::mod::io::serial::write_hex((uint64_t)fbPhys + framebufferSize);
+        ker::mod::io::serial::write_hex((uint64_t)fb_phys + FRAMEBUFFER_SIZE);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Framebuffer size: ");
-        ker::mod::io::serial::write_hex(framebufferSize);
+        ker::mod::io::serial::write_hex(FRAMEBUFFER_SIZE);
         ker::mod::io::serial::write("\n");
     } else {
         hcf();

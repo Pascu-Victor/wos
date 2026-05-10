@@ -1,17 +1,16 @@
 #include "tcp.hpp"
 
+#include <bits/ssize_t.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <net/checksum.hpp>
-#include <net/endian.hpp>
 #include <net/net_trace.hpp>
 #include <net/netif.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
-#include <net/proto/ipv4.hpp>
 #include <net/route.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -24,10 +23,11 @@
 namespace ker::net::proto {
 
 // Per-bucket hash tables.
+// NOLINTBEGIN(misc-use-internal-linkage)
 TcpHashBucket tcb_hash[TCB_HASH_SIZE] = {};
 TcpHashBucket listener_hash[LISTENER_HASH_SIZE] = {};
-
 volatile uint64_t tcp_ms_counter = 0;
+// NOLINTEND(misc-use-internal-linkage)
 
 namespace {
 using log = ker::mod::dbg::logger<"tcp">;
@@ -263,7 +263,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     return -EINPROGRESS;
 }
 
-auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
+auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssize_t {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr || (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::CLOSE_WAIT)) {
         return -1;
@@ -311,8 +311,8 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
         if (window == 0) {
             window = 1;
         }
-        uint32_t in_flight = cb->snd_nxt - cb->snd_una;
-        if (in_flight >= window) {
+        uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
+        if (IN_FLIGHT >= window) {
             cb->lock.unlock();
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
@@ -323,13 +323,13 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
             defer_socket_wait(sock);
             return -EAGAIN;
         }
-        uint32_t available = window - in_flight;
-        chunk = std::min<size_t>(chunk, available);
+        uint32_t const AVAILABLE = window - IN_FLIGHT;
+        chunk = std::min<size_t>(chunk, AVAILABLE);
 
         cb->lock.unlock();
-        bool ok = tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
+        bool const OK = tcp_send_segment(cb, TCP_ACK | TCP_PSH, data + sent, chunk);
 
-        if (!ok) {
+        if (!OK) {
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
@@ -345,7 +345,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int) -> ssize_t {
     return static_cast<ssize_t>(sent);
 }
 
-auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
+auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -1;
@@ -359,19 +359,19 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
     };
 
     if (sock->rcvbuf.available() > 0) {
-        ssize_t n = sock->rcvbuf.read(buf, len);
-        if (n > 0) {
-            uint32_t old_wnd = cb->rcv_wnd;
+        ssize_t const N = sock->rcvbuf.read(buf, len);
+        if (N > 0) {
+            uint32_t const OLD_WND = cb->rcv_wnd;
             cb->rcv_wnd = sock->rcvbuf.free_space();
             // Only send proactive update when recovering from zero-window.
-            if (old_wnd == 0) {
+            if (OLD_WND == 0) {
                 if (!tcp_send_ack(cb)) {
                     cb->ack_pending = true;
                     tcp_timer_arm(cb);
                 }
             }
         }
-        return n;
+        return N;
     }
 
     // EOF states.
@@ -403,15 +403,15 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
 
     for (;;) {
         if (sock->rcvbuf.available() > 0) {
-            ssize_t n = sock->rcvbuf.read(buf, len);
-            if (n > 0) {
-                uint32_t old_wnd = cb->rcv_wnd;
+            ssize_t const N = sock->rcvbuf.read(buf, len);
+            if (N > 0) {
+                uint32_t const OLD_WND = cb->rcv_wnd;
                 cb->rcv_wnd = sock->rcvbuf.free_space();
-                if (old_wnd == 0) {
+                if (OLD_WND == 0) {
                     tcp_send_ack(cb);
                 }
             }
-            return n;
+            return N;
         }
         if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
             cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
@@ -426,11 +426,13 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int) -> ssize_t {
     }
 }
 
-auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags, const void*, size_t) -> ssize_t {
+auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags, const void* /*unused*/, size_t /*unused*/) -> ssize_t {
     return tcp_send(sock, buf, len, flags);
 }
 
-auto tcp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void*, size_t*) -> ssize_t { return tcp_recv(sock, buf, len, flags); }
+auto tcp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* /*unused*/, size_t* /*unused*/) -> ssize_t {
+    return tcp_recv(sock, buf, len, flags);
+}
 
 void tcp_close_op(Socket* sock) {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
@@ -440,7 +442,7 @@ void tcp_close_op(Socket* sock) {
 
     cb->lock.lock();
 
-    bool was_listener = (cb->state == TcpState::LISTEN);
+    bool const WAS_LISTENER = (cb->state == TcpState::LISTEN);
     bool send_fin = false;
     TcpState next_state = cb->state;
 
@@ -506,7 +508,7 @@ void tcp_close_op(Socket* sock) {
         }
     }
 
-    if (was_listener) {
+    if (WAS_LISTENER) {
         tcp_remove_listener(cb);
     }
 
@@ -575,7 +577,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
     }
 }
 
-int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t optlen) {
+int tcp_setsockopt_op(Socket* sock, int /*unused*/, int optname, const void* optval, size_t optlen) {
     int optint = 0;
     if (optval != nullptr && optlen >= sizeof(optint)) {
         std::memcpy(&optint, optval, sizeof(optint));
@@ -593,7 +595,7 @@ int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t
     if (optname == 9 && optlen >= sizeof(int)) {  // SO_KEEPALIVE
         auto* cb = static_cast<TcpCB*>(sock->proto_data);
         if (cb != nullptr) {
-            uint64_t flags = cb->lock.lock_irqsave();
+            uint64_t const FLAGS = cb->lock.lock_irqsave();
             cb->keepalive_enabled = optint != 0;
             if (cb->keepalive_enabled && cb->state == TcpState::ESTABLISHED) {
                 cb->keepalive_count = 0;
@@ -602,13 +604,13 @@ int tcp_setsockopt_op(Socket* sock, int, int optname, const void* optval, size_t
             } else {
                 cb->keepalive_deadline = 0;
             }
-            cb->lock.unlock_irqrestore(flags);
+            cb->lock.unlock_irqrestore(FLAGS);
         }
     }
     return 0;
 }
 
-int tcp_getsockopt_op(Socket* sock, int, int optname, void* optval, size_t* optlen) {
+int tcp_getsockopt_op(Socket* sock, int /*unused*/, int optname, void* optval, size_t* optlen) {
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
         int value = static_cast<int>(sock->rcvbuf.capacity);
         std::memcpy(optval, &value, sizeof(value));
@@ -636,8 +638,8 @@ int tcp_poll_check_op(Socket* sock, int events) {
         if (cb == nullptr || cb->state != TcpState::ESTABLISHED) {
             ready |= 4;
         } else {
-            uint32_t in_flight = cb->snd_nxt - cb->snd_una;
-            if (in_flight < cb->snd_wnd) {
+            uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
+            if (IN_FLIGHT < cb->snd_wnd) {
                 ready |= 4;
             }
         }
@@ -672,8 +674,8 @@ auto tcp_alloc_cb() -> TcpCB* {
 }
 
 void tcp_insert_cb(TcpCB* cb) {
-    uint32_t idx = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[idx];
+    uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
+    auto& bucket = tcb_hash[IDX];
     bucket.lock.lock();
     // Hash membership owns a ref so lookups can safely retain under the bucket lock.
     tcp_cb_acquire(cb);
@@ -683,8 +685,8 @@ void tcp_insert_cb(TcpCB* cb) {
 }
 
 void tcp_insert_listener(TcpCB* cb) {
-    uint32_t idx = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[idx];
+    uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
+    auto& bucket = listener_hash[IDX];
     bucket.lock.lock();
     // Listener-table membership owns a ref independent of the owning socket.
     tcp_cb_acquire(cb);
@@ -694,8 +696,8 @@ void tcp_insert_listener(TcpCB* cb) {
 }
 
 void tcp_remove_listener(TcpCB* cb) {
-    uint32_t idx = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[idx];
+    uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
+    auto& bucket = listener_hash[IDX];
     bool removed = false;
     bucket.lock.lock();
     TcpCB** pp = &bucket.head;
@@ -757,8 +759,8 @@ void tcp_free_cb(TcpCB* cb) {
 
     tcp_timer_disarm(cb);
 
-    uint32_t idx = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[idx];
+    uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
+    auto& bucket = tcb_hash[IDX];
     bool removed = false;
     bucket.lock.lock();
     TcpCB** pp = &bucket.head;
@@ -780,8 +782,8 @@ void tcp_free_cb(TcpCB* cb) {
 
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
     NET_TRACE_SPAN(SPAN_TCP_FIND_CB);
-    uint32_t idx = tcp_hash_4tuple(local_ip, local_port, remote_ip, remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[idx];
+    uint32_t const IDX = tcp_hash_4tuple(local_ip, local_port, remote_ip, remote_port) % TCB_HASH_SIZE;
+    auto& bucket = tcb_hash[IDX];
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
         if (cb->local_port == local_port && cb->remote_port == remote_port && (cb->local_ip == local_ip || cb->local_ip == 0) &&
@@ -796,8 +798,8 @@ auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uin
 }
 
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
-    uint32_t idx = tcp_hash_listener(local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[idx];
+    uint32_t const IDX = tcp_hash_listener(local_port) % LISTENER_HASH_SIZE;
+    auto& bucket = listener_hash[IDX];
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
         if (cb->state == TcpState::LISTEN && cb->local_port == local_port && (cb->local_ip == local_ip || cb->local_ip == 0)) {

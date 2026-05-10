@@ -37,22 +37,22 @@ TEST(XfsFormat, AgflMagic) { EXPECT_EQ(XFS_AGFL_MAGIC, 0x5841464Cu); }
 // =============================================================================
 
 TEST(BigEndian, Be16RoundTrip) {
-    auto be = __be16::from_cpu(0x1234);
+    auto be = Be16::from_cpu(0x1234);
     EXPECT_EQ(be.to_cpu(), 0x1234u);
 }
 
 TEST(BigEndian, Be32RoundTrip) {
-    auto be = __be32::from_cpu(0xDEADBEEF);
+    auto be = Be32::from_cpu(0xDEADBEEF);
     EXPECT_EQ(be.to_cpu(), 0xDEADBEEFu);
 }
 
 TEST(BigEndian, Be64RoundTrip) {
-    auto be = __be64::from_cpu(0xCAFEBABE12345678ULL);
+    auto be = Be64::from_cpu(0xCAFEBABE12345678ULL);
     EXPECT_EQ(be.to_cpu(), 0xCAFEBABE12345678ULL);
 }
 
 TEST(BigEndian, Be16ByteOrder) {
-    auto be = __be16::from_cpu(0x0102);
+    auto be = Be16::from_cpu(0x0102);
     uint8_t bytes[2];
     memcpy(bytes, &be, 2);
     EXPECT_EQ(bytes[0], 0x01);
@@ -60,7 +60,7 @@ TEST(BigEndian, Be16ByteOrder) {
 }
 
 TEST(BigEndian, Be32ByteOrder) {
-    auto be = __be32::from_cpu(0x01020304);
+    auto be = Be32::from_cpu(0x01020304);
     uint8_t bytes[4];
     memcpy(bytes, &be, 4);
     EXPECT_EQ(bytes[0], 0x01);
@@ -75,10 +75,10 @@ TEST(BigEndian, Be32ByteOrder) {
 
 TEST(XfsSuperblock, FieldAccess) {
     XfsDsb sb{};
-    sb.sb_magicnum = __be32::from_cpu(XFS_SB_MAGIC);
-    sb.sb_blocksize = __be32::from_cpu(4096);
-    sb.sb_agcount = __be32::from_cpu(4);
-    sb.sb_versionnum = __be16::from_cpu(XFS_SB_VERSION_5);
+    sb.sb_magicnum = Be32::from_cpu(XFS_SB_MAGIC);
+    sb.sb_blocksize = Be32::from_cpu(4096);
+    sb.sb_agcount = Be32::from_cpu(4);
+    sb.sb_versionnum = Be16::from_cpu(XFS_SB_VERSION_5);
 
     EXPECT_EQ(sb.sb_magicnum.to_cpu(), XFS_SB_MAGIC);
     EXPECT_EQ(sb.sb_blocksize.to_cpu(), 4096u);
@@ -95,7 +95,7 @@ TEST(XfsSuperblock, CrcOffset) {
 
 TEST(XfsSuperblock, FeatureBits) {
     XfsDsb sb{};
-    sb.sb_features_incompat = __be32::from_cpu(XFS_SB_FEAT_INCOMPAT_FTYPE | XFS_SB_FEAT_INCOMPAT_BIGTIME);
+    sb.sb_features_incompat = Be32::from_cpu(XFS_SB_FEAT_INCOMPAT_FTYPE | XFS_SB_FEAT_INCOMPAT_BIGTIME);
     uint32_t feats = sb.sb_features_incompat.to_cpu();
     EXPECT_TRUE(feats & XFS_SB_FEAT_INCOMPAT_FTYPE);
     EXPECT_TRUE(feats & XFS_SB_FEAT_INCOMPAT_BIGTIME);
@@ -208,10 +208,10 @@ TEST(XfsBmbt, PackUnpackZeros) {
 
 TEST(XfsAg, AgfFieldAccess) {
     XfsAgf agf{};
-    agf.agf_magicnum = __be32::from_cpu(XFS_AGF_MAGIC);
-    agf.agf_seqno = __be32::from_cpu(2);
-    agf.agf_length = __be32::from_cpu(65536);
-    agf.agf_freeblks = __be32::from_cpu(1000);
+    agf.agf_magicnum = Be32::from_cpu(XFS_AGF_MAGIC);
+    agf.agf_seqno = Be32::from_cpu(2);
+    agf.agf_length = Be32::from_cpu(65536);
+    agf.agf_freeblks = Be32::from_cpu(1000);
 
     EXPECT_EQ(agf.agf_magicnum.to_cpu(), XFS_AGF_MAGIC);
     EXPECT_EQ(agf.agf_seqno.to_cpu(), 2u);
@@ -221,9 +221,9 @@ TEST(XfsAg, AgfFieldAccess) {
 
 TEST(XfsAg, AgiFieldAccess) {
     XfsAgi agi{};
-    agi.agi_magicnum = __be32::from_cpu(XFS_AGI_MAGIC);
-    agi.agi_count = __be32::from_cpu(64);
-    agi.agi_freecount = __be32::from_cpu(10);
+    agi.agi_magicnum = Be32::from_cpu(XFS_AGI_MAGIC);
+    agi.agi_count = Be32::from_cpu(64);
+    agi.agi_freecount = Be32::from_cpu(10);
 
     EXPECT_EQ(agi.agi_magicnum.to_cpu(), XFS_AGI_MAGIC);
     EXPECT_EQ(agi.agi_count.to_cpu(), 64u);

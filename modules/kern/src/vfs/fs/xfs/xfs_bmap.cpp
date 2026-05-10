@@ -17,9 +17,16 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <utility>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+
+#include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_inode.hpp"
+#include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -48,25 +55,25 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
     int found = -1;
 
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const XfsBmbtIrec& e = ext.list[mid];
+        int const MID = (lo + hi) / 2;
+        const XfsBmbtIrec& e = ext.list[MID];
 
         if (file_block < e.br_startoff) {
-            hi = mid - 1;
+            hi = MID - 1;
         } else if (file_block >= e.br_startoff + e.br_blockcount) {
-            lo = mid + 1;
+            lo = MID + 1;
         } else {
             // file_block is within this extent
-            found = mid;
+            found = MID;
             break;
         }
     }
 
     if (found >= 0) {
         const XfsBmbtIrec& e = ext.list[found];
-        xfs_filblks_t offset_in_extent = file_block - e.br_startoff;
-        result->startblock = e.br_startblock + offset_in_extent;
-        result->blockcount = e.br_blockcount - offset_in_extent;
+        xfs_filblks_t const OFFSET_IN_EXTENT = file_block - e.br_startoff;
+        result->startblock = e.br_startblock + OFFSET_IN_EXTENT;
+        result->blockcount = e.br_blockcount - OFFSET_IN_EXTENT;
         result->unwritten = e.br_unwritten;
         result->is_hole = false;
     } else {
@@ -77,7 +84,7 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
 
         // Compute the size of the hole (distance to next extent)
         // lo now points to the first extent starting after file_block
-        if (lo < static_cast<int>(ext.count)) {
+        if (std::cmp_less(lo, ext.count)) {
             result->blockcount = ext.list[lo].br_startoff - file_block;
         } else {
             // Past the last extent - unbounded hole to EOF.  Return a large
@@ -105,10 +112,10 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     // lookup manually (keys + long-form pointers within the inode fork data),
     // then hand off to the btree cursor for sub-trees.
     const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(bt.root);
-    uint16_t level = bmdr->bb_level.to_cpu();
-    uint16_t numrecs = bmdr->bb_numrecs.to_cpu();
+    uint16_t const LEVEL = bmdr->bb_level.to_cpu();
+    uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
 
-    if (numrecs == 0) {
+    if (NUMRECS == 0) {
         result->is_hole = true;
         result->startblock = NULLFSBLOCK;
         result->blockcount = ~static_cast<xfs_filblks_t>(0);
@@ -119,71 +126,71 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     // Keys start after the bmdr_block header (4 bytes)
     const uint8_t* keys_base = bt.root + sizeof(XfsBmdrBlock);
     // Pointers start after all keys
-    const uint8_t* ptrs_base = keys_base + (static_cast<size_t>(numrecs) * sizeof(XfsBmbtKey));
+    const uint8_t* ptrs_base = keys_base + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey));
 
     // Binary search within the root keys to find the right child pointer
     int lo = 0;
-    int hi = numrecs - 1;
+    int hi = NUMRECS - 1;
     int keyno = 0;  // 0-based for root node
 
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const auto* key = reinterpret_cast<const XfsBmbtKey*>(keys_base + (static_cast<size_t>(mid) * sizeof(XfsBmbtKey)));
-        uint64_t startoff = key->br_startoff.to_cpu();
+        int const MID = (lo + hi) / 2;
+        const auto* key = reinterpret_cast<const XfsBmbtKey*>(keys_base + (static_cast<size_t>(MID) * sizeof(XfsBmbtKey)));
+        uint64_t const STARTOFF = key->br_startoff.to_cpu();
 
-        if (startoff <= file_block) {
-            keyno = mid;
-            lo = mid + 1;
+        if (STARTOFF <= file_block) {
+            keyno = MID;
+            lo = MID + 1;
         } else {
-            hi = mid - 1;
+            hi = MID - 1;
         }
     }
 
     // Get the child pointer (long-form: 8 bytes, absolute fsblock)
-    __be64 ptr_val{};
-    __builtin_memcpy(&ptr_val, ptrs_base + (static_cast<size_t>(keyno) * sizeof(__be64)), sizeof(__be64));
-    uint64_t child_block = ptr_val.to_cpu();
+    Be64 ptr_val{};
+    __builtin_memcpy(&ptr_val, ptrs_base + (static_cast<size_t>(keyno) * sizeof(Be64)), sizeof(Be64));
+    uint64_t const CHILD_BLOCK = ptr_val.to_cpu();
 
-    if (level == 1) {
+    if (LEVEL == 1) {
         // Child is a leaf - we can read it directly and do the lookup
         // Set up a btree cursor positioned at the child block
         XfsBtreeCursor<XfsBmbtTraits> cur;
         cur.mount = mount;
         cur.nlevels = 1;
 
-        int rc = cur.read_block(0, child_block);
-        if (rc != 0) {
-            return rc;
+        int const RC = cur.read_block(0, CHILD_BLOCK);
+        if (RC != 0) {
+            return RC;
         }
 
         // Binary search within the leaf for file_block
-        int nr = cur.numrecs(0);
+        int const NR = cur.numrecs(0);
         int found_idx = -1;
 
         lo = 1;
-        hi = nr;
+        hi = NR;
         while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            const auto* rec = cur.rec_at(mid);
-            XfsBmbtIrec irec = xfs_bmbt_rec_unpack(rec);
+            int const MID = (lo + hi) / 2;
+            const auto* rec = cur.rec_at(MID);
+            XfsBmbtIrec const IREC = xfs_bmbt_rec_unpack(rec);
 
-            if (file_block < irec.br_startoff) {
-                hi = mid - 1;
-            } else if (file_block >= irec.br_startoff + irec.br_blockcount) {
-                lo = mid + 1;
+            if (file_block < IREC.br_startoff) {
+                hi = MID - 1;
+            } else if (file_block >= IREC.br_startoff + IREC.br_blockcount) {
+                lo = MID + 1;
             } else {
-                found_idx = mid;
+                found_idx = MID;
                 break;
             }
         }
 
         if (found_idx >= 0) {
             const auto* rec = cur.rec_at(found_idx);
-            XfsBmbtIrec irec = xfs_bmbt_rec_unpack(rec);
-            xfs_filblks_t offset_in = file_block - irec.br_startoff;
-            result->startblock = irec.br_startblock + offset_in;
-            result->blockcount = irec.br_blockcount - offset_in;
-            result->unwritten = irec.br_unwritten;
+            XfsBmbtIrec const IREC = xfs_bmbt_rec_unpack(rec);
+            xfs_filblks_t const OFFSET_IN = file_block - IREC.br_startoff;
+            result->startblock = IREC.br_startblock + OFFSET_IN;
+            result->blockcount = IREC.br_blockcount - OFFSET_IN;
+            result->unwritten = IREC.br_unwritten;
             result->is_hole = false;
         } else {
             result->is_hole = true;
@@ -198,13 +205,13 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     // We start from the child block at (level - 1) and descend
     XfsBtreeCursor<XfsBmbtTraits> cur;
     cur.mount = mount;
-    cur.nlevels = level;  // depth from this child down
+    cur.nlevels = LEVEL;  // depth from this child down
 
     // Target for lookup
     XfsBmbtIrec target{};
     target.br_startoff = file_block;
 
-    int rc = xfs_btree_lookup(&cur, child_block, level, target, XfsBtreeLookup::LE);
+    int rc = xfs_btree_lookup(&cur, CHILD_BLOCK, LEVEL, target, XfsBtreeLookup::LE);
     if (rc == -ENOENT) {
         result->is_hole = true;
         result->startblock = NULLFSBLOCK;
@@ -216,14 +223,14 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         return rc;
     }
 
-    XfsBmbtIrec irec = xfs_btree_get_rec(&cur);
+    XfsBmbtIrec const IREC = xfs_btree_get_rec(&cur);
 
     // Check if file_block falls within this extent
-    if (file_block >= irec.br_startoff && file_block < irec.br_startoff + irec.br_blockcount) {
-        xfs_filblks_t offset_in = file_block - irec.br_startoff;
-        result->startblock = irec.br_startblock + offset_in;
-        result->blockcount = irec.br_blockcount - offset_in;
-        result->unwritten = irec.br_unwritten;
+    if (file_block >= IREC.br_startoff && file_block < IREC.br_startoff + IREC.br_blockcount) {
+        xfs_filblks_t const OFFSET_IN = file_block - IREC.br_startoff;
+        result->startblock = IREC.br_startblock + OFFSET_IN;
+        result->blockcount = IREC.br_blockcount - OFFSET_IN;
+        result->unwritten = IREC.br_unwritten;
         result->is_hole = false;
     } else {
         result->is_hole = true;
@@ -232,8 +239,8 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         // Distance to next extent
         rc = xfs_btree_increment(&cur);
         if (rc == 0) {
-            XfsBmbtIrec next = xfs_btree_get_rec(&cur);
-            result->blockcount = next.br_startoff - file_block;
+            XfsBmbtIrec const NEXT = xfs_btree_get_rec(&cur);
+            result->blockcount = NEXT.br_startoff - file_block;
         } else {
             result->blockcount = 1;
         }
@@ -270,7 +277,8 @@ auto xfs_bmap_lookup(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* resu
             return bmap_lookup_btree(ip, file_block, result);
 
         default:
-            mod::dbg::log("[xfs] bmap: unsupported fork format %d for inode %lu", ip->data_fork.format, (unsigned long)ip->ino);
+            mod::dbg::log("[xfs] bmap: unsupported fork format %d for inode %lu", ip->data_fork.format,
+                          static_cast<unsigned long>(ip->ino));
             return -EINVAL;
     }
 }
@@ -298,17 +306,17 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
         }
 
         const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(bt.root);
-        uint16_t level = bmdr->bb_level.to_cpu();
-        uint16_t numrecs = bmdr->bb_numrecs.to_cpu();
-        if (numrecs == 0) {
+        uint16_t const LEVEL = bmdr->bb_level.to_cpu();
+        uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
+        if (NUMRECS == 0) {
             return 0;
         }
 
         // Get the leftmost child pointer (first key, first ptr)
-        const uint8_t* ptrs_base = bt.root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(numrecs) * sizeof(XfsBmbtKey));
-        __be64 ptr_val{};
-        __builtin_memcpy(&ptr_val, ptrs_base, sizeof(__be64));
-        uint64_t child_block = ptr_val.to_cpu();
+        const uint8_t* ptrs_base = bt.root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey));
+        Be64 ptr_val{};
+        __builtin_memcpy(&ptr_val, ptrs_base, sizeof(Be64));
+        uint64_t const CHILD_BLOCK = ptr_val.to_cpu();
 
         // Use a cursor positioned at the very beginning
         XfsBtreeCursor<XfsBmbtTraits> cur;
@@ -317,7 +325,7 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
         XfsBmbtIrec target{};
         target.br_startoff = 0;  // start from the very beginning
 
-        int rc = xfs_btree_lookup(&cur, child_block, level, target, XfsBtreeLookup::GE);
+        int rc = xfs_btree_lookup(&cur, CHILD_BLOCK, LEVEL, target, XfsBtreeLookup::GE);
         if (rc == -ENOENT) {
             return 0;
         }
@@ -415,12 +423,10 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
     // No merge - insert new extent.
     // Grow the list with capacity doubling to avoid O(N²) reallocations.
-    uint32_t new_count = ext.count + 1;
-    if (new_count > ext.capacity) {
+    uint32_t const NEW_COUNT = ext.count + 1;
+    if (NEW_COUNT > ext.capacity) {
         uint32_t new_cap = ext.capacity == 0 ? 4 : ext.capacity * 2;
-        if (new_cap < new_count) {
-            new_cap = new_count;
-        }
+        new_cap = std::max(new_cap, NEW_COUNT);
         auto* new_list = new XfsBmbtIrec[new_cap];
         if (new_list == nullptr) {
             return -ENOMEM;
@@ -438,8 +444,8 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         ext.list[i] = ext.list[i - 1];
     }
     ext.list[insert_at] = new_ext;
-    ext.count = new_count;
-    ip->nextents = new_count;
+    ext.count = NEW_COUNT;
+    ip->nextents = NEW_COUNT;
     ip->dirty = true;
     xfs_trans_log_inode(tp, ip);
 

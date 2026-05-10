@@ -3,7 +3,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <defines/defines.hpp>
 #include <dev/ahci.hpp>
 #include <dev/block_device.hpp>
 #include <dev/console.hpp>
@@ -20,7 +19,6 @@
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <net/backlog.hpp>
-#include <net/loopback.hpp>
 #include <net/net.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
@@ -44,6 +42,7 @@
 #include <platform/mm/mm.hpp>
 
 #include "platform/mm/dyn/kmalloc.hpp"
+#include "util/hcf.hpp"
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
 #endif
@@ -93,8 +92,8 @@ void fsgsbase_init() {
 
 void gdt_init() {
     // Initialize GDT with the captured stack pointer
-    uint64_t rsp = get_kernel_rsp();
-    auto* stack = reinterpret_cast<uint8_t*>(rsp);
+    uint64_t const RSP = get_kernel_rsp();
+    auto* stack = reinterpret_cast<uint8_t*>(RSP);
     mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack) + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
 }
 
@@ -229,12 +228,12 @@ void initramfs_init() {
 
     for (size_t i = 0; i < module_request.response->module_count; i++) {
         auto* mod_data = static_cast<uint8_t*>(module_request.response->modules[i]->address);
-        size_t mod_size = module_request.response->modules[i]->size;
+        size_t const MOD_SIZE = module_request.response->modules[i]->size;
         // Check for CPIO newc magic "070701"
-        if (mod_size >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' && mod_data[4] == '0' &&
+        if (MOD_SIZE >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' && mod_data[4] == '0' &&
             mod_data[5] == '1') {
-            mod::dbg::log("Found CPIO initramfs module at index %u (%u bytes)", static_cast<unsigned>(i), static_cast<unsigned>(mod_size));
-            vfs::initramfs::unpack_initramfs(mod_data, mod_size);
+            mod::dbg::log("Found CPIO initramfs module at index %u (%u bytes)", static_cast<unsigned>(i), static_cast<unsigned>(MOD_SIZE));
+            vfs::initramfs::unpack_initramfs(mod_data, MOD_SIZE);
         }
     }
 }

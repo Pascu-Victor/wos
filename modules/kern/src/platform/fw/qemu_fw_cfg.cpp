@@ -1,5 +1,6 @@
 #include "qemu_fw_cfg.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
 
@@ -26,18 +27,18 @@ struct FwCfgFile {
 } __attribute__((packed));
 
 auto read_be16() -> uint16_t {
-    uint8_t hi = inb(FW_CFG_PORT_DATA);
-    uint8_t lo = inb(FW_CFG_PORT_DATA);
-    return static_cast<uint16_t>((hi << 8) | lo);
+    uint8_t const HI = inb(FW_CFG_PORT_DATA);
+    uint8_t const LO = inb(FW_CFG_PORT_DATA);
+    return static_cast<uint16_t>((HI << 8) | LO);
 }
 
 auto read_be32() -> uint32_t {
-    uint8_t b3 = inb(FW_CFG_PORT_DATA);
-    uint8_t b2 = inb(FW_CFG_PORT_DATA);
-    uint8_t b1 = inb(FW_CFG_PORT_DATA);
-    uint8_t b0 = inb(FW_CFG_PORT_DATA);
-    return (static_cast<uint32_t>(b3) << 24) | (static_cast<uint32_t>(b2) << 16) | (static_cast<uint32_t>(b1) << 8) |
-           static_cast<uint32_t>(b0);
+    uint8_t const B3 = inb(FW_CFG_PORT_DATA);
+    uint8_t const B2 = inb(FW_CFG_PORT_DATA);
+    uint8_t const B1 = inb(FW_CFG_PORT_DATA);
+    uint8_t const B0 = inb(FW_CFG_PORT_DATA);
+    return (static_cast<uint32_t>(B3) << 24) | (static_cast<uint32_t>(B2) << 16) | (static_cast<uint32_t>(B1) << 8) |
+           static_cast<uint32_t>(B0);
 }
 
 void read_bytes(void* buf, size_t n) {
@@ -70,11 +71,11 @@ auto fw_cfg_read_file(const char* name, void* buf, size_t buf_size) -> int {
 
     // Read file directory
     outw(FW_CFG_PORT_SEL, FW_CFG_FILE_DIR);
-    uint32_t count = read_be32();
+    uint32_t const COUNT = read_be32();
 
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t file_size = read_be32();
-        uint16_t file_sel = read_be16();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        uint32_t const FILE_SIZE = read_be32();
+        uint16_t const FILE_SEL = read_be16();
         skip_bytes(2);  // reserved
 
         char file_name[FW_CFG_MAX_NAME] = {};
@@ -82,10 +83,10 @@ auto fw_cfg_read_file(const char* name, void* buf, size_t buf_size) -> int {
 
         if (std::strcmp(file_name, name) == 0) {
             // Found it — select and read
-            outw(FW_CFG_PORT_SEL, file_sel);
-            size_t to_read = (file_size < buf_size) ? file_size : buf_size;
-            read_bytes(buf, to_read);
-            return static_cast<int>(to_read);
+            outw(FW_CFG_PORT_SEL, FILE_SEL);
+            size_t const TO_READ = (FILE_SIZE < buf_size) ? FILE_SIZE : buf_size;
+            read_bytes(buf, TO_READ);
+            return static_cast<int>(TO_READ);
         }
     }
 
