@@ -83,7 +83,22 @@ extern "C" {
 
 /* Platform specific includes */
 #ifdef _TTHREAD_POSIX_
+#if defined(CLANG_TIDY)
+struct __clang_tidy_pthread_mutex_t;
+struct __clang_tidy_pthread_cond_t;
+struct __clang_tidy_pthread_key_t;
+
+using pthread_mutex_t = __clang_tidy_pthread_mutex_t;
+using pthread_cond_t = __clang_tidy_pthread_cond_t;
+using pthread_t = void*;
+using pthread_key_t = __clang_tidy_pthread_key_t*;
+
+#ifndef PTHREAD_DESTRUCTOR_ITERATIONS
+#define PTHREAD_DESTRUCTOR_ITERATIONS 1
+#endif
+#else
 #include <pthread.h>
+#endif
 #elifdef _TTHREAD_WIN32_
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
