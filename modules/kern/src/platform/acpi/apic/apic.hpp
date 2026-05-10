@@ -11,7 +11,7 @@
 namespace ker::mod::apic {
 static uint64_t apic_base = 0x0;
 
-enum class APICRegisters {
+enum class APICRegisters : uint16_t {
     ID = 0x20,
     VER = 0x30,
     TASK_PRIORITY = 0x80,
@@ -40,7 +40,7 @@ enum class APICRegisters {
     TMR_DIV_CFG = 0x3E0,
 };
 
-enum class X2APICMSRs {
+enum class X2APICMSRs : uint16_t {
     ID = 0x802,
     VER = 0x803,
     TASK_PRIORITY = 0x808,

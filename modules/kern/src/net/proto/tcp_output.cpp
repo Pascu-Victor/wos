@@ -1,5 +1,7 @@
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/packet.hpp>
@@ -10,6 +12,8 @@
 #include "tcp.hpp"
 
 namespace ker::net::proto {
+
+using log = ker::mod::dbg::logger<"tcp">;
 
 bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     auto* pkt = pkt_alloc_tx();
@@ -24,7 +28,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     if (SEQ_LEN > 0) {
         rtx_pkt = pkt_alloc_tx();
         if (rtx_pkt == nullptr) {
-            ker::mod::dbg::log("[net] RTX CLONE FAILED (pool_free=%zu)", ker::net::pkt_pool_free_count());
+            log::warn("RTX clone failed (pool_free=%zu)", ker::net::pkt_pool_free_count());
         } else {
             rtx_entry = new (std::nothrow) RetransmitEntry{};
             if (rtx_entry == nullptr) {
@@ -50,16 +54,17 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     const uint32_t SEQ = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
 
     // SYN options: MSS + WSCALE.
-    uint8_t options[8] = {};
+    std::array<uint8_t, 8> options{};
     size_t opts_len = 0;
     if ((flags & TCP_SYN) != 0) {
-        options[0] = 2;  // MSS kind
-        options[1] = 4;  // MSS length
-        *reinterpret_cast<uint16_t*>(options + 2) = htons(cb->rcv_mss);
-        options[4] = 1;               // NOP
-        options[5] = 3;               // WSCALE kind
-        options[6] = 3;               // WSCALE length
-        options[7] = cb->rcv_wscale;  // shift count
+        options.at(0) = 2;  // MSS kind
+        options.at(1) = 4;  // MSS length
+        uint16_t const MSS = htons(cb->rcv_mss);
+        std::memcpy(options.data() + 2, &MSS, sizeof(MSS));
+        options.at(4) = 1;               // NOP
+        options.at(5) = 3;               // WSCALE kind
+        options.at(6) = 3;               // WSCALE length
+        options.at(7) = cb->rcv_wscale;  // shift count
         opts_len = 8;
     }
 
@@ -72,7 +77,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     }
 
     if (opts_len > 0) {
-        std::memcpy(payload + sizeof(TcpHeader), options, opts_len);
+        std::memcpy(payload + sizeof(TcpHeader), options.data(), opts_len);
     }
 
     auto* hdr = reinterpret_cast<TcpHeader*>(payload);
@@ -143,8 +148,8 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
                 depth++;
             }
             if (depth == 64 || depth == 256 || depth == 512) {
-                ker::mod::dbg::log("[net] RTX QUEUE depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port,
-                                   ker::net::pkt_pool_free_count(), cb->snd_wnd);
+                log::debug("RTX queue depth=%zu port=%u pool_free=%zu snd_wnd=%u", depth, cb->local_port, ker::net::pkt_pool_free_count(),
+                           cb->snd_wnd);
             }
         }
 #endif
@@ -159,7 +164,8 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     return true;
 }
 
-void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t extra_flags) {
+void tcp_send_rst(IPv4Address src_ip, IPv4Address dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack,
+                  uint8_t extra_flags) {
     auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;

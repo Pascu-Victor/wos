@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace ker::mod::sched {
@@ -11,8 +13,11 @@ namespace ker::mod::sched {
 struct CpuEpoch {
     std::atomic<uint64_t> local_epoch{0};
     std::atomic<bool> in_critical_section{false};
-    char padding[48]{};  // Pad to 64 bytes to avoid false sharing
+    std::array<std::byte, 48> padding{};  // Pad to 64 bytes to avoid false sharing
 } __attribute__((aligned(64)));
+
+static_assert(sizeof(CpuEpoch) == 64, "CpuEpoch must occupy one cache line");
+static_assert(alignof(CpuEpoch) == 64, "CpuEpoch must remain cache-line aligned");
 
 // Epoch-based memory reclamation manager.
 // Provides lock-free read-side critical sections with deferred freeing.
@@ -72,7 +77,7 @@ class EpochGuard {
     auto operator=(EpochGuard&&) -> EpochGuard& = delete;
 
    private:
-    uint64_t cpu_id;
+    uint64_t cpu_id{};
 };
 
 }  // namespace ker::mod::sched

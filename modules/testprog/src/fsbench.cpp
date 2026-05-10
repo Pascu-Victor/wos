@@ -5,7 +5,7 @@
 #include <bits/ssize_t.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <time.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 
 #include <cstdint>
@@ -13,6 +13,7 @@
 #include <cstring>
 #include <ctime>
 #include <print>
+#include <vector>
 
 namespace {
 
@@ -92,11 +93,7 @@ auto run_read(int argc, char** argv) -> int {
         return 1;
     }
 
-    auto* buffer = static_cast<uint8_t*>(std::malloc(options.read_size));
-    if (buffer == nullptr) {
-        std::println("vfsbench-read: allocation failed");
-        return 1;
-    }
+    std::vector<uint8_t> buffer(options.read_size);
 
     uint64_t checksum = 0;
     uint64_t total_bytes = 0;
@@ -105,23 +102,21 @@ auto run_read(int argc, char** argv) -> int {
     for (uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
         int const FD = open(options.path, O_RDONLY);
         if (FD < 0) {
-            std::free(buffer);
             std::println("vfsbench-read: failed to open '{}'", options.path);
             return 1;
         }
 
         for (;;) {
-            ssize_t const BYTES_READ = read(FD, buffer, options.read_size);
+            ssize_t const BYTES_READ = read(FD, buffer.data(), buffer.size());
             if (BYTES_READ < 0) {
                 close(FD);
-                std::free(buffer);
                 std::println("vfsbench-read: read failed for '{}'", options.path);
                 return 1;
             }
             if (BYTES_READ == 0) {
                 break;
             }
-            checksum = fnv1a_update(checksum, buffer, static_cast<size_t>(BYTES_READ));
+            checksum = fnv1a_update(checksum, buffer.data(), static_cast<size_t>(BYTES_READ));
             total_bytes += static_cast<uint64_t>(BYTES_READ);
         }
 
@@ -129,7 +124,6 @@ auto run_read(int argc, char** argv) -> int {
     }
 
     uint64_t const ELAPSED_NS = monotonic_ns() - STARTED_NS;
-    std::free(buffer);
 
     const double ELAPSED_S = static_cast<double>(ELAPSED_NS) / 1000000000.0;
     const double THROUGHPUT_MIB_PER_S = (static_cast<double>(total_bytes) / (1024.0 * 1024.0)) / (ELAPSED_S > 0.0 ? ELAPSED_S : 1.0);

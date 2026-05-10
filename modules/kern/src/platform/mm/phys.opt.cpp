@@ -34,18 +34,14 @@ uint64_t kernel_cr3 = 0;
 namespace ker::mod::mm::phys {
 
 namespace {
+using log = ker::mod::dbg::logger<"phys">;
+
 // Per-CPU page cache for reducing lock contention
 struct PerCpuPageCache {
     static constexpr size_t CACHE_SIZE = 16;  // Pages per CPU cache
-    void* pages[CACHE_SIZE]{};
+    std::array<void*, CACHE_SIZE> pages{};
     size_t count{};
     sys::Spinlock lock;  // Fine-grained per-CPU lock
-
-    PerCpuPageCache() {
-        for (auto& page : pages) {
-            page = nullptr;
-        }
-    }
 };
 
 // Debug spinlock for memlock - records holder CR3, CPU, and caller RIP
@@ -96,7 +92,7 @@ struct TrackedSpinlock {
         locked.store(false, std::memory_order_release);
 
         // Restore interrupt state
-        if ((flags & 0x200) != 0) {
+        if ((flags & cpu::GATE_IF_MASK) != 0) {
             asm volatile("sti");
         }
     }
@@ -128,7 +124,7 @@ struct CallerStat {
     uint64_t pages;   // cumulative pages allocated from this site
 };
 constexpr size_t CALLER_STAT_SLOTS = 64;
-__attribute__((section(".bss"))) CallerStat caller_stats[CALLER_STAT_SLOTS];
+__attribute__((section(".bss"))) std::array<CallerStat, CALLER_STAT_SLOTS> caller_stats{};
 std::atomic<bool> caller_stat_lock{false};
 
 void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
@@ -144,14 +140,14 @@ void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
     size_t const START = (caller >> 3) % CALLER_STAT_SLOTS;
     for (size_t i = 0; i < CALLER_STAT_SLOTS; i++) {
         size_t const IDX = (START + i) % CALLER_STAT_SLOTS;
-        if (caller_stats[IDX].caller == caller) {
-            caller_stats[IDX].pages += num_pages;
+        if (caller_stats.at(IDX).caller == caller) {
+            caller_stats.at(IDX).pages += num_pages;
             caller_stat_lock.store(false, std::memory_order_release);
             return;
         }
-        if (caller_stats[IDX].caller == 0) {
-            caller_stats[IDX].caller = caller;
-            caller_stats[IDX].pages = num_pages;
+        if (caller_stats.at(IDX).caller == 0) {
+            caller_stats.at(IDX).caller = caller;
+            caller_stats.at(IDX).pages = num_pages;
             caller_stat_lock.store(false, std::memory_order_release);
             return;
         }
@@ -192,7 +188,7 @@ void dump_caller_page_stats() {
         asm volatile("pause");
     }
     for (size_t i = 0; i < CALLER_STAT_SLOTS; i++) {
-        snapshot[i] = caller_stats[i];
+        snapshot.at(i) = caller_stats.at(i);
     }
     caller_stat_lock.store(false, std::memory_order_release);
 
@@ -200,27 +196,27 @@ void dump_caller_page_stats() {
     for (size_t i = 0; i < CALLER_STAT_SLOTS - 1; i++) {
         size_t max_idx = i;
         for (size_t j = i + 1; j < CALLER_STAT_SLOTS; j++) {
-            if (snapshot[j].pages > snapshot[max_idx].pages) {
+            if (snapshot.at(j).pages > snapshot.at(max_idx).pages) {
                 max_idx = j;
             }
         }
         if (max_idx != i) {
-            CallerStat const TMP = snapshot[i];
-            snapshot[i] = snapshot[max_idx];
-            snapshot[max_idx] = TMP;
+            CallerStat const TMP = snapshot.at(i);
+            snapshot.at(i) = snapshot.at(max_idx);
+            snapshot.at(max_idx) = TMP;
         }
     }
 
     for (size_t i = 0; i < CALLER_STAT_SLOTS; i++) {
-        if (snapshot[i].caller == 0 || snapshot[i].pages == 0) {
+        if (snapshot.at(i).caller == 0 || snapshot.at(i).pages == 0) {
             break;
         }
         io::serial::write("  0x");
-        io::serial::write_hex(snapshot[i].caller);
+        io::serial::write_hex(snapshot.at(i).caller);
         io::serial::write(": ");
-        io::serial::write(snapshot[i].pages);
+        io::serial::write(snapshot.at(i).pages);
         io::serial::write(" pages (");
-        io::serial::write(snapshot[i].pages * paging::PAGE_SIZE / BYTES_PER_KB);
+        io::serial::write(snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
         io::serial::write(" KB)\n");
     }
 }
@@ -232,8 +228,8 @@ namespace {
 // Forward declaration
 auto find_free_block(uint64_t size) -> void*;
 
-auto init_page_zone(uint64_t base, uint64_t len, int zone_num) -> paging::PageZone* {
-    auto* zone = (paging::PageZone*)base;
+auto init_page_zone(uint64_t base, uint64_t len, uint64_t zone_num) -> paging::PageZone* {
+    auto* zone = reinterpret_cast<paging::PageZone*>(base);
 
     base = page_align_up(base + sizeof(paging::PageZone));
     len -= paging::PAGE_SIZE;
@@ -270,7 +266,7 @@ auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
     auto virt_base = reinterpret_cast<uint64_t>(addr::get_virt_pointer(base));
 
     zone->name = "Huge Pages";
-    zone->zone_num = 9999;  // Special zone number for huge pages
+    zone->zone_num = paging::PageZone::ZONE_HUGE_PAGES;  // Special zone number for huge pages
 
     // Initialize allocator with the huge page region (all virtual addresses now)
     allocator->init(virt_base, len);
@@ -341,14 +337,12 @@ void init(limine_memmap_response* memmap_response) {
     }
 
     // Find the largest usable region for huge pages (reserve ~10% or largest region > 128MB)
-    limine_memmap_entry const* huge_page_entry = nullptr;
     uint64_t largest_size = 0;
     size_t huge_page_idx = 0;
 
     for (size_t i = 0; i < MEMMAP.entry_count; i++) {
         if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE && MEMMAP.entries[i]->length > largest_size) {
             largest_size = MEMMAP.entries[i]->length;
-            huge_page_entry = MEMMAP.entries[i];
             huge_page_idx = i;
         }
     }
@@ -362,9 +356,11 @@ void init(limine_memmap_response* memmap_response) {
         }
 
         // If this is the huge page entry and it's large enough, split it
-        if (i == huge_page_idx && largest_size > 128 * 1024 * 1024) {
+        constexpr uint64_t MIN_HUGE_PAGE_REGION_BYTES = 128ULL * 1024ULL * 1024ULL;
+        constexpr uint64_t MIN_HUGE_PAGE_BYTES = 16ULL * 1024ULL * 1024ULL;
+        if (i == huge_page_idx && largest_size > MIN_HUGE_PAGE_REGION_BYTES) {
             uint64_t huge_sz = largest_size / 4;  // 25% for huge pages
-            huge_sz = std::max<uint64_t>(huge_sz, static_cast<const unsigned long>(16 * 1024 * 1024));
+            huge_sz = std::max<uint64_t>(huge_sz, MIN_HUGE_PAGE_BYTES);
             huge_sz = page_align_up(huge_sz);
 
             // Save huge page region info for later initialization (after virt::initPagemap)
@@ -377,8 +373,8 @@ void init(limine_memmap_response* memmap_response) {
 
         main_heap_size += MEMMAP.entries[i]->length;
 
-        paging::PageZone* zone =
-            init_page_zone((uint64_t)addr::get_virt_pointer(MEMMAP.entries[i]->base), MEMMAP.entries[i]->length, zone_num++);
+        paging::PageZone* zone = init_page_zone(reinterpret_cast<uint64_t>(addr::get_virt_pointer(MEMMAP.entries[i]->base)),
+                                                MEMMAP.entries[i]->length, zone_num++);
 
         if (zones_tail == nullptr) {
             zones = zone;  // set the head
@@ -409,15 +405,15 @@ void set_kernel_cr3(uint64_t cr3) {
 void init_huge_page_zone_deferred() {
     // Map and initialize per-CPU caches first
     if (per_cpu_caches_size > 0 && per_cpu_caches_phys_base != 0) {
-        mod::dbg::log("Mapping per-CPU caches: base=0x%016x size=0x%016x", per_cpu_caches_phys_base, per_cpu_caches_size);
+        log::info("mapping per-CPU caches: base=0x%016x size=0x%016x", per_cpu_caches_phys_base, per_cpu_caches_size);
 
         for (uint64_t offset = 0; offset < per_cpu_caches_size; offset += paging::PAGE_SIZE) {
             uint64_t const PHYS = per_cpu_caches_phys_base + offset;
-            auto virt = (uint64_t)addr::get_virt_pointer(PHYS);
+            auto virt = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
             virt::map_to_kernel_page_table(virt, PHYS, paging::page_types::KERNEL);
         }
 
-        mod::dbg::log("Per-CPU caches mapped, initializing structures");
+        log::info("per-CPU caches mapped, initializing structures");
 
         // Now we can safely access the memory
         void* cache_memory = addr::get_virt_pointer(per_cpu_caches_phys_base);
@@ -426,21 +422,21 @@ void init_huge_page_zone_deferred() {
             new (&per_cpu_caches[i]) PerCpuPageCache();  // Placement new
         }
 
-        mod::dbg::log("Per-CPU caches initialized for %zu CPUs", num_cpus);
+        log::info("per-CPU caches initialized for %zu CPUs", num_cpus);
     }
 
     // Initialize the huge page zone after virt::initPagemap() has set up the kernel page map
     // This ensures the zone metadata is in mapped memory
     if (huge_page_size > 0 && huge_page_base != 0) {
-        mod::dbg::log("Mapping huge page region: base=0x%016x size=0x%016x", huge_page_base, huge_page_size);
+        log::info("mapping huge page region: base=0x%016x size=0x%016x", huge_page_base, huge_page_size);
 
         for (uint64_t offset = 0; offset < huge_page_size; offset += paging::PAGE_SIZE) {
             uint64_t const PHYS = huge_page_base + offset;
-            auto virt = (uint64_t)addr::get_virt_pointer(PHYS);
+            auto virt = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
             virt::map_to_kernel_page_table(virt, PHYS, paging::page_types::KERNEL);
         }
 
-        mod::dbg::log("Huge page region mapped, initializing zone");
+        log::info("huge page region mapped, initializing zone");
 
         uint64_t const FLAGS = memlock.lock_irq();
         // Pass physical addresses - initHugePageZone will convert to virtual
@@ -448,10 +444,10 @@ void init_huge_page_zone_deferred() {
         memlock.unlock_irq(FLAGS);
 
         if (huge_page_zone != nullptr) {
-            mod::dbg::log("Huge page zone initialized: start=0x%016x len=0x%016x pages=%zu", huge_page_zone->start, huge_page_zone->len,
-                          huge_page_zone->page_count);
+            log::info("huge page zone initialized: start=0x%016x len=0x%016x pages=%zu", huge_page_zone->start, huge_page_zone->len,
+                      huge_page_zone->page_count);
         } else {
-            mod::dbg::log("Failed to initialize huge page zone");
+            log::error("failed to initialize huge page zone");
         }
     }
 }
@@ -474,7 +470,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
 
             if (cache.count > 0) {
                 // Fast path: pop from cache
-                void* page = cache.pages[--cache.count];
+                void* page = cache.pages.at(--cache.count);
                 cache.lock.unlock();
 
                 total_allocated_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -484,7 +480,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
                 // it was freed to this cache while still in the slab chain.
                 constexpr uint32_t SLAB_MAGIC_CACHE = 0x8CBEEFC8;
                 if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC_CACHE) {
-                    mod::dbg::log("DETECT: pageAlloc (cache) returning live slab page – double-alloc trap! virt=%p", page);
+                    log::critical("DETECT: pageAlloc (cache) returning live slab page - double-alloc trap! virt=%p", page);
                     hcf();
                 }
 
@@ -497,7 +493,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
                         wrcr3(kernel_cr3);
                     }
                 }
-                memset(page, 0, size);
+                std::memset(page, 0, size);
 #ifdef WOS_KASAN
                 if (kasan::is_enabled() && !kasan::in_shadow_fault()) {
                     kasan::unpoison_range(page, size);
@@ -525,7 +521,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         io::serial::write_hex(size);
         io::serial::write(" bytes\n");
         io::serial::write("Allocation site: 0x");
-        io::serial::write_hex((uint64_t)caller_addr);
+        io::serial::write_hex(reinterpret_cast<uint64_t>(caller_addr));
         io::serial::write(" (");
         io::serial::write(name.data(), name.size());
         io::serial::write(")\n");
@@ -537,7 +533,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
     alloc_count.fetch_add(1, std::memory_order_relaxed);
 
     // Validate the returned address is in a reasonable HHDM range
-    auto block_addr = (uint64_t)block;
+    auto block_addr = reinterpret_cast<uint64_t>(block);
     constexpr uint64_t HHDM_BASE = 0xffff800000000000ULL;
     constexpr uint64_t HHDM_END = 0xffff808000000000ULL;  // ~512GB max physical
     if (block_addr < HHDM_BASE || block_addr >= HHDM_END) {
@@ -552,7 +548,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
     // header it was freed to the buddy while still referenced by the slab chain.
     constexpr uint32_t SLAB_MAGIC_BUDDY = 0x8CBEEFC8;
     if (*reinterpret_cast<const volatile uint32_t*>(block) == SLAB_MAGIC_BUDDY) {
-        mod::dbg::log("DETECT: pageAlloc (buddy) returning live slab page – double-alloc trap! virt=%p", block);
+        log::critical("DETECT: pageAlloc (buddy) returning live slab page - double-alloc trap! virt=%p", block);
         hcf();
     }
 
@@ -566,7 +562,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         }
     }
 
-    memset(block, 0, size);
+    std::memset(block, 0, size);
 #ifdef WOS_KASAN
     if (kasan::is_enabled() && !kasan::in_shadow_fault()) {
         kasan::unpoison_range(block, size);
@@ -610,7 +606,7 @@ auto page_alloc_huge(uint64_t size) -> void* {
         }
     }
 
-    memset(block, 0, size);
+    std::memset(block, 0, size);
 #ifdef WOS_KASAN
     if (kasan::is_enabled() && !kasan::in_shadow_fault()) {
         kasan::unpoison_range(block, size);
@@ -635,7 +631,7 @@ void page_free(void* page) {
 
             if (cache.count < PerCpuPageCache::CACHE_SIZE) {
                 // Fast path: push to cache
-                cache.pages[cache.count++] = page;
+                cache.pages.at(cache.count++) = page;
                 cache.lock.unlock();
 
                 free_count.fetch_add(1, std::memory_order_relaxed);
@@ -651,7 +647,8 @@ void page_free(void* page) {
 
     // Try huge page zone first
     if (huge_page_zone != nullptr) {
-        if ((uint64_t)page >= huge_page_zone->start && (uint64_t)page < huge_page_zone->start + huge_page_zone->len) {
+        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+        if (PAGE_ADDR >= huge_page_zone->start && PAGE_ADDR < huge_page_zone->start + huge_page_zone->len) {
             if (huge_page_zone->allocator != nullptr) {
                 huge_page_zone->allocator->free(page);
                 free_count.fetch_add(1, std::memory_order_relaxed);
@@ -664,7 +661,8 @@ void page_free(void* page) {
 
     // Check regular zones
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-        if ((uint64_t)page < zone->start || (uint64_t)page >= zone->start + zone->len) {
+        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+        if (PAGE_ADDR < zone->start || PAGE_ADDR >= zone->start + zone->len) {
             continue;
         }
 
@@ -687,7 +685,8 @@ auto page_split_to_order0(void* page) -> bool {
     uint64_t const FLAGS = memlock.lock_irq();
 
     if (huge_page_zone != nullptr) {
-        if ((uint64_t)page >= huge_page_zone->start && (uint64_t)page < huge_page_zone->start + huge_page_zone->len) {
+        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+        if (PAGE_ADDR >= huge_page_zone->start && PAGE_ADDR < huge_page_zone->start + huge_page_zone->len) {
             bool const OK = huge_page_zone->allocator != nullptr && huge_page_zone->allocator->split_allocated_block_to_order0(page);
             memlock.unlock_irq(FLAGS);
             return OK;
@@ -695,7 +694,8 @@ auto page_split_to_order0(void* page) -> bool {
     }
 
     for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
-        if ((uint64_t)page < zone->start || (uint64_t)page >= zone->start + zone->len) {
+        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+        if (PAGE_ADDR < zone->start || PAGE_ADDR >= zone->start + zone->len) {
             continue;
         }
 
@@ -714,7 +714,7 @@ namespace {
 // Find the PageAllocator and page index for a given HHDM pointer.
 // Returns true if found, populating allocator and pageIdx.
 auto find_allocator_for_page(void* page, PageAllocator*& out_alloc, uint32_t& out_idx) -> bool {
-    auto addr = (uint64_t)page;
+    auto addr = reinterpret_cast<uint64_t>(page);
     // Check regular zones first
     for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
         if (addr >= zone->start && addr < zone->start + zone->len && zone->allocator != nullptr) {
@@ -764,11 +764,11 @@ auto page_ref_dec(void* page) -> uint32_t {
             new_ref = --alloc->page_refcounts[idx];
             if (new_ref == 0) {  // UAF sentinel: a live slab page must never reach refcount 0 via page_ref_dec.
                 // If the first 4 bytes match the slab magic the page is still in the slab
-                // chain – some corrupt PTE is being incorrectly treated as a user data page.
+                // chain - some corrupt PTE is being incorrectly treated as a user data page.
                 constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
                 if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC) {
                     memlock.unlock_irq(FLAGS);
-                    mod::dbg::log("DETECT: page_ref_dec freeing live slab page – UAF trap! virt=%p", page);
+                    log::critical("DETECT: page_ref_dec freeing live slab page - UAF trap! virt=%p", page);
                     hcf();
                 }
 
@@ -801,7 +801,7 @@ auto page_ref_get(void* page) -> uint32_t {
     return ref;
 }
 
-void dump_mini_malloc_stats() { ::mini_dump_stats(); }
+void dump_mini_malloc_stats() { mini_malloc::mini_dump_stats(); }
 
 void dump_kmalloc_tracked_allocs() { ker::mod::mm::dyn::kmalloc::dump_tracked_allocations(); }
 

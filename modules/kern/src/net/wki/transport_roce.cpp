@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
@@ -14,6 +15,8 @@
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::net::wki {
+
+namespace {
 
 // -----------------------------------------------------------------------------
 // RoCE wire format - raw L2 Ethernet (EtherType 0x88B8), no IP/UDP
@@ -54,21 +57,21 @@ struct RoceRegion {
     uint32_t size = 0;
 };
 
-static std::array<RoceRegion, ROCE_MAX_REGIONS> s_regions;
-static uint32_t s_next_rkey = 1;
+std::array<RoceRegion, ROCE_MAX_REGIONS> s_regions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t s_next_rkey = 1;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // Transport state
 // -----------------------------------------------------------------------------
 
-static WkiTransport s_roce_transport;
-static bool s_roce_initialized = false;
+WkiTransport s_roce_transport;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool s_roce_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // Region management
 // -----------------------------------------------------------------------------
 
-static auto region_find(uint32_t rkey) -> RoceRegion* {
+auto region_find(uint32_t rkey) -> RoceRegion* {
     for (auto& r : s_regions) {
         if (r.active && r.rkey == rkey) {
             return &r;
@@ -81,17 +84,17 @@ static auto region_find(uint32_t rkey) -> RoceRegion* {
 // Raw Ethernet TX helper - sends a RoCE frame (EtherType 0x88B8)
 // -----------------------------------------------------------------------------
 
-static auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
+auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
     auto* netdev = wki_eth_get_netdev();
     if (netdev == nullptr) {
         return -1;
     }
 
     // Resolve destination MAC from peer
-    std::array<uint8_t, 6> dst_mac{};
-    WkiPeer* peer = wki_peer_find(neighbor_id);
+    proto::MacAddress dst_mac;
+    WkiPeer const* peer = wki_peer_find(neighbor_id);
     if (peer != nullptr) {
-        memcpy(dst_mac.data(), peer->mac.data(), 6);
+        dst_mac = peer->mac;
     } else {
         return -1;  // unknown peer MAC
     }
@@ -120,8 +123,6 @@ static auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void*
 // -----------------------------------------------------------------------------
 // RDMA operations - WkiTransport function pointers
 // -----------------------------------------------------------------------------
-
-namespace {
 
 int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32_t size, uint32_t* rkey) {
     for (auto& r : s_regions) {

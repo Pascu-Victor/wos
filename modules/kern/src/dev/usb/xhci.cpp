@@ -1,8 +1,10 @@
 #include "xhci.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
@@ -19,12 +21,13 @@ using log = ker::mod::dbg::logger<"xhci">;
 
 constexpr size_t MAX_XHCI_CONTROLLERS = 2;
 // NOLINTBEGIN(misc-use-internal-linkage)
-XhciController* controllers[MAX_XHCI_CONTROLLERS] = {};
+std::array<XhciController*, MAX_XHCI_CONTROLLERS> controllers{};
 size_t controller_count = 0;
 // NOLINTEND(misc-use-internal-linkage)
 
 namespace {
 UsbClassDriver* class_drivers = nullptr;
+constexpr size_t PAGE_SIZE = 4096;
 
 // -- MMIO helpers --
 auto read32(const volatile uint8_t* base, uint32_t offset) -> uint32_t {
@@ -33,6 +36,7 @@ auto read32(const volatile uint8_t* base, uint32_t offset) -> uint32_t {
 
 void write32(volatile uint8_t* base, uint32_t offset, uint32_t val) { *reinterpret_cast<volatile uint32_t*>(base + offset) = val; }
 
+[[maybe_unused]]
 auto read64(const volatile uint8_t* base, uint32_t offset) -> uint64_t {
     return *reinterpret_cast<const volatile uint64_t*>(base + offset);
 }
@@ -44,7 +48,7 @@ auto virt_to_phys(void* v) -> uint64_t {
     if (addr >= 0xffffffff80000000ULL) {
         uint64_t const PHYS = mod::mm::virt::translate(mod::mm::virt::get_kernel_pagemap(), addr);
         if (PHYS == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("xhci: virt_to_phys failed for kernel address 0x%lx", addr);
+            log::error("virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
         }
         return PHYS;
@@ -59,22 +63,22 @@ struct Alloc {
 };
 
 auto alloc_page() -> Alloc {
-    void* v = mod::mm::phys::page_alloc(4096);
+    void* v = mod::mm::phys::page_alloc(PAGE_SIZE);
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
-    std::memset(v, 0, 4096);
+    std::memset(v, 0, PAGE_SIZE);
     return {.virt = v, .phys = virt_to_phys(v)};
 }
 
 auto alloc_pages(size_t bytes) -> Alloc {
     // Round up to page
-    size_t const PAGES = (bytes + 4095) / 4096;
-    void* v = mod::mm::phys::page_alloc(PAGES * 4096);
+    size_t const ALLOC_BYTES = ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    void* v = mod::mm::phys::page_alloc(ALLOC_BYTES);
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
-    std::memset(v, 0, PAGES * 4096);
+    std::memset(v, 0, ALLOC_BYTES);
     return {.virt = v, .phys = virt_to_phys(v)};
 }
 
@@ -170,7 +174,6 @@ auto max_packet_for_speed(uint8_t speed) -> uint16_t {
         case USB_SPEED_LOW:
             return 8;
         case USB_SPEED_FULL:
-            return 64;
         case USB_SPEED_HIGH:
             return 64;
         case USB_SPEED_SUPER:
@@ -205,6 +208,7 @@ void setup_ep0_context(InputContext* ictx, uint8_t speed, uint16_t max_packet, u
 }
 
 // Allocate a transfer ring for an endpoint
+[[maybe_unused]]
 auto alloc_transfer_ring() -> Trb* {
     auto a = alloc_pages(XFER_RING_SIZE * sizeof(Trb));
     return static_cast<Trb*>(a.virt);
@@ -314,7 +318,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
 
     log::debug("slot %u for port %u", SLOT, port);
 
-    auto& dev = hc->devices[SLOT];
+    auto& dev = hc->devices.at(static_cast<size_t>(SLOT));
     dev.slot_id = static_cast<uint8_t>(SLOT);
     dev.port = port;
     dev.speed = speed;
@@ -326,7 +330,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     if (dc_alloc.virt == nullptr) {
         return;
     }
-    dev.dev_ctx = static_cast<DeviceContext*>(dc_alloc.virt);
+    dev.dev_ctx = new (dc_alloc.virt) DeviceContext{};
     hc->dcbaap[SLOT] = dc_alloc.phys;
 
     // 3. Allocate input context
@@ -334,7 +338,7 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     if (ic_alloc.virt == nullptr) {
         return;
     }
-    dev.input_ctx = static_cast<InputContext*>(ic_alloc.virt);
+    dev.input_ctx = new (ic_alloc.virt) InputContext{};
     dev.input_ctx_phys = ic_alloc.phys;
 
     // 4. Allocate EP0 transfer ring
@@ -342,13 +346,14 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     if (ep0_ring.virt == nullptr) {
         return;
     }
-    dev.endpoints[0].ring = static_cast<Trb*>(ep0_ring.virt);
-    dev.endpoints[0].ring_phys = ep0_ring.phys;
-    dev.endpoints[0].ring_enqueue = 0;
-    dev.endpoints[0].ring_cycle = true;
-    dev.endpoints[0].address = 0;
-    dev.endpoints[0].type = USB_EP_TYPE_CONTROL;
-    dev.endpoints[0].max_packet = dev.max_packet0;
+    auto& ep0 = dev.endpoints.at(0);
+    ep0.ring = static_cast<Trb*>(ep0_ring.virt);
+    ep0.ring_phys = ep0_ring.phys;
+    ep0.ring_enqueue = 0;
+    ep0.ring_cycle = true;
+    ep0.address = 0;
+    ep0.type = USB_EP_TYPE_CONTROL;
+    ep0.max_packet = dev.max_packet0;
     dev.num_endpoints = 1;
 
     // 5. Set up input context
@@ -393,21 +398,21 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     }
 
     // First get just the config header to learn wTotalLength
-    uint8_t config_buf[256] = {};
+    std::array<uint8_t, 256> config_buf{};
     setup.w_value = (USB_DESC_CONFIG << 8);
     setup.w_length = sizeof(UsbConfigDescriptor);
-    if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf, sizeof(UsbConfigDescriptor), true) != 0) {
+    if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf.data(), sizeof(UsbConfigDescriptor), true) != 0) {
         log::warn("get config descriptor failed");
         return;
     }
 
-    auto* cfg = reinterpret_cast<UsbConfigDescriptor*>(config_buf);
+    auto* cfg = reinterpret_cast<UsbConfigDescriptor*>(config_buf.data());
     uint16_t total_len = cfg->w_total_length;
-    total_len = std::min<uint16_t>(total_len, sizeof(config_buf));
+    total_len = std::min<uint16_t>(total_len, config_buf.size());
 
     // Now fetch full config
     setup.w_length = total_len;
-    if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf, total_len, true) != 0) {
+    if (xhci_control_transfer(hc, dev.slot_id, &setup, config_buf.data(), total_len, true) != 0) {
         log::warn("get full config failed");
         return;
     }
@@ -415,14 +420,14 @@ void enumerate_device(XhciController* hc, uint8_t port, uint8_t speed) {
     // 9. Set Configuration
     UsbSetupPacket set_cfg = {};
     set_cfg.bm_request_type = 0x00;
-    set_cfg.bm_request_type = USB_REQ_SET_CONFIG;
+    set_cfg.b_request = USB_REQ_SET_CONFIG;
     set_cfg.w_value = cfg->b_configuration_value;
     set_cfg.w_index = 0;
     set_cfg.w_length = 0;
     xhci_control_transfer(hc, dev.slot_id, &set_cfg, nullptr, 0, false);
 
     // 10. Probe class drivers
-    probe_class_drivers(hc, &dev, config_buf, total_len);
+    probe_class_drivers(hc, &dev, config_buf.data(), total_len);
 }
 
 void probe_class_drivers(XhciController* hc, UsbDevice* dev, uint8_t* config_data, size_t config_len) {
@@ -461,10 +466,7 @@ void scan_ports(XhciController* hc) {
             uint8_t const SPD = (PORTSC & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
             log::debug("port %u already connected speed=%u", p, SPD);
 
-            if (SPD >= XHCI_SPEED_SUPER) {
-                enumerate_device(hc, p, SPD);
-            } else if ((PORTSC & XHCI_PORTSC_PED) != 0U) {
-                // Already enabled (e.g. by BIOS)
+            if (SPD >= XHCI_SPEED_SUPER || (PORTSC & XHCI_PORTSC_PED) != 0U) {
                 enumerate_device(hc, p, SPD);
             } else {
                 // Issue port reset
@@ -543,11 +545,12 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     }
 
     // Allocate controller state
-    auto* hc = static_cast<XhciController*>(mod::mm::phys::page_alloc(sizeof(XhciController)));
-    if (hc == nullptr) {
+    // NOLINTNEXTLINE(misc-const-correctness): placement-new constructs mutable controller storage.
+    void* hc_storage = mod::mm::phys::page_alloc(sizeof(XhciController));
+    if (hc_storage == nullptr) {
         return -1;
     }
-    std::memset(hc, 0, sizeof(XhciController));
+    auto* hc = new (hc_storage) XhciController{};
 
     hc->base = base;
     hc->op = op;
@@ -620,7 +623,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
     if (erst_alloc.virt == nullptr) {
         return -1;
     }
-    hc->erst = static_cast<ErstEntry*>(erst_alloc.virt);
+    hc->erst = new (erst_alloc.virt) ErstEntry{};
     hc->erst_phys = erst_alloc.phys;
     hc->erst[0].ring_base = hc->evt_ring_phys;
     hc->erst[0].ring_size = EVENT_RING_SIZE;
@@ -665,7 +668,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
         asm volatile("pause");
     }
 
-    controllers[controller_count++] = hc;
+    controllers.at(controller_count++) = hc;
 
     log::info("controller ready, vec=0x%02x", hc->irq_vector);
 
@@ -689,15 +692,19 @@ void usb_register_class_driver(UsbClassDriver* drv) {
 }
 
 auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* setup, void* data, size_t len, bool dir_in) -> int {
-    auto& dev = hc->devices[slot_id];
-    auto& ep0 = dev.endpoints[0];
+    auto& dev = hc->devices.at(slot_id);
+    auto& ep0 = dev.endpoints.at(0);
 
     // Build Setup Stage TRB
     uint64_t setup_param = 0;
-    std::memcpy(&setup_param, setup, 8);
+    std::memcpy(&setup_param, setup, sizeof(UsbSetupPacket));
 
     uint32_t const SETUP_STATUS = 8;  // TRB transfer length = 8
-    uint32_t const SETUP_CTRL = TRB_SETUP | TRB_IDT | (len > 0 ? (dir_in ? (3U << 16) : (2U << 16)) : 0);
+    uint32_t setup_dir = 0;
+    if (len > 0) {
+        setup_dir = dir_in ? (3U << 16) : (2U << 16);
+    }
+    uint32_t const SETUP_CTRL = TRB_SETUP | TRB_IDT | setup_dir;
 
     ring_enqueue(ep0.ring, &ep0.ring_enqueue, &ep0.ring_cycle, XFER_RING_SIZE, setup_param, SETUP_STATUS, SETUP_CTRL);
 
@@ -768,6 +775,13 @@ auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* ep, vo
 
     log::warn("bulk transfer timeout");
     return -1;
+}
+
+auto xhci_default_controller() -> XhciController* {
+    if (controller_count == 0) {
+        return nullptr;
+    }
+    return controllers.at(0);
 }
 
 auto xhci_init() -> int {

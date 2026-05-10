@@ -76,6 +76,7 @@ FileOperations epoll_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = nullptr,
     .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
 };
 
 // -- Helper: poll a single fd and return its ready mask -----------------------
@@ -274,29 +275,32 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
 
     // Scan all interest entries and collect ready events
     int ready = 0;
-    for (size_t i = 0; i < EPOLL_MAX_INTEREST && ready < maxevents; i++) {
-        if (!inst->interests[i].active) {
+    for (auto& interest : inst->interests) {
+        if (ready >= maxevents) {
+            break;
+        }
+        if (!interest.active) {
             continue;
         }
 
-        auto* target = vfs_get_file_retain(task, inst->interests[i].fd);
+        auto* target = vfs_get_file_retain(task, interest.fd);
         if (target == nullptr) {
             // fd was closed - auto-remove from interest list
-            inst->interests[i].active = false;
+            interest.active = false;
             inst->count--;
             continue;
         }
 
-        uint32_t const REVENTS = poll_fd(target, inst->interests[i].events);
+        uint32_t const REVENTS = poll_fd(target, interest.events);
         vfs_put_file(target);
         if (REVENTS != 0) {
             events[ready].events = REVENTS;
-            events[ready].data.u64 = inst->interests[i].data;
+            events[ready].data.u64 = interest.data;
             ready++;
 
             // EPOLLONESHOT: disable after reporting
-            if ((inst->interests[i].events & EPOLLONESHOT) != 0U) {
-                inst->interests[i].events = 0;
+            if ((interest.events & EPOLLONESHOT) != 0U) {
+                interest.events = 0;
             }
         }
     }
@@ -353,22 +357,25 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         // and waiter registration.  With deferred_task_switch already set,
         // any concurrent wake_waiters will clear it, preventing a block.
         int recheck = 0;
-        for (size_t i = 0; i < EPOLL_MAX_INTEREST && recheck < maxevents; i++) {
-            if (!inst->interests[i].active) {
+        for (auto& interest : inst->interests) {
+            if (recheck >= maxevents) {
+                break;
+            }
+            if (!interest.active) {
                 continue;
             }
-            auto* target = vfs_get_file_retain(task, inst->interests[i].fd);
+            auto* target = vfs_get_file_retain(task, interest.fd);
             if (target == nullptr) {
                 continue;
             }
-            uint32_t const REVENTS = poll_fd(target, inst->interests[i].events);
+            uint32_t const REVENTS = poll_fd(target, interest.events);
             vfs_put_file(target);
             if (REVENTS != 0) {
                 events[recheck].events = REVENTS;
-                events[recheck].data.u64 = inst->interests[i].data;
+                events[recheck].data.u64 = interest.data;
                 recheck++;
-                if ((inst->interests[i].events & EPOLLONESHOT) != 0U) {
-                    inst->interests[i].events = 0;
+                if ((interest.events & EPOLLONESHOT) != 0U) {
+                    interest.events = 0;
                 }
             }
         }

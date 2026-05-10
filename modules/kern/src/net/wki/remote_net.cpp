@@ -291,6 +291,7 @@ const ker::net::NetDeviceOps G_PROXY_NET_OPS = {
     .close = proxy_net_close,
     .start_xmit = proxy_net_xmit,
     .set_mac = proxy_net_set_mac,
+    .set_queue_cpu = nullptr,
 };
 
 }  // namespace
@@ -370,14 +371,10 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             break;
         }
 
-        case OP_NET_RX_NOTIFY: {
-            // D11: This op is sent by the server (owner) to the consumer.
-            // It should not arrive at the server-side handler. Ignore.
-            break;
-        }
-
+        case OP_NET_RX_NOTIFY:
         case OP_NET_STATE_NOTIFY: {
-            // Owner-pushed state update; only the consumer should handle this.
+            // D11: This op is sent by the server (owner) to the consumer.
+            // Owner-pushed state updates should also only reach the consumer.
             break;
         }
 
@@ -612,16 +609,18 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         name_len = ker::net::NETDEV_NAME_LEN - 1;
     }
     memcpy(state->netdev.name.data(), local_name, name_len);
-    state->netdev.name[name_len] = '\0';
+    state->netdev.name.at(name_len) = '\0';
 
     // V2: Locally-administered MAC: 02:57:4B:xx:yy:zz
     // 0x57,0x4B = "WK", xx:yy = local node_id (big-endian), zz = sequential index
-    state->netdev.mac[0] = 0x02;
-    state->netdev.mac[1] = 0x57;
-    state->netdev.mac[2] = 0x4B;
-    state->netdev.mac[3] = static_cast<uint8_t>((g_wki.my_node_id >> 8) & 0xFF);
-    state->netdev.mac[4] = static_cast<uint8_t>(g_wki.my_node_id & 0xFF);
-    state->netdev.mac[5] = g_wki.proxy_nic_index++;
+    state->netdev.mac.bytes = {
+        0x02,
+        0x57,
+        0x4B,
+        static_cast<uint8_t>((g_wki.my_node_id >> 8) & 0xFF),
+        static_cast<uint8_t>(g_wki.my_node_id & 0xFF),
+        g_wki.proxy_nic_index++,
+    };
 
     state->netdev.ops = &G_PROXY_NET_OPS;
     state->netdev.private_data = state;
@@ -649,8 +648,8 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->active = true;
 
     ker::mod::dbg::log("[WKI] Remote NIC attached: %s -> node=0x%04x res_id=%u ch=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", local_name,
-                       owner_node, resource_id, state->assigned_channel, state->netdev.mac[0], state->netdev.mac[1], state->netdev.mac[2],
-                       state->netdev.mac[3], state->netdev.mac[4], state->netdev.mac[5]);
+                       owner_node, resource_id, state->assigned_channel, state->netdev.mac.at(0), state->netdev.mac.at(1),
+                       state->netdev.mac.at(2), state->netdev.mac.at(3), state->netdev.mac.at(4), state->netdev.mac.at(5));
 
     return &state->netdev;
 }
@@ -881,14 +880,15 @@ void wki_remote_net_poll_stats() {
             continue;
         }
         if (target_count < MAX_POLL_TARGETS) {
-            targets[target_count++] = {.state = p.get(), .owner_node = p->owner_node, .channel = p->assigned_channel};
+            targets.at(target_count++) = {.state = p.get(), .owner_node = p->owner_node, .channel = p->assigned_channel};
         }
     }
     s_net_proxy_lock.unlock();
 
     // Send stats requests outside lock
     for (size_t i = 0; i < target_count; i++) {
-        auto* st = targets[i].state;
+        const auto& target = targets.at(i);
+        auto* st = target.state;
 
         DevOpReqPayload req = {};
         req.op_id = OP_NET_GET_STATS;
@@ -899,7 +899,7 @@ void wki_remote_net_poll_stats() {
         st->op_resp_buf = nullptr;
         st->op_resp_len = 0;
 
-        int const SEND_RET = wki_send(targets[i].owner_node, targets[i].channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
+        int const SEND_RET = wki_send(target.owner_node, target.channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
         if (SEND_RET != WKI_OK) {
             st->op_pending = false;
         }
@@ -944,7 +944,7 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
         uint16_t const CHANNEL = p->assigned_channel != 0 ? p->assigned_channel : p->attach_channel;
 
         if (CHANNEL != 0 && close_count < MAX_CLEANUP) {
-            to_close[close_count++] = {.owner_node = p->owner_node, .channel = CHANNEL};
+            to_close.at(close_count++) = {.owner_node = p->owner_node, .channel = CHANNEL};
         }
 
         if (p->active) {
@@ -964,7 +964,8 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
 
     // Close channels and log outside lock
     for (size_t i = 0; i < close_count; i++) {
-        WkiChannel* ch = wki_channel_get(to_close[i].owner_node, to_close[i].channel);
+        const auto& entry = to_close.at(i);
+        WkiChannel* ch = wki_channel_get(entry.owner_node, entry.channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }

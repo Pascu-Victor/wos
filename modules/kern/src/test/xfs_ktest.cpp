@@ -22,7 +22,7 @@
 namespace {
 
 auto xfs_null_read(ker::dev::BlockDevice* dev, uint64_t /*blk*/, size_t count, void* buf) -> int {
-    memset(buf, 0, count * dev->block_size);
+    std::memset(buf, 0, count * dev->block_size);
     return 0;
 }
 

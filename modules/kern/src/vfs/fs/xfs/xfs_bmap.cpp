@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <span>
 #include <utility>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
@@ -440,10 +441,12 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     }
 
     // Shift entries after insertion point right by one
-    for (uint32_t i = ext.count; i > insert_at; i--) {
-        ext.list[i] = ext.list[i - 1];
+    if (ext.list == nullptr || ext.count >= ext.capacity) {
+        return -EIO;
     }
-    ext.list[insert_at] = new_ext;
+    std::span<XfsBmbtIrec> const EXTENTS{ext.list, ext.capacity};
+    std::move_backward(EXTENTS.begin() + insert_at, EXTENTS.begin() + ext.count, EXTENTS.begin() + NEW_COUNT);
+    *(EXTENTS.begin() + insert_at) = new_ext;
     ext.count = NEW_COUNT;
     ip->nextents = NEW_COUNT;
     ip->dirty = true;

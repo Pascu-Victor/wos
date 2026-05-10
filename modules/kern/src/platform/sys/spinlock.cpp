@@ -120,15 +120,16 @@ void lock_ticket(Spinlock* lock) {
 auto try_lock_ticket(Spinlock* lock) -> bool {
     // Only succeed if no one else is waiting or holding the lock.
     uint32_t current = lock->now_serving.load(std::memory_order_relaxed);
-    if (!lock->next_ticket.compare_exchange_strong(current, current + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-        return false;
-    }
+    bool const ACQUIRED =
+        lock->next_ticket.compare_exchange_strong(current, current + 1, std::memory_order_acquire, std::memory_order_relaxed);
 #if SPINLOCK_DEBUG
-    lock->owner_caller = __builtin_return_address(0);
-    auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
-    walk_stack(fp, lock->owner_stack.data(), Spinlock::SPINLOCK_STACK_DEPTH);
+    if (ACQUIRED) {
+        lock->owner_caller = __builtin_return_address(0);
+        auto* fp = reinterpret_cast<void**>(__builtin_frame_address(0));
+        walk_stack(fp, lock->owner_stack.data(), Spinlock::SPINLOCK_STACK_DEPTH);
+    }
 #endif
-    return true;
+    return ACQUIRED;
 }
 
 void unlock_ticket(Spinlock* lock) {

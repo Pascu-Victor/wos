@@ -232,7 +232,7 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     };
 
     append("Name:\t");
-    append((task->exe_path[0] != 0) ? static_cast<const char*>(task->exe_path) : "(unknown)");
+    append((task->exe_path[0] != 0) ? task->exe_path.data() : "(unknown)");
     append("\nPid:\t");
     append_int(task->pid);
     append("\nPPid:\t");
@@ -361,7 +361,7 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     };
 
     // Extract comm (basename of exe_path)
-    const auto* comm = static_cast<const char*>(task->exe_path);
+    const auto* comm = task->exe_path.data();
     if (comm[0] != '\0') {
         const char* p = comm;
         while (*p != 0) {
@@ -465,7 +465,7 @@ auto generate_cmdline(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     }
 
     // Use exe_path as fallback (most processes won't have a saved argv)
-    const auto* path = static_cast<const char*>(task->exe_path);
+    const auto* path = task->exe_path.data();
     if (path[0] == '\0') {
         path = (task->name != nullptr) ? task->name : "";
     }
@@ -494,7 +494,7 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
     if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr && task->root[0] == '/' && task->root[1] != '\0') {
-            task_root = task->root;
+            task_root = task->root.data();
             root_len = std::strlen(task_root);
         }
     }
@@ -509,7 +509,8 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
 
         // Compute the task-relative display path by stripping the task root prefix.
         const char* display_path = mount_path;
-        if (root_len > 1 && std::strncmp(mount_path, task_root, root_len) == 0 &&
+        size_t const MOUNT_PATH_LEN = std::strlen(mount_path);
+        if (root_len > 1 && MOUNT_PATH_LEN >= root_len && std::strncmp(mount_path, task_root, root_len) == 0 &&
             (mount_path[root_len] == '/' || mount_path[root_len] == '\0')) {
             display_path = mount_path + root_len;
             if (display_path[0] == '\0') {
@@ -571,7 +572,7 @@ auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     auto* task = ker::mod::sched::find_task_by_pid(pid);
     const char* hostname = nullptr;
     if (task != nullptr && task->wki_submitter_hostname[0] != '\0') {
-        hostname = static_cast<const char*>(task->wki_submitter_hostname);
+        hostname = task->wki_submitter_hostname.data();
     } else {
         hostname = ker::net::wki::g_wki.local_hostname;
     }
@@ -614,7 +615,7 @@ auto task_wki_remote_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
     }
     const char* local_hostname = ker::net::wki::g_wki.local_hostname;
     if (task->wki_submitter_hostname[0] != '\0' && local_hostname != nullptr && local_hostname[0] != '\0' &&
-        std::strcmp(task->wki_submitter_hostname, local_hostname) != 0) {
+        std::strcmp(task->wki_submitter_hostname.data(), local_hostname) != 0) {
         return task->pid;
     }
     return 0;
@@ -751,25 +752,26 @@ auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
 
 // Hex helper
 void append_hex64(char*& p, const char* end, uint64_t v) {
-    static const char HX[] = "0123456789abcdef";
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
     if (p + 18 >= end) {
         return;
     }
     *p++ = '0';
     *p++ = 'x';
     for (int i = 60; i >= 0; i -= 4) {
-        *p++ = HX[(v >> i) & 0xf];
+        *p++ = HEX_DIGITS[static_cast<size_t>((v >> i) & 0xf)];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
 }
 
 void append_dec64(char*& p, const char* end, uint64_t v) {
-    char tmp[22];
+    std::array<char, 22> tmp{};
     int n = 0;
     if (v == 0) {
-        tmp[n++] = '0';
+        tmp[static_cast<size_t>(n++)] = '0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     } else {
-        while (v > 0 && n < 21) {
-            tmp[n++] = static_cast<char>('0' + (v % 10));
+        while (v > 0 && static_cast<size_t>(n) < tmp.size() - 1) {
+            tmp[static_cast<size_t>(n++)] =
+                static_cast<char>('0' + (v % 10));  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             v /= 10;
         }
     }
@@ -778,7 +780,7 @@ void append_dec64(char*& p, const char* end, uint64_t v) {
         return;
     }
     for (int i = n - 1; i >= 0; --i) {
-        *p++ = tmp[i];
+        *p++ = tmp[static_cast<size_t>(i)];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
 }
 
@@ -1089,8 +1091,8 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
-                    size_t const LEN = strlen(static_cast<const char*>(task->exe_path));
-                    memcpy(pfd->content, static_cast<const char*>(task->exe_path), LEN);
+                    size_t const LEN = strlen(task->exe_path.data());
+                    memcpy(pfd->content, task->exe_path.data(), LEN);
                     pfd->content[LEN] = '\0';
                     pfd->content_len = LEN;
                 } else {
@@ -1183,7 +1185,7 @@ auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    off_t new_pos = f->pos;
+    off_t new_pos = 0;
     switch (whence) {
         case 0:
             new_pos = offset;
@@ -1238,9 +1240,9 @@ auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
     if (task == nullptr) {
         return -ESRCH;
     }
-    size_t len = strlen(static_cast<const char*>(task->exe_path));
+    size_t len = strlen(task->exe_path.data());
     len = std::min(len, bufsz);
-    memcpy(buf, static_cast<const char*>(task->exe_path), len);
+    memcpy(buf, task->exe_path.data(), len);
     return static_cast<ssize_t>(len);
 }
 
@@ -1255,6 +1257,8 @@ FileOperations procfs_fops_instance = {
     .vfs_readlink = procfs_readlink,
     .vfs_truncate = nullptr,
     .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
 };
 
 }  // namespace

@@ -1,5 +1,6 @@
 #include "exit.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -23,10 +24,9 @@ namespace ker::syscall::process {
 
 namespace {
 using log = ker::mod::dbg::logger<"pexit">;
-}
 
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
-static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
+void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
     if (waiter->wait_rusage_user_addr == 0 || waiter->pagemap == nullptr) {
         waiter->wait_rusage_user_addr = 0;
         waiter->wait_rusage_phys_addr = 0;
@@ -48,7 +48,7 @@ static void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod
     waiter->wait_rusage_phys_addr = 0;
 }
 
-static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) {
+void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) {
     if (waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
         waiter->wait_status_user_addr = 0;
         waiter->wait_status_phys_addr = 0;
@@ -67,7 +67,7 @@ static void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, in
     waiter->wait_status_phys_addr = 0;
 }
 
-static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
+void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
     if (waiter == nullptr || waiter->pagemap == nullptr) {
         return;
     }
@@ -103,6 +103,8 @@ static void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter,
     }
 }
 
+}  // namespace
+
 void wos_proc_exit(int status) {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
@@ -123,7 +125,7 @@ void wos_proc_exit(int status) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 #ifdef EXIT_DEBUG
-    ker::mod::dbg::log("wos_proc_exit: Task PID %x exiting with status %d", currentTask->pid, status);
+    log::debug("task PID %x exiting with status %d", current_task->pid, status);
 #endif
 
     // Store exit status in POSIX waitpid format
@@ -196,18 +198,18 @@ void wos_proc_exit(int status) {
         // fd_table and may free radix-tree nodes, so mutating during for_each()
         // can invalidate the traversal.
         while (!current_task->fd_table.empty()) {
-            uint64_t fds[ker::mod::sched::task::Task::FD_TABLE_SIZE]{};
+            std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE> fds{};
             size_t fd_count = 0;
             current_task->fd_table.for_each([&](uint64_t key, void* /*val*/) -> void {
                 if (fd_count < ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-                    fds[fd_count++] = key;
+                    fds.at(fd_count++) = key;
                 }
             });
             if (fd_count == 0) {
                 break;
             }
             for (size_t i = 0; i < fd_count; ++i) {
-                ker::vfs::vfs_close(static_cast<int>(fds[i]));
+                ker::vfs::vfs_close(static_cast<int>(fds.at(i)));
             }
         }
 
@@ -228,17 +230,17 @@ void wos_proc_exit(int status) {
     // returns to the waiter.
     uint64_t const WAITER_LOCK_FLAGS = current_task->exit_waiters_lock.lock_irqsave();
     const size_t WAITER_COUNT = current_task->awaitee_on_exit.size();
-    uint64_t waiting_pids[16] = {};
-    const size_t WAITING_PIDS_CAP = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+    std::array<uint64_t, 16> waiting_pids{};
+    const size_t WAITING_PIDS_CAP = waiting_pids.size();
     for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        waiting_pids[i] = current_task->awaitee_on_exit[i];
+        waiting_pids.at(i) = current_task->awaitee_on_exit.at(i);
     }
     current_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 
     for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        uint64_t const WAITING_PID = waiting_pids[i];
+        uint64_t const WAITING_PID = waiting_pids.at(i);
 #ifdef EXIT_DEBUG
-        ker::mod::dbg::log("wos_proc_exit: Rescheduling waiting task PID %x", waiting_pid);
+        log::debug("rescheduling waiting task PID %x", WAITING_PID);
 #endif
 
         // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
@@ -255,7 +257,7 @@ void wos_proc_exit(int status) {
                 validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
                 write_wait_status_for_waiter(waiting_task, current_task->exit_status);
 #ifdef EXIT_DEBUG
-                ker::mod::dbg::log("wos_proc_exit: Set exit status %d for waiting task PID %x", current_task->exit_status, waitingPid);
+                log::debug("set exit status %d for waiting task PID %x", current_task->exit_status, WAITING_PID);
 #endif
                 fill_rusage_for_waiter(waiting_task, current_task);
                 waiting_task->waiting_for_pid = 0;
@@ -277,14 +279,14 @@ void wos_proc_exit(int status) {
             }
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);
 #ifdef EXIT_DEBUG
-            ker::mod::dbg::log("wos_proc_exit: Successfully rescheduled waiting task PID %x on CPU %d", waitingPid, waitingTask->cpu);
+            log::debug("successfully rescheduled waiting task PID %x on CPU %d", WAITING_PID, waiting_task->cpu);
 #endif
 
             // Release the reference we acquired from findTaskByPidSafe
             waiting_task->release();
         } else {
 #ifdef EXIT_DEBUG
-            ker::mod::dbg::log("wos_proc_exit: Could not find waiting task PID %x", waitingPid);
+            log::debug("could not find waiting task PID %x", WAITING_PID);
 #endif
         }
     }
@@ -336,7 +338,7 @@ void wos_proc_exit(int status) {
     current_task->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
 
 #ifdef EXIT_DEBUG
-    ker::mod::dbg::log("wos_proc_exit: Removing task from runqueue");
+    log::debug("removing task from runqueue");
 #endif
 
     // This function will not return - it switches to the next task

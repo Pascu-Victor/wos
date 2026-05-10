@@ -4,6 +4,7 @@
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -272,12 +273,12 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
-            char resolved[512];
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved, sizeof(resolved));
+            std::array<char, 512> resolved{};
+            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
             if (RES < 0) {
                 return static_cast<int64_t>(RES);
             }
-            return static_cast<int64_t>(ker::vfs::vfs_access(resolved, MODE));
+            return static_cast<int64_t>(ker::vfs::vfs_access(resolved.data(), MODE));
         }
         case ops::UNLINKAT: {
             int const DIRFD = static_cast<int>(a1);
@@ -287,15 +288,15 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
-            char resolved[512];
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved, sizeof(resolved));
+            std::array<char, 512> resolved{};
+            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
             if (RES < 0) {
                 return static_cast<int64_t>(RES);
             }
             if ((FLAGS & 0x200) != 0) {  // AT_REMOVEDIR
-                return static_cast<int64_t>(ker::vfs::vfs_rmdir(resolved));
+                return static_cast<int64_t>(ker::vfs::vfs_rmdir(resolved.data()));
             }
-            return static_cast<int64_t>(ker::vfs::vfs_unlink(resolved));
+            return static_cast<int64_t>(ker::vfs::vfs_unlink(resolved.data()));
         }
         case ops::RENAMEAT: {
             int const OLDDIRFD = static_cast<int>(a1);
@@ -306,17 +307,17 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
-            char resolved_old[512];
-            char resolved_new[512];
-            int res = ker::vfs::vfs_resolve_dirfd(task, OLDDIRFD, oldpath, resolved_old, sizeof(resolved_old));
+            std::array<char, 512> resolved_old{};
+            std::array<char, 512> resolved_new{};
+            int res = ker::vfs::vfs_resolve_dirfd(task, OLDDIRFD, oldpath, resolved_old.data(), resolved_old.size());
             if (res < 0) {
                 return static_cast<int64_t>(res);
             }
-            res = ker::vfs::vfs_resolve_dirfd(task, NEWDIRFD, newpath, resolved_new, sizeof(resolved_new));
+            res = ker::vfs::vfs_resolve_dirfd(task, NEWDIRFD, newpath, resolved_new.data(), resolved_new.size());
             if (res < 0) {
                 return static_cast<int64_t>(res);
             }
-            return static_cast<int64_t>(ker::vfs::vfs_rename(resolved_old, resolved_new));
+            return static_cast<int64_t>(ker::vfs::vfs_rename(resolved_old.data(), resolved_new.data()));
         }
         case ops::EPOLL_CREATE: {
             int const FLAGS = static_cast<int>(a1);

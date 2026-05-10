@@ -12,20 +12,22 @@
 #include <sys/net.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): sysroot exposes POSIX time APIs here.
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <span>
 
 #include "abi-bits/route.h"
 
-using logger = wos::journal<"netd">;
-
 namespace {
+using logger = wos::journal<"netd">;
 
 // ---- DHCP constants ----
 
@@ -52,7 +54,7 @@ constexpr uint8_t OPT_SERVER_ID = 54;
 constexpr uint8_t OPT_PARAM_LIST = 55;
 constexpr uint8_t OPT_END = 255;
 
-constexpr uint8_t MAGIC_COOKIE[4] = {99, 130, 83, 99};
+constexpr std::array<uint8_t, 4> MAGIC_COOKIE = {99, 130, 83, 99};
 
 constexpr int RECV_TIMEOUT_SECS = 5;  // real-time timeout for DHCP responses
 constexpr int MAX_DISCOVER_RETRIES = 5;
@@ -76,11 +78,12 @@ struct DhcpPacket {
     uint32_t yiaddr;
     uint32_t siaddr;
     uint32_t giaddr;
-    uint8_t chaddr[16];
-    uint8_t sname[64];
-    uint8_t file[128];
-    uint8_t options[312];
+    std::array<uint8_t, 16> chaddr;
+    std::array<uint8_t, 64> sname;
+    std::array<uint8_t, 128> file;
+    std::array<uint8_t, 312> options;
 };
+static_assert(sizeof(DhcpPacket) == 548);
 
 struct DhcpLease {
     uint32_t your_ip;      // host order
@@ -93,14 +96,33 @@ struct DhcpLease {
 
 // ---- Helpers ----
 
+void copy_ifreq_name(struct ifreq& ifr, const char* ifname) {
+    auto dest = std::span<char, IFNAMSIZ>(ifr.ifr_name);
+    std::ranges::fill(dest, '\0');
+    if (ifname == nullptr) {
+        return;
+    }
+
+    size_t const LEN = std::min(std::strlen(ifname), dest.size() - 1);
+    std::copy_n(ifname, LEN, dest.data());
+}
+
 auto get_mac(int sock, const char* ifname, std::array<uint8_t, 6>& mac) -> bool {
     ifreq ifr{};
-    std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    copy_ifreq_name(ifr, ifname);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0) {
         return false;
     }
-    std::memcpy(mac.data(), ifr.ifr_hwaddr.sa_data, 6);
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay): sockaddr is a C ioctl ABI.
+    std::memcpy(mac.data(), ifr.ifr_hwaddr.sa_data, mac.size());
     return true;
+}
+
+auto load_network_u32(const uint8_t* data) -> uint32_t {
+    uint32_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return ntohl(value);
 }
 
 void ip_to_str(uint32_t ip_host, char* buf, size_t len) {
@@ -109,18 +131,17 @@ void ip_to_str(uint32_t ip_host, char* buf, size_t len) {
     inet_ntop(AF_INET, &a, buf, static_cast<socklen_t>(len));
 }
 
-auto build_discover(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid) -> size_t {
-    std::memset(pkt, 0, sizeof(DhcpPacket));
+auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid) -> size_t {
+    *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
     pkt->hlen = DHCP_HLEN_ETHER;
     pkt->xid = htonl(xid);
     pkt->flags = htons(0x8000);  // broadcast flag
-    std::memcpy(pkt->chaddr, mac, 6);
+    std::ranges::copy(mac, pkt->chaddr.begin());
 
-    uint8_t* opt = pkt->options;
-    std::memcpy(opt, MAGIC_COOKIE, 4);
-    opt += 4;
+    uint8_t* opt = pkt->options.data();
+    opt = std::ranges::copy(MAGIC_COOKIE, opt).out;
     // Message type = DISCOVER
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
@@ -136,22 +157,22 @@ auto build_discover(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid) -> size_t
     *opt++ = OPT_END;
 
     // RFC 2131: DHCP messages MUST be at least 300 bytes (padding is already zeroed)
-    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    size_t const USED = sizeof(DhcpPacket) - pkt->options.size() + static_cast<size_t>(opt - pkt->options.data());
     return USED < 300 ? 300 : USED;
 }
 
-auto build_request(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t requested_ip_net, uint32_t server_ip_net) -> size_t {
-    std::memset(pkt, 0, sizeof(DhcpPacket));
+auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t requested_ip_net, uint32_t server_ip_net)
+    -> size_t {
+    *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
     pkt->hlen = DHCP_HLEN_ETHER;
     pkt->xid = htonl(xid);
     pkt->flags = htons(0x8000);
-    std::memcpy(pkt->chaddr, mac, 6);
+    std::ranges::copy(mac, pkt->chaddr.begin());
 
-    uint8_t* opt = pkt->options;
-    std::memcpy(opt, MAGIC_COOKIE, 4);
-    opt += 4;
+    uint8_t* opt = pkt->options.data();
+    opt = std::ranges::copy(MAGIC_COOKIE, opt).out;
     // Message type = REQUEST
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
@@ -176,28 +197,27 @@ auto build_request(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t r
     // End
     *opt++ = OPT_END;
 
-    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    size_t const USED = sizeof(DhcpPacket) - pkt->options.size() + static_cast<size_t>(opt - pkt->options.data());
     return USED < 300 ? 300 : USED;
 }
 
-auto build_renewal(DhcpPacket* pkt, const uint8_t* mac, uint32_t xid, uint32_t client_ip_host) -> size_t {
-    std::memset(pkt, 0, sizeof(DhcpPacket));
+auto build_renewal(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t client_ip_host) -> size_t {
+    *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
     pkt->hlen = DHCP_HLEN_ETHER;
     pkt->xid = htonl(xid);
     pkt->ciaddr = htonl(client_ip_host);  // We have an address now
-    std::memcpy(pkt->chaddr, mac, 6);
+    std::ranges::copy(mac, pkt->chaddr.begin());
 
-    uint8_t* opt = pkt->options;
-    std::memcpy(opt, MAGIC_COOKIE, 4);
-    opt += 4;
+    uint8_t* opt = pkt->options.data();
+    opt = std::ranges::copy(MAGIC_COOKIE, opt).out;
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
     *opt++ = DHCPREQUEST;
     *opt++ = OPT_END;
 
-    size_t const USED = sizeof(DhcpPacket) - sizeof(pkt->options) + static_cast<size_t>(opt - pkt->options);
+    size_t const USED = sizeof(DhcpPacket) - pkt->options.size() + static_cast<size_t>(opt - pkt->options.data());
     return USED < 300 ? 300 : USED;
 }
 
@@ -218,13 +238,13 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
     lease->server_ip = ntohl(pkt->siaddr);
 
     // Verify magic cookie
-    if (std::memcmp(pkt->options, MAGIC_COOKIE, 4) != 0) {
+    if (std::memcmp(pkt->options.data(), MAGIC_COOKIE.data(), MAGIC_COOKIE.size()) != 0) {
         return 0;
     }
 
     // Parse TLV options
     uint8_t msg_type = 0;
-    const uint8_t* opt = pkt->options + 4;
+    const uint8_t* opt = pkt->options.data() + MAGIC_COOKIE.size();
     const uint8_t* end = data + len;
 
     while (opt < end && *opt != OPT_END) {
@@ -244,32 +264,32 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
         switch (CODE) {
             case OPT_MSG_TYPE:
                 if (OLEN >= 1) {
-                    msg_type = opt[0];
+                    msg_type = *opt;
                 }
                 break;
             case OPT_SUBNET_MASK:
                 if (OLEN >= 4) {
-                    lease->subnet_mask = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                    lease->subnet_mask = load_network_u32(opt);
                 }
                 break;
             case OPT_ROUTER:
                 if (OLEN >= 4) {
-                    lease->router = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                    lease->router = load_network_u32(opt);
                 }
                 break;
             case OPT_DNS:
                 if (OLEN >= 4) {
-                    lease->dns = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                    lease->dns = load_network_u32(opt);
                 }
                 break;
             case OPT_SERVER_ID:
                 if (OLEN >= 4) {
-                    lease->server_ip = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                    lease->server_ip = load_network_u32(opt);
                 }
                 break;
             case OPT_LEASE_TIME:
                 if (OLEN >= 4) {
-                    lease->lease_time = ntohl(*reinterpret_cast<const uint32_t*>(opt));
+                    lease->lease_time = load_network_u32(opt);
                 }
                 break;
             default:
@@ -290,7 +310,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
     // Set IP address
     {
         ifreq ifr{};
-        std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        copy_ifreq_name(ifr, ifname);
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.your_ip);
@@ -300,7 +320,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
     // Set netmask
     if (lease.subnet_mask != 0) {
         ifreq ifr{};
-        std::strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        copy_ifreq_name(ifr, ifname);
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.subnet_mask);
@@ -312,8 +332,12 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
     if (lease.subnet_mask != 0) {
         struct rtentry rt{};
         rt.rt_flags = RTF_UP;
-        *reinterpret_cast<uint32_t*>(&rt.rt_dst) = htonl(lease.your_ip & lease.subnet_mask);
-        *reinterpret_cast<uint32_t*>(&rt.rt_genmask) = htonl(lease.subnet_mask);
+        auto* dst = reinterpret_cast<struct sockaddr_in*>(&rt.rt_dst);
+        dst->sin_family = AF_INET;
+        dst->sin_addr.s_addr = htonl(lease.your_ip & lease.subnet_mask);
+        auto* genmask = reinterpret_cast<struct sockaddr_in*>(&rt.rt_genmask);
+        genmask->sin_family = AF_INET;
+        genmask->sin_addr.s_addr = htonl(lease.subnet_mask);
         ioctl(SOCK, SIOCADDRT, &rt);
     }
 
@@ -321,7 +345,9 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
     if (lease.router != 0) {
         rtentry rt{};
         rt.rt_flags = RTF_UP | RTF_GATEWAY;
-        *reinterpret_cast<uint32_t*>(&rt.rt_gateway) = htonl(lease.router);
+        auto* gateway = reinterpret_cast<struct sockaddr_in*>(&rt.rt_gateway);
+        gateway->sin_family = AF_INET;
+        gateway->sin_addr.s_addr = htonl(lease.router);
         ioctl(SOCK, SIOCADDRT, &rt);
     }
 
@@ -433,22 +459,20 @@ auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t 
     return 0;
 }
 
-}  // anonymous namespace
-
 // Parse /etc/netdevs and return the first ifname assigned to the given driver.
 // On failure, returns the provided fallback.
-static auto netdevs_find_ifname(const char* driver, const char* fallback) -> const char* {
-    static char s_ifname[16] = {};
+auto netdevs_find_ifname(const char* driver, const char* fallback) -> const char* {
+    static std::array<char, 16> s_ifname{};
 
     FILE* f = fopen("/etc/netdevs", "r");
     if (f == nullptr) {
         return fallback;
     }
 
-    char line[128];
-    while (fgets(line, sizeof(line), f) != nullptr) {
+    std::array<char, 128> line{};
+    while (fgets(line.data(), static_cast<int>(line.size()), f) != nullptr) {
         // Skip comments and blank lines
-        char const* p = line;
+        char const* p = line.data();
         while (*p == ' ' || *p == '\t') {
             p++;
         }
@@ -457,22 +481,25 @@ static auto netdevs_find_ifname(const char* driver, const char* fallback) -> con
         }
 
         // Parse "<ifname> <driver>"
-        char tok_ifname[16] = {};
-        char tok_driver[32] = {};
-        if (sscanf(p, "%15s %31s", tok_ifname, tok_driver) != 2) {
+        std::array<char, 16> tok_ifname{};
+        std::array<char, 32> tok_driver{};
+        if (sscanf(p, "%15s %31s", tok_ifname.data(), tok_driver.data()) != 2) {
             continue;
         }
 
-        if (std::strcmp(tok_driver, driver) == 0) {
+        if (std::strcmp(tok_driver.data(), driver) == 0) {
             fclose(f);
-            std::strncpy(s_ifname, tok_ifname, 15);
-            s_ifname[15] = '\0';
-            return s_ifname;
+            std::ranges::fill(s_ifname, '\0');
+            size_t const LEN = std::min(std::strlen(tok_ifname.data()), s_ifname.size() - 1);
+            std::copy_n(tok_ifname.data(), LEN, s_ifname.data());
+            return s_ifname.data();
         }
     }
     fclose(f);
     return fallback;
 }
+
+}  // namespace
 
 auto main(int argc, char** argv) -> int {
     (void)argc;
@@ -508,7 +535,8 @@ auto main(int argc, char** argv) -> int {
             close(TMP);
         }
     }
-    logger::info("netd: MAC = %02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    logger::info("netd: MAC = %02x:%02x:%02x:%02x:%02x:%02x", std::get<0>(mac), std::get<1>(mac), std::get<2>(mac), std::get<3>(mac),
+                 std::get<4>(mac), std::get<5>(mac));
 
     // DHCP destination: 255.255.255.255:67
     struct sockaddr_in dst_addr{};
@@ -517,8 +545,8 @@ auto main(int argc, char** argv) -> int {
     dst_addr.sin_addr.s_addr = htonl(0xFFFFFFFF);
 
     // Derive xid from MAC address to ensure uniqueness across VMs
-    uint32_t xid = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) | (static_cast<uint32_t>(mac[4]) << 8) |
-                   static_cast<uint32_t>(mac[5]);
+    uint32_t xid = (static_cast<uint32_t>(std::get<2>(mac)) << 24) | (static_cast<uint32_t>(std::get<3>(mac)) << 16) |
+                   (static_cast<uint32_t>(std::get<4>(mac)) << 8) | static_cast<uint32_t>(std::get<5>(mac));
     DhcpPacket pkt{};
     std::array<uint8_t, 1500> recv_buf{};
     DhcpLease lease{};
@@ -530,7 +558,7 @@ nak_restart:
     lease = {};  // reset lease on restart
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
         logger::debug("netd: sending DISCOVER (attempt %d/%d)", attempt + 1, MAX_DISCOVER_RETRIES);
-        size_t const PKT_LEN = build_discover(&pkt, mac.data(), xid);
+        size_t const PKT_LEN = build_discover(&pkt, mac, xid);
         sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
         // Keep receiving until timeout, draining stale packets with wrong xid
@@ -542,13 +570,13 @@ nak_restart:
             uint8_t const MSG = parse_reply(recv_buf.data(), static_cast<size_t>(N), xid, &lease);
             if (MSG == DHCPOFFER) {
                 got_offer = true;
-                char ip_str[16];
-                char mask_str[16];
-                char gw_str[16];
-                ip_to_str(lease.your_ip, ip_str, sizeof(ip_str));
-                ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
-                ip_to_str(lease.router, gw_str, sizeof(gw_str));
-                logger::info("netd: received OFFER: ip=%s mask=%s gw=%s", ip_str, mask_str, gw_str);
+                std::array<char, 16> ip_str{};
+                std::array<char, 16> mask_str{};
+                std::array<char, 16> gw_str{};
+                ip_to_str(lease.your_ip, ip_str.data(), ip_str.size());
+                ip_to_str(lease.subnet_mask, mask_str.data(), mask_str.size());
+                ip_to_str(lease.router, gw_str.data(), gw_str.size());
+                logger::info("netd: received OFFER: ip=%s mask=%s gw=%s", ip_str.data(), mask_str.data(), gw_str.data());
             }
             // msg == 0 or other types: wrong xid or irrelevant, keep trying until timeout
         }
@@ -564,7 +592,7 @@ nak_restart:
     bool got_ack = false;
     for (int attempt = 0; attempt < MAX_REQUEST_RETRIES && !got_ack; attempt++) {
         logger::debug("netd: sending REQUEST (attempt %d/%d)", attempt + 1, MAX_REQUEST_RETRIES);
-        size_t const PKT_LEN = build_request(&pkt, mac.data(), xid, htonl(lease.your_ip), htonl(lease.server_ip));
+        size_t const PKT_LEN = build_request(&pkt, mac, xid, htonl(lease.your_ip), htonl(lease.server_ip));
         sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
 
         // Keep receiving until timeout, draining stale packets with wrong xid
@@ -619,16 +647,16 @@ request_failed:
     apply_lease(ifname, lease);
 
     {
-        char ip_str[16];
-        char mask_str[16];
-        char gw_str[16];
-        char dns_str[16];
-        ip_to_str(lease.your_ip, ip_str, sizeof(ip_str));
-        ip_to_str(lease.subnet_mask, mask_str, sizeof(mask_str));
-        ip_to_str(lease.router, gw_str, sizeof(gw_str));
-        ip_to_str(lease.dns, dns_str, sizeof(dns_str));
-        logger::info("netd: %s configured: ip=%s mask=%s gw=%s dns=%s lease=%us", ifname, ip_str, mask_str, gw_str, dns_str,
-                     lease.lease_time);
+        std::array<char, 16> ip_str{};
+        std::array<char, 16> mask_str{};
+        std::array<char, 16> gw_str{};
+        std::array<char, 16> dns_str{};
+        ip_to_str(lease.your_ip, ip_str.data(), ip_str.size());
+        ip_to_str(lease.subnet_mask, mask_str.data(), mask_str.size());
+        ip_to_str(lease.router, gw_str.data(), gw_str.size());
+        ip_to_str(lease.dns, dns_str.data(), dns_str.size());
+        logger::info("netd: %s configured: ip=%s mask=%s gw=%s dns=%s lease=%us", ifname, ip_str.data(), mask_str.data(), gw_str.data(),
+                     dns_str.data(), lease.lease_time);
     }
 
     // === LEASE RENEWAL LOOP ===
@@ -655,7 +683,7 @@ request_failed:
         }
         ++xid;
 
-        size_t const PKT_LEN = build_renewal(&pkt, mac.data(), xid, lease.your_ip);
+        size_t const PKT_LEN = build_renewal(&pkt, mac, xid, lease.your_ip);
 
         // Renewal: unicast to DHCP server
         struct sockaddr_in server{};

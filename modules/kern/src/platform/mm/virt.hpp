@@ -25,7 +25,7 @@ struct Range {
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
           limine_executable_address_response* kernel_address_response);
 
-static inline auto get_kernel_page_table() -> PageTable* { return (PageTable*)rdcr3(); }
+static inline auto get_kernel_page_table() -> PageTable* { return reinterpret_cast<PageTable*>(rdcr3()); }
 
 void map_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 bool is_page_mapped(PageTable* page_table, vaddr_t vaddr);

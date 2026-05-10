@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 
@@ -7,8 +9,9 @@ namespace ker::mod::mm {
 struct PageAllocator;
 }  // namespace ker::mod::mm
 namespace ker::mod::mm::paging {
-const static uint64_t PAGE_SHIFT = 12;
-const static uint64_t PAGE_SIZE = 0x1000;
+constexpr uint64_t PAGE_SHIFT = 12;
+constexpr uint64_t PAGE_SIZE = 0x1000;
+constexpr size_t PAGE_TABLE_ENTRIES = 512;
 }  // namespace ker::mod::mm::paging
 
 template <typename T>
@@ -23,6 +26,7 @@ constexpr auto page_align_up(T addr) -> T {
 
 namespace ker::mod::mm::paging {
 struct PageZone {
+    constexpr static uint64_t ZONE_HUGE_PAGES = 9999;  // Special zone number for huge pages
     PageZone* next;
     mm::PageAllocator* allocator;
     uint64_t start;
@@ -48,9 +52,16 @@ struct PageTableEntry {
     uint64_t no_execute : 1;  // NX bit (if EFER.NXE enabled)
 } __attribute__((packed));
 
+static_assert(sizeof(PageTableEntry) == sizeof(uint64_t));
+static_assert(alignof(PageTableEntry) == alignof(uint8_t));
+
 struct PageTable {
-    PageTableEntry entries[512];
+    std::array<PageTableEntry, PAGE_TABLE_ENTRIES> entries;
 } __attribute__((packed));
+
+static_assert(sizeof(PageTable) == PAGE_SIZE);
+static_assert(alignof(PageTable) == alignof(uint8_t));
+static_assert(offsetof(PageTable, entries) == 0);
 
 struct PageFault {
     uint8_t present;

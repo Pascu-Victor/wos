@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <string_view>
 #include <vfs/stat.hpp>
 
@@ -19,7 +19,7 @@ namespace ker::vfs {
 // Helper inline functions for logging (optimizes away when VFS_DEBUG is not defined)
 inline void vfs_debug_log(const char* msg) {
 #ifdef VFS_DEBUG
-    ker::mod::io::serial::write(msg);
+    ker::mod::dbg::logger<"vfs">::debug("%s", msg);
 #else
     (void)msg;
 #endif
@@ -27,7 +27,7 @@ inline void vfs_debug_log(const char* msg) {
 
 inline void vfs_debug_log_hex(uint64_t value) {
 #ifdef VFS_DEBUG
-    ker::mod::io::serial::writeHex(value);
+    ker::mod::dbg::logger<"vfs">::debug("0x%llx", static_cast<unsigned long long>(value));
 #else
     (void)value;
 #endif
@@ -38,9 +38,9 @@ enum class vfs_node_type : uint8_t { FILE, DIRECTORY, DEVICE, SOCKET, SYMLINK };
 struct File;
 
 struct VNode {
-    const char* name;
-    vfs_node_type type;
-    void* private_data;
+    const char* name{};
+    vfs_node_type type{};
+    void* private_data{};
 };
 
 // Open a path and return a file descriptor-like opaque pointer
@@ -118,7 +118,7 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
 auto vfs_ftruncate(int fd, off_t length) -> int;
 
 // Pipe
-auto vfs_pipe(int pipefd[2]) -> int;
+auto vfs_pipe(int pipefd[2]) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 
 // Sync
 auto vfs_fsync(int fd) -> int;

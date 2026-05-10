@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <net/netdevice.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -18,6 +20,8 @@
 
 namespace ker::net {
 
+using log = ker::mod::dbg::logger<"netpoll">;
+
 namespace {
 
 // Registry of all NAPI structures for worker thread lookup
@@ -27,9 +31,9 @@ ker::mod::sys::Spinlock g_registry_lock;
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
     auto* current = ker::mod::sched::get_current_task();
-    for (size_t i = 0; i < g_napi_registry.size(); ++i) {
-        if (g_napi_registry[i] != nullptr && g_napi_registry[i]->worker == current) {
-            return g_napi_registry[i];
+    for (auto* napi : g_napi_registry) {
+        if (napi != nullptr && napi->worker == current) {
+            return napi;
         }
     }
     return nullptr;
@@ -38,7 +42,7 @@ auto find_napi_for_current_task() -> NapiStruct* {
 // Register a NapiStruct in the global registry
 void register_napi(NapiStruct* napi) {
     g_registry_lock.lock();
-    g_napi_registry.push_back(napi);
+    static_cast<void>(g_napi_registry.push_back(napi));
     g_registry_lock.unlock();
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
                                           static_cast<int64_t>(g_napi_registry.size()), 0, 0);
@@ -48,7 +52,7 @@ void register_napi(NapiStruct* napi) {
 void unregister_napi(NapiStruct* napi) {
     g_registry_lock.lock();
     for (size_t i = 0; i < g_napi_registry.size(); ++i) {
-        if (g_napi_registry[i] == napi) {
+        if (g_napi_registry.at(i) == napi) {
             g_napi_registry.remove_at(i);
             g_registry_lock.unlock();
             ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
@@ -113,13 +117,13 @@ void unregister_napi(NapiStruct* napi) {
     NapiStruct* my_napi = find_napi_for_current_task();
 
     if (my_napi == nullptr) {
-        ker::mod::dbg::log("netpoll: FATAL - worker thread could not find its NapiStruct");
+        log::critical("worker thread could not find its NapiStruct");
         for (;;) {
             asm volatile("hlt");
         }
     }
 
-    ker::mod::dbg::log("netpoll: worker for %s started", my_napi->dev->name.data());
+    log::debug("worker for %s started", my_napi->dev->name.data());
 
     // Run the worker loop
     napi_worker_loop(my_napi);
@@ -148,18 +152,19 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     // Build thread name: "netpoll_eth0"
     std::array<char, 32> name{};
     const char* dev_name = napi->dev->name.data();
+    std::string_view const DEV_NAME = dev_name;
     std::string_view const PREFIX = "netpoll_";
     size_t name_len = PREFIX.size();
     std::ranges::copy(PREFIX, name.begin());
-    for (size_t i = 0; dev_name[i] != '\0' && name_len < name.size() - 1; ++i) {
-        name[name_len++] = dev_name[i];
-    }
-    name[name_len] = '\0';
+    size_t const COPY_LEN = std::min(DEV_NAME.size(), name.size() - name_len - 1);
+    std::ranges::copy(DEV_NAME.substr(0, COPY_LEN), std::next(name.begin(), static_cast<ptrdiff_t>(name_len)));
+    name_len += COPY_LEN;
+    name.at(name_len) = '\0';
 
     // Create dedicated worker thread
     napi->worker = ker::mod::sched::task::Task::create_kernel_thread(name.data(), napi_worker_entry);
     if (napi->worker == nullptr) {
-        ker::mod::dbg::log("netpoll: failed to create worker thread for %s", dev_name);
+        log::warn("failed to create worker thread for %s", dev_name);
         unregister_napi(napi);
         return;
     }
@@ -174,7 +179,7 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     // Transition to IDLE state (ready to receive IRQs)
     napi->state.store(NapiState::IDLE, std::memory_order_release);
 
-    ker::mod::dbg::log("netpoll: enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
+    log::debug("enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
 }
 
 void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) {
@@ -209,7 +214,7 @@ void napi_disable(NapiStruct* napi) {
     // Clear direct pointer
     napi->dev->napi = nullptr;
 
-    ker::mod::dbg::log("netpoll: disabled for %s", napi->dev->name.data());
+    log::debug("disabled for %s", napi->dev->name.data());
 }
 
 auto napi_schedule(NapiStruct* napi) -> bool {
@@ -314,16 +319,16 @@ auto napi_poll_all_pending() -> int {
     // (napi_poll_inline_budget is safe to call without the registry lock).
     g_registry_lock.lock();
     size_t count = g_napi_registry.size();
-    NapiStruct* snapshot[16];
+    std::array<NapiStruct*, 16> snapshot{};
     count = std::min<size_t>(count, 16);
     for (size_t i = 0; i < count; ++i) {
-        snapshot[i] = g_napi_registry[i];
+        snapshot.at(i) = g_napi_registry.at(i);
     }
     g_registry_lock.unlock();
 
     for (size_t i = 0; i < count; ++i) {
-        if (snapshot[i] != nullptr && snapshot[i]->dev != nullptr) {
-            total += napi_poll_inline_budget(snapshot[i]->dev, NAPI_DEFAULT_WEIGHT);
+        if (auto* napi = snapshot.at(i); napi != nullptr && napi->dev != nullptr) {
+            total += napi_poll_inline_budget(napi->dev, NAPI_DEFAULT_WEIGHT);
         }
     }
     return total;

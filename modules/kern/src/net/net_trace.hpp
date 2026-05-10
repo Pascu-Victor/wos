@@ -15,6 +15,8 @@ namespace ker::net::trace {
 
 #ifdef NET_TRACE
 
+using log = ker::mod::dbg::logger<"net">;
+
 constexpr uint32_t DUMP_INTERVAL = 1000;
 
 struct Span {
@@ -77,14 +79,14 @@ inline void flush() {
         }
         uint64_t avg = s.total_cycles / s.count;
         // keep format minimal kernel sprintf is not a full impl
-        ker::mod::dbg::log("TRACE %s n=%u  min=%lu  avg=%lu  max=%lu", s.name, s.count, static_cast<unsigned long>(s.min_cycles),
-                           static_cast<unsigned long>(avg), static_cast<unsigned long>(s.max_cycles));
+        log::trace("TRACE %s n=%u  min=%lu  avg=%lu  max=%lu", s.name, s.count, static_cast<unsigned long>(s.min_cycles),
+                   static_cast<unsigned long>(avg), static_cast<unsigned long>(s.max_cycles));
         s.total_cycles = 0;
         s.min_cycles = ~0ULL;
         s.max_cycles = 0;
         s.count = 0;
     }
-    ker::mod::dbg::log("TRACE ---");
+    log::trace("TRACE ---");
 }
 
 struct ScopedSpan {
@@ -94,13 +96,13 @@ struct ScopedSpan {
     ~ScopedSpan() { span.record(rdtsc() - start); }
 };
 
-#define NET_TRACE_SPAN(id) ker::net::trace::ScopedSpan _trace_##id(ker::net::trace::id)
-#define NET_TRACE_TICK() ker::net::trace::maybe_dump()
+#define NET_TRACE_SPAN(id) ker::net::trace::ScopedSpan _trace_##id(ker::net::trace::id)  // NOLINT(cppcoreguidelines-macro-usage)
+#define NET_TRACE_TICK() ker::net::trace::maybe_dump()                                   // NOLINT(cppcoreguidelines-macro-usage)
 
 #else
 
-#define NET_TRACE_SPAN(id) ((void)0)
-#define NET_TRACE_TICK() ((void)0)
+#define NET_TRACE_SPAN(id) ((void)0)  // NOLINT(cppcoreguidelines-macro-usage)
+#define NET_TRACE_TICK() ((void)0)    // NOLINT(cppcoreguidelines-macro-usage)
 
 #endif
 

@@ -17,6 +17,7 @@
 #include "util/hcf.hpp"
 #ifdef WOS_KASAN
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -32,7 +33,13 @@
 #include "kasan.hpp"
 #include "platform/asm/tlb.hpp"
 
+// KASan is a low-level sanitizer runtime: it must touch raw shadow memory,
+// page-table entries, and compiler ABI symbols directly.
+// NOLINTBEGIN(misc-use-anonymous-namespace, cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 namespace ker::mod::kasan {
+namespace {
+using log = ker::mod::dbg::logger<"kasan">;
+}
 
 // ---------------------------------------------------------------------------
 // Shadow region bounds
@@ -49,14 +56,14 @@ namespace ker::mod::kasan {
 // Lower bound of the shadow region we consider valid for demand-paging.
 // Derived: shadow_of(0x0) = SHADOW_OFFSET >> 3 * 0 + SHADOW_OFFSET.
 // For safety just use SHADOW_OFFSET as the bottom.
-static constexpr uint64_t SHADOW_REGION_BASE = SHADOW_OFFSET;
+constexpr uint64_t SHADOW_REGION_BASE = SHADOW_OFFSET;
 
 // Upper bound: shadow for the top of canonical address space.
 // shadow_of(0xffffffffffffffff) = (0xffffffffffffffff >> 3) + SHADOW_OFFSET
 //                                = 0x1fffffffffffffff + 0xdffffc0000000000
 //                                ≈ 0xfffffc0000000000 (wraps in 64 bits, fine)
 // Use a generous end that covers all kernel VA.
-static constexpr uint64_t SHADOW_REGION_END = 0xfffffc2000000000ULL;
+constexpr uint64_t SHADOW_REGION_END = 0xfffffc2000000000ULL;
 
 // ---------------------------------------------------------------------------
 // Shadow page fault handler
@@ -75,16 +82,16 @@ static std::atomic<uint64_t> s_shadow_dup_count{0};    // already-mapped hits (c
 
 // Ring buffer of the last 16 unique shadow_vaddrs we mapped, to detect
 // the "mapping not sticking" bug (same address faults again and again).
-static constexpr size_t SFAULT_RECENT = 16;
-static uint64_t s_recent_shadow_vaddr[SFAULT_RECENT]{};    // NOLINT
-static std::atomic<uint32_t> s_recent_head{0};             // NOLINT
-static std::atomic_flag s_recent_lock = ATOMIC_FLAG_INIT;  // NOLINT
+constexpr size_t SFAULT_RECENT = 16;
+static std::array<uint64_t, SFAULT_RECENT> s_recent_shadow_vaddr{};  // NOLINT
+static std::atomic<uint32_t> s_recent_head{0};                       // NOLINT
+static std::atomic_flag s_recent_lock = ATOMIC_FLAG_INIT;            // NOLINT
 
 // Get current CPU index — reads LAPIC ID via x2APIC MSR 0x802.
 // Before x2APIC is enabled (early boot), we're single-threaded on the BSP
 // so returning 0 is safe. We detect this by checking IA32_APIC_BASE (MSR 0x1B)
 // bit 10 (x2APIC enable).
-static inline auto shadow_cpu_index() -> uint64_t {
+static auto shadow_cpu_index() -> uint64_t {
     // NOLINTBEGIN(misc-const-correctness)
     uint32_t apic_base_lo = 0;
     uint32_t apic_base_hi = 0;
@@ -111,7 +118,7 @@ static inline auto shadow_cpu_index() -> uint64_t {
 // the task pagemap does not. We must propagate the slot here so the CPU can
 // walk the page tables correctly.
 static void sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) {
-    auto const KPHYS = (uint64_t)mm::addr::get_phys_pointer((mm::addr::vaddr_t)kernel_pml4);
+    auto const KPHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(kernel_pml4)));
     uint64_t const CUR_CR3 = rdcr3();
     if (CUR_CR3 != KPHYS) {
         auto* cur_pml4 = reinterpret_cast<mm::paging::PageTable*>(mm::addr::get_virt_pointer(static_cast<mm::addr::paddr_t>(CUR_CR3)));
@@ -139,14 +146,14 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
     void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
     if (phys_page == nullptr) {
-        dbg::log("[KASan] OOM allocating shadow page for cr2=0x%lx", cr2);
+        log::error("OOM allocating shadow page for cr2=0x%lx", cr2);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return false;
     }
-    memset(phys_page, 0x00, mm::paging::PAGE_SIZE);
+    std::memset(phys_page, 0x00, mm::paging::PAGE_SIZE);
 
     auto shadow_vaddr = static_cast<mm::addr::vaddr_t>(cr2 & ~(mm::paging::PAGE_SIZE - 1));
-    auto shadow_paddr = (mm::addr::paddr_t)mm::addr::get_phys_pointer((mm::addr::vaddr_t)phys_page);
+    auto shadow_paddr = reinterpret_cast<mm::addr::paddr_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(phys_page)));
 
     // Serialise page-table manipulation so two CPUs faulting on the same
     // shadow page don't both create a mapping and leak the second page.
@@ -160,8 +167,8 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
         s_shadow_map_lock.clear(std::memory_order_release);
         uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((DUPS % 1000) == 0) {
-            dbg::log(
-                "[KASan] already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
+            log::warn(
+                "already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
                 "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
                 "gpr info: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx "
                 "r13=0x%lx r14=0x%lx r15=0x%lx",
@@ -193,16 +200,16 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
         }
     }
     uint32_t const HEAD = s_recent_head.load(std::memory_order_relaxed);
-    s_recent_shadow_vaddr[HEAD % SFAULT_RECENT] = shadow_vaddr;
+    s_recent_shadow_vaddr[HEAD % s_recent_shadow_vaddr.size()] = shadow_vaddr;
     s_recent_head.store((HEAD + 1) % SFAULT_RECENT, std::memory_order_relaxed);
     s_recent_lock.clear(std::memory_order_release);
 
     if (repeat) {
-        dbg::log("[KASan] REPEAT shadow fault #%lu: shadow_vaddr=0x%lx — mapping not sticking!", N, shadow_vaddr);
+        log::warn("REPEAT shadow fault #%lu: shadow_vaddr=0x%lx - mapping not sticking", N, shadow_vaddr);
     }
     if ((N % 100000) == 0) {
-        dbg::log("[KASan] shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", N, cr2, shadow_vaddr,
-                 s_shadow_dup_count.load(std::memory_order_relaxed));
+        log::debug("shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", N, cr2, shadow_vaddr,
+                   s_shadow_dup_count.load(std::memory_order_relaxed));
     }
 
     s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
@@ -220,7 +227,7 @@ void poison_range(const void* ptr, size_t size, int8_t value) {
     size_t const FULL_UNITS = size / 8;
     int8_t* shadow = addr_to_shadow(addr);
     if (FULL_UNITS > 0) {
-        memset(shadow, value, FULL_UNITS);
+        std::memset(shadow, value, FULL_UNITS);
     }
 
     // Partial last granule: if poisoning, mark as partially accessible
@@ -250,15 +257,15 @@ void init() {
     // For global redzones (emitted by -asan-globals=1), Clang calls
     // __asan_register_globals() which we stub out below — we rely on the
     // demand-fault mechanism instead of pre-populating global shadows.
-    dbg::log("[KASan] initialized (shadow base=0x%lx)", SHADOW_OFFSET);
+    log::info("initialized (shadow base=0x%lx)", SHADOW_OFFSET);
 }
 
-void enable() { s_active = true; }
-
-bool is_enabled() {
-    return s_active;
-    dbg::log("[KASan] runtime shadow checks enabled");
+void enable() {
+    s_active = true;
+    log::info("runtime shadow checks enabled");
 }
+
+bool is_enabled() { return s_active; }
 
 bool in_shadow_fault() {
     uint64_t const CPU = shadow_cpu_index();
@@ -284,7 +291,7 @@ namespace {
 namespace ser = ker::mod::io::serial;
 
 void kasan_write_hex(uint64_t val) {
-    char buf[19];
+    std::array<char, 19> buf{};
     buf[0] = '0';
     buf[1] = 'x';
     constexpr const char* HEX = "0123456789abcdef";
@@ -292,12 +299,12 @@ void kasan_write_hex(uint64_t val) {
         buf[2 + (15 - i)] = HEX[(val >> (i * 4)) & 0xf];
     }
     buf[18] = '\0';
-    ser::write_unlocked(buf);
+    ser::write_unlocked(buf.data());
 }
 
 void kasan_write_dec(uint64_t val) {
-    char buf[21];
-    int pos = 20;
+    std::array<char, 21> buf{};
+    int pos = static_cast<int>(buf.size() - 1);
     buf[pos] = '\0';
     if (val == 0) {
         buf[--pos] = '0';
@@ -307,7 +314,7 @@ void kasan_write_dec(uint64_t val) {
             val /= 10;
         }
     }
-    ser::write_unlocked(buf + pos);
+    ser::write_unlocked(buf.data() + pos);
 }
 
 // Describe a shadow byte value (ASan convention)
@@ -376,11 +383,11 @@ void kasan_hexdump(uintptr_t addr, size_t size) {
             if (IS_TARGET) {
                 ser::write_unlocked("[");
             }
-            char h[3];
+            std::array<char, 3> h{};
             h[0] = HEX[p[i] >> 4];
             h[1] = HEX[p[i] & 0xf];
             h[2] = '\0';
-            ser::write_unlocked(h);
+            ser::write_unlocked(h.data());
             if (IS_TARGET) {
                 ser::write_unlocked("]");
             } else {
@@ -431,12 +438,12 @@ void kasan_shadow_map(uintptr_t addr) {
             if (IS_TARGET) {
                 ser::write_unlocked("[");
             }
-            char h[3];
+            std::array<char, 3> h{};
             auto byte = static_cast<uint8_t>(p[i]);
             h[0] = HEX[byte >> 4];
             h[1] = HEX[byte & 0xf];
             h[2] = '\0';
-            ser::write_unlocked(h);
+            ser::write_unlocked(h.data());
             if (IS_TARGET) {
                 ser::write_unlocked("]");
             } else {
@@ -493,13 +500,13 @@ void kasan_shadow_map(uintptr_t addr) {
     ser::write_unlocked("  Shadow byte: ");
     {
         constexpr const char* HEX = "0123456789abcdef";
-        char h[5];
+        std::array<char, 5> h{};
         h[0] = '0';
         h[1] = 'x';
         h[2] = HEX[(static_cast<uint8_t>(S)) >> 4];
         h[3] = HEX[(static_cast<uint8_t>(S)) & 0xf];
         h[4] = '\0';
-        ser::write_unlocked(h);
+        ser::write_unlocked(h.data());
     }
     ser::write_unlocked(" (");
     ser::write_unlocked(kasan_shadow_desc(S));
@@ -509,26 +516,26 @@ void kasan_shadow_map(uintptr_t addr) {
     ser::write_unlocked("  Adjacent: prev=");
     {
         constexpr const char* HEX = "0123456789abcdef";
-        char h[5];
+        std::array<char, 5> h{};
         h[0] = '0';
         h[1] = 'x';
         h[2] = HEX[(static_cast<uint8_t>(shadow[-1])) >> 4];
         h[3] = HEX[(static_cast<uint8_t>(shadow[-1])) & 0xf];
         h[4] = '\0';
-        ser::write_unlocked(h);
+        ser::write_unlocked(h.data());
     }
     ser::write_unlocked("(");
     ser::write_unlocked(kasan_shadow_desc(shadow[-1]));
     ser::write_unlocked(")  next=");
     {
         constexpr const char* HEX = "0123456789abcdef";
-        char h[5];
+        std::array<char, 5> h{};
         h[0] = '0';
         h[1] = 'x';
         h[2] = HEX[(static_cast<uint8_t>(shadow[1])) >> 4];
         h[3] = HEX[(static_cast<uint8_t>(shadow[1])) & 0xf];
         h[4] = '\0';
-        ser::write_unlocked(h);
+        ser::write_unlocked(h.data());
     }
     ser::write_unlocked("(");
     ser::write_unlocked(kasan_shadow_desc(shadow[1]));
@@ -553,19 +560,23 @@ void kasan_shadow_map(uintptr_t addr) {
 
 // NOLINTBEGIN(readability-identifier-naming)
 
-void __asan_report_load1(uintptr_t addr) { kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_load2(uintptr_t addr) { kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_load4(uintptr_t addr) { kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_load8(uintptr_t addr) { kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_load16(uintptr_t addr) { kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_load_n(uintptr_t addr, size_t size) { kasan_report(addr, size, false, (uintptr_t)__builtin_return_address(0)); }
+void __asan_report_load1(uintptr_t addr) { kasan_report(addr, 1, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_load2(uintptr_t addr) { kasan_report(addr, 2, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_load4(uintptr_t addr) { kasan_report(addr, 4, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_load8(uintptr_t addr) { kasan_report(addr, 8, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_load16(uintptr_t addr) { kasan_report(addr, 16, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_load_n(uintptr_t addr, size_t size) {
+    kasan_report(addr, size, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+}
 
-void __asan_report_store1(uintptr_t addr) { kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_store2(uintptr_t addr) { kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_store4(uintptr_t addr) { kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_store8(uintptr_t addr) { kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_store16(uintptr_t addr) { kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0)); }
-void __asan_report_store_n(uintptr_t addr, size_t size) { kasan_report(addr, size, true, (uintptr_t)__builtin_return_address(0)); }
+void __asan_report_store1(uintptr_t addr) { kasan_report(addr, 1, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_store2(uintptr_t addr) { kasan_report(addr, 2, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_store4(uintptr_t addr) { kasan_report(addr, 4, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_store8(uintptr_t addr) { kasan_report(addr, 8, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_store16(uintptr_t addr) { kasan_report(addr, 16, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0))); }
+void __asan_report_store_n(uintptr_t addr, size_t size) {
+    kasan_report(addr, size, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+}
 
 // ---- Outline shadow check -------------------------------------------------
 // With -asan-instrumentation-with-call-threshold=0, the compiler calls
@@ -579,7 +590,7 @@ void __asan_report_store_n(uintptr_t addr, size_t size) { kasan_report(addr, siz
 
 extern "C" char __kernel_end[];
 
-static inline auto check_shadow(uintptr_t addr, size_t size) -> bool {
+auto check_shadow(uintptr_t addr, size_t size) -> bool {
     if (__builtin_expect(static_cast<long>(!ker::mod::kasan::s_active), 0) != 0) {
         return true;  // KASan not yet live — skip
     }
@@ -630,63 +641,63 @@ static inline auto check_shadow(uintptr_t addr, size_t size) -> bool {
 
 void __asan_load1(uintptr_t addr) {
     if (!check_shadow(addr, 1)) {
-        kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 1, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load2(uintptr_t addr) {
     if (!check_shadow(addr, 2)) {
-        kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 2, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load4(uintptr_t addr) {
     if (!check_shadow(addr, 4)) {
-        kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 4, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load8(uintptr_t addr) {
     if (!check_shadow(addr, 8)) {
-        kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 8, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load16(uintptr_t addr) {
     if (!check_shadow(addr, 16)) {
-        kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 16, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load_n(uintptr_t addr, size_t n) {
     if (!check_shadow(addr, n)) {
-        kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, n, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 
 void __asan_store1(uintptr_t addr) {
     if (!check_shadow(addr, 1)) {
-        kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 1, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store2(uintptr_t addr) {
     if (!check_shadow(addr, 2)) {
-        kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 2, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store4(uintptr_t addr) {
     if (!check_shadow(addr, 4)) {
-        kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 4, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store8(uintptr_t addr) {
     if (!check_shadow(addr, 8)) {
-        kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 8, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store16(uintptr_t addr) {
     if (!check_shadow(addr, 16)) {
-        kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 16, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store_n(uintptr_t addr, size_t n) {
     if (!check_shadow(addr, n)) {
-        kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, n, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 
@@ -694,63 +705,63 @@ void __asan_store_n(uintptr_t addr, size_t n) {
 // We still treat violations as fatal in the kernel.
 void __asan_load1_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 1)) {
-        kasan_report(addr, 1, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 1, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load2_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 2)) {
-        kasan_report(addr, 2, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 2, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load4_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 4)) {
-        kasan_report(addr, 4, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 4, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load8_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 8)) {
-        kasan_report(addr, 8, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 8, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_load16_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 16)) {
-        kasan_report(addr, 16, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 16, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_loadN_noabort(uintptr_t addr, size_t n) {
     if (!check_shadow(addr, n)) {
-        kasan_report(addr, n, false, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, n, false, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 
 void __asan_store1_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 1)) {
-        kasan_report(addr, 1, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 1, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store2_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 2)) {
-        kasan_report(addr, 2, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 2, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store4_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 4)) {
-        kasan_report(addr, 4, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 4, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store8_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 8)) {
-        kasan_report(addr, 8, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 8, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_store16_noabort(uintptr_t addr) {
     if (!check_shadow(addr, 16)) {
-        kasan_report(addr, 16, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, 16, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 void __asan_storeN_noabort(uintptr_t addr, size_t n) {
     if (!check_shadow(addr, n)) {
-        kasan_report(addr, n, true, (uintptr_t)__builtin_return_address(0));
+        kasan_report(addr, n, true, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     }
 }
 
@@ -823,12 +834,12 @@ void __asan_unregister_elf_globals(uintptr_t /*unused*/, void* /*unused*/, void*
 // ---- Shadow bulk-set helpers ----------------------------------------------
 // Emitted by the compiler to fill shadow memory with a constant byte value
 // (e.g. 0x00 to unpoison, 0xf8 to mark freed).
-void __asan_set_shadow_00(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0x00, size); }
-void __asan_set_shadow_f1(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0xf1, size); }
-void __asan_set_shadow_f2(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0xf2, size); }
-void __asan_set_shadow_f3(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0xf3, size); }
-void __asan_set_shadow_f5(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0xf5, size); }
-void __asan_set_shadow_f8(uintptr_t addr, size_t size) { memset(reinterpret_cast<void*>(addr), 0xf8, size); }
+void __asan_set_shadow_00(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0x00, size); }
+void __asan_set_shadow_f1(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0xf1, size); }
+void __asan_set_shadow_f2(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0xf2, size); }
+void __asan_set_shadow_f3(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0xf3, size); }
+void __asan_set_shadow_f5(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0xf5, size); }
+void __asan_set_shadow_f8(uintptr_t addr, size_t size) { std::memset(reinterpret_cast<void*>(addr), 0xf8, size); }
 
 // ---- Dynamic init guards --------------------------------------------------
 // Called around dynamic initializers of globals when -asan-globals=1.
@@ -860,20 +871,23 @@ void __asan_version_mismatch_check_v8() {}
 // The compiler emits calls to these instead of the libc versions when ASan is
 // active.  We just delegate to the kernel's existing implementations.
 
-auto __asan_memset(void* dst, int c, size_t n) -> void* { return memset(dst, c, n); }
-auto __asan_memcpy(void* dst, const void* src, size_t n) -> void* { return memcpy(dst, src, n); }
-auto __asan_memmove(void* dst, const void* src, size_t n) -> void* { return memmove(dst, src, n); }
+auto __asan_memset(void* dst, int c, size_t n) -> void* { return std::memset(dst, c, n); }
+auto __asan_memcpy(void* dst, const void* src, size_t n) -> void* { return std::memcpy(dst, src, n); }
+auto __asan_memmove(void* dst, const void* src, size_t n) -> void* { return std::memmove(dst, src, n); }
 
 // ---- Poison/unpoison helpers called by the runtime ------------------------
 void __asan_poison_memory_region(void const volatile* addr, size_t size) {
-    ker::mod::kasan::poison_range((void*)addr, size, ker::mod::kasan::SHADOW_POISONED);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
+    // ASan's runtime ABI is const/volatile-qualified, but poisoning mutates shadow state only.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    ker::mod::kasan::poison_range(const_cast<void*>(addr), size, ker::mod::kasan::SHADOW_POISONED);
 }
 void __asan_unpoison_memory_region(void const volatile* addr, size_t size) {
-    ker::mod::kasan::unpoison_range((void*)addr, size);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    ker::mod::kasan::unpoison_range(const_cast<void*>(addr), size);
 }
 
 auto __asan_address_is_poisoned(void const volatile* addr) -> int {
-    auto a = (uintptr_t)addr;  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
+    auto a = reinterpret_cast<uintptr_t>(addr);
     int8_t const* shadow = ker::mod::kasan::addr_to_shadow(a);
     int8_t const shadow_val = *shadow;
     if (shadow_val == 0) {
@@ -895,4 +909,5 @@ uintptr_t __asan_region_is_poisoned(uintptr_t beg, size_t size) {
 
 }  // extern "C"
 // NOLINTEND(readability-identifier-naming)
+// NOLINTEND(misc-use-anonymous-namespace, cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 #endif  // WOS_KASAN

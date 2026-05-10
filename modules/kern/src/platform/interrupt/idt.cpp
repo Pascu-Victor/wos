@@ -1,15 +1,24 @@
 #include "idt.hpp"
 
+#include <array>
 #include <cstdint>
 
 #include "platform/interrupt/gdt.hpp"
 
 namespace ker::mod::desc::idt {
-__attribute__((aligned(0x10))) static IdtEntry idt[IDT_ENTRIES];  // at most 256 interrupts
-static IdtPtr idt_ptr;
+
+namespace {
+
+alignas(0x10) std::array<IdtEntry, IDT_ENTRIES> idt{};  // at most 256 interrupts
+IdtPtr idt_ptr;
+
+inline auto calc_idt_entry(uint8_t int_number) -> IdtEntry* { return &idt.at(int_number); }
+
+}  // namespace
 
 void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gate_type, uint8_t dpl) {
-    entry->offset0 = (uint64_t)isr & 0xFFFF;
+    auto const ISR_ADDR = reinterpret_cast<uint64_t>(isr);
+    entry->offset0 = ISR_ADDR & 0xFFFF;
     entry->kernel_cs = gdt::GDT_KERN_CS;
     entry->ist = 0;
     entry->reserved0 = 0;
@@ -17,19 +26,19 @@ void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gate_type, uint8_t dpl) {
     entry->zero0 = 0;
     entry->dpl = dpl;
     entry->present = 1;
-    entry->offset1 = ((uint64_t)isr >> 16) & 0xFFFF;
-    entry->offset2 = ((uint64_t)isr >> 32) & 0xFFFFFFFF;
+    entry->offset1 = (ISR_ADDR >> 16) & 0xFFFF;
+    entry->offset2 = (ISR_ADDR >> 32) & 0xFFFFFFFF;
     entry->reserved1 = 0;
 }
 
-static inline IdtEntry* calcIdtEntry(uint8_t int_number) { return &idt[int_number]; }
+#define ISR_ENTRY(n) idt_set_entry(calc_idt_entry(n), reinterpret_cast<void*>(isr##n), IDT_INTERRUPT_GATE, 0)
+#define ISR_ENTRY_USER(n) idt_set_entry(calc_idt_entry(n), reinterpret_cast<void*>(isr##n), IDT_INTERRUPT_GATE, 3)
+#define ISR_TRAP_ENTRY(n) idt_set_entry(calc_idt_entry(n), reinterpret_cast<void*>(isr_except##n), IDT_TRAP_GATE, 0)
+#define ISR_EXCEPT_ENTRY(n) idt_set_entry(calc_idt_entry(n), reinterpret_cast<void*>(isr_except##n), IDT_INTERRUPT_GATE, 0)
 
-#define ISR_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 0)
-#define ISR_ENTRY_USER(n) idt_set_entry(calcIdtEntry(n), (void*)isr##n, IDT_INTERRUPT_GATE, 3)
-#define ISR_TRAP_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr_except##n, IDT_TRAP_GATE, 0)
-#define ISR_EXCEPT_ENTRY(n) idt_set_entry(calcIdtEntry(n), (void*)isr_except##n, IDT_INTERRUPT_GATE, 0)
+namespace {
 
-static void map_isr_entries() {
+void map_isr_entries() {
     ISR_ENTRY(0);
     ISR_ENTRY(1);
     ISR_ENTRY(2);
@@ -288,11 +297,13 @@ static void map_isr_entries() {
     ISR_ENTRY(255);
 }
 
+}  // namespace
+
 void idt_init() {
     map_isr_entries();
 
     idt_ptr.limit = static_cast<uint16_t>(sizeof(idt)) - 1;
-    idt_ptr.base = (uint64_t)&idt;
+    idt_ptr.base = reinterpret_cast<uint64_t>(idt.data());
 
     load_idt();
 }

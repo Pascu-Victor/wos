@@ -38,16 +38,3 @@ inline static void free(T* ptr) {
     ::ker::mod::mm::dyn::kmalloc::free(static_cast<void*>(ptr));
 }
 }  // namespace ker::mod::mm::dyn::kmalloc
-
-auto operator new(size_t sz) -> void*;
-auto operator new[](size_t sz) -> void*;
-// void operator delete(void* ptr) noexcept;
-void operator delete(void* ptr, size_t size) noexcept;
-// void operator delete[](void* ptr) noexcept;
-void operator delete[](void* ptr, size_t size) noexcept;
-
-void operator delete(void* ptr) noexcept;
-void operator delete[](void* ptr) noexcept;
-
-auto operator new(unsigned long size, std::nothrow_t const& /*unused*/) noexcept -> void*;
-auto operator new[](unsigned long size, std::nothrow_t const& /*unused*/) noexcept -> void*;

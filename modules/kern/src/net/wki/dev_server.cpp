@@ -1,11 +1,13 @@
 #include "dev_server.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
+#include <net/address.hpp>
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
@@ -97,7 +99,7 @@ struct ExistingNetBindingInfo {
 struct NetStateSnapshot {
     uint32_t ipv4_addr = 0;
     uint32_t ipv4_mask = 0;
-    std::array<uint8_t, 6> real_mac = {};
+    proto::MacAddress real_mac;
     uint16_t link_state = 0;
     uint32_t mtu = 1500;
 };
@@ -140,8 +142,9 @@ auto capture_net_state(ker::net::NetDevice* ndev) -> NetStateSnapshot {
 
     auto* nif = ker::net::netif_get(ndev);
     if (nif != nullptr && nif->ipv4_addr_count > 0) {
-        snap.ipv4_addr = nif->ipv4_addrs[0].addr;
-        snap.ipv4_mask = nif->ipv4_addrs[0].netmask;
+        const auto& primary_ipv4 = nif->ipv4_addrs.front();
+        snap.ipv4_addr = primary_ipv4.addr;
+        snap.ipv4_mask = primary_ipv4.netmask;
     }
 
     return snap;
@@ -203,6 +206,17 @@ void rollback_net_binding(uint16_t consumer_node, uint32_t resource_id, ker::net
     }
 }
 
+auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel) -> WkiChannel* {
+    if (wki_requester_controls_dynamic_channel(requester_node, g_wki.my_node_id)) {
+        if (requested_channel < WKI_CHAN_DYNAMIC_BASE) {
+            return nullptr;
+        }
+        return wki_channel_reserve(requester_node, requested_channel, PriorityClass::THROUGHPUT);
+    }
+
+    return wki_channel_alloc(requester_node, PriorityClass::THROUGHPUT);
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -225,12 +239,8 @@ namespace {
 
 // s_server_lock must be held by caller
 auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
-    for (const auto& b : g_bindings) {
-        if (b.active && b.resource_type == ResourceType::NET && b.net_dev == dev) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(
+        g_bindings, [dev](const DevServerBinding& b) { return b.active && b.resource_type == ResourceType::NET && b.net_dev == dev; });
 }
 
 }  // namespace
@@ -289,7 +299,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
             continue;
         }
         if (target_count < MAX_RX_TARGETS) {
-            targets[target_count++] = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
+            targets.at(target_count++) = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -302,6 +312,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     }
 
     for (size_t i = 0; i < target_count; i++) {
+        const auto& target = targets.at(i);
         auto* req_buf = new (std::nothrow) uint8_t[req_total];
         if (req_buf == nullptr) {
             continue;
@@ -310,7 +321,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         req->op_id = OP_NET_RX_NOTIFY;
         req->data_len = pkt_data_len;
         memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt_data_len);
-        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+        wki_send(target.consumer_node, target.assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
         delete[] req_buf;
     }
 }
@@ -344,7 +355,7 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
 
         record_binding_net_state(b, SNAP);
         if (target_count < MAX_NOTIFY_TARGETS) {
-            targets[target_count++] = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
+            targets.at(target_count++) = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -361,7 +372,8 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
     fill_net_state_payload(*state, SNAP);
 
     for (size_t i = 0; i < target_count; i++) {
-        wki_send(targets[i].consumer_node, targets[i].assigned_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
+        const auto& target = targets.at(i);
+        wki_send(target.consumer_node, target.assigned_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     }
 }
 
@@ -430,12 +442,12 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
             continue;
         }
         if (work_count < MAX_DETACH) {
-            work[work_count++] = {.blk_zone_id = b.blk_zone_id,
-                                  .blk_rdma_active = b.blk_rdma_active,
-                                  .block_dev = b.block_dev,
-                                  .net_dev = b.net_dev,
-                                  .consumer_node = b.consumer_node,
-                                  .assigned_channel = b.assigned_channel};
+            work.at(work_count++) = {.blk_zone_id = b.blk_zone_id,
+                                     .blk_rdma_active = b.blk_rdma_active,
+                                     .block_dev = b.block_dev,
+                                     .net_dev = b.net_dev,
+                                     .consumer_node = b.consumer_node,
+                                     .assigned_channel = b.assigned_channel};
         }
         b.active = false;
     }
@@ -463,34 +475,36 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
 
     // Determine which NET devices need their RX forward hook uninstalled
     for (size_t i = 0; i < work_count; i++) {
-        if (work[i].net_dev == nullptr) {
+        const auto& item = work.at(i);
+        if (item.net_dev == nullptr) {
             continue;
         }
         bool dup = false;
         for (size_t j = 0; j < uninstall_count; j++) {
-            if (uninstall_devs[j] == work[i].net_dev) {
+            if (uninstall_devs.at(j) == item.net_dev) {
                 dup = true;
                 break;
             }
         }
-        if (!dup && uninstall_count < MAX_NET_DEVS && !has_net_binding_for_dev(work[i].net_dev)) {
-            uninstall_devs[uninstall_count++] = work[i].net_dev;
+        if (!dup && uninstall_count < MAX_NET_DEVS && !has_net_binding_for_dev(item.net_dev)) {
+            uninstall_devs.at(uninstall_count++) = item.net_dev;
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
     // Perform cleanup outside the lock
     for (size_t i = 0; i < work_count; i++) {
-        if (work[i].blk_rdma_active && work[i].blk_zone_id != 0) {
-            wki_zone_destroy(work[i].blk_zone_id);
+        const auto& item = work.at(i);
+        if (item.blk_rdma_active && item.blk_zone_id != 0) {
+            wki_zone_destroy(item.blk_zone_id);
         }
-        if (work[i].block_dev != nullptr && work[i].block_dev->remotable != nullptr) {
-            work[i].block_dev->remotable->on_remote_fault(node_id);
+        if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
+            item.block_dev->remotable->on_remote_fault(node_id);
         }
-        if (work[i].net_dev != nullptr && work[i].net_dev->remotable != nullptr) {
-            work[i].net_dev->remotable->on_remote_fault(node_id);
+        if (item.net_dev != nullptr && item.net_dev->remotable != nullptr) {
+            item.net_dev->remotable->on_remote_fault(node_id);
         }
-        WkiChannel* ch = wki_channel_get(work[i].consumer_node, work[i].assigned_channel);
+        WkiChannel* ch = wki_channel_get(item.consumer_node, item.assigned_channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
@@ -498,7 +512,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
 
     // D11: Uninstall RX forward hooks for NET devices that no longer have bindings
     for (size_t i = 0; i < uninstall_count; i++) {
-        uninstall_devs[i]->wki_rx_forward = nullptr;
+        uninstall_devs.at(i)->wki_rx_forward = nullptr;
     }
 }
 
@@ -507,17 +521,6 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
 // -----------------------------------------------------------------------------
 
 namespace detail {
-
-static auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel) -> WkiChannel* {
-    if (wki_requester_controls_dynamic_channel(requester_node, g_wki.my_node_id)) {
-        if (requested_channel < WKI_CHAN_DYNAMIC_BASE) {
-            return nullptr;
-        }
-        return wki_channel_reserve(requester_node, requested_channel, PriorityClass::THROUGHPUT);
-    }
-
-    return wki_channel_alloc(requester_node, PriorityClass::THROUGHPUT);
-}
 
 void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(DevAttachReqPayload)) {
@@ -1400,7 +1403,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 
         // Accumulate for batch RoCE push (instead of per-CQE push)
         if (batch_count < MAX_BATCH_CQ) {
-            batch_pushes[batch_count++] = {.data_slot = sqe->data_slot, .data_bytes = data_bytes, .cq_idx = CQ_IDX};
+            batch_pushes.at(batch_count++) = {.data_slot = sqe->data_slot, .data_bytes = data_bytes, .cq_idx = CQ_IDX};
         }
 
         posted_cqe = true;
@@ -1412,7 +1415,8 @@ void blk_ring_server_poll(DevServerBinding* binding) {
     // For single completions this falls back to the legacy per-CQE path
     // (equivalent cost: N data + 1 CQ region + 1 header, vs N * (1 data + 1 CQ entry + 1 header)).
     if (batch_count == 1) {
-        roce_push_completions(binding, batch_pushes[0].data_slot, batch_pushes[0].data_bytes, batch_pushes[0].cq_idx);
+        const auto& push = batch_pushes.front();
+        roce_push_completions(binding, push.data_slot, push.data_bytes, push.cq_idx);
     } else if (batch_count > 1) {
         roce_push_completions_batch(binding, batch_pushes.data(), batch_count);
     }
@@ -1471,7 +1475,7 @@ void wki_dev_server_process_pending_zones() {
             }
             b.blk_zone_pending = false;  // only attempt once
             if (pending_count < MAX_PENDING) {
-                pending[pending_count++] = &b;
+                pending.at(pending_count++) = &b;
             }
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -1479,7 +1483,7 @@ void wki_dev_server_process_pending_zones() {
 
     // Process each pending binding outside the lock (wki_zone_create may block)
     for (size_t pi = 0; pi < pending_count; pi++) {
-        auto& b = *pending[pi];
+        auto& b = *pending.at(pi);
 
         uint32_t const ZONE_SZ = blk_ring_default_zone_size();
         uint8_t const ZONE_ACCESS = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE | ZONE_ACCESS_REMOTE_READ | ZONE_ACCESS_REMOTE_WRITE;
@@ -1604,7 +1608,7 @@ void wki_dev_server_poll_rings() {
             }
             b.blk_sq_notified = false;
             if (ring_count < MAX_RINGS) {
-                rings[ring_count++] = &b;
+                rings.at(ring_count++) = &b;
             }
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -1612,7 +1616,7 @@ void wki_dev_server_poll_rings() {
 
     // blk_ring_server_poll may do block I/O - call outside the lock
     for (size_t i = 0; i < ring_count; i++) {
-        blk_ring_server_poll(rings[i]);
+        blk_ring_server_poll(rings.at(i));
     }
 }
 

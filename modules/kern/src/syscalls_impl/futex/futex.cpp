@@ -9,13 +9,14 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <util/hashtable.hpp>
 
 namespace ker::syscall::futex {
+namespace {
+using log = ker::mod::dbg::logger<"futex">;
 
 // ============================================================================
 // Futex wait queue implementation — hash table keyed by physical address
@@ -34,15 +35,17 @@ struct FutexKeyExtract {
 
 // 256 buckets — per-bucket spinlocks replace the single global lock.
 // Default-constructed (no allocation); init() called on first use.
-static ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash, ker::util::IntEqual> futex_table;
-static bool futex_table_initialized = false;
+ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash, ker::util::IntEqual> futex_table;
+bool futex_table_initialized = false;
 
-static void ensure_futex_table() {
+void ensure_futex_table() {
     if (__builtin_expect(static_cast<long>(!futex_table_initialized), 0) != 0) {
-        futex_table.init(256);
+        static_cast<void>(futex_table.init(256));
         futex_table_initialized = true;
     }
 }
+
+}  // namespace
 
 // ============================================================================
 // Syscall dispatcher
@@ -86,7 +89,7 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     // Read the current value at the address via HHDM
     uint64_t const PHYS_PAGE = PHYS_ADDR & ~0xFFFULL;
     uint64_t const OFFSET = PHYS_ADDR & 0xFFF;
-    int const* kernel_addr = reinterpret_cast<int*>((uint64_t)mod::mm::addr::get_virt_pointer(PHYS_PAGE) + OFFSET);
+    int const* kernel_addr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PHYS_PAGE)) + OFFSET);
 
     // Allocate a waiter node
     auto* waiter = new (std::nothrow) FutexWaiter{};
@@ -119,7 +122,7 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
 
     void* previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
     if (previous_waiter != nullptr) {
-        mod::dbg::log("futex_wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
+        log::warn("wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
     }
 
     // Set deferred task switch to move task to wait queue

@@ -2,9 +2,11 @@
 
 #include <abi/callnums/sys_log.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -24,17 +26,18 @@ enum class LogLevel : uint8_t {
 
 struct FixedString {
     size_t size{};
-    char value[abi::sys_log::JOURNAL_MODULE_MAX + 1]{};
+    std::array<char, abi::sys_log::JOURNAL_MODULE_MAX + 1> value{};
 
+    // String literal array reference is required for logger<"tag"> CTAD/NTTP use.
     template <size_t N>
-    consteval FixedString(const char (&str)[N]) : size(N - 1) {
+    consteval FixedString(const char (&str)[N]) : size(N - 1) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
         static_assert(N <= (abi::sys_log::JOURNAL_MODULE_MAX + 1), "logger tag exceeds JOURNAL_MODULE_MAX");
         for (size_t i = 0; i < N; i++) {
-            value[i] = str[i];
+            *std::next(value.begin(), static_cast<ptrdiff_t>(i)) = str[i];
         }
     }
 
-    [[nodiscard]] constexpr const char* c_str() const { return value; }
+    [[nodiscard]] constexpr const char* c_str() const { return value.data(); }
 };
 
 void emit_log(const char* module, LogLevel level, const char* format, ...);

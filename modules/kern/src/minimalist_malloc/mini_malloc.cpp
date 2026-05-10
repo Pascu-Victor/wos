@@ -1,3 +1,6 @@
+#include "minimalist_malloc/mini_malloc.hpp"
+
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -5,63 +8,64 @@
 #include <platform/dbg/dbg.hpp>
 
 #include "slab_allocator.hpp"
-
-const size_t PAGE_SIZE = 0x2000;
+namespace ker::mod::mm::mini_malloc {
 namespace {
-Slab<0x010, PAGE_SIZE> slab_0x10;
-Slab<0x020, PAGE_SIZE> slab_0x20;
-Slab<0x040, PAGE_SIZE> slab_0x40;
-Slab<0x080, PAGE_SIZE> slab_0x80;
-Slab<0x100, PAGE_SIZE> slab_0x100;
-Slab<0x200, PAGE_SIZE> slab_0x200;
-Slab<0x300, PAGE_SIZE> slab_0x300;
-Slab<0x400, PAGE_SIZE> slab_0x400;
-Slab<0x800, PAGE_SIZE> slab_0x800;
+constexpr size_t PAGE_SIZE = 0x2000;
+
+Slab<SLAB_SIZE10, PAGE_SIZE> slab_0x10;
+Slab<SLAB_SIZE20, PAGE_SIZE> slab_0x20;
+Slab<SLAB_SIZE40, PAGE_SIZE> slab_0x40;
+Slab<SLAB_SIZE80, PAGE_SIZE> slab_0x80;
+Slab<SLAB_SIZE100, PAGE_SIZE> slab_0x100;
+Slab<SLAB_SIZE200, PAGE_SIZE> slab_0x200;
+Slab<SLAB_SIZE300, PAGE_SIZE> slab_0x300;
+Slab<SLAB_SIZE400, PAGE_SIZE> slab_0x400;
+Slab<SLAB_SIZE800, PAGE_SIZE> slab_0x800;
 
 void free_from_slab(SlabHeader<1, 1>& generic_slab, void* address) {
     switch (generic_slab.size) {
-        case 0x10: {
-            auto* slab = reinterpret_cast<Slab<0x10, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE10: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE10, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x20: {
-            auto* slab = reinterpret_cast<Slab<0x20, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE20: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE20, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x40: {
-            auto* slab = reinterpret_cast<Slab<0x40, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE40: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE40, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x80: {
-            auto* slab = reinterpret_cast<Slab<0x80, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE80: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE80, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x100: {
-            auto* slab = reinterpret_cast<Slab<0x100, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE100: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE100, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x200: {
-            auto* slab = reinterpret_cast<Slab<0x200, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE200: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE200, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x300: {
-            auto* slab = reinterpret_cast<Slab<0x300, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE300: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE300, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x400: {
-            auto* slab = reinterpret_cast<Slab<0x400, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE400: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE400, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
-        case 0x800: {
-            auto* slab = reinterpret_cast<Slab<0x800, PAGE_SIZE>*>(&generic_slab);
+        case SLAB_SIZE800: {
+            auto* slab = reinterpret_cast<Slab<SLAB_SIZE800, PAGE_SIZE>*>(&generic_slab);
             slab->free(address);
             break;
         }
@@ -126,7 +130,7 @@ void mini_dump_stats() {
         uint64_t total_blocks;
         uint64_t free_blocks;
         uint64_t page_bytes;
-    } infos[9] = {};
+    };
 
     // helper to fill info
     auto fill_info = [&](const char* name, auto& slab_instance, uint64_t page_size) {
@@ -141,19 +145,14 @@ void mini_dump_stats() {
                             .page_bytes = slab_count * page_size};
     };
 
-    infos[0] = fill_info("0x10", slab_0x10, PAGE_SIZE);
-    infos[1] = fill_info("0x20", slab_0x20, PAGE_SIZE);
-    infos[2] = fill_info("0x40", slab_0x40, PAGE_SIZE);
-    infos[3] = fill_info("0x80", slab_0x80, PAGE_SIZE);
-    infos[4] = fill_info("0x100", slab_0x100, PAGE_SIZE);
-    infos[5] = fill_info("0x200", slab_0x200, PAGE_SIZE);
-    infos[6] = fill_info("0x300", slab_0x300, PAGE_SIZE);
-    infos[7] = fill_info("0x400", slab_0x400, PAGE_SIZE);
-    infos[8] = fill_info("0x800", slab_0x800, PAGE_SIZE);
+    const std::array INFOS{
+        fill_info("0x10", slab_0x10, PAGE_SIZE),   fill_info("0x20", slab_0x20, PAGE_SIZE),   fill_info("0x40", slab_0x40, PAGE_SIZE),
+        fill_info("0x80", slab_0x80, PAGE_SIZE),   fill_info("0x100", slab_0x100, PAGE_SIZE), fill_info("0x200", slab_0x200, PAGE_SIZE),
+        fill_info("0x300", slab_0x300, PAGE_SIZE), fill_info("0x400", slab_0x400, PAGE_SIZE), fill_info("0x800", slab_0x800, PAGE_SIZE)};
 
     ker::mod::io::serial::write("mini_malloc: Slab usage:\n");
     uint64_t total_slab_bytes = 0;
-    for (auto& info : infos) {
+    for (const auto& info : INFOS) {
         ker::mod::io::serial::write("  Slab ");
         ker::mod::io::serial::write(info.name);
         ker::mod::io::serial::write(": slabs=0x");
@@ -177,38 +176,38 @@ auto mini_malloc(size_t size) -> void* {
         return nullptr;
     }
 
-    // mini_malloc only handles slab allocations up to 0x800 bytes
+    // mini_malloc only handles slab allocations up to SLAB_SIZE800 bytes
     // Larger allocations should go through kmalloc
-    if (size > 0x800) {
+    if (size > SLAB_SIZE800) {
         return nullptr;  // Caller should use kmalloc for larger sizes
     }
 
     // Handle allocations via slab allocator
-    if (size <= 0x10) {
+    if (size <= SLAB_SIZE10) {
         return slab_0x10.alloc();
     }
-    if (size <= 0x20) {
+    if (size <= SLAB_SIZE20) {
         return slab_0x20.alloc();
     }
-    if (size <= 0x40) {
+    if (size <= SLAB_SIZE40) {
         return slab_0x40.alloc();
     }
-    if (size <= 0x80) {
+    if (size <= SLAB_SIZE80) {
         return slab_0x80.alloc();
     }
-    if (size <= 0x100) {
+    if (size <= SLAB_SIZE100) {
         return slab_0x100.alloc();
     }
-    if (size <= 0x200) {
+    if (size <= SLAB_SIZE200) {
         return slab_0x200.alloc();
     }
-    if (size <= 0x300) {
+    if (size <= SLAB_SIZE300) {
         return slab_0x300.alloc();
     }
-    if (size <= 0x400) {
+    if (size <= SLAB_SIZE400) {
         return slab_0x400.alloc();
     }
-    if (size <= 0x800) {
+    if (size <= SLAB_SIZE800) {
         return slab_0x800.alloc();
     }
 
@@ -260,7 +259,7 @@ void mini_free(void* address) {
 
     // mini_free only handles slab allocations
     // All allocations > 0x800 should be freed through kmalloc
-    auto* block = reinterpret_cast<MemoryBlock<0>*>(uintptr_t(address) - MemoryBlock<0>::DATA_OFFSET);
+    auto* block = reinterpret_cast<MemoryBlock<0>*>(reinterpret_cast<uintptr_t>(address) - MemoryBlock<0>::DATA_OFFSET);
 
     // Defensive checks: if block or slab_ptr are invalid, log diagnostics and skip freeing
     if (block == nullptr) {
@@ -312,3 +311,5 @@ void mini_free(void* address) {
 
     free_from_slab(*generic_slab, address);
 }
+
+}  // namespace ker::mod::mm::mini_malloc

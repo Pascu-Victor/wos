@@ -42,11 +42,11 @@ void copy_name(std::array<char, ker::vfs::tmpfs::TMPFS_NAME_MAX>& dst, const cha
     size_t i = 0;
     if (src != nullptr) {
         while (src[i] != '\0' && i < ker::vfs::tmpfs::TMPFS_NAME_MAX - 1) {
-            dst[i] = src[i];
+            dst.at(i) = src[i];
             i++;
         }
     }
-    dst[i] = '\0';
+    dst.at(i) = '\0';
 }
 }  // namespace
 
@@ -171,13 +171,15 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
         target_len++;
     }
     node->symlink_target = new char[target_len + 1];
-    memcpy(node->symlink_target, target, target_len + 1);
+    std::memcpy(node->symlink_target, target, target_len + 1);
     add_child(parent, node);
     return node;
 }
 
+namespace {
+
 // Internal unlocked version - caller must hold tmpfs_lock
-static auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate) -> TmpNode* {
+auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate) -> TmpNode* {
     // Skip leading slashes
     while (*path == '/') {
         path++;
@@ -204,10 +206,10 @@ static auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate)
         std::array<char, TMPFS_NAME_MAX> component{};
         size_t comp_len = 0;
         while (path[comp_len] != '\0' && path[comp_len] != '/' && comp_len < TMPFS_NAME_MAX - 1) {
-            component[comp_len] = path[comp_len];
+            component.at(comp_len) = path[comp_len];
             comp_len++;
         }
-        component[comp_len] = '\0';
+        component.at(comp_len) = '\0';
         path += comp_len;
 
         // Handle "." and ".."
@@ -244,6 +246,8 @@ static auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate)
 
     return current;
 }
+
+}  // namespace
 
 auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
     if (path == nullptr || root_node == nullptr) {
@@ -331,8 +335,8 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
             tmpfs_lock.unlock();
             return nullptr;
         }
-        memcpy(parent_path.data(), rel_path, parent_len);
-        parent_path[parent_len] = '\0';
+        std::memcpy(parent_path.data(), rel_path, parent_len);
+        parent_path.at(parent_len) = '\0';
 
         const char* final_name = last_slash + 1;
         if (*final_name == '\0') {
@@ -380,7 +384,7 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     }
     size_t to_read = n->size - offset;
     to_read = std::min(to_read, count);
-    memcpy(buf, n->data + offset, to_read);
+    std::memcpy(buf, n->data + offset, to_read);
     return static_cast<ssize_t>(to_read);
 }
 
@@ -397,13 +401,13 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
         }
         char* nd = new char[newcap];
         if (n->data != nullptr) {
-            memcpy(nd, n->data, n->size);
+            std::memcpy(nd, n->data, n->size);
         }
         delete[] n->data;
         n->data = nd;
         n->capacity = newcap;
     }
-    memcpy(n->data + offset, buf, count);
+    std::memcpy(n->data + offset, buf, count);
     n->size = std::max(NEED, n->size);
     return static_cast<ssize_t>(count);
 }
@@ -444,7 +448,7 @@ auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
     }
 
     size_t const FILE_SIZE = tmpfs_get_size(f);
-    off_t newpos = f->pos;
+    off_t newpos = 0;
 
     switch (whence) {
         case 0:  // SEEK_SET
@@ -490,8 +494,11 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
         entry->d_off = 1;
         entry->d_reclen = sizeof(DirEntry);
         entry->d_type = DT_DIR;
+        // DirEntry is a public ABI-style record with a raw d_name buffer.
+        // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         entry->d_name[0] = '.';
         entry->d_name[1] = '\0';
+        // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         return 0;
     }
     if (index == 1) {
@@ -500,9 +507,12 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
         entry->d_off = 2;
         entry->d_reclen = sizeof(DirEntry);
         entry->d_type = DT_DIR;
+        // DirEntry is a public ABI-style record with a raw d_name buffer.
+        // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         entry->d_name[0] = '.';
         entry->d_name[1] = '.';
         entry->d_name[2] = '\0';
+        // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         return 0;
     }
 
@@ -535,10 +545,13 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
     }
 
     size_t name_len = 0;
-    while (child->name[name_len] != '\0' && name_len < DIRENT_NAME_MAX - 1) {
-        entry->d_name[name_len] = child->name[name_len];
+    while (child->name.at(name_len) != '\0' && name_len < DIRENT_NAME_MAX - 1) {
+        // DirEntry is a public ABI-style record with a raw d_name buffer.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        entry->d_name[name_len] = child->name.at(name_len);
         name_len++;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     entry->d_name[name_len] = '\0';
 
     return 0;
@@ -557,7 +570,7 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
         len++;
     }
     size_t const TO_COPY = (len < bufsize) ? len : bufsize;
-    memcpy(buf, n->symlink_target, TO_COPY);
+    std::memcpy(buf, n->symlink_target, TO_COPY);
     return static_cast<ssize_t>(TO_COPY);
 }
 
@@ -592,16 +605,20 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     return 0;
 }
 
-ker::vfs::FileOperations tmpfs_fops_instance = {.vfs_open = nullptr,
-                                                .vfs_close = tmpfs_fops_close,
-                                                .vfs_read = tmpfs_fops_read,
-                                                .vfs_write = tmpfs_fops_write,
-                                                .vfs_lseek = tmpfs_fops_lseek,
-                                                .vfs_isatty = tmpfs_fops_isatty,
-                                                .vfs_readdir = tmpfs_fops_readdir,
-                                                .vfs_readlink = tmpfs_fops_readlink,
-                                                .vfs_truncate = tmpfs_fops_truncate,
-                                                .vfs_poll_check = nullptr};
+ker::vfs::FileOperations tmpfs_fops_instance = {
+    .vfs_open = nullptr,
+    .vfs_close = tmpfs_fops_close,
+    .vfs_read = tmpfs_fops_read,
+    .vfs_write = tmpfs_fops_write,
+    .vfs_lseek = tmpfs_fops_lseek,
+    .vfs_isatty = tmpfs_fops_isatty,
+    .vfs_readdir = tmpfs_fops_readdir,
+    .vfs_readlink = tmpfs_fops_readlink,
+    .vfs_truncate = tmpfs_fops_truncate,
+    .vfs_poll_check = nullptr,
+    .vfs_ioctl = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+};
 }  // namespace
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }

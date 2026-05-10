@@ -27,6 +27,9 @@ freely, subject to the following restrictions:
 #ifndef LODEPNG_H
 #define LODEPNG_H
 
+/* LodePNG exposes its upstream C-compatible structs, enums, arrays, and function signatures. */
+// NOLINTBEGIN
+
 #include <string.h> /*for size_t*/
 
 #ifdef __cplusplus
@@ -533,8 +536,8 @@ using LodePNGColorProfile = struct LodePNGColorProfile {
 void lodepng_color_profile_init(LodePNGColorProfile* profile);
 
 /*Get a LodePNGColorProfile of the image.*/
-unsigned lodepng_get_color_profile(LodePNGColorProfile* profile, const unsigned char* image, unsigned w, unsigned h,
-                                   const LodePNGColorMode* mode_in);
+unsigned lodepng_get_color_profile(LodePNGColorProfile* profile, const unsigned char* in, unsigned w, unsigned h,
+                                   const LodePNGColorMode* mode);
 /*The function LodePNG uses internally to decide the PNG color with auto_convert.
 Chooses an optimal color model, e.g. grey if only grey pixels, palette if < 256 colors, ...*/
 unsigned lodepng_auto_choose_color(LodePNGColorMode* mode_out, const unsigned char* image, unsigned w, unsigned h,
@@ -832,6 +835,8 @@ TODO:
 */
 
 #endif /*LODEPNG_H inclusion guard*/
+
+// NOLINTEND
 
 /*
 LodePNG Documentation

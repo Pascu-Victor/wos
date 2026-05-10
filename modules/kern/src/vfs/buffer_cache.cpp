@@ -11,9 +11,10 @@
 
 #include "buffer_cache.hpp"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <platform/dbg/dbg.hpp>
 
 #include "dev/block_device.hpp"
@@ -25,7 +26,13 @@ namespace {
 
 // --- Hash table -----------------------------------------------------------
 
-BufHead* hash_buckets[BUFFER_CACHE_HASH_BUCKETS] = {};  // NOLINT
+std::array<BufHead*, BUFFER_CACHE_HASH_BUCKETS> hash_buckets{};
+using log = ker::mod::dbg::logger<"buffer_cache">;
+
+auto hash_bucket_at(size_t idx) -> BufHead*& {
+    // hash_key() constrains dynamic indexes to the fixed bucket table.
+    return hash_buckets[idx];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
 
 auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no) -> size_t {
     // FNV-1a-style mix of device pointer and block number
@@ -50,15 +57,15 @@ bool is_valid_bufhead_ptr(const BufHead* ptr) {
 
 // Dump a single hash bucket chain for diagnostics (called while cache_lock held).
 void dump_hash_bucket(size_t idx) {
-    mod::dbg::log("buffer_cache: bucket[%zu] chain:", idx);
-    BufHead* bh = hash_buckets[idx];
+    log::critical("bucket[%zu] chain:", idx);
+    BufHead* bh = hash_bucket_at(idx);
     int depth = 0;
     while (bh != nullptr && depth < 32) {
         if (!is_valid_bufhead_ptr(bh)) {
-            mod::dbg::log("  [%d] CORRUPT ptr=%p (not a valid kernel address)", depth, reinterpret_cast<void*>(bh));
+            log::critical("  [%d] CORRUPT ptr=%p (not a valid kernel address)", depth, reinterpret_cast<void*>(bh));
             break;
         }
-        mod::dbg::log("  [%d] bh=%p bdev=%p block=%llu refcount=%d hash_next=%p", depth, reinterpret_cast<void*>(bh),
+        log::critical("  [%d] bh=%p bdev=%p block=%llu refcount=%d hash_next=%p", depth, reinterpret_cast<void*>(bh),
                       reinterpret_cast<void*>(bh->bdev), static_cast<unsigned long long>(bh->block_no),
                       static_cast<int>(bh->refcount.load(std::memory_order_relaxed)), reinterpret_cast<void*>(bh->hash_next));
         bh = bh->hash_next;
@@ -69,13 +76,13 @@ void dump_hash_bucket(size_t idx) {
 auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     size_t const IDX = hash_key(bdev, block_no);
     BufHead const* prev = nullptr;
-    for (BufHead* bh = hash_buckets[IDX]; bh != nullptr; bh = bh->hash_next) {
+    for (BufHead* bh = hash_bucket_at(IDX); bh != nullptr; bh = bh->hash_next) {
         if (!is_valid_bufhead_ptr(bh)) {
-            mod::dbg::log("buffer_cache: corrupt hash chain in lookup(bdev=%p block=%llu bucket=%zu)", reinterpret_cast<void*>(bdev),
+            log::critical("corrupt hash chain in lookup(bdev=%p block=%llu bucket=%zu)", reinterpret_cast<void*>(bdev),
                           static_cast<unsigned long long>(block_no), IDX);
-            mod::dbg::log("  bad ptr=%p loaded from %s=%p", reinterpret_cast<void*>(bh),
+            log::critical("  bad ptr=%p loaded from %s=%p", reinterpret_cast<void*>(bh),
                           (prev != nullptr) ? "prev->hash_next" : "hash_buckets[idx]",
-                          (prev != nullptr) ? reinterpret_cast<const void*>(prev) : (void*)&hash_buckets[IDX]);
+                          (prev != nullptr) ? reinterpret_cast<const void*>(prev) : static_cast<void*>(&hash_bucket_at(IDX)));
             dump_hash_bucket(IDX);
             mod::dbg::panic_handler("buffer_cache: corrupt hash chain detected in lookup");
         }
@@ -89,15 +96,15 @@ auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
 
 void hash_insert(BufHead* bh) {
     size_t const IDX = hash_key(bh->bdev, bh->block_no);
-    BufHead* old_head = hash_buckets[IDX];
+    BufHead* old_head = hash_bucket_at(IDX);
     if (old_head != nullptr && !is_valid_bufhead_ptr(old_head)) {
-        mod::dbg::log("buffer_cache: corrupt bucket head in insert(bh=%p bdev=%p block=%llu bucket=%zu) old_head=%p",
-                      reinterpret_cast<void*>(bh), reinterpret_cast<void*>(bh->bdev), static_cast<unsigned long long>(bh->block_no), IDX,
+        log::critical("corrupt bucket head in insert(bh=%p bdev=%p block=%llu bucket=%zu) old_head=%p", reinterpret_cast<void*>(bh),
+                      reinterpret_cast<void*>(bh->bdev), static_cast<unsigned long long>(bh->block_no), IDX,
                       reinterpret_cast<void*>(old_head));
         mod::dbg::panic_handler("buffer_cache: corrupt bucket head detected in insert");
     }
     bh->hash_next = old_head;
-    hash_buckets[IDX] = bh;
+    hash_bucket_at(IDX) = bh;
 }
 
 void hash_remove(BufHead* bh) {
@@ -105,16 +112,16 @@ void hash_remove(BufHead* bh) {
     // Validate bh->hash_next before propagating — if it is garbage it would
     // corrupt the live predecessor's hash_next and cause the crash we've seen.
     if (bh->hash_next != nullptr && !is_valid_bufhead_ptr(bh->hash_next)) {
-        mod::dbg::log("buffer_cache: corrupt hash_next in remove(bh=%p bdev=%p block=%llu bucket=%zu) hash_next=%p",
-                      reinterpret_cast<void*>(bh), reinterpret_cast<void*>(bh->bdev), static_cast<unsigned long long>(bh->block_no), IDX,
+        log::critical("corrupt hash_next in remove(bh=%p bdev=%p block=%llu bucket=%zu) hash_next=%p", reinterpret_cast<void*>(bh),
+                      reinterpret_cast<void*>(bh->bdev), static_cast<unsigned long long>(bh->block_no), IDX,
                       reinterpret_cast<void*>(bh->hash_next));
         dump_hash_bucket(IDX);
         mod::dbg::panic_handler("buffer_cache: corrupt hash_next detected in remove — not propagating");
     }
-    BufHead** pp = &hash_buckets[IDX];
+    BufHead** pp = &hash_bucket_at(IDX);
     while (*pp != nullptr) {
         if (!is_valid_bufhead_ptr(*pp)) {
-            mod::dbg::log("buffer_cache: corrupt chain entry in remove walk(bh=%p bucket=%zu bad_ptr=%p)", reinterpret_cast<void*>(bh), IDX,
+            log::critical("corrupt chain entry in remove walk(bh=%p bucket=%zu bad_ptr=%p)", reinterpret_cast<void*>(bh), IDX,
                           reinterpret_cast<void*>(*pp));
             mod::dbg::panic_handler("buffer_cache: corrupt chain entry during remove walk");
         }
@@ -139,7 +146,7 @@ void lru_init() {
 }
 
 void lru_remove(BufHead* bh) {
-    if (bh->lru_prev == nullptr && bh->lru_next == nullptr) {
+    if (bh->lru_prev == nullptr || bh->lru_next == nullptr) {
         return;  // Not on LRU
     }
     bh->lru_prev->lru_next = bh->lru_next;
@@ -169,7 +176,7 @@ auto lru_tail() -> BufHead* {
     if (bh == &lru_sentinel) {
         return nullptr;
     }
-    return bh;
+    return bh;  // NOLINT(clang-analyzer-cplusplus.NewDelete): lru_remove unlinks victims before free_buffer deletes them.
 }
 
 // --- Cache bookkeeping ----------------------------------------------------
@@ -286,7 +293,7 @@ void buffer_cache_init() {
     if (cache_initialized) {
         return;
     }
-    memset(static_cast<void*>(hash_buckets), 0, sizeof(hash_buckets));
+    hash_buckets.fill(nullptr);
     lru_init();
     cache_total_bytes = 0;
     cache_total_buffers = 0;
@@ -294,7 +301,7 @@ void buffer_cache_init() {
     stat_hits = 0;
     stat_misses = 0;
     cache_initialized = true;
-    mod::dbg::log("[buffer_cache] initialized (max %lu bytes)", static_cast<uint64_t>(cache_max_bytes));
+    log::info("initialized (max %lu bytes)", static_cast<uint64_t>(cache_max_bytes));
 }
 
 auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
@@ -328,7 +335,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     bh = alloc_buffer(bdev, block_no);
     if (bh == nullptr) {
         cache_lock.unlock_irqrestore(irqflags);
-        mod::dbg::log("[buffer_cache] OOM allocating buffer for block %lu", block_no);
+        log::error("OOM allocating buffer for block %lu", block_no);
         return nullptr;
     }
 
@@ -596,7 +603,7 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     // We bump refcount so they stay alive while we write with the lock dropped.
     // Use a fixed-size batch to avoid dynamic allocation.
     constexpr size_t BATCH_SIZE = 64;
-    BufHead* batch[BATCH_SIZE];  // NOLINT
+    std::array<BufHead*, BATCH_SIZE> batch{};
     size_t batch_count = 0;
     bool more = true;
 
@@ -604,11 +611,11 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
         batch_count = 0;
         more = false;
 
-        for (size_t i = 0; i < BUFFER_CACHE_HASH_BUCKETS && batch_count < BATCH_SIZE; i++) {
-            for (BufHead* bh = hash_buckets[i]; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
                 if (bh->bdev == bdev && (bh->flags & BH_DIRTY) != 0) {
                     bh->refcount.fetch_add(1, std::memory_order_relaxed);
-                    batch[batch_count++] = bh;
+                    batch[batch_count++] = bh;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
                 }
             }
             // If the batch is full, there may be more dirty buffers
@@ -622,11 +629,12 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
 
         // Write each dirty buffer with lock released
         for (size_t i = 0; i < batch_count; i++) {
-            int const RC = bwrite(batch[i]);
+            auto* bh = batch[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+            int const RC = bwrite(bh);
             if (RC != 0) {
                 result = RC;
             }
-            brelse(batch[i]);
+            brelse(bh);
         }
 
         if (more) {

@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
@@ -41,6 +40,8 @@ namespace ker::vfs::xfs {
 
 using log = ker::mod::dbg::logger<"xfs">;
 
+namespace {
+
 // ============================================================================
 // Per-open-file state
 // ============================================================================
@@ -57,8 +58,6 @@ struct XfsFileData {
 // Walk a filesystem-relative path and return the inode.
 // An empty path or "/" refers to the root inode.
 // Returns a reference-counted inode on success, nullptr on error.
-
-namespace {
 
 auto pointer_looks_like_kernel_object(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uint64_t>(ptr);
@@ -298,8 +297,9 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         uint64_t ni = s_read_ns_io.exchange(0, std::memory_order_relaxed);
         uint64_t by = s_read_bytes.exchange(0, std::memory_order_relaxed);
         uint64_t mbps = (ni > 0) ? (by * 1000ULL / ni) : 0;
-        ker::mod::dbg::log("[XFS read bench] call#%lu: bmap=%luus io=%luus bytes=%lu io_MB/s~%lu\n", (unsigned long)n,
-                           (unsigned long)(nb / 1000ULL), (unsigned long)(ni / 1000ULL), (unsigned long)by, (unsigned long)mbps);
+        ker::mod::dbg::log("[XFS read bench] call#%lu: bmap=%luus io=%luus bytes=%lu io_MB/s~%lu\n", static_cast<unsigned long>(n),
+                           static_cast<unsigned long>(nb / 1000ULL), static_cast<unsigned long>(ni / 1000ULL),
+                           static_cast<unsigned long>(by), static_cast<unsigned long>(mbps));
     }
 #endif
 
@@ -596,8 +596,9 @@ write_done:
         ker::mod::dbg::log(
             "[XFS write bench] call#%lu: bmap=%luus alloc=%luus io=%luus ilog=%luus "
             "bytes=%lu io_MB/s~%lu hole_iters=%lu map_iters=%lu\n",
-            (unsigned long)n, (unsigned long)(nb / 1000ULL), (unsigned long)(na / 1000ULL), (unsigned long)(ni / 1000ULL),
-            (unsigned long)(nil / 1000ULL), (unsigned long)by, (unsigned long)mbps, (unsigned long)nhol, (unsigned long)nmap);
+            static_cast<unsigned long>(n), static_cast<unsigned long>(nb / 1000ULL), static_cast<unsigned long>(na / 1000ULL),
+            static_cast<unsigned long>(ni / 1000ULL), static_cast<unsigned long>(nil / 1000ULL), static_cast<unsigned long>(by),
+            static_cast<unsigned long>(mbps), static_cast<unsigned long>(nhol), static_cast<unsigned long>(nmap));
     }
 #endif
 
@@ -687,7 +688,7 @@ auto readdir_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
         // Copy name
         size_t const COPY_LEN = xde->namelen < DIRENT_NAME_MAX - 1 ? xde->namelen : DIRENT_NAME_MAX - 1;
         std::memcpy(rctx->entry->d_name.data(), xde->name.data(), COPY_LEN);
-        rctx->entry->d_name[COPY_LEN] = '\0';
+        rctx->entry->d_name.at(COPY_LEN) = '\0';
 
         rctx->found = true;
         return 1;  // stop iteration
@@ -807,6 +808,8 @@ FileOperations xfs_fops = {
     .vfs_readlink = xfs_vfs_readlink,
     .vfs_truncate = xfs_vfs_truncate,
     .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
 };
 
 }  // anonymous namespace
@@ -947,7 +950,8 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     // Handle O_TRUNC on regular files
     if ((flags & O_TRUNC_FLAG) != 0 && xfs_inode_isreg(ip) && !ctx->read_only) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", (unsigned long)ip->ino, (unsigned long)ip->size);
+        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", static_cast<unsigned long>(ip->ino),
+                      static_cast<unsigned long>(ip->size));
 #endif
         ip->size = 0;
         ip->dirty = true;
@@ -1085,9 +1089,9 @@ auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     // Derive a 64-bit fsid by XOR-folding the 128-bit UUID
     uint64_t fsid_lo = 0;
     uint64_t fsid_hi = 0;
-    for (int i = 0; i < 8; i++) {
-        fsid_lo |= static_cast<uint64_t>(ctx->uuid.b[i]) << (i * 8);
-        fsid_hi |= static_cast<uint64_t>(ctx->uuid.b[i + 8]) << (i * 8);
+    for (size_t i = 0; i < 8; i++) {
+        fsid_lo |= static_cast<uint64_t>(ctx->uuid.b.at(i)) << (i * 8);
+        fsid_hi |= static_cast<uint64_t>(ctx->uuid.b.at(i + 8)) << (i * 8);
     }
 
     buf->f_bsize = ctx->block_size;
@@ -1364,7 +1368,7 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
 
 auto count_real_entries(const XfsDirEntry* entry, void* ctx) -> int {
     auto* count = static_cast<int*>(ctx);
-    if (entry->name[0] == '.' && (entry->namelen == 1 || (entry->namelen == 2 && entry->name[1] == '.'))) {
+    if (entry->name.at(0) == '.' && (entry->namelen == 1 || (entry->namelen == 2 && entry->name.at(1) == '.'))) {
         return 0;
     }
     (*count)++;

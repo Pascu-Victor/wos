@@ -308,6 +308,9 @@ class XfsBtreeCursor {
     // Get number of records in the block at a given level
     [[nodiscard]] auto numrecs(int level) const -> int;
 
+    [[nodiscard]] auto level_at(int level) -> XfsBtreeLevel& { return levels.at(static_cast<size_t>(level)); }
+    [[nodiscard]] auto level_at(int level) const -> XfsBtreeLevel const& { return levels.at(static_cast<size_t>(level)); }
+
     // Get pointer to the i-th key at a given level (1-based)
     [[nodiscard]] auto key_at(int level, int idx) const -> const Key*;
 

@@ -9,11 +9,11 @@ namespace ker::init::validation {
 
 // Validate all hard dependencies exist in the registry
 template <size_t N>
-constexpr bool validate_hard_deps_exist(const std::array<ModuleMeta, N>& registry) {
+[[nodiscard]] constexpr bool validate_hard_deps_exist(const std::array<ModuleMeta, N>& registry) {
     for (size_t i = 0; i < N; ++i) {
-        const auto& mod = registry[i];
+        const auto& mod = registry.at(i);
         for (size_t d = 0; d < mod.dep_count; ++d) {
-            const auto& dep = mod.deps[d];
+            const auto& dep = mod.deps.at(d);
             if (dep.type != DepType::HARD) {
                 continue;
             }
@@ -31,11 +31,11 @@ constexpr bool validate_hard_deps_exist(const std::array<ModuleMeta, N>& registr
 // Validate no module depends on a module in a later boot phase
 // (A PHASE_2 module cannot depend on a PHASE_4 module)
 template <size_t N>
-constexpr bool validate_phase_ordering(const std::array<ModuleMeta, N>& registry) {
+[[nodiscard]] constexpr bool validate_phase_ordering(const std::array<ModuleMeta, N>& registry) {
     for (size_t i = 0; i < N; ++i) {
-        const auto& mod = registry[i];
+        const auto& mod = registry.at(i);
         for (size_t d = 0; d < mod.dep_count; ++d) {
-            const auto& dep = mod.deps[d];
+            const auto& dep = mod.deps.at(d);
             if (dep.type != DepType::HARD) {
                 continue;
             }
@@ -46,7 +46,7 @@ constexpr bool validate_phase_ordering(const std::array<ModuleMeta, N>& registry
             }
 
             // Module's phase must be >= dependency's phase
-            if (static_cast<int>(mod.phase) < static_cast<int>(registry[DEP_IDX].phase)) {
+            if (static_cast<int>(mod.phase) < static_cast<int>(registry.at(static_cast<size_t>(DEP_IDX)).phase)) {
                 // Invalid: depending on a module in a later phase
                 return false;
             }
@@ -57,10 +57,10 @@ constexpr bool validate_phase_ordering(const std::array<ModuleMeta, N>& registry
 
 // Validate no duplicate module IDs
 template <size_t N>
-constexpr bool validate_no_duplicates(const std::array<ModuleMeta, N>& registry) {
+[[nodiscard]] constexpr bool validate_no_duplicates(const std::array<ModuleMeta, N>& registry) {
     for (size_t i = 0; i < N; ++i) {
         for (size_t j = i + 1; j < N; ++j) {
-            if (registry[i].id == registry[j].id) {
+            if (registry.at(i).id == registry.at(j).id) {
                 return false;
             }
         }
@@ -70,7 +70,7 @@ constexpr bool validate_no_duplicates(const std::array<ModuleMeta, N>& registry)
 
 // Combined validation - returns true if all checks pass
 template <size_t N>
-constexpr bool validate_registry(const std::array<ModuleMeta, N>& registry) {
+[[nodiscard]] constexpr bool validate_registry(const std::array<ModuleMeta, N>& registry) {
     return validate_no_duplicates(registry) && validate_hard_deps_exist(registry) && validate_phase_ordering(registry) &&
            !detect_cycle(build_adj_matrix(registry));
 }

@@ -10,7 +10,6 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/task.hpp>
-#include <platform/smt/smt.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
 

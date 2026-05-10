@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 #include "extern/limine.h"
 #include "platform/acpi/tables/rdst.hpp"
@@ -11,22 +10,41 @@
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
 
-__attribute__((used, section(".requests"))) static volatile limine_rsdp_request rsdp_request = {
+namespace {
+
+__attribute__((used, section(".requests"))) volatile limine_rsdp_request rsdp_request = {
+    // NOLINT
     .id = LIMINE_RSDP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-namespace ker::mod::acpi {
-void init() { ker::mod::acpi::rsdp::init((uint64_t)rsdp_request.response->address); }
+}  // namespace
 
-static bool validate_checksum(Sdt* sdt) {
+namespace ker::mod::acpi {
+
+namespace {
+
+auto validate_checksum(const Sdt* sdt) -> bool {
     uint8_t sum = 0;
     for (size_t i = 0; i < sdt->length; i++) {
-        sum += (reinterpret_cast<uint8_t*>(sdt))[i];
+        sum += reinterpret_cast<const uint8_t*>(sdt)[i];
     }
     return sum == 0;
 }
+
+auto signature_matches(const Sdt& sdt, const char* ident) -> bool {
+    for (size_t i = 0; i < 4; ++i) {
+        if (sdt.signature[i] != ident[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+void init() { ker::mod::acpi::rsdp::init(reinterpret_cast<uint64_t>(rsdp_request.response->address)); }
 
 ACPIResult parse_acpi_tables(const char* ident) {
     rsdp::Rsdp const RSDP = rsdp::get();
@@ -48,9 +66,9 @@ ACPIResult parse_acpi_tables(const char* ident) {
         hcf();  // no xsdt entries???
     }
     for (size_t i = 0; i < ENTRIES; i++) {
-        Sdt* sdt =
-            reinterpret_cast<Sdt*>(mm::addr::get_virt_pointer((rsdp::use_xsdt() ? xsdt->next[i] : static_cast<uint64_t>(rsdt->next[i]))));
-        if (memcmp(sdt->signature, ident, 4) == 0 && validate_checksum(sdt)) {
+        auto const TABLE_PHYS = rsdp::use_xsdt() ? xsdt->next[i] : static_cast<uint64_t>(rsdt->next[i]);
+        auto* sdt = reinterpret_cast<Sdt*>(mm::addr::get_virt_pointer(TABLE_PHYS));
+        if (signature_matches(*sdt, ident) && validate_checksum(sdt)) {
             ACPIResult result{};
             result.success = true;
             result.data = sdt;

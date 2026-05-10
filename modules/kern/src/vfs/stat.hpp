@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "bits/off_t.h"
@@ -38,8 +39,11 @@ struct Stat {
     struct Timespec st_atim;
     struct Timespec st_mtim;
     struct Timespec st_ctim;
-    long unused[3];
+    long unused[3];  // NOLINT(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): ABI mirror of mlibc struct stat.
 };
+
+static_assert(sizeof(Stat) == 144, "Stat must match mlibc x86_64 struct stat size");
+static_assert(offsetof(Stat, unused) == 120, "Stat::unused offset must match mlibc x86_64 struct stat");
 
 // File type mode flags (matching mlibc/POSIX)
 constexpr mode_t S_IFMT = 0x0F000;

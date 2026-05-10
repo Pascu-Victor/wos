@@ -26,11 +26,17 @@
 #include "vfs/file_operations.hpp"
 #include "vfs/vfs.hpp"
 
+// DevFS exposes kernel pseudo-files and WKI resource names through fixed-size
+// directory, symlink, and stats buffers. The indexed writes below are bounded
+// by local capacity checks and keep this filesystem allocation-light.
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, cppcoreguidelines-interfaces-global-init,
+// readability-suspicious-call-argument)
 namespace ker::vfs::devfs {
 
 namespace {
 
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
+using log = ker::mod::dbg::logger<"devfs">;
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
@@ -199,29 +205,28 @@ auto validate_devfs_file(File* f, const char* op) -> DevFSFile* {
 
     auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
     if (!is_valid_kernel_pointer(devfs_file)) {
-        ker::mod::dbg::log("devfs_%s: private_data %p outside valid kernel range", op, devfs_file);
+        log::error("%s: private_data %p outside valid kernel range", op, devfs_file);
         return nullptr;
     }
 
     if (devfs_file->magic != DEVFS_FILE_MAGIC) {
-        ker::mod::dbg::log("devfs_%s: private_data %p has invalid magic 0x%x", op, devfs_file, devfs_file->magic);
+        log::error("%s: private_data %p has invalid magic 0x%x", op, devfs_file, devfs_file->magic);
         return nullptr;
     }
 
     if (devfs_file->node != nullptr && !is_valid_kernel_pointer(devfs_file->node)) {
-        ker::mod::dbg::log("devfs_%s: node pointer %p invalid (df=%p)", op, devfs_file->node, devfs_file);
+        log::error("%s: node pointer %p invalid (df=%p)", op, devfs_file->node, devfs_file);
         return nullptr;
     }
 
     if (devfs_file->device != nullptr && !is_valid_kernel_pointer(devfs_file->device)) {
-        ker::mod::dbg::log("devfs_%s: device pointer %p invalid (df=%p)", op, devfs_file->device, devfs_file);
+        log::error("%s: device pointer %p invalid (df=%p)", op, devfs_file->device, devfs_file);
         return nullptr;
     }
 
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr &&
         !is_valid_kernel_pointer(devfs_file->device->char_ops)) {
-        ker::mod::dbg::log("devfs_%s: char_ops pointer %p invalid (device=%p df=%p)", op, devfs_file->device->char_ops, devfs_file->device,
-                           devfs_file);
+        log::error("%s: char_ops pointer %p invalid (device=%p df=%p)", op, devfs_file->device->char_ops, devfs_file->device, devfs_file);
         return nullptr;
     }
 
@@ -247,19 +252,13 @@ auto devfs_close(File* f) -> int {
     bool const IN_HHDM = (df_addr >= 0xffff800000000000ULL && df_addr < 0xffff900000000000ULL);
     bool const IN_KERNEL_STATIC = (df_addr >= 0xffffffff80000000ULL && df_addr < 0xffffffffc0000000ULL);
     if (!IN_HHDM && !IN_KERNEL_STATIC) {
-        ker::mod::dbg::log(
-            "devfs_close: devfs_file %p out of valid kernel range; "
-            "skipping delete\n",
-            devfs_file);
+        log::error("close: devfs_file %p out of valid kernel range; skipping delete", devfs_file);
         f->private_data = nullptr;
         return 0;
     }
 
     if (devfs_file->magic != DEVFS_FILE_MAGIC) {
-        ker::mod::dbg::log(
-            "devfs_close: devfs_file %p has invalid magic 0x%x; "
-            "skipping delete\n",
-            devfs_file, devfs_file->magic);
+        log::error("close: devfs_file %p has invalid magic 0x%x; skipping delete", devfs_file, devfs_file->magic);
         f->private_data = nullptr;
         return 0;
     }
@@ -441,6 +440,7 @@ FileOperations devfs_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = devfs_poll_check,
     .vfs_poll_register_waiter = devfs_poll_register_waiter,
+    .vfs_ioctl = devfs_ioctl,
 };
 
 }  // anonymous namespace
@@ -533,6 +533,10 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
         vfs_debug_log("devfs: opened symlink: ");
         vfs_debug_log(node->name.data());
         vfs_debug_log("\n");
+    } else {
+        delete devfs_file;
+        delete file;
+        return nullptr;
     }
 
     return file;
@@ -596,29 +600,44 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode* {
 }
 
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode* {
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    std::array<char, DEVFS_NAME_MAX> name_buf{};
+    size_t name_len = std::strlen(name);
+    if (name_len >= name_buf.size()) {
+        name_len = name_buf.size() - 1;
+    }
+    std::memcpy(name_buf.data(), name, name_len);
+    name_buf[name_len] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return devfs_add_device_node(name_buf, dev);
+}
+
+auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::dev::Device* dev) -> DevFSNode* {
     // If the name contains '/', walk to the parent directory first.
     // e.g. "pts/0" => find (or create) the "pts" dir, then add node "0" there.
     const char* slash = nullptr;
-    for (const char* p = name; *p != '\0'; p++) {
+    for (const char* p = name.data(); *p != '\0'; p++) {
         if (*p == '/') {
             slash = p;
         }
     }
 
     DevFSNode* parent = &root_node;
-    const char* leaf_name = name;
+    const char* leaf_name = name.data();
 
     if (slash != nullptr) {
         // Extract the directory portion and walk/create it
-        auto dir_len = static_cast<size_t>(slash - name);
-        char dir_path[DEVFS_NAME_MAX]{};
+        auto dir_len = static_cast<size_t>(slash - name.data());
+        std::array<char, DEVFS_NAME_MAX> dir_path{};
         if (dir_len >= DEVFS_NAME_MAX) {
             dir_len = DEVFS_NAME_MAX - 1;
         }
-        std::memcpy(dir_path, name, dir_len);
+        std::memcpy(dir_path.data(), name.data(), dir_len);
         dir_path[dir_len] = '\0';
 
-        parent = walk_path(dir_path, true);  // create intermediate dirs if needed
+        parent = walk_path(dir_path.data(), true);  // create intermediate dirs if needed
         if (parent == nullptr) {
             return nullptr;
         }
@@ -756,6 +775,7 @@ void devfs_populate_net_nodes() {
         // Allocate a Device struct to hold the netdev pointer
         auto* dev = new ker::dev::Device();
         if (dev == nullptr) {
+            delete node;
             continue;
         }
 
@@ -774,37 +794,37 @@ void devfs_populate_net_nodes() {
                 auto* nd = static_cast<ker::net::NetDevice*>(df->device->private_data);
 
                 // Format stats into a temporary buffer
-                char stats[512];
+                std::array<char, 512> stats{};
                 size_t pos = 0;
 
                 // Helper to append string
                 auto append_str = [&](const char* s) {
-                    while (*s != '\0' && pos < sizeof(stats) - 1) {
+                    while (*s != '\0' && pos < stats.size() - 1) {
                         stats[pos++] = *s++;
                     }
                 };
                 // Helper to append uint64 as decimal
                 auto append_u64 = [&](uint64_t val) {
                     if (val == 0) {
-                        if (pos < sizeof(stats) - 1) {
+                        if (pos < stats.size() - 1) {
                             stats[pos++] = '0';
                         }
                         return;
                     }
-                    char tmp[21];
+                    std::array<char, 21> tmp{};
                     int ti = 0;
                     while (val > 0) {
                         tmp[ti++] = '0' + static_cast<char>(val % 10);
                         val /= 10;
                     }
-                    for (int j = ti - 1; j >= 0 && pos < sizeof(stats) - 1; j--) {
+                    for (int j = ti - 1; j >= 0 && pos < stats.size() - 1; j--) {
                         stats[pos++] = tmp[j];
                     }
                 };
                 // Helper to append hex byte
                 auto append_hex_byte = [&](uint8_t b) {
-                    const char HEX[] = "0123456789abcdef";
-                    if (pos < sizeof(stats) - 2) {
+                    constexpr std::string_view HEX{"0123456789abcdef"};
+                    if (pos < stats.size() - 2) {
                         stats[pos++] = HEX[b >> 4];
                         stats[pos++] = HEX[b & 0xF];
                     }
@@ -868,12 +888,15 @@ void devfs_populate_net_nodes() {
                 }
                 size_t const AVAILABLE = pos - offset;
                 size_t const TO_COPY = (count < AVAILABLE) ? count : AVAILABLE;
-                std::memcpy(buf, stats + offset, TO_COPY);
+                std::memcpy(buf, stats.data() + offset, TO_COPY);
                 f->pos += static_cast<off_t>(TO_COPY);
                 return static_cast<ssize_t>(TO_COPY);
             },
             .write = nullptr,
             .isatty = nullptr,
+            .ioctl = nullptr,
+            .poll_check = nullptr,
+            .poll_register_waiter = nullptr,
         };
 
         dev->major = 10;
@@ -909,11 +932,11 @@ struct WkiAutoLock {
 };
 
 // Persistent directory pointers (lazily initialized)
-DevFSNode* g_wki_dir = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-DevFSNode* g_wki_by_zone = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-DevFSNode* g_wki_by_peer = nullptr;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_wki_type_counters[7] = {};  // indexed by ResourceType (1-6), slot 0 unused // NOLINT
-size_t g_wki_total = 0;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_dir = nullptr;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_zone = nullptr;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_peer = nullptr;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<uint32_t, 7> g_wki_type_counters{};  // indexed by ResourceType (1-6), slot 0 unused // NOLINT
+size_t g_wki_total = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // ResourceType => directory name
 auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
@@ -932,7 +955,7 @@ auto wki_type_dir(ker::net::wki::ResourceType type) -> const char* {
         case RT::CUSTOM:
             return "custom";
         default:
-            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d", static_cast<int>(type));
             break;
     }
     return "unknown";
@@ -955,7 +978,7 @@ auto wki_type_prefix(ker::net::wki::ResourceType type) -> const char* {
         case RT::CUSTOM:
             return "cst";
         default:
-            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d", static_cast<int>(type));
             break;
     }
     return "unk";
@@ -977,7 +1000,7 @@ auto wki_type_name(ker::net::wki::ResourceType type) -> const char* {
         case RT::CUSTOM:
             return "custom";
         default:
-            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d\n", static_cast<int>(type));
+            mod::dbg::logger<"devfs_wki">::error("invalid WKI resource type: %d", static_cast<int>(type));
             break;
     }
     return "unknown";
@@ -985,13 +1008,13 @@ auto wki_type_name(ker::net::wki::ResourceType type) -> const char* {
 
 // Per-resource context stored in Device::private_data
 struct WkiDevfsCtx {
-    ker::net::wki::ResourceType resource_type;
-    uint16_t peer_node_id;
-    uint16_t rdma_zone_id;
-    uint32_t resource_id;
-    uint8_t flags;
-    char remote_name[64];  // NOLINT(modernize-avoid-c-arrays)
-    char dev_name[64];     // NOLINT(modernize-avoid-c-arrays) - persistent name for Device::name
+    ker::net::wki::ResourceType resource_type{ker::net::wki::ResourceType::CUSTOM};
+    uint16_t peer_node_id{};
+    uint16_t rdma_zone_id{};
+    uint32_t resource_id{};
+    uint8_t flags{};
+    std::array<char, 64> remote_name{};
+    std::array<char, 64> dev_name{};  // persistent name backing Device::name
 };
 
 // Read handler for WKI device nodes
@@ -1008,28 +1031,28 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         }
         auto* ctx = static_cast<WkiDevfsCtx*>(df->device->private_data);
 
-        char stats[512];
+        std::array<char, 512> stats{};
         size_t pos = 0;
 
         auto append_str = [&](const char* s) -> void {
-            while (*s != '\0' && pos < sizeof(stats) - 1) {
+            while (*s != '\0' && pos < stats.size() - 1) {
                 stats[pos++] = *s++;
             }
         };
         auto append_u64 = [&](uint64_t val) {
             if (val == 0) {
-                if (pos < sizeof(stats) - 1) {
+                if (pos < stats.size() - 1) {
                     stats[pos++] = '0';
                 }
                 return;
             }
-            char tmp[21];
+            std::array<char, 21> tmp{};
             int ti = 0;
             while (val > 0) {
                 tmp[ti++] = '0' + static_cast<char>(val % 10);
                 val /= 10;
             }
-            for (int j = ti - 1; j >= 0 && pos < sizeof(stats) - 1; j--) {
+            for (int j = ti - 1; j >= 0 && pos < stats.size() - 1; j--) {
                 stats[pos++] = tmp[j];
             }
         };
@@ -1053,7 +1076,7 @@ ker::dev::CharDeviceOps wki_resource_ops = {
             append_str(" none");
         }
         append_str("\nremote_name: ");
-        append_str(ctx->remote_name);
+        append_str(ctx->remote_name.data());
         append_str("\n");
         stats[pos] = '\0';
 
@@ -1063,13 +1086,14 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         }
         size_t const AVAILABLE = pos - offset;
         size_t const TO_COPY = (count < AVAILABLE) ? count : AVAILABLE;
-        std::memcpy(buf, stats + offset, TO_COPY);
+        std::memcpy(buf, stats.data() + offset, TO_COPY);
         f->pos += static_cast<off_t>(TO_COPY);
         return static_cast<ssize_t>(TO_COPY);
     },
     .write = nullptr,
     .isatty = nullptr,
     .ioctl = nullptr,
+    .poll_check = nullptr,
     .poll_register_waiter = nullptr,
 };
 
@@ -1081,7 +1105,7 @@ auto fmt_u32(char* buf, size_t cap, uint32_t val) -> size_t {
         }
         return 1;
     }
-    char tmp[11];
+    std::array<char, 11> tmp{};
     int ti = 0;
     while (val > 0) {
         tmp[ti++] = '0' + static_cast<char>(val % 10);
@@ -1096,7 +1120,7 @@ auto fmt_u32(char* buf, size_t cap, uint32_t val) -> size_t {
 
 // Format a uint16 as 4-character lowercase hex into buf, returns 4
 auto fmt_u16_hex4(char* buf, size_t cap, uint16_t val) -> size_t {
-    constexpr char HEX[] = "0123456789abcdef";
+    constexpr std::string_view HEX{"0123456789abcdef"};
     if (cap < 4) {
         return 0;
     }
@@ -1162,12 +1186,12 @@ void wki_add_symlink(DevFSNode* parent_dir, std::string_view name, std::string_v
 
 // Find or create a hex-named subdirectory (e.g. "0000", "0003") under parent.
 auto wki_ensure_hex_subdir(DevFSNode* parent, uint16_t num) -> DevFSNode* {
-    char name[8] = {};  // NOLINT(modernize-avoid-c-arrays)
-    fmt_u16_hex4(name, sizeof(name) - 1, num);
+    std::array<char, 8> name{};
+    fmt_u16_hex4(name.data(), name.size() - 1, num);
     name[4] = '\0';
-    DevFSNode* sub = find_child(parent, name);
+    DevFSNode* sub = find_child(parent, name.data());
     if (sub == nullptr) {
-        sub = create_node(name, DevFSNodeType::DIRECTORY);
+        sub = create_node(name.data(), DevFSNodeType::DIRECTORY);
         if (sub != nullptr) {
             add_child(parent, sub);
         }
@@ -1220,14 +1244,14 @@ auto wki_find_device_in_type_dir(DevFSNode* type_dir, uint16_t node_id, ker::net
 
 // Remove a device node and its by-zone/by-peer symlinks given the device name and zone/peer IDs.
 void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node, const WkiDevfsCtx* ctx) {
-    const char* name = ctx->dev_name;
+    const char* name = ctx->dev_name.data();
 
     // Remove symlink from by-zone subdirectory
     {
-        char zone_str[8] = {};  // NOLINT(modernize-avoid-c-arrays)
-        fmt_u16_hex4(zone_str, sizeof(zone_str) - 1, ctx->rdma_zone_id);
+        std::array<char, 8> zone_str{};
+        fmt_u16_hex4(zone_str.data(), zone_str.size() - 1, ctx->rdma_zone_id);
         zone_str[4] = '\0';
-        DevFSNode* zone_sub = find_child(g_wki_by_zone, zone_str);
+        DevFSNode* zone_sub = find_child(g_wki_by_zone, zone_str.data());
         if (zone_sub != nullptr) {
             wki_remove_named_child(zone_sub, name);
         }
@@ -1235,10 +1259,10 @@ void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node,
 
     // Remove symlink from by-peer subdirectory
     {
-        char peer_str[8] = {};  // NOLINT(modernize-avoid-c-arrays)
-        fmt_u16_hex4(peer_str, sizeof(peer_str) - 1, ctx->peer_node_id);
+        std::array<char, 8> peer_str{};
+        fmt_u16_hex4(peer_str.data(), peer_str.size() - 1, ctx->peer_node_id);
         peer_str[4] = '\0';
-        DevFSNode* peer_sub = find_child(g_wki_by_peer, peer_str);
+        DevFSNode* peer_sub = find_child(g_wki_by_peer, peer_str.data());
         if (peer_sub != nullptr) {
             wki_remove_named_child(peer_sub, name);
         }
@@ -1274,7 +1298,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     uint16_t const ZONE_ID = (peer != nullptr) ? peer->rdma_zone_id : 0;
 
     // Assign local counter
-    uint32_t const LOCAL_NUM = g_wki_type_counters[type_idx]++;
+    uint32_t const LOCAL_NUM = g_wki_type_counters[type_idx]++;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // Ensure type subdirectory exists under wki/
     const char* type_dir_name = wki_type_dir(type);
@@ -1299,29 +1323,32 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
     rctx->flags = flags;
     {
         size_t nlen = std::strlen(name);
-        if (nlen >= sizeof(rctx->remote_name)) {
-            nlen = sizeof(rctx->remote_name) - 1;
+        if (nlen >= rctx->remote_name.size()) {
+            nlen = rctx->remote_name.size() - 1;
         }
-        std::memcpy(rctx->remote_name, name, nlen);
-        rctx->remote_name[nlen] = '\0';
+        std::memcpy(rctx->remote_name.data(), name, nlen);
+        rctx->remote_name[nlen] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
-    wki_build_dev_name(rctx->dev_name, sizeof(rctx->dev_name), ZONE_ID, node_id, type, LOCAL_NUM);
+    wki_build_dev_name(rctx->dev_name.data(), rctx->dev_name.size(), ZONE_ID, node_id, type, LOCAL_NUM);
 
     // Allocate Device struct
     auto* dev = new ker::dev::Device();
     if (dev == nullptr) {
+        delete rctx;
         return;
     }
     dev->major = 11;
     dev->minor = static_cast<unsigned>(g_wki_total);
-    dev->name = rctx->dev_name;  // points into heap-allocated ctx
+    dev->name = rctx->dev_name.data();  // points into heap-allocated ctx
     dev->type = (type == ker::net::wki::ResourceType::BLOCK) ? ker::dev::DeviceType::BLOCK : ker::dev::DeviceType::CHAR;
     dev->private_data = rctx;
     dev->char_ops = &wki_resource_ops;
 
     // Create device node under type directory
-    auto* node = create_node(rctx->dev_name, DevFSNodeType::DEVICE);
+    auto* node = create_node(rctx->dev_name.data(), DevFSNodeType::DEVICE);
     if (node == nullptr) {
+        delete dev;
+        delete rctx;
         return;
     }
     node->device = dev;
@@ -1339,11 +1366,11 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         app("/dev/wki/");
         app(type_dir_name);
         app("/");
-        app(static_cast<const char*>(rctx->dev_name));
+        app(rctx->dev_name.data());
         target[p] = '\0';
     }
 
-    std::string_view const DEV_NAME_SV{static_cast<const char*>(rctx->dev_name)};
+    std::string_view const DEV_NAME_SV{rctx->dev_name.data()};
     std::string_view const TARGET_SV{target.data()};
 
     // Symlink in by-zone/{zone_id}/
@@ -1405,7 +1432,7 @@ void devfs_wki_remove_peer_resources(uint16_t node_id) {
         }
 
         // Collect matching nodes first (removal modifies children array)
-        std::array<DevFSNode*, 64> to_remove = {};  // NOLINT(modernize-avoid-c-arrays)
+        std::array<DevFSNode*, 64> to_remove = {};
         size_t remove_count = 0;
 
         for (size_t i = 0; i < type_dir->children_count && remove_count < 64; i++) {
@@ -1463,7 +1490,7 @@ auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
     if (node->device->major == 11 && node->device->private_data != nullptr) {
         auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
         if (ctx->resource_type == ker::net::wki::ResourceType::BLOCK) {
-            return ker::net::wki::wki_dev_proxy_attach_block(ctx->peer_node_id, ctx->resource_id, static_cast<const char*>(ctx->dev_name));
+            return ker::net::wki::wki_dev_proxy_attach_block(ctx->peer_node_id, ctx->resource_id, ctx->dev_name.data());
         }
     }
 
@@ -1478,9 +1505,9 @@ namespace {
 
 // Context for each devfs file under /dev/nodes/<hostname>/
 struct NodeDevfsCtx {
-    uint16_t node_id;   // WKI node ID (0 = self)
-    uint8_t file_type;  // 0 = id, 1 = state, 2 = load
-    char hostname[64];  // Copy of hostname for lookup
+    uint16_t node_id{};               // WKI node ID (0 = self)
+    uint8_t file_type{};              // 0 = id, 1 = state, 2 = load
+    std::array<char, 64> hostname{};  // Copy of hostname for lookup
 };
 
 // Separate CharDeviceOps for id, state, and load files
@@ -1511,6 +1538,7 @@ ker::dev::CharDeviceOps s_node_id_ops = {
     .isatty = nullptr,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 ker::dev::CharDeviceOps s_node_state_ops = {
@@ -1566,7 +1594,6 @@ ker::dev::CharDeviceOps s_node_state_ops = {
     .ioctl = nullptr,
     .poll_check = nullptr,
     .poll_register_waiter = nullptr,
-    .ioctl = nullptr,
 };
 
 ker::dev::CharDeviceOps s_node_load_ops = {
@@ -1607,6 +1634,7 @@ ker::dev::CharDeviceOps s_node_load_ops = {
     .isatty = nullptr,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 unsigned s_node_minor_counter = 0;
@@ -1625,16 +1653,29 @@ auto make_node_device(const char* hostname, uint16_t node_id, uint8_t file_type,
 
     ctx->node_id = node_id;
     ctx->file_type = file_type;
-    std::strncpy(static_cast<char*>(ctx->hostname), hostname, sizeof(ctx->hostname) - 1);
+    size_t host_len = std::strlen(hostname);
+    if (host_len >= ctx->hostname.size()) {
+        host_len = ctx->hostname.size() - 1;
+    }
+    std::memcpy(ctx->hostname.data(), hostname, host_len);
+    ctx->hostname[host_len] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     dev->major = 10;
     dev->minor = 300 + s_node_minor_counter++;
-    dev->name = static_cast<char*>(ctx->hostname);  // devfs doesn't use this for path
+    dev->name = ctx->hostname.data();  // devfs doesn't use this for path
     dev->type = ker::dev::DeviceType::CHAR;
     dev->private_data = ctx;
     dev->char_ops = ops;
 
     return dev;
+}
+
+void destroy_node_device(ker::dev::Device* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+    delete static_cast<NodeDevfsCtx*>(dev->private_data);
+    delete dev;
 }
 
 }  // namespace
@@ -1658,21 +1699,27 @@ void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
     snprintf(path.data(), path.size(), "nodes/%s/id", hostname);
     auto* id_dev = make_node_device(hostname, node_id, 0, &s_node_id_ops);
     if (id_dev != nullptr) {
-        devfs_add_device_node(path.data(), id_dev);
+        if (devfs_add_device_node(path.data(), id_dev) == nullptr) {
+            destroy_node_device(id_dev);
+        }
     }
 
     // Create state file
     snprintf(path.data(), path.size(), "nodes/%s/state", hostname);
     auto* state_dev = make_node_device(hostname, node_id, 1, &s_node_state_ops);
     if (state_dev != nullptr) {
-        devfs_add_device_node(path.data(), state_dev);
+        if (devfs_add_device_node(path.data(), state_dev) == nullptr) {
+            destroy_node_device(state_dev);
+        }
     }
 
     // Create load file
     snprintf(path.data(), path.size(), "nodes/%s/load", hostname);
     auto* load_dev = make_node_device(hostname, node_id, 2, &s_node_load_ops);
     if (load_dev != nullptr) {
-        devfs_add_device_node(path.data(), load_dev);
+        if (devfs_add_device_node(path.data(), load_dev) == nullptr) {
+            destroy_node_device(load_dev);
+        }
     }
 }
 
@@ -1706,3 +1753,5 @@ void devfs_nodes_remove_peer(const char* hostname) {
 }
 
 }  // namespace ker::vfs::devfs
+// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, cppcoreguidelines-interfaces-global-init,
+// readability-suspicious-call-argument)

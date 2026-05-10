@@ -11,9 +11,9 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_log.hpp>
 
@@ -33,9 +33,6 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
 
     auto* tp = new XfsTransaction{};
     tp->mount = mount;
-    tp->item_count = 0;
-    tp->committed = false;
-    tp->cancelled = false;
     return tp;
 }
 
@@ -51,20 +48,21 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     // Check if this buffer (or a different buffer for the same disk block)
     // is already logged in this transaction.
     for (int i = 0; i < tp->item_count; i++) {
-        if (tp->items[i].type != XfsLogItemType::BUFFER || tp->items[i].buf.bp == nullptr) {
+        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
+        if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
             continue;
         }
-        BufHead const* existing = tp->items[i].buf.bp;
+        BufHead const* existing = item.buf.bp;
 
         if (existing == bp) {
             // Same buffer pointer - extend the logged region.
-            uint32_t const OLD_END = tp->items[i].buf.offset + tp->items[i].buf.len;
+            uint32_t const OLD_END = item.buf.offset + item.buf.len;
             uint32_t const NEW_END = offset + len;
-            uint32_t const START = (offset < tp->items[i].buf.offset) ? offset : tp->items[i].buf.offset;
+            uint32_t const START = (offset < item.buf.offset) ? offset : item.buf.offset;
             uint32_t const END = (NEW_END > OLD_END) ? NEW_END : OLD_END;
-            tp->items[i].buf.offset = START;
-            tp->items[i].buf.len = END - START;
-            tp->items[i].buf.dirty = true;
+            item.buf.offset = START;
+            item.buf.len = END - START;
+            item.buf.dirty = true;
             return;
         }
 
@@ -74,13 +72,13 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
         // the existing one so that a single write carries all changes.
         if (existing->bdev == bp->bdev && existing->block_no == bp->block_no && existing->size == bp->size) {
             __builtin_memcpy(existing->data + offset, bp->data + offset, len);
-            uint32_t const OLD_END = tp->items[i].buf.offset + tp->items[i].buf.len;
+            uint32_t const OLD_END = item.buf.offset + item.buf.len;
             uint32_t const NEW_END = offset + len;
-            uint32_t const START = (offset < tp->items[i].buf.offset) ? offset : tp->items[i].buf.offset;
+            uint32_t const START = (offset < item.buf.offset) ? offset : item.buf.offset;
             uint32_t const END = (NEW_END > OLD_END) ? NEW_END : OLD_END;
-            tp->items[i].buf.offset = START;
-            tp->items[i].buf.len = END - START;
-            tp->items[i].buf.dirty = true;
+            item.buf.offset = START;
+            item.buf.len = END - START;
+            item.buf.dirty = true;
             // No refcount bump - the caller will release their own reference
             // to bp normally (via brelse or cursor destructor).
             return;
@@ -92,7 +90,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     // call brelse() before the transaction commits.
     bp->refcount.fetch_add(1, std::memory_order_relaxed);
 
-    XfsTransItem& item = tp->items[tp->item_count++];
+    XfsTransItem& item = tp->items.at(static_cast<size_t>(tp->item_count++));
     item.type = XfsLogItemType::BUFFER;
     item.buf.bp = bp;
     item.buf.offset = offset;
@@ -118,12 +116,13 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
 
     // Check if already logged
     for (int i = 0; i < tp->item_count; i++) {
-        if (tp->items[i].type == XfsLogItemType::INODE && tp->items[i].inode.ip == ip) {
+        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
+        if (item.type == XfsLogItemType::INODE && item.inode.ip == ip) {
             return;  // already tracked
         }
     }
 
-    XfsTransItem& item = tp->items[tp->item_count++];
+    XfsTransItem& item = tp->items.at(static_cast<size_t>(tp->item_count++));
     item.type = XfsLogItemType::INODE;
     item.inode.ip = ip;
 }
@@ -139,7 +138,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     // Phase 1: Write dirty inodes back to their buffers so the buffer
     // data is up-to-date before we write the log record.
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem const& item = tp->items[i];
+        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
         if (item.type == XfsLogItemType::INODE && item.inode.ip != nullptr) {
             int const WRC = xfs_inode_write(item.inode.ip, tp);
             if (WRC != 0) {
@@ -162,7 +161,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     // be flushed to disk by LRU writeback, avoiding per-transaction I/O.
     int const RC = 0;
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem& item = tp->items[i];
+        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
         if (item.type == XfsLogItemType::BUFFER && item.buf.dirty && item.buf.bp != nullptr) {
             bdirty(item.buf.bp);
             brelse(item.buf.bp);
@@ -185,7 +184,7 @@ void xfs_trans_cancel(XfsTransaction* tp) {
 
     // Release the transaction's buffer references (taken in xfs_trans_log_buf).
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem& item = tp->items[i];
+        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
         if (item.type == XfsLogItemType::BUFFER && item.buf.bp != nullptr) {
             brelse(item.buf.bp);
             item.buf.bp = nullptr;

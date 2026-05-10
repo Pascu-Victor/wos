@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/netif.hpp>
@@ -12,11 +13,14 @@
 #include <net/proto/tcp.hpp>
 #include <net/proto/udp.hpp>
 #include <net/route.hpp>
+#include <platform/dbg/dbg.hpp>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
 
 namespace ker::net::proto {
+
+using log = ker::mod::dbg::logger<"ipv4">;
 
 namespace {
 uint16_t ip_id_counter = 0;
@@ -24,7 +28,7 @@ uint16_t ip_id_counter = 0;
 
 void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
 #ifdef DEBUG_IPV4
-    ker::mod::dbg::log("ipv4_rx: received packet len=%zu on device %s\n", pkt->len, dev ? dev->name : "null");
+    log::debug("ipv4_rx: received packet len=%zu on device %s", pkt->len, dev != nullptr ? dev->name.data() : "null");
 #endif
 
     if (pkt->len < sizeof(IPv4Header)) {
@@ -63,8 +67,8 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    uint32_t const DST = ntohl(hdr->dst_addr);
-    uint32_t const SRC = ntohl(hdr->src_addr);
+    IPv4Address const DST = IPv4Address::from_network_order(hdr->dst_addr);
+    IPv4Address const SRC = IPv4Address::from_network_order(hdr->src_addr);
     uint8_t const PROTO = hdr->protocol;
 
     // Learn sender's MAC via ARP (dynamic learning from incoming packets)
@@ -80,12 +84,12 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
     // Check for broadcast (limited)
-    if (DST == 0xFFFFFFFF) {
+    if (DST.is_broadcast()) {
         for_us = true;
     }
 
     // Check for loopback range
-    if ((DST >> 24) == 127) {
+    if (DST.is_loopback()) {
         for_us = true;
     }
 
@@ -105,8 +109,8 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     switch (PROTO) {
         case IPPROTO_ICMP:
 #ifdef DEBUG_IPV4
-            ker::mod::dbg::log("ipv4_rx: ICMP packet from %u.%u.%u.%u to %u.%u.%u.%u\n", (src >> 24) & 0xFF, (src >> 16) & 0xFF,
-                               (src >> 8) & 0xFF, src & 0xFF, (dst >> 24) & 0xFF, (dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF);
+            log::debug("ipv4_rx: ICMP packet from %u.%u.%u.%u to %u.%u.%u.%u", (SRC >> 24) & 0xFF, (SRC >> 16) & 0xFF, (SRC >> 8) & 0xFF,
+                       SRC & 0xFF, (DST >> 24) & 0xFF, (DST >> 16) & 0xFF, (DST >> 8) & 0xFF, DST & 0xFF);
 #endif
             icmp_rx(dev, pkt, SRC, DST, hdr->ttl);
             break;
@@ -122,7 +126,7 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 }
 
-auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8_t ttl) -> int {
+auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int {
     // Prepend IPv4 header
     auto* hdr = reinterpret_cast<IPv4Header*>(pkt->push(sizeof(IPv4Header)));
     std::memset(hdr, 0, sizeof(IPv4Header));
@@ -135,8 +139,8 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
     hdr->ttl = ttl;
     hdr->protocol = proto;
     hdr->checksum = 0;
-    hdr->src_addr = htonl(src);
-    hdr->dst_addr = htonl(dst);
+    hdr->src_addr = src.to_network_order();
+    hdr->dst_addr = dst.to_network_order();
 
     // Compute header checksum
     hdr->checksum = checksum_compute(hdr, sizeof(IPv4Header));
@@ -156,7 +160,7 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
 
     if (route != nullptr && route->dev != nullptr) {
         out_dev = route->dev;
-    } else if (dst == 0xFFFFFFFF) {
+    } else if (dst.is_broadcast()) {
         // Broadcast fallback: no route needed, use first UP non-loopback device
         for (size_t i = 0; i < netdev_count(); i++) {
             auto* d = netdev_at(i);
@@ -174,21 +178,21 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
 
     // Determine next hop: if the matched route has a gateway, use it.
     // Direct routes (on-link) have gateway=0, so next_hop stays as dst.
-    uint32_t next_hop = dst;
-    if (route != nullptr && route->gateway != 0) {
+    IPv4Address next_hop = dst;
+    if (route != nullptr && !route->gateway.is_any()) {
         next_hop = route->gateway;
     }
 
     // If the device is loopback, bypass ARP
     if (std::strcmp(out_dev->name.data(), "lo") == 0) {
 #ifdef DEBUG_IPV4
-        ker::mod::dbg::log("ipv4_tx: loopback device, calling start_xmit\n");
+        log::debug("ipv4_tx: loopback device, calling start_xmit");
 #endif
         return out_dev->ops->start_xmit(out_dev, pkt);
     }
 
     // Resolve MAC address via ARP
-    std::array<uint8_t, 6> dst_mac{};
+    MacAddress dst_mac{};
     int const ARP_RESULT = arp_resolve(out_dev, next_hop, dst_mac, pkt);
     if (ARP_RESULT < 0) {
         // Packet queued in ARP pending list or dropped on timeout
@@ -199,45 +203,44 @@ auto ipv4_tx(PacketBuffer* pkt, uint32_t src, uint32_t dst, uint8_t proto, uint8
     return eth_tx(out_dev, pkt, dst_mac, ETH_TYPE_IPV4);
 }
 
-auto ipv4_tx_auto(PacketBuffer* pkt, uint32_t dst, uint8_t proto) -> int {
+auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
 #ifdef DEBUG_IPV4
-    ker::mod::dbg::log("ipv4_tx_auto: dst=%u.%u.%u.%u proto=%u\n", (dst >> 24) & 0xFF, (dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF,
-                       proto);
+    log::debug("ipv4_tx_auto: dst=%u.%u.%u.%u proto=%u", (dst >> 24) & 0xFF, (dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF, proto);
 #endif
 
     // Route to determine source address
     auto* route = route_lookup(dst);
     if (route == nullptr || route->dev == nullptr) {
         // Broadcast fallback: send via first UP non-loopback device with src=0.0.0.0
-        if (dst == 0xFFFFFFFF) {
-            return ipv4_tx(pkt, 0, dst, proto, 64);
+        if (dst.is_broadcast()) {
+            return ipv4_tx(pkt, IPv4Address::any(), dst, proto, IPV4_DEFAULT_TTL);
         }
 #ifdef DEBUG_IPV4
-        ker::mod::dbg::log("ipv4_tx_auto: route lookup failed\n");
+        log::debug("ipv4_tx_auto: route lookup failed");
 #endif
         pkt_free(pkt);
         return -1;
     }
 
 #ifdef DEBUG_IPV4
-    ker::mod::dbg::log("ipv4_tx_auto: route found, dev=%s\n", route->dev->name);
+    log::debug("ipv4_tx_auto: route found, dev=%s", route->dev->name.data());
 #endif
 
     // Get the first IPv4 address on the outgoing interface
     auto* nif = netif_get(route->dev);
     if (nif == nullptr || nif->ipv4_addr_count == 0) {
         // Broadcast fallback: no address configured yet (e.g. pre-DHCP)
-        if (dst == 0xFFFFFFFF) {
-            return ipv4_tx(pkt, 0, dst, proto, 64);
+        if (dst.is_broadcast()) {
+            return ipv4_tx(pkt, IPv4Address::any(), dst, proto, IPV4_DEFAULT_TTL);
         }
 #ifdef DEBUG_IPV4
-        ker::mod::dbg::log("ipv4_tx_auto: no IPv4 address on interface\n");
+        log::debug("ipv4_tx_auto: no IPv4 address on interface");
 #endif
         pkt_free(pkt);
         return -1;
     }
 
-    return ipv4_tx(pkt, nif->ipv4_addrs[0].addr, dst, proto, 64);
+    return ipv4_tx(pkt, nif->ipv4_addrs.front().addr, dst, proto, IPV4_DEFAULT_TTL);
 }
 
 }  // namespace ker::net::proto

@@ -16,6 +16,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <span>
 #include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -29,6 +30,7 @@ namespace {
 
 constexpr size_t JOURNAL_RING_SIZE = 4096;
 constexpr size_t JOURNAL_MODULE_COUNT = 128;
+constexpr size_t MAX_POLL_WAKEUPS = 64;
 constexpr uint64_t NO_SEQUENCE = 0;
 constexpr int EPOLLIN_VALUE = 0x001;
 constexpr int EPOLLOUT_VALUE = 0x004;
@@ -36,8 +38,8 @@ constexpr int EPOLLOUT_VALUE = 0x004;
 struct ModuleDevice {
     bool used = false;
     bool device_registered = false;
-    char module[JOURNAL_MODULE_MAX]{};
-    char dev_name[64]{};
+    std::array<char, JOURNAL_MODULE_MAX> module{};
+    std::array<char, vfs::devfs::DEVFS_NAME_MAX> dev_name{};
     ker::dev::Device device{};
 };
 
@@ -137,7 +139,7 @@ auto extract_prefix_module(const char* message, char* out_module, size_t out_mod
 
 auto find_module_locked(const char* module) -> ModuleDevice* {
     for (auto& entry : s_modules) {
-        if (entry.used && std::strcmp(entry.module, module) == 0) {
+        if (entry.used && std::strcmp(entry.module.data(), module) == 0) {
             return &entry;
         }
     }
@@ -154,22 +156,22 @@ auto alloc_module_locked(const char* module) -> ModuleDevice* {
             continue;
         }
         entry.used = true;
-        copy_lower_module(entry.module, sizeof(entry.module), module);
+        copy_lower_module(entry.module.data(), entry.module.size(), module);
         const char* prefix = "journal/modules/";
         size_t const PREFIX_LEN = std::strlen(prefix);
-        std::memcpy(entry.dev_name, prefix, PREFIX_LEN);
-        size_t module_len = std::strlen(entry.module);
-        if (PREFIX_LEN + module_len >= sizeof(entry.dev_name)) {
-            module_len = sizeof(entry.dev_name) - PREFIX_LEN - 1;
+        std::copy_n(prefix, PREFIX_LEN, entry.dev_name.begin());
+        size_t module_len = std::strlen(entry.module.data());
+        if (PREFIX_LEN + module_len >= entry.dev_name.size()) {
+            module_len = entry.dev_name.size() - PREFIX_LEN - 1;
         }
-        std::memcpy(entry.dev_name + PREFIX_LEN, entry.module, module_len);
-        entry.dev_name[PREFIX_LEN + module_len] = '\0';
+        std::copy_n(entry.module.begin(), module_len, entry.dev_name.data() + PREFIX_LEN);
+        entry.dev_name.at(PREFIX_LEN + module_len) = '\0';
         entry.device = {
             .major = 10,
             .minor = static_cast<unsigned>(200 + (&entry - s_modules.data())),
-            .name = entry.dev_name,
+            .name = entry.dev_name.data(),
             .type = ker::dev::DeviceType::CHAR,
-            .private_data = entry.module,
+            .private_data = entry.module.data(),
             .char_ops = nullptr,
         };
         return &entry;
@@ -189,6 +191,9 @@ auto module_from_file(ker::vfs::File* file) -> const char* {
 }
 
 auto record_matches(const JournalRecord& rec, const char* module_filter) -> bool {
+    // JournalRecord is a packed userspace ABI record, so its C string fields are
+    // deliberately raw arrays.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     return module_filter == nullptr || module_filter[0] == '\0' || std::strcmp(rec.module, module_filter) == 0;
 }
 
@@ -247,18 +252,17 @@ void serial_write_record(const JournalRecord& rec) {
 }
 
 void wake_waiters() {
-    uint64_t pending[64]{};
-    size_t pending_count = 0;
+    std::array<uint64_t, MAX_POLL_WAKEUPS> pending{};
     uint64_t const FLAGS = s_lock.lock_irqsave();
-    pending_count = std::min(s_poll_waiters.size(), size_t{64});
-    for (size_t i = 0; i < pending_count; i++) {
-        pending[i] = s_poll_waiters[i];
+    size_t const PENDING_COUNT = std::min(s_poll_waiters.size(), pending.size());
+    for (size_t i = 0; i < PENDING_COUNT; i++) {
+        pending.at(i) = s_poll_waiters.at(i);
     }
     s_poll_waiters.clear();
     s_lock.unlock_irqrestore(FLAGS);
 
-    for (size_t i = 0; i < pending_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(pending[i]);
+    for (uint64_t const PID : std::span(pending.data(), PENDING_COUNT)) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(PID);
         if (waiter == nullptr) {
             continue;
         }
@@ -287,11 +291,11 @@ ssize_t journal_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
     if (buf == nullptr) {
         return -EINVAL;
     }
-    char message[JOURNAL_MESSAGE_MAX]{};
+    std::array<char, JOURNAL_MESSAGE_MAX> message{};
     size_t const COPY_LEN = std::min(count, JOURNAL_MESSAGE_MAX - 1);
-    std::memcpy(message, buf, COPY_LEN);
-    message[COPY_LEN] = '\0';
-    emit(LogLevel::INFO, "userspace", message, (count >= JOURNAL_MESSAGE_MAX) ? JOURNAL_FLAG_TRUNCATED : 0);
+    std::memcpy(message.data(), buf, COPY_LEN);
+    message.at(COPY_LEN) = '\0';
+    emit(LogLevel::INFO, "userspace", message.data(), (count >= JOURNAL_MESSAGE_MAX) ? JOURNAL_FLAG_TRUNCATED : 0);
     return static_cast<ssize_t>(count);
 }
 
@@ -375,12 +379,12 @@ void set_serial_threshold(LogLevel level) { s_serial_threshold.store(static_cast
 auto get_serial_threshold() -> LogLevel { return static_cast<LogLevel>(s_serial_threshold.load(std::memory_order_acquire)); }
 
 void emit(LogLevel level, const char* module, const char* message, uint32_t flags) {
-    char module_buf[JOURNAL_MODULE_MAX]{};
+    std::array<char, JOURNAL_MODULE_MAX> module_buf{};
     const char* body = message != nullptr ? message : "";
     uint32_t rec_flags = flags;
 
-    if (!extract_prefix_module(body, module_buf, sizeof(module_buf), &body)) {
-        copy_lower_module(module_buf, sizeof(module_buf), module);
+    if (!extract_prefix_module(body, module_buf.data(), module_buf.size(), &body)) {
+        copy_lower_module(module_buf.data(), module_buf.size(), module);
     } else {
         rec_flags |= JOURNAL_FLAG_PREFIX_COMPAT;
     }
@@ -395,14 +399,17 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         rec.cpu = static_cast<uint32_t>(ker::mod::cpu::get_current_cpu_id_safe());
         rec.level = static_cast<uint8_t>(level);
         rec.flags = rec_flags;
-        std::memcpy(rec.module, module_buf, sizeof(rec.module));
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+        std::memcpy(rec.module, module_buf.data(), sizeof(rec.module));
 
         size_t msg_len = std::strlen(body);
         if (msg_len >= JOURNAL_MESSAGE_MAX) {
             msg_len = JOURNAL_MESSAGE_MAX - 1;
             rec.flags |= JOURNAL_FLAG_TRUNCATED;
         }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         std::memcpy(rec.message, body, msg_len);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         rec.message[msg_len] = '\0';
         rec.message_len = static_cast<uint16_t>(msg_len);
 
@@ -419,7 +426,8 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     rec.cpu = static_cast<uint32_t>(ker::mod::cpu::get_current_cpu_id_safe());
     rec.level = static_cast<uint8_t>(level);
     rec.flags = rec_flags;
-    std::memcpy(rec.module, module_buf, sizeof(rec.module));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    std::memcpy(rec.module, module_buf.data(), sizeof(rec.module));
 
     if (ker::mod::sched::can_query_current_task()) {
         if (auto* task = ker::mod::sched::get_current_task(); task != nullptr) {
@@ -433,17 +441,20 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         msg_len = JOURNAL_MESSAGE_MAX - 1;
         rec.flags |= JOURNAL_FLAG_TRUNCATED;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     std::memcpy(rec.message, body, msg_len);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     rec.message[msg_len] = '\0';
     rec.message_len = static_cast<uint16_t>(msg_len);
 
     uint64_t const IRQ_FLAGS = s_lock.lock_irqsave();
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     auto* module_entry = alloc_module_locked(rec.module);
     if (module_entry != nullptr) {
         maybe_register_module_device(*module_entry);
     }
     rec.sequence = s_next_sequence.fetch_add(1, std::memory_order_relaxed);
-    s_ring[(rec.sequence - 1) % JOURNAL_RING_SIZE] = rec;
+    s_ring.at((rec.sequence - 1) % JOURNAL_RING_SIZE) = rec;
     s_latest_sequence.store(rec.sequence, std::memory_order_release);
     s_oldest_sequence.store(oldest_sequence_locked(), std::memory_order_release);
     s_lock.unlock_irqrestore(IRQ_FLAGS);
@@ -455,21 +466,21 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
 }
 
 void emit_v(LogLevel level, const char* module, const char* format, va_list args, uint32_t flags) {
-    char buf[JOURNAL_MESSAGE_MAX]{};
+    std::array<char, JOURNAL_MESSAGE_MAX> buf{};
     if (format == nullptr) {
         emit(level, module, "(null)", flags);
         return;
     }
-    int const WRITTEN = std::vsnprintf(buf, sizeof(buf), format, args);
+    int const WRITTEN = std::vsnprintf(buf.data(), buf.size(), format, args);
     uint32_t rec_flags = flags;
     if (WRITTEN < 0) {
         emit(level, module, "log formatting failed", rec_flags);
         return;
     }
-    if (static_cast<size_t>(WRITTEN) >= sizeof(buf)) {
+    if (static_cast<size_t>(WRITTEN) >= buf.size()) {
         rec_flags |= JOURNAL_FLAG_TRUNCATED;
     }
-    emit(level, module, buf, rec_flags);
+    emit(level, module, buf.data(), rec_flags);
 }
 
 auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* module_filter) -> ssize_t {
@@ -497,7 +508,7 @@ auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* mod
     }
 
     for (uint64_t seq = cursor; seq <= LATEST && copied < RECORD_COUNT; seq++) {
-        const auto& rec = s_ring[(seq - 1) % JOURNAL_RING_SIZE];
+        const auto& rec = s_ring.at((seq - 1) % JOURNAL_RING_SIZE);
         if (rec.sequence != seq || !record_matches(rec, module_filter)) {
             continue;
         }
@@ -526,7 +537,7 @@ auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> 
         cursor = OLDEST;
     }
     for (uint64_t seq = cursor; seq <= LATEST; seq++) {
-        const auto& rec = s_ring[(seq - 1) % JOURNAL_RING_SIZE];
+        const auto& rec = s_ring.at((seq - 1) % JOURNAL_RING_SIZE);
         if (rec.sequence == seq && record_matches(rec, module_filter)) {
             s_lock.unlock_irqrestore(FLAGS);
             return events & EPOLLIN_VALUE;
@@ -538,8 +549,8 @@ auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> 
 
 auto poll_register_waiter(ker::vfs::File* /*file*/, uint64_t pid) -> bool {
     uint64_t const FLAGS = s_lock.lock_irqsave();
-    for (size_t i = 0; i < s_poll_waiters.size(); i++) {
-        if (s_poll_waiters[i] == pid) {
+    for (uint64_t const WAITER_PID : s_poll_waiters) {
+        if (WAITER_PID == pid) {
             s_lock.unlock_irqrestore(FLAGS);
             return true;
         }

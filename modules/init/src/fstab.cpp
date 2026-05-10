@@ -15,6 +15,15 @@ namespace {
 constexpr size_t FSTAB_BUF_SIZE = 4096;
 constexpr size_t FIELD_MAX = 256;
 using init_log = wos::journal<"init">;
+
+auto parse_field(const char*& cursor, std::array<char, FIELD_MAX>& out) -> bool {
+    size_t field_index = 0;
+    while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && field_index < out.size() - 1) {
+        out.at(field_index++) = *cursor++;
+    }
+    out.at(field_index) = '\0';
+    return out.front() != '\0';
+}
 }  // namespace
 
 void mount_filesystems() {
@@ -35,7 +44,7 @@ void mount_filesystems() {
         return;
     }
 
-    fstab_buf[static_cast<size_t>(BYTES_READ)] = '\0';
+    fstab_buf.at(static_cast<size_t>(BYTES_READ)) = '\0';
     init_log::info("init[%llu]: parsing /etc/fstab (%ld bytes)", static_cast<unsigned long long>(CPUNO), static_cast<long>(BYTES_READ));
 
     // Parse line by line
@@ -63,11 +72,7 @@ void mount_filesystems() {
             std::array<char, FIELD_MAX> fstype{};
 
             // Parse device field
-            size_t fi = 0;
-            while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
-                device[fi++] = *p++;
-            }
-            device[fi] = '\0';
+            bool const HAS_DEVICE = parse_field(p, device);
 
             // Skip whitespace
             while (*p == ' ' || *p == '\t') {
@@ -75,11 +80,7 @@ void mount_filesystems() {
             }
 
             // Parse mountpoint field
-            fi = 0;
-            while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
-                mountpoint[fi++] = *p++;
-            }
-            mountpoint[fi] = '\0';
+            bool const HAS_MOUNTPOINT = parse_field(p, mountpoint);
 
             // Skip whitespace
             while (*p == ' ' || *p == '\t') {
@@ -87,13 +88,9 @@ void mount_filesystems() {
             }
 
             // Parse fstype field
-            fi = 0;
-            while (*p != '\0' && *p != ' ' && *p != '\t' && fi < FIELD_MAX - 1) {
-                fstype[fi++] = *p++;
-            }
-            fstype[fi] = '\0';
+            bool const HAS_FSTYPE = parse_field(p, fstype);
 
-            if (device[0] != '\0' && mountpoint[0] != '\0' && fstype[0] != '\0') {
+            if (HAS_DEVICE && HAS_MOUNTPOINT && HAS_FSTYPE) {
                 // Create mount point directory
                 constexpr mode_t DIR_MODE = 0755;
                 ker::abi::vfs::mkdir(mountpoint.data(), DIR_MODE);

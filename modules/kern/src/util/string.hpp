@@ -1,15 +1,66 @@
 #pragma once
 #include <array>
 #include <cstdarg>
+#include <cstdint>
 #include <cstring>
 #include <span>
+#include <type_traits>
 #include <utility>
 // NOLINTNEXTLINE
-namespace _std {
+namespace ker::util::string {
 
 auto itoa(int n, std::span<char> s, int base = 10) -> int;
 
 auto u64toh(uint64_t n, std::span<char> s) -> int;
+
+auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int;
+
+[[nodiscard]] constexpr auto bounded_copy_len(size_t write_pos, size_t source_len, size_t buffer_size) -> size_t {
+    if (write_pos + source_len + 1 < buffer_size) {
+        return source_len;
+    }
+    if (buffer_size > write_pos + 1) {
+        return buffer_size - write_pos - 1;
+    }
+    return 0;
+}
+
+template <size_t N>
+auto u64_decimal_to_buffer(std::array<char, N>& buf, uint64_t n) -> int {
+    size_t len = 0;
+    if (n == 0) {
+        buf.at(len++) = '0';
+    } else {
+        std::array<char, N> temp{};
+        size_t temp_len = 0;
+        while (n > 0) {
+            temp.at(temp_len++) = static_cast<char>('0' + (n % 10));
+            n /= 10;
+        }
+        for (size_t k = 0; k < temp_len; k++) {
+            buf.at(k) = temp.at(temp_len - 1 - k);
+        }
+        len = temp_len;
+    }
+    buf.at(len) = '\0';
+    return static_cast<int>(len);
+}
+
+template <size_t N>
+auto i64_decimal_to_buffer(std::array<char, N>& buf, int64_t value) -> int {
+    bool const NEGATIVE = value < 0;
+    uint64_t const MAGNITUDE = NEGATIVE ? (~static_cast<uint64_t>(value) + 1U) : static_cast<uint64_t>(value);
+    int len = u64_decimal_to_buffer(buf, MAGNITUDE);
+    if (NEGATIVE) {
+        for (int k = len; k > 0; k--) {
+            buf.at(static_cast<size_t>(k)) = buf.at(static_cast<size_t>(k - 1));
+        }
+        buf.at(0) = '-';
+        len++;
+        buf.at(static_cast<size_t>(len)) = '\0';
+    }
+    return len;
+}
 
 template <typename T>
 auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
@@ -62,7 +113,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             while (std::cmp_less(slen, precision) && s[slen] != '\0') {
                                 slen++;
                             }
-                            size_t const COPY_LEN = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            size_t const COPY_LEN = bounded_copy_len(j, slen, size);
                             if (COPY_LEN > 0) {
                                 strncpy(str + j, s, COPY_LEN);
                                 j += COPY_LEN;
@@ -85,7 +136,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             while (std::cmp_less(slen, precision) && s[slen] != '\0') {
                                 slen++;
                             }
-                            size_t const COPY_LEN = (j + slen + 1 < size) ? slen : (size > j + 1 ? size - j - 1 : 0);
+                            size_t const COPY_LEN = bounded_copy_len(j, slen, size);
                             if (COPY_LEN > 0) {
                                 strncpy(str + j, s, COPY_LEN);
                                 j += COPY_LEN;
@@ -127,26 +178,11 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
-                        uint64_t n = va_arg(args, uint64_t);
+                        uint64_t const N = va_arg(args, uint64_t);
 
-                        int len = 0;
-                        if (n == 0) {
-                            buf[len++] = '0';
-                        } else {
-                            std::array<char, 64> temp{};
-                            int temp_len = 0;
-                            while (n > 0) {
-                                temp[temp_len++] = static_cast<char>('0' + (n % 10));
-                                n /= 10;
-                            }
-                            for (int k = 0; k < temp_len; k++) {
-                                buf[k] = temp[temp_len - 1 - k];
-                            }
-                            len = temp_len;
-                        }
-                        buf[len] = '\0';
+                        int const LEN = u64_decimal_to_buffer(buf, N);
 
-                        int const PAD_LEN = width - len;
+                        int const PAD_LEN = width - LEN;
                         if (PAD_LEN > 0 && j + PAD_LEN < size) {
                             for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
@@ -154,7 +190,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         }
 
                         strncpy(str + j, buf.data(), size - j);
-                        j += len;
+                        j += LEN;
                     } else if (format[i] == 'x') {
                         // %lx - unsigned long hex (64-bit on x86_64)
                         if (width_from_arg) {
@@ -178,35 +214,10 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             width = va_arg(args, int);
                         }
                         int64_t const SN = va_arg(args, int64_t);
-                        bool const NEGATIVE = SN < 0;
-                        uint64_t n = NEGATIVE ? static_cast<uint64_t>(-SN) : static_cast<uint64_t>(SN);
 
-                        int len = 0;
-                        if (n == 0) {
-                            buf[len++] = '0';
-                        } else {
-                            std::array<char, 64> temp{};
-                            int temp_len = 0;
-                            while (n > 0) {
-                                temp[temp_len++] = static_cast<char>('0' + (n % 10));
-                                n /= 10;
-                            }
-                            for (int k = 0; k < temp_len; k++) {
-                                buf[k] = temp[temp_len - 1 - k];
-                            }
-                            len = temp_len;
-                        }
-                        if (NEGATIVE) {
-                            // Shift right and prepend '-'
-                            for (int k = len; k > 0; k--) {
-                                buf[k] = buf[k - 1];
-                            }
-                            buf[0] = '-';
-                            len++;
-                        }
-                        buf[len] = '\0';
+                        int const LEN = i64_decimal_to_buffer(buf, SN);
 
-                        int const PAD_LEN = width - len;
+                        int const PAD_LEN = width - LEN;
                         if (PAD_LEN > 0 && j + PAD_LEN < size) {
                             for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
@@ -214,36 +225,20 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         }
 
                         strncpy(str + j, buf.data(), size - j);
-                        j += len;
+                        j += LEN;
                     } else if (format[i] == 'l') {
                         i++;
                         if (format[i] == 'u') {
                             if (width_from_arg) {
                                 width = va_arg(args, int);
                             }
-                            uint64_t n = va_arg(args, uint64_t);
+                            uint64_t const N = va_arg(args, uint64_t);
 
                             // Convert unsigned to decimal string
-                            int len = 0;
-                            if (n == 0) {
-                                buf[len++] = '0';
-                            } else {
-                                std::array<char, 64> temp{};
-                                int temp_len = 0;
-                                while (n > 0) {
-                                    temp[temp_len++] = static_cast<char>('0' + (n % 10));
-                                    n /= 10;
-                                }
-                                // Reverse into buf
-                                for (int k = 0; k < temp_len; k++) {
-                                    buf[k] = temp[temp_len - 1 - k];
-                                }
-                                len = temp_len;
-                            }
-                            buf[len] = '\0';
+                            int const LEN = u64_decimal_to_buffer(buf, N);
 
                             // Apply padding
-                            int const PAD_LEN = width - len;
+                            int const PAD_LEN = width - LEN;
                             if (PAD_LEN > 0 && j + PAD_LEN < size) {
                                 for (int k = 0; k < PAD_LEN; k++) {
                                     str[j++] = pad_char;
@@ -251,7 +246,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                             }
 
                             strncpy(str + j, buf.data(), size - j);
-                            j += len;
+                            j += LEN;
                         } else if (format[i] == 'x') {
                             if (width_from_arg) {
                                 width = va_arg(args, int);
@@ -299,29 +294,13 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         if (width_from_arg) {
                             width = va_arg(args, int);
                         }
-                        size_t n = va_arg(args, size_t);
+                        size_t const N = va_arg(args, size_t);
 
                         // Convert unsigned to decimal string
-                        int len = 0;
-                        if (n == 0) {
-                            buf[len++] = '0';
-                        } else {
-                            std::array<char, 64> temp{};
-                            int temp_len = 0;
-                            while (n > 0) {
-                                temp[temp_len++] = static_cast<char>('0' + (n % 10));
-                                n /= 10;
-                            }
-                            // Reverse into buf
-                            for (int k = 0; k < temp_len; k++) {
-                                buf[k] = temp[temp_len - 1 - k];
-                            }
-                            len = temp_len;
-                        }
-                        buf[len] = '\0';
+                        int const LEN = u64_decimal_to_buffer(buf, static_cast<uint64_t>(N));
 
                         // Apply padding
-                        int const PAD_LEN = width - len;
+                        int const PAD_LEN = width - LEN;
                         if (PAD_LEN > 0 && j + PAD_LEN < size) {
                             for (int k = 0; k < PAD_LEN; k++) {
                                 str[j++] = pad_char;
@@ -329,7 +308,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                         }
 
                         strncpy(str + j, buf.data(), size - j);
-                        j += len;
+                        j += LEN;
                     } else {
                         // Unsupported z modifier
                         str[j++] = '%';
@@ -342,29 +321,13 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     if (width_from_arg) {
                         width = va_arg(args, int);
                     }
-                    unsigned int n = va_arg(args, unsigned int);
+                    unsigned int const N = va_arg(args, unsigned int);
 
                     // Convert unsigned to decimal string
-                    int len = 0;
-                    if (n == 0) {
-                        buf[len++] = '0';
-                    } else {
-                        std::array<char, 64> temp{};
-                        int temp_len = 0;
-                        while (n > 0) {
-                            temp[temp_len++] = static_cast<char>('0' + (n % 10));
-                            n /= 10;
-                        }
-                        // Reverse into buf
-                        for (int k = 0; k < temp_len; k++) {
-                            buf[k] = temp[temp_len - 1 - k];
-                        }
-                        len = temp_len;
-                    }
-                    buf[len] = '\0';
+                    int const LEN = u64_decimal_to_buffer(buf, static_cast<uint64_t>(N));
 
                     // Apply padding
-                    int const PAD_LEN = width - len;
+                    int const PAD_LEN = width - LEN;
                     if (PAD_LEN > 0 && j + PAD_LEN < size) {
                         for (int k = 0; k < PAD_LEN; k++) {
                             str[j++] = pad_char;
@@ -372,7 +335,7 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
                     }
 
                     strncpy(str + j, buf.data(), size - j);
-                    j += len;
+                    j += LEN;
                     break;
                 }
                 case 's': {
@@ -445,19 +408,4 @@ auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
     return static_cast<int>(j);
 }
 
-}  // namespace _std
-
-namespace std {
-using _std::itoa;
-// using std_ext::reverse;
-// using std_ext::snprintf;
-// using std_ext::strcat;
-// using std_ext::strcpy;
-// using std_ext::strlcat;
-// using std_ext::strlen;
-// using std_ext::strncmp;
-// using std_ext::strncpy;
-// using std_ext::u64toa;
-using _std::u64toh;
-using _std::vsnprintf;
-};  // namespace std
+}  // namespace ker::util::string

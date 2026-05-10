@@ -13,7 +13,7 @@ struct GdbDebugInfo {
 
     // Process information
     uint64_t pid;
-    char name[64];
+    char name[64];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): debugger-visible ABI buffer.
     uint64_t base_address;
     uint64_t entry_point;
 
@@ -41,6 +41,8 @@ struct GdbDebugInfo {
     // Next process in chain
     uint64_t next_process_addr;
 } __attribute__((packed));
+
+static_assert(sizeof(GdbDebugInfo) == 192, "GdbDebugInfo debugger ABI size changed");
 
 // Global debug info chain
 extern GdbDebugInfo* gdb_debug_info_chain;

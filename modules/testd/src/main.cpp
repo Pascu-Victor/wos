@@ -30,6 +30,7 @@
 #include <bits/winsize.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>  // NOLINT(modernize-deprecated-headers): this sysroot exposes PATH_MAX here.
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -54,6 +55,10 @@
 #include <utility>
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
+// POSIX pipe/socketpair APIs intentionally use fixed two-fd arrays throughout
+// this test harness; indexing is kept local and checked by the surrounding test
+// assertions.
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 // ---------------------------------------------------------------------------
 // Test reporting helpers
 // ---------------------------------------------------------------------------
@@ -75,6 +80,9 @@ struct TestSpec {
 #define TESTD_RUN_BEGIN(name) constexpr int name##_pass_counter_begin = __COUNTER__;
 #define TESTD_RUN(name) TESTD_RUN_BEGIN(name) void name()  // NOLINT(cppcoreguidelines-macro-usage)
 #define TESTD_RUN_END(name) constexpr int name##_pass_count = __COUNTER__ - name##_pass_counter_begin - 1;
+#define TESTD_PASS_MARKER(id) /* NOLINT(cppcoreguidelines-macro-usage) */ \
+    static constexpr int TESTD_CONCAT(kTestdPassMarker_, id) = 0;         \
+    (void)TESTD_CONCAT(kTestdPassMarker_, id)
 
 constexpr auto total_tests() -> int;
 
@@ -98,11 +106,10 @@ void fail(const char* name, const char* reason) {
     fflush(stdout);
 }
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define TESTD_PASS(name)                                           \
-    do { /* NOLINTBEGIN(performance-enum-size)*/                   \
-        enum { TESTD_CONCAT(kTestdPassMarker_, __COUNTER__) = 0 }; \
-        /* NOLINTEND(performance-enum-size)*/                      \
-        testd_pass_impl((name));                                   \
+#define TESTD_PASS(name)                \
+    do {                                \
+        TESTD_PASS_MARKER(__COUNTER__); \
+        testd_pass_impl((name));        \
     } while (0)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 // Convenience: run an expression that must return 0 or non-negative
@@ -130,7 +137,7 @@ constexpr int RH_EXIT_UNKNOWN_MODE = 127;
 // Fork a child and exec testd --rh <mode> <fd>.
 // Closes close_fd in the child (the end we don't want the child to have).
 // Returns child pid or -1 on error.
-pid_t spawn_remote_helper(const char* mode, int fd, int close_fd) {
+auto spawn_remote_helper(const char* mode, int fd, int close_fd) -> pid_t {
     std::array<char, 16> fd_str{};
     std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
     pid_t const PID = fork();
@@ -138,11 +145,9 @@ pid_t spawn_remote_helper(const char* mode, int fd, int close_fd) {
         if (close_fd >= 0) {
             close(close_fd);
         }
-        std::array<char, 15> exec_path{};
-        std::array<char, 5> rh_flag{};
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
         std::array<char, 16> mode_buf{};
-        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
-        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
         std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
         std::array<char*, 5> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
@@ -153,7 +158,7 @@ pid_t spawn_remote_helper(const char* mode, int fd, int close_fd) {
     return PID;
 }
 
-pid_t spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) {
+auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) -> pid_t {
     std::array<char, 16> fd_str{};
     std::array<char, 16> arg_str{};
     std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
@@ -163,11 +168,9 @@ pid_t spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char
         if (close_fd >= 0) {
             close(close_fd);
         }
-        std::array<char, 15> exec_path{};
-        std::array<char, 5> rh_flag{};
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
         std::array<char, 16> mode_buf{};
-        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
-        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
         std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
         std::array<char*, 6> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), arg_str.data(), nullptr,
@@ -1551,12 +1554,9 @@ TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
         std::array<char, 16> fd_str{};
         std::snprintf(fd_str.data(), fd_str.size(), "%d", pipe_fds[0]);
 
-        std::array<char, 15> exec_path{};
-        std::array<char, 5> rh_flag{};
-        std::array<char, 16> mode_buf{};
-        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
-        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
-        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", "epoll-wait");
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
+        auto mode_buf = std::to_array("epoll-wait");
         std::array<char*, 5> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
         };
@@ -1622,12 +1622,9 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
         std::snprintf(epfd_str.data(), epfd_str.size(), "%d", EPFD);
         std::snprintf(rfd_str.data(), rfd_str.size(), "%d", fds[0]);
 
-        std::array<char, 15> exec_path{};
-        std::array<char, 5> rh_flag{};
-        std::array<char, 10> mode_buf{};
-        std::snprintf(exec_path.data(), exec_path.size(), "%s", "/usr/bin/testd");
-        std::snprintf(rh_flag.data(), rh_flag.size(), "%s", "--rh");
-        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", "epoll-add");
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
+        auto mode_buf = std::to_array("epoll-add");
         std::array<char*, 6> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), epfd_str.data(), rfd_str.data(), nullptr,
         };
@@ -1735,15 +1732,32 @@ constexpr auto total_tests() -> int { return G_TOTAL; }
 }  // namespace
 
 // ---------------------------------------------------------------------------
+static auto parse_int_arg(const char* text, int fallback = -1) -> int {  // NOLINT(misc-use-anonymous-namespace)
+    if (text == nullptr) {
+        return fallback;
+    }
+    errno = 0;
+    char* end = nullptr;
+    long const VALUE = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || errno != 0 || VALUE < INT_MIN || VALUE > INT_MAX) {
+        return fallback;
+    }
+    return static_cast<int>(VALUE);
+}
+
 // Main: run all tests
 // ---------------------------------------------------------------------------
 
+// NOLINTNEXTLINE(bugprone-exception-escape): testd reports failures via process status/logging.
 auto main(int argc, char** argv) -> int {
     // Remote helper mode: child process execed to run on a remote node.
     // argv: testd --rh <mode> <fd>
     if (argc >= 4 && std::strcmp(argv[1], "--rh") == 0) {
         const char* mode = argv[2];
-        int const FD = std::atoi(argv[3]);
+        int const FD = parse_int_arg(argv[3]);
+        if (FD < 0) {
+            return 1;
+        }
         if (std::strcmp(mode, "pipe-write") == 0) {
             ssize_t const N = write(FD, RH_PIPE_WRITE_MSG.data(), RH_PIPE_WRITE_MSG.size());
             close(FD);
@@ -1780,7 +1794,11 @@ auto main(int argc, char** argv) -> int {
                 close(FD);
                 return 1;
             }
-            int const EXPECTED_PORT = std::atoi(argv[4]);
+            int const EXPECTED_PORT = parse_int_arg(argv[4]);
+            if (EXPECTED_PORT < 0) {
+                close(FD);
+                return 1;
+            }
             struct sockaddr_in peer{};
             socklen_t peer_len = sizeof(peer);
             if (getpeername(FD, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) != 0) {
@@ -1830,7 +1848,11 @@ auto main(int argc, char** argv) -> int {
                 close(FD);
                 return 1;
             }
-            int const TARGET_FD = std::atoi(argv[4]);
+            int const TARGET_FD = parse_int_arg(argv[4]);
+            if (TARGET_FD < 0) {
+                close(FD);
+                return 1;
+            }
             struct epoll_event ev{};
             ev.events = EPOLLIN;
             ev.data.fd = TARGET_FD;
@@ -1886,4 +1908,5 @@ auto main(int argc, char** argv) -> int {
 
     return (g_fail == 0) ? 0 : 1;
 }
+// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 // NOLINTEND(cppcoreguidelines-pro-type-vararg)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
@@ -43,10 +44,10 @@ struct DiscoveredResource {
     uint8_t flags = 0;
     uint32_t net_ipv4_addr = 0;
     uint32_t net_ipv4_mask = 0;
-    std::array<uint8_t, 6> net_real_mac = {};
+    proto::MacAddress net_real_mac;
     uint16_t net_link_state = 0;
     uint32_t net_mtu = 1500;
-    char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
+    char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     bool valid = false;
 };
 

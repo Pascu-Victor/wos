@@ -3,7 +3,13 @@
 #include "mod/io/port/port.hpp"
 
 namespace ker::mod::pic {
-static bool pic_enabled = true;
+
+namespace {
+
+bool pic_enabled = true;
+
+}  // namespace
+
 void eoi(int isr_nr) {
     if (isr_nr > 40) {
         outb(0xA0, 0x20);

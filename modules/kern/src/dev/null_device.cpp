@@ -35,6 +35,7 @@ CharDeviceOps null_ops = {
     .isatty = null_isatty,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // --- /dev/zero operations ---
@@ -64,6 +65,7 @@ CharDeviceOps zero_ops = {
     .isatty = zero_isatty,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // Device instances
@@ -88,7 +90,7 @@ Device zero_dev = {
 }  // anonymous namespace
 
 void null_device_init() {
-    ker::mod::dbg::logger<"null_device">::info("Initializing /dev/null and /dev/zero\n");
+    ker::mod::dbg::logger<"null_device">::info("Initializing /dev/null and /dev/zero");
     dev_register(&null_dev);
     dev_register(&zero_dev);
 }

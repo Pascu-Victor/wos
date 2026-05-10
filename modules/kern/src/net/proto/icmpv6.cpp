@@ -1,19 +1,19 @@
 #include "icmpv6.hpp"
 
-#include <array>
 #include <cstdint>
 #include <cstring>
 #include <net/checksum.hpp>
 #include <net/proto/ipv6.hpp>
 #include <net/proto/ndp.hpp>
 
+#include "net/address.hpp"
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
 
 namespace ker::net::proto {
 
 namespace {
-void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst) {
+void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const IPv6Address& src, const IPv6Address& dst) {
     // Build echo reply with same payload
     size_t const PAYLOAD_LEN = pkt->len;  // includes ICMPv6 header + echo header + data
 
@@ -35,16 +35,19 @@ void handle_echo_request(NetDevice* dev, PacketBuffer* pkt, const std::array<uin
 
     // Compute ICMPv6 checksum (mandatory, uses IPv6 pseudo-header)
     // Reply: src=our dst, dst=their src
-    icmp->checksum = checksum_pseudo_ipv6(dst, src, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(reply->len), reply->data, reply->len);
+    const auto& reply_src = dst;
+    const auto& reply_dst = src;
+    icmp->checksum =
+        checksum_pseudo_ipv6(reply_src, reply_dst, IPV6_PROTO_ICMPV6, static_cast<uint32_t>(reply->len), reply->data, reply->len);
 
     pkt_free(pkt);
 
     // Send reply (swap src/dst)
-    ipv6_tx(reply, dst, src, IPV6_PROTO_ICMPV6, 64, dev);
+    ipv6_tx(reply, reply_src, reply_dst, IPV6_PROTO_ICMPV6, 64, dev);
 }
 }  // namespace
 
-void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst) {
+void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const IPv6Address& src, const IPv6Address& dst) {
     if (pkt->len < sizeof(ICMPv6Header)) {
         pkt_free(pkt);
         return;
@@ -78,11 +81,8 @@ void icmpv6_rx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 16>&
         case ICMPV6_ECHO_REPLY:
         case ICMPV6_ROUTER_SOLICIT:
         case ICMPV6_ROUTER_ADVERT:
-            // Not handled yet
-            pkt_free(pkt);
-            break;
-
         default:
+            // Not handled yet
             pkt_free(pkt);
             break;
     }

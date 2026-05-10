@@ -1,14 +1,17 @@
 #include "block_device.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <span>
 #include <util/smallvec.hpp>
 
 #include "device.hpp"
+#include "util/string.hpp"
 
 namespace ker::dev {
 
@@ -16,8 +19,9 @@ using log = ker::mod::dbg::logger<"bdev">;
 
 // Block device registry
 namespace {
-ker::util::SmallVec<BlockDevice*, 8> block_devices;
-ker::util::SmallVec<Device, 8> block_dev_nodes;
+constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
+ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
+ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
 }  // namespace
 
 auto block_device_register(BlockDevice* bdev) -> int {
@@ -50,7 +54,7 @@ auto block_device_register(BlockDevice* bdev) -> int {
         return -1;
     }
 
-    dev_register(&block_dev_nodes[block_dev_nodes.size() - 1]);
+    dev_register(&block_dev_nodes.at(block_dev_nodes.size() - 1));
 
     mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_INSERT,
                                      static_cast<int64_t>(block_devices.size()), 0, 0);
@@ -62,9 +66,9 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
         return -1;
     }
-    for (size_t i = 0; i < block_devices.size(); i++) {
-        if (block_devices[i] == bdev) {
-            block_devices.remove_at(i);
+    for (auto& i : block_devices) {
+        if (i == bdev) {
+            block_devices.remove(i);
 
             // Also remove the corresponding /dev node
             Device* dev_node = dev_find_by_name(bdev->name.data());
@@ -83,9 +87,9 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
 }
 
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice* {
-    for (size_t i = 0; i < block_devices.size(); i++) {
-        if (block_devices[i] != nullptr && block_devices[i]->major == major && block_devices[i]->minor == minor) {
-            return block_devices[i];
+    for (auto* block_device : block_devices) {
+        if (block_device != nullptr && block_device->major == major && block_device->minor == minor) {
+            return block_device;
         }
     }
     return nullptr;
@@ -96,19 +100,9 @@ auto block_device_find_by_name(const char* name) -> BlockDevice* {
         return nullptr;
     }
 
-    for (size_t i = 0; i < block_devices.size(); i++) {
-        if (block_devices[i] != nullptr && !block_devices[i]->name.empty()) {
-            // Simple string comparison
-            size_t j = 0;
-            while (name[j] != '\0' && block_devices[i]->name[j] != '\0') {
-                if (name[j] != block_devices[i]->name[j]) {
-                    break;
-                }
-                j++;
-            }
-            if (name[j] == '\0' && block_devices[i]->name[j] == '\0') {
-                return block_devices[i];
-            }
+    for (auto* block_device : block_devices) {
+        if (block_device != nullptr && std::strcmp(block_device->name.data(), name) == 0) {
+            return block_device;
         }
     }
     return nullptr;
@@ -120,9 +114,8 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
     }
 
     if (block + count > bdev->total_blocks) {
-        log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p",
-                  static_cast<unsigned long>(block), static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks),
-                  __builtin_return_address(0), __builtin_return_address(1));
+        log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
+                  static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
         return -1;
     }
 
@@ -140,9 +133,8 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
     }
 
     if (block + count > bdev->total_blocks) {
-        log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p caller_caller=%p",
-                  static_cast<unsigned long>(block), static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks),
-                  __builtin_return_address(0), __builtin_return_address(1));
+        log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
+                  static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
         return -1;
     }
 
@@ -172,29 +164,16 @@ auto block_device_at(size_t index) -> BlockDevice* {
     if (index >= block_devices.size()) {
         return nullptr;
     }
-    return block_devices[index];
+    return block_devices.at(index);
 }
 
 auto block_device_find_by_partuuid(const char* uuid_str) -> BlockDevice* {
     if (uuid_str == nullptr) {
         return nullptr;
     }
-    for (size_t i = 0; i < block_devices.size(); i++) {
-        if (block_devices[i] != nullptr && block_devices[i]->is_partition) {
-            // Compare PARTUUID strings
-            bool match = true;
-            for (size_t j = 0; j < PARTUUID_STRING_SIZE - 1; ++j) {
-                if (block_devices[i]->partuuid_str[j] != uuid_str[j]) {
-                    match = false;
-                    break;
-                }
-                if (uuid_str[j] == '\0') {
-                    break;
-                }
-            }
-            if (match && uuid_str[PARTUUID_STRING_SIZE - 1] == '\0') {
-                return block_devices[i];
-            }
+    for (auto* block_device : block_devices) {
+        if (block_device != nullptr && block_device->is_partition && std::strcmp(block_device->partuuid_str.data(), uuid_str) == 0) {
+            return block_device;
         }
     }
     return nullptr;
@@ -238,24 +217,15 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
 
     // Build name: e.g. "sda" + "1" -> "sda1"
     // Find end of parent name
-    size_t parent_name_len = 0;
-    while (parent_name_len < BLOCK_NAME_SIZE - 1 && parent_disk->name[parent_name_len] != '\0') {
-        parent_name_len++;
-    }
+    auto* const PARENT_NAME_END = std::ranges::find(parent_disk->name, '\0');
+    auto const PARENT_NAME_LEN = std::min(static_cast<size_t>(PARENT_NAME_END - parent_disk->name.begin()), BLOCK_NAME_SIZE - 1);
     // Copy parent name
-    for (size_t i = 0; i < parent_name_len; ++i) {
-        part->name[i] = parent_disk->name[i];
-    }
+    std::copy_n(parent_disk->name.begin(), PARENT_NAME_LEN, part->name.begin());
     // Append 1-based partition number (simple: single digit for index < 9, two digits otherwise)
     uint32_t const PART_NUM = partition_index + 1;
-    if (PART_NUM < 10) {
-        part->name[parent_name_len] = static_cast<char>('0' + PART_NUM);
-        part->name[parent_name_len + 1] = '\0';
-    } else {
-        part->name[parent_name_len] = static_cast<char>('0' + (PART_NUM / 10));
-        part->name[parent_name_len + 1] = static_cast<char>('0' + (PART_NUM % 10));
-        part->name[parent_name_len + 2] = '\0';
-    }
+    auto const NUM_OFFSET = static_cast<size_t>(
+        ker::util::string::u64toa(PART_NUM, std::span<char>(part->name.data() + PARENT_NAME_LEN, BLOCK_NAME_SIZE - PARENT_NAME_LEN)));
+    part->name.at(PARENT_NAME_LEN + NUM_OFFSET) = '\0';
 
     part->block_size = parent_disk->block_size;
     part->total_blocks = end_lba - start_lba + 1;
@@ -266,9 +236,7 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
     part->remotable = parent_disk->remotable;
 
     part->is_partition = true;
-    for (size_t i = 0; i < 16; ++i) {
-        part->partuuid[i] = partuuid[i];
-    }
+    std::copy_n(partuuid, part->partuuid.size(), part->partuuid.begin());
     gpt::guid_to_string(partuuid, part->partuuid_str.data());
     part->parent_disk = parent_disk;
     part->partition_start_lba = start_lba;
@@ -289,7 +257,7 @@ auto block_device_init() -> void {
     // We snapshot the current count since enumeration will register new partition devices
     size_t const DISK_COUNT = block_devices.size();
     for (size_t i = 0; i < DISK_COUNT; ++i) {
-        BlockDevice* disk = block_devices[i];
+        BlockDevice* disk = block_devices.at(i);
         if (disk == nullptr || disk->is_partition) {
             continue;
         }
@@ -303,7 +271,7 @@ auto block_device_init() -> void {
         log::debug("GPT: %s has %d partitions", disk->name.data(), disk_info.partition_count);
 
         for (uint32_t p = 0; p < disk_info.partition_count; ++p) {
-            auto& part = disk_info.partitions[p];
+            auto& part = disk_info.partitions.at(p);
             block_device_create_partition(disk, part.starting_lba, part.ending_lba, part.unique_partition_guid.data(), p);
         }
     }

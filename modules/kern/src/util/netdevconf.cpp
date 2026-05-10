@@ -2,8 +2,11 @@
 
 #include <bits/ssize_t.h>
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <net/netdevice.hpp>
+#include <string_view>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -11,10 +14,14 @@
 
 namespace ker::util::netdevconf {
 
-static constexpr const char* NETDEVS_PATH = "/etc/netdevs";
-static constexpr size_t BUF_SIZE = 512;
+constexpr const char* NETDEVS_PATH = "/etc/netdevs";
+constexpr size_t BUF_SIZE = 512;
 
 auto find_device(const char* driver) -> net::NetDevice* {
+    if (driver == nullptr) {
+        return nullptr;
+    }
+    std::string_view const DRIVER_NAME{driver};
     auto* f = ker::vfs::vfs_open_file(NETDEVS_PATH, 0, 0);
     if (f == nullptr || f->fops == nullptr || f->fops->vfs_read == nullptr) {
         if (f != nullptr && f->fops != nullptr && f->fops->vfs_close != nullptr) {
@@ -24,18 +31,18 @@ auto find_device(const char* driver) -> net::NetDevice* {
         return nullptr;
     }
 
-    char buf[BUF_SIZE] = {};
-    ssize_t const N = f->fops->vfs_read(f, buf, sizeof(buf) - 1, 0);
+    std::array<char, BUF_SIZE> buf{};
+    ssize_t const N = f->fops->vfs_read(f, buf.data(), buf.size() - 1, 0);
     if (f->fops->vfs_close != nullptr) {
         f->fops->vfs_close(f);
     }
     if (N <= 0) {
         return nullptr;
     }
-    buf[N] = '\0';
+    buf[static_cast<size_t>(N)] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // Parse line by line: "<ifname> <driver>"
-    const char* pos = buf;
+    const char* pos = buf.data();
     while (*pos != '\0') {
         // Skip whitespace and blank lines
         while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n') {
@@ -80,19 +87,19 @@ auto find_device(const char* driver) -> net::NetDevice* {
             continue;
         }
 
-        // Compare driver token
-        if (DRIVER_LEN == std::strlen(driver) && std::strncmp(driver_start, driver, DRIVER_LEN) == 0) {
+        std::string_view const DRIVER_TOKEN{driver_start, DRIVER_LEN};
+        if (DRIVER_TOKEN == DRIVER_NAME) {
             // Null-terminate ifname for lookup
-            char ifname[32] = {};
-            size_t const COPY_LEN = IFNAME_LEN < sizeof(ifname) - 1 ? IFNAME_LEN : sizeof(ifname) - 1;
-            std::memcpy(ifname, ifname_start, COPY_LEN);
-            ifname[COPY_LEN] = '\0';
+            std::array<char, 32> ifname{};
+            size_t const COPY_LEN = IFNAME_LEN < ifname.size() - 1 ? IFNAME_LEN : ifname.size() - 1;
+            std::copy_n(ifname_start, COPY_LEN, ifname.data());
+            ifname[COPY_LEN] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
-            auto* dev = net::netdev_find_by_name(ifname);
+            auto* dev = net::netdev_find_by_name(ifname.data());
             if (dev != nullptr) {
-                ker::mod::dbg::log("[netdevconf] assigned %s -> driver '%s'", ifname, driver);
+                ker::mod::dbg::log("[netdevconf] assigned %s -> driver '%s'", ifname.data(), driver);
             } else {
-                ker::mod::dbg::log("[netdevconf] %s: device '%s' not found", NETDEVS_PATH, ifname);
+                ker::mod::dbg::log("[netdevconf] %s: device '%s' not found", NETDEVS_PATH, ifname.data());
             }
             return dev;
         }

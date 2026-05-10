@@ -10,12 +10,18 @@
 
 // Linker-provided symbols for init/fini arrays
 extern "C" {
-extern void (*__preinit_array_start[])();  // NOLINT
-extern void (*__preinit_array_end[])();    // NOLINT
-extern void (*__init_array_start[])();     // NOLINT
-extern void (*__init_array_end[])();       // NOLINT
-extern void (*__fini_array_start[])();     // NOLINT
-extern void (*__fini_array_end[])();       // NOLINT
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker init-array ABI.
+extern void (*__preinit_array_start[])();
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker init-array ABI.
+extern void (*__preinit_array_end[])();
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker init-array ABI.
+extern void (*__init_array_start[])();
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker init-array ABI.
+extern void (*__init_array_end[])();
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker fini-array ABI.
+extern void (*__fini_array_start[])();
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,readability-identifier-naming): Linker fini-array ABI.
+extern void (*__fini_array_end[])();
 }
 
 namespace {
@@ -27,9 +33,10 @@ namespace {
 // triggers a KCFI violation.  These are trusted kernel-internal functions so
 // CFI protection on these call sites provides no security value.
 [[clang::no_sanitize("kcfi")]]
-void callGlobalDestructors() {  // NOLINT
+void call_global_destructors() {
     for (auto* dtor = static_cast<void (**)()>(__fini_array_end); dtor > static_cast<void (**)()>(__fini_array_start);) {
         --dtor;
+        // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound): Linker provides the half-open fini-array range.
         (*dtor)();
     }
 }
@@ -48,7 +55,7 @@ namespace ker::init::fns {
 // Calling them via void(*)() pointers with KCFI enabled would always trap.
 // These are closed, trusted kernel constructors so no CFI protection is needed.
 [[clang::no_sanitize("kcfi")]]
-void global_ctors_init() {  // NOLINT
+void global_ctors_init() {
     for (auto* ctor = static_cast<void (**)()>(__preinit_array_start); ctor < static_cast<void (**)()>(__preinit_array_end); ++ctor) {
         (*ctor)();
     }
@@ -59,10 +66,11 @@ void global_ctors_init() {  // NOLINT
 
 }  // namespace ker::init::fns
 
-__attribute__((used, section(".requests"))) volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);  // NOLINT
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,misc-use-internal-linkage): Limine request ABI.
+__attribute__((used, section(".requests"))) volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
 
 // Kernel entry point.
-extern "C" [[noreturn]] void _start(void) {  // NOLINT
+extern "C" [[noreturn]] void _start(void) {  // NOLINT(readability-identifier-naming): Linker entry-point ABI.
     // Check limine protocol support
     if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == 0) {
         while (true) {
@@ -82,7 +90,7 @@ extern "C" [[noreturn]] void _start(void) {  // NOLINT
     ker::init::InitExecutor::run_all();
 
     // Unreachable - run_all() never returns
-    callGlobalDestructors();
+    call_global_destructors();
     while (true) {
         asm volatile("hlt");
     }

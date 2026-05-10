@@ -3,10 +3,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 #include <net/wki/remotable.hpp>
+#include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
@@ -17,9 +17,7 @@
 
 namespace ker::dev::usb {
 
-// External references to xhci.cpp globals (must be outside anonymous namespace)
-extern XhciController* controllers[];
-extern size_t controller_count;
+using log = ker::mod::dbg::logger<"cdc">;
 
 namespace {
 
@@ -28,18 +26,11 @@ auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
 auto remotable_on_attach(uint16_t node_id) -> int {
-    (void)node_id;
-    ker::mod::io::serial::write("cdc-ether: remote attach\n");
+    log::trace("remote attach from 0x%04x", node_id);
     return 0;
 }
-void remotable_on_detach(uint16_t node_id) {
-    (void)node_id;
-    ker::mod::io::serial::write("cdc-ether: remote detach\n");
-}
-void remotable_on_fault(uint16_t node_id) {
-    (void)node_id;
-    ker::mod::io::serial::write("cdc-ether: remote fault\n");
-}
+void remotable_on_detach(uint16_t node_id) { log::trace("remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { log::trace("remote fault for 0x%04x", node_id); }
 const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
@@ -58,7 +49,7 @@ auto virt_to_phys(void* v) -> uint64_t {
     if (addr >= 0xffffffff80000000ULL) {
         uint64_t const PHYS = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
         if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            ker::mod::dbg::log("cdc_ether: virt_to_phys failed for kernel address 0x%lx", addr);
+            log::error("virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
         }
         return PHYS;
@@ -105,11 +96,12 @@ ker::net::NetDeviceOps const CDC_OPS = {
     .close = cdc_close,
     .start_xmit = cdc_start_xmit,
     .set_mac = cdc_set_mac,
+    .set_queue_cpu = nullptr,
 };
 
 // Find bulk IN and OUT endpoints from config descriptor
-bool find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_iface, UsbEndpointDescriptor** ep_in,
-                         UsbEndpointDescriptor** ep_out) {
+auto find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_iface, UsbEndpointDescriptor** ep_in,
+                         UsbEndpointDescriptor** ep_out) -> bool {
     *ep_in = nullptr;
     *ep_out = nullptr;
 
@@ -148,7 +140,8 @@ bool find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_i
 }
 
 // Find CDC Ethernet functional descriptor to get MAC address
-bool find_cdc_ether_desc(const uint8_t* config_data, size_t config_len, uint8_t* mac_string_idx) {
+[[maybe_unused]]
+auto find_cdc_ether_desc(const uint8_t* config_data, size_t config_len, uint8_t* mac_string_idx) -> bool {
     size_t offset = 0;
     while (offset + 2 <= config_len) {
         uint8_t const LEN = config_data[offset];
@@ -213,7 +206,7 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
 
     // Allocate transfer ring
     size_t const RING_BYTES = XFER_RING_SIZE * sizeof(Trb);
-    void* ring_virt = ker::mod::mm::phys::page_alloc(RING_BYTES);
+    auto* ring_virt = ker::mod::mm::phys::page_alloc(RING_BYTES);
     if (ring_virt == nullptr) {
         return;
     }
@@ -228,12 +221,12 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
     uint8_t const DCI = ((ep->address & 0x80) != 0) ? ((2 * (ep->address & 0x0F)) + 1) : (2 * (ep->address & 0x0F));
 
     auto* ictx = dev->input_ctx;
-    std::memset(ictx, 0, sizeof(InputContext));
+    *ictx = InputContext{};
     ictx->add_flags = (1 << 0) | (1U << DCI);  // Slot + this EP
     ictx->drop_flags = 0;
 
     // Copy current slot context
-    std::memcpy(&ictx->slot, &dev->dev_ctx->slot, sizeof(SlotContext));
+    ictx->slot = dev->dev_ctx->slot;
     // Update context entries to include this DCI
     uint32_t const CTX_ENTRIES = (ictx->slot.data[0] >> 27) & 0x1F;
     if (DCI > CTX_ENTRIES) {
@@ -278,14 +271,13 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
         return -1;
     }
 
-    // Find controller - use the first one from the global list
-    if (controller_count == 0) {
+    // Find controller - use the first registered xHCI controller.
+    auto* hc = xhci_default_controller();
+    if (hc == nullptr) {
         return -1;
     }
-    auto* hc = controllers[0];
 
-    auto* cdc = &cdc_devices[cdc_count];
-    std::memset(cdc, 0, sizeof(CdcEtherDevice));
+    auto* cdc = new (&cdc_devices.at(cdc_count)) CdcEtherDevice{};
     cdc->usb_dev = dev;
     cdc->hc = hc;
 
@@ -297,49 +289,37 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     UsbEndpointDescriptor* ep_in = nullptr;
     UsbEndpointDescriptor* ep_out = nullptr;
     if (!find_bulk_endpoints(config_data, config_len, DATA_IFACE, &ep_in, &ep_out)) {
-        ker::mod::io::serial::write("cdc-ether: no bulk endpoints found\n");
+        log::warn("no bulk endpoints found");
         return -1;
     }
 
-    ker::mod::io::serial::write("cdc-ether: bulk_in=");
-    ker::mod::io::serial::write_hex(ep_in->b_endpoint_address);
-    ker::mod::io::serial::write(" bulk_out=");
-    ker::mod::io::serial::write_hex(ep_out->b_endpoint_address);
-    ker::mod::io::serial::write("\n");
+    log::debug("bulk_in=0x%02x bulk_out=0x%02x", ep_in->b_endpoint_address, ep_out->b_endpoint_address);
 
     // Set up bulk endpoints
     setup_bulk_ep(hc, dev, &cdc->bulk_in, ep_in);
     setup_bulk_ep(hc, dev, &cdc->bulk_out, ep_out);
 
     // Generate a MAC address (use device VID/PID + index for uniqueness)
-    cdc->netdev.mac[0] = 0x02;  // locally administered
-    cdc->netdev.mac[1] = static_cast<uint8_t>(dev->vendor_id >> 8);
-    cdc->netdev.mac[2] = static_cast<uint8_t>(dev->vendor_id);
-    cdc->netdev.mac[3] = static_cast<uint8_t>(dev->product_id >> 8);
-    cdc->netdev.mac[4] = static_cast<uint8_t>(dev->product_id);
-    cdc->netdev.mac[5] = static_cast<uint8_t>(cdc_count);
+    cdc->netdev.mac.at(0) = 0x02;  // locally administered
+    cdc->netdev.mac.at(1) = static_cast<uint8_t>(dev->vendor_id >> 8);
+    cdc->netdev.mac.at(2) = static_cast<uint8_t>(dev->vendor_id);
+    cdc->netdev.mac.at(3) = static_cast<uint8_t>(dev->product_id >> 8);
+    cdc->netdev.mac.at(4) = static_cast<uint8_t>(dev->product_id);
+    cdc->netdev.mac.at(5) = static_cast<uint8_t>(cdc_count);
 
     // Register as network device
     cdc->netdev.ops = &CDC_OPS;
     cdc->netdev.mtu = 1500;
     cdc->netdev.state = 1;
     cdc->netdev.private_data = cdc;
-    cdc->netdev.name[0] = '\0';  // Auto-assign
+    cdc->netdev.name.at(0) = '\0';  // Auto-assign
     cdc->netdev.remotable = &S_REMOTABLE_OPS;
     cdc->active = true;
 
     ker::net::netdev_register(&cdc->netdev);
 
-    ker::mod::io::serial::write("cdc-ether: ");
-    ker::mod::io::serial::write(cdc->netdev.name.data());
-    ker::mod::io::serial::write(" MAC=");
-    for (int i = 0; i < 6; i++) {
-        if (i > 0) {
-            ker::mod::io::serial::write(":");
-        }
-        ker::mod::io::serial::write_hex(cdc->netdev.mac[i]);
-    }
-    ker::mod::io::serial::write(" ready\n");
+    log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x ready", cdc->netdev.name.data(), cdc->netdev.mac.at(0), cdc->netdev.mac.at(1),
+              cdc->netdev.mac.at(2), cdc->netdev.mac.at(3), cdc->netdev.mac.at(4), cdc->netdev.mac.at(5));
 
     cdc_count++;
     return 0;

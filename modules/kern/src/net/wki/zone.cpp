@@ -19,6 +19,8 @@
 
 namespace ker::net::wki {
 
+using log = ker::mod::dbg::logger<"wki">;
+
 // -----------------------------------------------------------------------------
 // Zone table - static storage for all zones on this node
 // -----------------------------------------------------------------------------
@@ -102,6 +104,7 @@ auto peer_rdma_transport(uint16_t node_id) -> WkiTransport* {
 }
 
 // Check if the peer's RDMA transport is RoCE (not ivshmem shared memory)
+[[maybe_unused]]
 auto peer_rdma_is_roce(uint16_t node_id) -> bool {
     WkiPeer const* peer = wki_peer_find(node_id);
     if (peer == nullptr) {
@@ -111,10 +114,7 @@ auto peer_rdma_is_roce(uint16_t node_id) -> bool {
     // it's the RoCE overlay. Also check if the primary transport is not rdma_capable.
     if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
         // If the primary transport is also rdma_capable, it's ivshmem (preferred)
-        if (peer->transport != nullptr && peer->transport->rdma_capable) {
-            return false;  // ivshmem
-        }
-        return true;  // RoCE
+        return peer->transport == nullptr || !peer->transport->rdma_capable;
     }
     return false;
 }
@@ -169,7 +169,7 @@ void wki_zone_init() {
     }
 
     s_zone_initialized = true;
-    ker::mod::dbg::log("[WKI] Zone subsystem initialized");
+    log::info("Zone subsystem initialized");
 }
 
 // -----------------------------------------------------------------------------
@@ -303,7 +303,7 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
     destroy.zone_id = zone_id;
     wki_send(PEER, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x destroyed", zone_id);
+    log::info("Zone 0x%08x destroyed", zone_id);
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_DESTROYED, &zone_id, sizeof(zone_id));
     return WKI_OK;
 }
@@ -537,7 +537,7 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
             continue;
         }
 
-        ker::mod::dbg::log("[WKI] Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
+        log::info("Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
 
         // Wake any pending waiters with error
         if (zone.read_wait_entry != nullptr) {
@@ -702,8 +702,8 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", req->zone_id, SRC_NODE, req->size,
-                       use_rdma ? 1 : 0, use_roce ? 1 : 0);
+    log::info("Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", req->zone_id, SRC_NODE, req->size,
+              use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &req->zone_id, sizeof(req->zone_id));
 }
@@ -810,8 +810,8 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
             wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify));
         }
 
-        ker::mod::dbg::log("[WKI] Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node,
-                           zone->size, use_rdma ? 1 : 0, use_roce ? 1 : 0);
+        log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node, zone->size,
+                  use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack->zone_id, sizeof(ack->zone_id));
 
@@ -821,7 +821,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         }
     } else {
         // Rejected
-        ker::mod::dbg::log("[WKI] Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
+        log::warn("Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
 
         WkiWaitEntry* waiter = zone->read_wait_entry;
         zone->state = ZoneState::NONE;
@@ -856,7 +856,7 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
         return;
     }
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
+    log::info("Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
 
     // Wake any pending waiters with error
     if (zone->read_wait_entry != nullptr) {

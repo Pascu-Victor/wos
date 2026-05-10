@@ -7,7 +7,10 @@
 #include "platform/mm/phys.hpp"
 
 namespace ker::mod::mm::dyn::slab {
-static Slab* create_slab(SlabCache* cache) {
+
+namespace {
+
+auto create_slab(SlabCache* cache) -> Slab* {
     auto* free_slab = static_cast<FreeSlab*>(phys::page_alloc());
     if (free_slab == nullptr) {
         return nullptr;
@@ -15,7 +18,7 @@ static Slab* create_slab(SlabCache* cache) {
 
     free_slab->next = nullptr;
 
-    Slab* slab = (Slab*)((uint64_t)free_slab + paging::PAGE_SIZE - sizeof(Slab));  // get Slab* at the end of the page
+    auto* slab = reinterpret_cast<Slab*>(reinterpret_cast<uint64_t>(free_slab) + paging::PAGE_SIZE - sizeof(Slab));
     slab->next = nullptr;
     slab->refs = 0;
     slab->freelist = free_slab;
@@ -23,7 +26,7 @@ static Slab* create_slab(SlabCache* cache) {
     if (cache->slabs == nullptr) {
         cache->slabs = slab;
     } else {
-        Slab* tail = cache->slabs;
+        auto* tail = cache->slabs;
         while (tail->next != nullptr) {
             tail = tail->next;
         }
@@ -32,17 +35,19 @@ static Slab* create_slab(SlabCache* cache) {
     return slab;
 }
 
+}  // namespace
+
 bool cache_grow(SlabCache* cache, uint64_t count) {
     for (uint64_t i = 0; i < count; i++) {
-        Slab* slab = create_slab(cache);
+        auto* slab = create_slab(cache);
         if (slab == nullptr) {
             // TODO: probably should free the created but not added slabs
             return false;
         }
-        FreeSlab* free_slab = slab->freelist;
+        auto* free_slab = slab->freelist;
 
         size_t const ELEMENT_COUNT = cache->size / cache->object_size;
-        FreeSlab* tail = free_slab;
+        auto* tail = free_slab;
 
         for (size_t j = 0; j < ELEMENT_COUNT - 1; j++) {
             uint64_t* offset = reinterpret_cast<uint64_t*>(free_slab) + (cache->object_size * j);

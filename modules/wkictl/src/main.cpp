@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <print>
+#include <string>
 
 namespace {
 
@@ -128,7 +129,7 @@ auto run_homeward(int argc, char** argv) -> int {
 
     std::array<char, 64> launcher = {};
     int64_t const LAUNCHER_LEN = ker::process::wki_launcher_node(launcher.data(), launcher.size());
-    if (LAUNCHER_LEN <= 0 || launcher[0] == '\0') {
+    if (LAUNCHER_LEN <= 0 || launcher.front() == '\0') {
         std::println(stderr, "homeward: failed to resolve launcher node");
         return 1;
     }
@@ -241,24 +242,13 @@ auto parse_route(const char* text, uint32_t* out) -> bool {
     return false;
 }
 
-auto flags_name(uint32_t flags, char* out, size_t out_size) -> const char* {
-    if (out == nullptr || out_size == 0) {
-        return "";
-    }
-    out[0] = '\0';
-    auto append = [&](const char* text) {
-        size_t used = std::strlen(out);
-        if (used >= out_size - 1) {
-            return;
+auto flags_name(uint32_t flags) -> std::string {
+    std::string out;
+    auto append = [&out](const char* text) {
+        if (!out.empty()) {
+            out += '|';
         }
-        if (out[0] != '\0') {
-            std::strncat(out, "|", out_size - used - 1);
-            used = std::strlen(out);
-            if (used >= out_size - 1) {
-                return;
-            }
-        }
-        std::strncat(out, text, out_size - used - 1);
+        out += text;
     };
     if ((flags & ker::process::WKI_TARGET_FLAG_STRICT) != 0) {
         append("strict");
@@ -272,26 +262,24 @@ auto flags_name(uint32_t flags, char* out, size_t out_size) -> const char* {
     if ((flags & ker::process::WKI_TARGET_FLAG_NOINHERIT) != 0) {
         append("noinherit");
     }
-    if (out[0] == '\0') {
-        std::strncpy(out, "auto", out_size - 1);
-        out[out_size - 1] = '\0';
+    if (out.empty()) {
+        out = "auto";
     }
     return out;
 }
 
 auto print_target() -> int {
-    char hostname[64] = {};
+    std::array<char, 64> hostname = {};
     uint32_t flags = 0;
-    int64_t rc = ker::process::getwkitarget(hostname, sizeof(hostname), &flags);
+    int64_t rc = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
     if (rc < 0) {
         std::println(stderr, "wkictl: target get failed: {}", static_cast<long>(rc));
         return 1;
     }
-    char flags_buf[64] = {};
     if (rc == 0) {
-        std::println("target: host=<auto> flags={}", flags_name(flags, flags_buf, sizeof(flags_buf)));
+        std::println("target: host=<auto> flags={}", flags_name(flags));
     } else {
-        std::println("target: host={} flags={}", hostname, flags_name(flags, flags_buf, sizeof(flags_buf)));
+        std::println("target: host={} flags={}", hostname.data(), flags_name(flags));
     }
     return 0;
 }
@@ -358,10 +346,10 @@ auto handle_target(int argc, char** argv) -> int {
 auto list_rules(bool defaults) -> int {
     bool any = false;
     for (uint32_t i = 0;; ++i) {
-        char prefix[128] = {};
+        std::array<char, 128> prefix = {};
         uint32_t route = 0;
-        int rc = defaults ? ker::abi::vfs::wki_rule_get_default_vfs(i, prefix, sizeof(prefix), &route)
-                          : ker::abi::vfs::wki_rule_get_vfs(i, prefix, sizeof(prefix), &route);
+        int rc = defaults ? ker::abi::vfs::wki_rule_get_default_vfs(i, prefix.data(), prefix.size(), &route)
+                          : ker::abi::vfs::wki_rule_get_vfs(i, prefix.data(), prefix.size(), &route);
         if (rc == -ENOENT) {
             break;
         }
@@ -369,7 +357,7 @@ auto list_rules(bool defaults) -> int {
             std::println(stderr, "wkictl: vfs rule get failed at {}: {}", i, rc);
             return 1;
         }
-        std::println("vfs-{}[{}]: {} -> {}", defaults ? "default" : "task", i, prefix, route_name(route));
+        std::println("vfs-{}[{}]: {} -> {}", defaults ? "default" : "task", i, prefix.data(), route_name(route));
         any = true;
     }
     if (!any) {
@@ -460,6 +448,7 @@ auto run_wkictl(int argc, char** argv) -> int {
 
 }  // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape): this CLI uses literal std::println calls throughout; failures are process-fatal.
 auto main(int argc, char** argv) -> int {
     const char* name = command_basename(argc > 0 ? argv[0] : "wkictl");
     if (std::strcmp(name, "locally") == 0) {

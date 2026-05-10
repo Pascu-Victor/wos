@@ -2,6 +2,8 @@
 #include <cstdint>
 
 namespace ker::abi::vmem {
+// Syscall operation selectors are carried in 64-bit registers.
+// NOLINTNEXTLINE(performance-enum-size)
 enum class ops : uint64_t {
     ANON_ALLOCATE,
     ANON_FREE,

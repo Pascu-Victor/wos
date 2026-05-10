@@ -2,15 +2,18 @@
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 #include <fcntl.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): mlibc exposes POSIX nanosleep here.
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
+#include <iterator>
 #include <print>
 #include <string_view>
 #include <utility>
@@ -25,7 +28,7 @@ using ker::abi::sys_log::JournalRecord;
 constexpr const char* JOURNAL_DEVICE = "/dev/journal";
 constexpr const char* JOURNAL_FILE = "/var/log/journal/wos.journal";
 constexpr const char* JOURNAL_FILE_OLD = "/var/log/journal/wos.journal.1";
-constexpr off_t ROTATE_BYTES = 8 * 1024 * 1024;
+constexpr off_t ROTATE_BYTES = static_cast<off_t>(8) * 1024 * 1024;
 constexpr uint32_t FLAG_KERNEL = 1U << 1;
 
 auto base_name(const char* path) -> const char* {
@@ -76,24 +79,32 @@ auto parse_level(const char* text, uint8_t* out) -> bool {
         const char* name;
         uint8_t level;
     };
-    constexpr Pair PAIRS[] = {
-        {.name = "trace", .level = 0}, {.name = "debug", .level = 1},    {.name = "info", .level = 2},  {.name = "notice", .level = 3},
-        {.name = "warn", .level = 4},  {.name = "warning", .level = 4},  {.name = "err", .level = 5},   {.name = "error", .level = 5},
-        {.name = "crit", .level = 6},  {.name = "critical", .level = 6}, {.name = "panic", .level = 7},
-    };
-    for (const auto& pair : PAIRS) {
+    constexpr std::array<Pair, 11> PAIRS{{
+        {.name = "trace", .level = 0},
+        {.name = "debug", .level = 1},
+        {.name = "info", .level = 2},
+        {.name = "notice", .level = 3},
+        {.name = "warn", .level = 4},
+        {.name = "warning", .level = 4},
+        {.name = "err", .level = 5},
+        {.name = "error", .level = 5},
+        {.name = "crit", .level = 6},
+        {.name = "critical", .level = 6},
+        {.name = "panic", .level = 7},
+    }};
+    return std::ranges::any_of(PAIRS, [&](const auto& pair) {
         if (std::strcmp(text, pair.name) == 0) {
             *out = pair.level;
             return true;
         }
-    }
-    return false;
+        return false;
+    });
 }
 
 void sleep_short() {
     timespec const TS{
         .tv_sec = 0,
-        .tv_nsec = 200 * 1000 * 1000,
+        .tv_nsec = 200L * 1000L * 1000L,
     };
     nanosleep(&TS, nullptr);
 }
@@ -135,7 +146,8 @@ auto record_matches(const JournalRecord& rec, const Options& opts) -> bool {
     if (opts.kernel_only && (rec.flags & FLAG_KERNEL) == 0) {
         return false;
     }
-    if (opts.module != nullptr && opts.module[0] != '\0' && std::strcmp(rec.module, opts.module) != 0) {
+    if (opts.module != nullptr && opts.module[0] != '\0' &&
+        std::strcmp(rec.module, opts.module) != 0) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay): ABI record field.
         return false;
     }
     if (opts.since_us != 0 && rec.monotonic_us < opts.since_us) {
@@ -197,15 +209,16 @@ auto run_daemon() -> int {
     }
 
     for (;;) {
-        JournalRecord batch[16]{};
-        ssize_t const N = read(DEV, batch, sizeof(batch));
+        std::array<JournalRecord, 16> batch{};
+        ssize_t const N = read(DEV, batch.data(), batch.size() * sizeof(JournalRecord));
         if (N <= 0) {
             sleep_short();
             continue;
         }
         size_t const RECORDS = static_cast<size_t>(N) / sizeof(JournalRecord);
         for (size_t i = 0; i < RECORDS; i++) {
-            if (!valid_record(batch[i])) {
+            const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
+            if (!valid_record(rec)) {
                 continue;
             }
             off_t const POS = lseek(out, 0, SEEK_END);
@@ -219,7 +232,7 @@ auto run_daemon() -> int {
                     return 1;
                 }
             }
-            write_all(out, &batch[i], sizeof(batch[i]));
+            write_all(out, &rec, sizeof(rec));
         }
     }
 }
@@ -290,22 +303,23 @@ auto run_query(const Options& opts) -> int {
     if (opts.tail != 0 && filtered.size() > opts.tail) {
         start = filtered.size() - opts.tail;
     }
-    for (size_t i = start; i < filtered.size(); i++) {
-        print_record(filtered[i]);
+    for (auto it = std::next(filtered.cbegin(), static_cast<ptrdiff_t>(start)); it != filtered.cend(); ++it) {
+        print_record(*it);
     }
 
     if (opts.follow && DEV >= 0) {
         for (;;) {
-            JournalRecord batch[16]{};
-            ssize_t const N = read(DEV, batch, sizeof(batch));
+            std::array<JournalRecord, 16> batch{};
+            ssize_t const N = read(DEV, batch.data(), batch.size() * sizeof(JournalRecord));
             if (N <= 0) {
                 sleep_short();
                 continue;
             }
             size_t const COUNT = static_cast<size_t>(N) / sizeof(JournalRecord);
             for (size_t i = 0; i < COUNT; i++) {
-                if (record_matches(batch[i], opts)) {
-                    print_record(batch[i]);
+                const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
+                if (record_matches(rec, opts)) {
+                    print_record(rec);
                 }
             }
         }
@@ -319,7 +333,7 @@ auto run_query(const Options& opts) -> int {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): userspace entry point uses STL formatting/allocation.
     Options opts{};
     if (std::strcmp(base_name(argv[0]), "journald") == 0) {
         opts.daemon = true;

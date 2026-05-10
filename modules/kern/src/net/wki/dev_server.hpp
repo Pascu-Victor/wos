@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <dev/block_device.hpp>
+#include <net/address.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -32,8 +33,8 @@ struct DevServerBinding {
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
     dev::BlockDevice* block_dev = nullptr;
-    char vfs_export_path[256] = {};  // NOLINT(modernize-avoid-c-arrays)
-    char vfs_export_name[256] = {};  // NOLINT(modernize-avoid-c-arrays)
+    char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    char vfs_export_name[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
@@ -43,7 +44,7 @@ struct DevServerBinding {
     bool net_state_valid = false;
     uint32_t net_last_ipv4_addr = 0;
     uint32_t net_last_ipv4_mask = 0;
-    std::array<uint8_t, 6> net_last_real_mac = {};
+    proto::MacAddress net_last_real_mac;
     uint16_t net_last_link_state = 0;
     uint32_t net_last_mtu = 1500;
 
@@ -108,8 +109,10 @@ struct DevServerBinding {
           vfs_rdma_read_staging_rkey(o.vfs_rdma_read_staging_rkey),
           vfs_rdma_bulk_staging_buf(o.vfs_rdma_bulk_staging_buf),
           vfs_rdma_bulk_staging_rkey(o.vfs_rdma_bulk_staging_rkey) {
-        // Copy the C array manually
+        // Copy the ABI-facing arrays manually.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
         o.vfs_rdma_write_buf = nullptr;  // ownership transfer
         o.vfs_rdma_read_staging_buf = nullptr;
@@ -123,7 +126,9 @@ struct DevServerBinding {
             resource_type = o.resource_type;
             resource_id = o.resource_id;
             block_dev = o.block_dev;
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
             net_dev = o.net_dev;
             net_rx_filter = o.net_rx_filter;

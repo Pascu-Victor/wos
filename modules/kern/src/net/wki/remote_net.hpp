@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -36,7 +37,7 @@ struct ProxyNetState {
     // V2: Extended attach info from NET ACK [V2 A5.3]
     uint32_t owner_ipv4_addr = 0;
     uint32_t owner_ipv4_mask = 0;
-    std::array<uint8_t, 6> owner_real_mac = {};
+    proto::MacAddress owner_real_mac;
     uint16_t owner_link_state = 0;
     uint32_t owner_mtu = 1500;
 

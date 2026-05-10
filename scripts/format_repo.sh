@@ -5,9 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$WOS_ROOT/build"
 FORMAT_JOBS="${WOS_FORMAT_JOBS:-4}"
-EXCLUDED_PATHS=()
+EXCLUDED_PATHS=(
+    "$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread.cpp"
+    "$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread.hpp"
+)
 TIDY_EXCLUDED_PATHS=(
     "$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread.cpp"
+    "$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread.hpp"
+    "$WOS_ROOT/modules/testprog/src/mandelbench/mandelbench.cpp"
+    "$WOS_ROOT/modules/testprog/src/mandelbench/mandelbench_wki.cpp"
 )
 
 usage() {
@@ -187,7 +193,7 @@ if [ "$RUN_FORMAT" -eq 1 ]; then
 
     FILTERED_FILES=()
     for file in "${FILES[@]}"; do
-        if path_is_excluded "$file"; then
+        if path_is_tidy_excluded "$file"; then
             continue
         fi
         FILTERED_FILES+=("$file")
@@ -245,7 +251,7 @@ if [ "$RUN_TIDY" -eq 1 ]; then
                 ;;
         esac
 
-        if path_is_tidy_excluded "$file"; then
+        if path_is_excluded "$file"; then
             continue
         fi
 
@@ -269,7 +275,6 @@ if [ "$RUN_TIDY" -eq 1 ]; then
         --extra-arg=-D_DEFAULT_SOURCE
         --extra-arg=-D__WOS__=1
         --extra-arg=-D_GNU_SOURCE=1
-        --extra-arg=-DCLANG_TIDY
     )
     if [ "$TIDY_FIX" -eq 1 ]; then
         TIDY_ARGS+=(-fix --checks=-portability-avoid-pragma-once)

@@ -16,6 +16,8 @@
 
 namespace ker::net::wki {
 
+namespace {
+
 // -----------------------------------------------------------------------------
 // BAR2 shared memory layout for WKI ivshmem transport
 // -----------------------------------------------------------------------------
@@ -115,8 +117,6 @@ struct IvshmemTransportPrivate {
     WkiRxHandler rx_handler;
 };
 
-namespace {
-
 WkiTransport s_ivshmem_transport;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 IvshmemTransportPrivate s_ivshmem_priv;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_ivshmem_initialized = false;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -201,7 +201,7 @@ auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t 
         uint32_t const BYTE_IDX = page / 8;
         uint32_t const BIT_IDX = page % 8;
 
-        if ((priv->rdma_bitmap[BYTE_IDX] & (1U << BIT_IDX)) != 0) {
+        if ((priv->rdma_bitmap.at(BYTE_IDX) & (1U << BIT_IDX)) != 0) {
             consecutive = 0;
             start_page = page + 1;
         } else {
@@ -211,7 +211,7 @@ auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t 
                 for (uint32_t p = start_page; p <= page; p++) {
                     uint32_t const BI = p / 8;
                     uint32_t const BT = p % 8;
-                    priv->rdma_bitmap[BI] |= static_cast<uint8_t>(1U << BT);
+                    priv->rdma_bitmap.at(BI) |= static_cast<uint8_t>(1U << BT);
                 }
                 return static_cast<int64_t>(start_page) * static_cast<int64_t>(RDMA_PAGE_SIZE);
             }
@@ -228,7 +228,7 @@ void rdma_bitmap_free(IvshmemTransportPrivate* priv, int64_t offset, uint32_t si
     for (uint32_t p = start_page; p < start_page + PAGES && p < RDMA_MAX_PAGES; p++) {
         uint32_t const BI = p / 8;
         uint32_t const BT = p % 8;
-        priv->rdma_bitmap[BI] &= static_cast<uint8_t>(~(1U << BT));
+        priv->rdma_bitmap.at(BI) &= static_cast<uint8_t>(~(1U << BT));
     }
 }
 

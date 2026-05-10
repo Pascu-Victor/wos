@@ -7,8 +7,10 @@
 #include "util/hcf.hpp"
 
 namespace ker::mod::mm::addr {
-static uint64_t hhdm_offset = 0;
-static uint64_t mmap_size = 0;
+namespace {
+uint64_t hhdm_offset = 0;
+uint64_t mmap_size = 0;
+}  // namespace
 
 void set_hhdm_offset(uint64_t offset) { hhdm_offset = offset; }
 

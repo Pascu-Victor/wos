@@ -24,26 +24,22 @@ freely, subject to the following restrictions:
 
 #include "tinycthread.hpp"
 
-#include <stdlib.h>
-
+#include <cstdlib>
 #include <ctime>
 
 /* Platform specific includes */
 #if defined(_TTHREAD_POSIX_)
-#include <errno.h>
 #include <sched.h>
-#include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#include <cerrno>
 #elif defined(_TTHREAD_WIN32_)
 #include <process.h>
 #include <sys/timeb.h>
 #endif
 
 /* Standard, good-to-have defines */
-#ifndef NULL
-#define NULL (void*)0
-#endif
 #ifndef TRUE
 #define TRUE 1
 #endif
@@ -63,8 +59,8 @@ int mtx_init(mtx_t* mtx, int type) {
     if (!mtx->mTimed) {
         InitializeCriticalSection(&(mtx->mHandle.cs));
     } else {
-        mtx->mHandle.mut = CreateMutex(NULL, FALSE, NULL);
-        if (mtx->mHandle.mut == NULL) {
+        mtx->mHandle.mut = CreateMutex(nullptr, FALSE, nullptr);
+        if (mtx->mHandle.mut == nullptr) {
             return THRD_ERROR;
         }
     }
@@ -132,7 +128,7 @@ int mtx_timedlock(mtx_t* mtx, const timespec* ts) {
     if ((current_ts.tv_sec > ts->tv_sec) || ((current_ts.tv_sec == ts->tv_sec) && (current_ts.tv_nsec >= ts->tv_nsec))) {
         timeoutMs = 0;
     } else {
-        timeoutMs = (DWORD)(ts->tv_sec - current_ts.tv_sec) * 1000;
+        timeoutMs = static_cast<DWORD>(ts->tv_sec - current_ts.tv_sec) * 1000;
         timeoutMs += (ts->tv_nsec - current_ts.tv_nsec) / 1000000;
         timeoutMs += 1;
     }
@@ -188,7 +184,7 @@ int mtx_timedlock(mtx_t* mtx, const timespec* ts) {
             dur.tv_nsec = 5000000;
         }
 
-        nanosleep(&dur, NULL);
+        nanosleep(&dur, nullptr);
     }
 
     switch (rc) {
@@ -257,30 +253,30 @@ int cnd_init(cnd_t* cond) {
     InitializeCriticalSection(&cond->mWaitersCountLock);
 
     /* Init events */
-    cond->mEvents[_CONDITION_EVENT_ONE] = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (cond->mEvents[_CONDITION_EVENT_ONE] == NULL) {
-        cond->mEvents[_CONDITION_EVENT_ALL] = NULL;
+    cond->mEvents[_CONDITION_EVENT_ONE] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (cond->mEvents[_CONDITION_EVENT_ONE] == nullptr) {
+        cond->mEvents[_CONDITION_EVENT_ALL] = nullptr;
         return THRD_ERROR;
     }
-    cond->mEvents[_CONDITION_EVENT_ALL] = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (cond->mEvents[_CONDITION_EVENT_ALL] == NULL) {
+    cond->mEvents[_CONDITION_EVENT_ALL] = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (cond->mEvents[_CONDITION_EVENT_ALL] == nullptr) {
         CloseHandle(cond->mEvents[_CONDITION_EVENT_ONE]);
-        cond->mEvents[_CONDITION_EVENT_ONE] = NULL;
+        cond->mEvents[_CONDITION_EVENT_ONE] = nullptr;
         return THRD_ERROR;
     }
 
     return THRD_SUCCESS;
 #else
-    return pthread_cond_init(cond, NULL) == 0 ? THRD_SUCCESS : THRD_ERROR;
+    return pthread_cond_init(cond, nullptr) == 0 ? THRD_SUCCESS : THRD_ERROR;
 #endif
 }
 
 void cnd_destroy(cnd_t* cond) {
 #if defined(_TTHREAD_WIN32_)
-    if (cond->mEvents[_CONDITION_EVENT_ONE] != NULL) {
+    if (cond->mEvents[_CONDITION_EVENT_ONE] != nullptr) {
         CloseHandle(cond->mEvents[_CONDITION_EVENT_ONE]);
     }
-    if (cond->mEvents[_CONDITION_EVENT_ALL] != NULL) {
+    if (cond->mEvents[_CONDITION_EVENT_ALL] != nullptr) {
         CloseHandle(cond->mEvents[_CONDITION_EVENT_ALL]);
     }
     DeleteCriticalSection(&cond->mWaitersCountLock);
@@ -351,7 +347,7 @@ static int _cnd_timedwait_win32(cnd_t* cond, mtx_t* mtx, DWORD timeout) {
     result = WaitForMultipleObjects(2, cond->mEvents, FALSE, timeout);
     if (result == WAIT_TIMEOUT) {
         return thrd_timedout;
-    } else if (result == (int)WAIT_FAILED) {
+    } else if (result == static_cast<int>(WAIT_FAILED)) {
         return THRD_ERROR;
     }
 
@@ -387,7 +383,7 @@ auto cnd_timedwait(cnd_t* cond, mtx_t* mtx, const timespec* ts) -> int {
 #if defined(_TTHREAD_WIN32_)
     timespec now;
     if (timespec_get(&now, TIME_UTC) == TIME_UTC) {
-        DWORD delta = (DWORD)((ts->tv_sec - now.tv_sec) * 1000 + (ts->tv_nsec - now.tv_nsec + 500000) / 1000000);
+        DWORD delta = static_cast<DWORD>((ts->tv_sec - now.tv_sec) * 1000 + (ts->tv_nsec - now.tv_nsec + 500000) / 1000000);
         return _cnd_timedwait_win32(cond, mtx, delta);
     } else
         return THRD_ERROR;
@@ -409,11 +405,11 @@ struct TinyCThreadTSSData {
 };
 
 static tss_dtor_t _tinycthread_tss_dtors[1088] = {
-    NULL,
+    nullptr,
 };
 
-static _Thread_local struct TinyCThreadTSSData* _tinycthread_tss_head = NULL;
-static _Thread_local struct TinyCThreadTSSData* _tinycthread_tss_tail = NULL;
+static _Thread_local struct TinyCThreadTSSData* _tinycthread_tss_head = nullptr;
+static _Thread_local struct TinyCThreadTSSData* _tinycthread_tss_tail = nullptr;
 
 static void _tinycthread_tss_cleanup() {
     struct TinyCThreadTSSData* data;
@@ -423,12 +419,12 @@ static void _tinycthread_tss_cleanup() {
 
     for (iteration = 0; iteration < TSS_DTOR_ITERATIONS && again > 0; iteration++) {
         again = 0;
-        for (data = _tinycthread_tss_head; data != NULL; data = data->next) {
-            if (data->value != NULL) {
+        for (data = _tinycthread_tss_head; data != nullptr; data = data->next) {
+            if (data->value != nullptr) {
                 value = data->value;
-                data->value = NULL;
+                data->value = nullptr;
 
-                if (_tinycthread_tss_dtors[data->key] != NULL) {
+                if (_tinycthread_tss_dtors[data->key] != nullptr) {
                     again = 1;
                     _tinycthread_tss_dtors[data->key](value);
                 }
@@ -436,20 +432,20 @@ static void _tinycthread_tss_cleanup() {
         }
     }
 
-    while (_tinycthread_tss_head != NULL) {
+    while (_tinycthread_tss_head != nullptr) {
         data = _tinycthread_tss_head->next;
-        free(_tinycthread_tss_head);
+        std::free(_tinycthread_tss_head);
         _tinycthread_tss_head = data;
     }
-    _tinycthread_tss_head = NULL;
-    _tinycthread_tss_tail = NULL;
+    _tinycthread_tss_head = nullptr;
+    _tinycthread_tss_tail = nullptr;
 }
 
 static void NTAPI _tinycthread_tss_callback(PVOID h, DWORD dwReason, PVOID pv) {
     (void)h;
     (void)pv;
 
-    if (_tinycthread_tss_head != NULL && (dwReason == DLL_THREAD_DETACH || dwReason == DLL_PROCESS_DETACH)) {
+    if (_tinycthread_tss_head != nullptr && (dwReason == DLL_THREAD_DETACH || dwReason == DLL_PROCESS_DETACH)) {
         _tinycthread_tss_cleanup();
     }
 }
@@ -485,7 +481,7 @@ auto thrd_wrapper_function(void* a_arg) -> void*
 #endif
 
     /* Get thread startup information */
-    auto* ti = (thread_start_info*)a_arg;
+    auto* ti = static_cast<thread_start_info*>(a_arg);
     fun = ti->m_function;
     arg = ti->m_arg;
 
@@ -496,15 +492,15 @@ auto thrd_wrapper_function(void* a_arg) -> void*
     res = fun(arg);
 
 #if defined(_TTHREAD_WIN32_)
-    if (_tinycthread_tss_head != NULL) {
+    if (_tinycthread_tss_head != nullptr) {
         _tinycthread_tss_cleanup();
     }
 
     return res;
 #else
     pres = new int(res);
-    if (pres != NULL) {
-        *(int*)pres = res;
+    if (pres != nullptr) {
+        *static_cast<int*>(pres) = res;
     }
     return pres;
 #endif
@@ -515,7 +511,7 @@ auto thrd_create(thrd_t* thr, thrd_start_t func, void* arg) -> int {
     /* Fill out the thread startup information (passed to the thread wrapper,
        which will eventually free it) */
     auto* ti = new thread_start_info;
-    if (ti == NULL) {
+    if (ti == nullptr) {
         return THRD_NOMEM;
     }
     ti->m_function = func;
@@ -523,10 +519,10 @@ auto thrd_create(thrd_t* thr, thrd_start_t func, void* arg) -> int {
 
     /* Create the thread */
 #if defined(_TTHREAD_WIN32_)
-    *thr = CreateThread(NULL, 0, thrd_wrapper_function, (LPVOID)ti, 0, NULL);
+    *thr = CreateThread(nullptr, 0, thrd_wrapper_function, static_cast<LPVOID>(ti), 0, nullptr);
 #elif defined(_TTHREAD_POSIX_)
-    if (pthread_create(thr, NULL, thrd_wrapper_function, (void*)ti) != 0) {
-        *thr = 0;
+    if (pthread_create(thr, nullptr, thrd_wrapper_function, static_cast<void*>(ti)) != 0) {
+        *thr = nullptr;
     }
 #endif
 
@@ -566,15 +562,15 @@ int thrd_equal(thrd_t thr0, thrd_t thr1) {
 
 void thrd_exit(int res) {
 #if defined(_TTHREAD_WIN32_)
-    if (_tinycthread_tss_head != NULL) {
+    if (_tinycthread_tss_head != nullptr) {
         _tinycthread_tss_cleanup();
     }
 
     ExitThread(res);
 #else
     void* pres = new int(res);
-    if (pres != NULL) {
-        *(int*)pres = res;
+    if (pres != nullptr) {
+        *static_cast<int*>(pres) = res;
     }
     pthread_exit(pres);
 #endif
@@ -587,7 +583,7 @@ int thrd_join(thrd_t thr, int* res) {
     if (WaitForSingleObject(thr, INFINITE) == WAIT_FAILED) {
         return THRD_ERROR;
     }
-    if (res != NULL) {
+    if (res != nullptr) {
         if (GetExitCodeThread(thr, &dwRes) != 0) {
             *res = dwRes;
         } else {
@@ -601,11 +597,11 @@ int thrd_join(thrd_t thr, int* res) {
     if (pthread_join(thr, &pres) != 0) {
         return THRD_ERROR;
     }
-    if (pres != NULL) {
-        ires = *(int*)pres;
-        delete (int*)pres;
+    if (pres != nullptr) {
+        ires = *static_cast<int*>(pres);
+        delete static_cast<int*>(pres);
     }
-    if (res != NULL) {
+    if (res != nullptr) {
         *res = ires;
     }
 #endif
@@ -621,11 +617,12 @@ int thrd_sleep(const timespec* duration, timespec* remaining) {
 
     timespec_get(&start, TIME_UTC);
 
-    t = SleepEx((DWORD)(duration->tv_sec * 1000 + duration->tv_nsec / 1000000 + (((duration->tv_nsec % 1000000) == 0) ? 0 : 1)), TRUE);
+    t = SleepEx(static_cast<DWORD>(duration->tv_sec * 1000 + duration->tv_nsec / 1000000 + (((duration->tv_nsec % 1000000) == 0) ? 0 : 1)),
+                TRUE);
 
     if (t == 0) {
         return 0;
-    } else if (remaining != NULL) {
+    } else if (remaining != nullptr) {
         timespec_get(remaining, TIME_UTC);
         remaining->tv_sec -= start.tv_sec;
         remaining->tv_nsec -= start.tv_nsec;
@@ -666,14 +663,14 @@ int tss_create(tss_t* key, tss_dtor_t dtor) {
 
 void tss_delete(tss_t key) {
 #if defined(_TTHREAD_WIN32_)
-    struct TinyCThreadTSSData* data = (struct TinyCThreadTSSData*)TlsGetValue(key);
-    struct TinyCThreadTSSData* prev = NULL;
-    if (data != NULL) {
+    auto* data = static_cast<TinyCThreadTSSData*>(TlsGetValue(key));
+    TinyCThreadTSSData* prev = nullptr;
+    if (data != nullptr) {
         if (data == _tinycthread_tss_head) {
             _tinycthread_tss_head = data->next;
         } else {
             prev = _tinycthread_tss_head;
-            if (prev != NULL) {
+            if (prev != nullptr) {
                 while (prev->next != data) {
                     prev = prev->next;
                 }
@@ -684,9 +681,9 @@ void tss_delete(tss_t key) {
             _tinycthread_tss_tail = prev;
         }
 
-        free(data);
+        std::free(data);
     }
-    _tinycthread_tss_dtors[key] = NULL;
+    _tinycthread_tss_dtors[key] = nullptr;
     TlsFree(key);
 #else
     pthread_key_delete(key);
@@ -695,9 +692,9 @@ void tss_delete(tss_t key) {
 
 void* tss_get(tss_t key) {
 #if defined(_TTHREAD_WIN32_)
-    struct TinyCThreadTSSData* data = (struct TinyCThreadTSSData*)TlsGetValue(key);
-    if (data == NULL) {
-        return NULL;
+    auto* data = static_cast<TinyCThreadTSSData*>(TlsGetValue(key));
+    if (data == nullptr) {
+        return nullptr;
     }
     return data->value;
 #else
@@ -707,29 +704,29 @@ void* tss_get(tss_t key) {
 
 int tss_set(tss_t key, void* val) {
 #if defined(_TTHREAD_WIN32_)
-    struct TinyCThreadTSSData* data = (struct TinyCThreadTSSData*)TlsGetValue(key);
-    if (data == NULL) {
-        data = (struct TinyCThreadTSSData*)malloc(sizeof(struct TinyCThreadTSSData));
-        if (data == NULL) {
+    auto* data = static_cast<TinyCThreadTSSData*>(TlsGetValue(key));
+    if (data == nullptr) {
+        data = static_cast<TinyCThreadTSSData*>(std::malloc(sizeof(TinyCThreadTSSData)));
+        if (data == nullptr) {
             return THRD_ERROR;
         }
 
-        data->value = NULL;
+        data->value = nullptr;
         data->key = key;
-        data->next = NULL;
+        data->next = nullptr;
 
-        if (_tinycthread_tss_tail != NULL) {
+        if (_tinycthread_tss_tail != nullptr) {
             _tinycthread_tss_tail->next = data;
         } else {
             _tinycthread_tss_tail = data;
         }
 
-        if (_tinycthread_tss_head == NULL) {
+        if (_tinycthread_tss_head == nullptr) {
             _tinycthread_tss_head = data;
         }
 
         if (!TlsSetValue(key, data)) {
-            free(data);
+            std::free(data);
             return THRD_ERROR;
         }
     }
@@ -756,14 +753,14 @@ int _tthread_timespec_get(timespec* ts, int base) {
 
 #if defined(_TTHREAD_WIN32_)
     _ftime64_s(&tb);
-    ts->tv_sec = (time_t)tb.time;
-    ts->tv_nsec = 1000000L * (long)tb.millitm;
+    ts->tv_sec = static_cast<time_t>(tb.time);
+    ts->tv_nsec = 1000000L * static_cast<long>(tb.millitm);
 #elif defined(CLOCK_REALTIME)
     base = (clock_gettime(CLOCK_REALTIME, ts) == 0) ? base : 0;
 #else
-    gettimeofday(&tv, NULL);
-    ts->tv_sec = (time_t)tv.tv_sec;
-    ts->tv_nsec = 1000L * (long)tv.tv_usec;
+    gettimeofday(&tv, nullptr);
+    ts->tv_sec = static_cast<time_t>(tv.tv_sec);
+    ts->tv_nsec = 1000L * static_cast<long>(tv.tv_usec);
 #endif
 
     return base;

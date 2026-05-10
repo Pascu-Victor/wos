@@ -79,7 +79,7 @@ void pkt_debug_dump_in_use(size_t avail) {
 
             size_t slot = DEBUG_SITE_TRACK_SLOTS;
             for (size_t j = 0; j < DEBUG_SITE_TRACK_SLOTS; j++) {
-                if (site_counts[j].site == pkt->debug_alloc_site) {
+                if (site_counts.at(j).site == pkt->debug_alloc_site) {
                     slot = j;
                     break;
                 }
@@ -87,21 +87,23 @@ void pkt_debug_dump_in_use(size_t avail) {
 
             if (slot == DEBUG_SITE_TRACK_SLOTS) {
                 for (size_t j = 0; j < DEBUG_SITE_TRACK_SLOTS; j++) {
-                    if (site_counts[j].count == 0) {
+                    if (site_counts.at(j).count == 0) {
                         slot = j;
-                        site_counts[j].site = pkt->debug_alloc_site;
-                        site_counts[j].oldest_seq = pkt->debug_alloc_seq;
-                        site_counts[j].oldest_pkt = pkt;
+                        auto& summary = site_counts.at(j);
+                        summary.site = pkt->debug_alloc_site;
+                        summary.oldest_seq = pkt->debug_alloc_seq;
+                        summary.oldest_pkt = pkt;
                         break;
                     }
                 }
             }
 
-            if (slot != DEBUG_SITE_TRACK_SLOTS && site_counts[slot].site == pkt->debug_alloc_site) {
-                site_counts[slot].count++;
-                if (pkt->debug_alloc_seq < site_counts[slot].oldest_seq) {
-                    site_counts[slot].oldest_seq = pkt->debug_alloc_seq;
-                    site_counts[slot].oldest_pkt = pkt;
+            if (slot != DEBUG_SITE_TRACK_SLOTS && site_counts.at(slot).site == pkt->debug_alloc_site) {
+                auto& summary = site_counts.at(slot);
+                summary.count++;
+                if (pkt->debug_alloc_seq < summary.oldest_seq) {
+                    summary.oldest_seq = pkt->debug_alloc_seq;
+                    summary.oldest_pkt = pkt;
                 }
             }
         }
@@ -110,8 +112,8 @@ void pkt_debug_dump_in_use(size_t avail) {
     std::ranges::sort(site_counts, [](const SiteSummary& a, const SiteSummary& b) -> bool { return a.count > b.count; });
 
     log::debug("pkt pool snapshot: free=%zu reserve=%zu outstanding=%zu capacity=%zu", avail, RX_RESERVE, outstanding, pool_capacity);
-    for (size_t i = 0; i < DEBUG_TOP_SITES && i < site_counts.size(); i++) {
-        const auto& entry = site_counts[i];
+    for (size_t i = 0; i < DEBUG_TOP_SITES; i++) {
+        const auto& entry = site_counts.at(i);
         if (entry.count == 0 || entry.oldest_pkt == nullptr) {
             continue;
         }

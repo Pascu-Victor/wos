@@ -11,7 +11,14 @@
 namespace ker::loader::debug {
 
 std::vector<ProcessDebugInfo> debug_registry;
-static ker::mod::sys::Spinlock debug_registry_lock;
+
+namespace {
+
+using log = ker::mod::dbg::logger<"debug">;
+
+ker::mod::sys::Spinlock debug_registry_lock;
+
+}  // namespace
 
 void register_process(uint64_t pid, const char* name, uint64_t base_addr, uint64_t entry_point) {
     ProcessDebugInfo info;
@@ -25,7 +32,7 @@ void register_process(uint64_t pid, const char* name, uint64_t base_addr, uint64
     debug_registry.push_back(info);
     debug_registry_lock.unlock();
 #ifdef ELF_DEBUG
-    ker::mod::dbg::log("Registered process for debugging: pid=%x, name=%s, base=%x, entry=%x", pid, name, baseAddr, entryPoint);
+    log::debug("registered process: pid=%x, name=%s, base=%x, entry=%x", pid, name, base_addr, entry_point);
 #endif
 }
 
@@ -44,7 +51,7 @@ void add_debug_section(uint64_t pid, const char* name, uint64_t vaddr, uint64_t 
             process.sections.push_back(section);
             debug_registry_lock.unlock();
 #ifdef ELF_DEBUG
-            ker::mod::dbg::log("Added debug section: %s, vaddr=%x, paddr=%x, size=%x", name, vaddr, paddr, size);
+            log::debug("added section: %s, vaddr=%x, paddr=%x, size=%x", name, vaddr, paddr, size);
 #endif
             return;
         }
@@ -71,8 +78,7 @@ void add_debug_symbol(uint64_t pid, const char* name, uint64_t vaddr, uint64_t p
             process.symbols.push_back(sym);
             debug_registry_lock.unlock();
 #ifdef ELF_DEBUG
-            ker::mod::dbg::log("Added debug symbol: %s, vaddr=%x, paddr=%x, size=%x, bind=%d, type=%d", name, vaddr, paddr, size, bind,
-                               type);
+            log::debug("added symbol: %s, vaddr=%x, paddr=%x, size=%x, bind=%d, type=%d", name, vaddr, paddr, size, bind, type);
 #endif
             return;
         }
@@ -176,22 +182,21 @@ void print_debug_info(uint64_t pid) {
     }
     if (info == nullptr) {
         debug_registry_lock.unlock();
-        ker::mod::dbg::log("No debug info found for PID %x", pid);
+        log::warn("no debug info found for PID %x", pid);
         return;
     }
 
-    ker::mod::dbg::log("Debug info for process %s (PID %x):", info->name, pid);
-    ker::mod::dbg::log("  Base address: %x", info->base_address);
-    ker::mod::dbg::log("  Entry point: %x", info->entry_point);
-    ker::mod::dbg::log("  ELF header at: %x", info->elf_header_addr);
-    ker::mod::dbg::log("  Program headers at: %x (count: %d)", info->program_headers_addr, info->program_header_count);
-    ker::mod::dbg::log("  Section headers at: %x (count: %d)", info->section_headers_addr, info->section_header_count);
-    ker::mod::dbg::log("  String table at: %x (size: %x)", info->string_table_addr, info->string_table_size);
+    log::info("process %s (PID %x):", info->name, pid);
+    log::info("  Base address: %x", info->base_address);
+    log::info("  Entry point: %x", info->entry_point);
+    log::info("  ELF header at: %x", info->elf_header_addr);
+    log::info("  Program headers at: %x (count: %d)", info->program_headers_addr, info->program_header_count);
+    log::info("  Section headers at: %x (count: %d)", info->section_headers_addr, info->section_header_count);
+    log::info("  String table at: %x (size: %x)", info->string_table_addr, info->string_table_size);
 
-    ker::mod::dbg::log("  Sections:");
+    log::info("  Sections:");
     for (const auto& section : info->sections) {
-        ker::mod::dbg::log("    %s: vaddr=%x, paddr=%x, size=%x, type=%x", section.name, section.vaddr, section.paddr, section.size,
-                           section.type);
+        log::info("    %s: vaddr=%x, paddr=%x, size=%x, type=%x", section.name, section.vaddr, section.paddr, section.size, section.type);
     }
     debug_registry_lock.unlock();
 }

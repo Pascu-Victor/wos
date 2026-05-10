@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <cstring>
 #include <net/packet.hpp>
+#include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <span>
 
 #include "dev/pci.hpp"
 #include "net/netdevice.hpp"
@@ -15,13 +17,13 @@ namespace ker::dev::ivshmem {
 
 using log = ker::mod::dbg::logger<"ivsh">;
 
-// Forward declarations for NAPI
-static auto ivshmem_poll(ker::net::NapiStruct* napi, int budget) -> int;
-
 namespace {
+// Forward declarations for NAPI
+auto ivshmem_poll(ker::net::NapiStruct* napi, int budget) -> int;
+
 constexpr size_t MAX_IVSHMEM_DEVICES = 2;
-IvshmemNetDevice dev_pool[MAX_IVSHMEM_DEVICES] = {};
-IvshmemNetDevice* devices[MAX_IVSHMEM_DEVICES] = {};
+std::array<IvshmemNetDevice, MAX_IVSHMEM_DEVICES> dev_pool = {};
+std::array<IvshmemNetDevice*, MAX_IVSHMEM_DEVICES> devices = {};
 size_t device_count = 0;
 
 // BAR0 register offsets (ivshmem-plain)
@@ -44,9 +46,10 @@ void ivshmem_irq_enable(IvshmemNetDevice* dev) {
 // -- Ring buffer operations --
 
 // Write a packet to the ring. Returns 0 on success, -1 if ring full.
-int ring_write(RingBuffer* ring, const uint8_t* data, uint16_t len) {
+auto ring_write(RingBuffer* ring, std::span<const uint8_t> data) -> int {
     // Packet format: [len:u16][data][pad to 4 bytes]
-    uint32_t const PKT_SIZE = 2 + len;
+    auto const LEN = static_cast<uint16_t>(data.size());
+    uint32_t const PKT_SIZE = 2 + LEN;
     uint32_t const PADDED = (PKT_SIZE + 3) & ~3U;
 
     uint32_t const HEAD = ring->head;
@@ -64,15 +67,16 @@ int ring_write(RingBuffer* ring, const uint8_t* data, uint16_t len) {
 
     // Write length
     uint32_t pos = HEAD;
-    ring->data[pos % ring->size] = static_cast<uint8_t>(len & 0xFF);
-    ring->data[(pos + 1) % ring->size] = static_cast<uint8_t>(len >> 8);
+    ring->data[pos % ring->size] = static_cast<uint8_t>(LEN & 0xFF);
+    ring->data[(pos + 1) % ring->size] = static_cast<uint8_t>(LEN >> 8);
     pos += 2;
 
     // Write data
-    for (uint16_t i = 0; i < len; i++) {
+    for (uint16_t i = 0; i < LEN; i++) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): bounded by LEN from the span size.
         ring->data[(pos + i) % ring->size] = data[i];
     }
-    pos += len;
+    pos += LEN;
 
     // Pad
     while (((pos - HEAD) & 3U) != 0U) {
@@ -87,7 +91,7 @@ int ring_write(RingBuffer* ring, const uint8_t* data, uint16_t len) {
 }
 
 // Read a packet from the ring. Returns packet length, 0 if empty.
-uint16_t ring_read(RingBuffer* ring, uint8_t* buf, uint16_t buf_size) {
+auto ring_read(RingBuffer* ring, std::span<uint8_t> buf) -> uint16_t {
     uint32_t const HEAD = ring->head;
     uint32_t const TAIL = ring->tail;
     asm volatile("" ::: "memory");
@@ -106,8 +110,9 @@ uint16_t ring_read(RingBuffer* ring, uint8_t* buf, uint16_t buf_size) {
     uint32_t const POS = TAIL + 2;
 
     // Read data
-    uint16_t const COPY_LEN = (LEN > buf_size) ? buf_size : LEN;
+    uint16_t const COPY_LEN = (LEN > buf.size()) ? static_cast<uint16_t>(buf.size()) : LEN;
     for (uint16_t i = 0; i < COPY_LEN; i++) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): bounded by COPY_LEN from the span size.
         buf[i] = ring->data[(POS + i) % ring->size];
     }
 
@@ -135,7 +140,7 @@ int ivshmem_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt)
     }
 
     dev->tx_lock.lock();
-    int const RET = ring_write(&dev->tx_ring, pkt->data, static_cast<uint16_t>(pkt->len));
+    int const RET = ring_write(&dev->tx_ring, std::span(pkt->data, static_cast<uint16_t>(pkt->len)));
     dev->tx_lock.unlock();
 
     if (RET == 0) {
@@ -158,6 +163,7 @@ ker::net::NetDeviceOps ivshmem_ops = {
     .close = ivshmem_close,
     .start_xmit = ivshmem_start_xmit,
     .set_mac = ivshmem_set_mac,
+    .set_queue_cpu = nullptr,
 };
 
 // -- IRQ handler (minimal - just schedule NAPI) --
@@ -201,16 +207,15 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
         log::error("BAR2 is zero");
         return -1;
     }
-    auto* shmem = const_cast<uint8_t*>(reinterpret_cast<volatile uint8_t*>(bar2_ptr));
+    auto* shmem = static_cast<uint8_t*>(bar2_ptr);
 
     // Determine VM position (0 or 1)
     uint32_t const IV_POS = regs[IVSHMEM_REG_IVPOSITION / 4];
 
     // Use 16MB as default shared memory size
-    constexpr size_t SHMEM_SIZE = 16 * 1024 * 1024;
+    constexpr size_t SHMEM_SIZE = size_t{16} * 1024 * 1024;
 
-    auto* idev = &dev_pool[device_count];
-    std::memset(idev, 0, sizeof(IvshmemNetDevice));
+    auto* idev = new (&dev_pool.at(device_count)) IvshmemNetDevice{};
 
     idev->pci = pci_dev;
     idev->regs = regs;
@@ -279,19 +284,19 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     }
 
     // Generate MAC: locally administered, based on VM position
-    idev->netdev.mac[0] = 0x02;
-    idev->netdev.mac[1] = 0x44;  // 'D' for DMA
-    idev->netdev.mac[2] = 0x4D;  // 'M'
-    idev->netdev.mac[3] = 0x41;  // 'A'
-    idev->netdev.mac[4] = 0x00;
-    idev->netdev.mac[5] = static_cast<uint8_t>(idev->my_vm_id);
+    idev->netdev.mac.at(0) = 0x02;
+    idev->netdev.mac.at(1) = 0x44;  // 'D' for DMA
+    idev->netdev.mac.at(2) = 0x4D;  // 'M'
+    idev->netdev.mac.at(3) = 0x41;  // 'A'
+    idev->netdev.mac.at(4) = 0x00;
+    idev->netdev.mac.at(5) = static_cast<uint8_t>(idev->my_vm_id);
 
     // Register NetDevice as "dmaN"
     std::array<char, 16> name = {};
-    name[0] = 'd';
-    name[1] = 'm';
-    name[2] = 'a';
-    name[3] = static_cast<char>(static_cast<uint8_t>('0') + device_count);
+    name.at(0) = 'd';
+    name.at(1) = 'm';
+    name.at(2) = 'a';
+    name.at(3) = static_cast<char>(static_cast<uint8_t>('0') + device_count);
     std::memcpy(idev->netdev.name.data(), name.data(), 5);
 
     idev->netdev.ops = &ivshmem_ops;
@@ -306,13 +311,12 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     ker::net::napi_init(&idev->napi, &idev->netdev, ivshmem_poll, 64);
     ker::net::napi_enable(&idev->napi);
 
-    devices[device_count++] = idev;
+    devices.at(device_count++) = idev;
 
     log::info("%s vm_id=%u shmem=0x%lx ready", idev->netdev.name.data(), idev->my_vm_id, reinterpret_cast<uint64_t>(shmem));
 
     return 0;
 }
-}  // namespace
 
 // -- NAPI poll function (runs in worker thread context) --
 int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
@@ -323,11 +327,11 @@ int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
     }
 
     int processed = 0;
-    uint8_t buf[2048];
+    std::array<uint8_t, 2048> buf{};
 
     // Process RX packets up to budget
     while (processed < budget) {
-        uint16_t const LEN = ring_read(&dev->rx_ring, buf, sizeof(buf));
+        uint16_t const LEN = ring_read(&dev->rx_ring, buf);
         if (LEN == 0) {
             break;
         }
@@ -338,7 +342,7 @@ int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
         }
 
         auto* dst = pkt->put(LEN);
-        std::memcpy(dst, buf, LEN);
+        std::memcpy(dst, buf.data(), LEN);
         pkt->dev = &dev->netdev;
 
         dev->netdev.rx_packets++;
@@ -356,10 +360,11 @@ int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
 
     return processed;
 }
+}  // namespace
 
 auto ivshmem_net_is_claimed(pci::PCIDevice* dev) -> bool {
     for (size_t i = 0; i < device_count; i++) {
-        if (devices[i] != nullptr && devices[i]->pci == dev) {
+        if (devices.at(i) != nullptr && devices.at(i)->pci == dev) {
             return true;
         }
     }

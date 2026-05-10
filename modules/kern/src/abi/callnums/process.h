@@ -2,6 +2,8 @@
 #include <cstdint>
 
 namespace ker::abi::process {
+// Syscall operation selectors are carried in 64-bit registers.
+// NOLINTNEXTLINE(performance-enum-size)
 enum class procmgmt_ops : uint64_t {
     EXIT,          // 0
     EXEC,          // 1

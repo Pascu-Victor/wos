@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <format>
 #include <print>
+#include <span>
 
 #include "config.hpp"
 #ifdef WOS
@@ -169,11 +170,11 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
     std::vector<double> times(repeat);
     uint64_t start_time = 0;
     uint64_t end_time = 0;
-    int i = 0;
-    int r = 0;
 
-    for (r = 0; r < repeat; r++) {
-        memset(image, 0, static_cast<long>(width * height) * 4);
+    int repeat_index = 0;
+    for (auto& elapsed_seconds : times) {
+        const std::span<unsigned char> IMAGE_PIXELS(image, static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
+        std::ranges::fill(IMAGE_PIXELS, 0);
 
         start_time = get_time();
 #if MANDELBENCH_DEBUG
@@ -181,62 +182,70 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
 #endif
         int created_threads = 0;
 
-        for (i = 0; i < threads; i++) {
-            a[i].image = image;
-            a[i].colormap = colormap;
-            a[i].width = width;
-            a[i].height = height;
-            a[i].max = max_iteration;
-            a[i].id = i;
-            a[i].threads = threads;
+        auto thread_it = t.begin();
+        int worker_id = 0;
+        for (auto& thread_arg : a) {
+            thread_arg.image = image;
+            thread_arg.colormap = colormap;
+            thread_arg.width = width;
+            thread_arg.height = height;
+            thread_arg.max = max_iteration;
+            thread_arg.id = worker_id;
+            thread_arg.threads = threads;
 #if MANDELBENCH_DEBUG
-            a[i].thread_start_ns = 0;
-            a[i].thread_end_ns = 0;
-            a[i].thread_cpu_ns = 0;
-            a[i].cpu_mask = 0;
-            a[i].total_iterations = 0;
-            a[i].rows_completed = 0;
-            a[i].cpu_id = -1;
-            a[i].cpu_end_id = -1;
-            a[i].cpu_changes = 0;
+            thread_arg.thread_start_ns = 0;
+            thread_arg.thread_end_ns = 0;
+            thread_arg.thread_cpu_ns = 0;
+            thread_arg.cpu_mask = 0;
+            thread_arg.total_iterations = 0;
+            thread_arg.rows_completed = 0;
+            thread_arg.cpu_id = -1;
+            thread_arg.cpu_end_id = -1;
+            thread_arg.cpu_changes = 0;
 #endif
 
-            int create_result = thrd_create(&t[i], generate_image, &a[i]);
+            int create_result = thrd_create(&*thread_it, generate_image, &thread_arg);
             if (create_result != THRD_SUCCESS) {
-                std::println(stderr, "  error: thrd_create failed for worker {} on repeat {} (rc={})", i, r, create_result);
+                std::println(stderr, "  error: thrd_create failed for worker {} on repeat {} (rc={})", worker_id, repeat_index, create_result);
                 break;
             }
             ++created_threads;
+            ++thread_it;
+            ++worker_id;
         }
 
 #if MANDELBENCH_DEBUG
         uint64_t all_spawned = now_ns();
 #endif
         if (created_threads != threads) {
-            for (i = 0; i < created_threads; i++) {
-                thrd_join(t[i], nullptr);
+            auto created_end = t.begin() + created_threads;
+            for (auto created_thread_it = t.begin(); created_thread_it != created_end; ++created_thread_it) {
+                thrd_join(*created_thread_it, nullptr);
             }
             return 1;
         }
 
 #if MANDELBENCH_DEBUG
-        std::println(stderr, "  [repeat {}/{}] spawned {} workers in {:.2f}ms; computing...", r + 1, repeat, created_threads,
+        std::println(stderr, "  [repeat {}/{}] spawned {} workers in {:.2f}ms; computing...", repeat_index + 1, repeat, created_threads,
                      (double)(all_spawned - spawn_start) / 1e6);
 #endif
 
-        for (i = 0; i < threads; i++) {
-            int join_result = thrd_join(t[i], nullptr);
+        int joined_worker_id = 0;
+        for (auto& thread : t) {
+            int join_result = thrd_join(thread, nullptr);
             if (join_result != THRD_SUCCESS) {
-                std::println(stderr, "  error: thrd_join failed for worker {} on repeat {} (rc={})", i, r, join_result);
+                std::println(stderr, "  error: thrd_join failed for worker {} on repeat {} (rc={})", joined_worker_id, repeat_index,
+                             join_result);
                 return 1;
             }
+            ++joined_worker_id;
         }
 
 #if MANDELBENCH_DEBUG
         uint64_t all_joined = now_ns();
 #endif
         end_time = get_time();
-        times[r] = static_cast<double>(end_time - start_time) / 1000.0;
+        elapsed_seconds = static_cast<double>(end_time - start_time) / 1000.0;
 
 #if MANDELBENCH_DEBUG
         // find earliest/latest thread start and latest thread end
@@ -319,9 +328,10 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
             ((double)a[worst_thread].thread_cpu_ns / (double)(a[worst_thread].thread_end_ns - a[worst_thread].thread_start_ns)) * 100.0);
 #endif
 
-        std::string const PATH = std::format(IMAGE, DEVICE_NAME, r);
+        std::string const PATH = std::format(IMAGE, DEVICE_NAME, repeat_index);
         save_image(PATH.c_str(), image, width, height);
-        progress(DEVICE_NAME, width, height, max_iteration, threads, repeat, r, times[r]);
+        progress(DEVICE_NAME, width, height, max_iteration, threads, repeat, repeat_index, elapsed_seconds);
+        repeat_index++;
     }
     report(DEVICE_NAME, width, height, max_iteration, threads, repeat, times);
 

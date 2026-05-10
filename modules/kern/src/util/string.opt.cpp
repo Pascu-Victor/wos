@@ -7,8 +7,15 @@
 #include <cstring>
 #include <span>
 
-namespace _std {
-static __attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
+// This translation unit provides the kernel's freestanding C string/stdio ABI
+// symbols, so raw char buffers, va_list forwarding, and exact libc parameter
+// names are intentional at this boundary.
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// clang-analyzer-security.insecureAPI.strcpy, readability-inconsistent-declaration-parameter-name,
+// readability-inconsistent-declaration-parameter-name)
+namespace ker::util::string {
+namespace {
+__attribute__((no_builtin("strlen"))) inline auto strlen(const char* str) -> size_t {
     size_t len = 0;
     while (str[len] != '\0') {
         len++;
@@ -16,7 +23,7 @@ static __attribute__((no_builtin("strlen"))) inline auto strlen(const char* str)
     return len;
 }
 
-static __attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) {
+__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) {
     size_t i = 0;
     for (; src[i] != '\0'; i++) {
         dest[i] = src[i];
@@ -26,7 +33,7 @@ static __attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char
     return dest;
 }
 
-static __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
+__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
     size_t i = 0;
     for (; src[i] != '\0' && i < n; i++) {
         dest[i] = src[i];
@@ -36,17 +43,20 @@ static __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const ch
     return dest;
 }
 
-static __attribute__((no_builtin("strlen"))) void reverse(char s[]) {
-    int c = 0;
-    int i = 0;
-    int j = 0;
+__attribute__((no_builtin("strlen"))) void reverse(char* s) {
+    size_t j = strlen(s);
+    if (j == 0) {
+        return;
+    }
+    --j;
 
-    for (i = 0, j = strlen(s) - 1; i < j; i++, j--) {
-        c = s[i];
+    for (size_t i = 0; i < j; i++, j--) {
+        char const C = s[i];
         s[i] = s[j];
-        s[j] = c;
+        s[j] = C;
     }
 }
+}  // namespace
 auto itoa(int n, std::span<char> s, int base) -> int {
     int i = 0;
     bool is_negative = false;
@@ -78,7 +88,7 @@ auto itoa(int n, std::span<char> s, int base) -> int {
     return i;
 }
 
-static auto u64toa(uint64_t n, std::span<char> s, int base = 10) -> int {
+auto u64toa(uint64_t n, std::span<char> s, int base) -> int {
     int i = 0;
 
     if (n == 0) {
@@ -121,39 +131,9 @@ auto u64toh(uint64_t n, std::span<char> s) -> int {
 
     return i;
 }
-
-static int u64toh(uint64_t n, char s[]) {
-    int i = 0;
-
-    if (n == 0) {
-        s[i++] = '0';
-        s[i] = '\0';
-        return 1;
-    }
-
-    while (n != 0) {
-        int const REM = n % 16;
-        s[i++] = (REM > 9) ? (REM - 10) + 'a' : REM + '0';
-        n = n / 16;
-    }
-
-    s[i] = '\0';
-
-    reverse(s);
-
-    return i;
-}
-
-static auto snprintf(char* str, size_t size, const char* format, ...) -> int {
-    va_list args;
-    va_start(args, format);
-    int const RET = _std::vsnprintf(str, size, format, args);
-    va_end(args);
-    return RET;
-}
-
-static auto strcat(char* dest, const char* src) -> char* {
-    size_t const DEST_LEN = _std::strlen(dest);
+namespace {
+auto strcat(char* dest, const char* src) -> char* {
+    size_t const DEST_LEN = ker::util::string::strlen(dest);
     size_t i = 0;
 
     for (i = 0; src[i] != '\0'; i++) {
@@ -165,9 +145,9 @@ static auto strcat(char* dest, const char* src) -> char* {
     return dest;
 }
 
-static auto strlcat(char* dest, const char* src, size_t size) -> size_t {
-    size_t const DEST_LEN = _std::strlen(dest);
-    size_t const SRC_LEN = _std::strlen(src);
+auto strlcat(char* dest, const char* src, size_t size) -> size_t {
+    size_t const DEST_LEN = ker::util::string::strlen(dest);
+    size_t const SRC_LEN = ker::util::string::strlen(src);
     size_t i = 0;
 
     if (size <= DEST_LEN) {
@@ -183,7 +163,7 @@ static auto strlcat(char* dest, const char* src, size_t size) -> size_t {
     return DEST_LEN + SRC_LEN;
 }
 
-static int strcmp(const char* str1, const char* str2) {
+auto strcmp(const char* str1, const char* str2) -> int {
     while (*str1 != '\0' && *str1 == *str2) {
         str1++;
         str2++;
@@ -191,7 +171,7 @@ static int strcmp(const char* str1, const char* str2) {
     return static_cast<unsigned char>(*str1) - static_cast<unsigned char>(*str2);
 }
 
-static int strncmp(const char* str1, const char* str2, size_t n) {
+auto strncmp(const char* str1, const char* str2, size_t n) -> int {
     for (size_t i = 0; i < n; i++) {
         if (str1[i] != str2[i]) {
             return str1[i] - str2[i];
@@ -200,55 +180,74 @@ static int strncmp(const char* str1, const char* str2, size_t n) {
     return 0;
 }
 
-static char* strdup(const char* str) {
-    size_t const LEN = _std::strlen(str);
+auto strdup(const char* str) -> char* {
+    size_t const LEN = ker::util::string::strlen(str);
     char* new_str = new char[LEN + 1];
     strncpy(new_str, str, LEN);
     return new_str;
 }
-}  // namespace _std
+}  // namespace
+}  // namespace ker::util::string
 
 // Expose functions as extern "C"
 extern "C" {
-__attribute__((no_builtin("strlen"))) size_t strlen(const char* str) { return _std::strlen(str); }
+__attribute__((no_builtin("strlen"))) size_t strlen(const char* str) { return ker::util::string::strlen(str); }
 
-__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) { return _std::strcpy(dest, src); }
+__attribute__((no_builtin("strcpy"))) char* strcpy(char* dest, const char* src) { return ker::util::string::strcpy(dest, src); }
 
-__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) { return _std::strncpy(dest, src, n); }
+__attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src, size_t n) {
+    return ker::util::string::strncpy(dest, src, n);
+}
 
-__attribute__((no_builtin("strlen"))) void reverse(char s[]) { _std::reverse(s); }
+__attribute__((no_builtin("strlen"))) void reverse(char* s) { ker::util::string::reverse(s); }
 
-int itoa(int n, std::span<char> s, int base) { return _std::itoa(n, s, base); }
+auto itoa(int n, std::span<char> s, int base) -> int { return ker::util::string::itoa(n, s, base); }
 
-int u64toa(uint64_t n, std::span<char> s, int base) { return _std::u64toa(n, s, base); }
+auto u64toa(uint64_t n, std::span<char> s, int base) -> int { return ker::util::string::u64toa(n, s, base); }
 
-int u64toh(uint64_t n, std::span<char> s) { return _std::u64toh(n, s); }
+auto u64toh(uint64_t n, std::span<char> s) -> int { return ker::util::string::u64toh(n, s); }
 
-int snprintf(char* str, size_t size, const char* format, ...) {
+auto snprintf(char* str, size_t size, const char* format, ...) -> int {
     va_list args;
     va_start(args, format);
-    int const RET = _std::vsnprintf(str, size, format, args);
+    int const RET = ker::util::string::vsnprintf(str, size, format, args);
     va_end(args);
     return RET;
 }
 
-int vsnprintf(char* str, size_t size, const char* format, va_list args) { return _std::vsnprintf(str, size, format, args); }
+auto vsnprintf(char* str, size_t size, const char* format, va_list args) -> int {
+    return ker::util::string::vsnprintf(str, size, format, args);
+}
 
-char* strcat(char* dest, const char* src) { return _std::strcat(dest, src); }
+auto strcat(char* dest, const char* src) -> char* { return ker::util::string::strcat(dest, src); }
 
-size_t strlcat(char* dest, const char* src, size_t size) { return _std::strlcat(dest, src, size); }
+auto strlcat(char* dest, const char* src, size_t size) -> size_t { return ker::util::string::strlcat(dest, src, size); }
 
-int strcmp(const char* str1, const char* str2) { return _std::strcmp(str1, str2); }
+auto strcmp(const char* str1, const char* str2) -> int { return ker::util::string::strcmp(str1, str2); }
 
-int strncmp(const char* str1, const char* str2, size_t n) { return _std::strncmp(str1, str2, n); }
+auto strncmp(const char* str1, const char* str2, size_t n) -> int { return ker::util::string::strncmp(str1, str2, n); }
 
-char* strdup(const char* str) { return _std::strdup(str); }
+auto strdup(const char* str) -> char* { return ker::util::string::strdup(str); }
 
-size_t strnlen(const char* s, size_t n) {
+auto strnlen(const char* s, size_t n) -> size_t {
     size_t len = 0;
     while (len < n && (s[len] != 0)) {
         ++len;
     }
     return len;
 }
+
+auto memchr(const void* ptr, int value, size_t num) -> void* {
+    const auto* p = static_cast<const unsigned char*>(ptr);
+    for (size_t i = 0; i < num; i++) {
+        if (p[i] == static_cast<unsigned char>(value)) {
+            // NOLINTNEXTLINE
+            return const_cast<unsigned char*>(p + i);
+        }
+    }
+    return nullptr;
 }
+}
+// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// clang-analyzer-security.insecureAPI.strcpy, readability-inconsistent-declaration-parameter-name,
+// readability-inconsistent-declaration-parameter-name)

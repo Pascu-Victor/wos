@@ -6,10 +6,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 #include "abi/callnums/process.h"
-#include "mod/io/serial/serial.hpp"
 #include "net/wki/remote_compute.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/asm/cpu.hpp"
@@ -31,8 +31,6 @@
 #include "vfs/vfs.hpp"
 
 // Signal constants (matching Linux ABI from abi-bits/signal.h)
-static constexpr uint64_t WOS_SIG_DFL = 0;
-static constexpr uint64_t WOS_SIG_IGN = 1;
 static constexpr int WOS_SIGKILL = 9;
 static constexpr int WOS_SIGSTOP = 19;
 static constexpr uint64_t WOS_SA_RESTORER = 0x04000000;
@@ -42,6 +40,21 @@ namespace ker::syscall::process {
 
 namespace {
 using fork_log = ker::mod::dbg::logger<"fork">;
+using process_log = ker::mod::dbg::logger<"process">;
+
+inline auto signal_handler_slot(ker::mod::sched::task::Task& task, size_t index) -> ker::mod::sched::task::Task::SigHandler& {
+    // Signal numbers are range-checked before conversion to this zero-based index.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return task.sig_handlers[index];
+}
+
+inline auto mutable_hostname_char(ker::mod::sched::task::Task::HostnameBuffer& hostname, size_t index) -> char& {
+    // Hostname setters validate len against hostname.size() before indexing.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return hostname[index];
+}
+
+inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
 
 inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child,
                                             uint64_t saved_rip, uint64_t saved_rsp, uint64_t saved_flags) {
@@ -70,9 +83,8 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
         static_cast<unsigned long long>(saved_rip), static_cast<unsigned long long>(saved_rsp),
         static_cast<unsigned long long>(saved_flags), parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
 }
-}  // namespace
 
-static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
     auto* parent = sched::get_current_task();
@@ -84,11 +96,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     parent->context.regs = gpr;
 
     // --- Allocate child kernel stack ---
-    auto kernel_stack_base = (uint64_t)mm::phys::page_alloc(KERNEL_STACK_SIZE);
+    auto kernel_stack_base = reinterpret_cast<uint64_t>(mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
     if (kernel_stack_base == 0) {
         return static_cast<uint64_t>(-ENOMEM);
     }
-    uint64_t const KERNEL_RSP = kernel_stack_base + KERNEL_STACK_SIZE;
+    uint64_t const KERNEL_RSP = kernel_stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
 
     // --- Allocate child Task without the ELF-loading constructor ---
     auto* child = new sched::task::Task{};
@@ -100,9 +112,9 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // --- Initialize child task fields ---
     // Copy name
     if (parent->name != nullptr) {
-        size_t const NAME_LEN = strlen(parent->name);
+        size_t const NAME_LEN = std::strlen(parent->name);
         char* name_copy = new char[NAME_LEN + 1];
-        memcpy(name_copy, parent->name, NAME_LEN + 1);
+        std::memcpy(name_copy, parent->name, NAME_LEN + 1);
         child->name = name_copy;
     }
 
@@ -135,27 +147,23 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sched_queue = sched::task::Task::sched_queue::NONE;
     child->sched_next = nullptr;
 
-    // Copy CWD
-    memcpy(child->cwd, parent->cwd, sched::task::Task::CWD_MAX);
-
-    // Copy root directory (pivot_root / chroot)
-    memcpy(child->root, parent->root, sched::task::Task::CWD_MAX);
-
-    // Copy executable path
-    memcpy(child->exe_path, parent->exe_path, sched::task::Task::EXE_PATH_MAX);
+    // Copy fixed per-process path storage.
+    child->cwd = parent->cwd;
+    child->root = parent->root;
+    child->exe_path = parent->exe_path;
 
     // Copy WKI spawn configuration. NOINHERIT applies when a process creates
     // a child: the parent keeps its policy, but the child starts automatic.
     if ((parent->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_NOINHERIT) != 0) {
-        child->wki_target_hostname[0] = '\0';
+        child->wki_target_hostname.front() = '\0';
         child->wki_target_flags = 0;
     } else {
-        memcpy(child->wki_target_hostname, parent->wki_target_hostname, sizeof(child->wki_target_hostname));
+        child->wki_target_hostname = parent->wki_target_hostname;
         child->wki_target_flags = parent->wki_target_flags;
     }
-    memcpy(child->wki_submitter_hostname, parent->wki_submitter_hostname, sizeof(child->wki_submitter_hostname));
+    child->wki_submitter_hostname = parent->wki_submitter_hostname;
     child->wki_remote_pid =
-        (child->wki_submitter_hostname[0] != '\0' && std::strcmp(child->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+        (child->wki_submitter_hostname.front() != '\0' && std::strcmp(child->wki_submitter_hostname.data(), local_wki_hostname()) != 0)
             ? child->pid
             : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
@@ -185,7 +193,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sig_mask = parent->sig_mask;
     child->in_signal_handler = false;
     child->do_sigreturn = false;
-    memcpy(child->sig_handlers, parent->sig_handlers, sizeof(parent->sig_handlers));
+    child->sig_handlers = parent->sig_handlers;
 
     // --- Create child pagemap with COW ---
     child->pagemap = mm::virt::create_pagemap();
@@ -240,7 +248,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto* per_cpu = new cpu::PerCpu();
     per_cpu->syscall_stack = KERNEL_RSP;
     per_cpu->cpu_id = cpu::current_cpu();
-    child->context.syscall_scratch_area = (uint64_t)per_cpu;
+    child->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
 
     // Copy parent's register context - child will resume at the same RIP
     child->context.regs = parent->context.regs;
@@ -293,14 +301,11 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             file->refcount.fetch_add(1, std::memory_order_relaxed);  // Increment refcount for shared file
             // TODO: Checked insertion, should have a process cleanup system that can handle partially initialized processes if this fails
             // instead of leaking
-            child->fd_table.insert(key, file);
+            (void)child->fd_table.insert(key, file);
         }
     });
 
-    // Copy per-fd close-on-exec bitmap
-    for (unsigned i = 0; i < sched::task::Task::FD_TABLE_SIZE / 64; i++) {
-        child->fd_cloexec[i] = parent->fd_cloexec[i];
-    }
+    child->fd_cloexec = parent->fd_cloexec;
 
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
@@ -312,7 +317,7 @@ static auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         });
 
         delete child->thread;
-        delete (cpu::PerCpu*)child->context.syscall_scratch_area;
+        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -337,7 +342,7 @@ struct KernelSigaction {
     // Remaining 120 bytes of sa_mask are unused padding
 };
 
-static auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> uint64_t {
+auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> uint64_t {
     using namespace ker::mod;
 
     auto* task = sched::get_current_task();
@@ -360,28 +365,30 @@ static auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr
     // Return old handler if requested
     if (oldact_ptr != 0) {
         auto* old = reinterpret_cast<KernelSigaction*>(oldact_ptr);
-        old->handler = task->sig_handlers[IDX].handler;
-        old->flags = task->sig_handlers[IDX].flags;
-        old->restorer = task->sig_handlers[IDX].restorer;
-        old->mask = task->sig_handlers[IDX].mask;
+        const auto& handler = signal_handler_slot(*task, IDX);
+        old->handler = handler.handler;
+        old->flags = handler.flags;
+        old->restorer = handler.restorer;
+        old->mask = handler.mask;
     }
 
     // Set new handler if provided
     if (act_ptr != 0) {
         const auto* act = reinterpret_cast<const KernelSigaction*>(act_ptr);
-        task->sig_handlers[IDX].handler = act->handler;
-        task->sig_handlers[IDX].flags = act->flags;
-        task->sig_handlers[IDX].mask = act->mask;
+        auto& handler = signal_handler_slot(*task, IDX);
+        handler.handler = act->handler;
+        handler.flags = act->flags;
+        handler.mask = act->mask;
         // Store restorer if SA_RESTORER flag is set
         if ((act->flags & WOS_SA_RESTORER) != 0U) {
-            task->sig_handlers[IDX].restorer = act->restorer;
+            handler.restorer = act->restorer;
         }
     }
 
     return 0;
 }
 
-static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uint64_t {
+auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uint64_t {
     using namespace ker::mod;
 
     auto* task = sched::get_current_task();
@@ -422,7 +429,7 @@ static auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr)
     return 0;
 }
 
-static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
+auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     using namespace ker::mod;
 
     if (sig < 0 || std::cmp_greater(sig, sched::task::Task::MAX_SIGNALS)) {
@@ -488,7 +495,7 @@ static auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     return 0;
 }
 
-static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
+auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
     if (which != WOS_PRIO_PROCESS) {
         return static_cast<uint64_t>(-EINVAL);
     }
@@ -520,7 +527,7 @@ static auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
     return 0;
 }
 
-static auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> uint64_t {
+auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
@@ -538,33 +545,33 @@ static auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t fla
     }
 
     if (hostname == nullptr || len == 0) {
-        task->wki_target_hostname[0] = '\0';
+        task->wki_target_hostname.front() = '\0';
         task->wki_target_flags = flags;
         return 0;
     }
 
-    if (len >= sizeof(task->wki_target_hostname)) {
+    if (len >= task->wki_target_hostname.size()) {
         return static_cast<uint64_t>(-ENAMETOOLONG);
     }
 
-    memcpy(task->wki_target_hostname, hostname, len);
-    task->wki_target_hostname[len] = '\0';
+    std::memcpy(task->wki_target_hostname.data(), hostname, len);
+    mutable_hostname_char(task->wki_target_hostname, len) = '\0';
     task->wki_target_flags = flags;
     return 0;
 }
 
-static auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_t* flags_out) -> uint64_t {
+auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_t* flags_out) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    size_t const LEN = strnlen(task->wki_target_hostname, sizeof(task->wki_target_hostname));
+    size_t const LEN = strnlen(task->wki_target_hostname.data(), task->wki_target_hostname.size());
     if (hostname_out != nullptr) {
         if (hostname_out_size == 0 || LEN + 1 > hostname_out_size) {
             return static_cast<uint64_t>(-ENAMETOOLONG);
         }
-        memcpy(hostname_out, task->wki_target_hostname, LEN + 1);
+        std::memcpy(hostname_out, task->wki_target_hostname.data(), LEN + 1);
     }
 
     if (flags_out != nullptr) {
@@ -573,6 +580,7 @@ static auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, 
 
     return LEN;
 }
+}  // namespace
 
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     switch (op) {
@@ -796,11 +804,11 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 return static_cast<uint64_t>(-EFAULT);
             }
             const char* name = ker::util::hostname::get();
-            size_t const LEN = strlen(name);
+            size_t const LEN = std::strlen(name);
             if (LEN + 1 > bufsize) {
                 return static_cast<uint64_t>(-ENAMETOOLONG);
             }
-            memcpy(buf, name, LEN + 1);
+            std::memcpy(buf, name, LEN + 1);
             return 0;
         }
         case abi::process::procmgmt_ops::SETHOSTNAME: {
@@ -823,7 +831,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
 
         default:
-            mod::io::serial::write("sys_process: unknown op\n");
+            process_log::warn("unknown op %llu", static_cast<unsigned long long>(op));
             return static_cast<uint64_t>(ENOSYS);
     }
 }

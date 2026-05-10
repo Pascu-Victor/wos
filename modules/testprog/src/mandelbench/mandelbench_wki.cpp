@@ -10,13 +10,17 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <format>
+#include <limits>
 #include <print>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "config.hpp"
@@ -38,11 +42,23 @@ auto worker_output_path(int pid, int repeat_index, int worker_id) -> std::string
     return std::format("/tmp/mandelbench_{}_{}_{}.raw", pid, repeat_index, worker_id);
 }
 
-auto write_all(int fd, const void* buf, size_t count) -> bool {
-    const auto* src = static_cast<const unsigned char*>(buf);
+auto parse_int_arg(const char* text, int& value) -> bool {
+    char* end = nullptr;
+    errno = 0;
+    const long PARSED = std::strtol(text, &end, 10);
+    if (text == end || *end != '\0' || errno == ERANGE || PARSED < std::numeric_limits<int>::min() ||
+        PARSED > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    value = static_cast<int>(PARSED);
+    return true;
+}
+
+auto write_all(int fd, std::span<const unsigned char> bytes) -> bool {
     size_t written_total = 0;
-    while (written_total < count) {
-        ssize_t const WRITTEN = write(fd, src + written_total, count - written_total);
+    while (written_total < bytes.size()) {
+        ssize_t const WRITTEN = write(fd, bytes.data() + written_total, bytes.size() - written_total);
         if (WRITTEN <= 0) {
             return false;
         }
@@ -102,9 +118,12 @@ struct WorkerLaunch {
 auto wait_for_worker(const WorkerLaunch& launch) -> bool {
     int32_t status = 0;
     int64_t ret = 0;
-    do {
-        ret = ker::process::waitpid(launch.child_pid, &status, 0, nullptr);
-    } while (ret == EINTR_NEG);
+    while (true) {
+        ret = static_cast<int64_t>(ker::process::waitpid(launch.child_pid, &status, 0, nullptr));
+        if (ret != EINTR_NEG) {
+            break;
+        }
+    }
 
     if (ret < 0) {
         std::println(stderr, "mandelbench: waitpid({}) failed: {}", launch.child_pid, ret);
@@ -137,11 +156,12 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
     }
 
     int const ACTIVE_WORKERS = std::min(workers, height);
-    std::vector<unsigned char> image(static_cast<size_t>(width * height * 4));
+    std::vector<unsigned char> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
     std::vector<double> times(repeat);
 
-    for (int r = 0; r < repeat; r++) {
-        std::memset(image.data(), 0, image.size());
+    int repeat_index = 0;
+    for (auto& elapsed_seconds : times) {
+        std::ranges::fill(image, 0);
         uint64_t const START_TIME = now_ms();
 
         std::vector<WorkerLaunch> launches;
@@ -162,21 +182,26 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         }
 
         for (auto& launch : launches) {
-            auto output = worker_output_path(PID, r, launch.output_slot);
-            auto id_str = std::to_string(launch.output_slot);
-            auto threads_str = std::to_string(1);
-            auto width_str = std::to_string(width);
-            auto height_str = std::to_string(height);
-            auto max_iter_str = std::to_string(max_iteration);
-            auto start_row_str = std::to_string(launch.start_row);
-            auto row_count_str = std::to_string(launch.row_count);
-            // NOLINTNEXTLINE(misc-const-correctness)
-            const char* argv[] = {
-                "testprog",    "--mandelbench-worker", "--id",        id_str.c_str(),        "--threads", threads_str.c_str(),
-                "--start-row", start_row_str.c_str(),  "--row-count", row_count_str.c_str(), "--width",   width_str.c_str(),
-                "--height",    height_str.c_str(),     "--max-iter",  max_iter_str.c_str(),  "--output",  output.c_str(),
-                nullptr,
+            auto output = worker_output_path(PID, repeat_index, launch.output_slot);
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+            std::array<std::string, 17> arg_storage = {
+                "testprog",    "--mandelbench-worker",
+                "--id",        std::to_string(launch.output_slot),
+                "--threads",   std::to_string(1),
+                "--start-row", std::to_string(launch.start_row),
+                "--row-count", std::to_string(launch.row_count),
+                "--width",     std::to_string(width),
+                "--height",    std::to_string(height),
+                "--max-iter",  std::to_string(max_iteration),
+                "--output",
             };
+            std::array<char*, arg_storage.size() + 2> argv{};
+            auto* argv_out = argv.begin();
+            for (auto& arg : arg_storage) {
+                *argv_out++ = arg.data();
+            }
+            *argv_out++ = output.data();
+            *argv_out = nullptr;
 
             int64_t child_pid = ker::process::fork();
             if (child_pid < 0) {
@@ -184,22 +209,18 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
                 return 1;
             }
             if (child_pid == 0) {
-                execv(get_testprog_path(), const_cast<char* const*>(argv));
+                execv(get_testprog_path(), argv.data());
                 std::println(stderr, "mandelbench: execv failed for worker {}", launch.output_slot);
                 _exit(1);
             }
             launch.child_pid = child_pid;
         }
 
-        bool ok = true;
-        for (const auto& launch : launches) {
-            if (!wait_for_worker(launch)) {
-                ok = false;
-            }
-        }
-        if (!ok) {
+        const auto FAILED_WORKERS =
+            std::count_if(launches.begin(), launches.end(), [](const auto& launch) { return !wait_for_worker(launch); });
+        if (FAILED_WORKERS != 0) {
             for (const auto& launch : launches) {
-                auto path = worker_output_path(PID, r, launch.output_slot);
+                auto path = worker_output_path(PID, repeat_index, launch.output_slot);
                 unlink(path.c_str());
             }
             return 1;
@@ -207,7 +228,7 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
 
         size_t const ROW_SIZE = static_cast<size_t>(width) * 4;
         for (const auto& launch : launches) {
-            auto path = worker_output_path(PID, r, launch.output_slot);
+            auto path = worker_output_path(PID, repeat_index, launch.output_slot);
             FILE* f = fopen(path.c_str(), "rb");
             if (f == nullptr) {
                 std::println(stderr, "mandelbench: failed to open worker output {}", path);
@@ -226,11 +247,12 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         }
 
         uint64_t const END_TIME = now_ms();
-        times[r] = static_cast<double>(END_TIME - START_TIME) / 1000.0;
+        elapsed_seconds = static_cast<double>(END_TIME - START_TIME) / 1000.0;
 
-        std::string const IMG_PATH = std::format(IMAGE, DEVICE_NAME, r);
+        std::string const IMG_PATH = std::format(IMAGE, DEVICE_NAME, repeat_index);
         save_image(IMG_PATH.c_str(), image.data(), static_cast<unsigned>(width), static_cast<unsigned>(height));
-        progress(DEVICE_NAME, width, height, max_iteration, workers, repeat, r, times[r]);
+        progress(DEVICE_NAME, width, height, max_iteration, workers, repeat, repeat_index, elapsed_seconds);
+        repeat_index++;
     }
 
     report(DEVICE_NAME, width, height, max_iteration, workers, repeat, times);
@@ -248,21 +270,22 @@ auto mandelbench_worker(int argc, char** argv) -> int {
     const char* output = nullptr;
 
     for (int i = 0; i < argc; i++) {
-        if (std::strcmp(argv[i], "--id") == 0 && i + 1 < argc) {
-            id = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-            thread_count = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--start-row") == 0 && i + 1 < argc) {
-            start_row = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--row-count") == 0 && i + 1 < argc) {
-            row_count = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
-            width = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
-            height = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--max-iter") == 0 && i + 1 < argc) {
-            max_iter = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+        const std::string_view ARG = argv[i];
+        if (ARG == "--id" && i + 1 < argc) {
+            parse_int_arg(argv[++i], id);
+        } else if (ARG == "--threads" && i + 1 < argc) {
+            parse_int_arg(argv[++i], thread_count);
+        } else if (ARG == "--start-row" && i + 1 < argc) {
+            parse_int_arg(argv[++i], start_row);
+        } else if (ARG == "--row-count" && i + 1 < argc) {
+            parse_int_arg(argv[++i], row_count);
+        } else if (ARG == "--width" && i + 1 < argc) {
+            parse_int_arg(argv[++i], width);
+        } else if (ARG == "--height" && i + 1 < argc) {
+            parse_int_arg(argv[++i], height);
+        } else if (ARG == "--max-iter" && i + 1 < argc) {
+            parse_int_arg(argv[++i], max_iter);
+        } else if (ARG == "--output" && i + 1 < argc) {
             output = argv[++i];
         }
     }
@@ -277,11 +300,15 @@ auto mandelbench_worker(int argc, char** argv) -> int {
 
     size_t const ROW_SIZE = static_cast<size_t>(width) * 4;
     std::vector<unsigned char> image(static_cast<size_t>(row_count) * ROW_SIZE);
-    std::vector<WorkerThreadArg> thread_args(static_cast<size_t>(thread_count));
-    std::vector<thrd_t> threads(static_cast<size_t>(thread_count));
+    struct WorkerThread {
+        WorkerThreadArg arg{};
+        thrd_t thread{};
+    };
+    std::vector<WorkerThread> worker_threads(static_cast<size_t>(thread_count));
 
-    for (int thread_index = 0; thread_index < thread_count; thread_index++) {
-        auto& thread_arg = thread_args[static_cast<size_t>(thread_index)];
+    int thread_index = 0;
+    for (auto& worker_thread : worker_threads) {
+        auto& thread_arg = worker_thread.arg;
         thread_arg.image = image.data();
         thread_arg.colormap = colormap.data();
         thread_arg.width = width;
@@ -293,19 +320,22 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         thread_arg.local_thread_count = thread_count;
         thread_arg.rows_done = 0;
 
-        if (thrd_create(&threads[static_cast<size_t>(thread_index)], generate_rows, &thread_arg) != THRD_SUCCESS) {
+        if (thrd_create(&worker_thread.thread, generate_rows, &thread_arg) != THRD_SUCCESS) {
             std::println(stderr, "mandelbench-worker[{}]: failed to create thread {}", id, thread_index);
             return 1;
         }
+        thread_index++;
     }
 
     int rows_done = 0;
-    for (int thread_index = 0; thread_index < thread_count; thread_index++) {
-        if (thrd_join(threads[static_cast<size_t>(thread_index)], nullptr) != THRD_SUCCESS) {
-            std::println(stderr, "mandelbench-worker[{}]: failed to join thread {}", id, thread_index);
+    int joined_thread_index = 0;
+    for (auto& worker_thread : worker_threads) {
+        if (thrd_join(worker_thread.thread, nullptr) != THRD_SUCCESS) {
+            std::println(stderr, "mandelbench-worker[{}]: failed to join thread {}", id, joined_thread_index);
             return 1;
         }
-        rows_done += thread_args[static_cast<size_t>(thread_index)].rows_done;
+        rows_done += worker_thread.arg.rows_done;
+        joined_thread_index++;
     }
 
     int const FD = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -314,7 +344,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         return 1;
     }
 
-    if (!write_all(FD, image.data(), image.size())) {
+    if (!write_all(FD, image)) {
         close(FD);
         std::println(stderr, "mandelbench-worker[{}]: failed while writing '{}'", id, output);
         return 1;

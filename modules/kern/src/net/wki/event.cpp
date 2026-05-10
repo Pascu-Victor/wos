@@ -90,12 +90,13 @@ ker::mod::sys::Spinlock s_event_lock;
 constexpr size_t EVENT_LOG_MAX = 128;
 
 struct EventLogEntry {
+    static constexpr size_t DATA_MAX = 256;
     uint16_t event_class = 0;
     uint16_t event_id = 0;
     uint16_t origin_node = 0;
     uint16_t data_len = 0;
     uint64_t timestamp_us = 0;
-    std::array<uint8_t, 256> data = {};
+    std::array<uint8_t, DATA_MAX> data = {};
 };
 
 std::array<EventLogEntry, EVENT_LOG_MAX> g_event_log;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -103,7 +104,7 @@ uint32_t g_event_log_head = 0;                         // NOLINT(cppcoreguidelin
 uint32_t g_event_log_count = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 void event_log_push(uint16_t event_class, uint16_t event_id, uint16_t origin_node, const void* data, uint16_t data_len) {
-    auto& entry = g_event_log[g_event_log_head];
+    auto& entry = g_event_log.at(g_event_log_head);
     entry.event_class = event_class;
     entry.event_id = event_id;
     entry.origin_node = origin_node;
@@ -134,7 +135,7 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
 
     for (uint32_t i = 0; i < g_event_log_count; i++) {
         uint32_t const IDX = (start + i) % EVENT_LOG_MAX;
-        const auto& entry = g_event_log[IDX];
+        const auto& entry = g_event_log.at(IDX);
 
         if (!event_matches(sub_class, sub_id, entry.event_class, entry.event_id)) {
             continue;
@@ -142,7 +143,7 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
 
         // Build publish payload and send to subscriber
         auto total_len = static_cast<uint16_t>(sizeof(EventPublishPayload) + entry.data_len);
-        std::array<uint8_t, sizeof(EventPublishPayload) + 256> buf = {};
+        std::array<uint8_t, sizeof(EventPublishPayload) + EventLogEntry::DATA_MAX> buf = {};
 
         auto* pub = reinterpret_cast<EventPublishPayload*>(buf.data());
         pub->event_class = entry.event_class;
@@ -219,7 +220,7 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
 
     // Build the publish payload: EventPublishPayload + data
     auto total_len = static_cast<uint16_t>(sizeof(EventPublishPayload) + data_len);
-    std::array<uint8_t, sizeof(EventPublishPayload) + 256> buf = {};
+    std::array<uint8_t, sizeof(EventPublishPayload) + EventLogEntry::DATA_MAX> buf = {};
 
     // Clamp data to fit in stack buffer
     if (total_len > sizeof(buf)) {

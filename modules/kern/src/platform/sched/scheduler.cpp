@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/userspace.hpp>
@@ -28,6 +29,7 @@
 #include "platform/ktime/ktime.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/sched/run_heap.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
 #include "platform/smt/smt.hpp"
@@ -62,6 +64,11 @@ bool (*wki_try_remote_placement_fn)(task::Task* task) = nullptr;  // NOLINT(cppc
 // ============================================================================
 // Global state
 // ============================================================================
+namespace {
+using wait_log = ker::mod::dbg::logger<"wait">;
+using resume_log = ker::mod::dbg::logger<"resume">;
+using preempt_log = ker::mod::dbg::logger<"preempt">;
+
 // PID hash table for O(1) amortized lookups.
 // Open-addressing with linear probing, backward-shift deletion.
 // PIDs are 64-bit monotonically increasing; the table supports up to MAX_PIDS
@@ -70,12 +77,22 @@ struct PidHashEntry {
     uint64_t pid;      // 0 = empty slot
     task::Task* task;  // nullptr when slot empty
 };
-namespace {
-using wait_log = ker::mod::dbg::logger<"wait">;
-using resume_log = ker::mod::dbg::logger<"resume">;
-using preempt_log = ker::mod::dbg::logger<"preempt">;
 
 std::atomic<uint64_t> g_preempt_block_warnings{0};
+constexpr size_t PENDING_WAKE_LIMIT = 16;
+using PendingWakeList = std::array<task::Task*, PENDING_WAKE_LIMIT>;
+
+inline auto pending_wake_slot(PendingWakeList& tasks, uint32_t index) -> task::Task*& {
+    // Wake collectors cap index by PENDING_WAKE_LIMIT before accessing.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return tasks[static_cast<size_t>(index)];
+}
+
+inline auto signal_handler_slot(task::Task& task, unsigned index) -> task::Task::SigHandler& {
+    // Signal numbers are validated before converting to zero-based indexes.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return task.sig_handlers[static_cast<size_t>(index)];
+}
 
 inline auto is_valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
 
@@ -229,7 +246,16 @@ inline auto clamp_nice(int nice) -> int {
     return nice;
 }
 
-inline auto nice_to_weight(int nice) -> uint32_t { return K_NICE_TO_WEIGHT[static_cast<size_t>(clamp_nice(nice) + 20)]; }
+inline auto nice_weight_slot(size_t index) -> const uint32_t& {
+    // Index is derived from clamp_nice(), keeping it within K_NICE_TO_WEIGHT.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return K_NICE_TO_WEIGHT[index];
+}
+
+inline auto nice_to_weight(int nice) -> uint32_t {
+    auto const INDEX = static_cast<size_t>(clamp_nice(nice) - SCHED_NICE_MIN);
+    return nice_weight_slot(INDEX);
+}
 
 inline bool has_short_burst_history(const task::Task* task) { return task->last_run_us >= 250U && task->last_run_us <= 8'000U; }
 
@@ -331,21 +357,33 @@ uint32_t active_task_count = 0;
 
 ker::mod::sys::Spinlock global_task_registry_lock;
 
+inline auto active_task_slot(uint32_t index) -> task::Task*& {
+    // Callers hold global_task_registry_lock and bound index by active_task_count.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return active_task_list[static_cast<size_t>(index)];
+}
+
+inline auto pid_slot(uint32_t index) -> PidHashEntry& {
+    // PID indexes are masked with MAX_PIDS - 1 before reaching this helper.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return pid_table[static_cast<size_t>(index)];
+}
+
 void active_list_insert(task::Task* t) {
     if (t == nullptr) {
         return;
     }
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     for (uint32_t i = 0; i < active_task_count; ++i) {
-        auto* existing = active_task_list[i];
+        auto* existing = active_task_slot(i);
         if (existing == t || (existing != nullptr && existing->pid == t->pid)) {
-            active_task_list[i] = t;
+            active_task_slot(i) = t;
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return;
         }
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
-        active_task_list[active_task_count++] = t;
+        active_task_slot(active_task_count++) = t;
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
 }
@@ -354,9 +392,9 @@ void active_list_remove(uint64_t pid) {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     uint32_t i = 0;
     while (i < active_task_count) {
-        if (active_task_list[i] != nullptr && active_task_list[i]->pid == pid) {
-            active_task_list[i] = active_task_list[--active_task_count];
-            active_task_list[active_task_count] = nullptr;
+        if (active_task_slot(i) != nullptr && active_task_slot(i)->pid == pid) {
+            active_task_slot(i) = active_task_slot(--active_task_count);
+            active_task_slot(active_task_count) = nullptr;
             continue;
         }
         ++i;
@@ -376,15 +414,16 @@ auto pid_table_insert(task::Task* t) -> bool {
     uint32_t const SLOT = pid_hash(t->pid);
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t const IDX = (SLOT + i) & (MAX_PIDS - 1);
-        if (pid_table[IDX].pid == 0) {
-            pid_table[IDX].pid = t->pid;
-            pid_table[IDX].task = t;
+        auto& entry = pid_slot(IDX);
+        if (entry.pid == 0) {
+            entry.pid = t->pid;
+            entry.task = t;
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return true;
         }
-        if (pid_table[IDX].pid == t->pid) {
+        if (entry.pid == t->pid) {
             // Slot already taken by same PID - update pointer (shouldn't happen)
-            pid_table[IDX].task = t;
+            entry.task = t;
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return true;
         }
@@ -401,12 +440,13 @@ __attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pi
     uint32_t const SLOT = pid_hash(pid);
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t const IDX = (SLOT + i) & (MAX_PIDS - 1);
-        if (pid_table[IDX].pid == 0) {
+        auto& entry = pid_slot(IDX);
+        if (entry.pid == 0) {
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return nullptr;  // Empty slot - not found
         }
-        if (pid_table[IDX].pid == pid) {
-            task::Task* t = pid_table[IDX].task;
+        if (entry.pid == pid) {
+            task::Task* t = entry.task;
             if (acquire) {
                 if (!t->try_acquire()) {
                     t = nullptr;
@@ -434,11 +474,12 @@ void pid_table_remove(uint64_t pid) {
     // Find the entry
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         idx = (SLOT + i) & (MAX_PIDS - 1);
-        if (pid_table[idx].pid == 0) {
+        auto& entry = pid_slot(idx);
+        if (entry.pid == 0) {
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return;  // Not in table
         }
-        if (pid_table[idx].pid == pid) {
+        if (entry.pid == pid) {
             found = true;
             break;
         }
@@ -449,12 +490,12 @@ void pid_table_remove(uint64_t pid) {
     }
 
     // Remove and backward-shift to maintain probe chains
-    pid_table[idx].pid = 0;
-    pid_table[idx].task = nullptr;
+    pid_slot(idx).pid = 0;
+    pid_slot(idx).task = nullptr;
 
     uint32_t next = (idx + 1) & (MAX_PIDS - 1);
-    while (pid_table[next].pid != 0) {
-        uint32_t const NATURAL = pid_hash(pid_table[next].pid);
+    while (pid_slot(next).pid != 0) {
+        uint32_t const NATURAL = pid_hash(pid_slot(next).pid);
         // Check if 'next' would benefit from being moved to 'idx'.
         // Condition: natural slot of 'next' is in the wrapped range (natural, idx].
         bool shift = false;
@@ -464,9 +505,9 @@ void pid_table_remove(uint64_t pid) {
             shift = (NATURAL <= idx && NATURAL > next);
         }
         if (shift) {
-            pid_table[idx] = pid_table[next];
-            pid_table[next].pid = 0;
-            pid_table[next].task = nullptr;
+            pid_slot(idx) = pid_slot(next);
+            pid_slot(next).pid = 0;
+            pid_slot(next).task = nullptr;
             idx = next;
         }
         next = (next + 1) & (MAX_PIDS - 1);
@@ -479,6 +520,18 @@ smt::PerCpuCrossAccess<RunQueue>* run_queues;  // NOLINT(cppcoreguidelines-avoid
 
 // Debug: Per-CPU current task pointers for panic inspection
 std::array<task::Task*, desc::gdt::MAX_CPUS> debug_task_ptrs = {nullptr};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+inline auto debug_task_slot(uint64_t cpu_no) -> task::Task*& {
+    // CPU ids come from smt/cpu topology and are bounded by desc::gdt::MAX_CPUS.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return debug_task_ptrs[static_cast<size_t>(cpu_no)];
+}
+
+inline auto run_heap_entry(RunHeap& heap, uint32_t index) -> task::Task*& {
+    // Scans bound index by heap.size before peeking into the fixed heap storage.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return heap.entries[static_cast<size_t>(index)];
+}
 
 // Vector allocated at init time for scheduler wake IPIs.
 // Must not conflict with device driver IRQ allocations.
@@ -545,8 +598,8 @@ void set_task_nice_impl(task::Task* task, int nice) {
     int const CLAMPED_NICE = clamp_nice(nice);
     uint32_t const NEW_WEIGHT = nice_to_weight(CLAMPED_NICE);
     uint64_t cpu_no = task->cpu;
-    uint64_t const cpu_count = smt::get_core_count();
-    if (cpu_no >= cpu_count) {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (cpu_no >= CORE_COUNT) {
         cpu_no = cpu::current_cpu();
     }
 
@@ -591,7 +644,7 @@ void set_task_nice_impl(task::Task* task, int nice) {
 // wakeups; long-idle interactive wakes keep zero penalty.
 inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us) -> int64_t {
     int64_t const AVG = compute_avg_vruntime(rq);
-    int64_t const FAIR_VRUNTIME = std::max((int64_t)rq->min_vruntime, AVG);
+    int64_t const FAIR_VRUNTIME = std::max(rq->min_vruntime, AVG);
 
     if (t->last_sleep_start_us == 0 || t->last_run_us == 0 || now_us <= t->last_sleep_start_us) {
         return FAIR_VRUNTIME;
@@ -698,7 +751,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             uint32_t scan = victim_rq->runnable_heap.size;
             scan = std::min<uint32_t>(scan, 16);  // Bound scan in interrupt context
             for (uint32_t i = 0; i < scan; ++i) {
-                task::Task* t = victim_rq->runnable_heap.entries[i];
+                task::Task* t = run_heap_entry(victim_rq->runnable_heap, i);
                 if (t == nullptr) {
                     continue;
                 }
@@ -797,8 +850,8 @@ uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
         return 0;
     }
 
-    uint64_t const cpu_count = smt::get_core_count();
-    if (cpu_count <= 1) {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT <= 1) {
         return 0;
     }
 
@@ -806,20 +859,20 @@ uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
 
     // Respect domain_mask: if the task has a restricted mask, only consider those CPUs.
     uint64_t allowed_mask = (incoming_task != nullptr) ? incoming_task->domain_mask : ~0ULL;
-    uint64_t const ALL_MASK = (cpu_count >= 64) ? UINT64_MAX : ((1ULL << cpu_count) - 1ULL);
+    uint64_t const ALL_MASK = (CORE_COUNT >= 64) ? UINT64_MAX : ((1ULL << CORE_COUNT) - 1ULL);
     allowed_mask &= ALL_MASK;
     if (allowed_mask == 0) {
         allowed_mask = ALL_MASK;  // fallback: allow all
     }
 
     static std::atomic<uint64_t> rr_seed{0};
-    uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+    uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % CORE_COUNT;
 
     auto best_cpu = static_cast<uint64_t>(__builtin_ctzll(allowed_mask));  // safe default
     uint32_t best_load = UINT32_MAX;
 
-    for (uint64_t off = 0; off < cpu_count; ++off) {
-        uint64_t const CPU_NO = (START + off) % cpu_count;
+    for (uint64_t off = 0; off < CORE_COUNT; ++off) {
+        uint64_t const CPU_NO = (START + off) % CORE_COUNT;
         if ((allowed_mask & (1ULL << CPU_NO)) == 0) {
             continue;
         }
@@ -856,8 +909,8 @@ void release_cpu_reservation(uint64_t cpu_no) {
 
 bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_reservation) {
 #ifdef SCHED_DEBUG
-    dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?", (int)cpu_no,
-             task->heapIndex, (int)cpu::current_cpu());
+    dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?",
+             static_cast<int>(cpu_no), task->heap_index, static_cast<int>(cpu::current_cpu()));
 #endif
     task->cpu = cpu_no;
 
@@ -1256,31 +1309,31 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     // Scan this CPU's wait list; tasks with wakeAtUs != 0 are timer sleeps.
     // Also arm ITIMER_REAL for blocked tasks so signal-driven interfaces
     // like ping can wake from a blocking recvfrom().
-    task::Task* signal_wake[16] = {};
+    PendingWakeList signal_wake{};
     uint32_t signal_wake_count = 0;
     {
         uint64_t const NOW_US = time::get_us();
         run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count](RunQueue* rq) {
             // Collect tasks to wake (can't modify list while iterating)
-            task::Task* to_wake[16];
+            PendingWakeList to_wake{};
             uint32_t wake_count = 0;
             task::Task* t = rq->wait_list.head;
-            while (t != nullptr && wake_count < 16) {
+            while (t != nullptr && wake_count < PENDING_WAKE_LIMIT) {
                 if (t->wake_at_us != 0 && NOW_US >= t->wake_at_us) {
-                    to_wake[wake_count++] = t;
-                } else if (t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us && signal_wake_count < 16) {
+                    pending_wake_slot(to_wake, wake_count++) = t;
+                } else if (t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us && signal_wake_count < PENDING_WAKE_LIMIT) {
                     t->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
                     if (t->itimer_real_interval_us != 0) {
                         t->itimer_real_expire_us = NOW_US + t->itimer_real_interval_us;
                     } else {
                         t->itimer_real_expire_us = 0;
                     }
-                    signal_wake[signal_wake_count++] = t;
+                    pending_wake_slot(signal_wake, signal_wake_count++) = t;
                 }
                 t = t->sched_next;
             }
             for (uint32_t i = 0; i < wake_count; i++) {
-                task::Task* w = to_wake[i];
+                task::Task* w = pending_wake_slot(to_wake, i);
                 rq->wait_list.remove(w);
                 // Mark freshly woken: inhibits immediate wakeup-preemption (see process_tasks guard).
                 w->just_woke = true;
@@ -1303,7 +1356,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         });
     }
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
-        wake_task_for_signal(signal_wake[i]);
+        wake_task_for_signal(pending_wake_slot(signal_wake, i));
     }
 
     auto* rq = run_queues->this_cpu();
@@ -1351,19 +1404,20 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             return;  // Stay idle
         }
 #ifdef SCHED_DEBUG
-        dbg::log("PICK-IDLE: CPU %d picked PID %x (heapIdx=%d)", (int)cpu::current_cpu(), nextTask->pid, nextTask->heapIndex);
+        dbg::log("PICK-IDLE: CPU %d picked PID %x (heapIdx=%d)", static_cast<int>(cpu::current_cpu()), next_task->pid,
+                 next_task->heap_index);
 #endif
         rq->is_idle.store(false, std::memory_order_release);
-        debug_task_ptrs[cpu::current_cpu()] = next_task;
+        debug_task_slot(cpu::current_cpu()) = next_task;
         prepare_first_run_daemon(next_task, "idle-switch");
         rq->last_tick_us = time::get_us();
 
         if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
 #ifdef SCHED_DEBUG
-            dbg::log("PICK-IDLE: CPU %d switchTo FAILED for PID %x", (int)cpu::current_cpu(), nextTask->pid);
+            dbg::log("PICK-IDLE: CPU %d switchTo FAILED for PID %x", static_cast<int>(cpu::current_cpu()), next_task->pid);
 #endif
             rq->current_task = rq->idle_task;
-            debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+            debug_task_slot(cpu::current_cpu()) = rq->idle_task;
             rq->is_idle.store(true, std::memory_order_release);
             arm_idle_timer_for_this_cpu();
         } else {
@@ -1605,7 +1659,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             auto* idle_rq = run_queues->this_cpu();
             idle_rq->current_task = idle_rq->idle_task;
             idle_rq->is_idle.store(true, std::memory_order_release);
-            debug_task_ptrs[cpu::current_cpu()] = idle_rq->idle_task;
+            debug_task_slot(cpu::current_cpu()) = idle_rq->idle_task;
             mm::virt::switch_to_kernel_pagemap();
             restore_kernel_gs_for_idle();
 
@@ -1620,8 +1674,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         return;
     }
 #ifdef SCHED_DEBUG
-    dbg::log("PICK-PREEMPT: CPU %d switching PID %x -> PID %x (heapIdx=%d)", (int)cpu::current_cpu(), currentTask->pid, nextTask->pid,
-             nextTask->heapIndex);
+    dbg::log("PICK-PREEMPT: CPU %d switching PID %x -> PID %x (heapIdx=%d)", static_cast<int>(cpu::current_cpu()), current_task->pid,
+             next_task->pid, next_task->heap_index);
 #endif
     // Perf: record preemption context switch
     {
@@ -1637,13 +1691,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
 
     task::Task* original_task = current_task;
-    debug_task_ptrs[cpu::current_cpu()] = next_task;
+    debug_task_slot(cpu::current_cpu()) = next_task;
     rq->is_idle.store(false, std::memory_order_release);
     prepare_first_run_daemon(next_task, "timer-switch");
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
         rq->current_task = original_task;
-        debug_task_ptrs[cpu::current_cpu()] = original_task;
+        debug_task_slot(cpu::current_cpu()) = original_task;
     } else {
         next_task->has_run = true;
     }
@@ -1705,7 +1759,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
 #endif
         auto* rq = run_queues->this_cpu();
         rq->current_task = rq->idle_task;
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
@@ -1714,18 +1768,18 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     if (next_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
         auto* rq = run_queues->this_cpu();
         rq->current_task = rq->idle_task;
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
 
     if (next_task->type == task::TaskType::PROCESS && (next_task->thread == nullptr || next_task->pagemap == nullptr)) {
 #ifdef SCHED_DEBUG
-        dbg::log("jumpToNextTask: PID %x missing resources, entering idle", nextTask->pid);
+        dbg::log("jumpToNextTask: PID %x missing resources, entering idle", next_task->pid);
 #endif
         auto* rq = run_queues->this_cpu();
         rq->current_task = rq->idle_task;
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
@@ -1734,7 +1788,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     if (next_task->type == task::TaskType::IDLE) {
         auto* rq = run_queues->this_cpu();
         rq->current_task = next_task;
-        debug_task_ptrs[cpu::current_cpu()] = next_task;
+        debug_task_slot(cpu::current_cpu()) = next_task;
         rq->is_idle.store(true, std::memory_order_release);
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
@@ -1744,16 +1798,16 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     auto* rq = run_queues->this_cpu();
     rq->is_idle.store(false, std::memory_order_release);
     rq->current_task = next_task;
-    debug_task_ptrs[cpu::current_cpu()] = next_task;
+    debug_task_slot(cpu::current_cpu()) = next_task;
     prepare_first_run_daemon(next_task, "exit-switch");
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
 #ifdef SCHED_DEBUG
-        dbg::log("jumpToNextTask: switchTo FAILED for PID %x", nextTask->pid);
+        dbg::log("jumpToNextTask: switchTo FAILED for PID %x", next_task->pid);
 #endif
         rq->current_task = rq->idle_task;
         rq->is_idle.store(true, std::memory_order_release);
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         mm::virt::switch_to_kernel_pagemap();
         restore_kernel_gs_for_idle();
 
@@ -1865,7 +1919,7 @@ void start_scheduler() {
     mm::virt::switch_pagemap(first_task);
 
     // Update debug task pointer
-    debug_task_ptrs[cpu::current_cpu()] = first_task;
+    debug_task_slot(cpu::current_cpu()) = first_task;
 
     // Initialize HPET timestamp for first tick
     rq->last_tick_us = time::get_us();
@@ -1932,7 +1986,8 @@ void start_scheduler() {
 // wos_deferred_task_switch_return bypasses syscall.asm's check_pending_signals,
 // so we must handle signals here for tasks woken from the wait queue.
 // Called with GS and pagemap already switched to `task`.
-static void check_pending_signals_deferred(task::Task* task) {
+namespace {
+void check_pending_signals_deferred(task::Task* task) {
     if (task->type != task::TaskType::PROCESS) {
         return;
     }
@@ -1959,7 +2014,7 @@ static void check_pending_signals_deferred(task::Task* task) {
     auto idx = static_cast<unsigned>(SIGNO - 1);
     task->sig_pending &= ~(1ULL << idx);
 
-    auto& handler = task->sig_handlers[idx];
+    auto& handler = signal_handler_slot(*task, idx);
 
     if (handler.handler == 0 /*SIG_DFL*/) {
         // Signals with default-ignore action: SIGCHLD, SIGURG, SIGWINCH, SIGCONT
@@ -1999,9 +2054,9 @@ static void check_pending_signals_deferred(task::Task* task) {
 
     // GPRs in GPRegs struct are r15..rax (15 fields, same order as saved_regs)
     const auto* regs_arr = reinterpret_cast<const uint64_t*>(&task->context.regs);
-    for (int i = 0; i < 15; i++) {
-        sigframe->saved_regs[i] = regs_arr[i];
-    }
+    constexpr size_t NUM_REGS = sizeof(cpu::GPRegs) / sizeof(uint64_t);
+    static_assert(sizeof(cpu::GPRegs) == sizeof(decltype(sigframe->saved_regs)));
+    std::memcpy(sigframe->saved_regs.data(), regs_arr, NUM_REGS * sizeof(uint64_t));
 
     // Redirect task context to signal handler
     task->context.regs.rdi = static_cast<uint64_t>(SIGNO);  // arg1
@@ -2020,6 +2075,7 @@ static void check_pending_signals_deferred(task::Task* task) {
     }
     task->in_signal_handler = true;
 }
+}  // namespace
 
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unused]] ker::mod::gates::InterruptFrame* frame_ptr) {
     if (gpr_ptr == nullptr) {
@@ -2114,10 +2170,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                             uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
                             if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
                                 auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                                ru->ru_utime_sec = (int64_t)(child->user_time_us / 1000000ULL);
-                                ru->ru_utime_usec = (int64_t)(child->user_time_us % 1000000ULL);
-                                ru->ru_stime_sec = (int64_t)(child->system_time_us / 1000000ULL);
-                                ru->ru_stime_usec = (int64_t)(child->system_time_us % 1000000ULL);
+                                ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
+                                ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
+                                ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
+                                ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
                             }
                             current_task->wait_rusage_user_addr = 0;
                             current_task->wait_rusage_phys_addr = 0;
@@ -2150,10 +2206,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
                     if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
                         auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                        ru->ru_utime_sec = (int64_t)(target->user_time_us / 1000000ULL);
-                        ru->ru_utime_usec = (int64_t)(target->user_time_us % 1000000ULL);
-                        ru->ru_stime_sec = (int64_t)(target->system_time_us / 1000000ULL);
-                        ru->ru_stime_usec = (int64_t)(target->system_time_us % 1000000ULL);
+                        ru->ru_utime_sec = static_cast<int64_t>(target->user_time_us / 1000000ULL);
+                        ru->ru_utime_usec = static_cast<int64_t>(target->user_time_us % 1000000ULL);
+                        ru->ru_stime_sec = static_cast<int64_t>(target->system_time_us / 1000000ULL);
+                        ru->ru_stime_usec = static_cast<int64_t>(target->system_time_us % 1000000ULL);
                     }
                     current_task->wait_rusage_user_addr = 0;
                     current_task->wait_rusage_phys_addr = 0;
@@ -2169,7 +2225,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     task::Task* next_task = run_queues->this_cpu_locked([current_task, IS_YIELD, skip_wait_queue](RunQueue* rq) -> task::Task* {
         // Account for time used during syscall
         uint64_t const NOW_US = time::get_us();
-        auto delta_us = (int64_t)(NOW_US - rq->last_tick_us);
+        auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
         rq->last_tick_us = NOW_US;
         if (delta_us <= 0) {
             delta_us = 1;
@@ -2178,13 +2234,13 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
         // Deferred switch is always from syscall context (kernel mode) - attribute to system time
         if (current_task->type != task::TaskType::IDLE) {
-            current_task->system_time_us += (uint64_t)delta_us;
+            current_task->system_time_us += static_cast<uint64_t>(delta_us);
         }
 
         if (rq->runnable_heap.contains(current_task)) {
-            int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / (int64_t)current_task->sched_weight;
+            int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
             current_task->vruntime += VRUNTIME_DELTA;
-            rq->total_weighted_vruntime += VRUNTIME_DELTA * (int64_t)current_task->sched_weight;
+            rq->total_weighted_vruntime += VRUNTIME_DELTA * static_cast<int64_t>(current_task->sched_weight);
         }
 
         // A concurrent wakeup may have seen this task as rq->currentTask and
@@ -2210,8 +2266,8 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (rq->runnable_heap.contains(current_task)) {
                 note_perf_wait_callsite(current_task, current_task->context.frame.rip);
                 current_task->slice_used_ns = 0;
-                current_task->vdeadline =
-                    current_task->vruntime + (((int64_t)current_task->slice_ns * 1024) / (int64_t)current_task->sched_weight);
+                current_task->vdeadline = current_task->vruntime + ((static_cast<int64_t>(current_task->slice_ns) * 1024) /
+                                                                    static_cast<int64_t>(current_task->sched_weight));
                 rq->runnable_heap.update(current_task);
             }
         } else {
@@ -2250,13 +2306,18 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     });
 
 #ifdef SCHED_DEBUG
-    dbg::log("deferred_task_switch: Moved PID %x to %s", currentTask->pid,
-             isYield ? "yield (heap)" : (skipWaitQueue ? "skip-wait (heap)" : "wait queue"));
+    char const* switch_reason = "wait queue";
+    if (IS_YIELD) {
+        switch_reason = "yield (heap)";
+    } else if (skip_wait_queue) {
+        switch_reason = "skip-wait (heap)";
+    }
+    dbg::log("deferred_task_switch: Moved PID %x to %s", current_task->pid, switch_reason);
 #endif
 
     // Perf: deferred context switch (yield or block path)
     if (next_task != nullptr && next_task != current_task) {
-        uint8_t const SW_FLAGS = IS_YIELD ? perf::PERF_FLAG_YIELD : (skip_wait_queue ? perf::PERF_FLAG_YIELD : perf::PERF_FLAG_BLOCK);
+        uint8_t const SW_FLAGS = (IS_YIELD || skip_wait_queue) ? perf::PERF_FLAG_YIELD : perf::PERF_FLAG_BLOCK;
         perf::record_switch(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, next_task->pid, SW_FLAGS, 0,
                             current_task->slice_used_ns / 1000U, (IS_YIELD || !skip_wait_queue) ? perf_wait_callsite(current_task) : 0);
     }
@@ -2269,7 +2330,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     if (next_task == current_task) {
         current_task->has_run = true;
-        debug_task_ptrs[cpu::current_cpu()] = current_task;
+        debug_task_slot(cpu::current_cpu()) = current_task;
         return;
     }
 
@@ -2277,7 +2338,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         // Enter idle loop
         auto* rq = run_queues->this_cpu();
         rq->current_task = rq->idle_task;
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         rq->is_idle.store(true, std::memory_order_release);
         arm_idle_timer_for_this_cpu();
 
@@ -2340,7 +2401,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     }
     validate_user_resume_target(next_task, "deferred-resume-next");
 
-    debug_task_ptrs[cpu::current_cpu()] = next_task;
+    debug_task_slot(cpu::current_cpu()) = next_task;
 
     validate_kernel_resume_target(next_task, "deferred-resume-next");
     check_pending_signals_deferred(next_task);
@@ -2405,7 +2466,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
             auto* rq = run_queues->this_cpu();
             rq->current_task = rq->idle_task;
             rq->is_idle.store(true, std::memory_order_release);
-            debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+            debug_task_slot(cpu::current_cpu()) = rq->idle_task;
             mm::virt::switch_to_kernel_pagemap();
             restore_kernel_gs_for_idle();
 
@@ -2424,7 +2485,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
         auto* rq = run_queues->this_cpu();
         rq->current_task = rq->idle_task;
         rq->is_idle.store(true, std::memory_order_release);
-        debug_task_ptrs[cpu::current_cpu()] = rq->idle_task;
+        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         arm_idle_timer_for_this_cpu();
         mm::virt::switch_to_kernel_pagemap();
         restore_kernel_gs_for_idle();
@@ -2446,14 +2507,14 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
     // DIAGNOSTIC: Always log reschedule attempts
-    dbg::log("RESCHED: PID %x -> CPU %d (heapIdx=%d, schedQ=%d, curCpu=%d)", task->pid, (int)cpuNo, task->heapIndex, (int)task->sched_queue,
-             (int)cpu::current_cpu());
+    dbg::log("RESCHED: PID %x -> CPU %d (heapIdx=%d, schedQ=%d, curCpu=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index,
+             static_cast<int>(task->sched_queue), static_cast<int>(cpu::current_cpu()));
 #endif
     // Don't reschedule tasks that are exiting or dead
     auto state = task->state.load(std::memory_order_acquire);
     if (state != task::TaskState::ACTIVE) {
 #ifdef SCHED_DEBUG
-        dbg::log("RESCHED: PID %x SKIP - not ACTIVE (state=%d)", task->pid, (int)state);
+        dbg::log("RESCHED: PID %x SKIP - not ACTIVE (state=%d)", task->pid, static_cast<int>(state));
 #endif
         return;
     }
@@ -2506,19 +2567,20 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                         is_current_on_some_cpu = true;
                         current_cpu_of_task = search_cpu;
 #ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, (int)search_cpu);
+                        dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
 #endif
                         return;
                     }
                     if (rq->wait_list.remove(task)) {
                         found_and_removed = true;
 #ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, (int)search_cpu);
+                        dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
 #endif
                     }
                     if (rq->runnable_heap.contains(task)) {
 #ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, (int)search_cpu, task->heap_index);
+                        dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
+                                 task->heap_index);
 #endif
                         remove_from_sums(rq, task);
                         rq->runnable_heap.remove(task);
@@ -2570,7 +2632,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 // Insert into target CPU's heap with updated vruntime.
 // For pinned tasks, always re-insert on the task's own CPU, not the requested cpu_no.
 #ifdef SCHED_DEBUG
-    dbg::log("RESCHED: PID %x INSERT -> CPU %d (heapIdx=%d before insert)", task->pid, (int)cpu_no, task->heap_index);
+    dbg::log("RESCHED: PID %x INSERT -> CPU %d (heapIdx=%d before insert)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
 
     // Guard against concurrent wakers: if another reschedule_task_for_cpu() already
@@ -2615,7 +2677,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         // Using avg_vruntime places the task at the current fair position,
         // so it doesn't cut ahead of tasks that have been running continuously.
         int64_t const FAIR_VRUNTIME =
-            WAS_WAITING ? compute_wakeup_floor_vruntime(rq, task, NOW_US) : std::max((int64_t)rq->min_vruntime, compute_avg_vruntime(rq));
+            WAS_WAITING ? compute_wakeup_floor_vruntime(rq, task, NOW_US) : std::max(rq->min_vruntime, compute_avg_vruntime(rq));
         task->vruntime = std::max(task->vruntime, FAIR_VRUNTIME);
         if (WAS_WAITING) {
             perf::record_wake(static_cast<uint32_t>(cpu_no), task->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, true, false),
@@ -2644,7 +2706,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         wake_cpu(cpu_no);
     }
 #ifdef SCHED_DEBUG
-    dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, (int)cpuNo, task->heapIndex);
+    dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
 }
 
@@ -2667,14 +2729,14 @@ auto get_active_task_count() -> uint32_t {
 
 auto get_active_task_at(uint32_t index) -> task::Task* {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    task::Task* task = (index < active_task_count) ? active_task_list[index] : nullptr;
+    task::Task* task = (index < active_task_count) ? active_task_slot(index) : nullptr;
     global_task_registry_lock.unlock_irqrestore(FLAGS);
     return task;
 }
 
 auto get_active_task_at_safe(uint32_t index) -> task::Task* {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    task::Task* task = (index < active_task_count) ? active_task_list[index] : nullptr;
+    task::Task* task = (index < active_task_count) ? active_task_slot(index) : nullptr;
     if (task != nullptr && !task->try_acquire()) {
         task = nullptr;
     }
@@ -2689,12 +2751,12 @@ auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
     uint32_t count = active_task_count;
     count = std::min(count, MAX_ACTIVE_TASKS);
     for (uint32_t i = 0; i < count; ++i) {
-        auto* task = active_task_list[i];
+        auto* task = active_task_slot(i);
         if (task == nullptr || task->context.syscall_kernel_stack == 0) {
             continue;
         }
         uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
-        if (rsp > STACK_TOP - KERNEL_STACK_SIZE && rsp <= STACK_TOP) {
+        if (rsp > STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP) {
             return task;
         }
     }
@@ -2799,7 +2861,7 @@ void insert_into_dead_list(task::Task* task) {
 
     bool found_current = false;
     uint64_t const LAST_CPU = task->cpu;
-    uint64_t const cpu_count = smt::get_core_count();
+    uint64_t const CORE_COUNT = smt::get_core_count();
 
     auto detach_from_cpu = [task, &found_current](RunQueue* rq) {
         if (rq->current_task == task) {
@@ -2813,11 +2875,11 @@ void insert_into_dead_list(task::Task* task) {
         }
     };
 
-    if (LAST_CPU < cpu_count) {
+    if (LAST_CPU < CORE_COUNT) {
         run_queues->with_lock_void(LAST_CPU, detach_from_cpu);
     }
 
-    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         if (cpu_no == LAST_CPU) {
             continue;
         }
@@ -2839,7 +2901,10 @@ void insert_into_dead_list(task::Task* task) {
 
 void gc_expired_tasks() {
     for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count(); ++cpu_no) {
-        run_queues->with_lock_void(cpu_no, [cpu_no](RunQueue* rq) {
+        run_queues->with_lock_void(cpu_no, [cpu_no](RunQueue* rq) -> void {
+#ifndef SCHED_DEBUG
+            (void)cpu_no;
+#endif
             bool made_progress = true;
             while (made_progress) {
                 made_progress = false;
@@ -2915,7 +2980,7 @@ void gc_expired_tasks() {
                     }
 
 #ifdef SCHED_DEBUG
-                    dbg::log("GC: Reclaiming PID %x from CPU %d", cur->pid, cpuNo);
+                    dbg::log("GC: Reclaiming PID %x from CPU %d", cur->pid, cpu_no);
 #endif
 
                     // Validate task struct before freeing
@@ -3021,8 +3086,8 @@ void gc_expired_tasks() {
                     if (cur->context.syscall_kernel_stack != 0) {
                         uint64_t const TOP = cur->context.syscall_kernel_stack;
                         uint64_t base = 0;
-                        if (TOP > KERNEL_STACK_SIZE) {
-                            base = TOP - KERNEL_STACK_SIZE;
+                        if (TOP > ker::mod::mm::KERNEL_STACK_SIZE) {
+                            base = TOP - ker::mod::mm::KERNEL_STACK_SIZE;
                         }
                         if (base != 0) {
                             mm::phys::page_free(reinterpret_cast<void*>(base));
@@ -3110,7 +3175,10 @@ void note_scheduler_timer_interrupt() {
         return;
     }
     auto* rq = run_queues->this_cpu();
-    auto* current = rq != nullptr ? rq->current_task : nullptr;
+    if (rq == nullptr) {
+        return;
+    }
+    auto* current = rq->current_task;
     if (current == nullptr || current->type == task::TaskType::IDLE) {
         rq->idle_timer_wakeups.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3182,8 +3250,8 @@ void dump_scheduler_trace_stats() {
         return;
     }
 
-    uint64_t const cpu_count = smt::get_core_count();
-    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto stats = get_scheduler_trace_stats(cpu_no);
         if (stats.idle_timer_arms == 0 && stats.idle_timer_disarms == 0 && stats.idle_timer_wakeups == 0 && stats.wake_ipis_sent == 0 &&
             stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 && stats.load_balance_pushes == 0) {
@@ -3203,8 +3271,8 @@ void dump_scheduler_cpu_states() {
         return;
     }
 
-    uint64_t const cpu_count = smt::get_core_count();
-    for (uint64_t cpu_no = 0; cpu_no < cpu_count; ++cpu_no) {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto state = get_scheduler_cpu_state(cpu_no);
         dbg::log("schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u",
                  static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
@@ -3219,8 +3287,8 @@ auto get_least_loaded_cpu() -> uint64_t {
         return 0;
     }
 
-    uint64_t const cpu_count = smt::get_core_count();
-    if (cpu_count <= 1) {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT <= 1) {
         return 0;
     }
 
@@ -3231,13 +3299,13 @@ auto get_least_loaded_cpu() -> uint64_t {
     // reservations so burst thread creation does not keep choosing the same CPU
     // before earlier insertions become visible in the steady-state load metric.
     static std::atomic<uint64_t> rr_seed{0};
-    uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+    uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % CORE_COUNT;
 
     uint64_t best_cpu = START;
     uint32_t best_load = UINT32_MAX;
 
-    for (uint64_t off = 0; off < cpu_count; off++) {
-        uint64_t const I = (START + off) % cpu_count;
+    for (uint64_t off = 0; off < CORE_COUNT; off++) {
+        uint64_t const I = (START + off) % CORE_COUNT;
         uint32_t const LOAD = run_queues->with_lock(I, [](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq); });
 
         if (LOAD < best_load) {
@@ -3256,8 +3324,8 @@ auto get_least_loaded_cpu_in_mask(uint64_t mask) -> uint64_t {
     if (run_queues == nullptr || mask == 0) {
         return 0;
     }
-    uint64_t const cpu_count = smt::get_core_count();
-    uint64_t const ALL_MASK = (cpu_count >= 64) ? UINT64_MAX : ((1ULL << cpu_count) - 1ULL);
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    uint64_t const ALL_MASK = (CORE_COUNT >= 64) ? UINT64_MAX : ((1ULL << CORE_COUNT) - 1ULL);
     mask &= ALL_MASK;
     if (mask == 0) {
         return 0;

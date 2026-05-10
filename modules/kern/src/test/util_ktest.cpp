@@ -87,9 +87,9 @@ KTEST(SmallVec, PushBackInline) {
     KREQUIRE_TRUE(v.push_back(20));
     KREQUIRE_TRUE(v.push_back(30));
     KEXPECT_EQ(v.size(), 3UL);
-    KEXPECT_EQ(v[0], 10U);
-    KEXPECT_EQ(v[1], 20U);
-    KEXPECT_EQ(v[2], 30U);
+    KEXPECT_EQ(v.at(0), 10U);
+    KEXPECT_EQ(v.at(1), 20U);
+    KEXPECT_EQ(v.at(2), 30U);
 }
 
 KTEST(SmallVec, PushBackSpillToHeap) {
@@ -99,10 +99,48 @@ KTEST(SmallVec, PushBackSpillToHeap) {
     KREQUIRE_TRUE(v.push_back(3));  // spills to heap
     KREQUIRE_TRUE(v.push_back(4));
     KEXPECT_EQ(v.size(), 4UL);
-    KEXPECT_EQ(v[0], 1U);
-    KEXPECT_EQ(v[1], 2U);
-    KEXPECT_EQ(v[2], 3U);
-    KEXPECT_EQ(v[3], 4U);
+    KEXPECT_EQ(v.at(0), 1U);
+    KEXPECT_EQ(v.at(1), 2U);
+    KEXPECT_EQ(v.at(2), 3U);
+    KEXPECT_EQ(v.at(3), 4U);
+}
+
+KTEST(SmallVec, RangeForInline) {
+    ker::util::SmallVec<uint32_t, 4> v;
+    KREQUIRE_TRUE(v.push_back(10));
+    KREQUIRE_TRUE(v.push_back(20));
+    KREQUIRE_TRUE(v.push_back(30));
+
+    uint32_t sum = 0;
+    for (uint32_t const VAL : v) {
+        sum += VAL;
+    }
+    KEXPECT_EQ(sum, 60U);
+
+    for (auto& val : v) {
+        val++;
+    }
+    KEXPECT_EQ(v.at(0), 11U);
+    KEXPECT_EQ(v.at(1), 21U);
+    KEXPECT_EQ(v.at(2), 31U);
+}
+
+KTEST(SmallVec, RangeForSpilledConst) {
+    ker::util::SmallVec<uint32_t, 2> v;
+    KREQUIRE_TRUE(v.push_back(1));
+    KREQUIRE_TRUE(v.push_back(2));
+    KREQUIRE_TRUE(v.push_back(3));
+    KREQUIRE_TRUE(v.push_back(4));
+
+    auto const& cv = v;
+    uint32_t expected = 1;
+    size_t count = 0;
+    for (uint32_t const VAL : cv) {
+        KEXPECT_EQ(VAL, expected);
+        expected++;
+        count++;
+    }
+    KEXPECT_EQ(count, 4UL);
 }
 
 KTEST(SmallVec, Clear) {
@@ -112,7 +150,7 @@ KTEST(SmallVec, Clear) {
     v.clear();
     KEXPECT_EQ(v.size(), 0UL);
     KREQUIRE_TRUE(v.push_back(99));
-    KEXPECT_EQ(v[0], 99U);
+    KEXPECT_EQ(v.at(0), 99U);
 }
 
 KTEST(SmallVec, Empty) {
@@ -126,7 +164,7 @@ KTEST(SmallVec, LastElement) {
     ker::util::SmallVec<uint32_t, 4> v;
     KREQUIRE_TRUE(v.push_back(42));
     KREQUIRE_TRUE(v.push_back(99));
-    KEXPECT_EQ(v[v.size() - 1], 99U);
+    KEXPECT_EQ(v.at(v.size() - 1), 99U);
 }
 
 // ---------------------------------------------------------------------------

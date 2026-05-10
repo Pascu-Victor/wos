@@ -3,6 +3,7 @@
 #include <extern/limine.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -12,18 +13,36 @@
 #include "mod/io/serial/serial.hpp"
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
-__attribute__((used, section(".requests"))) static volatile limine_framebuffer_request framebuffer_request = {
+
+namespace ker::mod::gfx::fb {
+namespace {
+constexpr uint64_t MAX_FRAMEBUFFER_WIDTH = 3840;
+constexpr uint64_t MAX_FRAMEBUFFER_HEIGHT = 2160;
+constexpr std::size_t BACK_BUFFER_PIXELS = MAX_FRAMEBUFFER_WIDTH * MAX_FRAMEBUFFER_HEIGHT;
+using BackBuffer = std::array<uint32_t, BACK_BUFFER_PIXELS>;
+
+// Limine discovers requests by scanning the .requests section; keep the section
+// and volatile storage semantics while using anonymous-namespace linkage.
+__attribute__((used, section(".requests"))) volatile limine_framebuffer_request framebuffer_request = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
-namespace ker::mod::gfx::fb {
-namespace {
 FbFont current_font;
 limine_framebuffer* framebuffer;
 [[maybe_unused]]
-uint32_t back_buffer[3840 * 2160];
+BackBuffer back_buffer{};
+static_assert(sizeof(BackBuffer) == BACK_BUFFER_PIXELS * sizeof(uint32_t));
+
+[[maybe_unused]]
+auto back_buffer_at(std::size_t index) -> uint32_t& {
+    if (index >= back_buffer.size()) {
+        hcf();
+    }
+    // Bounds are checked above; operator[] avoids hosted-library exception paths.
+    return back_buffer[index];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
 }  // namespace
 
 void init() {
@@ -34,13 +53,15 @@ void init() {
 
         framebuffer = framebuffer_request.response->framebuffers[0];
 
-        framebuffer->width = std::min<uint64_t>(framebuffer->width, static_cast<uint64_t>(3840));
-        framebuffer->height = std::min<uint64_t>(framebuffer->height, static_cast<uint64_t>(2160));
+        framebuffer->width = std::min<uint64_t>(framebuffer->width, MAX_FRAMEBUFFER_WIDTH);
+        framebuffer->height = std::min<uint64_t>(framebuffer->height, MAX_FRAMEBUFFER_HEIGHT);
 
         // manual constructor calling since we can't use new for now
-        std::strcpy(current_font.name, "default");
-        current_font.height = 16;
-        current_font.width = 16;
+        std::strncpy(current_font.name.data(), "default", current_font.name.size());
+        constexpr uint8_t DEFAULT_FONT_WIDTH = 16;
+        constexpr uint8_t DEFAULT_FONT_HEIGHT = 16;
+        current_font.height = DEFAULT_FONT_HEIGHT;
+        current_font.width = DEFAULT_FONT_WIDTH;
         current_font.load_font();
 
         clear(TERM_BG_COLOR);
@@ -53,20 +74,23 @@ void init() {
     }
 }
 
-static inline void swap_buffers() {
+namespace {
+[[maybe_unused]]
+inline void swap_buffers() {
     if constexpr (WOS_HAS_GFX_FB) {
         auto* fb = static_cast<uint32_t*>(framebuffer->address);
         for (size_t i = 0; i < framebuffer->width * framebuffer->height; i++) {
-            fb[i] = back_buffer[i];
+            fb[i] = back_buffer_at(i);
         }
     } else {
         hcf();
     }
 }
+}  // namespace
 
 inline void write_pixel(uint16_t x, uint16_t y, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
-        back_buffer[x + (y * framebuffer->width)] = color;
+        back_buffer_at(static_cast<std::size_t>(x + (y * framebuffer->width))) = color;
     } else {
         hcf();
     }
@@ -75,7 +99,7 @@ inline void write_pixel(uint16_t x, uint16_t y, uint32_t color) {
 void clear(uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
         for (size_t i = 0; i < framebuffer->width * framebuffer->height; i++) {
-            back_buffer[i] = color;
+            back_buffer_at(i) = color;
         }
         swap_buffers();
     } else {
@@ -107,7 +131,9 @@ void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color, F
     }
 }
 
-static inline void draw_char_no_swap(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
+namespace {
+[[maybe_unused]]
+inline void draw_char_no_swap(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
         if (mode == OffsetMode::OFFSET_CHAR) {
             x *= current_font.width;
@@ -127,6 +153,7 @@ static inline void draw_char_no_swap(uint16_t x, uint16_t y, char c, uint32_t co
         hcf();
     }
 }
+}  // namespace
 
 void draw_char(uint16_t x, uint16_t y, char c, uint32_t color, uint32_t bg_color, OffsetMode mode) {
     if constexpr (WOS_HAS_GFX_FB) {
@@ -164,7 +191,9 @@ uint64_t draw_string(uint16_t x, uint16_t y, const char* str, uint32_t color, ui
     }
 }
 
-static void draw_line_no_swap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
+namespace {
+[[maybe_unused]]
+void draw_line_no_swap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
         int const DX = x2 - x1;
         int const DY = y2 - y1;
@@ -216,6 +245,7 @@ static void draw_line_no_swap(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2
         hcf();
     }
 }
+}  // namespace
 
 void draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color) {
     if constexpr (WOS_HAS_GFX_FB) {
@@ -308,11 +338,11 @@ uint64_t viewport_height_chars() {
 void scroll() {
     if constexpr (WOS_HAS_GFX_FB) {
         for (size_t i = 0; i < (framebuffer->height - current_font.height) * framebuffer->width; i++) {
-            back_buffer[i] = back_buffer[i + (framebuffer->width * current_font.height)];
+            back_buffer_at(i) = back_buffer_at(i + (framebuffer->width * current_font.height));
         }
         for (size_t i = (framebuffer->height - current_font.height) * framebuffer->width; i < framebuffer->width * framebuffer->height;
              i++) {
-            back_buffer[i] = TERM_BG_COLOR;
+            back_buffer_at(i) = TERM_BG_COLOR;
         }
     } else {
         hcf();
@@ -329,7 +359,8 @@ void scroll() {
 
 void map_framebuffer() {
     if constexpr (WOS_HAS_GFX_FB) {
-        auto fb_phys = (uint64_t)mm::addr::get_phys_pointer((mm::addr::paddr_t)(framebuffer->address));
+        auto const FB_PHYS =
+            reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::paddr_t>(framebuffer->address)));
 
         ker::mod::io::serial::write("Mapping framebuffer\n");
         ker::mod::io::serial::write("\n");
@@ -340,11 +371,11 @@ void map_framebuffer() {
         ker::mod::io::serial::write(framebuffer->height);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Start physical address: ");
-        ker::mod::io::serial::write_hex(fb_phys);
+        ker::mod::io::serial::write_hex(FB_PHYS);
         uint64_t const FRAMEBUFFER_SIZE = framebuffer->width * framebuffer->height * framebuffer->bpp / 8;
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Theoretical end physical address: ");
-        ker::mod::io::serial::write_hex((uint64_t)fb_phys + FRAMEBUFFER_SIZE);
+        ker::mod::io::serial::write_hex(FB_PHYS + FRAMEBUFFER_SIZE);
         ker::mod::io::serial::write("\n");
         ker::mod::io::serial::write("Framebuffer size: ");
         ker::mod::io::serial::write_hex(FRAMEBUFFER_SIZE);

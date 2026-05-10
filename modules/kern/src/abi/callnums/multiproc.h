@@ -2,11 +2,14 @@
 #include <cstdint>
 
 namespace ker::abi::multiproc {
+// Syscall operation selectors are carried in 64-bit registers.
+// NOLINTNEXTLINE(performance-enum-size)
 enum class threadInfoOps : uint64_t {
     CURRENT_THREAD_ID,
     NATIVE_THREAD_COUNT,
     CURRENT_CPU,
 };
+// NOLINTNEXTLINE(performance-enum-size)
 enum class threadControlOps : uint64_t {
     SET_TCB = 0x100,  // Offset to avoid overlap with threadInfoOps
     YIELD = 0x101,

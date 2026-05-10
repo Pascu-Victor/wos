@@ -16,7 +16,6 @@
 #include <cstring>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
 
@@ -326,7 +325,6 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     }
 
     // --- Allocate per-AG state and read AGF/AGI headers ---
-    size_t const PAG_SIZE = sizeof(XfsPerAG) * ctx->ag_count;
     ctx->per_ag = new (std::nothrow) XfsPerAG[ctx->ag_count]{};
     if (ctx->per_ag == nullptr) {
         mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)", ctx->ag_count);

@@ -17,16 +17,22 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_ipc.hpp>
 #include <new>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <span>
 #include <string_view>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/ktime/ktime.hpp"
 #include "vfs/file_operations.hpp"
 
+// The net syscall layer mirrors user-visible ABI records and POSIX poll/ioctl
+// buffers, so several fixed C-style arrays and indexed fd buffers are kept by
+// design at this boundary.
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays, modernize-avoid-c-arrays, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 namespace ker::syscall::net {
 
 namespace {
@@ -110,7 +116,7 @@ template <typename T, typename Fn>
 auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, Fn&& fn) -> T {
     bool const EFFECTIVE_NONBLOCK = socket_effective_nonblock(file, sock, call_flags);
     SocketNonblockGuard const GUARD(sock, EFFECTIVE_NONBLOCK);
-    return maybe_restart_socket_wait<T>(fn(), EFFECTIVE_NONBLOCK);
+    return maybe_restart_socket_wait<T>(std::forward<Fn>(fn)(), EFFECTIVE_NONBLOCK);
 }
 
 // Socket file operations (integrate sockets with VFS fd table)
@@ -283,6 +289,25 @@ constexpr uint32_t WOS_NET_LINK_SET_TXQLEN = 1U << 2;
 constexpr uint32_t WOS_NET_LINK_SET_NAME = 1U << 3;
 constexpr uint32_t WOS_NET_LINK_SET_HWADDR = 1U << 4;
 
+template <size_t N>
+void copy_cstr_trunc(std::span<char, N> dest, std::string_view src) {
+    static_assert(N > 0);
+    std::ranges::fill(dest, '\0');
+    std::ranges::copy_n(src.begin(), std::min(src.size(), N - 1), dest.begin());
+}
+
+template <typename T>
+auto load_unaligned(const uint8_t* src) -> T {
+    T value{};
+    std::memcpy(&value, src, sizeof(value));
+    return value;
+}
+
+template <typename T>
+void store_unaligned(uint8_t* dest, T value) {
+    std::memcpy(dest, &value, sizeof(value));
+}
+
 struct WosNetIfInfo {
     uint32_t ifindex;
     char name[WOS_NET_IF_NAME_LEN];
@@ -390,20 +415,20 @@ void apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
 }
 
 void fill_if_info(WosNetIfInfo& out, ker::net::NetDevice* dev) {
-    std::memset(&out, 0, sizeof(out));
+    out = {};
     if (dev == nullptr) {
         return;
     }
     out.ifindex = dev->ifindex;
-    std::strncpy(out.name, dev->name.data(), sizeof(out.name) - 1);
+    copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{out.name}, dev->name.data());
     out.flags = effective_ifflags(dev);
     out.mtu = dev->mtu;
     out.tx_queue_len = dev->tx_queue_len;
     out.type = ((out.flags & IFF_LOOPBACK) != 0) ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
     out.addr_len = 6;
     out.operstate = dev->state != 0 ? 6 : 2;  // Linux IF_OPER_UP / IF_OPER_DOWN
-    std::memcpy(out.addr, dev->mac.data(), 6);
-    std::memset(out.broadcast, 0xff, 6);
+    std::copy_n(dev->mac.data(), 6, out.addr);
+    std::fill_n(out.broadcast, 6, 0xff);
 }
 
 auto find_dev_by_ifindex(uint32_t ifindex) -> ker::net::NetDevice* {
@@ -434,8 +459,8 @@ auto rename_netdev(ker::net::NetDevice* dev, const char* new_name) -> int {
     if (ker::net::netdev_find_by_name(std::string_view(new_name, LEN)) != nullptr) {
         return -EEXIST;
     }
-    std::memset(dev->name.data(), 0, dev->name.size());
-    std::memcpy(dev->name.data(), new_name, LEN);
+    dev->name.fill('\0');
+    std::copy_n(new_name, LEN, dev->name.data());
     return 0;
 }
 
@@ -446,7 +471,7 @@ auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t 
     if (dev->ops != nullptr && dev->ops->set_mac != nullptr) {
         dev->ops->set_mac(dev, hwaddr);
     } else {
-        std::memcpy(dev->mac.data(), hwaddr, 6);
+        std::copy_n(hwaddr, 6, dev->mac.data());
     }
     ker::net::wki::wki_dev_server_notify_net_changed(dev);
     ker::net::wki::wki_remotable_notify_net_changed(dev);
@@ -566,7 +591,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     if (static_cast<int>(a4) != 0) {
                         return static_cast<uint64_t>(-EOPNOTSUPP);
                     }
@@ -594,7 +619,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     if (static_cast<int>(a4) != 0) {
                         return static_cast<uint64_t>(-EOPNOTSUPP);
                     }
@@ -664,7 +689,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     int const RESULT =
                         ker::net::wki::wki_ipc_socket_setsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
                                                                  reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
@@ -686,7 +711,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     int const RESULT =
                         ker::net::wki::wki_ipc_socket_getsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
                                                                  reinterpret_cast<void*>(a4), reinterpret_cast<size_t*>(a5));
@@ -708,7 +733,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     int const RESULT = ker::net::wki::wki_ipc_socket_shutdown(file_handle.file, static_cast<int>(a2));
                     return static_cast<uint64_t>(RESULT);
                 }
@@ -727,7 +752,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
-                if (ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
+                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     int const RESULT = ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, reinterpret_cast<void*>(a2),
                                                                                  reinterpret_cast<size_t*>(a3));
                     return static_cast<uint64_t>(RESULT);
@@ -794,9 +819,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 // offset 40: rt_genmask sockaddr (sin_addr at offset 44)
                 // offset 56: rt_flags (uint16_t)
                 auto* rt = arg;
-                uint32_t dst = *reinterpret_cast<uint32_t*>(rt + 12);
-                uint32_t gw = *reinterpret_cast<uint32_t*>(rt + 28);
-                uint32_t mask = *reinterpret_cast<uint32_t*>(rt + 44);
+                auto dst = load_unaligned<uint32_t>(rt + 12);
+                auto gw = load_unaligned<uint32_t>(rt + 28);
+                auto mask = load_unaligned<uint32_t>(rt + 44);
                 // Convert from network byte order
                 dst = ker::net::ntohl(dst);
                 gw = ker::net::ntohl(gw);
@@ -883,11 +908,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
             switch (request) {
                 case SIOC_GIFFLAGS: {
-                    *reinterpret_cast<int16_t*>(arg + 16) = static_cast<int16_t>(effective_ifflags(dev));
+                    store_unaligned<int16_t>(arg + 16, static_cast<int16_t>(effective_ifflags(dev)));
                     return 0;
                 }
                 case SIOC_SIFFLAGS: {
-                    auto flags = static_cast<uint32_t>(*reinterpret_cast<uint16_t*>(arg + 16));
+                    auto flags = static_cast<uint32_t>(load_unaligned<uint16_t>(arg + 16));
                     apply_ifflags(dev, flags, IFF_UP | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST);
                     return 0;
                 }
@@ -898,12 +923,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     }
                     // Fill sockaddr_in at offset 16
                     std::memset(arg + 16, 0, 16);
-                    *reinterpret_cast<uint16_t*>(arg + 16) = 2;  // AF_INET
-                    *reinterpret_cast<uint32_t*>(arg + 20) = ker::net::htonl(nif->ipv4_addrs[0].addr);
+                    store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
+                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].addr));
                     return 0;
                 }
                 case SIOC_SIFADDR: {
-                    uint32_t const ADDR = ker::net::ntohl(*reinterpret_cast<uint32_t*>(arg + 20));
+                    uint32_t const ADDR = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
                     // Check if interface already has addresses; if so, update first one
                     auto* nif = ker::net::netif_get(dev);
                     if (nif != nullptr && nif->ipv4_addr_count > 0) {
@@ -919,12 +944,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         return static_cast<uint64_t>(-EADDRNOTAVAIL);
                     }
                     std::memset(arg + 16, 0, 16);
-                    *reinterpret_cast<uint16_t*>(arg + 16) = 2;  // AF_INET
-                    *reinterpret_cast<uint32_t*>(arg + 20) = ker::net::htonl(nif->ipv4_addrs[0].netmask);
+                    store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
+                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].netmask));
                     return 0;
                 }
                 case SIOC_SIFNETMASK: {
-                    uint32_t const MASK = ker::net::ntohl(*reinterpret_cast<uint32_t*>(arg + 20));
+                    uint32_t const MASK = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
                     auto* nif = ker::net::netif_get(dev);
                     if (nif != nullptr && nif->ipv4_addr_count > 0) {
                         nif->ipv4_addrs[0].netmask = MASK;
@@ -934,16 +959,16 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 case SIOC_GIFHWADDR: {
                     // sa_family = ARPHRD_ETHER (1), then 6 bytes of MAC
                     std::memset(arg + 16, 0, 16);
-                    *reinterpret_cast<uint16_t*>(arg + 16) = (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
+                    store_unaligned<uint16_t>(arg + 16, (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER);
                     std::memcpy(arg + 18, dev->mac.data(), 6);
                     return 0;
                 }
                 case SIOC_GIFMTU: {
-                    *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->mtu);
+                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->mtu));
                     return 0;
                 }
                 case SIOC_SIFMTU: {
-                    int32_t const MTU = *reinterpret_cast<int32_t*>(arg + 16);
+                    auto const MTU = load_unaligned<int32_t>(arg + 16);
                     if (MTU <= 0) {
                         return static_cast<uint64_t>(-EINVAL);
                     }
@@ -951,11 +976,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return 0;
                 }
                 case SIOC_GIFTXQLEN: {
-                    *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->tx_queue_len);
+                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->tx_queue_len));
                     return 0;
                 }
                 case SIOC_SIFTXQLEN: {
-                    int32_t const QLEN = *reinterpret_cast<int32_t*>(arg + 16);
+                    auto const QLEN = load_unaligned<int32_t>(arg + 16);
                     if (QLEN < 0) {
                         return static_cast<uint64_t>(-EINVAL);
                     }
@@ -973,7 +998,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return static_cast<uint64_t>(rename_netdev(dev, reinterpret_cast<const char*>(arg + 16)));
                 }
                 case SIOC_GIFINDEX: {
-                    *reinterpret_cast<int32_t*>(arg + 16) = static_cast<int32_t>(dev->ifindex);
+                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->ifindex));
                     return 0;
                 }
                 default:
@@ -990,7 +1015,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EINVAL);
             }
             std::string_view const IFNAME(reinterpret_cast<char*>(req), strnlen(reinterpret_cast<char*>(req), 16));
-            uint64_t const CPU_MASK = *reinterpret_cast<uint64_t*>(req + 16);
+            auto const CPU_MASK = load_unaligned<uint64_t>(req + 16);
             auto* dev = ker::net::netdev_find_by_name(IFNAME);
             if (dev == nullptr) {
                 return static_cast<uint64_t>(-ENODEV);
@@ -1044,13 +1069,13 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
                     if (out != nullptr && written < CAP) {
                         auto& info = out[written];
-                        std::memset(&info, 0, sizeof(info));
+                        info = {};
                         info.ifindex = dev->ifindex;
                         info.family = WOS_AF_INET;
                         info.prefix_len = mask_to_prefix(nif->ipv4_addrs[j].netmask);
                         info.scope = (nif->ipv4_addrs[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
                         info.flags = WOS_IFA_F_PERMANENT;
-                        std::strncpy(info.label, dev->name.data(), sizeof(info.label) - 1);
+                        copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{info.label}, dev->name.data());
                         uint32_t addr_be = ker::net::htonl(nif->ipv4_addrs[j].addr);
                         uint32_t brd_be = ker::net::htonl(nif->ipv4_addrs[j].addr | ~nif->ipv4_addrs[j].netmask);
                         std::memcpy(info.address, &addr_be, sizeof(addr_be));
@@ -1291,3 +1316,5 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 }
 
 }  // namespace ker::syscall::net
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays, modernize-avoid-c-arrays, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)

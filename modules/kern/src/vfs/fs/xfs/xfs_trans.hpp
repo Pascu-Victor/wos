@@ -23,39 +23,42 @@ constexpr int XFS_TRANS_MAX_ITEMS = 64;  // max logged items per transaction
 
 // Log item types
 enum class XfsLogItemType : uint8_t {
+    NONE = 0,
     BUFFER = 1,
     INODE = 2,
 };
 
 // A logged buffer region - records which part of a buffer was modified
 struct XfsTransBufItem {
-    BufHead* bp;
-    uint32_t offset;  // byte offset of modified region within buffer
-    uint32_t len;     // byte length of modified region
-    bool dirty;
+    BufHead* bp{};
+    uint32_t offset{};  // byte offset of modified region within buffer
+    uint32_t len{};     // byte length of modified region
+    bool dirty{};
 };
 
 // A logged inode
 struct XfsTransInodeItem {
-    XfsInode* ip;
+    XfsInode* ip{};
 };
 
 // A logged item (union of buffer and inode)
 struct XfsTransItem {
-    XfsLogItemType type;
+    XfsLogItemType type{XfsLogItemType::NONE};
     union {
         XfsTransBufItem buf;
         XfsTransInodeItem inode;
     };
+
+    constexpr XfsTransItem() : buf{} {}
 };
 
 // Transaction structure
 struct XfsTransaction {
-    XfsMountContext* mount;
-    std::array<XfsTransItem, XFS_TRANS_MAX_ITEMS> items;
-    int item_count;
-    bool committed;
-    bool cancelled;
+    XfsMountContext* mount{};
+    std::array<XfsTransItem, XFS_TRANS_MAX_ITEMS> items{};
+    int item_count{};
+    bool committed{};
+    bool cancelled{};
 };
 
 // ============================================================================

@@ -83,7 +83,6 @@ auto get_mime_type(std::string_view path) -> const char* {
     // Images
     if (ext == ".png") {
         return "image/png";
-        return "image/png";
     }
     if (ext == ".jpg" || ext == ".jpeg") {
         return "image/jpeg";
@@ -155,8 +154,9 @@ auto url_decode(std::string_view encoded) -> std::string {
     result.reserve(encoded.size());
 
     for (size_t i = 0; i < encoded.size(); ++i) {
-        if (encoded[i] == '%' && i + 2 < encoded.size()) {
-            std::array<char, 3> hex = {encoded[i + 1], encoded[i + 2], '\0'};
+        char const CURRENT = encoded.at(i);
+        if (CURRENT == '%' && i + 2 < encoded.size()) {
+            std::array<char, 3> hex = {encoded.at(i + 1), encoded.at(i + 2), '\0'};
             char* end = nullptr;
             long const VAL = strtol(hex.data(), &end, 16);
             if (end == hex.data() + 2) {
@@ -164,11 +164,11 @@ auto url_decode(std::string_view encoded) -> std::string {
                 i += 2;
                 continue;
             }
-        } else if (encoded[i] == '+') {
+        } else if (CURRENT == '+') {
             result += ' ';
             continue;
         }
-        result += encoded[i];
+        result += CURRENT;
     }
     return result;
 }
@@ -191,10 +191,12 @@ auto format_size(size_t size) -> std::string {
         return std::format("{}.{} {}", whole, tenth, suffix);
     };
 
-    if (size < static_cast<size_t>(1024 * 1024)) {
+    constexpr size_t KIB = 1024;
+    constexpr size_t MIB = KIB * 1024;
+    if (size < MIB) {
         return format_tenths(size, 1024, "KB");
     }
-    return format_tenths(size, 1024 * 1024, "MB");
+    return format_tenths(size, MIB, "MB");
 }
 
 // Simple HTTP response templates
@@ -372,26 +374,24 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             html += "</a></td><td>";
             // Format mode as octal
             {
-                char mode_str[32];
                 // rwx string
-                const char* rwx = "rwxrwxrwx";
-                char perms[11];
-                perms[0] = ent.is_dir ? 'd' : (ent.is_blk ? 'b' : '-');
+                constexpr std::string_view RWX = "rwxrwxrwx";
+                std::array<char, 11> perms{};
+                char type_char = '-';
+                if (ent.is_dir) {
+                    type_char = 'd';
+                } else if (ent.is_blk) {
+                    type_char = 'b';
+                }
+                perms.at(0) = type_char;
                 for (int b = 0; b < 9; b++) {
-                    perms[1 + b] = ((ent.mode & (1 << (8 - b))) != 0U) ? rwx[b] : '-';
+                    perms.at(1 + static_cast<size_t>(b)) = ((ent.mode & (1 << (8 - b))) != 0U) ? RWX.at(static_cast<size_t>(b)) : '-';
                 }
-                perms[10] = '\0';
-                int const N = snprintf(mode_str, sizeof(mode_str), "%s (%04o)", perms, ent.mode & 07777);
-                if (N > 0 && std::cmp_less(N, sizeof(mode_str))) {
-                    html.append(mode_str, N);
-                }
+                perms.at(10) = '\0';
+                html += std::format("{} ({:04o})", std::string_view(perms.data(), 10), ent.mode & 07777);
             }
             html += "</td><td>";
-            {
-                char owner_str[32];
-                int const N = snprintf(owner_str, sizeof(owner_str), "%u:%u", ent.uid, ent.gid);
-                html.append(owner_str, N);
-            }
+            html += std::format("{}:{}", ent.uid, ent.gid);
             html += "</td><td class='size'>";
             html += ent.is_dir ? "-" : format_size(size);
             html += "</td><td class='type'>";
@@ -465,19 +465,17 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
 // Send an HTTP response with custom headers
 auto send_response(int client_fd, int status_code, const char* status_text, const char* content_type, const void* body, size_t body_len)
     -> ssize_t {
-    // Build header
-    std::array<char, 512> header{};
-    int const HEADER_LEN = snprintf(header.data(), header.size(),
-                                    "HTTP/1.1 %d %s\r\n"
-                                    "Content-Type: %s\r\n"
-                                    "Content-Length: %zu\r\n"
-                                    "Connection: close\r\n"
-                                    "Server: WOS-httpd/1.0\r\n"
-                                    "\r\n",
-                                    status_code, status_text, content_type, body_len);
+    std::string const HEADER = std::format(
+        "HTTP/1.1 {} {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n"
+        "Server: WOS-httpd/1.0\r\n"
+        "\r\n",
+        status_code, status_text, content_type, body_len);
 
     // Send header (using send_all to handle partial sends)
-    ssize_t sent = send_all(client_fd, header.data(), HEADER_LEN);
+    ssize_t sent = send_all(client_fd, HEADER.data(), HEADER.size());
     if (sent < 0) {
         return sent;
     }
@@ -703,7 +701,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
         // Parent: wait for mount to complete
         int32_t exit_code = 0;
-        ker::process::waitpid(exec_res, &exit_code, 0, nullptr);
+        ker::process::waitpid(static_cast<int64_t>(exec_res), &exit_code, 0, nullptr);
 
         if (exit_code == 0) {
             log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
@@ -747,20 +745,19 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     }
 
     if (decoded_path == "/info") {
-        std::array<char, 1024> info_body{};
-        int const BODY_LEN = snprintf(info_body.data(), info_body.size(),
-                                      "<html><head><title>Server Info</title></head><body>"
-                                      "<h1>Server Information</h1>"
-                                      "<ul>"
-                                      "<li><strong>Process ID:</strong> %lu</li>"
-                                      "<li><strong>Thread ID:</strong> %lu</li>"
-                                      "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
-                                      "<li><strong>Port:</strong> %d</li>"
-                                      "<li><strong>Document Root:</strong> %s</li>"
-                                      "</ul>"
-                                      "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
-                                      pid, tid, HTTP_PORT, SERVE_ROOT);
-        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", info_body.data(), BODY_LEN);
+        std::string const INFO_BODY = std::format(
+            "<html><head><title>Server Info</title></head><body>"
+            "<h1>Server Information</h1>"
+            "<ul>"
+            "<li><strong>Process ID:</strong> {}</li>"
+            "<li><strong>Thread ID:</strong> {}</li>"
+            "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
+            "<li><strong>Port:</strong> {}</li>"
+            "<li><strong>Document Root:</strong> {}</li>"
+            "</ul>"
+            "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
+            pid, tid, HTTP_PORT, SERVE_ROOT);
+        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", INFO_BODY.data(), INFO_BODY.size());
         log_message("httpd[t:{},p:{}]: Served /info", tid, pid);
         return;
     }
@@ -770,7 +767,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     if (decoded_path.empty() || decoded_path == "/") {
         // Root - serve from SERVE_ROOT
     } else {
-        if (decoded_path[0] != '/') {
+        if (decoded_path.front() != '/') {
             fs_path += '/';
         }
         fs_path += decoded_path;
@@ -794,6 +791,8 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
 }  // namespace
 
+// std::format can theoretically throw, but WOS service entry points use the normal process boundary for fatal failures.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 auto main(int argc, char** argv) -> int {
     (void)argc;
     (void)argv;
@@ -856,9 +855,9 @@ auto main(int argc, char** argv) -> int {
         // Get client IP
         std::array<char, INET_ADDRSTRLEN> client_ip{};
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
-        uint16_t client_port = ntohs(client_addr.sin_port);
+        uint16_t const CLIENT_PORT = ntohs(client_addr.sin_port);
 
-        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), client_port);
+        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), CLIENT_PORT);
 
         // Read request
         ssize_t received = recv(client_fd, buffer.data(), REQUEST_BUFFER_SIZE - 1, 0);
@@ -874,10 +873,10 @@ auto main(int argc, char** argv) -> int {
             continue;
         }
 
-        buffer[received] = '\0';
-        std::string_view const REQUEST(buffer.data(), received);
+        buffer.at(static_cast<size_t>(received)) = '\0';
+        std::string_view const REQUEST(buffer.data(), static_cast<size_t>(received));
 
-        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), client_port);
+        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), CLIENT_PORT);
 
         // Handle request and send response
         handle_request(client_fd, REQUEST);

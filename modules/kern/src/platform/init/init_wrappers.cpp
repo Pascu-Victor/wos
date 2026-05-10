@@ -1,6 +1,5 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <dev/ahci.hpp>
@@ -18,6 +17,7 @@
 #include <dev/virtio/virtio_net.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <net/address.hpp>
 #include <net/backlog.hpp>
 #include <net/net.hpp>
 #include <net/netdevice.hpp>
@@ -94,7 +94,7 @@ void gdt_init() {
     // Initialize GDT with the captured stack pointer
     uint64_t const RSP = get_kernel_rsp();
     auto* stack = reinterpret_cast<uint8_t*>(RSP);
-    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack) + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
+    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack) + ker::mod::mm::KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
 }
 
 void kmalloc_init() {
@@ -206,9 +206,8 @@ void ipv6_linklocal_init() {
         if (dev == nullptr || dev->wki_transport) {
             continue;
         }
-        std::array<uint8_t, 16> ll_addr{};
-        net::proto::ipv6_make_link_local(ll_addr, dev->mac);
-        net::netif_add_ipv6(dev, ll_addr, 64);
+        net::proto::IPv6Address const LL_ADDR = net::proto::ipv6_make_link_local(dev->mac);
+        net::netif_add_ipv6(dev, LL_ADDR, 64);
     }
 }
 
@@ -248,6 +247,7 @@ void sched_init() {
     mod::sched::setup_queues();
 #ifdef WOS_SELFTEST
     if (strcmp(get_kernel_cmdline(), "--selftest") == 0) {
+        mod::smt::park_secondary_cpus_for_selftest();
         ker::test::run_all();
         hcf();
     }

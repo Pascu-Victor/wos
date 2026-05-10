@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 
@@ -14,9 +15,9 @@ void wki_eth_transport_init(net::NetDevice* netdev);
 void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
 
 // Neighbor MAC table management (used by peer.cpp during HELLO handshake)
-void wki_eth_neighbor_add(uint16_t node_id, const std::array<uint8_t, 6>& mac);
+void wki_eth_neighbor_add(uint16_t node_id, const proto::MacAddress& mac);
 void wki_eth_neighbor_remove(uint16_t node_id);
-auto eth_neighbor_find_mac(uint16_t node_id, std::array<uint8_t, 6>& mac_out) -> bool;
+auto eth_neighbor_find_mac(uint16_t node_id, proto::MacAddress& mac_out) -> bool;
 
 // Return the underlying NetDevice used by the WKI Ethernet transport.
 // Used by wki_spin_yield() to drive inline NAPI polling.

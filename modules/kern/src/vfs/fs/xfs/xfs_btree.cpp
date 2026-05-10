@@ -35,10 +35,10 @@ namespace ker::vfs::xfs {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::numrecs(int level) const -> int {
-    if (levels[level].bp == nullptr) {
+    if (level_at(level).bp == nullptr) {
         return 0;
     }
-    const auto* data = levels[level].bp->data;
+    const auto* data = level_at(level).bp->data;
 
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
         const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(data);
@@ -52,14 +52,14 @@ auto XfsBtreeCursor<Traits>::numrecs(int level) const -> int {
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::key_at(int level, int idx) const -> const Key* {
     // Keys start right after the header, at 1-based index idx.
-    const uint8_t* base = levels[level].bp->data + Traits::HDR_LEN;
+    const uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
     return reinterpret_cast<const Key*>(base + (static_cast<size_t>(idx - 1) * Traits::KEY_LEN));
 }
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::rec_at(int idx) const -> const Rec* {
     // Records are at leaf level (level 0), starting after header
-    const uint8_t* base = levels[0].bp->data + Traits::HDR_LEN;
+    const uint8_t* base = level_at(0).bp->data + Traits::HDR_LEN;
     return reinterpret_cast<const Rec*>(base + (static_cast<size_t>(idx - 1) * Traits::REC_LEN));
 }
 
@@ -68,7 +68,7 @@ auto XfsBtreeCursor<Traits>::ptr_at(int level, int idx) const -> uint64_t {
     // Pointers are stored after all keys in an internal node.
     // Layout: [header][key0][key1]...[keyN][ptr0][ptr1]...[ptrN]
     int const NRECS = numrecs(level);
-    const uint8_t* base = levels[level].bp->data + Traits::HDR_LEN;
+    const uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
     const uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
     const uint8_t* ptr_addr = ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
 
@@ -86,9 +86,9 @@ auto XfsBtreeCursor<Traits>::ptr_at(int level, int idx) const -> uint64_t {
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::read_block(int level, uint64_t blockno) -> int {
     // Release existing buffer at this level
-    if (levels[level].bp != nullptr) {
-        brelse(levels[level].bp);
-        levels[level].bp = nullptr;
+    if (level_at(level).bp != nullptr) {
+        brelse(level_at(level).bp);
+        level_at(level).bp = nullptr;
     }
 
     // For short-form (AG) btrees, convert AG-relative block to absolute
@@ -122,34 +122,34 @@ auto XfsBtreeCursor<Traits>::read_block(int level, uint64_t blockno) -> int {
         }
     }
 
-    levels[level].bp = bh;
+    level_at(level).bp = bh;
     return 0;
 }
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::left_sibling(int level) const -> uint64_t {
-    if (levels[level].bp == nullptr) {
+    if (level_at(level).bp == nullptr) {
         return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
     }
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-        const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(levels[level].bp->data);
+        const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(level_at(level).bp->data);
         return hdr->bb_leftsib.to_cpu();
     } else {
-        const auto* hdr = reinterpret_cast<const XfsBtreeLblock*>(levels[level].bp->data);
+        const auto* hdr = reinterpret_cast<const XfsBtreeLblock*>(level_at(level).bp->data);
         return hdr->bb_leftsib.to_cpu();
     }
 }
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::right_sibling(int level) const -> uint64_t {
-    if (levels[level].bp == nullptr) {
+    if (level_at(level).bp == nullptr) {
         return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
     }
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-        const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(levels[level].bp->data);
+        const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(level_at(level).bp->data);
         return hdr->bb_rightsib.to_cpu();
     } else {
-        const auto* hdr = reinterpret_cast<const XfsBtreeLblock*>(levels[level].bp->data);
+        const auto* hdr = reinterpret_cast<const XfsBtreeLblock*>(level_at(level).bp->data);
         return hdr->bb_rightsib.to_cpu();
     }
 }
@@ -177,7 +177,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
         int const NR = cur->numrecs(level);
         if (NR == 0) {
             // Empty block - tree is empty or corrupted
-            cur->levels[level].ptr = 0;
+            cur->level_at(level).ptr = 0;
             return -ENOENT;
         }
 
@@ -221,7 +221,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
             if (cmp_r > 0 && keyno > 1) {
                 keyno--;
             }
-            cur->levels[level].ptr = keyno;
+            cur->level_at(level).ptr = keyno;
 
             // Follow child pointer down to next level
             uint64_t const CHILD_BLOCK = cur->ptr_at(level, keyno);
@@ -235,12 +235,12 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
                 // key > target: the record at keyno is bigger than what we want
                 keyno--;
             }
-            cur->levels[0].ptr = keyno;
+            cur->level_at(0).ptr = keyno;
         }
     }
 
     // Adjust position based on lookup direction
-    int ptr = cur->levels[0].ptr;
+    int ptr = cur->level_at(0).ptr;
     int nr = cur->numrecs(0);
 
     switch (dir) {
@@ -250,7 +250,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
                 return -ENOENT;
             }
             if (ptr > nr) {
-                cur->levels[0].ptr = nr;
+                cur->level_at(0).ptr = nr;
             }
             break;
 
@@ -273,7 +273,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
             // We want the smallest record >= target
             if (ptr < 1) {
                 ptr = 1;
-                cur->levels[0].ptr = 1;
+                cur->level_at(0).ptr = 1;
             }
             if (ptr > nr) {
                 // Need to move to next block
@@ -288,7 +288,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
                 if (Traits::cmp_key(&synth_key, target) < 0) {
                     // Current record is less than target, advance
                     if (ptr < nr) {
-                        cur->levels[0].ptr = ptr + 1;
+                        cur->level_at(0).ptr = ptr + 1;
                     } else {
                         rc = xfs_btree_increment(cur);
                         if (rc != 0) {
@@ -301,7 +301,7 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
     }
 
     // Final validation: cursor must point to a valid record
-    ptr = cur->levels[0].ptr;
+    ptr = cur->level_at(0).ptr;
     nr = cur->numrecs(0);
     if (ptr < 1 || ptr > nr) {
         return -ENOENT;
@@ -317,18 +317,18 @@ auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t 
 template <typename Traits>
 auto xfs_btree_increment(XfsBtreeCursor<Traits>* cur) -> int {
     // Try to advance within the current leaf block
-    int ptr = cur->levels[0].ptr + 1;
+    int ptr = cur->level_at(0).ptr + 1;
     if (ptr <= cur->numrecs(0)) {
-        cur->levels[0].ptr = ptr;
+        cur->level_at(0).ptr = ptr;
         return 0;
     }
 
     // Walk up the tree until we find a level where we can advance
     int level = 0;
     for (level = 1; level < cur->nlevels; level++) {
-        ptr = cur->levels[level].ptr + 1;
+        ptr = cur->level_at(level).ptr + 1;
         if (ptr <= cur->numrecs(level)) {
-            cur->levels[level].ptr = ptr;
+            cur->level_at(level).ptr = ptr;
             break;
         }
     }
@@ -340,12 +340,12 @@ auto xfs_btree_increment(XfsBtreeCursor<Traits>* cur) -> int {
 
     // Walk back down from 'level' to leaf, always taking the leftmost child
     for (int lev = level - 1; lev >= 0; lev--) {
-        uint64_t const CHILD_BLOCK = cur->ptr_at(lev + 1, cur->levels[lev + 1].ptr);
+        uint64_t const CHILD_BLOCK = cur->ptr_at(lev + 1, cur->level_at(lev + 1).ptr);
         int const RC = cur->read_block(lev, CHILD_BLOCK);
         if (RC != 0) {
             return RC;
         }
-        cur->levels[lev].ptr = 1;  // leftmost entry
+        cur->level_at(lev).ptr = 1;  // leftmost entry
     }
 
     return 0;
@@ -358,18 +358,18 @@ auto xfs_btree_increment(XfsBtreeCursor<Traits>* cur) -> int {
 template <typename Traits>
 auto xfs_btree_decrement(XfsBtreeCursor<Traits>* cur) -> int {
     // Try to back up within the current leaf block
-    int ptr = cur->levels[0].ptr - 1;
+    int ptr = cur->level_at(0).ptr - 1;
     if (ptr >= 1) {
-        cur->levels[0].ptr = ptr;
+        cur->level_at(0).ptr = ptr;
         return 0;
     }
 
     // Walk up the tree until we find a level where we can back up
     int level = 0;
     for (level = 1; level < cur->nlevels; level++) {
-        ptr = cur->levels[level].ptr - 1;
+        ptr = cur->level_at(level).ptr - 1;
         if (ptr >= 1) {
-            cur->levels[level].ptr = ptr;
+            cur->level_at(level).ptr = ptr;
             break;
         }
     }
@@ -381,12 +381,12 @@ auto xfs_btree_decrement(XfsBtreeCursor<Traits>* cur) -> int {
 
     // Walk back down from 'level' to leaf, always taking the rightmost child
     for (int lev = level - 1; lev >= 0; lev--) {
-        uint64_t const CHILD_BLOCK = cur->ptr_at(lev + 1, cur->levels[lev + 1].ptr);
+        uint64_t const CHILD_BLOCK = cur->ptr_at(lev + 1, cur->level_at(lev + 1).ptr);
         int const RC = cur->read_block(lev, CHILD_BLOCK);
         if (RC != 0) {
             return RC;
         }
-        cur->levels[lev].ptr = cur->numrecs(lev);  // rightmost entry
+        cur->level_at(lev).ptr = cur->numrecs(lev);  // rightmost entry
     }
 
     return 0;
@@ -398,7 +398,7 @@ auto xfs_btree_decrement(XfsBtreeCursor<Traits>* cur) -> int {
 
 template <typename Traits>
 auto xfs_btree_get_rec(const XfsBtreeCursor<Traits>* cur) -> Traits::IRec {
-    int const PTR = cur->levels[0].ptr;
+    int const PTR = cur->level_at(0).ptr;
     const auto* rec = cur->rec_at(PTR);
     return Traits::decode_rec(rec);
 }
@@ -409,20 +409,20 @@ auto xfs_btree_get_rec(const XfsBtreeCursor<Traits>* cur) -> Traits::IRec {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::rec_at_mut(int idx) -> Rec* {
-    uint8_t* base = levels[0].bp->data + Traits::HDR_LEN;
+    uint8_t* base = level_at(0).bp->data + Traits::HDR_LEN;
     return reinterpret_cast<Rec*>(base + (static_cast<size_t>(idx - 1) * Traits::REC_LEN));
 }
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::key_at_mut(int level, int idx) -> Key* {
-    uint8_t* base = levels[level].bp->data + Traits::HDR_LEN;
+    uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
     return reinterpret_cast<Key*>(base + (static_cast<size_t>(idx - 1) * Traits::KEY_LEN));
 }
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::ptr_addr(int level, int idx) -> uint8_t* {
     int const NRECS = numrecs(level);
-    uint8_t* base = levels[level].bp->data + Traits::HDR_LEN;
+    uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
     uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
     return ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
 }
@@ -432,7 +432,7 @@ void XfsBtreeCursor<Traits>::set_ptr(int level, int idx, uint64_t blockno) {
     // Pointers are after keys. But we need to compute based on the current numrecs
     // which includes the pointers area layout. We access the raw pointer slot directly.
     int const NRECS = numrecs(level);
-    uint8_t* base = levels[level].bp->data + Traits::HDR_LEN;
+    uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
     uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
     uint8_t* p = ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
 
@@ -447,14 +447,14 @@ void XfsBtreeCursor<Traits>::set_ptr(int level, int idx, uint64_t blockno) {
 
 template <typename Traits>
 void XfsBtreeCursor<Traits>::set_numrecs(int level, int nrecs) {
-    if (levels[level].bp == nullptr) {
+    if (level_at(level).bp == nullptr) {
         return;
     }
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(levels[level].bp->data);
+        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(level_at(level).bp->data);
         hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(nrecs));
     } else {
-        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(levels[level].bp->data);
+        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(level_at(level).bp->data);
         hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(nrecs));
     }
 }
@@ -465,9 +465,9 @@ void XfsBtreeCursor<Traits>::set_numrecs(int level, int nrecs) {
 
 template <typename Traits>
 auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typename Traits::IRec& irec) -> int {
-    int const PTR = cur->levels[0].ptr;
+    int const PTR = cur->level_at(0).ptr;
     int const NR = cur->numrecs(0);
-    if (PTR < 1 || PTR > NR || cur->levels[0].bp == nullptr) {
+    if (PTR < 1 || PTR > NR || cur->level_at(0).bp == nullptr) {
         return -EINVAL;
     }
 
@@ -478,19 +478,19 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     __builtin_memcpy(rec, &new_rec, Traits::REC_LEN);
 
     // Log the modified record
-    auto rec_offset = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(rec) - cur->levels[0].bp->data);
-    xfs_trans_log_buf(tp, cur->levels[0].bp, rec_offset, static_cast<uint32_t>(Traits::REC_LEN));
+    auto rec_offset = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(rec) - cur->level_at(0).bp->data);
+    xfs_trans_log_buf(tp, cur->level_at(0).bp, rec_offset, static_cast<uint32_t>(Traits::REC_LEN));
 
     // Update the key at parent levels if the first record was modified
     if (PTR == 1) {
         typename Traits::Key key;
         Traits::init_key_from_rec(&key, rec);
         for (int lev = 1; lev < cur->nlevels; lev++) {
-            int const PARENT_PTR = cur->levels[lev].ptr;
+            int const PARENT_PTR = cur->level_at(lev).ptr;
             auto* pkey = cur->key_at_mut(lev, PARENT_PTR);
             __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
-            auto key_off = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(pkey) - cur->levels[lev].bp->data);
-            xfs_trans_log_buf(tp, cur->levels[lev].bp, key_off, static_cast<uint32_t>(Traits::KEY_LEN));
+            auto key_off = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(pkey) - cur->level_at(lev).bp->data);
+            xfs_trans_log_buf(tp, cur->level_at(lev).bp, key_off, static_cast<uint32_t>(Traits::KEY_LEN));
             if (PARENT_PTR != 1) {
                 break;  // only propagate if we changed the leftmost key
             }
@@ -682,14 +682,14 @@ template <typename Traits>
 auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, const typename Traits::Key& new_key,
                               uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int;
 
-// Split a full internal node at level `lev`.  The cursor's levels[lev].ptr
+// Split a full internal node at level `lev`.  The cursor's level_at(lev).ptr
 // indicates the current child position.  After the split the new key/pointer
 // are inserted into the right or left half as appropriate, and the promoted
 // middle key plus the new sibling's block number are passed up.
 template <typename Traits>
 auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, int insert_pos, const typename Traits::Key& insert_key,
                           uint64_t insert_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int {
-    BufHead* left_bp = cur->levels[lev].bp;
+    BufHead* left_bp = cur->level_at(lev).bp;
     int const NR = cur->numrecs(lev);  // should == max_keys (full)
     int const MID = NR / 2;            // left keeps [1..mid], right gets [mid+1..nr]
 
@@ -839,7 +839,7 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
                               uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int {
     if (lev == cur->nlevels) {
         // Need a new root one level above the current root.
-        BufHead const* old_root_bp = cur->levels[nlevels - 1].bp;
+        BufHead const* old_root_bp = cur->level_at(nlevels - 1).bp;
         uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
 
         BufHead* new_root_bp = nullptr;
@@ -883,9 +883,9 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         return 0;
     }
 
-    // We have a parent block at levels[lev]
-    BufHead* parent_bp = cur->levels[lev].bp;
-    int const INSERT_POS = cur->levels[lev].ptr + 1;  // new child is to the right of current
+    // We have a parent block at level_at(lev)
+    BufHead* parent_bp = cur->level_at(lev).bp;
+    int const INSERT_POS = cur->level_at(lev).ptr + 1;  // new child is to the right of current
     int const PARENT_NR = cur->numrecs(lev);
     int const MAX_KEYS = btree_max_keys_node<Traits>(cur->mount->block_size);
 
@@ -932,12 +932,12 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         return 0;
     }
 
-    BufHead* parent_bp = cur->levels[lev].bp;
+    BufHead* parent_bp = cur->level_at(lev).bp;
     if (parent_bp == nullptr) {
         return 0;
     }
 
-    int const REMOVE_POS = cur->levels[lev].ptr;
+    int const REMOVE_POS = cur->level_at(lev).ptr;
     int const PARENT_NR = cur->numrecs(lev);
     uint8_t* p_data = parent_bp->data;
 
@@ -989,14 +989,15 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         typename Traits::Key new_first_key;
         __builtin_memcpy(&new_first_key, p_data + Traits::HDR_LEN, Traits::KEY_LEN);
         for (int glev = lev + 1; glev < cur->nlevels; glev++) {
-            if (cur->levels[glev].bp == nullptr) {
+            if (cur->level_at(glev).bp == nullptr) {
                 break;
             }
-            int const GPTR = cur->levels[glev].ptr;
-            auto* gkey = reinterpret_cast<Traits::Key*>(cur->levels[glev].bp->data + btree_key_off<Traits>(static_cast<size_t>(GPTR - 1)));
+            int const GPTR = cur->level_at(glev).ptr;
+            auto* gkey =
+                reinterpret_cast<Traits::Key*>(cur->level_at(glev).bp->data + btree_key_off<Traits>(static_cast<size_t>(GPTR - 1)));
             __builtin_memcpy(gkey, &new_first_key, Traits::KEY_LEN);
-            btree_update_crc<Traits>(cur->levels[glev].bp);
-            xfs_trans_log_buf_full(tp, cur->levels[glev].bp);
+            btree_update_crc<Traits>(cur->level_at(glev).bp);
+            xfs_trans_log_buf_full(tp, cur->level_at(glev).bp);
             if (GPTR != 1) {
                 break;
             }
@@ -1031,7 +1032,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         insert_ptr = cur->numrecs(0) + 1;
     } else if (RC == 0) {
         // Cursor is at GE position - insert before it
-        insert_ptr = cur->levels[0].ptr;
+        insert_ptr = cur->level_at(0).ptr;
     } else {
         return RC;
     }
@@ -1045,7 +1046,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
 
     if (NR < MAX_RECS) {
         // Room in current leaf - shift records right and insert
-        uint8_t* base = cur->levels[0].bp->data + Traits::HDR_LEN;
+        uint8_t* base = cur->level_at(0).bp->data + Traits::HDR_LEN;
         if (insert_ptr <= NR) {
             // Shift records from insert_ptr..nr to insert_ptr+1..nr+1
             std::memmove(base + (static_cast<size_t>(insert_ptr) * Traits::REC_LEN),
@@ -1055,20 +1056,20 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         // Write the new record
         __builtin_memcpy(base + (static_cast<size_t>(insert_ptr - 1) * Traits::REC_LEN), &new_rec, Traits::REC_LEN);
         cur->set_numrecs(0, NR + 1);
-        cur->levels[0].ptr = insert_ptr;
+        cur->level_at(0).ptr = insert_ptr;
 
         // Log the entire modified region
-        xfs_trans_log_buf_full(tp, cur->levels[0].bp);
+        xfs_trans_log_buf_full(tp, cur->level_at(0).bp);
 
         // Update parent keys if we inserted at position 1
         if (insert_ptr == 1) {
             Key key;
             Traits::init_key_from_rec(&key, reinterpret_cast<const Rec*>(base));
             for (int lev = 1; lev < cur->nlevels; lev++) {
-                int const PP = cur->levels[lev].ptr;
+                int const PP = cur->level_at(lev).ptr;
                 auto* pkey = cur->key_at_mut(lev, PP);
                 __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
-                xfs_trans_log_buf_full(tp, cur->levels[lev].bp);
+                xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
                 if (PP != 1) {
                     break;
                 }
@@ -1078,7 +1079,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     }
 
     // Leaf is full - split it.
-    BufHead* left_bp = cur->levels[0].bp;
+    BufHead* left_bp = cur->level_at(0).bp;
     int const MID = NR / 2;  // left keeps [1..mid], right gets [mid+1..nr]
 
     uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
@@ -1147,7 +1148,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         }
         __builtin_memcpy(base + (static_cast<size_t>(insert_ptr - 1) * Traits::REC_LEN), &new_rec, Traits::REC_LEN);
         btree_set_numrecs_raw<Traits>(left_data, LEFT_NR + 1);
-        cur->levels[0].ptr = insert_ptr;
+        cur->level_at(0).ptr = insert_ptr;
     } else {
         // Insert into right half
         int const RIGHT_INSERT = insert_ptr - MID - 1;  // 1-based in right block
@@ -1159,11 +1160,11 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         }
         __builtin_memcpy(base + (static_cast<size_t>(RIGHT_INSERT - 1) * Traits::REC_LEN), &new_rec, Traits::REC_LEN);
         btree_set_numrecs_raw<Traits>(right_data, RIGHT_NR + 1);
-        cur->levels[0].ptr = RIGHT_INSERT;
+        cur->level_at(0).ptr = RIGHT_INSERT;
         // Swap the cursor's leaf buffer to the right block
-        brelse(cur->levels[0].bp);
+        brelse(cur->level_at(0).bp);
         right_bp->refcount.fetch_add(1, std::memory_order_relaxed);
-        cur->levels[0].bp = right_bp;
+        cur->level_at(0).bp = right_bp;
         left_data = left_bp->data;  // keep left_data valid for key extraction below
     }
 
@@ -1190,14 +1191,14 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
     using Key = Traits::Key;
     using Rec = Traits::Rec;
 
-    int const PTR = cur->levels[0].ptr;
+    int const PTR = cur->level_at(0).ptr;
     int const NR = cur->numrecs(0);
-    if (PTR < 1 || PTR > NR || cur->levels[0].bp == nullptr) {
+    if (PTR < 1 || PTR > NR || cur->level_at(0).bp == nullptr) {
         return -EINVAL;
     }
 
     // Shift records left to fill the gap
-    uint8_t* base = cur->levels[0].bp->data + Traits::HDR_LEN;
+    uint8_t* base = cur->level_at(0).bp->data + Traits::HDR_LEN;
     if (PTR < NR) {
         std::memmove(base + (static_cast<size_t>(PTR - 1) * Traits::REC_LEN), base + (static_cast<size_t>(PTR) * Traits::REC_LEN),
                      static_cast<size_t>(NR - PTR) * Traits::REC_LEN);
@@ -1205,17 +1206,17 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
     cur->set_numrecs(0, NR - 1);
 
     // Log the entire modified leaf
-    xfs_trans_log_buf_full(tp, cur->levels[0].bp);
+    xfs_trans_log_buf_full(tp, cur->level_at(0).bp);
 
     // Update parent keys if we deleted the first record
     if (PTR == 1 && NR > 1) {
         Key key;
         Traits::init_key_from_rec(&key, reinterpret_cast<const Rec*>(base));
         for (int lev = 1; lev < cur->nlevels; lev++) {
-            int const PP = cur->levels[lev].ptr;
+            int const PP = cur->level_at(lev).ptr;
             auto* pkey = cur->key_at_mut(lev, PP);
             __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
-            xfs_trans_log_buf_full(tp, cur->levels[lev].bp);
+            xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
             if (PP != 1) {
                 break;
             }
@@ -1224,7 +1225,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
 
     if (NR - 1 == 0) {
         // Leaf is now empty.
-        BufHead* leaf_bp = cur->levels[0].bp;
+        BufHead* leaf_bp = cur->level_at(0).bp;
 
         if (cur->nlevels == 1) {
             // Root leaf - don't free it, just leave it empty.
@@ -1285,8 +1286,8 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
     }
 
     // Adjust cursor position
-    if (cur->levels[0].ptr > NR - 1 && NR - 1 > 0) {
-        cur->levels[0].ptr = NR - 1;
+    if (cur->level_at(0).ptr > NR - 1 && NR - 1 > 0) {
+        cur->level_at(0).ptr = NR - 1;
     }
 
     return 0;

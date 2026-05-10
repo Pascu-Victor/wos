@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/packet.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
@@ -32,7 +33,7 @@ struct NetDeviceOps {
 
 struct NetDevice {
     std::array<char, NETDEV_NAME_LEN> name{};
-    std::array<uint8_t, 6> mac{};
+    proto::MacAddress mac;
     uint32_t mtu = 1500;
     uint32_t tx_queue_len = 1000;
     uint32_t link_flags = 0;

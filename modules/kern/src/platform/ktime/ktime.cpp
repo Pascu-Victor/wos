@@ -11,23 +11,32 @@
 #include "platform/interrupt/gates.hpp"
 #include "platform/sched/task.hpp"
 namespace ker::mod::time {
-static bool is_init = false;
-static util::List<void (*)(gates::InterruptFrame*)> tasks;
 
-static uint64_t ktime_pit_tick = 0;
+namespace {
 
-static void handle_pit(sched::task::Context ctx, gates::InterruptFrame* frame) {
+using log = ker::mod::dbg::logger<"ktime">;
+
+constexpr uint64_t APIC_CALIBRATION_US = 2000;
+
+bool is_init = false;
+util::List<void (*)(gates::InterruptFrame*)> tasks;
+
+uint64_t ktime_pit_tick = 0;
+
+[[maybe_unused]] void handle_pit(sched::task::Context ctx, gates::InterruptFrame* frame) {
     (void)ctx;
     ktime_pit_tick++;
     for (auto* task = tasks.get_head(); task != nullptr; task = task->next) {
         task->data(frame);
     }
     apic::eoi();
-    auto c = apic::calibrate_timer(2000);
-    apic::one_shot_timer(c);
-    dbg::log("PIT tick!");
+    auto const CALIBRATION_TICKS = apic::calibrate_timer(APIC_CALIBRATION_US);
+    apic::one_shot_timer(CALIBRATION_TICKS);
+    log::trace("PIT tick");
     asm volatile("iretq");
 }
+
+}  // namespace
 
 void init() {
     if (is_init) {

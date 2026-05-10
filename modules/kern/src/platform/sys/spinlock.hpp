@@ -4,7 +4,8 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 
-#define SPINLOCK_DEBUG 0
+// Must remain a preprocessor flag because it gates Spinlock's debug-only layout.
+#define SPINLOCK_DEBUG 0  // NOLINT(cppcoreguidelines-macro-usage)
 
 #if SPINLOCK_DEBUG
 #include <array>

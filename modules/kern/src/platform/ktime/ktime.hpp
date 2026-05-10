@@ -4,7 +4,6 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/acpi/hpet/hpet.hpp>
-#include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/task.hpp>

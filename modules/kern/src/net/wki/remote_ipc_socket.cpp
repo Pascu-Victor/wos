@@ -131,7 +131,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
     uint16_t const RESP_LEN = proxy->pending_wait_resp_len;
     if (resp_buf != nullptr && resp_max > 0 && RESP_LEN > 0) {
         uint16_t const COPY_LEN = RESP_LEN < resp_max ? RESP_LEN : resp_max;
-        std::memcpy(resp_buf, proxy->pending_wait_resp, COPY_LEN);
+        std::memcpy(resp_buf, static_cast<const void*>(proxy->pending_wait_resp), COPY_LEN);
     }
     if (resp_len_out != nullptr) {
         *resp_len_out = RESP_LEN;
@@ -405,14 +405,3 @@ ker::vfs::FileOperations g_proxy_socket_fops = {
 };
 
 }  // namespace ker::net::wki
-
-static void wki_ipc_socket_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len) {
-    (void)src_node;
-    (void)channel;
-    if (payload == nullptr || len < sizeof(ker::net::wki::DevOpRespPayload)) {
-        return;
-    }
-
-    // Socket control responses are intentionally a no-op for now.
-    // Follow-up milestones will match responses to waiting socket proxy ops.
-}

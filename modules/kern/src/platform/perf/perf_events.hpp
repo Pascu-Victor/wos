@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <platform/sys/spinlock.hpp>
 
@@ -259,11 +260,16 @@ constexpr size_t PERF_MAX_CPUS = 16;
 
 struct PerfCpuRing {
     PerfCpuStats stats;
-    uint64_t head;                 // Monotonically-increasing write index
-    uint64_t drain;                // Consumer read index (advances on drain_events)
-    ker::mod::sys::Spinlock lock;  // IRQ-safe spinlock protecting head/drain/events
-    PerfEvent events[PERF_RING_ENTRIES];
+    uint64_t head;                        // Monotonically-increasing write index
+    uint64_t drain;                       // Consumer read index (advances on drain_events)
+    ker::mod::sys::Spinlock lock;         // IRQ-safe spinlock protecting head/drain/events
+    PerfEvent events[PERF_RING_ENTRIES];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
+
+static_assert(offsetof(PerfCpuRing, stats) == 0, "PerfCpuRing stats must stay first");
+static_assert(offsetof(PerfCpuRing, events) > offsetof(PerfCpuRing, lock), "PerfCpuRing event storage offset changed unexpectedly");
+static_assert(sizeof(PerfCpuRing) == offsetof(PerfCpuRing, events) + (sizeof(PerfEvent) * PERF_RING_ENTRIES),
+              "PerfCpuRing layout must remain a fixed trailing event ring");
 
 // ===========================================================================
 // Public API

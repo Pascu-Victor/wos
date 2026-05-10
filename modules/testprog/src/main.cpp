@@ -17,13 +17,16 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <print>
+#include <span>
 
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
@@ -31,7 +34,29 @@
 #include "netbench.hpp"
 #include "perfbench.hpp"
 
+namespace {
+
 using tprog_log = wos::journal<"tprog">;
+
+void copy_ifreq_name(struct ifreq& ifr, const char* ifname) {
+    auto dest = std::span<char, IFNAMSIZ>(ifr.ifr_name);
+    std::ranges::fill(dest, '\0');
+    if (ifname == nullptr) {
+        return;
+    }
+    size_t const LEN = std::min(std::strlen(ifname), dest.size() - 1);
+    std::copy_n(ifname, LEN, dest.data());
+}
+
+template <size_t Size>
+void copy_literal(std::array<char, Size>& dest, const char* literal) {
+    std::ranges::fill(dest, '\0');
+    if (literal == nullptr) {
+        return;
+    }
+    size_t const LEN = std::min(std::strlen(literal), dest.size() - 1);
+    std::copy_n(literal, LEN, dest.data());
+}
 
 // ICMP Echo Request structure
 struct IcmpHeader {
@@ -43,17 +68,18 @@ struct IcmpHeader {
 };
 
 // Calculate checksum for ICMP
-static auto icmp_checksum(void* data, size_t len) -> uint16_t {
+auto icmp_checksum(std::span<const uint8_t> data) -> uint16_t {
     uint32_t sum = 0;
-    auto* ptr = static_cast<uint16_t*>(data);
-
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
+    size_t offset = 0;
+    while (offset + sizeof(uint16_t) <= data.size()) {
+        uint16_t word = 0;
+        std::memcpy(&word, data.data() + offset, sizeof(word));
+        sum += word;
+        offset += sizeof(word);
     }
 
-    if (len == 1) {
-        sum += *reinterpret_cast<uint8_t*>(ptr);
+    if (offset < data.size()) {
+        sum += data.subspan(offset, 1).front();
     }
 
     sum = (sum >> 16) + (sum & 0xFFFF);
@@ -63,9 +89,9 @@ static auto icmp_checksum(void* data, size_t len) -> uint16_t {
 }
 
 // Ping a specific IP address
-static auto ping(const char* ip_str) -> bool {
-    int const PID = ker::process::getpid();
-    int const TID = ker::multiproc::currentThreadId();
+auto ping(const char* ip_str) -> bool {
+    int const PID = static_cast<int>(ker::process::getpid());
+    int const TID = static_cast<int>(ker::multiproc::currentThreadId());
 
     // std::println("testprog[t:{},p:{}]: Pinging {}...", tid, pid, ip_str);
 
@@ -94,11 +120,11 @@ static auto ping(const char* ip_str) -> bool {
 
     // Fill data with pattern
     for (size_t i = sizeof(IcmpHeader); i < PACKET_SIZE; i++) {
-        packet[i] = static_cast<uint8_t>(i);
+        packet.at(i) = static_cast<uint8_t>(i);
     }
 
     // Calculate checksum
-    icmp->checksum = icmp_checksum(packet.data(), PACKET_SIZE);
+    icmp->checksum = icmp_checksum(packet);
 
     // Send packet
     ssize_t const SENT = sendto(SOCK, packet.data(), PACKET_SIZE, 0, reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
@@ -135,9 +161,9 @@ static auto ping(const char* ip_str) -> bool {
 }
 
 // Get network interface information
-static auto get_interface_info(const char* ifname) -> bool {
-    int const PID = ker::process::getpid();
-    int const TID = ker::multiproc::currentThreadId();
+auto get_interface_info(const char* ifname) -> bool {
+    int const PID = static_cast<int>(ker::process::getpid());
+    int const TID = static_cast<int>(ker::multiproc::currentThreadId());
 
     // std::println("testprog[t:{},p:{}]: Getting info for interface {}...", tid, pid, ifname);
 
@@ -149,14 +175,14 @@ static auto get_interface_info(const char* ifname) -> bool {
 
     // Get interface address
     struct ifreq ifr{};
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    copy_ifreq_name(ifr, ifname);
 
     uint32_t ip_addr = 0;
     if (ioctl(SOCK, SIOCGIFADDR, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         ip_addr = ntohl(addr->sin_addr.s_addr);
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+        std::array<char, INET_ADDRSTRLEN> ip_str{};
+        inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
         // std::println("testprog[t:{},p:{}]:   IP address: {}", tid, pid, ip_str);
     } else {
         tprog_log::error("testprog[t:%d,p:%d]: failed to get IP address", TID, PID);
@@ -165,11 +191,11 @@ static auto get_interface_info(const char* ifname) -> bool {
     }
 
     // Get netmask and calculate gateway
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    copy_ifreq_name(ifr, ifname);
     if (ioctl(SOCK, SIOCGIFNETMASK, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
-        char mask_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr->sin_addr, mask_str, sizeof(mask_str));
+        std::array<char, INET_ADDRSTRLEN> mask_str{};
+        inet_ntop(AF_INET, &addr->sin_addr, mask_str.data(), mask_str.size());
         // std::println("testprog[t:{},p:{}]:   Netmask: {}", tid, pid, mask_str);
 
         // Calculate gateway (QEMU user-mode uses .2 as gateway, not .1)
@@ -178,15 +204,15 @@ static auto get_interface_info(const char* ifname) -> bool {
 
         struct in_addr gw_addr{};
         gw_addr.s_addr = htonl(GATEWAY);
-        char gw_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &gw_addr, gw_str, sizeof(gw_str));
+        std::array<char, INET_ADDRSTRLEN> gw_str{};
+        inet_ntop(AF_INET, &gw_addr, gw_str.data(), gw_str.size());
         // std::println("testprog[t:{},p:{}]:   Gateway (assumed): {}", tid, pid, gw_str);
 
         close(SOCK);
 
         // Now ping the gateway
         for (int i = 0; i < 100; i++) {
-            ping(gw_str);
+            ping(gw_str.data());
         }
         return true;
     }
@@ -195,10 +221,10 @@ static auto get_interface_info(const char* ifname) -> bool {
     return false;
 }
 
-static auto print_wki_target_state() -> int {
-    char hostname[64] = {};
+auto print_wki_target_state() -> int {
+    std::array<char, 64> hostname{};
     uint32_t flags = 0;
-    int64_t result = ker::process::getwkitarget(hostname, sizeof(hostname), &flags);
+    int64_t result = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
     if (result < 0) {
         std::println("wki-target: get failed: {}", result);
         return 1;
@@ -209,11 +235,11 @@ static auto print_wki_target_state() -> int {
         return 0;
     }
 
-    std::println("wki-target: host='{}' flags=0x{:x}", hostname, flags);
+    std::println("wki-target: host='{}' flags=0x{:x}", hostname.data(), flags);
     return 0;
 }
 
-static auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
+auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
     if (text == nullptr || flags_out == nullptr) {
         return false;
     }
@@ -228,7 +254,7 @@ static auto parse_target_flags(const char* text, uint32_t* flags_out) -> bool {
     return false;
 }
 
-static auto handle_wki_target_command(int argc, char** argv) -> int {
+auto handle_wki_target_command(int argc, char** argv) -> int {
     if (argc < 3) {
         std::println("usage: testprog --wki-target <show|clear|set>");
         return 1;
@@ -273,7 +299,7 @@ static auto handle_wki_target_command(int argc, char** argv) -> int {
     return 1;
 }
 
-static auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
+auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
     if (text == nullptr || route_out == nullptr) {
         return false;
     }
@@ -288,7 +314,23 @@ static auto parse_vfs_route(const char* text, uint32_t* route_out) -> bool {
     return false;
 }
 
-static auto print_vfs_route(uint32_t route) -> const char* {
+auto parse_int_arg(const char* text, int* value_out) -> bool {
+    if (text == nullptr || value_out == nullptr) {
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    long const PARSED = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || errno != 0 || PARSED < INT_MIN || PARSED > INT_MAX) {
+        return false;
+    }
+
+    *value_out = static_cast<int>(PARSED);
+    return true;
+}
+
+auto print_vfs_route(uint32_t route) -> const char* {
     switch (route) {
         case ker::abi::vfs::WKI_VFS_ROUTE_LOCAL:
             return "local";
@@ -299,12 +341,12 @@ static auto print_vfs_route(uint32_t route) -> const char* {
     }
 }
 
-static auto list_wki_vfs_rules() -> int {
-    char prefix[128] = {};
+auto list_wki_vfs_rules() -> int {
+    std::array<char, 128> prefix{};
     uint32_t route = 0;
     bool any = false;
     for (uint32_t index = 0;; ++index) {
-        int rc = ker::abi::vfs::wki_rule_get_vfs(index, prefix, sizeof(prefix), &route);
+        int rc = ker::abi::vfs::wki_rule_get_vfs(index, prefix.data(), prefix.size(), &route);
         if (rc == -2) {
             break;
         }
@@ -312,7 +354,7 @@ static auto list_wki_vfs_rules() -> int {
             std::println("wki-vfs: get rule {} failed: {}", index, rc);
             return 1;
         }
-        std::println("wki-vfs[{}]: {} -> {}", index, prefix, print_vfs_route(route));
+        std::println("wki-vfs[{}]: {} -> {}", index, prefix.data(), print_vfs_route(route));
         any = true;
     }
 
@@ -322,11 +364,11 @@ static auto list_wki_vfs_rules() -> int {
     return 0;
 }
 
-static auto probe_wki_path(const char* path) -> int {
-    char cwd_before[512] = {};
-    char cwd_after[512] = {};
-    if (getcwd(cwd_before, sizeof(cwd_before)) == nullptr) {
-        std::strcpy(cwd_before, "<getcwd failed>");
+auto probe_wki_path(const char* path) -> int {
+    std::array<char, 512> cwd_before{};
+    std::array<char, 512> cwd_after{};
+    if (getcwd(cwd_before.data(), cwd_before.size()) == nullptr) {
+        copy_literal(cwd_before, "<getcwd failed>");
     }
 
     struct stat st{};
@@ -343,30 +385,30 @@ static auto probe_wki_path(const char* path) -> int {
     std::println("wki-vfs-probe: access(F_OK)={} errno={}", access_rc, errno);
 
     errno = 0;
-    ssize_t link_len = readlink(path, cwd_after, sizeof(cwd_after) - 1);
+    ssize_t link_len = readlink(path, cwd_after.data(), cwd_after.size() - 1);
     if (link_len >= 0) {
-        cwd_after[link_len] = '\0';
-        std::println("wki-vfs-probe: readlink='{}'", cwd_after);
+        cwd_after.at(static_cast<size_t>(link_len)) = '\0';
+        std::println("wki-vfs-probe: readlink='{}'", cwd_after.data());
     } else {
         std::println("wki-vfs-probe: readlink={} errno={}", static_cast<int>(link_len), errno);
     }
 
     errno = 0;
     if (chdir(path) == 0) {
-        if (getcwd(cwd_after, sizeof(cwd_after)) == nullptr) {
-            std::strcpy(cwd_after, "<getcwd failed>");
+        if (getcwd(cwd_after.data(), cwd_after.size()) == nullptr) {
+            copy_literal(cwd_after, "<getcwd failed>");
         }
-        std::println("wki-vfs-probe: chdir succeeded cwd='{}'", cwd_after);
-        chdir(cwd_before);
+        std::println("wki-vfs-probe: chdir succeeded cwd='{}'", cwd_after.data());
+        chdir(cwd_before.data());
     } else {
         std::println("wki-vfs-probe: chdir failed errno={}", errno);
     }
 
-    std::println("wki-vfs-probe: cwd-before='{}'", cwd_before);
+    std::println("wki-vfs-probe: cwd-before='{}'", cwd_before.data());
     return 0;
 }
 
-static auto handle_wki_vfs_command(int argc, char** argv) -> int {
+auto handle_wki_vfs_command(int argc, char** argv) -> int {
     if (argc < 3) {
         std::println("usage: testprog --wki-vfs <list|clear|add|probe>");
         return 1;
@@ -418,15 +460,18 @@ static auto handle_wki_vfs_command(int argc, char** argv) -> int {
     return 1;
 }
 
-auto main(int argc, char** argv, char** envp) -> int {
-    int pid = ker::process::getpid();
-    (void)envp;
-    int tid = ker::multiproc::currentThreadId();
+}  // namespace
 
-    char launcher[64] = {};
-    char runner[64] = {};
-    ker::process::wki_launcher_node(launcher, sizeof(launcher));
-    ker::process::wki_runner_node(runner, sizeof(runner));
+// NOLINTNEXTLINE(bugprone-exception-escape)
+auto main(int argc, char** argv, char** envp) -> int {
+    int pid = static_cast<int>(ker::process::getpid());
+    (void)envp;
+    int tid = static_cast<int>(ker::multiproc::currentThreadId());
+
+    std::array<char, 64> launcher{};
+    std::array<char, 64> runner{};
+    ker::process::wki_launcher_node(launcher.data(), launcher.size());
+    ker::process::wki_runner_node(runner.data(), runner.size());
 
     const char* command = nullptr;
     if (argc > 1) {
@@ -465,15 +510,30 @@ auto main(int argc, char** argv, char** envp) -> int {
 
         for (int i = 2; i < argc; i++) {
             if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
-                width = std::atoi(argv[++i]);
+                if (!parse_int_arg(argv[++i], &width)) {
+                    std::println("mandelbench: invalid --width '{}'", argv[i]);
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
-                height = std::atoi(argv[++i]);
+                if (!parse_int_arg(argv[++i], &height)) {
+                    std::println("mandelbench: invalid --height '{}'", argv[i]);
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "--max-iter") == 0 && i + 1 < argc) {
-                max_iter = std::atoi(argv[++i]);
+                if (!parse_int_arg(argv[++i], &max_iter)) {
+                    std::println("mandelbench: invalid --max-iter '{}'", argv[i]);
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-                threads = std::atoi(argv[++i]);
+                if (!parse_int_arg(argv[++i], &threads)) {
+                    std::println("mandelbench: invalid --threads '{}'", argv[i]);
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
-                repeat = std::atoi(argv[++i]);
+                if (!parse_int_arg(argv[++i], &repeat)) {
+                    std::println("mandelbench: invalid --repeat '{}'", argv[i]);
+                    return 1;
+                }
             }
         }
         if (MANDELBENCH_DEBUG_ENABLED) {
@@ -488,7 +548,7 @@ auto main(int argc, char** argv, char** envp) -> int {
         return mandelbench_worker(argc, argv);
     }
 
-    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: argc = {}", tid, pid, launcher, runner, argc);
+    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: argc = {}", tid, pid, launcher.data(), runner.data(), argc);
 
     // Test 1: Ping loopback
     // std::println("testprog[t:{},p:{}]: === Test 1: Ping loopback ===", tid, pid);
@@ -498,7 +558,7 @@ auto main(int argc, char** argv, char** envp) -> int {
     // std::println("testprog[t:{},p:{}]: === Test 2: Get eth0 info ===", tid, pid);
     (void)get_interface_info;
 
-    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: Network tests complete", tid, pid, launcher, runner);
+    std::println("testprog[t:{},p:{},launcher:{},runner:{}]: Network tests complete", tid, pid, launcher.data(), runner.data());
 
     return 0;
 }

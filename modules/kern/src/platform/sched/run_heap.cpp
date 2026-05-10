@@ -1,11 +1,16 @@
 #include "run_heap.hpp"
 
+#include <array>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/task.hpp>
 #include <utility>
 
 namespace ker::mod::sched {
+
+namespace {
+using log = ker::mod::dbg::logger<"runheap">;
+}
 
 // ============================================================================
 // RunHeap - array-backed binary min-heap keyed on Task::vdeadline
@@ -15,24 +20,24 @@ void RunHeap::init() { size = 0; }
 
 void RunHeap::swap_entries(uint32_t i, uint32_t j) {
     if (i >= PER_CPU_HEAP_CAP || j >= PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::swap_entries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
+        log::error("swap_entries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
         dbg::panic_handler("RunHeap: swap_entries index out of bounds (size field corrupted?)");
     }
-    task::Task* tmp = entries[i];
-    entries[i] = entries[j];
-    entries[j] = tmp;
-    entries[i]->heap_index = static_cast<int32_t>(i);
-    entries[j]->heap_index = static_cast<int32_t>(j);
+    task::Task* tmp = entries.at(i);
+    entries.at(i) = entries.at(j);
+    entries.at(j) = tmp;
+    entries.at(i)->heap_index = static_cast<int32_t>(i);
+    entries.at(j)->heap_index = static_cast<int32_t>(j);
 }
 
 void RunHeap::sift_up(uint32_t idx) {
     if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::sift_up: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        log::error("sift_up: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
         dbg::panic_handler("RunHeap: size field corrupted in sift_up");
     }
     while (idx > 0) {
         uint32_t const PARENT = (idx - 1) / 2;
-        if (entries[idx]->vdeadline < entries[PARENT]->vdeadline) {
+        if (entries.at(idx)->vdeadline < entries.at(PARENT)->vdeadline) {
             swap_entries(idx, PARENT);
             idx = PARENT;
         } else {
@@ -43,7 +48,7 @@ void RunHeap::sift_up(uint32_t idx) {
 
 void RunHeap::sift_down(uint32_t idx) {
     if (size > PER_CPU_HEAP_CAP) [[unlikely]] {
-        dbg::log("RunHeap::sift_down: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
+        log::error("sift_down: size=%u corrupted (cap=%u), idx=%u", size, PER_CPU_HEAP_CAP, idx);
         dbg::panic_handler("RunHeap: size field corrupted in sift_down");
     }
     while (true) {
@@ -53,19 +58,19 @@ void RunHeap::sift_down(uint32_t idx) {
 
         if (LEFT < size) {
             if (LEFT >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::sift_down: left=%u >= cap=%u, size=%u corrupted", LEFT, PER_CPU_HEAP_CAP, size);
+                log::error("sift_down: left=%u >= cap=%u, size=%u corrupted", LEFT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries[LEFT]->vdeadline < entries[smallest]->vdeadline) {
+            if (entries.at(LEFT)->vdeadline < entries.at(smallest)->vdeadline) {
                 smallest = LEFT;
             }
         }
         if (RIGHT < size) {
             if (RIGHT >= PER_CPU_HEAP_CAP) [[unlikely]] {
-                dbg::log("RunHeap::sift_down: right=%u >= cap=%u, size=%u corrupted", RIGHT, PER_CPU_HEAP_CAP, size);
+                log::error("sift_down: right=%u >= cap=%u, size=%u corrupted", RIGHT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries[RIGHT]->vdeadline < entries[smallest]->vdeadline) {
+            if (entries.at(RIGHT)->vdeadline < entries.at(smallest)->vdeadline) {
                 smallest = RIGHT;
             }
         }
@@ -85,18 +90,18 @@ bool RunHeap::insert(task::Task* t) {
     }
     // DIAGNOSTIC: Detect double-insertion - task already in some heap
     if (t->heap_index >= 0) {
-        dbg::log("BUG: RunHeap::insert: PID %x ALREADY has heap_index=%d (size=%d, cpu=%d)! Refusing insert.", t->pid, t->heap_index, size,
-                 static_cast<int>(t->cpu));
+        log::error("insert: PID %x already has heap_index=%d (size=%d, cpu=%d); refusing insert", t->pid, t->heap_index, size,
+                   static_cast<int>(t->cpu));
         // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
-            if (entries[i] == t) {
-                dbg::log("  -> task IS in THIS heap at index %d", i);
+            if (entries.at(i) == t) {
+                log::error("task is in this heap at index %d", i);
             }
         }
         return false;
     }
     uint32_t const IDX = size;
-    entries[IDX] = t;
+    entries.at(IDX) = t;
     t->heap_index = static_cast<int32_t>(IDX);
     size++;
     sift_up(IDX);
@@ -108,7 +113,7 @@ bool RunHeap::remove(task::Task* t) {
         return false;
     }
     auto const IDX = static_cast<uint32_t>(t->heap_index);
-    if (entries[IDX] != t) {
+    if (entries.at(IDX) != t) {
         return false;  // heap_index stale / wrong heap
     }
 
@@ -121,8 +126,8 @@ bool RunHeap::remove(task::Task* t) {
     }
 
     // Move the last element into the gap
-    entries[IDX] = entries[size];
-    entries[IDX]->heap_index = static_cast<int32_t>(IDX);
+    entries.at(IDX) = entries.at(size);
+    entries.at(IDX)->heap_index = static_cast<int32_t>(IDX);
 
     // Re-sift: could go up or down depending on relative vdeadline
     sift_up(IDX);
@@ -143,14 +148,14 @@ task::Task* RunHeap::peek_min() const {
     if (size == 0) {
         return nullptr;
     }
-    return entries[0];
+    return entries.front();
 }
 
 bool RunHeap::contains(task::Task* t) const {
     if (t->heap_index < 0 || std::cmp_greater_equal(t->heap_index, size)) {
         return false;
     }
-    return entries[static_cast<uint32_t>(t->heap_index)] == t;
+    return entries.at(static_cast<uint32_t>(t->heap_index)) == t;
 }
 
 task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
@@ -172,18 +177,18 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
     int64_t best_deadline = 0;
 
     // Stack-based bounded BFS (no allocations)
-    uint32_t stack[32];
+    std::array<uint32_t, 32> stack{};
     uint32_t stack_size = 0;
 
-    stack[stack_size++] = 0;  // Start at root
+    stack.at(stack_size++) = 0;  // Start at root
 
     while (stack_size > 0) {
-        uint32_t const IDX = stack[--stack_size];
+        uint32_t const IDX = stack.at(--stack_size);
         if (IDX >= size) {
             continue;
         }
 
-        task::Task* t = entries[IDX];
+        task::Task* t = entries.at(IDX);
         int64_t const LAG = avg_vruntime - t->vruntime;
 
         if (LAG >= 0) {
@@ -204,10 +209,10 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
                 uint32_t const LEFT = (2 * IDX) + 1;
                 uint32_t const RIGHT = (2 * IDX) + 2;
                 if (LEFT < size) {
-                    stack[stack_size++] = LEFT;
+                    stack.at(stack_size++) = LEFT;
                 }
                 if (RIGHT < size) {
-                    stack[stack_size++] = RIGHT;
+                    stack.at(stack_size++) = RIGHT;
                 }
             }
         }
@@ -216,7 +221,7 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
     // If no eligible task found, return the root (smallest vdeadline overall).
     // This prevents starvation when all tasks have negative lag.
     if (best == nullptr) {
-        best = entries[0];
+        best = entries.front();
     }
 
     return best;

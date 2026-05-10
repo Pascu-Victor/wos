@@ -1,6 +1,7 @@
 #include "gates.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +25,14 @@
 namespace ker::mod::gates {
 namespace {
 using journal = dbg::logger<"kernel">;
-interruptHandler_t interrupt_handlers[256] = {nullptr};
+constexpr size_t INTERRUPT_VECTOR_COUNT = 256;
+constexpr uint8_t DYNAMIC_VECTOR_BEGIN = 48;
+constexpr uint64_t HHDM_BEGIN = 0xffff800000000000ULL;
+constexpr uint64_t HHDM_END = 0xffff900000000000ULL;
+constexpr uint64_t KERNEL_STATIC_BEGIN = 0xffffffff80000000ULL;
+constexpr uint64_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
+
+std::array<interruptHandler_t, INTERRUPT_VECTOR_COUNT> interrupt_handlers{};
 std::atomic<bool> panic_lock{false};
 std::atomic<int64_t> panic_lock_owner{-1};
 
@@ -34,45 +42,52 @@ struct IrqContext {
     void* data = nullptr;
     const char* name = nullptr;
 };
-IrqContext irq_contexts[256] = {};
+std::array<IrqContext, INTERRUPT_VECTOR_COUNT> irq_contexts{};
 
 // Next vector to try for allocation (48+ to avoid legacy ISA range)
-uint8_t next_alloc_vector = 48;
+uint8_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
+
+[[nodiscard]] constexpr auto is_kernel_pointer_range(uintptr_t addr) -> bool {
+    return (addr >= HHDM_BEGIN && addr < HHDM_END) || (addr >= KERNEL_STATIC_BEGIN && addr < KERNEL_STATIC_END);
+}
+
+[[nodiscard]] constexpr auto page_table_index(uint64_t vaddr, uint8_t shift) -> size_t {
+    return static_cast<size_t>((vaddr >> shift) & 0x1FFU);
+}
 
 auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
     if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return nullptr;
     }
 
-    const uint64_t IDX4 = (vaddr >> 39) & 0x1FF;
-    const uint64_t IDX3 = (vaddr >> 30) & 0x1FF;
-    const uint64_t IDX2 = (vaddr >> 21) & 0x1FF;
-    const uint64_t IDX1 = (vaddr >> 12) & 0x1FF;
+    const auto IDX4 = page_table_index(vaddr, 39);
+    const auto IDX3 = page_table_index(vaddr, 30);
+    const auto IDX2 = page_table_index(vaddr, 21);
+    const auto IDX1 = page_table_index(vaddr, 12);
 
-    if (!pagemap->entries[IDX4].present) {
+    if (!pagemap->entries.at(IDX4).present) {
         return nullptr;
     }
     auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pagemap->entries[IDX4].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml3->entries[IDX3].present) {
+        ker::mod::mm::addr::get_virt_pointer(pagemap->entries.at(IDX4).frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml3->entries.at(IDX3).present) {
         return nullptr;
     }
     auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml2->entries[IDX2].present) {
+        ker::mod::mm::addr::get_virt_pointer(pml3->entries.at(IDX3).frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml2->entries.at(IDX2).present) {
         return nullptr;
     }
     auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml1->entries[IDX1].present) {
+        ker::mod::mm::addr::get_virt_pointer(pml2->entries.at(IDX2).frame << ker::mod::mm::paging::PAGE_SHIFT));
+    if (!pml1->entries.at(IDX1).present) {
         return nullptr;
     }
 
-    return &pml1->entries[IDX1];
+    return &pml1->entries.at(IDX1);
 }
-}  // namespace
 
-static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
+auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
     // Page fault handler - handles COW faults and user-space segfaults.
     // This MUST run before the panic ownership CAS below, because page faults
     // (especially COW resolution) are normal concurrent events. If two CPUs
@@ -80,7 +95,7 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
     // think it was a nested panic and halt.
     if (frame.int_num == 14) {
         // NOLINTNEXTLINE(misc-const-correctness)
-        uint64_t cr2 = cr2;
+        uint64_t cr2{};
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
 
         // If pagefault_handler resolved a COW fault, we're done.
@@ -182,26 +197,29 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
             }
 
             auto* pml4 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF));
-            const uint64_t IDX4 = (cr2 >> 39) & 0x1FF;
-            const uint64_t IDX3 = (cr2 >> 30) & 0x1FF;
-            const uint64_t IDX2 = (cr2 >> 21) & 0x1FF;
-            const uint64_t IDX1 = (cr2 >> 12) & 0x1FF;
+            const auto IDX4 = page_table_index(cr2, 39);
+            const auto IDX3 = page_table_index(cr2, 30);
+            const auto IDX2 = page_table_index(cr2, 21);
+            const auto IDX1 = page_table_index(cr2, 12);
 
-            journal::warn("PML4[%d]: present=%d frame=0x%lx", IDX4, pml4->entries[IDX4].present, pml4->entries[IDX4].frame);
-            if (pml4->entries[IDX4].present) {
+            const auto& pml4e = pml4->entries.at(IDX4);
+            journal::warn("PML4[%d]: present=%d frame=0x%lx", IDX4, pml4e.present, pml4e.frame);
+            if (pml4e.present) {
                 auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                    ker::mod::mm::addr::get_virt_pointer(pml4->entries[IDX4].frame << 12));
-                journal::warn(" PML3[%d]: present=%d frame=0x%lx", IDX3, pml3->entries[IDX3].present, pml3->entries[IDX3].frame);
-                if (pml3->entries[IDX3].present) {
+                    ker::mod::mm::addr::get_virt_pointer(pml4e.frame << ker::mod::mm::paging::PAGE_SHIFT));
+                const auto& pml3e = pml3->entries.at(IDX3);
+                journal::warn(" PML3[%d]: present=%d frame=0x%lx", IDX3, pml3e.present, pml3e.frame);
+                if (pml3e.present) {
                     auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                        ker::mod::mm::addr::get_virt_pointer(pml3->entries[IDX3].frame << 12));
-                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", IDX2, pml2->entries[IDX2].present, pml2->entries[IDX2].frame);
-                    if (pml2->entries[IDX2].present) {
+                        ker::mod::mm::addr::get_virt_pointer(pml3e.frame << ker::mod::mm::paging::PAGE_SHIFT));
+                    const auto& pml2e = pml2->entries.at(IDX2);
+                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", IDX2, pml2e.present, pml2e.frame);
+                    if (pml2e.present) {
                         auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                            ker::mod::mm::addr::get_virt_pointer(pml2->entries[IDX2].frame << 12));
-                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1->entries[IDX1].present,
-                                      pml1->entries[IDX1].frame, pml1->entries[IDX1].user, pml1->entries[IDX1].writable,
-                                      pml1->entries[IDX1].no_execute);
+                            ker::mod::mm::addr::get_virt_pointer(pml2e.frame << ker::mod::mm::paging::PAGE_SHIFT));
+                        const auto& pml1e = pml1->entries.at(IDX1);
+                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1e.present, pml1e.frame,
+                                      pml1e.user, pml1e.writable, pml1e.no_execute);
                     }
                 }
             }
@@ -268,10 +286,9 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
 
     // stack trace - validate RSP before dereferencing
     journal::panic("Stack trace:");
-    auto* rsp = (uint64_t*)frame.rsp;
+    auto* rsp = reinterpret_cast<uint64_t*>(frame.rsp);
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp);
-    const bool RSP_VALID = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
-                           (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
+    const bool RSP_VALID = is_kernel_pointer_range(rsp_addr);
 
     if (RSP_VALID) {
         constexpr uint64_t MAX_STACK_TRACE = 64;
@@ -295,32 +312,28 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
     current_task = sched::get_current_task();
 
     journal::panic("=== Current Task Info ===");
-    journal::panic("debug_task_ptrs[%d] = 0x%lx", CPU_ID, (uint64_t)current_task);
+    journal::panic("debug_task_ptrs[%d] = 0x%lx", CPU_ID, reinterpret_cast<uint64_t>(current_task));
 
     if (current_task != nullptr) {
         // CRITICAL: Validate task pointer is in valid memory range before dereferencing
         // This prevents nested faults if GC is freeing the task concurrently
         auto task_addr = reinterpret_cast<uintptr_t>(current_task);
-        const bool IN_HHDM = (task_addr >= 0xffff800000000000ULL && task_addr < 0xffff900000000000ULL);
-        const bool IN_KERNEL_STATIC = (task_addr >= 0xffffffff80000000ULL && task_addr < 0xffffffffc0000000ULL);
 
-        if (!IN_HHDM && !IN_KERNEL_STATIC) {
-            journal::panic("currentTask pointer 0x%lx is out of valid kernel range!", (uint64_t)current_task);
+        if (!is_kernel_pointer_range(task_addr)) {
+            journal::panic("currentTask pointer 0x%lx is out of valid kernel range!", reinterpret_cast<uint64_t>(current_task));
             journal::panic("=========================");
             goto skip_task_dump;  // NOLINT
         }
 
         // Use volatile access to detect if memory is being freed (may contain garbage)
-        journal::panic("Task address: 0x%lx", (uint64_t)current_task);
+        journal::panic("Task address: 0x%lx", reinterpret_cast<uint64_t>(current_task));
 
         // Validate and print name with extreme caution
         const char* name_ptr = current_task->name;
         if (name_ptr != nullptr) {
             auto name_addr = reinterpret_cast<uintptr_t>(name_ptr);
-            const bool NAME_IN_HHDM = (name_addr >= 0xffff800000000000ULL && name_addr < 0xffff900000000000ULL);
-            const bool NAME_IN_KERNEL_STATIC = (name_addr >= 0xffffffff80000000ULL && name_addr < 0xffffffffc0000000ULL);
 
-            if (NAME_IN_HHDM || NAME_IN_KERNEL_STATIC) {
+            if (is_kernel_pointer_range(name_addr)) {
                 // Check first byte without assuming string is valid
                 volatile const char* volatile_name_ptr = name_ptr;
                 volatile char const FIRST_CHAR = volatile_name_ptr[0];
@@ -340,9 +353,9 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
         journal::panic("PID: 0x%x", current_task->pid);
         journal::panic("Type: 0x%x", static_cast<uint64_t>(current_task->type));
         journal::panic("Entry: 0x%lx", current_task->entry);
-        journal::panic("kthread_entry: 0x%lx", (uint64_t)current_task->kthread_entry);
-        journal::panic("Pagemap: 0x%lx", (uint64_t)current_task->pagemap);
-        journal::panic("Thread: 0x%lx", (uint64_t)current_task->thread);
+        journal::panic("kthread_entry: 0x%lx", reinterpret_cast<uint64_t>(current_task->kthread_entry));
+        journal::panic("Pagemap: 0x%lx", reinterpret_cast<uint64_t>(current_task->pagemap));
+        journal::panic("Thread: 0x%lx", reinterpret_cast<uint64_t>(current_task->thread));
 
         journal::panic("Task Context Frame:");
         journal::panic("  frame.rip: 0x%lx", current_task->context.frame.rip);
@@ -369,8 +382,8 @@ static void exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) {
 skip_task_dump:
 
     // Check if page 0 is mapped (it should NOT be - null derefs should crash)
-    auto* pml4 = (uint64_t*)(cr3 + 0xffff800000000000ULL);  // HHDM offset
-    uint64_t const PML4E = pml4[0];                         // Entry for VA 0x0
+    auto* pml4 = reinterpret_cast<uint64_t*>(cr3 + HHDM_BEGIN);
+    uint64_t const PML4E = pml4[0];  // Entry for VA 0x0
     journal::panic("Page 0 check: PML4[0] = 0x%lx (Present=%d)", PML4E, ((PML4E & 1) != 0U) ? 1 : 0);
     if ((PML4E & 1) != 0U) {
         journal::panic("WARNING: Page 0 is mapped! NULL derefs won't crash!");
@@ -419,17 +432,17 @@ skip_task_dump:
     asm volatile("sgdt %0" : "=m"(gdtr));
 
     // Validate GDTR before using it
-    bool gdtr_valid = (gdtr.base >= 0xffff800000000000ULL || gdtr.base >= 0xffffffff80000000ULL);
-    journal::panic("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, gdtr_valid ? 1 : 0);
+    const bool GDTR_VALID = is_kernel_pointer_range(static_cast<uintptr_t>(gdtr.base));
+    journal::panic("GDTR: base=0x%lx, limit=0x%x, valid=%d", gdtr.base, gdtr.limit, GDTR_VALID ? 1 : 0);
 
     // NOLINTBEGIN(misc-const-correctness)
-    uint16_t sel_cs = sel_cs;
-    uint16_t sel_ds = sel_ds;
-    uint16_t sel_es = sel_es;
-    uint16_t sel_fs = sel_fs;
-    uint16_t sel_gs = sel_gs;
-    uint16_t sel_ss = sel_ss;
-    uint16_t sel_tr = sel_tr;
+    uint16_t sel_cs{};
+    uint16_t sel_ds{};
+    uint16_t sel_es{};
+    uint16_t sel_fs{};
+    uint16_t sel_gs{};
+    uint16_t sel_ss{};
+    uint16_t sel_tr{};
     // NOLINTEND(misc-const-correctness)
     asm volatile("mov %%cs, %0" : "=r"(sel_cs));
     asm volatile("mov %%ds, %0" : "=r"(sel_ds));
@@ -447,7 +460,7 @@ skip_task_dump:
             return;
         }
 
-        if (!gdtr_valid) {
+        if (!GDTR_VALID) {
             journal::panic("  Skipping descriptor dump (invalid GDTR)");
             return;
         }
@@ -457,15 +470,14 @@ skip_task_dump:
         uint64_t const DESC_ADDR = GDT_BASE + (INDEX * 8);
 
         // Validate descriptor address is in valid kernel memory
-        const bool DESC_ADDR_VALID = (DESC_ADDR >= 0xffff800000000000ULL && DESC_ADDR < 0xffff900000000000ULL) ||
-                                     (DESC_ADDR >= 0xffffffff80000000ULL && DESC_ADDR < 0xffffffffc0000000ULL);
+        const bool DESC_ADDR_VALID = is_kernel_pointer_range(static_cast<uintptr_t>(DESC_ADDR));
 
         if (!DESC_ADDR_VALID) {
             journal::panic("  Invalid descriptor address: 0x%lx", DESC_ADDR);
             return;
         }
 
-        uint64_t const DESC = *(uint64_t*)DESC_ADDR;
+        uint64_t const DESC = *reinterpret_cast<const uint64_t*>(DESC_ADDR);
 
         journal::panic("  Raw descriptor: 0x%lx", DESC);
 
@@ -489,11 +501,10 @@ skip_task_dump:
         if (!S_BIT) {
             // system descriptor (e.g., TSS) -- read second qword for full base
             const uint64_t DESC_ADDR_HIGH = DESC_ADDR + 8;
-            const bool DESC_ADDR_HIGH_VALID = (DESC_ADDR_HIGH >= 0xffff800000000000ULL && DESC_ADDR_HIGH < 0xffff900000000000ULL) ||
-                                              (DESC_ADDR_HIGH >= 0xffffffff80000000ULL && DESC_ADDR_HIGH < 0xffffffffc0000000ULL);
+            const bool DESC_ADDR_HIGH_VALID = is_kernel_pointer_range(static_cast<uintptr_t>(DESC_ADDR_HIGH));
 
             if (DESC_ADDR_HIGH_VALID) {
-                const uint64_t DESC_HIGH = *(uint64_t*)DESC_ADDR_HIGH;
+                const uint64_t DESC_HIGH = *reinterpret_cast<const uint64_t*>(DESC_ADDR_HIGH);
                 const uint64_t BASE_HIGH = DESC_HIGH & 0xFFFFFFFF;
                 const uint64_t FULL_BASE = BASE | (BASE_HIGH << 32);
                 journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", FULL_BASE, limit);
@@ -524,13 +535,18 @@ skip_task_dump:
         const char* name;
         uint32_t id;
     };
-    const MsrInfo MSRS[] = {{.name = "IA32_EFER", .id = 0xC0000080},      {.name = "IA32_STAR", .id = 0xC0000081},
-                            {.name = "IA32_LSTAR", .id = 0xC0000082},     {.name = "IA32_FMASK", .id = 0xC0000084},
-                            {.name = "IA32_APIC_BASE", .id = 0x1B},       {.name = "IA32_PAT", .id = 0x277},
-                            {.name = "IA32_MISC_ENABLE", .id = 0x1A0},    {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
-                            {.name = "IA32_GS_BASE", .id = IA32_GS_BASE}, {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}};
+    const std::array<MsrInfo, 10> MSRS = {{{.name = "IA32_EFER", .id = 0xC0000080},
+                                           {.name = "IA32_STAR", .id = 0xC0000081},
+                                           {.name = "IA32_LSTAR", .id = 0xC0000082},
+                                           {.name = "IA32_FMASK", .id = 0xC0000084},
+                                           {.name = "IA32_APIC_BASE", .id = 0x1B},
+                                           {.name = "IA32_PAT", .id = 0x277},
+                                           {.name = "IA32_MISC_ENABLE", .id = 0x1A0},
+                                           {.name = "IA32_FS_BASE", .id = IA32_FS_BASE},
+                                           {.name = "IA32_GS_BASE", .id = IA32_GS_BASE},
+                                           {.name = "IA32_KERNEL_GS_BASE", .id = 0xC0000102}}};
     for (const auto& m : MSRS) {
-        uint64_t val = val;
+        uint64_t val{};
         cpu_get_msr(m.id, &val);
         journal::panic("%s: 0x%lx", m.name, val);
     }
@@ -540,6 +556,8 @@ skip_task_dump:
     hcf();
 }
 
+}  // namespace
+
 extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
     if (frame.err_code != UINT64_MAX) {
         exception_handler(gpr, frame);
@@ -547,15 +565,21 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
     }
 
     // Check context-based handler first (for device drivers)
-    if (irq_contexts[frame.int_num].handler != nullptr) {
-        irq_contexts[frame.int_num].handler(static_cast<uint8_t>(frame.int_num), irq_contexts[frame.int_num].data);
+    if (frame.int_num >= interrupt_handlers.size()) {
+        exception_handler(gpr, frame);
+        return;
+    }
+    const auto VECTOR = static_cast<size_t>(frame.int_num);
+
+    if (irq_contexts.at(VECTOR).handler != nullptr) {
+        irq_contexts.at(VECTOR).handler(static_cast<uint8_t>(frame.int_num), irq_contexts.at(VECTOR).data);
         ker::mod::apic::eoi();
         return;
     }
 
-    if (interrupt_handlers[frame.int_num] != nullptr) {
-        interrupt_handlers[frame.int_num](gpr, frame);
-    } else if (IS_IRQ(frame.int_num)) {
+    if (interrupt_handlers.at(VECTOR) != nullptr) {
+        interrupt_handlers.at(VECTOR)(gpr, frame);
+    } else if (is_irq(frame.int_num)) {
         // Unexpected hardware IRQ with no handler - log and ignore.
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
         ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.int_num));
@@ -578,38 +602,38 @@ void set_interrupt_handler(uint8_t int_num, interruptHandler_t handler) {
         ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
         return;
     }
-    if (interrupt_handlers[int_num] != nullptr) {
+    if (interrupt_handlers.at(int_num) != nullptr) {
         ker::mod::io::serial::write("Handler already set\n");
         return;
     }
-    interrupt_handlers[int_num] = handler;
+    interrupt_handlers.at(int_num) = handler;
 }
 
-void remove_interrupt_handler(uint8_t int_num) { interrupt_handlers[int_num] = nullptr; }
+void remove_interrupt_handler(uint8_t int_num) { interrupt_handlers.at(int_num) = nullptr; }
 
-auto is_interrupt_handler_set(uint8_t int_num) -> bool { return interrupt_handlers[int_num] != nullptr; }
+auto is_interrupt_handler_set(uint8_t int_num) -> bool { return interrupt_handlers.at(int_num) != nullptr; }
 
 auto request_irq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
     if (vector == TIMER_VECTOR) {
         journal::error("requestIrq: vector 32 is reserved for timer");
         return -1;
     }
-    if (interrupt_handlers[vector] != nullptr || irq_contexts[vector].handler != nullptr) {
-        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interrupt_handlers[vector],
-                       irq_contexts[vector].handler);
+    if (interrupt_handlers.at(vector) != nullptr || irq_contexts.at(vector).handler != nullptr) {
+        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interrupt_handlers.at(vector),
+                       irq_contexts.at(vector).handler);
         return -1;
     }
     journal::info("requestIrq: vector=%d name=%s", vector, name);
-    irq_contexts[vector].handler = handler;
-    irq_contexts[vector].data = data;
-    irq_contexts[vector].name = name;
+    irq_contexts.at(vector).handler = handler;
+    irq_contexts.at(vector).data = data;
+    irq_contexts.at(vector).name = name;
     return 0;
 }
 
 void free_irq(uint8_t vector) {
-    irq_contexts[vector].handler = nullptr;
-    irq_contexts[vector].data = nullptr;
-    irq_contexts[vector].name = nullptr;
+    irq_contexts.at(vector).handler = nullptr;
+    irq_contexts.at(vector).data = nullptr;
+    irq_contexts.at(vector).name = nullptr;
 }
 
 auto allocate_vector() -> uint8_t {
@@ -619,15 +643,15 @@ auto allocate_vector() -> uint8_t {
     // (isr32 -> task_switch_handler). NEVER allocate it.
     // Vectors 33-47 are reserved for legacy ISA IRQs.
     // Vectors 48-255 are available for MSI/dynamic allocation.
-    for (uint16_t v = next_alloc_vector; v < 256; v++) {
-        if (interrupt_handlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+    for (size_t v = next_alloc_vector; v < interrupt_handlers.size(); v++) {
+        if (interrupt_handlers.at(v) == nullptr && irq_contexts.at(v).handler == nullptr) {
             next_alloc_vector = static_cast<uint8_t>(v + 1);
             return static_cast<uint8_t>(v);
         }
     }
     // Wrap around and search from 48
-    for (uint16_t v = 48; v < next_alloc_vector; v++) {
-        if (interrupt_handlers[v] == nullptr && irq_contexts[v].handler == nullptr) {
+    for (uint16_t v = DYNAMIC_VECTOR_BEGIN; v < next_alloc_vector; v++) {
+        if (interrupt_handlers.at(v) == nullptr && irq_contexts.at(v).handler == nullptr) {
             return static_cast<uint8_t>(v);
         }
     }

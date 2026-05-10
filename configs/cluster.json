@@ -25,7 +25,7 @@
         {
             "id": 0,
             "name": "lan",
-            "nodes": 4,
+            "nodes": 1,
             "nic_model": "virtio-net-pci",
             "nic_queues": 2,
             "netdev_driver": "dhcp",
@@ -36,7 +36,7 @@
         {
             "id": 1,
             "name": "wki",
-            "nodes": 4,
+            "nodes": 1,
             "nic_model": "virtio-net-pci",
             "netdev_driver": "wki",
             "ivshmem": {

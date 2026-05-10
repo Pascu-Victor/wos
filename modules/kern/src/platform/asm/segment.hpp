@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <defines/defines.hpp>
 
 inline void wrgsbase(uint64_t base) { asm volatile("wrgsbase %0" : : "r"(base)); }

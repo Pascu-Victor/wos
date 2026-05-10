@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/wki/wire.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -148,7 +149,7 @@ enum class PeerState : uint8_t {
 
 struct WkiPeer {
     uint16_t node_id = WKI_NODE_INVALID;
-    std::array<uint8_t, 6> mac = {};
+    proto::MacAddress mac;
     WkiTransport* transport = nullptr;
     WkiTransport* rdma_transport = nullptr;  // RDMA-capable overlay (ivshmem or RoCE)
     PeerState state = PeerState::UNKNOWN;
@@ -166,7 +167,8 @@ struct WkiPeer {
     uint32_t rdma_zone_bitmap = 0;  // peer's zone membership
 
     // V2: Hostname identity [V2 A1.5]
-    char hostname[WKI_HOSTNAME_MAX] = {};
+    char hostname[WKI_HOSTNAME_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                                           // C-string state used directly by existing WKI C/varargs boundaries.
 
     // Routing (for non-direct peers)
     uint16_t next_hop = WKI_NODE_INVALID;
@@ -299,11 +301,12 @@ constexpr size_t WKI_PEER_HASH_SIZE = 256;
 
 struct WkiState {
     uint16_t my_node_id = WKI_NODE_INVALID;
-    std::array<uint8_t, 6> my_mac = {};
+    proto::MacAddress my_mac;
     bool initialized = false;
 
     // V2: Local hostname identity [V2 A1.6]
-    char local_hostname[WKI_HOSTNAME_MAX] = {};
+    char local_hostname[WKI_HOSTNAME_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                                                 // C-string state used directly by existing WKI C/varargs boundaries.
 
     // Peer table
     std::array<WkiPeer, WKI_MAX_PEERS> peers;

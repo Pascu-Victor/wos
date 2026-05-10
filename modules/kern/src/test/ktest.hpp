@@ -86,7 +86,9 @@ inline auto check_null(const char* file, int line, const void* ptr, const char* 
 
 // Linker-section boundaries (provided by linker.ld)
 // NOLINTBEGIN(readability-identifier-naming)
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): Linker-provided section bounds.
 extern const ker::test::KTest __start_ktests[];
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): Linker-provided section bounds.
 extern const ker::test::KTest __stop_ktests[];
 // NOLINTEND(readability-identifier-naming)
 
@@ -99,8 +101,8 @@ extern const ker::test::KTest __stop_ktests[];
     static constexpr ker::test::KTest _ktrec_##S##_##N = {#S, #N, &_kt_##S##_##N, (E)}; \
     static void _kt_##S##_##N()
 
-#define KTEST(S, N) KTEST_IMPL(S, N, true)
-#define KTEST_OFF(S, N) KTEST_IMPL(S, N, false)
+#define KTEST(S, N) KTEST_IMPL(S, N, true)       // NOLINT(cppcoreguidelines-macro-usage)
+#define KTEST_OFF(S, N) KTEST_IMPL(S, N, false)  // NOLINT(cppcoreguidelines-macro-usage)
 
 // Assertion helpers.
 // KEXPECT_*: log failure and continue.

@@ -1,5 +1,6 @@
 #include "pci.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
@@ -11,11 +12,15 @@
 
 namespace ker::dev::pci {
 
+using log = ker::mod::dbg::logger<"pci">;
+
 namespace {
 constexpr int MAX_PCI_DEVICES = 64;
-PCIDevice discovered_devices[MAX_PCI_DEVICES];
+std::array<PCIDevice, MAX_PCI_DEVICES> discovered_devices = {};
 int device_count = 0;
 bool enumerated = false;
+constexpr int PCI_FUNCTION_COUNT = 8;
+constexpr int PCI_SLOT_COUNT = 32;
 
 // 32-bit port I/O using inline assembly
 inline auto inl(uint16_t port) -> uint32_t {
@@ -39,7 +44,7 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func) {
         return;
     }
 
-    auto* dev = &discovered_devices[device_count];
+    auto* dev = &discovered_devices.at(static_cast<size_t>(device_count));
     dev->bus = bus;
     dev->slot = slot;
     dev->function = func;
@@ -58,8 +63,8 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func) {
 
     // Read BARs for type 0 (normal) devices
     if ((dev->header_type & 0x7F) == PCI_HEADER_TYPE_NORMAL) {
-        for (int i = 0; i < BAR_COUNT; i++) {
-            dev->bar[i] = pci_config_read32(bus, slot, func, PCI_BAR0 + (i * 4));
+        for (size_t i = 0; i < BAR_COUNT; i++) {
+            dev->bar.at(i) = pci_config_read32(bus, slot, func, static_cast<uint8_t>(PCI_BAR0 + (i * sizeof(uint32_t))));
         }
     } else {
         for (unsigned int& i : dev->bar) {
@@ -89,7 +94,7 @@ void scan_slot(uint8_t bus, uint8_t slot) {
     // Check for multi-function device
     uint8_t const HEADER_TYPE = pci_config_read8(bus, slot, 0, PCI_HEADER_TYPE);
     if ((HEADER_TYPE & PCI_HEADER_TYPE_MULTI_FUNC) != 0) {
-        for (uint8_t func = 1; func < 8; func++) {
+        for (uint8_t func = 1; func < PCI_FUNCTION_COUNT; func++) {
             if (pci_config_read16(bus, slot, func, PCI_VENDOR_ID) != 0xFFFF) {
                 scan_function(bus, slot, func);
             }
@@ -98,7 +103,7 @@ void scan_slot(uint8_t bus, uint8_t slot) {
 }
 
 void scan_bus(uint8_t bus) {
-    for (uint8_t slot = 0; slot < 32; slot++) {
+    for (uint8_t slot = 0; slot < PCI_SLOT_COUNT; slot++) {
         scan_slot(bus, slot);
     }
 }
@@ -126,7 +131,7 @@ auto pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -
 }
 
 // Write 32-bit to PCI configuration space
-void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) {
+auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) -> void {
     uint32_t const ADDRESS = (static_cast<uint32_t>(bus) << 16) | (static_cast<uint32_t>(slot) << 11) | (static_cast<uint32_t>(func) << 8) |
                              (offset & 0xFC) | 0x80000000UL;
 
@@ -135,7 +140,7 @@ void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 }
 
 // Write 16-bit to PCI configuration space
-void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) {
+auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) -> void {
     uint32_t dword = pci_config_read32(bus, slot, func, offset);
     int const SHIFT = (offset & 2) * 8;
     dword = (dword & ~(0xFFFF << SHIFT)) | (static_cast<uint32_t>(value) << SHIFT);
@@ -143,7 +148,7 @@ void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 }
 
 // Write 8-bit to PCI configuration space
-void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) {
+auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) -> void {
     uint32_t dword = pci_config_read32(bus, slot, func, offset);
     int const SHIFT = (offset & 3) * 8;
     dword = (dword & ~(0xFF << SHIFT)) | (static_cast<uint32_t>(value) << SHIFT);
@@ -161,7 +166,7 @@ auto pci_enumerate_all() -> int {
     // Check if host bridge is multi-function (multiple root buses)
     uint8_t const HEADER_TYPE = pci_config_read8(0, 0, 0, PCI_HEADER_TYPE);
     if ((HEADER_TYPE & PCI_HEADER_TYPE_MULTI_FUNC) != 0) {
-        for (uint8_t func = 0; func < 8; func++) {
+        for (uint8_t func = 0; func < PCI_FUNCTION_COUNT; func++) {
             if (pci_config_read16(0, 0, func, PCI_VENDOR_ID) != 0xFFFF) {
                 scan_bus(func);
             }
@@ -172,13 +177,12 @@ auto pci_enumerate_all() -> int {
 
     enumerated = true;
 
-    ker::mod::dbg::log("PCI: Found %d devices", device_count);
+    log::info("found %d devices", device_count);
     for (int i = 0; i < device_count; i++) {
-        auto* d = &discovered_devices[i];
-        ker::mod::dbg::log("  PCI %d:%d.%d  vendor=%x device=%x class=%x:%x prog_if=%x", static_cast<int>(d->bus),
-                           static_cast<int>(d->slot), static_cast<int>(d->function), static_cast<int>(d->vendor_id),
-                           static_cast<int>(d->device_id), static_cast<int>(d->class_code), static_cast<int>(d->subclass_code),
-                           static_cast<int>(d->prog_if));
+        auto* d = &discovered_devices.at(static_cast<size_t>(i));
+        log::debug("%d:%d.%d vendor=%x device=%x class=%x:%x prog_if=%x", static_cast<int>(d->bus), static_cast<int>(d->slot),
+                   static_cast<int>(d->function), static_cast<int>(d->vendor_id), static_cast<int>(d->device_id),
+                   static_cast<int>(d->class_code), static_cast<int>(d->subclass_code), static_cast<int>(d->prog_if));
     }
 
     return device_count;
@@ -188,7 +192,7 @@ auto pci_get_device(size_t idx) -> PCIDevice* {
     if (std::cmp_greater_equal(idx, device_count)) {
         return nullptr;
     }
-    return &discovered_devices[idx];
+    return &discovered_devices.at(idx);
 }
 
 auto pci_device_count() -> size_t { return static_cast<size_t>(device_count); }
@@ -198,8 +202,9 @@ auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice* {
         pci_enumerate_all();
     }
     for (int i = 0; i < device_count; i++) {
-        if (discovered_devices[i].class_code == cls && discovered_devices[i].subclass_code == sub) {
-            return &discovered_devices[i];
+        auto& dev = discovered_devices.at(static_cast<size_t>(i));
+        if (dev.class_code == cls && dev.subclass_code == sub) {
+            return &dev;
         }
     }
     return nullptr;
@@ -210,20 +215,21 @@ auto pci_find_by_vendor_device(uint16_t vendor, uint16_t device) -> PCIDevice* {
         pci_enumerate_all();
     }
     for (int i = 0; i < device_count; i++) {
-        if (discovered_devices[i].vendor_id == vendor && discovered_devices[i].device_id == device) {
-            return &discovered_devices[i];
+        auto& dev = discovered_devices.at(static_cast<size_t>(i));
+        if (dev.vendor_id == vendor && dev.device_id == device) {
+            return &dev;
         }
     }
     return nullptr;
 }
 
-void pci_enable_bus_master(PCIDevice* dev) {
+auto pci_enable_bus_master(PCIDevice* dev) -> void {
     uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
     cmd |= PCI_COMMAND_BUS_MASTER;
     pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
 }
 
-void pci_enable_memory_space(PCIDevice* dev) {
+auto pci_enable_memory_space(PCIDevice* dev) -> void {
     uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
     cmd |= PCI_COMMAND_MEM_SPACE;
     pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
@@ -346,11 +352,12 @@ auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int
 }
 
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
-    if (bar_idx < 0 || bar_idx >= BAR_COUNT) {
+    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
         return 0;
     }
 
-    uint32_t const BAR_VAL = dev->bar[bar_idx];
+    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
+    uint32_t const BAR_VAL = dev->bar.at(BAR_INDEX);
 
     if ((BAR_VAL & 1) != 0U) {
         // I/O space BAR
@@ -359,10 +366,10 @@ auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
 
     // Memory space BAR
     uint8_t const TYPE = (BAR_VAL >> 1) & 0x3;
-    if (TYPE == 0x02 && bar_idx + 1 < BAR_COUNT) {
+    if (TYPE == 0x02 && (BAR_INDEX + 1) < BAR_COUNT) {
         // 64-bit BAR: combine with next BAR register
         uint64_t addr = BAR_VAL & ~0xFUL;
-        addr |= static_cast<uint64_t>(dev->bar[bar_idx + 1]) << 32;
+        addr |= static_cast<uint64_t>(dev->bar.at(BAR_INDEX + 1)) << 32;
         return addr;
     }
 
@@ -371,11 +378,12 @@ auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
 }
 
 auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
-    if (bar_idx < 0 || bar_idx >= BAR_COUNT) {
+    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
         return 0;
     }
 
-    uint8_t const REG = PCI_BAR0 + (bar_idx * 4);
+    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
+    auto const REG = static_cast<uint8_t>(PCI_BAR0 + (BAR_INDEX * sizeof(uint32_t)));
     uint32_t const ORIGINAL = pci_config_read32(dev->bus, dev->slot, dev->function, REG);
 
     // I/O BAR - no MMIO size needed
@@ -383,56 +391,62 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
         return 0;
     }
 
+    uint8_t const TYPE = (ORIGINAL >> 1) & 0x3;
+
     // Disable memory decoding before BAR sizing to prevent KVM from trying
     // to map intermediate bogus addresses (e.g. writing 0xFFFFFFFF to a
     // 64-bit BAR while the high half still holds the original value).
     uint16_t const CMD = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
     pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD & ~PCI_COMMAND_MEM_SPACE);
 
-    // Write all 1s to determine size
-    pci_config_write32(dev->bus, dev->slot, dev->function, REG, 0xFFFFFFFF);
-    uint32_t readback = pci_config_read32(dev->bus, dev->slot, dev->function, REG);
-    // Restore original value
-    pci_config_write32(dev->bus, dev->slot, dev->function, REG, ORIGINAL);
+    if (TYPE == 0x02 && (BAR_INDEX + 1) < BAR_COUNT) {
+        auto const REG_HI = static_cast<uint8_t>(PCI_BAR0 + ((BAR_INDEX + 1) * sizeof(uint32_t)));
+        uint32_t const ORIGINAL_HI = pci_config_read32(dev->bus, dev->slot, dev->function, REG_HI);
 
-    readback &= ~0xFU;  // mask type/prefetch bits
-    if (readback == 0) {
-        // Restore command register and return
-        pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD);
-        return 0;
-    }
-
-    uint8_t const TYPE = (ORIGINAL >> 1) & 0x3;
-    if (TYPE == 0x02 && bar_idx + 1 < BAR_COUNT) {
-        // 64-bit BAR: also size the upper 32 bits
-        uint8_t const REG_HI = PCI_BAR0 + ((bar_idx + 1) * 4);
-        uint32_t const ORIG_HI = pci_config_read32(dev->bus, dev->slot, dev->function, REG_HI);
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, 0xFFFFFFFF);
+        // For 64-bit BARs, both halves must be all-ones at the same time.
+        pci_config_write32(dev->bus, dev->slot, dev->function, REG, 0xFFFFFFFFU);
+        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, 0xFFFFFFFFU);
+        uint32_t const READBACK_LO = pci_config_read32(dev->bus, dev->slot, dev->function, REG) & ~0xFU;
         uint32_t const READBACK_HI = pci_config_read32(dev->bus, dev->slot, dev->function, REG_HI);
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, ORIG_HI);
 
-        // Re-enable memory decoding now that BARs are restored
+        pci_config_write32(dev->bus, dev->slot, dev->function, REG, ORIGINAL);
+        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, ORIGINAL_HI);
         pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD);
 
-        uint64_t const MASK = (static_cast<uint64_t>(READBACK_HI) << 32) | readback;
+        uint64_t const MASK = (static_cast<uint64_t>(READBACK_HI) << 32) | READBACK_LO;
+        if (MASK == 0) {
+            return 0;
+        }
         return (~MASK) + 1;
     }
 
-    // Re-enable memory decoding now that BAR is restored
+    pci_config_write32(dev->bus, dev->slot, dev->function, REG, 0xFFFFFFFFU);
+    uint32_t const READBACK = pci_config_read32(dev->bus, dev->slot, dev->function, REG) & ~0xFU;
+    pci_config_write32(dev->bus, dev->slot, dev->function, REG, ORIGINAL);
     pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD);
 
-    // 32-bit BAR
-    return static_cast<uint64_t>(~readback + 1);
+    if (READBACK == 0) {
+        return 0;
+    }
+
+    // Keep the complement arithmetic 32-bit. Widening before `~` turns a
+    // 4 KiB BAR mask (0xfffff000) into a huge 64-bit size.
+    return static_cast<uint64_t>(static_cast<uint32_t>(~READBACK + 1U));
 }
 
 auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
+    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
+        return nullptr;
+    }
+
     uint64_t const PHYS = pci_get_bar_addr(dev, bar_idx);
     if (PHYS == 0) {
         return nullptr;
     }
 
     // Don't map I/O space BARs
-    if ((dev->bar[bar_idx] & 1) != 0U) {
+    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
+    if ((dev->bar.at(BAR_INDEX) & 1) != 0U) {
         return nullptr;
     }
 
@@ -493,7 +507,7 @@ auto pci_find_ahci_controller() -> PCIDevice* {
     }
 
     for (int i = 0; i < device_count; i++) {
-        auto* dev = &discovered_devices[i];
+        auto* dev = &discovered_devices.at(static_cast<size_t>(i));
         bool const IS_AHCI = (dev->class_code == PCI_CLASS_STORAGE && dev->subclass_code == PCI_SUBCLASS_SATA) ||
                              (dev->vendor_id == 0x8086 && dev->device_id == 0x2922);
         if (IS_AHCI) {

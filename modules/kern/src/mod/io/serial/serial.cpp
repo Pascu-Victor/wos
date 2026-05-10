@@ -1,5 +1,6 @@
 #include "serial.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,9 +9,13 @@
 #include "mod/io/port/port.hpp"
 
 namespace ker::mod::io::serial {
-static bool is_init = false;
 
 namespace {
+constexpr uint16_t DATA_PORT = 0x3F8;
+constexpr uint16_t STATUS_PORT = DATA_PORT + 5;
+constexpr uint8_t STATUS_TX_READY = 0x20;
+constexpr uint8_t OP_DISABLE_INTERRUPTS = 0x00;
+bool is_init = false;
 // Reentrant spinlock: tracks owner CPU and recursion depth
 // Use UINT64_MAX for "no owner"
 constexpr uint64_t NO_OWNER = UINT64_MAX;
@@ -91,68 +96,78 @@ void release_lock() {
     }
 }
 
+namespace {
 // Internal unlocked character write
-static void write_char_unlocked(char c) {
-    while ((inb(0x3F8 + 5) & 0x20) == 0) {
+void write_char_unlocked(char c) {
+    while ((inb(STATUS_PORT) & STATUS_TX_READY) == 0) {
         ;
     }
-    outb(0x3F8, c);
+    outb(DATA_PORT, c);
 }
 
 // Per-CPU line buffers: each CPU accumulates characters here and only takes
 // the serial lock when flushing a complete line or on overflow. This prevents
 // characters from different CPUs interleaving within a single output line.
-static constexpr size_t MAX_CPUS = 256;
-static constexpr size_t BUF_DATA_SIZE = 256 - sizeof(size_t);  // 248 bytes, struct = 256 = 4 cache lines
+constexpr size_t MAX_CPUS = 256;
+constexpr size_t BUF_DATA_SIZE = 256 - sizeof(size_t);  // 248 bytes, struct = 256 = 4 cache lines
+constexpr size_t SERIAL_BUF_ALIGNMENT = 256;            // Align to cache line size to avoid false sharing
 
-struct alignas(64) CpuSerialBuf {
+struct alignas(SERIAL_BUF_ALIGNMENT) CpuSerialBuf {
     size_t len = 0;
-    char data[BUF_DATA_SIZE] = {};
+    std::array<char, BUF_DATA_SIZE> data{};
 };
-static_assert(sizeof(CpuSerialBuf) == 256, "CpuSerialBuf must be 256 bytes");
+static_assert(sizeof(CpuSerialBuf) == SERIAL_BUF_ALIGNMENT, "CpuSerialBuf must be 256 bytes");
 
-static CpuSerialBuf cpu_bufs[MAX_CPUS];
+std::array<CpuSerialBuf, MAX_CPUS> cpu_bufs{};
 
-static size_t get_buf_idx() {
+auto get_buf_idx() -> size_t {
     if (!cpu_id_available.load(std::memory_order_acquire)) {
         return 0;  // during early boot all CPUs share buffer 0 (they run serially at that point)
     }
     return cpu::current_cpu() % MAX_CPUS;
 }
 
-static void flush_buf(size_t idx) {
-    CpuSerialBuf& buf = cpu_bufs[idx];
+void flush_buf(size_t idx) {
+    CpuSerialBuf& buf = cpu_bufs[idx];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     if (buf.len == 0) {
         return;
     }
     acquire_lock();
     for (size_t i = 0; i < buf.len; i++) {
-        write_char_unlocked(buf.data[i]);
+        write_char_unlocked(buf.data[i]);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
     release_lock();
     buf.len = 0;
 }
 
-static void buf_char(char c) {
+void buf_char(char c) {
     size_t const IDX = get_buf_idx();
-    CpuSerialBuf& buf = cpu_bufs[IDX];
-    buf.data[buf.len++] = c;
-    if (c == '\n' || buf.len >= BUF_DATA_SIZE) {
+    CpuSerialBuf& buf = cpu_bufs[IDX];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    buf.data[buf.len++] = c;            // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    if (c == '\n' || buf.len >= buf.data.size()) {
         flush_buf(IDX);
     }
 }
+}  // namespace
 
 void init() {
     if (is_init) {
         return;
     }
-    outb(0x3F8 + 1, 0x00);  // Disable all interrupts
-    outb(0x3F8 + 3, 0x80);  // Enable DLAB (set baud rate divisor)
-    outb(0x3F8 + 0, 0x02);  // Set divisor to 2 (lo byte) 38400 baud
-    outb(0x3F8 + 1, 0x00);  //                  (hi byte)
-    outb(0x3F8 + 3, 0x03);  // 8 bits, no parity, one stop bit
-    outb(0x3F8 + 2, 0xC7);  // Enable FIFO, clear them, with 14-byte threshold
-    outb(0x3F8 + 4, 0x0B);  // IRQs enabled, RTS/DSR set
+    constexpr uint8_t OP_ENABLE_DLAB = 0x80;
+    constexpr uint8_t DIVISOR_LO = 0x03;  // 38400 baud
+    constexpr uint8_t DIVISOR_HI = 0x00;
+    constexpr uint8_t LINE_CTRL_8N1 = 0x03;
+    constexpr uint8_t FIFO_CTRL_ENABLE = 0xC7;
+    constexpr uint8_t MODEM_CTRL = 0x0B;
+
+    outb(DATA_PORT + 1, OP_DISABLE_INTERRUPTS);
+    outb(DATA_PORT + 3, OP_ENABLE_DLAB);
+    outb(DATA_PORT + 0, DIVISOR_LO);
+    outb(DATA_PORT + 1, DIVISOR_HI);
+    outb(DATA_PORT + 3, LINE_CTRL_8N1);
+    outb(DATA_PORT + 2, FIFO_CTRL_ENABLE);
+    outb(DATA_PORT + 4, MODEM_CTRL);
     is_init = true;
 }
 
@@ -170,43 +185,49 @@ void write(const char* str, uint64_t len) {
 
 void write(const char C) { buf_char(C); }
 
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): fixed-size numeric formatting buffers.
 void write(uint64_t num) {
-    char str[21];
-    str[20] = '\0';
-    int pos = 20;
+    constexpr size_t BUF_SIZE = 21;  // Max uint64_t is 20 digits + null terminator
+    std::array<char, BUF_SIZE> str{};
+    constexpr uint64_t BASE = 10;
+    str[BUF_SIZE - 1] = '\0';
+    size_t pos = BUF_SIZE - 1;
     if (num == 0) {
         str[--pos] = '0';
     } else {
         while (num > 0 && pos > 0) {
-            str[--pos] = static_cast<char>('0' + (num % 10));
-            num /= 10;
+            str[--pos] = static_cast<char>('0' + (num % BASE));
+            num /= BASE;
         }
     }
-    write(str + pos);
+    write(str.data() + pos);
 }
 
 void write_hex(uint64_t num) {
-    char str[17];
-    str[16] = '\0';
-    const char* hex = "0123456789abcdef";
-    for (int i = 0; i < 16; ++i) {
-        str[15 - i] = hex[num & 0xF];
+    constexpr size_t BUF_SIZE = 17;  // 16 hex digits for uint64_t + null terminator
+    std::array<char, BUF_SIZE> str{};
+    str[BUF_SIZE - 1] = '\0';
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    for (size_t i = 0; i < BUF_SIZE - 1; ++i) {
+        constexpr uint64_t NIBBLE_MASK = 0xFU;
+        str[(BUF_SIZE - 2 - i)] = HEX_DIGITS[static_cast<size_t>(num & NIBBLE_MASK)];
         num >>= 4;
     }
-    int start = 0;
-    while (start < 15 && str[start] == '0') {
+    size_t start = 0;
+    while (start < BUF_SIZE - 1 && str[start] == '0') {
         ++start;
     }
-    write(str + start);
+    write(str.data() + start);
 }
 
 void write_bin(uint64_t num) {
-    char str[65];
-    str[64] = '\0';
-    for (uint64_t i = 64; i > 0; i--) {
-        str[64 - i] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
+    constexpr size_t BUF_SIZE = 65;  // 64 binary digits for uint64_t + null terminator
+    std::array<char, BUF_SIZE> str{};
+    str[BUF_SIZE - 1] = '\0';
+    for (uint64_t i = BUF_SIZE - 1; i > 0; i--) {
+        str[static_cast<size_t>(BUF_SIZE - 2 - (i - 1))] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
     }
-    write(str);
+    write(str.data());
 }
 
 // Unlocked write variants - caller must hold lock
@@ -225,51 +246,57 @@ void write_unlocked(const char* str, uint64_t len) {
 void write_unlocked(const char C) { write_char_unlocked(C); }
 
 void write_unlocked(uint64_t num) {
-    char str[21];
-    str[20] = '\0';
-    int pos = 20;
+    constexpr size_t BUF_SIZE = 21;  // Max uint64_t is 20 digits + null terminator
+    std::array<char, BUF_SIZE> str{};
+    constexpr uint64_t BASE = 10;
+    str[BUF_SIZE - 1] = '\0';
+    size_t pos = BUF_SIZE - 1;
     if (num == 0) {
         str[--pos] = '0';
     } else {
         while (num > 0 && pos > 0) {
-            str[--pos] = static_cast<char>('0' + (num % 10));
-            num /= 10;
+            str[--pos] = static_cast<char>('0' + (num % BASE));
+            num /= BASE;
         }
     }
-    int const LEN = 20 - pos;
-    for (int i = 0; i < LEN; ++i) {
+    size_t const LEN = BUF_SIZE - 1 - pos;
+    for (size_t i = 0; i < LEN; ++i) {
         str[i] = str[pos + i];
     }
     str[LEN] = '\0';
-    write_unlocked(str);
+    write_unlocked(str.data());
 }
 
 void write_hex_unlocked(uint64_t num) {
-    char str[17];
-    str[16] = '\0';
-    const char* hex = "0123456789abcdef";
-    for (int i = 0; i < 16; ++i) {
-        str[15 - i] = hex[num & 0xF];
+    constexpr size_t BUF_SIZE = 17;  // 16 hex digits for uint64_t + null terminator
+    std::array<char, BUF_SIZE> str{};
+    str[BUF_SIZE - 1] = '\0';
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    constexpr uint64_t NIBBLE_MASK = 0xFU;
+    for (size_t i = 0; i < BUF_SIZE - 1; ++i) {
+        str[(BUF_SIZE - 2 - i)] = HEX_DIGITS[static_cast<size_t>(num & NIBBLE_MASK)];
         num >>= 4;
     }
-    int start = 0;
-    while (start < 15 && str[start] == '0') {
+    size_t start = 0;
+    while (start < BUF_SIZE - 1 && str[start] == '0') {
         ++start;
     }
-    int const LEN = 16 - start;
-    for (int i = 0; i < LEN; ++i) {
+    size_t const LEN = BUF_SIZE - 1 - start;
+    for (size_t i = 0; i < LEN; ++i) {
         str[i] = str[start + i];
     }
     str[LEN] = '\0';
-    write_unlocked(str);
+    write_unlocked(str.data());
 }
 
 void write_bin_unlocked(uint64_t num) {
-    char str[65];
-    str[64] = '\0';
-    for (uint64_t i = 64; i > 0; i--) {
-        str[64 - i] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
+    constexpr size_t BUF_SIZE = 65;  // 64 binary digits for uint64_t + null terminator
+    std::array<char, BUF_SIZE> str{};
+    str[BUF_SIZE - 1] = '\0';
+    for (uint64_t i = BUF_SIZE - 1; i > 0; i--) {
+        str[static_cast<size_t>(BUF_SIZE - 2 - (i - 1))] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
     }
-    write_unlocked(str);
+    write_unlocked(str.data());
 }
+// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }  // namespace ker::mod::io::serial

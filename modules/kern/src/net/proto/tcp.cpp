@@ -3,6 +3,7 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -24,8 +25,8 @@ namespace ker::net::proto {
 
 // Per-bucket hash tables.
 // NOLINTBEGIN(misc-use-internal-linkage)
-TcpHashBucket tcb_hash[TCB_HASH_SIZE] = {};
-TcpHashBucket listener_hash[LISTENER_HASH_SIZE] = {};
+std::array<TcpHashBucket, TCB_HASH_SIZE> tcb_hash = {};
+std::array<TcpHashBucket, LISTENER_HASH_SIZE> listener_hash = {};
 volatile uint64_t tcp_ms_counter = 0;
 // NOLINTEND(misc-use-internal-linkage)
 
@@ -38,7 +39,7 @@ struct TcpBinding {
     uint16_t local_port = 0;
 };
 
-TcpBinding tcp_bindings[MAX_TCP_BINDINGS] = {};
+std::array<TcpBinding, MAX_TCP_BINDINGS> tcp_bindings = {};
 ker::mod::sys::Spinlock tcp_bind_lock;
 
 uint16_t tcp_ephemeral_port = 49152;
@@ -141,13 +142,13 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     // Empty queue: park caller and return EAGAIN.
     sock->lock.lock();
 #ifdef TCP_DEBUG
-    ker::mod::dbg::log("[tcp] tcp_accept: sock=%p aq_count=%zu owner_pid=%lu", static_cast<void*>(sock), sock->aq_count, sock->owner_pid);
+    log::debug("tcp_accept: sock=%p aq_count=%zu owner_pid=%lu", static_cast<void*>(sock), sock->aq_count, sock->owner_pid);
 #endif
     if (sock->aq_count == 0) {
         sock->lock.unlock();
         defer_socket_wait(sock);
 #ifdef TCP_DEBUG
-        ker::mod::dbg::log("[tcp] tcp_accept: queue empty, parking pid=%lu", sock->owner_pid);
+        log::debug("tcp_accept: queue empty, parking pid=%lu", sock->owner_pid);
 #endif
         return -EAGAIN;
     }
@@ -165,7 +166,7 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
         socket_fill_sockaddr_v4(addr_out, *addr_len, addr_len, child->remote_v4.addr, child->remote_v4.port);
     }
 #ifdef TCP_DEBUG
-    ker::mod::dbg::log("[tcp] tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote_v4.port);
+    log::debug("tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote_v4.port);
 #endif
     *new_sock_out = child;
     return 0;
@@ -223,7 +224,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
         if (route != nullptr && route->dev != nullptr) {
             auto* nif = ker::net::netif_get(route->dev);
             if (nif != nullptr && nif->ipv4_addr_count > 0) {
-                cb->local_ip = nif->ipv4_addrs[0].addr;
+                cb->local_ip = nif->ipv4_addrs.front().addr;
                 sock->local_v4.addr = cb->local_ip;
             }
         }
@@ -351,12 +352,14 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
         return -1;
     }
 
+#ifdef TCP_DEBUG
     auto current_pid = [&]() -> uint64_t {
         if (auto* current_task = ker::mod::sched::get_current_task(); current_task != nullptr) {
             return current_task->pid;
         }
         return sock->owner_pid;
     };
+#endif
 
     if (sock->rcvbuf.available() > 0) {
         ssize_t const N = sock->rcvbuf.read(buf, len);
@@ -447,7 +450,7 @@ void tcp_close_op(Socket* sock) {
     TcpState next_state = cb->state;
 
     // Drain outstanding retransmits.
-    size_t rtx_drained = 0;
+    [[maybe_unused]] size_t rtx_drained = 0;
     while (cb->retransmit_head != nullptr) {
         auto* entry = cb->retransmit_head;
         cb->retransmit_head = entry->next;
@@ -460,15 +463,12 @@ void tcp_close_op(Socket* sock) {
     cb->retransmit_tail = nullptr;
 #ifdef TCP_DEBUG
     if (rtx_drained > 0) {
-        ker::mod::dbg::log("tcp_close: drained %zu rtx entries, pool_free=%zu", rtx_drained, ker::net::pkt_pool_free_count());
+        log::debug("tcp_close: drained %zu rtx entries, pool_free=%zu", rtx_drained, ker::net::pkt_pool_free_count());
     }
 #endif
     switch (cb->state) {
         case TcpState::CLOSED:
         case TcpState::LISTEN:
-            cb->state = TcpState::CLOSED;
-            break;
-
         case TcpState::SYN_SENT:
             cb->state = TcpState::CLOSED;
             break;
@@ -481,14 +481,6 @@ void tcp_close_op(Socket* sock) {
         case TcpState::CLOSE_WAIT:
             send_fin = true;
             next_state = TcpState::LAST_ACK;
-            break;
-
-        case TcpState::FIN_WAIT_1:
-        case TcpState::FIN_WAIT_2:
-        case TcpState::CLOSING:
-            break;
-
-        case TcpState::TIME_WAIT:
             break;
 
         default:
@@ -529,7 +521,7 @@ void tcp_close_op(Socket* sock) {
         tcp_free_cb(cb);
     }
     // Drop the owning socket ref; timer/hash/listener refs keep the TCB alive if needed.
-    tcp_cb_release(cb);
+    tcp_cb_release(cb);  // NOLINT(clang-analyzer-cplusplus.NewDelete)
 }
 
 int tcp_shutdown_op(Socket* sock, int how) {
@@ -675,7 +667,7 @@ auto tcp_alloc_cb() -> TcpCB* {
 
 void tcp_insert_cb(TcpCB* cb) {
     uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[IDX];
+    auto& bucket = tcb_hash.at(IDX);
     bucket.lock.lock();
     // Hash membership owns a ref so lookups can safely retain under the bucket lock.
     tcp_cb_acquire(cb);
@@ -686,7 +678,7 @@ void tcp_insert_cb(TcpCB* cb) {
 
 void tcp_insert_listener(TcpCB* cb) {
     uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[IDX];
+    auto& bucket = listener_hash.at(IDX);
     bucket.lock.lock();
     // Listener-table membership owns a ref independent of the owning socket.
     tcp_cb_acquire(cb);
@@ -697,7 +689,7 @@ void tcp_insert_listener(TcpCB* cb) {
 
 void tcp_remove_listener(TcpCB* cb) {
     uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[IDX];
+    auto& bucket = listener_hash.at(IDX);
     bool removed = false;
     bucket.lock.lock();
     TcpCB** pp = &bucket.head;
@@ -760,7 +752,7 @@ void tcp_free_cb(TcpCB* cb) {
     tcp_timer_disarm(cb);
 
     uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[IDX];
+    auto& bucket = tcb_hash.at(IDX);
     bool removed = false;
     bucket.lock.lock();
     TcpCB** pp = &bucket.head;
@@ -783,7 +775,7 @@ void tcp_free_cb(TcpCB* cb) {
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
     NET_TRACE_SPAN(SPAN_TCP_FIND_CB);
     uint32_t const IDX = tcp_hash_4tuple(local_ip, local_port, remote_ip, remote_port) % TCB_HASH_SIZE;
-    auto& bucket = tcb_hash[IDX];
+    auto& bucket = tcb_hash.at(IDX);
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
         if (cb->local_port == local_port && cb->remote_port == remote_port && (cb->local_ip == local_ip || cb->local_ip == 0) &&
@@ -799,7 +791,7 @@ auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uin
 
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
     uint32_t const IDX = tcp_hash_listener(local_port) % LISTENER_HASH_SIZE;
-    auto& bucket = listener_hash[IDX];
+    auto& bucket = listener_hash.at(IDX);
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
         if (cb->state == TcpState::LISTEN && cb->local_port == local_port && (cb->local_ip == local_ip || cb->local_ip == 0)) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace ker::mod::sched {
@@ -14,8 +15,10 @@ struct Task;  // Forward declaration - full definition in task.hpp
 static constexpr uint32_t PER_CPU_HEAP_CAP = 8192;
 
 struct RunHeap {
-    task::Task* entries[PER_CPU_HEAP_CAP];
-    uint32_t size;
+    using EntryStorage = std::array<task::Task*, PER_CPU_HEAP_CAP>;
+
+    EntryStorage entries{};
+    uint32_t size{};
 
     void init();
 
@@ -48,12 +51,14 @@ struct RunHeap {
     void swap_entries(uint32_t i, uint32_t j);
 };
 
+static_assert(sizeof(RunHeap::EntryStorage) == sizeof(task::Task*) * PER_CPU_HEAP_CAP, "RunHeap storage must stay pointer-dense");
+
 // Intrusive singly-linked list for wait queue and dead list.
 // Uses Task::schedNext pointer - zero allocations.
 // No ordering, just a bag of parked tasks.
 struct IntrusiveTaskList {
-    task::Task* head;
-    uint32_t count;
+    task::Task* head{};
+    uint32_t count{};
 
     void init();
 

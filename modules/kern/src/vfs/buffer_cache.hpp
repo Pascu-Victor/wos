@@ -37,7 +37,7 @@ struct BufHead {
 };
 
 // Buffer cache configuration
-constexpr size_t BUFFER_CACHE_DEFAULT_SIZE = 64 * 1024 * 1024;  // 64 MB
+constexpr size_t BUFFER_CACHE_DEFAULT_SIZE = static_cast<size_t>(64) * 1024 * 1024;  // 64 MB
 constexpr size_t BUFFER_CACHE_HASH_BUCKETS = 4096;
 
 // Initialize the buffer cache subsystem. Call once at kernel init.

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
@@ -116,38 +117,46 @@ constexpr uint32_t TRB_DIR_IN = (1 << 16);  // Data direction IN (for setup TRB)
 constexpr uint32_t TRB_CC_SUCCESS = 1;
 constexpr uint32_t TRB_CC_SHORT_PKT = 13;
 
+constexpr uint32_t NUM_EPS = 31;               // Max endpoints per device (excluding EP0)
+constexpr uint32_t SIZE_OF_EACH_CONTEXT = 32;  // bytes
+
 // -- Event Ring Segment Table Entry --
 struct ErstEntry {
     uint64_t ring_base;
     uint32_t ring_size;
     uint32_t reserved;
 } __attribute__((packed));
+static_assert(sizeof(ErstEntry) == sizeof(uint64_t) + (sizeof(uint32_t) * 2));
 
 // -- Device Context structures --
 // Slot context (32 bytes)
 struct SlotContext {
-    uint32_t data[8];
+    uint32_t data[8];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): xHCI context ABI.
 } __attribute__((packed));
+static_assert(sizeof(SlotContext) == ker::dev::usb::SIZE_OF_EACH_CONTEXT);
 
 // Endpoint context (32 bytes)
 struct EndpointContext {
-    uint32_t data[8];
+    uint32_t data[8];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): xHCI context ABI.
 } __attribute__((packed));
+static_assert(sizeof(EndpointContext) == ker::dev::usb::SIZE_OF_EACH_CONTEXT);
 
 // Input context: Input Control Context + Slot + 31 EPs = 33 * 32 = 1056 bytes
 struct InputContext {
     uint32_t drop_flags;
     uint32_t add_flags;
-    uint32_t reserved[6];
+    uint32_t reserved[6];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): xHCI context ABI.
     SlotContext slot;
-    EndpointContext ep[31];
+    EndpointContext ep[ker::dev::usb::NUM_EPS];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): xHCI context ABI.
 } __attribute__((packed));
+static_assert(sizeof(InputContext) == (sizeof(uint32_t) * 8) + sizeof(SlotContext) + (sizeof(EndpointContext) * ker::dev::usb::NUM_EPS));
 
 // Device context: Slot + 31 EPs = 32 * 32 = 1024 bytes
 struct DeviceContext {
     SlotContext slot;
-    EndpointContext ep[31];
+    EndpointContext ep[ker::dev::usb::NUM_EPS];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): xHCI context ABI.
 } __attribute__((packed));
+static_assert(sizeof(DeviceContext) == sizeof(SlotContext) + (sizeof(EndpointContext) * ker::dev::usb::NUM_EPS));
 
 // -- Ring sizes --
 constexpr size_t CMD_RING_SIZE = 256;  // TRBs
@@ -193,6 +202,7 @@ struct UsbDeviceDescriptor {
     uint8_t i_serial_number;
     uint8_t b_num_configurations;
 } __attribute__((packed));
+static_assert(sizeof(UsbDeviceDescriptor) == 18);
 
 struct UsbConfigDescriptor {
     uint8_t b_length;
@@ -204,6 +214,7 @@ struct UsbConfigDescriptor {
     uint8_t bm_attributes;
     uint8_t b_max_power;
 } __attribute__((packed));
+static_assert(sizeof(UsbConfigDescriptor) == 9);
 
 struct UsbInterfaceDescriptor {
     uint8_t b_length;
@@ -216,6 +227,7 @@ struct UsbInterfaceDescriptor {
     uint8_t b_interface_protocol;
     uint8_t i_interface;
 } __attribute__((packed));
+static_assert(sizeof(UsbInterfaceDescriptor) == 9);
 
 struct UsbEndpointDescriptor {
     uint8_t b_length;
@@ -225,6 +237,7 @@ struct UsbEndpointDescriptor {
     uint16_t w_max_packet_size;
     uint8_t b_interval;
 } __attribute__((packed));
+static_assert(sizeof(UsbEndpointDescriptor) == 7);
 
 // -- USB Setup Packet --
 struct UsbSetupPacket {
@@ -234,6 +247,7 @@ struct UsbSetupPacket {
     uint16_t w_index;
     uint16_t w_length;
 } __attribute__((packed));
+static_assert(sizeof(UsbSetupPacket) == 8);
 
 // -- USB Endpoint descriptor helpers --
 constexpr uint8_t USB_EP_DIR_IN = 0x80;
@@ -272,7 +286,7 @@ struct UsbDevice {
     uint8_t device_subclass;
     uint8_t device_protocol;
     uint8_t max_packet0;
-    UsbEndpoint endpoints[16];
+    std::array<UsbEndpoint, 16> endpoints{};
     uint8_t num_endpoints;
     DeviceContext* dev_ctx;
     InputContext* input_ctx;
@@ -332,7 +346,7 @@ struct XhciController {
     uint64_t scratchpad_array_phys;
 
     // Devices
-    UsbDevice devices[MAX_XHCI_SLOTS];
+    std::array<UsbDevice, MAX_XHCI_SLOTS> devices{};
 
     // Command completion
     volatile bool cmd_done;
@@ -341,6 +355,7 @@ struct XhciController {
 };
 
 auto xhci_init() -> int;
+auto xhci_default_controller() -> XhciController*;
 
 // Internal: used by USB core for transfers
 auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* setup, void* data, size_t len, bool dir_in) -> int;

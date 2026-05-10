@@ -11,18 +11,25 @@
 namespace ker::loader::debug {
 
 GdbDebugInfo* gdb_debug_info_chain = nullptr;
-static ker::mod::sys::Spinlock gdb_debug_info_lock;
+
+namespace {
+
+using log = ker::mod::dbg::logger<"gdb">;
+
+ker::mod::sys::Spinlock gdb_debug_info_lock;
+
+}  // namespace
 
 void init_gdb_debug_info() {
     gdb_debug_info_chain = nullptr;
-    ker::mod::dbg::log("Initialized GDB debug info chain");
+    log::info("initialized debug info chain");
 }
 
 void add_gdb_debug_info(uint64_t pid, const char* name, uint64_t base_addr, uint64_t entry_point) {
     // Allocate memory for the debug info structure
-    auto const DEBUG_INFO_PADDR = (uint64_t)ker::mod::mm::phys::page_alloc();
+    auto const DEBUG_INFO_PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc());
     if (DEBUG_INFO_PADDR == 0) {
-        ker::mod::dbg::log("Failed to allocate memory for GDB debug info");
+        log::error("failed to allocate memory for debug info");
         return;
     }
 
@@ -31,7 +38,7 @@ void add_gdb_debug_info(uint64_t pid, const char* name, uint64_t base_addr, uint
     // Initialize the debug info structure
     debug_info->magic = 0x47444255;  // 'GDBU' in little endian
     debug_info->pid = pid;
-    std::strncpy(debug_info->name, name, sizeof(debug_info->name) - 1);
+    std::strncpy(debug_info->name, name, sizeof(debug_info->name) - 1);  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     debug_info->name[sizeof(debug_info->name) - 1] = '\0';
     debug_info->base_address = base_addr;
     debug_info->entry_point = entry_point;
@@ -52,10 +59,10 @@ void add_gdb_debug_info(uint64_t pid, const char* name, uint64_t base_addr, uint
     debug_info->debug_str_size = 0;
 
     // Link into the chain
-    debug_info->next_process_addr = (uint64_t)gdb_debug_info_chain;
+    debug_info->next_process_addr = reinterpret_cast<uint64_t>(gdb_debug_info_chain);
     gdb_debug_info_chain = debug_info;
 
-    ker::mod::dbg::log("Added GDB debug info for process %s (PID %x) at %x", name, pid, debug_info);
+    log::info("added debug info for process %s (PID %x) at %x", name, pid, debug_info);
 }
 
 void update_gdb_debug_section(uint64_t pid, const char* section_name, uint64_t addr, uint64_t size) {
@@ -75,10 +82,10 @@ void update_gdb_debug_section(uint64_t pid, const char* section_name, uint64_t a
                 current->debug_str_size = size;
             }
 
-            ker::mod::dbg::log("Updated GDB debug section %s for PID %x: addr=%x, size=%x", section_name, pid, addr, size);
+            log::debug("updated section %s for PID %x: addr=%x, size=%x", section_name, pid, addr, size);
             return;
         }
-        current = (GdbDebugInfo*)current->next_process_addr;
+        current = reinterpret_cast<GdbDebugInfo*>(current->next_process_addr);
     }
 }
 
@@ -87,18 +94,18 @@ void finalize_gdb_debug_info(uint64_t pid) {
     GdbDebugInfo* current = gdb_debug_info_chain;
     while (current != nullptr) {
         if (current->pid == pid) {
-            ker::mod::dbg::log("Finalized GDB debug info for PID %x", pid);
-            ker::mod::dbg::log("  Name: %s", current->name);
-            ker::mod::dbg::log("  Base: %x, Entry: %x", current->base_address, current->entry_point);
-            ker::mod::dbg::log("  ELF Header: %x", current->elf_header_addr);
-            ker::mod::dbg::log("  Section Headers: %x (count: %d)", current->section_headers_addr, current->section_count);
-            ker::mod::dbg::log("  String Table: %x (size: %x)", current->string_table_addr, current->string_table_size);
-            ker::mod::dbg::log("  Debug Info: %x (size: %x)", current->debug_info_addr, current->debug_info_size);
-            ker::mod::dbg::log("  Debug Line: %x (size: %x)", current->debug_line_addr, current->debug_line_size);
-            ker::mod::dbg::log("  Debug Str: %x (size: %x)", current->debug_str_addr, current->debug_str_size);
+            log::info("finalized debug info for PID %x", pid);
+            log::info("  Name: %s", current->name);  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+            log::info("  Base: %x, Entry: %x", current->base_address, current->entry_point);
+            log::info("  ELF Header: %x", current->elf_header_addr);
+            log::info("  Section Headers: %x (count: %d)", current->section_headers_addr, current->section_count);
+            log::info("  String Table: %x (size: %x)", current->string_table_addr, current->string_table_size);
+            log::info("  Debug Info: %x (size: %x)", current->debug_info_addr, current->debug_info_size);
+            log::info("  Debug Line: %x (size: %x)", current->debug_line_addr, current->debug_line_size);
+            log::info("  Debug Str: %x (size: %x)", current->debug_str_addr, current->debug_str_size);
             return;
         }
-        current = (GdbDebugInfo*)current->next_process_addr;
+        current = reinterpret_cast<GdbDebugInfo*>(current->next_process_addr);
     }
 }
 
@@ -112,7 +119,7 @@ void remove_gdb_debug_info(uint64_t pid) {
             // Remove from linked list
             if (prev == nullptr) {
                 // Head of list
-                gdb_debug_info_chain = (GdbDebugInfo*)current->next_process_addr;
+                gdb_debug_info_chain = reinterpret_cast<GdbDebugInfo*>(current->next_process_addr);
             } else {
                 prev->next_process_addr = current->next_process_addr;
             }
@@ -123,7 +130,7 @@ void remove_gdb_debug_info(uint64_t pid) {
             return;
         }
         prev = current;
-        current = (GdbDebugInfo*)current->next_process_addr;
+        current = reinterpret_cast<GdbDebugInfo*>(current->next_process_addr);
     }
     gdb_debug_info_lock.unlock();
 }

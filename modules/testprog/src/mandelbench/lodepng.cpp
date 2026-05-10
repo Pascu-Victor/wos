@@ -31,6 +31,7 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 #include "lodepng.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,22 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 #include <numbers>
 #include <utility>
 #endif /*LODEPNG_COMPILE_CPP*/
+
+/*
+LodePNG is kept as a single-file third-party implementation with a public C-compatible ABI, custom allocation hooks, macro-based
+error unwinding, and byte-oriented PNG/zlib buffer walking. Suppress only the lint families that are inherent to that design.
+*/
+// NOLINTBEGIN(bugprone-branch-clone, bugprone-implicit-widening-of-multiplication-result, bugprone-narrowing-conversions,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// bugprone-switch-missing-default-case, clang-analyzer-security.ArrayBound, clang-analyzer-unix.Errno,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-avoid-c-arrays, cppcoreguidelines-macro-usage, cppcoreguidelines-narrowing-conversions,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-no-malloc, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, misc-const-correctness, misc-use-anonymous-namespace,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// misc-use-internal-linkage, modernize-avoid-c-arrays)
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1310) /*Visual Studio: A few warning types are not desired here.*/
 #pragma warning(disable : 4244)             /*implicit conversions: not warned by gcc -Wall -Wextra and requires too much casts*/
@@ -368,9 +385,15 @@ unsigned lodepng_load_file(unsigned char** out, size_t* outsize, const char* fil
     }
 
     /*get filesize:*/
-    fseek(file, 0, SEEK_END);
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 78;
+    }
     size = ftell(file);
-    rewind(file);
+    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 78;
+    }
 
     /*read contents of the file into the vector*/
     *outsize = 0;
@@ -393,7 +416,7 @@ unsigned lodepng_save_file(const unsigned char* buffer, size_t buffersize, const
     if (file == nullptr) {
         return 79;
     }
-    fwrite((char*)buffer, 1, buffersize, file);
+    fwrite(buffer, 1, buffersize, file);
     fclose(file);
     return 0;
 }
@@ -409,29 +432,29 @@ unsigned lodepng_save_file(const unsigned char* buffer, size_t buffersize, const
 #ifdef LODEPNG_COMPILE_ZLIB
 #ifdef LODEPNG_COMPILE_ENCODER
 /*TODO: this ignores potential out of memory errors*/
-#define ADD_BIT_TO_STREAM(/*size_t**/ bitpointer, /*ucvector**/ bitstream, /*unsigned char*/ bit) \
-    {                                                                                             \
-        /*add a new byte at the end*/                                                             \
-        if (((*(bitpointer)) & 7) == 0) ucvector_push_back(bitstream, (unsigned char)0);          \
-        /*earlier bit of huffman code is in a lesser significant bit of an earlier byte*/         \
-        ((bitstream)->data[(bitstream)->size - 1]) |= ((bit) << ((*(bitpointer)) & 0x7));         \
-        ++(*(bitpointer));                                                                        \
+#define ADD_BIT_TO_STREAM(/*size_t**/ bitpointer, /*ucvector**/ bitstream, /*unsigned char*/ bit)     \
+    {                                                                                                 \
+        /*add a new byte at the end*/                                                                 \
+        if (((*(bitpointer)) & 7) == 0) ucvector_push_back(bitstream, static_cast<unsigned char>(0)); \
+        /*earlier bit of huffman code is in a lesser significant bit of an earlier byte*/             \
+        ((bitstream)->data[(bitstream)->size - 1]) |= ((bit) << ((*(bitpointer)) & 0x7));             \
+        ++(*(bitpointer));                                                                            \
     }
 
 static void add_bits_to_stream(size_t* bitpointer, ucvector* bitstream, unsigned value, size_t nbits) {
     size_t i = 0;
-    for (i = 0; i != nbits; ++i) ADD_BIT_TO_STREAM(bitpointer, bitstream, (unsigned char)((value >> i) & 1));
+    for (i = 0; i != nbits; ++i) ADD_BIT_TO_STREAM(bitpointer, bitstream, static_cast<unsigned char>((value >> i) & 1));
 }
 
 static void add_bits_to_stream_reversed(size_t* bitpointer, ucvector* bitstream, unsigned value, size_t nbits) {
     size_t i = 0;
-    for (i = 0; i != nbits; ++i) ADD_BIT_TO_STREAM(bitpointer, bitstream, (unsigned char)((value >> (nbits - 1 - i)) & 1));
+    for (i = 0; i != nbits; ++i) ADD_BIT_TO_STREAM(bitpointer, bitstream, static_cast<unsigned char>((value >> (nbits - 1 - i)) & 1));
 }
 #endif /*LODEPNG_COMPILE_ENCODER*/
 
 #ifdef LODEPNG_COMPILE_DECODER
 
-#define READBIT(bitpointer, bitstream) (((bitstream)[(bitpointer) >> 3] >> ((bitpointer) & 0x7)) & (unsigned char)1)
+#define READBIT(bitpointer, bitstream) (((bitstream)[(bitpointer) >> 3] >> ((bitpointer) & 0x7)) & static_cast<unsigned char>(1))
 
 static unsigned char read_bit_from_stream(size_t* bitpointer, const unsigned char* bitstream) {
     auto const RESULT = static_cast<unsigned char>(READBIT(*bitpointer, bitstream));
@@ -454,33 +477,36 @@ static unsigned read_bits_from_stream(size_t* bitpointer, const unsigned char* b
 /* / Deflate - Huffman                                                      / */
 /* ////////////////////////////////////////////////////////////////////////// */
 
-#define FIRST_LENGTH_CODE_INDEX 257
-#define LAST_LENGTH_CODE_INDEX 285
+static constexpr unsigned FIRST_LENGTH_CODE_INDEX = 257;
+static constexpr unsigned LAST_LENGTH_CODE_INDEX = 285;
 /*256 literals, the end code, some length codes, and 2 unused codes*/
-#define NUM_DEFLATE_CODE_SYMBOLS 288
+static constexpr unsigned NUM_DEFLATE_CODE_SYMBOLS = 288;
 /*the distance codes have their own symbols, 30 used, 2 unused*/
-#define NUM_DISTANCE_SYMBOLS 32
+static constexpr unsigned NUM_DISTANCE_SYMBOLS = 32;
 /*the code length codes. 0-15: code lengths, 16: copy previous 3-6 times, 17: 3-10 zeros, 18: 11-138 zeros*/
-#define NUM_CODE_LENGTH_CODES 19
+static constexpr unsigned NUM_CODE_LENGTH_CODES = 19;
 
 /*the base lengths represented by codes 257-285*/
-static const unsigned LENGTHBASE[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
-                                        31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+static constexpr std::array<unsigned, 29> LENGTHBASE = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
+                                                        31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
 
 /*the extra bits used by codes 257-285 (added to base length)*/
-static const unsigned LENGTHEXTRA[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+static constexpr std::array<unsigned, 29> LENGTHEXTRA = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+                                                         2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
 
 /*the base backwards distances (the bits of distance codes appear after length codes and use their own huffman tree)*/
-static const unsigned DISTANCEBASE[30] = {1,   2,   3,   4,   5,   7,    9,    13,   17,   25,   33,   49,   65,    97,    129,
-                                          193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+static constexpr std::array<unsigned, 30> DISTANCEBASE = {1,    2,    3,    4,    5,    7,    9,    13,    17,    25,
+                                                          33,   49,   65,   97,   129,  193,  257,  385,   513,   769,
+                                                          1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
 
 /*the extra bits of backwards distances (added to base)*/
-static const unsigned DISTANCEEXTRA[30] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
-                                           6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+static constexpr std::array<unsigned, 30> DISTANCEEXTRA = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
+                                                           6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 
 /*the order in which "code length alphabet code lengths" are stored, out of this
 the huffman tree of the dynamic huffman tree lengths is generated*/
-static const unsigned CLCL_ORDER[NUM_CODE_LENGTH_CODES] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+static constexpr std::array<unsigned, NUM_CODE_LENGTH_CODES> CLCL_ORDER = {16, 17, 18, 0, 8,  7, 9,  6, 10, 5,
+                                                                           11, 4,  12, 3, 13, 2, 14, 1, 15};
 
 /* ////////////////////////////////////////////////////////////////////////// */
 
@@ -1296,7 +1322,7 @@ static unsigned lodepng_inflatev(ucvector* out, const unsigned char* in, size_t 
     size_t pos = 0; /*byte position in the out buffer*/
     unsigned error = 0;
 
-    (void)settings;
+    static_cast<void>(settings);
 
     while (bfinal == 0U) {
         unsigned btype = 0;
@@ -1351,7 +1377,7 @@ static unsigned inflate(unsigned char** out, size_t* outsize, const unsigned cha
 /* / Deflator (Compressor)                                                  / */
 /* ////////////////////////////////////////////////////////////////////////// */
 
-static const size_t MAX_SUPPORTED_DEFLATE_LENGTH = 258;
+static constexpr size_t MAX_SUPPORTED_DEFLATE_LENGTH = 258;
 
 /*bitlen is the size in bits of the code*/
 static void add_huffman_symbol(size_t* bp, ucvector* compressed, unsigned code, unsigned bitlen) {
@@ -1360,14 +1386,15 @@ static void add_huffman_symbol(size_t* bp, ucvector* compressed, unsigned code, 
 
 /*search the index in the array, that has the largest value smaller than or equal to the given value,
 given array must be sorted (if no value is smaller, it returns the size of the given array)*/
-static size_t search_code_index(const unsigned* array, size_t array_size, size_t value) {
+template <size_t Size>
+static size_t search_code_index(const std::array<unsigned, Size>& array, size_t value) {
     /*linear search implementation*/
     /*for(size_t i = 1; i < array_size; ++i) if(array[i] > value) return i - 1;
     return array_size - 1;*/
 
     /*binary search implementation (not that much faster) (precondition: array_size > 0)*/
     size_t left = 1;
-    size_t right = array_size - 1;
+    size_t right = array.size() - 1;
     while (left <= right) {
         size_t const MID = (left + right) / 2;
         if (array[MID] <= value) {
@@ -1378,7 +1405,7 @@ static size_t search_code_index(const unsigned* array, size_t array_size, size_t
             return MID - 1;
         }
     }
-    return array_size - 1;
+    return array.size() - 1;
 }
 
 static void add_length_distance(uivector* values, size_t length, size_t distance) {
@@ -1388,9 +1415,9 @@ static void add_length_distance(uivector* values, size_t length, size_t distance
     257-285: length/distance pair (length code, followed by extra length bits, distance code, extra distance bits)
     286-287: invalid*/
 
-    auto const LENGTH_CODE = static_cast<unsigned>(search_code_index(LENGTHBASE, 29, length));
+    auto const LENGTH_CODE = static_cast<unsigned>(search_code_index(LENGTHBASE, length));
     auto const EXTRA_LENGTH = static_cast<unsigned>(length - LENGTHBASE[LENGTH_CODE]);
-    auto const DIST_CODE = static_cast<unsigned>(search_code_index(DISTANCEBASE, 30, distance));
+    auto const DIST_CODE = static_cast<unsigned>(search_code_index(DISTANCEBASE, distance));
     auto const EXTRA_DISTANCE = static_cast<unsigned>(distance - DISTANCEBASE[DIST_CODE]);
 
     uivector_push_back(values, LENGTH_CODE + FIRST_LENGTH_CODE_INDEX);
@@ -1401,8 +1428,8 @@ static void add_length_distance(uivector* values, size_t length, size_t distance
 
 /*3 bytes of data get encoded into two bytes. The hash cannot use more than 3
 bytes as input because 3 is the minimum match length for deflate*/
-static const unsigned HASH_NUM_VALUES = 65536;
-static const unsigned HASH_BIT_MASK = 65535; /*HASH_NUM_VALUES - 1, but C90 does not like that as initializer*/
+static constexpr unsigned HASH_NUM_VALUES = 65536;
+static constexpr unsigned HASH_BIT_MASK = 65535; /*HASH_NUM_VALUES - 1, but C90 does not like that as initializer*/
 
 using Hash = struct Hash {
     int* head; /*hash value to head circular pos - can be outdated if went around window*/
@@ -2333,7 +2360,7 @@ static unsigned zlib_compress(unsigned char** out, size_t* outsize, const unsign
 #ifdef LODEPNG_COMPILE_ENCODER
 
 /*this is a good tradeoff between speed and compression ratio*/
-#define DEFAULT_WINDOWSIZE 2048
+static constexpr unsigned DEFAULT_WINDOWSIZE = 2048;
 
 void lodepng_compress_settings_init(LodePNGCompressSettings* settings) {
     /*compress with dynamic huffman tree (not in the mathematical sense, just not the predefined one)*/
@@ -2570,7 +2597,7 @@ unsigned lodepng_chunk_create(unsigned char** out, size_t* outlength, unsigned l
     chunk = &(*out)[(*outlength) - length - 12];
 
     /*1: length*/
-    lodepng_set32bit_int(chunk, (unsigned)length);
+    lodepng_set32bit_int(chunk, length);
 
     /*2: chunk name (4 letters)*/
     chunk[4] = static_cast<unsigned char>(type[0]);
@@ -3769,10 +3796,12 @@ static unsigned char paeth_predictor(short a, short b, short c) {
 
 /*shared values used by multiple Adam7 related functions*/
 
-static const unsigned ADAM7_IX[7] = {0, 4, 0, 2, 0, 1, 0}; /*x start values*/
-static const unsigned ADAM7_IY[7] = {0, 0, 4, 0, 2, 0, 1}; /*y start values*/
-static const unsigned ADAM7_DX[7] = {8, 8, 4, 4, 2, 2, 1}; /*x delta values*/
-static const unsigned ADAM7_DY[7] = {8, 8, 8, 4, 4, 2, 2}; /*y delta values*/
+static constexpr std::array<unsigned, 7> ADAM7_IX = {0, 4, 0, 2, 0, 1, 0}; /*x start values*/
+static constexpr std::array<unsigned, 7> ADAM7_IY = {0, 0, 4, 0, 2, 0, 1}; /*y start values*/
+static constexpr std::array<unsigned, 7> ADAM7_DX = {8, 8, 4, 4, 2, 2, 1}; /*x delta values*/
+static constexpr std::array<unsigned, 7> ADAM7_DY = {8, 8, 8, 4, 4, 2, 2}; /*y delta values*/
+
+static size_t scanline_byte_width(unsigned pixel_width, unsigned bpp) { return ((static_cast<size_t>(pixel_width) * bpp) + 7) / 8; }
 
 /*
 Outputs various dimensions and positions in the image related to the Adam7 reduced images.
@@ -3789,8 +3818,9 @@ bpp: bits per pixel
 "padded" is only relevant if bpp is less than 8 and a scanline or image does not
  end at a full byte
 */
-static void adam7_getpassvalues(unsigned passw[7], unsigned passh[7], size_t filter_passstart[8], size_t padded_passstart[8],
-                                size_t passstart[8], unsigned w, unsigned h, unsigned bpp) {
+static void adam7_getpassvalues(std::array<unsigned, 7>& passw, std::array<unsigned, 7>& passh, std::array<size_t, 8>& filter_passstart,
+                                std::array<size_t, 8>& padded_passstart, std::array<size_t, 8>& passstart, unsigned w, unsigned h,
+                                unsigned bpp) {
     /*the passstart values have 8 values: the 8th one indicates the byte after the end of the 7th (= last) pass*/
     unsigned i = 0;
 
@@ -3808,13 +3838,15 @@ static void adam7_getpassvalues(unsigned passw[7], unsigned passh[7], size_t fil
 
     filter_passstart[0] = padded_passstart[0] = passstart[0] = 0;
     for (i = 0; i != 7; ++i) {
+        size_t const PASS_LINEBYTES = scanline_byte_width(passw[i], bpp);
+        size_t const PASS_BITS = static_cast<size_t>(passw[i]) * bpp;
         /*if passw[i] is 0, it's 0 bytes, not 1 (no filtertype-byte)*/
         filter_passstart[i + 1] =
-            filter_passstart[i] + (((passw[i] != 0U) && (passh[i] != 0U)) ? passh[i] * (1 + (((passw[i] * bpp) + 7) / 8)) : 0);
+            filter_passstart[i] + (((passw[i] != 0U) && (passh[i] != 0U)) ? static_cast<size_t>(passh[i]) * (1 + PASS_LINEBYTES) : 0);
         /*bits padded if needed to fill full byte at end of each scanline*/
-        padded_passstart[i + 1] = padded_passstart[i] + (passh[i] * (((passw[i] * bpp) + 7) / 8));
+        padded_passstart[i + 1] = padded_passstart[i] + (static_cast<size_t>(passh[i]) * PASS_LINEBYTES);
         /*only padded at end of reduced image*/
-        passstart[i + 1] = passstart[i] + (((passh[i] * passw[i] * bpp) + 7) / 8);
+        passstart[i + 1] = passstart[i] + (((static_cast<size_t>(passh[i]) * PASS_BITS) + 7) / 8);
     }
 }
 
@@ -3996,11 +4028,11 @@ out must be big enough AND must be 0 everywhere if bpp < 8 in the current implem
 NOTE: comments about padding bits are only relevant if bpp < 8
 */
 static void adam7_deinterlace(unsigned char* out, const unsigned char* in, unsigned w, unsigned h, unsigned bpp) {
-    unsigned passw[7];
-    unsigned passh[7];
-    size_t filter_passstart[8];
-    size_t padded_passstart[8];
-    size_t passstart[8];
+    std::array<unsigned, 7> passw{};
+    std::array<unsigned, 7> passh{};
+    std::array<size_t, 8> filter_passstart{};
+    std::array<size_t, 8> padded_passstart{};
+    std::array<size_t, 8> passstart{};
     unsigned i = 0;
 
     adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, bpp);
@@ -4096,11 +4128,11 @@ static unsigned post_process_scanlines(unsigned char* out, unsigned char* in, un
             CERROR_TRY_RETURN(unfilter(out, in, w, h, BPP));
     } else /*interlace_method is 1 (Adam7)*/
     {
-        unsigned passw[7];
-        unsigned passh[7];
-        size_t filter_passstart[8];
-        size_t padded_passstart[8];
-        size_t passstart[8];
+        std::array<unsigned, 7> passw{};
+        std::array<unsigned, 7> passh{};
+        std::array<size_t, 8> filter_passstart{};
+        std::array<size_t, 8> padded_passstart{};
+        std::array<size_t, 8> passstart{};
         unsigned i = 0;
 
         adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, BPP);
@@ -4812,7 +4844,7 @@ void lodepng_state_copy(LodePNGState* dest, const LodePNGState* source) {
 
 /*chunkName must be string of 4 characters*/
 static unsigned add_chunk(ucvector* out, const char* chunk_name, const unsigned char* data, size_t length) {
-    CERROR_TRY_RETURN(lodepng_chunk_create(&out->data, &out->size, (unsigned)length, chunk_name, data));
+    CERROR_TRY_RETURN(lodepng_chunk_create(&out->data, &out->size, static_cast<unsigned>(length), chunk_name, data));
     out->allocsize = out->size; /*fix the allocsize again*/
     return 0;
 }
@@ -4969,7 +5001,7 @@ static unsigned add_chunk_z_t_xt(ucvector* out, const char* keyword, const char*
     ucvector_push_back(&data, 0); /*0 termination char*/
     ucvector_push_back(&data, 0); /*compression method: 0*/
 
-    error = zlib_compress(&compressed.data, &compressed.size, (unsigned char*)textstring, TEXTSIZE, zlibsettings);
+    error = zlib_compress(&compressed.data, &compressed.size, reinterpret_cast<const unsigned char*>(textstring), TEXTSIZE, zlibsettings);
     if (error == 0U) {
         for (i = 0; i != compressed.size; ++i) {
             ucvector_push_back(&data, compressed.data[i]);
@@ -5012,7 +5044,8 @@ static unsigned add_chunk_i_t_xt(ucvector* out, unsigned compressed, const char*
     if (compressed != 0U) {
         ucvector compressed_data;
         ucvector_init(&compressed_data);
-        error = zlib_compress(&compressed_data.data, &compressed_data.size, (unsigned char*)textstring, TEXTSIZE, zlibsettings);
+        error = zlib_compress(&compressed_data.data, &compressed_data.size, reinterpret_cast<const unsigned char*>(textstring), TEXTSIZE,
+                              zlibsettings);
         if (error == 0U) {
             for (i = 0; i != compressed_data.size; ++i) {
                 ucvector_push_back(&data, compressed_data.data[i]);
@@ -5431,11 +5464,11 @@ out is possibly bigger due to padding bits between reduced images
 NOTE: comments about padding bits are only relevant if bpp < 8
 */
 static void adam7_interlace(unsigned char* out, const unsigned char* in, unsigned w, unsigned h, unsigned bpp) {
-    unsigned passw[7];
-    unsigned passh[7];
-    size_t filter_passstart[8];
-    size_t padded_passstart[8];
-    size_t passstart[8];
+    std::array<unsigned, 7> passw{};
+    std::array<unsigned, 7> passh{};
+    std::array<size_t, 8> filter_passstart{};
+    std::array<size_t, 8> padded_passstart{};
+    std::array<size_t, 8> passstart{};
     unsigned i = 0;
 
     adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, bpp);
@@ -5493,7 +5526,8 @@ static unsigned pre_process_scanlines(unsigned char** out, size_t* outsize, cons
     unsigned error = 0;
 
     if (info_png->interlace_method == 0) {
-        *outsize = h + (h * (((w * BPP) + 7) / 8)); /*image size plus an extra byte per scanline + possible padding bits*/
+        size_t const LINEBYTES = scanline_byte_width(w, BPP);
+        *outsize = static_cast<size_t>(h) + (static_cast<size_t>(h) * LINEBYTES); /*image size plus one filter byte per scanline*/
         *out = static_cast<unsigned char*>(lodepng_malloc(*outsize));
         if (((*out) == nullptr) && ((*outsize) != 0U)) {
             error = 83; /*alloc fail*/
@@ -5501,13 +5535,13 @@ static unsigned pre_process_scanlines(unsigned char** out, size_t* outsize, cons
 
         if (error == 0U) {
             /*non multiple of 8 bits per scanline, padding bits needed per scanline*/
-            if (BPP < 8 && w * BPP != (((w * BPP) + 7) / 8) * 8) {
-                auto* padded = static_cast<unsigned char*>(lodepng_malloc(h * (((w * BPP) + 7) / 8)));
+            if (BPP < 8 && static_cast<size_t>(w) * BPP != LINEBYTES * 8) {
+                auto* padded = static_cast<unsigned char*>(lodepng_malloc(static_cast<size_t>(h) * LINEBYTES));
                 if (padded == nullptr) {
                     error = 83; /*alloc fail*/
                 }
                 if (error == 0U) {
-                    add_padding_bits(padded, in, (((w * BPP) + 7) / 8) * 8, w * BPP, h);
+                    add_padding_bits(padded, in, LINEBYTES * 8, static_cast<size_t>(w) * BPP, h);
                     error = filter(*out, padded, w, h, &info_png->color, settings);
                 }
                 lodepng_free(padded);
@@ -5518,11 +5552,11 @@ static unsigned pre_process_scanlines(unsigned char** out, size_t* outsize, cons
         }
     } else /*interlace_method is 1 (Adam7)*/
     {
-        unsigned passw[7];
-        unsigned passh[7];
-        size_t filter_passstart[8];
-        size_t padded_passstart[8];
-        size_t passstart[8];
+        std::array<unsigned, 7> passw{};
+        std::array<unsigned, 7> passh{};
+        std::array<size_t, 8> filter_passstart{};
+        std::array<size_t, 8> padded_passstart{};
+        std::array<size_t, 8> passstart{};
         unsigned char* adam7 = nullptr;
 
         adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, BPP);
@@ -5546,7 +5580,8 @@ static unsigned pre_process_scanlines(unsigned char** out, size_t* outsize, cons
                 if (BPP < 8) {
                     auto* padded = static_cast<unsigned char*>(lodepng_malloc(padded_passstart[i + 1] - padded_passstart[i]));
                     if (padded == nullptr) ERROR_BREAK(83); /*alloc fail*/
-                    add_padding_bits(padded, &adam7[passstart[i]], (((passw[i] * BPP) + 7) / 8) * 8, passw[i] * BPP, passh[i]);
+                    size_t const PASS_LINEBYTES = scanline_byte_width(passw[i], BPP);
+                    add_padding_bits(padded, &adam7[passstart[i]], PASS_LINEBYTES * 8, static_cast<size_t>(passw[i]) * BPP, passh[i]);
                     error = filter(&(*out)[filter_passstart[i]], padded, passw[i], passh[i], &info_png->color, settings);
                     lodepng_free(padded);
                 } else {
@@ -6082,7 +6117,7 @@ unsigned save_file(const std::vector<unsigned char>& buffer, const std::string& 
     if (!file) {
         return 79;
     }
-    file.write(buffer.empty() ? nullptr : (char*)buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    file.write(buffer.empty() ? nullptr : reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
     return 0;
 }
 #endif /* LODEPNG_COMPILE_DISK */
@@ -6248,3 +6283,15 @@ unsigned encode(const std::string& filename, const std::vector<unsigned char>& i
 #endif /* LODEPNG_COMPILE_PNG */
 } /* namespace lodepng */
 #endif /*LODEPNG_COMPILE_CPP*/
+
+// NOLINTEND(bugprone-branch-clone, bugprone-implicit-widening-of-multiplication-result, bugprone-narrowing-conversions,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// bugprone-switch-missing-default-case, clang-analyzer-security.ArrayBound, clang-analyzer-unix.Errno,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-avoid-c-arrays, cppcoreguidelines-macro-usage, cppcoreguidelines-narrowing-conversions,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-no-malloc, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, misc-const-correctness, misc-use-anonymous-namespace,
+// NOLINTNEXTLINE(readability-comment-starts-with-space)
+// misc-use-internal-linkage, modernize-avoid-c-arrays)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
 #include <net/netdevice.hpp>
@@ -37,6 +38,7 @@ struct IvshmemHeader {
     uint32_t vm_id;       // Set by each VM on init (0 or 1)
     uint32_t peer_ready;  // Set to 1 when peer has initialized
 } __attribute__((packed));
+static_assert(sizeof(IvshmemHeader) == 32);
 
 struct RingBuffer {
     volatile uint32_t head;  // Written by producer

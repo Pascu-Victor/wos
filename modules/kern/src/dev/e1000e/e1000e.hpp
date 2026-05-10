@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
 #include <net/netdevice.hpp>
@@ -89,6 +91,7 @@ struct E1000RxDesc {
     uint8_t errors;     // Descriptor errors
     uint16_t special;
 } __attribute__((packed));
+static_assert(sizeof(E1000RxDesc) == 16);
 
 constexpr uint8_t RX_STATUS_DD = (1U << 0);   // Descriptor Done
 constexpr uint8_t RX_STATUS_EOP = (1U << 1);  // End of Packet
@@ -103,6 +106,7 @@ struct E1000TxDesc {
     uint8_t css;      // Checksum start
     uint16_t special;
 } __attribute__((packed));
+static_assert(sizeof(E1000TxDesc) == 16);
 
 constexpr uint8_t TX_CMD_EOP = (1U << 0);    // End of Packet
 constexpr uint8_t TX_CMD_IFCS = (1U << 1);   // Insert FCS/CRC
@@ -117,12 +121,12 @@ struct E1000Device {
 
     // RX ring
     E1000RxDesc* rx_descs = nullptr;  // physically contiguous
-    ker::net::PacketBuffer* rx_bufs[NUM_RX_DESC] = {};
+    std::array<ker::net::PacketBuffer*, NUM_RX_DESC> rx_bufs{};
     uint16_t rx_tail = 0;
 
     // TX ring
     E1000TxDesc* tx_descs = nullptr;  // physically contiguous
-    ker::net::PacketBuffer* tx_bufs[NUM_TX_DESC] = {};
+    std::array<ker::net::PacketBuffer*, NUM_TX_DESC> tx_bufs{};
     uint16_t tx_tail = 0;
 
     uint8_t irq_vector = 0;

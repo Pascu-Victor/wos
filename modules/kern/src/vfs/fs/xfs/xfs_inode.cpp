@@ -56,7 +56,7 @@ auto icache_hash(xfs_ino_t ino) -> size_t {
 // Look up an inode in the cache.  Returns with bucket locked and refcount
 // incremented if found, or nullptr with bucket locked if not found.
 auto icache_lookup_locked(xfs_ino_t ino, size_t bucket) -> XfsInode* {
-    XfsInode* ip = icache[bucket].head;
+    XfsInode* ip = icache.at(bucket).head;
     while (ip != nullptr) {
         if (ip->ino == ino) {
             ip->refcount++;
@@ -69,13 +69,13 @@ auto icache_lookup_locked(xfs_ino_t ino, size_t bucket) -> XfsInode* {
 
 // Insert an inode into the cache.  Caller must hold bucket lock.
 void icache_insert_locked(XfsInode* ip, size_t bucket) {
-    ip->hash_next = icache[bucket].head;
-    icache[bucket].head = ip;
+    ip->hash_next = icache.at(bucket).head;
+    icache.at(bucket).head = ip;
 }
 
 // Remove an inode from the cache.  Caller must hold bucket lock.
 void icache_remove_locked(XfsInode* ip, size_t bucket) {
-    XfsInode** pp = &icache[bucket].head;
+    XfsInode** pp = &icache.at(bucket).head;
     while (*pp != nullptr) {
         if (*pp == ip) {
             *pp = ip->hash_next;
@@ -264,13 +264,13 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     size_t const BUCKET = icache_hash(ino);
 
     // Check cache first
-    uint64_t flags = icache[BUCKET].lock.lock_irqsave();
+    uint64_t flags = icache.at(BUCKET).lock.lock_irqsave();
     XfsInode* ip = icache_lookup_locked(ino, BUCKET);
     if (ip != nullptr) {
-        icache[BUCKET].lock.unlock_irqrestore(flags);
+        icache.at(BUCKET).lock.unlock_irqrestore(flags);
         return ip;
     }
-    icache[BUCKET].lock.unlock_irqrestore(flags);
+    icache.at(BUCKET).lock.unlock_irqrestore(flags);
 
     // Not in cache - read from disk
     xfs_fsblock_t const BLOCK = xfs_inode_block(mount, ino);
@@ -405,16 +405,16 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     ip->hash_next = nullptr;
     ip->dirty = false;
 
-    flags = icache[BUCKET].lock.lock_irqsave();
+    flags = icache.at(BUCKET).lock.lock_irqsave();
     // Check for a race - another thread might have loaded the same inode
     XfsInode* existing = icache_lookup_locked(ino, BUCKET);
     if (existing != nullptr) {
-        icache[BUCKET].lock.unlock_irqrestore(flags);
+        icache.at(BUCKET).lock.unlock_irqrestore(flags);
         free_inode(ip);
         return existing;
     }
     icache_insert_locked(ip, BUCKET);
-    icache[BUCKET].lock.unlock_irqrestore(flags);
+    icache.at(BUCKET).lock.unlock_irqrestore(flags);
 
     return ip;
 }
@@ -425,14 +425,14 @@ void xfs_inode_release(XfsInode* ip) {
     }
 
     size_t const BUCKET = icache_hash(ip->ino);
-    uint64_t const FLAGS = icache[BUCKET].lock.lock_irqsave();
+    uint64_t const FLAGS = icache.at(BUCKET).lock.lock_irqsave();
 
     ip->refcount--;
     if (ip->refcount <= 0) {
         // Inode is no longer referenced - remove from cache and free
         bool const NEEDS_INACTIVATION = (ip->nlink == 0);
         icache_remove_locked(ip, BUCKET);
-        icache[BUCKET].lock.unlock_irqrestore(FLAGS);
+        icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
         if (NEEDS_INACTIVATION) {
             inactivate_unlinked_inode(ip);
         }
@@ -440,7 +440,7 @@ void xfs_inode_release(XfsInode* ip) {
         return;
     }
 
-    icache[BUCKET].lock.unlock_irqrestore(FLAGS);
+    icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
 }
 
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {

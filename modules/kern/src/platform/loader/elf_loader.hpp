@@ -28,7 +28,7 @@ struct ElfLoadResult {
 
     // PT_INTERP fields — set when the ELF requests a dynamic linker
     static constexpr unsigned INTERP_PATH_MAX = 256;
-    char interp_path[INTERP_PATH_MAX] = {};  // e.g. "/lib/ld.so"
+    char interp_path[INTERP_PATH_MAX] = {};  // NOLINT: c-string ABI consumed by exec/task paths.
     bool has_interp = false;                 // true if PT_INTERP was found
 };
 

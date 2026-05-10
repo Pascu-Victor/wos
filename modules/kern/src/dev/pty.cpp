@@ -3,6 +3,7 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <span>
 #include <util/radix_tree.hpp>
 #include <utility>
 #include <vfs/file.hpp>
@@ -62,7 +64,7 @@ auto PtyRingBuf::write(const void* src, size_t len) -> size_t {
     const auto* bytes = static_cast<const uint8_t*>(src);
     size_t written = 0;
     while (written < len && count < PTY_BUF_SIZE) {
-        data[head] = bytes[written];
+        data.at(head) = bytes[written];
         head = (head + 1) % PTY_BUF_SIZE;
         count++;
         written++;
@@ -74,7 +76,7 @@ auto PtyRingBuf::read(void* dst, size_t len) -> size_t {
     auto* bytes = static_cast<uint8_t*>(dst);
     size_t rd = 0;
     while (rd < len && count > 0) {
-        bytes[rd] = data[tail];
+        bytes[rd] = data.at(tail);
         tail = (tail + 1) % PTY_BUF_SIZE;
         count--;
         rd++;
@@ -107,15 +109,15 @@ auto devfs_file_from_file(ker::vfs::File* f, const char* op) -> DevFSFileHack* {
     }
     auto* dff = static_cast<DevFSFileHack*>(f->private_data);
     if (!is_valid_kernel_pointer(dff)) {
-        ker::mod::dbg::log("pty_%s: invalid devfs wrapper %p", op, dff);
+        log::warn("pty_%s: invalid devfs wrapper %p", op, dff);
         return nullptr;
     }
     if (dff->magic != DEVFS_FILE_MAGIC) {
-        ker::mod::dbg::log("pty_%s: bad devfs wrapper magic 0x%x at %p", op, dff->magic, dff);
+        log::warn("pty_%s: bad devfs wrapper magic 0x%x at %p", op, dff->magic, dff);
         return nullptr;
     }
     if (dff->device != nullptr && !is_valid_kernel_pointer(dff->device)) {
-        ker::mod::dbg::log("pty_%s: invalid device pointer %p in wrapper %p", op, dff->device, dff);
+        log::warn("pty_%s: invalid device pointer %p in wrapper %p", op, dff->device, dff);
         return nullptr;
     }
     return dff;
@@ -127,11 +129,11 @@ auto pair_from_device(ker::dev::Device* device, const char* op) -> PtyPair* {
     }
     auto* pair = static_cast<PtyPair*>(device->private_data);
     if (pair == nullptr || !is_valid_kernel_pointer(pair)) {
-        ker::mod::dbg::log("pty_%s: invalid pair pointer %p from device %p", op, pair, device);
+        log::warn("pty_%s: invalid pair pointer %p from device %p", op, pair, device);
         return nullptr;
     }
     if (device != &pair->master_dev && device != &pair->slave_dev) {
-        ker::mod::dbg::log("pty_%s: device %p does not belong to pair %p", op, device, pair);
+        log::warn("pty_%s: device %p does not belong to pair %p", op, device, pair);
         return nullptr;
     }
     return pair;
@@ -155,15 +157,30 @@ auto current_task_has_deliverable_signal() -> bool {
     return (task->sig_pending & ~task->sig_mask) != 0;
 }
 
+auto make_devfs_name(const char* name) -> std::array<char, vfs::devfs::DEVFS_NAME_MAX> {
+    std::array<char, vfs::devfs::DEVFS_NAME_MAX> devfs_name{};
+    size_t const COPY_LEN = std::min(std::strlen(name) + 1, devfs_name.size());
+    std::copy_n(name, COPY_LEN, devfs_name.data());
+    devfs_name.back() = '\0';
+    return devfs_name;
+}
+
+auto make_pts_path(const std::array<char, 8>& slave_name) -> std::array<char, vfs::devfs::DEVFS_NAME_MAX> {
+    constexpr std::array<char, 4> PTS_PREFIX = {'p', 't', 's', '/'};
+
+    std::array<char, vfs::devfs::DEVFS_NAME_MAX> pts_path{};
+    std::ranges::copy(PTS_PREFIX, pts_path.begin());
+    std::copy_n(slave_name.data(), std::strlen(slave_name.data()) + 1, pts_path.data() + PTS_PREFIX.size());
+    return pts_path;
+}
+
 void pty_unregister_slave(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
 
-    char pts_path[16]{};
-    strcpy(pts_path, "pts/");
-    std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
-    ker::vfs::devfs::devfs_remove_node(pts_path);
+    auto pts_path = make_pts_path(pair->slave_name);
+    ker::vfs::devfs::devfs_remove_node(pts_path.data());
     ker::dev::dev_unregister(&pair->slave_dev);
 }
 
@@ -188,8 +205,8 @@ void pty_detach_devices(PtyPair* pair) {
 }
 
 auto register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
-    for (size_t i = 0; i < waiters.size(); i++) {
-        if (waiters[i] == pid) {
+    for (uint64_t const WAITER_PID : waiters) {
+        if (WAITER_PID == pid) {
             return true;
         }
     }
@@ -209,9 +226,9 @@ auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* w
     return true;
 }
 
-void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
-    for (size_t i = 0; i < waiter_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
+void wake_waiters(std::span<const uint64_t> waiters) {
+    for (uint64_t const WAITER_PID : waiters) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(WAITER_PID);
         if (waiter == nullptr) {
             continue;
         }
@@ -226,15 +243,15 @@ void wake_waiters(const uint64_t* waiters, size_t waiter_count) {
 }
 
 void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, ker::util::SmallVec<uint64_t, 2>& waiters) {
-    uint64_t pending[32]{};
+    std::array<uint64_t, 32> pending{};
     uint64_t const IRQF = lock.lock_irqsave();
-    size_t const PENDING_COUNT = std::min(waiters.size(), size_t{32});
+    size_t const PENDING_COUNT = std::min(waiters.size(), pending.size());
     for (size_t i = 0; i < PENDING_COUNT; i++) {
-        pending[i] = waiters[i];
+        pending.at(i) = waiters.at(i);
     }
     waiters.clear();
     lock.unlock_irqrestore(IRQF);
-    wake_waiters(pending, PENDING_COUNT);
+    wake_waiters(std::span(pending.data(), PENDING_COUNT));
 }
 
 void wake_master_pollers(PtyPair* pair) {
@@ -283,23 +300,23 @@ void wake_both_pollers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    uint64_t master_pending[32]{};
-    uint64_t slave_pending[32]{};
+    std::array<uint64_t, 32> master_pending{};
+    std::array<uint64_t, 32> slave_pending{};
     uint64_t const IRQF = pair->lock.lock_irqsave();
-    size_t const MASTER_PENDING_COUNT = std::min(pair->master_poll_waiters.size(), size_t{32});
+    size_t const MASTER_PENDING_COUNT = std::min(pair->master_poll_waiters.size(), master_pending.size());
     for (size_t i = 0; i < MASTER_PENDING_COUNT; i++) {
-        master_pending[i] = pair->master_poll_waiters[i];
+        master_pending.at(i) = pair->master_poll_waiters.at(i);
     }
     pair->master_poll_waiters.clear();
 
-    size_t const SLAVE_PENDING_COUNT = std::min(pair->slave_poll_waiters.size(), size_t{32});
+    size_t const SLAVE_PENDING_COUNT = std::min(pair->slave_poll_waiters.size(), slave_pending.size());
     for (size_t i = 0; i < SLAVE_PENDING_COUNT; i++) {
-        slave_pending[i] = pair->slave_poll_waiters[i];
+        slave_pending.at(i) = pair->slave_poll_waiters.at(i);
     }
     pair->slave_poll_waiters.clear();
     pair->lock.unlock_irqrestore(IRQF);
-    wake_waiters(master_pending, MASTER_PENDING_COUNT);
-    wake_waiters(slave_pending, SLAVE_PENDING_COUNT);
+    wake_waiters(std::span(master_pending.data(), MASTER_PENDING_COUNT));
+    wake_waiters(std::span(slave_pending.data(), SLAVE_PENDING_COUNT));
 }
 
 auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
@@ -409,10 +426,10 @@ auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* rep
     }
 
     if (pair->cpr_filter_len < CPR_FILTER_BUF_SIZE) {
-        pair->cpr_filter_buf[pair->cpr_filter_len++] = ch;
+        pair->cpr_filter_buf.at(pair->cpr_filter_len++) = ch;
     } else {
         for (size_t i = 0; i < pair->cpr_filter_len; i++) {
-            replay_out[i] = pair->cpr_filter_buf[i];
+            replay_out[i] = pair->cpr_filter_buf.at(i);
         }
         *replay_len_out = pair->cpr_filter_len;
         pair->cpr_filter_active = false;
@@ -420,7 +437,7 @@ auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* rep
         return CprFeedAction::REPLAY;
     }
 
-    switch (classify_cpr_prefix(pair->cpr_filter_buf, pair->cpr_filter_len)) {
+    switch (classify_cpr_prefix(pair->cpr_filter_buf.data(), pair->cpr_filter_len)) {
         case CprPrefixMatch::PREFIX:
             return CprFeedAction::HOLD;
         case CprPrefixMatch::COMPLETE:
@@ -430,7 +447,7 @@ auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* rep
         case CprPrefixMatch::INVALID:
         default:
             for (size_t i = 0; i < pair->cpr_filter_len; i++) {
-                replay_out[i] = pair->cpr_filter_buf[i];
+                replay_out[i] = pair->cpr_filter_buf.at(i);
             }
             *replay_len_out = pair->cpr_filter_len;
             pair->cpr_filter_active = false;
@@ -441,7 +458,6 @@ auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* rep
 
 ker::util::RadixTree<PtyPair*> pty_tree;
 ker::mod::sys::Spinlock pty_tree_lock;
-size_t pty_next_index = 0;
 bool pty_initialized = false;
 
 // --- Master-side device operations ---
@@ -619,6 +635,11 @@ void pty_echo_ctrl(PtyPair* pair, uint8_t ch) {
     pair->s2m.write(&letter, 1);
 }
 
+void pty_echo_erase(PtyPair* pair) {
+    constexpr std::array<uint8_t, 3> ERASE = {'\b', ' ', '\b'};
+    pair->s2m.write(ERASE.data(), ERASE.size());
+}
+
 ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     auto* pair = pair_from_file(file);
     if (pair == nullptr) {
@@ -646,7 +667,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     const auto* bytes = static_cast<const uint8_t*>(buf);
     size_t processed = 0;
 
-    uint8_t replay_buf[CPR_FILTER_BUF_SIZE]{};
+    std::array<uint8_t, CPR_FILTER_BUF_SIZE> replay_buf{};
     size_t replay_pos = 0;
     size_t replay_len = 0;
 
@@ -655,7 +676,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         uint8_t ch = 0;
 
         if (replay_pos < replay_len) {
-            ch = replay_buf[replay_pos++];
+            ch = replay_buf.at(replay_pos++);
             from_replay = true;
             if (replay_pos == replay_len) {
                 replay_pos = 0;
@@ -669,9 +690,9 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         uint64_t const IRQF = pair->lock.lock_irqsave();
 
         if (!from_replay) {
-            uint8_t filter_replay[CPR_FILTER_BUF_SIZE]{};
+            std::array<uint8_t, CPR_FILTER_BUF_SIZE> filter_replay{};
             size_t filter_replay_len = 0;
-            CprFeedAction const FILTER_ACTION = cpr_filter_feed(pair, ch, filter_replay, &filter_replay_len);
+            CprFeedAction const FILTER_ACTION = cpr_filter_feed(pair, ch, filter_replay.data(), &filter_replay_len);
 
             if (FILTER_ACTION == CprFeedAction::HOLD || FILTER_ACTION == CprFeedAction::DROP) {
                 pair->lock.unlock_irqrestore(IRQF);
@@ -682,9 +703,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 pair->lock.unlock_irqrestore(IRQF);
                 processed++;
                 if (filter_replay_len > 0) {
-                    for (size_t j = 0; j < filter_replay_len; j++) {
-                        replay_buf[j] = filter_replay[j];
-                    }
+                    std::copy_n(filter_replay.data(), filter_replay_len, replay_buf.data());
                     replay_pos = 0;
                     replay_len = filter_replay_len;
                 }
@@ -767,8 +786,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 if (pair->canon_len > 0) {
                     pair->canon_len--;
                     if ((pair->termios.c_lflag & TIOS_ECHOE) != 0U) {
-                        uint8_t erase[] = {'\b', ' ', '\b'};
-                        pair->s2m.write(erase, 3);
+                        pty_echo_erase(pair);
                     }
                 }
                 pair->lock.unlock_irqrestore(IRQF);
@@ -781,8 +799,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             if (ch == pair->termios.c_cc[CC_VKILL] && pair->termios.c_cc[CC_VKILL] != 0) {
                 if ((pair->termios.c_lflag & (TIOS_ECHOK | TIOS_ECHOE)) != 0U) {
                     while (pair->canon_len > 0) {
-                        uint8_t erase[] = {'\b', ' ', '\b'};
-                        pair->s2m.write(erase, 3);
+                        pty_echo_erase(pair);
                         pair->canon_len--;
                     }
                 }
@@ -796,7 +813,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
 
             if (ch == pair->termios.c_cc[CC_VEOF] && pair->termios.c_cc[CC_VEOF] != 0) {
                 if (pair->canon_len > 0) {
-                    pair->m2s.write(pair->canon_buf, pair->canon_len);
+                    pair->m2s.write(pair->canon_buf.data(), pair->canon_len);
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
@@ -807,7 +824,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
 
             if (pair->canon_len < CANON_BUF_SIZE) {
-                pair->canon_buf[pair->canon_len++] = ch;
+                pair->canon_buf.at(pair->canon_len++) = ch;
             }
 
             if (((pair->termios.c_lflag & TIOS_ECHO) != 0U) || (((pair->termios.c_lflag & TIOS_ECHONL) != 0U) && ch == '\n')) {
@@ -819,7 +836,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
 
             if (ch == '\n') {
-                pair->m2s.write(pair->canon_buf, pair->canon_len);
+                pair->m2s.write(pair->canon_buf.data(), pair->canon_len);
                 pair->canon_len = 0;
             }
 
@@ -1480,7 +1497,8 @@ void pty_init() {
 
     // pty_init runs AFTER devfs_init, so we must explicitly add ptmx to the
     // devfs tree (devfs_init already scanned the device table).
-    vfs::devfs::devfs_add_device_node("ptmx", &ptmx_dev);
+    auto ptmx_name = make_devfs_name("ptmx");
+    vfs::devfs::devfs_add_device_node(ptmx_name, &ptmx_dev);
 
     // Create /dev/pts/ directory in devfs
     vfs::devfs::devfs_create_directory("pts");
@@ -1521,24 +1539,24 @@ auto pty_alloc() -> int {
 
     // Build the slave name: "N" (e.g., "0", "12")
     if (N < 10) {
-        pair->slave_name[0] = '0' + static_cast<char>(N);
-        pair->slave_name[1] = '\0';
+        pair->slave_name.at(0) = static_cast<char>('0' + N);
+        pair->slave_name.at(1) = '\0';
     } else if (N < 100) {
-        pair->slave_name[0] = '0' + static_cast<char>(N / 10);
-        pair->slave_name[1] = '0' + static_cast<char>(N % 10);
-        pair->slave_name[2] = '\0';
+        pair->slave_name.at(0) = static_cast<char>('0' + (N / 10));
+        pair->slave_name.at(1) = static_cast<char>('0' + (N % 10));
+        pair->slave_name.at(2) = '\0';
     } else {
-        pair->slave_name[0] = '0' + static_cast<char>(N / 100);
-        pair->slave_name[1] = '0' + static_cast<char>((N / 10) % 10);
-        pair->slave_name[2] = '0' + static_cast<char>(N % 10);
-        pair->slave_name[3] = '\0';
+        pair->slave_name.at(0) = static_cast<char>('0' + (N / 100));
+        pair->slave_name.at(1) = static_cast<char>('0' + ((N / 10) % 10));
+        pair->slave_name.at(2) = static_cast<char>('0' + (N % 10));
+        pair->slave_name.at(3) = '\0';
     }
 
     // Set up the slave Device struct
     pair->slave_dev = Device{
         .major = 136,
         .minor = static_cast<unsigned>(N),
-        .name = pair->slave_name,
+        .name = pair->slave_name.data(),
         .type = DeviceType::CHAR,
         .private_data = pair,
         .char_ops = &slave_ops,
@@ -1565,9 +1583,7 @@ auto pty_alloc() -> int {
     }
 
     // Register slave device into devfs as /dev/pts/<N>
-    char pts_path[16]{};
-    strcpy(pts_path, "pts/");
-    std::memcpy(pts_path + 4, pair->slave_name, std::strlen(pair->slave_name) + 1);
+    auto pts_path = make_pts_path(pair->slave_name);
 
     dev_register(&pair->slave_dev);
     if (vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev) == nullptr) {
@@ -1581,7 +1597,7 @@ auto pty_alloc() -> int {
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::PTY_POOL, static_cast<uint32_t>(N),
                                           ker::mod::perf::PERF_FLAG_CT_INSERT, static_cast<int64_t>(PTY_COUNT), 0, 0);
 #ifdef DEBUG_PTY
-    ker::mod::dbg::log("pty: allocated pair %d", n);
+    log::debug("allocated pair %d", N);
 #endif
     return N;
 }

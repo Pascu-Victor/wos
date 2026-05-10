@@ -8,6 +8,7 @@ Diagnostics:
             - "misc-*"
             - "modernize-*"
             - "cppcoreguidelines-*"
+            - "misc-include-cleaner"
         Remove:
             - readability-identifier-length
             - cppcoreguidelines-pro-type-reinterpret-cast

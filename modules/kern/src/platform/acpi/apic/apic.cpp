@@ -11,6 +11,18 @@
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
 namespace ker::mod::apic {
+
+namespace {
+
+auto check_x2_apic_support() -> bool {
+    cpu::CpuidContext cpuid_context{};
+    cpuid_context.function = 0x1;
+    cpu::cpuid(&cpuid_context);
+    return (cpuid_context.ecx & (1 << 21)) > 0;
+}
+
+}  // namespace
+
 void write_reg(uint32_t reg, uint64_t value) { cpu_set_msr(reg, value); }
 
 uint32_t read_reg(uint32_t reg) {
@@ -27,23 +39,13 @@ void send_ipi(IPIConfig message_type, uint32_t destination) {
     write_reg(static_cast<uint32_t>(X2APICMSRs::ICR), ICR_VALUE);
 }
 
-static void self_ipi(uint8_t vector) { cpu_set_msr(static_cast<uint32_t>(X2APICMSRs::SELF_IPI), vector, 0); }
-
 void reset_apic_counter() { write_reg(static_cast<uint32_t>(APICRegisters::TMR_INIT_CNT), 0xFFFFFFFF); }
 
-static auto check_x2_apic_support() -> bool {
-    cpu::CpuidContext cpuid_context{};
-    cpuid_context.function = 0x1;
-    cpu::cpuid(&cpuid_context);
-    return (cpuid_context.ecx & (1 << 21)) > 0;
-}
-
 void init() {
-    char ident[] = "APIC";
-    acpi::ACPIResult const MADT = acpi::parse_acpi_tables(ident);
+    acpi::ACPIResult const MADT = acpi::parse_acpi_tables("APIC");
     if (MADT.success) {
         acpi::madt::ApicInfo const APIC_INFO = acpi::madt::parse_madt(MADT.data);
-        apic_base = (uint64_t)mm::addr::get_virt_pointer(APIC_INFO.lapic_addr);
+        apic_base = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(APIC_INFO.lapic_addr));
     } else {
         io::serial::write("Failed to parse MADT table\n");
         hcf();

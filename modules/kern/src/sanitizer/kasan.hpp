@@ -29,18 +29,18 @@
 namespace ker::mod::kasan {
 
 // Shadow memory base.  Must match -asan-mapping-offset passed to Clang.
-static constexpr uint64_t SHADOW_OFFSET = 0xdffffc0000000000ULL;
+constexpr uint64_t SHADOW_OFFSET = 0xdffffc0000000000ULL;
 
 // Shadow byte sentinels
-static constexpr int8_t SHADOW_ACCESSIBLE = 0x00;
-static constexpr int8_t SHADOW_HEAP_LREDZONE = static_cast<int8_t>(0xf1);
-static constexpr int8_t SHADOW_HEAP_RREDZONE = static_cast<int8_t>(0xf3);
-static constexpr int8_t SHADOW_HEAP_FREED = static_cast<int8_t>(0xf8);
-static constexpr int8_t SHADOW_GLOBAL_REDZONE = static_cast<int8_t>(0xf9);
-static constexpr int8_t SHADOW_POISONED = static_cast<int8_t>(0xff);
+constexpr int8_t SHADOW_ACCESSIBLE = 0x00;
+constexpr int8_t SHADOW_HEAP_LREDZONE = static_cast<int8_t>(0xf1);
+constexpr int8_t SHADOW_HEAP_RREDZONE = static_cast<int8_t>(0xf3);
+constexpr int8_t SHADOW_HEAP_FREED = static_cast<int8_t>(0xf8);
+constexpr int8_t SHADOW_GLOBAL_REDZONE = static_cast<int8_t>(0xf9);
+constexpr int8_t SHADOW_POISONED = static_cast<int8_t>(0xff);
 
 // Convert an application address to its shadow address.
-static inline auto addr_to_shadow(uintptr_t addr) -> int8_t* { return reinterpret_cast<int8_t*>((addr >> 3) + SHADOW_OFFSET); }
+inline auto addr_to_shadow(uintptr_t addr) -> int8_t* { return reinterpret_cast<int8_t*>((addr >> 3) + SHADOW_OFFSET); }
 
 // Handle a shadow-region page fault (cr2 in shadow range).
 // Called from the page-fault handler in gates.cpp / pagefault_handler().

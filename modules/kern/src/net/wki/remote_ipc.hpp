@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -41,21 +43,23 @@ struct WkiPipeSharedRegion {
     std::atomic<uint32_t> credits;  // sender's credit view
     uint32_t capacity;
     uint32_t flags;  // WRITE_CLOSED | READ_CLOSED
-    uint32_t pad[3];
+    std::array<uint32_t, 3> pad;
     // Followed by `capacity` bytes of ring data (power of 2, page-aligned)
 };
 
 static_assert(sizeof(WkiPipeSharedRegion) == 32, "WkiPipeSharedRegion header must be 32 bytes");
+static_assert(offsetof(WkiPipeSharedRegion, pad) == 20, "WkiPipeSharedRegion padding offset must remain stable");
 
 constexpr uint32_t WKI_PIPE_FLAG_WRITE_CLOSED = 0x01;
 constexpr uint32_t WKI_PIPE_FLAG_READ_CLOSED = 0x02;
 
 struct WkiEventfdSharedRegion {
     std::atomic<uint64_t> counter;
-    uint64_t pad[7];
+    std::array<uint64_t, 7> pad;
 };
 
 static_assert(sizeof(WkiEventfdSharedRegion) == 64, "WkiEventfdSharedRegion must be 64 bytes");
+static_assert(offsetof(WkiEventfdSharedRegion, pad) == 8, "WkiEventfdSharedRegion padding offset must remain stable");
 
 struct WkiFutexWaiterBlock {
     uint64_t phys_addr;
@@ -63,25 +67,32 @@ struct WkiFutexWaiterBlock {
     uint32_t waiter_pid;
     std::atomic<uint32_t> woken;
     uint32_t seqlock;
-    uint64_t pad[2];
+    std::array<uint64_t, 2> pad;
 };
 
 static_assert(sizeof(WkiFutexWaiterBlock) == 40, "WkiFutexWaiterBlock must be 40 bytes");
+static_assert(offsetof(WkiFutexWaiterBlock, pad) == 24, "WkiFutexWaiterBlock padding offset must remain stable");
 
 struct WkiEpollSharedRegion {
-    uint64_t readiness[8];  // 512-bit bitmap
-    uint64_t last_seen[8];  // shadow bitmap for edge-triggered
-    uint64_t generation;    // incremented by waker
-    uint64_t pad[7];
+    std::array<uint64_t, 8> readiness;  // 512-bit bitmap
+    std::array<uint64_t, 8> last_seen;  // shadow bitmap for edge-triggered
+    uint64_t generation;                // incremented by waker
+    std::array<uint64_t, 7> pad;
 };
 
 static_assert(sizeof(WkiEpollSharedRegion) == 192, "WkiEpollSharedRegion must be 192 bytes");
+static_assert(offsetof(WkiEpollSharedRegion, last_seen) == 64, "WkiEpollSharedRegion bitmap offsets must remain stable");
+static_assert(offsetof(WkiEpollSharedRegion, generation) == 128, "WkiEpollSharedRegion generation offset must remain stable");
+static_assert(offsetof(WkiEpollSharedRegion, pad) == 136, "WkiEpollSharedRegion padding offset must remain stable");
 
 struct WkiSockControlRegion {
     std::atomic<size_t> consumer_ptr;
     uint32_t flags;  // SHUTDOWN_RD | SHUTDOWN_WR | CLOSED
-    uint32_t pad[1];
+    std::array<uint32_t, 1> pad;
 };
+
+static_assert(sizeof(WkiSockControlRegion) == 16, "WkiSockControlRegion must be 16 bytes");
+static_assert(offsetof(WkiSockControlRegion, pad) == 12, "WkiSockControlRegion padding offset must remain stable");
 
 constexpr uint32_t WKI_SOCK_FLAG_SHUTDOWN_RD = 0x01;
 constexpr uint32_t WKI_SOCK_FLAG_SHUTDOWN_WR = 0x02;
@@ -95,6 +106,8 @@ union WkiIpcSharedRegion {
     WkiEpollSharedRegion epoll;
     WkiSockControlRegion sock;
 };
+
+static_assert(sizeof(WkiIpcSharedRegion) == sizeof(WkiEpollSharedRegion), "WkiIpcSharedRegion size must match largest region");
 
 // -----------------------------------------------------------------------------
 // ProxyIpcState (consumer/remote side) - per-fd proxy state
@@ -131,7 +144,8 @@ struct ProxyIpcState {
     uint16_t pending_wait_op = 0;
     int pending_wait_status = 0;
     static constexpr size_t SOCK_CTRL_RESP_MAX = 128;
-    uint8_t pending_wait_resp[SOCK_CTRL_RESP_MAX] = {};
+    uint8_t pending_wait_resp[SOCK_CTRL_RESP_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                                                         // Kept as a raw C buffer for existing memcpy/fops boundaries.
     uint16_t pending_wait_resp_len = 0;
 
     // Reference count: one per live fops user (read, close, message handler).

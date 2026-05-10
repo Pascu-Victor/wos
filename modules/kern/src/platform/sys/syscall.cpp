@@ -34,18 +34,20 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
 
     switch (callnum) {
         case abi::callnums::SYS_LOG:
-            return ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), (const char*)A2, A3, A4, (const char*)A5);
+            return ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), reinterpret_cast<const char*>(A2), A3, A4,
+                                              reinterpret_cast<const char*>(A5));
         case abi::callnums::FUTEX:
             return ker::syscall::futex::sys_futex(A1, A2, A3, A4);
         case abi::callnums::THREADING:
             // Dispatch based on operation - threadControlOps start at 0x100
             if (A1 >= 0x100) {
-                return ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1), (void*)A2, (void*)A3,
-                                                               (void*)A4);
+                return ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1),
+                                                               reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3),
+                                                               reinterpret_cast<void*>(A4));
             }
             return ker::syscall::multiproc::thread_info(static_cast<abi::multiproc::threadInfoOps>(A1));
         case abi::callnums::TIME:
-            return ker::syscall::time::sys_time_get(A1, (void*)A2, (void*)A3);
+            return ker::syscall::time::sys_time_get(A1, reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3));
         case abi::callnums::VFS:
             return ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5);
         case abi::callnums::NET:
@@ -59,17 +61,24 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
 
         case abi::callnums::DEBUG:
             // a1=0: disable interrupts on this CPU; a1=1: re-enable
-            if (A1 == 0) {
-                asm volatile("cli" ::: "memory");
-            } else {
-                asm volatile("sti" ::: "memory");
+            // clang-tidy treats distinct inline asm branches as identical.
+            // NOLINTBEGIN(bugprone-branch-clone)
+            switch (A1) {
+                case 0:
+                    asm volatile("cli" ::: "memory");
+                    break;
+                case 1:
+                default:
+                    asm volatile("sti" ::: "memory");
+                    break;
             }
+            // NOLINTEND(bugprone-branch-clone)
             return 0;
 
         default:
             io::serial::write("Syscall undefined\n");
             io::serial::write("Callnum: ");
-            io::serial::write((uint64_t)callnum);
+            io::serial::write(static_cast<uint64_t>(callnum));
             io::serial::write("\n");
             io::serial::write("a1: ");
             io::serial::write(A1);
@@ -91,7 +100,7 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             io::serial::write("\n");
             io::serial::write("Halting\n");
             hcf();
-            break;
+            __builtin_unreachable();
     }
 }
 
@@ -140,11 +149,11 @@ void init() {
     cpu_get_msr(IA32_EFER, &efer);
     cpu_set_msr(IA32_EFER, efer | (1 << 0));                                                      // Enable syscall/sysret
     cpu_set_msr(IA32_FMASK, (1 << 9) | (1 << 8));                                                 // clear IF and TF
-    const uint64_t KERN_CS = desc::gdt::GDT_ENTRY_KERNEL_CODE * 8;                                // Kernel CS
-    const uint64_t USER_CS = ((desc::gdt::GDT_ENTRY_USER_CODE * 8) | desc::gdt::GDT_RING3) - 16;  // -16 since 64 bit sysret offsets
-    const uint64_t* star_value = (uint64_t*)((KERN_CS | (USER_CS << 16)) << 32);  // kern/user CS stored in high half of STAR
-    cpu_set_msr(IA32_STAR, (uint64_t)star_value);
-    cpu_set_msr(IA32_LSTAR, (uint64_t)&wos_asm_syscall_handler);
+    uint64_t const KERN_CS = desc::gdt::GDT_ENTRY_KERNEL_CODE * 8;                                // Kernel CS
+    uint64_t const USER_CS = ((desc::gdt::GDT_ENTRY_USER_CODE * 8) | desc::gdt::GDT_RING3) - 16;  // -16 since 64 bit sysret offsets
+    uint64_t const STAR_VALUE = (KERN_CS | (USER_CS << 16)) << 32;  // kern/user CS stored in high half of STAR
+    cpu_set_msr(IA32_STAR, STAR_VALUE);
+    cpu_set_msr(IA32_LSTAR, reinterpret_cast<uint64_t>(&wos_asm_syscall_handler));
     uint32_t eax = 0;
     uint32_t edx = 0;
     cpu_get_msr(IA32_STAR, &eax, &edx);

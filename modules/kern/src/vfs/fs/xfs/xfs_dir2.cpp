@@ -85,7 +85,7 @@ auto dir2_data_entry_ino(const XfsDir2DataEntry* dep) -> xfs_ino_t { return dep-
 // Read the file type from a data entry (ftype byte after the name)
 auto dir2_data_entry_ftype(const XfsMountContext* ctx, const XfsDir2DataEntry* dep) -> uint8_t {
     if (xfs_has_ftype(ctx)) {
-        return dep->name[dep->namelen];
+        return xfs_dir2_data_entry_name(dep)[dep->namelen];
     }
     return XFS_DIR3_FT_UNKNOWN;
 }
@@ -95,8 +95,8 @@ void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, Xfs
     entry->ino = dir2_data_entry_ino(dep);
     entry->ftype = dir2_data_entry_ftype(ctx, dep);
     entry->namelen = dep->namelen;
-    __builtin_memcpy(entry->name.data(), dep->name, dep->namelen);
-    entry->name[dep->namelen] = '\0';
+    __builtin_memcpy(entry->name.data(), xfs_dir2_data_entry_name(dep), dep->namelen);
+    entry->name.at(dep->namelen) = '\0';
 }
 
 // Get directory block number from dataptr
@@ -125,19 +125,20 @@ auto dir2_read_block(XfsInode* dp, xfs_dir2_db_t db, BufHead** bhp) -> int {
     int const RC = xfs_bmap_lookup(dp, FILE_BLOCK, &bmap);
     if (RC != 0) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_read_block: bmap_lookup failed ino=%lu db=%u rc=%d", (unsigned long)dp->ino, db, rc);
+        mod::dbg::log("[xfs] dir2_read_block: bmap_lookup failed ino=%lu db=%u rc=%d", static_cast<unsigned long>(dp->ino), db, RC);
 #endif
         return RC;
     }
     if (bmap.is_hole) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_read_block: HOLE ino=%lu db=%u fmt=%d ext_count=%u", (unsigned long)dp->ino, db, dp->data_fork.format,
-                      dp->data_fork.extents.count);
+        mod::dbg::log("[xfs] dir2_read_block: HOLE ino=%lu db=%u fmt=%d ext_count=%u", static_cast<unsigned long>(dp->ino), db,
+                      dp->data_fork.format, dp->data_fork.extents.count);
 #endif
         return -EINVAL;
     }
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir2_read_block: ino=%lu db=%u blk=%lu", (unsigned long)dp->ino, db, (unsigned long)bmap.startblock);
+    mod::dbg::log("[xfs] dir2_read_block: ino=%lu db=%u blk=%lu", static_cast<unsigned long>(dp->ino), db,
+                  static_cast<unsigned long>(bmap.startblock));
 #endif
 
     uint32_t const FBS = 1U << ctx->dir_blk_log;  // fs blocks per dir block
@@ -190,8 +191,8 @@ auto dir2_sf_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
         entry->ino = dp->ino;
         entry->ftype = XFS_DIR3_FT_DIR;
         entry->namelen = 1;
-        entry->name[0] = '.';
-        entry->name[1] = '\0';
+        entry->name.at(0) = '.';
+        entry->name.at(1) = '\0';
         return 0;
     }
 
@@ -200,9 +201,9 @@ auto dir2_sf_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
         entry->ino = xfs_dir2_sf_get_parent(hdr);
         entry->ftype = XFS_DIR3_FT_DIR;
         entry->namelen = 2;
-        entry->name[0] = '.';
-        entry->name[1] = '.';
-        entry->name[2] = '\0';
+        entry->name.at(0) = '.';
+        entry->name.at(1) = '.';
+        entry->name.at(2) = '\0';
         return 0;
     }
 
@@ -222,19 +223,19 @@ auto dir2_sf_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
         uint8_t const ENTRY_NAMELEN = sfep->namelen;
 
         // Inode number is at: sfep->name + namelen [+ 1 if ftype]
-        const uint8_t* ino_ptr = sfep->name + ENTRY_NAMELEN;
+        const uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + ENTRY_NAMELEN;
         uint8_t ftype = XFS_DIR3_FT_UNKNOWN;
         if (HAS_FTYPE) {
             ftype = *ino_ptr;
             ino_ptr++;
         }
 
-        if (ENTRY_NAMELEN == namelen && __builtin_memcmp(sfep->name, name, namelen) == 0) {
+        if (ENTRY_NAMELEN == namelen && __builtin_memcmp(xfs_dir2_sf_entry_name(sfep), name, namelen) == 0) {
             entry->ino = sf_get_ino(hdr, ino_ptr);
             entry->ftype = ftype;
             entry->namelen = namelen;
             __builtin_memcpy(entry->name.data(), name, namelen);
-            entry->name[namelen] = '\0';
+            entry->name.at(namelen) = '\0';
             return 0;
         }
 
@@ -268,8 +269,8 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     entry.ino = dp->ino;
     entry.ftype = XFS_DIR3_FT_DIR;
     entry.namelen = 1;
-    entry.name[0] = '.';
-    entry.name[1] = '\0';
+    entry.name.at(0) = '.';
+    entry.name.at(1) = '\0';
     int rc = fn(&entry, user_ctx);
     if (rc != 0) {
         return 0;
@@ -279,9 +280,9 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     entry.ino = xfs_dir2_sf_get_parent(hdr);
     entry.ftype = XFS_DIR3_FT_DIR;
     entry.namelen = 2;
-    entry.name[0] = '.';
-    entry.name[1] = '.';
-    entry.name[2] = '\0';
+    entry.name.at(0) = '.';
+    entry.name.at(1) = '.';
+    entry.name.at(2) = '\0';
     rc = fn(&entry, user_ctx);
     if (rc != 0) {
         return 0;
@@ -302,7 +303,7 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
         const auto* sfep = reinterpret_cast<const XfsDir2SfEntry*>(ptr);
         uint8_t const ENTRY_NAMELEN = sfep->namelen;
 
-        const uint8_t* ino_ptr = sfep->name + ENTRY_NAMELEN;
+        const uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + ENTRY_NAMELEN;
         uint8_t ftype = XFS_DIR3_FT_UNKNOWN;
         if (HAS_FTYPE) {
             ftype = *ino_ptr;
@@ -312,8 +313,8 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
         entry.ino = sf_get_ino(hdr, ino_ptr);
         entry.ftype = ftype;
         entry.namelen = ENTRY_NAMELEN;
-        __builtin_memcpy(entry.name.data(), sfep->name, ENTRY_NAMELEN);
-        entry.name[ENTRY_NAMELEN] = '\0';
+        __builtin_memcpy(entry.name.data(), xfs_dir2_sf_entry_name(sfep), ENTRY_NAMELEN);
+        entry.name.at(ENTRY_NAMELEN) = '\0';
 
         rc = fn(&entry, user_ctx);
         if (rc != 0) {
@@ -412,7 +413,7 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
 
         const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + OFF);
 
-        if (dep->namelen == namelen && __builtin_memcmp(dep->name, name, namelen) == 0) {
+        if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
             fill_dir_entry(ctx, dep, entry);
             brelse(bh);
             return 0;
@@ -430,7 +431,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     int rc = dir2_read_block(dp, 0, &bh);
     if (rc != 0) {
 #ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] dir2_block_iterate: read_block failed ino=%lu rc=%d", (unsigned long)dp->ino, rc);
+        mod::dbg::log("[xfs] dir2_block_iterate: read_block failed ino=%lu rc=%d", static_cast<unsigned long>(dp->ino), rc);
 #endif
         return rc;
     }
@@ -444,8 +445,8 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 
 #ifdef XFS_DEBUG
     const auto* dbg_hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
-    mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u", (unsigned long)dp->ino, dbg_hdr->hdr.magic.to_cpu(),
-                  leaf_count);
+    mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u", static_cast<unsigned long>(dp->ino),
+                  dbg_hdr->hdr.magic.to_cpu(), LEAF_COUNT);
 #endif
     // Data entries start after the v3 header
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
@@ -645,7 +646,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
             if (OFF + sizeof(XfsDir2DataEntry) <= ctx->dir_blk_size) {
                 const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(data_bh->data + OFF);
-                if (dep->namelen == namelen && __builtin_memcmp(dep->name, name, namelen) == 0) {
+                if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
                     fill_dir_entry(ctx, dep, entry);
                     brelse(data_bh);
                     brelse(leaf_bh);
@@ -695,7 +696,7 @@ linear_scan:
                     break;
                 }
 
-                if (dep->namelen == namelen && __builtin_memcmp(dep->name, name, namelen) == 0) {
+                if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
                     fill_dir_entry(ctx, dep, entry);
                     brelse(data_bh);
                     return 0;
@@ -752,8 +753,8 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
         return -ENOTDIR;
     }
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s", (unsigned long)dp->ino, dp->data_fork.format,
-                  (unsigned long)dp->size, (int)namelen, name);
+    mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s", static_cast<unsigned long>(dp->ino), dp->data_fork.format,
+                  static_cast<unsigned long>(dp->size), static_cast<int>(namelen), name);
 #endif
     switch (dp->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
@@ -923,10 +924,10 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
 
     // --- 1. Collect all shortform entries into a temporary array ---
     struct SfRec {
-        char name[256];
-        uint8_t namelen;
-        xfs_ino_t ino;
-        uint8_t ftype;
+        std::array<char, 256> name{};
+        uint8_t namelen{};
+        xfs_ino_t ino{};
+        uint8_t ftype{};
     };
 
     uint8_t const SF_COUNT = sf_hdr->count;
@@ -939,16 +940,16 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
 
     // "." entry
     recs[0].namelen = 1;
-    recs[0].name[0] = '.';
-    recs[0].name[1] = '\0';
+    recs[0].name.at(0) = '.';
+    recs[0].name.at(1) = '\0';
     recs[0].ino = dp->ino;
     recs[0].ftype = XFS_DIR3_FT_DIR;
 
     // ".." entry
     recs[1].namelen = 2;
-    recs[1].name[0] = '.';
-    recs[1].name[1] = '.';
-    recs[1].name[2] = '\0';
+    recs[1].name.at(0) = '.';
+    recs[1].name.at(1) = '.';
+    recs[1].name.at(2) = '\0';
     recs[1].ino = PARENT_INO;
     recs[1].ftype = XFS_DIR3_FT_DIR;
 
@@ -964,7 +965,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
         const auto* sfep = reinterpret_cast<const XfsDir2SfEntry*>(ptr);
         uint8_t const ENTRY_NAMELEN = sfep->namelen;
 
-        const uint8_t* ino_ptr = sfep->name + ENTRY_NAMELEN;
+        const uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + ENTRY_NAMELEN;
         uint8_t ftype = XFS_DIR3_FT_UNKNOWN;
         if (HAS_FTYPE) {
             ftype = *ino_ptr;
@@ -972,8 +973,8 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
         }
 
         recs[total_entries].namelen = ENTRY_NAMELEN;
-        __builtin_memcpy(recs[total_entries].name, sfep->name, ENTRY_NAMELEN);
-        recs[total_entries].name[ENTRY_NAMELEN] = '\0';
+        __builtin_memcpy(recs[total_entries].name.data(), xfs_dir2_sf_entry_name(sfep), ENTRY_NAMELEN);
+        recs[total_entries].name.at(ENTRY_NAMELEN) = '\0';
         recs[total_entries].ino = sf_get_ino(sf_hdr, ino_ptr);
         recs[total_entries].ftype = ftype;
         total_entries++;
@@ -1050,11 +1051,11 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
         auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block + data_offset);
         dep->inumber = Be64::from_cpu(recs[i].ino);
         dep->namelen = recs[i].namelen;
-        __builtin_memcpy(dep->name, recs[i].name, recs[i].namelen);
+        __builtin_memcpy(xfs_dir2_data_entry_name(dep), recs[i].name.data(), recs[i].namelen);
 
         // ftype
         if (HAS_FTYPE) {
-            dep->name[recs[i].namelen] = recs[i].ftype;
+            xfs_dir2_data_entry_name(dep)[recs[i].namelen] = recs[i].ftype;
         }
 
         // Zero pad
@@ -1070,7 +1071,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
         *tag = Be16::from_cpu(static_cast<uint16_t>(data_offset));
 
         // Build leaf record
-        leaves[leaf_count].hash = xfs_da_hashname(reinterpret_cast<const uint8_t*>(recs[i].name), recs[i].namelen);
+        leaves[leaf_count].hash = xfs_da_hashname(reinterpret_cast<const uint8_t*>(recs[i].name.data()), recs[i].namelen);
         leaves[leaf_count].address = static_cast<uint32_t>(data_offset >> XFS_DIR2_DATA_ALIGN_LOG);
         leaf_count++;
 
@@ -1114,8 +1115,8 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
         *unused_tag = Be16::from_cpu(static_cast<uint16_t>(data_offset));
 
         // Update best_free in the header
-        hdr3->best_free[0].offset = Be16::from_cpu(static_cast<uint16_t>(data_offset));
-        hdr3->best_free[0].length = Be16::from_cpu(static_cast<uint16_t>(FREE_LEN));
+        hdr3->best_free.at(0).offset = Be16::from_cpu(static_cast<uint16_t>(data_offset));
+        hdr3->best_free.at(0).length = Be16::from_cpu(static_cast<uint16_t>(FREE_LEN));
     }
 
     // 3f. Compute CRC over the block
@@ -1151,8 +1152,8 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     dp->dirty = true;
     xfs_trans_log_inode(tp, dp);
 #ifdef XFS_DEBUG
-    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", (unsigned long)dp->ino, (unsigned long)disk_block,
-                  total_entries);
+    mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", static_cast<unsigned long>(dp->ino),
+                  static_cast<unsigned long>(disk_block), total_entries);
 #endif
     return 0;
 }
@@ -1233,12 +1234,12 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block + found_offset);
     dep->inumber = Be64::from_cpu(ino);
     dep->namelen = static_cast<uint8_t>(namelen);
-    __builtin_memcpy(dep->name, name, namelen);
+    __builtin_memcpy(xfs_dir2_data_entry_name(dep), name, namelen);
 
     // ftype + tag
     size_t tag_off = 8 + 1 + namelen;  // inumber(8) + namelen(1) + name
     if (HAS_FTYPE_FLAG) {
-        dep->name[namelen] = ftype;
+        xfs_dir2_data_entry_name(dep)[namelen] = ftype;
         tag_off++;
     }
     // Tag (starting offset within the block, stored as Be16)
@@ -1366,12 +1367,12 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
         size_t const CURRENT_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - (static_cast<size_t>(leaf_count) * sizeof(XfsDir2LeafEntry));
         // The remaining free space is between entry_end and current_leaf_start
         // (only if a free-space marker was written there earlier, check it)
-        mutable_hdr->best_free[0].offset = Be16{0};
-        mutable_hdr->best_free[0].length = Be16{0};
-        mutable_hdr->best_free[1].offset = Be16{0};
-        mutable_hdr->best_free[1].length = Be16{0};
-        mutable_hdr->best_free[2].offset = Be16{0};
-        mutable_hdr->best_free[2].length = Be16{0};
+        mutable_hdr->best_free.at(0).offset = Be16{0};
+        mutable_hdr->best_free.at(0).length = Be16{0};
+        mutable_hdr->best_free.at(1).offset = Be16{0};
+        mutable_hdr->best_free.at(1).length = Be16{0};
+        mutable_hdr->best_free.at(2).offset = Be16{0};
+        mutable_hdr->best_free.at(2).length = Be16{0};
         // Check the remainder area for a free-tag marker
         if (ENTRY_END < CURRENT_LEAF_START) {
             const auto* rem = reinterpret_cast<const XfsDir2DataUnused*>(block + ENTRY_END);
@@ -1388,8 +1389,8 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
                     *adj_tag = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
                     rem_len = static_cast<uint16_t>(MAX_FREE);
                 }
-                mutable_hdr->best_free[0].offset = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
-                mutable_hdr->best_free[0].length = Be16::from_cpu(rem_len);
+                mutable_hdr->best_free.at(0).offset = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
+                mutable_hdr->best_free.at(0).length = Be16::from_cpu(rem_len);
             }
         }
     }
@@ -1446,7 +1447,7 @@ auto dir2_sf_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
         const auto* sfep = reinterpret_cast<const XfsDir2SfEntry*>(ptr);
         uint8_t const ENTRY_NAMELEN = sfep->namelen;
 
-        if (ENTRY_NAMELEN == namelen && __builtin_memcmp(sfep->name, name, namelen) == 0) {
+        if (ENTRY_NAMELEN == namelen && __builtin_memcmp(xfs_dir2_sf_entry_name(sfep), name, namelen) == 0) {
             found = true;
             entry_size = sizeof(uint8_t) + 2 + ENTRY_NAMELEN + (HAS_FTYPE ? 1 : 0) + INO_SIZE;
             break;
@@ -1590,7 +1591,7 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                 continue;
             }
 
-            if (dep->namelen == namelen && __builtin_memcmp(dep->name, name, namelen) == 0) {
+            if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
                 match_idx = i;
                 entry_off = OFF;
                 entry_size = DEP_SIZE;
@@ -1701,11 +1702,11 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
                 BestFreeSlot const CUR{.off = static_cast<uint16_t>(off), .len = FREE_LEN};
                 for (int idx = 0; idx < 3; idx++) {
-                    if (CUR.len > best[idx].len) {
+                    if (CUR.len > best.at(static_cast<size_t>(idx)).len) {
                         for (int j = 2; j > idx; j--) {
-                            best[j] = best[j - 1];
+                            best.at(static_cast<size_t>(j)) = best.at(static_cast<size_t>(j - 1));
                         }
-                        best[idx] = CUR;
+                        best.at(static_cast<size_t>(idx)) = CUR;
                         break;
                     }
                 }
@@ -1724,8 +1725,8 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
     }
 
     for (int i = 0; i < 3; i++) {
-        hdr->best_free[i].offset = Be16::from_cpu(best[i].off);
-        hdr->best_free[i].length = Be16::from_cpu(best[i].len);
+        hdr->best_free.at(static_cast<size_t>(i)).offset = Be16::from_cpu(best.at(static_cast<size_t>(i)).off);
+        hdr->best_free.at(static_cast<size_t>(i)).length = Be16::from_cpu(best.at(static_cast<size_t>(i)).len);
     }
 
     // Update CRC over the block

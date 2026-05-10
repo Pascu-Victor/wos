@@ -1,7 +1,11 @@
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <span>
 
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "mod/io/serial/serial.hpp"
@@ -16,10 +20,10 @@
 #include "platform/smt/smt.hpp"
 #include "util/hcf.hpp"
 
-// Atomic flag to ensure only one CPU enters OOM dump
-// Uses __atomic builtins to safely coordinate between CPUs
+// Atomic flag to ensure only one CPU enters OOM dump.
+// Keep this lock-free and allocation-free for OOM paths.
 namespace {
-volatile uint64_t oom_dump_in_progress = 0;
+std::atomic<uint64_t> oom_dump_in_progress{0};
 }
 // ============================================================================
 // OOM DUMP PRE-ALLOCATED MEMORY
@@ -161,7 +165,6 @@ struct PageCountResult {
 };
 
 // Page table constants
-constexpr size_t PAGE_TABLE_ENTRIES = 512;
 constexpr size_t USER_SPACE_PML4_ENTRIES = 256;      // First 256 entries are user space
 constexpr uint64_t PAGES_PER_1GB_HUGEPAGE = 262144;  // 1GB / 4KB
 constexpr uint64_t PAGES_PER_2MB_HUGEPAGE = 512;     // 2MB / 4KB
@@ -270,25 +273,27 @@ __attribute__((no_sanitize("address"))) void dump_buddy_free_histogram(const pag
             bad_order = true;
             continue;
         }
-        order_counts[ORD]++;
+        *std::next(order_counts.begin(), ORD) += 1;
         free_pages_found += (1U << ORD);
     }
 
     io::serial::write("  Buddy free histogram:\n");
     bool any_free = false;
-    for (int ord = 0; ord <= PageAllocator::MAX_ORDER; ord++) {
-        if (order_counts[ord] == 0) {
+    uint8_t ord = 0;
+    for (uint32_t const ORDER_COUNT : order_counts) {
+        if (ORDER_COUNT == 0) {
+            ord++;
             continue;
         }
         any_free = true;
         io::serial::write("    order ");
         io::serial::write(u64_to_dec_no_alloc(static_cast<uint64_t>(ord), oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(": ");
-        io::serial::write(u64_to_dec_no_alloc(static_cast<uint64_t>(order_counts[ord]), oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(u64_to_dec_no_alloc(static_cast<uint64_t>(ORDER_COUNT), oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(" block(s) = ");
-        io::serial::write(
-            u64_to_dec_no_alloc(static_cast<uint64_t>(order_counts[ord]) << ord, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(u64_to_dec_no_alloc(static_cast<uint64_t>(ORDER_COUNT) << ord, oom_dump_buffer.data(), oom_dump_buffer.size()));
         io::serial::write(" pages\n");
+        ord++;
     }
     if (!any_free) {
         io::serial::write("    (no free blocks)\n");
@@ -338,13 +343,13 @@ __attribute__((no_sanitize("address"))) auto count_mapped_pages_no_alloc(paging:
 
     // Only process user-space entries (first 256 entries of PML4)
     // Entries 256-511 are kernel space
-    for (size_t i4 = 0; i4 < USER_SPACE_PML4_ENTRIES; i4++) {
-        if (pml4->entries[i4].present == 0) {
+    for (const auto& pml4_entry : std::span(pml4->entries.data(), USER_SPACE_PML4_ENTRIES)) {
+        if (pml4_entry.present == 0) {
             continue;
         }
 
         // Get physical address of PML3 table
-        uint64_t const PML3_PHYS_ADDR = get_frame_addr(pml4->entries[i4]);
+        uint64_t const PML3_PHYS_ADDR = get_frame_addr(pml4_entry);
         uint64_t const PML3_VIRT_ADDR = phys_to_virt_safe(PML3_PHYS_ADDR);
         if (PML3_VIRT_ADDR == 0) {
             // Can't safely access this PML3 - count the PML4 entry but skip
@@ -355,20 +360,20 @@ __attribute__((no_sanitize("address"))) auto count_mapped_pages_no_alloc(paging:
         auto* pml3 = reinterpret_cast<paging::PageTable*>(PML3_VIRT_ADDR);
         result.page_table_pages++;  // Count the PML3 page
 
-        for (auto& entrie : pml3->entries) {
-            if (entrie.present == 0) {
+        for (auto& entry : pml3->entries) {
+            if (entry.present == 0) {
                 continue;
             }
 
             // Check for 1GB huge page
-            if (entrie.pagesize != 0) {
+            if (entry.pagesize != 0) {
                 // 1GB page - counts as 262144 4KB pages
                 result.user_pages += PAGES_PER_1GB_HUGEPAGE;
                 continue;
             }
 
             // Get physical address of PML2 table
-            uint64_t const PML2_PHYS_ADDR = get_frame_addr(entrie);
+            uint64_t const PML2_PHYS_ADDR = get_frame_addr(entry);
             uint64_t const PML2_VIRT_ADDR = phys_to_virt_safe(PML2_PHYS_ADDR);
             if (PML2_VIRT_ADDR == 0) {
                 result.page_table_pages++;
@@ -378,20 +383,20 @@ __attribute__((no_sanitize("address"))) auto count_mapped_pages_no_alloc(paging:
             auto* pml2 = reinterpret_cast<paging::PageTable*>(PML2_VIRT_ADDR);
             result.page_table_pages++;  // Count the PML2 page
 
-            for (auto& entrie : pml2->entries) {
-                if (entrie.present == 0) {
+            for (auto& entry : pml2->entries) {
+                if (entry.present == 0) {
                     continue;
                 }
 
                 // Check for 2MB huge page
-                if (entrie.pagesize != 0) {
+                if (entry.pagesize != 0) {
                     // 2MB page - counts as 512 4KB pages
                     result.user_pages += PAGES_PER_2MB_HUGEPAGE;
                     continue;
                 }
 
                 // Get physical address of PML1 table
-                uint64_t const PML1_PHYS_ADDR = get_frame_addr(entrie);
+                uint64_t const PML1_PHYS_ADDR = get_frame_addr(entry);
                 uint64_t const PML1_VIRT_ADDR = phys_to_virt_safe(PML1_PHYS_ADDR);
                 if (PML1_VIRT_ADDR == 0) {
                     result.page_table_pages++;
@@ -402,8 +407,8 @@ __attribute__((no_sanitize("address"))) auto count_mapped_pages_no_alloc(paging:
                 result.page_table_pages++;  // Count the PML1 page
 
                 // Count present entries in PML1 (actual 4KB pages)
-                for (auto& entrie : pml1->entries) {
-                    if (entrie.present != 0) {
+                for (auto& entry : pml1->entries) {
+                    if (entry.present != 0) {
                         result.user_pages++;
                     }
                 }
@@ -438,12 +443,14 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
     }
 
     // Walk all user-space PML4 entries
-    for (size_t i4 = 0; i4 < USER_SPACE_PML4_ENTRIES; i4++) {
-        if (pml4->entries[i4].present == 0) {
+    size_t i4 = 0;
+    for (const auto& pml4_entry : std::span(pml4->entries.data(), USER_SPACE_PML4_ENTRIES)) {
+        size_t const PML4_INDEX = i4++;
+        if (pml4_entry.present == 0) {
             continue;
         }
 
-        uint64_t const PML3_PHYS_ADDR = get_frame_addr(pml4->entries[i4]);
+        uint64_t const PML3_PHYS_ADDR = get_frame_addr(pml4_entry);
         uint64_t const PML3_VIRT_ADDR = phys_to_virt_safe(PML3_PHYS_ADDR);
         if (PML3_VIRT_ADDR == 0) {
             continue;
@@ -451,15 +458,17 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
 
         auto* pml3 = reinterpret_cast<paging::PageTable*>(PML3_VIRT_ADDR);
 
-        for (size_t i3 = 0; i3 < PAGE_TABLE_ENTRIES; i3++) {
-            if (pml3->entries[i3].present == 0) {
+        size_t i3 = 0;
+        for (const auto& pml3_entry : pml3->entries) {
+            size_t const PML3_INDEX = i3++;
+            if (pml3_entry.present == 0) {
                 continue;
             }
 
             // Check for 1GB huge page
-            if (pml3->entries[i3].pagesize != 0) {
+            if (pml3_entry.pagesize != 0) {
                 // Calculate virtual address for this 1GB region
-                uint64_t const VADDR = (i4 << PML4_SHIFT) | (i3 << PML3_SHIFT);
+                uint64_t const VADDR = (PML4_INDEX << PML4_SHIFT) | (PML3_INDEX << PML3_SHIFT);
                 uint64_t const PAGE_COUNT = PAGES_PER_1GB_HUGEPAGE;
 
                 // Categorize by address
@@ -477,9 +486,9 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                 stats.total_pages += PAGE_COUNT;
 
                 // Categorize by permissions
-                if (pml3->entries[i3].writable != 0) {
+                if (pml3_entry.writable != 0) {
                     stats.rw_pages += PAGE_COUNT;
-                } else if (pml3->entries[i3].no_execute == 0) {
+                } else if (pml3_entry.no_execute == 0) {
                     stats.rx_pages += PAGE_COUNT;
                 } else {
                     stats.ro_pages += PAGE_COUNT;
@@ -487,7 +496,7 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                 continue;
             }
 
-            uint64_t const PML2_PHYS_ADDR = get_frame_addr(pml3->entries[i3]);
+            uint64_t const PML2_PHYS_ADDR = get_frame_addr(pml3_entry);
             uint64_t const PML2_VIRT_ADDR = phys_to_virt_safe(PML2_PHYS_ADDR);
             if (PML2_VIRT_ADDR == 0) {
                 continue;
@@ -495,14 +504,16 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
 
             auto* pml2 = reinterpret_cast<paging::PageTable*>(PML2_VIRT_ADDR);
 
-            for (size_t i2 = 0; i2 < PAGE_TABLE_ENTRIES; i2++) {
-                if (pml2->entries[i2].present == 0) {
+            size_t i2 = 0;
+            for (const auto& pml2_entry : pml2->entries) {
+                size_t const PML2_INDEX = i2++;
+                if (pml2_entry.present == 0) {
                     continue;
                 }
 
                 // Check for 2MB huge page
-                if (pml2->entries[i2].pagesize != 0) {
-                    uint64_t const VADDR = (i4 << PML4_SHIFT) | (i3 << PML3_SHIFT) | (i2 << PML2_SHIFT);
+                if (pml2_entry.pagesize != 0) {
+                    uint64_t const VADDR = (PML4_INDEX << PML4_SHIFT) | (PML3_INDEX << PML3_SHIFT) | (PML2_INDEX << PML2_SHIFT);
                     uint64_t const PAGE_COUNT = PAGES_PER_2MB_HUGEPAGE;
 
                     if (VADDR >= MMAP_REGION_START && VADDR < MMAP_REGION_END) {
@@ -518,9 +529,9 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                     }
                     stats.total_pages += PAGE_COUNT;
 
-                    if (pml2->entries[i2].writable != 0) {
+                    if (pml2_entry.writable != 0) {
                         stats.rw_pages += PAGE_COUNT;
-                    } else if (pml2->entries[i2].no_execute == 0) {
+                    } else if (pml2_entry.no_execute == 0) {
                         stats.rx_pages += PAGE_COUNT;
                     } else {
                         stats.ro_pages += PAGE_COUNT;
@@ -528,7 +539,7 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                     continue;
                 }
 
-                uint64_t const PML1_PHYS_ADDR = get_frame_addr(pml2->entries[i2]);
+                uint64_t const PML1_PHYS_ADDR = get_frame_addr(pml2_entry);
                 uint64_t const PML1_VIRT_ADDR = phys_to_virt_safe(PML1_PHYS_ADDR);
                 if (PML1_VIRT_ADDR == 0) {
                     continue;
@@ -536,13 +547,16 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
 
                 auto* pml1 = reinterpret_cast<paging::PageTable*>(PML1_VIRT_ADDR);
 
-                for (size_t i1 = 0; i1 < PAGE_TABLE_ENTRIES; i1++) {
-                    if (pml1->entries[i1].present == 0) {
+                size_t i1 = 0;
+                for (const auto& pml1_entry : pml1->entries) {
+                    size_t const PML1_INDEX = i1++;
+                    if (pml1_entry.present == 0) {
                         continue;
                     }
 
                     // Calculate full virtual address
-                    uint64_t const VADDR = (i4 << PML4_SHIFT) | (i3 << PML3_SHIFT) | (i2 << PML2_SHIFT) | (i1 << PML1_SHIFT);
+                    uint64_t const VADDR =
+                        (PML4_INDEX << PML4_SHIFT) | (PML3_INDEX << PML3_SHIFT) | (PML2_INDEX << PML2_SHIFT) | (PML1_INDEX << PML1_SHIFT);
 
                     // Categorize by address range
                     if (VADDR >= MMAP_REGION_START && VADDR < MMAP_REGION_END) {
@@ -559,9 +573,9 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
                     stats.total_pages++;
 
                     // Categorize by permissions
-                    if (pml1->entries[i1].writable != 0) {
+                    if (pml1_entry.writable != 0) {
                         stats.rw_pages++;
-                    } else if (pml1->entries[i1].no_execute == 0) {
+                    } else if (pml1_entry.no_execute == 0) {
                         stats.rx_pages++;
                     } else {
                         stats.ro_pages++;
@@ -574,12 +588,8 @@ __attribute__((no_sanitize("address"))) void analyze_memory_regions(paging::Page
 
 // Check if a pagemap is in our known list
 __attribute__((no_sanitize("address"))) auto is_pagemap_known(paging::PageTable* pagemap) -> bool {
-    for (size_t i = 0; i < oom_known_pagemap_count; i++) {
-        if (oom_known_pagemaps[i] == pagemap) {
-            return true;
-        }
-    }
-    return false;
+    auto const KNOWN_PAGEMAPS = std::span(oom_known_pagemaps.data(), oom_known_pagemap_count);
+    return std::ranges::find(KNOWN_PAGEMAPS, pagemap) != KNOWN_PAGEMAPS.end();
 }
 
 // Add a pagemap to our known list
@@ -588,7 +598,7 @@ __attribute__((no_sanitize("address"))) void add_known_pagemap(paging::PageTable
         return;
     }
     if (!is_pagemap_known(pagemap)) {
-        oom_known_pagemaps[oom_known_pagemap_count++] = pagemap;
+        *std::next(oom_known_pagemaps.begin(), static_cast<ptrdiff_t>(oom_known_pagemap_count++)) = pagemap;
     }
 }
 
@@ -610,15 +620,20 @@ __attribute__((no_sanitize("address"))) void collect_task_info(sched::task::Task
         return;
     }
 
-    // Store info BEFORE trying to access pagemap
-    TaskMemoryInfo& info = oom_task_info[oom_task_count];
+    // Check if we already have this task (by PID, not pagemap - pagemap might be shared)
+    for (const auto& tracked_task : std::span(oom_task_info.data(), oom_task_count)) {
+        if (tracked_task.pid == task->pid) {
+            return;  // Already tracked
+        }
+    }
+
+    // Validate pagemap pointer
+    paging::PageTable* pagemap = task->pagemap;
+    TaskMemoryInfo& info = *std::next(oom_task_info.begin(), static_cast<ptrdiff_t>(oom_task_count));
     info.pid = task->pid;
     info.name = task->name;
     info.is_active = is_active;
     info.has_exited = task->has_exited;
-
-    // Validate pagemap pointer
-    paging::PageTable* pagemap = task->pagemap;
     if (pagemap == nullptr) {
         // No pagemap - still record the task but with no memory info
         info.pagemap = nullptr;
@@ -637,13 +652,6 @@ __attribute__((no_sanitize("address"))) void collect_task_info(sched::task::Task
         info.page_table_count = 0;
         oom_task_count++;
         return;
-    }
-
-    // Check if we already have this task (by PID, not pagemap - pagemap might be shared)
-    for (size_t i = 0; i < oom_task_count; i++) {
-        if (oom_task_info[i].pid == task->pid) {
-            return;  // Already tracked
-        }
     }
 
     info.pagemap = pagemap;
@@ -680,7 +688,7 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     // Atomically try to claim the OOM dump - only one CPU can proceed
     // Other CPUs that hit OOM will just halt immediately
     uint64_t expected = 0;
-    if (!__atomic_compare_exchange_n(&oom_dump_in_progress, &expected, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    if (!oom_dump_in_progress.compare_exchange_strong(expected, 1, std::memory_order_seq_cst, std::memory_order_seq_cst)) {
         // Another CPU is already doing the OOM dump - just halt
         hcf();
     }
@@ -697,15 +705,15 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     // We'll print allocator stats later after the MEMORY SUMMARY so we can
     // use the computed totals there to refine the unaccounted memory estimate.
     // For now just call the raw dumps so they appear early in the log for visibility.
-    mini_dump_stats();
+    mini_malloc::mini_dump_stats();
     ker::mod::mm::dyn::kmalloc::dump_tracked_allocations();
     dump_alloc_stats();  // Dump page allocation counters
 
     // Reset tracking arrays
     oom_task_count = 0;
     oom_known_pagemap_count = 0;
-    memset(oom_task_info.data(), 0, sizeof(oom_task_info));
-    memset(static_cast<void*>(oom_known_pagemaps.data()), 0, sizeof(oom_known_pagemaps));
+    std::memset(oom_task_info.data(), 0, sizeof(oom_task_info));
+    std::memset(static_cast<void*>(oom_known_pagemaps.data()), 0, sizeof(oom_known_pagemaps));
 
     // ========================================================================
     // SECTION 1: Physical Memory Zones
@@ -829,9 +837,7 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
         io::serial::write(" tasks) ---\n\n");
 
         // Print task information for this batch
-        for (size_t i = 0; i < oom_task_count; i++) {
-            TaskMemoryInfo const& info = oom_task_info[i];
-
+        for (TaskMemoryInfo const& info : std::span(oom_task_info.data(), oom_task_count)) {
             io::serial::write("  PID ");
             io::serial::write(u64_to_dec_no_alloc(info.pid, oom_dump_buffer.data(), oom_dump_buffer.size()));
             io::serial::write(": ");
@@ -1000,13 +1006,15 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
             }
 
             // Print this block
-            for (size_t i = 0; i < N; ++i) {
+            auto* ref = refs.data();
+            for (uint64_t const PID : std::span(pids.data(), N)) {
                 printed_any = true;
                 io::serial::write("PID=");
-                io::serial::write(u64_to_dec_no_alloc(pids[i], oom_dump_buffer.data(), oom_dump_buffer.size()));
+                io::serial::write(u64_to_dec_no_alloc(PID, oom_dump_buffer.data(), oom_dump_buffer.size()));
                 io::serial::write(" ref=");
-                io::serial::write(u64_to_dec_no_alloc(refs[i], oom_dump_buffer.data(), oom_dump_buffer.size()));
+                io::serial::write(u64_to_dec_no_alloc(*ref, oom_dump_buffer.data(), oom_dump_buffer.size()));
                 io::serial::write("  ");
+                ref++;
             }
 
             // Advance start index; if fewer than BLOCK returned, we've reached the end
@@ -1167,7 +1175,7 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     uint64_t kmalloc_count = 0;
     uint64_t kmalloc_bytes = 0;
     ker::mod::mm::dyn::kmalloc::get_tracked_alloc_totals(kmalloc_count, kmalloc_bytes);
-    uint64_t const SLAB_BYTES = mini_get_total_slab_bytes();
+    uint64_t const SLAB_BYTES = mini_malloc::mini_get_total_slab_bytes();
 
     io::serial::write("\n");
     phys::dump_caller_page_stats();

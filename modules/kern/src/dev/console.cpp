@@ -15,6 +15,8 @@
 
 namespace ker::dev::console {
 
+using log = ker::mod::dbg::logger<"console">;
+
 // Forward declarations of device operations
 namespace {
 
@@ -55,6 +57,7 @@ CharDeviceOps serial_ops = {
     .isatty = serial_isatty,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // VGA console operations
@@ -90,6 +93,7 @@ CharDeviceOps vga_ops = {
     .isatty = vga_isatty,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // Device instances
@@ -127,7 +131,7 @@ int tty_open(ker::vfs::File* file) {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr || task->controlling_tty < 0) {
 #ifdef CONSOLE_DEBUG
-        ker::mod::io::serial::write("tty_open: no controlling terminal\n");
+        log::debug("tty_open: no controlling terminal");
 #endif
         return -ENXIO;  // No controlling terminal
     }
@@ -135,14 +139,14 @@ int tty_open(ker::vfs::File* file) {
     auto* pair = ker::dev::pty::pty_get(task->controlling_tty);
     if (pair == nullptr) {
 #ifdef CONSOLE_DEBUG
-        ker::mod::io::serial::write("tty_open: invalid controlling_tty index\n");
+        log::debug("tty_open: invalid controlling_tty index");
 #endif
         task->controlling_tty = -1;
         return -ENXIO;
     }
 
 #ifdef CONSOLE_DEBUG
-    ker::mod::io::serial::write("tty_open: redirecting to PTY slave\n");
+    log::debug("tty_open: redirecting to PTY slave");
 #endif
     // Redirect the DevFSFile to the PTY slave device, so subsequent
     // read/write/ioctl use slave_ops instead of tty_ops.
@@ -174,6 +178,7 @@ CharDeviceOps tty_ops = {
     .isatty = serial_isatty,  // /dev/tty is always a tty
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 Device tty_device = {
@@ -188,7 +193,7 @@ Device tty_device = {
 }  // anonymous namespace
 
 void console_init() {
-    mod::dbg::logger<"console">::info("Initializing console devices");
+    log::info("Initializing console devices");
 
     // Register serial console
     dev_register(&serial_device);

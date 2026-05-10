@@ -69,7 +69,7 @@ void check_true_log(const char* file, int line, const char* cexpr) {
 
 void check_null_log(const char* file, int line, const void* ptr, const char* pexpr) {
     ker::mod::dbg::log("[KTEST] FAIL %s:%d  expected null: %s (got 0x%llx)", file, line, pexpr,
-                       static_cast<unsigned long long>((uintptr_t)ptr));
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr)));
 }
 
 void run_all() {

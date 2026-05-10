@@ -7,21 +7,27 @@
 
 namespace ker::mod::tsc {
 
-static uint64_t tsc_hz = 0;
-static uint64_t tsc_base = 0;
+namespace {
 
-static bool check_invariant() {
+using log = ker::mod::dbg::logger<"tsc">;
+
+uint64_t tsc_hz = 0;
+uint64_t tsc_base = 0;
+
+bool check_invariant() {
     uint32_t eax_out = 0;
     uint32_t edx_out = 0;
     cpuid(0x80000007U, &eax_out, &edx_out);
     return (edx_out & (1U << 8)) != 0;
 }
 
+}  // namespace
+
 void init() {
     if (check_invariant()) {
-        dbg::log("tsc: invariant TSC detected");
+        log::info("invariant TSC detected");
     } else {
-        dbg::log("tsc: invariant TSC not reported by CPUID (proceeding)");
+        log::warn("invariant TSC not reported by CPUID (proceeding)");
     }
 
     // Calibrate TSC frequency against HPET over a 10 ms window.
@@ -34,14 +40,14 @@ void init() {
     uint64_t const ELAPSED_US = hpet::get_us() - HPET_START;
 
     if (ELAPSED_US == 0) {
-        dbg::log("tsc: HPET calibration window returned 0 us; defaulting to 1 GHz");
+        log::warn("HPET calibration window returned 0 us; defaulting to 1 GHz");
         tsc_hz = 1000000000ULL;
     } else {
         tsc_hz = (TSC_DELTA * 1000000ULL) / ELAPSED_US;
     }
 
     tsc_base = rdtsc();
-    dbg::log("tsc: calibrated at %lu MHz", static_cast<unsigned long>(tsc_hz / 1000000ULL));
+    log::info("calibrated at %lu MHz", static_cast<unsigned long>(tsc_hz / 1000000ULL));
 }
 
 uint64_t get_hz() { return tsc_hz; }

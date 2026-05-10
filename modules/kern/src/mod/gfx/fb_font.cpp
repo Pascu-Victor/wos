@@ -4,61 +4,44 @@
 #include <cstdint>
 #include <cstring>
 namespace ker::mod::gfx::fb {
-FbFont::FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]) : height(height), width(width) {
-    std::strncpy(this->name, name, 256);
+FbFont::FbFont(const char* name, uint8_t height, uint8_t width, const FontData* data) : height(height), width(width) {
+    std::strncpy(this->name.data(), name, this->name.size());
 
     if (data == nullptr) {
-        for (auto& i : this->data) {
-            for (unsigned long& j : i) {
-                j = 0;
-            }
-        }
         return;
     }
-    for (size_t i = 0; i < 256; i++) {
-        for (size_t j = 0; j < 64; j++) {
-            this->data[i][j] = data[i][j];
-        }
-    }
+    this->data = *data;
 }
 
 FbFont::FbFont() : height(16), width(16) {
-    std::strcpy(name, "default");
+    std::strncpy(name.data(), "default", name.size());
 
     load_font();
 }
 
 FbFont& FbFont::operator=(const FbFont& other) {
     if (this != &other) {  // protect against self-assignment
-        // std::strcpy(this->name, other.name);
+        // Preserve legacy copy behavior: font names are not copied.
         this->height = other.height;
         this->width = other.width;
-        for (size_t i = 0; i < 256; ++i) {
-            for (size_t j = 0; j < 64; ++j) {
-                this->data[i][j] = other.data[i][j];
-            }
-        }
+        this->data = other.data;
     }
     return *this;
 }
 
-FbFont::FbFont(const FbFont& other) : height(other.height), width(other.width) {
-    // std::strcpy(this->name, other.name);
-
-    for (size_t i = 0; i < 256; ++i) {
-        for (size_t j = 0; j < 64; ++j) {
-            this->data[i][j] = other.data[i][j];
-        }
-    }
-}
+FbFont::FbFont(const FbFont& other) : height(other.height), width(other.width), data(other.data) {}
 
 uint8_t FbFont::get_width() const { return width; }
 
 uint8_t FbFont::get_height() const { return height; }
 
-const uint64_t* FbFont::get_data(char c) const { return data[static_cast<uint64_t>(c)]; }
+const uint64_t* FbFont::get_data(char c) const {
+    return data[static_cast<uint8_t>(c)].data();  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
 
-void FbFont::load_font() {
+// Glyph literals are fixed indices into the 256x64 owned font table; operator[] keeps this freestanding path non-throwing.
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+void FbFont::load_font() {  // NOLINT(readability-function-size): Literal glyph table initialization.
     this->data[' '][0] = 0b0000000000000000;
     this->data[' '][1] = 0b0000000000000000;
     this->data[' '][2] = 0b0000000000000000;
@@ -1674,5 +1657,6 @@ void FbFont::load_font() {
     this->data['~'][14] = 0b0000000000000000;
     this->data['~'][15] = 0b0000000000000000;
 }
+// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
 }  // namespace ker::mod::gfx::fb

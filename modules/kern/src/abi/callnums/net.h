@@ -2,7 +2,7 @@
 #include <cstdint>
 
 namespace ker::abi::net {
-enum class ops : uint64_t {
+enum class ops : uint64_t {  // NOLINT(performance-enum-size): syscall ABI passes op numbers in 64-bit registers.
     SOCKET,
     BIND,
     LISTEN,

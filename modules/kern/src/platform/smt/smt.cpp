@@ -5,8 +5,10 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/tcp.hpp"
@@ -45,6 +47,8 @@ namespace {
 PerCpuCrossAccess<CpuInfo>* cpu_data;
 std::atomic<uint64_t> halted_cpu_mask{0};
 std::atomic<bool> halt_other_cores_requested{false};
+std::atomic<uint64_t> selftest_parked_cpu_mask{0};
+uint64_t** selftest_ap_stacks = nullptr;
 uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t g_cpu_count;
@@ -52,8 +56,10 @@ uint64_t g_cpu_count;
 // ============================================================================
 // CPU Domain registry
 // ============================================================================
-CpuDomain domain_table[MAX_CPU_DOMAINS];
+std::array<CpuDomain, MAX_CPU_DOMAINS> domain_table{};
 uint32_t domain_count = 0;
+
+auto domain_at(uint32_t index) -> CpuDomain& { return *std::next(domain_table.begin(), static_cast<std::ptrdiff_t>(index)); }
 
 }  // namespace
 
@@ -72,8 +78,9 @@ auto get_cpu_domain_count() -> uint32_t { return domain_count; }
 
 auto get_cpu_domain(uint32_t id) -> CpuDomain* {
     for (uint32_t i = 0; i < domain_count; ++i) {
-        if (domain_table[i].id == id) {
-            return &domain_table[i];
+        auto& domain = domain_at(i);
+        if (domain.id == id) {
+            return &domain;
         }
     }
     return nullptr;
@@ -81,8 +88,9 @@ auto get_cpu_domain(uint32_t id) -> CpuDomain* {
 
 auto find_group_for_cpu(uint64_t cpu_no) -> uint32_t {
     for (uint32_t i = 0; i < domain_count; ++i) {
-        if (domain_table[i].level == CpuDomainLevel::GROUP && (domain_table[i].cpu_mask & (1ULL << cpu_no)) != 0) {
-            return domain_table[i].id;
+        auto& domain = domain_at(i);
+        if (domain.level == CpuDomainLevel::GROUP && (domain.cpu_mask & (1ULL << cpu_no)) != 0) {
+            return domain.id;
         }
     }
     return 0;  // fall back to ROOT
@@ -93,20 +101,17 @@ auto create_leaf_domain(const char* name, uint64_t cpu_mask, bool soft_exclusive
         return DOMAIN_ID_INVALID;
     }
     uint32_t const NEW_ID = domain_count;
-    CpuDomain& d = domain_table[domain_count++];
+    CpuDomain& d = domain_at(domain_count++);
     d.id = NEW_ID;
     d.level = CpuDomainLevel::LEAF;
     d.cpu_mask = cpu_mask;
     d.parent_id = 1;  // child of GROUP_0 by default
     d.soft_exclusive = soft_exclusive;
     d.hard = hard;
-    d.name[0] = '\0';
-    for (int i = 0; i < 31 && name[i] != '\0'; ++i) {
-        d.name[i] = name[i];
-        d.name[i + 1] = '\0';
-    }
-    dbg::log("smt: created LEAF domain %u '%s' mask=0x%llx soft_excl=%d hard=%d", NEW_ID, d.name, static_cast<unsigned long long>(cpu_mask),
-             static_cast<int>(soft_exclusive), static_cast<int>(hard));
+    d.name.fill('\0');
+    std::strncpy(d.name.data(), name, d.name.size() - 1);
+    dbg::log("smt: created LEAF domain %u '%s' mask=0x%llx soft_excl=%d hard=%d", NEW_ID, d.name.data(),
+             static_cast<unsigned long long>(cpu_mask), static_cast<int>(soft_exclusive), static_cast<int>(hard));
     return NEW_ID;
 }
 
@@ -120,25 +125,25 @@ void init_cpu_domains() {
     }
 
     // Domain 0: ROOT
-    CpuDomain& root = domain_table[domain_count++];
+    CpuDomain& root = domain_at(domain_count++);
     root.id = 0;
     root.level = CpuDomainLevel::ROOT;
     root.cpu_mask = all_mask;
     root.parent_id = DOMAIN_ID_INVALID;
     root.soft_exclusive = false;
     root.hard = false;
-    __builtin_memcpy(root.name, "root", 5);
+    __builtin_memcpy(root.name.data(), "root", 5);
 
     // Domain 1: single GROUP_0 (flat topology - one socket)
     // Future NUMA support: parse MADT/SRAT to create one group per proximity domain
-    CpuDomain& grp = domain_table[domain_count++];
+    CpuDomain& grp = domain_at(domain_count++);
     grp.id = 1;
     grp.level = CpuDomainLevel::GROUP;
     grp.cpu_mask = all_mask;
     grp.parent_id = 0;
     grp.soft_exclusive = false;
     grp.hard = false;
-    __builtin_memcpy(grp.name, "group0", 7);
+    __builtin_memcpy(grp.name.data(), "group0", 7);
 
     dbg::log("smt: cpu_domains initialised: root mask=0x%llx group0 mask=0x%llx", static_cast<unsigned long long>(all_mask),
              static_cast<unsigned long long>(all_mask));
@@ -166,16 +171,16 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     // Allocate a dedicated PerCpu structure for this CPU (don't reuse stack bottom
     // as that can corrupt adjacent memory or heap metadata)
     auto* per_cpu_data = new cpu::PerCpu();
-    auto per_cpu_addr = (uint64_t)per_cpu_data;
+    auto const PER_CPU_ADDR = reinterpret_cast<uint64_t>(per_cpu_data);
 
     // Zero out the PerCpu area
-    memset((void*)per_cpu_addr, 0, sizeof(cpu::PerCpu));
+    std::memset(static_cast<void*>(per_cpu_data), 0, sizeof(cpu::PerCpu));
 
     // Store kernel stack in the PerCpu structure
     per_cpu_data->syscall_stack = stack_top;
 
-    cpu::wrgsbase(per_cpu_addr);
-    cpu_set_msr(IA32_KERNEL_GS_BASE, per_cpu_addr);
+    cpu::wrgsbase(PER_CPU_ADDR);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, PER_CPU_ADDR);
 
     // Write cpuId directly to the memory location to verify
     per_cpu_data->cpu_id = cpu_no;
@@ -192,12 +197,12 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     uint64_t const READ_BACK = cpu::current_cpu();
     if (READ_BACK != cpu_no) {
         // Use serial directly since dbg might not be ready
-        dbg::log("CPU INIT ERROR: wrote cpuId=%d but read back %d, perCpuAddr=%p\n", cpu_no, READ_BACK, per_cpu_addr);
+        dbg::log("CPU INIT ERROR: wrote cpuId=%d but read back %d, perCpuAddr=%p\n", cpu_no, READ_BACK, PER_CPU_ADDR);
     }
 
     // Initialize GDT for this CPU (includes per-CPU TSS)
     // NOTE: GDT/IDT asm routines no longer load GS selector to preserve GS.base
-    desc::gdt::init_descriptors((uint64_t*)stack_top, cpu_no);
+    desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack_top), cpu_no);
 
     // Initialize IDT for this CPU (loads the shared IDT)
     desc::idt::idt_init();
@@ -234,21 +239,25 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
 void non_primary_cpu_init(limine_mp_info* smp_info) {
     // FIRST: Switch to kernel page table before accessing any kernel data
     mm::virt::switch_to_kernel_pagemap();
+    auto* response = SMP_REQUEST.response;
+    if (response == nullptr) {
+        hcf();
+    }
 
     uint64_t cpu_no = 0;
 
     // Find our CPU number from the LAPIC ID
     for (uint64_t i = 0; i < g_cpu_count; i++) {
-        if (SMP_REQUEST.response->cpus[i]->lapic_id == smp_info->lapic_id) {
+        if (response->cpus[i]->lapic_id == smp_info->lapic_id) {
             cpu_no = i;
             break;
         }
     }
 
-    auto stack_top = (uint64_t)cpu_data->that_cpu(cpu_no)->stack_pointer_ref;
+    auto const STACK_TOP = reinterpret_cast<uint64_t>(cpu_data->that_cpu(cpu_no)->stack_pointer_ref);
 
     // Initialize this CPU fully
-    cpu_param_init(cpu_no, stack_top);
+    cpu_param_init(cpu_no, STACK_TOP);
 
     // Should never reach here
     hcf();
@@ -271,7 +280,8 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
     for (uint64_t i = 0; i < mod_struct.count; i++) {
         const auto& module = mod_struct.modules[i];
-        auto* new_task = new sched::task::Task(module.name, (uint64_t)module.entry, kernel_rsp, sched::task::TaskType::PROCESS);
+        auto* new_task =
+            new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), kernel_rsp, sched::task::TaskType::PROCESS);
 
         if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
             dbg::log("FATAL: Failed to create handover task %s - OOM", module.name);
@@ -290,13 +300,13 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
             console_stderr->fops = ker::vfs::devfs::get_devfs_fops();
 
             // Assign file descriptors 0, 1, 2
-            new_task->fd_table.insert(0, console_stdin);
+            (void)new_task->fd_table.insert(0, console_stdin);
             console_stdin->fd = 0;
             dbg::log("Setup fd 0 (stdin): %p", console_stdin);
-            new_task->fd_table.insert(1, console_stdout);
+            (void)new_task->fd_table.insert(1, console_stdout);
             console_stdout->fd = 1;
             dbg::log("Setup fd 1 (stdout): %p", console_stdout);
-            new_task->fd_table.insert(2, console_stderr);
+            (void)new_task->fd_table.insert(2, console_stderr);
             console_stderr->fd = 2;
             dbg::log("Setup fd 2 (stderr): %p", console_stderr);
             dbg::log("Verifying: fds[0]=%p, fds[1]=%p, fds[2]=%p", new_task->fd_table.lookup(0), new_task->fd_table.lookup(1),
@@ -313,7 +323,7 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
         // Helper to push data onto stack
         auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
-            if (current_virt_offset + size > USER_STACK_SIZE) {
+            if (current_virt_offset + size > ker::mod::mm::USER_STACK_SIZE) {
                 return 0;
             }
             current_virt_offset += size;
@@ -339,7 +349,7 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
         // Helper to push string onto stack
         auto push_string = [&](const char* str) -> uint64_t {
             size_t const LEN = std::strlen(str) + 1;
-            if (current_virt_offset + LEN > USER_STACK_SIZE) {
+            if (current_virt_offset + LEN > ker::mod::mm::USER_STACK_SIZE) {
                 return 0;
             }
             current_virt_offset += LEN;
@@ -378,15 +388,16 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
         constexpr uint64_t AT_PHDR = 3;
         constexpr uint64_t AT_EHDR = 33;  // AT_EHDR (glibc extension but widely supported)
 
-        std::array<uint64_t, 10> auxv_entries = {AT_PAGESZ, mm::paging::PAGE_SIZE,
-                                                 AT_ENTRY,  new_task->entry,
-                                                 AT_PHDR,   new_task->program_header_addr,
-                                                 AT_EHDR,   new_task->elf_header_addr,
-                                                 AT_NULL,   0};
+        const std::array<uint64_t, 10> AUXV_ENTRIES = {AT_PAGESZ, mm::paging::PAGE_SIZE,
+                                                       AT_ENTRY,  new_task->entry,
+                                                       AT_PHDR,   new_task->program_header_addr,
+                                                       AT_EHDR,   new_task->elf_header_addr,
+                                                       AT_NULL,   0};
 
         // Push auxv in reverse order
-        for (int j = auxv_entries.size() - 1; j >= 0; j--) {
-            uint64_t val = auxv_entries[static_cast<size_t>(j)];
+        // NOLINTNEXTLINE(modernize-loop-convert): Reverse iterators keep this freestanding-friendly without ranges.
+        for (auto it = AUXV_ENTRIES.crbegin(); it != AUXV_ENTRIES.crend(); ++it) {
+            uint64_t val = *it;
             push_to_stack(&val, sizeof(uint64_t));
         }
 
@@ -557,13 +568,61 @@ void halt_nmi_handler(cpu::GPRegs gpr, gates::InterruptFrame frame) {
     }
     ker::mod::dbg::panic_handler("unexpected NMI");
 }
+
+void selftest_secondary_cpu_park(limine_mp_info* smp_info) {
+    mm::virt::switch_to_kernel_pagemap();
+    auto* response = SMP_REQUEST.response;
+    if (response == nullptr) {
+        hcf();
+    }
+
+    uint64_t cpu_no = 0;
+    for (uint64_t i = 0; i < g_cpu_count; ++i) {
+        if (response->cpus[i]->lapic_id == smp_info->lapic_id) {
+            cpu_no = i;
+            break;
+        }
+    }
+
+    uint64_t const STACK_TOP = selftest_ap_stacks != nullptr ? reinterpret_cast<uint64_t>(selftest_ap_stacks[cpu_no]) : 0;
+
+    cpu::enable_fsgsbase();
+    cpu::enable_sse();
+    cpu::enable_xsave();
+
+    auto* per_cpu_data = new cpu::PerCpu();
+    auto const PER_CPU_ADDR = reinterpret_cast<uint64_t>(per_cpu_data);
+    std::memset(reinterpret_cast<void*>(PER_CPU_ADDR), 0, sizeof(cpu::PerCpu));
+    per_cpu_data->syscall_stack = STACK_TOP;
+    per_cpu_data->cpu_id = cpu_no;
+
+    cpu::wrgsbase(PER_CPU_ADDR);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, PER_CPU_ADDR);
+    cpu::set_current_cpuid(cpu_no);
+
+    if (kernel_per_cpu_ptrs != nullptr) {
+        kernel_per_cpu_ptrs[cpu_no] = per_cpu_data;
+    }
+
+    desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(STACK_TOP), cpu_no);
+    desc::idt::idt_init();
+    sys::init();
+    apic::init_apic_mp();
+
+    selftest_parked_cpu_mask.fetch_or(1ULL << cpu_no, std::memory_order_acq_rel);
+    halt_this_cpu_forever();
+}
 }  // namespace
 
 void init() {
-    assert(smp_request.response != nullptr);
-    flags = SMP_REQUEST.response->flags;
-    bsp_lapic_id = SMP_REQUEST.response->bsp_lapic_id;
-    g_cpu_count = SMP_REQUEST.response->cpu_count;
+    auto* response = SMP_REQUEST.response;
+    assert(response != nullptr);
+    if (response == nullptr) {
+        hcf();
+    }
+    flags = response->flags;
+    bsp_lapic_id = response->bsp_lapic_id;
+    g_cpu_count = response->cpu_count;
 
     // Allocate the kernel PerCpu pointers array
     kernel_per_cpu_ptrs = new cpu::PerCpu*[g_cpu_count];
@@ -583,9 +642,52 @@ void init() {
     init_cpu_domains();
 }
 
+void park_secondary_cpus_for_selftest() {
+    auto* response = SMP_REQUEST.response;
+    if (response == nullptr || g_cpu_count <= 1) {
+        return;
+    }
+
+    if (selftest_ap_stacks == nullptr) {
+        selftest_ap_stacks = new uint64_t*[g_cpu_count];
+    }
+
+    for (uint64_t i = 0; i < g_cpu_count; ++i) {
+        auto stack = mm::Stack();
+        selftest_ap_stacks[i] = stack.sp;
+    }
+
+    halt_other_cores_requested.store(true, std::memory_order_release);
+
+    uint64_t expected_mask = 0;
+    for (uint64_t i = 0; i < response->cpu_count; ++i) {
+        if (response->cpus[i]->lapic_id == bsp_lapic_id) {
+            continue;
+        }
+        expected_mask |= 1ULL << i;
+        __atomic_store_n(&response->cpus[i]->goto_address, static_cast<limine_goto_address>(selftest_secondary_cpu_park), __ATOMIC_SEQ_CST);
+    }
+
+    for (uint64_t spin = 0; spin < 10'000'000; ++spin) {
+        if ((selftest_parked_cpu_mask.load(std::memory_order_acquire) & expected_mask) == expected_mask) {
+            dbg::log("smt: parked secondary CPUs for selftest (mask=0x%llx)", static_cast<unsigned long long>(expected_mask));
+            return;
+        }
+        asm volatile("pause" ::: "memory");
+    }
+
+    dbg::log("smt: timed out parking secondary CPUs for selftest (got=0x%llx expected=0x%llx)",
+             static_cast<unsigned long long>(selftest_parked_cpu_mask.load(std::memory_order_acquire)),
+             static_cast<unsigned long long>(expected_mask));
+}
+
 // init per cpu data
 void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
-    assert(smp_request.response != nullptr);
+    auto* response = SMP_REQUEST.response;
+    assert(response != nullptr);
+    if (response == nullptr) {
+        hcf();
+    }
 
     // Allocate a dedicated PerCpu structure for BSP (like APs do in cpuParamInit)
     // Don't reuse stack bottom as that can cause issues
@@ -593,7 +695,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     auto per_cpu_addr = reinterpret_cast<uint64_t>(bsp_per_cpu);
 
     // Zero out the PerCpu area before use
-    memset((void*)per_cpu_addr, 0, sizeof(cpu::PerCpu));
+    std::memset(static_cast<void*>(bsp_per_cpu), 0, sizeof(cpu::PerCpu));
 
     // Store kernel stack in the PerCpu structure
     bsp_per_cpu->syscall_stack = kernel_rsp;
@@ -623,14 +725,14 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
     // Initialize CPU info for all CPUs first
     for (uint64_t i = 0; i < get_core_count(); i++) {
-        cpu_data->that_cpu(i)->processor_id = SMP_REQUEST.response->cpus[i]->processor_id;
-        cpu_data->that_cpu(i)->lapic_id = SMP_REQUEST.response->cpus[i]->lapic_id;
-        cpu_data->that_cpu(i)->goto_address = &SMP_REQUEST.response->cpus[i]->goto_address;
-        cpu_data->that_cpu(i)->stack_pointer_ref = (uint64_t*)(SMP_REQUEST.response->cpus[i]->extra_argument);
+        cpu_data->that_cpu(i)->processor_id = response->cpus[i]->processor_id;
+        cpu_data->that_cpu(i)->lapic_id = response->cpus[i]->lapic_id;
+        cpu_data->that_cpu(i)->goto_address = &response->cpus[i]->goto_address;
+        cpu_data->that_cpu(i)->stack_pointer_ref = reinterpret_cast<uint64_t*>(response->cpus[i]->extra_argument);
     }
 
     // Allocate stacks for all CPUs first (don't start secondary CPUs yet)
-    for (uint64_t i = 0; i < SMP_REQUEST.response->cpu_count; i++) {
+    for (uint64_t i = 0; i < response->cpu_count; i++) {
         auto stack = mm::Stack();
         cpu_data->that_cpu(i)->stack_pointer_ref = stack.sp;
     }
@@ -652,18 +754,17 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     ker::net::wki::wki_remote_compute_start_submit_thread();
 
     // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)
-    for (uint64_t i = 0; i < SMP_REQUEST.response->cpu_count; i++) {
+    for (uint64_t i = 0; i < response->cpu_count; i++) {
         // Skip BSP - it's already running
-        if (SMP_REQUEST.response->cpus[i]->lapic_id == bsp_lapic_id) {
+        if (response->cpus[i]->lapic_id == bsp_lapic_id) {
             continue;
         }
 
-        dbg::log("Starting CPU %d (LAPIC ID: %d)", i, SMP_REQUEST.response->cpus[i]->lapic_id);
+        dbg::log("Starting CPU %d (LAPIC ID: %d)", i, response->cpus[i]->lapic_id);
 
         // Use Limine's goto_address to start the CPU
         // The CPU will call nonPrimaryCpuInit with its limine_smp_info as argument
-        __atomic_store_n(&SMP_REQUEST.response->cpus[i]->goto_address, static_cast<limine_goto_address>(non_primary_cpu_init),
-                         __ATOMIC_SEQ_CST);
+        __atomic_store_n(&response->cpus[i]->goto_address, static_cast<limine_goto_address>(non_primary_cpu_init), __ATOMIC_SEQ_CST);
     }
 
     dbg::log("All CPUs started, starting scheduler on BSP");
@@ -693,9 +794,10 @@ auto set_tcb(void* tcb) -> uint64_t {
     mod::dbg::log("setTcb: task=%s pid=%d tcb=0x%x old_fsbase=0x%x", currentTask->name ? currentTask->name : "null", currentTask->pid,
                   (uint64_t)tcb, currentTask->thread ? currentTask->thread->fsbase : 0);
 #endif
-    current_task->thread->fsbase = (uint64_t)tcb;
-    *static_cast<uint64_t*>(tcb) = (uint64_t)tcb;
-    cpu::wrfsbase((uint64_t)tcb);
+    auto const TCB_ADDR = reinterpret_cast<uint64_t>(tcb);
+    current_task->thread->fsbase = TCB_ADDR;
+    *static_cast<uint64_t*>(tcb) = TCB_ADDR;
+    cpu::wrfsbase(TCB_ADDR);
     asm volatile("sti");
     return 0;
 }

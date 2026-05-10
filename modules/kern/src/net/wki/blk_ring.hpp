@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace ker::net::wki {
@@ -52,7 +53,7 @@ constexpr uint32_t BLK_RING_BULK_THRESHOLD = 262144;  // 256 KB
 struct BlkSqEntry {
     uint32_t tag;    // unique request ID (consumer-assigned, echoed in CQE)
     uint8_t opcode;  // BlkOpcode
-    uint8_t reserved[3];
+    std::array<uint8_t, 3> reserved;
     uint64_t lba;          // starting logical block address
     uint32_t block_count;  // number of blocks to read/write
     uint32_t data_slot;    // index into the data region (0..data_slot_count-1)
@@ -73,7 +74,7 @@ static_assert(sizeof(BlkSqEntry) == 24, "BlkSqEntry must be 24 bytes");
 struct BlkBulkSqEntry {
     uint32_t tag;    // unique request ID (consumer-assigned)
     uint8_t opcode;  // BlkOpcode::BULK_READ or BULK_WRITE
-    uint8_t reserved[3];
+    std::array<uint8_t, 3> reserved;
     uint64_t lba;          // starting logical block address
     uint32_t block_count;  // number of blocks to transfer
     uint32_t roce_rkey;    // consumer's RDMA rkey for the registered staging buffer
@@ -115,8 +116,8 @@ struct BlkRingHeader {
     uint32_t block_size;      // block device block size (e.g. 512, 4096)
     uint64_t total_blocks;    // block device total blocks
 
-    volatile uint8_t server_ready;  // 1 when server has initialized the ring
-    uint8_t reserved[19];           // pad to exactly 64 bytes (cache line)
+    volatile uint8_t server_ready;     // 1 when server has initialized the ring
+    std::array<uint8_t, 19> reserved;  // pad to exactly 64 bytes (cache line)
 } __attribute__((packed));
 
 static_assert(sizeof(BlkRingHeader) == 64, "BlkRingHeader must be exactly 64 bytes");

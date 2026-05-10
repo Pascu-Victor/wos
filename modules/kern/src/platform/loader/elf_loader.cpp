@@ -61,6 +61,31 @@ auto header_is_valid(const Elf64_Ehdr& ehdr) -> bool {
            && ehdr.e_ident[EI_MAG3] == ELFMAG3;                  // Magic 3
 }
 
+template <typename T>
+auto ptr_from_addr(uint64_t addr) -> T* {
+    return reinterpret_cast<T*>(addr);
+}
+
+template <typename T>
+auto ptr_at(uint8_t* base, uint64_t offset) -> T* {
+    return reinterpret_cast<T*>(base + offset);
+}
+
+template <typename T>
+auto ptr_at(const uint8_t* base, uint64_t offset) -> const T* {
+    return reinterpret_cast<const T*>(base + offset);
+}
+
+auto section_header_at(const ElfFile& elf, size_t index) -> Elf64_Shdr* {
+    return ptr_from_addr<Elf64_Shdr>(reinterpret_cast<uint64_t>(elf.se_head) + (index * elf.elf_head.e_shentsize));
+}
+
+auto program_header_at(const ElfFile& elf, size_t index) -> Elf64_Phdr* {
+    return ptr_from_addr<Elf64_Phdr>(reinterpret_cast<uint64_t>(elf.pg_head) + (index * elf.elf_head.e_phentsize));
+}
+
+auto hhdm_to_phys(uint64_t hhdm_addr) -> uint64_t { return reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(hhdm_addr)); }
+
 auto parse_elf(uint8_t* base) -> ElfFile {
     ElfFile elf{};
     elf.base = base;
@@ -72,7 +97,7 @@ auto parse_elf(uint8_t* base) -> ElfFile {
     }
 
     // Copy ELF header first and validate magic numbers before using offsets
-    elf.elf_head = *reinterpret_cast<Elf64_Ehdr*>(base);
+    elf.elf_head = *ptr_at<Elf64_Ehdr>(base, 0);
 
     // Validate ELF magic numbers immediately to catch corruption
     if (elf.elf_head.e_ident[EI_MAG0] != ELFMAG0 || elf.elf_head.e_ident[EI_MAG1] != ELFMAG1 || elf.elf_head.e_ident[EI_MAG2] != ELFMAG2 ||
@@ -88,12 +113,9 @@ auto parse_elf(uint8_t* base) -> ElfFile {
         return elf;
     }
 
-    elf.pg_head = reinterpret_cast<Elf64_Phdr*>(base + elf.elf_head.e_phoff);
-    elf.se_head = reinterpret_cast<Elf64_Shdr*>(base + elf.elf_head.e_shoff);
-    elf.sct_head_str_tab = (Elf64_Shdr*)(elf.elf_head.e_shoff +                                // Section header offset
-                                         (static_cast<Elf64_Off>(elf.elf_head.e_shstrndx       // Section header string table index
-                                                                 * elf.elf_head.e_shentsize))  // Size of each section header
-    );
+    elf.pg_head = ptr_at<Elf64_Phdr>(base, elf.elf_head.e_phoff);
+    elf.se_head = ptr_at<Elf64_Shdr>(base, elf.elf_head.e_shoff);
+    elf.sct_head_str_tab = section_header_at(elf, elf.elf_head.e_shstrndx);
     // Choose a non-zero base for PIE executables so their writable/data segments
     // live in normal user space instead of the low pages near NULL.
     if (elf.elf_head.e_type == ET_DYN) {
@@ -112,17 +134,24 @@ auto parse_elf(uint8_t* base) -> ElfFile {
 }
 
 void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap) {
+    if (elf.base == nullptr) {
+        return;
+    }
+
     // Get section header string table so we can detect .relr sections by name
-    Elf64_Shdr const* shdr_table = elf.se_head;
-    const char* shstr = reinterpret_cast<const char*>(elf.base + shdr_table[elf.elf_head.e_shstrndx].sh_offset);
+    const char* shstr = nullptr;
+    if (elf.base != nullptr && elf.elf_head.e_shstrndx < elf.elf_head.e_shnum) {
+        auto const* shstr_table = section_header_at(elf, elf.elf_head.e_shstrndx);
+        shstr = reinterpret_cast<const char*>(elf.base + shstr_table->sh_offset);
+    }
     // No per-process resolver stub: we eagerly resolve and enforce RELRO.
     // Find relocation sections (REL and RELA)
     for (size_t i = 0; i < elf.elf_head.e_shnum; i++) {
-        auto* section_header = (Elf64_Shdr*)((uint64_t)elf.se_head + (i * elf.elf_head.e_shentsize));
+        auto* section_header = section_header_at(elf, i);
 
         // Handle the newer SHT_RELR compressed relocation section by name
         const char* sec_name = nullptr;
-        if (elf.elf_head.e_shstrndx < elf.elf_head.e_shnum) {
+        if (shstr != nullptr) {
             sec_name = shstr + section_header->sh_name;
         }
 
@@ -194,15 +223,13 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                 if (SYM_INDEX != 0) {
                     // The relocation section's sh_link tells which symbol table to use
                     if (section_header->sh_link < elf.elf_head.e_shnum) {
-                        auto* sym_tab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                          (static_cast<uint64_t>(section_header->sh_link * elf.elf_head.e_shentsize)));
+                        auto* sym_tab_sec = section_header_at(elf, section_header->sh_link);
                         auto* syms = reinterpret_cast<Elf64_Sym*>(elf.base + sym_tab_sec->sh_offset);
                         uint64_t const N = sym_tab_sec->sh_size / sym_tab_sec->sh_entsize;
                         // Get string table for symbol names if available
                         const char* sym_strs = nullptr;
                         if (sym_tab_sec->sh_link < elf.elf_head.e_shnum) {
-                            auto* strtab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                             (static_cast<uint64_t>(sym_tab_sec->sh_link * elf.elf_head.e_shentsize)));
+                            auto* strtab_sec = section_header_at(elf, sym_tab_sec->sh_link);
                             sym_strs = reinterpret_cast<const char*>(elf.base + strtab_sec->sh_offset);
                         }
                         if (SYM_INDEX < N) {
@@ -211,8 +238,7 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                             s = sym->st_value;
                             // If the symbol is defined in a section, add loadBase (unless TLS)
                             if (sym->st_shndx < elf.elf_head.e_shnum) {
-                                auto* sym_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                              (static_cast<uint64_t>(sym->st_shndx * elf.elf_head.e_shentsize)));
+                                auto* sym_sec = section_header_at(elf, sym->st_shndx);
                                 if ((sym_sec->sh_flags & SHF_TLS) == 0U) {
                                     s += elf.load_base;
                                 }
@@ -221,7 +247,7 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                     } else {
                         // Fallback: search symbol tables if sh_link is invalid
                         for (size_t sidx = 0; sidx < elf.elf_head.e_shnum; sidx++) {
-                            auto* sec = (Elf64_Shdr*)((uint64_t)elf.se_head + (sidx * elf.elf_head.e_shentsize));
+                            auto* sec = section_header_at(elf, sidx);
                             if (sec->sh_type == SHT_SYMTAB || sec->sh_type == SHT_DYNSYM) {
                                 auto* syms = reinterpret_cast<Elf64_Sym*>(elf.base + sec->sh_offset);
                                 uint64_t const N = sec->sh_size / sec->sh_entsize;
@@ -229,15 +255,13 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                                     Elf64_Sym const* sym = &syms[SYM_INDEX];
                                     // Try to get symbol name from string table
                                     if (sec->sh_link < elf.elf_head.e_shnum) {
-                                        auto* strtab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                                         (static_cast<uint64_t>(sec->sh_link * elf.elf_head.e_shentsize)));
+                                        auto* strtab_sec = section_header_at(elf, sec->sh_link);
                                         const char* sym_strs = reinterpret_cast<const char*>(elf.base + strtab_sec->sh_offset);
                                         sym_name = (sym_strs != nullptr) ? (sym_strs + sym->st_name) : "";
                                     }
                                     s = sym->st_value;
                                     if (sym->st_shndx < elf.elf_head.e_shnum) {
-                                        auto* sym_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                                      (static_cast<uint64_t>(sym->st_shndx * elf.elf_head.e_shentsize)));
+                                        auto* sym_sec = section_header_at(elf, sym->st_shndx);
                                         if ((sym_sec->sh_flags & SHF_TLS) == 0U) {
                                             s += elf.load_base;
                                         }
@@ -277,10 +301,10 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto new_paddr = (uint64_t)mod::mm::phys::page_alloc();
-                            if (new_paddr != 0) {
-                                auto phys_ptr_page = (uint64_t)mod::mm::addr::get_phys_pointer(new_paddr);
-                                mod::mm::virt::map_page(pagemap, TARGET_PAGE, phys_ptr_page, mod::mm::paging::page_types::USER);
+                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+                            if (NEW_PADDR != 0) {
+                                auto const PHYS_PTR_PAGE = hhdm_to_phys(NEW_PADDR);
+                                mod::mm::virt::map_page(pagemap, TARGET_PAGE, PHYS_PTR_PAGE, mod::mm::paging::page_types::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
@@ -366,14 +390,12 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                 const char* sym_name = "";
                 if (SYM_INDEX != 0) {
                     if (section_header->sh_link < elf.elf_head.e_shnum) {
-                        auto* sym_tab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                          (static_cast<uint64_t>(section_header->sh_link * elf.elf_head.e_shentsize)));
+                        auto* sym_tab_sec = section_header_at(elf, section_header->sh_link);
                         auto* syms = reinterpret_cast<Elf64_Sym*>(elf.base + sym_tab_sec->sh_offset);
                         uint64_t const N = sym_tab_sec->sh_size / sym_tab_sec->sh_entsize;
                         const char* sym_strs = nullptr;
                         if (sym_tab_sec->sh_link < elf.elf_head.e_shnum) {
-                            auto* strtab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                             (static_cast<uint64_t>(sym_tab_sec->sh_link * elf.elf_head.e_shentsize)));
+                            auto* strtab_sec = section_header_at(elf, sym_tab_sec->sh_link);
                             sym_strs = reinterpret_cast<const char*>(elf.base + strtab_sec->sh_offset);
                         }
 
@@ -382,8 +404,7 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                             sym_name = (sym_strs != nullptr) ? (sym_strs + sym->st_name) : "";
                             s = sym->st_value;
                             if (sym->st_shndx < elf.elf_head.e_shnum) {
-                                auto* sym_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                              (static_cast<uint64_t>(sym->st_shndx * elf.elf_head.e_shentsize)));
+                                auto* sym_sec = section_header_at(elf, sym->st_shndx);
                                 if ((sym_sec->sh_flags & SHF_TLS) == 0U) {
                                     s += elf.load_base;
                                 }
@@ -391,7 +412,7 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                         }
                     } else {
                         for (size_t sidx = 0; sidx < elf.elf_head.e_shnum; sidx++) {
-                            auto* sec = (Elf64_Shdr*)((uint64_t)elf.se_head + (sidx * elf.elf_head.e_shentsize));
+                            auto* sec = section_header_at(elf, sidx);
                             if (sec->sh_type == SHT_SYMTAB || sec->sh_type == SHT_DYNSYM) {
                                 auto* syms = reinterpret_cast<Elf64_Sym*>(elf.base + sec->sh_offset);
                                 uint64_t const N = sec->sh_size / sec->sh_entsize;
@@ -399,15 +420,13 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
                                     Elf64_Sym const* sym = &syms[SYM_INDEX];
                                     // Try to get symbol name from string table
                                     if (sec->sh_link < elf.elf_head.e_shnum) {
-                                        auto* strtab_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                                         (static_cast<uint64_t>(sec->sh_link * elf.elf_head.e_shentsize)));
+                                        auto* strtab_sec = section_header_at(elf, sec->sh_link);
                                         const char* sym_strs = reinterpret_cast<const char*>(elf.base + strtab_sec->sh_offset);
                                         sym_name = (sym_strs != nullptr) ? (sym_strs + sym->st_name) : "";
                                     }
                                     s = sym->st_value;
                                     if (sym->st_shndx < elf.elf_head.e_shnum) {
-                                        auto* sym_sec = (Elf64_Shdr*)((uint64_t)elf.se_head +
-                                                                      (static_cast<uint64_t>(sym->st_shndx * elf.elf_head.e_shentsize)));
+                                        auto* sym_sec = section_header_at(elf, sym->st_shndx);
                                         if ((sym_sec->sh_flags & SHF_TLS) == 0U) {
                                             s += elf.load_base;
                                         }
@@ -448,10 +467,10 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto new_paddr = (uint64_t)mod::mm::phys::page_alloc();
-                            if (new_paddr != 0) {
-                                auto phys_ptr = (uint64_t)mod::mm::addr::get_phys_pointer(new_paddr);
-                                mod::mm::virt::map_page(pagemap, TARGET_PAGE, phys_ptr, mod::mm::paging::page_types::USER);
+                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+                            if (NEW_PADDR != 0) {
+                                auto const PHYS_PTR = hhdm_to_phys(NEW_PADDR);
+                                mod::mm::virt::map_page(pagemap, TARGET_PAGE, PHYS_PTR, mod::mm::paging::page_types::USER);
                                 paddr = mod::mm::virt::translate(pagemap, P);
                             }
                         }
@@ -538,7 +557,7 @@ void process_eh_frame_segment(Elf64_Phdr* segment, ker::mod::mm::virt::PageTable
     }
 
     // Register the .eh_frame section for exception handling
-    register_eh_frame((void*)VADDR, segment->p_memsz);
+    register_eh_frame(ptr_from_addr<void>(VADDR), segment->p_memsz);
 }
 
 void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf64_Phdr* program_header, uint64_t page_no,
@@ -566,16 +585,16 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
             mod::dbg::log("elf_loader: translate failed for already-mapped pageVA 0x%lx", PAGE_VA);
             hcf();
         }
-        page_hhdm_ptr = (uint64_t)mod::mm::addr::get_virt_pointer(PADDR);
+        page_hhdm_ptr = reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PADDR));
     } else {
         // Allocate a new physical page; allocator returns an HHDM pointer to the page memory
-        auto new_page_hhdm_ptr = (uint64_t)mod::mm::phys::page_alloc();
-        page_hhdm_ptr = new_page_hhdm_ptr;
+        auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        page_hhdm_ptr = NEW_PAGE_HHDM_PTR;
         // Map using the physical address corresponding to that HHDM pointer
-        mod::mm::virt::map_page(pagemap, PAGE_VA, (mod::mm::addr::paddr_t)mod::mm::addr::get_phys_pointer(new_page_hhdm_ptr),
+        mod::mm::virt::map_page(pagemap, PAGE_VA, static_cast<mod::mm::addr::paddr_t>(hhdm_to_phys(NEW_PAGE_HHDM_PTR)),
                                 mod::mm::paging::page_types::USER);
         // Zero freshly mapped page to handle bss/holes
-        memset((void*)page_hhdm_ptr, 0, mod::mm::virt::PAGE_SIZE);
+        std::memset(ptr_from_addr<void>(page_hhdm_ptr), 0, mod::mm::virt::PAGE_SIZE);
     }
 
     // Determine source file offset and destination in-page offset for this page
@@ -602,15 +621,12 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
 
     // Copy from ELF file to destination page at the correct in-page offset
     const uint64_t SRC_OFFSET = program_header->p_offset + bytes_before_this_page;
-    memcpy((void*)(page_hhdm_ptr + DST_IN_PAGE), elf_base + SRC_OFFSET, COPY_SIZE);
+    std::memcpy(ptr_from_addr<void>(page_hhdm_ptr + DST_IN_PAGE), elf_base + SRC_OFFSET, COPY_SIZE);
 }
 
 void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const uint64_t& pid) {
     (void)pid;
-    auto* scn_head_table = (Elf64_Shdr*)((uint64_t)elf.base                                       // Base address of the ELF file
-                                         + elf.elf_head.e_shoff                                   // Section header offset
-                                         + (static_cast<uint64_t>(elf.elf_head.e_shstrndx         // Section header string table index
-                                                                  * elf.elf_head.e_shentsize)));  // Size of each section header
+    auto* scn_head_table = section_header_at(elf, elf.elf_head.e_shstrndx);
 
     const char* section_names = reinterpret_cast<const char*>(elf.base + scn_head_table->sh_offset);
 
@@ -621,27 +637,27 @@ void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
 
     uint64_t section_headers_phys_ptr = 0;  // Make this accessible throughout function
     for (uint64_t i = 0; i < SECTION_HEADERS_PAGES; i++) {
-        auto paddr = (uint64_t)mod::mm::phys::page_alloc();
-        if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto phys_ptr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
-            mod::mm::virt::map_page(pagemap, SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), phys_ptr,
+        auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
+            auto const PHYS_PTR = hhdm_to_phys(PADDR);
+            mod::mm::virt::map_page(pagemap, SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
                                     mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
-            memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
+            std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
 
             // Remember first page for copying
             if (i == 0) {
-                section_headers_phys_ptr = paddr;
+                section_headers_phys_ptr = PADDR;
             }
         }
     }
 
     // Copy section headers to allocated physical memory
     if (section_headers_phys_ptr != 0) {
-        memcpy((void*)section_headers_phys_ptr, elf.se_head, section_headers_size);
+        std::memcpy(ptr_from_addr<void>(section_headers_phys_ptr), elf.se_head, section_headers_size);
     }
-    debug::set_section_headers(pid, (Elf64_Shdr*)SECTION_HEADERS_VADDR, SECTION_HEADERS_VADDR, elf.elf_head.e_shnum);
+    debug::set_section_headers(pid, ptr_from_addr<Elf64_Shdr>(SECTION_HEADERS_VADDR), SECTION_HEADERS_VADDR, elf.elf_head.e_shnum);
 
     // Allocate memory for string table
     uint64_t const STRING_TABLE_SIZE = scn_head_table->sh_size;
@@ -650,30 +666,30 @@ void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
 
     uint64_t string_table_phys_ptr = 0;
     for (uint64_t i = 0; i < STRING_TABLE_PAGES; i++) {
-        auto paddr = (uint64_t)mod::mm::phys::page_alloc();
-        if (paddr != ker::mod::mm::virt::PADDR_INVALID) {
-            auto phys_ptr = (uint64_t)mod::mm::addr::get_phys_pointer(paddr);
-            mod::mm::virt::map_page(pagemap, STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), phys_ptr,
+        auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
+            auto const PHYS_PTR = hhdm_to_phys(PADDR);
+            mod::mm::virt::map_page(pagemap, STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
                                     mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
             // Zero the page
-            memset((void*)paddr, 0, mod::mm::virt::PAGE_SIZE);
+            std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
 
             // Remember first page for copying
             if (i == 0) {
-                string_table_phys_ptr = paddr;
+                string_table_phys_ptr = PADDR;
             }
         }
     }
 
     // Copy string table to allocated physical memory
     if (string_table_phys_ptr != 0) {
-        memcpy((void*)string_table_phys_ptr, section_names, STRING_TABLE_SIZE);
+        std::memcpy(ptr_from_addr<void>(string_table_phys_ptr), section_names, STRING_TABLE_SIZE);
     }
-    debug::set_string_table(pid, (const char*)STRING_TABLE_VADDR, STRING_TABLE_VADDR, STRING_TABLE_SIZE);
+    debug::set_string_table(pid, ptr_from_addr<const char>(STRING_TABLE_VADDR), STRING_TABLE_VADDR, STRING_TABLE_SIZE);
 
     for (size_t section_index = 0; section_index < elf.elf_head.e_shnum; section_index++) {
-        auto* section_header = (Elf64_Shdr*)((uint64_t)elf.se_head + (section_index * elf.elf_head.e_shentsize));
+        auto* section_header = section_header_at(elf, section_index);
         const char* section_name = &section_names[section_header->sh_name];
 #ifdef ELF_DEBUG
         mod::dbg::log("Section name: %s", sectionName);
@@ -745,13 +761,13 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     }
 
     // Register this process for debugging
-    debug::register_process(pid, process_name, (uint64_t)elf_file.base, elf_file.elf_head.e_entry + elf_file.load_base);
+    debug::register_process(pid, process_name, reinterpret_cast<uint64_t>(elf_file.base), elf_file.elf_head.e_entry + elf_file.load_base);
 
     // Collect all program headers for the executable — ld.so needs the full set
     // (PT_LOAD, PT_DYNAMIC, PT_TLS, PT_PHDR, PT_GNU_RELRO, etc.)
     std::vector<Elf64_Phdr> filtered_headers;
     for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-        auto* ph = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+        auto* ph = program_header_at(elf_file, i);
         filtered_headers.push_back(*ph);
     }
 
@@ -770,7 +786,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
         // PT_PHDR.p_vaddr matches e_phoff, so ld.so computes baseAddress = AT_PHDR - p_vaddr = 0.
         elf_header_vaddr = elf_file.load_base;
         program_headers_vaddr = elf_file.load_base + elf_file.elf_head.e_phoff;
-        debug::set_program_headers(pid, (Elf64_Phdr*)program_headers_vaddr, program_headers_vaddr, elf_file.elf_head.e_phnum);
+        debug::set_program_headers(pid, ptr_from_addr<Elf64_Phdr>(program_headers_vaddr), program_headers_vaddr, elf_file.elf_head.e_phnum);
     } else if (base_address == 0) {
         // Non-PIE (ET_EXEC): copy headers to 0x1000 (no PT_LOAD overlap at low addresses)
         constexpr uint64_t HEADER_COPY_VADDR = 0x1000;
@@ -785,20 +801,20 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
         // Allocate physical pages for both ELF and program headers
         std::vector<uint64_t> header_phys_addrs;
         for (uint64_t i = 0; i < TOTAL_HEADERS_PAGES; i++) {
-            auto paddr = (uint64_t)mod::mm::phys::page_alloc();
-            if (paddr == ker::mod::mm::virt::PADDR_INVALID) {
+            auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+            if (PADDR == ker::mod::mm::virt::PADDR_INVALID) {
                 mod::dbg::log("ERROR: Failed to allocate physical page for headers");
                 return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
             }
-            mod::mm::virt::map_page(pagemap, HEADER_COPY_VADDR + (i * mod::mm::virt::PAGE_SIZE),
-                                    (uint64_t)mod::mm::addr::get_phys_pointer(paddr), mod::mm::paging::page_types::USER);
-            header_phys_addrs.push_back(paddr);
+            mod::mm::virt::map_page(pagemap, HEADER_COPY_VADDR + (i * mod::mm::virt::PAGE_SIZE), hhdm_to_phys(PADDR),
+                                    mod::mm::paging::page_types::USER);
+            header_phys_addrs.push_back(PADDR);
         }
 
         // Copy ELF header
         {
-            auto* header_ptr = (Elf64_Ehdr*)header_phys_addrs[0];
-            memcpy(header_ptr, &elf_file.elf_head, sizeof(Elf64_Ehdr));
+            auto* header_ptr = ptr_from_addr<Elf64_Ehdr>(header_phys_addrs.front());
+            std::memcpy(header_ptr, &elf_file.elf_head, sizeof(Elf64_Ehdr));
             header_ptr->e_phoff = PROGRAM_HEADERS_OFFSET_IN_HEADER;
             header_ptr->e_phnum = static_cast<Elf64_Half>(filtered_headers.size());
         }
@@ -824,7 +840,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                         return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
                     }
 
-                    uint8_t* dest_ptr = (uint8_t*)header_phys_addrs[PAGE_IDX] + OFFSET_IN_PAGE;
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PAGE_IDX is checked above.
+                    auto* dest_ptr = ptr_from_addr<uint8_t>(header_phys_addrs[PAGE_IDX] + OFFSET_IN_PAGE);
                     uint8_t const* src_ptr = reinterpret_cast<uint8_t*>(&filtered_header) + i;
                     *dest_ptr = *src_ptr;
                     dest_offset++;
@@ -832,11 +849,11 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
             }
         }
 
-        debug::set_program_headers(pid, (Elf64_Phdr*)program_headers_vaddr, program_headers_vaddr,
+        debug::set_program_headers(pid, ptr_from_addr<Elf64_Phdr>(program_headers_vaddr), program_headers_vaddr,
                                    static_cast<uint16_t>(filtered_headers.size()));
     }
     for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-        auto* current_header = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+        auto* current_header = program_header_at(elf_file, i);
 
         switch (current_header->p_type) {
             case PT_GNU_STACK:
@@ -896,21 +913,14 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                 break;
 
             case PT_PHDR:
-                // Program header table - informational only, no loading needed
-#ifdef ELF_DEBUG
-                mod::dbg::log("PT_PHDR segment skipped (informational only)");
-#endif
-                break;
-
             case PT_INTERP:
-                // Extract the dynamic linker path from the segment data.
-                // The path is a null-terminated string at p_offset within the ELF.
-                // We don't load the interpreter here — the caller (exec) handles it.
-                break;
-
             case PT_DYNAMIC:
-                // TODO: should be fine since mlibc loads these
-                // mod::dbg::log("WARN: PT_DYNAMIC skipped FIXME!");
+                // Informational/user-loader segments: no kernel mapping work needed here.
+#ifdef ELF_DEBUG
+                if (current_header->p_type == PT_PHDR) {
+                    mod::dbg::log("PT_PHDR segment skipped (informational only)");
+                }
+#endif
                 break;
 
             case PT_NOTE:
@@ -964,7 +974,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     // ld.so itself (loaded with non-zero loadBase) handles its own via relocateSelf().
     bool has_dynamic_interp = false;
     for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-        auto* ph = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+        auto* ph = program_header_at(elf_file, i);
         if (ph->p_type == PT_INTERP) {
             has_dynamic_interp = true;
             break;
@@ -984,7 +994,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     // Pass 1: Apply read-only segment permissions
     for (int pass = 0; pass < 2; pass++) {
         for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-            auto* ph = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+            auto* ph = program_header_at(elf_file, i);
             if (ph->p_type == PT_LOAD) {
                 const bool WRITABLE = (ph->p_flags & PF_W) != 0;
                 const bool EXECUTABLE = (ph->p_flags & PF_X) != 0;
@@ -1009,8 +1019,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                         if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
                             bool skip_page = false;
                             for (Elf64_Half j = 0; j < elf_file.elf_head.e_phnum; j++) {
-                                auto* ph2 =
-                                    (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(j * elf_file.elf_head.e_phentsize)));
+                                auto* ph2 = program_header_at(elf_file, j);
                                 if (ph2->p_type == PT_LOAD && (ph2->p_flags & PF_W) != 0) {
                                     uint64_t const WSTART = (ph2->p_vaddr + elf_file.load_base) & ~(mod::mm::virt::PAGE_SIZE - 1);
                                     uint64_t const WEND =
@@ -1048,7 +1057,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     // Skip for dynamically-linked binaries and ld.so — ld.so handles RELRO after its own relocations.
     if (!SKIP_RELOCATIONS) {
         for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-            auto* ph = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+            auto* ph = program_header_at(elf_file, i);
             if (ph->p_type == PT_GNU_RELRO) {
 #ifdef ELF_DEBUG
                 mod::dbg::log("Found PT_GNU_RELRO at vaddr=0x%x, memsz=0x%x", ph->p_vaddr, ph->p_memsz);
@@ -1057,12 +1066,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                 uint64_t const END = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
 
                 // Find .got.plt sections to exclude from RELRO
-                const char* section_names =
-                    (const char*)((uint64_t)elf_file.se_head +
-                                  (static_cast<uint64_t>(elf_file.elf_head.e_shstrndx * elf_file.elf_head.e_shentsize)));
-                auto* shstrtab_hdr = (Elf64_Shdr*)((uint64_t)elf_file.se_head +
-                                                   (static_cast<uint64_t>(elf_file.elf_head.e_shstrndx * elf_file.elf_head.e_shentsize)));
-                section_names = (const char*)((uint64_t)elf_file.base + shstrtab_hdr->sh_offset);
+                auto* shstrtab_hdr = section_header_at(elf_file, elf_file.elf_head.e_shstrndx);
+                auto const* section_names = reinterpret_cast<const char*>(elf_file.base + shstrtab_hdr->sh_offset);
 
                 // Check each page to see if it overlaps with any GOT.PLT sections
                 for (uint64_t va = START; va < END; va += mod::mm::virt::PAGE_SIZE) {
@@ -1073,7 +1078,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                     // Check if this page contains any .got.plt section
                     bool has_got_plt = false;
                     for (size_t section_index = 0; section_index < elf_file.elf_head.e_shnum; section_index++) {
-                        auto* section_header = (Elf64_Shdr*)((uint64_t)elf_file.se_head + (section_index * elf_file.elf_head.e_shentsize));
+                        auto* section_header = section_header_at(elf_file, section_index);
                         const char* section_name = &section_names[section_header->sh_name];
 
                         if (std::strncmp(section_name, ".got.plt", 8) == 0 && section_header->sh_addr != 0) {
@@ -1106,19 +1111,21 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     if (register_special_symbols) {
         // Iterate section headers to find symbol tables
         for (size_t sidx = 0; sidx < elf_file.elf_head.e_shnum; sidx++) {
-            auto* section = (Elf64_Shdr*)((uint64_t)elf_file.se_head + (sidx * elf_file.elf_head.e_shentsize));
+            auto* section = section_header_at(elf_file, sidx);
 
             if (section->sh_type == SHT_SYMTAB || section->sh_type == SHT_DYNSYM) {
                 // Get string table for this symbol table
-                auto* strtab = reinterpret_cast<Elf64_Shdr*>(elf_file.base + elf_file.elf_head.e_shoff +
-                                                             (static_cast<size_t>(section->sh_link * elf_file.elf_head.e_shentsize)));
-                const char* strs = reinterpret_cast<const char*>(elf_file.base + strtab->sh_offset);
+                auto* strtab = section_header_at(elf_file, section->sh_link);
+                auto const* strs = reinterpret_cast<const char*>(elf_file.base + strtab->sh_offset);
+                if (strs == nullptr) {
+                    continue;
+                }
                 uint64_t const NUM_SYMBOLS = section->sh_size / section->sh_entsize;
                 auto* syms = reinterpret_cast<Elf64_Sym*>(elf_file.base + section->sh_offset);
 
                 for (uint64_t si = 0; si < NUM_SYMBOLS; si++) {
                     Elf64_Sym const* sym = &syms[si];
-                    const char* sname = strs + sym->st_name;
+                    auto const* sname = strs + sym->st_name;
                     if ((sname == nullptr) || (sname[0] == 0)) {
                         continue;
                     }
@@ -1140,10 +1147,10 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
 
     // Extract PT_INTERP path if present
     for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-        auto* ph = (Elf64_Phdr*)((uint64_t)elf_file.pg_head + (static_cast<uint64_t>(i * elf_file.elf_head.e_phentsize)));
+        auto* ph = program_header_at(elf_file, i);
         if (ph->p_type == PT_INTERP && ph->p_filesz > 0 && ph->p_filesz < ElfLoadResult::INTERP_PATH_MAX) {
             const char* interp_str = reinterpret_cast<const char*>(elf_file.base + ph->p_offset);
-            std::memcpy(result.interp_path, interp_str, ph->p_filesz);
+            std::memcpy(&result.interp_path[0], interp_str, ph->p_filesz);
             result.interp_path[ph->p_filesz] = '\0';
             result.has_interp = true;
 #ifdef ELF_DEBUG
@@ -1186,8 +1193,7 @@ auto extract_tls_info(void* elf_data) -> TlsModule {
 
     // Look for PT_TLS segment - use a local pointer instead of modifying elfFile.pgHead
     for (uint32_t i = 0; i < ELF_FILE.elf_head.e_phnum; i++) {
-        auto* current_phdr = reinterpret_cast<Elf64_Phdr*>(ELF_FILE.base + ELF_FILE.elf_head.e_phoff +
-                                                           (static_cast<size_t>(i * ELF_FILE.elf_head.e_phentsize)));
+        auto* current_phdr = program_header_at(ELF_FILE, i);
 
         if (current_phdr->p_type == PT_TLS) {
             tls_info.tls_size = current_phdr->p_memsz;

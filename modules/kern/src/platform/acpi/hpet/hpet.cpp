@@ -1,6 +1,7 @@
 #include "hpet.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 #include "platform/acpi/acpi.hpp"
 #include "platform/mm/addr.hpp"
@@ -9,11 +10,20 @@
 #include "util/hcf.hpp"
 
 namespace ker::mod::hpet {
-static volatile Hpet* hpet = nullptr;
+
+namespace {
+
+volatile Hpet* hpet = nullptr;
 // Intel hpet spec 1-0a: General Capabilities and ID Register Bit Definitions
 // This indicates the period at which
 // the counter increments in femtoseconds (10^-15 seconds)
-static int tick_period = 0;
+uint64_t tick_period = 0;
+
+auto usec_to_ticks(uint64_t us) -> uint64_t { return (us * 1000000000) / tick_period; }
+
+auto ticks_to_usec(uint64_t ticks) -> uint64_t { return (ticks * tick_period) / 1000000000; }
+
+}  // namespace
 
 void init() {
     if (hpet != nullptr) {
@@ -30,11 +40,12 @@ void init() {
     }
 
     uint64_t hpet_phys = 0;
-    __builtin_memcpy(&hpet_phys, (const void*)((uint64_t)HPET_RESULT.data + HPET_OFFSET), sizeof(hpet_phys));
+    std::memcpy(&hpet_phys, reinterpret_cast<const void*>(reinterpret_cast<uint64_t>(HPET_RESULT.data) + HPET_OFFSET), sizeof(hpet_phys));
     auto* hpet_addr = mm::addr::get_virt_pointer(hpet_phys);
 
     // Map HPET to the kernel page table so all CPUs can access it
-    mm::virt::map_to_kernel_page_table((uint64_t)hpet_addr, (uint64_t)mm::addr::get_phys_pointer((uint64_t)hpet_addr),
+    auto const HPET_VIRT = reinterpret_cast<uint64_t>(hpet_addr);
+    mm::virt::map_to_kernel_page_table(HPET_VIRT, reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(HPET_VIRT)),
                                        mm::virt::page_types::KERNEL);
 
     hpet = reinterpret_cast<Hpet*>(hpet_addr);
@@ -46,10 +57,6 @@ void init() {
 }
 
 uint64_t get_ticks() { return hpet->counter_value; }
-
-static uint64_t usec_to_ticks(uint64_t us) { return (us * 1000000000) / tick_period; }
-
-static uint64_t ticks_to_usec(uint64_t ticks) { return (ticks * tick_period) / 1000000000; }
 
 uint64_t get_us() { return ticks_to_usec(get_ticks()); }
 

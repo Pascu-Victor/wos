@@ -25,6 +25,8 @@
 
 namespace ker::vfs::xfs {
 
+namespace {
+
 // Remote symlink header (v5/CRC)
 struct XfsDsymlinkHdr {
     Be32 sl_magic;     // 0x58534C4D ('XSLM')
@@ -38,6 +40,8 @@ struct XfsDsymlinkHdr {
 } __attribute__((packed));
 
 constexpr uint32_t XFS_SYMLINK_MAGIC = 0x58534C4D;  // 'XSLM'
+
+}  // namespace
 
 auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
     if (ip == nullptr || buf == nullptr || buflen == 0) {

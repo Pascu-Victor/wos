@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <platform/dbg/dbg.hpp>
 
 namespace ker::dev::pci {
 
@@ -66,22 +68,22 @@ constexpr uint8_t PCI_HEADER_TYPE_NORMAL = 0x00;
 constexpr uint8_t PCI_HEADER_TYPE_BRIDGE = 0x01;
 constexpr uint8_t PCI_HEADER_TYPE_MULTI_FUNC = 0x80;
 
-constexpr int BAR_COUNT = 6;
+constexpr size_t BAR_COUNT = 6;
 
 // PCI Device structure
 struct PCIDevice {
-    uint8_t bus;
-    uint8_t slot;
-    uint8_t function;
-    uint16_t vendor_id;
-    uint16_t device_id;
-    uint8_t class_code;
-    uint8_t subclass_code;
-    uint32_t bar[BAR_COUNT];  // Base Address Registers NOLINT
-    uint8_t prog_if;
-    uint8_t header_type;
-    uint8_t interrupt_line;
-    uint8_t interrupt_pin;
+    uint8_t bus = 0;
+    uint8_t slot = 0;
+    uint8_t function = 0;
+    uint16_t vendor_id = 0;
+    uint16_t device_id = 0;
+    uint8_t class_code = 0;
+    uint8_t subclass_code = 0;
+    std::array<uint32_t, BAR_COUNT> bar{};  // Base Address Registers
+    uint8_t prog_if = 0;
+    uint8_t header_type = 0;
+    uint8_t interrupt_line = 0;
+    uint8_t interrupt_pin = 0;
 };
 
 // Read from PCI configuration space
@@ -90,9 +92,9 @@ auto pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) 
 auto pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint8_t;
 
 // Write to PCI configuration space
-void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value);
-void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value);
-void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value);
+auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) -> void;
+auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) -> void;
+auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) -> void;
 
 // Full PCI bus enumeration (all buses, slots, functions; follows bridges)
 auto pci_enumerate_all() -> int;
@@ -106,8 +108,8 @@ auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice*;
 auto pci_find_by_vendor_device(uint16_t vendor, uint16_t device) -> PCIDevice*;
 
 // Enable PCI features on a device
-void pci_enable_bus_master(PCIDevice* dev);
-void pci_enable_memory_space(PCIDevice* dev);
+auto pci_enable_bus_master(PCIDevice* dev) -> void;
+auto pci_enable_memory_space(PCIDevice* dev) -> void;
 
 // PCI Capability support
 auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t;  // config offset, 0 = not found
@@ -138,7 +140,7 @@ auto pci_find_ahci_controller() -> PCIDevice*;
 // PCI Logging Control
 inline void pci_log(const char* msg) {
 #ifdef PCI_DEBUG
-    ker::mod::io::serial::write(msg);
+    ker::mod::dbg::logger<"pci">::debug("%s", msg);
 #else
     (void)msg;
 #endif
@@ -146,7 +148,7 @@ inline void pci_log(const char* msg) {
 
 inline void pci_log_hex(uint64_t value) {
 #ifdef PCI_DEBUG
-    ker::mod::io::serial::writeHex(value);
+    ker::mod::dbg::logger<"pci">::debug("0x%lx", value);
 #else
     (void)value;
 #endif

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace ker::mod::mm {
@@ -34,14 +35,14 @@ struct PageAllocator {
     static constexpr uint8_t FLAG_ALLOC_CONT = 0xC0;
     static constexpr uint8_t FLAG_RESERVED = 0xFF;
 
-    FreeBlock* free_list[MAX_ORDER + 1];  // one singly-linked list per order
-    uint8_t* page_flags;                  // 1 byte per page
-    uint32_t* page_refcounts;             // 1 refcount per page (for COW fork)
-    uint64_t base;                        // HHDM start of the managed region
-    uint32_t total_pages;                 // total pages in the region (incl. metadata)
-    uint32_t usable_pages;                // pages available for allocation
-    uint32_t free_count;                  // current free page count
-    uint32_t metadata_pages;              // pages consumed by metadata
+    std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
+    uint8_t* page_flags = nullptr;                      // 1 byte per page
+    uint32_t* page_refcounts = nullptr;                 // 1 refcount per page (for COW fork)
+    uint64_t base = 0;                                  // HHDM start of the managed region
+    uint32_t total_pages = 0;                           // total pages in the region (incl. metadata)
+    uint32_t usable_pages = 0;                          // pages available for allocation
+    uint32_t free_count = 0;                            // current free page count
+    uint32_t metadata_pages = 0;                        // pages consumed by metadata
 
     // Initialise this allocator over the zone starting at `zoneBase`
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at

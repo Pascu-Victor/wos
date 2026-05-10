@@ -1,20 +1,25 @@
 #include "ramdisk.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <new>
+#include <platform/dbg/dbg.hpp>
 
 #include "dev/block_device.hpp"
 
 namespace ker::dev::ramdisk {
+
+using log = ker::mod::dbg::logger<"ramdisk">;
+
+namespace {
 
 struct RamdiskPrivate {
     uint8_t* buffer;
     size_t size_bytes;
 };
 
-namespace {
 auto ramdisk_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int {
     if (bdev == nullptr || buffer == nullptr) {
         return -1;
@@ -34,8 +39,8 @@ auto ramdisk_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* 
         return -1;
     }
 
-    // Copy from ramdisk buffer
-    std::memcpy(buffer, priv->buffer + BYTE_OFFSET, READ_SIZE);
+    auto* out = static_cast<uint8_t*>(buffer);
+    std::copy_n(priv->buffer + BYTE_OFFSET, READ_SIZE, out);
     return 0;
 }
 
@@ -58,8 +63,8 @@ auto ramdisk_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const
         return -1;
     }
 
-    // Copy to ramdisk buffer
-    std::memcpy(priv->buffer + BYTE_OFFSET, buffer, WRITE_SIZE);
+    const auto* in = static_cast<const uint8_t*>(buffer);
+    std::copy_n(in, WRITE_SIZE, priv->buffer + BYTE_OFFSET);
     return 0;
 }
 
@@ -71,33 +76,33 @@ auto ramdisk_flush(BlockDevice* bdev) -> int {
 
 auto ramdisk_create(size_t size_bytes) -> BlockDevice* {
     if (size_bytes == 0) {
-        ker::mod::io::serial::write("ramdisk_create: invalid size\n");
+        log::warn("ramdisk_create: invalid size");
         return nullptr;
     }
 
     // Allocate private data
-    auto* priv = new RamdiskPrivate;
+    auto* priv = new (std::nothrow) RamdiskPrivate{};
     if (priv == nullptr) {
-        ker::mod::io::serial::write("ramdisk_create: failed to allocate private data\n");
+        log::warn("ramdisk_create: failed to allocate private data");
         return nullptr;
     }
 
     // Allocate buffer
     priv->buffer = new (std::nothrow) uint8_t[size_bytes];
     if (priv->buffer == nullptr) {
-        ker::mod::io::serial::write("ramdisk_create: failed to allocate buffer\n");
+        log::warn("ramdisk_create: failed to allocate buffer");
         delete priv;
         return nullptr;
     }
 
     // Initialize buffer to zero
-    std::memset(priv->buffer, 0, size_bytes);
+    std::fill_n(priv->buffer, size_bytes, uint8_t{0});
     priv->size_bytes = size_bytes;
 
     // Allocate BlockDevice structure
-    auto* bdev = new BlockDevice;
+    auto* bdev = new (std::nothrow) BlockDevice{};
     if (bdev == nullptr) {
-        ker::mod::io::serial::write("ramdisk_create: failed to allocate BlockDevice\n");
+        log::warn("ramdisk_create: failed to allocate BlockDevice");
         delete[] priv->buffer;
         delete priv;
         return nullptr;
@@ -107,7 +112,8 @@ auto ramdisk_create(size_t size_bytes) -> BlockDevice* {
     constexpr size_t BLOCK_SIZE = 512;
     bdev->major = 1;
     bdev->minor = 0;
-    std::strcpy(bdev->name.data(), "ramdisk0");
+    constexpr std::array RAMDISK_NAME = {'r', 'a', 'm', 'd', 'i', 's', 'k', '0', '\0'};
+    std::copy_n(RAMDISK_NAME.begin(), RAMDISK_NAME.size(), bdev->name.begin());
     bdev->block_size = BLOCK_SIZE;
     bdev->total_blocks = (size_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;  // Round up to nearest block
     bdev->private_data = priv;
@@ -116,11 +122,7 @@ auto ramdisk_create(size_t size_bytes) -> BlockDevice* {
     bdev->write_blocks = ramdisk_write_blocks;
     bdev->flush = ramdisk_flush;
 
-    ker::mod::io::serial::write("ramdisk_create: created disk with ");
-    ker::mod::io::serial::write(bdev->total_blocks);
-    ker::mod::io::serial::write(" blocks (");
-    ker::mod::io::serial::write(size_bytes);
-    ker::mod::io::serial::write(" bytes)\n");
+    log::info("ramdisk_create: created disk with %lu blocks (%zu bytes)", static_cast<unsigned long>(bdev->total_blocks), size_bytes);
 
     return bdev;
 }

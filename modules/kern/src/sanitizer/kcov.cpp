@@ -16,13 +16,16 @@
 #include <new>
 #ifdef WOS_KCOV
 
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <sanitizer/kcov.hpp>
+
+namespace {
 
 // Per-CPU KCOV buffer pointer.  In a full implementation this would be
 // stored in the Task struct (per-task).  For the initial bring-up we use
 // a single global buffer — sufficient for single-threaded syz-executor.
-static ker::sanitizer::kcov::KcovBuffer* s_current_buffer = nullptr;
+ker::sanitizer::kcov::KcovBuffer* s_current_buffer = nullptr;
+
+}  // namespace
 
 namespace ker::sanitizer::kcov {
 

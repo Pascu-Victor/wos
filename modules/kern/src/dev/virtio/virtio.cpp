@@ -10,9 +10,13 @@
 
 namespace ker::dev::virtio {
 
+using log = ker::mod::dbg::logger<"virtio">;
+
 namespace {
 // Align value up to alignment boundary
-auto align_up(size_t val, size_t align) -> size_t { return (val + align - 1) & ~(align - 1); }
+constexpr size_t PAGE_SIZE = 4096;
+
+constexpr auto align_up(size_t val, size_t align) -> size_t { return (val + align - 1) & ~(align - 1); }
 }  // namespace
 
 auto virtq_desc_size(uint16_t qsz) -> size_t { return sizeof(VirtqDesc) * qsz; }
@@ -27,33 +31,33 @@ auto virtq_used_size(uint16_t qsz) -> size_t {
 
 auto virtq_total_size(uint16_t qsz) -> size_t {
     // Descriptor table, then available ring (aligned to 2), then used ring (aligned to 4096)
-    size_t const DESC_AVAIL = align_up(virtq_desc_size(qsz) + virtq_avail_size(qsz), 4096);
-    return DESC_AVAIL + align_up(virtq_used_size(qsz), 4096);
+    size_t const DESC_AVAIL = align_up(virtq_desc_size(qsz) + virtq_avail_size(qsz), PAGE_SIZE);
+    return DESC_AVAIL + align_up(virtq_used_size(qsz), PAGE_SIZE);
 }
 
 auto virtq_alloc(uint16_t size) -> Virtqueue* {
     if (size == 0 || size > VIRTQ_MAX_SIZE) {
-        mod::dbg::log("virtq_alloc: invalid size %u (max %u)", size, VIRTQ_MAX_SIZE);
+        log::warn("virtq_alloc: invalid size %u (max %u)", size, VIRTQ_MAX_SIZE);
         return nullptr;
     }
 
-    mod::dbg::log("virtq_alloc: sizeof(Virtqueue)=%u, using new", sizeof(Virtqueue));
+    log::debug("virtq_alloc: sizeof(Virtqueue)=%u, using new", sizeof(Virtqueue));
     // Allocate the Virtqueue control structure with zero initialization
     auto* vq = new Virtqueue{};
 
     // Allocate physically contiguous memory for descriptor table + rings
     size_t const TOTAL = virtq_total_size(size);
-    size_t const PAGES_NEEDED = align_up(TOTAL, 4096);
+    size_t const ALLOC_BYTES = align_up(TOTAL, PAGE_SIZE);
 
-    mod::dbg::log("virtq_alloc: size=%u, total=%u bytes, pages=%u", size, TOTAL, PAGES_NEEDED);
+    log::debug("virtq_alloc: size=%u, total=%zu bytes, alloc=%zu bytes", size, TOTAL, ALLOC_BYTES);
 
-    auto* mem = ker::mod::mm::phys::page_alloc(PAGES_NEEDED);
+    auto* mem = ker::mod::mm::phys::page_alloc(ALLOC_BYTES);
     if (mem == nullptr) {
-        mod::dbg::log("virtq_alloc: pageAlloc(%u) failed", PAGES_NEEDED);
+        log::warn("virtq_alloc: page_alloc(%zu) failed", ALLOC_BYTES);
         delete vq;
         return nullptr;
     }
-    std::memset(mem, 0, PAGES_NEEDED);
+    std::memset(mem, 0, ALLOC_BYTES);
 
     auto* base = reinterpret_cast<uint8_t*>(mem);
 
@@ -66,7 +70,7 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     vq->desc = reinterpret_cast<VirtqDesc*>(base);
     vq->avail = reinterpret_cast<VirtqAvail*>(base + virtq_desc_size(size));
 
-    size_t const USED_OFFSET = align_up(virtq_desc_size(size) + virtq_avail_size(size), 4096);
+    size_t const USED_OFFSET = align_up(virtq_desc_size(size) + virtq_avail_size(size), PAGE_SIZE);
     vq->used = reinterpret_cast<VirtqUsed*>(base + USED_OFFSET);
 
     // Initialize free list: each descriptor points to the next
@@ -76,7 +80,9 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     vq->desc[size - 1].next = 0xFFFF;  // End of free list
 
     // Clear packet map
-    std::memset(vq->pkt_map, 0, sizeof(vq->pkt_map));
+    for (auto*& pkt : vq->pkt_map) {
+        pkt = nullptr;
+    }
 
     return vq;
 }
@@ -95,7 +101,7 @@ auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, k
     vq->desc[IDX].flags = flags;
     vq->desc[IDX].next = 0;
 
-    vq->pkt_map[IDX] = pkt;
+    vq->pkt_map.at(IDX) = pkt;
 
     // Add to available ring
     uint16_t const AVAIL_IDX = vq->avail->idx;

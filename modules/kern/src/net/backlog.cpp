@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
@@ -17,10 +18,14 @@
 
 namespace ker::net {
 
+using log = ker::mod::dbg::logger<"backlog">;
+
 namespace {
 BacklogQueue* queues = nullptr;
 std::atomic<bool> ready{false};
 uint64_t num_cpus = 0;
+
+auto is_loopback_dev(const NetDevice* dev) -> bool { return dev != nullptr && std::strncmp(dev->name.data(), "lo", dev->name.size()) == 0; }
 
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
@@ -65,8 +70,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             PacketBuffer* next = reversed->next;
             reversed->next = nullptr;
             NET_TRACE_TICK();
-            if (reversed->dev != nullptr && reversed->dev->name[0] == 'l' && reversed->dev->name[1] == 'o' &&
-                reversed->dev->name[2] == '\0') {
+            if (is_loopback_dev(reversed->dev)) {
                 if (reversed->len > 0) {
                     uint8_t const VERSION = (reversed->data[0] >> 4) & 0xF;
                     if (VERSION == 4) {
@@ -102,20 +106,20 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 void backlog_init() {
     num_cpus = ker::mod::smt::get_core_count();
     if (num_cpus <= 1) {
-        ker::mod::dbg::log("backlog: single CPU, steering disabled");
+        log::info("single CPU, steering disabled");
         return;
     }
 
     queues = new BacklogQueue[num_cpus]{};
     if (queues == nullptr) {
-        ker::mod::dbg::log("backlog: failed to allocate queues");
+        log::warn("failed to allocate queues");
         return;
     }
 
     for (uint64_t i = 0; i < num_cpus; i++) {
         auto* task = ker::mod::sched::task::Task::create_kernel_thread("net_backlog", backlog_handler_entry);
         if (task == nullptr) {
-            ker::mod::dbg::log("backlog: failed to create handler for CPU %u", static_cast<unsigned>(i));
+            log::warn("failed to create handler for CPU %u", static_cast<unsigned>(i));
             continue;
         }
         queues[i].handler = task;
@@ -124,7 +128,7 @@ void backlog_init() {
     }
 
     ready.store(true, std::memory_order_release);
-    ker::mod::dbg::log("backlog: %u handler threads started", static_cast<unsigned>(num_cpus));
+    log::info("%u handler threads started", static_cast<unsigned>(num_cpus));
 }
 
 void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
@@ -175,9 +179,10 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
     }
 
     // Non-IPv4: hash source MAC
-    uint32_t mac_hash = static_cast<uint32_t>(eth->src[0]) | (static_cast<uint32_t>(eth->src[1]) << 8) |
-                        (static_cast<uint32_t>(eth->src[2]) << 16) | (static_cast<uint32_t>(eth->src[3]) << 24);
-    mac_hash ^= static_cast<uint32_t>(eth->src[4]) | (static_cast<uint32_t>(eth->src[5]) << 8);
+    const auto& src = eth->src;
+    uint32_t mac_hash = static_cast<uint32_t>(src.at(0)) | (static_cast<uint32_t>(src.at(1)) << 8) |
+                        (static_cast<uint32_t>(src.at(2)) << 16) | (static_cast<uint32_t>(src.at(3)) << 24);
+    mac_hash ^= static_cast<uint32_t>(src.at(4)) | (static_cast<uint32_t>(src.at(5)) << 8);
     mac_hash *= 0x9e3779b9U;
     return mac_hash % num_cpus;
 }

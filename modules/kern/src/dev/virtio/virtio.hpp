@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <net/packet.hpp>
@@ -100,6 +101,7 @@ struct VirtIONetHeader {
     uint16_t csum_start;
     uint16_t csum_offset;
 } __attribute__((packed));
+static_assert(sizeof(VirtIONetHeader) == 10);
 
 constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);  // 10 bytes (legacy / no VERSION_1)
 constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = 12;                // virtio 1.0: num_buffers field always present
@@ -111,23 +113,27 @@ struct VirtqDesc {
     uint16_t flags;  // VRING_DESC_F_* flags
     uint16_t next;   // Index of next descriptor (if VRING_DESC_F_NEXT)
 } __attribute__((packed));
+static_assert(sizeof(VirtqDesc) == 16);
 
 struct VirtqAvail {
     uint16_t flags;
     uint16_t idx;
-    uint16_t ring[];  // Flexible array member
+    uint16_t ring[];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): virtqueue flexible array ABI.
 } __attribute__((packed));
+static_assert(sizeof(VirtqAvail) == 4);
 
 struct VirtqUsedElem {
     uint32_t id;   // Index of start of used descriptor chain
     uint32_t len;  // Total bytes written to buffer
 } __attribute__((packed));
+static_assert(sizeof(VirtqUsedElem) == 8);
 
 struct VirtqUsed {
     uint16_t flags;
     uint16_t idx;
-    VirtqUsedElem ring[];
+    VirtqUsedElem ring[];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): virtqueue flexible array ABI.
 } __attribute__((packed));
+static_assert(sizeof(VirtqUsed) == 4);
 
 // Maximum virtqueue size
 constexpr uint16_t VIRTQ_MAX_SIZE = 256;
@@ -143,7 +149,7 @@ struct Virtqueue {
     VirtqUsed* used;    // Used ring
 
     // Map descriptor index -> PacketBuffer for RX completion
-    ker::net::PacketBuffer* pkt_map[VIRTQ_MAX_SIZE];
+    std::array<ker::net::PacketBuffer*, VIRTQ_MAX_SIZE> pkt_map{};
 
     uint16_t io_base;                  // BAR0 for legacy notify (unused in modern mode)
     uint16_t queue_index;              // Which queue (0=RX, 1=TX, ...)

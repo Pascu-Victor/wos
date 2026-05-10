@@ -34,10 +34,10 @@ struct File {
     FileOperations* fops{};
     off_t pos{};
     bool is_directory{};
-    FSType fs_type;
-    std::atomic<int> refcount;  // reference count for shared file descriptors (fork/exec)
-    int open_flags{};           // O_RDONLY, O_WRONLY, etc. - preserved from open() for fcntl F_GETFL
-    int fd_flags{};             // FD_CLOEXEC - per-descriptor flags for fcntl F_GETFD/F_SETFD
+    FSType fs_type{};
+    std::atomic<int> refcount{0};  // reference count for shared file descriptors (fork/exec)
+    int open_flags{};              // O_RDONLY, O_WRONLY, etc. - preserved from open() for fcntl F_GETFL
+    int fd_flags{};                // FD_CLOEXEC - per-descriptor flags for fcntl F_GETFD/F_SETFD
 
     // Mount-overlay directory listing support
     const char* vfs_path{};  // Absolute VFS path (heap-allocated, set by vfs_open)

@@ -3,7 +3,8 @@
 #include <abi/callnums/time.h>
 
 #include <abi/callnums.hpp>
+#include <cstdint>
 
 namespace ker::syscall::time {
 uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2);
-}
+}  // namespace ker::syscall::time

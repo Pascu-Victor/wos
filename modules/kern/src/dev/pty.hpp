@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,7 @@ struct Winsize {
     uint16_t ws_xpixel;
     uint16_t ws_ypixel;
 };
+static_assert(sizeof(Winsize) == 8);  // NOLINT
 
 // Kernel-side termios struct (matches mlibc ABI layout exactly)
 static constexpr size_t KERNEL_NCCS = 32;
@@ -31,10 +33,12 @@ struct KTermios {
     uint32_t c_cflag;
     uint32_t c_lflag;
     uint8_t c_line;
-    uint8_t c_cc[KERNEL_NCCS];
+    uint8_t c_cc[KERNEL_NCCS];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): mlibc termios ABI.
     uint32_t ibaud;
     uint32_t obaud;
 };
+static_assert(offsetof(KTermios, ibaud) == 52);  // NOLINT
+static_assert(sizeof(KTermios) == 60);           // NOLINT
 
 // c_cc indices
 static constexpr int CC_VINTR = 0;
@@ -106,16 +110,17 @@ static constexpr int SIG_TSTP = 20;
 // poll event bits (Linux-compatible)
 static constexpr int POLLIN = 0x001;
 static constexpr int POLLOUT = 0x004;
+static constexpr int POLLERR = 0x008;
 static constexpr int POLLHUP = 0x010;
 
 // Returns a default termios (cooked mode, echo on, signals on)
-KTermios default_termios();
+auto default_termios() -> KTermios;
 
 // Ring buffer for PTY data flow
 static constexpr size_t PTY_BUF_SIZE = 65536;
 
 struct PtyRingBuf {
-    uint8_t data[PTY_BUF_SIZE]{};
+    std::array<uint8_t, PTY_BUF_SIZE> data{};
     size_t head = 0;   // write position
     size_t tail = 0;   // read position
     size_t count = 0;  // bytes in buffer
@@ -130,6 +135,7 @@ struct PtyRingBuf {
 // Canonical line buffer size
 static constexpr size_t CANON_BUF_SIZE = 256;
 static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
+static constexpr size_t SLAVE_NAME_BUF_SIZE = 8;
 
 // A single PTY pair (master + slave)
 struct PtyPair {
@@ -153,13 +159,13 @@ struct PtyPair {
     PtyRingBuf s2m;  // slave -> master (slave write -> master read)
 
     // Canonical mode line editing buffer
-    uint8_t canon_buf[CANON_BUF_SIZE]{};
+    std::array<uint8_t, CANON_BUF_SIZE> canon_buf{};
     size_t canon_len = 0;
 
     // Tracks potential terminal cursor-position reports (ESC[row;colR)
     // across fragmented master writes so stale ASK_TERMINAL replies can be
     // consumed in-kernel without leaking into userspace input.
-    uint8_t cpr_filter_buf[CPR_FILTER_BUF_SIZE]{};
+    std::array<uint8_t, CPR_FILTER_BUF_SIZE> cpr_filter_buf{};
     size_t cpr_filter_len = 0;
     bool cpr_filter_active = false;
 
@@ -171,7 +177,7 @@ struct PtyPair {
     ker::util::SmallVec<uint64_t, 2> slave_write_waiters;
 
     // Persistent slave name buffer (e.g., "0", "12")
-    char slave_name[8]{};
+    std::array<char, SLAVE_NAME_BUF_SIZE> slave_name{};
 
     // Device structs for master and slave
     Device master_dev;

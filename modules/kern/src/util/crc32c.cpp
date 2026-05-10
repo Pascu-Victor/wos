@@ -9,17 +9,21 @@
 
 #include "crc32c.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 
 namespace ker::util {
+namespace {
 
 // ---------------------------------------------------------------------------
 // CPUID helper - detect SSE4.2 (bit 20 of ECX from CPUID leaf 1)
 // ---------------------------------------------------------------------------
 
-static bool hw_crc32_available = false;
-static bool hw_checked = false;
+bool hw_crc32_available = false;
+bool hw_checked = false;
+
+}  // namespace
 
 auto crc32c_has_hw() -> bool {
     if (!hw_checked) {
@@ -40,7 +44,9 @@ auto crc32c_has_hw() -> bool {
 // SSE4.2 hardware CRC32C
 // ---------------------------------------------------------------------------
 
-__attribute__((target("sse4.2"))) static auto crc32c_hw(uint32_t crc, const uint8_t* data, size_t length) -> uint32_t {
+namespace {
+
+__attribute__((target("sse4.2"))) auto crc32c_hw(uint32_t crc, const uint8_t* data, size_t length) -> uint32_t {
     // Process 8 bytes at a time using the 64-bit CRC32 instruction
     uint64_t crc64 = crc;
     while (length >= 8) {
@@ -65,10 +71,10 @@ __attribute__((target("sse4.2"))) static auto crc32c_hw(uint32_t crc, const uint
 // Software CRC32C lookup table (CRC32C polynomial 0x82F63B78, reflected)
 // ---------------------------------------------------------------------------
 
-static uint32_t sw_table[256];  // NOLINT
-static bool sw_table_built = false;
+std::array<uint32_t, 256> sw_table{};
+bool sw_table_built = false;
 
-static void build_sw_table() {
+void build_sw_table() {
     constexpr uint32_t POLY = 0x82F63B78U;  // Reflected CRC32C polynomial
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
@@ -79,20 +85,22 @@ static void build_sw_table() {
                 crc >>= 1;
             }
         }
-        sw_table[i] = crc;
+        sw_table[i] = crc;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
     sw_table_built = true;
 }
 
-static auto crc32c_sw(uint32_t crc, const uint8_t* data, size_t length) -> uint32_t {
+auto crc32c_sw(uint32_t crc, const uint8_t* data, size_t length) -> uint32_t {
     if (!sw_table_built) {
         build_sw_table();
     }
     for (size_t i = 0; i < length; i++) {
-        crc = sw_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        crc = sw_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
     return crc;
 }
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Public API

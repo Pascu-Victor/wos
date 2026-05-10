@@ -12,7 +12,7 @@ namespace ker::net {
 struct NetDevice;
 
 // NAPI states - managed atomically for lock-free IRQ/worker coordination
-enum class NapiState : uint32_t {
+enum class NapiState : uint8_t {
     IDLE = 0,       // No pending work, device interrupts enabled
     SCHEDULED = 1,  // Work pending, worker thread will poll
     POLLING = 2,    // Worker actively polling device

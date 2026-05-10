@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 
@@ -32,6 +31,8 @@ Workqueue* Workqueue::current_wq_ = nullptr;  // NOLINT
 // Workqueue to drain.  We store the "pending launch" workqueue in a global
 // that is consumed exactly once by the next worker_entry invocation.
 namespace {
+using log = ker::mod::dbg::logger<"workq">;
+
 Workqueue* pending_launch_wq = nullptr;  // NOLINT
 sys::Spinlock launch_lock;
 }  // namespace
@@ -45,7 +46,7 @@ void Workqueue::worker_entry() {
     launch_lock.unlock_irqrestore(IRQF);
 
     if (wq == nullptr) {
-        mod::dbg::log("[workqueue] worker_entry: no pending wq!\n");
+        log::error("worker_entry: no pending wq");
         while (true) {
             kern_yield();
         }
@@ -127,13 +128,13 @@ auto Workqueue::create(const char* wk_name) -> Workqueue* {
 
     wq->thread = task::Task::create_kernel_thread(wk_name, worker_entry);
     if (wq->thread == nullptr) {
-        mod::dbg::log("[workqueue] failed to create worker thread '%s'\n", wk_name);
+        log::error("failed to create worker thread '%s'", wk_name);
         delete wq;
         return nullptr;
     }
 
     post_task_balanced(wq->thread);
-    mod::dbg::log("[workqueue] created '%s'\n", wk_name);
+    log::info("created '%s'", wk_name);
     return wq;
 }
 
@@ -185,7 +186,7 @@ void Workqueue::destroy() {
         kern_yield();
     }
 
-    mod::dbg::log("[workqueue] destroyed '%s'\n", wk_name);
+    log::info("destroyed '%s'", wk_name);
     // Note: the Task itself will be GC'd by the scheduler's epoch-based
     // reclamation.  We do not free it here.
 }

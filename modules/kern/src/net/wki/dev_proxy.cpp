@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -30,6 +31,14 @@ namespace {
 std::deque<std::unique_ptr<ProxyBlockState>> g_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_dev_proxy_initialized = false;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_proxy_lock;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr size_t MAX_PROXY_SCRATCH = 64;
+
+auto tag_completion(ProxyBlockState* state, uint32_t tag) -> ProxyBlockState::TagCompletion& { return state->tag_completions.at(tag); }
+
+auto tag_in_use(ProxyBlockState const* state, uint32_t tag) -> bool {
+    return tag < ProxyBlockState::TAG_POOL_SIZE && (state->tag_bitmap & (1ULL << tag)) != 0;
+}
 
 // Caller must hold s_proxy_lock.
 auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
@@ -84,8 +93,9 @@ auto rdma_alloc_tag(ProxyBlockState* state) -> int {
     for (uint32_t i = 0; i < ProxyBlockState::TAG_POOL_SIZE; i++) {
         if ((state->tag_bitmap & (1ULL << i)) == 0) {
             state->tag_bitmap |= (1ULL << i);
-            state->tag_completions[i].pending = true;
-            state->tag_completions[i].completed = false;
+            auto& completion = tag_completion(state, i);
+            completion.pending = true;
+            completion.completed = false;
             return static_cast<int>(i);
         }
     }
@@ -95,8 +105,9 @@ auto rdma_alloc_tag(ProxyBlockState* state) -> int {
 void rdma_free_tag(ProxyBlockState* state, uint32_t tag) {
     if (tag < ProxyBlockState::TAG_POOL_SIZE) {
         state->tag_bitmap &= ~(1ULL << tag);
-        state->tag_completions[tag].pending = false;
-        state->tag_completions[tag].completed = false;
+        auto& completion = tag_completion(state, tag);
+        completion.pending = false;
+        completion.completed = false;
     }
 }
 
@@ -182,10 +193,13 @@ auto ra_cache_hit(ProxyBlockState* state, uint64_t lba, uint32_t count) -> bool 
 // In multi-outstanding mode, multiple CQEs may arrive for different tags.
 auto rdma_wait_cqe_push(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cqe) -> bool {
     // Check if already completed in a previous drain
-    if (tag < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[tag].completed) {
-        *out_cqe = state->tag_completions[tag].cqe;
-        state->tag_completions[tag].completed = false;
-        return true;
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
     }
 
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
@@ -197,20 +211,24 @@ auto rdma_wait_cqe_push(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cq
     while (!blk_cq_empty(hdr)) {
         uint32_t const IDX = hdr->cq_tail % hdr->cq_depth;
         uint32_t const CTAG = cq[IDX].tag;
-        if (CTAG < ProxyBlockState::TAG_POOL_SIZE && (state->tag_bitmap & (1ULL << CTAG)) != 0) {
-            state->tag_completions[CTAG].cqe = cq[IDX];
-            state->tag_completions[CTAG].completed = true;
-            state->tag_completions[CTAG].pending = false;
+        if (tag_in_use(state, CTAG)) {
+            auto& completion = tag_completion(state, CTAG);
+            completion.cqe = cq[IDX];
+            completion.completed = true;
+            completion.pending = false;
         }
         asm volatile("" ::: "memory");
         hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
     }
 
     // Check if our target tag completed
-    if (tag < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[tag].completed) {
-        *out_cqe = state->tag_completions[tag].cqe;
-        state->tag_completions[tag].completed = false;
-        return true;
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
     }
 
     return false;
@@ -231,10 +249,11 @@ void rdma_drain_cq(ProxyBlockState* state) {
 
         // Store completion in per-tag tracking array (O(1) lookup by tag)
         uint32_t const TAG = cqe.tag;
-        if (TAG < ProxyBlockState::TAG_POOL_SIZE && (state->tag_bitmap & (1ULL << TAG)) != 0) {
-            state->tag_completions[TAG].cqe = cqe;
-            state->tag_completions[TAG].completed = true;
-            state->tag_completions[TAG].pending = false;
+        if (tag_in_use(state, TAG)) {
+            auto& completion = tag_completion(state, TAG);
+            completion.cqe = cqe;
+            completion.completed = true;
+            completion.pending = false;
         }
         // Tags not in the bitmap are stale/orphaned - safe to drop
 
@@ -246,20 +265,26 @@ void rdma_drain_cq(ProxyBlockState* state) {
 // Drain CQ and look for a specific tag. Returns true if found and fills out_cqe.
 auto rdma_drain_cq_for_tag(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cqe) -> bool {
     // Check per-tag completion array (O(1) lookup)
-    if (tag < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[tag].completed) {
-        *out_cqe = state->tag_completions[tag].cqe;
-        state->tag_completions[tag].completed = false;
-        return true;
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
     }
 
     // Drain fresh CQ entries
     rdma_drain_cq(state);
 
     // Check again
-    if (tag < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[tag].completed) {
-        *out_cqe = state->tag_completions[tag].cqe;
-        state->tag_completions[tag].completed = false;
-        return true;
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
     }
 
     return false;
@@ -898,7 +923,8 @@ struct BatchEntry {
 
 // Post up to `count` SQEs into the SQ ring without signaling the server.
 // Allocates tags and data slots for each entry.  Returns number actually posted.
-auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRange* ranges, uint32_t count, BatchEntry* entries_out) -> int {
+auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRange* ranges, uint32_t count,
+                       std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH>& entries_out) -> int {
     if (!state->active || state->rdma_zone_ptr == nullptr || count == 0) {
         return -1;
     }
@@ -958,8 +984,9 @@ auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRang
         asm volatile("" ::: "memory");  // write barrier before advancing head
         ring_hdr->sq_head = (ring_hdr->sq_head + 1) % ring_hdr->sq_depth;
 
-        entries_out[posted].tag = static_cast<uint32_t>(tag);
-        entries_out[posted].slot = (slot >= 0) ? static_cast<uint32_t>(slot) : 0;
+        auto& entry = entries_out.at(posted);
+        entry.tag = static_cast<uint32_t>(tag);
+        entry.slot = (slot >= 0) ? static_cast<uint32_t>(slot) : 0;
         posted++;
     }
 
@@ -975,7 +1002,8 @@ void rdma_batch_signal(ProxyBlockState* state) {
 // Poll CQ for completions matching the given batch entries.
 // In blocking mode, spins until all `count` entries complete or timeout.
 // Returns the number of completed entries.
-auto rdma_batch_collect(ProxyBlockState* state, const BatchEntry* entries, uint32_t count, bool blocking) -> int {
+auto rdma_batch_collect(ProxyBlockState* state, const std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH>& entries, uint32_t count,
+                        bool blocking) -> int {
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
     uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
 
@@ -983,8 +1011,8 @@ auto rdma_batch_collect(ProxyBlockState* state, const BatchEntry* entries, uint3
         // Count completed entries
         uint32_t completed = 0;
         for (uint32_t i = 0; i < count; i++) {
-            uint32_t const TAG = entries[i].tag;
-            if (TAG < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[TAG].completed) {
+            uint32_t const TAG = entries.at(i).tag;
+            if (TAG < ProxyBlockState::TAG_POOL_SIZE && tag_completion(state, TAG).completed) {
                 completed++;
             }
         }
@@ -1002,10 +1030,11 @@ auto rdma_batch_collect(ProxyBlockState* state, const BatchEntry* entries, uint3
             while (!blk_cq_empty(hdr)) {
                 uint32_t const IDX = hdr->cq_tail % hdr->cq_depth;
                 uint32_t const CTAG = cq[IDX].tag;
-                if (CTAG < ProxyBlockState::TAG_POOL_SIZE && (state->tag_bitmap & (1ULL << CTAG)) != 0) {
-                    state->tag_completions[CTAG].cqe = cq[IDX];
-                    state->tag_completions[CTAG].completed = true;
-                    state->tag_completions[CTAG].pending = false;
+                if (tag_in_use(state, CTAG)) {
+                    auto& completion = tag_completion(state, CTAG);
+                    completion.cqe = cq[IDX];
+                    completion.completed = true;
+                    completion.pending = false;
                 }
                 asm volatile("" ::: "memory");
                 hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
@@ -1018,8 +1047,8 @@ auto rdma_batch_collect(ProxyBlockState* state, const BatchEntry* entries, uint3
             // Non-blocking: count what we got and return
             uint32_t got = 0;
             for (uint32_t i = 0; i < count; i++) {
-                uint32_t const TAG = entries[i].tag;
-                if (TAG < ProxyBlockState::TAG_POOL_SIZE && state->tag_completions[TAG].completed) {
+                uint32_t const TAG = entries.at(i).tag;
+                if (TAG < ProxyBlockState::TAG_POOL_SIZE && tag_completion(state, TAG).completed) {
                     got++;
                 }
             }
@@ -1051,19 +1080,20 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
 
     std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
 
-    int const POSTED = rdma_batch_submit(state, BlkOpcode::READ, ranges, BATCH_COUNT, entries.data());
+    int const POSTED = rdma_batch_submit(state, BlkOpcode::READ, ranges, BATCH_COUNT, entries);
     if (POSTED <= 0) {
         return -1;
     }
 
     rdma_batch_signal(state);
 
-    int const COLLECTED = rdma_batch_collect(state, entries.data(), static_cast<uint32_t>(POSTED), true);
+    int const COLLECTED = rdma_batch_collect(state, entries, static_cast<uint32_t>(POSTED), true);
     if (COLLECTED != POSTED) {
         // Timeout - free resources for all posted entries
         for (int i = 0; i < POSTED; i++) {
-            rdma_free_slot(state, entries[i].slot);
-            rdma_free_tag(state, entries[i].tag);
+            auto const& entry = entries.at(static_cast<size_t>(i));
+            rdma_free_slot(state, entry.slot);
+            rdma_free_tag(state, entry.tag);
         }
         return -1;
     }
@@ -1071,8 +1101,9 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
     // Collect results: copy data from slots to caller buffers
     int result = 0;
     for (int i = 0; i < POSTED; i++) {
-        uint32_t const TAG = entries[i].tag;
-        auto& tc = state->tag_completions[TAG];
+        auto const& entry = entries.at(static_cast<size_t>(i));
+        uint32_t const TAG = entry.tag;
+        auto& tc = tag_completion(state, TAG);
 
         if (tc.cqe.status != 0) {
             result = tc.cqe.status;
@@ -1080,14 +1111,14 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
             // For non-RoCE ivshmem: data is already in local shared memory.
             // roce_pull_data_slot is a no-op for both paths (server-push for
             // RoCE, coherent shared mem for ivshmem).
-            auto* slot_data = blk_data_slot(state->rdma_zone_ptr, ring_hdr, entries[i].slot);
+            auto* slot_data = blk_data_slot(state->rdma_zone_ptr, ring_hdr, entry.slot);
             uint32_t const COPY_BYTES = ranges[i].block_count * ring_hdr->block_size;
             memcpy(ranges[i].buffer, slot_data, COPY_BYTES);
         }
 
         tc.completed = false;
-        rdma_free_slot(state, entries[i].slot);
-        rdma_free_tag(state, entries[i].tag);
+        rdma_free_slot(state, entry.slot);
+        rdma_free_tag(state, entry.tag);
     }
 
     // Handle remaining ranges (if count > MAX_BATCH) via recursive call
@@ -1112,19 +1143,20 @@ auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ran
 
     std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
 
-    int const POSTED = rdma_batch_submit(state, BlkOpcode::WRITE, ranges, BATCH_COUNT, entries.data());
+    int const POSTED = rdma_batch_submit(state, BlkOpcode::WRITE, ranges, BATCH_COUNT, entries);
     if (POSTED <= 0) {
         return -1;
     }
 
     rdma_batch_signal(state);
 
-    int const COLLECTED = rdma_batch_collect(state, entries.data(), static_cast<uint32_t>(POSTED), true);
+    int const COLLECTED = rdma_batch_collect(state, entries, static_cast<uint32_t>(POSTED), true);
     if (COLLECTED != POSTED) {
         // Timeout - free resources
         for (int i = 0; i < POSTED; i++) {
-            rdma_free_slot(state, entries[i].slot);
-            rdma_free_tag(state, entries[i].tag);
+            auto const& entry = entries.at(static_cast<size_t>(i));
+            rdma_free_slot(state, entry.slot);
+            rdma_free_tag(state, entry.tag);
         }
         return -1;
     }
@@ -1132,16 +1164,17 @@ auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ran
     // Collect results
     int result = 0;
     for (int i = 0; i < POSTED; i++) {
-        uint32_t const TAG = entries[i].tag;
-        auto& tc = state->tag_completions[TAG];
+        auto const& entry = entries.at(static_cast<size_t>(i));
+        uint32_t const TAG = entry.tag;
+        auto& tc = tag_completion(state, TAG);
 
         if (tc.cqe.status != 0) {
             result = tc.cqe.status;
         }
 
         tc.completed = false;
-        rdma_free_slot(state, entries[i].slot);
-        rdma_free_tag(state, entries[i].tag);
+        rdma_free_slot(state, entry.slot);
+        rdma_free_tag(state, entry.tag);
     }
 
     // Handle remaining ranges (if count > MAX_BATCH)
@@ -1835,7 +1868,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             name_len = ker::dev::BLOCK_NAME_SIZE - 1;
         }
         memcpy(state->bdev.name.data(), local_name, name_len);
-        state->bdev.name[name_len] = '\0';
+        state->bdev.name.at(name_len) = '\0';
     }
     state->bdev.block_size = static_cast<size_t>(block_size);
     state->bdev.total_blocks = total_blocks;
@@ -1994,8 +2027,8 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         uint16_t channel;
         uint8_t* ra_buf;
     };
-    PendingCleanup cleanup[64];  // NOLINT
-    int cleanup_count = 0;
+    std::array<PendingCleanup, MAX_PROXY_SCRATCH> cleanup = {};
+    size_t cleanup_count = 0;
 
     s_proxy_lock.lock();
     for (auto& p : g_proxies) {
@@ -2018,10 +2051,11 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         }
 
         // Save RA buffer + channel info for cleanup outside lock
-        if (cleanup_count < 64) {
-            cleanup[cleanup_count].owner_node = p->owner_node;
-            cleanup[cleanup_count].channel = p->assigned_channel;
-            cleanup[cleanup_count].ra_buf = p->ra_buffer;
+        if (cleanup_count < cleanup.size()) {
+            auto& entry = cleanup.at(cleanup_count);
+            entry.owner_node = p->owner_node;
+            entry.channel = p->assigned_channel;
+            entry.ra_buf = p->ra_buffer;
             cleanup_count++;
         }
 
@@ -2048,10 +2082,11 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
     s_proxy_lock.unlock();
 
     // Free RA buffers and close channels outside lock
-    for (int i = 0; i < cleanup_count; i++) {
-        delete[] cleanup[i].ra_buf;
+    for (size_t i = 0; i < cleanup_count; i++) {
+        auto const& entry = cleanup.at(i);
+        delete[] entry.ra_buf;
 
-        WkiChannel* ch = wki_channel_get(cleanup[i].owner_node, cleanup[i].channel);
+        WkiChannel* ch = wki_channel_get(entry.owner_node, entry.channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
@@ -2062,19 +2097,19 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
     // Collect matching proxies under lock (deque pointer stability guarantees
     // the raw pointers remain valid after unlock as long as no erase occurs;
     // erases only happen in detach/cleanup paths which mark active=false first).
-    ProxyBlockState* to_resume[64];  // NOLINT
+    std::array<ProxyBlockState*, MAX_PROXY_SCRATCH> to_resume = {};
     size_t resume_count = 0;
 
     s_proxy_lock.lock();
     for (auto& p : g_proxies) {
-        if (p->active && p->fenced && p->owner_node == node_id && resume_count < 64) {
-            to_resume[resume_count++] = p.get();
+        if (p->active && p->fenced && p->owner_node == node_id && resume_count < to_resume.size()) {
+            to_resume.at(resume_count++) = p.get();
         }
     }
     s_proxy_lock.unlock();
 
     for (size_t ri = 0; ri < resume_count; ri++) {
-        auto* p = to_resume[ri];
+        auto* p = to_resume.at(ri);
 
         // Re-check validity (another thread may have detached this proxy)
         if (!p->active || !p->fenced) {
@@ -2192,8 +2227,8 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
         uint16_t channel;
         ker::dev::BlockDevice* bdev;
     };
-    DetachInfo info[64];  // NOLINT
-    int info_count = 0;
+    std::array<DetachInfo, MAX_PROXY_SCRATCH> info = {};
+    size_t info_count = 0;
 
     // Lock to iterate, collect info, and mark inactive
     s_proxy_lock.lock();
@@ -2215,12 +2250,13 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
         }
 
         // Collect info for cleanup outside lock
-        if (info_count < 64) {
-            info[info_count].ra_buf = p->ra_buffer;
-            info[info_count].rdma_zone_id = p->rdma_zone_id;
-            info[info_count].owner_node = p->owner_node;
-            info[info_count].channel = p->assigned_channel;
-            info[info_count].bdev = &p->bdev;
+        if (info_count < info.size()) {
+            auto& entry = info.at(info_count);
+            entry.ra_buf = p->ra_buffer;
+            entry.rdma_zone_id = p->rdma_zone_id;
+            entry.owner_node = p->owner_node;
+            entry.channel = p->assigned_channel;
+            entry.bdev = &p->bdev;
             info_count++;
         }
 
@@ -2242,18 +2278,19 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
     s_proxy_lock.unlock();
 
     // Cleanup outside lock: unregister + close channels + free RA + destroy zones
-    for (int i = 0; i < info_count; i++) {
-        delete[] info[i].ra_buf;
+    for (size_t i = 0; i < info_count; i++) {
+        auto const& entry = info.at(i);
+        delete[] entry.ra_buf;
 
-        if (info[i].rdma_zone_id != 0) {
-            wki_zone_destroy(info[i].rdma_zone_id);
+        if (entry.rdma_zone_id != 0) {
+            wki_zone_destroy(entry.rdma_zone_id);
         }
-        WkiChannel* ch = wki_channel_get(info[i].owner_node, info[i].channel);
+        WkiChannel* ch = wki_channel_get(entry.owner_node, entry.channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
-        ker::dev::block_device_unregister(info[i].bdev);
-        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: node=0x%04x ch=%u", info[i].owner_node, info[i].channel);
+        ker::dev::block_device_unregister(entry.bdev);
+        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: node=0x%04x ch=%u", entry.owner_node, entry.channel);
     }
 
     // Remove inactive entries under lock
@@ -2274,8 +2311,8 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
         ProxyBlockState* state;
         uint64_t elapsed;
     };
-    TimedOutInfo timed_out[64];  // NOLINT
-    int to_count = 0;
+    std::array<TimedOutInfo, MAX_PROXY_SCRATCH> timed_out = {};
+    size_t to_count = 0;
 
     s_proxy_lock.lock();
     for (auto& p : g_proxies) {
@@ -2300,9 +2337,10 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
             p->active = false;
             asm volatile("mfence" ::: "memory");
 
-            if (to_count < 64) {
-                timed_out[to_count].state = p.get();
-                timed_out[to_count].elapsed = ELAPSED;
+            if (to_count < timed_out.size()) {
+                auto& entry = timed_out.at(to_count);
+                entry.state = p.get();
+                entry.elapsed = ELAPSED;
                 to_count++;
             }
         }
@@ -2316,9 +2354,10 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
     // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
     // checks active, and all other g_proxies iterators skip inactive
     // entries.
-    for (int i = 0; i < to_count; i++) {
-        auto* st = timed_out[i].state;
-        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x - tearing down", timed_out[i].elapsed / 1000000ULL,
+    for (size_t i = 0; i < to_count; i++) {
+        auto const& entry = timed_out.at(i);
+        auto* st = entry.state;
+        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x - tearing down", entry.elapsed / 1000000ULL,
                            st->bdev.name.data(), st->owner_node);
         ker::dev::block_device_unregister(&st->bdev);
     }

@@ -10,6 +10,7 @@
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/socket.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 
 #include <array>
@@ -24,22 +25,25 @@ using init_log = wos::journal<"init">;
 }
 
 void start_network() {
-    int const CPUNO = ker::multiproc::currentThreadId();
+    uint64_t const CPUNO = ker::multiproc::currentThreadId();
 
-    init_log::info("init[%d]: spawning netd (DHCP daemon)", CPUNO);
+    init_log::info("init[%llu]: spawning netd (DHCP daemon)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
     std::array<const char*, 1> netd_envp = {nullptr};
     uint64_t const NETD_PID = ker::process::exec("/sbin/netd", netd_argv.data(), netd_envp.data());
     if (NETD_PID == 0) {
-        init_log::error("init[%d]: failed to spawn netd", CPUNO);
+        init_log::error("init[%llu]: failed to spawn netd", static_cast<unsigned long long>(CPUNO));
     } else {
-        init_log::info("init[%d]: netd spawned as PID %llu", CPUNO, static_cast<unsigned long long>(NETD_PID));
+        init_log::info("init[%llu]: netd spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
+                       static_cast<unsigned long long>(NETD_PID));
     }
 
     // Poll eth0 for IP address readiness (wait for DHCP to complete)
     int const POLL_SOCK = socket(AF_INET, SOCK_DGRAM, 0);
     if (POLL_SOCK >= 0) {
         struct ifreq ifr{};
+        // ifreq::ifr_name is a POSIX ABI raw array.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
 
         constexpr long POLL_TIMEOUT_SECS = 10;
@@ -52,7 +56,7 @@ void start_network() {
                 if (addr->sin_addr.s_addr != 0) {
                     std::array<char, INET_ADDRSTRLEN> ip_str{};
                     inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-                    init_log::info("init[%d]: eth0 configured with IP %s", CPUNO, ip_str.data());
+                    init_log::info("init[%llu]: eth0 configured with IP %s", static_cast<unsigned long long>(CPUNO), ip_str.data());
                     net_ready = true;
                     break;
                 }
@@ -66,7 +70,7 @@ void start_network() {
         }
         close(POLL_SOCK);
         if (!net_ready) {
-            init_log::warn("init[%d]: eth0 not configured after polling, continuing anyway", CPUNO);
+            init_log::warn("init[%llu]: eth0 not configured after polling, continuing anyway", static_cast<unsigned long long>(CPUNO));
         }
     }
 }

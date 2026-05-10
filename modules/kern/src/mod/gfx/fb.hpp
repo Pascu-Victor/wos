@@ -12,7 +12,7 @@ constexpr bool WOS_HAS_GFX_FB = false;
 
 enum class OffsetMode : uint8_t { OFFSET_PIXEL, OFFSET_CHAR };
 
-enum TermColors : uint32_t {
+enum class TermColors : uint32_t {
     BLACK = 0x00000000,
     RED = 0x00AA0000,
     ORANGE = 0x00FFAA00,

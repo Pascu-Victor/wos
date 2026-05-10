@@ -36,8 +36,8 @@ constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
 struct VfsExport {
     bool active = false;
     uint32_t resource_id = 0;
-    char export_path[VFS_EXPORT_PATH_LEN] = {};
-    char name[VFS_EXPORT_NAME_LEN] = {};
+    char export_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    char name[VFS_EXPORT_NAME_LEN] = {};         // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
 
 // -----------------------------------------------------------------------------
@@ -89,7 +89,7 @@ struct ProxyVfsState {
     uint16_t attach_max_op_size = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
-    char local_mount_path[VFS_EXPORT_PATH_LEN] = {};
+    std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
     std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
 
     // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
@@ -143,7 +143,7 @@ struct RemoteFileContext {
     // When browsing a remote host's /wki directory through its root export,
     // suppress entries that would recurse back into that same exported root.
     bool hide_recursive_wki_entries = false;
-    char recursive_wki_hostname[WKI_HOSTNAME_MAX] = {};
+    std::array<char, WKI_HOSTNAME_MAX> recursive_wki_hostname = {};
 
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;

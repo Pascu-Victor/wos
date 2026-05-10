@@ -19,6 +19,8 @@
 
 namespace ker::dev::e1000e {
 
+using log = ker::mod::dbg::logger<"e1000e">;
+
 namespace {
 
 // WKI remotable ops for E1000E devices
@@ -26,11 +28,11 @@ auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
 auto remotable_on_attach(uint16_t node_id) -> int {
-    ker::mod::dbg::log("[E1000E] remote attach from 0x%04x", node_id);
+    log::trace("remote attach from 0x%04x", node_id);
     return 0;
 }
-void remotable_on_detach(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote detach from 0x%04x", node_id); }
-void remotable_on_fault(uint16_t node_id) { ker::mod::dbg::log("[E1000E] remote fault for 0x%04x", node_id); }
+void remotable_on_detach(uint16_t node_id) { log::trace("remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { log::trace("remote fault for 0x%04x", node_id); }
 const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
@@ -41,7 +43,7 @@ const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
 };
 
 constexpr size_t MAX_E1000_DEVICES = 4;
-E1000Device* devices[MAX_E1000_DEVICES] = {};  // NOLINT
+std::array<E1000Device*, MAX_E1000_DEVICES> devices = {};
 size_t device_count = 0;
 
 // Supported PCI device IDs (vendor = 0x8086)
@@ -79,13 +81,13 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
         auto* kernel_pt = ker::mod::mm::virt::get_kernel_page_table();
         uint64_t const PHYS = ker::mod::mm::virt::translate(kernel_pt, addr);
         if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            ker::mod::dbg::log("e1000e: virt_to_phys failed for kernel address 0x%lx", addr);
+            log::error("virt_to_phys failed for kernel address 0x%lx", addr);
             hcf();
         }
         return PHYS;
     }
 
-    ker::mod::dbg::log("e1000e: virt_to_phys called with unrecognized address 0x%lx", addr);
+    log::error("virt_to_phys called with unrecognized address 0x%lx", addr);
     hcf();
     __builtin_unreachable();
 }
@@ -114,12 +116,12 @@ void read_mac(E1000Device* dev) {
     uint32_t const RAH = reg_read(dev, REG_RAH);
 
     if (RAL != 0 || (RAH & 0xFFFF) != 0) {
-        dev->netdev.mac[0] = static_cast<uint8_t>(RAL);
-        dev->netdev.mac[1] = static_cast<uint8_t>(RAL >> 8);
-        dev->netdev.mac[2] = static_cast<uint8_t>(RAL >> 16);
-        dev->netdev.mac[3] = static_cast<uint8_t>(RAL >> 24);
-        dev->netdev.mac[4] = static_cast<uint8_t>(RAH);
-        dev->netdev.mac[5] = static_cast<uint8_t>(RAH >> 8);
+        dev->netdev.mac.at(0) = static_cast<uint8_t>(RAL);
+        dev->netdev.mac.at(1) = static_cast<uint8_t>(RAL >> 8);
+        dev->netdev.mac.at(2) = static_cast<uint8_t>(RAL >> 16);
+        dev->netdev.mac.at(3) = static_cast<uint8_t>(RAL >> 24);
+        dev->netdev.mac.at(4) = static_cast<uint8_t>(RAH);
+        dev->netdev.mac.at(5) = static_cast<uint8_t>(RAH >> 8);
         return;
     }
 
@@ -128,12 +130,12 @@ void read_mac(E1000Device* dev) {
     uint16_t const W1 = eeprom_read(dev, 1);
     uint16_t const W2 = eeprom_read(dev, 2);
 
-    dev->netdev.mac[0] = static_cast<uint8_t>(W0);
-    dev->netdev.mac[1] = static_cast<uint8_t>(W0 >> 8);
-    dev->netdev.mac[2] = static_cast<uint8_t>(W1);
-    dev->netdev.mac[3] = static_cast<uint8_t>(W1 >> 8);
-    dev->netdev.mac[4] = static_cast<uint8_t>(W2);
-    dev->netdev.mac[5] = static_cast<uint8_t>(W2 >> 8);
+    dev->netdev.mac.at(0) = static_cast<uint8_t>(W0);
+    dev->netdev.mac.at(1) = static_cast<uint8_t>(W0 >> 8);
+    dev->netdev.mac.at(2) = static_cast<uint8_t>(W1);
+    dev->netdev.mac.at(3) = static_cast<uint8_t>(W1 >> 8);
+    dev->netdev.mac.at(4) = static_cast<uint8_t>(W2);
+    dev->netdev.mac.at(5) = static_cast<uint8_t>(W2 >> 8);
 }
 
 // -- Initialize RX ring --------------------------------------------------
@@ -141,19 +143,19 @@ void init_rx(E1000Device* dev) {
     // Allocate descriptor ring (physically contiguous, 16-byte aligned)
     size_t const RING_SIZE = NUM_RX_DESC * sizeof(E1000RxDesc);
     auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
-    memset(descs, 0, RING_SIZE);
+    std::memset(descs, 0, RING_SIZE);
     dev->rx_descs = descs;
 
     // Allocate packet buffers and fill descriptors
     for (size_t i = 0; i < NUM_RX_DESC; i++) {
         auto* pkt = ker::net::pkt_alloc();
         if (pkt == nullptr) {
-            ker::mod::dbg::log("e1000e: Failed to allocate RX buffer %d", i);
+            log::warn("failed to allocate RX buffer %zu", i);
             break;
         }
         pkt->data = pkt->storage.data();
         pkt->len = 0;
-        dev->rx_bufs[i] = pkt;
+        dev->rx_bufs.at(i) = pkt;
         descs[i].addr = virt_to_phys(pkt->storage.data());
         descs[i].status = 0;
     }
@@ -177,7 +179,7 @@ void init_rx(E1000Device* dev) {
 void init_tx(E1000Device* dev) {
     size_t const RING_SIZE = NUM_TX_DESC * sizeof(E1000TxDesc);
     auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
-    memset(descs, 0, RING_SIZE);
+    std::memset(descs, 0, RING_SIZE);
     dev->tx_descs = descs;
 
     // Program descriptor ring registers
@@ -213,7 +215,7 @@ int process_rx_budget(E1000Device* dev, int budget) {
         }
 
         if ((desc->status & RX_STATUS_EOP) != 0 && desc->errors == 0) {
-            auto* pkt = dev->rx_bufs[IDX];
+            auto* pkt = dev->rx_bufs.at(IDX);
             if (pkt != nullptr) {
                 pkt->data = pkt->storage.data();
                 pkt->len = desc->length;
@@ -228,11 +230,11 @@ int process_rx_budget(E1000Device* dev, int budget) {
                 if (new_pkt != nullptr) {
                     new_pkt->data = new_pkt->storage.data();
                     new_pkt->len = 0;
-                    dev->rx_bufs[IDX] = new_pkt;
+                    dev->rx_bufs.at(IDX) = new_pkt;
                     desc->addr = virt_to_phys(new_pkt->storage.data());
                 } else {
                     // No buffer available - mark slot as empty
-                    dev->rx_bufs[IDX] = nullptr;
+                    dev->rx_bufs.at(IDX) = nullptr;
                     desc->addr = 0;
                 }
             }
@@ -250,9 +252,9 @@ int process_rx_budget(E1000Device* dev, int budget) {
 void process_tx(E1000Device* dev) {
     for (size_t i = 0; i < NUM_TX_DESC; i++) {
         auto* desc = &dev->tx_descs[i];
-        if ((desc->status & TX_STATUS_DD) != 0 && dev->tx_bufs[i] != nullptr) {
-            ker::net::pkt_free(dev->tx_bufs[i]);
-            dev->tx_bufs[i] = nullptr;
+        if ((desc->status & TX_STATUS_DD) != 0 && dev->tx_bufs.at(i) != nullptr) {
+            ker::net::pkt_free(dev->tx_bufs.at(i));
+            dev->tx_bufs.at(i) = nullptr;
             desc->status = 0;
         }
     }
@@ -294,9 +296,9 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     if ((ICR & ICR_LSC) != 0) {
         uint32_t const STATUS = reg_read(dev, REG_STATUS);
         if ((STATUS & 0x02) != 0) {
-            ker::mod::dbg::log("e1000e: Link up");
+            log::info("link up");
         } else {
-            ker::mod::dbg::log("e1000e: Link down");
+            log::info("link down");
         }
     }
 
@@ -327,10 +329,10 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     auto* desc = &dev->tx_descs[IDX];
 
     // Check if descriptor is available
-    if (dev->tx_bufs[IDX] != nullptr) {
+    if (dev->tx_bufs.at(IDX) != nullptr) {
         // TX ring full - try to reclaim
         process_tx(dev);
-        if (dev->tx_bufs[IDX] != nullptr) {
+        if (dev->tx_bufs.at(IDX) != nullptr) {
             dev->tx_lock.unlock_irqrestore(TXFLAGS);
             ker::net::pkt_free(pkt);
             return -1;  // Drop packet
@@ -346,7 +348,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     desc->css = 0;
     desc->special = 0;
 
-    dev->tx_bufs[IDX] = pkt;
+    dev->tx_bufs.at(IDX) = pkt;
     dev->tx_tail = (IDX + 1) % NUM_TX_DESC;
 
     // Notify hardware
@@ -368,6 +370,7 @@ ker::net::NetDeviceOps e1000_netdev_ops = {
     .close = e1000_close,
     .start_xmit = e1000_start_xmit,
     .set_mac = e1000_set_mac,
+    .set_queue_cpu = nullptr,
 };
 
 // -- Check if PCI device is supported ------------------------------------
@@ -400,7 +403,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     // Map BAR0 (MMIO) into kernel page table
     auto* bar0_ptr = pci::pci_map_bar(pci_dev, 0);
     if (bar0_ptr == nullptr) {
-        ker::mod::dbg::log("e1000e: BAR0 is 0, cannot map MMIO");
+        log::error("BAR0 is 0, cannot map MMIO");
         delete dev;
         return;
     }
@@ -443,9 +446,9 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     }
 
     // Program MAC into RAL/RAH
-    uint32_t const RAL = static_cast<uint32_t>(dev->netdev.mac[0]) | (static_cast<uint32_t>(dev->netdev.mac[1]) << 8) |
-                         (static_cast<uint32_t>(dev->netdev.mac[2]) << 16) | (static_cast<uint32_t>(dev->netdev.mac[3]) << 24);
-    uint32_t const RAH = static_cast<uint32_t>(dev->netdev.mac[4]) | (static_cast<uint32_t>(dev->netdev.mac[5]) << 8) | RAH_AV;
+    uint32_t const RAL = static_cast<uint32_t>(dev->netdev.mac.at(0)) | (static_cast<uint32_t>(dev->netdev.mac.at(1)) << 8) |
+                         (static_cast<uint32_t>(dev->netdev.mac.at(2)) << 16) | (static_cast<uint32_t>(dev->netdev.mac.at(3)) << 24);
+    uint32_t const RAH = static_cast<uint32_t>(dev->netdev.mac.at(4)) | (static_cast<uint32_t>(dev->netdev.mac.at(5)) << 8) | RAH_AV;
     reg_write(dev, REG_RAL, RAL);
     reg_write(dev, REG_RAH, RAH);
 
@@ -456,7 +459,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     // Set up interrupt
     uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
-        ker::mod::dbg::log("e1000e: Failed to allocate IRQ vector");
+        log::error("failed to allocate IRQ vector");
         delete dev;
         return;
     }
@@ -467,7 +470,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     int const MSI_RESULT = pci::pci_enable_msi(pci_dev, vector);
     if (MSI_RESULT != 0) {
         // Use legacy IRQ
-        ker::mod::dbg::log("e1000e: MSI not available, using legacy IRQ %d", pci_dev->interrupt_line);
+        log::warn("MSI not available, using legacy IRQ %d", pci_dev->interrupt_line);
         vector = pci_dev->interrupt_line + 32;  // IRQ line + ISA offset
         dev->irq_vector = vector;
     }
@@ -488,7 +491,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     ker::net::napi_init(&dev->napi, &dev->netdev, e1000_poll, 64);
     ker::net::napi_enable(&dev->napi);
 
-    devices[device_count] = dev;
+    devices.at(device_count) = dev;
     device_count++;
 
     // Clear any pending interrupts before enabling them
@@ -497,9 +500,9 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     // Enable interrupts: RX timer, RX overrun, link status change, TX done
     reg_write(dev, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
 
-    ker::mod::dbg::log("e1000e: %s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s) napi", name, dev->netdev.mac[0],
-                       dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5], dev->irq_vector,
-                       MSI_RESULT == 0 ? "MSI" : "legacy");
+    log::info("%s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s) napi", name, dev->netdev.mac.at(0), dev->netdev.mac.at(1),
+              dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4), dev->netdev.mac.at(5), dev->irq_vector,
+              MSI_RESULT == 0 ? "MSI" : "legacy");
 }
 }  // namespace
 
@@ -519,13 +522,13 @@ void e1000e_init() {
         }
         const char* name = find_device_name(dev->device_id);
         if (name != nullptr) {
-            ker::mod::dbg::log("e1000e: Found %s (device 0x%x) at %d:%d.%d", name, dev->device_id, dev->bus, dev->slot, dev->function);
+            log::info("found %s (device 0x%x) at %d:%d.%d", name, dev->device_id, dev->bus, dev->slot, dev->function);
             init_device(dev, name);
         }
     }
 
     if (device_count == 0) {
-        ker::mod::dbg::log("e1000e: No supported Intel NIC found");
+        log::info("no supported Intel NIC found");
     }
 }
 

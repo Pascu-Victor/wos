@@ -7,6 +7,7 @@
 #include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <utility>
 
 namespace ker::util {
 
@@ -184,7 +185,7 @@ class IntrHashTable {
     // Remove all elements matching key. Callback receives each removed element.
     // Returns count of removed elements.
     template <typename Key, typename Fn>
-    size_t remove_all_by_key(const Key& key, Fn&& fn) {
+    size_t remove_all_by_key(const Key& key, Fn fn) {
         if (!m_buckets) {
             return 0;
         }
@@ -227,7 +228,7 @@ class IntrHashTable {
             T* cur = bucket.head;
             while (cur) {
                 T* next = cur->hash_next;  // save before callback might modify
-                fn(cur);
+                std::forward<Fn>(fn)(cur);
                 cur = next;
             }
             bucket.lock.unlock_irqrestore(saved);

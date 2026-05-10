@@ -12,6 +12,7 @@
 #include <platform/smt/smt.hpp>
 
 #include "minimalist_malloc/mini_malloc.hpp"
+#include "minimalist_malloc/slab_allocator.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -26,23 +27,24 @@ namespace ker::mod::mm::dyn::kmalloc {
 static constexpr int NUM_SLAB_CLASSES = 9;
 static constexpr int MAGAZINE_CAPACITY = 32;
 
+namespace {
 // Per-CPU magazine cache - Linux SLUB pattern.
 // Fast path: pop/push from per-CPU magazine with IRQs disabled (no lock).
 // Slow path: fall through to mini_malloc/mini_free which hold per-size-class slab_lock.
 struct PerCpuAllocator {
     bool initialized{false};
-    void* magazine[NUM_SLAB_CLASSES][MAGAZINE_CAPACITY]{};
-    uint8_t mag_count[NUM_SLAB_CLASSES]{};
+    std::array<std::array<void*, MAGAZINE_CAPACITY>, NUM_SLAB_CLASSES> magazine{};
+    std::array<uint8_t, NUM_SLAB_CLASSES> mag_count{};
 
     PerCpuAllocator() = default;
 };
 
-static PerCpuAllocator* per_cpu_allocators = nullptr;
-static size_t num_cpus = 0;
-static std::atomic<bool> per_cpu_ready{false};  // Set after per-CPU structures are initialized
+PerCpuAllocator* per_cpu_allocators = nullptr;
+size_t num_cpus = 0;
+std::atomic<bool> per_cpu_ready{false};  // Set after per-CPU structures are initialized
 
 // Safe CPU ID getter - falls back to APIC ID during early boot
-static inline uint64_t get_current_cpu_id() {
+inline auto get_current_cpu_id() -> uint64_t {
     if (per_cpu_ready.load(std::memory_order_acquire)) {
         return cpu::current_cpu();
     }
@@ -63,7 +65,7 @@ constexpr uint64_t SLAB_MAX_SIZE = 0x800;     // 2KB - maximum size mini_malloc 
 constexpr uint64_t MEDIUM_MAX_SIZE = 0xFFFF;  // ~64KB - maximum size for medium allocations
 
 // Medium allocation header for sizes 0x801 - 0xFFFF
-struct alignas(16) MediumAllocationHeader {
+struct alignas(MEMORY_ALIGNMENT) MediumAllocationHeader {
     MediumAllocationHeader* next;
     uint64_t size;   // Total allocation size including header
     uint64_t magic;  // For validation
@@ -79,7 +81,7 @@ struct alignas(16) MediumAllocationHeader {
 constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
 
 // Large allocation header for sizes >= 0x10000
-struct alignas(16) LargeAllocationHeader {
+struct alignas(MEMORY_ALIGNMENT) LargeAllocationHeader {
     LargeAllocationHeader* next;
     uint64_t size;
     uint64_t magic;  // For validation
@@ -98,11 +100,11 @@ static_assert(sizeof(MediumAllocationHeader) == sizeof(LargeAllocationHeader), "
 static_assert(sizeof(MediumAllocationHeader) == sizeof(void*) + (3 * sizeof(uint64_t)),
               "MediumAllocationHeader must be 32 bytes (no accidental padding)");
 
-static MediumAllocationHeader* medium_alloc_list = nullptr;
-static sys::Spinlock medium_alloc_lock;
+MediumAllocationHeader* medium_alloc_list = nullptr;
+sys::Spinlock medium_alloc_lock;
 
-static LargeAllocationHeader* large_alloc_list = nullptr;
-static sys::Spinlock large_alloc_lock;
+LargeAllocationHeader* large_alloc_list = nullptr;
+sys::Spinlock large_alloc_lock;
 
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
 // Per-allocation debug side-table.  Stored in .bss so it is always available during OOM.
@@ -112,12 +114,12 @@ struct AllocDebugInfo {
     uintptr_t caller;  // return address captured at the kmalloc call site
     const char* tag;   // compile-time string (type name or "::new"), may be null
 };
-static constexpr uint32_t ALLOC_DEBUG_NONE = 0;
-static constexpr size_t ALLOC_DEBUG_MAX = 4096;
-__attribute__((section(".bss"))) static std::array<AllocDebugInfo, ALLOC_DEBUG_MAX> s_alloc_debug{};
-static std::atomic<uint32_t> s_alloc_debug_next{1};
+constexpr uint32_t ALLOC_DEBUG_NONE = 0;
+constexpr size_t ALLOC_DEBUG_MAX = 4096;
+__attribute__((section(".bss"))) std::array<AllocDebugInfo, ALLOC_DEBUG_MAX> s_alloc_debug{};
+std::atomic<uint32_t> s_alloc_debug_next{1};
 
-static auto register_alloc_debug(uintptr_t caller, const char* tag) -> uint32_t {
+auto register_alloc_debug(uintptr_t caller, const char* tag) -> uint32_t {
     uint32_t const SLOT = s_alloc_debug_next.fetch_add(1, std::memory_order_relaxed);
     if (SLOT >= ALLOC_DEBUG_MAX) {
         return ALLOC_DEBUG_NONE;
@@ -126,15 +128,16 @@ static auto register_alloc_debug(uintptr_t caller, const char* tag) -> uint32_t 
     return SLOT;
 }
 #endif
+}  // namespace
 
 void init() {
     // Initialize per-CPU allocators
     num_cpus = smt::get_early_cpu_count();
 
-    mini_malloc_init();
+    mini_malloc::mini_malloc_init();
 
     // Allocate per-CPU allocator structures using mini_malloc
-    per_cpu_allocators = static_cast<PerCpuAllocator*>(mini_malloc(sizeof(PerCpuAllocator) * num_cpus));
+    per_cpu_allocators = static_cast<PerCpuAllocator*>(mini_malloc::mini_malloc(sizeof(PerCpuAllocator) * num_cpus));
     if (per_cpu_allocators != nullptr) {
         for (size_t i = 0; i < num_cpus; i++) {
             new (&per_cpu_allocators[i]) PerCpuAllocator();
@@ -222,7 +225,7 @@ void dump_tracked_allocations() {
 
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
     ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info (KASAN/KUBSAN):\n");
-    mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uint32_t dbg_idx) -> void {
+    mini_malloc::mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uint32_t dbg_idx) -> void {
         if (dbg_idx == ALLOC_DEBUG_NONE || dbg_idx >= ALLOC_DEBUG_MAX) {
             return;
         }
@@ -267,92 +270,105 @@ void get_tracked_alloc_totals(uint64_t& out_count, uint64_t& out_bytes) {
     }
     large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
 }
+namespace {
+enum class SlabClass : int8_t {
+    SLAB_0X10 = 0,
+    SLAB_0X20 = 1,
+    SLAB_0X40 = 2,
+    SLAB_0X80 = 3,
+    SLAB_0X100 = 4,
+    SLAB_0X200 = 5,
+    SLAB_0X300 = 6,
+    SLAB_0X400 = 7,
+    SLAB_0X800 = 8,
+    SLAB_INVALID = -1
+};
 
-static auto size_to_slab_idx(uint64_t size) -> int {
-    if (size <= 0x10) {
-        return 0;
+auto size_to_slab_idx(uint64_t size) -> SlabClass {
+    if (size <= mini_malloc::SLAB_SIZE10) {
+        return SlabClass::SLAB_0X10;
     }
-    if (size <= 0x20) {
-        return 1;
+    if (size <= mini_malloc::SLAB_SIZE20) {
+        return SlabClass::SLAB_0X20;
     }
-    if (size <= 0x40) {
-        return 2;
+    if (size <= mini_malloc::SLAB_SIZE40) {
+        return SlabClass::SLAB_0X40;
     }
-    if (size <= 0x80) {
-        return 3;
+    if (size <= mini_malloc::SLAB_SIZE80) {
+        return SlabClass::SLAB_0X80;
     }
-    if (size <= 0x100) {
-        return 4;
+    if (size <= mini_malloc::SLAB_SIZE100) {
+        return SlabClass::SLAB_0X100;
     }
-    if (size <= 0x200) {
-        return 5;
+    if (size <= mini_malloc::SLAB_SIZE200) {
+        return SlabClass::SLAB_0X200;
     }
-    if (size <= 0x300) {
-        return 6;
+    if (size <= mini_malloc::SLAB_SIZE300) {
+        return SlabClass::SLAB_0X300;
     }
-    if (size <= 0x400) {
-        return 7;
+    if (size <= mini_malloc::SLAB_SIZE400) {
+        return SlabClass::SLAB_0X400;
     }
-    if (size <= 0x800) {
-        return 8;
+    if (size <= mini_malloc::SLAB_SIZE800) {
+        return SlabClass::SLAB_0X800;
     }
-    return -1;
+    return SlabClass::SLAB_INVALID;
 }
 
-static auto slab_size_to_idx(size_t slab_size) -> int {
+auto slab_size_to_idx(size_t slab_size) -> SlabClass {
     switch (slab_size) {
-        case 0x10:
-            return 0;
-        case 0x20:
-            return 1;
-        case 0x40:
-            return 2;
-        case 0x80:
-            return 3;
-        case 0x100:
-            return 4;
-        case 0x200:
-            return 5;
-        case 0x300:
-            return 6;
-        case 0x400:
-            return 7;
-        case 0x800:
-            return 8;
+        case mini_malloc::SLAB_SIZE10:
+            return SlabClass::SLAB_0X10;
+        case mini_malloc::SLAB_SIZE20:
+            return SlabClass::SLAB_0X20;
+        case mini_malloc::SLAB_SIZE40:
+            return SlabClass::SLAB_0X40;
+        case mini_malloc::SLAB_SIZE80:
+            return SlabClass::SLAB_0X80;
+        case mini_malloc::SLAB_SIZE100:
+            return SlabClass::SLAB_0X100;
+        case mini_malloc::SLAB_SIZE200:
+            return SlabClass::SLAB_0X200;
+        case mini_malloc::SLAB_SIZE300:
+            return SlabClass::SLAB_0X300;
+        case mini_malloc::SLAB_SIZE400:
+            return SlabClass::SLAB_0X400;
+        case mini_malloc::SLAB_SIZE800:
+            return SlabClass::SLAB_0X800;
         default:
-            return -1;
+            return SlabClass::SLAB_INVALID;
     }
 }
 
-static auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
+auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     if (size == 0) {
         return nullptr;
     }
 
     // Tier 1: Small allocations (0x1 - 0x800) - magazine fast path, slab slow path
     if (size <= SLAB_MAX_SIZE) {
-        int const IDX = size_to_slab_idx(size);
+        SlabClass const IDX = size_to_slab_idx(size);
         void* ptr = nullptr;
-        if (IDX >= 0 && per_cpu_allocators != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
+        if (IDX != SlabClass::SLAB_INVALID && per_cpu_allocators != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
             // NOLINTNEXTLINE(misc-const-correctness)
             uint64_t flags = 0;
             asm volatile("pushfq; popq %0; cli" : "=r"(flags));
             uint64_t const CPU_ID = get_current_cpu_id();
             auto& cpu = per_cpu_allocators[CPU_ID];
-            if (cpu.initialized && cpu.mag_count[IDX] > 0) {
-                ptr = cpu.magazine[IDX][--cpu.mag_count[IDX]];
-                if ((flags & 0x200) != 0U) {
+            if (cpu.initialized && cpu.mag_count[static_cast<int>(IDX)] > 0) {
+                ptr = cpu.magazine[static_cast<int>(IDX)][--cpu.mag_count[static_cast<int>(IDX)]];
+                if ((flags & cpu::GATE_IF_MASK) != 0U) {
                     asm volatile("sti");
                 }
             } else {
-                if ((flags & 0x200) != 0U) {
+                if ((flags & cpu::GATE_IF_MASK) != 0U) {
                     asm volatile("sti");
                 }
             }
         }
         // Slow path: mini_malloc acquires per-size-class slab_lock internally
         if (ptr == nullptr) {
-            ptr = mini_malloc(size);
+            ptr = mini_malloc::mini_malloc(size);
         }
 #ifdef WOS_KASAN
         if (ptr != nullptr) {
@@ -470,16 +486,6 @@ static auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> voi
     return data;
 }
 
-auto malloc(uint64_t size) -> void* {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
-    return malloc_impl(size, (uintptr_t)__builtin_return_address(0), nullptr);
-#else
-    return malloc_impl(size, 0, nullptr);
-#endif
-}
-
-auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void* { return malloc_impl(size, caller, tag); }
-
 // Tri-state result for the medium/large free helpers.
 //   NotTracked: header magic does not match this tier; caller should try the next tier.
 //   Freed:      header was found in the tracker list, spliced out, and magic cleared.
@@ -492,7 +498,7 @@ enum class TrackedFreeResult : uint8_t { NOT_TRACKED, FREED, DOUBLE_FREE };
 // must be atomic w.r.t. other free()/malloc() callers — otherwise a concurrent
 // free of the same pointer can race past the magic check after the entry was
 // removed but before magic was zeroed, and panic spuriously.
-static auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResult {
+auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResult {
     auto* header = static_cast<MediumAllocationHeader*>(data_ptr) - 1;
 
     uint64_t const FLAGS = medium_alloc_lock.lock_irqsave();
@@ -624,7 +630,7 @@ static auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> Tracked
     return TrackedFreeResult::DOUBLE_FREE;
 }
 
-static auto try_free_large_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResult {
+auto try_free_large_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResult {
     auto* header = static_cast<LargeAllocationHeader*>(data_ptr) - 1;
 
     uint64_t const FLAGS = large_alloc_lock.lock_irqsave();
@@ -647,18 +653,29 @@ static auto try_free_large_alloc(void* data_ptr, uint64_t& out_size) -> TrackedF
     large_alloc_lock.unlock_irqrestore(FLAGS);
     return TrackedFreeResult::DOUBLE_FREE;
 }
+}  // namespace
 
-static auto realloc(void* ptr, int sz) -> void* {
+auto malloc(uint64_t size) -> void* {
+#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+    return malloc_impl(size, (uintptr_t)__builtin_return_address(0), nullptr);
+#else
+    return malloc_impl(size, 0, nullptr);
+#endif
+}
+
+auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void* { return malloc_impl(size, caller, tag); }
+
+auto realloc(void* ptr, size_t size) -> void* {
     if (ptr == nullptr) {
-        return malloc(static_cast<uint64_t>(sz));
+        return malloc(static_cast<uint64_t>(size));
     }
 
-    if (sz <= 0) {
+    if (size <= 0) {
         free(ptr);
         return nullptr;
     }
 
-    auto const NEW_SIZE = static_cast<uint64_t>(sz);
+    auto const NEW_SIZE = static_cast<uint64_t>(size);
 
     // Determine the type of the existing allocation by checking headers
     auto* potential_large_header = static_cast<LargeAllocationHeader*>(ptr) - 1;
@@ -812,18 +829,6 @@ static auto realloc(void* ptr, int sz) -> void* {
     return new_ptr;
 }
 
-static void* calloc(int sz) {
-    if (sz <= 0) {
-        return nullptr;
-    }
-
-    void* ptr = malloc(static_cast<uint64_t>(sz));
-    if (ptr != nullptr) [[likely]] {
-        memset(ptr, 0, sz);
-    }
-    return ptr;
-}
-
 auto calloc(size_t nmemb, size_t size) -> void* {
     if (nmemb == 0 || size == 0) {
         return nullptr;
@@ -909,8 +914,8 @@ void free(void* ptr) {
     }
 
     // Otherwise, it's a small allocation (<= 0x800) - magazine fast path, slab slow path
-    size_t const SLAB_SZ = mini_get_slab_size(ptr);
-    int const IDX = (SLAB_SZ > 0) ? slab_size_to_idx(SLAB_SZ) : -1;
+    size_t const SLAB_SZ = mini_malloc::mini_get_slab_size(ptr);
+    int const IDX = (SLAB_SZ > 0) ? static_cast<int>(slab_size_to_idx(SLAB_SZ)) : -1;
 
 #ifdef WOS_KASAN
     // Poison the slab chunk as freed before returning it to the magazine/slab.
@@ -935,32 +940,32 @@ void free(void* ptr) {
             }
             // Magazine full: flush all entries to slab, push new ptr, then drain
             uint8_t const CNT = cpu.mag_count[IDX];
-            void* batch[MAGAZINE_CAPACITY];
+            std::array<void*, MAGAZINE_CAPACITY> batch{};
             for (uint8_t i = 0; i < CNT; i++) {
                 batch[i] = cpu.magazine[IDX][i];
             }
             cpu.mag_count[IDX] = 0;
             cpu.magazine[IDX][cpu.mag_count[IDX]++] = ptr;
-            if ((flags & 0x200) != 0U) {
+            if ((flags & cpu::GATE_IF_MASK) != 0U) {
                 asm volatile("sti");
             }
             for (uint8_t i = 0; i < CNT; i++) {
-                mini_free(batch[i]);
+                mini_malloc::mini_free(batch[i]);
             }
             return;
         }
-        if ((flags & 0x200) != 0U) {
+        if ((flags & cpu::GATE_IF_MASK) != 0U) {
             asm volatile("sti");
         }
     }
 
     // Slow path: mini_free acquires per-size-class slab_lock internally
-    mini_free(ptr);
+    mini_malloc::mini_free(ptr);
 }
 
 }  // namespace ker::mod::mm::dyn::kmalloc
 
-auto operator new(size_t sz) -> void* {
+auto operator new(std::size_t sz) -> void* {
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
     return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new");
 #else
@@ -968,7 +973,7 @@ auto operator new(size_t sz) -> void* {
 #endif
 }
 
-auto operator new[](size_t sz) -> void* {
+auto operator new[](std::size_t sz) -> void* {
 #if defined(WOS_KASAN) || defined(WOS_KUBSAN)
     return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new[]");
 #else
@@ -976,20 +981,12 @@ auto operator new[](size_t sz) -> void* {
 #endif
 }
 
-// void operator delete(void* ptr) noexcept {
-//     ker::mod::mm::dyn::kmalloc::kfree(ptr);
-// }
-
-void operator delete(void* ptr, size_t size) noexcept {
+void operator delete(void* ptr, std::size_t size) noexcept {
     (void)size;
     ker::mod::mm::dyn::kmalloc::free(ptr);
 }
 
-// void operator delete[](void* ptr) noexcept {
-//     ker::mod::mm::dyn::kmalloc::kfree(ptr);
-// }
-
-void operator delete[](void* ptr, size_t size) noexcept {
+void operator delete[](void* ptr, std::size_t size) noexcept {
     (void)size;
     ker::mod::mm::dyn::kmalloc::free(ptr);
 }
@@ -1002,6 +999,6 @@ namespace std {
 extern const nothrow_t nothrow{};
 }
 
-auto operator new(size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }
+auto operator new(std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }
 
-auto operator new[](size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }
+auto operator new[](std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }

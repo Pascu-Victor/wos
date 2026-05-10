@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <platform/asm/msr.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -34,7 +35,7 @@ inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool
         return false;
     }
     uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
-    return rsp > STACK_TOP - KERNEL_STACK_SIZE && rsp <= STACK_TOP;
+    return rsp > STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP;
 }
 
 inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::task::Task* task, const char* path) {
@@ -160,11 +161,12 @@ auto current_stack_matches_current_task() -> bool {
 // NOTE: The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
 // Now we just use the scheduler's getCurrentTask() instead of a separate debug array.
 // This function is now a no-op since the scheduler tracks currentTask internally.
-static inline void update_debug_task_ptr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpu_id) {
+namespace {
+inline void update_debug_task_ptr([[maybe_unused]] sched::task::Task* task, [[maybe_unused]] uint64_t cpu_id) {
     // No-op: scheduler's runQueues->thisCpu()->currentTask is the authoritative source
 }
 
-static inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr) {
+inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr) {
 #ifdef WOS_KASAN
     if (ker::mod::kasan::is_enabled()) {
         // Built by hardware/assembly, then patched by C++ before iretq.
@@ -172,6 +174,7 @@ static inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr
     }
 #endif
 }
+}  // namespace
 
 // Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
 // The memory operand must be 64-byte aligned for xsave, 16-byte for fxsave.
@@ -345,12 +348,12 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     return true;
 }
 
-static long timer_quantum;
+namespace {
+long timer_quantum;
 
 // Tick counter for periodic epoch advancement and garbage collection
-static std::atomic<uint64_t> timer_tick_count{0};
+std::atomic<uint64_t> timer_tick_count{0};
 
-namespace {
 constexpr bool K_ENABLE_SCHED_HOT_LOGGING = false;
 constexpr bool K_ENABLE_SCHED_CPU_DUMP = false;
 
@@ -366,6 +369,13 @@ struct HotTaskTracker {
 
 [[maybe_unused]]
 std::array<HotTaskTracker, 16> hot_task_trackers;
+
+[[maybe_unused]]
+inline auto hot_task_tracker_slot(uint64_t cpu_no) -> HotTaskTracker& {
+    // CPU_NO is checked against hot_task_trackers.size() before access.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return hot_task_trackers[static_cast<size_t>(cpu_no)];
+}
 }  // namespace
 
 #ifdef SCHED_DEBUG
@@ -389,17 +399,18 @@ void dump_irq_stats() {
         uint64_t sw = irqStats[i].ctx_switches.load(std::memory_order_relaxed);
         uint64_t xns = irqStats[i].xsave_ns.load(std::memory_order_relaxed);
         if (cnt == 0) continue;
-        dbg::log("irqstats: cpu%lu ticks=%lu avg_ns=%lu switches=%lu xsave_ms=%lu", (unsigned long)i, (unsigned long)cnt,
-                 (unsigned long)(ns / cnt), (unsigned long)sw, (unsigned long)(xns / 1000000ULL));
+        dbg::log("irqstats: cpu%lu ticks=%lu avg_ns=%lu switches=%lu xsave_ms=%lu", static_cast<unsigned long>(i),
+                 static_cast<unsigned long>(cnt), static_cast<unsigned long>(ns / cnt), static_cast<unsigned long>(sw),
+                 static_cast<unsigned long>(xns / 1000000ULL));
         grand_total_ns += ns;
         grand_count += cnt;
         grand_switches += sw;
         grand_xsave_ns += xns;
     }
     if (grand_count > 0) {
-        dbg::log("irqstats: TOTAL ticks=%lu switches=%lu total_irq_ms=%lu xsave_ms=%lu avg_ns=%lu", (unsigned long)grand_count,
-                 (unsigned long)grand_switches, (unsigned long)(grand_total_ns / 1000000ULL), (unsigned long)(grand_xsave_ns / 1000000ULL),
-                 (unsigned long)(grand_total_ns / grand_count));
+        dbg::log("irqstats: TOTAL ticks=%lu switches=%lu total_irq_ms=%lu xsave_ms=%lu avg_ns=%lu", static_cast<unsigned long>(grand_count),
+                 static_cast<unsigned long>(grand_switches), static_cast<unsigned long>(grand_total_ns / 1000000ULL),
+                 static_cast<unsigned long>(grand_xsave_ns / 1000000ULL), static_cast<unsigned long>(grand_total_ns / grand_count));
     }
 }
 #endif  // SCHED_DEBUG
@@ -459,41 +470,45 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         __builtin_unreachable();
     }
 
-    uint64_t const CPU_NO = cpu::current_cpu();
-    if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
-        if (CPU_NO < hot_task_trackers.size()) {
-            auto& tracker = hot_task_trackers[CPU_NO];
-            uint64_t const CURRENT_PID = current_task != nullptr ? current_task->pid : 0;
+    if constexpr (K_ENABLE_SCHED_HOT_LOGGING || K_ENABLE_SCHED_CPU_DUMP) {
+        uint64_t const CPU_NO = cpu::current_cpu();
+        if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
+            if (CPU_NO < hot_task_trackers.size()) {
+                auto& tracker = hot_task_tracker_slot(CPU_NO);
+                uint64_t const CURRENT_PID = current_task != nullptr ? current_task->pid : 0;
 
-            if (CURRENT_PID != 0 && CURRENT_PID == tracker.last_pid) {
-                tracker.streak++;
-            } else {
-                tracker.last_pid = CURRENT_PID;
-                tracker.streak = CURRENT_PID != 0 ? 1 : 0;
-            }
+                if (CURRENT_PID != 0 && CURRENT_PID == tracker.last_pid) {
+                    tracker.streak++;
+                } else {
+                    tracker.last_pid = CURRENT_PID;
+                    tracker.streak = CURRENT_PID != 0 ? 1 : 0;
+                }
 
-            if (current_task != nullptr && current_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
-                (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
-                auto stats = sched::get_run_queue_stats(CPU_NO);
-                dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
-                         (unsigned long)CPU_NO, (unsigned long)current_task->pid, current_task->name != nullptr ? current_task->name : "?",
-                         (unsigned long)tracker.streak, (unsigned)current_task->type, current_task->voluntary_block ? 1U : 0U,
-                         current_task->wants_block ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U, (unsigned long)stats.active_task_count,
-                         (unsigned long)stats.wait_queue_count, (unsigned)frame_ptr->cs);
+                if (current_task != nullptr && current_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
+                    (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
+                    auto stats = sched::get_run_queue_stats(CPU_NO);
+                    dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
+                             static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(current_task->pid),
+                             current_task->name != nullptr ? current_task->name : "?", static_cast<unsigned long>(tracker.streak),
+                             static_cast<unsigned>(current_task->type), current_task->voluntary_block ? 1U : 0U,
+                             current_task->wants_block ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U,
+                             static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
+                             static_cast<unsigned>(frame_ptr->cs));
+                }
             }
         }
-    }
 
-    if constexpr (K_ENABLE_SCHED_CPU_DUMP) {
-        if (CPU_NO == 0 && (TICKS % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
-            sched::dump_scheduler_cpu_states();
+        if constexpr (K_ENABLE_SCHED_CPU_DUMP) {
+            if (CPU_NO == 0 && (TICKS % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
+                sched::dump_scheduler_cpu_states();
+            }
         }
     }
 
 #ifdef SCHED_DEBUG
     auto* task_after = sched::get_current_task();
     uint64_t elapsed_ns = tsc::ticks_to_ns(rdtsc() - t0);
-    uint64_t cpu = cpu_no;
+    uint64_t cpu = CPU_NO;
     if (cpu < 16) {
         irqStats[cpu].total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
         irqStats[cpu].count.fetch_add(1, std::memory_order_relaxed);
@@ -503,18 +518,19 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     }
 
     static std::atomic<uint64_t> switch_log_count{0};
-    if (cpu == 0 && task_before != task_after && ticks > 25000) {
+    if (cpu == 0 && task_before != task_after && TICKS > 25000) {
         uint64_t n = switch_log_count.fetch_add(1, std::memory_order_relaxed);
         if (n < 32) {
             const char* name_before = (task_before != nullptr && task_before->name != nullptr) ? task_before->name : "?";
             const char* name_after = (task_after != nullptr && task_after->name != nullptr) ? task_after->name : "?";
-            dbg::log("sw[%lu] t=%lu: %lu(%s)->%lu(%s) cs=0x%x", (unsigned long)n, (unsigned long)ticks,
-                     task_before != nullptr ? (unsigned long)task_before->pid : 0UL, name_before,
-                     task_after != nullptr ? (unsigned long)task_after->pid : 0UL, name_after, (unsigned)(frame_ptr->cs));
+            dbg::log("sw[%lu] t=%lu: %lu(%s)->%lu(%s) cs=0x%x", static_cast<unsigned long>(n), static_cast<unsigned long>(TICKS),
+                     task_before != nullptr ? static_cast<unsigned long>(task_before->pid) : 0UL, name_before,
+                     task_after != nullptr ? static_cast<unsigned long>(task_after->pid) : 0UL, name_after,
+                     static_cast<unsigned>(frame_ptr->cs));
         }
     }
 
-    if (cpu == 0 && (ticks % 500) == 499) {
+    if (cpu == 0 && (TICKS % 500) == 499) {
         dump_irq_stats();
         sched::dump_scheduler_trace_stats();
     }

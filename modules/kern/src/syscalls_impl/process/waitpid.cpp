@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
@@ -11,10 +12,12 @@
 #include "platform/asm/cpu.hpp"
 
 namespace ker::syscall::process {
+namespace {
+using log = ker::mod::dbg::logger<"waitpid">;
 
 // Fill POSIX struct rusage with the child's timing data (ru_utime and ru_stime only).
 // rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
-static void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
+void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
     if (rusage_phys_addr == 0 || rusage_phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
         return;
     }
@@ -26,11 +29,11 @@ static void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* 
 }
 
 // Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child"
-static constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 
 // Scan for an exited child of the given parent task.
 // Returns the exited child task pointer, or nullptr if none found.
-static auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
+auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
     // Iterate active task list for children
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
@@ -48,7 +51,7 @@ static auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::
     return nullptr;
 }
 
-static void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
+void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
     if (task == nullptr) {
         return;
     }
@@ -58,14 +61,14 @@ static void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
     task->wait_resume_rsp_phys_addr = 0;
 }
 
-static auto current_syscall_user_rsp() -> uint64_t {
+auto current_syscall_user_rsp() -> uint64_t {
     // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t rsp = 0;
     asm volatile("movq %%gs:0x08, %0" : "=r"(rsp)::"memory");
     return rsp;
 }
 
-static void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mod::cpu::GPRegs& gpr) {
+void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mod::cpu::GPRegs& gpr) {
     if (task == nullptr || task->pagemap == nullptr) {
         clear_wait_resume_debug(task);
         return;
@@ -84,13 +87,15 @@ static void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mo
     }
 }
 
+}  // namespace
+
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t rusage_vaddr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     ker::mod::sched::EpochGuard const EPOCH_GUARD;
 
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
 #ifdef WAITPID_DEBUG
-        ker::mod::dbg::log("wos_proc_waitpid: Current task is null");
+        log::debug("current task is null");
 #endif
         return static_cast<uint64_t>(-1);
     }
@@ -152,14 +157,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // --- Handle pid > 0: wait for specific child ---
 
 #ifdef WAITPID_DEBUG
-    ker::mod::dbg::log("wos_proc_waitpid: PID %x waiting for PID %x", currentTask->pid, pid);
+    log::debug("PID %x waiting for PID %x", current_task->pid, pid);
 #endif
 
     // Find the task with the given PID
     auto* target_task = ker::mod::sched::find_task_by_pid(pid);
     if (target_task == nullptr) {
 #ifdef WAITPID_DEBUG
-        ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x not found", pid);
+        log::debug("target task PID %x not found", pid);
 #endif
         return static_cast<uint64_t>(-1);  // Task not found
     }
@@ -171,7 +176,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // Check if the target task has already exited
     if (target_task->has_exited) {
 #ifdef WAITPID_DEBUG
-        ker::mod::dbg::log("wos_proc_waitpid: Target task PID %x has already exited with status %d", pid, target_task->exit_status);
+        log::debug("target task PID %x has already exited with status %d", pid, target_task->exit_status);
 #endif
         if (status != nullptr) {
             *status = target_task->exit_status;
@@ -244,19 +249,19 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
 #ifdef WAITPID_DEBUG
-        ker::mod::dbg::log("wos_proc_waitpid: Awaitee list full for PID %x", pid);
+        log::debug("awaitee list full for PID %x", pid);
 #endif
         return static_cast<uint64_t>(-1);  // OOM
     }
     current_task->deferred_task_switch = true;
     target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 #ifdef WAITPID_DEBUG
-    ker::mod::dbg::log("wos_proc_waitpid: Added PID %x to awaitee list of PID %x", currentTask->pid, pid);
+    log::debug("added PID %x to awaitee list of PID %x", current_task->pid, pid);
 #endif
 #ifdef WAITPID_DEBUG
-    ker::mod::dbg::log("wos_proc_waitpid: Setting deferred task switch for PID %x, flag at %p = %d", currentTask->pid,
-                       &(currentTask->deferred_task_switch), currentTask->deferred_task_switch);
-    ker::mod::dbg::log("wos_proc_waitpid: Task pointer = %p", currentTask);
+    log::debug("setting deferred task switch for PID %x, flag at %p = %d", current_task->pid, &(current_task->deferred_task_switch),
+               current_task->deferred_task_switch);
+    log::debug("task pointer = %p", current_task);
 #endif
 
     // Return normally - the syscall.asm will check the flag and perform the task switch

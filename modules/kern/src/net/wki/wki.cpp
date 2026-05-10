@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <ranges>
+#include <span>
 #include <util/hostname.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
@@ -45,12 +47,14 @@ using log = ker::mod::dbg::logger<"wki">;
 
 WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+namespace {
+
 // Re-entrancy guard for deferred work processed inside wki_timer_tick().
 // wki_remote_vfs_mount() spin-waits via wki_spin_yield() which calls
 // wki_timer_tick() recursively.  The guard prevents the deferred mount/
 // attach processing from re-entering itself while the outer call is
 // still blocked inside wki_wait_for_op().
-static std::atomic<bool> s_timer_deferred_running{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_timer_deferred_running{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // RAII guard: ensures s_timer_deferred_running is reset even if a deferred
 // work function panics or asserts.  Without this, a crash inside the
@@ -69,8 +73,6 @@ struct DeferredGuard {
         }
     }
 };
-
-namespace {
 
 auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport*;
 auto resolve_next_hop(uint16_t dst_node) -> uint16_t;
@@ -163,7 +165,7 @@ constexpr std::array<uint32_t, 256> CRC32_TABLE = [] {
         for (int j = 0; j < 8; j++) {
             crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320U : crc >> 1;
         }
-        table[i] = crc;
+        table.at(i) = crc;
     }
     return table;
 }();
@@ -172,18 +174,20 @@ constexpr std::array<uint32_t, 256> CRC32_TABLE = [] {
 
 auto wki_crc32(const void* data, size_t len) -> uint32_t {
     const auto* p = static_cast<const uint8_t*>(data);
+    std::span<const uint8_t> const BYTES{p, len};
     uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc = CRC32_TABLE[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    for (uint8_t const BYTE : BYTES) {
+        crc = CRC32_TABLE.at((crc ^ BYTE) & 0xFF) ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFF;
 }
 
 auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint32_t {
     const auto* p = static_cast<const uint8_t*>(data);
+    std::span<const uint8_t> const BYTES{p, len};
     uint32_t crc = prev_crc ^ 0xFFFFFFFF;  // un-finalize previous
-    for (size_t i = 0; i < len; i++) {
-        crc = CRC32_TABLE[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    for (uint8_t const BYTE : BYTES) {
+        crc = CRC32_TABLE.at((crc ^ BYTE) & 0xFF) ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFF;
 }
@@ -195,10 +199,12 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
 // path (completed flag check) is a plain volatile read with no lock.
 // -----------------------------------------------------------------------------
 
-static mod::sys::Spinlock s_wait_lock;
-static WkiWaitEntry* s_wait_head = nullptr;
+namespace {
 
-static void wait_list_link(WkiWaitEntry* entry) {
+mod::sys::Spinlock s_wait_lock;       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+WkiWaitEntry* s_wait_head = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void wait_list_link(WkiWaitEntry* entry) {
     s_wait_lock.lock();
     entry->prev = nullptr;
     entry->next = s_wait_head;
@@ -209,7 +215,7 @@ static void wait_list_link(WkiWaitEntry* entry) {
     s_wait_lock.unlock();
 }
 
-static void wait_list_unlink(WkiWaitEntry* entry) {
+void wait_list_unlink(WkiWaitEntry* entry) {
     s_wait_lock.lock();
     if (entry->prev != nullptr) {
         entry->prev->next = entry->next;
@@ -223,6 +229,8 @@ static void wait_list_unlink(WkiWaitEntry* entry) {
     entry->prev = nullptr;
     s_wait_lock.unlock();
 }
+
+}  // namespace
 
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Record the calling task so wake_op can send an IPI. Do not reset
@@ -363,21 +371,29 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task) {
     s_wait_lock.unlock();
 }
 
+namespace {
+
+[[nodiscard]] auto local_hostname_data() -> char* {
+    return g_wki.local_hostname;  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+}
+
 // -----------------------------------------------------------------------------
 // V2: Hostname resolution
 // Priority: 1) /etc/hostname  2) fallback "node-{id:04x}"
 // Note: kernel cmdline parsing for wki.hostname= deferred until cmdline API exists
 // -----------------------------------------------------------------------------
 
-static void resolve_local_hostname() {
+void resolve_local_hostname() {
     // Use the kernel-wide hostname cache (populated from /etc/hostname at boot)
     const char* cached = ker::util::hostname::get();
     size_t len = strlen(cached);
     if (len >= WKI_HOSTNAME_MAX) {
         len = WKI_HOSTNAME_MAX - 1;
     }
-    memcpy(g_wki.local_hostname, cached, len + 1);
+    memcpy(local_hostname_data(), cached, len + 1);
 }
+
+}  // namespace
 
 // -----------------------------------------------------------------------------
 // Initialization
@@ -459,18 +475,18 @@ void wki_init() {
     // FIXME:does not seem to link VFS properly inside of subdirs that are on different mounts need to update symlink handling to re-resolve
     // after crossing mount point
     {
-        char self_link[WKI_HOSTNAME_MAX + 6];  // "/wki/" + hostname + NUL
-        snprintf(self_link, sizeof(self_link), "/wki/%s", g_wki.local_hostname);
-        ker::vfs::vfs_symlink("/", self_link);
+        std::array<char, WKI_HOSTNAME_MAX + 6> self_link{};  // "/wki/" + hostname + NUL
+        snprintf(self_link.data(), self_link.size(), "/wki/%s", local_hostname_data());
+        ker::vfs::vfs_symlink("/", self_link.data());
     }
 
     ker::vfs::vfs_wki_load_default_rules();
 
     // V2: Create /dev/nodes/ hierarchy and register self
     ker::vfs::devfs::devfs_nodes_init();
-    ker::vfs::devfs::devfs_nodes_add_peer(g_wki.local_hostname, g_wki.my_node_id);
+    ker::vfs::devfs::devfs_nodes_add_peer(local_hostname_data(), g_wki.my_node_id);
 
-    ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x hostname='%s'", g_wki.my_node_id, g_wki.local_hostname);
+    ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x hostname='%s'", g_wki.my_node_id, local_hostname_data());
 }
 
 void wki_shutdown() {
@@ -551,7 +567,7 @@ inline auto peer_hash_slot(uint16_t node_id) -> uint8_t { return static_cast<uin
 void peer_hash_insert(uint16_t node_id, int16_t peer_idx) {
     uint8_t const SLOT = peer_hash_slot(node_id);
     for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
-        auto& entry = g_wki.peer_hash[(SLOT + probe) & (WKI_PEER_HASH_SIZE - 1)];
+        auto& entry = g_wki.peer_hash.at((SLOT + probe) & (WKI_PEER_HASH_SIZE - 1));
         if (entry.node_id == WKI_NODE_INVALID) {
             entry.node_id = node_id;
             entry.peer_idx = peer_idx;
@@ -564,16 +580,16 @@ void peer_hash_insert(uint16_t node_id, int16_t peer_idx) {
     uint8_t const SLOT = peer_hash_slot(node_id);
     for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
         size_t const IDX = (SLOT + probe) & (WKI_PEER_HASH_SIZE - 1);
-        auto& entry = g_wki.peer_hash[IDX];
+        auto& entry = g_wki.peer_hash.at(IDX);
         if (entry.node_id == node_id) {
             entry.node_id = WKI_NODE_INVALID;
             entry.peer_idx = -1;
             // Re-insert any entries that were displaced past this slot
             size_t next = (IDX + 1) & (WKI_PEER_HASH_SIZE - 1);
-            while (g_wki.peer_hash[next].node_id != WKI_NODE_INVALID) {
-                auto displaced = g_wki.peer_hash[next];
-                g_wki.peer_hash[next].node_id = WKI_NODE_INVALID;
-                g_wki.peer_hash[next].peer_idx = -1;
+            while (g_wki.peer_hash.at(next).node_id != WKI_NODE_INVALID) {
+                auto displaced = g_wki.peer_hash.at(next);
+                g_wki.peer_hash.at(next).node_id = WKI_NODE_INVALID;
+                g_wki.peer_hash.at(next).peer_idx = -1;
                 peer_hash_insert(displaced.node_id, displaced.peer_idx);
                 next = (next + 1) & (WKI_PEER_HASH_SIZE - 1);
             }
@@ -590,9 +606,9 @@ void peer_hash_insert(uint16_t node_id, int16_t peer_idx) {
 auto wki_peer_find(uint16_t node_id) -> WkiPeer* {
     uint8_t const SLOT = peer_hash_slot(node_id);
     for (size_t probe = 0; probe < WKI_PEER_HASH_SIZE; probe++) {
-        auto& entry = g_wki.peer_hash[(SLOT + probe) & (WKI_PEER_HASH_SIZE - 1)];
+        auto& entry = g_wki.peer_hash.at((SLOT + probe) & (WKI_PEER_HASH_SIZE - 1));
         if (entry.node_id == node_id) {
-            return &g_wki.peers[entry.peer_idx];
+            return entry.peer_idx >= 0 ? &g_wki.peers.at(static_cast<size_t>(entry.peer_idx)) : nullptr;
         }
         if (entry.node_id == WKI_NODE_INVALID) {
             return nullptr;
@@ -616,12 +632,13 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer* {
 
     // Find an empty slot
     for (size_t i = 0; i < WKI_MAX_PEERS; i++) {
-        if (g_wki.peers[i].node_id == WKI_NODE_INVALID) {
-            new (&g_wki.peers[i]) WkiPeer();  // placement new to reset
-            g_wki.peers[i].node_id = node_id;
+        auto& peer = g_wki.peers.at(i);
+        if (peer.node_id == WKI_NODE_INVALID) {
+            new (&peer) WkiPeer();  // placement new to reset
+            peer.node_id = node_id;
             g_wki.peer_count++;
             peer_hash_insert(node_id, static_cast<int16_t>(i));
-            return &g_wki.peers[i];
+            return &peer;
         }
     }
     return nullptr;  // peer table full
@@ -646,8 +663,8 @@ void channel_pool_init() {
     if (s_channel_pool_init) {
         return;
     }
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        s_channel_pool[i].active = false;
+    for (auto& channel : s_channel_pool) {
+        channel.active = false;
     }
     s_channel_pool_init = true;
 }
@@ -697,11 +714,11 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
 // Allocate a pool slot and register in peer->channels[].
 // Caller must hold s_channel_pool_lock.
 auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id, PriorityClass prio, uint16_t credits) -> WkiChannel* {
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (!s_channel_pool[i].active) {
-            WkiChannel* ch = &s_channel_pool[i];
+    for (auto& pool_entry : s_channel_pool) {
+        if (!pool_entry.active) {
+            WkiChannel* ch = &pool_entry;
             channel_init(ch, peer_node, chan_id, prio, credits);
-            peer->channels[chan_id] = ch;
+            peer->channels.at(chan_id) = ch;
             return ch;
         }
     }
@@ -784,8 +801,8 @@ auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
     uint64_t next_deadline = UINT64_MAX;
 
     s_channel_pool_lock.lock();
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        WkiChannel const* ch = &s_channel_pool[i];
+    for (const auto& channel : s_channel_pool) {
+        WkiChannel const* ch = &channel;
         if (!ch->active) {
             continue;
         }
@@ -820,7 +837,7 @@ auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel* {
     // Fast path: O(1) lookup via peer->channels[]
     WkiPeer* peer = wki_peer_find(peer_node);
     if (peer != nullptr) {
-        WkiChannel* ch = peer->channels[channel_id];
+        WkiChannel* ch = peer->channels.at(channel_id);
         if (ch != nullptr && ch->active) {
             return ch;
         }
@@ -831,7 +848,7 @@ auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel* {
 
     // Re-check under lock (another CPU may have allocated while we were unlocked)
     if (peer != nullptr) {
-        WkiChannel* ch = peer->channels[channel_id];
+        WkiChannel* ch = peer->channels.at(channel_id);
         if (ch != nullptr && ch->active) {
             s_channel_pool_lock.unlock();
             return ch;
@@ -865,10 +882,10 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel
     // Find the first free dynamic channel ID for this peer via per-peer array.
     uint16_t next_id = WKI_MAX_CHANNELS;
     for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_MAX_CHANNELS; i++) {
-        WkiChannel const* existing = peer->channels[i];
+        WkiChannel const* existing = peer->channels.at(i);
         if (existing == nullptr || !existing->active) {
             if (existing != nullptr && !existing->active) {
-                peer->channels[i] = nullptr;
+                peer->channels.at(i) = nullptr;
             }
             next_id = i;
             break;
@@ -899,13 +916,13 @@ auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass 
 
     s_channel_pool_lock.lock();
 
-    WkiChannel const* existing = peer->channels[channel_id];
+    WkiChannel const* existing = peer->channels.at(channel_id);
     if (existing != nullptr) {
         if (existing->active) {
             s_channel_pool_lock.unlock();
             return nullptr;
         }
-        peer->channels[channel_id] = nullptr;
+        peer->channels.at(channel_id) = nullptr;
     }
 
     WkiChannel* ch = channel_pool_alloc(peer, peer_node, channel_id, priority, WKI_CREDITS_DYNAMIC);
@@ -940,7 +957,7 @@ void wki_channel_close(WkiChannel* ch) {
     // Clear per-peer index entry
     WkiPeer* peer = wki_peer_find(ch->peer_node_id);
     if (peer != nullptr && ch->channel_id < WKI_MAX_CHANNELS) {
-        peer->channels[ch->channel_id] = nullptr;
+        peer->channels.at(ch->channel_id) = nullptr;
     }
 
     ch->active = false;
@@ -953,9 +970,9 @@ void wki_channels_close_for_peer(uint16_t node_id) {
     WkiPeer* peer = wki_peer_find(node_id);
 
     s_channel_pool_lock.lock();
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        if (s_channel_pool[i].active && s_channel_pool[i].peer_node_id == node_id) {
-            WkiChannel* ch = &s_channel_pool[i];
+    for (auto& pool_entry : s_channel_pool) {
+        if (pool_entry.active && pool_entry.peer_node_id == node_id) {
+            WkiChannel* ch = &pool_entry;
             ch->lock.lock();
 
             // Free retransmit queue
@@ -1340,7 +1357,9 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
 // Dispatch a reliable (sequenced) message to the appropriate handler.
 // Used for both in-order delivery and reorder buffer drain.
-static void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+namespace {
+
+void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     switch (type) {
         case MsgType::LSA:
             detail::handle_lsa(hdr, payload, payload_len);
@@ -1446,6 +1465,8 @@ static void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const 
             break;
     }
 }
+
+}  // namespace
 
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
     if (len < WKI_HEADER_SIZE) {
@@ -2031,8 +2052,8 @@ void wki_timer_tick(uint64_t now_us) {
     }
 
     // Check retransmit deadlines on all active channels
-    for (size_t i = 0; i < CHANNEL_POOL_SIZE; i++) {
-        WkiChannel* ch = &s_channel_pool[i];
+    for (auto& pool_entry : s_channel_pool) {
+        WkiChannel* ch = &pool_entry;
         if (!ch->active) {
             continue;
         }

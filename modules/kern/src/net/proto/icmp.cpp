@@ -2,16 +2,20 @@
 
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/raw.hpp>
+#include <platform/dbg/dbg.hpp>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
 
 namespace ker::net::proto {
 
-void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip, uint8_t ttl) {
+using log = ker::mod::dbg::logger<"icmp">;
+
+void icmp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip, uint8_t ttl) {
     (void)dev;
 
     if (pkt->len < sizeof(IcmpHeader)) {
@@ -33,8 +37,8 @@ void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip
             // Respond with echo reply
             // Reuse the packet: swap src/dst, change type to reply
 #ifdef DEBUG_ICMP
-            ker::mod::dbg::log("icmp_rx: got ECHO_REQUEST from %u.%u.%u.%u, sending reply\n", (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
-                               (src_ip >> 8) & 0xFF, src_ip & 0xFF);
+            log::debug("icmp_rx: got ECHO_REQUEST from %u.%u.%u.%u, sending reply", (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                       (src_ip >> 8) & 0xFF, src_ip & 0xFF);
 #endif
             hdr->type = ICMP_ECHO_REPLY;
             hdr->code = 0;
@@ -42,14 +46,16 @@ void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip
             hdr->checksum = checksum_compute(pkt->data, pkt->len);
 
             // Send reply: dst_ip becomes our source, src_ip becomes dest
-            ipv4_tx(pkt, dst_ip, src_ip, IPPROTO_ICMP, 64);
+            IPv4Address const REPLY_SRC_IP = dst_ip;
+            IPv4Address const REPLY_DST_IP = src_ip;
+            ipv4_tx(pkt, REPLY_SRC_IP, REPLY_DST_IP, IPPROTO_ICMP, 64);
             return;  // pkt ownership transferred
         }
 
         case ICMP_ECHO_REPLY:
             // Deliver to raw sockets listening for ICMP
 #ifdef DEBUG_ICMP
-            ker::mod::dbg::log("icmp_rx: got ECHO_REPLY, delivering to raw sockets\n");
+            log::debug("icmp_rx: got ECHO_REPLY, delivering to raw sockets");
 #endif
             raw_deliver(pkt, IPPROTO_ICMP, src_ip, dst_ip, ttl);
             // Packet freed by raw_deliver
@@ -58,14 +64,15 @@ void icmp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip
         case ICMP_DEST_UNREACHABLE:
             // Could notify relevant socket
 #ifdef DEBUG_ICMP
-            ker::mod::dbg::log("icmp_rx: got DEST_UNREACHABLE, dropping packet\n");
+            log::debug("icmp_rx: got DEST_UNREACHABLE, dropping packet");
 #endif
-            pkt_free(pkt);
-            break;
+            [[fallthrough]];
 
         default:
 #ifdef DEBUG_ICMP
-            ker::mod::dbg::log("icmp_rx: got unknown type %u, dropping packet\n", hdr->type);
+            if (hdr->type != ICMP_DEST_UNREACHABLE) {
+                log::debug("icmp_rx: got unknown type %u, dropping packet", hdr->type);
+            }
 #endif
             pkt_free(pkt);
             break;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 #include <net/socket.hpp>
@@ -12,16 +13,17 @@
 namespace ker::net::proto {
 
 struct TcpHeader {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint32_t seq;
-    uint32_t ack;
-    uint8_t data_offset;  // upper 4 bits = header length in 32-bit words
-    uint8_t flags;
-    uint16_t window;
-    uint16_t checksum;
-    uint16_t urgent_ptr;
+    uint16_t src_port{};
+    uint16_t dst_port{};
+    uint32_t seq{};
+    uint32_t ack{};
+    uint8_t data_offset{};  // upper 4 bits = header length in 32-bit words
+    uint8_t flags{};
+    uint16_t window{};
+    uint16_t checksum{};
+    uint16_t urgent_ptr{};
 } __attribute__((packed));
+static_assert(sizeof(TcpHeader) == 20);
 
 constexpr uint8_t TCP_FIN = 0x01;
 constexpr uint8_t TCP_SYN = 0x02;
@@ -45,12 +47,12 @@ enum class TcpState : uint8_t {
 };
 
 struct RetransmitEntry {
-    PacketBuffer* pkt;
-    uint32_t seq;
-    size_t len;
-    uint64_t send_time_ms;
-    uint8_t retries;
-    RetransmitEntry* next;
+    PacketBuffer* pkt{};
+    uint32_t seq{};
+    size_t len{};
+    uint64_t send_time_ms{};
+    uint8_t retries{};
+    RetransmitEntry* next{};
 };
 
 constexpr uint8_t TCP_KEEPALIVE_PROBES_DEFAULT = 9;
@@ -145,7 +147,7 @@ inline auto tcp_hash_listener(uint16_t lp) -> uint32_t { return static_cast<uint
 
 constexpr size_t MAX_TCP_BINDINGS = 128;
 
-void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip);
+void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip);
 void tcp_timer_tick(uint64_t now_ms);
 [[noreturn]] void tcp_timer_thread();
 void tcp_timer_thread_start();
@@ -157,7 +159,7 @@ void tcp_timer_disarm(TcpCB* cb);
 auto get_tcp_proto_ops() -> SocketProtoOps*;
 
 auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) -> bool;
-void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t flags);
+void tcp_send_rst(IPv4Address src_ip, IPv4Address dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t flags);
 auto tcp_send_ack(TcpCB* cb) -> bool;
 
 // Build ACK without sending; caller holds cb->lock.
@@ -165,7 +167,8 @@ auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> Pack
 // Build a keepalive probe (ACK with seq = snd_una - 1); caller holds cb->lock.
 auto tcp_build_keepalive_probe(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
 
-void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, uint32_t src_ip, uint32_t dst_ip);
+void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, IPv4Address src_ip,
+                         IPv4Address dst_ip);
 
 auto tcp_alloc_cb() -> TcpCB*;
 void tcp_insert_cb(TcpCB* cb);

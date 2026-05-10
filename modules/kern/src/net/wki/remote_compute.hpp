@@ -43,8 +43,7 @@ struct SubmittedTask {
     uint16_t target_node = WKI_NODE_INVALID;
 
     std::atomic<bool> response_pending{false};
-    uint8_t accept_status = 0;  // TaskRejectReason
-    uint64_t remote_pid = 0;
+    uint8_t accept_status = 0;                    // TaskRejectReason
     WkiWaitEntry* response_wait_entry = nullptr;  // V2 I-4: async wait for TASK_ACCEPT/REJECT
 
     std::atomic<bool> complete_pending{false};
@@ -66,7 +65,6 @@ struct SubmittedTask {
           target_node(o.target_node),
           response_pending(o.response_pending.load(std::memory_order_relaxed)),
           accept_status(o.accept_status),
-          remote_pid(o.remote_pid),
           response_wait_entry(o.response_wait_entry),
           complete_pending(o.complete_pending.load(std::memory_order_relaxed)),
           complete_wait_entry(o.complete_wait_entry),
@@ -82,7 +80,6 @@ struct SubmittedTask {
             target_node = o.target_node;
             response_pending.store(o.response_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accept_status = o.accept_status;
-            remote_pid = o.remote_pid;
             response_wait_entry = o.response_wait_entry;
             complete_pending.store(o.complete_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             complete_wait_entry = o.complete_wait_entry;
@@ -140,14 +137,18 @@ void wki_remote_compute_init();
 
 // Submitter side: submit a task with inline binary.
 // Returns task_id on success, 0 on failure.
-auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len, const char* const argv[],
-                            const char* const envp[], const char* cwd, ker::mod::sched::task::Task* local_task,
-                            const WkiIpcFdEntry* ipc_fd_map = nullptr, uint16_t ipc_fd_count = 0) -> uint32_t;
+auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len,
+                            const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                            const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                            const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
+                            uint16_t ipc_fd_count = 0) -> uint32_t;
 
 // Submitter side: submit a task via VFS_REF (path-based delivery).
 // The remote node loads the ELF from its VFS (typically via /wki/<hostname>/... mount).
 // Returns task_id on success, 0 on failure.
-auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path, const char* const argv[], const char* const envp[],
+auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
+                             const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                             const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
                              uint16_t ipc_fd_count = 0) -> uint32_t;
 

@@ -10,6 +10,8 @@
 
 namespace ker::mod::ioapic {
 
+using log = ker::mod::dbg::logger<"ioapic">;
+
 namespace {
 volatile uint32_t* ioapic_base = nullptr;
 uint32_t gsi_base = 0;
@@ -46,7 +48,7 @@ void init() {
     const auto& apic_info = acpi::madt::get_apic_info();
 
     if (apic_info.usable_ioapics == 0) {
-        dbg::log("IOAPIC: No IO APICs found in MADT");
+        log::warn("No IO APICs found in MADT");
         return;
     }
 
@@ -66,7 +68,7 @@ void init() {
     uint32_t const VER = ioapic_read(IOAPIC_REG_VER);
     max_redirection_entries = ((VER >> 16) & 0xFF) + 1;
 
-    dbg::log("IOAPIC: addr=0x%x gsi_base=%d max_entries=%d", PHYS_ADDR, gsi_base, max_redirection_entries);
+    log::info("addr=0x%x gsi_base=%d max_entries=%d", PHYS_ADDR, gsi_base, max_redirection_entries);
 
     // Mask all entries initially
     for (uint32_t i = 0; i < max_redirection_entries; i++) {
@@ -77,7 +79,7 @@ void init() {
     // These remap ISA IRQs (e.g., IRQ 0->GSI 2 for timer)
     for (uint32_t i = 0; i < apic_info.usable_ioapic_isos; i++) {
         const auto& iso = apic_info.ioapic_isos[i];
-        dbg::log("IOAPIC: ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x", iso.bus, iso.source, iso.global_sys_int, iso.flags);
+        log::debug("ISO: bus=%d source(IRQ)=%d -> GSI %d flags=0x%x", iso.bus, iso.source, iso.global_sys_int, iso.flags);
     }
 }
 
@@ -118,7 +120,7 @@ void route_irq(uint8_t gsi, uint8_t vector, uint32_t dest_apic_id) {
     }
 
     write_redirection(INDEX, entry);
-    dbg::log("IOAPIC: Routed GSI %d -> vector %d (dest APIC %d)", gsi, vector, dest_apic_id);
+    log::debug("Routed GSI %d -> vector %d (dest APIC %d)", gsi, vector, dest_apic_id);
 }
 
 void mask_irq(uint8_t gsi) {

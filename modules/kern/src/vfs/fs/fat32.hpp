@@ -33,6 +33,7 @@ struct FAT32MountContext {
 };
 
 // FAT32 Boot Sector Structure (simplified)
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): fixed FAT32 on-disk layout.
 struct __attribute__((packed)) FAT32BootSector {
     uint8_t jump_boot[3];
     char oem_name[8];
@@ -62,8 +63,11 @@ struct __attribute__((packed)) FAT32BootSector {
     char volume_label[11];
     char file_system_type[8];
 };
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+static_assert(sizeof(FAT32BootSector) == 90);
 
 // FAT32 Directory Entry (32 bytes)
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): fixed FAT32 on-disk layout.
 struct __attribute__((packed)) FAT32DirectoryEntry {
     char name[11];
     uint8_t attributes;
@@ -78,6 +82,8 @@ struct __attribute__((packed)) FAT32DirectoryEntry {
     uint16_t cluster_low;
     uint32_t file_size;
 };
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+static_assert(sizeof(FAT32DirectoryEntry) == 32);
 
 // Fs limits
 constexpr uint64_t FAT32_NAME_PART_LEN = 9;

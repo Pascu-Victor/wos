@@ -30,7 +30,7 @@ inline void copy_sse(uint8_t* dst, const uint8_t* src, size_t len) {
         cpu = 0;
     }
     // NOLINTBEGIN(misc-const-correctness)
-    FxState& state = g_fx_state[cpu];
+    FxState& state = g_fx_state.at(static_cast<size_t>(cpu));
     uint64_t rflags = 0;
     size_t chunks = len / 16;
     // NOLINTEND(misc-const-correctness)

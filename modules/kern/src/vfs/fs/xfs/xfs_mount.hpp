@@ -16,6 +16,9 @@
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 
+// XFS mount contexts are zeroed/populated as a unit during mount setup; keeping
+// the plain layout avoids hidden constructor work in this kernel structure.
+// NOLINTBEGIN(cppcoreguidelines-pro-type-member-init)
 namespace ker::vfs::xfs {
 
 // Per-AG in-memory state (read from AGF + AGI at mount time)
@@ -128,3 +131,4 @@ inline bool xfs_has_exchrange(const XfsMountContext* ctx) { return (ctx->feat_in
 inline bool xfs_has_bigtime(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_BIGTIME) != 0; }
 
 }  // namespace ker::vfs::xfs
+// NOLINTEND(cppcoreguidelines-pro-type-member-init)

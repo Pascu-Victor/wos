@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <net/wki/remote_compute.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/loader/debug_info.hpp>
@@ -37,12 +38,22 @@
 #include "vfs/stat.hpp"
 namespace ker::syscall::process {
 
-static auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* const envp[], int shebang_depth) -> uint64_t;
-static auto wos_proc_execve_impl(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr,
-                                 int shebang_depth) -> uint64_t;
-
 namespace {
+auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp, int shebang_depth) -> uint64_t;
+auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
+    -> uint64_t;
+
 constexpr int MAX_SHEBANG_DEPTH = 4;
+using exec_log = ker::mod::dbg::logger<"exec">;
+
+template <typename T, size_t N>
+auto fixed_slot(std::array<T, N>& values, size_t index) -> T& {
+    // Callers validate logical extents before indexing fixed kernel buffers.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return values[index];
+}
+
+inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
 
 struct ShebangInfo {
     std::array<char, ker::mod::sched::task::Task::EXE_PATH_MAX> interpreter = {};
@@ -51,12 +62,12 @@ struct ShebangInfo {
 };
 
 auto allocate_kernel_stack() -> uint64_t {
-    auto stack_base = (uint64_t)ker::mod::mm::phys::page_alloc(KERNEL_STACK_SIZE);
+    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
     if (stack_base == 0) {
         return 0;
     }
 
-    return stack_base + KERNEL_STACK_SIZE;
+    return stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
 }
 
 auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo* out) -> bool {
@@ -79,7 +90,7 @@ auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo*
         return false;
     }
     std::memcpy(out->interpreter.data(), file_data + INTERP_BEGIN, INTERP_LEN);
-    out->interpreter[INTERP_LEN] = '\0';
+    fixed_slot(out->interpreter, INTERP_LEN) = '\0';
 
     while (pos < file_size && (file_data[pos] == ' ' || file_data[pos] == '\t')) {
         pos++;
@@ -103,14 +114,14 @@ auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo*
     }
 
     std::memcpy(out->argument.data(), file_data + ARG_BEGIN, ARG_LEN);
-    out->argument[ARG_LEN] = '\0';
+    fixed_slot(out->argument, ARG_LEN) = '\0';
     out->has_argument = true;
     return true;
 }
 
 template <typename ExecFn>
-auto exec_shebang_script(const char* script_path, const char* const argv[], const char* const envp[], size_t argv_count,
-                         const ShebangInfo& shebang, int shebang_depth, ExecFn&& exec_fn) -> uint64_t {
+auto exec_shebang_script(const char* script_path, const char* const* argv, const char* const* envp, size_t argv_count,
+                         const ShebangInfo& shebang, int shebang_depth, ExecFn exec_fn) -> uint64_t {
     size_t const FORWARDED_ARGS = argv_count > 0 ? (argv_count - 1) : 0;
     size_t const NEW_ARGC = 2 + FORWARDED_ARGS + (shebang.has_argument ? 1 : 0);
     auto** shebang_argv = new const char*[NEW_ARGC + 1];
@@ -136,11 +147,12 @@ auto exec_shebang_script(const char* script_path, const char* const argv[], cons
 
 }  // namespace
 
-auto wos_proc_exec(const char* path, const char* const argv[], const char* const envp[]) -> uint64_t {
+auto wos_proc_exec(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
     return wos_proc_exec_impl(path, argv, envp, 0);
 }
 
-auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* const envp[], int shebang_depth) -> uint64_t {
+namespace {
+auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp, int shebang_depth) -> uint64_t {
     std::string_view const STR(path, std::strlen(path));
     size_t argv_count = 0;
     if (argv != nullptr) {
@@ -166,7 +178,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     uint64_t const PARENT_PID = parent_task->pid;
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Loading '%.*s'", (int)str.size(), str.data());
+    dbg::log("wos_proc_exec: Loading '%.*s'", static_cast<int>(STR.size()), STR.data());
 #endif
 
     int const FD = vfs::vfs_open(STR, 0, 0);
@@ -218,7 +230,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
             return 0;
         }
         return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [](const char* interp, const char* const argv2[], const char* const envp2[], int depth) -> uint64_t {
+                                   [](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
                                        return wos_proc_exec_impl(interp, argv2, envp2, depth);
                                    });
     }
@@ -239,14 +251,12 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     }
 
     const char* process_name = STR.data();
-    for (size_t i = 0; i < STR.size(); i++) {
-        if (STR[i] == '/') {
-            process_name = STR.data() + i + 1;
-        }
+    if (size_t const SLASH = STR.rfind('/'); SLASH != std::string_view::npos) {
+        process_name = STR.data() + SLASH + 1;
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Creating task for '%s', parent PID: %x", process_name, parent_pid);
+    dbg::log("wos_proc_exec: Creating task for '%s', parent PID: %x", process_name, PARENT_PID);
 #endif
 
     uint64_t const KERNEL_RSP = allocate_kernel_stack();
@@ -261,7 +271,8 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     volatile uint64_t canary1 = 0xDEAD'BEEF'CAFE'BABEULL;  // NOLINT
     volatile uint64_t canary2 = 0x1234'5678'9ABC'DEF0ULL;  // NOLINT
 
-    auto* new_task = new sched::task::Task(process_name, (uint64_t)elf_buffer, KERNEL_RSP, sched::task::TaskType::PROCESS);
+    auto* new_task =
+        new sched::task::Task(process_name, reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP, sched::task::TaskType::PROCESS);
 
     // Check canaries for stack corruption
     if (canary1 != 0xDEAD'BEEF'CAFE'BABEULL || canary2 != 0x1234'5678'9ABC'DEF0ULL) {  // NOLINT
@@ -301,8 +312,8 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
-    memcpy(new_task->cwd, parent_task->cwd, sizeof(new_task->cwd));
-    memcpy(new_task->root, parent_task->root, sizeof(new_task->root));
+    new_task->cwd = parent_task->cwd;
+    new_task->root = parent_task->root;
     new_task->uid = parent_task->uid;
     new_task->gid = parent_task->gid;
     new_task->euid = parent_task->euid;
@@ -314,11 +325,11 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : parent_task->pid;
     new_task->controlling_tty = parent_task->controlling_tty;
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
-    memcpy(new_task->wki_target_hostname, parent_task->wki_target_hostname, sizeof(new_task->wki_target_hostname));
+    new_task->wki_target_hostname = parent_task->wki_target_hostname;
     new_task->wki_target_flags = parent_task->wki_target_flags;
-    memcpy(new_task->wki_submitter_hostname, parent_task->wki_submitter_hostname, sizeof(new_task->wki_submitter_hostname));
-    new_task->wki_remote_pid = (new_task->wki_submitter_hostname[0] != '\0' &&
-                                std::strcmp(new_task->wki_submitter_hostname, ker::net::wki::g_wki.local_hostname) != 0)
+    new_task->wki_submitter_hostname = parent_task->wki_submitter_hostname;
+    new_task->wki_remote_pid = (new_task->wki_submitter_hostname.front() != '\0' &&
+                                std::strcmp(new_task->wki_submitter_hostname.data(), local_wki_hostname()) != 0)
                                    ? new_task->pid
                                    : 0;
     [[maybe_unused]] bool const CLONED_RULES = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
@@ -362,8 +373,8 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         if (path_len >= sched::task::Task::EXE_PATH_MAX) {
             path_len = sched::task::Task::EXE_PATH_MAX - 1;
         }
-        memcpy(new_task->exe_path, path, path_len);
-        new_task->exe_path[path_len] = '\0';
+        std::memcpy(new_task->exe_path.data(), path, path_len);
+        fixed_slot(new_task->exe_path, path_len) = '\0';
     }
 
     // Handle setuid/setgid bits from the executable
@@ -390,7 +401,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     uint64_t current_virt_offset = 0;
 
     auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
-        if (current_virt_offset + size > USER_STACK_SIZE) {
+        if (current_virt_offset + size > ker::mod::mm::USER_STACK_SIZE) {
             return 0;  // Stack overflow
         }
         current_virt_offset += size;
@@ -401,7 +412,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
         uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
         if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushData: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
+            exec_log::critical("pushData: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
             hcf();
         }
 
@@ -413,7 +424,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
     auto push_string = [&](std::string_view str) -> uint64_t {
         size_t const LEN = str.size() + 1;  // Include null terminator
-        if (current_virt_offset + LEN > USER_STACK_SIZE) {
+        if (current_virt_offset + LEN > ker::mod::mm::USER_STACK_SIZE) {
             return 0;
         }
         current_virt_offset += LEN;
@@ -424,7 +435,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
         uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
         if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
-            mod::dbg::log("exec pushString: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
+            exec_log::critical("pushString: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
             hcf();
         }
 
@@ -523,7 +534,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
         }
 
         for (int j = static_cast<int>(auxv.size()) - 1; j >= 0; j--) {
-            uint64_t val = auxv[static_cast<size_t>(j)];
+            uint64_t val = auxv.at(static_cast<size_t>(j));
             push_to_stack(&val, sizeof(uint64_t));
         }
     }
@@ -549,7 +560,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
         .argv = argv,
         .envp = envp,
-        .cwd = parent_task->cwd,
+        .cwd = parent_task->cwd.data(),
     };
     auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, REMOTE_SPAWN);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
@@ -562,7 +573,7 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Setup stack - argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", argc, argv_ptr, envp_ptr, new_task->context.frame.rsp);
+    dbg::log("wos_proc_exec: Setup stack - argc=%d, argv=0x%x, envp=0x%x, rsp=0x%x", argc, ARGV_PTR, ENVP_PTR, new_task->context.frame.rsp);
     dbg::log("wos_proc_exec: Entry point (RIP) = 0x%x", new_task->context.frame.rip);
     dbg::log("wos_proc_exec: Task entry field = 0x%x", new_task->entry);
 #endif
@@ -583,13 +594,15 @@ auto wos_proc_exec_impl(const char* path, const char* const argv[], const char* 
 
     // Note: elfBuffer is now owned by the task and will be cleaned up when the task exits
 }
+}  // namespace
 
-auto wos_proc_execve(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+auto wos_proc_execve(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     return wos_proc_execve_impl(path, argv, envp, gpr, 0);
 }
 
-auto wos_proc_execve_impl(const char* path, const char* const argv[], const char* const envp[], ker::mod::cpu::GPRegs& gpr,
-                          int shebang_depth) -> uint64_t {
+namespace {
+auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
+    -> uint64_t {
     // POSIX execve: replace current process image with a new one.
     // On success, the sysret return path is patched to land at the new
     // binary's entry point (gpr is a local copy and NOT used).
@@ -724,7 +737,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
             return static_cast<uint64_t>(-ELOOP);
         }
         return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [&gpr](const char* interp, const char* const argv2[], const char* const envp2[], int depth) -> uint64_t {
+                                   [&gpr](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
                                        return wos_proc_execve_impl(interp, argv2, envp2, gpr, depth);
                                    });
     }
@@ -748,7 +761,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         bool const SAVED_WKI_SKIP_LEGACY_PLACEMENT = task->wki_skip_legacy_placement;
         uint64_t const SAVED_WKI_REMOTE_PID = task->wki_remote_pid;
         std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
-        std::memcpy(saved_exe_path.data(), task->exe_path, saved_exe_path.size());
+        std::memcpy(saved_exe_path.data(), task->exe_path.data(), saved_exe_path.size());
 
         size_t path_len = std::strlen(path);
         if (path_len >= sched::task::Task::EXE_PATH_MAX) {
@@ -758,13 +771,13 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         task->elf_buffer = elf_buffer;
         task->elf_buffer_size = static_cast<size_t>(FILE_SIZE);
         task->is_elf_buffer_shared = false;
-        std::memcpy(task->exe_path, path, path_len);
-        task->exe_path[path_len] = '\0';
+        std::memcpy(task->exe_path.data(), path, path_len);
+        fixed_slot(task->exe_path, path_len) = '\0';
 
         ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
             .argv = k_argv,
             .envp = k_envp,
-            .cwd = task->cwd,
+            .cwd = task->cwd.data(),
         };
         auto remote_result = ker::net::wki::wki_try_remote_spawn(task, REMOTE_SPAWN);
 
@@ -780,7 +793,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
             return 0;
         }
 
-        std::memcpy(task->exe_path, saved_exe_path.data(), saved_exe_path.size());
+        std::memcpy(task->exe_path.data(), saved_exe_path.data(), saved_exe_path.size());
         task->wki_skip_legacy_placement = SAVED_WKI_SKIP_LEGACY_PLACEMENT;
         task->wki_remote_pid = SAVED_WKI_REMOTE_PID;
 
@@ -810,8 +823,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     }
 
     // --- Create new thread (user stack + TLS) ---
-    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info((void*)(uint64_t)elf_buffer);
-    auto* new_thread = mod::sched::threading::create_thread(USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, TLS_INFO);
+    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info(static_cast<void*>(elf_buffer));
+    auto* new_thread = mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, TLS_INFO);
     char* new_name = nullptr;
     auto cleanup_new_image = [&]() {
         if (new_pagemap != nullptr) {
@@ -848,7 +861,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     // --- Load ELF into new pagemap ---
     loader::elf::ElfLoadResult elf_result =
-        loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)elf_buffer, new_pagemap, task->pid, task->name);
+        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
@@ -869,10 +882,11 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // If the binary requests a dynamic linker (PT_INTERP), load it.
     if (elf_result.has_interp) {
         constexpr uint64_t INTERP_BASE = 0x40000000ULL;
+        const char* const INTERP_PATH = std::begin(elf_result.interp_path);
 
-        int const INTERP_FD = vfs::vfs_open(std::string_view(elf_result.interp_path, std::strlen(elf_result.interp_path)), 0, 0);
+        int const INTERP_FD = vfs::vfs_open(std::string_view(INTERP_PATH, std::strlen(INTERP_PATH)), 0, 0);
         if (INTERP_FD < 0) {
-            dbg::log("wos_proc_execve: Failed to open interpreter '%s'", elf_result.interp_path);
+            dbg::log("wos_proc_execve: Failed to open interpreter '%s'", INTERP_PATH);
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
@@ -900,7 +914,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         loader::elf::ElfLoadResult const INTERP_RESULT =
-            loader::elf::load_elf((loader::elf::ElfFile*)(uint64_t)interp_buf, new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
+            loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf), new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
 
         if (INTERP_RESULT.entry_point == 0) {
             delete[] interp_buf;
@@ -918,10 +932,8 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     std::string_view const PATH_STR(path, std::strlen(path));
     const char* base_name = PATH_STR.data();
-    for (size_t i = 0; i < PATH_STR.size(); i++) {
-        if (PATH_STR[i] == '/') {
-            base_name = PATH_STR.data() + i + 1;
-        }
+    if (size_t const SLASH = PATH_STR.rfind('/'); SLASH != std::string_view::npos) {
+        base_name = PATH_STR.data() + SLASH + 1;
     }
     {
         size_t const BASE_LEN = std::strlen(base_name);
@@ -939,7 +951,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     uint64_t current_virt_offset = 0;
 
     auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
-        if (current_virt_offset + size > USER_STACK_SIZE) {
+        if (current_virt_offset + size > ker::mod::mm::USER_STACK_SIZE) {
             return 0;
         }
         current_virt_offset += size;
@@ -948,7 +960,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
         uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
         if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
-            dbg::log("exec pushData: translate failed for stack vaddr 0x%x", PAGE_VIRT);
+            exec_log::critical("pushData: translate failed for stack vaddr 0x%x", PAGE_VIRT);
             hcf();
         }
         auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
@@ -958,7 +970,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 
     auto push_string = [&](const char* str) -> uint64_t {
         size_t const LEN = std::strlen(str) + 1;
-        if (current_virt_offset + LEN > USER_STACK_SIZE) {
+        if (current_virt_offset + LEN > ker::mod::mm::USER_STACK_SIZE) {
             return 0;
         }
         current_virt_offset += LEN;
@@ -967,7 +979,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
         uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
         if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
-            dbg::log("exec pushString: translate failed for stack vaddr 0x%x", PAGE_VIRT);
+            exec_log::critical("pushString: translate failed for stack vaddr 0x%x", PAGE_VIRT);
             hcf();
         }
         auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
@@ -1067,7 +1079,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         for (int j = static_cast<int>(auxv.size()) - 1; j >= 0; j--) {
-            uint64_t val = auxv[static_cast<size_t>(j)];
+            uint64_t val = auxv.at(static_cast<size_t>(j));
             push_to_stack(&val, sizeof(uint64_t));
         }
     }
@@ -1099,14 +1111,14 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // failed execve() must leave the original process image intact.
     // Snapshot descriptors first because vfs_close() mutates fd_table.
     while (!task->fd_table.empty()) {
-        uint64_t fds[sched::task::Task::FD_TABLE_SIZE]{};
+        std::array<uint64_t, sched::task::Task::FD_TABLE_SIZE> fds{};
         size_t fd_count = 0;
         task->fd_table.for_each([&](uint64_t key, void* val) {
             if (val == nullptr) {
                 return;
             }
             if (task->get_fd_cloexec(static_cast<unsigned>(key)) && fd_count < sched::task::Task::FD_TABLE_SIZE) {
-                fds[fd_count++] = key;
+                fixed_slot(fds, fd_count++) = key;
             }
         });
 
@@ -1115,7 +1127,7 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         }
 
         for (size_t i = 0; i < fd_count; ++i) {
-            vfs::vfs_close(static_cast<int>(fds[i]));
+            vfs::vfs_close(static_cast<int>(fixed_slot(fds, i)));
         }
     }
 
@@ -1139,13 +1151,11 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
         if (path_len >= sched::task::Task::EXE_PATH_MAX) {
             path_len = sched::task::Task::EXE_PATH_MAX - 1;
         }
-        std::memcpy(task->exe_path, path, path_len);
-        task->exe_path[path_len] = '\0';
+        std::memcpy(task->exe_path.data(), path, path_len);
+        fixed_slot(task->exe_path, path_len) = '\0';
     }
 
-    if (task->name != nullptr) {
-        delete[] const_cast<char*>(task->name);
-    }
+    delete[] task->name;
     task->name = new_name;
     new_name = nullptr;
 
@@ -1279,11 +1289,11 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
 #ifdef EXEC_DEBUG
     // Log BEFORE patching the stack - dbg::log uses the stack and would
     // clobber the patched register slots if called after.
-    dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path, elf_result.entryPoint,
+    dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path.data(), elf_result.entryPoint,
              new_rsp);
 #endif
     // Compute physical pagemap address before we enter the critical section
-    auto phys_pagemap = (uint64_t)mm::addr::get_phys_pointer((uint64_t)new_pagemap);
+    auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
 
     // === CRITICAL SECTION: No function calls below this point! ===
     // Any function call (including dbg::log) would use the kernel stack
@@ -1309,5 +1319,6 @@ auto wos_proc_execve_impl(const char* path, const char* const argv[], const char
     // the new entry point.
     return 0;
 }
+}  // namespace
 
 }  // namespace ker::syscall::process

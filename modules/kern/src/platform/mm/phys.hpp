@@ -51,6 +51,6 @@ auto get_total_mem_bytes() -> uint64_t;
 
 template <typename T>
 inline static void page_free(T* page) {
-    page_free((void*)page);
+    page_free(static_cast<void*>(page));
 }
 }  // namespace ker::mod::mm::phys

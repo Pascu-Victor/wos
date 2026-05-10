@@ -16,6 +16,12 @@
 
 namespace ker::net {
 
+namespace {
+constexpr int SOCK_STREAM_TYPE = 1;
+constexpr int SOCK_DGRAM_TYPE = 2;
+constexpr int SOCK_RAW_TYPE = 3;
+}  // namespace
+
 auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
     // Lock-free SPSC producer path (NAPI worker, single writer).
     // Load used with acquire so all prior consumer reads are visible,
@@ -77,7 +83,7 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
     // Assign protocol-specific ops
     // TODO: Extract me into enums
     size_t rcvbuf_size = UDP_RCVBUF_SIZE;  // default for unknown types
-    if (BASE_TYPE == 1) {                  // SOCK_STREAM
+    if (BASE_TYPE == SOCK_STREAM_TYPE) {
         sock->proto_ops = proto::get_tcp_proto_ops();
         rcvbuf_size = TCP_RCVBUF_SIZE;
         // Allocate TCP control block
@@ -86,10 +92,10 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
             cb->socket = sock;
             sock->proto_data = cb;
         }
-    } else if (BASE_TYPE == 2) {  // SOCK_DGRAM
+    } else if (BASE_TYPE == SOCK_DGRAM_TYPE) {
         sock->proto_ops = proto::get_udp_proto_ops();
         rcvbuf_size = UDP_RCVBUF_SIZE;
-    } else if (BASE_TYPE == 3) {  // SOCK_RAW
+    } else if (BASE_TYPE == SOCK_RAW_TYPE) {
         sock->proto_ops = proto::get_raw_proto_ops();
         rcvbuf_size = RAW_RCVBUF_SIZE;
         // Auto-bind raw sockets to receive packets
@@ -157,7 +163,7 @@ auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int {
 
     // For TCP sockets: update the advertised receive window and recompute the
     // window-scale shift (takes effect on the next connection's SYN).
-    if (sock->type == 1 && sock->proto_data != nullptr) {
+    if (sock->type == SOCK_STREAM_TYPE && sock->proto_data != nullptr) {
         auto* cb = static_cast<proto::TcpCB*>(sock->proto_data);
         cb->lock.lock();
         cb->rcv_wnd = new_size;

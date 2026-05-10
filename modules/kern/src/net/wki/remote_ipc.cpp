@@ -3,6 +3,7 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <span>
 #include <syscalls_impl/futex/futex.hpp>
 #include <utility>
 #include <vfs/epoll.hpp>
@@ -28,10 +30,6 @@
 #include "util/smallvec.hpp"
 
 namespace ker::net::wki {
-
-namespace detail {
-static void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-}
 
 // =============================================================================
 // File-scope globals (anonymous namespace)
@@ -92,9 +90,11 @@ constexpr size_t WKI_IPC_DEV_OP_MAX_PENDING = 256;
 constexpr ssize_t WKI_IPC_PIPE_RESTARTSYS = -512;
 constexpr uint64_t WKI_IPC_PIPE_WRITE_RETRY_US = 1000;
 constexpr uint32_t WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS = 128;
+constexpr size_t WKI_IPC_MAX_POLL_WAKE_WAITERS = 32;
 
-static auto consume_deferred_wait_for_daemon() -> bool;
-static auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool;
+auto consume_deferred_wait_for_daemon() -> bool;
+auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool;
+void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 
 auto should_proxy_tty_like_file(ker::vfs::File* file) -> bool {
     if (file == nullptr || file->fs_type != ker::vfs::FSType::DEVFS) {
@@ -117,25 +117,33 @@ auto ipc_pipe_send_retry_sleep_us(int ret, uint32_t attempt) -> uint64_t {
 }
 
 auto proxy_register_waiter_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
-    for (size_t i = 0; i < waiters.size(); i++) {
-        if (waiters[i] == pid) {
+    for (auto waiter : waiters) {
+        if (waiter == pid) {
             return true;
         }
     }
     return waiters.push_back(pid);
 }
 
-void proxy_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t* pending, size_t* pending_count) {
-    *pending_count = std::min(waiters.size(), size_t{32});
-    for (size_t i = 0; i < *pending_count; i++) {
-        pending[i] = waiters[i];
+void proxy_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_WAITERS>& pending,
+                                  size_t* pending_count) {
+    size_t copied = 0;
+    auto* pending_it = pending.begin();
+    for (auto waiter : waiters) {
+        if (pending_it == pending.end()) {
+            break;
+        }
+        *pending_it = waiter;
+        ++pending_it;
+        copied++;
     }
     waiters.clear();
+    *pending_count = copied;
 }
 
-void proxy_reschedule_waiters(const uint64_t* waiters, size_t waiter_count) {
-    for (size_t i = 0; i < waiter_count; i++) {
-        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
+void proxy_reschedule_waiters(const std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_WAITERS>& waiters, size_t waiter_count) {
+    for (auto waiter_pid : std::span(waiters.data(), waiter_count)) {
+        auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiter_pid);
         if (waiter == nullptr) {
             continue;
         }
@@ -706,7 +714,7 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
 
 auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
-    if (proxy == nullptr || !proxy->active) {
+    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
         return -EBADF;
     }
 
@@ -749,14 +757,14 @@ auto proxy_pipe_close(ker::vfs::File* f) -> int {
     uint16_t const OP = (f->fops != nullptr && f->fops->vfs_write == nullptr) ? OP_PIPE_CLOSE_READ : OP_PIPE_CLOSE_WRITE;
 
     constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-    uint8_t msg[HEADER_SIZE];
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    std::array<uint8_t, HEADER_SIZE> msg = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP;
     req->data_len = sizeof(uint32_t);
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     if (proxy->home_node != WKI_NODE_INVALID) {
-        wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE));
+        wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     }
 
     wki_ipc_detach_proxy_file(f, proxy);
@@ -777,16 +785,16 @@ auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
 
     if (f->fops != nullptr && f->fops->vfs_write == nullptr) {
         // Read end
-        if (((events & 0x0001) != 0) && (AVAIL > 0 || WR_CLOSED)) {
-            ready |= 0x0001;  // POLLIN
+        if (((events & dev::pty::POLLIN) != 0) && (AVAIL > 0 || WR_CLOSED)) {
+            ready |= dev::pty::POLLIN;
         }
         if (WR_CLOSED && AVAIL == 0) {
-            ready |= 0x0010;  // POLLHUP
+            ready |= dev::pty::POLLHUP;
         }
     } else {
         // Write end — always writable (sends via wire message)
-        if ((events & 0x0004) != 0) {
-            ready |= 0x0004;  // POLLOUT
+        if ((events & dev::pty::POLLOUT) != 0) {
+            ready |= dev::pty::POLLOUT;
         }
     }
     return ready;
@@ -809,6 +817,7 @@ ker::vfs::FileOperations g_proxy_pipe_read_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = proxy_pipe_poll_check,
     .vfs_poll_register_waiter = proxy_pipe_poll_register_waiter,
+    .vfs_ioctl = nullptr,
 };
 
 ker::vfs::FileOperations g_proxy_pipe_write_fops = {
@@ -823,6 +832,7 @@ ker::vfs::FileOperations g_proxy_pipe_write_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = proxy_pipe_poll_check,
     .vfs_poll_register_waiter = proxy_pipe_poll_register_waiter,
+    .vfs_ioctl = nullptr,
 };
 
 // ---- Server-side helpers ----
@@ -870,13 +880,13 @@ auto proxy_epoll_close(ker::vfs::File* f) -> int {
     // Send OP_PIPE_CLOSE_READ to home node — the server handler tears down the export
     // (sets exp->active = false, releases file ref) for any resource type.
     constexpr size_t CLOSE_MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-    uint8_t close_msg[CLOSE_MSG_SIZE] = {};
-    auto* req = reinterpret_cast<DevOpReqPayload*>(close_msg);
+    std::array<uint8_t, CLOSE_MSG_SIZE> close_msg = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(close_msg.data());
     req->op_id = OP_PIPE_CLOSE_READ;
     req->data_len = sizeof(uint32_t);
-    std::memcpy(close_msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
+    std::memcpy(close_msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
     if (HOME_NODE != WKI_NODE_INVALID) {
-        wki_send(HOME_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, close_msg, static_cast<uint16_t>(CLOSE_MSG_SIZE));
+        wki_send(HOME_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, close_msg.data(), static_cast<uint16_t>(close_msg.size()));
     }
 
     wki_ipc_detach_proxy_file(f, proxy);
@@ -918,24 +928,24 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     // Wire layout (after resource_id): [cmd:u64][arg_val:u64][arg_in:128B]
     constexpr size_t EXTRA = sizeof(uint64_t) + sizeof(uint64_t) + PTY_IOCTL_ARG_SIZE;
     constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t) + EXTRA;
-    uint8_t msg[MSG_SIZE] = {};
+    std::array<uint8_t, MSG_SIZE> msg = {};
 
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_PTY_IOCTL;
     req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + EXTRA);
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     auto cmd64 = static_cast<uint64_t>(cmd);
     auto arg64 = static_cast<uint64_t>(arg);
     size_t cursor = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-    std::memcpy(msg + cursor, &cmd64, sizeof(uint64_t));
+    std::memcpy(msg.data() + cursor, &cmd64, sizeof(uint64_t));
     cursor += sizeof(uint64_t);
-    std::memcpy(msg + cursor, &arg64, sizeof(uint64_t));
+    std::memcpy(msg.data() + cursor, &arg64, sizeof(uint64_t));
     cursor += sizeof(uint64_t);
 
     // If arg looks like a pointer, copy the pointed-to data into the request
     if (arg >= 4096) {
-        std::memcpy(msg + cursor, reinterpret_cast<const void*>(arg), PTY_IOCTL_ARG_SIZE);
+        std::memcpy(msg.data() + cursor, reinterpret_cast<const void*>(arg), PTY_IOCTL_ARG_SIZE);
     }
 
     WkiWaitEntry wait = {};
@@ -950,7 +960,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     proxy->pending_wait_resp_len = 0;
     proxy->lock.unlock_irqrestore(irqf);
 
-    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     if (TX != WKI_OK) {
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
@@ -970,7 +980,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     int const STATUS = proxy->pending_wait_status;
     // Copy response arg_out back to caller's pointer (output ioctls)
     if (arg >= 4096 && proxy->pending_wait_resp_len >= PTY_IOCTL_ARG_SIZE) {
-        std::memcpy(reinterpret_cast<void*>(arg), proxy->pending_wait_resp, PTY_IOCTL_ARG_SIZE);
+        std::memcpy(reinterpret_cast<void*>(arg), static_cast<const void*>(proxy->pending_wait_resp), PTY_IOCTL_ARG_SIZE);
     }
     proxy->pending_wait = nullptr;
     proxy->lock.unlock_irqrestore(irqf);
@@ -987,13 +997,13 @@ auto proxy_pty_close(ker::vfs::File* f) -> int {
 
     // Send OP_PTY_CLOSE to home node (no response expected)
     constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-    uint8_t msg[MSG_SIZE] = {};
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    std::array<uint8_t, MSG_SIZE> msg = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_PTY_CLOSE;
     req->data_len = sizeof(uint32_t);
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
     if (proxy->home_node != WKI_NODE_INVALID) {
-        wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+        wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     }
 
     wki_ipc_detach_proxy_file(f, proxy);
@@ -1038,7 +1048,7 @@ struct PipePumpArg {
 };
 
 constexpr int MAX_PUMPS = 32;
-PipePumpArg g_pump_args[MAX_PUMPS];
+std::array<PipePumpArg, MAX_PUMPS> g_pump_args;
 
 auto stop_pipe_pump_locked(WkiIpcExport* exp) -> ker::mod::sched::task::Task* {
     if (exp == nullptr) {
@@ -1089,7 +1099,7 @@ auto register_poll_read_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
 }
 
 auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
-    constexpr int POLL_WRITE_EVENTS = 0x0004 | 0x0008;  // POLLOUT | POLLERR
+    constexpr int POLL_WRITE_EVENTS = dev::pty::POLLOUT | dev::pty::POLLERR;
     if (ready_now != nullptr) {
         *ready_now = false;
     }
@@ -1109,7 +1119,7 @@ auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
 
 template <int SLOT>
 [[noreturn]] void pipe_pump_thread_fn() {
-    auto* arg = &g_pump_args[SLOT];
+    auto* arg = &std::get<SLOT>(g_pump_args);
 
     for (;;) {
         auto* exp = arg->exp.load(std::memory_order_acquire);
@@ -1249,7 +1259,7 @@ template <int SLOT>
 }
 
 using PumpFn = void (*)();
-constexpr PumpFn G_PUMP_FNS[MAX_PUMPS] = {
+constexpr std::array<PumpFn, MAX_PUMPS> G_PUMP_FNS = {
     pipe_pump_thread_fn<0>,  pipe_pump_thread_fn<1>,  pipe_pump_thread_fn<2>,  pipe_pump_thread_fn<3>,  pipe_pump_thread_fn<4>,
     pipe_pump_thread_fn<5>,  pipe_pump_thread_fn<6>,  pipe_pump_thread_fn<7>,  pipe_pump_thread_fn<8>,  pipe_pump_thread_fn<9>,
     pipe_pump_thread_fn<10>, pipe_pump_thread_fn<11>, pipe_pump_thread_fn<12>, pipe_pump_thread_fn<13>, pipe_pump_thread_fn<14>,
@@ -1260,33 +1270,37 @@ constexpr PumpFn G_PUMP_FNS[MAX_PUMPS] = {
 };
 
 void start_pipe_pump(WkiIpcExport* exp) {
-    int slot = -1;
-    for (int i = 0; i < MAX_PUMPS; i++) {
+    PipePumpArg* slot_arg = nullptr;
+    PumpFn pump_fn = nullptr;
+    const auto* pump_fn_it = G_PUMP_FNS.begin();
+    for (auto& pump_arg : g_pump_args) {
         WkiIpcExport* expected = nullptr;
-        if (g_pump_args[i].exp.compare_exchange_strong(expected, exp, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            slot = i;
+        if (pump_arg.exp.compare_exchange_strong(expected, exp, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            slot_arg = &pump_arg;
+            pump_fn = *pump_fn_it;
             break;
         }
+        ++pump_fn_it;
     }
 
-    if (slot < 0) {
+    if (slot_arg == nullptr || pump_fn == nullptr) {
         ker::mod::dbg::log("[WKI] IPC pump slots exhausted");
         return;
     }
 
     exp->pump_running.store(true, std::memory_order_release);
 
-    auto* task = g_pump_args[slot].worker;
+    auto* task = slot_arg->worker;
     if (task == nullptr) {
-        task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_pump", G_PUMP_FNS[slot]);
+        task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_pump", pump_fn);
         if (task == nullptr) {
             exp->pump_running.store(false, std::memory_order_release);
             exp->pump_task = nullptr;
-            g_pump_args[slot].exp.store(nullptr, std::memory_order_release);
+            slot_arg->exp.store(nullptr, std::memory_order_release);
             ker::mod::dbg::log("[WKI] IPC pump: failed to create kernel thread");
             return;
         }
-        g_pump_args[slot].worker = task;
+        slot_arg->worker = task;
         ker::mod::sched::post_task_balanced(task);
     } else {
         ker::mod::sched::kern_wake(task);
@@ -1320,10 +1334,10 @@ void send_ipc_dev_op_error_response(const WkiHeader* hdr, uint16_t op_id, uint32
     resp.status = status;
     resp.data_len = sizeof(uint32_t);
 
-    uint8_t resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t)] = {};
-    std::memcpy(resp_buf, &resp, sizeof(resp));
-    std::memcpy(resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
-    wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf, static_cast<uint16_t>(sizeof(resp_buf)));
+    std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint32_t)> resp_buf = {};
+    std::memcpy(resp_buf.data(), &resp, sizeof(resp));
+    std::memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+    wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
 }
 
 auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_node) -> bool {
@@ -1420,7 +1434,7 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
             continue;
         }
 
-        detail::handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len);
+        handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len);
         free_ipc_dev_op_work(work);
     }
 }
@@ -1467,7 +1481,7 @@ void wki_ipc_proxy_wake_poll_waiters(ProxyIpcState* proxy) {
         return;
     }
 
-    uint64_t pending_waiters[32]{};
+    std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_WAITERS> pending_waiters = {};
     size_t pending_waiter_count = 0;
 
     uint64_t const IRQF = proxy->lock.lock_irqsave();
@@ -1525,13 +1539,10 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         g_ipc_exports.push_back(exp);
         s_ipc_lock.unlock_irqrestore(IRQF);
 
-        // Start pump thread for pipe read-ends, sockets, and PTY files (data flows home->consumer)
-        if (res_type == ResourceType::IPC_PIPE && file->open_flags == 0) {
+        bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && file->open_flags == 0) ||
+                                     res_type == ResourceType::IPC_SOCKET || res_type == ResourceType::IPC_PTY;
+        if (NEEDS_DATA_PUMP) {
             start_pipe_pump(exp);
-        } else if (res_type == ResourceType::IPC_SOCKET) {
-            start_pipe_pump(exp);  // reuse pump: reads from socket file fops then sends OP_PIPE_DATA
-        } else if (res_type == ResourceType::IPC_PTY) {
-            start_pipe_pump(exp);  // reuse pump: reads from PTY devfs fops then sends OP_PIPE_DATA
         }
 
         auto& entry = map_out[count];
@@ -1558,8 +1569,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         return;
     }
 
-    for (uint16_t i = 0; i < count; i++) {
-        const auto& entry = map[i];
+    for (const auto& entry : std::span(map, count)) {
         auto* proxy = new ProxyIpcState();
         proxy->active = true;
         proxy->res_type = static_cast<ResourceType>(entry.res_type);
@@ -1573,7 +1583,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             constexpr uint32_t PIPE_RING_CAPACITY = 65536;  // 64 KB
             auto* rb = new uint8_t[PIPE_RING_CAPACITY];
             if (rb != nullptr) {
-                std::memset(rb, 0, PIPE_RING_CAPACITY);
+                std::fill_n(rb, PIPE_RING_CAPACITY, uint8_t{0});
                 proxy->ring_buf = rb;
                 proxy->ring_capacity = PIPE_RING_CAPACITY;
             } else {
@@ -1618,7 +1628,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             // ProxyEpollFile so the cast in epoll_ctl is valid.
             auto* epf = new ProxyEpollFile();
             epf->inst.count = 0;
-            std::memset(epf->inst.interests.data(), 0, sizeof(epf->inst.interests));
+            epf->inst.interests.fill({});
             epf->resource_id = proxy->resource_id;
             epf->home_node = proxy->home_node;
             proxy_file->private_data = epf;  // epoll_ctl casts this to EpollInstance*
@@ -1722,13 +1732,13 @@ auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t 
     constexpr size_t RID_SIZE = sizeof(uint32_t);
     constexpr size_t EXTRA_SIZE = sizeof(EpollCtlWire);
     constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + RID_SIZE + EXTRA_SIZE;
-    uint8_t msg[MSG_SIZE] = {};
+    std::array<uint8_t, MSG_SIZE> msg = {};
 
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_EPOLL_CTL;
     req->data_len = static_cast<uint16_t>(RID_SIZE + EXTRA_SIZE);
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, RID_SIZE);
-    std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE, &ctl, EXTRA_SIZE);
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, RID_SIZE);
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload) + RID_SIZE, &ctl, EXTRA_SIZE);
 
     WkiWaitEntry wait = {};
     uint64_t irqf = proxy->lock.lock_irqsave();
@@ -1743,7 +1753,7 @@ auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t 
     proxy->pending_wait_resp_len = 0;
     proxy->lock.unlock_irqrestore(irqf);
 
-    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     if (TX != WKI_OK) {
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
@@ -1875,7 +1885,7 @@ void wki_ipc_socket_handle_dev_op_resp(uint16_t /*src_node*/, uint16_t /*channel
             if (EXTRA_LEN > 0) {
                 uint16_t const COPY_LEN =
                     EXTRA_LEN < ProxyIpcState::SOCK_CTRL_RESP_MAX ? EXTRA_LEN : static_cast<uint16_t>(ProxyIpcState::SOCK_CTRL_RESP_MAX);
-                std::memcpy(target_proxy->pending_wait_resp, extra_data, COPY_LEN);
+                std::memcpy(static_cast<void*>(target_proxy->pending_wait_resp), extra_data, COPY_LEN);
                 target_proxy->pending_wait_resp_len = COPY_LEN;
             } else {
                 target_proxy->pending_wait_resp_len = 0;
@@ -1936,16 +1946,18 @@ void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
 
 void wki_ipc_cleanup_for_peer(uint16_t node_id) {
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-    // NOLINTNEXTLINE(misc-const-correctness)
-    ker::mod::sched::task::Task* stopped_pumps[WKI_IPC_MAX_EXPORTS]{};
+    std::array<ker::mod::sched::task::Task*, WKI_IPC_MAX_EXPORTS> stopped_pumps = {};
     size_t stopped_pump_count = 0;
+    auto* stopped_pump_it = stopped_pumps.begin();
 
     // Clean up exports for this peer
     for (auto* exp : g_ipc_exports) {
         if (exp->active && exp->consumer_node == node_id) {
             auto* pump_task = stop_pipe_pump_locked(exp);
-            if (pump_task != nullptr && stopped_pump_count < WKI_IPC_MAX_EXPORTS) {
-                stopped_pumps[stopped_pump_count++] = pump_task;
+            if (pump_task != nullptr && stopped_pump_it != stopped_pumps.end()) {
+                *stopped_pump_it = pump_task;
+                ++stopped_pump_it;
+                stopped_pump_count++;
             }
             if (exp->file != nullptr) {
                 // Release the refcount bump taken at export time.
@@ -1963,18 +1975,20 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
     }
 
     size_t detached_proxy_count = 0;
-    // NOLINTBEGIN(misc-const-correctness)
-    ProxyIpcState* detached_proxies[WKI_IPC_MAX_PROXIES]{};
-    PendingPipeDelivery* detached_pending[WKI_IPC_MAX_EXPORTS]{};
-    // NOLINTEND(misc-const-correctness)
+    std::array<ProxyIpcState*, WKI_IPC_MAX_PROXIES> detached_proxies = {};
+    std::array<PendingPipeDelivery*, WKI_IPC_MAX_EXPORTS> detached_pending = {};
     size_t detached_pending_count = 0;
+    auto* detached_proxy_it = detached_proxies.begin();
+    auto* detached_pending_it = detached_pending.begin();
     bool wake_export_pipe_flush = false;
     for (auto it = g_ipc_proxies.begin(); it != g_ipc_proxies.end();) {
         auto* proxy = *it;
         if (proxy != nullptr && proxy->active.load(std::memory_order_acquire) && proxy->home_node == node_id) {
             proxy->active.store(false, std::memory_order_release);
-            if (detached_proxy_count < WKI_IPC_MAX_PROXIES) {
-                detached_proxies[detached_proxy_count++] = proxy;
+            if (detached_proxy_it != detached_proxies.end()) {
+                *detached_proxy_it = proxy;
+                ++detached_proxy_it;
+                detached_proxy_count++;
             }
             it = g_ipc_proxies.erase(it);
             continue;
@@ -1985,8 +1999,10 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
     for (auto it = g_pending_pipe_deliveries.begin(); it != g_pending_pipe_deliveries.end();) {
         auto* pending = *it;
         if (pending != nullptr && pending->home_node == node_id) {
-            if (detached_pending_count < WKI_IPC_MAX_EXPORTS) {
-                detached_pending[detached_pending_count++] = pending;
+            if (detached_pending_it != detached_pending.end()) {
+                *detached_pending_it = pending;
+                ++detached_pending_it;
+                detached_pending_count++;
             }
             it = g_pending_pipe_deliveries.erase(it);
             continue;
@@ -2007,16 +2023,15 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
 
     s_ipc_lock.unlock_irqrestore(IRQF);
 
-    for (size_t i = 0; i < stopped_pump_count; i++) {
-        wake_pipe_pump(stopped_pumps[i]);
+    for (auto* stopped_pump : std::span(stopped_pumps.data(), stopped_pump_count)) {
+        wake_pipe_pump(stopped_pump);
     }
 
     if (wake_export_pipe_flush && g_export_pipe_write_flush_task != nullptr) {
         ker::mod::sched::kern_wake(g_export_pipe_write_flush_task);
     }
 
-    for (size_t i = 0; i < detached_proxy_count; i++) {
-        auto* proxy = detached_proxies[i];
+    for (auto* proxy : std::span(detached_proxies.data(), detached_proxy_count)) {
         auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
         if (reader != nullptr) {
             reader->deferred_task_switch = false;
@@ -2027,8 +2042,8 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
         proxy_release(proxy);
     }
 
-    for (size_t i = 0; i < detached_pending_count; i++) {
-        free_pending_pipe_delivery(detached_pending[i]);
+    for (auto* pending : std::span(detached_pending.data(), detached_pending_count)) {
+        free_pending_pipe_delivery(pending);
     }
 }
 
@@ -2045,6 +2060,10 @@ void handle_ipc_attach_req(const WkiHeader* /*hdr*/, const uint8_t* /*payload*/,
 void handle_ipc_attach_ack(const WkiHeader* /*hdr*/, const uint8_t* /*payload*/, uint16_t /*payload_len*/) {
     // Future: handle IPC resource attach acknowledgements
 }
+
+}  // namespace detail
+
+namespace {
 
 void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(DevOpReqPayload)) {
@@ -2206,9 +2225,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         poll_resp.data_len = sizeof(uint32_t) * 2;  // [resource_id, ready_flags]
         poll_resp.reserved = 0;
 
-        uint8_t poll_resp_buf[sizeof(DevOpRespPayload) + (sizeof(uint32_t) * 2)] = {};
-        std::memcpy(poll_resp_buf, &poll_resp, sizeof(poll_resp));
-        std::memcpy(poll_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+        std::array<uint8_t, sizeof(DevOpRespPayload) + (sizeof(uint32_t) * 2)> poll_resp_buf = {};
+        std::memcpy(poll_resp_buf.data(), &poll_resp, sizeof(poll_resp));
+        std::memcpy(poll_resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
 
         int ready_flags = 0;
         if (f != nullptr) {
@@ -2220,8 +2239,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             poll_resp.status = -ENOENT;
         }
 
-        std::memcpy(poll_resp_buf + sizeof(DevOpRespPayload) + sizeof(uint32_t), &ready_flags, sizeof(uint32_t));
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, poll_resp_buf, static_cast<uint16_t>(sizeof(poll_resp_buf)));
+        std::memcpy(poll_resp_buf.data() + sizeof(DevOpRespPayload) + sizeof(uint32_t), &ready_flags, sizeof(uint32_t));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, poll_resp_buf.data(), static_cast<uint16_t>(poll_resp_buf.size()));
         return;
     }
 
@@ -2233,9 +2252,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         ctl_resp.status = -EINVAL;
         ctl_resp.data_len = sizeof(uint32_t);  // [resource_id]
 
-        uint8_t ctl_resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t)] = {};
-        std::memcpy(ctl_resp_buf, &ctl_resp, sizeof(ctl_resp));
-        std::memcpy(ctl_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+        std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint32_t)> ctl_resp_buf = {};
+        std::memcpy(ctl_resp_buf.data(), &ctl_resp, sizeof(ctl_resp));
+        std::memcpy(ctl_resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
 
         if (OP_DATA_LEN >= sizeof(int32_t) + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t)) {
             int32_t ctl_op = 0;
@@ -2272,8 +2291,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             }
         }
 
-        std::memcpy(ctl_resp_buf, &ctl_resp, sizeof(ctl_resp));
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, ctl_resp_buf, static_cast<uint16_t>(sizeof(ctl_resp_buf)));
+        std::memcpy(ctl_resp_buf.data(), &ctl_resp, sizeof(ctl_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, ctl_resp_buf.data(), static_cast<uint16_t>(ctl_resp_buf.size()));
         return;
     }
 
@@ -2285,9 +2304,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         wake_resp.status = -EINVAL;
         wake_resp.data_len = sizeof(uint32_t);  // [resource_id]
 
-        uint8_t wake_resp_buf[sizeof(DevOpRespPayload) + sizeof(uint32_t)] = {};
-        std::memcpy(wake_resp_buf, &wake_resp, sizeof(wake_resp));
-        std::memcpy(wake_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+        std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint32_t)> wake_resp_buf = {};
+        std::memcpy(wake_resp_buf.data(), &wake_resp, sizeof(wake_resp));
+        std::memcpy(wake_resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
 
         if (OP_DATA_LEN >= sizeof(uint64_t)) {
             uint64_t phys_addr = 0;
@@ -2295,8 +2314,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             wake_resp.status = static_cast<int16_t>(ker::syscall::futex::futex_wake_by_phys(phys_addr));
         }
 
-        std::memcpy(wake_resp_buf, &wake_resp, sizeof(wake_resp));
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, wake_resp_buf, static_cast<uint16_t>(sizeof(wake_resp_buf)));
+        std::memcpy(wake_resp_buf.data(), &wake_resp, sizeof(wake_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, wake_resp_buf.data(), static_cast<uint16_t>(wake_resp_buf.size()));
         return;
     }
 
@@ -2310,8 +2329,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         pty_resp.data_len = static_cast<uint16_t>(sizeof(uint32_t) + PTY_ARG_SIZE);
 
         constexpr size_t RESP_BUF_SIZE = sizeof(DevOpRespPayload) + sizeof(uint32_t) + PTY_ARG_SIZE;
-        uint8_t pty_resp_buf[RESP_BUF_SIZE] = {};
-        std::memcpy(pty_resp_buf + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
+        std::array<uint8_t, RESP_BUF_SIZE> pty_resp_buf = {};
+        std::memcpy(pty_resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
 
         constexpr size_t MIN_REQ = sizeof(uint64_t) + sizeof(uint64_t) + PTY_ARG_SIZE;
         if (OP_DATA_LEN >= MIN_REQ) {
@@ -2330,11 +2349,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
             if (f != nullptr) {
                 unsigned long effective_arg = 0;
-                alignas(8) uint8_t local_buf[PTY_ARG_SIZE] = {};
+                alignas(8) std::array<uint8_t, PTY_ARG_SIZE> local_buf = {};
                 if (ioctl_arg_val >= 4096) {
                     // Pointer-type ioctl: use local buffer
-                    std::memcpy(local_buf, arg_in, PTY_ARG_SIZE);
-                    effective_arg = reinterpret_cast<unsigned long>(local_buf);
+                    std::memcpy(local_buf.data(), arg_in, PTY_ARG_SIZE);
+                    effective_arg = reinterpret_cast<unsigned long>(local_buf.data());
                 } else {
                     // Value-type ioctl: pass arg_val directly
                     effective_arg = static_cast<unsigned long>(ioctl_arg_val);
@@ -2344,15 +2363,15 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 pty_resp.status = static_cast<int16_t>(RC < 0 ? RC : 0);
 
                 // Always copy back local buffer (for output ioctls)
-                std::memcpy(pty_resp_buf + sizeof(DevOpRespPayload) + sizeof(uint32_t), local_buf, PTY_ARG_SIZE);
+                std::memcpy(pty_resp_buf.data() + sizeof(DevOpRespPayload) + sizeof(uint32_t), local_buf.data(), PTY_ARG_SIZE);
                 ipc_release_file_ref(f);
             } else {
                 pty_resp.status = -ENOENT;
             }
         }
 
-        std::memcpy(pty_resp_buf, &pty_resp, sizeof(pty_resp));
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, pty_resp_buf, static_cast<uint16_t>(RESP_BUF_SIZE));
+        std::memcpy(pty_resp_buf.data(), &pty_resp, sizeof(pty_resp));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, pty_resp_buf.data(), static_cast<uint16_t>(pty_resp_buf.size()));
         return;
     }
 
@@ -2444,12 +2463,12 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
         // Reserve up to 128 bytes for optional response payload (e.g. getpeername addr)
         constexpr size_t EXTRA_MAX = 128;
-        uint8_t resp_buf[RESP_HEADER + RID_SIZE + EXTRA_MAX] = {};
-        auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
+        std::array<uint8_t, RESP_HEADER + RID_SIZE + EXTRA_MAX> resp_buf = {};
+        auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
         resp->op_id = OP_ID;
         resp->status = -ENOSYS;
         resp->data_len = RID_SIZE;  // at minimum include resource_id
-        std::memcpy(resp_buf + RESP_HEADER, &resource_id, RID_SIZE);
+        std::memcpy(resp_buf.data() + RESP_HEADER, &resource_id, RID_SIZE);
 
         if (OP_ID == OP_SOCK_CLOSE) {
             ker::mod::sched::task::Task* pump_task = nullptr;
@@ -2520,7 +2539,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                     peer_addr.family = static_cast<uint16_t>(sock->domain);
                     peer_addr.addr = sock->remote_v4.addr;
                     peer_addr.port = sock->remote_v4.port;
-                    std::memcpy(resp_buf + RESP_HEADER + RID_SIZE, &peer_addr, sizeof(peer_addr));
+                    std::memcpy(resp_buf.data() + RESP_HEADER + RID_SIZE, &peer_addr, sizeof(peer_addr));
                     resp->data_len = static_cast<uint16_t>(RID_SIZE + sizeof(peer_addr));
                     resp->status = 0;
                 } else {
@@ -2546,13 +2565,13 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 if (f != nullptr) {
                     auto* sock = static_cast<ker::net::Socket*>(f->private_data);
                     if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->getsockopt != nullptr) {
-                        uint8_t opt_val[64] = {};
-                        size_t opt_len = sizeof(opt_val);
+                        std::array<uint8_t, 64> opt_val = {};
+                        size_t opt_len = opt_val.size();
                         int const RC =
-                            sock->proto_ops->getsockopt(sock, static_cast<int>(level), static_cast<int>(optname), opt_val, &opt_len);
+                            sock->proto_ops->getsockopt(sock, static_cast<int>(level), static_cast<int>(optname), opt_val.data(), &opt_len);
                         resp->status = static_cast<int16_t>(RC);
                         if (RC == 0 && opt_len > 0 && opt_len <= EXTRA_MAX) {
-                            std::memcpy(resp_buf + RESP_HEADER + RID_SIZE, opt_val, opt_len);
+                            std::memcpy(resp_buf.data() + RESP_HEADER + RID_SIZE, opt_val.data(), opt_len);
                             resp->data_len = static_cast<uint16_t>(RID_SIZE + opt_len);
                         }
                     } else {
@@ -2598,12 +2617,17 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             }
         }
 
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf, static_cast<uint16_t>(RESP_HEADER + resp->data_len));
+        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf.data(),
+                 static_cast<uint16_t>(RESP_HEADER + resp->data_len));
         return;
     }
 
     (void)hdr;
 }
+
+}  // namespace
+
+namespace detail {
 
 void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (hdr == nullptr || payload == nullptr || payload_len < sizeof(DevOpReqPayload)) {

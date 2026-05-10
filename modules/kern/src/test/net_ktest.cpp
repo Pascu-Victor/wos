@@ -100,7 +100,7 @@ static ker::net::PacketBuffer g_ktest_pkt;  // NOLINT
 
 KTEST(Net, PacketBufferPushPull) {
     // Reset to initial state
-    g_ktest_pkt.data = &g_ktest_pkt.storage[ker::net::PKT_HEADROOM];
+    g_ktest_pkt.data = g_ktest_pkt.storage.data() + ker::net::PKT_HEADROOM;
     g_ktest_pkt.len = 0;
 
     KEXPECT_EQ(g_ktest_pkt.headroom(), static_cast<size_t>(ker::net::PKT_HEADROOM));
@@ -108,7 +108,7 @@ KTEST(Net, PacketBufferPushPull) {
 
     // push 14 bytes (Ethernet header prepend)
     uint8_t* eth = g_ktest_pkt.push(14);
-    KEXPECT_EQ(eth, &g_ktest_pkt.storage[ker::net::PKT_HEADROOM - 14]);
+    KEXPECT_EQ(eth, g_ktest_pkt.storage.data() + ker::net::PKT_HEADROOM - 14);
     KEXPECT_EQ(g_ktest_pkt.len, static_cast<size_t>(14));
     KEXPECT_EQ(g_ktest_pkt.headroom(), static_cast<size_t>(ker::net::PKT_HEADROOM - 14));
 
@@ -121,12 +121,12 @@ KTEST(Net, PacketBufferPushPull) {
 
 KTEST(Net, PacketBufferPut) {
     // Reset
-    g_ktest_pkt.data = &g_ktest_pkt.storage[ker::net::PKT_HEADROOM];
+    g_ktest_pkt.data = g_ktest_pkt.storage.data() + ker::net::PKT_HEADROOM;
     g_ktest_pkt.len = 0;
 
     // put 20 bytes (append IP header at tail)
     uint8_t* ip = g_ktest_pkt.put(20);
-    KEXPECT_EQ(ip, &g_ktest_pkt.storage[ker::net::PKT_HEADROOM]);
+    KEXPECT_EQ(ip, g_ktest_pkt.storage.data() + ker::net::PKT_HEADROOM);
     KEXPECT_EQ(g_ktest_pkt.len, static_cast<size_t>(20));
 
     // tailroom should have shrunk

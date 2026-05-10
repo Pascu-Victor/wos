@@ -6,10 +6,10 @@
 
 namespace ker::mod::desc::idt {
 // IDT Setup
-const static uint64_t IDT_ENTRIES = 256;
+inline constexpr uint64_t IDT_ENTRIES = 256;
 
-const static uint64_t IDT_INTERRUPT_GATE = 0xE;
-const static uint64_t IDT_TRAP_GATE = 0xF;
+inline constexpr uint8_t IDT_INTERRUPT_GATE = 0xE;
+inline constexpr uint8_t IDT_TRAP_GATE = 0xF;
 
 // interrupt descriptor table long mode
 struct IdtEntry {
@@ -31,7 +31,7 @@ struct IdtPtr {
     uint64_t base;
 } __attribute__((packed));
 
-void idt_set_entry(IdtEntry* entry, void* isr, uint8_t flags, uint8_t dpl = 0);
+void idt_set_entry(IdtEntry* entry, void* isr, uint8_t gate_type, uint8_t dpl = 0);
 
 void idt_init();
 

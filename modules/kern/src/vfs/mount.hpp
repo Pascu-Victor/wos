@@ -13,22 +13,25 @@ namespace ker::vfs {
 
 // Mount point structure
 struct MountPoint {
-    const char* path;               // Mount path (e.g., "/mnt/disk0")
-    const char* fstype;             // Filesystem type (e.g., "fat32", "tmpfs")
-    FSType fs_type;                 // Filesystem type enum
-    ker::dev::BlockDevice* device;  // Associated block device
-    FileOperations* fops;           // Filesystem operations
-    void* private_data;             // Filesystem-specific data
-    uint32_t dev_id;                // Unique synthetic st_dev for this mount
+    const char* path{};               // Mount path (e.g., "/mnt/disk0")
+    const char* fstype{};             // Filesystem type (e.g., "fat32", "tmpfs")
+    FSType fs_type{};                 // Filesystem type enum
+    ker::dev::BlockDevice* device{};  // Associated block device
+    FileOperations* fops{};           // Filesystem operations
+    void* private_data{};             // Filesystem-specific data
+    uint32_t dev_id{};                // Unique synthetic st_dev for this mount
 };
 
 constexpr size_t MOUNT_PATH_MAX = 512;
 
 struct MountSnapshot {
-    char path[MOUNT_PATH_MAX];
-    FSType fs_type;
-    uint32_t dev_id;
+    char path[MOUNT_PATH_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    FSType fs_type{};
+    uint32_t dev_id{};
 };
+
+static_assert(offsetof(MountSnapshot, path) == 0, "MountSnapshot path buffer must stay first");
+static_assert(offsetof(MountSnapshot, fs_type) == MOUNT_PATH_MAX, "MountSnapshot fs_type offset changed");
 
 // Mount point management
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int;

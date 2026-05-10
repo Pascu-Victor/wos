@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <defines/defines.hpp>
 #include <platform/acpi/acpi.hpp>
 #include <platform/acpi/tables/sdt.hpp>
@@ -16,10 +17,13 @@ struct Hpet {
     uint64_t reserved1;
     uint64_t interrupt_status;
     uint64_t reserved2;
-    uint64_t reserved3[24];
+    uint64_t reserved3[24];  // NOLINT(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): MMIO register gap.
     uint64_t counter_value;
     uint64_t reserved4;
 };
+
+static_assert(offsetof(Hpet, counter_value) == 0xF0);
+static_assert(sizeof(Hpet) == 0x100);
 
 void init();
 

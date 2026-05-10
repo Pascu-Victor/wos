@@ -1,17 +1,20 @@
 #pragma once
 #include <extern/limine.h>
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/boot/handover.hpp>
-#include <platform/dbg/dbg.hpp>
-#include <platform/interrupt/interrupt.hpp>
 #include <platform/mm/mm.hpp>
-#include <platform/sched/scheduler.hpp>
-#include <platform/sched/task.hpp>
 #include <type_traits>
+#include <utility>
+
+namespace ker::mod::sched::task {
+struct Task;
+}  // namespace ker::mod::sched::task
 
 namespace ker::mod::smt {
 
@@ -40,6 +43,7 @@ auto get_cpu_index_from_apic_id(uint32_t apic_id) -> uint64_t;
 auto get_kernel_per_cpu(uint64_t cpu_index) -> cpu::PerCpu*;
 
 void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp);
+void park_secondary_cpus_for_selftest();
 
 void init();
 
@@ -64,10 +68,10 @@ class PerCpuVar {
 
     auto operator->() -> T* { return &data[cpu::current_cpu()]; }
 
-    void set(const T& data) { data[cpu::current_cpu()] = data; }
+    void set(const T& value) { data[cpu::current_cpu()] = value; }
 
-    auto operator=(const T& data) -> PerCpuVar& {
-        data[cpu::current_cpu()] = data;
+    auto operator=(const T& value) -> PerCpuVar& {
+        data[cpu::current_cpu()] = value;
         return *this;
     }
 };
@@ -117,10 +121,10 @@ class PerCpuCrossAccess {
 
     // Locked access to current CPU's data - use when other CPUs might modify via withLock
     template <typename Func>
-    auto this_cpu_locked(Func&& func) -> decltype(func(std::declval<T*>())) {
+    auto this_cpu_locked(Func&& func) -> decltype(std::forward<Func>(func)(std::declval<T*>())) {
         uint64_t const CPU = cpu::current_cpu();
         uint64_t const FLAGS = lock_cpu(CPU);
-        auto result = func(&data[CPU]);
+        auto result = std::forward<Func>(func)(&data[CPU]);
         unlock_cpu(CPU, FLAGS);
         return result;
     }
@@ -130,7 +134,7 @@ class PerCpuCrossAccess {
     void this_cpu_locked_void(Func&& func) {
         uint64_t const CPU = cpu::current_cpu();
         uint64_t const FLAGS = lock_cpu(CPU);
-        func(&data[CPU]);
+        std::forward<Func>(func)(&data[CPU]);
         unlock_cpu(CPU, FLAGS);
     }
 
@@ -139,9 +143,9 @@ class PerCpuCrossAccess {
 
     // Locked access to another CPU's data - use when modifying cross-CPU
     template <typename Func>
-    auto with_lock(uint64_t cpu, Func&& func) -> decltype(func(std::declval<T*>())) {
+    auto with_lock(uint64_t cpu, Func&& func) -> decltype(std::forward<Func>(func)(std::declval<T*>())) {
         uint64_t const FLAGS = lock_cpu(cpu);
-        auto result = func(&data[cpu]);
+        auto result = std::forward<Func>(func)(&data[cpu]);
         unlock_cpu(cpu, FLAGS);
         return result;
     }
@@ -150,7 +154,7 @@ class PerCpuCrossAccess {
     template <typename Func>
     void with_lock_void(uint64_t cpu, Func&& func) {
         uint64_t const FLAGS = lock_cpu(cpu);
-        func(&data[cpu]);
+        std::forward<Func>(func)(&data[cpu]);
         unlock_cpu(cpu, FLAGS);
     }
 
@@ -166,16 +170,16 @@ class PerCpuCrossAccess {
             asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
             return false;
         }
-        func(&data[cpu]);
+        std::forward<Func>(func)(&data[cpu]);
         unlock_cpu(cpu, flags);
         return true;
     }
 
-    void set_this_cpu(const T& data) { data[cpu::current_cpu()] = data; }
+    void set_this_cpu(const T& value) { data[cpu::current_cpu()] = value; }
 
-    void set_that_cpu(const T& data, uint64_t cpu) {
+    void set_that_cpu(const T& value, uint64_t cpu) {
         uint64_t flags = lock_cpu(cpu);
-        data[cpu] = data;
+        data[cpu] = value;
         unlock_cpu(cpu, flags);
     }
 };
@@ -188,6 +192,7 @@ class PerCpuCrossAccess {
 
 static constexpr uint32_t MAX_CPU_DOMAINS = 64;
 static constexpr uint32_t DOMAIN_ID_INVALID = 0xFFFFFFFF;
+using CpuDomainName = std::array<char, 32>;
 
 enum class CpuDomainLevel : uint8_t {
     ROOT = 0,   // All online CPUs
@@ -202,8 +207,11 @@ struct CpuDomain {
     uint32_t parent_id;   // Parent domain ID (DOMAIN_ID_INVALID for root)
     bool soft_exclusive;  // When true, compute tasks penalised for entering
     bool hard;            // When true, tasks never leave this domain
-    char name[32];        // Human-readable name
+    CpuDomainName name;   // Human-readable NUL-terminated name
 };
+static_assert(sizeof(CpuDomainName) == 32);
+static_assert(offsetof(CpuDomain, name) == 22);
+static_assert(sizeof(CpuDomain) == 56);
 
 // Domain registry API
 void init_cpu_domains();  // Called from smt::init()

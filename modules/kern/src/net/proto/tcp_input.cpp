@@ -1,8 +1,10 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
@@ -18,7 +20,61 @@
 
 namespace ker::net::proto {
 
+using log = ker::mod::dbg::logger<"tcp">;
+
 namespace {
+constexpr auto TCP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
+constexpr uint8_t TCP_OPTION_EOL = 0;
+constexpr uint8_t TCP_OPTION_NOP = 1;
+constexpr uint8_t TCP_OPTION_MSS = 2;
+constexpr uint8_t TCP_OPTION_WSCALE = 3;
+constexpr uint8_t TCP_OPTION_MSS_LEN = 4;
+constexpr uint8_t TCP_OPTION_WSCALE_LEN = 3;
+constexpr size_t TCP_OPTION_LEN_OFFSET = 1;
+constexpr size_t TCP_OPTION_DATA_OFFSET = 2;
+
+auto tcp_header_len(const TcpHeader* hdr) -> size_t { return static_cast<size_t>(hdr->data_offset >> 4U) * sizeof(uint32_t); }
+
+auto read_be16_unaligned(const uint8_t* bytes) -> uint16_t {
+    return static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8U) | bytes[1]);
+}
+
+void parse_syn_options(TcpCB* cb, const TcpHeader* hdr, bool refresh_receive_wscale) {
+    size_t const HDR_LEN = tcp_header_len(hdr);
+    if (HDR_LEN <= sizeof(TcpHeader)) {
+        return;
+    }
+
+    const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
+    size_t const OPTS_LEN = HDR_LEN - sizeof(TcpHeader);
+    for (size_t i = 0; i < OPTS_LEN;) {
+        if (opts[i] == TCP_OPTION_EOL) {
+            break;
+        }
+        if (opts[i] == TCP_OPTION_NOP) {
+            i++;
+            continue;
+        }
+        if (i + TCP_OPTION_LEN_OFFSET >= OPTS_LEN) {
+            break;
+        }
+        uint8_t const OPT_LEN = opts[i + TCP_OPTION_LEN_OFFSET];
+        if (OPT_LEN < TCP_OPTION_DATA_OFFSET || i + OPT_LEN > OPTS_LEN) {
+            break;
+        }
+        if (opts[i] == TCP_OPTION_MSS && OPT_LEN == TCP_OPTION_MSS_LEN) {
+            cb->snd_mss = read_be16_unaligned(opts + i + TCP_OPTION_DATA_OFFSET);
+        } else if (opts[i] == TCP_OPTION_WSCALE && OPT_LEN == TCP_OPTION_WSCALE_LEN) {
+            cb->snd_wscale = opts[i + TCP_OPTION_DATA_OFFSET];
+            cb->ws_enabled = true;
+            if (refresh_receive_wscale && cb->socket != nullptr) {
+                cb->rcv_wscale = tcp_wscale_for_buf(cb->socket->rcvbuf.capacity);
+            }
+        }
+        i += OPT_LEN;
+    }
+}
+
 // Wake a task blocked on this socket.
 void wake_socket(Socket* sock) {
     if (sock == nullptr) {
@@ -26,12 +82,12 @@ void wake_socket(Socket* sock) {
     }
     uint64_t const PID = sock->owner_pid;
 #ifdef TCP_DEBUG
-    ker::mod::dbg::log("[tcp] wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), pid);
+    log::debug("wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), PID);
 #endif
     if (PID != 0) {
         auto* task = ker::mod::sched::find_task_by_pid_safe(PID);
 #ifdef TCP_DEBUG
-        ker::mod::dbg::log("[tcp] wake_socket: pid=%lu task=%p", pid, static_cast<void*>(task));
+        log::debug("wake_socket: pid=%lu task=%p", PID, static_cast<void*>(task));
 #endif
         if (task != nullptr) {
             task->deferred_task_switch = false;
@@ -40,7 +96,7 @@ void wake_socket(Socket* sock) {
                 target_cpu = ker::mod::sched::get_least_loaded_cpu();
             }
 #ifdef TCP_DEBUG
-            ker::mod::dbg::log("[tcp] wake_socket: rescheduling pid=%lu on cpu=%lu", pid, target_cpu);
+            log::debug("wake_socket: rescheduling pid=%lu on cpu=%lu", PID, target_cpu);
 #endif
             ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
             task->release();
@@ -62,20 +118,19 @@ void drain_retransmit_queue(TcpCB* cb) {
     }
     cb->retransmit_tail = nullptr;
     if (n > 0) {
-        ker::mod::dbg::log("[net] drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local_port, ker::net::pkt_pool_free_count());
+        log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local_port, ker::net::pkt_pool_free_count());
     }
 }
 
 // Handle SYN on a listening socket.
-void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, uint32_t dst_ip) {
+void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip, IPv4Address dst_ip) {
     Socket const* listen_sock = listener->socket;
     if (listen_sock == nullptr) {
         return;
     }
 
     if (std::cmp_greater_equal(listen_sock->aq_count, listen_sock->backlog)) {
-        ker::mod::dbg::log("[net] ACCEPT QUEUE FULL port=%u aq=%zu backlog=%d", listener->local_port, listen_sock->aq_count,
-                           listen_sock->backlog);
+        log::warn("accept queue full port=%u aq=%zu backlog=%d", listener->local_port, listen_sock->aq_count, listen_sock->backlog);
         return;
     }
 
@@ -117,35 +172,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, u
     // SYN window is not scaled (RFC 1323).
     child_cb->snd_wnd = ntohs(hdr->window);
 
-    // Parse MSS and WSCALE options.
-    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
-    if (HDR_LEN > sizeof(TcpHeader)) {
-        const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
-        size_t const OPTS_LEN = HDR_LEN - sizeof(TcpHeader);
-        for (size_t i = 0; i < OPTS_LEN;) {
-            if (opts[i] == 0) {
-                break;
-            }
-            if (opts[i] == 1) {
-                i++;
-                continue;
-            }
-            if (i + 1 >= OPTS_LEN) {
-                break;
-            }
-            uint8_t const OPT_LEN = opts[i + 1];
-            if (OPT_LEN < 2 || i + OPT_LEN > OPTS_LEN) {
-                break;
-            }
-            if (opts[i] == 2 && OPT_LEN == 4) {
-                child_cb->snd_mss = ntohs(*reinterpret_cast<const uint16_t*>(opts + i + 2));
-            } else if (opts[i] == 3 && OPT_LEN == 3) {
-                child_cb->snd_wscale = opts[i + 2];
-                child_cb->ws_enabled = true;
-            }
-            i += OPT_LEN;
-        }
-    }
+    parse_syn_options(child_cb, hdr, false);
 
     child_cb->state = TcpState::SYN_RECEIVED;
     child->state = SocketState::CONNECTING;
@@ -156,7 +183,8 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, uint32_t src_ip, u
 }
 }  // namespace
 
-void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, uint32_t src_ip, uint32_t dst_ip) {
+void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, IPv4Address src_ip,
+                         IPv4Address dst_ip) {
     NET_TRACE_SPAN(SPAN_TCP_PROCESS);
     uint8_t flags = hdr->flags;
     uint32_t const SEG_SEQ = ntohl(hdr->seq);
@@ -258,38 +286,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->snd_wnd = seg_wnd;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
-                    // Parse MSS and WSCALE options.
-                    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
-                    if (HDR_LEN > sizeof(TcpHeader)) {
-                        const auto* opts = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
-                        size_t const OPTS_LEN = HDR_LEN - sizeof(TcpHeader);
-                        for (size_t i = 0; i < OPTS_LEN;) {
-                            if (opts[i] == 0) {
-                                break;
-                            }
-                            if (opts[i] == 1) {
-                                i++;
-                                continue;
-                            }
-                            if (i + 1 >= OPTS_LEN) {
-                                break;
-                            }
-                            uint8_t const OPT_LEN = opts[i + 1];
-                            if (OPT_LEN < 2 || i + OPT_LEN > OPTS_LEN) {
-                                break;
-                            }
-                            if (opts[i] == 2 && OPT_LEN == 4) {
-                                cb->snd_mss = ntohs(*reinterpret_cast<const uint16_t*>(opts + i + 2));
-                            } else if (opts[i] == 3 && OPT_LEN == 3) {
-                                cb->snd_wscale = opts[i + 2];
-                                cb->ws_enabled = true;
-                                if (cb->socket != nullptr) {
-                                    cb->rcv_wscale = tcp_wscale_for_buf(cb->socket->rcvbuf.capacity);
-                                }
-                            }
-                            i += OPT_LEN;
-                        }
-                    }
+                    parse_syn_options(cb, hdr, true);
 
                     cb->state = TcpState::ESTABLISHED;
                     tcp_send_ack(cb);
@@ -355,9 +352,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         child_sock->state = SocketState::CONNECTED;
                         TcpCB* listener = tcp_find_listener(SAVED_LOCAL_IP, SAVED_LOCAL_PORT);
 #ifdef TCP_DEBUG
-                        ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", saved_local_port,
-                                           static_cast<void*>(listener),
-                                           (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
+                        log::debug("SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", SAVED_LOCAL_PORT, static_cast<void*>(listener),
+                                   (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
 #endif
                         if (listener != nullptr && listener->socket != nullptr) {
                             Socket* lsock = listener->socket;
@@ -373,13 +369,13 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                                 lsock->aq_count++;
                             }
 #ifdef TCP_DEBUG
-                            ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: enqueued child, aq_count=%zu", lsock->aq_count);
+                            log::debug("SYN_RCVD->ESTAB: enqueued child, aq_count=%zu", lsock->aq_count);
 #endif
                             lsock->lock.unlock_irqrestore(LSOCK_FLAGS);
                             wake_socket(lsock);
                         } else {
 #ifdef TCP_DEBUG
-                            ker::mod::dbg::log("[tcp] SYN_RCVD->ESTAB: NO LISTENER found for port=%u", saved_local_port);
+                            log::debug("SYN_RCVD->ESTAB: no listener found for port=%u", SAVED_LOCAL_PORT);
 #endif
                         }
                         if (listener != nullptr) {
@@ -399,7 +395,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         }
                         cb->lock.unlock_irqrestore(cb_lock_flags);
                         if (deferred_ack != nullptr) {
-                            if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, 64) < 0) {
+                            if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, TCP_IPV4_TTL) < 0) {
                                 cb_lock_flags = cb->lock.lock_irqsave();
                                 cb->ack_pending = true;
                                 tcp_timer_arm(cb);
@@ -455,8 +451,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         deferred_wake = true;
                     } else {
-                        ker::mod::dbg::log("[net] RCVBUF FULL port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port,
-                                           cb->socket->rcvbuf.available(), cb->socket->rcvbuf.capacity, payload_len);
+                        log::warn("rcvbuf full port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port, cb->socket->rcvbuf.available(),
+                                  cb->socket->rcvbuf.capacity, payload_len);
                     }
                     // Keep advertised window in sync with receive buffer.
                     cb->rcv_wnd = cb->socket->rcvbuf.free_space();
@@ -466,15 +462,11 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 // on the delayed-ACK timer here can stall the peer if the timer
                 // worker is not scheduled quickly enough under early boot/load.
                 const bool ACK_IMMEDIATELY = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
-                if (ACK_IMMEDIATELY) {
-                    cb->segs_pending_ack = 0;
-                    cb->delayed_ack_deadline = 0;
-                    build_deferred_ack();
-                    if (deferred_ack == nullptr) {
-                        cb->ack_pending = true;
-                        tcp_timer_arm(cb);
-                    }
-                } else if (++cb->segs_pending_ack >= 2) {
+                bool should_ack_now = ACK_IMMEDIATELY;
+                if (!should_ack_now) {
+                    should_ack_now = ++cb->segs_pending_ack >= 2;
+                }
+                if (should_ack_now) {
                     cb->segs_pending_ack = 0;
                     cb->delayed_ack_deadline = 0;
                     build_deferred_ack();
@@ -706,7 +698,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     // Send deferred ACK outside cb->lock.
     if (deferred_ack != nullptr) {
-        if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, 64) < 0) {
+        if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, TCP_IPV4_TTL) < 0) {
             cb_lock_flags = cb->lock.lock_irqsave();
             cb->ack_pending = true;
             tcp_timer_arm(cb);
@@ -727,7 +719,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
     tcp_cb_release(cb);
 }
 
-void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip) {
+void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip) {
     (void)dev;
 
     if (pkt->len < sizeof(TcpHeader)) {
@@ -736,7 +728,7 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     }
 
     const auto* hdr = reinterpret_cast<const TcpHeader*>(pkt->data);
-    uint8_t const HDR_LEN = (hdr->data_offset >> 4) * 4;
+    size_t const HDR_LEN = tcp_header_len(hdr);
     if (HDR_LEN < sizeof(TcpHeader) || HDR_LEN > pkt->len) {
         pkt_free(pkt);
         return;
@@ -777,6 +769,8 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
     // No match: send RST.
     if ((hdr->flags & TCP_RST) == 0) {
         if ((hdr->flags & TCP_ACK) != 0) {
+            // RST replies intentionally reverse the incoming tuple.
+            // NOLINTNEXTLINE(readability-suspicious-call-argument)
             tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, ntohl(hdr->ack), 0, 0);
         } else {
             uint32_t ack_seq = ntohl(hdr->seq) + static_cast<uint32_t>(PAYLOAD_LEN);
@@ -786,6 +780,8 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, uint32_t src_ip, uint32_t dst_ip)
             if ((hdr->flags & TCP_FIN) != 0) {
                 ack_seq++;
             }
+            // RST replies intentionally reverse the incoming tuple.
+            // NOLINTNEXTLINE(readability-suspicious-call-argument)
             tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, 0, ack_seq, TCP_ACK);
         }
     }

@@ -1,13 +1,41 @@
 #include "checksum.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/endian.hpp>
+#include <span>
 
 namespace ker::net {
 
 namespace {
+auto add_little_endian_words(uint32_t sum, std::span<const uint8_t> bytes) -> uint32_t {
+    uint16_t word = 0;
+    bool have_low_byte = false;
+    for (uint8_t const BYTE : bytes) {
+        if (!have_low_byte) {
+            word = BYTE;
+            have_low_byte = true;
+            continue;
+        }
+
+        sum += word | (static_cast<uint16_t>(BYTE) << 8U);
+        have_low_byte = false;
+    }
+
+    if (have_low_byte) {
+        sum += word;
+    }
+    return sum;
+}
+
+auto add_ipv6_address_words(uint32_t sum, const proto::IPv6Address& addr) -> uint32_t {
+    for (size_t i = 0; i < proto::IPv6Address::SIZE_BYTES; i += 2) {
+        sum += (static_cast<uint16_t>(addr.bytes.at(i)) << 8U) | addr.bytes.at(i + 1);
+    }
+    return sum;
+}
+
 auto fold_checksum(uint32_t sum) -> uint16_t {
     while ((sum >> 16) != 0U) {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -17,32 +45,18 @@ auto fold_checksum(uint32_t sum) -> uint16_t {
 }  // namespace
 
 auto checksum_compute(const void* data, size_t len) -> uint16_t {
-    const auto* buf = static_cast<const uint8_t*>(data);
-    uint32_t sum = 0;
-
-    // Sum 16-bit words
-    while (len > 1) {
-        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += WORD;
-        buf += 2;
-        len -= 2;
-    }
-
-    // Handle odd byte
-    if (len == 1) {
-        sum += buf[0];
-    }
-
-    return fold_checksum(sum);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    return fold_checksum(add_little_endian_words(0, std::span<const uint8_t>{bytes, len}));
 }
 
-auto checksum_pseudo_ipv4(uint32_t src, uint32_t dst, uint8_t proto, uint16_t len, const void* data, size_t data_len) -> uint16_t {
+auto checksum_pseudo_ipv4(proto::IPv4Address src, proto::IPv4Address dst, uint8_t proto, uint16_t len, const void* data, size_t data_len)
+    -> uint16_t {
     uint32_t sum = 0;
 
     // Pseudo header: src(32) + dst(32) + zero(8) + proto(8) + length(16)
     // All in network byte order
-    uint32_t const SRC_N = htonl(src);
-    uint32_t const DST_N = htonl(dst);
+    uint32_t const SRC_N = src.to_network_order();
+    uint32_t const DST_N = dst.to_network_order();
     sum += (SRC_N >> 16) & 0xFFFF;
     sum += SRC_N & 0xFFFF;
     sum += (DST_N >> 16) & 0xFFFF;
@@ -50,51 +64,27 @@ auto checksum_pseudo_ipv4(uint32_t src, uint32_t dst, uint8_t proto, uint16_t le
     sum += htons(proto);
     sum += htons(len);
 
-    // Add data
-    const auto* buf = static_cast<const uint8_t*>(data);
-    size_t remaining = data_len;
-    while (remaining > 1) {
-        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += WORD;
-        buf += 2;
-        remaining -= 2;
-    }
-    if (remaining == 1) {
-        sum += buf[0];
-    }
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    sum = add_little_endian_words(sum, std::span<const uint8_t>{bytes, data_len});
 
     return fold_checksum(sum);
 }
 
-auto checksum_pseudo_ipv6(const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst, uint8_t next_header, uint32_t payload_len,
+auto checksum_pseudo_ipv6(const proto::IPv6Address& src, const proto::IPv6Address& dst, uint8_t next_header, uint32_t payload_len,
                           const void* data, size_t data_len) -> uint16_t {
     uint32_t sum = 0;
 
     // IPv6 pseudo-header: src(128) + dst(128) + payload_len(32) + zero(24) + next_header(8)
-    for (int i = 0; i < 16; i += 2) {
-        sum += (static_cast<uint16_t>(src[i]) << 8) | src[i + 1];
-    }
-    for (int i = 0; i < 16; i += 2) {
-        sum += (static_cast<uint16_t>(dst[i]) << 8) | dst[i + 1];
-    }
+    sum = add_ipv6_address_words(sum, src);
+    sum = add_ipv6_address_words(sum, dst);
 
     uint32_t const LEN_N = htonl(payload_len);
     sum += (LEN_N >> 16) & 0xFFFF;
     sum += LEN_N & 0xFFFF;
     sum += htons(static_cast<uint16_t>(next_header));
 
-    // Add data
-    const auto* buf = static_cast<const uint8_t*>(data);
-    size_t remaining = data_len;
-    while (remaining > 1) {
-        uint16_t const WORD = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
-        sum += WORD;
-        buf += 2;
-        remaining -= 2;
-    }
-    if (remaining == 1) {
-        sum += buf[0];
-    }
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    sum = add_little_endian_words(sum, std::span<const uint8_t>{bytes, data_len});
 
     return fold_checksum(sum);
 }

@@ -14,20 +14,26 @@
 #include "abi/callnums/time.h"
 #include "platform/dbg/dbg.hpp"
 
+namespace ker::syscall::time {
+
+namespace {
+
+using log = ker::mod::dbg::logger<"time">;
+
 struct Itimerval {
     struct timeval it_interval;
     struct timeval it_value;
 };
 
-static constexpr int ITIMER_REAL = 0;
+constexpr int ITIMER_REAL = 0;
 
 // CLK_TCK for times() return values - must match userspace sysconf(_SC_CLK_TCK)
-static constexpr uint64_t WOS_CLK_TCK = 100;
-
-namespace ker::syscall::time {
+constexpr uint64_t WOS_CLK_TCK = 100;
 
 // Convert microseconds to clock ticks (CLK_TCK = 100, so 1 tick = 10000 us)
-static inline uint64_t us_to_ticks(uint64_t us) { return us / (1000000 / WOS_CLK_TCK); }
+auto us_to_ticks(uint64_t us) -> uint64_t { return us / (1000000 / WOS_CLK_TCK); }
+
+}  // namespace
 
 uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
     // op 0 => gettimeofday: arg1 is struct timeval*
@@ -134,7 +140,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
 
             // Return value: elapsed real time in ticks since an arbitrary epoch (system boot)
             if (arg2 != nullptr) {
-                auto* out = static_cast<long*>(arg2);
+                auto* out = reinterpret_cast<long*>(arg2);
                 *out = static_cast<long>(us_to_ticks(ker::mod::time::get_us()));
             }
             return 0;
@@ -150,7 +156,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             }
 
             int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
-            if (WHICH != 0 /* ITIMER_REAL */) {
+            if (WHICH != ITIMER_REAL) {
                 return static_cast<uint64_t>(-EINVAL);
             }
 
@@ -182,7 +188,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             }
 
             int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
-            if (WHICH != 0 /* ITIMER_REAL */) {
+            if (WHICH != ITIMER_REAL) {
                 return static_cast<uint64_t>(-EINVAL);
             }
 
@@ -205,7 +211,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
         }
 
         default:
-            ker::mod::dbg::error("Invalid op in syscall time");
+            log::error("invalid op %llu", static_cast<unsigned long long>(op));
             return static_cast<uint64_t>(-1);
     }
 }

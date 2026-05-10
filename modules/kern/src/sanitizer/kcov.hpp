@@ -16,7 +16,7 @@
 namespace ker::sanitizer::kcov {
 
 // Maximum PCs per task buffer (256K entries = 2MB per task)
-constexpr size_t KCOV_MAX_ENTRIES = 256 * 1024;
+constexpr size_t KCOV_MAX_ENTRIES = static_cast<size_t>(256) * 1024;
 
 // Per-task KCOV buffer.  Allocated lazily when userspace enables coverage
 // collection for a task via ioctl/procfs.

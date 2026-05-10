@@ -3,7 +3,9 @@
 #include <cstdint>
 
 namespace ker::mod::mm::paging {
-static inline auto is_flag_set(uint64_t flags, uint64_t flag) -> bool { return (flags >> flag & 1) != 0U; }
+namespace {
+auto is_flag_set(uint64_t flags, uint64_t flag) -> bool { return (flags >> flag & 1) != 0U; }
+}  // namespace
 
 auto create_page_table_entry(uint64_t frame, uint64_t flags) -> PageTableEntry {
     PageTableEntry entry = {};  // CRITICAL: Zero-initialize to clear reserved bits and pagesize

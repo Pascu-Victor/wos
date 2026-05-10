@@ -93,6 +93,7 @@ CharDeviceOps urandom_ops = {
     .isatty = urandom_isatty,
     .ioctl = nullptr,
     .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 Device urandom_dev = {
@@ -117,11 +118,11 @@ void random_device_init() {
     // NOLINTEND(misc-const-correctness)
     asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
     if ((ecx & (1U << 30)) == 0U) {
-        ker::mod::dbg::logger<"random_device">::warn("RDRAND not supported, /dev/urandom unavailable\n");
+        ker::mod::dbg::logger<"random_device">::warn("RDRAND not supported, /dev/urandom unavailable");
         return;
     }
 
-    ker::mod::dbg::logger<"random_device">::info("Initializing /dev/urandom (RDRAND)\n");
+    ker::mod::dbg::logger<"random_device">::info("Initializing /dev/urandom (RDRAND)");
     dev_register(&urandom_dev);
 }
 

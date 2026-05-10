@@ -2,6 +2,7 @@
 
 #include <extern/limine.h>
 
+#include <cstddef>
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/mm/addr.hpp>
@@ -42,9 +43,9 @@ struct TssDescriptor {
 
 struct TssType {
     uint32_t reserved0;
-    uint64_t rsp[3];
+    uint64_t rsp[3];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     uint64_t reserved1;
-    uint64_t ist[7];
+    uint64_t ist[7];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     uint64_t interrupt_ssp_table;
     uint16_t reserved3;
     uint16_t iomap_base;
@@ -84,10 +85,22 @@ struct GdtPtr {
 } __attribute__((packed));
 
 struct Gdt {
-    GdtEntry memory_segments[GDT_ENTRY_COUNT];
+    GdtEntry memory_segments[GDT_ENTRY_COUNT];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     TssDescriptor tss;
     GdtPtr ptr;
 } __attribute__((packed));
+
+static_assert(sizeof(TssDescriptor) == 16);
+static_assert(sizeof(TssType) == 104);
+static_assert(offsetof(TssType, rsp) == 4);
+static_assert(offsetof(TssType, ist) == 36);
+static_assert(offsetof(TssType, iomap_base) == 102);
+static_assert(sizeof(GdtEntry) == 8);
+static_assert(sizeof(GdtPtr) == 10);
+static_assert(sizeof(Gdt) == 66);
+static_assert(offsetof(Gdt, memory_segments) == 0);
+static_assert(offsetof(Gdt, tss) == 40);
+static_assert(offsetof(Gdt, ptr) == 56);
 
 void init_descriptors(uint64_t* stack_pointer, uint64_t cpu_id);
 }  // namespace ker::mod::desc::gdt

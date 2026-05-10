@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+namespace {
+constexpr uint16_t IO_WAIT_PORT = 0x80;
+}
+
 void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %b0, %w1" : : "a"(val), "Nd"(port) : "memory");
     /* There's an outb %al, $imm8 encoding, for compile-time constant port numbers that fit in 8b. (N constraint).
@@ -17,4 +21,4 @@ uint8_t inb(uint16_t port) {
     return ret;
 }
 
-void io_wait() { outb(0x80, 0); }
+void io_wait() { outb(IO_WAIT_PORT, 0); }

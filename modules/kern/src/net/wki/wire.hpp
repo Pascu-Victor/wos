@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 
 namespace ker::net::wki {
 
@@ -151,20 +152,22 @@ constexpr uint16_t WKI_CAP_ZONE_SUPPORT = 0x0002;
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
 
 struct HelloPayload {
-    uint32_t magic;  // WKI_HELLO_MAGIC
-    uint16_t protocol_version;
-    uint16_t node_id;                 // sender's claimed node ID
-    std::array<uint8_t, 6> mac_addr;  // sender's MAC (for Ethernet transport)
-    uint16_t capabilities;            // bitmask: WKI_CAP_*
-    uint16_t heartbeat_interval_ms;   // proposed heartbeat interval (milliseconds)
-    uint16_t max_channels;
-    uint32_t rdma_zone_bitmap;  // RDMA zone membership (32 zones max)
-    std::array<uint8_t, 8> reserved;
+    uint32_t magic{};  // WKI_HELLO_MAGIC
+    uint16_t protocol_version{};
+    uint16_t node_id{};                // sender's claimed node ID
+    proto::MacAddress mac_addr;        // sender's MAC (for Ethernet transport)
+    uint16_t capabilities{};           // bitmask: WKI_CAP_*
+    uint16_t heartbeat_interval_ms{};  // proposed heartbeat interval (milliseconds)
+    uint16_t max_channels{};
+    uint32_t rdma_zone_bitmap{};  // RDMA zone membership (32 zones max)
+    std::array<uint8_t, 8> reserved{};
     // --- V2 extension (offset 32) ---
-    char hostname[WKI_HOSTNAME_MAX];  // NUL-terminated hostname string [V2 A1.3]
+    char hostname[WKI_HOSTNAME_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+                                        // NUL-terminated hostname string [V2 A1.3]; raw for wire ABI.
 } __attribute__((packed));
 
 static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
+static_assert(offsetof(HelloPayload, hostname) == 32, "HelloPayload hostname offset must stay wire-compatible");
 
 // -----------------------------------------------------------------------------
 // HEARTBEAT Payload - 16 bytes
@@ -262,17 +265,17 @@ struct ResourceAdvertPayload {
 } __attribute__((packed));
 
 struct ResourceAdvertNetPayload {
-    uint16_t node_id;        // owner node
-    uint16_t resource_type;  // ResourceType::NET
-    uint32_t resource_id;    // unique on owning node
-    uint8_t flags;           // RESOURCE_FLAG_*
-    uint8_t name_len;
-    uint16_t reserved;
-    uint32_t ipv4_addr;               // owner NIC IPv4 address (host byte order)
-    uint32_t ipv4_mask;               // owner NIC IPv4 mask (host byte order)
-    std::array<uint8_t, 6> real_mac;  // owner NIC real MAC
-    uint16_t link_state;              // 0=DOWN, 1=UP
-    uint32_t mtu;                     // owner NIC MTU
+    uint16_t node_id{};        // owner node
+    uint16_t resource_type{};  // ResourceType::NET
+    uint32_t resource_id{};    // unique on owning node
+    uint8_t flags{};           // RESOURCE_FLAG_*
+    uint8_t name_len{};
+    uint16_t reserved{};
+    uint32_t ipv4_addr{};        // owner NIC IPv4 address (host byte order)
+    uint32_t ipv4_mask{};        // owner NIC IPv4 mask (host byte order)
+    proto::MacAddress real_mac;  // owner NIC real MAC
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // owner NIC MTU
     // Followed by name_len bytes of name (e.g., "eth0")
 } __attribute__((packed));
 
@@ -514,29 +517,29 @@ static_assert(sizeof(DevAttachAckPayload) == 24, "DevAttachAckPayload must be 24
 // V2: Extended attach ACK for NET resources - includes owner NIC info [V2 A5.3]
 struct DevAttachAckNetPayload {
     // V1 base fields (identical layout to DevAttachAckPayload)
-    uint8_t status;
-    uint8_t reserved;
-    uint16_t assigned_channel;
-    uint32_t resource_id;
-    uint16_t max_op_size;
-    uint16_t rdma_flags;
-    uint32_t blk_zone_id;  // unused for NET, kept for layout compatibility
+    uint8_t status{};
+    uint8_t reserved{};
+    uint16_t assigned_channel{};
+    uint32_t resource_id{};
+    uint16_t max_op_size{};
+    uint16_t rdma_flags{};
+    uint32_t blk_zone_id{};  // unused for NET, kept for layout compatibility
     // V2 NET extension fields
-    uint32_t ipv4_addr;               // Owner NIC's IPv4 address (network byte order)
-    uint32_t ipv4_mask;               // Owner NIC's IPv4 subnet mask
-    std::array<uint8_t, 6> real_mac;  // Owner NIC's real MAC address
-    uint16_t link_state;              // 0=DOWN, 1=UP
-    uint32_t mtu;                     // Owner NIC MTU
+    uint32_t ipv4_addr{};        // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask{};        // Owner NIC's IPv4 subnet mask
+    proto::MacAddress real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // Owner NIC MTU
 } __attribute__((packed));
 
 static_assert(sizeof(DevAttachAckNetPayload) == 36, "DevAttachAckNetPayload must be 36 bytes");
 
 struct NetStateNotifyPayload {
-    uint32_t ipv4_addr;               // Owner NIC's IPv4 address (network byte order)
-    uint32_t ipv4_mask;               // Owner NIC's IPv4 subnet mask
-    std::array<uint8_t, 6> real_mac;  // Owner NIC's real MAC address
-    uint16_t link_state;              // 0=DOWN, 1=UP
-    uint32_t mtu;                     // Owner NIC MTU
+    uint32_t ipv4_addr{};        // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask{};        // Owner NIC's IPv4 subnet mask
+    proto::MacAddress real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // Owner NIC MTU
 } __attribute__((packed));
 
 static_assert(sizeof(NetStateNotifyPayload) == 20, "NetStateNotifyPayload must be 20 bytes");

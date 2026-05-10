@@ -1,6 +1,7 @@
 #include "page_alloc.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
@@ -9,12 +10,14 @@
 
 namespace ker::mod::mm {
 
+namespace {
+
 // ============================================================================
 // Helpers
 // ============================================================================
 
 // Smallest order k such that (1 << k) pages >= the requested byte count.
-static inline int size_to_order(uint64_t size_bytes) {
+auto size_to_order(uint64_t size_bytes) -> int {
     uint64_t const PAGES = (size_bytes + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
     if (PAGES <= 1) {
         return 0;
@@ -26,16 +29,18 @@ static inline int size_to_order(uint64_t size_bytes) {
 }
 
 // Convert a page index to the HHDM pointer inside the zone.
-static inline void* page_to_ptr(uint64_t base, uint32_t page_idx) {
+auto page_to_ptr(uint64_t base, uint32_t page_idx) -> void* {
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
 }
 
 // Convert an HHDM pointer to a page index relative to the zone base.
-static inline uint32_t ptr_to_page(uint64_t base, void* ptr) { return static_cast<uint32_t>(((uint64_t)ptr - base) / paging::PAGE_SIZE); }
+auto ptr_to_page(uint64_t base, void* ptr) -> uint32_t {
+    return static_cast<uint32_t>((reinterpret_cast<uint64_t>(ptr) - base) / paging::PAGE_SIZE);
+}
 
-static inline bool ptr_is_page_aligned(const void* ptr) { return (((uint64_t)ptr) & (paging::PAGE_SIZE - 1)) == 0; }
+auto ptr_is_page_aligned(const void* ptr) -> bool { return (reinterpret_cast<uint64_t>(ptr) & (paging::PAGE_SIZE - 1)) == 0; }
 
-static bool ptr_in_zone(const PageAllocator* alloc, const void* ptr) {
+auto ptr_in_zone(const PageAllocator* alloc, const void* ptr) -> bool {
     if (ptr == nullptr || !ptr_is_page_aligned(ptr)) {
         return false;
     }
@@ -45,7 +50,7 @@ static bool ptr_in_zone(const PageAllocator* alloc, const void* ptr) {
     return ADDR >= alloc->base && ADDR < END;
 }
 
-static bool free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) {
+auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) -> bool {
     if (!ptr_in_zone(alloc, block)) {
         return false;
     }
@@ -59,7 +64,7 @@ static bool free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBl
     return alloc->page_flags[page_idx] == (PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(order));
 }
 
-static void drop_corruptfree_list_head(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+void drop_corrupt_free_list_head(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
     ker::mod::io::serial::write("page_alloc: dropping corrupt free-list head order=");
     ker::mod::io::serial::write(static_cast<uint64_t>(order));
     ker::mod::io::serial::write(" ptr=0x");
@@ -67,12 +72,12 @@ static void drop_corruptfree_list_head(PageAllocator* alloc, int order, PageAllo
     ker::mod::io::serial::write(" zone_base=0x");
     ker::mod::io::serial::write_hex(alloc->base);
     ker::mod::io::serial::write("\n");
-    alloc->free_list[order] = nullptr;
+    alloc->free_list.at(static_cast<size_t>(order)) = nullptr;
 }
 
 // Remove a specific FreeBlock from a singly-linked list.
 // Returns true if found and removed.
-static bool list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) {
+auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) -> bool {
     PageAllocator::FreeBlock** prev = &head;
     PageAllocator::FreeBlock* cur = head;
     while (cur != nullptr) {
@@ -95,6 +100,8 @@ static bool list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBloc
     }
     return false;
 }
+
+}  // namespace
 
 // ============================================================================
 // init
@@ -123,11 +130,11 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
         // Zone too small to hold any usable pages.
         usable_pages = 0;
         free_count = 0;
-        for (int i = 0; i <= MAX_ORDER; i++) {
-            free_list[i] = nullptr;
+        for (auto*& list_head : free_list) {
+            list_head = nullptr;
         }
-        memset(page_flags, FLAG_RESERVED, total_pages);
-        memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
+        std::memset(page_flags, FLAG_RESERVED, total_pages);
+        std::memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
         return;
     }
 
@@ -135,16 +142,16 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     free_count = 0;
 
     // Zero the free lists.
-    for (int i = 0; i <= MAX_ORDER; i++) {
-        free_list[i] = nullptr;
+    for (auto*& list_head : free_list) {
+        list_head = nullptr;
     }
 
     // Mark metadata pages as reserved, all others as allocated-continuation
     // (prevents false buddy matches during the decomposition loop below).
-    memset(page_flags, FLAG_RESERVED, metadata_pages);
-    memset(page_flags + metadata_pages, FLAG_ALLOC_CONT, total_pages - metadata_pages);
+    std::memset(page_flags, FLAG_RESERVED, metadata_pages);
+    std::memset(page_flags + metadata_pages, FLAG_ALLOC_CONT, total_pages - metadata_pages);
     // Zero all refcounts (free pages have refcount 0)
-    memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
+    std::memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
 
     // --- decompose usable range into largest aligned power-of-2 blocks ---
 
@@ -174,8 +181,8 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 
         // Prepend to the order's free list (link through the page itself).
         auto* block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, page));
-        block->next = free_list[order];
-        free_list[order] = block;
+        block->next = free_list.at(static_cast<size_t>(order));
+        free_list.at(static_cast<size_t>(order)) = block;
 
         free_count += BLOCK_SIZE;
         page += BLOCK_SIZE;
@@ -194,20 +201,20 @@ void* PageAllocator::alloc(uint64_t size_bytes) {
     uint32_t page_idx = 0;
     FreeBlock* block = nullptr;
     while (k <= MAX_ORDER) {
-        block = free_list[k];
+        block = free_list.at(static_cast<size_t>(k));
         if (block == nullptr) {
             k++;
             continue;
         }
 
         if (!free_head_is_valid(this, block, k, page_idx)) {
-            drop_corruptfree_list_head(this, k, block);
+            drop_corrupt_free_list_head(this, k, block);
             k++;
             continue;
         }
 
         // Pop head of free_list[k].
-        free_list[k] = block->next;
+        free_list.at(static_cast<size_t>(k)) = block->next;
         break;
     }
 
@@ -228,8 +235,8 @@ void* PageAllocator::alloc(uint64_t size_bytes) {
         }
 
         auto* buddy_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, BUDDY_IDX));
-        buddy_block->next = free_list[k];
-        free_list[k] = buddy_block;
+        buddy_block->next = free_list.at(static_cast<size_t>(k));
+        free_list.at(static_cast<size_t>(k)) = buddy_block;
     }
 
     // Mark the allocated block.
@@ -294,6 +301,15 @@ void PageAllocator::free(void* ptr) {
     }
 
     int const ORDER = FLAGS & 0x1F;
+    if (ORDER > MAX_ORDER) {
+        ker::mod::io::serial::write("page_alloc: rejecting free with invalid order=");
+        ker::mod::io::serial::write(static_cast<uint64_t>(ORDER));
+        ker::mod::io::serial::write(" ptr=0x");
+        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
+        ker::mod::io::serial::write("\n");
+        return;
+    }
+
     uint32_t const BLOCK_SIZE = 1U << ORDER;
 
     // Clear flags for the entire allocation.
@@ -319,7 +335,7 @@ void PageAllocator::free(void* ptr) {
 
         // Remove buddy from its free list.
         auto* buddy_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, BUDDY_IDX));
-        if (!list_remove(this, k, free_list[k], buddy_block)) {
+        if (!list_remove(this, k, free_list.at(static_cast<size_t>(k)), buddy_block)) {
             break;
         }
 
@@ -337,8 +353,8 @@ void PageAllocator::free(void* ptr) {
 
     // Prepend to the free list.
     auto* free_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, page_idx));
-    free_block->next = free_list[k];
-    free_list[k] = free_block;
+    free_block->next = free_list.at(static_cast<size_t>(k));
+    free_list.at(static_cast<size_t>(k)) = free_block;
 }
 
 auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {

@@ -1,7 +1,7 @@
 #pragma once
 
+#include <cstddef>
 #include <defines/defines.hpp>
-#include <platform/acpi/acpi.hpp>
 #include <platform/acpi/tables/sdt.hpp>
 #include <platform/pic/pic.hpp>
 
@@ -13,6 +13,7 @@ const uint64_t MADT_TYPE_IOAPIC_NMI = 3;
 const uint64_t MADT_TYPE_LAPIC_NMI = 4;
 const uint64_t MADT_TYPE_LAPIC_ADDR_OVERRIDE = 5;
 const uint64_t MADT_TYPE_LAPIC_X2APIC = 9;
+constexpr size_t MADT_PARSED_ENTRY_CAPACITY = 512;
 
 struct IOApic {
     uint8_t type;
@@ -67,18 +68,34 @@ struct MultiApicTable {
     uint32_t local_apic_addr;
     uint32_t local_apic_flags;
 } __attribute__((packed));
+
+static_assert(sizeof(IOApic) == 12);
+static_assert(sizeof(LAPIC) == 8);
+static_assert(sizeof(LAPICNMI) == 6);
+static_assert(sizeof(LAPICIntSrcOverride) == 10);
+static_assert(sizeof(X2APIC) == 16);
+static_assert(sizeof(APICRecord) == 2);
+static_assert(offsetof(MultiApicTable, local_apic_addr) == 36);
+static_assert(offsetof(MultiApicTable, local_apic_flags) == 40);
+static_assert(sizeof(MultiApicTable) == 44);
+
 struct ApicInfo {
     uint64_t lapic_addr;
     uint32_t usable_ioapics;
-    IOApic ioapics[512];
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): Parsed MADT storage.
+    IOApic ioapics[MADT_PARSED_ENTRY_CAPACITY];
     uint32_t usable_lapics;
-    LAPIC lapics[512];
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): Parsed MADT storage.
+    LAPIC lapics[MADT_PARSED_ENTRY_CAPACITY];
     uint32_t usable_lapic_nmis;
-    LAPICNMI lapic_nmis[512];
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): Parsed MADT storage.
+    LAPICNMI lapic_nmis[MADT_PARSED_ENTRY_CAPACITY];
     uint32_t usable_ioapic_isos;
-    LAPICIntSrcOverride ioapic_isos[512];
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): Parsed MADT storage.
+    LAPICIntSrcOverride ioapic_isos[MADT_PARSED_ENTRY_CAPACITY];
     uint32_t usable_x2_apics;
-    X2APIC x2apics[512];
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays): Parsed MADT storage.
+    X2APIC x2apics[MADT_PARSED_ENTRY_CAPACITY];
 } __attribute__((packed));
 
 ApicInfo parse_madt(void* madt);

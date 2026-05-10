@@ -1,9 +1,12 @@
 #include "gpt.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <span>
 
 #include "dev/block_device.hpp"
 
@@ -11,37 +14,28 @@ namespace ker::dev::gpt {
 
 namespace {
 // Compare two GUIDs as byte arrays
-auto guid_compare(const uint8_t* guid1, const uint8_t* guid2) -> bool {
-    for (size_t i = 0; i < GUID_SIZE; i++) {
-        if (guid1[i] != guid2[i]) {
-            return false;
-        }
-    }
-    return true;
+auto guid_compare(std::span<const uint8_t, GUID_SIZE> guid1, std::span<const uint8_t, GUID_SIZE> guid2) -> bool {
+    return std::equal(guid1.begin(), guid1.end(), guid2.begin());
 }
 
 // Check if a GPT partition entry is empty (all-zero type GUID)
 auto is_entry_empty(const GPTPartitionEntry* entry) -> bool {
-    for (unsigned char const J : entry->partition_type_guid) {
-        if (J != 0) {
-            return false;
-        }
-    }
-    return true;
+    std::span<const uint8_t, GUID_SIZE> const TYPE_GUID{entry->partition_type_guid};
+    return std::ranges::all_of(TYPE_GUID, [](uint8_t value) { return value == 0; });
 }
 
-constexpr char HEX_CHARS[] = "0123456789abcdef";  // NOLINT
+constexpr std::array HEX_CHARS = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
 
-void byte_to_hex(uint8_t byte, char* out) {
-    out[0] = HEX_CHARS[(byte >> 4) & 0x0F];
-    out[1] = HEX_CHARS[byte & 0x0F];
+auto byte_to_hex(uint8_t byte, char* out) -> void {
+    out[0] = HEX_CHARS.at((byte >> 4) & 0x0F);
+    out[1] = HEX_CHARS.at(byte & 0x0F);
 }
 }  // namespace
 
 // Convert a 16-byte mixed-endian GPT GUID to lowercase string
 // GPT GUIDs are stored in mixed endian: first 3 groups are little-endian, last 2 are big-endian
 // Output: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-void guid_to_string(const uint8_t* guid, char* out) {
+auto guid_to_string(const uint8_t* guid, char* out) -> void {
     // Group 1: bytes 0-3, little-endian (reverse order)
     byte_to_hex(guid[3], out + 0);
     byte_to_hex(guid[2], out + 2);
@@ -100,9 +94,8 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
     }
 
     // Copy disk GUID
-    for (size_t i = 0; i < GUID_SIZE; ++i) {
-        disk_info->disk_guid[i] = hdr->disk_guid[i];
-    }
+    std::span<const uint8_t, GUID_SIZE> const DISK_GUID{hdr->disk_guid};
+    std::copy_n(DISK_GUID.begin(), DISK_GUID.size(), disk_info->disk_guid.begin());
 
     uint64_t const ENTRIES_LBA = hdr->partition_entries_lba;
     uint32_t const NUM_ENTRIES = hdr->num_partition_entries;
@@ -139,12 +132,12 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
             }
 
             uint32_t const IDX = disk_info->partition_count;
-            auto& part = disk_info->partitions[IDX];
+            auto& part = disk_info->partitions.at(IDX);
 
-            for (size_t b = 0; b < GUID_SIZE; ++b) {
-                part.partition_type_guid[b] = entry->partition_type_guid[b];
-                part.unique_partition_guid[b] = entry->unique_partition_guid[b];
-            }
+            std::span<const uint8_t, GUID_SIZE> const PARTITION_TYPE_GUID{entry->partition_type_guid};
+            std::span<const uint8_t, GUID_SIZE> const UNIQUE_PARTITION_GUID{entry->unique_partition_guid};
+            std::copy_n(PARTITION_TYPE_GUID.begin(), PARTITION_TYPE_GUID.size(), part.partition_type_guid.begin());
+            std::copy_n(UNIQUE_PARTITION_GUID.begin(), UNIQUE_PARTITION_GUID.size(), part.unique_partition_guid.begin());
             part.starting_lba = entry->starting_lba;
             part.ending_lba = entry->ending_lba;
             part.partition_index = (sector * ENTRIES_PER_SECTOR) + i;
@@ -192,9 +185,10 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
 
     gpt_log("gpt_find_fat32_partition: Valid GPT found\n");
     gpt_log("gpt_find_fat32_partition: Looking for FAT32 GUID: ");
-    for (size_t j = 0; j < GUID_SIZE; ++j) {
-        gpt_log_hex(FAT32_PARTITION_GUID[j]);
-        if (j < GUID_SIZE - 1) {
+    size_t guid_offset = 0;
+    for (uint8_t const BYTE : FAT32_PARTITION_GUID) {
+        gpt_log_hex(BYTE);
+        if (++guid_offset < FAT32_PARTITION_GUID.size()) {
             gpt_log(" ");
         }
     }
@@ -257,8 +251,8 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
             gpt_log("\n");
 
             // Check if partition type matches FAT32
-            const auto* type_guid = static_cast<const uint8_t*>(entry->partition_type_guid);
-            if (guid_compare(type_guid, static_cast<const uint8_t*>(FAT32_PARTITION_GUID))) {
+            std::span<const uint8_t, GUID_SIZE> const TYPE_GUID{entry->partition_type_guid};
+            if (guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{FAT32_PARTITION_GUID})) {
                 fat32_start_lba = entry->starting_lba;
                 gpt_log("gpt_find_fat32_partition: Found FAT32 partition at LBA 0x");
                 gpt_log_hex(fat32_start_lba);
@@ -267,7 +261,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
             }
 
             // Also check for Microsoft Basic Data partition (commonly used for FAT32)
-            if (!found && guid_compare(type_guid, static_cast<const uint8_t*>(BASIC_DATA_PARTITION_GUID))) {
+            if (!found && guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{BASIC_DATA_PARTITION_GUID})) {
                 fat32_start_lba = entry->starting_lba;
                 gpt_log("gpt_find_fat32_partition: Found Basic Data partition at LBA 0x");
                 gpt_log_hex(fat32_start_lba);
@@ -276,7 +270,7 @@ auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
             }
 
             // Also check for Linux filesystem data partition (used by guestfish)
-            if (!found && guid_compare(type_guid, static_cast<const uint8_t*>(LINUX_DATA_PARTITION_GUID))) {
+            if (!found && guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{LINUX_DATA_PARTITION_GUID})) {
                 fat32_start_lba = entry->starting_lba;
                 gpt_log("gpt_find_fat32_partition: Found Linux data partition at LBA 0x");
                 gpt_log_hex(fat32_start_lba);

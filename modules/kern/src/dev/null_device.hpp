@@ -5,9 +5,9 @@
 namespace ker::dev::null_device {
 
 // Initialize /dev/null and /dev/zero devices
-void null_device_init();
+auto null_device_init() -> void;
 
-Device* get_null_device();
-Device* get_zero_device();
+auto get_null_device() -> Device*;
+auto get_zero_device() -> Device*;
 
 }  // namespace ker::dev::null_device

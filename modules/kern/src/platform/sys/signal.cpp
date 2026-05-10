@@ -9,49 +9,41 @@
 #include "platform/sched/task.hpp"
 #include "syscalls_impl/process/exit.hpp"
 
+namespace {
+
 // Signal constants (matching Linux ABI)
-static constexpr uint64_t WOS_SIG_DFL = 0;
-static constexpr uint64_t WOS_SIG_IGN = 1;
-static constexpr int WOS_SIGKILL = 9;
-static constexpr int WOS_SIGHUP = 1;
-static constexpr int WOS_SIGINT = 2;
-static constexpr int WOS_SIGQUIT = 3;
-static constexpr int WOS_SIGTERM = 15;
-static constexpr int WOS_SIGSTOP = 19;
-static constexpr int WOS_SIGCHLD = 17;
-static constexpr int WOS_SIGURG = 23;
-static constexpr int WOS_SIGWINCH = 28;
-static constexpr int WOS_SIGCONT = 18;
+constexpr uint64_t WOS_SIG_DFL = 0;
+constexpr uint64_t WOS_SIG_IGN = 1;
+constexpr int WOS_SIGKILL = 9;
+constexpr int WOS_SIGHUP = 1;
+constexpr int WOS_SIGINT = 2;
+constexpr int WOS_SIGQUIT = 3;
+constexpr int WOS_SIGTERM = 15;
+constexpr int WOS_SIGSTOP = 19;
+constexpr int WOS_SIGCHLD = 17;
+constexpr int WOS_SIGURG = 23;
+constexpr int WOS_SIGWINCH = 28;
+constexpr int WOS_SIGCONT = 18;
 
 // Stack offsets for the pushed GP registers in syscall.asm (pushq macro).
 // After pushq, RSP points to r15. Offsets from RSP:
 //   0x00=r15, 0x08=r14, 0x10=r13, 0x18=r12, 0x20=r11, 0x28=r10,
 //   0x30=r9,  0x38=r8,  0x40=rbp, 0x48=rdi, 0x50=rsi, 0x58=rdx,
 //   0x60=rcx, 0x68=rbx, 0x70=rax, 0x78=return_value
-constexpr auto STACK_OFF_R15 = 0x00;
-constexpr auto STACK_OFF_R14 = 0x08;
-constexpr auto STACK_OFF_R13 = 0x10;
-constexpr auto STACK_OFF_R12 = 0x18;
 constexpr auto STACK_OFF_R11 = 0x20;
-constexpr auto STACK_OFF_R10 = 0x28;
-constexpr auto STACK_OFF_R9 = 0x30;
-constexpr auto STACK_OFF_R8 = 0x38;
-constexpr auto STACK_OFF_RBP = 0x40;
 constexpr auto STACK_OFF_RDI = 0x48;
-constexpr auto STACK_OFF_RSI = 0x50;
-constexpr auto STACK_OFF_RDX = 0x58;
 constexpr auto STACK_OFF_RCX = 0x60;
-constexpr auto STACK_OFF_RBX = 0x68;
-constexpr auto STACK_OFF_RAX = 0x70;
 constexpr auto STACK_OFF_RETVAL = 0x78;
 
-namespace ker::mod::sys::signal {
-
 // Helper: read a uint64_t from a stack slot
-static inline auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpret_cast<const uint64_t*>(base + offset); }
+auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpret_cast<const uint64_t*>(base + offset); }
 
 // Helper: write a uint64_t to a stack slot
-static inline void stack_write(uint8_t* base, int offset, uint64_t value) { *reinterpret_cast<uint64_t*>(base + offset) = value; }
+void stack_write(uint8_t* base, int offset, uint64_t value) { *reinterpret_cast<uint64_t*>(base + offset) = value; }
+
+}  // namespace
+
+namespace ker::mod::sys::signal {
 
 // Called from syscall.asm after the deferred task switch check, before returning
 // to userspace. Handles both sigreturn (context restore) and signal delivery.
@@ -81,7 +73,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
 
         // Restore GP registers to the on-stack positions
         for (int i = 0; i < 15; i++) {
-            stack_write(stack_base, i * 8, frame->saved_regs[i]);
+            stack_write(stack_base, i * 8, frame->saved_regs.at(static_cast<size_t>(i)));
         }
 
         // Restore the return value slot
@@ -113,7 +105,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     // Clear the pending bit
     task->sig_pending &= ~(1ULL << IDX);
 
-    auto& handler = task->sig_handlers[IDX];
+    auto& handler = task->sig_handlers.at(IDX);
 
     // Handle SIG_DFL
     if (handler.handler == WOS_SIG_DFL) {
@@ -175,7 +167,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
 
     // Save all 15 GP registers from the stack
     for (int i = 0; i < 15; i++) {
-        frame->saved_regs[i] = stack_read(stack_base, i * 8);
+        frame->saved_regs.at(static_cast<size_t>(i)) = stack_read(stack_base, i * 8);
     }
 
     // Modify the on-stack registers to redirect to the signal handler
@@ -222,7 +214,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     auto const IDX = static_cast<unsigned>(SIGNO - 1);
     task->sig_pending &= ~(1ULL << IDX);
 
-    auto& handler = task->sig_handlers[IDX];
+    auto& handler = task->sig_handlers.at(IDX);
 
     if (handler.handler == WOS_SIG_DFL) {
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
@@ -263,7 +255,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
 
     const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
     for (int i = 0; i < 15; i++) {
-        sigframe->saved_regs[i] = regs_arr[i];
+        sigframe->saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
 
     gpr.rdi = static_cast<uint64_t>(SIGNO);

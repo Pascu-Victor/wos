@@ -18,6 +18,9 @@
 #include <cstdint>
 #include <net/endian.hpp>
 
+// XFS structures mirror packed on-disk records. They are normally populated by
+// block reads rather than constructors, so member-init warnings are noise here.
+// NOLINTBEGIN(cppcoreguidelines-pro-type-member-init)
 namespace ker::vfs::xfs {
 
 // ============================================================================
@@ -154,6 +157,8 @@ constexpr size_t XFS_SB_CRC_OFF = offsetof(XfsDsb, sb_crc);
 constexpr uint16_t XFS_DINODE_MAGIC = 0x494E;  // 'IN'
 
 // Inode data fork format (di_format / di_aformat)
+// Kept unscoped because these constants are stored in on-disk one-byte fields and used in switch labels across the XFS parser.
+// NOLINTNEXTLINE(cppcoreguidelines-use-enum-class)
 enum xfs_dinode_fmt : uint8_t {
     XFS_DINODE_FMT_DEV = 0,      // device (special file)
     XFS_DINODE_FMT_LOCAL = 1,    // inline data (shortform)
@@ -518,6 +523,15 @@ struct XfsDir2SfEntry {
     // Followed by: uint8_t filetype (if ftype feature), then 4 or 8 byte inode
 } __attribute__((packed));
 
+inline auto xfs_dir2_sf_entry_name(XfsDir2SfEntry* e) -> uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
+inline auto xfs_dir2_sf_entry_name(const XfsDir2SfEntry* e) -> const uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
+
 // Helper: get size of inline inode number (4 or 8 bytes)
 inline auto xfs_dir2_sf_inumber_size(const XfsDir2SfHdr* hdr) -> size_t { return (hdr->i8count != 0) ? 8 : 4; }
 
@@ -531,8 +545,8 @@ inline auto xfs_dir2_sf_get_parent(const XfsDir2SfHdr* hdr) -> xfs_ino_t {
         return val;
     }
     uint32_t val = 0;
-    for (int i = 0; i < 4; i++) {
-        val = (val << 8) | hdr->parent[i];
+    for (size_t i = 0; i < 4; i++) {
+        val = (val << 8) | hdr->parent.at(i);
     }
     return val;
 }
@@ -551,6 +565,15 @@ struct XfsDir2DataEntry {
     // Followed by: uint8_t filetype (if ftype), then Be16 tag (starting offset)
     // Padded to 8-byte alignment
 } __attribute__((packed));
+
+inline auto xfs_dir2_data_entry_name(XfsDir2DataEntry* e) -> uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
+inline auto xfs_dir2_data_entry_name(const XfsDir2DataEntry* e) -> const uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
 
 // Unused/free space entry in a data block
 struct XfsDir2DataUnused {
@@ -661,8 +684,19 @@ struct XfsAttrSfEntry {
 // Helper: size of one shortform attr entry (header + name + value)
 inline auto xfs_attr_sf_entry_size(const XfsAttrSfEntry* e) -> size_t { return sizeof(XfsAttrSfEntry) + e->namelen + e->valuelen; }
 
+// Helper: get pointer to name bytes within a shortform attr entry.
+inline auto xfs_attr_sf_entry_name(XfsAttrSfEntry* e) -> uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->nameval;
+}
+inline auto xfs_attr_sf_entry_name(const XfsAttrSfEntry* e) -> const uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->nameval;
+}
+
 // Helper: get pointer to value within a shortform attr entry
-inline auto xfs_attr_sf_entry_value(const XfsAttrSfEntry* e) -> const uint8_t* { return e->nameval + e->namelen; }
+inline auto xfs_attr_sf_entry_value(XfsAttrSfEntry* e) -> uint8_t* { return xfs_attr_sf_entry_name(e) + e->namelen; }
+inline auto xfs_attr_sf_entry_value(const XfsAttrSfEntry* e) -> const uint8_t* { return xfs_attr_sf_entry_name(e) + e->namelen; }
 
 // --- Leaf attribute structures ---
 constexpr uint16_t XFS_ATTR3_LEAF_MAGIC = 0x3BEE;
@@ -682,7 +716,9 @@ struct XfsAttr3LeafHdr {
     Be16 firstused;      // first used byte in name area
     uint8_t holes;       // non-zero if compaction needed
     uint8_t pad1;
-    XfsAttrLeafMap freemap[XFS_ATTR_LEAF_MAPSIZE];  // N largest free regions
+    // N largest free regions; raw array is part of the packed on-disk XFS leaf header.
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
+    XfsAttrLeafMap freemap[XFS_ATTR_LEAF_MAPSIZE];
     // Followed by XfsAttrLeafEntry[] array
 } __attribute__((packed));
 static_assert(sizeof(XfsAttr3LeafHdr) == 76);
@@ -705,6 +741,19 @@ struct XfsAttrLeafNameLocal {
     uint8_t nameval[];  // name followed by value  // NOLINT(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 } __attribute__((packed));
 
+inline auto xfs_attr_leaf_name_local_name(XfsAttrLeafNameLocal* e) -> uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->nameval;
+}
+inline auto xfs_attr_leaf_name_local_name(const XfsAttrLeafNameLocal* e) -> const uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->nameval;
+}
+inline auto xfs_attr_leaf_name_local_value(XfsAttrLeafNameLocal* e) -> uint8_t* { return xfs_attr_leaf_name_local_name(e) + e->namelen; }
+inline auto xfs_attr_leaf_name_local_value(const XfsAttrLeafNameLocal* e) -> const uint8_t* {
+    return xfs_attr_leaf_name_local_name(e) + e->namelen;
+}
+
 // Remote attribute name in leaf block (value stored in separate block)
 struct XfsAttrLeafNameRemote {
     Be32 valueblk;    // logical attr block number of value data
@@ -712,6 +761,15 @@ struct XfsAttrLeafNameRemote {
     uint8_t namelen;  // length of name
     uint8_t name[];   // name bytes  // NOLINT(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 } __attribute__((packed));
+
+inline auto xfs_attr_leaf_name_remote_name(XfsAttrLeafNameRemote* e) -> uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
+inline auto xfs_attr_leaf_name_remote_name(const XfsAttrLeafNameRemote* e) -> const uint8_t* {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return e->name;
+}
 
 // --- Remote attribute value block header (XFS v5) ---
 constexpr uint32_t XFS_ATTR3_RMT_MAGIC = 0x5841524d;  // 'XARM'
@@ -814,3 +872,4 @@ inline auto xfs_ag_ino(xfs_ino_t ino, uint32_t agino_log) -> xfs_agino_t {
 inline auto xfs_ino_ag(xfs_ino_t ino, uint32_t agino_log) -> xfs_agnumber_t { return static_cast<xfs_agnumber_t>(ino >> agino_log); }
 
 }  // namespace ker::vfs::xfs
+// NOLINTEND(cppcoreguidelines-pro-type-member-init)

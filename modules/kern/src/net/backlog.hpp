@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace ker::mod::sched::task {
@@ -14,10 +16,12 @@ struct PacketBuffer;
 // Lock-free MPSC backlog queue for per-CPU packet distribution
 struct BacklogQueue {
     std::atomic<PacketBuffer*> head{nullptr};
-    char pad[56];  // avoid false sharing
+    std::array<std::byte, 56> pad{};  // avoid false sharing
     ker::mod::sched::task::Task* handler = nullptr;
     std::atomic<bool> handler_active{false};
 };
+
+static_assert(offsetof(BacklogQueue, handler) >= 64, "BacklogQueue handler state must stay off the head cache line");
 
 void backlog_init();
 void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt);

@@ -34,18 +34,11 @@ auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
 auto remotable_on_attach(uint16_t node_id) -> int {
-    (void)node_id;
-    net_log::trace("remote attach");
+    net_log::trace("remote attach from 0x%04x", node_id);
     return 0;
 }
-void remotable_on_detach(uint16_t node_id) {
-    (void)node_id;
-    net_log::trace("remote detach");
-}
-void remotable_on_fault(uint16_t node_id) {
-    (void)node_id;
-    net_log::trace("remote fault");
-}
+void remotable_on_detach(uint16_t node_id) { net_log::trace("remote detach from 0x%04x", node_id); }
+void remotable_on_fault(uint16_t node_id) { net_log::trace("remote fault for 0x%04x", node_id); }
 const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
@@ -110,8 +103,8 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
     uint16_t desc_idx = 0;
 
     while (processed < budget && (desc_idx = virtq_get_buf(rxq, &len)) != 0xFFFF) {
-        auto* pkt = rxq->pkt_map[desc_idx];
-        rxq->pkt_map[desc_idx] = nullptr;
+        auto* pkt = rxq->pkt_map.at(desc_idx);
+        rxq->pkt_map.at(desc_idx) = nullptr;
 
         if (pkt == nullptr || len <= static_cast<uint32_t>(dev->hdr_size)) {
             if (pkt != nullptr) {
@@ -142,8 +135,8 @@ auto collect_tx_for(Virtqueue* txq) -> ker::net::PacketBuffer* {
     uint16_t desc_idx = 0;
 
     while ((desc_idx = virtq_get_buf(txq, &len)) != 0xFFFF) {
-        auto* pkt = txq->pkt_map[desc_idx];
-        txq->pkt_map[desc_idx] = nullptr;
+        auto* pkt = txq->pkt_map.at(desc_idx);
+        txq->pkt_map.at(desc_idx) = nullptr;
         if (pkt != nullptr) {
             pkt->next = head;
             head = pkt;
@@ -256,8 +249,8 @@ void virtio_net_irq(uint8_t vector, void* private_data) {
     }
 
     if (!dev->msix_enabled) {
-        uint8_t const isr = ::inb(dev->io_base + VIRTIO_REG_ISR_STATUS);
-        if (isr == 0) {
+        uint8_t const ISR_STATUS = ::inb(dev->io_base + VIRTIO_REG_ISR_STATUS);
+        if (ISR_STATUS == 0) {
             return;
         }
     }
@@ -456,7 +449,7 @@ void virtio_net_set_mac(ker::net::NetDevice* netdev, const uint8_t* mac) {
     uint16_t const MAC_OFF = dev->msix_enabled ? VIRTIO_NET_CFG_MAC_MSIX : VIRTIO_NET_CFG_MAC;
     for (size_t i = 0; i < netdev->mac.size(); i++) {
         ::outb(dev->io_base + MAC_OFF + static_cast<uint16_t>(i), mac[i]);
-        netdev->mac[i] = mac[i];
+        netdev->mac.at(i) = mac[i];
     }
 }
 
@@ -536,6 +529,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
     dev->pci = pci_dev;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PCI BAR0 is fixed config-space layout.
     dev->io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
     dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE_MODERN);
     dev->modern_cfg = cfg;
@@ -736,8 +730,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     dev->num_queue_pairs = (want_mq && dev->msix_enabled) ? 2 : 1;
 
     if ((our_lo & VIRTIO_NET_F_MAC) != 0 && devcfg_va != nullptr) {
-        for (int i = 0; i < 6; i++) {
-            dev->netdev.mac[i] = devcfg_va[i];
+        for (size_t i = 0; i < ker::net::proto::MacAddress::SIZE_BYTES; i++) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): virtio device config is MMIO bytes.
+            dev->netdev.mac.at(i) = devcfg_va[i];
         }
     }
 
@@ -763,7 +758,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     dev->netdev.mtu = 9000;
     dev->netdev.state = 1;
     dev->netdev.private_data = dev;
-    dev->netdev.name[0] = '\0';
+    dev->netdev.name.at(0) = '\0';
     dev->netdev.remotable = &S_REMOTABLE_OPS;
 
     ker::net::netdev_register(&dev->netdev);
@@ -780,10 +775,10 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         virtio_net_irq_enable_pair(dev, 1);
     }
 
-    devices[device_count++] = dev;
+    devices.at(device_count++) = dev;
 
-    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(), dev->netdev.mac[0],
-                  dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5], vector,
+    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(), dev->netdev.mac.at(0),
+                  dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4), dev->netdev.mac.at(5), vector,
                   dev->msix_enabled ? " modern msix" : " modern msi/intx", dev->num_queue_pairs);
 
     return 0;
@@ -798,6 +793,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return 0;
     }
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PCI BAR0 is fixed config-space layout.
     auto io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
     if (io_base == 0) {
         net_log::error("BAR0 is zero");
@@ -1042,8 +1038,8 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     // MAC offset depends on MSI-X vector fields.
     uint16_t const MAC_OFF = dev->msix_enabled ? VIRTIO_NET_CFG_MAC_MSIX : VIRTIO_NET_CFG_MAC;
     if ((our_features & VIRTIO_NET_F_MAC) != 0) {
-        for (int i = 0; i < 6; i++) {
-            dev->netdev.mac[i] = ::inb(io_base + MAC_OFF + i);
+        for (size_t i = 0; i < ker::net::proto::MacAddress::SIZE_BYTES; i++) {
+            dev->netdev.mac.at(i) = ::inb(io_base + MAC_OFF + static_cast<uint16_t>(i));
         }
     }
 
@@ -1068,7 +1064,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     dev->netdev.mtu = 9000;
     dev->netdev.state = 1;
     dev->netdev.private_data = dev;
-    dev->netdev.name[0] = '\0';
+    dev->netdev.name.at(0) = '\0';
     dev->netdev.remotable = &S_REMOTABLE_OPS;
 
     ker::net::netdev_register(&dev->netdev);
@@ -1082,11 +1078,11 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         virtio_net_irq_enable_pair(dev, 1);
     }
 
-    devices[device_count++] = dev;
+    devices.at(device_count++) = dev;
 
     net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x rxq=%u txq=%u vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(),
-                  dev->netdev.mac[0], dev->netdev.mac[1], dev->netdev.mac[2], dev->netdev.mac[3], dev->netdev.mac[4], dev->netdev.mac[5],
-                  rxq_size, txq_size, vector, dev->msix_enabled ? " msix" : " legacy", dev->num_queue_pairs);
+                  dev->netdev.mac.at(0), dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4),
+                  dev->netdev.mac.at(5), rxq_size, txq_size, vector, dev->msix_enabled ? " msix" : " legacy", dev->num_queue_pairs);
 
     return 0;
 }

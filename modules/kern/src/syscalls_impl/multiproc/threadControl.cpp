@@ -1,5 +1,6 @@
 #include "threadControl.hpp"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -52,9 +53,9 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             // arg4 (tid_out) is passed via the a4 register (r8); not yet exposed here -
             // the TID is returned as the syscall return value and mlibc writes it to tid_out.
             auto* parent = mod::sched::get_current_task();
-            auto tcb_va = (uint64_t)arg1;
-            auto user_sp = (uint64_t)arg2;
-            auto enter_va = (uint64_t)arg3;
+            auto tcb_va = reinterpret_cast<uint64_t>(arg1);
+            auto user_sp = reinterpret_cast<uint64_t>(arg2);
+            auto enter_va = reinterpret_cast<uint64_t>(arg3);
 
             auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
             if (t == nullptr) {
@@ -62,10 +63,10 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             }
 
             bool posted = false;
-            uint64_t const cpu_count = mod::smt::get_core_count();
-            if (cpu_count > 0) {
+            uint64_t const CPU_COUNT = mod::smt::get_core_count();
+            if (CPU_COUNT > 0) {
                 static std::atomic<uint64_t> next_thread_cpu{0};
-                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % cpu_count;
+                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
                 posted = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             }
             if (!posted) {
@@ -95,15 +96,15 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             // Wake anyone waiting on this thread (e.g. via awaitee list)
             uint64_t const WAITER_LOCK_FLAGS = task->exit_waiters_lock.lock_irqsave();
             const size_t WAITER_COUNT = task->awaitee_on_exit.size();
-            uint64_t waiting_pids[16] = {};
-            const size_t WAITING_PIDS_CAP = sizeof(waiting_pids) / sizeof(waiting_pids[0]);
+            std::array<uint64_t, 16> waiting_pids{};
+            const size_t WAITING_PIDS_CAP = waiting_pids.size();
             for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-                waiting_pids[i] = task->awaitee_on_exit[i];
+                waiting_pids.at(i) = task->awaitee_on_exit.at(i);
             }
             task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 
             for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; i++) {
-                auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids[i]);
+                auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids.at(i));
                 if (waiter != nullptr) {
                     mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
                     waiter->release();
@@ -115,8 +116,8 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         }
 
         case abi::multiproc::threadControlOps::SET_AFFINITY: {
-            auto const TID = (uint64_t)arg1;
-            auto const MASK = (uint64_t)arg2;
+            auto const TID = reinterpret_cast<uint64_t>(arg1);
+            auto const MASK = reinterpret_cast<uint64_t>(arg2);
 
             auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
@@ -164,7 +165,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         }
 
         case abi::multiproc::threadControlOps::GET_AFFINITY: {
-            auto const TID = (uint64_t)arg1;
+            auto const TID = reinterpret_cast<uint64_t>(arg1);
 
             auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
@@ -196,9 +197,9 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (req == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            char name[32];
-            __builtin_memcpy(name, req, 31);
-            name[31] = '\0';
+            std::array<char, 32> name{};
+            __builtin_memcpy(name.data(), req, name.size() - 1);
+            name.at(31) = '\0';
             uint64_t cpu_mask = *reinterpret_cast<uint64_t*>(req + 32);
             bool const SOFT_EXCLUSIVE = req[40] != 0;
             bool const HARD = req[41] != 0;
@@ -207,14 +208,14 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-EINVAL);
             }
             cpu_mask &= VALID;
-            uint32_t const DOMAIN_ID = mod::smt::create_leaf_domain(name, cpu_mask, SOFT_EXCLUSIVE, HARD);
+            uint32_t const DOMAIN_ID = mod::smt::create_leaf_domain(name.data(), cpu_mask, SOFT_EXCLUSIVE, HARD);
             if (DOMAIN_ID == mod::smt::DOMAIN_ID_INVALID) {
                 return static_cast<uint64_t>(-ENOMEM);
             }
             // Apply daemon_load_penalty to each CPU in the new domain if soft_exclusive
             if (SOFT_EXCLUSIVE) {
-                uint64_t const cpu_count = mod::smt::get_core_count();
-                for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
+                uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
                     if ((cpu_mask & (1ULL << cpu)) != 0U) {
                         mod::sched::set_cpu_daemon_penalty(cpu, 56);
                     }
@@ -223,8 +224,8 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             // Phase 8: stamp domain_id on each CPU's RunQueue so work-stealing
             // checks can enforce hard-domain boundaries without a separate registry lookup.
             {
-                uint64_t const cpu_count = mod::smt::get_core_count();
-                for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
+                uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
                     if ((cpu_mask & (1ULL << cpu)) != 0U) {
                         mod::sched::set_cpu_domain_id(cpu, DOMAIN_ID);
                     }
@@ -235,9 +236,9 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::SET_DOMAIN: {
             // arg1=tid, arg2=domain_id, arg3=hard (0=soft, 1=hard)
-            auto const TID = (uint64_t)arg1;
-            auto const DOMAIN_ID = static_cast<uint32_t>((uint64_t)arg2);
-            bool const HARD = ((uint64_t)arg3) != 0;
+            auto const TID = reinterpret_cast<uint64_t>(arg1);
+            auto const DOMAIN_ID = static_cast<uint32_t>(reinterpret_cast<uint64_t>(arg2));
+            bool const HARD = reinterpret_cast<uint64_t>(arg3) != 0;
             auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
             if (dom == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -260,7 +261,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::QUERY_DOMAIN: {
             // arg1=domain_id, arg2=ptr to struct { uint64_t cpu_mask; uint32_t cpu_loads[64]; }
-            auto const DOMAIN_ID = static_cast<uint32_t>((uint64_t)arg1);
+            auto const DOMAIN_ID = static_cast<uint32_t>(reinterpret_cast<uint64_t>(arg1));
             auto* out = reinterpret_cast<uint8_t*>(arg2);
             if (out == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -271,8 +272,8 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             }
             *reinterpret_cast<uint64_t*>(out) = dom->cpu_mask;
             auto* loads = reinterpret_cast<uint32_t*>(out + 8);
-            uint64_t const cpu_count = mod::smt::get_core_count();
-            for (uint64_t cpu = 0; cpu < cpu_count && cpu < 64; ++cpu) {
+            uint64_t const CPU_COUNT = mod::smt::get_core_count();
+            for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
                 loads[cpu] = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
             }
             return 0;

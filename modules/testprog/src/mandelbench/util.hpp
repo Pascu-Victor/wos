@@ -8,9 +8,6 @@
 
 #include "config.hpp"
 
-#ifndef _UTIL_H
-#define UTIL_H
-
 struct Arg {
     unsigned char* image;
     unsigned char* colormap;
@@ -54,5 +51,3 @@ void description(const char* name, int width, int height, int max_iteration, int
 void progress(const char* name, int width, int height, int max_iteration, int threads, int repeat, int r, double time);
 
 void report(const char* name, int width, int height, int max_iteration, int threads, int repeat, const std::vector<double>& times);
-
-#endif

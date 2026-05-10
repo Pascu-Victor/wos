@@ -1,8 +1,19 @@
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <platform/mm/phys.hpp>
 #include <test/ktest.hpp>
 
 namespace phys = ker::mod::mm::phys;
+
+namespace {
+
+constexpr uintptr_t PAGE_ALIGNMENT_MASK = 0xFFFULL;
+
+auto is_page_aligned(const void* ptr) -> bool { return (reinterpret_cast<uintptr_t>(ptr) & PAGE_ALIGNMENT_MASK) == 0; }
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Basic page alloc/free round-trip
@@ -12,7 +23,7 @@ KTEST(MM, PageAllocFree) {
     void* page = phys::page_alloc();
     KREQUIRE_NE(page, nullptr);
     // Page address must be page-aligned (4 KiB)
-    KEXPECT_EQ(reinterpret_cast<uintptr_t>(page) & 0xFFFULL, 0ULL);
+    KEXPECT_EQ(is_page_aligned(page), true);
     phys::page_free(page);
 }
 
@@ -27,21 +38,21 @@ KTEST(MM, PageAllocWriteReadback) {
 }
 
 KTEST(MM, MultiplePageAllocFree) {
-    constexpr int N = 8;
-    void const* pages[N] = {};
-    for (int i = 0; i < N; ++i) {
-        pages[i] = phys::page_alloc();
-        KEXPECT_NE(pages[i], nullptr);
+    constexpr size_t PAGE_COUNT = 8;
+    std::array<void*, PAGE_COUNT> pages{};
+    for (auto& page : pages) {
+        page = phys::page_alloc();
+        KEXPECT_NE(page, nullptr);
     }
     // All pages must be distinct
-    for (int i = 0; i < N; ++i) {
-        for (int j = i + 1; j < N; ++j) {
-            KEXPECT_NE(pages[i], pages[j]);
+    for (const auto* first = pages.cbegin(); first != pages.cend(); ++first) {
+        for (const auto* second = std::next(first); second != pages.cend(); ++second) {
+            KEXPECT_NE(*first, *second);
         }
     }
-    for (int i = 0; i < N; ++i) {
-        if (pages[i] != nullptr) {
-            phys::page_free(pages[i]);
+    for (auto* page : pages) {
+        if (page != nullptr) {
+            phys::page_free(page);
         }
     }
 }
@@ -74,6 +85,6 @@ KTEST(MM, LargePageAlloc) {
     constexpr uint64_t TWO_PAGES = 8192;
     void* mem = phys::page_alloc(TWO_PAGES);
     KREQUIRE_NE(mem, nullptr);
-    KEXPECT_EQ(reinterpret_cast<uintptr_t>(mem) & 0xFFFULL, 0ULL);
+    KEXPECT_EQ(is_page_aligned(mem), true);
     phys::page_free(mem);
 }

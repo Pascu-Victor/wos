@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
+#include <iterator>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/paging.hpp>
@@ -25,14 +26,15 @@ enum class WkiVfsRoute : uint8_t {
 
 struct WkiVfsRule {
     static constexpr unsigned PREFIX_MAX = 256;
+    using PrefixBuffer = std::array<char, PREFIX_MAX>;
 
-    char prefix[PREFIX_MAX] = {};
+    PrefixBuffer prefix{};
     uint16_t prefix_len = 0;
     uint8_t route = static_cast<uint8_t>(WkiVfsRoute::LOCAL);
     uint8_t reserved = 0;
 };
 
-enum class TaskType {
+enum class TaskType : uint8_t {
     DAEMON,
     PROCESS,
     IDLE,
@@ -40,7 +42,7 @@ enum class TaskType {
 
 // Task lifecycle state for lock-free scheduling
 // Transitions: ACTIVE -> EXITING -> DEAD
-enum class TaskState : uint32_t {
+enum class TaskState : uint8_t {
     ACTIVE = 0,   // Task is runnable/running
     EXITING = 1,  // Task is in exit process, resources being freed
     DEAD = 2,     // Task fully dead, safe to reclaim memory after epoch grace period
@@ -62,22 +64,29 @@ struct Context {
 // We over-allocate by 63 bytes so we can always find a 64-byte-aligned region
 // inside the buffer, regardless of the Task allocation's alignment.
 struct FxState {
-    uint8_t raw[2688 + 63] = {};
+    static constexpr size_t XSAVE_AREA_SIZE = 2688;
+    static constexpr size_t ALIGNMENT_SLACK = 63;
+    using RawBuffer = std::array<uint8_t, XSAVE_AREA_SIZE + ALIGNMENT_SLACK>;
+
+    RawBuffer raw{};
     bool saved = false;  // true after first save_fpu_state - guards xrstor on zeroed buffer
 
     // Return a pointer to the 64-byte-aligned region within raw[].
     uint8_t* aligned() {
-        auto addr = reinterpret_cast<uintptr_t>(raw);
+        auto addr = reinterpret_cast<uintptr_t>(raw.data());
         addr = (addr + 63) & ~static_cast<uintptr_t>(63);
         return reinterpret_cast<uint8_t*>(addr);
     }
     [[nodiscard]] auto aligned() const -> const uint8_t* {
-        auto addr = reinterpret_cast<uintptr_t>(raw);
+        auto addr = reinterpret_cast<uintptr_t>(raw.data());
         addr = (addr + 63) & ~static_cast<uintptr_t>(63);
         return reinterpret_cast<const uint8_t*>(addr);
     }
 };
 
+// Keep related scheduler/process fields grouped; optimal packing order makes the
+// lifecycle-heavy type harder to audit for little memory win.
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct Task {
     Task(Task&&) = delete;
     auto operator=(const Task&) -> Task& = delete;
@@ -111,9 +120,15 @@ struct Task {
     // Which scheduling queue the task is logically in.
     enum class sched_queue : uint8_t { NONE = 0, RUNNABLE = 1, WAITING = 2, DEAD_GC = 3 };
     static constexpr unsigned FD_TABLE_SIZE = 256;
+    static constexpr unsigned FD_CLOEXEC_WORDS = FD_TABLE_SIZE / 64;
     static constexpr unsigned CWD_MAX = 256;
     static constexpr unsigned EXE_PATH_MAX = 256;
     static constexpr unsigned WKI_TARGET_HOSTNAME_MAX = 64;
+    using FdCloexecBitmap = std::array<uint64_t, FD_CLOEXEC_WORDS>;
+    using SignalHandlerTable = std::array<SigHandler, MAX_SIGNALS>;
+    using PathBuffer = std::array<char, CWD_MAX>;
+    using ExePathBuffer = std::array<char, EXE_PATH_MAX>;
+    using HostnameBuffer = std::array<char, WKI_TARGET_HOSTNAME_MAX>;
     static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
     static constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1;      // pin task to local node (skip remote placement)
     static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to child processes
@@ -124,7 +139,7 @@ struct Task {
     // Lock-free lifecycle management (epoch-based reclamation).
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
 
-    TaskType type;
+    TaskType type{TaskType::DAEMON};
     mm::paging::PageTable* pagemap{};
     uint64_t entry{};
     void (*kthread_entry)(){};  // Kernel thread entry (DAEMON only), nullptr otherwise
@@ -218,7 +233,7 @@ struct Task {
     ker::util::RadixTree<void*> fd_table;
 
     // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
-    uint64_t fd_cloexec[FD_TABLE_SIZE / 64] = {};
+    FdCloexecBitmap fd_cloexec{};
 
     // List of task IDs waiting for this task to exit. When this task exits,
     // all tasks in this list will be rescheduled on their respective CPUs.
@@ -228,7 +243,7 @@ struct Task {
     ker::util::SmallVec<WkiVfsRule, 4> wki_vfs_rules;
 
     // Signal handler entry (matches Linux ABI struct sigaction layout).
-    SigHandler sig_handlers[MAX_SIGNALS]{};
+    SignalHandlerTable sig_handlers{};
 
     uint32_t domain_id = 0;
     uint32_t wki_target_flags = 0;
@@ -301,7 +316,7 @@ struct Task {
     bool in_signal_handler{};  // Set to true when a signal handler frame is being delivered
     bool do_sigreturn{};       // Set by sigreturn syscall; check_pending_signals restores context
     int8_t sched_nice = 0;     // POSIX nice value backing sched_weight for PROCESS tasks
-    sched_queue sched_queue;
+    sched_queue sched_queue{sched_queue::NONE};
     bool wants_block{};
 
     // Set when a task transitions from the wait list to the runnable heap
@@ -315,41 +330,44 @@ struct Task {
 
     // WKI: optional explicit remote target hostname for spawned processes.
     // Empty means use automatic load-based placement.
-    char wki_target_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
+    HostnameBuffer wki_target_hostname{};
 
     // WKI: hostname of the logical submitter host whose filesystem should be
     // treated as /wki/host for this task.
-    char wki_submitter_hostname[WKI_TARGET_HOSTNAME_MAX] = "";
+    HostnameBuffer wki_submitter_hostname{};
 
     Context context{};
 
     // Current working directory (absolute path, "/" by default).
-    char cwd[CWD_MAX] = "/";
+    PathBuffer cwd{'/', '\0'};
 
     // Per-process root directory (for pivot_root / chroot).
     // Path resolution prepends this to absolute paths when it differs from "/".
-    char root[CWD_MAX] = "/";
+    PathBuffer root{'/', '\0'};
 
     // Executable path (set by exec, used by procfs /proc/self/exe).
-    char exe_path[EXE_PATH_MAX] = "";
+    ExePathBuffer exe_path{};
 
     FxState fx_state;  // FPU/SSE register state (fxsave/fxrstor on context switch)
 
     void set_fd_cloexec(unsigned fd) {
         if (fd < FD_TABLE_SIZE) {
-            fd_cloexec[fd / 64] |= (1ULL << (fd % 64));
+            auto* word = std::next(fd_cloexec.data(), static_cast<ptrdiff_t>(fd / 64));
+            *word |= (1ULL << (fd % 64));
         }
     }
     void clear_fd_cloexec(unsigned fd) {
         if (fd < FD_TABLE_SIZE) {
-            fd_cloexec[fd / 64] &= ~(1ULL << (fd % 64));
+            auto* word = std::next(fd_cloexec.data(), static_cast<ptrdiff_t>(fd / 64));
+            *word &= ~(1ULL << (fd % 64));
         }
     }
     [[nodiscard]] bool get_fd_cloexec(unsigned fd) const {
         if (fd >= FD_TABLE_SIZE) {
             return false;
         }
-        return (fd_cloexec[fd / 64] & (1ULL << (fd % 64))) != 0;
+        const auto* word = std::next(fd_cloexec.data(), static_cast<ptrdiff_t>(fd / 64));
+        return (*word & (1ULL << (fd % 64))) != 0;
     }
 
     void load_context(cpu::GPRegs* gpr);

@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
@@ -14,7 +15,6 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <util/hcf.hpp>
-#include <utility>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -124,7 +124,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     // Validate pagemap pointer is in valid HHDM range (not kernel static range)
     auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);
     if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
-        ker::mod::dbg::log("vmem: task PID %x has corrupted pagemap ptr 0x%x", task->pid, pm_addr);
+        log::error("task PID %x has corrupted pagemap ptr 0x%x", task->pid, pm_addr);
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
 
@@ -157,7 +157,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         // Find a suitable range
         vaddr = find_free_range(task, size, hint);
         if (vaddr == 0) {
-            ker::mod::dbg::log("vmem: no free range found for size %x", size);
+            log::warn("no free range found for size %x", size);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
     }
@@ -171,7 +171,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     // Allocate all physical pages at once for efficiency
     void* phys_pages = ker::mod::mm::phys::page_alloc(size);
     if (phys_pages == nullptr) {
-        ker::mod::dbg::log("vmem: out of physical memory for %llu pages", num_pages);
+        log::error("out of physical memory for %llu pages", num_pages);
         ker::mod::mm::phys::dump_page_allocations_oom();
         // TODO: implement process termination on OOM here for now dump will HCF
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -266,7 +266,7 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         }
     }
 #ifdef VMEM_DEBUG
-    ker::mod::dbg::log("vmem: freed %x bytes at %p", size, addr);
+    log::debug("freed %x bytes at %p", size, addr);
 #endif
     return 0;  // Success
 }
@@ -402,16 +402,21 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
         }
 
         default:
-            ker::mod::dbg::log("vmem: invalid operation %llu", op);
+            log::warn("invalid operation %llu", op);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 }
 
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
-    if (std::cmp_not_equal(fd, (-1))) {
-        return file_allocate(hint, size, prot, flags, static_cast<int>(fd), offset);
+    if ((flags & ker::abi::vmem::MAP_ANONYMOUS) != 0) {
+        return anon_allocate(hint, size, prot, flags);
     }
-    return anon_allocate(hint, size, prot, flags);
+
+    if (fd > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    return file_allocate(hint, size, prot, flags, static_cast<int>(fd), offset);
 }
 
 }  // namespace ker::syscall::vmem

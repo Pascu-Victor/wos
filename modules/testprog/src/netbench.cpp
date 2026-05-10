@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <print>
+#include <vector>
 
 namespace {
 
@@ -181,32 +182,25 @@ void fill_payload(uint8_t* buf, uint32_t len) {
 }
 
 auto handle_pingpong_server(int client_fd, const BenchHeader& header) -> bool {
-    auto* buf = static_cast<uint8_t*>(std::malloc(header.payload_size));
-    if (buf == nullptr) {
-        return false;
-    }
+    std::vector<uint8_t> buf(header.payload_size);
 
     bool ok = true;
     for (uint32_t i = 0; i < header.iterations; ++i) {
-        ok = recv_all(client_fd, buf, header.payload_size);
+        ok = recv_all(client_fd, buf.data(), buf.size());
         if (!ok) {
             break;
         }
-        ok = send_all(client_fd, buf, header.payload_size);
+        ok = send_all(client_fd, buf.data(), buf.size());
         if (!ok) {
             break;
         }
     }
 
-    std::free(buf);
     return ok;
 }
 
 auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
-    auto* buf = static_cast<uint8_t*>(std::malloc(header.payload_size));
-    if (buf == nullptr) {
-        return false;
-    }
+    std::vector<uint8_t> buf(header.payload_size);
 
     uint64_t remaining = header.total_bytes;
     bool ok = true;
@@ -215,7 +209,7 @@ auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
         if (remaining < chunk) {
             chunk = static_cast<uint32_t>(remaining);
         }
-        ok = recv_all(client_fd, buf, chunk);
+        ok = recv_all(client_fd, buf.data(), chunk);
         if (!ok) {
             break;
         }
@@ -227,7 +221,6 @@ auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
         ok = send_all(client_fd, &ack, sizeof(ack));
     }
 
-    std::free(buf);
     return ok;
 }
 
@@ -370,22 +363,18 @@ auto run_client(int argc, char** argv) -> int {
         return 1;
     }
 
-    auto* payload = static_cast<uint8_t*>(std::malloc(options.payload_size));
-    if (payload == nullptr) {
-        close(FD);
-        return 1;
-    }
-    fill_payload(payload, options.payload_size);
+    std::vector<uint8_t> payload(options.payload_size);
+    fill_payload(payload.data(), options.payload_size);
 
     uint64_t const START_US = wallclock_us();
     bool ok = true;
     if (options.mode == BenchMode::K_PINGPONG) {
         for (uint32_t i = 0; i < options.iterations; ++i) {
-            ok = send_all(FD, payload, options.payload_size);
+            ok = send_all(FD, payload.data(), payload.size());
             if (!ok) {
                 break;
             }
-            ok = recv_all(FD, payload, options.payload_size);
+            ok = recv_all(FD, payload.data(), payload.size());
             if (!ok) {
                 break;
             }
@@ -397,7 +386,7 @@ auto run_client(int argc, char** argv) -> int {
             if (remaining < chunk) {
                 chunk = static_cast<uint32_t>(remaining);
             }
-            ok = send_all(FD, payload, chunk);
+            ok = send_all(FD, payload.data(), chunk);
             if (!ok) {
                 break;
             }
@@ -410,7 +399,6 @@ auto run_client(int argc, char** argv) -> int {
     }
     uint64_t const ELAPSED_US = wallclock_us() - START_US;
 
-    std::free(payload);
     close(FD);
 
     if (!ok) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/acpi/apic/apic.hpp>
@@ -18,24 +19,22 @@ struct InterruptFrame {
     uint64_t ss;
 } __attribute__((packed));
 
-enum : uint64_t {
-    IRQ0 = 32,
-    IRQ1 = 33,
-    IRQ2 = 34,
-    IRQ3 = 35,
-    IRQ4 = 36,
-    IRQ5 = 37,
-    IRQ6 = 38,
-    IRQ7 = 39,
-    IRQ8 = 40,
-    IRQ9 = 41,
-    IRQ10 = 42,
-    IRQ11 = 43,
-    IRQ12 = 44,
-    IRQ13 = 45,
-    IRQ14 = 46,
-    IRQ15 = 47
-};
+inline constexpr uint8_t IRQ0 = 32;
+inline constexpr uint8_t IRQ1 = 33;
+inline constexpr uint8_t IRQ2 = 34;
+inline constexpr uint8_t IRQ3 = 35;
+inline constexpr uint8_t IRQ4 = 36;
+inline constexpr uint8_t IRQ5 = 37;
+inline constexpr uint8_t IRQ6 = 38;
+inline constexpr uint8_t IRQ7 = 39;
+inline constexpr uint8_t IRQ8 = 40;
+inline constexpr uint8_t IRQ9 = 41;
+inline constexpr uint8_t IRQ10 = 42;
+inline constexpr uint8_t IRQ11 = 43;
+inline constexpr uint8_t IRQ12 = 44;
+inline constexpr uint8_t IRQ13 = 45;
+inline constexpr uint8_t IRQ14 = 46;
+inline constexpr uint8_t IRQ15 = 47;
 
 using interruptHandler_t = void (*)(cpu::GPRegs gpr, InterruptFrame frame);
 
@@ -43,7 +42,7 @@ extern "C" {
 void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame);
 }
 
-#define IS_IRQ(vector) ((vector) >= IRQ0 && (vector) <= IRQ15)
+[[nodiscard]] constexpr auto is_irq(uint64_t vector) -> bool { return vector >= IRQ0 && vector <= IRQ15; }
 
 void set_interrupt_handler(uint8_t int_num, interruptHandler_t handler);
 void remove_interrupt_handler(uint8_t int_num);

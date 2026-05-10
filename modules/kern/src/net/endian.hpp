@@ -39,7 +39,7 @@ constexpr auto cpu_to_be64(uint64_t cpu) -> uint64_t { return __builtin_bswap64(
 // ============================================================================
 
 struct Be16 {
-    uint16_t raw;  // stored in big-endian byte order
+    uint16_t raw{};  // stored in big-endian byte order
 
     Be16() = default;
     constexpr explicit Be16(uint16_t be_val) : raw(be_val) {}
@@ -55,7 +55,7 @@ struct Be16 {
 } __attribute__((packed));
 
 struct Be32 {
-    uint32_t raw;  // stored in big-endian byte order
+    uint32_t raw{};  // stored in big-endian byte order
 
     Be32() = default;
     constexpr explicit Be32(uint32_t be_val) : raw(be_val) {}
@@ -68,7 +68,7 @@ struct Be32 {
 } __attribute__((packed));
 
 struct Be64 {
-    uint64_t raw;  // stored in big-endian byte order
+    uint64_t raw{};  // stored in big-endian byte order
 
     Be64() = default;
     constexpr explicit Be64(uint64_t be_val) : raw(be_val) {}

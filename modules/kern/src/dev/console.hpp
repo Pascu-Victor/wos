@@ -5,11 +5,11 @@
 namespace ker::dev::console {
 
 // Initialize console devices (serial and VGA)
-void console_init();
+auto console_init() -> void;
 
 // Get console device instances
-Device* get_serial_console();
-Device* get_vga_console();
-Device* get_console();  // Main console (currently points to serial)
+auto get_serial_console() -> Device*;
+auto get_vga_console() -> Device*;
+auto get_console() -> Device*;  // Main console (currently points to serial)
 
 }  // namespace ker::dev::console

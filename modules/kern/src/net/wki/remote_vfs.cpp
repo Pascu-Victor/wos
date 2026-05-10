@@ -8,10 +8,12 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/wire.hpp>
@@ -35,6 +37,18 @@ namespace ker::net::wki {
 // -------------------------------------------------------------------------------
 
 namespace {
+
+template <typename T, size_t N>
+auto raw_data(T (&buffer)[N]) -> T* {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+    return &buffer[0];
+}
+
+template <typename T, size_t N>
+auto raw_data(const T (&buffer)[N]) -> const T* {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+    return &buffer[0];
+}
 
 auto transport_supports_vfs_write_push_rdma(const WkiTransport* transport) -> bool {
     if (transport == nullptr || transport->name == nullptr) {
@@ -261,8 +275,8 @@ void build_export_name(char* out, size_t out_size, const char* export_path) {
     if (ker::mod::sched::has_run_queues()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
-            size_t const ROOT_LEN = std::strlen(task->root);
-            if (ROOT_LEN > 1 && std::strncmp(export_path, task->root, ROOT_LEN) == 0 &&
+            size_t const ROOT_LEN = std::strlen(task->root.data());
+            if (ROOT_LEN > 1 && std::strncmp(export_path, task->root.data(), ROOT_LEN) == 0 &&
                 (export_path[ROOT_LEN] == '\0' || export_path[ROOT_LEN] == '/')) {
                 visible_path = export_path + ROOT_LEN;
                 if (*visible_path == '\0') {
@@ -284,10 +298,10 @@ bool path_crosses_remote_mount(const char* path) {
         return false;
     }
 
-    char resolved_path[512] = {};
+    std::array<char, 512> resolved_path{};
     const char* mount_path = path;
-    if (ker::vfs::resolve_mount_path(path, resolved_path, sizeof(resolved_path)) == 0) {
-        mount_path = resolved_path;
+    if (ker::vfs::resolve_mount_path(path, resolved_path.data(), resolved_path.size()) == 0) {
+        mount_path = resolved_path.data();
     }
 
     auto* mp = ker::vfs::find_mount_point(mount_path);
@@ -308,16 +322,16 @@ bool path_crosses_recursive_self_alias(const char* path) {
         return false;
     }
 
-    constexpr char HOST_PREFIX[] = "/wki/host";
-    constexpr size_t HOST_PREFIX_LEN = sizeof(HOST_PREFIX) - 1;
+    constexpr const char* HOST_PREFIX = "/wki/host";
+    constexpr size_t HOST_PREFIX_LEN = 9;
     if (std::strncmp(path, HOST_PREFIX, HOST_PREFIX_LEN) == 0 && (path[HOST_PREFIX_LEN] == '\0' || path[HOST_PREFIX_LEN] == '/')) {
         return true;
     }
 
-    char self_prefix[WKI_HOSTNAME_MAX + 6] = {};
-    std::snprintf(self_prefix, sizeof(self_prefix), "/wki/%s", g_wki.local_hostname);
-    size_t const SELF_PREFIX_LEN = std::strlen(self_prefix);
-    return std::strncmp(path, self_prefix, SELF_PREFIX_LEN) == 0 && (path[SELF_PREFIX_LEN] == '\0' || path[SELF_PREFIX_LEN] == '/');
+    std::array<char, WKI_HOSTNAME_MAX + 6> self_prefix{};
+    std::snprintf(self_prefix.data(), self_prefix.size(), "/wki/%s", raw_data(g_wki.local_hostname));
+    size_t const SELF_PREFIX_LEN = std::strlen(self_prefix.data());
+    return std::strncmp(path, self_prefix.data(), SELF_PREFIX_LEN) == 0 && (path[SELF_PREFIX_LEN] == '\0' || path[SELF_PREFIX_LEN] == '/');
 }
 
 bool path_crosses_recursive_wki_boundary(const char* path) {
@@ -337,7 +351,7 @@ bool should_hide_recursive_wki_entry(const RemoteFileContext* ctx, const ker::vf
         return true;
     }
 
-    return ctx->recursive_wki_hostname[0] != '\0' && std::strcmp(entry.d_name.data(), ctx->recursive_wki_hostname) == 0;
+    return ctx->recursive_wki_hostname.front() != '\0' && std::strcmp(entry.d_name.data(), ctx->recursive_wki_hostname.data()) == 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -457,7 +471,7 @@ auto find_vfs_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> Prox
 
 auto find_vfs_proxy_by_mount(const char* mount_path) -> ProxyVfsState* {
     for (auto& p : g_vfs_proxies) {
-        if (p->active && strncmp(static_cast<const char*>(p->local_mount_path), mount_path, VFS_EXPORT_PATH_LEN) == 0) {
+        if (p->active && strncmp(p->local_mount_path.data(), mount_path, p->local_mount_path.size()) == 0) {
             return p.get();
         }
     }
@@ -492,8 +506,8 @@ void reset_readlink_cache_entry(ProxyVfsState::ReadlinkCacheEntry& entry) {
     entry.status = 0;
     entry.target_len = 0;
     entry.cached_at_us = 0;
-    entry.path[0] = '\0';
-    entry.target[0] = '\0';
+    entry.path.front() = '\0';
+    entry.target.front() = '\0';
 }
 
 void invalidate_readlink_cache_locked(ProxyVfsState* state) {
@@ -974,7 +988,7 @@ auto vfs_read_retry_timeout_us(uint16_t op_id, uint32_t attempt) -> uint64_t {
     if (index >= VFS_READLINK_TIMEOUTS_US.size()) {
         index = VFS_READLINK_TIMEOUTS_US.size() - 1;
     }
-    return VFS_READLINK_TIMEOUTS_US[index];
+    return *std::next(VFS_READLINK_TIMEOUTS_US.begin(), static_cast<ptrdiff_t>(index));
 }
 
 auto vfs_read_status_is_retryable(int status) -> bool {
@@ -1346,7 +1360,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             auto available = static_cast<uint16_t>(rc->cached_len - cache_off);
             auto to_copy = static_cast<uint16_t>(std::min(static_cast<uint32_t>(available), remaining));
 
-            memcpy(dest, &rc->data[cache_off], to_copy);
+            memcpy(dest, rc->data.data() + cache_off, to_copy);
             dest += to_copy;
             cur_offset += to_copy;
             remaining -= to_copy;
@@ -1465,7 +1479,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
         if (IS_SEQUENTIAL && space > 0) {
             // Buffer this write
             auto to_buffer = static_cast<uint16_t>(std::min(static_cast<uint32_t>(space), remaining));
-            memcpy(&wb->data[wb->pending_len], src, to_buffer);
+            memcpy(wb->data.data() + wb->pending_len, src, to_buffer);
             if (wb->pending_len == 0) {
                 wb->pending_offset = cur_offset;
             }
@@ -1768,6 +1782,7 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
     .vfs_truncate = remote_vfs_truncate,
     .vfs_poll_check = nullptr,
     .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
 };
 
 }  // namespace
@@ -1788,7 +1803,9 @@ void wki_remote_vfs_init() {
 // Server Side - VFS Export Management
 // -------------------------------------------------------------------------------
 
-static auto wki_remote_vfs_export_add_internal(const char* export_path, const char* name, uint32_t preferred_resource_id) -> uint32_t {
+namespace {
+
+auto wki_remote_vfs_export_add_internal(const char* export_path, const char* name, uint32_t preferred_resource_id) -> uint32_t {
     if (export_path == nullptr || name == nullptr) {
         return 0;
     }
@@ -1797,7 +1814,7 @@ static auto wki_remote_vfs_export_add_internal(const char* export_path, const ch
 
     // Check if this path is already exported (prevent duplicates)
     for (const auto& existing : g_vfs_exports) {
-        if (existing.active && strcmp(existing.export_path, export_path) == 0) {
+        if (existing.active && strcmp(raw_data(existing.export_path), export_path) == 0) {
             // Already exported - return existing resource_id
             uint32_t const EXISTING_ID = existing.resource_id;
             s_vfs_lock.unlock();
@@ -1820,24 +1837,25 @@ static auto wki_remote_vfs_export_add_internal(const char* export_path, const ch
     if (path_len >= VFS_EXPORT_PATH_LEN) {
         path_len = VFS_EXPORT_PATH_LEN - 1;
     }
-    memcpy(static_cast<void*>(exp.export_path), export_path, path_len);
+    memcpy(static_cast<void*>(raw_data(exp.export_path)), export_path, path_len);
     exp.export_path[path_len] = '\0';
 
     size_t name_len = strlen(name);
     if (name_len >= VFS_EXPORT_NAME_LEN) {
         name_len = VFS_EXPORT_NAME_LEN - 1;
     }
-    memcpy(static_cast<void*>(exp.name), name, name_len);
+    memcpy(static_cast<void*>(raw_data(exp.name)), name, name_len);
     exp.name[name_len] = '\0';
 
     g_vfs_exports.push_back(exp);
     uint32_t const RESULT_ID = exp.resource_id;
     s_vfs_lock.unlock();
 
-    ker::mod::dbg::log("[WKI] VFS export added: %s -> %s (resource_id=%u)", static_cast<const char*>(exp.name),
-                       static_cast<const char*>(exp.export_path), RESULT_ID);
+    ker::mod::dbg::log("[WKI] VFS export added: %s -> %s (resource_id=%u)", raw_data(exp.name), raw_data(exp.export_path), RESULT_ID);
     return RESULT_ID;
 }
+
+}  // namespace
 
 auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t {
     return wki_remote_vfs_export_add_internal(export_path, name, 0);
@@ -1868,19 +1886,16 @@ void advertise_exports_to_peer(uint16_t peer_node) {
             s_vfs_lock.unlock();
             break;
         }
-        auto& exp = g_vfs_exports[idx];
+        auto& exp = *std::next(g_vfs_exports.begin(), static_cast<ptrdiff_t>(idx));
         if (!exp.active) {
             s_vfs_lock.unlock();
             continue;
         }
 
         // Build ResourceAdvertPayload + name under lock
-        uint8_t name_len = 0;
-        while (name_len < 63 && exp.name[name_len] != '\0') {
-            name_len++;
-        }
+        auto const NAME_LEN = static_cast<uint8_t>(std::min<size_t>(std::strlen(raw_data(exp.name)), 63U));
 
-        auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertPayload) + name_len);
+        auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertPayload) + NAME_LEN);
         std::array<uint8_t, sizeof(ResourceAdvertPayload) + 64> buf{};
 
         auto* adv = reinterpret_cast<ResourceAdvertPayload*>(buf.data());
@@ -1888,8 +1903,8 @@ void advertise_exports_to_peer(uint16_t peer_node) {
         adv->resource_type = static_cast<uint16_t>(ResourceType::VFS);
         adv->resource_id = exp.resource_id;
         adv->flags = 0;
-        adv->name_len = name_len;
-        memcpy(buf.data() + sizeof(ResourceAdvertPayload), static_cast<const void*>(exp.name), name_len);
+        adv->name_len = NAME_LEN;
+        memcpy(buf.data() + sizeof(ResourceAdvertPayload), static_cast<const void*>(raw_data(exp.name)), NAME_LEN);
         s_vfs_lock.unlock();
 
         wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
@@ -1917,7 +1932,7 @@ void wki_remote_vfs_advertise_exports() {
     }
 
     for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-        WkiPeer const* peer = &g_wki.peers[p];
+        WkiPeer const* peer = &g_wki.peers[p];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
         if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
             continue;
         }
@@ -1931,6 +1946,7 @@ void wki_remote_vfs_advertise_exports() {
 
 namespace detail {
 
+// NOLINTNEXTLINE(readability-function-size): Protocol opcode dispatcher.
 void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,
                    const uint8_t* data, uint16_t data_len) {
     const auto REQ_COOKIE = static_cast<uint16_t>(hdr->seq_num & UINT16_MAX);
@@ -3195,8 +3211,8 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     if (path_len >= VFS_EXPORT_PATH_LEN) {
         path_len = VFS_EXPORT_PATH_LEN - 1;
     }
-    memcpy(static_cast<void*>(state->local_mount_path), local_mount_path, path_len);
-    state->local_mount_path[path_len] = '\0';
+    memcpy(static_cast<void*>(state->local_mount_path.data()), local_mount_path, path_len);
+    *std::next(state->local_mount_path.begin(), static_cast<ptrdiff_t>(path_len)) = '\0';
 
     WkiWaitEntry wait = {};
     state->attach_wait_entry = &wait;
@@ -3383,10 +3399,10 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     // try both the current-root-resolved path and the raw mount path.  Never use
     // longest-prefix lookup here: if the exact mount is temporarily invisible,
     // that can return the containing XFS root and corrupt its private_data.
-    char resolved_mount[512] = {};
+    std::array<char, 512> resolved_mount{};
     bool configured = false;
-    if (ker::vfs::resolve_mount_path(local_mount_path, resolved_mount, sizeof(resolved_mount)) == 0) {
-        configured = ker::vfs::configure_mount_point_exact(resolved_mount, ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
+    if (ker::vfs::resolve_mount_path(local_mount_path, resolved_mount.data(), resolved_mount.size()) == 0) {
+        configured = ker::vfs::configure_mount_point_exact(resolved_mount.data(), ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
     }
     if (!configured) {
         configured = ker::vfs::configure_mount_point_exact(local_mount_path, ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
@@ -3457,12 +3473,12 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
             continue;
         }
 
-        size_t const MOUNT_LEN = std::strlen(proxy->local_mount_path);
+        size_t const MOUNT_LEN = std::strlen(proxy->local_mount_path.data());
         if (MOUNT_LEN + 1 > out_size) {
             break;
         }
 
-        std::memcpy(out, proxy->local_mount_path, MOUNT_LEN + 1);
+        std::memcpy(out, proxy->local_mount_path.data(), MOUNT_LEN + 1);
         s_vfs_lock.unlock();
         return true;
     }
@@ -3473,14 +3489,18 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
 
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active) {
+    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
         return nullptr;
     }
 
     // Build request: {flags:u32, mode:u32, path_len:u16, path[N]}
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > UINT16_MAX - 10U) {
+        return nullptr;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
     auto req_data_len = static_cast<uint16_t>(10 + path_len);
-    auto* req_data = new (std::nothrow) uint8_t[req_data_len + 1];
+    auto* req_data = new (std::nothrow) uint8_t[req_data_len];
     if (req_data == nullptr) {
         return nullptr;
     }
@@ -3491,7 +3511,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     memcpy(req_data + 4, &u_mode, sizeof(uint32_t));
     memcpy(req_data + 8, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 10), fs_relative_path);
+        memcpy(req_data + 10, fs_relative_path, path_len);
     }
 
     // Response: {remote_fd:i32, is_dir:u8} = 5 bytes
@@ -3529,8 +3549,9 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         ctx->hide_recursive_wki_entries = true;
         const char* owner_hostname = wki_peer_get_hostname(state->owner_node);
         if (owner_hostname != nullptr) {
-            std::strncpy(ctx->recursive_wki_hostname, owner_hostname, sizeof(ctx->recursive_wki_hostname) - 1);
-            ctx->recursive_wki_hostname[sizeof(ctx->recursive_wki_hostname) - 1] = '\0';
+            size_t const HOSTNAME_LEN = std::min(std::strlen(owner_hostname), ctx->recursive_wki_hostname.size() - 1);
+            std::memcpy(ctx->recursive_wki_hostname.data(), owner_hostname, HOSTNAME_LEN);
+            *std::next(ctx->recursive_wki_hostname.begin(), static_cast<ptrdiff_t>(HOSTNAME_LEN)) = '\0';
         }
     }
 
@@ -3551,19 +3572,23 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
 
 auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || statbuf == nullptr) {
+    if (state == nullptr || !state->active || fs_relative_path == nullptr || statbuf == nullptr) {
         return -1;
     }
 
     // Build request: {path_len:u16, path[N]}
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
-    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     std::array<uint8_t, 514> req_stack{};  // NOLINT(modernize-avoid-c-arrays)
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 2U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     uint8_t* req_data = req_stack.data();
 
     memcpy(req_data, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
+        memcpy(req_data + 2, fs_relative_path, path_len);
     }
 
     // Use a kernel-stack buffer for the proxy response.  The caller's statbuf
@@ -3579,21 +3604,25 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
 
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active) {
+    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
         return -1;
     }
 
     // Build request: {mode:u32, path_len:u16, path[N]}
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
-    auto req_data_len = static_cast<uint16_t>(6 + path_len);
     std::array<uint8_t, 518> req_stack{};  // NOLINT(modernize-avoid-c-arrays)
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 6U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(6 + path_len);
     uint8_t* req_data = req_stack.data();
 
     auto u_mode = static_cast<uint32_t>(mode);
     memcpy(req_data, &u_mode, sizeof(uint32_t));
     memcpy(req_data + 4, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 6), fs_relative_path);
+        memcpy(req_data + 6, fs_relative_path, path_len);
     }
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len, nullptr, 0);
@@ -3606,18 +3635,22 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
 // Consumer side: unlink a file on the remote server
 auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active) {
+    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
         return -1;
     }
 
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
-    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     std::array<uint8_t, 514> req_stack{};
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 2U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     uint8_t* req_data = req_stack.data();
 
     memcpy(req_data, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
+        memcpy(req_data + 2, fs_relative_path, path_len);
     }
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len, nullptr, 0);
@@ -3630,18 +3663,22 @@ auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_pat
 // Consumer side: remove a directory on the remote server
 auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active) {
+    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
         return -1;
     }
 
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
-    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     std::array<uint8_t, 514> req_stack{};
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 2U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     uint8_t* req_data = req_stack.data();
 
     memcpy(req_data, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
+        memcpy(req_data + 2, fs_relative_path, path_len);
     }
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len, nullptr, 0);
@@ -3654,23 +3691,28 @@ auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path
 // Consumer side: rename a file/directory on the remote server
 auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active) {
+    if (state == nullptr || !state->active || old_fs_path == nullptr || new_fs_path == nullptr) {
         return -1;
     }
 
-    auto old_len = static_cast<uint16_t>(strlen(old_fs_path));
-    auto new_len = static_cast<uint16_t>(strlen(new_fs_path));
-    auto req_data_len = static_cast<uint16_t>(4 + old_len + new_len);
     std::array<uint8_t, 1028> req_stack{};
+    size_t const OLD_LEN = strlen(old_fs_path);
+    size_t const NEW_LEN = strlen(new_fs_path);
+    if (OLD_LEN > UINT16_MAX || NEW_LEN > UINT16_MAX || OLD_LEN + NEW_LEN > req_stack.size() - 4U) {
+        return -ENAMETOOLONG;
+    }
+    auto old_len = static_cast<uint16_t>(OLD_LEN);
+    auto new_len = static_cast<uint16_t>(NEW_LEN);
+    auto req_data_len = static_cast<uint16_t>(4 + old_len + new_len);
     uint8_t* req_data = req_stack.data();
 
     memcpy(req_data, &old_len, sizeof(uint16_t));
     if (old_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 2), old_fs_path);
+        memcpy(req_data + 2, old_fs_path, old_len);
     }
     memcpy(req_data + 2 + old_len, &new_len, sizeof(uint16_t));
     if (new_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 4 + old_len), new_fs_path);
+        memcpy(req_data + 4 + old_len, new_fs_path, new_len);
     }
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len, nullptr, 0);
@@ -3703,14 +3745,18 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
     }
 
     // Build request: {path_len:u16, path[N]}
-    auto path_len = static_cast<uint16_t>(strlen(fs_relative_path));
-    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     std::array<uint8_t, 514> req_stack{};
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 2U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(2 + path_len);
     uint8_t* req_data = req_stack.data();
 
     memcpy(req_data, &path_len, sizeof(uint16_t));
     if (path_len > 0) {
-        strcpy(reinterpret_cast<char*>(req_data + 2), fs_relative_path);
+        memcpy(req_data + 2, fs_relative_path, path_len);
     }
 
     // Response: {target_len:u16, target[]}
@@ -3912,7 +3958,9 @@ void wki_remote_vfs_gc_stale_fds() {
 // D9: Auto-Discover Exportable Mount Points
 // -------------------------------------------------------------------------------
 
-static void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports) {
+namespace {
+
+void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports) {
     size_t const MOUNT_COUNT = ker::vfs::get_mount_count();
     for (size_t i = 0; i < MOUNT_COUNT; i++) {
         auto* mp = ker::vfs::get_mount_at(i);
@@ -3927,13 +3975,13 @@ static void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_e
             continue;
         }
 
-        char export_name[VFS_EXPORT_NAME_LEN] = {};
-        build_export_name(export_name, sizeof(export_name), mp->path);
+        std::array<char, VFS_EXPORT_NAME_LEN> export_name{};
+        build_export_name(export_name.data(), export_name.size(), mp->path);
 
         // Check if this visible export name is already exported.
         bool already_exported = false;
         for (const auto& exp : g_vfs_exports) {
-            if (exp.active && strncmp(static_cast<const char*>(exp.name), export_name, VFS_EXPORT_NAME_LEN) == 0) {
+            if (exp.active && strncmp(raw_data(exp.name), export_name.data(), export_name.size()) == 0) {
                 already_exported = true;
                 break;
             }
@@ -3946,13 +3994,15 @@ static void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_e
         // namespace. After pivot_root("/rootfs", ...), this yields "/",
         // "/boot", and "/oldroot", which resolve correctly for all tasks whose
         // root has been updated to "/rootfs".
-        uint32_t const PRESERVED_RESOURCE_ID = take_preserved_export_id(stale_exports, export_name);
-        uint32_t const RESOURCE_ID = wki_remote_vfs_export_add_internal(mp->path, export_name, PRESERVED_RESOURCE_ID);
+        uint32_t const PRESERVED_RESOURCE_ID = take_preserved_export_id(stale_exports, export_name.data());
+        uint32_t const RESOURCE_ID = wki_remote_vfs_export_add_internal(mp->path, export_name.data(), PRESERVED_RESOURCE_ID);
         if (RESOURCE_ID != 0) {
-            wki_dev_server_refresh_vfs_binding(RESOURCE_ID, mp->path, export_name);
+            wki_dev_server_refresh_vfs_binding(RESOURCE_ID, mp->path, export_name.data());
         }
     }
 }
+
+}  // namespace
 
 void wki_remote_vfs_auto_discover() {
     if (!g_remote_vfs_initialized) {
@@ -4003,7 +4053,7 @@ void wki_remote_vfs_rebuild_exports() {
         withdraw.name_len = 0;
 
         for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-            WkiPeer const* peer = &g_wki.peers[p];
+            WkiPeer const* peer = &g_wki.peers[p];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
                 continue;
             }
@@ -4046,7 +4096,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
 
         if (p->op_pending.load(std::memory_order_acquire)) {
             ker::mod::dbg::log("[WKI] VFS op FENCE_CLEANUP: node=0x%04x ch=%u op=%u seq=%u mount=%s", p->owner_node, p->assigned_channel,
-                               p->op_expected_id, p->op_expected_seq, static_cast<const char*>(p->local_mount_path));
+                               p->op_expected_id, p->op_expected_seq, p->local_mount_path.data());
             p->op_status = -1;
             p->op_expected_id = 0;
             p->op_expected_seq = 0;
@@ -4067,7 +4117,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             wki_channel_close(ch);
         }
 
-        ker::mod::dbg::log("[WKI] Remote VFS proxy fenced: %s node=0x%04x", static_cast<const char*>(p->local_mount_path), node_id);
+        ker::mod::dbg::log("[WKI] Remote VFS proxy fenced: %s node=0x%04x", p->local_mount_path.data(), node_id);
         p->active = false;
     }
 }

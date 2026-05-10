@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -15,8 +16,10 @@
 
 namespace ker::net::proto {
 
+using log = ker::mod::dbg::logger<"tcp">;
+
 // Defined in tcp.cpp (namespace scope, not anonymous)
-extern TcpHashBucket tcb_hash[];
+extern std::array<TcpHashBucket, TCB_HASH_SIZE> tcb_hash;
 extern volatile uint64_t tcp_ms_counter;
 
 // Timer list: only TCBs with pending timer work are scanned.
@@ -58,7 +61,8 @@ void timer_lock_acquire() {
 
 void timer_lock_release() { timer_lock.unlock(); }
 
-auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* deferred, size_t deferred_count) -> size_t {
+auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, std::array<DeferredRetransmit, MAX_DEFERRED_RETRANSMITS>& deferred,
+                        size_t deferred_count) -> size_t {
     entry->retries++;
     entry->send_time_ms = tcp_now_ms();
 
@@ -78,12 +82,13 @@ auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, DeferredRetransmit* d
     pkt->data = pkt->storage.data() + (entry->pkt->data - entry->pkt->storage.data());
     pkt->len = entry->pkt->len;
 
-    deferred[deferred_count].pkt = pkt;
-    deferred[deferred_count].local_ip = cb->local_ip;
-    deferred[deferred_count].remote_ip = cb->remote_ip;
-    deferred[deferred_count].seq_end = entry->seq + static_cast<uint32_t>(entry->len);
+    auto& deferred_entry = deferred.at(deferred_count);
+    deferred_entry.pkt = pkt;
+    deferred_entry.local_ip = cb->local_ip;
+    deferred_entry.remote_ip = cb->remote_ip;
+    deferred_entry.seq_end = entry->seq + static_cast<uint32_t>(entry->len);
     tcp_cb_acquire(cb);
-    deferred[deferred_count].cb = cb;
+    deferred_entry.cb = cb;
     return deferred_count + 1;
 }
 
@@ -191,19 +196,19 @@ void tcp_timer_tick(uint64_t now_ms) {
             timer_list_len++;
         }
         timer_lock_release();
-        ker::mod::dbg::log("[net] pool_free=%zu/%zu timer_list=%zu timer_lock_contentions=%lu", ker::net::pkt_pool_free_count(),
-                           ker::net::pkt_pool_size(), timer_list_len, timer_lock_contentions.load(std::memory_order_relaxed));
+        log::debug("pool_free=%zu/%zu timer_list=%zu timer_lock_contentions=%lu", ker::net::pkt_pool_free_count(),
+                   ker::net::pkt_pool_size(), timer_list_len, timer_lock_contentions.load(std::memory_order_relaxed));
     }
 #endif
 
-    DeferredRetransmit deferred[MAX_DEFERRED_RETRANSMITS] = {};
+    std::array<DeferredRetransmit, MAX_DEFERRED_RETRANSMITS> deferred{};
     size_t deferred_count = 0;
-    Socket* sockets_to_wake[MAX_DEFERRED_RETRANSMITS];
+    std::array<Socket*, MAX_DEFERRED_RETRANSMITS> sockets_to_wake{};
     size_t wake_count = 0;
 
     // Snapshot work under timer_lock; process under cb->lock.
     constexpr size_t MAX_BATCH = 32;
-    TcpCB* batch[MAX_BATCH];
+    std::array<TcpCB*, MAX_BATCH> batch{};
     size_t batch_count = 0;
 
     TcpCB* to_free = nullptr;
@@ -260,7 +265,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 
         if (needs_work) {
             tcp_cb_acquire(cb);
-            batch[batch_count++] = cb;
+            batch.at(batch_count++) = cb;
         }
 
         if (cb->retransmit_head != nullptr) {
@@ -294,7 +299,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         // hash_next still has the original bucket chain.
         uint32_t const IDX =
             tcp_hash_4tuple(to_free->local_ip, to_free->local_port, to_free->remote_ip, to_free->remote_port) % TCB_HASH_SIZE;
-        auto& bucket = tcb_hash[IDX];
+        auto& bucket = tcb_hash.at(IDX);
         bool removed_from_hash = false;
         bucket.lock.lock();
         TcpCB** hp = &bucket.head;
@@ -318,7 +323,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 
     constexpr size_t MAX_TIMER_BATCH_ENTRIES = 4;
     for (size_t i = 0; i < batch_count; i++) {
-        TcpCB* rcb = batch[i];
+        TcpCB* rcb = batch.at(i);
         uint64_t const RCB_LOCK_FLAGS = rcb->lock.lock_irqsave();
 
         if (rcb->delayed_ack_deadline != 0 && now_ms >= rcb->delayed_ack_deadline && rcb->state == TcpState::ESTABLISHED &&
@@ -330,7 +335,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
             if (ack_pkt != nullptr) {
                 tcp_cb_acquire(rcb);
-                deferred[deferred_count++] = {
+                deferred.at(deferred_count++) = {
                     .pkt = ack_pkt,
                     .local_ip = ack_local,
                     .remote_ip = ack_remote,
@@ -349,7 +354,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
             if (ack_pkt != nullptr) {
                 tcp_cb_acquire(rcb);
-                deferred[deferred_count++] = {
+                deferred.at(deferred_count++) = {
                     .pkt = ack_pkt,
                     .local_ip = ack_local,
                     .remote_ip = ack_remote,
@@ -377,14 +382,14 @@ void tcp_timer_tick(uint64_t now_ms) {
                 }
                 rcb->retransmit_tail = nullptr;
                 if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
-                    sockets_to_wake[wake_count++] = rcb->socket;
+                    sockets_to_wake.at(wake_count++) = rcb->socket;
                 }
             } else {
                 uint32_t ka_local = 0;
                 uint32_t ka_remote = 0;
                 auto* ka_pkt = tcp_build_keepalive_probe(rcb, &ka_local, &ka_remote);
                 if (ka_pkt != nullptr) {
-                    deferred[deferred_count++] = {
+                    deferred.at(deferred_count++) = {
                         .pkt = ka_pkt,
                         .local_ip = ka_local,
                         .remote_ip = ka_remote,
@@ -415,7 +420,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                     }
                     rcb->retransmit_tail = nullptr;
                     if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
-                        sockets_to_wake[wake_count++] = rcb->socket;
+                        sockets_to_wake.at(wake_count++) = rcb->socket;
                     }
                 } else {
                     deferred_count = retransmit_segment(rcb, entry, deferred, deferred_count);
@@ -449,25 +454,26 @@ void tcp_timer_tick(uint64_t now_ms) {
     // Send deferred packets outside all locks.
     for (size_t i = 0; i < deferred_count; i++) {
         int tx_res = 0;
-        if (deferred[i].seq_end != 0 && deferred[i].cb != nullptr) {
-            uint32_t const UNA = deferred[i].cb->snd_una;
-            if (!tcp_seq_after(deferred[i].seq_end, UNA)) {
-                pkt_free(deferred[i].pkt);
-                tcp_cb_release(deferred[i].cb);
-                if (deferred[i].ack_cb != nullptr) {
-                    tcp_cb_release(deferred[i].ack_cb);
+        auto& deferred_entry = deferred.at(i);
+        if (deferred_entry.seq_end != 0 && deferred_entry.cb != nullptr) {
+            uint32_t const UNA = deferred_entry.cb->snd_una;
+            if (!tcp_seq_after(deferred_entry.seq_end, UNA)) {
+                pkt_free(deferred_entry.pkt);
+                tcp_cb_release(deferred_entry.cb);
+                if (deferred_entry.ack_cb != nullptr) {
+                    tcp_cb_release(deferred_entry.ack_cb);
                 }
                 continue;
             }
         }
-        tx_res = ipv4_tx(deferred[i].pkt, deferred[i].local_ip, deferred[i].remote_ip, 6, 64);
+        tx_res = ipv4_tx(deferred_entry.pkt, deferred_entry.local_ip, deferred_entry.remote_ip, 6, 64);
 
-        if (deferred[i].cb != nullptr) {
-            tcp_cb_release(deferred[i].cb);
+        if (deferred_entry.cb != nullptr) {
+            tcp_cb_release(deferred_entry.cb);
         }
 
-        if (deferred[i].ack_cb != nullptr) {
-            TcpCB* ack_cb = deferred[i].ack_cb;
+        if (deferred_entry.ack_cb != nullptr) {
+            TcpCB* ack_cb = deferred_entry.ack_cb;
             uint64_t const ACK_CB_FLAGS = ack_cb->lock.lock_irqsave();
             if (tx_res >= 0) {
                 ack_cb->ack_pending = false;
@@ -481,7 +487,7 @@ void tcp_timer_tick(uint64_t now_ms) {
     }
 
     for (size_t i = 0; i < wake_count; i++) {
-        wake_socket_timer(sockets_to_wake[i]);
+        wake_socket_timer(sockets_to_wake.at(i));
     }
 }
 
@@ -514,12 +520,12 @@ void tcp_timer_tick(uint64_t now_ms) {
 void tcp_timer_thread_start() {
     auto* task = ker::mod::sched::task::Task::create_kernel_thread("tcp_timer", tcp_timer_thread);
     if (task == nullptr) {
-        ker::mod::dbg::log("FATAL: Failed to create TCP timer kernel thread");
+        log::critical("failed to create TCP timer kernel thread");
         return;
     }
     timer_task = task;
     ker::mod::sched::post_task_balanced(task);
-    ker::mod::dbg::log("TCP timer kernel thread created (PID %x)", task->pid);
+    log::info("TCP timer kernel thread created (PID %x)", task->pid);
 }
 
 }  // namespace ker::net::proto

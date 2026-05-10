@@ -1,42 +1,61 @@
 #include "sys_log.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 
 #include "abi/callnums/sys_log.h"
 #include "mod/gfx/fb.hpp"
-#include "mod/io/serial/serial.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/dbg/journal.hpp"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/virt.hpp"
+#include "platform/sched/get_current_pagemap.hpp"
 
 namespace ker::syscall::log {
-#include <platform/mm/addr.hpp>
-#include <platform/mm/virt.hpp>
-#include <platform/sched/get_current_pagemap.hpp>
 
-static constexpr size_t MAX_SYSLOG_COPY = 4096;
+namespace {
+
+constexpr size_t MAX_SYSLOG_COPY = 4096;
+using sys_log_logger = ker::mod::dbg::logger<"sys_log">;
+
+template <size_t Size>
+void nul_terminate_copy(std::array<char, Size>& buf, uint64_t copied, bool trim_trailing_nul) {
+    size_t nul_index = copied < buf.size() ? static_cast<size_t>(copied) : buf.size() - 1;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    if (trim_trailing_nul && nul_index > 0 && buf[nul_index - 1] == '\0') {
+        --nul_index;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    buf[nul_index] = '\0';
+}
+
+}  // namespace
 
 auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, uint64_t device_or_level, const char* module) -> uint64_t {
     auto* current_pagemap = wos_get_current_pagemap();
 
     // Helper to safely copy from user/kernel pointer into a kernel buffer.
-    auto safe_copy_to_kernel = [&](const char* src, uint64_t requested_len, char* dest, uint64_t& out_len) -> bool {
-        if (!src) {
+    auto safe_copy_to_kernel = [&](const char* src, char* dest, size_t dest_size, uint64_t copy_limit, uint64_t& copied_count) -> bool {
+        if (src == nullptr || dest == nullptr || dest_size == 0) {
             return false;
         }
         uint64_t copied = 0;
-        uint64_t const MAX_TO_COPY = (requested_len == 0) ? MAX_SYSLOG_COPY : requested_len;
+        uint64_t const MAX_TO_COPY =
+            std::min((copy_limit == 0) ? static_cast<uint64_t>(dest_size) : copy_limit, static_cast<uint64_t>(dest_size));
         // If src looks like a kernel pointer (high half), we can read directly
-        auto const SRC_ADDR = (uint64_t)src;
+        auto const SRC_ADDR = reinterpret_cast<uint64_t>(src);
         bool const SRC_IS_KERNEL = (SRC_ADDR & 0xffff800000000000ULL) != 0ULL;
         while (copied < MAX_TO_COPY) {
             uint64_t phys = 0;
             if (SRC_IS_KERNEL) {
                 // direct kernel virtual read
-                phys = (uint64_t)ker::mod::mm::addr::get_phys_pointer(static_cast<ker::mod::mm::addr::vaddr_t>(SRC_ADDR) + copied);
+                phys = reinterpret_cast<uint64_t>(
+                    ker::mod::mm::addr::get_phys_pointer(static_cast<ker::mod::mm::addr::vaddr_t>(SRC_ADDR) + copied));
                 // If getPhysPointer fails, fall back to virtual direct read
                 if (phys == 0) {
-                    dest[copied] = *(const char*)(SRC_ADDR + copied);
+                    dest[copied] = *reinterpret_cast<const char*>(SRC_ADDR + copied);
                 } else {
                     dest[copied] = *reinterpret_cast<const char*>(ker::mod::mm::addr::get_virt_pointer(phys + 0));
                 }
@@ -56,7 +75,7 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
             }
             copied++;
         }
-        out_len = copied;
+        copied_count = copied;
         return true;
     };
 
@@ -67,55 +86,44 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                 if (str == nullptr) {
                     return 1;
                 }
-                char buf[MAX_SYSLOG_COPY];
+                std::array<char, MAX_SYSLOG_COPY> buf{};
                 uint64_t copied = 0;
                 if (len == 0) {
-                    if (!safe_copy_to_kernel(str, 0, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
                         return 1;
                     }
-                    // if last byte is NUL, don't include it in write (strlen semantics)
-                    if ((copied != 0U) && buf[copied - 1] == '\0') {
-                        copied--;
-                    }
-                    if (copied == 0) {
+                    nul_terminate_copy(buf, copied, true);
+                    if (buf.front() == '\0') {
                         return 0;
                     }
-                    if (copied >= MAX_SYSLOG_COPY) {
-                        copied = MAX_SYSLOG_COPY - 1;
-                    }
-                    buf[copied] = '\0';
-                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf, 0);
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(), 0);
                 } else {
                     // Copy exactly 'len' bytes or until an unmapped page
-                    if (!safe_copy_to_kernel(str, len, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
                         return 1;
                     }
                     if (copied == 0) {
                         return 0;
                     }
-                    buf[(copied < MAX_SYSLOG_COPY) ? copied : (MAX_SYSLOG_COPY - 1)] = '\0';
-                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
+                    nul_terminate_copy(buf, copied, false);
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(),
                                             copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
             } else if (device == abi::sys_log::sys_log_device::VGA) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
-                    char buf[MAX_SYSLOG_COPY];
+                    std::array<char, MAX_SYSLOG_COPY> buf{};
                     uint64_t copied = 0;
-                    if (!safe_copy_to_kernel(str, 0, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
                         return 1;
                     }
-                    buf[(copied >= 1 && buf[copied - 1] == '\0') ? (copied - 1) : copied] = '\0';
-                    mod::dbg::log_fb_only(buf);
+                    nul_terminate_copy(buf, copied, true);
+                    mod::dbg::log_fb_only(buf.data());
                 } else {
-                    mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
-                    mod::io::serial::write(static_cast<uint64_t>(device));
-                    mod::io::serial::write("\n");
+                    sys_log_logger::warn("framebuffer module is not compiled; device is invalid: %u", static_cast<unsigned>(device));
                     return 1;
                 }
             } else {
-                mod::io::serial::write("Invalid sysLog device: ");
-                mod::io::serial::write(static_cast<uint64_t>(device));
-                mod::io::serial::write("\n");
+                sys_log_logger::warn("invalid device: %u", static_cast<unsigned>(device));
                 return 1;
             }
         } break;
@@ -125,56 +133,46 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                 if (str == nullptr) {
                     return 1;
                 }
-                char buf[MAX_SYSLOG_COPY];
+                std::array<char, MAX_SYSLOG_COPY> buf{};
                 uint64_t copied = 0;
                 if (len == 0) {
-                    if (!safe_copy_to_kernel(str, 0, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
                         return 1;
                     }
-                    if ((copied != 0U) && buf[copied - 1] == '\0') {
-                        copied--;
-                    }
-                    if (copied == 0) {
+                    nul_terminate_copy(buf, copied, true);
+                    if (buf.front() == '\0') {
                         mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", "", 0);
                         return 0;
                     }
-                    if (copied >= MAX_SYSLOG_COPY) {
-                        copied = MAX_SYSLOG_COPY - 1;
-                    }
-                    buf[copied] = '\0';
-                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf, 0);
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(), 0);
                 } else {
-                    if (!safe_copy_to_kernel(str, len, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
                         return 1;
                     }
                     if (copied == 0) {
                         mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", "", 0);
                         return 0;
                     }
-                    buf[(copied < MAX_SYSLOG_COPY) ? copied : (MAX_SYSLOG_COPY - 1)] = '\0';
-                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf,
+                    nul_terminate_copy(buf, copied, false);
+                    mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(),
                                             copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
                 }
             } else if (device == abi::sys_log::sys_log_device::VGA) {
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
-                    char buf[MAX_SYSLOG_COPY];
+                    std::array<char, MAX_SYSLOG_COPY> buf{};
                     uint64_t copied = 0;
-                    if (!safe_copy_to_kernel(str, 0, buf, copied)) {
+                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
                         return 1;
                     }
-                    buf[(copied >= 1 && buf[copied - 1] == '\0') ? (copied - 1) : copied] = '\0';
-                    mod::dbg::log_fb_only(buf);
+                    nul_terminate_copy(buf, copied, true);
+                    mod::dbg::log_fb_only(buf.data());
                     mod::dbg::log_fb_advance();
                 } else {
-                    mod::io::serial::write("framebuffer module is not compiled device is invalid: ");
-                    mod::io::serial::write(static_cast<uint64_t>(device));
-                    mod::io::serial::write("\n");
+                    sys_log_logger::warn("framebuffer module is not compiled; device is invalid: %u", static_cast<unsigned>(device));
                     return 1;
                 }
             } else {
-                mod::io::serial::write("Invalid sysLog device: ");
-                mod::io::serial::write(static_cast<uint64_t>(device));
-                mod::io::serial::write("\n");
+                sys_log_logger::warn("invalid device: %u", static_cast<unsigned>(device));
                 return 1;
             }
         } break;
@@ -182,42 +180,30 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
             if (str == nullptr) {
                 return 1;
             }
-            char buf[MAX_SYSLOG_COPY];
+            std::array<char, MAX_SYSLOG_COPY> buf{};
             uint64_t copied = 0;
-            if (!safe_copy_to_kernel(str, len, buf, copied)) {
+            if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
                 return 1;
             }
-            if (copied >= MAX_SYSLOG_COPY) {
-                copied = MAX_SYSLOG_COPY - 1;
-            }
-            if (copied > 0 && len == 0 && buf[copied - 1] == '\0') {
-                copied--;
-            }
-            buf[copied] = '\0';
+            nul_terminate_copy(buf, copied, len == 0);
 
-            char module_buf[mod::dbg::journal::JOURNAL_MODULE_MAX]{};
+            std::array<char, mod::dbg::journal::JOURNAL_MODULE_MAX> module_buf{};
             uint64_t module_copied = 0;
-            if (module != nullptr && safe_copy_to_kernel(module, 0, module_buf, module_copied)) {
-                if (module_copied >= sizeof(module_buf)) {
-                    module_copied = sizeof(module_buf) - 1;
-                }
-                if (module_copied > 0 && module_buf[module_copied - 1] == '\0') {
-                    module_copied--;
-                }
-                module_buf[module_copied] = '\0';
+            if (module != nullptr && safe_copy_to_kernel(module, module_buf.data(), module_buf.size(), 0, module_copied)) {
+                nul_terminate_copy(module_buf, module_copied, true);
             } else {
-                std::memcpy(module_buf, "userspace", sizeof("userspace"));
+                std::memcpy(module_buf.data(), "userspace", sizeof("userspace"));
             }
 
             uint64_t raw_level = device_or_level;
             if (raw_level > static_cast<uint64_t>(mod::dbg::LogLevel::PANIC)) {
                 raw_level = static_cast<uint64_t>(mod::dbg::LogLevel::INFO);
             }
-            mod::dbg::journal::emit(static_cast<mod::dbg::LogLevel>(raw_level), module_buf, buf,
+            mod::dbg::journal::emit(static_cast<mod::dbg::LogLevel>(raw_level), module_buf.data(), buf.data(),
                                     copied < len ? mod::dbg::journal::JOURNAL_FLAG_TRUNCATED : 0);
         } break;
         default:
-            mod::io::serial::write("Invalid sysLog operation\n");
+            sys_log_logger::warn("invalid operation");
             return 1;
             break;
     }

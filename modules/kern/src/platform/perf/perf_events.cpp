@@ -3,35 +3,38 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <platform/ktime/ktime.hpp>
 #include <platform/smt/smt.hpp>
+#include <string_view>
 
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::mod::perf {
 
+namespace {
+
 // Recording is OFF by default - enabled explicitly via perf record / /proc/kperfctl.
 // Stats counters (ctx_switches etc.) always increment regardless of this flag so
 // /proc/kcpustat is always live and has zero overhead impact on the hot path.
-static std::atomic<bool> g_enabled{false};
+std::atomic<bool> g_enabled{false};
 
 // Event type mask: bitmask of PerfEventType values to record.
 // Default: all types enabled (0x1F). Only checked when g_enabled is true.
-static std::atomic<uint8_t> g_event_mask{PERF_MASK_ALL};
+std::atomic<uint8_t> g_event_mask{PERF_MASK_ALL};
 
 // Static ring buffers — dynamically allocated at init() time based on actual CPU count.
-static PerfCpuRing* g_rings = nullptr;
-static size_t g_num_cpus = 0;
+PerfCpuRing* g_rings = nullptr;
+size_t g_num_cpus = 0;
 
 // Sub-sampler: emit one SAMPLE per 10 timer ticks (~100 Hz at 1 kHz tick rate)
-static uint64_t* g_tick_count = nullptr;
+uint64_t* g_tick_count = nullptr;
 
 // Per-subsystem aggregate statistics (always-on, lock-free via atomics).
 // Total: ~13 subsystems * 48 bytes = ~624 bytes BSS.
-static PerfSubsystemStats g_subsys_stats[PERF_SUBSYSTEM_COUNT];
-static std::atomic<uint32_t> g_wki_trace_correlation{1};
+std::array<PerfSubsystemStats, PERF_SUBSYSTEM_COUNT> g_subsys_stats{};
+std::atomic<uint32_t> g_wki_trace_correlation{1};
 
 struct WkiPerfSummaryBucket {
     bool used = false;
@@ -49,10 +52,8 @@ struct WkiPerfSummaryBucket {
     std::array<uint32_t, WKI_PERF_HIST_BUCKETS> latency_hist = {};
 };
 
-static WkiPerfSummaryBucket g_wki_summary[WKI_PERF_SUMMARY_BUCKETS];
-static ker::mod::sys::Spinlock g_wki_summary_lock;
-
-namespace {
+std::array<WkiPerfSummaryBucket, WKI_PERF_SUMMARY_BUCKETS> g_wki_summary{};
+ker::mod::sys::Spinlock g_wki_summary_lock;
 
 void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
     uint64_t const SLOT = ring.head & PERF_RING_MASK;
@@ -74,7 +75,7 @@ auto wki_scope_hash(uint8_t scope, uint8_t op, uint16_t peer, uint16_t channel) 
 auto wki_get_or_create_summary_bucket(uint8_t scope, uint8_t op, uint16_t peer, uint16_t channel) -> WkiPerfSummaryBucket* {
     size_t const SLOT = wki_scope_hash(scope, op, peer, channel);
     for (size_t probe = 0; probe < WKI_PERF_SUMMARY_BUCKETS; ++probe) {
-        auto& bucket = g_wki_summary[(SLOT + probe) % WKI_PERF_SUMMARY_BUCKETS];
+        auto& bucket = g_wki_summary.at((SLOT + probe) % WKI_PERF_SUMMARY_BUCKETS);
         if (!bucket.used) {
             bucket.used = true;
             bucket.scope = scope;
@@ -135,7 +136,7 @@ auto wki_hist_percentile(const std::array<uint32_t, WKI_PERF_HIST_BUCKETS>& hist
 
     uint64_t cumulative = 0;
     for (size_t i = 0; i < hist.size(); ++i) {
-        cumulative += hist[i];
+        cumulative += hist.at(i);
         if (cumulative >= threshold) {
             return wki_hist_bucket_value(i);
         }
@@ -370,7 +371,7 @@ void init() {
         g_rings[i].head = 0;
         g_rings[i].drain = 0;
         g_tick_count[i] = 0;
-        memset(&g_rings[i].stats, 0, sizeof(PerfCpuStats));
+        g_rings[i].stats = {};
     }
     g_enabled.store(false, std::memory_order_release);  // Off by default; enabled via perf record
     g_event_mask.store(PERF_MASK_ALL, std::memory_order_release);
@@ -728,7 +729,7 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
             bucket->latency_samples++;
             bucket->total_latency_us += latency_us;
             bucket->max_latency_us = std::max(bucket->max_latency_us, latency_us);
-            bucket->latency_hist[wki_hist_bucket(latency_us)]++;
+            bucket->latency_hist.at(wki_hist_bucket(latency_us))++;
         }
     }
     g_wki_summary_lock.unlock_irqrestore(saved);
@@ -778,7 +779,7 @@ void update_subsystem_stat(PerfSubsystem subsystem, uint8_t flags, uint64_t curr
         return;
     }
 
-    auto& s = g_subsys_stats[idx];
+    auto& s = g_subsys_stats.at(idx);
 
     if ((flags & PERF_FLAG_CT_INSERT) != 0) {
         s.inserts.fetch_add(1, std::memory_order_relaxed);
@@ -813,7 +814,7 @@ PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem) {
         return {};
     }
 
-    auto& s = g_subsys_stats[idx];
+    auto& s = g_subsys_stats.at(idx);
     return PerfSubsystemSnapshot{
         .inserts = s.inserts.load(std::memory_order_relaxed),
         .removes = s.removes.load(std::memory_order_relaxed),
@@ -835,6 +836,10 @@ uint8_t get_event_mask() { return g_event_mask.load(std::memory_order_acquire); 
 // parse_event_mask - parse "switch,wake,container,wki,wki_launch" into bitmask
 // ---------------------------------------------------------------------------
 uint8_t parse_event_mask(const char* str, size_t len) {
+    if (str == nullptr) {
+        return 0;
+    }
+    std::string_view const INPUT{str, len};
     uint8_t mask = 0;
     size_t i = 0;
 
@@ -853,22 +858,23 @@ uint8_t parse_event_mask(const char* str, size_t len) {
             i++;
         }
         size_t const TOK_LEN = i - START;
+        std::string_view const TOKEN = INPUT.substr(START, TOK_LEN);
 
-        if (TOK_LEN == 6 && memcmp(str + START, "sample", 6) == 0) {
+        if (TOKEN == "sample") {
             mask |= PERF_MASK_SAMPLE;
-        } else if (TOK_LEN == 6 && memcmp(str + START, "switch", 6) == 0) {
+        } else if (TOKEN == "switch") {
             mask |= PERF_MASK_SWITCH;
-        } else if (TOK_LEN == 4 && memcmp(str + START, "wake", 4) == 0) {
+        } else if (TOKEN == "wake") {
             mask |= PERF_MASK_WAKE;
-        } else if (TOK_LEN == 5 && memcmp(str + START, "sleep", 5) == 0) {
+        } else if (TOKEN == "sleep") {
             mask |= PERF_MASK_SLEEP;
-        } else if (TOK_LEN == 9 && memcmp(str + START, "container", 9) == 0) {
+        } else if (TOKEN == "container") {
             mask |= PERF_MASK_CONTAINER;
-        } else if (TOK_LEN == 3 && memcmp(str + START, "wki", 3) == 0) {
+        } else if (TOKEN == "wki") {
             mask |= PERF_MASK_WKI;
-        } else if (TOK_LEN == 10 && memcmp(str + START, "wki_launch", 10) == 0) {
+        } else if (TOKEN == "wki_launch") {
             mask |= PERF_MASK_WKI_LAUNCH;
-        } else if (TOK_LEN == 3 && memcmp(str + START, "all", 3) == 0) {
+        } else if (TOKEN == "all") {
             mask = PERF_MASK_ALL;
         } else {
             return 0;  // unknown token

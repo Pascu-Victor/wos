@@ -21,6 +21,9 @@ constexpr uint32_t JOURNAL_FLAG_TRUNCATED = 1U << 0;
 constexpr uint32_t JOURNAL_FLAG_KERNEL = 1U << 1;
 constexpr uint32_t JOURNAL_FLAG_PREFIX_COMPAT = 1U << 2;
 
+// On-disk/userspace ABI: raw fixed arrays are intentional and covered by the
+// size assertion below.
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 struct __attribute__((packed)) JournalRecord {
     uint32_t magic;
     uint16_t version;
@@ -39,6 +42,7 @@ struct __attribute__((packed)) JournalRecord {
     uint16_t reserved1;
     char message[JOURNAL_MESSAGE_MAX];
 };
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 
 static_assert(sizeof(JournalRecord) == 608, "JournalRecord ABI size changed");
 

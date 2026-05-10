@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -44,15 +45,15 @@ inline auto socket_fill_sockaddr_v4(void* addr_out, size_t max_len, size_t* addr
         return false;
     }
 
-    uint8_t encoded[SOCKADDR_V4_LEN] = {};
+    std::array<uint8_t, SOCKADDR_V4_LEN> encoded{};
     const uint16_t FAMILY = SOCKADDR_V4_FAMILY;
     const uint16_t PORT_BE = htons(port);
     const uint32_t IP_BE = htonl(ip);
-    std::memcpy(encoded, &FAMILY, sizeof(FAMILY));
-    std::memcpy(encoded + 2, &PORT_BE, sizeof(PORT_BE));
-    std::memcpy(encoded + 4, &IP_BE, sizeof(IP_BE));
+    std::memcpy(encoded.data(), &FAMILY, sizeof(FAMILY));
+    std::memcpy(encoded.data() + 2, &PORT_BE, sizeof(PORT_BE));
+    std::memcpy(encoded.data() + 4, &IP_BE, sizeof(IP_BE));
     const size_t COPY_LEN = max_len < SOCKADDR_V4_LEN ? max_len : SOCKADDR_V4_LEN;
-    std::memcpy(addr_out, encoded, COPY_LEN);
+    std::memcpy(addr_out, encoded.data(), COPY_LEN);
     return true;
 }
 
@@ -124,7 +125,7 @@ struct Socket {
 
     // IPv6 addresses
     struct {
-        uint8_t addr[16];
+        std::array<uint8_t, 16> addr{};
         uint16_t port;
     } local_v6 = {}, remote_v6 = {};
 

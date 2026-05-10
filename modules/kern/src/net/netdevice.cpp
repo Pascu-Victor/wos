@@ -8,6 +8,7 @@
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
 
@@ -16,6 +17,8 @@
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::net {
+
+using log = ker::mod::dbg::logger<"netdev">;
 
 namespace {
 std::array<NetDevice*, MAX_NET_DEVICES> devices = {};
@@ -27,6 +30,8 @@ mod::sys::Spinlock devices_lock;
 constexpr uint32_t IFF_BROADCAST = 0x0002;
 constexpr uint32_t IFF_LOOPBACK = 0x0008;
 constexpr uint32_t IFF_MULTICAST = 0x1000;
+
+auto is_loopback_name(const std::array<char, NETDEV_NAME_LEN>& name) -> bool { return std::string_view(name.data()) == "lo"; }
 }  // namespace
 
 auto netdev_register(NetDevice* dev) -> int {
@@ -39,21 +44,21 @@ auto netdev_register(NetDevice* dev) -> int {
     dev->ifindex = next_ifindex++;
 
     // Auto-name if the device name is empty
-    if (dev->name[0] == '\0') {
+    if (dev->name.front() == '\0') {
         // Name format: "ethN"
         std::array<char, NETDEV_NAME_LEN> buf = {};
-        buf[0] = 'e';
-        buf[1] = 't';
-        buf[2] = 'h';
+        buf.at(0) = 'e';
+        buf.at(1) = 't';
+        buf.at(2) = 'h';
         uint32_t const IDX = next_eth_index++;
         // Simple integer-to-string for index
         if (IDX < 10) {
-            buf[3] = static_cast<char>('0' + static_cast<char>(IDX));
-            buf[4] = '\0';
+            buf.at(3) = static_cast<char>('0' + static_cast<char>(IDX));
+            buf.at(4) = '\0';
         } else {
-            buf[3] = static_cast<char>('0' + static_cast<char>(IDX / 10));
-            buf[4] = static_cast<char>('0' + static_cast<char>(IDX % 10));
-            buf[5] = '\0';
+            buf.at(3) = static_cast<char>('0' + static_cast<char>(IDX / 10));
+            buf.at(4) = static_cast<char>('0' + static_cast<char>(IDX % 10));
+            buf.at(5) = '\0';
         }
         dev->name = buf;
     }
@@ -62,20 +67,20 @@ auto netdev_register(NetDevice* dev) -> int {
         dev->tx_queue_len = 1000;
     }
     if (dev->link_flags == 0) {
-        if (std::strcmp(dev->name.data(), "lo") == 0) {
+        if (is_loopback_name(dev->name)) {
             dev->link_flags = IFF_LOOPBACK;
         } else {
             dev->link_flags = IFF_BROADCAST | IFF_MULTICAST;
         }
     }
 
-    devices[device_count] = dev;
+    devices.at(device_count) = dev;
     device_count++;
     devices_lock.unlock();
 
 #ifdef DEBUG_NETDEV
-    ker::mod::dbg::log("net: Registered device %s (ifindex=%d, MAC=%x:%x:%x:%x:%x:%x)", dev->name, dev->ifindex, dev->mac[0], dev->mac[1],
-                       dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5]);
+    log::debug("registered device %s (ifindex=%d, MAC=%x:%x:%x:%x:%x:%x)", dev->name.data(), dev->ifindex, dev->mac[0], dev->mac[1],
+               dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5]);
 #endif
 
     return 0;
@@ -88,15 +93,15 @@ auto netdev_unregister(NetDevice* dev) -> int {
 
     devices_lock.lock();
     for (size_t i = 0; i < device_count; i++) {
-        if (devices[i] != dev) {
+        if (devices.at(i) != dev) {
             continue;
         }
 
         for (size_t j = i + 1; j < device_count; j++) {
-            devices[j - 1] = devices[j];
+            devices.at(j - 1) = devices.at(j);
         }
         device_count--;
-        devices[device_count] = nullptr;
+        devices.at(device_count) = nullptr;
         devices_lock.unlock();
         return 0;
     }
@@ -110,8 +115,8 @@ auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
     }
     devices_lock.lock();
     for (size_t i = 0; i < device_count; i++) {
-        if (std::string_view(devices[i]->name.data()) == NAME) {
-            NetDevice* result = devices[i];
+        if (std::string_view(devices.at(i)->name.data()) == NAME) {
+            NetDevice* result = devices.at(i);
             devices_lock.unlock();
             return result;
         }
@@ -133,7 +138,7 @@ auto netdev_at(size_t i) -> NetDevice* {
         devices_lock.unlock();
         return nullptr;
     }
-    NetDevice* dev = devices[i];
+    NetDevice* dev = devices.at(i);
     devices_lock.unlock();
     return dev;
 }
@@ -146,7 +151,7 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
 #ifdef DEBUG_NETDEV
-    ker::mod::dbg::log("netdev_rx: received packet len=%zu on device %s\n", pkt->len, dev->name);
+    log::debug("netdev_rx: received packet len=%zu on device %s", pkt->len, dev->name.data());
 #endif
 
     pkt->dev = dev;
@@ -161,15 +166,15 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
 
     // Loopback device sends raw IP packets (no Ethernet header)
     // Check if this is loopback by name
-    if (dev->name[0] == 'l' && dev->name[1] == 'o' && dev->name[2] == '\0') {
+    if (is_loopback_name(dev->name)) {
 #ifdef DEBUG_NETDEV
-        ker::mod::dbg::log("netdev_rx: loopback device detected, bypassing Ethernet\n");
+        log::debug("netdev_rx: loopback device detected, bypassing Ethernet");
 #endif
         // Determine protocol from IP version in first byte
         if (pkt->len > 0) {
             uint8_t const VERSION = (pkt->data[0] >> 4) & 0xF;
 #ifdef DEBUG_NETDEV
-            ker::mod::dbg::log("netdev_rx: IP version = %u\n", version);
+            log::debug("netdev_rx: IP version = %u", VERSION);
 #endif
             if (VERSION == 4) {
                 proto::ipv4_rx(dev, pkt);

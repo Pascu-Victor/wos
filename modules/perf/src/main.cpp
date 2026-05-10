@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/process.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): POSIX clock_gettime/nanosleep are declared here.
 #include <unistd.h>
 
 #include <algorithm>
@@ -24,7 +25,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <optional>
 #include <print>
 #include <ranges>
@@ -441,7 +441,7 @@ auto trim_left(std::string_view text) -> std::string_view {
 }
 
 auto next_token(std::string_view text, std::size_t& pos) -> std::string_view {
-    while (pos < text.size() && text[pos] == ' ') {
+    while (pos < text.size() && text.at(pos) == ' ') {
         ++pos;
     }
     if (pos >= text.size()) {
@@ -449,7 +449,7 @@ auto next_token(std::string_view text, std::size_t& pos) -> std::string_view {
     }
 
     std::size_t end = pos;
-    while (end < text.size() && text[end] != ' ') {
+    while (end < text.size() && text.at(end) != ' ') {
         ++end;
     }
 
@@ -1065,7 +1065,7 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     constexpr int TOK_WKI_CALLSITE = 11;
 
     out = {};
-    if (line.size() < 2 || line[1] != ' ') {
+    if (line.size() < 2 || line.at(1) != ' ') {
         return false;
     }
 
@@ -1077,7 +1077,7 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
         if (TOKEN.empty()) {
             break;
         }
-        tokens[static_cast<std::size_t>(token_count)] = TOKEN;
+        tokens.at(static_cast<std::size_t>(token_count)) = TOKEN;
         ++token_count;
     }
 
@@ -1086,45 +1086,45 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     }
 
     out.type = line.front();
-    out.ts_ns = parse_u64(tokens[TOK_TS]);
-    out.cpu = parse_u32(tokens[TOK_CPU]);
+    out.ts_ns = parse_u64(tokens.at(TOK_TS));
+    out.cpu = parse_u32(tokens.at(TOK_CPU));
 
     switch (out.type) {
         case 'S':
             if (token_count < EVENT_EXTENDED_TOKEN_COUNT) {
                 return false;
             }
-            out.pid = parse_u64(tokens[TOK_PID]);
-            out.data = parse_u64(tokens[TOK_DATA], 0);
-            out.lag = parse_i64(tokens[TOK_LAG]);
-            out.flags = parse_u8(tokens[TOK_FLAGS]);
+            out.pid = parse_u64(tokens.at(TOK_PID));
+            out.data = parse_u64(tokens.at(TOK_DATA), 0);
+            out.lag = parse_i64(tokens.at(TOK_LAG));
+            out.flags = parse_u8(tokens.at(TOK_FLAGS));
             return true;
 
         case 'X':
             if (token_count < EVENT_EXTENDED_TOKEN_COUNT) {
                 return false;
             }
-            out.pid = parse_u64(tokens[TOK_PID]);
-            out.other_pid = parse_u64(tokens[TOK_DATA]);
-            out.lag = parse_i64(tokens[TOK_LAG]);
-            out.flags = parse_u8(tokens[TOK_FLAGS]);
+            out.pid = parse_u64(tokens.at(TOK_PID));
+            out.other_pid = parse_u64(tokens.at(TOK_DATA));
+            out.lag = parse_i64(tokens.at(TOK_LAG));
+            out.flags = parse_u8(tokens.at(TOK_FLAGS));
             if (token_count >= TOK_AUX + 1) {
-                out.aux = parse_u32(tokens[TOK_AUX]);
+                out.aux = parse_u32(tokens.at(TOK_AUX));
             }
             if (token_count >= TOK_CALLSITE + 1) {
-                out.callsite = std::string(tokens[TOK_CALLSITE]);
+                out.callsite = std::string(tokens.at(TOK_CALLSITE));
             }
             return true;
 
         case 'W':
         case 'B':
-            out.pid = parse_u64(tokens[TOK_PID]);
-            out.data = parse_u64(tokens[TOK_DATA]);
+            out.pid = parse_u64(tokens.at(TOK_PID));
+            out.data = parse_u64(tokens.at(TOK_DATA));
             if (token_count >= EVENT_EXTENDED_TOKEN_COUNT) {
-                out.aux = parse_u32(tokens[TOK_LAG]);
-                out.flags = parse_u8(tokens[TOK_FLAGS]);
+                out.aux = parse_u32(tokens.at(TOK_LAG));
+                out.flags = parse_u8(tokens.at(TOK_FLAGS));
                 if (token_count >= TOK_CALLSITE + 1) {
-                    out.callsite = std::string(tokens[TOK_CALLSITE]);
+                    out.callsite = std::string(tokens.at(TOK_CALLSITE));
                 }
             } else {
                 out.flags = static_cast<uint8_t>((out.type == 'B' ? FLAG_BLOCK : 0U) | (out.data != 0 ? FLAG_TIMED : 0U));
@@ -1136,15 +1136,15 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
             if (token_count < EVENT_EXTENDED_TOKEN_COUNT) {
                 return false;
             }
-            out.pid = parse_u64(tokens[TOK_PID]);
-            out.subsys_name = std::string(tokens[TOK_DATA]);  // tok 3 = subsys_name
-            out.flags = parse_u8(tokens[TOK_LAG]);            // tok 4 = flags
-            out.lag = parse_i64(tokens[TOK_FLAGS]);           // tok 5 = element count
+            out.pid = parse_u64(tokens.at(TOK_PID));
+            out.subsys_name = std::string(tokens.at(TOK_DATA));  // tok 3 = subsys_name
+            out.flags = parse_u8(tokens.at(TOK_LAG));            // tok 4 = flags
+            out.lag = parse_i64(tokens.at(TOK_FLAGS));           // tok 5 = element count
             if (token_count >= TOK_AUX + 1) {
-                out.aux = parse_u32(tokens[TOK_AUX]);  // tok 6 = capacity
+                out.aux = parse_u32(tokens.at(TOK_AUX));  // tok 6 = capacity
             }
             if (token_count >= TOK_CALLSITE + 1) {
-                out.callsite = std::string(tokens[TOK_CALLSITE]);
+                out.callsite = std::string(tokens.at(TOK_CALLSITE));
             }
             return true;
 
@@ -1152,17 +1152,17 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
             if (token_count < TOK_WKI_AUX + 1) {
                 return false;
             }
-            out.pid = parse_u64(tokens[TOK_PID]);
-            out.scope_name = std::string(tokens[TOK_SCOPE]);
-            out.op_name = std::string(tokens[TOK_OP]);
-            out.phase_name = std::string(tokens[TOK_PHASE]);
-            out.peer = parse_u64(tokens[TOK_PEER], 0);
-            out.channel = parse_u64(tokens[TOK_CHANNEL], 0);
-            out.correlation = parse_u64(tokens[TOK_CORR], 0);
-            out.status = static_cast<int32_t>(parse_i64(tokens[TOK_STATUS], 0));
-            out.aux = parse_u32(tokens[TOK_WKI_AUX], 0);
+            out.pid = parse_u64(tokens.at(TOK_PID));
+            out.scope_name = std::string(tokens.at(TOK_SCOPE));
+            out.op_name = std::string(tokens.at(TOK_OP));
+            out.phase_name = std::string(tokens.at(TOK_PHASE));
+            out.peer = parse_u64(tokens.at(TOK_PEER), 0);
+            out.channel = parse_u64(tokens.at(TOK_CHANNEL), 0);
+            out.correlation = parse_u64(tokens.at(TOK_CORR), 0);
+            out.status = static_cast<int32_t>(parse_i64(tokens.at(TOK_STATUS), 0));
+            out.aux = parse_u32(tokens.at(TOK_WKI_AUX), 0);
             if (token_count >= TOK_WKI_CALLSITE + 1) {
-                out.callsite = std::string(tokens[TOK_WKI_CALLSITE]);
+                out.callsite = std::string(tokens.at(TOK_WKI_CALLSITE));
             }
             return true;
 
@@ -1389,7 +1389,7 @@ void print_hotspot_tables(const std::vector<HotspotStats>& rows) {
                      "max_run(us)");
         std::println("{:->6}  {:->20}  {:->18}  {:->7}  {:->7}  {:->11}  {:->11}", "", "", "", "", "", "", "");
         for (std::size_t index = 0; index < busy_yield.size() && index < HOTSPOT_ROW_LIMIT; ++index) {
-            const auto& row = busy_yield[index];
+            const auto& row = busy_yield.at(index);
             uint64_t avg_run = row.yield_count != 0U ? row.yield_run_total_us / row.yield_count : 0;
             std::println("{:>6}  {:<20}  {:<18}  {:>7}  {:>7}  {:>11}  {:>11}", row.pid, row.comm.empty() ? "?" : row.comm,
                          display_callsite(row.callsite), row.yield_count, row.short_yield_count, avg_run, row.yield_run_max_us);
@@ -1422,7 +1422,7 @@ void print_hotspot_tables(const std::vector<HotspotStats>& rows) {
                      "explicit", "current", "avg_sleep(us)", "avg_run(us)");
         std::println("{:->6}  {:->20}  {:->18}  {:->5}  {:->5}  {:->8}  {:->7}  {:->13}  {:->11}", "", "", "", "", "", "", "", "", "");
         for (std::size_t index = 0; index < wake_churn.size() && index < HOTSPOT_ROW_LIMIT; ++index) {
-            const auto& row = wake_churn[index];
+            const auto& row = wake_churn.at(index);
             uint64_t avg_sleep = row.wake_count != 0U ? row.wake_sleep_total_us / row.wake_count : 0;
             uint64_t avg_run = row.sleep_count != 0U ? row.sleep_run_total_us / row.sleep_count : 0;
             std::println("{:>6}  {:<20}  {:<18}  {:>5}  {:>5}  {:>8}  {:>7}  {:>13}  {:>11}", row.pid, row.comm.empty() ? "?" : row.comm,
@@ -1906,7 +1906,7 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
     std::println("{:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "",
                  "", "", "", "", "", "", "", "", "");
     for (int i = 0; std::cmp_less(i, launch_rows.size()) && i < limit; ++i) {
-        const auto& row = launch_rows[static_cast<std::size_t>(i)];
+        const auto& row = launch_rows.at(static_cast<std::size_t>(i));
         std::optional<uint32_t> setup_us;
         if (row.handle_submit_us.has_value() && row.load_elf_us.has_value() && *row.handle_submit_us >= *row.load_elf_us) {
             setup_us = *row.handle_submit_us - *row.load_elf_us;
@@ -1985,7 +1985,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
                          "P999(us)", "P9999(us)", "P99999(us)", "MAX(us)");
             std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "");
             for (int i = 0; std::cmp_less(i, rows.size()) && i < limit; ++i) {
-                const auto& row = rows[static_cast<std::size_t>(i)];
+                const auto& row = rows.at(static_cast<std::size_t>(i));
                 std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
                              wki_peer_label(row.peer, summary_peer_resolver), row.channel, row.calls, row.p999_us, row.p9999_us,
                              row.p99999_us, row.max_us);
@@ -2034,7 +2034,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
                  "CORR");
     std::println("{:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}", "", "", "", "", "", "", "", "");
     for (int i = 0; std::cmp_less(i, slow_events.size()) && i < limit; ++i) {
-        const auto& event = slow_events[static_cast<std::size_t>(i)];
+        const auto& event = slow_events.at(static_cast<std::size_t>(i));
         std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}", event.scope_name, event.op_name, event.phase_name,
                      wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation);
     }
@@ -2082,7 +2082,7 @@ void cmd_wki_tail(int limit, const WkiDisplayOptions& display_options) {
     std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", "SCOPE", "OP", "PEER", "CH", "GAP(us)");
     std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}", "", "", "", "", "");
     for (int i = 0; std::cmp_less(i, gaps.size()) && i < limit; ++i) {
-        const auto& gap = gaps[static_cast<std::size_t>(i)];
+        const auto& gap = gaps.at(static_cast<std::size_t>(i));
         std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", gap.scope, gap.op, wki_peer_label(gap.peer, event_peer_resolver), gap.channel,
                      gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
     }
@@ -2195,20 +2195,20 @@ auto read_shebang(const char* path) -> std::string {
     if (FD < 0) {
         return {};
     }
-    char hdr[256];
-    ssize_t const N = read(FD, hdr, sizeof(hdr) - 1);
+    std::array<char, 256> hdr{};
+    ssize_t const N = read(FD, hdr.data(), hdr.size() - 1);
     close(FD);
-    if (N < 3 || hdr[0] != '#' || hdr[1] != '!') {
+    if (N < 3 || hdr.at(0) != '#' || hdr.at(1) != '!') {
         return {};
     }
-    hdr[N] = '\0';
+    hdr.at(static_cast<size_t>(N)) = '\0';
     // Find end of first line
-    char* nl = std::strchr(hdr + 2, '\n');
+    char* nl = std::strchr(hdr.data() + 2, '\n');
     if (nl != nullptr) {
         *nl = '\0';
     }
     // Skip whitespace after #!
-    const char* p = hdr + 2;
+    const char* p = hdr.data() + 2;
     while (*p == ' ' || *p == '\t') {
         p++;
     }
@@ -2578,6 +2578,7 @@ void usage() {
 }
 }  // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         usage();

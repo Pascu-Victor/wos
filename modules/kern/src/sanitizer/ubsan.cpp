@@ -13,6 +13,7 @@
 #include "util/hcf.hpp"
 #ifdef WOS_KUBSAN
 
+#include <array>
 #include <cstdint>
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -36,6 +37,8 @@ struct UbsanSourceLocation {
 struct UbsanTypeDescriptor {
     uint16_t type_kind;
     uint16_t type_info;
+    // Flexible array member emitted by Clang's UBSan ABI.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char type_name[];  // Flexible array — null-terminated
 };
 
@@ -109,32 +112,34 @@ struct UbsanImplicitConversionData {
 namespace {
 
 namespace ser = ker::mod::io::serial;
+using log = ker::mod::dbg::logger<"ubsan">;
 
 void ubsan_write_hex(uint64_t val) {
-    char buf[19];  // "0x" + 16 hex digits + NUL
-    buf[0] = '0';
-    buf[1] = 'x';
+    std::array<char, 19> buf{};  // "0x" + 16 hex digits + NUL
+    auto* out = buf.data();
+    *out++ = '0';
+    *out++ = 'x';
     constexpr const char* HEX = "0123456789abcdef";
     for (int i = 15; i >= 0; i--) {
-        buf[2 + (15 - i)] = HEX[(val >> (i * 4)) & 0xf];
+        *out++ = *(HEX + ((val >> (i * 4)) & 0xf));
     }
-    buf[18] = '\0';
-    ser::write_unlocked(buf);
+    *out = '\0';
+    ser::write_unlocked(buf.data());
 }
 
 void ubsan_write_dec(uint64_t val) {
-    char buf[21];
-    int pos = 20;
-    buf[pos] = '\0';
+    std::array<char, 21> buf{};
+    auto* pos = buf.data() + buf.size() - 1;
+    *pos = '\0';
     if (val == 0) {
-        buf[--pos] = '0';
+        *--pos = '0';
     } else {
         while (val > 0) {
-            buf[--pos] = static_cast<char>('0' + (val % 10));
+            *--pos = static_cast<char>('0' + (val % 10));
             val /= 10;
         }
     }
-    ser::write_unlocked(buf + pos);
+    ser::write_unlocked(pos);
 }
 
 void ubsan_write_type(const UbsanTypeDescriptor* type) {
@@ -144,7 +149,7 @@ void ubsan_write_type(const UbsanTypeDescriptor* type) {
     }
     // Print the human-readable name from the flexible array member
     ser::write_unlocked("'");
-    ser::write_unlocked(type->type_name);
+    ser::write_unlocked(static_cast<const char*>(type->type_name));
     ser::write_unlocked("'");
     // Print kind/info details
     ser::write_unlocked(" (kind=");
@@ -194,19 +199,21 @@ void ubsan_hexdump(uintptr_t addr, size_t size) {
         ser::write_unlocked(": ");
 
         // 16 hex bytes with markers
-        const auto* p = reinterpret_cast<const uint8_t*>(row);
-        for (int i = 0; i < 16; i++) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(row);
+        const auto* p = bytes;
+        for (int i = 0; i < 16; i++, p++) {
             // Mark the faulting byte(s)
             bool const IS_TARGET = ((row + i) >= addr && (row + i) < addr + size);
             if (IS_TARGET) {
                 ser::write_unlocked("[");
             }
 
-            char h[3];
-            h[0] = HEX[p[i] >> 4];
-            h[1] = HEX[p[i] & 0xf];
-            h[2] = '\0';
-            ser::write_unlocked(h);
+            std::array<char, 3> h{};
+            auto* hex_out = h.data();
+            *hex_out++ = *(HEX + (*p >> 4));
+            *hex_out++ = *(HEX + (*p & 0xf));
+            *hex_out = '\0';
+            ser::write_unlocked(h.data());
 
             if (IS_TARGET) {
                 ser::write_unlocked("]");
@@ -220,30 +227,28 @@ void ubsan_hexdump(uintptr_t addr, size_t size) {
 
         // ASCII
         ser::write_unlocked(" |");
-        for (int i = 0; i < 16; i++) {
-            char const C = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
+        p = bytes;
+        for (int i = 0; i < 16; i++, p++) {
+            char const C = (*p >= 0x20 && *p < 0x7f) ? static_cast<char>(*p) : '.';
             ser::write_unlocked(C);
         }
         ser::write_unlocked("|\n");
     }
 }
 
-}  // namespace
-
-static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
-    ker::mod::dbg::log("[UBSAN] %s at %s:%u:%u", kind, (loc->file != nullptr) ? loc->file : "?", loc->line, loc->column);
+void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
+    log::error("%s at %s:%u:%u", kind, (loc->file != nullptr) ? loc->file : "?", loc->line, loc->column);
 }
 
 // Enhanced abort: prints detailed info before calling panic_handler
-[[noreturn]] static void ubsan_abort(const char* kind, const UbsanSourceLocation* loc) {
+[[noreturn]] void ubsan_abort(const char* kind, const UbsanSourceLocation* loc) {
     ubsan_log(kind, loc);
     ker::mod::dbg::panic_handler("UBSan violation (see above)");
     __builtin_unreachable();
 }
 
 // Abort with value and type context (for handlers that have them)
-[[noreturn]] static void ubsan_abort_with_val(const char* kind, const UbsanSourceLocation* loc, const UbsanTypeDescriptor* type,
-                                              uintptr_t val) {
+[[noreturn]] void ubsan_abort_with_val(const char* kind, const UbsanSourceLocation* loc, const UbsanTypeDescriptor* type, uintptr_t val) {
     // Use direct serial writes for panic-safe output
     ser::enter_panic_mode();
     if (!ser::is_panic_owner()) {
@@ -278,7 +283,10 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
 
     // Caller RIP
     ser::write_unlocked("  Caller: ");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wframe-address"
     ubsan_write_hex(reinterpret_cast<uintptr_t>(__builtin_return_address(1)));
+#pragma clang diagnostic pop
     ser::write_unlocked("\n");
 
     ker::mod::dbg::panic_handler("UBSan violation (see above)");
@@ -286,8 +294,8 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
 }
 
 // Abort with two values (for overflow/shift/conversion handlers)
-[[noreturn]] static void ubsan_abort_with_vals(const char* kind, const UbsanSourceLocation* loc, const UbsanTypeDescriptor* type,
-                                               uintptr_t lhs, uintptr_t rhs) {
+[[noreturn]] void ubsan_abort_with_vals(const char* kind, const UbsanSourceLocation* loc, const UbsanTypeDescriptor* type, uintptr_t lhs,
+                                        uintptr_t rhs) {
     ser::enter_panic_mode();
     if (!ser::is_panic_owner()) {
         hcf();
@@ -317,6 +325,8 @@ static void ubsan_log(const char* kind, const UbsanSourceLocation* loc) {
     ker::mod::dbg::panic_handler("UBSan violation (see above)");
     __builtin_unreachable();
 }
+
+}  // namespace
 
 // --------------------------------------------------------------------------
 // Handlers - called by compiler-generated instrumentation
