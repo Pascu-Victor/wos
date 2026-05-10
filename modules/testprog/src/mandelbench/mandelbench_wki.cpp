@@ -170,8 +170,8 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
             auto max_iter_str = std::to_string(max_iteration);
             auto start_row_str = std::to_string(launch.start_row);
             auto row_count_str = std::to_string(launch.row_count);
-
-            const char const const const const* argv[] = {
+            // NOLINTNEXTLINE(misc-const-correctness)
+            const char* argv[] = {
                 "testprog",    "--mandelbench-worker", "--id",        id_str.c_str(),        "--threads", threads_str.c_str(),
                 "--start-row", start_row_str.c_str(),  "--row-count", row_count_str.c_str(), "--width",   width_str.c_str(),
                 "--height",    height_str.c_str(),     "--max-iter",  max_iter_str.c_str(),  "--output",  output.c_str(),

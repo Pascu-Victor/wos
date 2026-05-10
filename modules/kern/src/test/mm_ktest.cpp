@@ -28,7 +28,7 @@ KTEST(MM, PageAllocWriteReadback) {
 
 KTEST(MM, MultiplePageAllocFree) {
     constexpr int N = 8;
-    void const const const const const const const const const const const const const const const* pages[N] = {};
+    void const* pages[N] = {};
     for (int i = 0; i < N; ++i) {
         pages[i] = phys::page_alloc();
         KEXPECT_NE(pages[i], nullptr);
