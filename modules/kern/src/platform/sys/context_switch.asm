@@ -154,6 +154,7 @@ global task_switch_handler
 task_switch_handler:
     mov rdi, rsp
     call wos_sched_timer
+    cli
 
     ; Same-CPL iretq does not pop SS:RSP, so kernel-mode task switches
     ; must explicitly move to the target kernel stack first.
@@ -223,6 +224,7 @@ jump_to_next_task_no_save:
 
     mov rdi, rsp
     call wos_jump_to_next_task_no_save
+    cli
 
     ; Same-CPL iretq does not restore RSP; kernel targets need a frame on
     ; their own stack.
@@ -273,6 +275,7 @@ jump_to_next_task_no_save:
 global wos_deferred_task_switch_return
 wos_deferred_task_switch_return:
     ; rdi = GPRegs*, rsi = InterruptFrame*
+    cli
 
     ; Returning to a kernel-mode task is a same-CPL iretq. Build the return
     ; frame on the saved kernel stack so RSP is restored correctly.

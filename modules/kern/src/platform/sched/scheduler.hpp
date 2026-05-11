@@ -154,6 +154,20 @@ struct PreemptGuard {
     auto operator=(const PreemptGuard&) -> PreemptGuard& = delete;
 };
 
+inline auto interrupts_enabled() -> bool {
+    uint64_t flags = 0;
+    asm volatile("pushfq\n\tpop %0" : "=r"(flags)::"memory");
+    return (flags & cpu::GATE_IF_MASK) != 0;
+}
+
+inline void halt_once_preserving_interrupt_state(bool const INTERRUPTS_WERE_ENABLED) {
+    if (INTERRUPTS_WERE_ENABLED) {
+        asm volatile("sti\n\thlt" ::: "memory");
+    } else {
+        asm volatile("sti\n\thlt\n\tcli" ::: "memory");
+    }
+}
+
 // OOM diagnostics - get queue sizes for a specific CPU
 struct RunQueueStats {
     uint64_t active_task_count;   // runnable_heap.size
@@ -205,6 +219,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     if (preempt_count() != 0) {
         note_preempt_disabled_block("kern_yield", perf_callsite);
     }
+    bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
@@ -216,7 +231,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
             return;
         }
     }
-    asm volatile("sti\n\thlt" ::: "memory");
+    halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
         task->voluntary_block = false;
@@ -234,6 +249,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     if (preempt_count() != 0) {
         note_preempt_disabled_block("kern_block", perf_callsite);
     }
+    bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
@@ -248,7 +264,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         }
     }
     for (;;) {
-        asm volatile("sti\n\thlt" ::: "memory");
+        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
         if (task == nullptr) {
             break;
         }
@@ -281,6 +297,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     if (preempt_count() != 0) {
         note_preempt_disabled_block("kern_sleep", perf_callsite);
     }
+    bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
@@ -297,7 +314,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         }
     }
     for (;;) {
-        asm volatile("sti\n\thlt" ::: "memory");
+        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
         if (task == nullptr) {
             break;
         }

@@ -26,6 +26,7 @@
 #include "syscalls_impl/process/getpid.hpp"
 #include "syscalls_impl/process/getppid.hpp"
 #include "syscalls_impl/process/waitpid.hpp"
+#include "syscalls_impl/shm/shm.hpp"
 #include "util/hostname.hpp"
 #include "vfs/file.hpp"
 #include "vfs/vfs.hpp"
@@ -217,12 +218,22 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(-ENOMEM);
     }
 
+    if (!ker::syscall::shm::shm_clone_for_fork(parent, child)) {
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-shm-clone-fail");
+        mm::phys::page_free(child->pagemap);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        delete child;
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
     // --- Clone thread metadata ---
     // The child shares the same user-space layout (stack, TLS) via COW.
     // Allocate a Thread struct for the child that mirrors the parent's.
     if (parent->thread != nullptr) {
         auto* child_thread = new sched::threading::Thread();
         if (child_thread == nullptr) {
+            ker::syscall::shm::shm_cleanup_for_task(child);
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
             mm::phys::page_free(child->pagemap);
             delete[] child->name;
@@ -318,6 +329,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
+        ker::syscall::shm::shm_cleanup_for_task(child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -482,14 +494,18 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     }
 
     // Forward interrupt/termination signals to the remote node if target is a
-    // WKI proxy task.
-    ker::net::wki::wki_proxy_task_forward_signal(target, sig);
+    // WKI proxy task. When forwarding succeeds, the remote task owns signal
+    // termination semantics; do not also queue the signal locally on the proxy
+    // task or execve()-proxy handoff can be interrupted by a duplicate fatal
+    // signal before TASK_COMPLETE finalizes it.
+    bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(target, sig);
+    if (!FORWARDED) {
+        // Set the signal pending bit (signal N is bit N-1)
+        target->sig_pending |= (1ULL << (sig - 1));
 
-    // Set the signal pending bit (signal N is bit N-1)
-    target->sig_pending |= (1ULL << (sig - 1));
-
-    // Ensure blocked tasks become runnable so pending signals are delivered promptly.
-    sched::wake_task_for_signal(target);
+        // Ensure blocked tasks become runnable so pending signals are delivered promptly.
+        sched::wake_task_for_signal(target);
+    }
 
     target->release();
     return 0;

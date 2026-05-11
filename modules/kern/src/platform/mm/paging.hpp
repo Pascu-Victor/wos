@@ -86,6 +86,10 @@ const static uint64_t PAGE_NX = (1ULL << 63);
 // When set, the page is shared and read-only; a write fault triggers a copy.
 const static uint64_t PAGE_COW = (1ULL << 9);
 
+// Shared user mapping flag: stored in PTE bit 10. Fork preserves writable
+// shared mappings instead of converting them to COW.
+const static uint64_t PAGE_SHARED = (1ULL << 10);
+
 namespace page_types {
 const static uint64_t READONLY = PAGE_PRESENT;
 const static uint64_t KERNEL = PAGE_PRESENT | PAGE_WRITE;

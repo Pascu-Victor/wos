@@ -2,11 +2,11 @@
 
 #include <abi/callnums/vmem.h>
 #include <bits/off_t.h>
+#include <bits/ssize_t.h>
 
 #include <algorithm>
-#include <cassert>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
@@ -14,7 +14,6 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
-#include <util/hcf.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -107,6 +106,19 @@ auto prot_to_page_flags(uint64_t prot) -> uint64_t {
     return flags;
 }
 
+void rollback_mapped_pages(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t mapped_pages) {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return;
+    }
+
+    for (uint64_t i = 0; i < mapped_pages; i++) {
+        uint64_t const CURRENT_VADDR = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+        if (ker::mod::mm::virt::is_page_mapped(task->pagemap, CURRENT_VADDR)) {
+            ker::mod::mm::virt::unmap_page(task->pagemap, CURRENT_VADDR);
+        }
+    }
+}
+
 // Allocate anonymous memory
 auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {
     // Get current task
@@ -163,31 +175,29 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     }
 
     // Convert protection flags to page flags
-    auto page_flags = prot_to_page_flags(prot);
+    auto const PAGE_FLAGS = prot_to_page_flags(prot);
 
-    // Allocate and map pages
-    auto num_pages = size / ker::mod::mm::paging::PAGE_SIZE;
-
-    // Allocate all physical pages at once for efficiency
-    void* phys_pages = ker::mod::mm::phys::page_alloc(size);
-    if (phys_pages == nullptr) {
-        log::error("out of physical memory for %llu pages", num_pages);
-        ker::mod::mm::phys::dump_page_allocations_oom();
-        // TODO: implement process termination on OOM here for now dump will HCF
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-
-    for (uint64_t i = 0; i < num_pages; i++) {
+    // Virtual mappings do not require physically contiguous backing. Allocate
+    // page-by-page so mmap can use fragmented free memory instead of needing a
+    // high-order buddy block for every large arena.
+    auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+    uint64_t mapped_pages = 0;
+    for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        auto* phys_page = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(phys_pages) + (i * ker::mod::mm::paging::PAGE_SIZE));
-        // Get physical address
-        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(phys_page)));
+        const void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
+        if (PHYS_PAGE == nullptr) {
+            log::error("out of physical memory after mapping %llu/%llu anon pages", static_cast<unsigned long long>(mapped_pages),
+                       static_cast<unsigned long long>(NUM_PAGES));
+            rollback_mapped_pages(task, vaddr, mapped_pages);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
 
-        // Zero out the page for security
-        memset(phys_page, 0, ker::mod::mm::paging::PAGE_SIZE);
+        // Get physical address
+        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
 
         // Map the page
-        ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, page_flags);
+        ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, PAGE_FLAGS);
+        mapped_pages++;
 
         if (is_watched_mmap_vaddr(current_vaddr)) {
             log::warn(
@@ -197,11 +207,6 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
                 static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
                 static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot));
         }
-    }
-
-    if (!ker::mod::mm::phys::page_split_to_order0(phys_pages)) {
-        log::error("failed to split anon backing block for leaf reclaim");
-        hcf();
     }
 
     return vaddr;
@@ -302,29 +307,43 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         }
     }
 
-    auto page_flags = prot_to_page_flags(prot);
-    auto num_pages = size / ker::mod::mm::paging::PAGE_SIZE;
-
-    void* phys_pages = ker::mod::mm::phys::page_alloc(size);
-    if (phys_pages == nullptr) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-    memset(phys_pages, 0, size);
+    auto const PAGE_FLAGS = prot_to_page_flags(prot);
+    auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
 
     // Read file content into the backing pages
-    auto file_size = static_cast<uint64_t>(st.st_size);
-    if (offset < file_size) {
-        uint64_t read_size = file_size - offset;
-        read_size = std::min(read_size, size);
+    auto const FILE_SIZE = static_cast<uint64_t>(st.st_size);
+    uint64_t file_bytes_remaining = 0;
+    if (offset < FILE_SIZE) {
+        file_bytes_remaining = std::min(FILE_SIZE - offset, size);
         ker::vfs::vfs_lseek(fd, static_cast<off_t>(offset), 0 /* SEEK_SET */);
-        ker::vfs::vfs_read(fd, phys_pages, static_cast<size_t>(read_size));
     }
 
-    for (uint64_t i = 0; i < num_pages; i++) {
+    uint64_t mapped_pages = 0;
+    for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        auto* phys_page = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(phys_pages) + (i * ker::mod::mm::paging::PAGE_SIZE));
-        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(phys_page)));
-        ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, page_flags);
+        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
+        if (PHYS_PAGE == nullptr) {
+            rollback_mapped_pages(task, vaddr, mapped_pages);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+
+        if (file_bytes_remaining > 0) {
+            uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, file_bytes_remaining);
+            ssize_t const READ_RET = ker::vfs::vfs_read(fd, PHYS_PAGE, static_cast<size_t>(READ_SIZE));
+            if (READ_RET > 0) {
+                auto const BYTES_READ = static_cast<uint64_t>(READ_RET);
+                file_bytes_remaining -= std::min(BYTES_READ, file_bytes_remaining);
+                if (BYTES_READ < READ_SIZE) {
+                    file_bytes_remaining = 0;
+                }
+            } else {
+                file_bytes_remaining = 0;
+            }
+        }
+
+        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
+        ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, PAGE_FLAGS);
+        mapped_pages++;
         if (is_watched_mmap_vaddr(current_vaddr)) {
             log::warn(
                 "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx "
@@ -333,11 +352,6 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
                 static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
                 static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), fd, static_cast<unsigned long long>(offset));
         }
-    }
-
-    if (!ker::mod::mm::phys::page_split_to_order0(phys_pages)) {
-        log::error("vmem: failed to split file backing block for leaf reclaim");
-        hcf();
     }
 
     return vaddr;

@@ -62,6 +62,15 @@ std::atomic<bool> s_devfs_ready{false};
 std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::TRACE)};
 uint64_t s_boot_id = 0x574f530000000001ULL;
 
+auto mix_boot_id(uint64_t value) -> uint64_t {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+}
+
 auto level_name(LogLevel level) -> const char* {
     switch (level) {
         case LogLevel::TRACE:
@@ -343,7 +352,17 @@ void maybe_register_module_device(ModuleDevice& entry) {
 
 }  // namespace
 
-void init() { s_boot_id = 0x574f530000000000ULL ^ reinterpret_cast<uint64_t>(&s_ring) ^ reinterpret_cast<uint64_t>(&s_modules); }
+void init() {
+    uint64_t seed = 0x574f530000000001ULL;
+    seed ^= rdtsc();
+    seed ^= reinterpret_cast<uint64_t>(&s_ring);
+    seed ^= reinterpret_cast<uint64_t>(&s_modules);
+    seed ^= static_cast<uint64_t>(ker::mod::cpu::get_current_cpu_id_safe()) << 48;
+    s_boot_id = mix_boot_id(seed);
+    if (s_boot_id == 0) {
+        s_boot_id = 1;
+    }
+}
 
 void enable_time() { s_time_available.store(true, std::memory_order_release); }
 

@@ -14,7 +14,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
-#include <print>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -30,6 +29,7 @@ constexpr const char* JOURNAL_FILE = "/var/log/journal/wos.journal";
 constexpr const char* JOURNAL_FILE_OLD = "/var/log/journal/wos.journal.1";
 constexpr off_t ROTATE_BYTES = static_cast<off_t>(8) * 1024 * 1024;
 constexpr uint32_t FLAG_KERNEL = 1U << 1;
+constexpr uint16_t JOURNAL_HEADER_SIZE = sizeof(JournalRecord) - ker::abi::sys_log::JOURNAL_MESSAGE_MAX;
 
 auto base_name(const char* path) -> const char* {
     if (path == nullptr) {
@@ -122,8 +122,34 @@ auto write_all(int fd, const void* data, size_t len) -> bool {
     return true;
 }
 
+auto bounded_string_length(const char* text, size_t limit) -> size_t {
+    if (text == nullptr) {
+        return 0;
+    }
+    size_t len = 0;
+    while (len < limit && text[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+void report_errno(const char* context) {
+    int const saved_errno = errno;
+    std::fprintf(stderr, "%s: %s\n", context, std::strerror(saved_errno));
+}
+
 auto valid_record(const JournalRecord& rec) -> bool {
-    return rec.magic == ker::abi::sys_log::JOURNAL_RECORD_MAGIC && rec.version == ker::abi::sys_log::JOURNAL_RECORD_VERSION;
+    if (rec.magic != ker::abi::sys_log::JOURNAL_RECORD_MAGIC || rec.version != ker::abi::sys_log::JOURNAL_RECORD_VERSION ||
+        rec.header_size != JOURNAL_HEADER_SIZE) {
+        return false;
+    }
+    if (rec.level > 7 || rec.message_len >= ker::abi::sys_log::JOURNAL_MESSAGE_MAX) {
+        return false;
+    }
+    if (bounded_string_length(rec.module, ker::abi::sys_log::JOURNAL_MODULE_MAX) >= ker::abi::sys_log::JOURNAL_MODULE_MAX) {
+        return false;
+    }
+    return bounded_string_length(rec.message, static_cast<size_t>(rec.message_len) + 1) == rec.message_len;
 }
 
 struct Options {
@@ -156,10 +182,20 @@ auto record_matches(const JournalRecord& rec, const Options& opts) -> bool {
     return true;
 }
 
-void print_record(const JournalRecord& rec) {
-    std::println("[{}.{:03}] {:8} {:16} {:.{}}", static_cast<unsigned long long>(rec.monotonic_us / 1000000ULL),
-                 ((rec.monotonic_us / 1000ULL) % 1000ULL), level_name(rec.level), rec.module, rec.message,
-                 static_cast<int>(rec.message_len));
+auto print_record(const JournalRecord& rec) -> bool {
+    size_t const MODULE_LEN = bounded_string_length(rec.module, ker::abi::sys_log::JOURNAL_MODULE_MAX);
+    std::array<char, 96> prefix{};
+    int const prefix_len = std::snprintf(prefix.data(), prefix.size(), "[%llu.%03llu] %-8s %-16.*s ",
+                                         static_cast<unsigned long long>(rec.monotonic_us / 1000000ULL),
+                                         static_cast<unsigned long long>((rec.monotonic_us / 1000ULL) % 1000ULL), level_name(rec.level),
+                                         static_cast<int>(MODULE_LEN), rec.module);
+    if (prefix_len < 0) {
+        return false;
+    }
+
+    size_t const PREFIX_BYTES = std::min(static_cast<size_t>(prefix_len), prefix.size() - 1);
+    return write_all(STDOUT_FILENO, prefix.data(), PREFIX_BYTES) &&
+           write_all(STDOUT_FILENO, rec.message, static_cast<size_t>(rec.message_len)) && write_all(STDOUT_FILENO, "\n", 1);
 }
 
 void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
@@ -179,7 +215,7 @@ void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
 }
 
 auto open_journal_file_append() -> int {
-    int fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY, 0644);
+    int fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) {
         return fd;
     }
@@ -188,12 +224,25 @@ auto open_journal_file_append() -> int {
         close(fd);
         unlink(JOURNAL_FILE_OLD);
         rename(JOURNAL_FILE, JOURNAL_FILE_OLD);
-        fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY, 0644);
+        fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
     }
     if (fd >= 0) {
         lseek(fd, 0, SEEK_END);
     }
     return fd;
+}
+
+auto persist_record(int& fd, const JournalRecord& rec) -> bool {
+    if (write_all(fd, &rec, sizeof(rec))) {
+        return true;
+    }
+
+    close(fd);
+    fd = open_journal_file_append();
+    if (fd < 0) {
+        return false;
+    }
+    return write_all(fd, &rec, sizeof(rec));
 }
 
 auto run_daemon() -> int {
@@ -232,12 +281,20 @@ auto run_daemon() -> int {
                     return 1;
                 }
             }
-            write_all(out, &rec, sizeof(rec));
+            if (!persist_record(out, rec)) {
+                report_errno("journald: failed to persist journal record");
+                close(out);
+                close(DEV);
+                return 1;
+            }
         }
     }
 }
 
-void usage() { std::println("usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec]"); }
+void usage() {
+    constexpr std::string_view USAGE = "usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec]\n";
+    (void)write_all(STDOUT_FILENO, USAGE.data(), USAGE.size());
+}
 
 auto parse_args(int argc, char** argv, Options& opts) -> bool {
     for (int i = 1; i < argc; i++) {
@@ -304,7 +361,13 @@ auto run_query(const Options& opts) -> int {
         start = filtered.size() - opts.tail;
     }
     for (auto it = std::next(filtered.cbegin(), static_cast<ptrdiff_t>(start)); it != filtered.cend(); ++it) {
-        print_record(*it);
+        if (!print_record(*it)) {
+            report_errno("journalctl: failed to write output");
+            if (DEV >= 0) {
+                close(DEV);
+            }
+            return 1;
+        }
     }
 
     if (opts.follow && DEV >= 0) {
@@ -319,7 +382,11 @@ auto run_query(const Options& opts) -> int {
             for (size_t i = 0; i < COUNT; i++) {
                 const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
                 if (record_matches(rec, opts)) {
-                    print_record(rec);
+                    if (!print_record(rec)) {
+                        report_errno("journalctl: failed to write output");
+                        close(DEV);
+                        return 1;
+                    }
                 }
             }
         }

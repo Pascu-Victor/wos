@@ -34,6 +34,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/threading.hpp"
+#include "syscalls_impl/shm/shm.hpp"
 #include "util/hcf.hpp"
 #include "vfs/stat.hpp"
 namespace ker::syscall::process {
@@ -1246,6 +1247,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // and thread backing storage must be reclaimed now rather than deferred to
     // task GC. Otherwise each successful exec leaks another user stack/TLS set
     // plus the old pagemap's user pages.
+    ker::syscall::shm::shm_cleanup_for_task(task);
     if (old_pagemap != nullptr && old_pagemap != new_pagemap) {
         mm::virt::switch_to_kernel_pagemap();
         mm::virt::destroy_user_space(old_pagemap, task->pid, task->name, "exec-old-image");

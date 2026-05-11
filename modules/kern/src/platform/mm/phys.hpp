@@ -17,7 +17,7 @@ void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
 void enable_per_cpu_allocations();    // Call after cpuParamInit to enable per-CPU page caches
 auto page_alloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
-auto page_alloc_huge(uint64_t size) -> void*;  // Allocate from huge page zone
+auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 void page_free(void* page);
 auto page_split_to_order0(void* page) -> bool;
 

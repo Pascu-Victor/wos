@@ -40,6 +40,7 @@
 #include <platform/interrupt/idt.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/phys.hpp>
 
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "util/hcf.hpp"
@@ -91,10 +92,17 @@ void fsgsbase_init() {
 }
 
 void gdt_init() {
-    // Initialize GDT with the captured stack pointer
-    uint64_t const RSP = get_kernel_rsp();
-    auto* stack = reinterpret_cast<uint8_t*>(RSP);
-    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(stack) + ker::mod::mm::KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
+    // User->kernel interrupts load RSP0 from the TSS. Give the BSP a real
+    // interrupt stack; the captured boot RSP is just the current stack pointer.
+    static uint64_t bsp_rsp0 = 0;
+    if (bsp_rsp0 == 0) {
+        auto const STACK_BASE = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc(mod::mm::KERNEL_STACK_SIZE));
+        if (STACK_BASE == 0) {
+            hcf();
+        }
+        bsp_rsp0 = STACK_BASE + mod::mm::KERNEL_STACK_SIZE;
+    }
+    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(bsp_rsp0), 0);  // BSP is CPU 0
 }
 
 void kmalloc_init() {

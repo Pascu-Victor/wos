@@ -38,6 +38,7 @@ wos_asm_syscall_handler:
     xor rbp, rbp
 
     call syscall_handler
+    cli
     ; save return value
     mov [rsp+0x78], rax
 
@@ -48,6 +49,7 @@ wos_asm_syscall_handler:
     sub rsp, 8  ; Align stack for call
     call wos_get_current_task
     add rsp, 8  ; Restore stack
+    cli
 
     ; rax now contains current task pointer
     ; Check if deferred_task_switch flag is set at the calculated offset
@@ -65,6 +67,7 @@ wos_asm_syscall_handler:
     ; deferred_task_switch returns only if it decided to resume this task via
     ; the normal syscall exit path.
     add rsp, 8
+    cli
 
 .no_deferred_switch:
     ; Check for pending signals before returning to userspace
@@ -73,6 +76,7 @@ wos_asm_syscall_handler:
     sub rsp, 8              ; align stack for call
     call check_pending_signals
     add rsp, 8
+    cli
 
     ; restore usermode segment ds and es
     mov ds, [gs:0x18]

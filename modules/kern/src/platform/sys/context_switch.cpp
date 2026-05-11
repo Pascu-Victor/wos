@@ -125,7 +125,7 @@ void validate_timer_stack(const gates::InterruptFrame& frame, const cpu::GPRegs&
     hcf();
 }
 
-auto current_stack_matches_current_task() -> bool {
+auto current_stack_allows_local_reschedule() -> bool {
     if (!sched::can_query_current_task()) {
         return true;
     }
@@ -136,7 +136,16 @@ auto current_stack_matches_current_task() -> bool {
     // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t rsp = 0;
     asm volatile("mov %%rsp, %0" : "=r"(rsp)::"memory");
-    return stack_belongs_to_task(task, rsp);
+    if (stack_belongs_to_task(task, rsp)) {
+        return true;
+    }
+
+    // User-mode interrupts enter on the CPU's TSS/RSP0 stack, which is not
+    // owned by any Task. That path is safe to use for merely arming the local
+    // APIC timer. The dangerous case is a real task stack owned by someone
+    // other than current_task, which can happen during the handoff window after
+    // current_task is changed but before the actual RSP switch.
+    return sched::debug_find_task_by_kernel_stack(rsp) == nullptr;
 }
 
 [[noreturn]] void enter_idle_from_timer(sched::task::Task* task, const gates::InterruptFrame& frame) {
@@ -555,7 +564,7 @@ void start_sched_timer() {
 
 void request_reschedule() {
     // Fires the scheduler timer on the next CPU cycle
-    if (!current_stack_matches_current_task()) {
+    if (!current_stack_allows_local_reschedule()) {
         static std::atomic<uint64_t> skipped_mismatch_logs{0};
         uint64_t const N = skipped_mismatch_logs.fetch_add(1, std::memory_order_relaxed);
         if (N < 8) {
@@ -563,10 +572,13 @@ void request_reschedule() {
             // NOLINTNEXTLINE(misc-const-correctness)
             uint64_t rsp = 0;
             asm volatile("mov %%rsp, %0" : "=r"(rsp)::"memory");
-            dbg::logger<"ctxswitch">::warn("skip local resched on non-current stack: current=%lu(%s) rsp=0x%llx stack=0x%llx",
-                                           task != nullptr ? task->pid : 0UL, (task != nullptr && task->name != nullptr) ? task->name : "?",
-                                           static_cast<unsigned long long>(rsp),
-                                           task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL);
+            auto* owner = sched::debug_find_task_by_kernel_stack(rsp);
+            dbg::logger<"ctxswitch">::warn(
+                "skip local resched on non-current task stack: current=%lu(%s) owner=%lu(%s) rsp=0x%llx stack=0x%llx",
+                task != nullptr ? task->pid : 0UL, (task != nullptr && task->name != nullptr) ? task->name : "?",
+                owner != nullptr ? owner->pid : 0UL, (owner != nullptr && owner->name != nullptr) ? owner->name : "?",
+                static_cast<unsigned long long>(rsp),
+                task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL);
         }
         return;
     }

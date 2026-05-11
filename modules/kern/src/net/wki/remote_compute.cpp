@@ -36,7 +36,6 @@
 
 #include "platform/mm/paging.hpp"
 #include "platform/sys/spinlock.hpp"
-#include "util/hcf.hpp"
 
 namespace ker::net::wki {
 
@@ -52,6 +51,7 @@ std::deque<RunningRemoteTask> g_running_remote_tasks;  // NOLINT(cppcoreguidelin
 uint32_t g_next_task_id = 1;                           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_compute_initialized = false;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_last_load_report_us = 0;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint16_t g_preferred_remote_cursor = 0;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_compute_lock;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // Pending queue for VFS_REF/RESOURCE_REF task submits.
@@ -646,9 +646,10 @@ struct WkiTaskIdentityContext {
     uint64_t session_id;
     uint64_t pgid;
     int32_t controlling_tty;
+    std::array<char, WKI_HOSTNAME_MAX> submitter_hostname;
 } __attribute__((packed));
 
-static_assert(sizeof(WkiTaskIdentityContext) == 48, "WkiTaskIdentityContext must stay wire-stable");
+static_assert(sizeof(WkiTaskIdentityContext) == 112, "WkiTaskIdentityContext must stay wire-stable");
 
 void fill_task_identity_context(const ker::mod::sched::task::Task* task, WkiTaskIdentityContext* identity) {
     if (task == nullptr || identity == nullptr) {
@@ -665,6 +666,10 @@ void fill_task_identity_context(const ker::mod::sched::task::Task* task, WkiTask
     identity->session_id = task->session_id;
     identity->pgid = task->pgid;
     identity->controlling_tty = static_cast<int32_t>(task->controlling_tty);
+    if (task->wki_submitter_hostname.front() != '\0') {
+        std::strncpy(identity->submitter_hostname.data(), task->wki_submitter_hostname.data(), identity->submitter_hostname.size() - 1);
+        identity->submitter_hostname.back() = '\0';
+    }
 }
 
 void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiTaskIdentityContext& identity) {
@@ -685,6 +690,10 @@ void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiT
     // than a receiver-local controlling tty, so detach instead of accidentally
     // binding /dev/tty to a same-numbered PTY on the receiver.
     task->controlling_tty = -1;
+    if (identity.submitter_hostname.front() != '\0') {
+        std::strncpy(task->wki_submitter_hostname.data(), identity.submitter_hostname.data(), task->wki_submitter_hostname.size() - 1);
+        task->wki_submitter_hostname.back() = '\0';
+    }
 }
 
 auto serialized_task_vfs_rules_size(const ker::mod::sched::task::Task* task) -> uint16_t {
@@ -1108,12 +1117,13 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     const bool STRICT_TARGET = EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
     const bool PREFER_REMOTE = !EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
     const bool STRICT_REMOTE = PREFER_REMOTE && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
+    const bool REMOTE_RECEIVER =
+        task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0;
 
-    // A task that was already submitted from another node should stay on its
-    // receiver node for subsequent exec/fork paths.  Re-placing those tasks
-    // remotely again turns wrappers such as /bin/time into nested cross-node
-    // launches and inflates launch latency for no benefit.
-    if (task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0) {
+    // A task that was already submitted from another node stays on its receiver
+    // for automatic follow-on execs. Explicit targets and remote-preferred
+    // policies are an opt-in fan-out path used by distributed launchers.
+    if (REMOTE_RECEIVER && !EXPLICIT_TARGET && !PREFER_REMOTE) {
         return WkiRemoteSpawnResult::LOCAL;
     }
 
@@ -1759,20 +1769,41 @@ void wki_task_cancel(uint32_t task_id) {
     cancel.task_id = task_id;
 
     wki_send(TARGET_NODE, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
-
-    s_compute_lock.lock();
-    task = find_submitted_task_any(task_id);
-    if (task != nullptr) {
-        task->active = false;
-        task->complete_pending = false;
-        task->complete_wait_entry = nullptr;
-    }
-    s_compute_lock.unlock();
 }
 
 // ===============================================================================
 //  Signal Forwarding for Proxy Tasks
 // ===============================================================================
+
+static auto task_process_owner_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
+    if (task == nullptr) {
+        return 0;
+    }
+    return task->is_thread && task->owner_pid != 0 ? task->owner_pid : task->pid;
+}
+
+static auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> size_t {
+    if (owner_pid == 0 || signum <= 0 || std::cmp_greater(signum, ker::mod::sched::task::Task::MAX_SIGNALS)) {
+        return 0;
+    }
+
+    size_t signaled = 0;
+    uint64_t const MASK = 1ULL << (signum - 1);
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto* candidate = ker::mod::sched::get_active_task_at_safe(i);
+        if (candidate == nullptr) {
+            continue;
+        }
+        if (!candidate->has_exited && task_process_owner_pid(candidate) == owner_pid) {
+            candidate->sig_pending |= MASK;
+            ker::mod::sched::wake_task_for_signal(candidate);
+            ++signaled;
+        }
+        candidate->release();
+    }
+    return signaled;
+}
 
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool {
     if (task == nullptr || task->wki_proxy_task_id == 0) {
@@ -1892,8 +1923,9 @@ namespace {
 
 // s_compute_lock must be held by caller.
 auto wki_preferred_remote_node() -> uint16_t {
-    uint16_t best_node = WKI_NODE_INVALID;
-    uint16_t best_load = UINT16_MAX;
+    std::array<uint16_t, WKI_MAX_PEERS> candidates = {};
+    size_t candidate_count = 0;
+    uint32_t best_load = UINT32_MAX;
     uint64_t const NOW = wki_now_us();
 
     for (const auto& rl : g_remote_loads) {
@@ -1907,24 +1939,39 @@ auto wki_preferred_remote_node() -> uint16_t {
         if (peer == nullptr || peer->state != PeerState::CONNECTED) {
             continue;
         }
-        uint16_t const ADJUSTED = rl.avg_load_pct + WKI_REMOTE_PLACEMENT_PENALTY;
+        uint32_t const ADJUSTED = static_cast<uint32_t>(rl.avg_load_pct) + WKI_REMOTE_PLACEMENT_PENALTY;
         if (ADJUSTED < best_load) {
             best_load = ADJUSTED;
-            best_node = rl.node_id;
+            candidate_count = 0;
+        }
+        if (ADJUSTED == best_load && candidate_count < candidates.size()) {
+            candidates.at(candidate_count++) = rl.node_id;
         }
     }
 
-    if (best_node != WKI_NODE_INVALID) {
-        return best_node;
+    if (candidate_count != 0) {
+        uint16_t const NODE = candidates.at(g_preferred_remote_cursor % candidate_count);
+        ++g_preferred_remote_cursor;
+        return NODE;
     }
 
+    candidate_count = 0;
     for (auto* peer = std::begin(g_wki.peers); peer != std::end(g_wki.peers); ++peer) {
         if (peer->node_id != WKI_NODE_INVALID && peer->state == PeerState::CONNECTED) {
-            return peer->node_id;
+            candidates.at(candidate_count++) = peer->node_id;
+            if (candidate_count == candidates.size()) {
+                break;
+            }
         }
     }
 
-    return WKI_NODE_INVALID;
+    if (candidate_count == 0) {
+        return WKI_NODE_INVALID;
+    }
+
+    uint16_t const NODE = candidates.at(g_preferred_remote_cursor % candidate_count);
+    ++g_preferred_remote_cursor;
+    return NODE;
 }
 
 }  // namespace
@@ -2870,8 +2917,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         }
     }
 
-    // Remote-receiver tasks and their descendants should execute locally on
-    // the receiver unless they opt into a different policy explicitly later.
+    // Remote-receiver tasks execute locally by default. A later setwkitarget()
+    // call can still opt an execve() into explicit or remote-preferred fan-out.
     new_task->wki_target_hostname.front() = '\0';
     new_task->wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL;
     new_task->wki_skip_legacy_placement = true;
@@ -2899,45 +2946,61 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
 
         uint64_t user_stack_top = new_task->thread->stack;
         uint64_t stack_offset = 0;
+        constexpr uint64_t STACK_SETUP_LIMIT = 0x10000;  // 64 KiB safety limit
+
+        auto stack_has_room = [&](size_t size) -> bool {
+            if (size > STACK_SETUP_LIMIT) {
+                return false;
+            }
+            return stack_offset <= STACK_SETUP_LIMIT - size;
+        };
+
+        auto copy_to_user_stack = [&](uint64_t vaddr, const void* data, size_t size) -> bool {
+            auto const* src = static_cast<const uint8_t*>(data);
+            size_t copied = 0;
+            while (copied < size) {
+                uint64_t const CUR = vaddr + copied;
+                uint64_t const PAGE_VIRT = CUR & ~(paging::PAGE_SIZE - 1);
+                uint64_t const PAGE_OFF = CUR & (paging::PAGE_SIZE - 1);
+                size_t const CHUNK = std::min(size - copied, static_cast<size_t>(paging::PAGE_SIZE - PAGE_OFF));
+
+                uint64_t const PAGE_PHYS = virt::translate(new_task->pagemap, PAGE_VIRT);
+                if (PAGE_PHYS == virt::PADDR_INVALID) {
+                    mod::dbg::log("remote_compute: translate failed for stack vaddr 0x%x", PAGE_VIRT);
+                    return false;
+                }
+
+                auto* dest = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFF;
+                std::memcpy(dest, src + copied, CHUNK);
+                copied += CHUNK;
+            }
+            return true;
+        };
 
         auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
-            if (stack_offset + size > 0x10000) {  // 64 KiB safety limit
+            if (!stack_has_room(size)) {
                 return 0;
             }
             stack_offset += size;
             uint64_t const VADDR = user_stack_top - stack_offset;
 
-            uint64_t const PAGE_VIRT = VADDR & ~(paging::PAGE_SIZE - 1);
-            uint64_t const PAGE_OFF = VADDR & (paging::PAGE_SIZE - 1);
-
-            uint64_t const PAGE_PHYS = virt::translate(new_task->pagemap, PAGE_VIRT);
-            if (PAGE_PHYS == virt::PADDR_INVALID) {
-                mod::dbg::log("remote_compute: translate failed for stack vaddr 0x%x", PAGE_VIRT);
-                hcf();
+            if (!copy_to_user_stack(VADDR, data, size)) {
+                return 0;
             }
-            auto* dest = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFF;
-            std::memcpy(dest, data, size);
             return VADDR;
         };
 
         auto push_string = [&](const char* str) -> uint64_t {
             size_t const LEN = std::strlen(str) + 1;
-            if (stack_offset + LEN > 0x10000) {
+            if (!stack_has_room(LEN)) {
                 return 0;
             }
             stack_offset += LEN;
             uint64_t const VADDR = user_stack_top - stack_offset;
 
-            uint64_t const PAGE_VIRT = VADDR & ~(paging::PAGE_SIZE - 1);
-            uint64_t const PAGE_OFF = VADDR & (paging::PAGE_SIZE - 1);
-
-            uint64_t const PAGE_PHYS = virt::translate(new_task->pagemap, PAGE_VIRT);
-            if (PAGE_PHYS == virt::PADDR_INVALID) {
-                mod::dbg::log("remote_compute push_string: translate failed for stack vaddr 0x%x", PAGE_VIRT);
-                hcf();
+            if (!copy_to_user_stack(VADDR, str, LEN)) {
+                return 0;
             }
-            auto* dest = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFF;
-            std::memcpy(dest, str, LEN);
             return VADDR;
         };
 
@@ -3454,10 +3517,15 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         task = ker::mod::sched::find_task_by_pid_safe(LOCAL_PID);
         drop_lookup_ref = (task != nullptr);
     }
-    if (task != nullptr && !task->has_exited) {
+    uint64_t const OWNER_PID = task != nullptr ? task_process_owner_pid(task) : LOCAL_PID;
+    size_t const SIGNALED = queue_signal_for_process_tasks(OWNER_PID, WKI_SIGKILL_NUM);
+    if (SIGNALED != 0) {
+        ker::mod::dbg::log("[WKI] Task cancel queued: task_id=%u pid=0x%lx tasks=%lu", cancel->task_id, LOCAL_PID,
+                           static_cast<unsigned long>(SIGNALED));
+    } else if (task != nullptr && !task->has_exited) {
         task->sig_pending |= (1ULL << (WKI_SIGKILL_NUM - 1));
         ker::mod::sched::wake_task_for_signal(task);
-        ker::mod::dbg::log("[WKI] Task cancel queued: task_id=%u pid=0x%lx", cancel->task_id, LOCAL_PID);
+        ker::mod::dbg::log("[WKI] Task cancel queued fallback: task_id=%u pid=0x%lx", cancel->task_id, LOCAL_PID);
     }
 
     if (drop_lookup_ref) {

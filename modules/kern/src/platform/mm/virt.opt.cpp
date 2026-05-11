@@ -1151,11 +1151,12 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                                            (static_cast<uint64_t>(i2) << 21) | (static_cast<uint64_t>(i1) << 12);
                     uint64_t raw = pte_raw(src_pml1e);
                     const bool WAS_WRITABLE = (raw & paging::PAGE_WRITE) != 0U;
+                    const bool IS_SHARED = (raw & paging::PAGE_SHARED) != 0U;
 
                     // Only writable mappings need COW. Shared read-only mappings
                     // (text/debug metadata) can stay read-only in both address
                     // spaces and simply share the backing page.
-                    if (WAS_WRITABLE) {
+                    if (WAS_WRITABLE && !IS_SHARED) {
                         raw &= ~paging::PAGE_WRITE;
                         raw |= paging::PAGE_COW;
                         src_pml1e = pte_from_raw(raw);

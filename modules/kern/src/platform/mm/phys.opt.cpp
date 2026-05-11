@@ -2,7 +2,6 @@
 
 #include <extern/limine.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -336,39 +335,12 @@ void init(limine_memmap_response* memmap_response) {
         hcf();  // Can't allocate per-CPU caches
     }
 
-    // Find the largest usable region for huge pages (reserve ~10% or largest region > 128MB)
-    uint64_t largest_size = 0;
-    size_t huge_page_idx = 0;
-
-    for (size_t i = 0; i < MEMMAP.entry_count; i++) {
-        if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE && MEMMAP.entries[i]->length > largest_size) {
-            largest_size = MEMMAP.entries[i]->length;
-            huge_page_idx = i;
-        }
-    }
-
     paging::PageZone* zones_tail = nullptr;
     size_t zone_num = 0;
 
     for (size_t i = 0; i < MEMMAP.entry_count; i++) {
         if (MEMMAP.entries[i]->type != LIMINE_MEMMAP_USABLE || MEMMAP.entries[i]->length == paging::PAGE_SIZE) {
             continue;
-        }
-
-        // If this is the huge page entry and it's large enough, split it
-        constexpr uint64_t MIN_HUGE_PAGE_REGION_BYTES = 128ULL * 1024ULL * 1024ULL;
-        constexpr uint64_t MIN_HUGE_PAGE_BYTES = 16ULL * 1024ULL * 1024ULL;
-        if (i == huge_page_idx && largest_size > MIN_HUGE_PAGE_REGION_BYTES) {
-            uint64_t huge_sz = largest_size / 4;  // 25% for huge pages
-            huge_sz = std::max<uint64_t>(huge_sz, MIN_HUGE_PAGE_BYTES);
-            huge_sz = page_align_up(huge_sz);
-
-            // Save huge page region info for later initialization (after virt::initPagemap)
-            huge_page_base = MEMMAP.entries[i]->base + MEMMAP.entries[i]->length - huge_sz;
-            huge_page_size = huge_sz;
-
-            // Reduce the main zone size
-            MEMMAP.entries[i]->length -= huge_sz;
         }
 
         main_heap_size += MEMMAP.entries[i]->length;
@@ -578,6 +550,10 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
 }
 
 auto page_alloc_huge(uint64_t size) -> void* {
+    if (huge_page_zone == nullptr) {
+        return nullptr;
+    }
+
     void* caller_addr = __builtin_return_address(0);
     uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
 
@@ -587,9 +563,6 @@ auto page_alloc_huge(uint64_t size) -> void* {
     memlock.unlock_irq(FLAGS);
 
     if (block == nullptr) {
-        io::serial::write("OOM: pageAllocHuge failed for size 0x");
-        io::serial::write_hex(size);
-        io::serial::write(" bytes\n");
         return nullptr;
     }
 

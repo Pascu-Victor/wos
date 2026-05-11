@@ -361,30 +361,41 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
     };
 #endif
 
-    if (sock->rcvbuf.available() > 0) {
-        ssize_t const N = sock->rcvbuf.read(buf, len);
-        if (N > 0) {
-            uint32_t const OLD_WND = cb->rcv_wnd;
-            cb->rcv_wnd = sock->rcvbuf.free_space();
-            // Only send proactive update when recovering from zero-window.
-            if (OLD_WND == 0) {
-                if (!tcp_send_ack(cb)) {
-                    cb->ack_pending = true;
-                    tcp_timer_arm(cb);
+    ssize_t completed = 0;
+    auto maybe_finish_recv = [&]() -> bool {
+        if (sock->rcvbuf.available() > 0) {
+            ssize_t const N = sock->rcvbuf.read(buf, len);
+            if (N > 0) {
+                uint32_t const OLD_WND = cb->rcv_wnd;
+                cb->rcv_wnd = sock->rcvbuf.free_space();
+                // Only send proactive update when recovering from zero-window.
+                if (OLD_WND == 0) {
+                    if (!tcp_send_ack(cb)) {
+                        cb->ack_pending = true;
+                        tcp_timer_arm(cb);
+                    }
                 }
             }
+            completed = N;
+            return true;
         }
-        return N;
-    }
 
-    // EOF states.
-    if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
-        cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
+        // EOF states.
+        if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
+            cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
 #ifdef TCP_DEBUG
-        log::trace("tcp_recv: pid=%lu eof state=%u len=%zu avail=%zu", current_pid(), static_cast<unsigned>(cb->state), len,
-                   sock->rcvbuf.available());
+            log::trace("tcp_recv: pid=%lu eof state=%u len=%zu avail=%zu", current_pid(), static_cast<unsigned>(cb->state), len,
+                       sock->rcvbuf.available());
 #endif
-        return 0;
+            completed = 0;
+            return true;
+        }
+
+        return false;
+    };
+
+    if (maybe_finish_recv()) {
+        return completed;
     }
 
     if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::FIN_WAIT_1 && cb->state != TcpState::FIN_WAIT_2) {
@@ -404,29 +415,26 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
         }
     }
 
-    for (;;) {
-        if (sock->rcvbuf.available() > 0) {
-            ssize_t const N = sock->rcvbuf.read(buf, len);
-            if (N > 0) {
-                uint32_t const OLD_WND = cb->rcv_wnd;
-                cb->rcv_wnd = sock->rcvbuf.free_space();
-                if (OLD_WND == 0) {
-                    tcp_send_ack(cb);
-                }
-            }
-            return N;
-        }
-        if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
-            cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
-#ifdef TCP_DEBUG
-            log::trace("tcp_recv: pid=%lu eof-after-wait state=%u len=%zu avail=%zu", current_pid(), static_cast<unsigned>(cb->state), len,
-                       sock->rcvbuf.available());
-#endif
-            return 0;
-        }
-        ker::mod::sched::kern_yield();
-        ker::net::napi_poll_all_pending();
+    // Drain any already-pending RX work before committing to a blocking wait.
+    ker::net::napi_poll_all_pending();
+    if (maybe_finish_recv()) {
+        return completed;
     }
+
+    socket_defer_wait(sock, "tcp_wait");
+
+    // Close the race where data arrives after the last readiness check but
+    // before syscall exit. A concurrent wake clears deferred_task_switch; if
+    // the bytes are already present here, consume them immediately.
+    if (maybe_finish_recv()) {
+        if (auto* current_task = ker::mod::sched::get_current_task(); current_task != nullptr) {
+            current_task->deferred_task_switch = false;
+            current_task->wait_channel = nullptr;
+        }
+        return completed;
+    }
+
+    return -EAGAIN;
 }
 
 auto tcp_sendto(Socket* sock, const void* buf, size_t len, int flags, const void* /*unused*/, size_t /*unused*/) -> ssize_t {

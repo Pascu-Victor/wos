@@ -20,6 +20,7 @@
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
+#include "net/wki/remote_compute.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "release.hpp"
@@ -114,8 +115,16 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "version", 8);
             return 0;
         }
+        if (count == 6) {
+            buf->d_ino = 6;
+            buf->d_off = 7;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_DIR;
+            std::memcpy(buf->d_name.data(), "wki", 4);
+            return 0;
+        }
         // PID directories from active task list
-        size_t const PID_INDEX = count - 6;
+        size_t const PID_INDEX = count - 7;
         uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
         if (PID_INDEX >= TASK_COUNT) {
             return -1;  // No more entries
@@ -192,6 +201,18 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             return 0;
         }
         return -1;  // No more entries
+    }
+
+    if (pfd->node.type == ProcNodeType::WKI_DIR) {
+        if (count == 2) {
+            buf->d_ino = 20;
+            buf->d_off = 3;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "peers", 6);
+            return 0;
+        }
+        return -1;
     }
 
     return -1;
@@ -634,6 +655,63 @@ auto generate_wki_remote_pid(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         return bufsz != 0 ? bufsz - 1 : 0;
     }
     return static_cast<size_t>(LEN);
+}
+
+auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s != '\0' && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_row = [&](const char* hostname, uint64_t node_id, bool connected, uint64_t cpus, uint64_t load_pct, uint64_t last_update_us,
+                          bool local) {
+        if (off >= bufsz - 1) {
+            return;
+        }
+        int const LEN = std::snprintf(
+            buf + off, bufsz - off, "%s %llu %u %llu %llu %llu %u\n", hostname != nullptr && hostname[0] != '\0' ? hostname : "unknown",
+            static_cast<unsigned long long>(node_id), connected ? 1U : 0U, static_cast<unsigned long long>(cpus),
+            static_cast<unsigned long long>(load_pct), static_cast<unsigned long long>(last_update_us), local ? 1U : 0U);
+        if (LEN <= 0) {
+            return;
+        }
+        off += std::min(static_cast<size_t>(LEN), bufsz - off - 1);
+    };
+
+    append("hostname node_id connected cpus load_pct last_update_us local\n");
+
+    uint64_t const CPU_COUNT = std::max<uint64_t>(ker::mod::smt::get_core_count(), 1);
+    uint64_t local_runnable = 0;
+    for (uint64_t cpu = 0; cpu < CPU_COUNT; ++cpu) {
+        auto stats = ker::mod::sched::get_run_queue_stats(cpu);
+        local_runnable += stats.active_task_count;
+    }
+    uint64_t const LOCAL_LOAD = std::min<uint64_t>((local_runnable * 1000ULL) / CPU_COUNT, 1000ULL);
+    uint16_t const LOCAL_NODE = ker::net::wki::g_wki.my_node_id != ker::net::wki::WKI_NODE_INVALID ? ker::net::wki::g_wki.my_node_id : 0;
+    append_row(ker::net::wki::g_wki.local_hostname, LOCAL_NODE, true, CPU_COUNT, LOCAL_LOAD, ker::net::wki::wki_now_us(), true);
+
+    uint64_t const FLAGS = ker::net::wki::g_wki.peer_lock.lock_irqsave();
+    for (const auto& peer : ker::net::wki::g_wki.peers) {
+        if (peer.node_id == ker::net::wki::WKI_NODE_INVALID) {
+            continue;
+        }
+
+        auto const* load = ker::net::wki::wki_remote_node_load(peer.node_id);
+        uint64_t const CPUS = load != nullptr && load->valid && load->num_cpus != 0 ? load->num_cpus : 0;
+        uint64_t const LOAD_PCT = load != nullptr && load->valid ? load->avg_load_pct : 0;
+        uint64_t const LAST_UPDATE =
+            load != nullptr && load->valid ? load->last_update_us : std::max(peer.last_heartbeat, peer.last_rx_activity);
+        append_row(peer.hostname, peer.node_id, peer.state == ker::net::wki::PeerState::CONNECTED, CPUS, LOAD_PCT, LAST_UPDATE, false);
+    }
+    ker::net::wki::g_wki.peer_lock.unlock_irqrestore(FLAGS);
+
+    buf[off] = '\0';
+    return off;
 }
 
 // Generate content for /proc/version
@@ -1088,6 +1166,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::WKI_REMOTE_PID_FILE:
                 pfd->content_len = generate_wki_remote_pid(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
                 break;
+            case ProcNodeType::WKI_PEERS_FILE:
+                pfd->content_len = generate_wki_peers(pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
@@ -1344,6 +1425,16 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/kcontstat - per-subsystem container statistics
     if (strcmp(path, "kcontstat") == 0) {
         return make_file(ProcNodeType::KCONTSTAT_FILE, 0, false);
+    }
+
+    // /proc/wki
+    if (strcmp(path, "wki") == 0) {
+        return make_file(ProcNodeType::WKI_DIR, 0, true);
+    }
+
+    // /proc/wki/peers
+    if (strcmp(path, "wki/peers") == 0) {
+        return make_file(ProcNodeType::WKI_PEERS_FILE, 0, false);
     }
 
     // /proc/self -> symlink to /proc/<pid>

@@ -61,7 +61,8 @@ add_subdirectory(httpd)
 add_subdirectory(perf)
 add_subdirectory(journal)
 add_subdirectory(wkictl)
+add_subdirectory(renderbench)
 
 # Aggregate target for all WOS modules
 add_custom_target(wos_modules)
-add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd perf journal wkictl)
+add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd perf journal wkictl renderbench)

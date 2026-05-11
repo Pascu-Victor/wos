@@ -109,7 +109,7 @@ static auto shadow_cpu_index() -> uint64_t {
 }
 
 // Propagate the kernel pagemap's PML4 entry for shadow_vaddr into the currently
-// active pagemap, then flush the local TLB for that page.
+// active pagemap, then flush stale paging-structure state.
 //
 // copyKernelMappings() does a SHALLOW PML4 copy at task-creation time. If the
 // PML4 entry covering this shadow address was created AFTER the task was made
@@ -117,15 +117,28 @@ static auto shadow_cpu_index() -> uint64_t {
 // task pagemap's PML4 slot is still NULL. The kernel pagemap has the mapping;
 // the task pagemap does not. We must propagate the slot here so the CPU can
 // walk the page tables correctly.
-static void sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) {
+static auto pte_raw(const mm::paging::PageTableEntry& entry) -> uint64_t {
+    uint64_t raw = 0;
+    std::memcpy(&raw, &entry, sizeof(raw));
+    return raw;
+}
+
+static auto sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) -> bool {
     auto const KPHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(kernel_pml4)));
     uint64_t const CUR_CR3 = rdcr3();
     if (CUR_CR3 != KPHYS) {
         auto* cur_pml4 = reinterpret_cast<mm::paging::PageTable*>(mm::addr::get_virt_pointer(static_cast<mm::addr::paddr_t>(CUR_CR3)));
         size_t const PML4_IDX = (shadow_vaddr >> 39) & 0x1FF;
-        cur_pml4->entries[PML4_IDX] = kernel_pml4->entries[PML4_IDX];
+        if (pte_raw(cur_pml4->entries[PML4_IDX]) != pte_raw(kernel_pml4->entries[PML4_IDX])) {
+            cur_pml4->entries[PML4_IDX] = kernel_pml4->entries[PML4_IDX];
+            wrcr3(CUR_CR3);
+            return true;
+        }
+        invlpg(shadow_vaddr);
+        return false;
     }
     invlpg(shadow_vaddr);
+    return false;
 }
 
 auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gates::InterruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
@@ -166,7 +179,8 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
         s_shadow_map_lock.clear(std::memory_order_release);
         uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((DUPS % 1000) == 0) {
+        bool const SYNCED_CURRENT_PML4 = sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
+        if (!SYNCED_CURRENT_PML4 && (DUPS % 1000) == 0) {
             log::warn(
                 "already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
                 "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
@@ -175,8 +189,9 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
                 DUPS, shadow_vaddr, cr2, static_cast<int>(SOURCE.size()), SOURCE.data(), frame.rip, frame.rsp, frame.flags,
                 s_shadow_dup_count.load(std::memory_order_relaxed), gpr.rax, gpr.rbx, gpr.rcx, gpr.rdx, gpr.rsi, gpr.rdi, gpr.r8, gpr.r9,
                 gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
+        } else if (SYNCED_CURRENT_PML4 && (DUPS % 100000) == 0) {
+            log::debug("shadow page already mapped in kernel; synced current CR3 #%lu shadow_vaddr=0x%lx", DUPS, shadow_vaddr);
         }
-        sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
         mm::phys::page_free(phys_page);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return true;

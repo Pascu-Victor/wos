@@ -19,7 +19,7 @@ auto create_page_table_entry(uint64_t frame, uint64_t flags) -> PageTableEntry {
     entry.dirty = 0;
     entry.pagesize = 0;  // 4KB pages, not large pages
     entry.global = 0;
-    entry.available = 0;
+    entry.available = static_cast<uint8_t>((flags >> 9) & 0x7U);
     entry.reserved = 0;  // x86-64 requires reserved bits to be 0
     entry.no_execute = ((flags & PAGE_NX) != 0U) ? 1 : 0;
     return entry;

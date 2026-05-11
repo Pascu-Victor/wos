@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <net/wki/remote_compute.hpp>
@@ -18,6 +19,7 @@
 #include "platform/sched/task.hpp"
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
+#include "syscalls_impl/shm/shm.hpp"
 #include "waitpid.hpp"
 
 namespace ker::syscall::process {
@@ -194,22 +196,22 @@ void wos_proc_exit(int status) {
     // This ensures files written by the exiting process are fully committed to
     // the VFS before waitpid returns to the parent.
     if (!current_task->is_thread) {
-        // Snapshot descriptor numbers before closing. vfs_close() removes from
-        // fd_table and may free radix-tree nodes, so mutating during for_each()
-        // can invalidate the traversal.
+        // vfs_close() removes from fd_table and may free radix-tree nodes, so
+        // close one descriptor per traversal instead of mutating during for_each().
         while (!current_task->fd_table.empty()) {
-            std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE> fds{};
-            size_t fd_count = 0;
+            uint64_t fd = 0;
+            bool found_fd = false;
             current_task->fd_table.for_each([&](uint64_t key, void* /*val*/) -> void {
-                if (fd_count < ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-                    fds.at(fd_count++) = key;
+                if (!found_fd) {
+                    fd = key;
+                    found_fd = true;
                 }
             });
-            if (fd_count == 0) {
+            if (!found_fd) {
                 break;
             }
-            for (size_t i = 0; i < fd_count; ++i) {
-                ker::vfs::vfs_close(static_cast<int>(fds.at(i)));
+            if (ker::vfs::vfs_close(static_cast<int>(fd)) == -EBADF) {
+                ker::vfs::vfs_release_fd(current_task, static_cast<int>(fd));
             }
         }
 
@@ -329,6 +331,8 @@ void wos_proc_exit(int status) {
     // Remove any futex waiter node still owned by this task. Otherwise a later
     // futex_wake() can target a DEAD task and keep stale 64-byte wait nodes alive.
     ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
+
+    ker::syscall::shm::shm_cleanup_for_task(current_task);
 
     // TODO: Handle signal handlers cleanup
 

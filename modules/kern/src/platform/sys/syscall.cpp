@@ -4,6 +4,7 @@
 #include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
+#include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -58,6 +59,8 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             return ker::syscall::vmem::sys_vmem_map(A1, A2, A3, A4, A5, A6);
         case abi::callnums::PROCESS:
             return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(A1), A2, A3, A4, A5, regs);
+        case abi::callnums::SHM:
+            return ker::syscall::shm::sys_shm(A1, A2, A3, A4, A5);
 
         case abi::callnums::DEBUG:
             // a1=0: disable interrupts on this CPU; a1=1: re-enable

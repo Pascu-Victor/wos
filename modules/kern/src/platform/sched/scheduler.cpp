@@ -2837,9 +2837,11 @@ void signal_process_group(uint64_t pgid, int sig) {
         auto* t = get_active_task_at_safe(i);
         if (t != nullptr) {
             if (t->pgid == pgid && !t->has_exited) {
-                ker::net::wki::wki_proxy_task_forward_signal(t, sig);
-                t->sig_pending |= MASK;
-                wake_task_for_signal(t);
+                bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
+                if (!FORWARDED) {
+                    t->sig_pending |= MASK;
+                    wake_task_for_signal(t);
+                }
             }
             t->release();
         }
