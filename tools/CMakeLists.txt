@@ -53,6 +53,8 @@ project(wos_tools
     VERSION 1.0
     DESCRIPTION "WOS development tools"
     LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable color output for clang
 add_compile_options(-fdiagnostics-color=always)

@@ -7,12 +7,22 @@
 #include <QRegularExpression>
 #include <numeric>
 
+#include "debug_analysis_service.h"
 #include "log_processor.h"
+#include "mcp_http_server.h"
 
 LogServer::LogServer(quint16 port, QObject* parent)
-    : QObject(parent), tcpServer(new QTcpServer(this)), clientSocket(nullptr), processor(nullptr), filterActive(false) {
+    : QObject(parent),
+      tcpServer(new QTcpServer(this)),
+      clientSocket(nullptr),
+      processor(nullptr),
+      analysisService(new DebugAnalysisService(this)),
+      mcpServer(new McpHttpServer(analysisService, this)),
+      filterActive(false) {
     // Load config
     config.loadFromFile();
+    analysisService->setConfig(config);
+    mcpServer->set_allowed_cidrs(config.getMcpSettings().allowedCidrs);
 
     if (!tcpServer->listen(QHostAddress::Any, port)) {
         qCritical() << "Server failed to start:" << tcpServer->errorString();
@@ -30,7 +40,28 @@ LogServer::~LogServer() {
     if (processor) {
         delete processor;
     }
+    stopMcpServer();
 }
+
+bool LogServer::startMcpServer(const QString& bindAddress, quint16 port) {
+    const auto& settings = config.getMcpSettings();
+    QString host = bindAddress.isEmpty() ? settings.bindAddress : bindAddress;
+    quint16 listenPort = port == 0 ? settings.port : port;
+    mcpServer->set_allowed_cidrs(settings.allowedCidrs);
+    bool ok = mcpServer->start(host, listenPort);
+    if (ok) {
+        qInfo() << "MCP server listening at" << mcpServer->endpoint();
+    } else {
+        qWarning() << "Failed to start MCP server at" << host << listenPort;
+    }
+    return ok;
+}
+
+void LogServer::stopMcpServer() { mcpServer->stop(); }
+
+bool LogServer::isMcpListening() const { return mcpServer->is_listening(); }
+
+QString LogServer::mcpEndpoint() const { return mcpServer->endpoint(); }
 
 void LogServer::onNewConnection() {
     if (clientSocket) {
@@ -332,6 +363,23 @@ void LogServer::processMessage(MessageType type, QDataStream& in) {
             sendFileListResponse(files);
             break;
         }
+        case MessageType::StartMcpServer: {
+            QString bindAddress;
+            quint16 port;
+            in >> bindAddress >> port;
+            bool ok = startMcpServer(bindAddress, port);
+            sendMcpServerStatus(ok ? "MCP server started" : "Failed to start MCP server");
+            break;
+        }
+        case MessageType::StopMcpServer: {
+            stopMcpServer();
+            sendMcpServerStatus("MCP server stopped");
+            break;
+        }
+        case MessageType::McpServerStatusRequest: {
+            sendMcpServerStatus();
+            break;
+        }
         default:
             break;
     }
@@ -492,6 +540,17 @@ void LogServer::sendFileListResponse(const QStringList& files) {
     QDataStream out(&block, QIODevice::WriteOnly);
     out.setVersion(QDataStream::Qt_6_0);
     out << (quint32)0 << (quint8)MessageType::FileListResponse << files;
+    out.device()->seek(0);
+    out << (quint32)(block.size() - sizeof(quint32));
+    clientSocket->write(block);
+}
+
+void LogServer::sendMcpServerStatus(const QString& message) {
+    if (!clientSocket) return;
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << (quint32)0 << (quint8)MessageType::McpServerStatusResponse << isMcpListening() << mcpEndpoint() << message;
     out.device()->seek(0);
     out << (quint32)(block.size() - sizeof(quint32));
     clientSocket->write(block);

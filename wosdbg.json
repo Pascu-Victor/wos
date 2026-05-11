@@ -48,5 +48,17 @@
             "path": "./build/modules/kern/wos",
             "to": "0xffffffffffffffff"
         }
-    ]
+    ],
+    "mcp": {
+        "bindAddress": "127.0.0.1",
+        "port": 12346,
+        "allowedCidrs": ["127.0.0.1/32", "::1/128"],
+        "allowedRoots": ["."],
+        "maxEntries": 200,
+        "maxMemoryBytes": 4096,
+        "maxHits": 200,
+        "maxStringLength": 160,
+        "sourceWindowLines": 8,
+        "maxDisassemblyInstructions": 48
+    }
 }

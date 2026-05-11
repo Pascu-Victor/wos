@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 #include <cstdint>
 #include <vector>
 
@@ -31,6 +32,19 @@ struct BinaryMapping {
 
     BinaryMapping() = default;
     BinaryMapping(const QString& n, const QString& p) : name(n), elfPath(p) {}
+};
+
+struct McpSettings {
+    QString bindAddress = "127.0.0.1";
+    quint16 port = 12346;
+    QStringList allowedCidrs = {"127.0.0.1/32", "::1/128"};
+    QStringList allowedRoots;
+    int maxEntries = 200;
+    int maxMemoryBytes = 4096;
+    int maxHits = 200;
+    int maxStringLength = 160;
+    int sourceWindowLines = 8;
+    int maxDisassemblyInstructions = 48;
 };
 
 class Config {
@@ -73,6 +87,9 @@ class Config {
     // Resolve a potentially-relative path against the config file's directory
     QString resolvePath(const QString& path) const;
 
+    const McpSettings& getMcpSettings() const { return mcpSettings; }
+    McpSettings& getMutableMcpSettings() { return mcpSettings; }
+
     // Get default configuration
     void loadDefaults();
 
@@ -83,6 +100,7 @@ class Config {
     std::vector<AddressLookup> addressLookups;
     QString coredumpDirectory = "./coredumps";
     std::vector<BinaryMapping> binaryMappings;
+    McpSettings mcpSettings;
     QString configBaseDir;  // Directory containing the config file, for resolving relative paths
 
     // Helper functions for JSON parsing
@@ -90,6 +108,8 @@ class Config {
     QString formatAddress(uint64_t address) const;
     AddressLookup parseAddressLookup(const QJsonObject& obj) const;
     QJsonObject serializeAddressLookup(const AddressLookup& lookup) const;
+    McpSettings parseMcpSettings(const QJsonObject& obj) const;
+    QJsonObject serializeMcpSettings(const McpSettings& settings) const;
 };
 
 // Global configuration instance

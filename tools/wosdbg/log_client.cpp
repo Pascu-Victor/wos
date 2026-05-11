@@ -167,6 +167,14 @@ void LogClient::processMessage(MessageType type, QDataStream& in) {
             emit fileListReceived(fileList);
             break;
         }
+        case MessageType::McpServerStatusResponse: {
+            bool running;
+            QString endpoint;
+            QString message;
+            in >> running >> endpoint >> message;
+            emit mcpServerStatus(running, endpoint, message);
+            break;
+        }
         default:
             break;
     }
@@ -302,6 +310,36 @@ void LogClient::requestFileList() {
     QDataStream out(&block, QIODevice::WriteOnly);
     out.setVersion(QDataStream::Qt_6_0);
     out << (quint32)0 << (quint8)MessageType::RequestFileList;
+    out.device()->seek(0);
+    out << (quint32)(block.size() - sizeof(quint32));
+    socket->write(block);
+}
+
+void LogClient::startMcpServer(const QString& bindAddress, quint16 port) {
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << (quint32)0 << (quint8)MessageType::StartMcpServer << bindAddress << port;
+    out.device()->seek(0);
+    out << (quint32)(block.size() - sizeof(quint32));
+    socket->write(block);
+}
+
+void LogClient::stopMcpServer() {
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << (quint32)0 << (quint8)MessageType::StopMcpServer;
+    out.device()->seek(0);
+    out << (quint32)(block.size() - sizeof(quint32));
+    socket->write(block);
+}
+
+void LogClient::requestMcpServerStatus() {
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << (quint32)0 << (quint8)MessageType::McpServerStatusRequest;
     out.device()->seek(0);
     out << (quint32)(block.size() - sizeof(quint32));
     socket->write(block);

@@ -130,4 +130,10 @@ add_dependencies(boot_image busybox dropbear)
 add_custom_target(wos_full
     COMMENT "WOS full build complete."
 )
-add_dependencies(wos_full check_headers wos_modules mountfs_disk boot_image)
+add_dependencies(wos_full
+    check_headers
+    wos_modules
+    mountfs_disk
+    boot_image
+    wos_tools_build_always
+)

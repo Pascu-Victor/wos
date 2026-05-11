@@ -743,10 +743,13 @@ QemuLogViewer::QemuLogViewer(LogClient* client, QWidget* parent)
     connect(client, &LogClient::interruptsReceived, this, &QemuLogViewer::onInterruptsReceived);
     connect(client, &LogClient::filterApplied, this, &QemuLogViewer::onFilterApplied);
     connect(client, &LogClient::progress, this, &QemuLogViewer::onProgressUpdate);
+    connect(client, &LogClient::mcpServerStatus, this, &QemuLogViewer::onMcpServerStatus);
 
     // Initialize interrupt navigation state
     currentSelectedInterrupt.clear();
     currentInterruptIndex = -1;
+
+    client->requestMcpServerStatus();
 }
 
 QemuLogViewer::~QemuLogViewer() {
@@ -1232,6 +1235,13 @@ void QemuLogViewer::setupToolbar() {
     refreshDumpsBtn->setToolTip("Refresh coredump list");
     connect(refreshDumpsBtn, &QPushButton::clicked, this, &QemuLogViewer::refreshCoredumps);
     toolbar->addWidget(refreshDumpsBtn);
+
+    toolbar->addSeparator();
+
+    mcpToggleBtn = new QPushButton("MCP Off");
+    mcpToggleBtn->setToolTip("Start the MCP server on the active wosdbg backend");
+    connect(mcpToggleBtn, &QPushButton::clicked, this, &QemuLogViewer::onMcpToggle);
+    toolbar->addWidget(mcpToggleBtn);
 }
 
 void QemuLogViewer::setupMainContent() {
@@ -2547,4 +2557,28 @@ void QemuLogViewer::extractCoredumps() {
 void QemuLogViewer::refreshCoredumps() {
     coredumpBrowser_->refresh();
     statusLabel->setText("Coredump list refreshed");
+}
+
+void QemuLogViewer::onMcpToggle() {
+    if (!client) {
+        return;
+    }
+    if (mcpRunning) {
+        client->stopMcpServer();
+    } else {
+        client->startMcpServer();
+    }
+}
+
+void QemuLogViewer::onMcpServerStatus(bool running, const QString& endpoint, const QString& message) {
+    mcpRunning = running;
+    mcpEndpoint = endpoint;
+    if (mcpToggleBtn) {
+        mcpToggleBtn->setText(running ? "MCP On" : "MCP Off");
+        mcpToggleBtn->setToolTip(running ? QString("MCP server running at %1").arg(endpoint)
+                                         : "Start the MCP server on the active wosdbg backend");
+    }
+    if (!message.isEmpty()) {
+        statusLabel->setText(running && !endpoint.isEmpty() ? QString("%1: %2").arg(message, endpoint) : message);
+    }
 }

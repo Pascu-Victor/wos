@@ -34,6 +34,9 @@ class LogClient : public QObject {
     void requestRowForLine(int lineNumber);
     void requestOpenSourceFile(const QString& file, int line);
     void requestFileList();
+    void startMcpServer(const QString& bindAddress = QString(), quint16 port = 0);
+    void stopMcpServer();
+    void requestMcpServerStatus();
 
    signals:
     void searchResults(const std::vector<int>& matches);
@@ -49,6 +52,7 @@ class LogClient : public QObject {
     void progress(int percentage);
     void errorOccurred(const QString& error);
     void dataReceived(int startLine, int count);  // Signal to repaint
+    void mcpServerStatus(bool running, const QString& endpoint, const QString& message);
 
    private slots:
     void onConnected();

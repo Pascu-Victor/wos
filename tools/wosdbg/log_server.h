@@ -9,6 +9,7 @@
 #include "protocol.h"
 #include "wosdbg.h"
 
+class DebugAnalysisService;
 class LogServer : public QObject {
     Q_OBJECT
 
@@ -18,6 +19,10 @@ class LogServer : public QObject {
 
     bool isListening() const { return tcpServer->isListening(); }
     quint16 serverPort() const { return tcpServer->serverPort(); }
+    bool startMcpServer(const QString& bindAddress = QString(), quint16 port = 0);
+    void stopMcpServer();
+    bool isMcpListening() const;
+    QString mcpEndpoint() const;
 
    private slots:
     void onNewConnection();
@@ -31,6 +36,8 @@ class LogServer : public QObject {
     QTcpServer* tcpServer;
     QTcpSocket* clientSocket;
     LogProcessor* processor;
+    DebugAnalysisService* analysisService;
+    class McpHttpServer* mcpServer;
     Config config;
     QString currentFilename;
     std::vector<size_t> filteredIndices;
@@ -48,6 +55,7 @@ class LogServer : public QObject {
     void sendSetFilterResponse(int totalLines);
     void sendRowForLineResponse(int row);
     void sendFileListResponse(const QStringList& files);
+    void sendMcpServerStatus(const QString& message = QString());
 
     void applyFilter(bool hideStructural, const QString& interruptFilter);
 };

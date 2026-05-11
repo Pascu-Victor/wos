@@ -43,6 +43,15 @@ int main(int argc, char* argv[]) {
     QCommandLineOption remoteOption("remote", "Run in remote client mode", "host:port");
     parser.addOption(remoteOption);
 
+    QCommandLineOption mcpOption("mcp", "Start the MCP server with the wosdbg backend");
+    parser.addOption(mcpOption);
+
+    QCommandLineOption mcpHostOption("mcp-host", "MCP bind address", "host");
+    parser.addOption(mcpHostOption);
+
+    QCommandLineOption mcpPortOption("mcp-port", "MCP port", "port");
+    parser.addOption(mcpPortOption);
+
     parser.process(*app);
 
     // Initialize config service - search CWD and upward for wosdbg.json
@@ -82,6 +91,14 @@ int main(int argc, char* argv[]) {
         if (!server.isListening()) {
             qCritical() << "Failed to start server on" << host << ":" << port;
             return 1;
+        }
+
+        if (parser.isSet(mcpOption)) {
+            QString mcpHost = parser.value(mcpHostOption);
+            quint16 mcpPort = static_cast<quint16>(parser.value(mcpPortOption).toUInt());
+            if (!server.startMcpServer(mcpHost, mcpPort)) {
+                return 1;
+            }
         }
 
         qInfo() << "Server started on" << host << ":" << port;

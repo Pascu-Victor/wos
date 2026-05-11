@@ -27,7 +27,11 @@ enum class MessageType : uint8_t {
     RowForLineResponse = 16,
     OpenSourceFile = 17,
     RequestFileList = 18,
-    FileListResponse = 19
+    FileListResponse = 19,
+    StartMcpServer = 20,
+    StopMcpServer = 21,
+    McpServerStatusRequest = 22,
+    McpServerStatusResponse = 23
 };
 
 // Serialization helpers for LogEntry
@@ -76,14 +80,16 @@ inline QDataStream& operator>>(QDataStream& in, LogEntry& entry) {
 
 // Serialization helpers for AddressLookup (Config)
 inline QDataStream& operator<<(QDataStream& out, const AddressLookup& lookup) {
-    out << static_cast<qulonglong>(lookup.fromAddress) << static_cast<qulonglong>(lookup.toAddress) << lookup.symbolFilePath;
+    out << static_cast<qulonglong>(lookup.fromAddress) << static_cast<qulonglong>(lookup.toAddress) << static_cast<qulonglong>(lookup.loadOffset)
+        << lookup.symbolFilePath;
     return out;
 }
 
 inline QDataStream& operator>>(QDataStream& in, AddressLookup& lookup) {
-    qulonglong from, to;
-    in >> from >> to >> lookup.symbolFilePath;
+    qulonglong from, to, loadOffset;
+    in >> from >> to >> loadOffset >> lookup.symbolFilePath;
     lookup.fromAddress = static_cast<uint64_t>(from);
     lookup.toAddress = static_cast<uint64_t>(to);
+    lookup.loadOffset = static_cast<uint64_t>(loadOffset);
     return in;
 }

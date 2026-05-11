@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <algorithm>
 
 Config::Config() { loadDefaults(); }
 
@@ -93,6 +94,12 @@ bool Config::loadFromFile(const QString& filePath) {
     qDebug() << "Loaded" << binaryMappings.size() << "binary mappings,"
              << "coredump directory:" << coredumpDirectory;
 
+    if (root.contains("mcp") && root["mcp"].isObject()) {
+        mcpSettings = parseMcpSettings(root["mcp"].toObject());
+    } else {
+        mcpSettings = McpSettings{};
+    }
+
     return true;
 }
 
@@ -119,6 +126,8 @@ bool Config::saveToFile(const QString& filePath) const {
         binariesArray.append(obj);
     }
     root["binaries"] = binariesArray;
+
+    root["mcp"] = serializeMcpSettings(mcpSettings);
 
     QJsonDocument doc(root);
 
@@ -175,6 +184,7 @@ QString Config::resolvePath(const QString& path) const {
 
 void Config::loadDefaults() {
     addressLookups.clear();
+    mcpSettings = McpSettings{};
 
     // Add some common default lookups that might be useful
     // These are examples and can be customized based on typical use cases
@@ -270,6 +280,62 @@ QJsonObject Config::serializeAddressLookup(const AddressLookup& lookup) const {
     if (lookup.loadOffset != 0) {
         obj["offset"] = formatAddress(lookup.loadOffset);
     }
+    return obj;
+}
+
+McpSettings Config::parseMcpSettings(const QJsonObject& obj) const {
+    McpSettings settings;
+    if (obj.contains("bindAddress")) {
+        settings.bindAddress = obj["bindAddress"].toString(settings.bindAddress);
+    }
+    if (obj.contains("port")) {
+        settings.port = static_cast<quint16>(std::clamp(obj["port"].toInt(settings.port), 1, 65535));
+    }
+    if (obj.contains("allowedCidrs") && obj["allowedCidrs"].isArray()) {
+        settings.allowedCidrs.clear();
+        for (const auto& value : obj["allowedCidrs"].toArray()) {
+            if (value.isString()) {
+                settings.allowedCidrs << value.toString();
+            }
+        }
+    }
+    if (obj.contains("allowedRoots") && obj["allowedRoots"].isArray()) {
+        settings.allowedRoots.clear();
+        for (const auto& value : obj["allowedRoots"].toArray()) {
+            if (value.isString()) {
+                settings.allowedRoots << resolvePath(value.toString());
+            }
+        }
+    }
+    settings.maxEntries = std::clamp(obj["maxEntries"].toInt(settings.maxEntries), 1, 5000);
+    settings.maxMemoryBytes = std::clamp(obj["maxMemoryBytes"].toInt(settings.maxMemoryBytes), 256, 1024 * 1024);
+    settings.maxHits = std::clamp(obj["maxHits"].toInt(settings.maxHits), 1, 10000);
+    settings.maxStringLength = std::clamp(obj["maxStringLength"].toInt(settings.maxStringLength), 16, 4096);
+    settings.sourceWindowLines = std::clamp(obj["sourceWindowLines"].toInt(settings.sourceWindowLines), 0, 200);
+    settings.maxDisassemblyInstructions = std::clamp(obj["maxDisassemblyInstructions"].toInt(settings.maxDisassemblyInstructions), 1, 512);
+    return settings;
+}
+
+QJsonObject Config::serializeMcpSettings(const McpSettings& settings) const {
+    QJsonObject obj;
+    obj["bindAddress"] = settings.bindAddress;
+    obj["port"] = static_cast<int>(settings.port);
+    QJsonArray allowedCidrs;
+    for (const auto& cidr : settings.allowedCidrs) {
+        allowedCidrs.append(cidr);
+    }
+    obj["allowedCidrs"] = allowedCidrs;
+    QJsonArray allowedRoots;
+    for (const auto& root : settings.allowedRoots) {
+        allowedRoots.append(root);
+    }
+    obj["allowedRoots"] = allowedRoots;
+    obj["maxEntries"] = settings.maxEntries;
+    obj["maxMemoryBytes"] = settings.maxMemoryBytes;
+    obj["maxHits"] = settings.maxHits;
+    obj["maxStringLength"] = settings.maxStringLength;
+    obj["sourceWindowLines"] = settings.sourceWindowLines;
+    obj["maxDisassemblyInstructions"] = settings.maxDisassemblyInstructions;
     return obj;
 }
 

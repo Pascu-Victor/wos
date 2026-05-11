@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "coredump_parser.h"
+#include "elf_symbol_resolver.h"
+
 // Forward declarations to avoid including BFD in header
 typedef struct bfd bfd;
 typedef struct bfd_symbol asymbol;
@@ -61,12 +64,6 @@ class CoredumpMemoryPanel;
 class CoredumpElfPanel;
 class CoredumpDisasmPanel;
 
-namespace wosdbg {
-struct CoreDump;
-class SymbolTable;
-class SectionMap;
-}  // namespace wosdbg
-
 #include "log_entry.h"
 
 class QemuLogViewer : public QMainWindow {
@@ -105,6 +102,8 @@ class QemuLogViewer : public QMainWindow {
     void onInterruptNext();
     void onInterruptPrevious();
     void onInterruptToggleFold(QTreeWidgetItem* item, int column);
+    void onMcpToggle();
+    void onMcpServerStatus(bool running, const QString& endpoint, const QString& message);
 
    private:
     // UI Components
@@ -123,6 +122,7 @@ class QemuLogViewer : public QMainWindow {
     QPushButton* interruptPrevBtn;
     QPushButton* interruptNextBtn;
     QCheckBox* onlyInterruptsCheckbox;
+    QPushButton* mcpToggleBtn;
 
     // Main content
     QTableWidget* legacyLogTable;          // Keep for compatibility during transition
@@ -156,6 +156,8 @@ class QemuLogViewer : public QMainWindow {
 
     // Data
     LogClient* client;
+    bool mcpRunning = false;
+    QString mcpEndpoint;
     std::unique_ptr<CapstoneDisassembler> disassembler;
     SyntaxHighlighter* disassemblyHighlighter;
     SyntaxHighlighter* detailsHighlighter;
