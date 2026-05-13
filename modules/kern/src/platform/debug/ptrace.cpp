@@ -5,6 +5,7 @@
 #include <abi/ptrace.hpp>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
@@ -204,6 +205,32 @@ void wake_tracer_for_stop(Task& stopped) {
     }
     complete_trace_wait(*tracer, stopped);
     tracer->release();
+}
+
+auto record_signal_stop(Task& stopped, uint32_t signal) -> bool {
+    if (!stopped.ptrace_traced || stopped.ptrace_tracer_pid == 0 ||
+        stopped.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) {
+        return false;
+    }
+
+    stopped.ptrace_stop_reason = abi::ptrace::stop_reason::SIGNAL;
+    stopped.ptrace_stop_signal = signal;
+    stopped.ptrace_stop_address = 0;
+    stopped.ptrace_event_msg = 0;
+    stopped.ptrace_stopped = true;
+    stopped.ptrace_stop_pending = true;
+    stopped.ptrace_single_step = false;
+    stopped.wait_channel = "ptrace";
+
+    auto* current = ker::mod::sched::get_current_task();
+    if (current == &stopped) {
+        stopped.deferred_task_switch = true;
+    } else {
+        ker::mod::sched::debug_stop_task(&stopped);
+    }
+
+    wake_tracer_for_stop(stopped);
+    return true;
 }
 
 __attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) void clear_local_trap_flag() {
@@ -866,5 +893,7 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     restore_syscall_stop_context(*task, gpr);
     return true;
 }
+
+auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool { return record_signal_stop(task, signal); }
 
 }  // namespace ker::mod::debug::ptrace

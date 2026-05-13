@@ -331,6 +331,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
 
     // Share the parent's pagemap - do NOT create a new one
     t->pagemap = parent->pagemap;
+    t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
     auto* thr = new threading::Thread{};

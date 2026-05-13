@@ -30,9 +30,9 @@ constexpr int WOS_SIGCONT = 18;
 //   0x00=r15, 0x08=r14, 0x10=r13, 0x18=r12, 0x20=r11, 0x28=r10,
 //   0x30=r9,  0x38=r8,  0x40=rbp, 0x48=rdi, 0x50=rsi, 0x58=rdx,
 //   0x60=rcx, 0x68=rbx, 0x70=rax, 0x78=return_value
-constexpr auto STACK_OFF_R11 = 0x20;
 constexpr auto STACK_OFF_RDI = 0x48;
 constexpr auto STACK_OFF_RCX = 0x60;
+constexpr auto STACK_OFF_RAX = 0x70;
 constexpr auto STACK_OFF_RETVAL = 0x78;
 
 // Helper: read a uint64_t from a stack slot
@@ -49,10 +49,10 @@ namespace ker::mod::sys::signal {
 // to userspace. Handles both sigreturn (context restore) and signal delivery.
 //
 // stack_base: pointer to RSP at the bottom of pushed GP registers (from pushq).
-extern "C" void check_pending_signals(uint8_t* stack_base) {
+extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     auto* task = sched::get_current_task();
     if (task == nullptr) {
-        return;
+        return 0;
     }
 
     // Get PerCpu struct to read/write user RSP, RIP, and RFLAGS
@@ -78,24 +78,21 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
 
         // Restore the return value slot
         stack_write(stack_base, STACK_OFF_RETVAL, frame->saved_retval);
+        stack_write(stack_base, STACK_OFF_RAX, frame->saved_retval);
 
         // Restore user RIP, RSP, and RFLAGS through PerCpu
         per_cpu->user_rsp = frame->saved_rsp;
         per_cpu->syscall_ret_rip = frame->saved_rip;
         per_cpu->syscall_ret_flags = frame->saved_rflags;
 
-        // Also update the on-stack RCX (used by sysret) and R11 (RFLAGS)
-        stack_write(stack_base, STACK_OFF_RCX, frame->saved_rip);
-        stack_write(stack_base, STACK_OFF_R11, frame->saved_rflags);
-
         task->in_signal_handler = false;
-        return;  // Don't deliver new signals right after sigreturn
+        return 1;  // Return via iretq so RCX/R11 are restored as user GPRs.
     }
 
     // --- Check for deliverable signals ---
     uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
     if (DELIVERABLE == 0) {
-        return;
+        return 0;
     }
 
     // Find the first pending signal (1-based)
@@ -114,18 +111,18 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
         // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
         // SIGKILL, SIGTERM, SIGINT, etc: terminate
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
-            return;  // Ignore
+            return 0;  // Ignore
         }
         // Uncatchable stop signal
         if (SIGNO == WOS_SIGSTOP) {
             task->voluntary_block = true;
-            return;
+            return 0;
         }
         // Job control stop signals: default action is to stop the process
         if (SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
             // Block the task so the scheduler won't run it until SIGCONT
             task->voluntary_block = true;
-            return;
+            return 0;
         }
         // Default terminate semantics for normal fatal signals.
         // Shells expect status 128 + signo for signal-terminated tasks.
@@ -142,7 +139,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
 
     // Handle SIG_IGN
     if (handler.handler == WOS_SIG_IGN) {
-        return;
+        return 0;
     }
 
     // --- Deliver the signal: set up signal frame on user stack ---
@@ -186,6 +183,7 @@ extern "C" void check_pending_signals(uint8_t* stack_base) {
     }
 
     task->in_signal_handler = true;
+    return 0;
 }
 
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {

@@ -24,6 +24,7 @@ enum class ProcNodeType : uint8_t {
     KCPUSTAT_FILE,        // /proc/kcpustat -> per-CPU aggregate scheduler statistics
     KPERFCTL_FILE,        // /proc/kperfctl -> write "enable"/"disable" to control recording
     KCONTSTAT_FILE,       // /proc/kcontstat -> per-subsystem container statistics
+    KIPCSTAT_FILE,        // /proc/kipcstat -> WKI IPC memory/queue snapshot
     WKI_LAUNCHER_FILE,    // /proc/<pid>/wki_launcher -> hostname of the node that launched the process
     WKI_RUNNER_FILE,      // /proc/<pid>/wki_runner   -> hostname of the node currently running the process
     WKI_REMOTE_PID_FILE,  // /proc/<pid>/wki_remote_pid -> remote execution PID for this process

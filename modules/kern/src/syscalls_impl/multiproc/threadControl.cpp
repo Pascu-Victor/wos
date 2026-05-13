@@ -10,6 +10,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
+#include <vfs/vfs.hpp>
 
 #include "abi/callnums/multiproc.h"
 #include "platform/dbg/dbg.hpp"
@@ -26,6 +27,39 @@ auto online_cpu_mask() -> uint64_t {
         return UINT64_MAX;
     }
     return (1ULL << CPU_COUNT) - 1ULL;
+}
+
+void release_thread_fd_refs(mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    while (!task->fd_table.empty()) {
+        uint64_t fd = 0;
+        bool found_fd = false;
+        task->fd_table.for_each([&](uint64_t key, void* val) {
+            if (!found_fd && val != nullptr) {
+                fd = key;
+                found_fd = true;
+            }
+        });
+        if (!found_fd) {
+            break;
+        }
+
+        auto* file = static_cast<ker::vfs::File*>(nullptr);
+        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+        file = static_cast<ker::vfs::File*>(task->fd_table.lookup(fd));
+        if (file != nullptr) {
+            task->fd_table.remove(fd);
+            task->clear_fd_cloexec(static_cast<unsigned>(fd));
+        }
+        task->fd_table_lock.unlock_irqrestore(IRQF);
+
+        if (file != nullptr) {
+            ker::vfs::vfs_put_file(file);
+        }
+    }
 }
 }  // namespace
 
@@ -82,11 +116,12 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::THREAD_EXIT: {
             // Exit the current thread without tearing down the process.
-            // The pagemap, FDs, and ELF are shared - do NOT free them.
+            // The pagemap and ELF are shared - do NOT free them.
             auto* task = mod::sched::get_current_task();
             if (task == nullptr) {
                 return 0;
             }
+            release_thread_fd_refs(task);
             task->has_exited = true;
             task->exit_status = 0;
             task->exit_notify_ready.store(true, std::memory_order_release);

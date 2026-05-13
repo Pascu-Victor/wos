@@ -107,7 +107,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
     uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const STARTED_US = wki_now_us();
     auto finish = [&](int rc, uint64_t bytes = 0) -> int {
-        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::SOCK_CTRL), ker::mod::perf::WkiPerfPhase::END,
                               proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, rc, ELAPSED_US,
                               CALLSITE);
@@ -203,11 +203,26 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
 
 auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, STATUS, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, STATUS, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
     if (proxy->ring_buf == nullptr) {
-        return -EIO;
+        return finish(-EIO);
     }
 
     for (;;) {
@@ -228,17 +243,17 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
                     std::memcpy(dst + FIRST, proxy->ring_buf, TO_READ - FIRST);
                 }
                 proxy->ring_tail.store(TAIL + TO_READ, std::memory_order_release);
-                return static_cast<ssize_t>(TO_READ);
+                return finish(static_cast<ssize_t>(TO_READ), TO_READ);
             }
             if (proxy->write_closed.load(std::memory_order_acquire) != 0U) {
-                return 0;
+                return finish(0);
             }
             asm volatile("pause" ::: "memory");
         }
 
         auto* task = ker::mod::sched::get_current_task();
         if (task == nullptr) {
-            return -ESRCH;
+            return finish(-ESRCH);
         }
 
         uint64_t const IRQF = proxy->lock.lock_irqsave();
@@ -250,11 +265,11 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
         }
         if (proxy->write_closed.load(std::memory_order_acquire) != 0U) {
             proxy->lock.unlock_irqrestore(IRQF);
-            return 0;
+            return finish(0);
         }
         if (current_task_has_deliverable_signal()) {
             proxy->lock.unlock_irqrestore(IRQF);
-            return -EINTR;
+            return finish(-EINTR);
         }
         task->wait_channel = "wki_proxy_sock";
         proxy->blocked_reader.store(task, std::memory_order_release);
@@ -263,15 +278,30 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
         if (current_task_has_deliverable_signal()) {
             auto* expected = task;
             proxy->blocked_reader.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
-            return -EINTR;
+            return finish(-EINTR);
         }
     }
 }
 
 auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, STATUS, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, STATUS, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
 
     // Forward data to home node via OP_PIPE_DATA (home writes it into socket send path)
@@ -282,7 +312,7 @@ auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t
 
     auto* msg = new (std::nothrow) uint8_t[MSG_SIZE];
     if (msg == nullptr) {
-        return -ENOMEM;
+        return finish(-ENOMEM);
     }
 
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
@@ -295,9 +325,9 @@ auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t
     delete[] msg;
 
     if (RET != WKI_OK) {
-        return -EIO;
+        return finish(-EIO);
     }
-    return static_cast<ssize_t>(TO_SEND);
+    return finish(static_cast<ssize_t>(TO_SEND), TO_SEND);
 }
 
 auto proxy_socket_close(ker::vfs::File* f) -> int {

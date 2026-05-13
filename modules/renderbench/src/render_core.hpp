@@ -18,6 +18,12 @@ enum class Placement {
     ProcessPerCore,
 };
 
+enum class ParseStatus {
+    Ok,
+    Help,
+    Error,
+};
+
 struct Options {
     std::string scene_path;
     Backend backend = Backend::Ipc;
@@ -59,7 +65,7 @@ struct FilmView {
 
 struct Scene;
 
-auto parse_options(int argc, char* const* argv, Backend default_backend) -> Options;
+auto parse_options(int argc, char* const* argv, Backend default_backend, Options& options) -> ParseStatus;
 auto backend_name(Backend backend) -> const char*;
 auto placement_name(Placement placement) -> const char*;
 auto make_tiles(int width, int height, int tile_size) -> std::vector<Tile>;

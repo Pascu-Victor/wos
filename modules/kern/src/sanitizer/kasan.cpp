@@ -10,10 +10,6 @@
 // Gated behind WOS_KASAN; when the macro is not defined the file is still
 // compiled but everything inside the #ifdef is stripped by the preprocessor.
 
-#include <string_view>
-
-#include "platform/asm/cpu.hpp"
-#include "platform/interrupt/gates.hpp"
 #include "util/hcf.hpp"
 #ifdef WOS_KASAN
 
@@ -76,9 +72,8 @@ static std::atomic<uint64_t> s_shadow_fault_cpus{0};  // NOLINT
 // to create the same PML entry and leak a page.
 static std::atomic_flag s_shadow_map_lock = ATOMIC_FLAG_INIT;  // NOLINT
 
-// Diagnostic counters.
+// Diagnostic counter used only for actionable repeat-fault warnings.
 static std::atomic<uint64_t> s_shadow_fault_count{0};  // NOLINT
-static std::atomic<uint64_t> s_shadow_dup_count{0};    // already-mapped hits (concurrent CPUs) // NOLINT
 
 // Ring buffer of the last 16 unique shadow_vaddrs we mapped, to detect
 // the "mapping not sticking" bug (same address faults again and again).
@@ -141,8 +136,7 @@ static auto sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::pagi
     return false;
 }
 
-auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gates::InterruptFrame& frame, const ker::mod::cpu::GPRegs& gpr)
-    -> bool {
+auto handle_shadow_fault(uint64_t cr2) -> bool {
     if (cr2 < SHADOW_REGION_BASE || cr2 >= SHADOW_REGION_END) {
         return false;  // Not our fault
     }
@@ -168,27 +162,14 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     auto* kernel_pt = mm::virt::get_kernel_pagemap();
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
         s_shadow_map_lock.clear(std::memory_order_release);
-        uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        bool const SYNCED_CURRENT_PML4 = sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
-        if (!SYNCED_CURRENT_PML4 && (DUPS % 1000) == 0) {
-            log::debug(
-                "already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
-                "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
-                "gpr info: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx "
-                "r13=0x%lx r14=0x%lx r15=0x%lx",
-                DUPS, shadow_vaddr, cr2, static_cast<int>(SOURCE.size()), SOURCE.data(), frame.rip, frame.rsp, frame.flags,
-                s_shadow_dup_count.load(std::memory_order_relaxed), gpr.rax, gpr.rbx, gpr.rcx, gpr.rdx, gpr.rsi, gpr.rdi, gpr.r8, gpr.r9,
-                gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
-        } else if (SYNCED_CURRENT_PML4 && (DUPS % 100000) == 0) {
-            log::debug("shadow page already mapped in kernel; synced current CR3 #%lu shadow_vaddr=0x%lx", DUPS, shadow_vaddr);
-        }
+        (void)sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return true;
     }
     s_shadow_map_lock.clear(std::memory_order_release);
 
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
-    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
+    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "kasan shadow fault");
     if (phys_page == nullptr) {
         log::error("OOM allocating shadow page for cr2=0x%lx", cr2);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
@@ -203,11 +184,7 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     }
     if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
         s_shadow_map_lock.clear(std::memory_order_release);
-        uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
         (void)sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
-        if ((DUPS % 100000) == 0) {
-            log::debug("shadow page already mapped after allocation #%lu shadow_vaddr=0x%lx", DUPS, shadow_vaddr);
-        }
         mm::phys::page_free(phys_page);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
         return true;
@@ -237,10 +214,6 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
 
     if (repeat) {
         log::warn("REPEAT shadow fault #%lu: shadow_vaddr=0x%lx - mapping not sticking", N, shadow_vaddr);
-    }
-    if ((N % 100000) == 0) {
-        log::debug("shadow fault #%lu: cr2=0x%lx shadow_vaddr=0x%lx dups=%lu", N, cr2, shadow_vaddr,
-                   s_shadow_dup_count.load(std::memory_order_relaxed));
     }
 
     s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);

@@ -159,9 +159,10 @@ struct Task {
     // ELF buffer for cleanup and auxv metadata.
     uint8_t* elf_buffer{};
     size_t elf_buffer_size{};
-    uint64_t program_header_addr{};  // Virtual address of program headers (AT_PHDR)
-    uint64_t elf_header_addr{};      // Virtual address of ELF header (AT_EHDR)
-    uint64_t interp_base = 0;        // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    uint64_t program_header_addr{};      // Virtual address of program headers (AT_PHDR)
+    uint64_t elf_header_addr{};          // Virtual address of ELF header (AT_EHDR)
+    uint64_t interp_base = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    std::atomic<uint64_t> mmap_next{0};  // Next preferred mmap search address; zero means use syscall default.
 
     // PID of the process that owns this thread (set by create_user_thread).
     // 0 for regular processes.

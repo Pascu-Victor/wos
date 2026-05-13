@@ -22,13 +22,32 @@ struct Range {
     uint64_t end;
 };
 
+struct PageMapBatch {
+    PageTable* root{};
+    PageTable* pml3{};
+    PageTable* pml2{};
+    PageTable* pml1{};
+    uint64_t cached_idx4 = UINT64_MAX;
+    uint64_t cached_idx3 = UINT64_MAX;
+    uint64_t cached_idx2 = UINT64_MAX;
+    uint64_t table_flags{};
+    bool dirty{};
+};
+
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
           limine_executable_address_response* kernel_address_response);
 
 static inline auto get_kernel_page_table() -> PageTable* { return reinterpret_cast<PageTable*>(rdcr3()); }
 
 void map_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
+void init_page_map_batch(PageMapBatch* batch, PageTable* page_table, uint64_t flags);
+void map_page_batched(PageMapBatch* batch, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
+void flush_page_map_batch(PageMapBatch* batch);
+void map_same_page_range(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t page_count, uint64_t flags);
+void reserve_page_range(PageTable* page_table, vaddr_t vaddr, uint64_t page_count);
 bool is_page_mapped(PageTable* page_table, vaddr_t vaddr);
+bool is_page_reserved(PageTable* page_table, vaddr_t vaddr);
+bool is_page_mapped_or_reserved(PageTable* page_table, vaddr_t vaddr);
 void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags);
 void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset = 0);
 void unmap_page(PageTable* page_table, vaddr_t vaddr);

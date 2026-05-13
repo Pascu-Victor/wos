@@ -6,6 +6,11 @@
 //   perf report   [n=2000]    Display events from perf.data (or live /proc/kperf)
 //   perf sched    [n=2000]    Alias for perf report
 //   perf cpustat              Per-CPU aggregate scheduler statistics
+//   perf ipc-report [n=15]    IPC latency/jitter/throughput/memory report
+//   perf wki-report           Remote/WKI summary statistics
+//   perf local-report         Local pipe/process summary statistics
+//   perf vmem-report          Local mmap/cache/COW summary statistics
+//   perf all-report           Combined WKI and local summary statistics
 //   perf top      [ms=1000]   Continuous stat snapshots (Ctrl-C to stop)
 //   perf run      <cmd> [args] Trace cmd+descendants, save to perf.data
 //   perf show-map             Show PID->name/cmdline map from perf.data
@@ -67,6 +72,7 @@ constexpr int EXEC_FAILURE_EXIT_CODE = 127;
 constexpr int DEFAULT_WKI_TRACE_EVENTS = 200;
 constexpr int DEFAULT_WKI_TAIL_ROWS = 15;
 constexpr int DEFAULT_WKI_LAUNCH_ROWS = 20;
+constexpr uint64_t PERF_PAGE_SIZE = 4096;
 
 constexpr std::size_t INITIAL_FILE_CAPACITY = 131072;
 constexpr std::size_t PROC_READ_CAPACITY = 512;
@@ -87,6 +93,7 @@ constexpr std::string_view PROC_CMDLINE_SUFFIX = "/cmdline";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
 constexpr std::string_view KWKISTAT_PATH = "/proc/kwkistat";
+constexpr std::string_view KIPCSTAT_PATH = "/proc/kipcstat";
 constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
 constexpr std::string_view KCONTSTAT_PATH = "/proc/kcontstat";
 constexpr std::string_view DEV_NODES_ROOT = "/dev/nodes";
@@ -95,6 +102,8 @@ constexpr std::string_view SECTION_EVENTS = "--- SECTION EVENTS ---\n";
 constexpr std::string_view SECTION_EVENTS_END = "--- END EVENTS ---\n";
 constexpr std::string_view SECTION_WKI_SUMMARY = "--- SECTION WKI_SUMMARY ---\n";
 constexpr std::string_view SECTION_WKI_SUMMARY_END = "--- END WKI_SUMMARY ---\n";
+constexpr std::string_view SECTION_IPC_STATS = "--- SECTION IPC_STATS ---\n";
+constexpr std::string_view SECTION_IPC_STATS_END = "--- END IPC_STATS ---\n";
 constexpr std::string_view SECTION_PROC_MAP = "--- SECTION PROC_MAP ---\n";
 constexpr std::string_view SECTION_PROC_MAP_END = "--- END PROC_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP = "--- SECTION PEER_MAP ---\n";
@@ -215,13 +224,49 @@ struct WkiSummaryRow {
     uint64_t errors{};
     uint64_t retries{};
     uint64_t bytes{};
+    uint64_t samples{};
+    uint64_t total_us{};
     uint64_t avg_us{};
     uint64_t max_us{};
+    uint64_t p50_us{};
     uint64_t p95_us{};
     uint64_t p99_us{};
     uint64_t p999_us{};
     uint64_t p9999_us{};
     uint64_t p99999_us{};
+};
+
+struct IpcStatsSnapshot {
+    uint64_t exports{};
+    uint64_t proxies{};
+    uint64_t pump_tasks{};
+    uint64_t ring_bytes{};
+    uint64_t ring_used{};
+    uint64_t blocked_readers{};
+    uint64_t poll_waiters{};
+    uint64_t pending_deliveries{};
+    uint64_t pending_chunks{};
+    uint64_t pending_bytes{};
+    uint64_t export_backlogs{};
+    uint64_t export_backlog_chunks{};
+    uint64_t export_backlog_bytes{};
+    uint64_t export_flush_queue{};
+    uint64_t dev_op_queue{};
+    uint64_t dev_op_payload_bytes{};
+    uint64_t approx_alloc_bytes{};
+    uint64_t local_pipe_active{};
+    uint64_t local_pipe_created{};
+    uint64_t local_pipe_peak{};
+    uint64_t local_pipe_capacity{};
+    uint64_t local_pipe_peak_capacity{};
+    uint64_t local_pipe_buffered{};
+    uint64_t local_pipe_reader_waiters{};
+    uint64_t local_pipe_writer_waiters{};
+    uint64_t local_pipe_poll_waiters{};
+    uint64_t local_pipe_direct_writes{};
+    uint64_t local_pipe_read_closed{};
+    uint64_t local_pipe_write_closed{};
+    uint64_t local_pipe_approx_alloc_bytes{};
 };
 
 struct WkiGapRow {
@@ -266,6 +311,13 @@ struct WkiTraceFilter {
     std::optional<uint64_t> min_us;
     std::optional<uint64_t> from_ns;
     std::optional<uint64_t> to_ns;
+};
+
+enum class WkiDataView : uint8_t {
+    WKI,
+    LOCAL,
+    VMEM,
+    ALL,
 };
 
 struct HotspotStats {
@@ -323,6 +375,21 @@ auto now_ms() -> int64_t {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (static_cast<int64_t>(ts.tv_sec) * MILLISECONDS_PER_SECOND) + (static_cast<int64_t>(ts.tv_nsec) / NANOSECONDS_PER_MILLISECOND);
+}
+
+auto syscall_result_i64(uint64_t raw) -> int64_t {
+    if (raw <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return static_cast<int64_t>(raw);
+    }
+    uint64_t const MAGNITUDE = (~raw) + 1U;
+    if (MAGNITUDE > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return -static_cast<int64_t>(MAGNITUDE);
+}
+
+auto waitpid_nohang(int64_t pid, int32_t* status) -> int64_t {
+    return syscall_result_i64(ker::process::waitpid(pid, status, PROC_WAIT_NOHANG, nullptr));
 }
 
 void wall_sleep_ms(int target_ms) {
@@ -675,6 +742,18 @@ auto write_section_wki_summary(int fd) -> ssize_t {
     return static_cast<ssize_t>(summary->size());
 }
 
+auto write_section_ipc_stats(int fd) -> ssize_t {
+    auto stats = read_file(KIPCSTAT_PATH, PROC_READ_CAPACITY);
+    if (!stats.has_value() || stats->empty()) {
+        return 0;
+    }
+
+    write_all(fd, SECTION_IPC_STATS);
+    write_all(fd, *stats);
+    write_all(fd, SECTION_IPC_STATS_END);
+    return static_cast<ssize_t>(stats->size());
+}
+
 void write_section_peer_map(int fd) {
     auto peers = collect_live_wki_peer_map();
     if (peers.empty()) {
@@ -699,6 +778,7 @@ void save_perf_data() {
     write_section_peer_map(FD.get());
     ssize_t event_bytes = write_section_events(FD.get());
     write_section_wki_summary(FD.get());
+    write_section_ipc_stats(FD.get());
 
     if (event_bytes <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
@@ -859,6 +939,7 @@ void cmd_record(int ms, const char* filter = nullptr) {
 
     write_all(data_fd.get(), SECTION_EVENTS_END);
     write_section_wki_summary(data_fd.get());
+    write_section_ipc_stats(data_fd.get());
     write_section_peer_map(data_fd.get());
 
     // Write proc map: current live processes plus any tracked ones that exited.
@@ -1011,8 +1092,17 @@ auto parse_wki_summary_line(std::string_view line, WkiSummaryRow& out) -> bool {
     out.errors = parse_u64(extract_value(line, "errors="));
     out.retries = parse_u64(extract_value(line, "retries="));
     out.bytes = parse_u64(extract_value(line, "bytes="));
+    out.samples = parse_u64(extract_value(line, "samples="));
+    out.total_us = parse_u64(extract_value(line, "total_us="));
     out.avg_us = parse_u64(extract_value(line, "avg_us="));
+    if (out.total_us == 0 && out.avg_us != 0 && out.calls != 0) {
+        out.total_us = out.avg_us * out.calls;
+    }
+    if (out.samples == 0) {
+        out.samples = out.calls;
+    }
     out.max_us = parse_u64(extract_value(line, "max_us="));
+    out.p50_us = parse_u64(extract_value(line, "p50_us="));
     out.p95_us = parse_u64(extract_value(line, "p95_us="));
     out.p99_us = parse_u64(extract_value(line, "p99_us="));
     out.p999_us = parse_u64(extract_value(line, "p999_us="));
@@ -1050,6 +1140,76 @@ auto parse_wki_summary_section(std::string_view buffer, bool sectioned) -> std::
     }
 
     return rows;
+}
+
+auto parse_ipc_stats_line(std::string_view line, IpcStatsSnapshot& out) -> bool {
+    if (line.empty() || !line.starts_with("exports=")) {
+        return false;
+    }
+
+    out = {};
+    out.exports = parse_u64(extract_value(line, "exports="));
+    out.proxies = parse_u64(extract_value(line, "proxies="));
+    out.pump_tasks = parse_u64(extract_value(line, "pump_tasks="));
+    out.ring_bytes = parse_u64(extract_value(line, "ring_bytes="));
+    out.ring_used = parse_u64(extract_value(line, "ring_used="));
+    out.blocked_readers = parse_u64(extract_value(line, "blocked_readers="));
+    out.poll_waiters = parse_u64(extract_value(line, "poll_waiters="));
+    out.pending_deliveries = parse_u64(extract_value(line, "pending_deliveries="));
+    out.pending_chunks = parse_u64(extract_value(line, "pending_chunks="));
+    out.pending_bytes = parse_u64(extract_value(line, "pending_bytes="));
+    out.export_backlogs = parse_u64(extract_value(line, "export_backlogs="));
+    out.export_backlog_chunks = parse_u64(extract_value(line, "export_backlog_chunks="));
+    out.export_backlog_bytes = parse_u64(extract_value(line, "export_backlog_bytes="));
+    out.export_flush_queue = parse_u64(extract_value(line, "export_flush_queue="));
+    out.dev_op_queue = parse_u64(extract_value(line, "dev_op_queue="));
+    out.dev_op_payload_bytes = parse_u64(extract_value(line, "dev_op_payload_bytes="));
+    out.approx_alloc_bytes = parse_u64(extract_value(line, "approx_alloc_bytes="));
+    out.local_pipe_active = parse_u64(extract_value(line, "local_pipe_active="));
+    out.local_pipe_created = parse_u64(extract_value(line, "local_pipe_created="));
+    out.local_pipe_peak = parse_u64(extract_value(line, "local_pipe_peak="));
+    out.local_pipe_capacity = parse_u64(extract_value(line, "local_pipe_capacity="));
+    out.local_pipe_peak_capacity = parse_u64(extract_value(line, "local_pipe_peak_capacity="));
+    out.local_pipe_buffered = parse_u64(extract_value(line, "local_pipe_buffered="));
+    out.local_pipe_reader_waiters = parse_u64(extract_value(line, "local_pipe_reader_waiters="));
+    out.local_pipe_writer_waiters = parse_u64(extract_value(line, "local_pipe_writer_waiters="));
+    out.local_pipe_poll_waiters = parse_u64(extract_value(line, "local_pipe_poll_waiters="));
+    out.local_pipe_direct_writes = parse_u64(extract_value(line, "local_pipe_direct_writes="));
+    out.local_pipe_read_closed = parse_u64(extract_value(line, "local_pipe_read_closed="));
+    out.local_pipe_write_closed = parse_u64(extract_value(line, "local_pipe_write_closed="));
+    out.local_pipe_approx_alloc_bytes = parse_u64(extract_value(line, "local_pipe_approx_alloc_bytes="));
+    return true;
+}
+
+auto parse_ipc_stats_section(std::string_view buffer, bool sectioned) -> std::optional<IpcStatsSnapshot> {
+    std::size_t pos = 0;
+
+    if (sectioned) {
+        std::size_t const HEADER_POS = buffer.find(SECTION_IPC_STATS);
+        if (HEADER_POS == std::string_view::npos) {
+            return std::nullopt;
+        }
+
+        pos = buffer.find('\n', HEADER_POS);
+        if (pos == std::string_view::npos) {
+            return std::nullopt;
+        }
+        ++pos;
+    }
+
+    while (pos < buffer.size()) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (sectioned && LINE.starts_with(END_PREFIX)) {
+            break;
+        }
+
+        IpcStatsSnapshot snapshot{};
+        if (parse_ipc_stats_line(LINE, snapshot)) {
+            return snapshot;
+        }
+    }
+
+    return std::nullopt;
 }
 
 auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
@@ -1232,6 +1392,29 @@ constexpr uint32_t WKI_STALL_FLAG_ACK_DELAY_DUE = 1U << 6;
 
 auto is_transport_stall_event(const EventInfo& event) -> bool { return event.scope_name == "transport" && event.op_name == "stall"; }
 
+auto is_local_vmem_event(const EventInfo& event) -> bool { return event.scope_name == "local_vmem"; }
+
+auto is_local_loader_event(const EventInfo& event) -> bool { return event.scope_name == "local_loader"; }
+
+auto is_vmem_cow_op(std::string_view op) -> bool { return op == "cow_zero" || op == "cow_copy" || op == "cow_promote"; }
+
+auto is_vmem_file_cache_op(std::string_view op) -> bool { return op.starts_with("file_cache_"); }
+
+auto format_cow_ref_category(uint64_t category) -> std::string_view {
+    switch (category) {
+        case 1:
+            return "single";
+        case 2:
+            return "shared_le4";
+        case 3:
+            return "shared_le16";
+        case 4:
+            return "shared_gt16";
+        default:
+            return "?";
+    }
+}
+
 auto append_flag_name(std::string& out, bool& first, uint32_t flags, uint32_t bit, std::string_view name) -> void {
     if ((flags & bit) == 0) {
         return;
@@ -1278,8 +1461,57 @@ auto format_transport_stall_detail(const EventInfo& event) -> std::string {
     return out;
 }
 
+auto format_local_vmem_detail(const EventInfo& event) -> std::string {
+    std::string out;
+    out += is_vmem_file_cache_op(event.op_name) ? "offset=" : "addr=";
+    out += std::string(display_callsite(event.callsite));
+    out += " pages=";
+    out += std::to_string(event.peer);
+    if (is_vmem_cow_op(event.op_name)) {
+        out += " refcat=";
+        out += std::string(format_cow_ref_category(event.channel));
+        out += " ref=";
+        out += std::to_string(event.status);
+    } else {
+        out += " detail=";
+        out += std::to_string(event.channel);
+        out += " status=";
+        out += std::to_string(event.status);
+    }
+    return out;
+}
+
+auto format_local_loader_detail(const EventInfo& event) -> std::string {
+    std::string out;
+    out += "pages=";
+    out += std::to_string(event.peer);
+    if (event.op_name.starts_with("pt_load_")) {
+        auto const PACKED = static_cast<uint32_t>(event.status);
+        uint32_t const ALLOCATED = (PACKED >> 16U) & 0xFFFFU;
+        uint32_t const ALREADY = PACKED & 0xFFFFU;
+        out += " seg=";
+        out += std::to_string(event.channel);
+        out += " alloc=";
+        out += std::to_string(ALLOCATED);
+        out += " already=";
+        out += std::to_string(ALREADY);
+        out += " addr=";
+        out += std::string(display_callsite(event.callsite));
+    } else {
+        out += " site=";
+        out += std::string(display_callsite(event.callsite));
+    }
+    return out;
+}
+
 auto format_wki_trace_detail(const EventInfo& event) -> std::string {
     std::string out(display_callsite(event.callsite));
+    if (is_local_vmem_event(event)) {
+        return format_local_vmem_detail(event);
+    }
+    if (is_local_loader_event(event)) {
+        return format_local_loader_detail(event);
+    }
     if (!is_transport_stall_event(event)) {
         return out;
     }
@@ -1751,6 +1983,26 @@ auto load_wki_summary_text() -> std::optional<WkiLoadedText> {
     return WkiLoadedText{.source = std::string(KWKISTAT_PATH), .buffer = std::move(*live), .sectioned = false};
 }
 
+auto load_ipc_stats_text() -> std::optional<WkiLoadedText> {
+    if (access(PERF_DATA_FILE.begin(), R_OK) == 0) {
+        auto saved = read_file(PERF_DATA_FILE, PERF_DRAIN_CAPACITY);
+        if (saved.has_value() && !saved->empty()) {
+            WkiLoadedText loaded{.source = std::string(PERF_DATA_FILE), .buffer = std::move(*saved)};
+            loaded.sectioned = std::string_view(loaded.buffer).starts_with(SECTION_HEADER);
+            if (parse_ipc_stats_section(loaded.buffer, loaded.sectioned).has_value()) {
+                return loaded;
+            }
+        }
+    }
+
+    auto live = read_file(KIPCSTAT_PATH, PROC_READ_CAPACITY);
+    if (!live.has_value() || live->empty()) {
+        return std::nullopt;
+    }
+
+    return WkiLoadedText{.source = std::string(KIPCSTAT_PATH), .buffer = std::move(*live), .sectioned = false};
+}
+
 auto load_wki_event_text() -> std::optional<WkiLoadedText> {
     if (access(PERF_DATA_FILE.begin(), R_OK) == 0) {
         auto saved = read_file(PERF_DATA_FILE, PERF_DRAIN_CAPACITY);
@@ -1789,6 +2041,51 @@ struct WkiSummaryAccum {
 
 auto wki_trace_matches(const EventInfo& event, const WkiTraceFilter& filter) -> bool;
 
+auto wki_view_name(WkiDataView view) -> std::string_view {
+    switch (view) {
+        case WkiDataView::WKI:
+            return "wki";
+        case WkiDataView::LOCAL:
+            return "local";
+        case WkiDataView::VMEM:
+            return "vmem";
+        case WkiDataView::ALL:
+            return "all";
+        default:
+            return "wki";
+    }
+}
+
+auto is_local_data_scope(std::string_view scope) -> bool { return scope.starts_with("local_"); }
+
+auto summary_peer_for_event(const EventInfo& event) -> uint64_t {
+    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader") {
+        return 0;
+    }
+    return event.peer;
+}
+
+auto summary_channel_for_event(const EventInfo& event) -> uint64_t {
+    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader") {
+        return 0;
+    }
+    return event.channel;
+}
+
+auto scope_matches_view(std::string_view scope, const WkiTraceFilter& filter, WkiDataView view) -> bool {
+    if (!filter.scope.empty()) {
+        return true;
+    }
+    if (view == WkiDataView::ALL) {
+        return true;
+    }
+    if (view == WkiDataView::VMEM) {
+        return scope == "local_vmem";
+    }
+    bool const IS_LOCAL = is_local_data_scope(scope);
+    return view == WkiDataView::LOCAL ? IS_LOCAL : !IS_LOCAL;
+}
+
 auto wki_summary_matches(const WkiSummaryRow& row, const WkiTraceFilter& filter) -> bool {
     if (!filter.scope.empty() && row.scope != filter.scope) {
         return false;
@@ -1808,6 +2105,22 @@ auto wki_summary_matches(const WkiSummaryRow& row, const WkiTraceFilter& filter)
     return true;
 }
 
+auto view_summary_matches(const WkiSummaryRow& row, const WkiTraceFilter& filter, WkiDataView view) -> bool {
+    if (!scope_matches_view(row.scope, filter, view)) {
+        return false;
+    }
+    return wki_summary_matches(row, filter);
+}
+
+auto is_default_ipc_scope(std::string_view scope) -> bool { return scope == "remote_ipc" || scope == "local_pipe"; }
+
+auto ipc_summary_matches(const WkiSummaryRow& row, const WkiTraceFilter& filter) -> bool {
+    if (filter.scope.empty() && !is_default_ipc_scope(row.scope)) {
+        return false;
+    }
+    return wki_summary_matches(row, filter);
+}
+
 auto wki_summary_event_matches(const EventInfo& event, const WkiTraceFilter& filter) -> bool {
     if (event.type != 'K') {
         return false;
@@ -1816,6 +2129,30 @@ auto wki_summary_event_matches(const EventInfo& event, const WkiTraceFilter& fil
         return false;
     }
     return wki_trace_matches(event, filter);
+}
+
+auto view_trace_matches(const EventInfo& event, const WkiTraceFilter& filter, WkiDataView view) -> bool {
+    if (!scope_matches_view(event.scope_name, filter, view)) {
+        return false;
+    }
+    return wki_trace_matches(event, filter);
+}
+
+auto view_summary_event_matches(const EventInfo& event, const WkiTraceFilter& filter, WkiDataView view) -> bool {
+    if (event.type != 'K') {
+        return false;
+    }
+    if (event.phase_name != "end" && event.phase_name != "point") {
+        return false;
+    }
+    return view_trace_matches(event, filter, view);
+}
+
+auto ipc_summary_event_matches(const EventInfo& event, const WkiTraceFilter& filter) -> bool {
+    if (filter.scope.empty() && !is_default_ipc_scope(event.scope_name)) {
+        return false;
+    }
+    return wki_summary_event_matches(event, filter);
 }
 
 auto percentile_from_sorted(const std::vector<uint32_t>& sorted, uint64_t numerator, uint64_t denominator) -> uint64_t {
@@ -1830,13 +2167,16 @@ auto percentile_from_sorted(const std::vector<uint32_t>& sorted, uint64_t numera
     return sorted.at(static_cast<std::size_t>(INDEX));
 }
 
-auto build_wki_summary_from_events(const std::vector<EventInfo>& events, const WkiTraceFilter& filter) -> std::vector<WkiSummaryRow> {
+auto build_wki_summary_from_events(const std::vector<EventInfo>& events, const WkiTraceFilter& filter, WkiDataView view = WkiDataView::ALL)
+    -> std::vector<WkiSummaryRow> {
     std::vector<WkiSummaryAccum> accums;
 
     auto find_accum = [&](const EventInfo& event) -> WkiSummaryAccum& {
+        uint64_t const SUMMARY_PEER = summary_peer_for_event(event);
+        uint64_t const SUMMARY_CHANNEL = summary_channel_for_event(event);
         for (auto& accum : accums) {
-            if (accum.key.scope == event.scope_name && accum.key.op == event.op_name && accum.key.peer == event.peer &&
-                accum.key.channel == event.channel) {
+            if (accum.key.scope == event.scope_name && accum.key.op == event.op_name && accum.key.peer == SUMMARY_PEER &&
+                accum.key.channel == SUMMARY_CHANNEL) {
                 return accum;
             }
         }
@@ -1844,14 +2184,14 @@ auto build_wki_summary_from_events(const std::vector<EventInfo>& events, const W
         WkiSummaryAccum accum{};
         accum.key.scope = event.scope_name;
         accum.key.op = event.op_name;
-        accum.key.peer = event.peer;
-        accum.key.channel = event.channel;
+        accum.key.peer = SUMMARY_PEER;
+        accum.key.channel = SUMMARY_CHANNEL;
         accums.push_back(std::move(accum));
         return accums.back();
     };
 
     for (const auto& event : events) {
-        if (!wki_summary_event_matches(event, filter)) {
+        if (!view_summary_event_matches(event, filter, view)) {
             continue;
         }
         auto& accum = find_accum(event);
@@ -1879,8 +2219,11 @@ auto build_wki_summary_from_events(const std::vector<EventInfo>& events, const W
         row.calls = accum.calls;
         row.errors = accum.errors;
         row.retries = accum.retries;
+        row.samples = accum.samples.size();
+        row.total_us = accum.total_us;
         row.avg_us = accum.calls != 0 ? accum.total_us / accum.calls : 0;
         row.max_us = accum.samples.empty() ? 0 : accum.samples.back();
+        row.p50_us = percentile_from_sorted(accum.samples, 50, 100);
         row.p95_us = percentile_from_sorted(accum.samples, 95, 100);
         row.p99_us = percentile_from_sorted(accum.samples, 99, 100);
         row.p999_us = percentile_from_sorted(accum.samples, 999, 1000);
@@ -1984,6 +2327,97 @@ auto format_wki_launch_result(const WkiLaunchRow& row) -> std::string {
         return std::string("load(") + std::to_string(*row.load_status) + ')';
     }
     return "inflight";
+}
+
+auto format_scaled_bytes(uint64_t bytes) -> std::string {
+    if (bytes >= 1024ULL * 1024ULL) {
+        constexpr uint64_t MIB = 1024ULL * 1024ULL;
+        uint64_t whole = bytes / MIB;
+        uint64_t frac = (((bytes % MIB) * 10U) + (MIB / 2U)) / MIB;
+        if (frac >= 10U) {
+            whole++;
+            frac = 0;
+        }
+        return std::to_string(whole) + "." + std::to_string(frac) + "MiB";
+    }
+    if (bytes >= 1024ULL) {
+        constexpr uint64_t KIB = 1024ULL;
+        uint64_t whole = bytes / KIB;
+        uint64_t frac = (((bytes % KIB) * 10U) + (KIB / 2U)) / KIB;
+        if (frac >= 10U) {
+            whole++;
+            frac = 0;
+        }
+        return std::to_string(whole) + "." + std::to_string(frac) + "KiB";
+    }
+    return std::to_string(bytes) + "B";
+}
+
+auto format_hundredths(uint64_t scaled) -> std::string {
+    return std::to_string(scaled / 100U) + "." + (scaled % 100U < 10U ? "0" : "") + std::to_string(scaled % 100U);
+}
+
+auto format_mib_per_s(uint64_t bytes, uint64_t total_us) -> std::string {
+    if (bytes == 0 || total_us == 0) {
+        return "0.00";
+    }
+
+    constexpr uint64_t BYTES_PER_MIB = 1024ULL * 1024ULL;
+    constexpr uint64_t HUNDREDTHS_PER_UNIT = 100ULL;
+    constexpr uint64_t MICROSECONDS_PER_SECOND_U64 = 1000000ULL;
+    auto numerator = static_cast<unsigned __int128>(bytes) * HUNDREDTHS_PER_UNIT * MICROSECONDS_PER_SECOND_U64;
+    auto denominator = static_cast<unsigned __int128>(total_us) * BYTES_PER_MIB;
+    auto scaled = static_cast<uint64_t>((numerator + (denominator / 2U)) / denominator);
+    return format_hundredths(scaled);
+}
+
+auto row_jitter_us(const WkiSummaryRow& row) -> uint64_t {
+    if (row.p50_us != 0 && row.p99_us >= row.p50_us) {
+        return row.p99_us - row.p50_us;
+    }
+    if (row.p95_us != 0 && row.p99_us >= row.p95_us) {
+        return row.p99_us - row.p95_us;
+    }
+    return 0;
+}
+
+void print_ipc_memory_snapshot(const std::optional<WkiLoadedText>& loaded) {
+    if (!loaded.has_value()) {
+        std::println("perf: no IPC memory snapshot available from perf.data or {}", KIPCSTAT_PATH);
+        return;
+    }
+
+    auto snapshot = parse_ipc_stats_section(loaded->buffer, loaded->sectioned);
+    if (!snapshot.has_value()) {
+        std::println("perf: no IPC memory snapshot found in {}", loaded->source);
+        return;
+    }
+
+    double ring_pct = 0.0;
+    if (snapshot->ring_bytes != 0) {
+        ring_pct = (static_cast<double>(snapshot->ring_used) * 100.0) / static_cast<double>(snapshot->ring_bytes);
+    }
+
+    uint64_t const TOTAL_APPROX_ALLOC = snapshot->approx_alloc_bytes + snapshot->local_pipe_approx_alloc_bytes;
+
+    std::println("=== perf ipc memory [{}] ============================================", loaded->source);
+    std::println("total_approx={}  remote_approx={}  local_pipe_approx={}", format_scaled_bytes(TOTAL_APPROX_ALLOC),
+                 format_scaled_bytes(snapshot->approx_alloc_bytes), format_scaled_bytes(snapshot->local_pipe_approx_alloc_bytes));
+    std::println("remote: exports={} proxies={} pumps={}  ring={}/{} ({:.1f}%)", snapshot->exports, snapshot->proxies, snapshot->pump_tasks,
+                 format_scaled_bytes(snapshot->ring_used), format_scaled_bytes(snapshot->ring_bytes), ring_pct);
+    std::println("remote: pending={} chunks={} bytes={}  backlog={} chunks={} bytes={}  devq={} payload={}", snapshot->pending_deliveries,
+                 snapshot->pending_chunks, format_scaled_bytes(snapshot->pending_bytes), snapshot->export_backlogs,
+                 snapshot->export_backlog_chunks, format_scaled_bytes(snapshot->export_backlog_bytes), snapshot->dev_op_queue,
+                 format_scaled_bytes(snapshot->dev_op_payload_bytes));
+    std::println("remote: blocked_readers={} poll_waiters={} export_flush_queue={}", snapshot->blocked_readers, snapshot->poll_waiters,
+                 snapshot->export_flush_queue);
+    std::println("local_pipe: active={} created={} peak={}  capacity={} peak_capacity={} buffered={}", snapshot->local_pipe_active,
+                 snapshot->local_pipe_created, snapshot->local_pipe_peak, format_scaled_bytes(snapshot->local_pipe_capacity),
+                 format_scaled_bytes(snapshot->local_pipe_peak_capacity), format_scaled_bytes(snapshot->local_pipe_buffered));
+    std::println("local_pipe: readers={} writers={} poll_waiters={} direct={} read_closed={} write_closed={}",
+                 snapshot->local_pipe_reader_waiters, snapshot->local_pipe_writer_waiters, snapshot->local_pipe_poll_waiters,
+                 snapshot->local_pipe_direct_writes, snapshot->local_pipe_read_closed, snapshot->local_pipe_write_closed);
+    std::println("");
 }
 
 auto wki_launch_score(const WkiLaunchRow& row) -> uint32_t {
@@ -2143,33 +2577,32 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
     }
 }
 
-void cmd_wki_report(const WkiTraceFilter& filter, const WkiDisplayOptions& display_options) {
-    std::string source;
+void cmd_ipc_report(int limit, WkiTraceFilter filter, const WkiDisplayOptions& display_options) {
+    if (limit < 1) {
+        limit = DEFAULT_WKI_TAIL_ROWS;
+    }
+
+    auto ipc_stats_loaded = load_ipc_stats_text();
+    print_ipc_memory_snapshot(ipc_stats_loaded);
+
+    std::string summary_source;
     std::vector<WkiSummaryRow> rows;
+    auto summary_loaded = load_wki_summary_text();
+    if (summary_loaded.has_value()) {
+        summary_source = summary_loaded->source;
+        rows = parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned);
+        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !ipc_summary_matches(row, filter); });
+    }
 
     auto event_loaded = load_wki_event_text();
-    if (event_loaded.has_value()) {
-        source = event_loaded->source;
+    if (rows.empty() && event_loaded.has_value()) {
+        summary_source = event_loaded->source;
         rows = build_wki_summary_from_events(collect_wki_events(event_loaded->buffer, event_loaded->sectioned), filter);
+        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !ipc_summary_matches(row, filter); });
     }
 
     if (rows.empty()) {
-        auto loaded = load_wki_summary_text();
-        if (!loaded.has_value()) {
-            std::println("perf: no WKI summary data");
-            return;
-        }
-        source = loaded->source;
-        rows = parse_wki_summary_section(loaded->buffer, loaded->sectioned);
-        if (rows.empty()) {
-            std::println("perf: no WKI summary rows found in {}", loaded->source);
-            return;
-        }
-        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !wki_summary_matches(row, filter); });
-    }
-
-    if (rows.empty()) {
-        std::println("perf: no WKI summary rows matched the requested filters");
+        std::println("perf: no IPC summary rows matched the requested filters (default scopes: remote_ipc,local_pipe)");
         return;
     }
 
@@ -2183,21 +2616,179 @@ void cmd_wki_report(const WkiTraceFilter& filter, const WkiDisplayOptions& displ
         return lhs.calls > rhs.calls;
     });
 
-    auto peer_resolver = event_loaded.has_value() ? make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options)
-                                                  : make_wki_peer_resolver({}, false, display_options);
-    std::println("=== perf wki-report [{}] ============================================", source);
-    std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS",
-                 "ERR", "RETRY", "AVG(us)", "P99(us)", "P999(us)", "MAX(us)");
-    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->6}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "",
-                 "", "", "", "");
-    for (const auto& row : rows) {
-        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
-                     wki_peer_label(row.peer, peer_resolver), row.channel, row.calls, row.errors, row.retries, row.avg_us, row.p99_us,
-                     row.p999_us, row.max_us);
+    WkiPeerResolver summary_peer_resolver{};
+    if (summary_loaded.has_value()) {
+        summary_peer_resolver = make_wki_peer_resolver(summary_loaded->buffer, summary_loaded->sectioned, display_options);
+    } else if (event_loaded.has_value()) {
+        summary_peer_resolver = make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options);
+    } else {
+        summary_peer_resolver = make_wki_peer_resolver({}, false, display_options);
+    }
+
+    std::println("=== perf ipc-report [{}] ============================================", summary_source);
+    std::println("{:<12}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER",
+                 "CH", "CALLS", "ERR", "BYTES", "AVG(us)", "P50(us)", "P99(us)", "JIT(us)", "MAX(us)", "MiB/s");
+    std::println("{:->12}  {:->16}  {:->18}  {:->4}  {:->7}  {:->6}  {:->10}  {:->9}  {:->9}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "",
+                 "", "", "", "", "", "", "", "", "", "");
+    for (int i = 0; std::cmp_less(i, rows.size()) && i < limit; ++i) {
+        const auto& row = rows.at(static_cast<std::size_t>(i));
+        std::println("{:<12}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
+                     wki_peer_label(row.peer, summary_peer_resolver), row.channel, row.calls, row.errors, format_scaled_bytes(row.bytes),
+                     row.avg_us, row.p50_us, row.p99_us, row_jitter_us(row), row.max_us, format_mib_per_s(row.bytes, row.total_us));
+    }
+
+    if (!event_loaded.has_value()) {
+        return;
+    }
+
+    auto events = collect_wki_events(event_loaded->buffer, event_loaded->sectioned);
+    std::vector<EventInfo> slow_events;
+    for (const auto& event : events) {
+        if (ipc_summary_event_matches(event, filter) && event.aux > 0) {
+            slow_events.push_back(event);
+        }
+    }
+    if (slow_events.empty()) {
+        return;
+    }
+    std::ranges::sort(slow_events, [](const EventInfo& lhs, const EventInfo& rhs) { return lhs.aux > rhs.aux; });
+
+    auto event_peer_resolver = make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options);
+    std::println("");
+    std::println("=== slowest IPC events [{}] ========================================", event_loaded->source);
+    std::println("{:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)",
+                 "STATUS", "CORR", "DETAILS");
+    std::println("{:->12}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", "", "", "", "", "", "", "", "");
+    for (int i = 0; std::cmp_less(i, slow_events.size()) && i < limit; ++i) {
+        const auto& event = slow_events.at(static_cast<std::size_t>(i));
+        std::println("{:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", event.scope_name, event.op_name, event.phase_name,
+                     wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation,
+                     display_callsite(event.callsite));
     }
 }
 
-void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options) {
+void cmd_wki_report(const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view) {
+    std::string source;
+    std::vector<WkiSummaryRow> rows;
+    std::optional<WkiLoadedText> event_loaded;
+    std::optional<WkiLoadedText> summary_loaded;
+    bool const PREFER_SAVED_SUMMARY = view == WkiDataView::VMEM || filter.scope == "local_vmem" || filter.scope == "local_loader";
+
+    auto load_summary_rows = [&]() {
+        summary_loaded = load_wki_summary_text();
+        if (!summary_loaded.has_value()) {
+            return;
+        }
+        source = summary_loaded->source;
+        rows = parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned);
+        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !view_summary_matches(row, filter, view); });
+    };
+
+    if (PREFER_SAVED_SUMMARY) {
+        load_summary_rows();
+    }
+    if (rows.empty()) {
+        event_loaded = load_wki_event_text();
+        if (event_loaded.has_value()) {
+            source = event_loaded->source;
+            rows = build_wki_summary_from_events(collect_wki_events(event_loaded->buffer, event_loaded->sectioned), filter, view);
+        }
+    }
+    if (rows.empty() && !PREFER_SAVED_SUMMARY) {
+        load_summary_rows();
+        if (!summary_loaded.has_value()) {
+            std::println("perf: no {} summary data", wki_view_name(view));
+            return;
+        }
+    }
+
+    if (rows.empty()) {
+        std::println("perf: no {} summary rows matched the requested filters", wki_view_name(view));
+        return;
+    }
+
+    std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+        if (lhs.p99_us != rhs.p99_us) {
+            return lhs.p99_us > rhs.p99_us;
+        }
+        if (lhs.max_us != rhs.max_us) {
+            return lhs.max_us > rhs.max_us;
+        }
+        return lhs.calls > rhs.calls;
+    });
+
+    WkiPeerResolver peer_resolver{};
+    if (event_loaded.has_value()) {
+        peer_resolver = make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options);
+    } else if (summary_loaded.has_value()) {
+        peer_resolver = make_wki_peer_resolver(summary_loaded->buffer, summary_loaded->sectioned, display_options);
+    } else {
+        peer_resolver = make_wki_peer_resolver({}, false, display_options);
+    }
+    std::println("=== perf {}-report [{}] ============================================", wki_view_name(view), source);
+    std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH",
+                 "CALLS", "ERR", "RETRY", "BYTES", "AVG(us)", "P99(us)", "P999(us)", "MAX(us)");
+    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->6}  {:->7}  {:->10}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "",
+                 "", "", "", "", "", "", "");
+    for (const auto& row : rows) {
+        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>6}  {:>7}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}", row.scope, row.op,
+                     wki_peer_label(row.peer, peer_resolver), row.channel, row.calls, row.errors, row.retries,
+                     format_scaled_bytes(row.bytes), row.avg_us, row.p99_us, row.p999_us, row.max_us);
+    }
+}
+
+void cmd_vmem_report(WkiTraceFilter filter) {
+    if (filter.scope.empty()) {
+        filter.scope = "local_vmem";
+    }
+
+    std::string source;
+    std::vector<WkiSummaryRow> rows;
+
+    auto loaded = load_wki_summary_text();
+    if (loaded.has_value()) {
+        source = loaded->source;
+        rows = parse_wki_summary_section(loaded->buffer, loaded->sectioned);
+        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !view_summary_matches(row, filter, WkiDataView::VMEM); });
+    }
+
+    if (rows.empty()) {
+        auto event_loaded = load_wki_event_text();
+        if (event_loaded.has_value()) {
+            source = event_loaded->source;
+            rows =
+                build_wki_summary_from_events(collect_wki_events(event_loaded->buffer, event_loaded->sectioned), filter, WkiDataView::VMEM);
+        }
+    }
+
+    if (rows.empty()) {
+        std::println("perf: no vmem rows matched the requested filters");
+        return;
+    }
+
+    std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+        if (lhs.p99_us != rhs.p99_us) {
+            return lhs.p99_us > rhs.p99_us;
+        }
+        if (lhs.max_us != rhs.max_us) {
+            return lhs.max_us > rhs.max_us;
+        }
+        return lhs.calls > rhs.calls;
+    });
+
+    std::println("=== perf vmem-report [{}] ===========================================", source);
+    std::println("{:<18}  {:>7}  {:>6}  {:>11}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}", "OP", "CALLS", "ERR", "BYTES", "PAGES",
+                 "AVG(us)", "P50(us)", "P99(us)", "P999(us)", "MAX(us)");
+    std::println("{:->18}  {:->7}  {:->6}  {:->11}  {:->9}  {:->9}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "",
+                 "");
+    for (const auto& row : rows) {
+        uint64_t const PAGES = row.bytes / PERF_PAGE_SIZE;
+        std::println("{:<18}  {:>7}  {:>6}  {:>11}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}", row.op, row.calls, row.errors,
+                     format_scaled_bytes(row.bytes), PAGES, row.avg_us, row.p50_us, row.p99_us, row.p999_us, row.max_us);
+    }
+}
+
+void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view) {
     if (limit < 1) {
         limit = DEFAULT_WKI_TAIL_ROWS;
     }
@@ -2205,13 +2796,13 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
     auto event_loaded = load_wki_event_text();
     std::vector<WkiSummaryRow> rows;
     if (event_loaded.has_value()) {
-        rows = build_wki_summary_from_events(collect_wki_events(event_loaded->buffer, event_loaded->sectioned), filter);
+        rows = build_wki_summary_from_events(collect_wki_events(event_loaded->buffer, event_loaded->sectioned), filter, view);
     }
 
     auto summary_loaded = load_wki_summary_text();
     if (rows.empty() && summary_loaded.has_value()) {
         rows = parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned);
-        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !wki_summary_matches(row, filter); });
+        std::erase_if(rows, [&](const WkiSummaryRow& row) { return !view_summary_matches(row, filter, view); });
     }
 
     std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
@@ -2237,7 +2828,7 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
             summary_source = summary_loaded->source;
             summary_peer_resolver = make_wki_peer_resolver(summary_loaded->buffer, summary_loaded->sectioned, display_options);
         }
-        std::println("=== perf wki-tail summary [{}] ======================================", summary_source);
+        std::println("=== perf {}-tail summary [{}] ======================================", wki_view_name(view), summary_source);
         std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "SCOPE", "OP", "PEER", "CH", "CALLS", "P999(us)",
                      "P9999(us)", "P99999(us)", "MAX(us)");
         std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->7}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "");
@@ -2252,15 +2843,15 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
     if (!event_loaded.has_value()) {
         if (!rows.empty()) {
             std::println("");
-            std::println("perf: no raw WKI events available in perf.data or /proc/kperf");
+            std::println("perf: no raw {} events available in perf.data or /proc/kperf", wki_view_name(view));
             return;
         }
-        std::println("perf: no WKI summary or raw trace data");
+        std::println("perf: no {} summary or raw trace data", wki_view_name(view));
         return;
     }
 
     if (rows.empty()) {
-        std::println("perf: no WKI summary data; showing raw-event tail from {}", event_loaded->source);
+        std::println("perf: no {} summary data; showing raw-event tail from {}", wki_view_name(view), event_loaded->source);
     }
 
     auto events = collect_wki_events(event_loaded->buffer, event_loaded->sectioned);
@@ -2268,23 +2859,23 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
     if (events.empty()) {
         if (!rows.empty()) {
             std::println("");
-            std::println("perf: no raw WKI events found in {}", event_loaded->source);
+            std::println("perf: no raw {} events found in {}", wki_view_name(view), event_loaded->source);
             return;
         }
-        std::println("perf: no raw WKI events found in {}", event_loaded->source);
+        std::println("perf: no raw {} events found in {}", wki_view_name(view), event_loaded->source);
         return;
     }
 
     std::vector<EventInfo> slow_events;
     for (const auto& event : events) {
-        if (wki_summary_event_matches(event, filter) && event.aux > 0) {
+        if (view_summary_event_matches(event, filter, view) && event.aux > 0) {
             slow_events.push_back(event);
         }
     }
     std::ranges::sort(slow_events, [](const EventInfo& lhs, const EventInfo& rhs) { return lhs.aux > rhs.aux; });
 
     std::println("");
-    std::println("=== slowest WKI events [{}] ========================================", event_loaded->source);
+    std::println("=== slowest {} events [{}] ========================================", wki_view_name(view), event_loaded->source);
     std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)",
                  "STATUS", "CORR", "DETAILS");
     std::println("{:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", "", "", "", "", "", "", "", "");
@@ -2292,7 +2883,7 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
         const auto& event = slow_events.at(static_cast<std::size_t>(i));
         std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", event.scope_name, event.op_name, event.phase_name,
                      wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation,
-                     is_transport_stall_event(event) ? format_transport_stall_detail(event) : "");
+                     format_wki_trace_detail(event));
     }
 
     struct LastBegin {
@@ -2309,7 +2900,7 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
         if (event.phase_name != "begin") {
             continue;
         }
-        if (!wki_trace_matches(event, filter)) {
+        if (!view_trace_matches(event, filter, view)) {
             continue;
         }
 
@@ -2337,7 +2928,7 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
     std::ranges::sort(gaps, [](const WkiGapRow& lhs, const WkiGapRow& rhs) { return lhs.gap_ns > rhs.gap_ns; });
 
     std::println("");
-    std::println("=== largest WKI inter-call gaps ====================================");
+    std::println("=== largest {} inter-call gaps ====================================", wki_view_name(view));
     std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", "SCOPE", "OP", "PEER", "CH", "GAP(us)");
     std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}", "", "", "", "", "");
     for (int i = 0; std::cmp_less(i, gaps.size()) && i < limit; ++i) {
@@ -2347,7 +2938,7 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
     }
 }
 
-void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options) {
+void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view) {
     if (max_events < 1) {
         max_events = DEFAULT_WKI_TRACE_EVENTS;
     }
@@ -2356,9 +2947,10 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
     if (!loaded.has_value()) {
         auto summary_loaded = load_wki_summary_text();
         if (summary_loaded.has_value() && !parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned).empty()) {
-            std::println("perf: WKI summary data exists in {}, but no raw WKI events were saved", summary_loaded->source);
+            std::println("perf: {} summary data exists in {}, but no raw {} events were saved", wki_view_name(view), summary_loaded->source,
+                         wki_view_name(view));
         } else {
-            std::println("perf: no WKI trace data");
+            std::println("perf: no {} trace data", wki_view_name(view));
         }
         return;
     }
@@ -2369,14 +2961,15 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
     if (events.empty()) {
         auto summary_loaded = load_wki_summary_text();
         if (summary_loaded.has_value() && !parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned).empty()) {
-            std::println("perf: WKI summary data exists in {}, but no raw WKI events were saved", summary_loaded->source);
+            std::println("perf: {} summary data exists in {}, but no raw {} events were saved", wki_view_name(view), summary_loaded->source,
+                         wki_view_name(view));
         } else {
-            std::println("perf: no WKI trace data");
+            std::println("perf: no {} trace data", wki_view_name(view));
         }
         return;
     }
 
-    std::println("=== perf wki-trace [{}] ============================================", loaded->source);
+    std::println("=== perf {}-trace [{}] ============================================", wki_view_name(view), loaded->source);
     std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}", "TIME(ns)", "CPU", "PID", "SCOPE",
                  "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "CALLSITE/DETAILS");
     std::println("{:->18}  {:->3}  {:->24}  {:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->8}  {:->28}", "", "", "", "", "",
@@ -2384,7 +2977,7 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
 
     int printed = 0;
     for (const auto& event : events) {
-        if (!wki_trace_matches(event, filter)) {
+        if (!view_trace_matches(event, filter, view)) {
             continue;
         }
         std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}", event.ts_ns, event.cpu,
@@ -2614,6 +3207,7 @@ void cmd_run(int argc, char** argv) {
         return;
     }
 
+    ker::process::setpgid(child_pid, child_pid);
     int64_t target_pgid = child_pid;
     std::println("perf run: tracing pgid={} cmd={}", target_pgid, exec_path);
 
@@ -2645,20 +3239,30 @@ void cmd_run(int argc, char** argv) {
     int32_t status = 0;
     int64_t last_drain_ms = now_ms();
     ssize_t total_event_bytes = 0;
+    bool command_exited = false;
 
     for (;;) {
-        while (ker::process::waitpid(-1, &status, PROC_WAIT_NOHANG, nullptr) > 0) {
+        for (;;) {
+            int64_t const REAPED = waitpid_nohang(-1, &status);
+            if (REAPED <= 0) {
+                break;
+            }
+            if (REAPED == child_pid) {
+                command_exited = true;
+            }
         }
 
         bool any_alive = false;
         for_each_process_stat([&](const StatInfo& stat, std::string_view) {
             if (std::cmp_equal(stat.pgid, target_pgid)) {
-                any_alive = true;
                 upsert_tracked(stat);
+                if (stat.state != EXITED_STATE) {
+                    any_alive = true;
+                }
             }
         });
 
-        if (!any_alive) {
+        if (command_exited || !any_alive) {
             break;
         }
 
@@ -2673,7 +3277,7 @@ void cmd_run(int argc, char** argv) {
         }
     }
 
-    while (ker::process::waitpid(-1, &status, 1, nullptr) > 0) {
+    while (waitpid_nohang(-1, &status) > 0) {
     }
 
     int64_t elapsed_ms = now_ms() - START_MS;
@@ -2767,6 +3371,7 @@ void cmd_run(int argc, char** argv) {
 
         write_all(data_fd.get(), SECTION_EVENTS_END);
         write_section_wki_summary(data_fd.get());
+        write_section_ipc_stats(data_fd.get());
         write_section_peer_map(data_fd.get());
         write_all(data_fd.get(), SECTION_PROC_MAP);
 
@@ -2866,31 +3471,403 @@ void cmd_top(int ms) {
     }
 }
 
+using CommandHandler = int (*)(int argc, char** argv);
+
+struct CommandSpec {
+    std::string_view name;
+    std::string_view args;
+    std::string_view summary;
+    CommandHandler handler;
+};
+
+int run_stat_command(int argc, char** argv);
+int run_record_command(int argc, char** argv);
+int run_report_command(int argc, char** argv);
+int run_cpustat_command(int argc, char** argv);
+int run_contstat_command(int argc, char** argv);
+int run_ipc_report_command(int argc, char** argv);
+int run_wki_report_command(int argc, char** argv);
+int run_local_report_command(int argc, char** argv);
+int run_all_report_command(int argc, char** argv);
+int run_vmem_report_command(int argc, char** argv);
+int run_wki_launch_command(int argc, char** argv);
+int run_wki_tail_command(int argc, char** argv);
+int run_local_tail_command(int argc, char** argv);
+int run_all_tail_command(int argc, char** argv);
+int run_vmem_tail_command(int argc, char** argv);
+int run_wki_trace_command(int argc, char** argv);
+int run_local_trace_command(int argc, char** argv);
+int run_all_trace_command(int argc, char** argv);
+int run_vmem_trace_command(int argc, char** argv);
+int run_top_command(int argc, char** argv);
+int run_run_command(int argc, char** argv);
+int run_show_map_command(int argc, char** argv);
+int run_help_command(int argc, char** argv);
+
+constexpr std::array<CommandSpec, 24> COMMANDS = {{
+    {.name = "stat", .args = "[ms=1000]", .summary = "CPU% per process over a sampling window", .handler = run_stat_command},
+    {.name = "record",
+     .args = "[ms=1000] [--filter=<filters>]",
+     .summary = "Record kernel perf events to perf.data",
+     .handler = run_record_command},
+    {.name = "report",
+     .args = "[n=2000] [--peer-ids]",
+     .summary = "Display events from perf.data or live /proc/kperf",
+     .handler = run_report_command},
+    {.name = "sched",
+     .args = "[n=2000] [--peer-ids]",
+     .summary = "Alias for report with scheduler hotspot tables",
+     .handler = run_report_command},
+    {.name = "cpustat", .args = "", .summary = "Per-CPU aggregate scheduler statistics", .handler = run_cpustat_command},
+    {.name = "contstat", .args = "", .summary = "Per-subsystem container statistics", .handler = run_contstat_command},
+    {.name = "ipc-report",
+     .args = "[n=15] [filters]",
+     .summary = "Remote IPC and local pipe latency, jitter, throughput, memory, and queue pressure",
+     .handler = run_ipc_report_command},
+    {.name = "wki-report", .args = "[filters]", .summary = "Remote/WKI summary statistics", .handler = run_wki_report_command},
+    {.name = "local-report", .args = "[filters]", .summary = "Local pipe/process summary statistics", .handler = run_local_report_command},
+    {.name = "all-report", .args = "[filters]", .summary = "Combined WKI and local summary statistics", .handler = run_all_report_command},
+    {.name = "vmem-report",
+     .args = "[filters]",
+     .summary = "Local vmem mmap/COW/cache summary statistics",
+     .handler = run_vmem_report_command},
+    {.name = "wki-launch", .args = "[n=20] [--peer-ids]", .summary = "Remote launch stage timings", .handler = run_wki_launch_command},
+    {.name = "wki-tail",
+     .args = "[n=15] [filters]",
+     .summary = "Tail-latency WKI summary and slow remote events",
+     .handler = run_wki_tail_command},
+    {.name = "local-tail",
+     .args = "[n=15] [filters]",
+     .summary = "Tail-latency local summary and slow local events",
+     .handler = run_local_tail_command},
+    {.name = "all-tail",
+     .args = "[n=15] [filters]",
+     .summary = "Tail-latency combined WKI and local events",
+     .handler = run_all_tail_command},
+    {.name = "vmem-tail", .args = "[n=15] [filters]", .summary = "Tail-latency local vmem events", .handler = run_vmem_tail_command},
+    {.name = "wki-trace", .args = "[n=200] [filters]", .summary = "Raw remote/WKI trace events", .handler = run_wki_trace_command},
+    {.name = "local-trace", .args = "[n=200] [filters]", .summary = "Raw local trace events", .handler = run_local_trace_command},
+    {.name = "all-trace",
+     .args = "[n=200] [filters]",
+     .summary = "Raw combined WKI and local trace events",
+     .handler = run_all_trace_command},
+    {.name = "vmem-trace", .args = "[n=200] [filters]", .summary = "Raw local vmem trace events", .handler = run_vmem_trace_command},
+    {.name = "top", .args = "[ms=1000]", .summary = "Continuous CPU% snapshots", .handler = run_top_command},
+    {.name = "run", .args = "[--filter=<filters>] <cmd> [args]", .summary = "Trace a command and descendants", .handler = run_run_command},
+    {.name = "show-map", .args = "", .summary = "Show PID to command map from perf.data", .handler = run_show_map_command},
+    {.name = "help", .args = "[filters]", .summary = "Show this screen or detailed filter help", .handler = run_help_command},
+}};
+
+struct FilterHelp {
+    std::string_view name;
+    std::string_view summary;
+};
+
+constexpr std::array<FilterHelp, 13> RECORD_FILTER_HELP = {{
+    {.name = "sample", .summary = "timer CPU samples"},
+    {.name = "switch", .summary = "context-switch events"},
+    {.name = "wake", .summary = "task wake events"},
+    {.name = "sleep", .summary = "task sleep/block events"},
+    {.name = "container", .summary = "container and data-structure events"},
+    {.name = "wki", .summary = "all WKI transport/RPC/IPC events"},
+    {.name = "wki_launch", .summary = "remote-compute launch events only"},
+    {.name = "local_pipe", .summary = "local pipe events"},
+    {.name = "local_proc", .summary = "local fork/exec/process events"},
+    {.name = "vmem", .summary = "local vmem mmap/cache/COW events"},
+    {.name = "loader", .summary = "local ELF loader segment/perms events"},
+    {.name = "local", .summary = "all local pipe/process/vmem/loader events"},
+    {.name = "all", .summary = "all event classes"},
+}};
+
+constexpr std::array<FilterHelp, 11> WKI_FILTER_HELP = {{
+    {.name = "--scope=NAME", .summary = "scope name such as remote_ipc, local_pipe, local_proc, local_vmem, local_loader"},
+    {.name = "--op=NAME", .summary = "operation name such as cow_zero, file_mmap, pt_load_main, execve, read"},
+    {.name = "--phase=NAME", .summary = "begin, end, or point"},
+    {.name = "--peer=N", .summary = "numeric WKI peer id"},
+    {.name = "--channel=N", .summary = "WKI channel id"},
+    {.name = "--corr=N", .summary = "trace correlation id"},
+    {.name = "--pid=N", .summary = "subject process id"},
+    {.name = "--min-us=N", .summary = "minimum auxiliary latency in microseconds"},
+    {.name = "--from-ns=N", .summary = "minimum event timestamp"},
+    {.name = "--to-ns=N", .summary = "maximum event timestamp"},
+    {.name = "--peer-ids", .summary = "show numeric peer ids instead of hostnames"},
+}};
+
+auto joined_record_filter_names() -> std::string {
+    std::string out;
+    for (const auto& filter : RECORD_FILTER_HELP) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += filter.name;
+    }
+    return out;
+}
+
+void print_filters() {
+    std::println("Event filters for --filter=<list>:");
+    for (const auto& filter : RECORD_FILTER_HELP) {
+        std::println("  {:<12} {}", filter.name, filter.summary);
+    }
+    std::println("");
+    std::println("Trace filter options:");
+    for (const auto& filter : WKI_FILTER_HELP) {
+        std::println("  {:<14} {}", filter.name, filter.summary);
+    }
+}
+
 void usage() {
     std::println("Usage: perf <command> [args]");
     std::println("Commands:");
-    std::println("  stat     [ms=1000]    CPU% per process (sampling window in ms)");
-    std::println("  record   [ms=1000] [--filter=switch,container,wki,wki_launch]  Record events");
-    std::println("  report   [n=2000] [--peer-ids]  Display events from perf.data (or live ring buffer)");
-    std::println("  sched    [n=2000] [--peer-ids]  Alias for report");
-    std::println("  cpustat               Per-CPU aggregate scheduler statistics");
-    std::println("  contstat              Per-subsystem container statistics");
-    std::println(
-        "  wki-report [--scope=..] [--op=..] [--phase=..] [--peer=N] [--channel=N] [--corr=N] [--pid=N] [--min-us=N] [--from-ns=N] "
-        "[--to-ns=N] "
-        "[--peer-ids]");
-    std::println("  wki-launch [n=20] [--peer-ids]     Remote launch stage timings from perf.data or /proc/kperf");
-    std::println(
-        "  wki-tail [n=15] [--scope=..] [--op=..] [--phase=..] [--peer=N] [--channel=N] [--corr=N] [--pid=N] [--min-us=N] [--from-ns=N] "
-        "[--to-ns=N] "
-        "[--peer-ids]");
-    std::println(
-        "  wki-trace [n=200] [--scope=..] [--op=..] [--phase=..] [--peer=N] [--channel=N] [--corr=N] [--pid=N] [--min-us=N] [--from-ns=N] "
-        "[--to-ns=N] "
-        "[--peer-ids]");
-    std::println("  top      [ms=1000]    Continuous CPU% snapshots");
-    std::println("  run      [--filter=switch,wake,sleep,wki,wki_launch] <cmd> [args]  Trace cmd (default: no container)");
-    std::println("  show-map              Show PID->name/cmdline map from perf.data");
+    for (const auto& command : COMMANDS) {
+        std::println("  {:<12} {:<34} {}", command.name, command.args, command.summary);
+    }
+    std::println("");
+    std::println("Available --filter names: {}", joined_record_filter_names());
+    std::println("Use 'perf help filters' for filter details.");
+}
+
+int run_stat_command(int argc, char** argv) {
+    int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
+    cmd_stat(MS);
+    return 0;
+}
+
+int run_record_command(int argc, char** argv) {
+    int ms = DEFAULT_SAMPLE_MS;
+    const char* filter = nullptr;
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (ARG.starts_with("--filter=")) {
+            filter = argv[i] + 9;
+        } else {
+            ms = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        }
+    }
+    cmd_record(ms, filter);
+    return 0;
+}
+
+int run_report_command(int argc, char** argv) {
+    int max_events = DEFAULT_MAX_EVENTS;
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (ARG == "--peer-ids") {
+            display_options.show_peer_ids = true;
+        } else {
+            max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        }
+    }
+    cmd_sched(max_events, display_options);
+    return 0;
+}
+
+int run_cpustat_command(int /*argc*/, char** /*argv*/) {
+    cmd_cpustat();
+    return 0;
+}
+
+int run_contstat_command(int /*argc*/, char** /*argv*/) {
+    cmd_contstat();
+    return 0;
+}
+
+int run_ipc_report_command(int argc, char** argv) {
+    int rows = DEFAULT_WKI_TAIL_ROWS;
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (parse_wki_filter_arg(ARG, filter, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
+            rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf ipc-report: unrecognized argument '{}'", argv[i]);
+            return 1;
+        }
+    }
+    cmd_ipc_report(rows, filter, display_options);
+    return 0;
+}
+
+int run_view_report_command(int argc, char** argv, WkiDataView view) {
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        if (!parse_wki_filter_arg(argv[i], filter, display_options)) {
+            std::println("perf {}-report: unrecognized argument '{}'", wki_view_name(view), argv[i]);
+            return 1;
+        }
+    }
+    cmd_wki_report(filter, display_options, view);
+    return 0;
+}
+
+int run_wki_report_command(int argc, char** argv) { return run_view_report_command(argc, argv, WkiDataView::WKI); }
+
+int run_local_report_command(int argc, char** argv) { return run_view_report_command(argc, argv, WkiDataView::LOCAL); }
+
+int run_all_report_command(int argc, char** argv) { return run_view_report_command(argc, argv, WkiDataView::ALL); }
+
+int run_vmem_report_command(int argc, char** argv) {
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        if (!parse_wki_filter_arg(argv[i], filter, display_options)) {
+            std::println("perf vmem-report: unrecognized argument '{}'", argv[i]);
+            return 1;
+        }
+    }
+    if (filter.scope.empty()) {
+        filter.scope = "local_vmem";
+    }
+    cmd_vmem_report(filter);
+    return 0;
+}
+
+int run_wki_launch_command(int argc, char** argv) {
+    int rows = DEFAULT_WKI_LAUNCH_ROWS;
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (ARG == "--peer-ids") {
+            display_options.show_peer_ids = true;
+        } else {
+            rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        }
+    }
+    cmd_wki_launch(rows, display_options);
+    return 0;
+}
+
+int run_view_tail_command(int argc, char** argv, WkiDataView view) {
+    int rows = DEFAULT_WKI_TAIL_ROWS;
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (parse_wki_filter_arg(ARG, filter, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
+            rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf {}-tail: unrecognized argument '{}'", wki_view_name(view), argv[i]);
+            return 1;
+        }
+    }
+    cmd_wki_tail(rows, filter, display_options, view);
+    return 0;
+}
+
+int run_wki_tail_command(int argc, char** argv) { return run_view_tail_command(argc, argv, WkiDataView::WKI); }
+
+int run_local_tail_command(int argc, char** argv) { return run_view_tail_command(argc, argv, WkiDataView::LOCAL); }
+
+int run_all_tail_command(int argc, char** argv) { return run_view_tail_command(argc, argv, WkiDataView::ALL); }
+
+int run_vmem_tail_command(int argc, char** argv) {
+    int rows = DEFAULT_WKI_TAIL_ROWS;
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (parse_wki_filter_arg(ARG, filter, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
+            rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf vmem-tail: unrecognized argument '{}'", argv[i]);
+            return 1;
+        }
+    }
+    if (filter.scope.empty()) {
+        filter.scope = "local_vmem";
+    }
+    cmd_wki_tail(rows, filter, display_options, WkiDataView::VMEM);
+    return 0;
+}
+
+int run_view_trace_command(int argc, char** argv, WkiDataView view) {
+    int max_events = DEFAULT_WKI_TRACE_EVENTS;
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (parse_wki_filter_arg(ARG, filter, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
+            max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf {}-trace: unrecognized argument '{}'", wki_view_name(view), argv[i]);
+            return 1;
+        }
+    }
+    cmd_wki_trace(max_events, filter, display_options, view);
+    return 0;
+}
+
+int run_wki_trace_command(int argc, char** argv) { return run_view_trace_command(argc, argv, WkiDataView::WKI); }
+
+int run_local_trace_command(int argc, char** argv) { return run_view_trace_command(argc, argv, WkiDataView::LOCAL); }
+
+int run_all_trace_command(int argc, char** argv) { return run_view_trace_command(argc, argv, WkiDataView::ALL); }
+
+int run_vmem_trace_command(int argc, char** argv) {
+    int max_events = DEFAULT_WKI_TRACE_EVENTS;
+    WkiTraceFilter filter{};
+    WkiDisplayOptions display_options{};
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (parse_wki_filter_arg(ARG, filter, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
+            max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf vmem-trace: unrecognized argument '{}'", argv[i]);
+            return 1;
+        }
+    }
+    if (filter.scope.empty()) {
+        filter.scope = "local_vmem";
+    }
+    cmd_wki_trace(max_events, filter, display_options, WkiDataView::VMEM);
+    return 0;
+}
+
+int run_top_command(int argc, char** argv) {
+    int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
+    cmd_top(MS);
+    return 0;
+}
+
+int run_run_command(int argc, char** argv) {
+    if (argc < 3) {
+        std::println("perf run: usage: perf run <program> [args...]");
+        return 1;
+    }
+    cmd_run(argc - 2, argv + 2);
+    return 0;
+}
+
+int run_show_map_command(int /*argc*/, char** /*argv*/) {
+    cmd_show_map();
+    return 0;
+}
+
+int run_help_command(int argc, char** argv) {
+    if (argc >= 3 && std::string_view(argv[2]) == "filters") {
+        print_filters();
+    } else {
+        usage();
+    }
+    return 0;
 }
 }  // namespace
 
@@ -2903,108 +3880,12 @@ int main(int argc, char* argv[]) {
 
     std::string_view const CMD(argv[1]);
 
-    if (CMD == "stat") {
-        int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-        cmd_stat(MS);
-    } else if (CMD == "record") {
-        int ms = DEFAULT_SAMPLE_MS;
-        const char* filter = nullptr;
-        for (int i = 2; i < argc; ++i) {
-            std::string_view const ARG(argv[i]);
-            if (ARG.starts_with("--filter=")) {
-                filter = argv[i] + 9;
-            } else {
-                ms = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
-            }
+    for (const auto& command : COMMANDS) {
+        if (CMD == command.name) {
+            return command.handler(argc, argv);
         }
-        cmd_record(ms, filter);
-    } else if (CMD == "report" || CMD == "sched") {
-        int max_events = DEFAULT_MAX_EVENTS;
-        WkiDisplayOptions display_options{};
-        for (int i = 2; i < argc; ++i) {
-            std::string_view const ARG(argv[i]);
-            if (ARG == "--peer-ids") {
-                display_options.show_peer_ids = true;
-            } else {
-                max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
-            }
-        }
-        cmd_sched(max_events, display_options);
-    } else if (CMD == "cpustat") {
-        cmd_cpustat();
-    } else if (CMD == "contstat") {
-        cmd_contstat();
-    } else if (CMD == "wki-report") {
-        WkiTraceFilter filter{};
-        WkiDisplayOptions display_options{};
-        for (int i = 2; i < argc; ++i) {
-            if (!parse_wki_filter_arg(argv[i], filter, display_options)) {
-                std::println("perf wki-report: unrecognized argument '{}'", argv[i]);
-                return 1;
-            }
-        }
-        cmd_wki_report(filter, display_options);
-    } else if (CMD == "wki-launch") {
-        int rows = DEFAULT_WKI_LAUNCH_ROWS;
-        WkiDisplayOptions display_options{};
-        for (int i = 2; i < argc; ++i) {
-            std::string_view const ARG(argv[i]);
-            if (ARG == "--peer-ids") {
-                display_options.show_peer_ids = true;
-            } else {
-                rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
-            }
-        }
-        cmd_wki_launch(rows, display_options);
-    } else if (CMD == "wki-tail") {
-        int rows = DEFAULT_WKI_TAIL_ROWS;
-        WkiTraceFilter filter{};
-        WkiDisplayOptions display_options{};
-        for (int i = 2; i < argc; ++i) {
-            std::string_view const ARG(argv[i]);
-            if (parse_wki_filter_arg(ARG, filter, display_options)) {
-                continue;
-            }
-            if (!ARG.empty() && ARG.front() != '-') {
-                rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
-            } else {
-                std::println("perf wki-tail: unrecognized argument '{}'", argv[i]);
-                return 1;
-            }
-        }
-        cmd_wki_tail(rows, filter, display_options);
-    } else if (CMD == "wki-trace") {
-        int max_events = DEFAULT_WKI_TRACE_EVENTS;
-        WkiTraceFilter filter{};
-        WkiDisplayOptions display_options{};
-        for (int i = 2; i < argc; ++i) {
-            std::string_view const ARG(argv[i]);
-            if (parse_wki_filter_arg(ARG, filter, display_options)) {
-                continue;
-            }
-            if (!ARG.empty() && ARG.front() != '-') {
-                max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
-            } else {
-                std::println("perf wki-trace: unrecognized argument '{}'", argv[i]);
-                return 1;
-            }
-        }
-        cmd_wki_trace(max_events, filter, display_options);
-    } else if (CMD == "top") {
-        int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-        cmd_top(MS);
-    } else if (CMD == "run") {
-        if (argc < 3) {
-            std::println("perf run: usage: perf run <program> [args...]");
-            return 1;
-        }
-        cmd_run(argc - 2, argv + 2);
-    } else if (CMD == "show-map") {
-        cmd_show_map();
-    } else {
-        usage();
-        return 1;
     }
 
-    return 0;
+    usage();
+    return 1;
 }

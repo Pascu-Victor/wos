@@ -330,6 +330,10 @@ inline bool is_local_pipe_wait_channel(const char* wait_channel) {
     return std::strcmp(wait_channel, "pipe_read") == 0 || std::strcmp(wait_channel, "pipe_write") == 0;
 }
 
+inline bool is_low_latency_handoff_wait_channel(const char* wait_channel) {
+    return is_local_pipe_wait_channel(wait_channel) || (wait_channel != nullptr && std::strcmp(wait_channel, "waitpid") == 0);
+}
+
 inline void note_task_wakeup(task::Task* task, uint64_t now_us, const char* wait_channel) {
     if (task->last_sleep_start_us != 0 && now_us > task->last_sleep_start_us) {
         uint64_t const SLEEP_US = now_us - task->last_sleep_start_us;
@@ -337,7 +341,7 @@ inline void note_task_wakeup(task::Task* task, uint64_t now_us, const char* wait
     } else {
         task->last_sleep_us = 0;
     }
-    task->last_wake_us = is_local_pipe_wait_channel(wait_channel) ? 0 : now_us;
+    task->last_wake_us = is_low_latency_handoff_wait_channel(wait_channel) ? 0 : now_us;
     task->last_sleep_start_us = 0;
     task->perf_wait_callsite = 0;
 }
@@ -668,11 +672,11 @@ void set_task_nice_impl(task::Task* task, int nice) {
 // but they should not alternate 50/50 with CPU-bound workers just because sleep
 // time freezes vruntime. Charge a small wakeup tax only for short-run + short-sleep
 // wakeups; long-idle interactive wakes keep zero penalty.
-inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us) -> int64_t {
+inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us, const char* wait_channel) -> int64_t {
     int64_t const AVG = compute_avg_vruntime(rq);
     int64_t const FAIR_VRUNTIME = std::max(rq->min_vruntime, AVG);
 
-    if (is_local_pipe_wait_channel(t->wait_channel)) {
+    if (is_low_latency_handoff_wait_channel(wait_channel)) {
         return FAIR_VRUNTIME;
     }
 
@@ -1616,15 +1620,15 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 task::Task* w = pending_wake_slot(to_wake, i);
                 rq->wait_list.remove(w);
                 // Mark freshly woken: inhibits immediate wakeup-preemption (see process_tasks guard).
-                bool const PIPE_WAIT = is_local_pipe_wait_channel(w->wait_channel);
-                w->just_woke = !PIPE_WAIT;
+                bool const LOW_LATENCY_HANDOFF = is_low_latency_handoff_wait_channel(w->wait_channel);
+                w->just_woke = !LOW_LATENCY_HANDOFF;
                 // Perf: record wakeup before clearing wakeAtUs
                 uint64_t const WAKE_AT_US = w->wake_at_us;
                 perf::record_wake(static_cast<uint32_t>(cpu::current_cpu()), w->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, false, false),
                                   observed_sleep_us(w, NOW_US), perf_wait_callsite(w), w->wait_channel);
                 w->wake_at_us = 0;
                 w->wants_block = false;  // Clear any pending block from kern_block()
-                int64_t const WAKE_FLOOR = compute_wakeup_floor_vruntime(rq, w, NOW_US);
+                int64_t const WAKE_FLOOR = compute_wakeup_floor_vruntime(rq, w, NOW_US, w->wait_channel);
                 w->vruntime = w->vruntime > WAKE_FLOOR ? w->vruntime : WAKE_FLOOR;
                 note_task_wakeup(w, NOW_US, w->wait_channel);
                 w->vdeadline = w->vruntime + ((static_cast<int64_t>(w->slice_ns) * 1024) / static_cast<int64_t>(w->sched_weight));
@@ -2468,8 +2472,8 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             for (uint32_t i = 0; i < COUNT; i++) {
                 auto* child = get_active_task_at_safe(i);
                 if (child != nullptr) {
-                    if (child->parent_pid == current_task->pid && child->exit_notify_ready.load(std::memory_order_acquire) &&
-                        child->has_exited && !child->waited_on) {
+                    if (!child->is_thread && child->parent_pid == current_task->pid &&
+                        child->exit_notify_ready.load(std::memory_order_acquire) && child->has_exited && !child->waited_on) {
                         skip_wait_queue = true;
                         current_task->context.regs.rax = child->pid;
                         validate_wait_resume_mapping(current_task, child, "sched-any");
@@ -3015,15 +3019,15 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         task->wait_channel = nullptr;
         // Mark justWoke if this is a sleep->run transition (task was in WAITING state).
         // justWoke inhibits wakeup-preemption for SCHED_MIN_GRANULARITY_US; see process_tasks.
-        task->just_woke = WAS_WAITING && !is_local_pipe_wait_channel(WAIT_CHANNEL);
+        task->just_woke = WAS_WAITING && !is_low_latency_handoff_wait_channel(WAIT_CHANNEL);
         // Clamp vruntime to [minVruntime, avg_vruntime] on wakeup.
         // Using minVruntime gives the task an artificially early vdeadline
         // that immediately preempts active compute threads - causing thrashing
         // when daemons wake up frequently (e.g. every 4ms for netd/httpd).
         // Using avg_vruntime places the task at the current fair position,
         // so it doesn't cut ahead of tasks that have been running continuously.
-        int64_t const FAIR_VRUNTIME =
-            WAS_WAITING ? compute_wakeup_floor_vruntime(rq, task, NOW_US) : std::max(rq->min_vruntime, compute_avg_vruntime(rq));
+        int64_t const FAIR_VRUNTIME = WAS_WAITING ? compute_wakeup_floor_vruntime(rq, task, NOW_US, WAIT_CHANNEL)
+                                                  : std::max(rq->min_vruntime, compute_avg_vruntime(rq));
         task->vruntime = std::max(task->vruntime, FAIR_VRUNTIME);
         if (WAS_WAITING) {
             perf::record_wake(static_cast<uint32_t>(cpu_no), task->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, true, false),
@@ -3208,25 +3212,31 @@ void wake_task_for_signal(task::Task* task) {
     }
 }
 
-void signal_process_group(uint64_t pgid, int sig) {
-    if (pgid == 0 || sig <= 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
-        return;
+auto signal_process_group(uint64_t pgid, int sig) -> size_t {
+    if (pgid == 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
+        return 0;
     }
-    uint64_t const MASK = 1ULL << (sig - 1);
+    uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
+    size_t matched = 0;
     uint32_t const COUNT = get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* t = get_active_task_at_safe(i);
         if (t != nullptr) {
-            if (t->pgid == pgid && !t->has_exited) {
-                bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
-                if (!FORWARDED) {
-                    t->sig_pending |= MASK;
-                    wake_task_for_signal(t);
+            bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
+            if (t->pgid == pgid && ALIVE) {
+                ++matched;
+                if (sig != 0) {
+                    bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
+                    if (!FORWARDED) {
+                        t->sig_pending |= MASK;
+                        wake_task_for_signal(t);
+                    }
                 }
             }
             t->release();
         }
     }
+    return matched;
 }
 
 // ============================================================================

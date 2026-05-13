@@ -10,6 +10,10 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 
+#ifdef NET_TRACE
+#include <net/net_trace.hpp>
+#endif
+
 #include "net/socket.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "tcp.hpp"

@@ -208,7 +208,7 @@ constexpr int32_t WKI_WAIT_STATUS_FAILURE_CODE = 255;
 constexpr std::string_view WKI_PATH_PREFIX = "/wki/";
 
 auto wki_local_hostname() -> const char* {
-    return g_wki.local_hostname;  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return g_wki.local_hostname.data();  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
 }
 
 // s_compute_lock must be held by caller
@@ -465,13 +465,18 @@ void close_proxy_fd_table(ker::mod::sched::task::Task* task) {
     }
 
     for (unsigned fd = 0; fd < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++fd) {
-        auto* file = ker::vfs::vfs_get_file_retain(task, static_cast<int>(fd));
+        auto* file = static_cast<ker::vfs::File*>(nullptr);
+        // Take the fd-table ownership reference. Retaining here would leave
+        // proxy-owned pipe ends open and suppress EOF on the submitter side.
+        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+        file = static_cast<ker::vfs::File*>(task->fd_table.lookup(fd));
         if (file == nullptr) {
+            task->fd_table_lock.unlock_irqrestore(IRQF);
             continue;
         }
-
-        ker::vfs::vfs_release_fd(task, static_cast<int>(fd));
         task->clear_fd_cloexec(fd);
+        task->fd_table.remove(fd);
+        task->fd_table_lock.unlock_irqrestore(IRQF);
         ker::vfs::vfs_put_file(file);
     }
 }

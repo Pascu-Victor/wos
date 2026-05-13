@@ -47,6 +47,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     -> uint64_t;
 
 constexpr int MAX_SHEBANG_DEPTH = 4;
+constexpr size_t EXEC_PATH_MAX = 512;
 using exec_log = ker::mod::dbg::logger<"exec">;
 
 void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, ker::mod::perf::WkiPerfPhase phase,
@@ -61,6 +62,28 @@ void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::
 }
 
 auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
+
+auto check_exec_permission_from_stat(const ker::mod::sched::task::Task* task, const vfs::Stat& statbuf) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto const FILE_MODE = static_cast<uint32_t>(statbuf.st_mode & 07777);
+    if (task->euid == 0) {
+        return (FILE_MODE & 0111U) != 0 ? 0 : -EACCES;
+    }
+
+    uint32_t perm_bits = 0;
+    if (task->euid == statbuf.st_uid) {
+        perm_bits = (FILE_MODE >> 6U) & 7U;
+    } else if (task->egid == statbuf.st_gid) {
+        perm_bits = (FILE_MODE >> 3U) & 7U;
+    } else {
+        perm_bits = FILE_MODE & 7U;
+    }
+
+    return (perm_bits & 1U) != 0 ? 0 : -EACCES;
+}
 
 struct LocalProcStage {
     uint32_t correlation;
@@ -94,6 +117,23 @@ auto fixed_slot(std::array<T, N>& values, size_t index) -> T& {
 }
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
+
+auto copy_exec_path(const char* path, std::array<char, EXEC_PATH_MAX>& out) -> int {
+    if (path == nullptr) {
+        return -EFAULT;
+    }
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        char const C = path[i];
+        fixed_slot(out, i) = C;
+        if (C == '\0') {
+            return i == 0 ? -ENOENT : 0;
+        }
+    }
+
+    fixed_slot(out, out.size() - 1) = '\0';
+    return -ENAMETOOLONG;
+}
 
 struct ShebangInfo {
     std::array<char, ker::mod::sched::task::Task::EXE_PATH_MAX> interpreter = {};
@@ -260,21 +300,27 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    // Check execute permission
-    int const ACCESS_RET = vfs::vfs_access(path, 1 /* X_OK */);
+    vfs::Stat exec_stat{};
+    int const STAT_RET = vfs::vfs_fstat(FD, &exec_stat);
+    if (STAT_RET < 0) {
+        dbg::log("wos_proc_exec: Failed to stat file '%.*s'", static_cast<int>(STR.size()), STR.data());
+        vfs::vfs_close(FD);
+        return 0;
+    }
+
+    int const ACCESS_RET = check_exec_permission_from_stat(parent_task, exec_stat);
     if (ACCESS_RET < 0) {
         dbg::log("wos_proc_exec: Execute permission denied for '%.*s'", static_cast<int>(STR.size()), STR.data());
         vfs::vfs_close(FD);
         return 0;
     }
 
-    ssize_t const FILE_SIZE = vfs::vfs_lseek(FD, 0, 2);
+    ssize_t const FILE_SIZE = exec_stat.st_size;
     if (FILE_SIZE <= 0) {
         dbg::log("wos_proc_exec: Invalid file size: %d", FILE_SIZE);
         vfs::vfs_close(FD);
         return 0;
     }
-    vfs::vfs_lseek(FD, 0, 0);
 
     auto* elf_buffer = new uint8_t[FILE_SIZE];
     if (elf_buffer == nullptr) {
@@ -729,6 +775,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     // --- Copy argv/envp strings into kernel memory (before we destroy user mappings) ---
     LocalProcStage const ARG_COPY_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
+    std::array<char, EXEC_PATH_MAX> k_path{};
+    int const PATH_COPY_RET = copy_exec_path(path, k_path);
+    if (PATH_COPY_RET < 0) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, ARG_COPY_STAGE, PATH_COPY_RET, 0, WOS_PERF_CALLSITE());
+        return static_cast<uint64_t>(PATH_COPY_RET);
+    }
+    const char* exec_path = k_path.data();
+
     size_t argv_count = 0;
     if (argv != nullptr) {
         while (argv[argv_count] != nullptr) {
@@ -780,20 +834,29 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     // --- Read the ELF file ---
     LocalProcStage const OPEN_ACCESS_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, 0, WOS_PERF_CALLSITE());
-    int const FD = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
+    int const FD = vfs::vfs_open(std::string_view(exec_path, std::strlen(exec_path)), 0, 0);
     if (FD < 0) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", path, fd);
+        dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", exec_path, fd);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOENT, 0, WOS_PERF_CALLSITE());
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOENT);
     }
 
-    int const ACCESS_RET = vfs::vfs_access(path, 1 /* X_OK */);
+    vfs::Stat exec_stat{};
+    int const STAT_RET = vfs::vfs_fstat(FD, &exec_stat);
+    if (STAT_RET < 0) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, STAT_RET, 0, WOS_PERF_CALLSITE());
+        vfs::vfs_close(FD);
+        free_kernel_arg_env();
+        return static_cast<uint64_t>(STAT_RET);
+    }
+
+    int const ACCESS_RET = check_exec_permission_from_stat(task, exec_stat);
     if (ACCESS_RET < 0) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", path, access_ret);
+        dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", exec_path, access_ret);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -EACCES, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
@@ -801,29 +864,19 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         return static_cast<uint64_t>(-EACCES);
     }
 
-    ssize_t const FILE_SIZE = vfs::vfs_lseek(FD, 0, 2);
-    if (FILE_SIZE < 0) {
-#ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, file_size);
-#endif
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
-        vfs::vfs_close(FD);
-        free_kernel_arg_env();
-        return static_cast<uint64_t>(-EIO);
-    }
-    if (FILE_SIZE == 0) {
-        dbg::log("wos_proc_execve: empty file '%s'", path);
+    ssize_t const FILE_SIZE = exec_stat.st_size;
+    if (FILE_SIZE <= 0) {
+        dbg::log("wos_proc_execve: empty file '%s'", exec_path);
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
     }
-    vfs::vfs_lseek(FD, 0, 0);
 
     auto* elf_buffer = new uint8_t[FILE_SIZE];
     if (elf_buffer == nullptr) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", path, file_size);
+        dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", exec_path, file_size);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
@@ -837,7 +890,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
+    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
     int32_t const ELF_READ_STATUS = BYTES_READ == FILE_SIZE ? 0 : -EIO;
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
@@ -848,7 +901,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     if (BYTES_READ != FILE_SIZE) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, BYTES_READ, file_size);
+        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", exec_path, BYTES_READ, file_size);
 #endif
         delete[] elf_buffer;
         free_kernel_arg_env();
@@ -864,7 +917,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return static_cast<uint64_t>(-ELOOP);
         }
-        return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
+        return exec_shebang_script(exec_path, argv, envp, argv_count, shebang, shebang_depth,
                                    [&gpr](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
                                        return wos_proc_execve_impl(interp, argv2, envp2, gpr, depth);
                                    });
@@ -874,8 +927,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     if (elf_header->e_ident[EI_MAG0] != ELFMAG0 || elf_header->e_ident[EI_MAG1] != ELFMAG1 || elf_header->e_ident[EI_MAG2] != ELFMAG2 ||
         elf_header->e_ident[EI_MAG3] != ELFMAG3 || elf_header->e_ident[EI_CLASS] != ELFCLASS64) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: ELF magic check failed for '%s' (bytes: %02x %02x %02x %02x class=%02x)", path, elf_header->e_ident[0],
-                 elf_header->e_ident[1], elf_header->e_ident[2], elf_header->e_ident[3], elf_header->e_ident[4]);
+        dbg::log("wos_proc_execve: ELF magic check failed for '%s' (bytes: %02x %02x %02x %02x class=%02x)", exec_path,
+                 elf_header->e_ident[0], elf_header->e_ident[1], elf_header->e_ident[2], elf_header->e_ident[3], elf_header->e_ident[4]);
 #endif
         delete[] elf_buffer;
         free_kernel_arg_env();
@@ -893,7 +946,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
         std::memcpy(saved_exe_path.data(), task->exe_path.data(), saved_exe_path.size());
 
-        size_t path_len = std::strlen(path);
+        size_t path_len = std::strlen(exec_path);
         if (path_len >= sched::task::Task::EXE_PATH_MAX) {
             path_len = sched::task::Task::EXE_PATH_MAX - 1;
         }
@@ -901,7 +954,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         task->elf_buffer = elf_buffer;
         task->elf_buffer_size = static_cast<size_t>(FILE_SIZE);
         task->is_elf_buffer_shared = false;
-        std::memcpy(task->exe_path.data(), path, path_len);
+        std::memcpy(task->exe_path.data(), exec_path, path_len);
         fixed_slot(task->exe_path, path_len) = '\0';
 
         ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
@@ -1002,7 +1055,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
+        dbg::log("wos_proc_execve: ELF load failed for '%s'", exec_path);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, -ENOEXEC, static_cast<uint64_t>(FILE_SIZE),
                              WOS_PERF_CALLSITE());
@@ -1037,8 +1090,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
-        ssize_t const INTERP_SIZE = vfs::vfs_lseek(INTERP_FD, 0, 2);
-        vfs::vfs_lseek(INTERP_FD, 0, 0);
+        vfs::Stat interp_stat{};
+        int const INTERP_STAT_RET = vfs::vfs_fstat(INTERP_FD, &interp_stat);
+        ssize_t const INTERP_SIZE = INTERP_STAT_RET == 0 ? interp_stat.st_size : -1;
         if (INTERP_SIZE <= 0) {
             vfs::vfs_close(INTERP_FD);
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
@@ -1082,7 +1136,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     LocalProcStage const STACK_SETUP_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::STACK_SETUP, 0, WOS_PERF_CALLSITE());
 
-    std::string_view const PATH_STR(path, std::strlen(path));
+    std::string_view const PATH_STR(exec_path, std::strlen(exec_path));
     const char* base_name = PATH_STR.data();
     if (size_t const SLASH = PATH_STR.rfind('/'); SLASH != std::string_view::npos) {
         base_name = PATH_STR.data() + SLASH + 1;
@@ -1322,13 +1376,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     task->elf_buffer = elf_buffer;
     task->elf_buffer_size = FILE_SIZE;
     task->interp_base = new_interp_base;
+    task->mmap_next.store(0, std::memory_order_relaxed);
 
     {
-        size_t path_len = std::strlen(path);
+        size_t path_len = std::strlen(exec_path);
         if (path_len >= sched::task::Task::EXE_PATH_MAX) {
             path_len = sched::task::Task::EXE_PATH_MAX - 1;
         }
-        std::memcpy(task->exe_path.data(), path, path_len);
+        std::memcpy(task->exe_path.data(), exec_path, path_len);
         fixed_slot(task->exe_path, path_len) = '\0';
     }
 
@@ -1336,18 +1391,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     task->name = new_name;
     new_name = nullptr;
 
-    {
-        vfs::Stat exec_st{};
-        if (vfs::vfs_stat(path, &exec_st) == 0) {
-            if ((exec_st.st_mode & 04000) != 0U) {
-                task->euid = exec_st.st_uid;
-                task->suid = exec_st.st_uid;
-            }
-            if ((exec_st.st_mode & 02000) != 0U) {
-                task->egid = exec_st.st_gid;
-                task->sgid = exec_st.st_gid;
-            }
-        }
+    if ((exec_stat.st_mode & 04000) != 0U) {
+        task->euid = exec_stat.st_uid;
+        task->suid = exec_stat.st_uid;
+    }
+    if ((exec_stat.st_mode & 02000) != 0U) {
+        task->egid = exec_stat.st_gid;
+        task->sgid = exec_stat.st_gid;
     }
 
     task->sig_pending = 0;

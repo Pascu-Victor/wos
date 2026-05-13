@@ -476,7 +476,7 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task) {
 namespace {
 
 [[nodiscard]] auto local_hostname_data() -> char* {
-    return g_wki.local_hostname;  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    return g_wki.local_hostname.data();  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
 }
 
 // -----------------------------------------------------------------------------

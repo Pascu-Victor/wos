@@ -120,6 +120,25 @@ auto vfs_ftruncate(int fd, off_t length) -> int;
 // Pipe
 auto vfs_pipe(int pipefd[2]) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 
+struct LocalPipePerfSnapshot {
+    uint64_t active_pipes{};
+    uint64_t created_since_reset{};
+    uint64_t peak_pipes{};
+    uint64_t capacity_bytes{};
+    uint64_t peak_capacity_bytes{};
+    uint64_t buffered_bytes{};
+    uint64_t reader_waiters{};
+    uint64_t writer_waiters{};
+    uint64_t poll_waiters{};
+    uint64_t direct_writes{};
+    uint64_t read_closed{};
+    uint64_t write_closed{};
+    uint64_t approx_alloc_bytes{};
+};
+
+void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out);
+void vfs_reset_local_pipe_perf_counters();
+
 // Sync
 auto vfs_fsync(int fd) -> int;
 

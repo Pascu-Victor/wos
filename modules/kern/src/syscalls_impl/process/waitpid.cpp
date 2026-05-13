@@ -87,7 +87,7 @@ auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* t = ker::mod::sched::get_active_task_at(i);
-        if (t != nullptr && t->parent_pid == parent->pid && is_waitable_exit(t) && !t->waited_on) {
+        if (t != nullptr && !t->is_thread && t->parent_pid == parent->pid && is_waitable_exit(t) && !t->waited_on) {
             return t;
         }
     }
@@ -98,6 +98,17 @@ auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::
     // There's no direct child list, so we can't efficiently scan zombies.
     // For now, the SIGCHLD wakeup + retry approach handles this case.
     return nullptr;
+}
+
+auto has_unwaited_child(ker::mod::sched::task::Task* parent) -> bool {
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* t = ker::mod::sched::get_active_task_at(i);
+        if (t != nullptr && !t->is_thread && t->parent_pid == parent->pid && !t->waited_on) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
@@ -171,6 +182,13 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             clear_wait_resume_debug(current_task);
             exited->waited_on = true;
             return exited->pid;
+        }
+
+        // No direct child remains waitable.  POSIX waitpid(-1/0) must fail
+        // with ECHILD here; otherwise shells can block forever after their
+        // last pipeline child has already exited and been consumed.
+        if (!has_unwaited_child(current_task)) {
+            return static_cast<uint64_t>(-ECHILD);
         }
 
         // WNOHANG: return 0 immediately if no exited child

@@ -90,6 +90,10 @@ const static uint64_t PAGE_COW = (1ULL << 9);
 // shared mappings instead of converting them to COW.
 const static uint64_t PAGE_SHARED = (1ULL << 10);
 
+// Non-present software marker for reserved user VA ranges (e.g. PROT_NONE
+// anonymous mmap). This occupies address space without backing physical pages.
+const static uint64_t PAGE_RESERVED = (1ULL << 11);
+
 namespace page_types {
 const static uint64_t READONLY = PAGE_PRESENT;
 const static uint64_t KERNEL = PAGE_PRESENT | PAGE_WRITE;

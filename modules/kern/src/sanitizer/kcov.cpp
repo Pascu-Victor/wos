@@ -1,4 +1,4 @@
-// WOS Kernel Coverage (KCOV) — Syzkaller-compatible coverage tracing.
+// WOS Kernel Coverage (KCOV) - Syzkaller-compatible coverage tracing.
 //
 // The compiler (-fsanitize-coverage=trace-pc) inserts a call to
 // __sanitizer_cov_trace_pc() at every basic-block entry.  We record the
@@ -9,21 +9,26 @@
 // syscalls, then reads the buffer to extract coverage PCs.  Syzkaller uses
 // these to guide mutation.
 //
-// Gated behind cmake -DWOS_KCOV=ON.
+// Gated behind cmake -DWOS_KCOV=ON. When disabled, the compiler does not emit
+// coverage callbacks and the panic/selftest paths compile without KCOV output.
 
-#include <array>
-#include <atomic>
+#ifdef WOS_KCOV
+
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#ifdef WOS_KCOV
+#include <sanitizer/kcov.hpp>
 
+#ifdef WOS_KCOV_PANIC_TRACE
+#include <array>
+#include <atomic>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
-#include <sanitizer/kcov.hpp>
+#endif
 
 namespace {
+#ifdef WOS_KCOV_PANIC_TRACE
 using log = ker::mod::dbg::logger<"kcov">;
 
 constexpr size_t KCOV_PANIC_TRACE_ENTRIES = 128;
@@ -32,12 +37,15 @@ struct PanicTraceRing {
     std::array<uint64_t, KCOV_PANIC_TRACE_ENTRIES> pcs{};
     std::atomic<uint32_t> write_seq{0};
 };
+#endif
 
 // Per-CPU KCOV buffer pointer.  In a full implementation this would be
 // stored in the Task struct (per-task).  For the initial bring-up we use
 // a single global buffer — sufficient for single-threaded syz-executor.
 ker::sanitizer::kcov::KcovBuffer* s_current_buffer = nullptr;
+#ifdef WOS_KCOV_PANIC_TRACE
 std::array<PanicTraceRing, ker::mod::desc::gdt::MAX_CPUS> s_panic_rings{};
+#endif
 
 }  // namespace
 
@@ -90,6 +98,7 @@ void reset() {
 
 KcovBuffer* current_buffer() { return s_current_buffer; }
 
+#ifdef WOS_KCOV_PANIC_TRACE
 void dump_panic_trace_for_cpu(uint64_t cpu_id) {
     if (cpu_id >= s_panic_rings.size()) {
         log::panic("Recent PC trace: invalid cpu=%lu", cpu_id);
@@ -112,6 +121,7 @@ void dump_panic_trace_for_cpu(uint64_t cpu_id) {
         log::panic("  [%u] pc=0x%lx", i, ring.pcs.at(SLOT));
     }
 }
+#endif
 
 }  // namespace ker::sanitizer::kcov
 
@@ -120,7 +130,15 @@ void dump_panic_trace_for_cpu(uint64_t cpu_id) {
 // --------------------------------------------------------------------------
 // NOLINTNEXTLINE(readability-identifier-naming)
 extern "C" void __sanitizer_cov_trace_pc() {
+#ifndef WOS_KCOV_PANIC_TRACE
+    auto* buf = s_current_buffer;
+    if ((buf == nullptr) || !buf->enabled) {
+        return;
+    }
+#endif
+
     auto const PC = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+#ifdef WOS_KCOV_PANIC_TRACE
     if (ker::mod::cpu::is_per_cpu_ready()) {
         uint64_t const CPU_ID = ker::mod::cpu::current_cpu();
         if (CPU_ID < s_panic_rings.size()) {
@@ -131,6 +149,7 @@ extern "C" void __sanitizer_cov_trace_pc() {
     }
 
     auto* buf = s_current_buffer;
+#endif
     if ((buf == nullptr) || !buf->enabled) {
         return;
     }

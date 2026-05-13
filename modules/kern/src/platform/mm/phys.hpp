@@ -25,6 +25,7 @@ auto page_split_to_order0(void* page) -> bool;
 // Increment the refcount for a physical page (HHDM pointer).
 // Pages start at refcount 1 after pageAlloc().
 void page_ref_inc(void* page);
+void page_ref_add(void* page, uint64_t refs);
 // Decrement the refcount. When it reaches 0 the page is freed.
 // Returns the new refcount (0 = freed).
 uint32_t page_ref_dec(void* page);
@@ -43,7 +44,7 @@ void dump_page_allocations_oom();
 void dump_mini_malloc_stats();
 void dump_kmalloc_tracked_allocs();
 void dump_alloc_stats();        // Dump allocation/free counters for debugging
-void dump_caller_page_stats();  // Dump per-call-site page allocation histogram
+void dump_caller_page_stats();  // Dump per-call-site histogram when WOS_PHYS_ALLOC_CALLER_STATS is enabled
 void enable_stack_overlap_check();
 
 auto get_free_mem_bytes() -> uint64_t;

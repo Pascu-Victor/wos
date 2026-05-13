@@ -18,7 +18,7 @@ void free(void* ptr);
 auto realloc(void* ptr, size_t size) -> void*;
 auto calloc(size_t nmemb, size_t size) -> void*;
 
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
 // Typed allocation: captures call-site address and a compile-time type string for OOM dumps.
 // Called by the malloc<T>() template; may also be called directly with a custom tag.
 auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void*;
@@ -26,7 +26,7 @@ auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void*;
 
 template <typename T>
 inline static auto malloc() -> T* {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     return static_cast<T*>(malloc_tagged(sizeof(T), reinterpret_cast<uintptr_t>(__builtin_return_address(0)), __PRETTY_FUNCTION__));
 #else
     return static_cast<T*>(malloc(sizeof(T)));

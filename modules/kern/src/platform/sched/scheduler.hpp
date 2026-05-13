@@ -117,12 +117,12 @@ void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_i
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
 bool can_query_current_task();
-void remove_current_task();                               // Remove current task from runqueue (for exit)
-auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
-auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)
-void set_task_nice(task::Task* task, int nice);           // Update task weight safely on its run queue
-void signal_process_group(uint64_t pgid, int sig);        // Send signal to all tasks in a process group
-void wake_task_for_signal(task::Task* task);              // Make a signaled blocked task runnable so signal delivery can occur
+void remove_current_task();                                   // Remove current task from runqueue (for exit)
+auto find_task_by_pid(uint64_t pid) -> task::Task*;           // Find a task by PID (O(1) via PID registry)
+auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;      // Find task by PID with refcount (caller must release!)
+void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
+auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
+void wake_task_for_signal(task::Task* task);                  // Make a signaled blocked task runnable so signal delivery can occur
 
 // Event-driven waiters should resume on the CPU that observed the event when
 // they are truly parked and migratable.  Keeping this policy central prevents
@@ -426,6 +426,10 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
     }
 }
 
+inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t perf_callsite) {
+    preemptible_syscall_park_impl(wait_channel, 0, perf_callsite);
+}
+
 // kern_wake() - move a blocked DAEMON task back to the runnable heap.
 // Safe to call from interrupt context or any CPU.
 // No-op if the task is already runnable.
@@ -439,6 +443,15 @@ constexpr auto preemptible_syscall_park(const char* wait_channel, uint64_t deadl
 }
 
 }  // namespace ker::mod::sched
+
+// ker::mod::sched::kern_yield() valid after macro expansion.
+// NOLINTBEGIN(cppcoreguidelines-macro-usage, readability-identifier-naming)
+#define kern_yield() kern_yield_impl(WOS_PERF_CALLSITE())
+#define kern_block() kern_block_impl(WOS_PERF_CALLSITE())
+#define kern_sleep_us(sleep_us) kern_sleep_us_impl((sleep_us), WOS_PERF_CALLSITE())
+#define preemptible_syscall_park(...) preemptible_syscall_park_impl(__VA_ARGS__, WOS_PERF_CALLSITE())
+// NOLINTEND(cppcoreguidelines-macro-usage, readability-identifier-naming)
+
 extern "C" auto wos_get_current_task() -> ker::mod::sched::task::Task*;
 extern "C" const uint64_t WOS_DEFERRED_TASK_SWITCH_OFFSET;
 extern "C" void wos_deferred_task_switch_return(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::InterruptFrame* frame_ptr);

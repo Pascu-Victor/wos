@@ -11,11 +11,14 @@
 
 #include "debug_info.hpp"
 #include "mod/io/serial/serial.hpp"
+#include "platform/asm/cpu.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/ktime/ktime.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/perf/perf_events.hpp"
 #include "util/hcf.hpp"
 // TLS relocation support
 namespace {
@@ -85,6 +88,41 @@ auto program_header_at(const ElfFile& elf, size_t index) -> Elf64_Phdr* {
 }
 
 auto hhdm_to_phys(uint64_t hhdm_addr) -> uint64_t { return reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(hhdm_addr)); }
+
+auto perf_clamp_u16(uint64_t value) -> uint16_t { return value > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(value); }
+
+auto perf_clamp_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
+
+auto perf_elapsed_since(uint64_t started_us) -> uint32_t {
+    uint64_t const NOW_US = mod::time::get_us();
+    return perf_clamp_u32(NOW_US >= started_us ? NOW_US - started_us : 0);
+}
+
+auto pack_loader_page_counts(uint64_t allocated_pages, uint64_t already_mapped_pages) -> int32_t {
+    return static_cast<int32_t>((static_cast<uint32_t>(perf_clamp_u16(allocated_pages)) << 16U) |
+                                static_cast<uint32_t>(perf_clamp_u16(already_mapped_pages)));
+}
+
+auto loader_pt_load_op(uint64_t base_address) -> mod::perf::WkiPerfLocalLoaderOp {
+    return base_address == 0 ? mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_MAIN : mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_INTERP;
+}
+
+auto loader_final_perms_op(uint64_t base_address) -> mod::perf::WkiPerfLocalLoaderOp {
+    return base_address == 0 ? mod::perf::WkiPerfLocalLoaderOp::FINAL_PERMS_MAIN : mod::perf::WkiPerfLocalLoaderOp::FINAL_PERMS_INTERP;
+}
+
+void record_loader_event(uint64_t pid, mod::perf::WkiPerfLocalLoaderOp op, uint64_t pages, uint16_t detail, int32_t status,
+                         uint32_t latency_us, uint64_t callsite, uint64_t bytes) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    mod::perf::record_wki_event(static_cast<uint32_t>(mod::cpu::current_cpu()), pid, mod::perf::WkiPerfScope::LOCAL_LOADER,
+                                static_cast<uint8_t>(op), mod::perf::WkiPerfPhase::END, perf_clamp_u16(pages), detail,
+                                mod::perf::next_wki_trace_correlation(), status, latency_us, callsite);
+    mod::perf::record_wki_summary(mod::perf::WkiPerfScope::LOCAL_LOADER, static_cast<uint8_t>(op), 0, 0, status, latency_us, true, 0,
+                                  bytes);
+}
 
 auto parse_elf(uint8_t* base) -> ElfFile {
     ElfFile elf{};
@@ -560,8 +598,23 @@ void process_eh_frame_segment(Elf64_Phdr* segment, ker::mod::mm::virt::PageTable
     register_eh_frame(ptr_from_addr<void>(VADDR), segment->p_memsz);
 }
 
-void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf64_Phdr* program_header, uint64_t page_no,
-                  uint64_t base_offset) {
+auto page_flags_for_program_header(const Elf64_Phdr* program_header) -> uint64_t {
+    uint64_t flags =
+        ((program_header->p_flags & PF_W) != 0U) ? mod::mm::paging::page_types::USER : mod::mm::paging::page_types::USER_READONLY;
+    if ((program_header->p_flags & PF_X) == 0U) {
+        flags |= mod::mm::paging::PAGE_NX;
+    }
+    return flags;
+}
+
+struct LoadSegmentPageStats {
+    bool mapped{};
+    bool allocated{};
+    uint64_t bytes_copied{};
+};
+
+auto load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf64_Phdr* program_header, uint64_t page_no,
+                  uint64_t base_offset, ker::mod::mm::virt::PageMapBatch* map_batch = nullptr) -> LoadSegmentPageStats {
     // Compute aligned virtual address for this page and in-page offset of the segment start
     const uint64_t SEG_START_VA = program_header->p_vaddr + base_offset;
     const uint64_t FIRST_PAGE_OFFSET = SEG_START_VA & (mod::mm::virt::PAGE_SIZE - 1);
@@ -571,7 +624,7 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
     // Additional validation for PIE executables
     if (base_offset != 0 && PAGE_VA < mod::mm::virt::PAGE_SIZE) {
         ker::mod::io::serial::write("PIE program trying to map too low address 0x%x\n", PAGE_VA);
-        return;
+        return {};
     }
 
     // Map the page at a page-aligned virtual address
@@ -591,11 +644,18 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
         auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
         page_hhdm_ptr = NEW_PAGE_HHDM_PTR;
         // Map using the physical address corresponding to that HHDM pointer
-        mod::mm::virt::map_page(pagemap, PAGE_VA, static_cast<mod::mm::addr::paddr_t>(hhdm_to_phys(NEW_PAGE_HHDM_PTR)),
-                                mod::mm::paging::page_types::USER);
+        auto const PAGE_FLAGS = page_flags_for_program_header(program_header);
+        if (map_batch != nullptr) {
+            mod::mm::virt::map_page_batched(map_batch, PAGE_VA, static_cast<mod::mm::addr::paddr_t>(hhdm_to_phys(NEW_PAGE_HHDM_PTR)),
+                                            PAGE_FLAGS);
+        } else {
+            mod::mm::virt::map_page(pagemap, PAGE_VA, static_cast<mod::mm::addr::paddr_t>(hhdm_to_phys(NEW_PAGE_HHDM_PTR)), PAGE_FLAGS);
+        }
         // Zero freshly mapped page to handle bss/holes
         std::memset(ptr_from_addr<void>(page_hhdm_ptr), 0, mod::mm::virt::PAGE_SIZE);
     }
+
+    LoadSegmentPageStats stats{.mapped = true, .allocated = !ALREADY_MAPPED, .bytes_copied = 0};
 
     // Determine source file offset and destination in-page offset for this page
     const uint64_t DST_IN_PAGE = (page_no == 0) ? FIRST_PAGE_OFFSET : 0;
@@ -612,7 +672,7 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
 
     // If we've consumed the entire file content of the segment, nothing to copy for this page
     if (bytes_before_this_page >= program_header->p_filesz) {
-        return;
+        return stats;
     }
 
     // Compute how much to copy from this page
@@ -622,6 +682,8 @@ void load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
     // Copy from ELF file to destination page at the correct in-page offset
     const uint64_t SRC_OFFSET = program_header->p_offset + bytes_before_this_page;
     std::memcpy(ptr_from_addr<void>(page_hhdm_ptr + DST_IN_PAGE), elf_base + SRC_OFFSET, COPY_SIZE);
+    stats.bytes_copied = COPY_SIZE;
+    return stats;
 }
 
 void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const uint64_t& pid) {
@@ -890,9 +952,29 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
 #ifdef ELF_DEBUG
                     mod::dbg::log("Calculated pages: start_page=0x%x, end_page=0x%x, num_pages=%zu", startPageAddr, endPageAddr, num_pages);
 #endif
+                    uint64_t const SEGMENT_STARTED_US = mod::time::get_us();
+                    uint64_t allocated_pages = 0;
+                    uint64_t already_mapped_pages = 0;
+                    uint64_t bytes_copied = 0;
+                    mod::mm::virt::PageMapBatch map_batch{};
+                    mod::mm::virt::init_page_map_batch(&map_batch, pagemap, page_flags_for_program_header(current_header));
                     for (uint64_t j = 0; j < NUM_PAGES; j++) {
-                        load_segment(elf_file.base, pagemap, current_header, j, elf_file.load_base);
+                        LoadSegmentPageStats const PAGE_STATS =
+                            load_segment(elf_file.base, pagemap, current_header, j, elf_file.load_base, &map_batch);
+                        if (!PAGE_STATS.mapped) {
+                            continue;
+                        }
+                        if (PAGE_STATS.allocated) {
+                            allocated_pages++;
+                        } else {
+                            already_mapped_pages++;
+                        }
+                        bytes_copied += PAGE_STATS.bytes_copied;
                     }
+                    mod::mm::virt::flush_page_map_batch(&map_batch);
+                    record_loader_event(pid, loader_pt_load_op(base_address), NUM_PAGES, static_cast<uint16_t>(i),
+                                        pack_loader_page_counts(allocated_pages, already_mapped_pages),
+                                        perf_elapsed_since(SEGMENT_STARTED_US), current_header->p_vaddr + elf_file.load_base, bytes_copied);
                 }
                 break;
 
@@ -992,6 +1074,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     //
     // Pass 0: Apply writable segment permissions
     // Pass 1: Apply read-only segment permissions
+    uint64_t const FINAL_PERMS_STARTED_US = mod::time::get_us();
+    uint64_t final_perm_pages = 0;
     for (int pass = 0; pass < 2; pass++) {
         for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
             auto* ph = program_header_at(elf_file, i);
@@ -1044,6 +1128,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                                   executable ? "EXEC" : "NOEXEC");
 #endif
                     mod::mm::virt::unify_page_flags(pagemap, va, base_flags);
+                    final_perm_pages++;
                 }
 #ifdef ELF_DEBUG_EXTRA
                 mod::dbg::log("PT_LOAD perms applied: vaddr=[0x%x, 0x%x) flags=0x%x -> %s%s", start, end, ph->p_flags,
@@ -1052,6 +1137,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
             }
         }
     }
+    record_loader_event(pid, loader_final_perms_op(base_address), final_perm_pages, 0, 0, perf_elapsed_since(FINAL_PERMS_STARTED_US),
+                        WOS_PERF_CALLSITE(), final_perm_pages * mod::mm::virt::PAGE_SIZE);
 
     // Enforce RELRO after relocations: PT_GNU_RELRO pages become read-only.
     // Skip for dynamically-linked binaries and ld.so — ld.so handles RELRO after its own relocations.

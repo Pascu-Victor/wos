@@ -5,13 +5,23 @@ project(wos C CXX ASM_NASM)
 set(KERNEL wos)
 
 # ---------------------------------------------------------------------------
-# Sanitizer / instrumentation options (all default OFF for release builds)
+# Kernel build-time diagnostics, sanitizers, and instrumentation.
 # ---------------------------------------------------------------------------
-option(WOS_KCFI     "Enable Clang Kernel Control-Flow Integrity"            ON)
-option(WOS_KUBSAN   "Enable Kernel UndefinedBehaviorSanitizer"              ON)
-option(WOS_KASAN    "Enable Kernel AddressSanitizer (requires shadow map)"  ON)
-option(WOS_KCOV     "Enable kernel coverage instrumentation (for Syzkaller)" ON)
-option(WOS_SELFTEST "Enable kernel self-test mode (--selftest cmdline flag)" ON)
+option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity"                         ON)
+option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           ON)
+option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               ON)
+option(WOS_KCOV                    "Enable kernel coverage instrumentation (for Syzkaller)"             OFF)
+option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps using KCOV callbacks"       OFF)
+option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             ON)
+option(WOS_NET_TRACE               "Enable network hot-path cycle-count trace spans"                    OFF)
+option(WOS_NET_PACKET_DEBUG        "Track packet buffer allocation provenance and TX-refusal snapshots" OFF)
+option(WOS_PHYS_ALLOC_CALLER_STATS "Track physical page allocation call sites for OOM reports"          OFF)
+option(WOS_PHYS_LOCK_DEBUG         "Track physical allocator memlock holder CR3/CPU/RIP"                OFF)
+option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for OOM/corruption dumps"  OFF)
+
+if(WOS_KCOV_PANIC_TRACE AND NOT WOS_KCOV)
+    message(FATAL_ERROR "WOS_KCOV_PANIC_TRACE requires WOS_KCOV=ON")
+endif()
 
 # Internal flags
 set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
@@ -149,11 +159,41 @@ if(WOS_KCOV)
     )
     target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV=1)
     message(STATUS "[WOS] KCOV enabled (for Syzkaller coverage)")
+
+    if(WOS_KCOV_PANIC_TRACE)
+        target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV_PANIC_TRACE=1)
+        message(STATUS "[WOS] KCOV panic recent-PC trace enabled")
+    endif()
 endif()
 
 if(WOS_SELFTEST)
     target_compile_definitions(${KERNEL} PRIVATE WOS_SELFTEST=1)
     message(STATUS "[WOS] Self-test mode enabled (boot with --selftest to run)")
+endif()
+
+if(WOS_NET_TRACE)
+    target_compile_definitions(${KERNEL} PRIVATE NET_TRACE=1)
+    message(STATUS "[WOS] Network hot-path trace spans enabled")
+endif()
+
+if(WOS_NET_PACKET_DEBUG)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_NET_PACKET_DEBUG=1)
+    message(STATUS "[WOS] Packet buffer provenance debug enabled")
+endif()
+
+if(WOS_PHYS_ALLOC_CALLER_STATS)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_PHYS_ALLOC_CALLER_STATS=1)
+    message(STATUS "[WOS] Physical page allocation caller stats enabled")
+endif()
+
+if(WOS_PHYS_LOCK_DEBUG)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_PHYS_LOCK_DEBUG=1)
+    message(STATUS "[WOS] Physical allocator memlock holder tracking enabled")
+endif()
+
+if(WOS_KMALLOC_DEBUG_INFO)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KMALLOC_DEBUG_INFO=1)
+    message(STATUS "[WOS] kmalloc allocation provenance debug enabled")
 endif()
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)
@@ -181,12 +221,7 @@ execute_process(COMMAND whoami OUTPUT_VARIABLE _WOS_USER OUTPUT_STRIP_TRAILING_W
 cmake_host_system_information(RESULT _WOS_HOST QUERY HOSTNAME)
 target_compile_definitions(${KERNEL} PRIVATE "WOS_BUILDER=\"${_WOS_USER}@${_WOS_HOST}\"")
 
-# Network hot-path instrumentation (prints cycle-count stats every 1000 pkts)
-# Remove this line to disable tracing.
-# target_compile_definitions(${KERNEL} PRIVATE NET_TRACE)
-
 target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 
 # target_link_libraries(${KERNEL} stdkern)
-
 

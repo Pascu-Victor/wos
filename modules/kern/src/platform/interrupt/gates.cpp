@@ -13,7 +13,11 @@
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+
+#ifdef WOS_KCOV_PANIC_TRACE
 #include <sanitizer/kcov.hpp>
+#endif
+
 #include <syscalls_impl/process/exit.hpp>
 
 #include "abi/ptrace.hpp"
@@ -345,7 +349,7 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::panic("Invalid RSP: 0x%lx - skipping stack trace", rsp_addr);
     }
 
-#ifdef WOS_KCOV
+#ifdef WOS_KCOV_PANIC_TRACE
     ker::sanitizer::kcov::dump_panic_trace_for_cpu(apic::get_apic_id());
 #endif
 

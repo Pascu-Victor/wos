@@ -41,15 +41,21 @@ enum class PerfEventType : uint8_t {
 
 constexpr size_t PERF_EVENT_TYPE_COUNT = 6;
 
-// Bitmask for selective event recording
-constexpr uint8_t PERF_MASK_SAMPLE = 1U << 0;
-constexpr uint8_t PERF_MASK_SWITCH = 1U << 1;
-constexpr uint8_t PERF_MASK_WAKE = 1U << 2;
-constexpr uint8_t PERF_MASK_SLEEP = 1U << 3;
-constexpr uint8_t PERF_MASK_CONTAINER = 1U << 4;
-constexpr uint8_t PERF_MASK_WKI = 1U << 5;
-constexpr uint8_t PERF_MASK_WKI_LAUNCH = 1U << 6;
-constexpr uint8_t PERF_MASK_ALL = 0x7F;
+// Bitmask for selective event recording.
+constexpr uint16_t PERF_MASK_SAMPLE = 1U << 0;
+constexpr uint16_t PERF_MASK_SWITCH = 1U << 1;
+constexpr uint16_t PERF_MASK_WAKE = 1U << 2;
+constexpr uint16_t PERF_MASK_SLEEP = 1U << 3;
+constexpr uint16_t PERF_MASK_CONTAINER = 1U << 4;
+constexpr uint16_t PERF_MASK_WKI = 1U << 5;
+constexpr uint16_t PERF_MASK_WKI_LAUNCH = 1U << 6;
+constexpr uint16_t PERF_MASK_LOCAL_PIPE = 1U << 7;
+constexpr uint16_t PERF_MASK_LOCAL_PROC = 1U << 8;
+constexpr uint16_t PERF_MASK_LOCAL_VMEM = 1U << 9;
+constexpr uint16_t PERF_MASK_LOCAL_LOADER = 1U << 10;
+constexpr uint16_t PERF_MASK_LOCAL = PERF_MASK_LOCAL_PIPE | PERF_MASK_LOCAL_PROC | PERF_MASK_LOCAL_VMEM | PERF_MASK_LOCAL_LOADER;
+constexpr uint16_t PERF_MASK_ALL = PERF_MASK_SAMPLE | PERF_MASK_SWITCH | PERF_MASK_WAKE | PERF_MASK_SLEEP | PERF_MASK_CONTAINER |
+                                   PERF_MASK_WKI | PERF_MASK_WKI_LAUNCH | PERF_MASK_LOCAL;
 
 // Flags for SAMPLE / SWITCH events
 constexpr uint8_t PERF_FLAG_USER_MODE = 0x01;      // (SAMPLE) RIP was in userspace
@@ -83,6 +89,8 @@ enum class WkiPerfScope : uint8_t {
     REMOTE_IPC = 6,
     LOCAL_PIPE = 7,
     LOCAL_PROC = 8,
+    LOCAL_VMEM = 9,
+    LOCAL_LOADER = 10,
 };
 
 enum class WkiPerfPhase : uint8_t {
@@ -175,6 +183,7 @@ enum class WkiPerfIpcOp : uint8_t {
     DEV_OP_HANDLE = 9,
     WAKE_READER = 10,
     POLL_WAKE = 11,
+    EPOLL_CTL = 12,
 };
 
 enum class WkiPerfLocalPipeOp : uint8_t {
@@ -184,6 +193,10 @@ enum class WkiPerfLocalPipeOp : uint8_t {
     BLOCK_WRITE = 4,
     WAKE_READERS = 5,
     WAKE_WRITERS = 6,
+    DIRECT_RESERVE = 7,
+    DIRECT_BEGIN = 8,
+    DIRECT_READ = 9,
+    DIRECT_COMMIT = 10,
 };
 
 enum class WkiPerfLocalProcOp : uint8_t {
@@ -204,6 +217,26 @@ enum class WkiPerfLocalProcOp : uint8_t {
     EXIT = 15,
 };
 
+enum class WkiPerfLocalVmemOp : uint8_t {
+    ANON_MMAP = 1,
+    FILE_MMAP = 2,
+    ZERO_PAGE_MAP = 3,
+    FILE_CACHE_HIT = 4,
+    FILE_CACHE_MISS = 5,
+    FILE_CACHE_FILL = 6,
+    FILE_CACHE_EVICT = 7,
+    COW_ZERO = 8,
+    COW_COPY = 9,
+    COW_PROMOTE = 10,
+};
+
+enum class WkiPerfLocalLoaderOp : uint8_t {
+    PT_LOAD_MAIN = 1,
+    PT_LOAD_INTERP = 2,
+    FINAL_PERMS_MAIN = 3,
+    FINAL_PERMS_INTERP = 4,
+};
+
 const char* wki_scope_name(WkiPerfScope scope);
 const char* wki_phase_name(WkiPerfPhase phase);
 const char* wki_op_name(WkiPerfScope scope, uint8_t op);
@@ -222,7 +255,9 @@ struct WkiPerfSummarySnapshot {
     uint64_t retries;
     uint64_t bytes;
     uint64_t total_latency_us;
+    uint64_t latency_samples;
     uint32_t max_latency_us;
+    uint32_t p50_us;
     uint32_t p95_us;
     uint32_t p99_us;
     uint32_t p999_us;
@@ -395,10 +430,12 @@ void update_subsystem_stat(PerfSubsystem subsystem, uint8_t flags, uint64_t curr
 PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem);
 
 // Event mask control: set which event types are recorded.
-void set_event_mask(uint8_t mask);
-uint8_t get_event_mask();
+void set_event_mask(uint16_t mask);
+uint16_t get_event_mask();
 
 bool is_wki_recording_enabled();
+void register_local_vmem_zero_page(const void* page);
+bool is_local_vmem_zero_page(const void* page);
 
 uint64_t wki_pack_event_data(WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel);
 void wki_unpack_event_data(uint64_t data, WkiPerfScope& scope, uint8_t& op, WkiPerfPhase& phase, uint16_t& peer, uint16_t& channel);
@@ -414,8 +451,9 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
 size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max);
 
 // Parse a comma-separated event type string into a mask.
-// Recognized names: sample, switch, wake, sleep, container, wki, wki_launch
+// Recognized names: sample, switch, wake, sleep, container, wki, wki_launch,
+// local_pipe, local_proc, local_vmem/vmem, local_loader/loader, local, all.
 // Returns 0 on parse error.
-uint8_t parse_event_mask(const char* str, size_t len);
+uint16_t parse_event_mask(const char* str, size_t len);
 
 }  // namespace ker::mod::perf

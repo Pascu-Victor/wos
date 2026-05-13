@@ -167,8 +167,7 @@ struct WkiPeer {
     uint32_t rdma_zone_bitmap = 0;  // peer's zone membership
 
     // V2: Hostname identity [V2 A1.5]
-    char hostname[WKI_HOSTNAME_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-                                           // C-string state used directly by existing WKI C/varargs boundaries.
+    std::array<char, WKI_HOSTNAME_MAX> hostname;  // UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
 
     // Routing (for non-direct peers)
     uint16_t next_hop = WKI_NODE_INVALID;
@@ -307,8 +306,7 @@ struct WkiState {
     bool initialized = false;
 
     // V2: Local hostname identity [V2 A1.6]
-    char local_hostname[WKI_HOSTNAME_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-                                                 // C-string state used directly by existing WKI C/varargs boundaries.
+    std::array<char, WKI_HOSTNAME_MAX> local_hostname = {};
 
     // Peer table
     std::array<WkiPeer, WKI_MAX_PEERS> peers;

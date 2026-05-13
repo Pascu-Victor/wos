@@ -8,11 +8,14 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/serial/serial.hpp>
-#include <platform/acpi/apic/apic.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <sanitizer/kasan.hpp>
 #include <string_view>
+
+#ifdef WOS_PHYS_LOCK_DEBUG
+#include <platform/acpi/apic/apic.hpp>
+#endif
 
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "page_alloc.hpp"
@@ -43,7 +46,6 @@ struct PerCpuPageCache {
     sys::Spinlock lock;  // Fine-grained per-CPU lock
 };
 
-// Debug spinlock for memlock - records holder CR3, CPU, and caller RIP
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
 __attribute__((section(".data"))) paging::PageZone* huge_page_zone = nullptr;  // Dedicated zone for huge allocations
 
@@ -61,9 +63,11 @@ constexpr bool USE_PER_CPU_PAGE_CACHE = false;
 
 struct TrackedSpinlock {
     std::atomic<bool> locked{false};
+#ifdef WOS_PHYS_LOCK_DEBUG
     volatile uint64_t holder_cr3 = 0;
     volatile uint64_t holder_cpu = 0;
     volatile uint64_t holder_rip = 0;
+#endif
 
     auto lock_irq() -> uint64_t {
         // Save RFLAGS and disable interrupts before acquiring
@@ -77,17 +81,21 @@ struct TrackedSpinlock {
                 asm volatile("pause");
             }
         }
+#ifdef WOS_PHYS_LOCK_DEBUG
         // Record who holds the lock
         holder_cr3 = rdcr3();
         holder_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
         holder_cpu = per_cpu_ready.load(std::memory_order_acquire) ? cpu::current_cpu() : apic::get_apic_id();
+#endif
         return flags;
     }
 
     void unlock_irq(uint64_t flags) {
+#ifdef WOS_PHYS_LOCK_DEBUG
         holder_cr3 = 0;
         holder_cpu = 0;
         holder_rip = 0;
+#endif
         locked.store(false, std::memory_order_release);
 
         // Restore interrupt state
@@ -116,8 +124,9 @@ std::atomic<uint64_t> total_freed_bytes{0};
 std::atomic<uint64_t> alloc_count{0};
 std::atomic<uint64_t> free_count{0};
 
-// Per-caller page allocation histogram.
-// Indexed by return address so OOM output shows which subsystem consumed memory.
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+// Per-caller page allocation histogram. Indexed by return address so OOM
+// output shows which subsystem consumed memory.
 struct CallerStat {
     uint64_t caller;  // return address (0 = empty)
     uint64_t pages;   // cumulative pages allocated from this site
@@ -125,6 +134,7 @@ struct CallerStat {
 constexpr size_t CALLER_STAT_SLOTS = 64;
 __attribute__((section(".bss"))) std::array<CallerStat, CALLER_STAT_SLOTS> caller_stats{};
 std::atomic<bool> caller_stat_lock{false};
+#endif
 
 struct PhysRange {
     uint64_t base = 0;
@@ -208,6 +218,7 @@ void subtract_ranges(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t
     }
 }
 
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
 void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
     if (caller_addr == nullptr) {
         return;
@@ -236,6 +247,7 @@ void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
     // Table full - silently drop; 64 slots covers all known call sites.
     caller_stat_lock.store(false, std::memory_order_release);
 }
+#endif
 
 }  // namespace
 
@@ -258,6 +270,9 @@ auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated
 auto get_total_mem_bytes() -> uint64_t { return main_heap_size; }
 
 void dump_caller_page_stats() {
+#ifndef WOS_PHYS_ALLOC_CALLER_STATS
+    io::serial::write("Physical page alloc by caller: disabled (build with WOS_PHYS_ALLOC_CALLER_STATS=ON)\n");
+#else
     io::serial::write("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
 
     // Copy table under lock so we get a stable snapshot
@@ -300,6 +315,7 @@ void dump_caller_page_stats() {
         io::serial::write(snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
         io::serial::write(" KB)\n");
     }
+#endif
 }
 
 auto get_huge_page_zone() -> paging::PageZone* { return huge_page_zone; }
@@ -472,12 +488,16 @@ void init(limine_memmap_response* memmap_response) {
 void set_kernel_cr3(uint64_t cr3) {
     kernel_cr3 = cr3;
 
+#ifdef WOS_PHYS_LOCK_DEBUG
     // Re-initialize the tracked memlock after pagemap switch so that
     // stale CR3/RIP values from boot-time Limine pagemaps are cleared.
     memlock.locked.store(false, std::memory_order_release);
     memlock.holder_cr3 = 0;
     memlock.holder_cpu = 0;
     memlock.holder_rip = 0;
+#else
+    memlock.locked.store(false, std::memory_order_release);
+#endif
 }
 
 void init_huge_page_zone_deferred() {
@@ -536,8 +556,10 @@ void enable_per_cpu_allocations() {
 }
 
 auto page_alloc(uint64_t size, std::string_view name) -> void* {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
     void* caller_addr = __builtin_return_address(0);
     uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+#endif
 
     // Try per-CPU cache first for single-page allocations
     if (USE_PER_CPU_PAGE_CACHE && size == paging::PAGE_SIZE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
@@ -581,7 +603,9 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
                     wrcr3(saved_cr3);
                 }
 
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
                 record_page_alloc_caller(caller_addr, NUM_PAGES);
+#endif
                 return page;
             }
             cache.lock.unlock();
@@ -594,12 +618,17 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
     memlock.unlock_irq(FLAGS);
 
     if (block == nullptr) {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+        void* const OOM_CALLER_ADDR = caller_addr;
+#else
+        void* const OOM_CALLER_ADDR = __builtin_return_address(0);
+#endif
         // OOM condition - dump allocation info for debugging
         io::serial::write("OOM: pageAlloc failed for size ");
         io::serial::write_hex(size);
         io::serial::write(" bytes\n");
         io::serial::write("Allocation site: 0x");
-        io::serial::write_hex(reinterpret_cast<uint64_t>(caller_addr));
+        io::serial::write_hex(reinterpret_cast<uint64_t>(OOM_CALLER_ADDR));
         io::serial::write(" (");
         io::serial::write(name.data(), name.size());
         io::serial::write(")\n");
@@ -651,7 +680,9 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         wrcr3(saved_cr3);
     }
 
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
     record_page_alloc_caller(caller_addr, NUM_PAGES);
+#endif
     return block;
 }
 
@@ -660,8 +691,10 @@ auto page_alloc_huge(uint64_t size) -> void* {
         return nullptr;
     }
 
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
     void* caller_addr = __builtin_return_address(0);
     uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+#endif
 
     // Allocate from dedicated huge page zone
     uint64_t const FLAGS = memlock.lock_irq();
@@ -696,7 +729,9 @@ auto page_alloc_huge(uint64_t size) -> void* {
         wrcr3(saved_cr3);
     }
 
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
     record_page_alloc_caller(caller_addr, NUM_PAGES);
+#endif
     return block;
 }
 
@@ -826,6 +861,24 @@ void page_ref_inc(void* page) {
     uint64_t const FLAGS = memlock.lock_irq();
     if (find_allocator_for_page(page, alloc, idx)) {
         alloc->page_refcounts[idx]++;
+    }
+    memlock.unlock_irq(FLAGS);
+}
+
+void page_ref_add(void* page, uint64_t refs) {
+    if (page == nullptr || refs == 0) {
+        return;
+    }
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t const FLAGS = memlock.lock_irq();
+    if (find_allocator_for_page(page, alloc, idx)) {
+        if (refs > UINT32_MAX - alloc->page_refcounts[idx]) {
+            memlock.unlock_irq(FLAGS);
+            log::critical("page_ref_add overflow for page %p refs=%llu", page, static_cast<unsigned long long>(refs));
+            hcf();
+        }
+        alloc->page_refcounts[idx] += static_cast<uint32_t>(refs);
     }
     memlock.unlock_irq(FLAGS);
 }

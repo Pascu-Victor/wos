@@ -20,9 +20,9 @@ namespace {
 // /proc/kcpustat is always live and has zero overhead impact on the hot path.
 std::atomic<bool> g_enabled{false};
 
-// Event type mask: bitmask of PerfEventType values to record.
-// Default: all types enabled (0x1F). Only checked when g_enabled is true.
-std::atomic<uint8_t> g_event_mask{PERF_MASK_ALL};
+// Event type mask: bitmask of PerfEventType/local scope values to record.
+// Default: all types enabled. Only checked when g_enabled is true.
+std::atomic<uint16_t> g_event_mask{PERF_MASK_ALL};
 
 // Static ring buffers — dynamically allocated at init() time based on actual CPU count.
 PerfCpuRing* g_rings = nullptr;
@@ -35,6 +35,7 @@ uint64_t* g_tick_count = nullptr;
 // Total: ~13 subsystems * 48 bytes = ~624 bytes BSS.
 std::array<PerfSubsystemStats, PERF_SUBSYSTEM_COUNT> g_subsys_stats{};
 std::atomic<uint32_t> g_wki_trace_correlation{1};
+std::atomic<uintptr_t> g_local_vmem_zero_page{0};
 
 struct WkiPerfSummaryBucket {
     bool used = false;
@@ -182,12 +183,27 @@ auto wki_is_launch_measurement_event(WkiPerfScope scope, uint8_t op) -> bool {
     }
 }
 
-auto wki_should_record(uint8_t mask, WkiPerfScope scope, uint8_t op) -> bool {
+auto wki_should_record(uint16_t mask, WkiPerfScope scope, uint8_t op) -> bool {
     if ((mask & PERF_MASK_WKI) != 0U) {
         return true;
     }
 
-    return ((mask & PERF_MASK_WKI_LAUNCH) != 0U) && wki_is_launch_measurement_event(scope, op);
+    if (((mask & PERF_MASK_WKI_LAUNCH) != 0U) && wki_is_launch_measurement_event(scope, op)) {
+        return true;
+    }
+
+    switch (scope) {
+        case WkiPerfScope::LOCAL_PIPE:
+            return (mask & PERF_MASK_LOCAL_PIPE) != 0U;
+        case WkiPerfScope::LOCAL_PROC:
+            return (mask & PERF_MASK_LOCAL_PROC) != 0U;
+        case WkiPerfScope::LOCAL_VMEM:
+            return (mask & PERF_MASK_LOCAL_VMEM) != 0U;
+        case WkiPerfScope::LOCAL_LOADER:
+            return (mask & PERF_MASK_LOCAL_LOADER) != 0U;
+        default:
+            return false;
+    }
 }
 
 }  // namespace
@@ -237,6 +253,10 @@ const char* wki_scope_name(WkiPerfScope scope) {
             return "local_pipe";
         case WkiPerfScope::LOCAL_PROC:
             return "local_proc";
+        case WkiPerfScope::LOCAL_VMEM:
+            return "local_vmem";
+        case WkiPerfScope::LOCAL_LOADER:
+            return "local_loader";
         case WkiPerfScope::REMOTE_COMPUTE:
             return "remote_compute";
         case WkiPerfScope::EVENT_BUS:
@@ -376,6 +396,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "wake_reader";
                 case WkiPerfIpcOp::POLL_WAKE:
                     return "poll_wake";
+                case WkiPerfIpcOp::EPOLL_CTL:
+                    return "epoll_ctl";
                 default:
                     return "unknown";
             }
@@ -393,6 +415,14 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "wake_readers";
                 case WkiPerfLocalPipeOp::WAKE_WRITERS:
                     return "wake_writers";
+                case WkiPerfLocalPipeOp::DIRECT_RESERVE:
+                    return "direct_reserve";
+                case WkiPerfLocalPipeOp::DIRECT_BEGIN:
+                    return "direct_begin";
+                case WkiPerfLocalPipeOp::DIRECT_READ:
+                    return "direct_read";
+                case WkiPerfLocalPipeOp::DIRECT_COMMIT:
+                    return "direct_commit";
                 default:
                     return "unknown";
             }
@@ -428,6 +458,44 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "waitpid";
                 case WkiPerfLocalProcOp::EXIT:
                     return "exit";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_VMEM:
+            switch (static_cast<WkiPerfLocalVmemOp>(op)) {
+                case WkiPerfLocalVmemOp::ANON_MMAP:
+                    return "anon_mmap";
+                case WkiPerfLocalVmemOp::FILE_MMAP:
+                    return "file_mmap";
+                case WkiPerfLocalVmemOp::ZERO_PAGE_MAP:
+                    return "zero_page_map";
+                case WkiPerfLocalVmemOp::FILE_CACHE_HIT:
+                    return "file_cache_hit";
+                case WkiPerfLocalVmemOp::FILE_CACHE_MISS:
+                    return "file_cache_miss";
+                case WkiPerfLocalVmemOp::FILE_CACHE_FILL:
+                    return "file_cache_fill";
+                case WkiPerfLocalVmemOp::FILE_CACHE_EVICT:
+                    return "file_cache_evict";
+                case WkiPerfLocalVmemOp::COW_ZERO:
+                    return "cow_zero";
+                case WkiPerfLocalVmemOp::COW_COPY:
+                    return "cow_copy";
+                case WkiPerfLocalVmemOp::COW_PROMOTE:
+                    return "cow_promote";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_LOADER:
+            switch (static_cast<WkiPerfLocalLoaderOp>(op)) {
+                case WkiPerfLocalLoaderOp::PT_LOAD_MAIN:
+                    return "pt_load_main";
+                case WkiPerfLocalLoaderOp::PT_LOAD_INTERP:
+                    return "pt_load_interp";
+                case WkiPerfLocalLoaderOp::FINAL_PERMS_MAIN:
+                    return "final_perms_main";
+                case WkiPerfLocalLoaderOp::FINAL_PERMS_INTERP:
+                    return "final_perms_interp";
                 default:
                     return "unknown";
             }
@@ -775,7 +843,15 @@ bool is_wki_recording_enabled() {
     }
 
     auto mask = g_event_mask.load(std::memory_order_relaxed);
-    return (mask & (PERF_MASK_WKI | PERF_MASK_WKI_LAUNCH)) != 0U;
+    return (mask & (PERF_MASK_WKI | PERF_MASK_WKI_LAUNCH | PERF_MASK_LOCAL)) != 0U;
+}
+
+void register_local_vmem_zero_page(const void* page) {
+    g_local_vmem_zero_page.store(reinterpret_cast<uintptr_t>(page), std::memory_order_release);
+}
+
+bool is_local_vmem_zero_page(const void* page) {
+    return page != nullptr && g_local_vmem_zero_page.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(page);
 }
 
 uint64_t wki_pack_event_data(WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel) {
@@ -884,7 +960,9 @@ size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max) {
             .retries = bucket.retries,
             .bytes = bucket.bytes,
             .total_latency_us = bucket.total_latency_us,
+            .latency_samples = bucket.latency_samples,
             .max_latency_us = bucket.max_latency_us,
+            .p50_us = wki_hist_percentile(bucket.latency_hist, bucket.latency_samples, 50, 100),
             .p95_us = wki_hist_percentile(bucket.latency_hist, bucket.latency_samples, 95, 100),
             .p99_us = wki_hist_percentile(bucket.latency_hist, bucket.latency_samples, 99, 100),
             .p999_us = wki_hist_percentile(bucket.latency_hist, bucket.latency_samples, 999, 1000),
@@ -954,19 +1032,19 @@ PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem) {
 // ---------------------------------------------------------------------------
 // Event mask control
 // ---------------------------------------------------------------------------
-void set_event_mask(uint8_t mask) { g_event_mask.store(mask, std::memory_order_release); }
+void set_event_mask(uint16_t mask) { g_event_mask.store(mask, std::memory_order_release); }
 
-uint8_t get_event_mask() { return g_event_mask.load(std::memory_order_acquire); }
+uint16_t get_event_mask() { return g_event_mask.load(std::memory_order_acquire); }
 
 // ---------------------------------------------------------------------------
 // parse_event_mask - parse "switch,wake,container,wki,wki_launch" into bitmask
 // ---------------------------------------------------------------------------
-uint8_t parse_event_mask(const char* str, size_t len) {
+uint16_t parse_event_mask(const char* str, size_t len) {
     if (str == nullptr) {
         return 0;
     }
     std::string_view const INPUT{str, len};
-    uint8_t mask = 0;
+    uint16_t mask = 0;
     size_t i = 0;
 
     while (i < len) {
@@ -1000,6 +1078,16 @@ uint8_t parse_event_mask(const char* str, size_t len) {
             mask |= PERF_MASK_WKI;
         } else if (TOKEN == "wki_launch") {
             mask |= PERF_MASK_WKI_LAUNCH;
+        } else if (TOKEN == "local_pipe") {
+            mask |= PERF_MASK_LOCAL_PIPE;
+        } else if (TOKEN == "local_proc") {
+            mask |= PERF_MASK_LOCAL_PROC;
+        } else if (TOKEN == "local_vmem" || TOKEN == "vmem") {
+            mask |= PERF_MASK_LOCAL_VMEM;
+        } else if (TOKEN == "local_loader" || TOKEN == "loader") {
+            mask |= PERF_MASK_LOCAL_LOADER;
+        } else if (TOKEN == "local") {
+            mask |= PERF_MASK_LOCAL;
         } else if (TOKEN == "all") {
             mask = PERF_MASK_ALL;
         } else {

@@ -27,12 +27,14 @@ struct PacketBuffer {
     NetDevice* dev{};           // source/dest device
     uint16_t protocol{};        // EtherType (host byte order)
     proto::MacAddress src_mac;  // incoming source MAC (for reply use)
+#ifdef WOS_NET_PACKET_DEBUG
     bool debug_in_use = false;
     uint16_t debug_alloc_cpu = 0;
     uint16_t debug_free_cpu = 0;
     uint32_t debug_alloc_seq = 0;
     uintptr_t debug_alloc_site = 0;
     uintptr_t debug_free_site = 0;
+#endif
 
     // Prepend: move data pointer back by n bytes, increase length
     auto push(size_t n) -> uint8_t* {

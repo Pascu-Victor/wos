@@ -80,6 +80,8 @@ constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = uint64_t{2} * 1024 * 1024;
 constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
+constexpr size_t PIPE_DEFAULT_CAPACITY = 64UL * 1024UL;
+constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 
 void stream_detach_file(File* file);
 void stream_invalidate_file(File* file);
@@ -1053,7 +1055,7 @@ auto task_submitter_hostname(const ker::mod::sched::task::Task* task) -> const c
     if (task != nullptr && task->wki_submitter_hostname[0] != '\0') {
         return task->wki_submitter_hostname.data();
     }
-    return ker::net::wki::g_wki.local_hostname;
+    return ker::net::wki::g_wki.local_hostname.data();
 }
 
 auto path_prefix_matches(const char* path, const char* prefix, size_t prefix_len) -> bool {
@@ -1299,14 +1301,14 @@ void log_loader_path_event(const char* stage, const char* raw_path, const char* 
 
     auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     char const* task_name = (task != nullptr) ? task->name : "?";
-    uint64_t const pid = (task != nullptr) ? task->pid : 0;
+    uint64_t const PID = (task != nullptr) ? task->pid : 0;
     char const* submitter = (task != nullptr && task->wki_submitter_hostname[0] != '\0') ? task->wki_submitter_hostname.data() : "-";
     char const* mount_path = (mount != nullptr && mount->path != nullptr) ? mount->path : "-";
-    int const mount_type = (mount != nullptr) ? static_cast<int>(mount->fs_type) : -1;
+    int const MOUNT_TYPE = (mount != nullptr) ? static_cast<int>(mount->fs_type) : -1;
 
     log::info("loader-path: stage=%s pid=%llx task=%s submitter=%s raw=%s resolved=%s mount=%s fs=%d rc=%d", stage,
-              static_cast<unsigned long long>(pid), task_name, submitter, raw_path != nullptr ? raw_path : "-",
-              resolved_path != nullptr ? resolved_path : "-", mount_path, mount_type, rc);
+              static_cast<unsigned long long>(PID), task_name, submitter, raw_path != nullptr ? raw_path : "-",
+              resolved_path != nullptr ? resolved_path : "-", mount_path, MOUNT_TYPE, rc);
 }
 
 auto ensure_wki_host_root_mount(const char* path) -> int {
@@ -1341,7 +1343,7 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
     std::memcpy(hostname.data(), host_part, host_len);
     hostname[host_len] = '\0';
 
-    if (std::strcmp(hostname.data(), ker::net::wki::g_wki.local_hostname) == 0) {
+    if (std::strcmp(hostname.data(), ker::net::wki::g_wki.local_hostname.data()) == 0) {
         return 0;
     }
 
@@ -1422,7 +1424,7 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
     std::array<char, MAX_PATH_LEN> self_prefix{};
     size_t self_prefix_len = 0;
     if (ker::net::wki::g_wki.local_hostname[0] != '\0') {
-        copy_result = build_wki_host_path(ker::net::wki::g_wki.local_hostname, "", self_prefix.data(), self_prefix.size());
+        copy_result = build_wki_host_path(ker::net::wki::g_wki.local_hostname.data(), "", self_prefix.data(), self_prefix.size());
         if (copy_result < 0) {
             return copy_result;
         }
@@ -1442,7 +1444,7 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
         const char* suffix = nullptr;
         if (REWRITE_HOST_ALIAS) {
             const char* submitter = task_submitter_hostname(task);
-            if (submitter != nullptr && submitter[0] != '\0' && std::strcmp(submitter, ker::net::wki::g_wki.local_hostname) != 0) {
+            if (submitter != nullptr && submitter[0] != '\0' && std::strcmp(submitter, ker::net::wki::g_wki.local_hostname.data()) != 0) {
                 copy_result = build_wki_host_path(submitter, current.data() + HOST_PREFIX_LEN, current.data(), current.size());
                 if (copy_result < 0) {
                     return copy_result;
@@ -1713,7 +1715,7 @@ auto apply_task_vfs_route(const ker::mod::sched::task::Task* task, const char* p
         alias_result = copy_path_string(aliased.data(), routed.data(), routed.size());
     } else {
         const char* submitter = task_submitter_hostname(task);
-        if (submitter == nullptr || submitter[0] == '\0' || std::strcmp(submitter, ker::net::wki::g_wki.local_hostname) == 0) {
+        if (submitter == nullptr || submitter[0] == '\0' || std::strcmp(submitter, ker::net::wki::g_wki.local_hostname.data()) == 0) {
             alias_result = copy_path_string(aliased.data(), routed.data(), routed.size());
         } else {
             alias_result = build_wki_host_path(submitter, aliased.data(), routed.data(), routed.size());
@@ -2412,42 +2414,43 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
 
     // Convert string_view to null-terminated string
-    char rawPath[MAX_PATH_LEN];  // NOLINT
+    std::array<char, MAX_PATH_LEN> raw_path{};
     if (path.size() >= MAX_PATH_LEN) {
         return -ENAMETOOLONG;
     }
-    std::memcpy(rawPath, path.data(), path.size());
-    rawPath[path.size()] = '\0';
+    std::memcpy(raw_path.data(), path.data(), path.size());
+    raw_path[path.size()] = '\0';
 
-    char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    if (resolve_task_path_raw(rawPath, pathBuffer, MAX_PATH_LEN) < 0) {
-        log_loader_path_event("resolve-failed", rawPath, nullptr, nullptr, -ENOENT);
+    std::array<char, MAX_PATH_LEN> path_buffer{};
+    // NOLINTNEXTLINE(readability-suspicious-call-argument)
+    if (resolve_task_path_raw(raw_path.data(), path_buffer.data(), MAX_PATH_LEN) < 0) {
+        log_loader_path_event("resolve-failed", raw_path.data(), nullptr, nullptr, -ENOENT);
         return -ENOENT;
     }
 
-    ensure_wki_host_root_mount(pathBuffer);
-    log_loader_path_event("resolved", rawPath, pathBuffer, nullptr, 0);
+    ensure_wki_host_root_mount(path_buffer.data());
+    log_loader_path_event("resolved", raw_path.data(), path_buffer.data(), nullptr, 0);
 
     // Remote mounts resolve symlinks on the server side during the actual open.
     // Avoid probing each path component with client-side READLINK RPCs here:
     // they are redundant and can fail independently of the real open.
-    MountPoint const* mount = find_mount_point(pathBuffer);
+    MountPoint const* mount = find_mount_point(path_buffer.data());
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
 
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true);
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved, MAX_PATH_LEN, true);
         if (RESOLVE_RET == -ELOOP) {
             log::warn("vfs_open: too many symlink levels");
             return -ELOOP;
         }
         if (RESOLVE_RET == 0) {
             // Use the resolved path
-            std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+            std::memcpy(path_buffer.data(), resolved, MAX_PATH_LEN);
         }
-        log_loader_path_event("symlink-resolved", rawPath, pathBuffer, nullptr, RESOLVE_RET);
+        log_loader_path_event("symlink-resolved", raw_path.data(), path_buffer.data(), nullptr, RESOLVE_RET);
     } else {
-        log_loader_path_event("symlink-deferred-remote", rawPath, pathBuffer, mount, 0);
+        log_loader_path_event("symlink-deferred-remote", raw_path.data(), path_buffer.data(), mount, 0);
     }
 
     auto* current = ker::mod::sched::get_current_task();
@@ -2459,16 +2462,16 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     int const ACCMODE = flags & 3;
 
     // Find the mount point for this path
-    mount = find_mount_point(pathBuffer);
+    mount = find_mount_point(path_buffer.data());
     if (mount == nullptr) {
         vfs_debug_log("vfs_open: no mount point found for path\n");
-        log::warn("vfs_open: no mount point found for path: %s", pathBuffer);
-        log_loader_path_event("mount-miss", rawPath, pathBuffer, nullptr, -ENOENT);
+        log::warn("vfs_open: no mount point found for path: %s", path_buffer.data());
+        log_loader_path_event("mount-miss", raw_path.data(), path_buffer.data(), nullptr, -ENOENT);
         return -ENOENT;
     }
-    log_loader_path_event("mount-found", rawPath, pathBuffer, mount, 0);
+    log_loader_path_event("mount-found", raw_path.data(), path_buffer.data(), mount, 0);
 
-    const char* fs_relative_path = strip_mount_prefix(mount, pathBuffer);
+    const char* fs_relative_path = strip_mount_prefix(mount, path_buffer.data());
 
     ker::vfs::File* f = nullptr;
 
@@ -2489,7 +2492,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
                 f->fs_type = FSType::FAT32;
             } else {
                 log::warn("vfs_open: fat32_open_path failed for '%s' (mount='%s', original path='%s')", fs_relative_path, mount->path,
-                          pathBuffer);
+                          path_buffer.data());
             }
             break;
         case FSType::TMPFS:
@@ -2523,21 +2526,21 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
 
     if (f == nullptr && ACCMODE == 0 && (flags & ker::vfs::O_CREAT) == 0) {
-        f = create_synthetic_mount_dir_file(pathBuffer, mount->fs_type);
+        f = create_synthetic_mount_dir_file(path_buffer.data(), mount->fs_type);
     }
 
     if (f == nullptr) {
         vfs_debug_log("vfs_open: failed to open file\n");
-        log_loader_path_event("open-failed", rawPath, pathBuffer, mount, -ENOENT);
+        log_loader_path_event("open-failed", raw_path.data(), path_buffer.data(), mount, -ENOENT);
         return -ENOENT;
     }
-    log_loader_path_event("open-ok", rawPath, pathBuffer, mount, 0);
+    log_loader_path_event("open-ok", raw_path.data(), path_buffer.data(), mount, 0);
 
     // Store the absolute VFS path for mount-overlay directory listing
-    size_t const PATH_LEN = std::strlen(pathBuffer);
+    size_t const PATH_LEN = std::strlen(path_buffer.data());
     auto* path_copy = new char[PATH_LEN + 1];
     if (path_copy != nullptr) {
-        std::memcpy(path_copy, pathBuffer, PATH_LEN + 1);
+        std::memcpy(path_copy, path_buffer.data(), PATH_LEN + 1);
         f->vfs_path = path_copy;
     } else {
         f->vfs_path = nullptr;
@@ -2897,7 +2900,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                 break;
             }
 
-            const char* local_hostname = ker::net::wki::g_wki.local_hostname;
+            const char* local_hostname = ker::net::wki::g_wki.local_hostname.data();
             bool const INJECT_WKI_ROOT = std::strcmp(visible_dir_path, "/") == 0 && ker::net::wki::g_wki.initialized &&
                                          !logical_wki_root_has_mount_child() && !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, "wki");
             bool const INJECT_HOST_ALIAS =
@@ -4798,6 +4801,7 @@ struct PipeState {
     size_t count;  // bytes in buffer
     bool write_closed;
     bool read_closed;
+    bool direct_write_active;
     // Counts open file-ends (read + write). Initialized to 2; the closer that
     // drives it to 0 is responsible for freeing buf and this struct.
     std::atomic<int> open_ends{2};
@@ -4810,6 +4814,76 @@ struct PipeState {
     ker::util::SmallVec<uint64_t, 2> read_poll_waiting;
     ker::util::SmallVec<uint64_t, 2> write_poll_waiting;
 };
+
+std::deque<PipeState*> g_pipe_states;
+ker::mod::sys::Spinlock g_pipe_states_lock;
+std::atomic<uint64_t> g_pipe_created_since_reset{0};
+std::atomic<uint64_t> g_pipe_active_count{0};
+std::atomic<uint64_t> g_pipe_active_capacity_bytes{0};
+std::atomic<uint64_t> g_pipe_peak_count{0};
+std::atomic<uint64_t> g_pipe_peak_capacity_bytes{0};
+
+struct PipeDirectWriteWindow {
+    size_t offset;
+    size_t capacity;
+};
+
+void pipe_update_peak(std::atomic<uint64_t>& peak, uint64_t candidate) {
+    uint64_t observed = peak.load(std::memory_order_relaxed);
+    while (candidate > observed && !peak.compare_exchange_weak(observed, candidate, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+void pipe_note_capacity_delta(size_t added, size_t removed = 0) {
+    uint64_t active_capacity = g_pipe_active_capacity_bytes.load(std::memory_order_relaxed);
+    if (added > 0) {
+        active_capacity = g_pipe_active_capacity_bytes.fetch_add(added, std::memory_order_acq_rel) + added;
+    }
+    if (removed > 0) {
+        active_capacity = g_pipe_active_capacity_bytes.fetch_sub(removed, std::memory_order_acq_rel) - removed;
+    }
+    pipe_update_peak(g_pipe_peak_capacity_bytes, active_capacity);
+}
+
+void pipe_register_state(PipeState* st) {
+    if (st == nullptr) {
+        return;
+    }
+
+    uint64_t const IRQF = g_pipe_states_lock.lock_irqsave();
+    g_pipe_states.push_back(st);
+    g_pipe_states_lock.unlock_irqrestore(IRQF);
+
+    g_pipe_created_since_reset.fetch_add(1, std::memory_order_acq_rel);
+    uint64_t const ACTIVE = g_pipe_active_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    pipe_update_peak(g_pipe_peak_count, ACTIVE);
+    pipe_note_capacity_delta(st->capacity);
+}
+
+void pipe_unregister_state(PipeState* st) {
+    if (st == nullptr) {
+        return;
+    }
+
+    uint64_t const IRQF = g_pipe_states_lock.lock_irqsave();
+    auto it = std::ranges::find(g_pipe_states, st);
+    if (it != g_pipe_states.end()) {
+        g_pipe_states.erase(it);
+        g_pipe_active_count.fetch_sub(1, std::memory_order_acq_rel);
+        pipe_note_capacity_delta(0, st->capacity);
+    }
+    g_pipe_states_lock.unlock_irqrestore(IRQF);
+}
+
+void pipe_destroy_state(PipeState* st) {
+    if (st == nullptr) {
+        return;
+    }
+
+    pipe_unregister_state(st);
+    delete[] st->buf;
+    delete st;
+}
 
 auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
     for (unsigned long waiter : waiters) {
@@ -4842,6 +4916,13 @@ auto current_task_has_deliverable_signal() -> bool {
     return (task->sig_pending & ~task->sig_mask) != 0;
 }
 
+void signal_current_sigpipe() {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task != nullptr) {
+        task->sig_pending |= (1ULL << (13 - 1));
+    }
+}
+
 void perf_record_local_pipe_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint32_t correlation, int32_t status, uint32_t aux,
                                   uint64_t callsite) {
     if (!ker::mod::perf::is_wki_recording_enabled()) {
@@ -4858,6 +4939,28 @@ void perf_record_local_pipe_summary(uint8_t op, int32_t status, uint32_t latency
     }
 
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PIPE, op, 0, 0, status, latency_us, true, 0, bytes);
+}
+
+auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    uint64_t const ELAPSED_US = NOW_US >= started_us ? NOW_US - started_us : 0;
+    return ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
+}
+
+auto perf_local_pipe_stage_started_us() -> uint64_t {
+    return ker::mod::perf::is_wki_recording_enabled() ? ker::mod::time::get_us() : 0;
+}
+
+void perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp op, uint32_t correlation, int32_t status, uint64_t started_us,
+                                  uint64_t bytes, uint64_t callsite) {
+    if (started_us == 0 || !ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    uint32_t const ELAPSED_US = perf_elapsed_since_us(started_us);
+    auto const OP = static_cast<uint8_t>(op);
+    perf_record_local_pipe_event(OP, ker::mod::perf::WkiPerfPhase::END, correlation, status, ELAPSED_US, callsite);
+    perf_record_local_pipe_summary(OP, status, ELAPSED_US, bytes);
 }
 
 void pipe_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, PipeWakeList& pending, size_t* pending_count) {
@@ -4884,6 +4987,282 @@ void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, b
         waiter->release();
     }
 }
+
+auto pipe_contiguous_write_space_locked(const PipeState* st) -> size_t {
+    if (st == nullptr || st->count >= st->capacity) {
+        return 0;
+    }
+    if (st->head < st->tail) {
+        return st->tail - st->head;
+    }
+    return st->capacity - st->head;
+}
+
+auto pipe_direct_capacity_target(File* infile, off_t source_offset, size_t count) -> size_t {
+    if (infile == nullptr || source_offset < 0 || count == 0) {
+        return 0;
+    }
+
+    Stat statbuf{};
+    if (vfs_stream_cache_get_file_stat(infile, &statbuf) != 0 || statbuf.st_size <= source_offset) {
+        return 0;
+    }
+
+    auto const REMAINING64 = static_cast<uint64_t>(statbuf.st_size - source_offset);
+    size_t target = count > PIPE_DIRECT_MAX_CAPACITY ? PIPE_DIRECT_MAX_CAPACITY : count;
+    if (REMAINING64 < static_cast<uint64_t>(target)) {
+        target = static_cast<size_t>(REMAINING64);
+    }
+    return target;
+}
+
+auto pipe_install_buffer_locked(PipeState* st, char* new_buf, size_t new_capacity) -> char* {
+    if (st == nullptr || new_buf == nullptr || new_capacity <= st->capacity || new_capacity < st->count || st->direct_write_active) {
+        return nullptr;
+    }
+
+    char* old_buf = st->buf;
+    if (st->count > 0) {
+        size_t const FIRST = std::min(st->count, st->capacity - st->tail);
+        std::memcpy(new_buf, old_buf + st->tail, FIRST);
+        if (FIRST < st->count) {
+            std::memcpy(new_buf + FIRST, old_buf, st->count - FIRST);
+        }
+    }
+
+    st->buf = new_buf;
+    st->capacity = new_capacity;
+    st->tail = 0;
+    st->head = st->count % st->capacity;
+    return old_buf;
+}
+
+void pipe_reserve_direct_capacity(PipeState* st, File* infile, off_t source_offset, size_t count) {
+    size_t const TARGET = pipe_direct_capacity_target(infile, source_offset, count);
+    if (st == nullptr || TARGET <= PIPE_DEFAULT_CAPACITY) {
+        return;
+    }
+
+    uint64_t irqf = st->lock.lock_irqsave();
+    bool const ALREADY_LARGE_ENOUGH = TARGET <= st->capacity;
+    bool const RESIZE_BLOCKED = st->direct_write_active;
+    st->lock.unlock_irqrestore(irqf);
+    if (ALREADY_LARGE_ENOUGH || RESIZE_BLOCKED) {
+        return;
+    }
+
+    auto* new_buf = new char[TARGET];
+    if (new_buf == nullptr) {
+        return;
+    }
+
+    char* old_buf = nullptr;
+    size_t old_capacity = 0;
+    irqf = st->lock.lock_irqsave();
+    old_capacity = st->capacity;
+    old_buf = pipe_install_buffer_locked(st, new_buf, TARGET);
+    st->lock.unlock_irqrestore(irqf);
+
+    if (old_buf == nullptr) {
+        delete[] new_buf;
+        return;
+    }
+
+    pipe_note_capacity_delta(TARGET, old_capacity);
+    delete[] old_buf;
+}
+
+auto pipe_begin_direct_write(File* pipe_file, PipeState* st, PipeDirectWriteWindow* window, uint32_t correlation, uint64_t callsite)
+    -> int {
+    if (pipe_file == nullptr || st == nullptr || window == nullptr) {
+        return -EINVAL;
+    }
+
+    for (;;) {
+        uint64_t const IRQF = st->lock.lock_irqsave();
+        if (st->read_closed) {
+            st->lock.unlock_irqrestore(IRQF);
+            signal_current_sigpipe();
+            return -EPIPE;
+        }
+
+        if (!st->direct_write_active) {
+            size_t const CONTIGUOUS = pipe_contiguous_write_space_locked(st);
+            if (CONTIGUOUS > 0) {
+                st->direct_write_active = true;
+                window->offset = st->head;
+                window->capacity = CONTIGUOUS;
+                st->lock.unlock_irqrestore(IRQF);
+                return 0;
+            }
+        }
+
+        if (pipe_file->open_flags & O_NONBLOCK) {
+            st->lock.unlock_irqrestore(IRQF);
+            return -EAGAIN;
+        }
+
+        auto* current_task = ker::mod::sched::get_current_task();
+        if (current_task == nullptr) {
+            st->lock.unlock_irqrestore(IRQF);
+            return -ESRCH;
+        }
+
+        if (current_task_has_deliverable_signal()) {
+            st->lock.unlock_irqrestore(IRQF);
+            return -EINTR;
+        }
+
+        bool const REGISTERED = pipe_register_waiter(st->writers_waiting, current_task->pid);
+        auto const PIPE_SPACE = static_cast<uint32_t>(st->capacity - st->count);
+        st->lock.unlock_irqrestore(IRQF);
+        perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
+                                     ker::mod::perf::WkiPerfPhase::POINT, correlation, 0, PIPE_SPACE, callsite);
+        if (REGISTERED) {
+            ker::mod::sched::preemptible_syscall_park("pipe_write");
+        } else {
+            ker::mod::sched::kern_yield();
+        }
+    }
+}
+
+auto pipe_finish_direct_write(PipeState* st, size_t bytes_read) -> bool {
+    if (st == nullptr) {
+        return false;
+    }
+
+    PipeWakeList pending_readers{};
+    size_t pending_readers_count = 0;
+    PipeWakeList pending_read_pollers{};
+    size_t pending_read_pollers_count = 0;
+    PipeWakeList pending_writers{};
+    size_t pending_writers_count = 0;
+    PipeWakeList pending_write_pollers{};
+    size_t pending_write_pollers_count = 0;
+    bool committed = false;
+
+    uint64_t const IRQF = st->lock.lock_irqsave();
+    st->direct_write_active = false;
+    if (bytes_read > 0 && !st->read_closed) {
+        st->head = (st->head + bytes_read) % st->capacity;
+        st->count += bytes_read;
+        committed = true;
+
+        if (!st->readers_waiting.empty()) {
+            pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
+        }
+        if (!st->read_poll_waiting.empty()) {
+            pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
+        }
+    }
+
+    if (st->capacity > st->count) {
+        if (!st->writers_waiting.empty()) {
+            pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
+        }
+        if (!st->write_poll_waiting.empty()) {
+            pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
+        }
+    }
+    bool const READ_CLOSED = st->read_closed;
+    st->lock.unlock_irqrestore(IRQF);
+
+    pipe_reschedule_waiters(pending_readers, pending_readers_count);
+    pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
+    pipe_reschedule_waiters(pending_writers, pending_writers_count, READ_CLOSED);
+    pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+    return committed;
+}
+
+auto file_pread_direct(File* file, void* buf, size_t count, off_t offset) -> ssize_t {
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr) {
+        return -ENOSYS;
+    }
+    file->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
+    ssize_t const RESULT = file->fops->vfs_read(file, buf, count, static_cast<size_t>(offset));
+    file->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
+    return RESULT;
+}
+
+auto vfs_sendfile_to_pipe(File* outfile, File* infile, off_t* source_offset, size_t count) -> ssize_t {
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = ker::mod::time::get_us();
+    auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+        auto const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
+        int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+        perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), ker::mod::perf::WkiPerfPhase::END,
+                                     CORRELATION, STATUS, ELAPSED_US, CALLSITE);
+        perf_record_local_pipe_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), STATUS, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), ker::mod::perf::WkiPerfPhase::BEGIN,
+                                 CORRELATION, 0, 0, CALLSITE);
+
+    auto* st = static_cast<PipeState*>(outfile->private_data);
+    if (st == nullptr) {
+        return finish(-EBADF);
+    }
+
+    {
+        uint64_t const RESERVE_CALLSITE = WOS_PERF_CALLSITE();
+        uint64_t const RESERVE_STARTED_US = perf_local_pipe_stage_started_us();
+        pipe_reserve_direct_capacity(st, infile, *source_offset, count);
+        perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_RESERVE, CORRELATION, 0, RESERVE_STARTED_US, 0,
+                                     RESERVE_CALLSITE);
+    }
+
+    ssize_t total_sent = 0;
+    size_t remaining = count;
+    while (remaining > 0) {
+        PipeDirectWriteWindow window{};
+        uint64_t const BEGIN_CALLSITE = WOS_PERF_CALLSITE();
+        uint64_t const BEGIN_STARTED_US = perf_local_pipe_stage_started_us();
+        int const BEGIN_RET = pipe_begin_direct_write(outfile, st, &window, CORRELATION, CALLSITE);
+        perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_BEGIN, CORRELATION, BEGIN_RET < 0 ? BEGIN_RET : 0,
+                                     BEGIN_STARTED_US, BEGIN_RET < 0 ? 0 : window.capacity, BEGIN_CALLSITE);
+        if (BEGIN_RET < 0) {
+            return finish(total_sent == 0 ? static_cast<ssize_t>(BEGIN_RET) : total_sent, static_cast<uint64_t>(total_sent));
+        }
+
+        size_t const TO_READ = std::min(remaining, window.capacity);
+        uint64_t const READ_CALLSITE = WOS_PERF_CALLSITE();
+        uint64_t const READ_STARTED_US = perf_local_pipe_stage_started_us();
+        ssize_t const READ_RET = file_pread_direct(infile, st->buf + window.offset, TO_READ, *source_offset);
+        uint64_t const READ_BYTES = READ_RET > 0 ? static_cast<uint64_t>(std::min(static_cast<size_t>(READ_RET), TO_READ)) : 0;
+        perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_READ, CORRELATION,
+                                     READ_RET < 0 ? static_cast<int32_t>(READ_RET) : 0, READ_STARTED_US, READ_BYTES, READ_CALLSITE);
+        if (READ_RET <= 0) {
+            uint64_t const COMMIT_CALLSITE = WOS_PERF_CALLSITE();
+            uint64_t const COMMIT_STARTED_US = perf_local_pipe_stage_started_us();
+            static_cast<void>(pipe_finish_direct_write(st, 0));
+            perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_COMMIT, CORRELATION, 0, COMMIT_STARTED_US, 0,
+                                         COMMIT_CALLSITE);
+            if (READ_RET < 0 && total_sent == 0) {
+                return finish(READ_RET);
+            }
+            break;
+        }
+
+        size_t const BYTES_READ = static_cast<size_t>(READ_BYTES);
+        uint64_t const COMMIT_CALLSITE = WOS_PERF_CALLSITE();
+        uint64_t const COMMIT_STARTED_US = perf_local_pipe_stage_started_us();
+        if (!pipe_finish_direct_write(st, BYTES_READ)) {
+            perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_COMMIT, CORRELATION, -EPIPE, COMMIT_STARTED_US,
+                                         BYTES_READ, COMMIT_CALLSITE);
+            signal_current_sigpipe();
+            return finish(total_sent == 0 ? static_cast<ssize_t>(-EPIPE) : total_sent, static_cast<uint64_t>(total_sent));
+        }
+        perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp::DIRECT_COMMIT, CORRELATION, 0, COMMIT_STARTED_US, BYTES_READ,
+                                     COMMIT_CALLSITE);
+
+        total_sent += static_cast<ssize_t>(BYTES_READ);
+        *source_offset += static_cast<off_t>(BYTES_READ);
+        remaining -= BYTES_READ;
+    }
+
+    return finish(total_sent, static_cast<uint64_t>(total_sent));
+}
 }  // namespace
 
 auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -4897,17 +5276,17 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
 
     // Keep a moderate default capacity so simple producer/consumer pipelines do
     // not bounce through the scheduler every 4 KiB.
-    constexpr size_t PIPE_BUF_SIZE = 64UL * 1024UL;
-    auto* pipe_buf = new char[PIPE_BUF_SIZE];
+    auto* pipe_buf = new char[PIPE_DEFAULT_CAPACITY];
 
     auto* ps = new PipeState{};
     ps->buf = pipe_buf;
-    ps->capacity = PIPE_BUF_SIZE;
+    ps->capacity = PIPE_DEFAULT_CAPACITY;
     ps->head = 0;
     ps->tail = 0;
     ps->count = 0;
     ps->write_closed = false;
     ps->read_closed = false;
+    ps->direct_write_active = false;
 
     // Pipe fops - static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
@@ -5031,6 +5410,36 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
                 return finish(-EPIPE);
             }
 
+            if (st->direct_write_active) {
+                if (f->open_flags & O_NONBLOCK) {
+                    st->lock.unlock_irqrestore(IRQF);
+                    return finish(-EAGAIN);
+                }
+
+                auto* current_task = ker::mod::sched::get_current_task();
+                if (current_task == nullptr) {
+                    st->lock.unlock_irqrestore(IRQF);
+                    return finish(-ESRCH);
+                }
+
+                if (current_task_has_deliverable_signal()) {
+                    st->lock.unlock_irqrestore(IRQF);
+                    return finish(-EINTR);
+                }
+
+                bool const REGISTERED = pipe_register_waiter(st->writers_waiting, current_task->pid);
+                auto const PIPE_SPACE = static_cast<uint32_t>(st->capacity - st->count);
+                st->lock.unlock_irqrestore(IRQF);
+                perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
+                                             ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_SPACE, CALLSITE);
+                if (REGISTERED) {
+                    ker::mod::sched::preemptible_syscall_park("pipe_write");
+                } else {
+                    ker::mod::sched::kern_yield();
+                }
+                continue;
+            }
+
             size_t const AVAIL = st->capacity - st->count;
             if (AVAIL > 0) {
                 size_t const TO_WRITE = count < AVAIL ? count : AVAIL;
@@ -5110,8 +5519,7 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
         pipe_reschedule_waiters(pending_writers, pending_writers_count, true);
         pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
         if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete[] st->buf;
-            delete st;
+            pipe_destroy_state(st);
         }
         return 0;
     };
@@ -5139,8 +5547,7 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
         pipe_reschedule_waiters(pending_readers, pending_readers_count);
         pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
         if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete[] st->buf;
-            delete st;
+            pipe_destroy_state(st);
         }
         return 0;
     };
@@ -5273,7 +5680,66 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
 
     pipefd[0] = RFD;
     pipefd[1] = WFD;
+    pipe_register_state(ps);
     return 0;
+}
+
+void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out) {
+    LocalPipePerfSnapshot snapshot{
+        .created_since_reset = g_pipe_created_since_reset.load(std::memory_order_acquire),
+        .peak_pipes = g_pipe_peak_count.load(std::memory_order_acquire),
+        .peak_capacity_bytes = g_pipe_peak_capacity_bytes.load(std::memory_order_acquire),
+    };
+
+    uint64_t const STATES_IRQF = g_pipe_states_lock.lock_irqsave();
+    for (auto* st : g_pipe_states) {
+        if (st == nullptr) {
+            continue;
+        }
+
+        uint64_t const PIPE_IRQF = st->lock.lock_irqsave();
+        snapshot.active_pipes++;
+        snapshot.capacity_bytes += st->capacity;
+        snapshot.buffered_bytes += st->count;
+        snapshot.reader_waiters += st->readers_waiting.size();
+        snapshot.writer_waiters += st->writers_waiting.size();
+        snapshot.poll_waiters += st->read_poll_waiting.size() + st->write_poll_waiting.size();
+        if (st->direct_write_active) {
+            snapshot.direct_writes++;
+        }
+        if (st->read_closed) {
+            snapshot.read_closed++;
+        }
+        if (st->write_closed) {
+            snapshot.write_closed++;
+        }
+        st->lock.unlock_irqrestore(PIPE_IRQF);
+    }
+    g_pipe_states_lock.unlock_irqrestore(STATES_IRQF);
+
+    snapshot.approx_alloc_bytes = (snapshot.active_pipes * sizeof(PipeState)) + snapshot.capacity_bytes;
+    out = snapshot;
+}
+
+void vfs_reset_local_pipe_perf_counters() {
+    uint64_t active_pipes = 0;
+    uint64_t active_capacity = 0;
+
+    uint64_t const STATES_IRQF = g_pipe_states_lock.lock_irqsave();
+    for (auto* st : g_pipe_states) {
+        if (st == nullptr) {
+            continue;
+        }
+        uint64_t const PIPE_IRQF = st->lock.lock_irqsave();
+        active_pipes++;
+        active_capacity += st->capacity;
+        st->lock.unlock_irqrestore(PIPE_IRQF);
+    }
+    g_pipe_states_lock.unlock_irqrestore(STATES_IRQF);
+
+    g_pipe_created_since_reset.store(0, std::memory_order_release);
+    g_pipe_peak_count.store(active_pipes, std::memory_order_release);
+    g_pipe_peak_capacity_bytes.store(active_capacity, std::memory_order_release);
 }
 
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
@@ -5698,6 +6164,19 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         return -EBADF;
     }
 
+    off_t source_offset = offset != nullptr ? *offset : infile->pos;
+    if (g_pipe_write_fops_ptr != nullptr && outfile->fops == g_pipe_write_fops_ptr) {
+        ssize_t const RET = vfs_sendfile_to_pipe(outfile, infile, &source_offset, count);
+        if (offset != nullptr) {
+            *offset = source_offset;
+        } else {
+            infile->pos = source_offset;
+        }
+        vfs_put_file(outfile);
+        vfs_put_file(infile);
+        return RET;
+    }
+
     // Keep the staging buffer modest so blocking outputs do not cause sendfile()
     // to pre-read large chunks that cannot be written in the same call.
     constexpr size_t BUF_SIZE = 64UL * 1024UL;
@@ -5709,7 +6188,6 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     }
 
     ssize_t total_sent = 0;
-    off_t source_offset = offset != nullptr ? *offset : infile->pos;
     size_t remaining = count;
 
     while (remaining > 0) {

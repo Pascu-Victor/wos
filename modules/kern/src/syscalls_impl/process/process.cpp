@@ -17,6 +17,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/debug/ptrace.hpp"
 #include "platform/interrupt/gdt.hpp"
+#include "platform/ktime/ktime.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
@@ -60,6 +61,12 @@ inline auto mutable_hostname_char(ker::mod::sched::task::Task::HostnameBuffer& h
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
 
+inline auto is_ptrace_launch_stop_signal(int sig) -> bool { return sig == WOS_SIGSTOP; }
+
+inline auto is_live_signal_target(const ker::mod::sched::task::Task& task) -> bool {
+    return task.state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task.has_exited;
+}
+
 inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op,
                                     ker::mod::perf::WkiPerfPhase phase, uint32_t correlation, int32_t status, uint32_t aux,
                                     uint64_t callsite) {
@@ -70,6 +77,32 @@ inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod:
     ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), task->pid,
                                      ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), phase, 0, 0, correlation, status,
                                      aux, callsite);
+}
+
+inline auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
+
+struct LocalProcStage {
+    uint32_t correlation;
+    uint64_t started_us;
+};
+
+auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
+    -> LocalProcStage {
+    LocalProcStage const STAGE = {
+        .correlation = ker::mod::perf::next_wki_trace_correlation(),
+        .started_us = ker::mod::time::get_us(),
+    };
+    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::BEGIN, STAGE.correlation, 0, aux, callsite);
+    return STAGE;
+}
+
+auto end_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, const LocalProcStage& stage,
+                          int32_t status, uint64_t bytes, uint64_t callsite) -> uint32_t {
+    uint32_t const ELAPSED_US = clamp_perf_aux(ker::mod::time::get_us() - stage.started_us);
+    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::END, stage.correlation, status, ELAPSED_US, callsite);
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), 0, 0, status, ELAPSED_US, true,
+                                       0, bytes);
+    return ELAPSED_US;
 }
 
 inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child,
@@ -108,13 +141,20 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    LocalProcStage const FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
+    auto finish_fork = [&](int64_t result, uint64_t bytes = 0) -> uint64_t {
+        int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
+        end_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, FORK_STAGE, STATUS, bytes, WOS_PERF_CALLSITE());
+        return static_cast<uint64_t>(result);
+    };
+
     // Save parent's register context (will be copied to child)
     parent->context.regs = gpr;
 
     // --- Allocate child kernel stack ---
     auto kernel_stack_base = reinterpret_cast<uint64_t>(mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
     if (kernel_stack_base == 0) {
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
     uint64_t const KERNEL_RSP = kernel_stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
 
@@ -122,7 +162,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto* child = new sched::task::Task{};
     if (child == nullptr) {
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
 
     // --- Initialize child task fields ---
@@ -150,6 +190,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->elf_buffer = nullptr;
     child->elf_buffer_size = 0;
     child->is_elf_buffer_shared = false;
+    child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     child->waiting_for_pid = 0;
     child->wait_status_phys_addr = 0;
 
@@ -187,7 +228,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
     child->wki_skip_legacy_placement = false;
 
@@ -218,7 +259,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
 
     // Copy kernel mappings
@@ -231,7 +272,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
 
     if (!ker::syscall::shm::shm_clone_for_fork(parent, child)) {
@@ -240,7 +281,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
 
     // --- Clone thread metadata ---
@@ -255,7 +296,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             delete[] child->name;
             mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
             delete child;
-            return static_cast<uint64_t>(-ENOMEM);
+            return finish_fork(-ENOMEM);
         }
         // Copy all fields - virtual addresses are the same (same address space layout via COW)
         *child_thread = *parent->thread;
@@ -351,13 +392,13 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
         delete child;
-        return static_cast<uint64_t>(-ENOMEM);
+        return finish_fork(-ENOMEM);
     }
     record_local_proc_event(child, perf::WkiPerfLocalProcOp::FORK, perf::WkiPerfPhase::POINT, perf::next_wki_trace_correlation(), 0,
                             static_cast<uint32_t>(child->cpu), WOS_PERF_CALLSITE());
 
     // Return child PID to parent
-    return child->pid;
+    return finish_fork(static_cast<int64_t>(child->pid), child->cpu);
 }
 
 // --- Signal infrastructure ---
@@ -466,28 +507,14 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
         return static_cast<uint64_t>(-EINVAL);
     }
 
-    // sig == 0 is used to check if process exists (no signal sent)
-    if (sig == 0) {
-        if (pid <= 0) {
-            return 0;  // simplified
-        }
-        auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
-        if (target == nullptr) {
-            return static_cast<uint64_t>(-ESRCH);
-        }
-        target->release();
-        return 0;
-    }
-
     if (pid == 0) {
-        // pid==0: send signal to all processes in caller's process group
+        // pid==0: target all live processes in caller's process group.
         auto* self = sched::get_current_task();
         if (self == nullptr) {
             return static_cast<uint64_t>(-ESRCH);
         }
         uint64_t const PGRP = (self->pgid != 0) ? self->pgid : self->pid;
-        sched::signal_process_group(PGRP, sig);
-        return 0;
+        return sched::signal_process_group(PGRP, sig) != 0 ? 0 : static_cast<uint64_t>(-ESRCH);
     }
     if (pid < 0) {
         // pid < -1: send signal to process group -pid
@@ -500,15 +527,22 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
             }
             pgrp = (self->pgid != 0) ? self->pgid : self->pid;
         } else {
-            pgrp = static_cast<uint64_t>(-pid);
+            pgrp = static_cast<uint64_t>(-(pid + 1)) + 1;
         }
-        sched::signal_process_group(pgrp, sig);
-        return 0;
+        return sched::signal_process_group(pgrp, sig) != 0 ? 0 : static_cast<uint64_t>(-ESRCH);
     }
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
     if (target == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
+    }
+    if (!is_live_signal_target(*target)) {
+        target->release();
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    if (sig == 0) {
+        target->release();
+        return 0;
     }
 
     // Forward interrupt/termination signals to the remote node if target is a
@@ -518,6 +552,11 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     // signal before TASK_COMPLETE finalizes it.
     bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(target, sig);
     if (!FORWARDED) {
+        if (is_ptrace_launch_stop_signal(sig) && ker::mod::debug::ptrace::report_signal_stop(*target, static_cast<uint32_t>(sig))) {
+            target->release();
+            return 0;
+        }
+
         // Set the signal pending bit (signal N is bit N-1)
         target->sig_pending |= (1ULL << (sig - 1));
 

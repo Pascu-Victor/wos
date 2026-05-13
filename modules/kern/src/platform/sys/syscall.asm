@@ -85,6 +85,8 @@ wos_asm_syscall_handler:
     call check_pending_signals
     add rsp, 8
     cli
+    test rax, rax
+    jne .signal_iret_return
 
     ; restore usermode segment ds and es
     mov ds, [gs:0x18]
@@ -119,6 +121,56 @@ wos_asm_syscall_handler:
 .sysret_halt:
     hlt
     jmp .sysret_halt
+
+.signal_iret_return:
+    ; sigreturn must restore RCX and R11 as ordinary user GPRs.  SYSRET
+    ; consumes RCX/R11 for the return RIP/RFLAGS, so build an IRETQ frame
+    ; below the saved GPRegs block and restore the registers manually.
+    mov r10, [gs:0x28] ; restored user RIP
+    mov r11, [gs:0x30] ; restored user RFLAGS
+    mov r12, [gs:0x08] ; restored user RSP
+    sub rsp, 40
+    mov [rsp + 0], r10
+    mov qword [rsp + 8], 0x23
+    mov [rsp + 16], r11
+    mov [rsp + 24], r12
+    mov qword [rsp + 32], 0x1b
+
+    lea rdi, [rsp + 40] ; saved GPRegs block from syscall entry
+    mov r15, [rdi + 0]
+    mov r14, [rdi + 8]
+    mov r13, [rdi + 16]
+    mov r12, [rdi + 24]
+    mov r11, [rdi + 32]
+    mov r10, [rdi + 40]
+    mov r9,  [rdi + 48]
+    mov r8,  [rdi + 56]
+    mov rbp, [rdi + 64]
+    mov rsi, [rdi + 80]
+    mov rdx, [rdi + 88]
+    mov rcx, [rdi + 96]
+    mov rbx, [rdi + 104]
+    mov rax, [rdi + 120] ; saved syscall return value
+    mov rdi, [rdi + 72]
+
+    push rax
+    push r8
+    push r9
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
+
+    swapgs
+    iretq
 
 .bad_syscall_stack:
     ; gs:0x0 did not contain a kernel-half stack pointer.  Use an emergency

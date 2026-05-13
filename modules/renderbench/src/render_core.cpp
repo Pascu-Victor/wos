@@ -1865,6 +1865,42 @@ auto placement_name(Placement placement) -> const char* {
     return placement == Placement::NodeThreads ? "node-threads" : "process-per-core";
 }
 
+namespace {
+
+auto is_option_token(const char* value) -> bool { return value != nullptr && std::string_view(value).starts_with("--"); }
+
+auto require_option_value(int argc, char* const* argv, int& index, std::string_view name) -> const char* {
+    if (index + 1 >= argc || is_option_token(argv[index + 1])) {
+        std::fprintf(stderr, "renderbench: missing value for %.*s\n", static_cast<int>(name.size()), name.data());
+        return nullptr;
+    }
+    return argv[++index];
+}
+
+auto parse_int_option(std::string_view name, const char* value, int minimum, int& out) -> bool {
+    if (value == nullptr || value[0] == '\0') {
+        std::fprintf(stderr, "renderbench: invalid value for %.*s\n", static_cast<int>(name.size()), name.data());
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    long const PARSED = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE || PARSED > std::numeric_limits<int>::max()) {
+        std::fprintf(stderr, "renderbench: invalid value for %.*s: '%s'\n", static_cast<int>(name.size()), name.data(), value);
+        return false;
+    }
+    if (PARSED < minimum) {
+        std::fprintf(stderr, "renderbench: %.*s must be >= %d\n", static_cast<int>(name.size()), name.data(), minimum);
+        return false;
+    }
+
+    out = static_cast<int>(PARSED);
+    return true;
+}
+
+}  // namespace
+
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --scene scene.glb --backend ipc|mpi --placement node-threads|process-per-core "
@@ -1872,50 +1908,109 @@ void print_usage(const char* argv0) {
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
-auto parse_options(int argc, char* const* argv, Backend default_backend) -> Options {
-    Options options;
+auto parse_options(int argc, char* const* argv, Backend default_backend, Options& options) -> ParseStatus {
+    options = {};
     options.backend = default_backend;
     for (int i = 1; i < argc; ++i) {
         std::string_view const ARG = argv[i];
-        auto require_value = [&](std::string_view name) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "missing value for %.*s\n", static_cast<int>(name.size()), name.data());
-                return "";
-            }
-            return argv[++i];
+        auto parse_required_int = [&](int minimum, int& out) -> bool {
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            return VALUE != nullptr && parse_int_option(ARG, VALUE, minimum, out);
         };
         if (ARG == "--scene") {
-            options.scene_path = require_value(ARG);
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            if (VALUE == nullptr) {
+                return ParseStatus::Error;
+            }
+            options.scene_path = VALUE;
         } else if (ARG == "--backend") {
-            std::string_view const VALUE = require_value(ARG);
-            options.backend = VALUE == "mpi" ? Backend::Mpi : Backend::Ipc;
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            if (VALUE == nullptr) {
+                return ParseStatus::Error;
+            }
+            std::string_view const VALUE_VIEW = VALUE;
+            if (VALUE_VIEW == "mpi") {
+                options.backend = Backend::Mpi;
+            } else if (VALUE_VIEW == "ipc") {
+                options.backend = Backend::Ipc;
+            } else {
+                std::fprintf(stderr, "renderbench: invalid --backend '%s' (expected ipc or mpi)\n", VALUE);
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--placement") {
-            std::string_view const VALUE = require_value(ARG);
-            options.placement = VALUE == "process-per-core" ? Placement::ProcessPerCore : Placement::NodeThreads;
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            if (VALUE == nullptr) {
+                return ParseStatus::Error;
+            }
+            std::string_view const VALUE_VIEW = VALUE;
+            if (VALUE_VIEW == "process-per-core") {
+                options.placement = Placement::ProcessPerCore;
+            } else if (VALUE_VIEW == "node-threads") {
+                options.placement = Placement::NodeThreads;
+            } else {
+                std::fprintf(stderr, "renderbench: invalid --placement '%s' (expected node-threads or process-per-core)\n", VALUE);
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--width") {
-            options.width = std::max(1, std::atoi(require_value(ARG)));
+            if (!parse_required_int(1, options.width)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--height") {
-            options.height = std::max(1, std::atoi(require_value(ARG)));
+            if (!parse_required_int(1, options.height)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--spp") {
-            options.spp = std::max(1, std::atoi(require_value(ARG)));
+            if (!parse_required_int(1, options.spp)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--max-depth") {
-            options.max_depth = std::max(1, std::atoi(require_value(ARG)));
+            if (!parse_required_int(1, options.max_depth)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--tile-size") {
-            options.tile_size = std::max(4, std::atoi(require_value(ARG)));
+            if (!parse_required_int(4, options.tile_size)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--output-root") {
-            options.output_root = require_value(ARG);
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            if (VALUE == nullptr) {
+                return ParseStatus::Error;
+            }
+            options.output_root = VALUE;
         } else if (ARG == "--threads") {
-            options.threads = std::max(0, std::atoi(require_value(ARG)));
+            if (!parse_required_int(0, options.threads)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--run-id") {
-            options.run_id = require_value(ARG);
+            const char* const VALUE = require_option_value(argc, argv, i, ARG);
+            if (VALUE == nullptr) {
+                return ParseStatus::Error;
+            }
+            options.run_id = VALUE;
+        } else if (ARG == "--tracebench-worker") {
+            continue;
+        } else if (ARG == "--worker-id") {
+            int ignored = 0;
+            if (!parse_required_int(0, ignored)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--worker-count" || ARG == "--worker-threads") {
+            int ignored = 0;
+            if (!parse_required_int(1, ignored)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--help" || ARG == "-h") {
             print_usage(argv[0]);
+            return ParseStatus::Help;
+        } else if (ARG.starts_with("--")) {
+            std::fprintf(stderr, "renderbench: unknown option %.*s\n", static_cast<int>(ARG.size()), ARG.data());
+            return ParseStatus::Error;
         }
     }
     if (options.run_id.empty()) {
         options.run_id = make_run_id();
     }
-    return options;
+    return ParseStatus::Ok;
 }
 
 auto make_tiles(int width, int height, int tile_size) -> std::vector<Tile> {
@@ -1962,8 +2057,8 @@ void render_tile(const Scene& scene, FilmView film, const Options& options, cons
             Vec3 color{};
             for (int sample = 0; sample < options.spp; ++sample) {
                 float const U =
-                    ((static_cast<float>(x) + rng.uniform()) / static_cast<float>(options.width) - 0.5F) * 2.0F * ASPECT * SCALE;
-                float const V = (0.5F - (static_cast<float>(y) + rng.uniform()) / static_cast<float>(options.height)) * 2.0F * SCALE;
+                    (((static_cast<float>(x) + rng.uniform()) / static_cast<float>(options.width)) - 0.5F) * 2.0F * ASPECT * SCALE;
+                float const V = (0.5F - ((static_cast<float>(y) + rng.uniform()) / static_cast<float>(options.height))) * 2.0F * SCALE;
                 Ray ray{.origin = scene.camera.origin,
                         .direction = normalize(scene.camera.forward + (scene.camera.right * U) + (scene.camera.up * V))};
                 color += trace_ray(scene, ray, options, rng);
@@ -1994,9 +2089,9 @@ auto ensure_output_tree(const Options& options) -> bool { return ensure_dir(opti
 auto write_status(const Options& options, const Progress& progress) -> bool {
     std::ostringstream out;
     out << "{\n"
-        << "  \"run_id\": \"" << options.run_id << "\",\n"
-        << "  \"backend\": \"" << backend_name(options.backend) << "\",\n"
-        << "  \"placement\": \"" << placement_name(options.placement) << "\",\n"
+        << R"(  "run_id": ")" << options.run_id << "\",\n"
+        << R"(  "backend": ")" << backend_name(options.backend) << "\",\n"
+        << R"(  "placement": ")" << placement_name(options.placement) << "\",\n"
         << "  \"width\": " << options.width << ",\n"
         << "  \"height\": " << options.height << ",\n"
         << "  \"spp\": " << options.spp << ",\n"

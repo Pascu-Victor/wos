@@ -36,37 +36,21 @@ namespace ker::net::wki {
 using log = ker::mod::dbg::logger<"wki">;
 
 namespace {
-
-template <typename T, size_t N>
-auto raw_data(T (&buffer)[N]) -> T* {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    return std::begin(buffer);
-}
-
-template <typename T, size_t N>
-auto raw_data(const T (&buffer)[N]) -> const T* {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    return std::begin(buffer);
-}
-
-template <size_t N>
-void copy_hostname(char (&dst)[N], const char (&src)[N]) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    std::copy_n(raw_data(src), N, raw_data(dst));
-}
-
-void copy_hostname_for_log(std::array<char, WKI_HOSTNAME_MAX>& dst,
-                           const char (&src)[WKI_HOSTNAME_MAX]) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    std::copy_n(raw_data(src), dst.size(), dst.data());
+void copy_hostname_for_log(std::array<char, WKI_HOSTNAME_MAX>& dst, const std::array<char, WKI_HOSTNAME_MAX>& src) {
+    std::copy_n(src.data(), dst.size(), dst.data());
     dst.at(WKI_HOSTNAME_MAX - 1) = '\0';
 }
 
 template <size_t N>
-void set_fallback_hostname(char (&hostname)[N], uint16_t node_id) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    std::snprintf(raw_data(hostname), N, "node-%04x", node_id);
+void set_fallback_hostname(std::array<char, N>& hostname,
+                           uint16_t node_id) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    std::snprintf(hostname.data(), N, "node-%04x", node_id);
 }
 
 template <size_t N>
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-auto hostname_equals(const char (&hostname)[N], const char* other) -> bool {
-    return std::strcmp(raw_data(hostname), other) == 0;
+auto hostname_equals(const std::array<char, N>& hostname, const char* other) -> bool {
+    return std::strcmp(hostname.data(), other) == 0;
 }
 
 }  // namespace
@@ -86,7 +70,7 @@ void wki_peer_send_hello_broadcast() {
     hello.max_channels = g_wki.max_channels;
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
-    copy_hostname(hello.hostname, g_wki.local_hostname);
+    hello.hostname = g_wki.local_hostname;
 
     wki_send_raw(WKI_NODE_BROADCAST, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY);
 }
@@ -102,7 +86,7 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
     hello.max_channels = g_wki.max_channels;
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
-    copy_hostname(hello.hostname, g_wki.local_hostname);
+    hello.hostname = g_wki.local_hostname;
 
     // Build frame manually to use specific transport
     uint16_t const FRAME_LEN = WKI_HEADER_SIZE + sizeof(HelloPayload);
@@ -140,7 +124,7 @@ void wki_peer_send_hello_ack(WkiPeer* peer) {
     ack.max_channels = g_wki.max_channels;
     ack.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
-    copy_hostname(ack.hostname, g_wki.local_hostname);
+    ack.hostname = g_wki.local_hostname;
 
     wki_send_raw(peer->node_id, MsgType::HELLO_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
 }
@@ -268,12 +252,12 @@ void handle_hello(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8
     peer->missed_beats = 0;
 
     // V2: Copy hostname from HELLO payload
-    copy_hostname(peer->hostname, hello->hostname);
+    peer->hostname = hello->hostname;
     peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';  // ensure NUL-terminated
 
     // V2: Hostname collision detection
     // If the peer has the same hostname as us, the node with the lower MAC keeps it
-    if (peer->hostname[0] != '\0' && hostname_equals(peer->hostname, raw_data(g_wki.local_hostname))) {
+    if (peer->hostname[0] != '\0' && hostname_equals(peer->hostname, g_wki.local_hostname.data())) {
         int const MAC_CMP = hello->mac_addr.compare(g_wki.my_mac);
         if (MAC_CMP < 0) {
             // Remote has lower MAC -> remote keeps hostname, we fall back
@@ -424,7 +408,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->hop_count = 1;
 
     // V2: Copy hostname from HELLO_ACK payload
-    copy_hostname(peer->hostname, ack->hostname);
+    peer->hostname = ack->hostname;
     peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';
     // If peer sent empty hostname, generate a fallback
     if (peer->hostname[0] == '\0') {
@@ -979,14 +963,14 @@ auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t {
 
 auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
     if (node_id == g_wki.my_node_id) {
-        return raw_data(g_wki.local_hostname);
+        return g_wki.local_hostname.data();
     }
 
     WkiPeer* peer = wki_peer_find(node_id);
     if (peer == nullptr || peer->hostname[0] == '\0') {
         return nullptr;
     }
-    return raw_data(peer->hostname);
+    return peer->hostname.data();
 }
 
 // -----------------------------------------------------------------------------

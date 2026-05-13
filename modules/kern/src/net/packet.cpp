@@ -7,9 +7,12 @@
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <new>
-#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#ifdef WOS_NET_PACKET_DEBUG
+#include <platform/asm/cpu.hpp>
+#endif
 
 namespace ker::net {
 
@@ -18,8 +21,10 @@ using log = ker::mod::dbg::logger<"net">;
 namespace {
 
 constexpr size_t RX_RESERVE = 256;
+#ifdef WOS_NET_PACKET_DEBUG
 constexpr size_t DEBUG_TOP_SITES = 8;
 constexpr uint32_t REFUSE_DUMP_STRIDE = 64;
+#endif
 
 struct PacketChunk {
     PacketBuffer* base = nullptr;
@@ -27,6 +32,7 @@ struct PacketChunk {
     PacketChunk* next = nullptr;
 };
 
+#ifdef WOS_NET_PACKET_DEBUG
 struct SiteSummary {
     uintptr_t site = 0;
     size_t count = 0;
@@ -35,6 +41,7 @@ struct SiteSummary {
 };
 
 constexpr size_t DEBUG_SITE_TRACK_SLOTS = 32;
+#endif
 
 // ---------------------------------------------------------------------------
 // Global pool (fallback)
@@ -49,7 +56,9 @@ bool initialized = false;
 // Decremented on alloc, incremented on free.  Used by pkt_alloc_tx()
 // to cheaply check whether we should reserve buffers for RX.
 std::atomic<size_t> free_count{0};
+#ifdef WOS_NET_PACKET_DEBUG
 std::atomic<uint32_t> alloc_seq{0};
+#endif
 std::atomic<uint32_t> refuse_count{0};
 std::atomic<bool> expand_in_progress{false};
 
@@ -64,6 +73,7 @@ auto round_up_growth(size_t count) -> size_t {
     return count + (PKT_POOL_GROW_CHUNK - REM);
 }
 
+#ifdef WOS_NET_PACKET_DEBUG
 void pkt_debug_dump_in_use(size_t avail) {
     std::array<SiteSummary, DEBUG_SITE_TRACK_SLOTS> site_counts{};
     size_t outstanding = 0;
@@ -123,6 +133,7 @@ void pkt_debug_dump_in_use(size_t avail) {
                    entry.oldest_pkt->debug_alloc_cpu, reinterpret_cast<void*>(entry.oldest_pkt->debug_free_site));
     }
 }
+#endif
 
 void add_buffers_to_pool(size_t count) {
     // Allocate new buffers
@@ -245,12 +256,14 @@ auto pkt_alloc() -> PacketBuffer* {
     pkt->next = nullptr;
     pkt->dev = nullptr;
     pkt->protocol = 0;
+#ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = true;
     pkt->debug_alloc_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
     pkt->debug_alloc_seq = alloc_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     pkt->debug_alloc_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     pkt->debug_free_cpu = 0;
     pkt->debug_free_site = 0;
+#endif
 
     free_count.fetch_sub(1, std::memory_order_relaxed);
 
@@ -266,16 +279,20 @@ auto pkt_alloc_tx() -> PacketBuffer* {
     if (avail <= RX_RESERVE) {
         uint32_t const COUNT = refuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
         log::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu refused=%u)", avail, RX_RESERVE, COUNT);
+#ifdef WOS_NET_PACKET_DEBUG
         if ((COUNT % REFUSE_DUMP_STRIDE) == 1) {
             pkt_debug_dump_in_use(avail);
         }
+#endif
         return nullptr;  // Pool too low, reserve for RX
     }
 
     PacketBuffer* pkt = pkt_alloc();
+#ifdef WOS_NET_PACKET_DEBUG
     if (pkt != nullptr) {
         pkt->debug_alloc_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     }
+#endif
     return pkt;
 }
 
@@ -284,9 +301,11 @@ void pkt_free(PacketBuffer* pkt) {
         return;
     }
 
+#ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = false;
     pkt->debug_free_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
     pkt->debug_free_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
     pkt_global_free(pkt);
     free_count.fetch_add(1, std::memory_order_relaxed);
 }

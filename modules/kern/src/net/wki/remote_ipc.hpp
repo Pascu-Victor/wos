@@ -175,12 +175,35 @@ struct WkiIpcExport {
     ker::mod::sched::task::Task* pump_task = nullptr;
 };
 
+struct WkiIpcPerfSnapshot {
+    uint64_t exports = 0;
+    uint64_t proxies = 0;
+    uint64_t pump_tasks = 0;
+    uint64_t proxy_ring_bytes = 0;
+    uint64_t proxy_ring_used_bytes = 0;
+    uint64_t blocked_readers = 0;
+    uint64_t poll_waiters = 0;
+    uint64_t pending_deliveries = 0;
+    uint64_t pending_chunks = 0;
+    uint64_t pending_bytes = 0;
+    uint64_t export_backlogs = 0;
+    uint64_t export_backlog_chunks = 0;
+    uint64_t export_backlog_bytes = 0;
+    uint64_t export_flush_queue = 0;
+    uint64_t dev_op_queue = 0;
+    uint64_t dev_op_payload_bytes = 0;
+    uint64_t approx_alloc_bytes = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 
 // Initialize the IPC proxy subsystem. Called from wki_init().
 void wki_ipc_subsystem_init();
+
+// Read a best-effort IPC perf/memory snapshot for /proc and perf tooling.
+void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out);
 
 // Export a task's IPC fds before remote submission.
 // Iterates fd_table, identifies IPC primitives, creates exports.

@@ -524,7 +524,7 @@ bool path_crosses_recursive_self_alias(const char* path) {
     }
 
     std::array<char, WKI_HOSTNAME_MAX + 6> self_prefix{};
-    std::snprintf(self_prefix.data(), self_prefix.size(), "/wki/%s", raw_data(g_wki.local_hostname));
+    std::snprintf(self_prefix.data(), self_prefix.size(), "/wki/%s", g_wki.local_hostname.data());
     size_t const SELF_PREFIX_LEN = std::strlen(self_prefix.data());
     return std::strncmp(path, self_prefix.data(), SELF_PREFIX_LEN) == 0 && (path[SELF_PREFIX_LEN] == '\0' || path[SELF_PREFIX_LEN] == '/');
 }

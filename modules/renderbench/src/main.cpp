@@ -285,20 +285,20 @@ auto apply_tile_payload(tracebench::FilmView film, const TilePacketHeader& heade
         header.y0 >= header.y1) {
         return false;
     }
-    tracebench::Tile const tile{
+    tracebench::Tile const TILE{
         .x0 = static_cast<int>(header.x0),
         .y0 = static_cast<int>(header.y0),
         .x1 = static_cast<int>(header.x1),
         .y1 = static_cast<int>(header.y1),
         .index = static_cast<int>(header.tile_index),
     };
-    if (payload.size() != tile_float_count(tile)) {
+    if (payload.size() != tile_float_count(TILE)) {
         return false;
     }
 
     size_t in = 0;
-    for (int y = tile.y0; y < tile.y1; ++y) {
-        for (int x = tile.x0; x < tile.x1; ++x) {
+    for (int y = TILE.y0; y < TILE.y1; ++y) {
+        for (int x = TILE.x0; x < TILE.x1; ++x) {
             size_t const TARGET = ((static_cast<size_t>(y) * static_cast<size_t>(film.width)) + static_cast<size_t>(x)) * 3U;
             film.rgb[TARGET] = payload[in++];
             film.rgb[TARGET + 1U] = payload[in++];
@@ -686,7 +686,7 @@ auto wait_for_children(std::span<ChildWorker> workers, bool cancellation_expecte
     return ok;
 }
 
-auto run_distributed_ipc(const tracebench::Options& options, std::vector<WkiPeerInfo> peers, const char* argv0) -> int {
+auto run_distributed_ipc(const tracebench::Options& options, const std::vector<WkiPeerInfo>& peers, const char* argv0) -> int {
     auto specs = options.placement == tracebench::Placement::NodeThreads ? make_node_thread_specs(options, peers)
                                                                          : make_process_specs(options, peers);
     if (specs.empty()) {
@@ -818,9 +818,17 @@ auto parse_worker_invocation(int argc, char** argv) -> WorkerInvocation {
 
 auto main(int argc, char** argv) -> int {
     auto worker = parse_worker_invocation(argc, argv);
-    auto options = tracebench::parse_options(argc, argv, tracebench::Backend::Ipc);
+    tracebench::Options options;
+    auto const PARSE_STATUS = tracebench::parse_options(argc, argv, tracebench::Backend::Ipc, options);
+    if (PARSE_STATUS == tracebench::ParseStatus::Help) {
+        return 0;
+    }
+    if (PARSE_STATUS == tracebench::ParseStatus::Error) {
+        tracebench::print_usage(argv[0]);
+        return 2;
+    }
     if (options.backend != tracebench::Backend::Ipc) {
-        std::fprintf(stderr, "renderbench: WOS module supports --backend ipc\n");
+        std::println(stderr, "renderbench: WOS module supports --backend ipc");
         return 2;
     }
     if (worker.enabled) {
@@ -828,7 +836,7 @@ auto main(int argc, char** argv) -> int {
     }
     install_cancel_signal_handlers();
     if (!tracebench::ensure_output_tree(options)) {
-        std::fprintf(stderr, "renderbench: unable to create output tree under %s\n", options.output_root.c_str());
+        std::println(stderr, "renderbench: unable to create output tree under {}", options.output_root);
         return 2;
     }
 
@@ -836,5 +844,5 @@ auto main(int argc, char** argv) -> int {
     if (peers.size() <= 1 && options.placement == tracebench::Placement::NodeThreads) {
         return run_node_threads(options);
     }
-    return run_distributed_ipc(options, std::move(peers), argv[0]);
+    return run_distributed_ipc(options, peers, argv[0]);
 }

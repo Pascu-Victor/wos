@@ -69,11 +69,11 @@ struct alignas(MEMORY_ALIGNMENT) MediumAllocationHeader {
     MediumAllocationHeader* next;
     uint64_t size;   // Total allocation size including header
     uint64_t magic;  // For validation
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
     uint32_t pad;
 #else
-    uint64_t _pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
+    uint64_t pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
 #endif
     // Data follows immediately after this header
 };
@@ -85,11 +85,11 @@ struct alignas(MEMORY_ALIGNMENT) LargeAllocationHeader {
     LargeAllocationHeader* next;
     uint64_t size;
     uint64_t magic;  // For validation
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
     uint32_t pad;
 #else
-    uint64_t _pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
+    uint64_t pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
 #endif
     // Data follows immediately after this header
 };
@@ -106,10 +106,10 @@ sys::Spinlock medium_alloc_lock;
 LargeAllocationHeader* large_alloc_list = nullptr;
 sys::Spinlock large_alloc_lock;
 
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
 // Per-allocation debug side-table.  Stored in .bss so it is always available during OOM.
 // Index 0 is a sentinel meaning "no info".  The counter never wraps back — once full,
-// new allocations silently get index 0.  64 KB total; zero runtime cost in release builds.
+// new allocations silently get index 0.  64 KB total when explicitly enabled.
 struct AllocDebugInfo {
     uintptr_t caller;  // return address captured at the kmalloc call site
     const char* tag;   // compile-time string (type name or "::new"), may be null
@@ -162,7 +162,7 @@ void dump_tracked_allocations() {
             ker::mod::io::serial::write_hex((uint64_t)(curr + 1));
             ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::write_hex(curr->size);
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
             if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
                 const auto& d = s_alloc_debug[curr->debug_idx];
                 if (d.caller != 0) {
@@ -199,7 +199,7 @@ void dump_tracked_allocations() {
             ker::mod::io::serial::write_hex((uint64_t)(curr + 1));  // Data starts after header
             ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::write_hex(curr->size);
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
             if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
                 const auto& d = s_alloc_debug[curr->debug_idx];
                 if (d.caller != 0) {
@@ -223,8 +223,8 @@ void dump_tracked_allocations() {
     ker::mod::io::serial::write(" bytes\n");
     large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
 
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
-    ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info (KASAN/KUBSAN):\n");
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info:\n");
     mini_malloc::mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uint32_t dbg_idx) -> void {
         if (dbg_idx == ALLOC_DEBUG_NONE || dbg_idx >= ALLOC_DEBUG_MAX) {
             return;
@@ -341,6 +341,10 @@ auto slab_size_to_idx(size_t slab_size) -> SlabClass {
 }
 
 auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
+#ifndef WOS_KMALLOC_DEBUG_INFO
+    (void)caller;
+    (void)tag;
+#endif
     if (size == 0) {
         return nullptr;
     }
@@ -375,7 +379,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
             kasan::unpoison_range(ptr, size);
         }
 #endif
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
         if (ptr != nullptr) {
             // Store debug_idx in the lower 32 bits of _align_pad (the 8 bytes before user data).
             *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(ptr) - sizeof(uintptr_t)) = register_alloc_debug(caller, tag);
@@ -428,7 +432,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         kasan::poison_range(static_cast<void*>(header), sizeof(MediumAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
         kasan::unpoison_range(data, size);
 #endif
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
         header->debug_idx = register_alloc_debug(caller, tag);
 #endif
         return data;
@@ -480,7 +484,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     kasan::poison_range(static_cast<void*>(header), sizeof(LargeAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
     kasan::unpoison_range(data, size);
 #endif
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     header->debug_idx = register_alloc_debug(caller, tag);
 #endif
     return data;
@@ -527,7 +531,7 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
 
     // Helper lambda to print debug_idx info for a node.
     auto print_debug_info = [](const MediumAllocationHeader* node) {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
         if (node->debug_idx != ALLOC_DEBUG_NONE && node->debug_idx < ALLOC_DEBUG_MAX) {
             const auto& d = s_alloc_debug[node->debug_idx];
             if (d.caller != 0) {
@@ -656,14 +660,16 @@ auto try_free_large_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResu
 }  // namespace
 
 auto malloc(uint64_t size) -> void* {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     return malloc_impl(size, (uintptr_t)__builtin_return_address(0), nullptr);
 #else
     return malloc_impl(size, 0, nullptr);
 #endif
 }
 
+#ifdef WOS_KMALLOC_DEBUG_INFO
 auto malloc_tagged(uint64_t size, uintptr_t caller, const char* tag) -> void* { return malloc_impl(size, caller, tag); }
+#endif
 
 auto realloc(void* ptr, size_t size) -> void* {
     if (ptr == nullptr) {
@@ -727,7 +733,7 @@ auto realloc(void* ptr, size_t size) -> void* {
             large_alloc_list = new_header;
             potential_large_header->magic = 0;
             large_alloc_lock.unlock_irqrestore(LOCK_FLAGS);
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
             new_header->debug_idx = ALLOC_DEBUG_NONE;
 #endif
             phys::page_free(potential_large_header);
@@ -787,7 +793,7 @@ auto realloc(void* ptr, size_t size) -> void* {
             medium_alloc_list = new_header;
             potential_medium_header->magic = 0;
             medium_alloc_lock.unlock_irqrestore(LOCK_FLAGS);
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
             new_header->debug_idx = ALLOC_DEBUG_NONE;
 #endif
             phys::page_free(potential_medium_header);
@@ -966,7 +972,7 @@ void free(void* ptr) {
 }  // namespace ker::mod::mm::dyn::kmalloc
 
 auto operator new(std::size_t sz) -> void* {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new");
 #else
     return ker::mod::mm::dyn::kmalloc::malloc(sz);
@@ -974,7 +980,7 @@ auto operator new(std::size_t sz) -> void* {
 }
 
 auto operator new[](std::size_t sz) -> void* {
-#if defined(WOS_KASAN) || defined(WOS_KUBSAN)
+#ifdef WOS_KMALLOC_DEBUG_INFO
     return ker::mod::mm::dyn::kmalloc::malloc_tagged(sz, (uintptr_t)__builtin_return_address(0), "::new[]");
 #else
     return ker::mod::mm::dyn::kmalloc::malloc(sz);

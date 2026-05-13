@@ -21,6 +21,8 @@
 #include <vfs/vfs.hpp>
 
 #include "net/wki/remote_compute.hpp"
+#include "net/wki/remote_ipc.hpp"
+#include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "release.hpp"
@@ -595,7 +597,7 @@ auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     if (task != nullptr && task->wki_submitter_hostname[0] != '\0') {
         hostname = task->wki_submitter_hostname.data();
     } else {
-        hostname = ker::net::wki::g_wki.local_hostname;
+        hostname = ker::net::wki::g_wki.local_hostname.data();
     }
     if (hostname == nullptr || hostname[0] == '\0') {
         hostname = "local";
@@ -613,7 +615,7 @@ auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 // Generate content for /proc/<pid>/wki_runner
 // Returns the hostname of the node currently executing this process.
 auto generate_wki_runner(char* buf, size_t bufsz) -> size_t {
-    const char* hostname = ker::net::wki::g_wki.local_hostname;
+    const char* hostname = ker::net::wki::g_wki.local_hostname.data();
     if (hostname == nullptr || hostname[0] == '\0') {
         hostname = "local";
     }
@@ -634,7 +636,7 @@ auto task_wki_remote_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
     if (task->wki_remote_pid != 0) {
         return task->wki_remote_pid;
     }
-    const char* local_hostname = ker::net::wki::g_wki.local_hostname;
+    const char* local_hostname = ker::net::wki::g_wki.local_hostname.data();
     if (task->wki_submitter_hostname[0] != '\0' && local_hostname != nullptr && local_hostname[0] != '\0' &&
         std::strcmp(task->wki_submitter_hostname.data(), local_hostname) != 0) {
         return task->pid;
@@ -668,15 +670,15 @@ auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
             buf[off++] = *s++;
         }
     };
-    auto append_row = [&](const char* hostname, uint64_t node_id, bool connected, uint64_t cpus, uint64_t load_pct, uint64_t last_update_us,
-                          bool local) {
+    auto append_row = [&](const std::array<char, net::wki::WKI_HOSTNAME_MAX>& hostname, uint64_t node_id, bool connected, uint64_t cpus,
+                          uint64_t load_pct, uint64_t last_update_us, bool local) {
         if (off >= bufsz - 1) {
             return;
         }
-        int const LEN = std::snprintf(
-            buf + off, bufsz - off, "%s %llu %u %llu %llu %llu %u\n", hostname != nullptr && hostname[0] != '\0' ? hostname : "unknown",
-            static_cast<unsigned long long>(node_id), connected ? 1U : 0U, static_cast<unsigned long long>(cpus),
-            static_cast<unsigned long long>(load_pct), static_cast<unsigned long long>(last_update_us), local ? 1U : 0U);
+        int const LEN =
+            std::snprintf(buf + off, bufsz - off, "%s %llu %u %llu %llu %llu %u\n", hostname[0] != '\0' ? hostname.data() : "unknown",
+                          static_cast<unsigned long long>(node_id), connected ? 1U : 0U, static_cast<unsigned long long>(cpus),
+                          static_cast<unsigned long long>(load_pct), static_cast<unsigned long long>(last_update_us), local ? 1U : 0U);
         if (LEN <= 0) {
             return;
         }
@@ -805,10 +807,16 @@ auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, row.retries);
         append_sconst(p, end, " bytes=");
         append_dec64(p, end, row.bytes);
+        append_sconst(p, end, " samples=");
+        append_dec64(p, end, row.latency_samples);
+        append_sconst(p, end, " total_us=");
+        append_dec64(p, end, row.total_latency_us);
         append_sconst(p, end, " avg_us=");
         append_dec64(p, end, AVG);
         append_sconst(p, end, " max_us=");
         append_dec64(p, end, row.max_latency_us);
+        append_sconst(p, end, " p50_us=");
+        append_dec64(p, end, row.p50_us);
         append_sconst(p, end, " p95_us=");
         append_dec64(p, end, row.p95_us);
         append_sconst(p, end, " p99_us=");
@@ -822,6 +830,83 @@ auto generate_kwkistat(char* buf, size_t bufsz) -> size_t {
         if (p + 1 < end) {
             *p++ = '\n';
         }
+    }
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_kipcstat(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    ker::net::wki::WkiIpcPerfSnapshot snapshot{};
+    ker::net::wki::wki_ipc_get_perf_snapshot(snapshot);
+    ker::vfs::LocalPipePerfSnapshot local_pipe{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(local_pipe);
+
+    append_sconst(p, end, "exports=");
+    append_dec64(p, end, snapshot.exports);
+    append_sconst(p, end, " proxies=");
+    append_dec64(p, end, snapshot.proxies);
+    append_sconst(p, end, " pump_tasks=");
+    append_dec64(p, end, snapshot.pump_tasks);
+    append_sconst(p, end, " ring_bytes=");
+    append_dec64(p, end, snapshot.proxy_ring_bytes);
+    append_sconst(p, end, " ring_used=");
+    append_dec64(p, end, snapshot.proxy_ring_used_bytes);
+    append_sconst(p, end, " blocked_readers=");
+    append_dec64(p, end, snapshot.blocked_readers);
+    append_sconst(p, end, " poll_waiters=");
+    append_dec64(p, end, snapshot.poll_waiters);
+    append_sconst(p, end, " pending_deliveries=");
+    append_dec64(p, end, snapshot.pending_deliveries);
+    append_sconst(p, end, " pending_chunks=");
+    append_dec64(p, end, snapshot.pending_chunks);
+    append_sconst(p, end, " pending_bytes=");
+    append_dec64(p, end, snapshot.pending_bytes);
+    append_sconst(p, end, " export_backlogs=");
+    append_dec64(p, end, snapshot.export_backlogs);
+    append_sconst(p, end, " export_backlog_chunks=");
+    append_dec64(p, end, snapshot.export_backlog_chunks);
+    append_sconst(p, end, " export_backlog_bytes=");
+    append_dec64(p, end, snapshot.export_backlog_bytes);
+    append_sconst(p, end, " export_flush_queue=");
+    append_dec64(p, end, snapshot.export_flush_queue);
+    append_sconst(p, end, " dev_op_queue=");
+    append_dec64(p, end, snapshot.dev_op_queue);
+    append_sconst(p, end, " dev_op_payload_bytes=");
+    append_dec64(p, end, snapshot.dev_op_payload_bytes);
+    append_sconst(p, end, " approx_alloc_bytes=");
+    append_dec64(p, end, snapshot.approx_alloc_bytes);
+    append_sconst(p, end, " local_pipe_active=");
+    append_dec64(p, end, local_pipe.active_pipes);
+    append_sconst(p, end, " local_pipe_created=");
+    append_dec64(p, end, local_pipe.created_since_reset);
+    append_sconst(p, end, " local_pipe_peak=");
+    append_dec64(p, end, local_pipe.peak_pipes);
+    append_sconst(p, end, " local_pipe_capacity=");
+    append_dec64(p, end, local_pipe.capacity_bytes);
+    append_sconst(p, end, " local_pipe_peak_capacity=");
+    append_dec64(p, end, local_pipe.peak_capacity_bytes);
+    append_sconst(p, end, " local_pipe_buffered=");
+    append_dec64(p, end, local_pipe.buffered_bytes);
+    append_sconst(p, end, " local_pipe_reader_waiters=");
+    append_dec64(p, end, local_pipe.reader_waiters);
+    append_sconst(p, end, " local_pipe_writer_waiters=");
+    append_dec64(p, end, local_pipe.writer_waiters);
+    append_sconst(p, end, " local_pipe_poll_waiters=");
+    append_dec64(p, end, local_pipe.poll_waiters);
+    append_sconst(p, end, " local_pipe_direct_writes=");
+    append_dec64(p, end, local_pipe.direct_writes);
+    append_sconst(p, end, " local_pipe_read_closed=");
+    append_dec64(p, end, local_pipe.read_closed);
+    append_sconst(p, end, " local_pipe_write_closed=");
+    append_dec64(p, end, local_pipe.write_closed);
+    append_sconst(p, end, " local_pipe_approx_alloc_bytes=");
+    append_dec64(p, end, local_pipe.approx_alloc_bytes);
+    if (p + 1 < end) {
+        *p++ = '\n';
     }
 
     *p = '\0';
@@ -1016,7 +1101,14 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 *p++ = ' ';
                 append_dec64(p, end, ev.aux);
                 *p++ = ' ';
-                append_perf_callsite(p, end, ev.callsite);
+                if (scope == ker::mod::perf::WkiPerfScope::LOCAL_VMEM ||
+                    (scope == ker::mod::perf::WkiPerfScope::LOCAL_LOADER &&
+                     (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_MAIN) ||
+                      op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_INTERP)))) {
+                    append_hex64(p, end, ev.callsite);
+                } else {
+                    append_perf_callsite(p, end, ev.callsite);
+                }
             } else {
                 // WAKE or SLEEP
                 append_dec64(p, end, ev.pid);
@@ -1119,7 +1211,8 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
-                               pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE);
+                               pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
+                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE);
         size_t const ALLOC_SZ = IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
         pfd->content = new (std::nothrow) char[ALLOC_SZ];
         if (pfd->content == nullptr) {
@@ -1159,6 +1252,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::KCONTSTAT_FILE:
                 pfd->content_len = generate_kcontstat(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::KIPCSTAT_FILE:
+                pfd->content_len = generate_kipcstat(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::WKI_LAUNCHER_FILE:
                 pfd->content_len = generate_wki_launcher(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
@@ -1218,7 +1314,7 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
     if (count >= 6 && memcmp(s, "enable", 6) == 0) {
         // Check for optional filter: "enable switch,wake,container"
         if (count > 7 && s[6] == ' ') {
-            uint8_t const MASK = ker::mod::perf::parse_event_mask(s + 7, count - 7);
+            uint16_t const MASK = ker::mod::perf::parse_event_mask(s + 7, count - 7);
             if (MASK == 0) {
                 return -EINVAL;
             }
@@ -1228,11 +1324,12 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
         }
         // Reset ring buffers on fresh enable so report only sees the new session
         ker::mod::perf::reset_rings();
+        ker::vfs::vfs_reset_local_pipe_perf_counters();
         ker::mod::perf::enable();
     } else if (count >= 4 && memcmp(s, "mask", 4) == 0) {
         // Change mask without resetting rings or toggling enable: "mask switch,container"
         if (count > 5 && s[4] == ' ') {
-            uint8_t const MASK = ker::mod::perf::parse_event_mask(s + 5, count - 5);
+            uint16_t const MASK = ker::mod::perf::parse_event_mask(s + 5, count - 5);
             if (MASK == 0) {
                 return -EINVAL;
             }
@@ -1428,6 +1525,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/kcontstat - per-subsystem container statistics
     if (strcmp(path, "kcontstat") == 0) {
         return make_file(ProcNodeType::KCONTSTAT_FILE, 0, false);
+    }
+
+    // /proc/kipcstat - WKI IPC memory/queue snapshot
+    if (strcmp(path, "kipcstat") == 0) {
+        return make_file(ProcNodeType::KIPCSTAT_FILE, 0, false);
     }
 
     // /proc/wki
