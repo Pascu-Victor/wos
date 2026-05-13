@@ -90,15 +90,10 @@ void wake_socket(Socket* sock) {
         log::debug("wake_socket: pid=%lu task=%p", PID, static_cast<void*>(task));
 #endif
         if (task != nullptr) {
-            task->deferred_task_switch = false;
-            uint64_t target_cpu = task->cpu;
-            if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || task->voluntary_block) {
-                target_cpu = ker::mod::sched::get_least_loaded_cpu();
-            }
 #ifdef TCP_DEBUG
-            log::debug("wake_socket: rescheduling pid=%lu on cpu=%lu", PID, target_cpu);
+            log::debug("wake_socket: event-waking pid=%lu", PID);
 #endif
-            ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
+            ker::mod::sched::wake_task_from_event(task);
             task->release();
         }
     }
@@ -587,6 +582,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     if (WRITTEN > 0) {
                         cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         cb->rcv_wnd = cb->socket->rcvbuf.free_space();
+                        deferred_wake = true;
                     }
                     build_deferred_ack();
                 }
@@ -625,6 +621,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     if (WRITTEN > 0) {
                         cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
                         cb->rcv_wnd = cb->socket->rcvbuf.free_space();
+                        deferred_wake = true;
                     }
                     build_deferred_ack();
                 }

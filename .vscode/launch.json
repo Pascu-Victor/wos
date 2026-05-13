@@ -5,6 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "lldb-dap",
+            "request": "attach",
+            "name": "Attach httpd",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/httpd/httpd"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware",
+            ],
+            "attachCommands": [
+                "gdb-remote 10.10.0.235:4321"
+            ],
+        },
+        {
             "name": "Debug WOS Kernel",
             "type": "lldb-dap",
             "request": "attach",
@@ -66,9 +85,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -93,9 +109,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -120,9 +133,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -147,9 +157,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -174,9 +181,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -201,9 +205,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -228,9 +229,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -255,9 +253,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file false",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.require-hardware-breakpoint true",
-                "command alias b breakpoint set --hardware",
-                "command alias hbreak breakpoint set --hardware"
             ],
             "terminateCommands": [
                 "process kill"
@@ -285,7 +280,6 @@
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file true",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.process.thread.step-avoid-regexp ''",
                 "settings set target.skip-prologue false",
                 "settings set target.require-hardware-breakpoint true",
                 "command alias b breakpoint set --hardware",

@@ -15,13 +15,13 @@ static constexpr uint64_t COREDUMP_MAGIC = 0x504D55444F43534FULL;
 
 // Segment types
 enum class SegmentType : uint32_t {
-    ZeroUnmapped = 0,
-    StackPage = 1,
-    FaultPage = 2,
-    MemoryPage = 3,
+    ZERO_UNMAPPED = 0,
+    STACK_PAGE = 1,
+    FAULT_PAGE = 2,
+    MEMORY_PAGE = 3,
 };
 
-QString segmentTypeName(uint32_t type);
+QString segment_type_name(uint32_t type);
 
 // x86-64 interrupt frame - matches WOS kernel InterruptFrame layout
 struct InterruptFrame {
@@ -56,17 +56,17 @@ struct GPRegs {
 
 // A single memory segment in the coredump
 struct CoreDumpSegment {
-    uint64_t vaddr;
-    uint64_t size;
-    uint64_t fileOffset;
-    uint32_t type;
-    uint32_t present;
-    uint64_t pteFlags = 0;
-    uint64_t physAddr = 0;
+    uint64_t vaddr{};
+    uint64_t size{};
+    uint64_t file_offset{};
+    uint32_t type{};
+    uint32_t present{};
+    uint64_t pte_flags = 0;
+    uint64_t phys_addr = 0;
 
-    uint64_t vaddrEnd() const { return vaddr + size; }
-    QString typeName() const { return segmentTypeName(type); }
-    bool isPresent() const { return present != 0; }
+    [[nodiscard]] uint64_t vaddr_end() const { return vaddr + size; }
+    [[nodiscard]] QString type_name() const { return segment_type_name(type); }
+    [[nodiscard]] bool is_present() const { return present != 0; }
 };
 
 // Full parsed coredump
@@ -74,7 +74,7 @@ struct CoreDump {
     // Header fields
     uint64_t magic;
     uint32_t version;
-    uint32_t headerSize;
+    uint32_t header_size;
     uint64_t timestamp;
     uint64_t pid;
     uint64_t cpu;
@@ -84,38 +84,77 @@ struct CoreDump {
     uint64_t cr3;
 
     // CPU state at trap
-    InterruptFrame trapFrame;
-    GPRegs trapRegs;
+    InterruptFrame trap_frame;
+    GPRegs trap_regs;
 
     // Saved CPU state (before trap)
-    InterruptFrame savedFrame;
-    GPRegs savedRegs;
+    InterruptFrame saved_frame;
+    GPRegs saved_regs;
 
     // Task metadata
-    uint64_t taskEntry;
-    uint64_t taskPagemap;
-    uint64_t elfHeaderAddr;
-    uint64_t programHeaderAddr;
-    uint64_t segmentCount;
-    uint64_t segmentTableOffset;
-    uint64_t elfSize;
-    uint64_t elfOffset;
-    uint64_t segmentEntrySize = 32;
-    uint64_t pageSize = 4096;
-    uint64_t snapshotFlags = 0;
-    uint64_t interpBase = 0;
-    uint64_t programHeaderCount = 0;
-    uint64_t programHeaderEntSize = 0;
-    uint64_t threadFsBase = 0;
-    uint64_t threadGsBase = 0;
-    uint64_t threadStackBase = 0;
-    uint64_t threadStackSize = 0;
-    uint64_t threadTlsBase = 0;
-    uint64_t threadTlsSize = 0;
-    uint64_t threadSafeStack = 0;
-    QString exePath;
+    uint64_t task_entry;
+    uint64_t task_pagemap;
+    uint64_t elf_header_addr;
+    uint64_t program_header_addr;
+    uint64_t segment_count;
+    uint64_t segment_table_offset;
+    uint64_t elf_size;
+    uint64_t elf_offset;
+    uint64_t segment_entry_size = 32;
+    uint64_t page_size = 4096;
+    uint64_t snapshot_flags = 0;
+    uint64_t interp_base = 0;
+    uint64_t program_header_count = 0;
+    uint64_t program_header_ent_size = 0;
+    uint64_t thread_fs_base = 0;
+    uint64_t thread_gs_base = 0;
+    uint64_t thread_stack_base = 0;
+    uint64_t thread_stack_size = 0;
+    uint64_t thread_tls_base = 0;
+    uint64_t thread_tls_size = 0;
+    uint64_t thread_safe_stack = 0;
+    uint64_t task_ptr = 0;
+    uint64_t thread_ptr = 0;
+    uint64_t parent_pid = 0;
+    uint64_t owner_pid = 0;
+    uint64_t wki_remote_pid = 0;
+    uint64_t session_id = 0;
+    uint64_t pgid = 0;
+    uint64_t task_type = 0;
+    uint64_t task_state = 0;
+    uint64_t sched_queue = 0;
+    uint64_t current_cpu = 0;
+    uint64_t domain_id = 0;
+    uint64_t domain_mask = 0;
+    uint64_t wki_target_flags = 0;
+    uint64_t wki_proxy_task_id = 0;
+    uint64_t elf_buffer_addr = 0;
+    uint64_t captured_elf_buffer_size = 0;
+    bool elf_buffer_shared = false;
+    uint64_t start_time_us = 0;
+    uint64_t user_time_us = 0;
+    uint64_t system_time_us = 0;
+    uint64_t vruntime = 0;
+    uint64_t vdeadline = 0;
+    uint64_t wake_at_us = 0;
+    uint64_t wait_channel_addr = 0;
+    uint64_t waiting_for_pid = 0;
+    uint64_t wait_status_user_addr = 0;
+    uint64_t wait_rusage_user_addr = 0;
+    uint64_t sig_pending = 0;
+    uint64_t sig_mask = 0;
+    uint64_t ptrace_tracer_pid = 0;
+    uint64_t uid = 0;
+    uint64_t gid = 0;
+    uint64_t euid = 0;
+    uint64_t egid = 0;
+    uint64_t task_flags = 0;
+    QString exe_path;
     QString cwd;
     QString root;
+    QString wait_channel;
+    QString wki_target_hostname;
+    QString wki_submitter_hostname;
 
     // Segment table
     std::vector<CoreDumpSegment> segments;
@@ -124,29 +163,29 @@ struct CoreDump {
     QByteArray raw;
 
     // Source file path (set after parsing for symbol resolution)
-    QString sourceFilename;
+    QString source_filename;
 
     // Get the embedded ELF bytes, if present
-    QByteArray embeddedElf() const;
+    [[nodiscard]] QByteArray embedded_elf() const;
 
     // Check if magic is valid
-    bool isValid() const { return magic == COREDUMP_MAGIC; }
+    [[nodiscard]] bool is_valid() const { return magic == COREDUMP_MAGIC; }
 };
 
 // Parse a coredump from raw binary data.
 // Returns std::nullopt on parse failure.
-std::optional<CoreDump> parseCoreDump(const QByteArray& data);
+std::optional<CoreDump> parse_core_dump(const QByteArray& data);
 
 /// Load and parse a coredump from a file path. Sets sourceFilename on success.
-std::unique_ptr<CoreDump> parseCoreDump(const QString& filePath);
+std::unique_ptr<CoreDump> parse_core_dump(const QString& file_path);
 
 // Get human-readable interrupt/exception name
-QString interruptName(uint64_t num);
+QString interrupt_name(uint64_t num);
 
 // Format a uint64 as "0x%016llx"
-QString formatU64(uint64_t val);
+QString format_u64(uint64_t val);
 
 // Parse binary name from coredump filename pattern: {binary}_{timestamp}_coredump.bin
-QString parseBinaryNameFromFilename(const QString& filename);
+QString parse_binary_name_from_filename(const QString& filename);
 
 }  // namespace wosdbg

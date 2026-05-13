@@ -238,7 +238,7 @@ auto validate_devfs_file(File* f, const char* op) -> DevFSFile* {
 auto devfs_close(File* f) -> int {
     if (f == nullptr) {
         vfs_debug_log("devfs_close: file is null\n");
-        return -1;
+        return -EBADF;
     }
     if (f->private_data == nullptr) {
         vfs_debug_log("devfs_close: no private_data\n");
@@ -278,23 +278,23 @@ auto devfs_close(File* f) -> int {
 auto devfs_read(File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* devfs_file = validate_devfs_file(f, "read");
     if (devfs_file == nullptr) {
-        return -1;
+        return -EBADF;
     }
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->read != nullptr) {
         return devfs_file->device->char_ops->read(f, buf, count);
     }
-    return -1;
+    return -ENOSYS;
 }
 
 auto devfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* devfs_file = validate_devfs_file(f, "write");
     if (devfs_file == nullptr) {
-        return -1;
+        return -EBADF;
     }
     if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->write != nullptr) {
         return devfs_file->device->char_ops->write(f, buf, count);
     }
-    return -1;
+    return -ENOSYS;
 }
 
 auto devfs_lseek(File* /*f*/, off_t /*offset*/, int /*whence*/) -> off_t {
@@ -314,15 +314,15 @@ auto devfs_isatty(File* f) -> bool {
 
 auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (f == nullptr || entry == nullptr || !f->is_directory) {
-        return -1;
+        return -EINVAL;
     }
     auto* devfs_file = validate_devfs_file(f, "readdir");
     if (devfs_file == nullptr) {
-        return -1;
+        return -EBADF;
     }
     auto* dir_node = devfs_file->node;
     if (dir_node == nullptr || dir_node->type != DevFSNodeType::DIRECTORY) {
-        return -1;
+        return -ENOTDIR;
     }
 
     // Indices 0 and 1 are synthetic "." and ".." entries
@@ -349,7 +349,7 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
 
     size_t const CHILD_INDEX = index - 2;
     if (CHILD_INDEX >= dir_node->children_count) {
-        return -1;
+        return -ENOENT;
     }
 
     auto* child = dir_node->children[CHILD_INDEX];
@@ -386,12 +386,12 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
 
 auto devfs_fops_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
     if (buf == nullptr || bufsize == 0) {
-        return -1;
+        return -EINVAL;
     }
 
     auto* devfs_file = validate_devfs_file(f, "readlink");
     if (devfs_file == nullptr) {
-        return -1;
+        return -EBADF;
     }
     auto* node = devfs_file->node;
     if (node == nullptr || node->type != DevFSNodeType::SYMLINK) {

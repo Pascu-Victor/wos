@@ -66,7 +66,7 @@ void destroy_mount(MountPoint* mount) {
 auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
     size_t const PATH_LEN = std::strlen(path);
     if (PATH_LEN + 1 > outsize) {
-        return -1;
+        return -ENAMETOOLONG;
     }
     std::memcpy(out, path, PATH_LEN + 1);
 
@@ -76,7 +76,7 @@ auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
             size_t const ROOT_LEN = std::strlen(task->root.data());
             if (ROOT_LEN > 1) {  // root != "/"
                 if (ROOT_LEN + PATH_LEN + 1 > outsize) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);
                 std::memcpy(out, task->root.data(), ROOT_LEN);
@@ -111,7 +111,7 @@ auto fstype_to_enum(const char* fstype) -> FSType {
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
-        return -1;
+        return -EINVAL;
     }
 
     // Resolve through task root prefix so the stored path matches what
@@ -119,7 +119,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     std::array<char, MAX_MOUNT_PATH> resolved{};
     if (resolve_mount_path(path, resolved.data(), resolved.size()) < 0) {
         vfs_debug_log("mount_filesystem: path too long\n");
-        return -1;
+        return -ENAMETOOLONG;
     }
 
     auto* mount = new MountPoint;
@@ -129,7 +129,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     auto* path_copy = new char[PATH_LEN + 1];
     if (path_copy == nullptr) {
         destroy_mount(mount);
-        return -1;
+        return -ENOMEM;
     }
     std::memcpy(path_copy, resolved.data(), PATH_LEN + 1);
     mount->path = path_copy;
@@ -138,7 +138,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     auto* fstype_copy = new char[FSTYPE_LEN + 1];
     if (fstype_copy == nullptr) {
         destroy_mount(mount);
-        return -1;
+        return -ENOMEM;
     }
     std::memcpy(fstype_copy, fstype, FSTYPE_LEN + 1);
     mount->fstype = fstype_copy;
@@ -155,7 +155,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 requires a block device\n");
             destroy_mount(mount);
-            return -1;
+            return -EINVAL;
         }
 
         // Determine partition start LBA.
@@ -177,7 +177,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (context == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 initialization failed\n");
             destroy_mount(mount);
-            return -1;
+            return -EIO;
         }
 
         // Store mount context for per-mount use
@@ -200,20 +200,20 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: XFS requires a block device\n");
             destroy_mount(mount);
-            return -1;
+            return -EINVAL;
         }
         auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device);
         if (xfs_ctx == nullptr) {
             vfs_debug_log("mount_filesystem: XFS initialization failed\n");
             destroy_mount(mount);
-            return -1;
+            return -EIO;
         }
         mount->private_data = xfs_ctx;
         mount->fops = ker::vfs::xfs::get_xfs_fops();
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         destroy_mount(mount);
-        return -1;
+        return -ENODEV;
     }
 
     mount_lock.lock();
@@ -221,7 +221,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
         destroy_mount(mount);
-        return -1;
+        return -ENOMEM;
     }
     mount_lock.unlock();
 

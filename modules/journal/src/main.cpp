@@ -184,18 +184,22 @@ auto record_matches(const JournalRecord& rec, const Options& opts) -> bool {
 
 auto print_record(const JournalRecord& rec) -> bool {
     size_t const MODULE_LEN = bounded_string_length(rec.module, ker::abi::sys_log::JOURNAL_MODULE_MAX);
-    std::array<char, 96> prefix{};
-    int const prefix_len = std::snprintf(prefix.data(), prefix.size(), "[%llu.%03llu] %-8s %-16.*s ",
+    std::array<char, 96 + ker::abi::sys_log::JOURNAL_MESSAGE_MAX + 1> line{};
+    int const prefix_len = std::snprintf(line.data(), line.size(), "[%llu.%03llu] %-8s %-16.*s ",
                                          static_cast<unsigned long long>(rec.monotonic_us / 1000000ULL),
                                          static_cast<unsigned long long>((rec.monotonic_us / 1000ULL) % 1000ULL), level_name(rec.level),
                                          static_cast<int>(MODULE_LEN), rec.module);
-    if (prefix_len < 0) {
+    if (prefix_len < 0 || static_cast<size_t>(prefix_len) >= line.size()) {
         return false;
     }
-
-    size_t const PREFIX_BYTES = std::min(static_cast<size_t>(prefix_len), prefix.size() - 1);
-    return write_all(STDOUT_FILENO, prefix.data(), PREFIX_BYTES) &&
-           write_all(STDOUT_FILENO, rec.message, static_cast<size_t>(rec.message_len)) && write_all(STDOUT_FILENO, "\n", 1);
+    size_t cursor = static_cast<size_t>(prefix_len);
+    if (cursor + static_cast<size_t>(rec.message_len) + 1 > line.size()) {
+        return false;
+    }
+    std::memcpy(line.data() + cursor, rec.message, rec.message_len);
+    cursor += static_cast<size_t>(rec.message_len);
+    line[cursor++] = '\n';
+    return write_all(STDOUT_FILENO, line.data(), cursor);
 }
 
 void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
@@ -252,10 +256,6 @@ auto run_daemon() -> int {
     }
 
     int out = open_journal_file_append();
-    if (out < 0) {
-        close(DEV);
-        return 1;
-    }
 
     for (;;) {
         std::array<JournalRecord, 16> batch{};
@@ -270,6 +270,12 @@ auto run_daemon() -> int {
             if (!valid_record(rec)) {
                 continue;
             }
+            if (out < 0) {
+                out = open_journal_file_append();
+                if (out < 0) {
+                    continue;
+                }
+            }
             off_t const POS = lseek(out, 0, SEEK_END);
             if (POS >= ROTATE_BYTES) {
                 close(out);
@@ -282,10 +288,8 @@ auto run_daemon() -> int {
                 }
             }
             if (!persist_record(out, rec)) {
-                report_errno("journald: failed to persist journal record");
                 close(out);
-                close(DEV);
-                return 1;
+                out = -1;
             }
         }
     }

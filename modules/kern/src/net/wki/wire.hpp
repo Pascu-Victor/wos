@@ -777,12 +777,15 @@ struct TaskCompletePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// TASK_CANCEL Payload - 4 bytes
+// TASK_CANCEL Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct TaskCancelPayload {
     uint32_t task_id;
+    int32_t signum;
 } __attribute__((packed));
+
+static_assert(sizeof(TaskCancelPayload) == 8, "TaskCancelPayload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
 // LOAD_REPORT Payload - variable length

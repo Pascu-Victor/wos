@@ -1,5 +1,6 @@
 #pragma once
 
+#include <abi/ptrace.hpp>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -197,10 +198,32 @@ struct Task {
     uint64_t sig_pending{};  // Bit N = signal N+1 is pending, signals 1-64
     uint64_t sig_mask{};     // Bitmask of blocked signals
 
+    // Ptrace/debugging state. The syscall ABI is node-local; WKI proxy routing
+    // is represented through RemoteInfo and handled by userland debug brokers.
+    uint64_t ptrace_tracer_pid = 0;
+    uint64_t ptrace_options = 0;
+    uint64_t ptrace_event_msg = 0;
+    uint64_t ptrace_stop_address = 0;
+    std::array<uint64_t, 4> ptrace_dr_addr{};
+    uint64_t ptrace_dr6 = 0;
+    uint64_t ptrace_dr7 = 0;
+    ker::abi::ptrace::stop_reason ptrace_stop_reason = ker::abi::ptrace::stop_reason::NONE;
+    uint32_t ptrace_stop_signal = 0;
+    bool ptrace_traced = false;
+    bool ptrace_stopped = false;
+    bool ptrace_stop_pending = false;
+    bool ptrace_single_step = false;
+    bool ptrace_syscall_trace = false;
+    bool ptrace_syscall_in_stop = false;
+    cpu::GPRegs ptrace_syscall_regs{};
+    gates::InterruptFrame ptrace_syscall_frame{};
+
     // Process time accounting (microseconds).
-    uint64_t start_time_us{};   // Wall-clock time when task was created
-    uint64_t user_time_us{};    // Cumulative user-mode CPU time
-    uint64_t system_time_us{};  // Cumulative kernel-mode CPU time
+    uint64_t start_time_us{};               // Wall-clock time when task was created
+    uint64_t user_time_us{};                // Cumulative user-mode CPU time
+    uint64_t system_time_us{};              // Cumulative kernel-mode CPU time
+    uint64_t syscall_account_start_us{};    // Non-zero while this task is executing a syscall
+    uint64_t precharged_syscall_time_us{};  // Syscall time already charged before the next scheduler tick
 
     // ITIMER_REAL state (microseconds, 0 = not armed).
     uint64_t itimer_real_expire_us{};    // Absolute HPET time when SIGALRM fires (0 = disarmed)
@@ -298,6 +321,8 @@ struct Task {
     bool wki_skip_legacy_placement = false;
 
     bool has_exited{};
+    // Set after exit cleanup finishes; waitpid may reap only after this.
+    std::atomic<bool> exit_notify_ready{false};
     bool waited_on{};             // Set to true when parent retrieves exit status via waitpid
     bool deferred_task_switch{};  // Move to wait queue after syscall returns
     bool yield_switch{};          // Put task in expired queue instead of wait queue

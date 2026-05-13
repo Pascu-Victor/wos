@@ -10,14 +10,17 @@
 #include <utility>
 
 #include "abi/callnums/process.h"
+#include "abi/ptrace.hpp"
 #include "net/wki/remote_compute.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/debug/ptrace.hpp"
 #include "platform/interrupt/gdt.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
@@ -56,6 +59,18 @@ inline auto mutable_hostname_char(ker::mod::sched::task::Task::HostnameBuffer& h
 }
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
+
+inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op,
+                                    ker::mod::perf::WkiPerfPhase phase, uint32_t correlation, int32_t status, uint32_t aux,
+                                    uint64_t callsite) {
+    if (task == nullptr) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), task->pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), phase, 0, 0, correlation, status,
+                                     aux, callsite);
+}
 
 inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child,
                                             uint64_t saved_rip, uint64_t saved_rsp, uint64_t saved_flags) {
@@ -126,6 +141,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->has_run = false;
     child->exit_status = 0;
     child->has_exited = false;
+    child->exit_notify_ready.store(false, std::memory_order_relaxed);
     child->waited_on = false;
     child->deferred_task_switch = false;
     child->yield_switch = false;
@@ -337,6 +353,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete child;
         return static_cast<uint64_t>(-ENOMEM);
     }
+    record_local_proc_event(child, perf::WkiPerfLocalProcOp::FORK, perf::WkiPerfPhase::POINT, perf::next_wki_trace_correlation(), 0,
+                            static_cast<uint32_t>(child->cpu), WOS_PERF_CALLSITE());
 
     // Return child PID to parent
     return child->pid;
@@ -844,6 +862,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::GETWKITARGET: {
             return wos_proc_getwkitarget(reinterpret_cast<char*>(a2), static_cast<size_t>(a3), reinterpret_cast<uint32_t*>(a4));
+        }
+        case abi::process::procmgmt_ops::PTRACE: {
+            return ker::mod::debug::ptrace::sys_ptrace(static_cast<abi::ptrace::request>(a2), a3, a4, a5, gpr);
         }
 
         default:

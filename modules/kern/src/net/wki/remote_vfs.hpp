@@ -18,7 +18,7 @@ namespace ker::net::wki {
 
 constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
-constexpr size_t VFS_READLINK_CACHE_ENTRIES = 4;
+constexpr size_t VFS_READLINK_CACHE_ENTRIES = 32;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 
 // Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
@@ -110,6 +110,7 @@ struct ProxyVfsState {
     uint8_t* rdma_bulk_buf = nullptr;  // 2 MB bulk buffer for large reads
     uint32_t rdma_bulk_size = 0;       // actual allocated size
     int32_t bulk_owner_fd = -1;        // remote_fd of file that last prefetched into bulk buffer
+    std::atomic<bool> shared_io_in_use{false};
 
     ker::mod::sys::Spinlock lock;
 };

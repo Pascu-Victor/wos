@@ -206,15 +206,15 @@ void rollback_net_binding(uint16_t consumer_node, uint32_t resource_id, ker::net
     }
 }
 
-auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel) -> WkiChannel* {
+auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel, PriorityClass priority) -> WkiChannel* {
     if (wki_requester_controls_dynamic_channel(requester_node, g_wki.my_node_id)) {
         if (requested_channel < WKI_CHAN_DYNAMIC_BASE) {
             return nullptr;
         }
-        return wki_channel_reserve(requester_node, requested_channel, PriorityClass::THROUGHPUT);
+        return wki_channel_reserve(requester_node, requested_channel, priority);
     }
 
-    return wki_channel_alloc(requester_node, PriorityClass::THROUGHPUT);
+    return wki_channel_alloc(requester_node, priority);
 }
 
 }  // namespace
@@ -552,7 +552,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
 
         // The lower node ID is the channel allocator for the peer pair.
-        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
+        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::THROUGHPUT);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -580,9 +580,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // Compute the RDMA zone ID for the block ring.  Zone creation is
         // deferred to the timer tick (wki_dev_server_process_pending_zones)
         // because wki_zone_create() blocks on a spin-wait for the zone ACK,
-        // and we are currently inside the NAPI poll handler - calling
-        // napi_poll_inline() re-entrantly returns 0, so the ACK can never
-        // be received here.  Instead, send the ACK optimistically with the
+        // and we are currently inside the NAPI poll handler. Inline NAPI
+        // draining cannot re-enter that handler, so the ACK can never be
+        // received here. Instead, send the ACK optimistically with the
         // zone_id; the consumer already has a timeout loop waiting for the
         // zone to appear.
         uint32_t const BLK_ZONE_ID = (static_cast<uint32_t>(hdr->src_node) << 16) | req->resource_id;
@@ -634,7 +634,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
 
         // The lower node ID is the channel allocator for the peer pair.
-        WkiChannel const* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
+        // VFS proxy traffic is metadata-heavy and latency-sensitive. Keep it on
+        // a low-latency channel; large data transfers still use the dedicated
+        // RDMA paths behind the proxy rather than relying on delayed-ACK
+        // throughput lanes.
+        WkiChannel const* ch = reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::LATENCY);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -762,7 +766,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
 
         // The lower node ID is the channel allocator for the peer pair.
-        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel);
+        WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::THROUGHPUT);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
@@ -800,9 +804,15 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // V2: Send extended NET attach ACK with owner NIC info
         DevAttachAckNetPayload net_ack = {};
         build_net_attach_ack(net_ack, ndev, req->resource_id, ch->channel_id);
-
-        ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u ip=0x%08x mask=0x%08x", hdr->src_node, req->resource_id,
-                           ch->channel_id, net_ack.ipv4_addr, net_ack.ipv4_mask);
+        uint32_t netmask = net_ack.ipv4_mask;
+        uint32_t bit_count = 0;
+        while (netmask) {
+            bit_count += netmask & 1;
+            netmask >>= 1;
+        }
+        ker::mod::dbg::log("[WKI] NET attach: node=0x%04x res_id=%u ch=%u ip=%d.%d.%d.%d/%d", hdr->src_node, req->resource_id,
+                           ch->channel_id, (net_ack.ipv4_addr >> 24) & 0xFF, (net_ack.ipv4_addr >> 16) & 0xFF,
+                           (net_ack.ipv4_addr >> 8) & 0xFF, net_ack.ipv4_addr & 0xFF, bit_count);
 
         int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &net_ack, sizeof(net_ack));
         if (ACK_RET != WKI_OK) {

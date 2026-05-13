@@ -272,6 +272,8 @@ struct WkiChannel {
     uint64_t bytes_sent = 0;
     uint64_t bytes_received = 0;
     uint32_t retransmits = 0;
+    uint64_t perf_last_stall_report_us = 0;
+    uint32_t perf_last_stall_status = 0;
 
     // Pre-allocated inline retransmit buffers - eliminates kmalloc for
     // typical small messages (control, ACKs, small payloads).  Frames

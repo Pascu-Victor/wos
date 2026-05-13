@@ -50,29 +50,29 @@ class McpHttpServer : public QObject {
     };
 
     [[nodiscard]] auto peer_allowed(const QHostAddress& address) const -> bool;
-    [[nodiscard]] auto cidr_allows(const QString& cidr, const QHostAddress& address) const -> bool;
+    [[nodiscard]] static auto cidr_allows(const QString& cidr, const QHostAddress& address) -> bool;
     [[nodiscard]] auto parse_http_request(QTcpSocket* socket) -> std::optional<HttpRequest>;
     void on_socket_disconnected();
-    void send_json(QTcpSocket* socket, const QJsonObject& object, int status = 200, const QByteArray& protocol_version = {},
+    static void send_json(QTcpSocket* socket, const QJsonObject& object, int status = 200, const QByteArray& protocol_version = {},
                    const QByteArray& session_id = {}, bool close_connection = true);
-    void send_raw(QTcpSocket* socket, const QByteArray& body, const QByteArray& content_type, int status,
-                  const QByteArray& protocol_version = {}, const QByteArray& session_id = {}, bool close_connection = true);
-    void send_sse_headers(QTcpSocket* socket, const QByteArray& protocol_version = {}, const QByteArray& session_id = {});
-    void send_sse_event(QTcpSocket* socket, const QByteArray& event_id, const QByteArray& event, const QByteArray& data = {});
+    static void send_raw(QTcpSocket* socket, const QByteArray& body, const QByteArray& content_type, int status,
+                         const QByteArray& protocol_version = {}, const QByteArray& session_id = {}, bool close_connection = true);
+    static void send_sse_headers(QTcpSocket* socket, const QByteArray& protocol_version = {}, const QByteArray& session_id = {});
+    static void send_sse_event(QTcpSocket* socket, const QByteArray& event_id, const QByteArray& event, const QByteArray& data = {});
     [[nodiscard]] auto handle_json_rpc(const QJsonObject& request) -> QJsonObject;
     [[nodiscard]] auto handle_method(const QString& method, const QJsonObject& params) -> QJsonObject;
-    [[nodiscard]] auto tool_list() const -> QJsonObject;
+    [[nodiscard]] static auto tool_list() -> QJsonObject;
     [[nodiscard]] auto call_tool(const QJsonObject& params) const -> QJsonObject;
-    [[nodiscard]] auto json_rpc_error(const QJsonValue& id, int code, const QString& message) const -> QJsonObject;
-    [[nodiscard]] auto json_rpc_result(const QJsonValue& id, const QJsonObject& result) const -> QJsonObject;
-    [[nodiscard]] auto tool_result(const QJsonObject& payload) const -> QJsonObject;
+    [[nodiscard]] static auto json_rpc_error(const QJsonValue& id, int code, const QString& message) -> QJsonObject;
+    [[nodiscard]] static auto json_rpc_result(const QJsonValue& id, const QJsonObject& result) -> QJsonObject;
+    [[nodiscard]] static auto tool_result(const QJsonObject& payload) -> QJsonObject;
     [[nodiscard]] auto create_session_id() const -> QByteArray;
     [[nodiscard]] auto has_session(const QByteArray& session_id) const -> bool;
     auto ensure_valid_session(const QString& method, const QByteArray& session_id, QTcpSocket* socket) -> bool;
     auto register_listener(const QByteArray& session_id, QTcpSocket* socket) -> bool;
     void unregister_socket(QTcpSocket* socket);
     void remove_session(const QByteArray& session_id);
-    [[nodiscard]] auto negotiated_protocol(const QByteArray& header) const -> QByteArray;
+    [[nodiscard]] static auto negotiated_protocol(const QByteArray& header) -> QByteArray;
 
     DebugAnalysisService* analysis;
     QTcpServer tcp_server;

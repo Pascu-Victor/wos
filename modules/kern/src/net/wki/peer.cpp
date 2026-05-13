@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -992,13 +993,31 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 // WKI timer kernel thread - runs wki_peer_timer_tick() with deadline-driven sleeps
 // -----------------------------------------------------------------------------
 
-constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 50000;
+// Keep the fallback poll interval close to the latency target so that any
+// missed timer wake edge is repaired in a couple of milliseconds instead of
+// tens of milliseconds.
+constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 2000;
 constexpr uint64_t WKI_TIMER_IDLE_SLEEP_US = 1000000;
 constexpr uint64_t WKI_TIMER_OVERDUE_BACKOFF_US = 1000;
 
 namespace {
 
-mod::sched::task::Task* s_wki_timer_task = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 10'000'000;
+constexpr int WKI_LATENCY_DAEMON_NICE = 0;
+
+void promote_latency_sensitive_daemon(mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = WKI_LATENCY_DAEMON_SLICE_NS;
+    mod::sched::set_task_nice(task, WKI_LATENCY_DAEMON_NICE);
+}
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+mod::sched::task::Task* s_wki_timer_task = nullptr;
+std::atomic<uint32_t> s_wki_timer_notify_seq{0};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_wki_timer_sleep_armed{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto wki_has_connected_peers() -> bool {
     return std::ranges::any_of(
@@ -1008,7 +1027,8 @@ auto wki_has_connected_peers() -> bool {
 }  // namespace
 
 void wki_timer_notify() {
-    if (s_wki_timer_task != nullptr) {
+    s_wki_timer_notify_seq.fetch_add(1, std::memory_order_release);
+    if (s_wki_timer_task != nullptr && s_wki_timer_sleep_armed.load(std::memory_order_acquire)) {
         mod::sched::kern_wake(s_wki_timer_task);
     }
 }
@@ -1062,7 +1082,17 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
             sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_POLL_US);
         }
 
+        // Detect a notify that races with the sleep transition without turning
+        // every earlier notify in this loop iteration into a zero-sleep spin.
+        uint32_t const NOTIFY_SEQ_BEFORE_SLEEP = s_wki_timer_notify_seq.load(std::memory_order_acquire);
+        s_wki_timer_sleep_armed.store(true, std::memory_order_release);
+        if (s_wki_timer_notify_seq.load(std::memory_order_acquire) != NOTIFY_SEQ_BEFORE_SLEEP) {
+            s_wki_timer_sleep_armed.store(false, std::memory_order_release);
+            continue;
+        }
+
         mod::sched::kern_sleep_us(std::max<uint64_t>(sleep_us, 1));
+        s_wki_timer_sleep_armed.store(false, std::memory_order_release);
     }
 }
 
@@ -1072,6 +1102,7 @@ void wki_timer_thread_start() {
         log::error("Failed to create WKI timer kernel thread");
         return;
     }
+    promote_latency_sensitive_daemon(task);
     s_wki_timer_task = task;
     mod::sched::post_task_balanced(task);
     log::info("Timer kernel thread started (PID %d)", task->pid);

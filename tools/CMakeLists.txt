@@ -12,6 +12,7 @@ unset(ENV{LDFLAGS})
 # Resolve workspace root and path entries to remove from host compiler discovery.
 get_filename_component(WOS_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/sysroot/bin")
+set(WOS_HOST_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/host/bin")
 set(WOS_HOST_TOOLS_BIN "${WOS_WORKSPACE_ROOT}/tools/build/bin")
 
 # Reconstruct a clean host PATH so find_program() does not pick the target compiler
@@ -27,6 +28,7 @@ set(_wos_clean_path_entries "")
 foreach(_entry IN LISTS _wos_path_entries)
     if(NOT _entry STREQUAL ""
        AND NOT _entry STREQUAL "${WOS_TARGET_TOOLCHAIN_BIN}"
+       AND NOT _entry STREQUAL "${WOS_HOST_TOOLCHAIN_BIN}"
        AND NOT _entry STREQUAL "${WOS_HOST_TOOLS_BIN}")
         list(APPEND _wos_clean_path_entries "${_entry}")
     endif()
@@ -37,17 +39,34 @@ if(_wos_clean_path_entries)
     set(ENV{PATH} "${_wos_clean_path}")
 endif()
 
-# Find host clang/clang++ from the cleaned PATH.
-find_program(CLANG_C_COMPILER clang)
-find_program(CLANG_CXX_COMPILER clang++)
+# Find a host clang/clang++ from the cleaned PATH first. The repo toolchain's
+# clang defaults to x86_64-pc-wos, so it needs explicit host flags if used.
+unset(CLANG_C_COMPILER CACHE)
+unset(CLANG_CXX_COMPILER CACHE)
+unset(CLANG_C_COMPILER)
+unset(CLANG_CXX_COMPILER)
+find_program(CLANG_C_COMPILER NAMES clang PATHS ${_wos_clean_path_entries} NO_DEFAULT_PATH)
+find_program(CLANG_CXX_COMPILER NAMES clang++ PATHS ${_wos_clean_path_entries} NO_DEFAULT_PATH)
 
+set(WOS_HOST_CMAKE_EXTRA_FLAGS "")
 if(NOT CLANG_C_COMPILER OR NOT CLANG_CXX_COMPILER)
+    set(CLANG_C_COMPILER "${WOS_HOST_TOOLCHAIN_BIN}/clang")
+    set(CLANG_CXX_COMPILER "${WOS_HOST_TOOLCHAIN_BIN}/clang++")
+    set(WOS_HOST_CMAKE_EXTRA_FLAGS "--target=x86_64-pc-linux-gnu --sysroot=/")
+endif()
+
+if(NOT EXISTS "${CLANG_C_COMPILER}" OR NOT EXISTS "${CLANG_CXX_COMPILER}")
     message(FATAL_ERROR "clang and clang++ must be installed to build tools")
 endif()
 
 # Set Clang as the compiler using paths from find_program()
 set(CMAKE_C_COMPILER ${CLANG_C_COMPILER} CACHE FILEPATH "C compiler" FORCE)
 set(CMAKE_CXX_COMPILER ${CLANG_CXX_COMPILER} CACHE FILEPATH "C++ compiler" FORCE)
+if(WOS_HOST_CMAKE_EXTRA_FLAGS)
+    set(CMAKE_C_FLAGS "${WOS_HOST_CMAKE_EXTRA_FLAGS}" CACHE STRING "Host tool C flags" FORCE)
+    set(CMAKE_CXX_FLAGS "${WOS_HOST_CMAKE_EXTRA_FLAGS}" CACHE STRING "Host tool C++ flags" FORCE)
+    set(CMAKE_EXE_LINKER_FLAGS "${WOS_HOST_CMAKE_EXTRA_FLAGS}" CACHE STRING "Host tool linker flags" FORCE)
+endif()
 
 project(wos_tools
     VERSION 1.0
@@ -79,4 +98,3 @@ foreach(SUBDIR ${SUBDIRS})
         endif()
     endif()
 endforeach()
-

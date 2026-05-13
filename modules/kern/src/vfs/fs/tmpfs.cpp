@@ -376,7 +376,7 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
 
 auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {
-        return -1;
+        return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
     if (offset >= n->size) {
@@ -390,7 +390,7 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 
 auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {
-        return -1;
+        return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
     size_t const NEED = offset + count;
@@ -444,7 +444,7 @@ auto tmpfs_fops_close(ker::vfs::File* f) -> int {
 
 auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
     if (f == nullptr) {
-        return -1;
+        return -EBADF;
     }
 
     size_t const FILE_SIZE = tmpfs_get_size(f);
@@ -461,11 +461,11 @@ auto tmpfs_fops_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             newpos = static_cast<off_t>(FILE_SIZE) + offset;
             break;
         default:
-            return -1;
+            return -EINVAL;
     }
 
     if (newpos < 0) {
-        return -1;
+        return -EINVAL;
     }
     f->pos = newpos;
     return f->pos;
@@ -478,14 +478,17 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool {
 
 namespace {
 auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
-    if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
-        return -1;
+    if (entry == nullptr) {
+        return -EINVAL;
+    }
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EBADF;
     }
 
     auto* n = static_cast<TmpNode*>(f->private_data);
 
     if (n->type != TmpNodeType::DIRECTORY) {
-        return -1;
+        return -ENOTDIR;
     }
 
     // Indices 0 and 1 are synthetic "." and ".." entries
@@ -520,12 +523,12 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
     size_t const CHILD_INDEX = index - 2;
 
     if (CHILD_INDEX >= n->children_count) {
-        return -1;
+        return -ENOENT;
     }
 
     TmpNode* child = n->children[CHILD_INDEX];
     if (child == nullptr) {
-        return -1;
+        return -ENOENT;
     }
 
     entry->d_ino = reinterpret_cast<uint64_t>(child);
@@ -558,12 +561,15 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
 }
 
 auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr || buf == nullptr || bufsize == 0) {
-        return -1;
+    if (buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
     if (n->type != TmpNodeType::SYMLINK || n->symlink_target == nullptr) {
-        return -1;
+        return -EINVAL;
     }
     size_t len = 0;
     while (n->symlink_target[len] != '\0') {
@@ -578,7 +584,7 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 
 auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     if (f == nullptr || f->private_data == nullptr) {
-        return -1;
+        return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
     if (n->type != TmpNodeType::FILE) {

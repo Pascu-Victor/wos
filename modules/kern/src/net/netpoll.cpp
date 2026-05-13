@@ -22,11 +22,35 @@ namespace ker::net {
 
 using log = ker::mod::dbg::logger<"netpoll">;
 
+extern "C" char __kernel_text_start[];  // NOLINT(readability-identifier-naming)
+extern "C" char __kernel_text_end[];    // NOLINT(readability-identifier-naming)
+
 namespace {
 
+constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 10'000'000;
+constexpr int NET_LATENCY_DAEMON_NICE = 0;
+constexpr size_t NAPI_INLINE_REGISTRY_CAPACITY = 64;
+constexpr size_t NAPI_POLL_SNAPSHOT_CAPACITY = 64;
+
 // Registry of all NAPI structures for worker thread lookup
-ker::util::SmallVec<NapiStruct*, 4> g_napi_registry;
+ker::util::SmallVec<NapiStruct*, NAPI_INLINE_REGISTRY_CAPACITY> g_napi_registry;
 ker::mod::sys::Spinlock g_registry_lock;
+
+void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = NET_LATENCY_DAEMON_SLICE_NS;
+    ker::mod::sched::set_task_nice(task, NET_LATENCY_DAEMON_NICE);
+}
+
+auto poll_fn_is_valid(NapiPollFn poll) -> bool {
+    auto const ADDR = reinterpret_cast<uintptr_t>(poll);
+    auto const TEXT_START = reinterpret_cast<uintptr_t>(__kernel_text_start);
+    auto const TEXT_END = reinterpret_cast<uintptr_t>(__kernel_text_end);
+    return ADDR >= TEXT_START && ADDR < TEXT_END;
+}
 
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
@@ -40,12 +64,17 @@ auto find_napi_for_current_task() -> NapiStruct* {
 }
 
 // Register a NapiStruct in the global registry
-void register_napi(NapiStruct* napi) {
+auto register_napi(NapiStruct* napi) -> bool {
     g_registry_lock.lock();
-    static_cast<void>(g_napi_registry.push_back(napi));
+    bool const INSERTED = g_napi_registry.push_back(napi);
     g_registry_lock.unlock();
+    if (!INSERTED) {
+        log::critical("failed to register NAPI context for %s", napi->dev != nullptr ? napi->dev->name.data() : "?");
+        return false;
+    }
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
                                           static_cast<int64_t>(g_napi_registry.size()), 0, 0);
+    return true;
 }
 
 // Unregister a NapiStruct from the global registry
@@ -92,6 +121,15 @@ void unregister_napi(NapiStruct* napi) {
 
         // Poll while work remains.
         for (;;) {
+            if (!poll_fn_is_valid(napi->poll)) {
+                log::critical("invalid NAPI poll function for %s: poll=0x%lx napi=%p", napi->dev != nullptr ? napi->dev->name.data() : "?",
+                              reinterpret_cast<uintptr_t>(napi->poll), napi);
+                napi->state.store(NapiState::DISABLED, std::memory_order_release);
+                napi->has_work.store(false, std::memory_order_release);
+                for (;;) {
+                    asm volatile("hlt");
+                }
+            }
             int const PROCESSED = napi->poll(napi, napi->weight);
             napi->poll_count++;
 
@@ -143,11 +181,10 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
 }
 
 void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
-    // Set direct pointer for lock-free inline poll lookup
-    napi->dev->napi = napi;
-
     // Register in global registry first (so worker can find it)
-    register_napi(napi);
+    if (!register_napi(napi)) {
+        return;
+    }
 
     // Build thread name: "netpoll_eth0"
     std::array<char, 32> name{};
@@ -168,6 +205,8 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
         unregister_napi(napi);
         return;
     }
+
+    promote_latency_sensitive_daemon(napi->worker);
 
     // Schedule the worker thread - place on the preferred CPU
     if (cpu_affinity != UINT64_MAX) {
@@ -211,9 +250,6 @@ void napi_disable(NapiStruct* napi) {
     // Unregister from global registry
     unregister_napi(napi);
 
-    // Clear direct pointer
-    napi->dev->napi = nullptr;
-
     log::debug("disabled for %s", napi->dev->name.data());
 }
 
@@ -254,13 +290,9 @@ void napi_complete(NapiStruct* napi) {
     // Driver should re-enable device interrupts after calling this
 }
 
-auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
-    if (dev == nullptr) {
-        return 0;
-    }
+namespace {
 
-    // Lock-free lookup via direct dev->napi pointer (set by napi_enable)
-    NapiStruct* napi = dev->napi;
+auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
     if (napi == nullptr) {
         return 0;
     }
@@ -284,6 +316,13 @@ auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.
     int const EFFECTIVE_BUDGET = budget > 0 ? budget : napi->weight;
+    if (!poll_fn_is_valid(napi->poll)) {
+        log::critical("invalid inline NAPI poll function for %s: poll=0x%lx napi=%p", napi->dev != nullptr ? napi->dev->name.data() : "?",
+                      reinterpret_cast<uintptr_t>(napi->poll), napi);
+        napi->state.store(NapiState::DISABLED, std::memory_order_release);
+        napi->has_work.store(false, std::memory_order_release);
+        return 0;
+    }
     int const PROCESSED = napi->poll(napi, EFFECTIVE_BUDGET);
     napi->poll_count++;
 
@@ -311,16 +350,16 @@ auto napi_poll_inline_budget(NetDevice* dev, int budget) -> int {
     return PROCESSED;
 }
 
-auto napi_poll_inline(NetDevice* dev) -> int { return napi_poll_inline_budget(dev, 0); }
+}  // namespace
 
 auto napi_poll_all_pending() -> int {
     int total = 0;
     // Snapshot count under lock to avoid tearing, then poll without the lock
-    // (napi_poll_inline_budget is safe to call without the registry lock).
+    // (per-NAPI inline polling is safe to call without the registry lock).
     g_registry_lock.lock();
     size_t count = g_napi_registry.size();
-    std::array<NapiStruct*, 16> snapshot{};
-    count = std::min<size_t>(count, 16);
+    std::array<NapiStruct*, NAPI_POLL_SNAPSHOT_CAPACITY> snapshot{};
+    count = std::min<size_t>(count, snapshot.size());
     for (size_t i = 0; i < count; ++i) {
         snapshot.at(i) = g_napi_registry.at(i);
     }
@@ -328,7 +367,7 @@ auto napi_poll_all_pending() -> int {
 
     for (size_t i = 0; i < count; ++i) {
         if (auto* napi = snapshot.at(i); napi != nullptr && napi->dev != nullptr) {
-            total += napi_poll_inline_budget(napi->dev, NAPI_DEFAULT_WEIGHT);
+            total += napi_poll_struct_inline_budget(napi, NAPI_DEFAULT_WEIGHT);
         }
     }
     return total;

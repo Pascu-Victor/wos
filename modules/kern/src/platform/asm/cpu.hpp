@@ -23,6 +23,7 @@ constexpr uint64_t GATE_IF_MASK = 0x200;
 // Safe CPU ID getter - falls back to APIC ID during early boot before per-CPU
 // structures are initialized. Call notifyPerCpuReady() to enable the fast path.
 auto get_current_cpu_id_safe() -> uint64_t;
+auto is_per_cpu_ready() -> bool;
 void notify_per_cpu_ready();
 
 struct GPRegs {
@@ -52,8 +53,9 @@ struct PerCpu {
     uint64_t saved_es;           // 0x20 - saved ES segment
     uint64_t syscall_ret_rip;    // 0x28 - RCX at syscall entry (return RIP)
     uint64_t syscall_ret_flags;  // 0x30 - R11 at syscall entry (RFLAGS)
+    uint64_t syscall_entry_tmp;  // 0x38 - scratch before syscall stack switch
 } __attribute__((packed));       // NOLINT(cppcoreguidelines-pro-type-member-init): accessed by fixed GS offsets in asm.
-static_assert(sizeof(PerCpu) == 56, "PerCpu syscall/interrupt ABI size changed");  // NOLINT
+static_assert(sizeof(PerCpu) == 64, "PerCpu syscall/interrupt ABI size changed");  // NOLINT
 
 static ALWAYS_INLINE auto rdfsbase() -> uint64_t {
     // Written by inline asm output constraints.

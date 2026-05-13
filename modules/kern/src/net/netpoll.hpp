@@ -64,15 +64,6 @@ bool napi_schedule(NapiStruct* napi);
 // Driver should re-enable device interrupts after calling this
 void napi_complete(NapiStruct* napi);
 
-// Inline poll - called from spin-wait context to drain pending packets without
-// relying on the NAPI worker thread.  Returns number of packets processed (0 if
-// the device was already being polled or no work was pending).
-int napi_poll_inline(NetDevice* dev);
-
-// Bounded inline poll for IRQ fast paths: same semantics as napi_poll_inline(),
-// but caps the work done in interrupt/spin-wait context.
-int napi_poll_inline_budget(NetDevice* dev, int budget);
-
 // Drain all registered NAPI devices inline.  Call this after kern_yield() in
 // blocking kernel paths (tcp_send, tcp_recv) so incoming ACKs/data are
 // processed immediately instead of waiting for the next timer tick.

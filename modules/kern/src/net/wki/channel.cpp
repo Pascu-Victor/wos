@@ -152,6 +152,8 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->bytes_sent = 0;
     ch->bytes_received = 0;
     ch->retransmits = 0;
+    ch->perf_last_stall_report_us = 0;
+    ch->perf_last_stall_status = 0;
 
     // Restore default credits
     ch->tx_credits = wki_channel_default_credits(ch->channel_id);

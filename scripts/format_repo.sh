@@ -32,6 +32,7 @@ Defaults:
 Examples:
   ./scripts/format_repo.sh
   ./scripts/format_repo.sh modules/kern
+  ./scripts/format_repo.sh tools/wosdbg
   ./scripts/format_repo.sh --check modules/kern/src/net/wki
   ./scripts/format_repo.sh --tidy-fix modules/kern/src/net/wki
   ./scripts/format_repo.sh --format-only
@@ -179,6 +180,31 @@ FIND_ARGS=(
     ")"
 )
 
+fix_static_nodiscard_order() {
+    local roots=("$@")
+    local files=()
+    local candidate
+
+    for root in "${roots[@]}"; do
+        if [ ! -e "$root" ]; then
+            continue
+        fi
+
+        while IFS= read -r -d '' candidate; do
+            if path_is_tidy_excluded "$candidate"; then
+                continue
+            fi
+            files+=("$candidate")
+        done < <(find "$root" "${FIND_ARGS[@]}" -print0)
+    done
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        return
+    fi
+
+    perl -0pi -e 's/\bstatic\s+\[\[nodiscard\]\]/[[nodiscard]] static/g' "${files[@]}"
+}
+
 CLANG_FORMAT_ARGS=(--style=file)
 if [ "$FORMAT_MODE" = "format" ]; then
     CLANG_FORMAT_ARGS=(-i "${CLANG_FORMAT_ARGS[@]}")
@@ -226,69 +252,121 @@ if [ "$RUN_TIDY" -eq 1 ]; then
         fi
     fi
 
-    COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
-    if [ ! -f "$COMPILE_COMMANDS" ]; then
-        echo "error: missing compilation database: $COMPILE_COMMANDS" >&2
-        echo "hint: configure/build the repo first so clang-tidy can resolve compile flags" >&2
-        exit 1
-    fi
-
     if ! command -v jq >/dev/null 2>&1; then
         echo "error: jq is required to filter compile_commands.json for clang-tidy" >&2
         exit 1
     fi
 
-    TIDY_FILES=()
-    while IFS= read -r file; do
-        case "$file" in
-            "$WOS_ROOT"/modules/extern/*|"$WOS_ROOT"/toolchain/*)
-                continue
-                ;;
-            *.c|*.cc|*.cpp|*.cxx)
-                ;;
-            *)
-                continue
-                ;;
-        esac
+    COMPILE_DATABASE_DIRS=()
+    add_compile_database_dir() {
+        local compile_database_dir
+        compile_database_dir="$(resolve_path "$1")"
 
-        if path_is_excluded "$file"; then
-            continue
+        if [ ! -f "$compile_database_dir/compile_commands.json" ]; then
+            return
         fi
 
-        if path_is_in_targets "$file"; then
-            TIDY_FILES+=("$file")
-        fi
-    done < <(jq -r '.[].file' "$COMPILE_COMMANDS" | sort -u)
+        for existing in "${COMPILE_DATABASE_DIRS[@]}"; do
+            if [ "$existing" = "$compile_database_dir" ]; then
+                return
+            fi
+        done
 
-    if [ "${#TIDY_FILES[@]}" -eq 0 ]; then
+        COMPILE_DATABASE_DIRS+=("$compile_database_dir")
+    }
+
+    add_compile_database_dir "$BUILD_DIR"
+    add_compile_database_dir "$BUILD_DIR/tools"
+
+    if [ "${#COMPILE_DATABASE_DIRS[@]}" -eq 0 ]; then
+        echo "error: missing compilation database: $BUILD_DIR/compile_commands.json" >&2
+        echo "hint: configure/build the repo first so clang-tidy can resolve compile flags" >&2
+        exit 1
+    fi
+
+    TIDY_ENTRIES=()
+    declare -A SEEN_TIDY_FILES=()
+    for compile_database_dir in "${COMPILE_DATABASE_DIRS[@]}"; do
+        compile_commands="$compile_database_dir/compile_commands.json"
+        while IFS= read -r file; do
+            case "$file" in
+                "$WOS_ROOT"/modules/extern/*|"$WOS_ROOT"/toolchain/*)
+                    continue
+                    ;;
+                *.c|*.cc|*.cpp|*.cxx)
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+
+            if path_is_excluded "$file"; then
+                continue
+            fi
+
+            if path_is_in_targets "$file" && [ -z "${SEEN_TIDY_FILES[$file]:-}" ]; then
+                TIDY_ENTRIES+=("$compile_database_dir:$file")
+                SEEN_TIDY_FILES["$file"]=1
+            fi
+        done < <(jq -r '.[].file' "$compile_commands" | sort -u)
+    done
+
+    if [ "${#TIDY_ENTRIES[@]}" -eq 0 ]; then
         echo "No clang-tidy compilation units matched the selected paths."
         exit 0
     fi
 
-    TIDY_ARGS=(
-        -p "$BUILD_DIR"
+    TIDY_BASE_ARGS=(
         -quiet
         --use-color
-        --header-filter="^$WOS_ROOT/modules/.*"
-        --exclude-header-filter="^($WOS_ROOT/modules/extern/.*|$WOS_ROOT/toolchain/.*|$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread\\.hpp|$WOS_ROOT/modules/testprog/src/mandelbench/tinycthread\\.cpp)"
+    )
+
+    TIDY_WOS_ARGS=(
         --extra-arg=-D_GLIBCXX_HOSTED
         --extra-arg=-D_DEFAULT_SOURCE
         --extra-arg=-D__WOS__=1
         --extra-arg=-D_GNU_SOURCE=1
     )
+
+    TIDY_FIXUP_ROOTS=()
+    collect_tidy_fixup_roots() {
+        TIDY_FIXUP_ROOTS=("${TARGETS[@]}")
+        for entry in "${TIDY_ENTRIES[@]}"; do
+            file="${entry#*:}"
+            TIDY_FIXUP_ROOTS+=("$(dirname "$file")")
+        done
+    }
+
+    TIDY_CHECK_ARGS=()
     if [ "$TIDY_FIX" -eq 1 ]; then
-        TIDY_ARGS+=(-fix --checks=-portability-avoid-pragma-once)
-        echo "Running clang-tidy with fixes on ${#TIDY_FILES[@]} files..."
+        if ! command -v perl >/dev/null 2>&1; then
+            echo "error: perl is required to normalize clang-tidy static/nodiscard fixes" >&2
+            exit 1
+        fi
+        collect_tidy_fixup_roots
+        fix_static_nodiscard_order "${TIDY_FIXUP_ROOTS[@]}"
+        TIDY_CHECK_ARGS=(-fix)
+        echo "Running clang-tidy with fixes on ${#TIDY_ENTRIES[@]} files..."
     else
-        TIDY_ARGS+=(--checks=-portability-avoid-pragma-once)
-        echo "Running clang-tidy on ${#TIDY_FILES[@]} files..."
+        echo "Running clang-tidy on ${#TIDY_ENTRIES[@]} files..."
     fi
 
     if [ "${TIDY_RUNNER[0]}" != "clang-tidy" ]; then
         echo "Using clang-tidy-cache wrapper."
     fi
 
-    for file in "${TIDY_FILES[@]}"; do
+    for entry in "${TIDY_ENTRIES[@]}"; do
+        compile_database_dir="${entry%%:*}"
+        file="${entry#*:}"
+
+        TIDY_ARGS=(-p "$compile_database_dir" "${TIDY_BASE_ARGS[@]}")
+        case "$file" in
+            "$WOS_ROOT"/modules/*)
+                TIDY_ARGS+=("${TIDY_WOS_ARGS[@]}")
+                ;;
+        esac
+        TIDY_ARGS+=("${TIDY_CHECK_ARGS[@]}")
+
         echo "clang-tidy: $file"
         if [ "${TIDY_RUNNER[0]}" != "clang-tidy" ]; then
             CLANG_TIDY_CACHE_BINARY="$TIDY_BINARY" "${TIDY_RUNNER[@]}" "${TIDY_ARGS[@]}" "$file"
@@ -296,5 +374,8 @@ if [ "$RUN_TIDY" -eq 1 ]; then
             "${TIDY_RUNNER[@]}" "${TIDY_ARGS[@]}" "$file"
         fi
     done
+    if [ "$TIDY_FIX" -eq 1 ]; then
+        fix_static_nodiscard_order "${TIDY_FIXUP_ROOTS[@]}"
+    fi
     echo "clang-tidy completed successfully."
 fi

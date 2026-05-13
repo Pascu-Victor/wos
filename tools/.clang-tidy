@@ -1,0 +1,11 @@
+---
+# Clang-Tidy configuration for host-side tools.
+
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-*,
+  -misc-non-private-member-variables-in-classes,
+  -readability-implicit-bool-conversion,
+  -readability-magic-numbers,
+  -readability-redundant-access-specifiers
+...

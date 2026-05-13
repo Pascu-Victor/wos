@@ -136,6 +136,8 @@ rootfs_stage_manifest() {
 }
 
 rootfs_stage_etc() {
+    local tz_source=""
+
     mkdir -p "$ROOTFS_STAGING/etc/dropbear"
 
     cat > "$ROOTFS_STAGING/etc/passwd" <<'EOF'
@@ -148,13 +150,9 @@ EOF
 
     cat > "$ROOTFS_STAGING/etc/profile" <<'EOF'
 export USER="${USER:-root}"
-if ! read -r HOSTNAME < /etc/hostname 2>/dev/null || [ -z "$HOSTNAME" ]; then
-    HOSTNAME="wos"
-fi
-export HOSTNAME
+export HOSTNAME="${HOSTNAME:-wos}"
 export HOME="${HOME:-/root}"
 export PS1="$USER@$HOSTNAME:\w\$ "
-export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
 export ENV="/etc/profile"
 EOF
 
@@ -170,6 +168,16 @@ EOF
         printf '%s' "${WOS_HOSTNAME:-wos}" > "$ROOTFS_STAGING/etc/hostname"
     else
         printf '%s' "wos" > "$ROOTFS_STAGING/etc/hostname"
+    fi
+
+    if [ -f "/usr/share/zoneinfo/Etc/UTC" ]; then
+        tz_source="/usr/share/zoneinfo/Etc/UTC"
+    elif [ -f "/usr/share/zoneinfo/UTC" ]; then
+        tz_source="/usr/share/zoneinfo/UTC"
+    fi
+
+    if [ -n "$tz_source" ]; then
+        rootfs_copy_entry "$tz_source" "/etc/localtime"
     fi
 }
 

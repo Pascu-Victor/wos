@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <net/address.hpp>
+#include <net/backlog.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
@@ -80,6 +81,26 @@ auto region_find(uint32_t rkey) -> RoceRegion* {
     return nullptr;
 }
 
+auto next_temp_rkey() -> uint32_t {
+    // Keep temp response rkeys below 0x00010000 so they stay disjoint from
+    // zone doorbell values (node_id<<16 | counter, minimum 0x00010001).
+    // Always allocate a fresh key when recycling a slot so late RDMA_WRITE /
+    // DOORBELL packets from an older read cannot target a newly registered
+    // response buffer.
+    for (size_t attempts = 0; attempts < 0xFFFF; ++attempts) {
+        uint32_t candidate = s_next_rkey;
+        s_next_rkey++;
+        if (s_next_rkey == 0 || s_next_rkey >= 0x00010000U) {
+            s_next_rkey = 1;
+        }
+
+        if (region_find(candidate) == nullptr) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
 // -----------------------------------------------------------------------------
 // Raw Ethernet TX helper - sends a RoCE frame (EtherType 0x88B8)
 // -----------------------------------------------------------------------------
@@ -87,7 +108,7 @@ auto region_find(uint32_t rkey) -> RoceRegion* {
 auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
     auto* netdev = wki_eth_get_netdev();
     if (netdev == nullptr) {
-        return -1;
+        return WKI_ERR_NO_ROUTE;
     }
 
     // Resolve destination MAC from peer
@@ -96,18 +117,18 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
     if (peer != nullptr) {
         dst_mac = peer->mac;
     } else {
-        return -1;  // unknown peer MAC
+        return WKI_ERR_NO_ROUTE;  // unknown peer MAC
     }
 
     PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
-        return -1;
+        return WKI_ERR_NO_MEM;
     }
 
     uint32_t const TOTAL = sizeof(RoceHeader) + payload_len;
     if (TOTAL > PKT_BUF_SIZE - PKT_HEADROOM - proto::ETH_HLEN) {
         pkt_free(pkt);
-        return -1;
+        return WKI_ERR_INVALID;
     }
 
     memcpy(pkt->data, &hdr, sizeof(RoceHeader));
@@ -117,7 +138,8 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
     pkt->len = static_cast<uint16_t>(TOTAL);
     pkt->dev = netdev;
 
-    return proto::eth_tx(netdev, pkt, dst_mac, WKI_ETHERTYPE_ROCE);
+    int const RET = proto::eth_tx(netdev, pkt, dst_mac, WKI_ETHERTYPE_ROCE);
+    return (RET == 0) ? WKI_OK : WKI_ERR_TX_FAILED;
 }
 
 // -----------------------------------------------------------------------------
@@ -127,12 +149,12 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
 int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32_t size, uint32_t* rkey) {
     for (auto& r : s_regions) {
         if (!r.active) {
-            r.active = true;
-            // Reuse the existing rkey if the slot had one before (avoids
-            // burning through the rkey counter on repeated temp registrations).
-            if (r.rkey == 0) {
-                r.rkey = s_next_rkey++;
+            uint32_t const NEW_RKEY = next_temp_rkey();
+            if (NEW_RKEY == 0) {
+                return WKI_ERR_NO_MEM;
             }
+            r.active = true;
+            r.rkey = NEW_RKEY;
             // Convert physical address to HHDM virtual address
             // In wOS, phys_to_virt is simple offset addition via HHDM
             r.vaddr = reinterpret_cast<void*>(phys_addr);  // zone passes vaddr as phys_addr for non-ivshmem
@@ -141,7 +163,7 @@ int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32
             return 0;
         }
     }
-    return -1;  // no free slots
+    return WKI_ERR_NO_MEM;  // no free slots
 }
 
 int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf,
@@ -185,7 +207,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
     uint32_t local_rkey = 0;
     int const REG_RET = roce_rdma_register_region(&s_roce_transport, reinterpret_cast<uint64_t>(local_buf), len, &local_rkey);
     if (REG_RET != 0) {
-        return -1;
+        return REG_RET;
     }
 
     RoceHeader hdr = {};
@@ -219,7 +241,8 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
         // Drive NIC RX so the RDMA_WRITE + DOORBELL response can be processed.
         NetDevice* net_dev = wki_eth_get_netdev();
         if (net_dev != nullptr) {
-            napi_poll_inline(net_dev);
+            napi_poll_all_pending();
+            backlog_drain_all_pending_inline();
         }
         asm volatile("pause" ::: "memory");
     }
@@ -228,7 +251,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
     auto* cleanup_reg = region_find(local_rkey);
     if (cleanup_reg != nullptr && cleanup_reg->active) {
         cleanup_reg->active = false;
-        return -1;  // timeout
+        return WKI_ERR_TIMEOUT;  // timeout
     }
 
     return 0;

@@ -21,22 +21,23 @@ class CoredumpRegisterPanel : public QDockWidget {
     explicit CoredumpRegisterPanel(QWidget* parent = nullptr);
 
     // Load register data from a parsed coredump
-    void loadCoreDump(const wosdbg::CoreDump& dump, const std::vector<wosdbg::SymbolTable*>& symTables = {},
-                      const std::vector<wosdbg::SectionMap*>& sectionMaps = {});
+    void load_core_dump(const wosdbg::CoreDump& dump, const std::vector<wosdbg::SymbolTable*>& sym_tables = {},
+                        const std::vector<wosdbg::SectionMap*>& section_maps = {});
 
     // Clear all data
     void clear();
 
    signals:
     // Emitted when user clicks an address value (e.g. RIP) to navigate
-    void addressClicked(uint64_t addr);
+    void address_clicked(uint64_t addr);
 
    private:
-    void setupUI();
-    void populateFrameTable(QTableWidget* table, const wosdbg::CoreDump& dump, bool isTrap,
-                            const std::vector<wosdbg::SymbolTable*>& symTables, const std::vector<wosdbg::SectionMap*>& sectionMaps);
+    void setup_ui();
+    static void populate_frame_table(QTableWidget* table, const wosdbg::CoreDump& dump, bool is_trap,
+                                     const std::vector<wosdbg::SymbolTable*>& sym_tables,
+                                     const std::vector<wosdbg::SectionMap*>& section_maps);
 
-    QTableWidget* headerTable_;  // PID, CPU, interrupt, CR2, CR3, timestamp
-    QTableWidget* trapTable_;    // Trap frame + regs
-    QTableWidget* savedTable_;   // Saved frame + regs
+    QTableWidget* header_table;  // PID, CPU, interrupt, CR2, CR3, timestamp
+    QTableWidget* trap_table;    // Trap frame + regs
+    QTableWidget* saved_table;   // Saved frame + regs
 };

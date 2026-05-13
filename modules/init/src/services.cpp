@@ -14,6 +14,7 @@
 #include <ctime>
 #include <span>
 
+#include "env.h"
 #include "sys/multiproc.h"
 
 namespace {
@@ -103,8 +104,8 @@ void start_journald() {
 
     init_log::info("init[%llu]: spawning journald", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> argv = {"/sbin/journald", nullptr};
-    std::array<const char*, 1> envp = {nullptr};
-    uint64_t const PID = ker::process::exec("/sbin/journald", argv.data(), envp.data());
+    InitEnv env = make_init_env();
+    uint64_t const PID = ker::process::exec("/sbin/journald", argv.data(), env.envp.data());
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn journald", static_cast<unsigned long long>(CPUNO));
     } else {
@@ -123,8 +124,8 @@ void start_httpd() {
 
     init_log::info("init[%llu]: spawning httpd (HTTP server on port 80)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> httpd_argv = {"/sbin/httpd", nullptr};
-    std::array<const char*, 1> httpd_envp = {nullptr};
-    uint64_t const HTTPD_PID = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_envp.data());
+    InitEnv httpd_env = make_init_env();
+    uint64_t const HTTPD_PID = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_env.envp.data());
     if (HTTPD_PID == 0) {
         init_log::error("init[%llu]: failed to spawn httpd", static_cast<unsigned long long>(CPUNO));
     } else {
@@ -150,8 +151,8 @@ void start_dropbear() {
         init_log::info("init[%llu]: generating dropbear RSA host key...", static_cast<unsigned long long>(CPUNO));
         const std::array<const char*, 6> KEYGEN_ARGV = {
             "/bin/dropbearkey", "-t", "rsa", "-f", "/etc/dropbear/dropbear_rsa_host_key", nullptr};
-        const std::array<const char*, 1> KEYGEN_ENVP = {nullptr};
-        uint64_t const KEYGEN_PID = spawn_with_journal_stdio("/bin/dropbearkey", KEYGEN_ARGV, KEYGEN_ENVP, "sshd");
+        InitEnv keygen_env = make_init_env();
+        uint64_t const KEYGEN_PID = spawn_with_journal_stdio("/bin/dropbearkey", KEYGEN_ARGV, keygen_env.envp, "sshd");
         if (KEYGEN_PID == 0) {
             init_log::error("init[%llu]: failed to spawn dropbearkey", static_cast<unsigned long long>(CPUNO));
         } else {
@@ -166,8 +167,8 @@ void start_dropbear() {
     const std::array<const char*, 5> DROPBEAR_ARGV = {"/bin/dropbear", "-r", "/etc/dropbear/dropbear_rsa_host_key",
                                                       "-F",  // foreground, don't fork
                                                       nullptr};
-    const std::array<const char*, 1> DROPBEAR_ENVP = {nullptr};
-    uint64_t const DROPBEAR_PID = spawn_with_journal_stdio("/bin/dropbear", DROPBEAR_ARGV, DROPBEAR_ENVP, "sshd");
+    InitEnv dropbear_env = make_init_env();
+    uint64_t const DROPBEAR_PID = spawn_with_journal_stdio("/bin/dropbear", DROPBEAR_ARGV, dropbear_env.envp, "sshd");
     if (DROPBEAR_PID == 0) {
         init_log::error("init[%llu]: failed to spawn dropbear", static_cast<unsigned long long>(CPUNO));
     } else {
@@ -199,8 +200,8 @@ void start_testd() {
 
     init_log::info("init[%llu]: spawning testd (kernel test daemon)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> argv = {"/usr/bin/testd", nullptr};
-    std::array<const char*, 1> envp = {nullptr};
-    uint64_t const PID = ker::process::exec("/usr/bin/testd", argv.data(), envp.data());
+    InitEnv env = make_init_env();
+    uint64_t const PID = ker::process::exec("/usr/bin/testd", argv.data(), env.envp.data());
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn testd", static_cast<unsigned long long>(CPUNO));
     } else {

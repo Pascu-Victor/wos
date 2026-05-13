@@ -9,6 +9,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
+#include <util/smallvec.hpp>
 
 #include "platform/sched/task.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -23,6 +24,7 @@
 #include "platform/mm/addr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/sched/threading.hpp"
 #include "util/hcf.hpp"
 namespace ker::mod::mm::virt {
 
@@ -119,6 +121,17 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
         return true;
     }
 #endif
+
+    // Lazy user-stack backing. This handles non-present faults in the
+    // reserved process stack range, including kernel-mode faults caused by
+    // syscall copy paths writing into a not-yet-backed user stack page.
+    if (PAGEFAULT.present == 0U && control_register < 0x0000800000000000ULL) {
+        auto* current_task = sched::get_current_task();
+        if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
+            sched::threading::handle_lazy_stack_fault(current_task->thread, current_task->pagemap, control_register, frame.rsp)) {
+            return true;
+        }
+    }
 
     // COW handling for write faults to user-space COW pages.
     // This covers both user-mode writes AND kernel-mode writes to user pages
@@ -695,6 +708,58 @@ auto frame_is_live_medium_alloc(uint64_t phys_addr) -> bool {
     return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC;
 }
 
+struct PageTableFrameSet {
+    util::SmallVec<uint64_t, 64> frames;
+    bool complete{true};
+
+    auto add(uint64_t phys_addr) -> bool {
+        phys_addr &= ~(paging::PAGE_SIZE - 1);
+        if (phys_addr == 0 || frames.contains(phys_addr)) {
+            return true;
+        }
+        if (!frames.push_back(phys_addr)) {
+            complete = false;
+            return false;
+        }
+        return true;
+    }
+
+    auto contains(PageTable* root, uint64_t phys_addr) const -> bool {
+        phys_addr &= ~(paging::PAGE_SIZE - 1);
+        if (frames.contains(phys_addr)) {
+            return true;
+        }
+        return !complete && page_table_tree_contains_frame(root, phys_addr);
+    }
+};
+
+void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames) {
+    if (table == nullptr || level < 1) {
+        return;
+    }
+
+    frames.add(reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(table))));
+
+    const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
+    for (size_t i = 0; i < MAX_ENTRY; ++i) {
+        const auto& entry = entry_at(table, i);
+        if (entry.present == 0) {
+            continue;
+        }
+
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0 || level <= 1 || entry.pagesize != 0 || frame_is_live_medium_alloc(PHYS_ADDR)) {
+            continue;
+        }
+
+        frames.add(PHYS_ADDR);
+        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR));
+        if (next_level != nullptr) {
+            collect_page_table_frames(next_level, level - 1, frames);
+        }
+    }
+}
+
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
 constexpr uint64_t WATCH_MMAP_VADDR = 0x00001000007da000ULL;
 
@@ -856,8 +921,8 @@ bool debug_log_user_phys_mappings(uint64_t target_phys, const char* trigger, uin
 
 namespace {
 
-void free_user_data_pages(PageTable* table, int level, PageTable* root, uint64_t vaddr_base = 0, uint64_t owner_pid = 0,
-                          const char* owner_name = nullptr, const char* reason = nullptr) {
+void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames, uint64_t vaddr_base = 0,
+                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -902,7 +967,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, uint64_t
                     continue;
                 }
                 auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-                free_user_data_pages(next_level, level - 1, root, ENTRY_VADDR, owner_pid, owner_name, reason);
+                free_user_data_pages(next_level, level - 1, root, page_table_frames, ENTRY_VADDR, owner_pid, owner_name, reason);
             }
         } else {
             // Level 1 (PML1) - entries point to actual data pages
@@ -913,7 +978,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, uint64_t
             // cleanup reaches the same frame, which turns into a page_free()
             // of a live kmalloc page. Keep page-table frames owned by the
             // page-table cleanup phase below.
-            if (!page_table_tree_contains_frame(root, PHYS_ADDR) && !frame_is_live_medium_alloc(PHYS_ADDR)) {
+            if (!page_table_frames.contains(root, PHYS_ADDR) && !frame_is_live_medium_alloc(PHYS_ADDR)) {
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
                     void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
@@ -1013,7 +1078,9 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     // reclamation separate from page-table-page reclamation so a user PTE that
     // aliases a page-table frame cannot free that frame before the page-table
     // walk reaches it.
-    free_user_data_pages(pagemap, 4, pagemap, 0, owner_pid, owner_name, reason);
+    PageTableFrameSet page_table_frames{};
+    collect_page_table_frames(pagemap, 4, page_table_frames);
+    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, 0, owner_pid, owner_name, reason);
     free_page_table_pages(pagemap, 4);
 
     // Invalidate TLB for this address space

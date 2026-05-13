@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <limits.h>  // NOLINT(modernize-deprecated-headers): this sysroot exposes PATH_MAX here.
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -534,6 +535,233 @@ TESTD_RUN(test_pipe_eof_on_writer_close) {
 }
 TESTD_RUN_END(test_pipe_eof_on_writer_close)
 
+TESTD_RUN(test_pipe_blocking_read_wake) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("pipe_blocking_create", "pipe failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("pipe_blocking_fork", "fork failed");
+        return;
+    }
+
+    constexpr char BYTE = 0x5A;
+    if (PID == 0) {
+        close(fds[0]);
+        usleep(50000);
+        ssize_t const NW = write(fds[1], &BYTE, 1);
+        close(fds[1]);
+        _exit(NW == 1 ? 0 : 1);
+    }
+
+    close(fds[1]);
+    char got = 0;
+    ssize_t const NR = read(fds[0], &got, 1);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(PID, &status, 0);
+    if (NR != 1 || got != BYTE || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("pipe_blocking_read_wake", "blocking read did not wake with byte");
+        return;
+    }
+    TESTD_PASS("pipe_blocking_read_wake");
+}
+TESTD_RUN_END(test_pipe_blocking_read_wake)
+
+TESTD_RUN(test_poll_pipe_timeout_and_wake) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("poll_pipe_create", "pipe failed");
+        return;
+    }
+
+    struct pollfd pfd{
+        .fd = fds[0],
+        .events = POLLIN,
+        .revents = 0,
+    };
+    if (poll(&pfd, 1, 1) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("poll_pipe_timeout", "empty pipe should time out");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("poll_pipe_fork", "fork failed");
+        return;
+    }
+
+    constexpr char BYTE = 'p';
+    if (PID == 0) {
+        close(fds[0]);
+        usleep(50000);
+        ssize_t const NW = write(fds[1], &BYTE, 1);
+        close(fds[1]);
+        _exit(NW == 1 ? 0 : 1);
+    }
+
+    close(fds[1]);
+    pfd.revents = 0;
+    int const READY = poll(&pfd, 1, 1000);
+    char got = 0;
+    ssize_t const NR = read(fds[0], &got, 1);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(PID, &status, 0);
+    if (READY != 1 || (pfd.revents & POLLIN) == 0 || NR != 1 || got != BYTE || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("poll_pipe_wake", "poll did not wake on pipe readable");
+        return;
+    }
+    TESTD_PASS("poll_pipe_timeout_and_wake");
+}
+TESTD_RUN_END(test_poll_pipe_timeout_and_wake)
+
+TESTD_RUN(test_epoll_pipe_timeout_and_wake) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("epoll_pipe_create", "pipe failed");
+        return;
+    }
+
+    int const EPFD = epoll_create1(0);
+    if (EPFD < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_create1", "epoll_create1 failed");
+        return;
+    }
+
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = fds[0];
+    if (epoll_ctl(EPFD, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+        close(EPFD);
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_ctl", "epoll_ctl failed");
+        return;
+    }
+
+    struct epoll_event out{};
+    if (epoll_wait(EPFD, &out, 1, 1) != 0) {
+        close(EPFD);
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_timeout", "empty pipe should time out");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(EPFD);
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_fork", "fork failed");
+        return;
+    }
+
+    constexpr char BYTE = 'e';
+    if (PID == 0) {
+        close(EPFD);
+        close(fds[0]);
+        usleep(50000);
+        ssize_t const NW = write(fds[1], &BYTE, 1);
+        close(fds[1]);
+        _exit(NW == 1 ? 0 : 1);
+    }
+
+    close(fds[1]);
+    int const READY = epoll_wait(EPFD, &out, 1, 1000);
+    char got = 0;
+    ssize_t const NR = read(fds[0], &got, 1);
+    close(EPFD);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(PID, &status, 0);
+    if (READY != 1 || out.data.fd != fds[0] || (out.events & EPOLLIN) == 0 || NR != 1 || got != BYTE || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        fail("epoll_pipe_wake", "epoll did not wake on pipe readable");
+        return;
+    }
+    TESTD_PASS("epoll_pipe_timeout_and_wake");
+}
+TESTD_RUN_END(test_epoll_pipe_timeout_and_wake)
+
+TESTD_RUN(test_pty_blocking_read_wake) {
+    int const MASTER_FD = open("/dev/ptmx", O_RDWR);
+    if (MASTER_FD < 0) {
+        fail("pty_blocking_open_master", "open /dev/ptmx failed");
+        return;
+    }
+
+    unsigned int pty_num = 0;
+    if (ioctl(MASTER_FD, TIOCGPTN, &pty_num) != 0) {
+        close(MASTER_FD);
+        fail("pty_blocking_tiocgptn", "TIOCGPTN failed");
+        return;
+    }
+
+    int unlock = 0;
+    if (ioctl(MASTER_FD, TIOCSPTLCK, &unlock) != 0) {
+        close(MASTER_FD);
+        fail("pty_blocking_unlock", "TIOCSPTLCK failed");
+        return;
+    }
+
+    std::array<char, 32> slave_path{};
+    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    int const SLAVE_FD = open(slave_path.data(), O_RDWR);
+    if (SLAVE_FD < 0) {
+        close(MASTER_FD);
+        fail("pty_blocking_open_slave", "open slave failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_blocking_fork", "fork failed");
+        return;
+    }
+
+    constexpr std::string_view MSG = "pty_block_ok\n";
+    if (PID == 0) {
+        close(MASTER_FD);
+        usleep(50000);
+        ssize_t const NW = write(SLAVE_FD, MSG.data(), MSG.size());
+        close(SLAVE_FD);
+        _exit(std::cmp_equal(NW, MSG.size()) ? 0 : 1);
+    }
+
+    close(SLAVE_FD);
+    std::array<char, 64> buf{};
+    ssize_t const NR = read(MASTER_FD, buf.data(), buf.size());
+    close(MASTER_FD);
+
+    int status = 0;
+    waitpid(PID, &status, 0);
+    if (std::cmp_not_equal(NR, MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != MSG || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        fail("pty_blocking_read_wake", "blocking PTY read did not wake with payload");
+        return;
+    }
+    TESTD_PASS("pty_blocking_read_wake");
+}
+TESTD_RUN_END(test_pty_blocking_read_wake)
+
 // ---------------------------------------------------------------------------
 // B4: Process management
 // ---------------------------------------------------------------------------
@@ -591,7 +819,7 @@ TESTD_RUN(test_fork_pipe_byte) {
     int read_errno = errno;
     close(fds[0]);
     int close_errno = errno;
-    int wait_ret = waitpid(PID, nullptr, 0);
+    pid_t wait_ret = waitpid(PID, nullptr, 0);
     int wait_errno = errno;
     if (nr != 1) {
         std::println("[TESTD] DBG fork_pipe_byte: nr={} read_errno={} b=0x{:x} close_errno={} wait_ret={} wait_errno={}", nr, read_errno,
@@ -1689,6 +1917,10 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_truncate)                            \
     X(test_pipe_basic)                          \
     X(test_pipe_eof_on_writer_close)            \
+    X(test_pipe_blocking_read_wake)             \
+    X(test_poll_pipe_timeout_and_wake)          \
+    X(test_epoll_pipe_timeout_and_wake)         \
+    X(test_pty_blocking_read_wake)              \
     X(test_getpid_getppid)                      \
     X(test_getcwd_chdir)                        \
     X(test_fork_exit)                           \

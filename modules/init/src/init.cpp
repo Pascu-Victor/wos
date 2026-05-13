@@ -8,6 +8,7 @@
 #include <ctime>
 #include <utility>
 
+#include "env.h"
 #include "fstab.h"
 #include "network.h"
 #include "services.h"
@@ -49,9 +50,9 @@ auto main(int argc, char** argv) -> int {
 
         for (int i = 0; i < SPAWN_COUNT; i++) {
             std::array<const char*, 4> child_argv = {prog_path, "child-arg1", "child-arg2", nullptr};
-            std::array<const char*, 1> child_envp = {nullptr};
+            InitEnv child_env = make_init_env();
 
-            uint64_t const CHILD_PID = ker::process::exec(prog_path, child_argv.data(), child_envp.data());
+            uint64_t const CHILD_PID = ker::process::exec(prog_path, child_argv.data(), child_env.envp.data());
             if (CHILD_PID == 0) {
                 init_log::error("sub-init[%llu]: failed to exec '%s' (instance %d)", static_cast<unsigned long long>(CPUNO), prog_path, i);
             } else {
@@ -106,7 +107,11 @@ auto main(int argc, char** argv) -> int {
     ker::abi::vfs::mkdir("/var/log", 0755);
     ker::abi::vfs::mkdir("/var/log/journal", 0755);
     start_journald();
-    start_network();
+    if (!start_network()) {
+        init_log::critical("init[%llu]: network startup failed; stopping init before launching network-dependent services",
+                           static_cast<unsigned long long>(CPUNO));
+        return 1;
+    }
     start_httpd();
     start_dropbear();
     // start_testd();

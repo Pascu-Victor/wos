@@ -5,6 +5,7 @@
 #include <qhostaddress.h>
 #include <qjsonparseerror.h>
 #include <qlist.h>
+#include <qlogging.h>
 #include <qnamespace.h>
 #include <qobject.h>
 #include <qtcpserver.h>
@@ -19,7 +20,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
-#include <ranges>
 #include <string_view>
 
 #include "debug_analysis_service.h"
@@ -74,15 +74,15 @@ auto negotiated_protocol_version(const QString& requested) -> QString {
 }
 
 auto mcp_trace_enabled() -> bool {
-    static const bool enabled = [] {
+    static const bool ENABLED = [] {
         const char* env = std::getenv("WOSDBG_MCP_TRACE");
         if (!env) {
             return false;
         }
-        const std::string_view value(env);
-        return !value.empty() && value != "0" && value != "false" && value != "False" && value != "FALSE";
+        const std::string_view VALUE(env);
+        return !VALUE.empty() && VALUE != "0" && VALUE != "false" && VALUE != "False" && VALUE != "FALSE";
     }();
-    return enabled;
+    return ENABLED;
 }
 
 }  // namespace
@@ -234,7 +234,7 @@ void McpHttpServer::remove_session(const QByteArray& session_id) {
     sessions.erase(session_it);
 }
 
-[[nodiscard]] auto McpHttpServer::negotiated_protocol(const QByteArray& header) const -> QByteArray {
+[[nodiscard]] auto McpHttpServer::negotiated_protocol(const QByteArray& header) -> QByteArray {
     if (header.isEmpty()) {
         return default_protocol_version();
     }
@@ -258,7 +258,7 @@ auto McpHttpServer::peer_allowed(const QHostAddress& address) const -> bool {
     return std::ranges::any_of(allowed_cidrs, [&](const QString& cidr) -> bool { return cidr_allows(cidr, address); });
 }
 
-auto McpHttpServer::cidr_allows(const QString& cidr, const QHostAddress& address) const -> bool {
+auto McpHttpServer::cidr_allows(const QString& cidr, const QHostAddress& address) -> bool {
     if (cidr == "*") {
         return true;
     }
@@ -280,7 +280,7 @@ auto McpHttpServer::cidr_allows(const QString& cidr, const QHostAddress& address
     quint32 address_v4 = 0;
     if (ipv4_to_int(network, &network_v4) && ipv4_to_int(address, &address_v4)) {
         prefix = std::clamp(prefix, 0, 32);
-        quint32 mask = prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+        quint32 mask = prefix == 0 ? 0 : (0xffffffffU << (32 - prefix));
         return (network_v4 & mask) == (address_v4 & mask);
     }
     return network == address || (network.isLoopback() && address.isLoopback());
@@ -308,10 +308,10 @@ void McpHttpServer::on_ready_read() {
         const QByteArray EFFECTIVE_PROTOCOL = RESPONSE_PROTOCOL.isNull() ? default_protocol_version() : RESPONSE_PROTOCOL;
 
         if (request->path == "/.well-known/oauth-authorization-server" && request->method == "GET") {
-            const auto endpoint = this->endpoint();
+            const auto ENDPOINT = this->endpoint();
             QJsonObject discovery = {
                 {"issuer", "wosdbg"},
-                {"mcpEndpoint", endpoint.isEmpty() ? "unknown://localhost/mcp" : endpoint},
+                {"mcpEndpoint", ENDPOINT.isEmpty() ? "unknown://localhost/mcp" : ENDPOINT},
                 {"supported_protocols", QJsonArray::fromStringList(supported_protocol_versions())},
             };
             send_json(socket, discovery, 200, EFFECTIVE_PROTOCOL, {});
@@ -319,8 +319,8 @@ void McpHttpServer::on_ready_read() {
         }
 
         if (request->path == "/" && request->method == "GET") {
-            const QByteArray text = "wosdbg MCP endpoint: /mcp";
-            send_raw(socket, text, "text/plain", 200, EFFECTIVE_PROTOCOL);
+            const QByteArray TEXT = "wosdbg MCP endpoint: /mcp";
+            send_raw(socket, TEXT, "text/plain", 200, EFFECTIVE_PROTOCOL);
             return;
         }
 
@@ -363,7 +363,7 @@ void McpHttpServer::on_ready_read() {
             }
 
             const QByteArray CREATED = create_session_id();
-            sessions.insert(CREATED, SessionState{CREATED, {}, 1, {}});
+            sessions.insert(CREATED, SessionState{.id = CREATED, .last_event_id = {}, .next_event_id = 1, .listeners = {}});
             register_listener(CREATED, socket);
             send_sse_headers(socket, RESPONSE_PROTOCOL, CREATED);
             send_sse_event(socket, "0", "open", {});
@@ -620,11 +620,11 @@ void McpHttpServer::send_sse_event(QTcpSocket* socket, const QByteArray& event_i
     socket->write(frame);
 }
 
-auto McpHttpServer::json_rpc_error(const QJsonValue& id, int code, const QString& message) const -> QJsonObject {
+auto McpHttpServer::json_rpc_error(const QJsonValue& id, int code, const QString& message) -> QJsonObject {
     return QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"error", QJsonObject{{"code", code}, {"message", message}}}};
 }
 
-auto McpHttpServer::json_rpc_result(const QJsonValue& id, const QJsonObject& result) const -> QJsonObject {
+auto McpHttpServer::json_rpc_result(const QJsonValue& id, const QJsonObject& result) -> QJsonObject {
     return QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
 }
 
@@ -672,14 +672,14 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
         return call_tool(params);
     }
     if (method == "resources/list") {
-        return QJsonObject{{"resources", analysis->listResources()}};
+        return QJsonObject{{"resources", analysis->list_resources()}};
     }
     if (method == "resources/templates/list") {
-        return QJsonObject{{"resourceTemplates", analysis->listResourceTemplates()}};
+        return QJsonObject{{"resourceTemplates", DebugAnalysisService::list_resource_templates()}};
     }
     if (method == "resources/read") {
         QString uri = params["uri"].toString();
-        QJsonObject payload = analysis->readResource(uri);
+        QJsonObject payload = analysis->read_resource(uri);
         return QJsonObject{
             {"contents", QJsonArray{QJsonObject{{"uri", uri},
                                                 {"mimeType", "application/json"},
@@ -688,7 +688,7 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
     return QJsonObject{{"_jsonrpcError", QJsonObject{{"code", -32601}, {"message", QString("Method not found: %1").arg(method)}}}};
 }
 
-auto McpHttpServer::tool_list() const -> QJsonObject {
+auto McpHttpServer::tool_list() -> QJsonObject {
     auto schema = [](const QJsonObject& properties, const QJsonArray& required = {}) {
         return QJsonObject{{"type", "object"}, {"properties", properties}, {"required", required}};
     };
@@ -728,49 +728,263 @@ auto McpHttpServer::tool_list() const -> QJsonObject {
                     {"description", "Parse and cache a WOS coredump session."},
                     {"inputSchema", schema({{"path", QJsonObject{{"type", "string"}}}}, {"path"})}},
         QJsonObject{{"name", "wosdbg.get_crash_summary"},
-                    {"description", "Summarize fault, RIP, CR2, suspicious registers, and nearby disassembly."},
+                    {"description",
+                     "Quick JSON crash summary for an opened coredump: fault metadata, suspicious registers, decoded fault "
+                     "instruction, and nearby disassembly. For full/compact/text reports use wosdbg.analyze_coredump."},
                     {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}}}, {"dumpId"})}},
         QJsonObject{
+            {"name", "wosdbg.analyze_coredump"},
+            {"description",
+             "One-shot coredump report. Default mode returns full structured JSON: compact diagnosis, fault/trap/saved "
+             "contexts, decoded instruction, backtrace, red-zone, stack, PTE, and disassembly. compact=true, mode=compact, "
+             "or format=compact returns only {compact}. mode=text or format=text returns only {text}, a concise human "
+             "first-pass report. mode=human or format=human returns both {compact} JSON and {human} text. maxFrames caps both the "
+             "full backtrace and compact.topBacktrace."},
+            {"inputSchema",
+             schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                     {"maxFrames", QJsonObject{{"type", "integer"}, {"description", "Caps full backtrace and compact.topBacktrace."}}},
+                     {"stackBeforeBytes", QJsonObject{{"type", "integer"}}},
+                     {"stackAfterBytes", QJsonObject{{"type", "integer"}}},
+                     {"compact", QJsonObject{{"type", "boolean"}, {"description", "Alias for mode=compact; returns only compact JSON."}}},
+                     {"mode", QJsonObject{{"type", "string"}, {"description", "One of full/default, compact, text, or human."}}},
+                     {"format", QJsonObject{{"type", "string"}, {"description", "Same semantics as mode; useful for output preference."}}}},
+                    {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.backtrace_coredump"},
+            {"description",
+             "Best-effort userspace backtrace. frame=trap unwinds from the fault-time trap registers; frame=saved unwinds from the "
+             "scheduler/syscall saved task context. Uses frame pointers first with stack-scan fallback."},
+            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                    {"frame", QJsonObject{{"type", "string"},
+                                                          {"description", "trap for fault-time registers, or saved for task context."}}},
+                                    {"maxFrames", QJsonObject{{"type", "integer"}}}},
+                                   {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.decode_fault_instruction"},
+            {"description", "Decode the faulting instruction at trap RIP and compute memory effective addresses from trap registers."},
+            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}}}, {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.inspect_pte"},
+            {"description",
+             "Show coredump mapping/PTE information for an address or register. Defaults to CR2 when no address/register is "
+             "given. Reports mapped/unmapped, physical address, segment, and user/rw/nx/cow/shared bits."},
+            {"inputSchema",
+             schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                     {"address", QJsonObject{{"type", "string"}}},
+                     {"register", QJsonObject{{"type", "string"}}},
+                     {"frame", QJsonObject{{"type", "string"}, {"description", "Register frame for register lookup: trap or saved."}}}},
+                    {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.annotate_stack"},
+            {"description",
+             "Return annotated stack qwords around RSP/RBP. frame=trap uses the fault-time stack; frame=saved uses the "
+             "scheduler/syscall task stack. Highlights return addresses, pointers, red-zone slots, and suspicious small values."},
+            {"inputSchema",
+             schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                     {"frame", QJsonObject{{"type", "string"}, {"description", "trap for fault-time stack, or saved for task context."}}},
+                     {"beforeBytes", QJsonObject{{"type", "integer"}}},
+                     {"afterBytes", QJsonObject{{"type", "integer"}}}},
+                    {"dumpId"})}},
+        QJsonObject{
             {"name", "wosdbg.describe_registers"},
-            {"description", "Classify trap/saved registers and describe likely pointed-to memory."},
-            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}}, {"frame", QJsonObject{{"type", "string"}}}}, {"dumpId"})}},
-        QJsonObject{{"name", "wosdbg.follow_register"},
-                    {"description", "Return the best next view for a register."},
-                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
-                                            {"register", QJsonObject{{"type", "string"}}},
-                                            {"frame", QJsonObject{{"type", "string"}}}},
-                                           {"dumpId", "register"})}},
-        QJsonObject{{"name", "wosdbg.search_coredump_memory"},
-                    {"description", "Bounded search over present coredump segments."},
-                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
-                                            {"kind", QJsonObject{{"type", "string"}}},
-                                            {"needle", QJsonObject{}},
-                                            {"maxHits", QJsonObject{{"type", "integer"}}}},
-                                           {"dumpId"})}},
-        QJsonObject{{"name", "wosdbg.find_pointers"},
-                    {"description", "Find qwords that look like pointers, optionally filtered by target class."},
-                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
-                                            {"target", QJsonObject{{"type", "string"}}},
-                                            {"maxHits", QJsonObject{{"type", "integer"}}}},
-                                           {"dumpId"})}},
+            {"description",
+             "Classify registers and describe likely pointed-to memory. frame=trap means fault-time trap registers; frame=saved means "
+             "scheduler/syscall saved task registers."},
+            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                    {"frame", QJsonObject{{"type", "string"},
+                                                          {"description", "trap for fault-time registers, or saved for task context."}}}},
+                                   {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.follow_register"},
+            {"description",
+             "Return the best next view for a register in a chosen frame: disassembly for code-like values, memory/stack "
+             "context for mapped pointers, or explanation for scalar/unmapped values."},
+            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                    {"register", QJsonObject{{"type", "string"}}},
+                                    {"frame", QJsonObject{{"type", "string"},
+                                                          {"description", "trap for fault-time registers, or saved for task context."}}}},
+                                   {"dumpId", "register"})}},
+        QJsonObject{
+            {"name", "wosdbg.search_coredump_memory"},
+            {"description",
+             "Bounded search over present coredump segments. kind defaults to pointer; use qword/u64/uint64 with needle or value for "
+             "scalar qword matches, bytes for hex bytes, ascii for text, symbol for symbolized pointers, or nonzero. scope/scanScope "
+             "controls scan region: all scans every captured segment; around scans beforeBytes/afterBytes around address/register; "
+             "active_stack scans the trap/saved RSP page; stack scans active stack first then remaining stack pages; all_stack scans all "
+             "stack pages in address order; fault scans fault-page segments. Passing address or register without scope implies around. "
+             "Results include scannedRegions so truncation/scope are auditable."},
+            {"inputSchema",
+             schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                     {"kind",
+                      QJsonObject{{"type", "string"}, {"description", "pointer, symbol, qword/u64/uint64, bytes, ascii, or nonzero."}}},
+                     {"needle", QJsonObject{{"description", "Search value: qword address/scalar, hex bytes, or ASCII text."}}},
+                     {"value", QJsonObject{{"description", "Alias for needle for qword/u64/uint64 searches."}}},
+                     {"maxHits", QJsonObject{{"type", "integer"}}},
+                     {"scope", QJsonObject{{"type", "string"}, {"description", "all, around, active_stack, stack, all_stack, or fault."}}},
+                     {"scanScope", QJsonObject{{"type", "string"}, {"description", "Alias for scope."}}},
+                     {"maxScanBytes", QJsonObject{{"type", "integer"}}},
+                     {"address", QJsonObject{{"type", "string"}}},
+                     {"register", QJsonObject{{"type", "string"}}},
+                     {"beforeBytes", QJsonObject{{"type", "integer"}}},
+                     {"afterBytes", QJsonObject{{"type", "integer"}}}},
+                    {"dumpId"})}},
+        QJsonObject{
+            {"name", "wosdbg.find_pointers"},
+            {"description",
+             "Find qwords that look like pointers. Uses the same scope/scanScope behavior as search_coredump_memory: address "
+             "or register implies around; stack is active-stack-first; all_stack is literal full-stack order. target filters "
+             "matched pointer destinations by class or module text, e.g. code, stack, kernel, mapped, libc, ld.so."},
+            {"inputSchema",
+             schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                     {"target",
+                      QJsonObject{{"type", "string"},
+                                  {"description", "Optional destination filter: code, stack, kernel, mapped, or module/path text."}}},
+                     {"maxHits", QJsonObject{{"type", "integer"}}},
+                     {"scope", QJsonObject{{"type", "string"}, {"description", "all, around, active_stack, stack, all_stack, or fault."}}},
+                     {"scanScope", QJsonObject{{"type", "string"}, {"description", "Alias for scope."}}},
+                     {"maxScanBytes", QJsonObject{{"type", "integer"}}},
+                     {"address", QJsonObject{{"type", "string"}}},
+                     {"register", QJsonObject{{"type", "string"}}},
+                     {"beforeBytes", QJsonObject{{"type", "integer"}}},
+                     {"afterBytes", QJsonObject{{"type", "integer"}}}},
+                    {"dumpId"})}},
         QJsonObject{{"name", "wosdbg.get_memory_context"},
-                    {"description", "Return bounded annotated memory around an address or register."},
+                    {"description",
+                     "Return bounded annotated memory around an address or register. Defaults to RSP when no address/register is given. "
+                     "Rows annotate symbols, pointers, stack markers, suspicious small values, and redZone=true for trap red-zone slots."},
                     {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
                                             {"address", QJsonObject{{"type", "string"}}},
                                             {"register", QJsonObject{{"type", "string"}}}},
                                            {"dumpId"})}},
         QJsonObject{{"name", "wosdbg.disassemble_coredump"},
-                    {"description", "Disassemble around RIP, saved RIP, address, or register."},
+                    {"description",
+                     "Disassemble from the containing symbol boundary when available, otherwise from the exact address/register. Defaults "
+                     "to trap RIP. The trap RIP instruction is marked in the returned rows."},
                     {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
                                             {"address", QJsonObject{{"type", "string"}}},
                                             {"register", QJsonObject{{"type", "string"}}},
                                             {"instructions", QJsonObject{{"type", "integer"}}}},
                                            {"dumpId"})}},
         QJsonObject{{"name", "wosdbg.resolve_address"},
-                    {"description", "Explain an address using symbols, sections, segments, and heuristics."},
+                    {"description",
+                     "Explain an address/register using module discovery, symbols, source, sections, coredump segment data, and PTE "
+                     "mapping. moduleFilter/module can restrict results to kernel, userspace/user, or a module name substring."},
                     {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
                                             {"address", QJsonObject{{"type", "string"}}},
+                                            {"register", QJsonObject{{"type", "string"}}},
+                                            {"moduleFilter", QJsonObject{{"type", "string"}}},
+                                            {"module", QJsonObject{{"type", "string"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.verify_embedded_elf"},
+                    {"description",
+                     "Compare the coredump embedded ELF buffer against a local ELF chosen by path/elfPath, the opened binary path, or "
+                     "build-id lookup. Reports build IDs, hashes, first mismatch, mismatch ranges, and whether differing embedded bytes "
+                     "also occur elsewhere in the local file."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"path", QJsonObject{{"type", "string"}}},
+                                            {"elfPath", QJsonObject{{"type", "string"}}},
+                                            {"maxRanges", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.check_elf_mapping"},
+                    {"description",
+                     "For a runtime VA/register, compute PIE load base, ELF vaddr, PT_LOAD segment, and expected file offset, then "
+                     "compare captured coredump bytes with embedded/local ELF bytes. Good for detecting stale/wrong executable pages, "
+                     "for example a page at VA X whose bytes match another ELF file offset."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
+                                            {"register", QJsonObject{{"type", "string"}}},
+                                            {"bytes", QJsonObject{{"type", "integer"}}},
+                                            {"page", QJsonObject{{"type", "boolean"}}},
+                                            {"maxRanges", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.find_duplicate_pages"},
+                    {"description",
+                     "Hash captured pages and report duplicate page-content groups. Defaults to executable user pages only; use "
+                     "executableOnly=false or userOnly=false for broader scans. Reports regular address deltas for stale/chunk "
+                     "repetition clues."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"executableOnly", QJsonObject{{"type", "boolean"}}},
+                                            {"userOnly", QJsonObject{{"type", "boolean"}}},
+                                            {"maxGroups", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.analyze_elf_integrity"},
+                    {"description",
+                     "One-shot executable-image integrity report. Runs embedded ELF verification, mapped-page-vs-ELF comparison for "
+                     "RIP or a supplied address/register, and duplicate executable-page detection. Intended for remote exec/WKI VFS_REF "
+                     "or stale page corruption triage."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
+                                            {"register", QJsonObject{{"type", "string"}}},
+                                            {"bytes", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.elf_layout_summary"},
+                    {"description",
+                     "Readelf-style summary for discovered modules: ELF type, entrypoint, interpreter, PT_LOAD runtime ranges, file "
+                     "offsets, sizes, flags, and PIE base conversions. Optional module filters by module/role substring."},
+                    {"inputSchema",
+                     schema({{"dumpId", QJsonObject{{"type", "string"}}}, {"module", QJsonObject{{"type", "string"}}}}, {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.compare_expected_disassembly"},
+                    {"description",
+                     "Objdump-like side-by-side disassembly for a runtime VA/register: actual captured coredump bytes versus expected "
+                     "module ELF bytes at the PT_LOAD-derived file offset, plus byte comparison metadata."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
+                                            {"register", QJsonObject{{"type", "string"}}},
+                                            {"instructions", QJsonObject{{"type", "integer"}}},
+                                            {"bytes", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.scan_chunk_corruption"},
+                    {"description",
+                     "Scan mapped user image pages against their PT_LOAD source bytes and look for stale/wrong-page signatures aligned "
+                     "to common chunk sizes such as 4K, 64K, 256K, and 2M. Reports pages whose actual bytes match another ELF offset."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"chunkSizes", QJsonObject{{"type", "array"}}},
+                                            {"maxHits", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.audit_executable_ptes"},
+                    {"description",
+                     "Audit executable-image PTE permissions against ELF PT_LOAD flags. Flags executable pages that are NX or writable, "
+                     "read-only segments mapped writable, and userspace image pages missing the user bit."},
+                    {"inputSchema",
+                     schema({{"dumpId", QJsonObject{{"type", "string"}}}, {"maxIssues", QJsonObject{{"type", "integer"}}}}, {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.recognize_startup_stack"},
+                    {"description",
+                     "Inspect stack slots near RSP for startup-shape hints such as _start and __mlibc_entry return/code pointers. Useful "
+                     "for early process startup crashes."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"frame", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
                                             {"register", QJsonObject{{"type", "string"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.correlate_coredump_logs"},
+                    {"description",
+                     "Correlate an opened coredump with already-loaded logs by PID, RIP, CR2, and executable path. Call load_log first "
+                     "or pass logId. Returns matching log rows for nearby fault context."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"logId", QJsonObject{{"type", "string"}}},
+                                            {"maxHits", QJsonObject{{"type", "integer"}}}},
+                                           {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.reconstruct_wki_trace"},
+                    {"description",
+                     "Search already-loaded logs for WKI/VFS/RDMA operation traces: OP_VFS_READ, OP_VFS_READ_BULK, OP_VFS_READ_RDMA, "
+                     "VFS_REF, remote_vfs, remote_compute, and RDMA lines. Optional filter narrows by path, peer, cookie, or op text."},
+                    {"inputSchema", schema({{"logId", QJsonObject{{"type", "string"}}},
+                                            {"filter", QJsonObject{{"type", "string"}}},
+                                            {"maxHits", QJsonObject{{"type", "integer"}}}})}},
+        QJsonObject{
+            {"name", "wosdbg.explain_remote_exec_path"},
+            {"description",
+             "Explain the likely source-level path for a /wki/<peer>/... remote executable: remote_compute VFS_REF, exec/VFS "
+             "reads, remote_vfs/WKI operations, and ELF loader mapping. Returns next-tool suggestions."},
+            {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}}, {"path", QJsonObject{{"type", "string"}}}}, {"dumpId"})}},
+        QJsonObject{{"name", "wosdbg.diagnose_remote_exec_corruption"},
+                    {"description",
+                     "Canned remote executable corruption analysis. Combines remote path explanation, ELF integrity checks, chunk/stale "
+                     "page scan, and executable PTE audit; intended for WKI VFS_REF/RDMA/cache corruption triage."},
+                    {"inputSchema", schema({{"dumpId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
+                                            {"register", QJsonObject{{"type", "string"}}},
+                                            {"maxHits", QJsonObject{{"type", "integer"}}}},
                                            {"dumpId"})}},
         QJsonObject{{"name", "wosdbg.get_source_context"},
                     {"description", "Return bounded source around a file and line."},
@@ -782,7 +996,7 @@ auto McpHttpServer::tool_list() const -> QJsonObject {
     return QJsonObject{{"tools", tools}};
 }
 
-auto McpHttpServer::tool_result(const QJsonObject& payload) const -> QJsonObject {
+auto McpHttpServer::tool_result(const QJsonObject& payload) -> QJsonObject {
     QString text = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Indented));
     return QJsonObject{
         {"content", QJsonArray{text_content(text)}}, {"structuredContent", payload}, {"isError", !payload["ok"].toBool(true)}};
@@ -795,39 +1009,75 @@ auto McpHttpServer::call_tool(const QJsonObject& params) const -> QJsonObject {
     if (name == "wosdbg.status") {
         payload = analysis->status();
     } else if (name == "wosdbg.extract_coredumps") {
-        payload = analysis->extractCoredumps(args);
+        payload = analysis->extract_coredumps(args);
     } else if (name == "wosdbg.list_logs") {
-        payload = analysis->listLogs();
+        payload = DebugAnalysisService::list_logs();
     } else if (name == "wosdbg.load_log") {
-        payload = analysis->loadLog(args);
+        payload = analysis->load_log(args);
     } else if (name == "wosdbg.get_log_entries") {
-        payload = analysis->getLogEntries(args);
+        payload = analysis->get_log_entries(args);
     } else if (name == "wosdbg.search_log") {
-        payload = analysis->searchLog(args);
+        payload = analysis->search_log(args);
     } else if (name == "wosdbg.get_log_context") {
-        payload = analysis->getLogContext(args);
+        payload = analysis->get_log_context(args);
     } else if (name == "wosdbg.list_coredumps") {
-        payload = analysis->listCoredumps();
+        payload = analysis->list_coredumps();
     } else if (name == "wosdbg.open_coredump") {
-        payload = analysis->openCoredump(args);
+        payload = analysis->open_coredump(args);
     } else if (name == "wosdbg.get_crash_summary") {
-        payload = analysis->getCrashSummary(args);
+        payload = analysis->get_crash_summary(args);
+    } else if (name == "wosdbg.analyze_coredump") {
+        payload = analysis->analyze_coredump(args);
+    } else if (name == "wosdbg.backtrace_coredump") {
+        payload = analysis->backtrace_coredump(args);
+    } else if (name == "wosdbg.decode_fault_instruction") {
+        payload = analysis->decode_fault_instruction(args);
+    } else if (name == "wosdbg.inspect_pte") {
+        payload = analysis->inspect_page_table(args);
+    } else if (name == "wosdbg.annotate_stack") {
+        payload = analysis->annotate_stack(args);
     } else if (name == "wosdbg.describe_registers") {
-        payload = analysis->describeRegisters(args);
+        payload = analysis->describe_registers(args);
     } else if (name == "wosdbg.follow_register") {
-        payload = analysis->followRegister(args);
+        payload = analysis->follow_register(args);
     } else if (name == "wosdbg.search_coredump_memory") {
-        payload = analysis->searchCoredumpMemory(args);
+        payload = analysis->search_coredump_memory(args);
     } else if (name == "wosdbg.find_pointers") {
-        payload = analysis->findPointers(args);
+        payload = analysis->find_pointers(args);
     } else if (name == "wosdbg.get_memory_context") {
-        payload = analysis->getMemoryContext(args);
+        payload = analysis->get_memory_context(args);
     } else if (name == "wosdbg.disassemble_coredump") {
-        payload = analysis->disassembleCoredump(args);
+        payload = analysis->disassemble_coredump(args);
     } else if (name == "wosdbg.resolve_address") {
-        payload = analysis->resolveAddressTool(args);
+        payload = analysis->resolve_address_tool(args);
+    } else if (name == "wosdbg.verify_embedded_elf") {
+        payload = analysis->verify_embedded_elf(args);
+    } else if (name == "wosdbg.check_elf_mapping") {
+        payload = analysis->check_elf_mapping(args);
+    } else if (name == "wosdbg.find_duplicate_pages") {
+        payload = analysis->find_duplicate_pages(args);
+    } else if (name == "wosdbg.analyze_elf_integrity") {
+        payload = analysis->analyze_elf_integrity(args);
+    } else if (name == "wosdbg.elf_layout_summary") {
+        payload = analysis->elf_layout_summary(args);
+    } else if (name == "wosdbg.compare_expected_disassembly") {
+        payload = analysis->compare_expected_disassembly(args);
+    } else if (name == "wosdbg.scan_chunk_corruption") {
+        payload = analysis->scan_chunk_corruption(args);
+    } else if (name == "wosdbg.audit_executable_ptes") {
+        payload = analysis->audit_executable_ptes(args);
+    } else if (name == "wosdbg.recognize_startup_stack") {
+        payload = analysis->recognize_startup_stack(args);
+    } else if (name == "wosdbg.correlate_coredump_logs") {
+        payload = analysis->correlate_coredump_logs(args);
+    } else if (name == "wosdbg.reconstruct_wki_trace") {
+        payload = analysis->reconstruct_wki_trace(args);
+    } else if (name == "wosdbg.explain_remote_exec_path") {
+        payload = analysis->explain_remote_exec_path(args);
+    } else if (name == "wosdbg.diagnose_remote_exec_corruption") {
+        payload = analysis->diagnose_remote_exec_corruption(args);
     } else if (name == "wosdbg.get_source_context") {
-        payload = analysis->getSourceContext(args);
+        payload = analysis->get_source_context(args);
     } else {
         payload = QJsonObject{{"ok", false}, {"error", QString("Unknown tool: %1").arg(name)}};
     }

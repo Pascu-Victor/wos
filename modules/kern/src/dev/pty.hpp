@@ -206,4 +206,9 @@ auto get_ptmx_device() -> Device*;
 // Returns true if the file is a devfs-backed PTY master or slave file.
 auto pty_is_file(ker::vfs::File* f) -> bool;
 
+// Returns a stable per-endpoint identity for PTY-backed files, suitable for
+// coalescing duplicate fd exports that point at the same master or slave
+// device. Returns nullptr for non-PTY files.
+auto pty_file_identity_key(ker::vfs::File* f) -> const void*;
+
 }  // namespace ker::dev::pty

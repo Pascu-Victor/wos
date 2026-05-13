@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #include "dev/block_device.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -34,10 +35,12 @@ auto hash_bucket_at(size_t idx) -> BufHead*& {
     return hash_buckets[idx];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
-auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no) -> size_t {
-    // FNV-1a-style mix of device pointer and block number
+auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no, size_t size) -> size_t {
+    // FNV-1a-style mix of device pointer, start block, and span.
     auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bdev));
     h ^= block_no;
+    h *= 0x517cc1b727220a95ULL;
+    h ^= static_cast<uint64_t>(size);
     h *= 0x517cc1b727220a95ULL;
     h ^= (h >> 32);
     return static_cast<size_t>(h % BUFFER_CACHE_HASH_BUCKETS);
@@ -73,8 +76,8 @@ void dump_hash_bucket(size_t idx) {
     }
 }
 
-auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
-    size_t const IDX = hash_key(bdev, block_no);
+auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no, size_t size) -> BufHead* {
+    size_t const IDX = hash_key(bdev, block_no, size);
     BufHead const* prev = nullptr;
     for (BufHead* bh = hash_bucket_at(IDX); bh != nullptr; bh = bh->hash_next) {
         if (!is_valid_bufhead_ptr(bh)) {
@@ -86,7 +89,7 @@ auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
             dump_hash_bucket(IDX);
             mod::dbg::panic_handler("buffer_cache: corrupt hash chain detected in lookup");
         }
-        if (bh->bdev == bdev && bh->block_no == block_no) {
+        if (bh->bdev == bdev && bh->block_no == block_no && bh->size == size) {
             return bh;
         }
         prev = bh;
@@ -95,7 +98,7 @@ auto hash_lookup(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
 }
 
 void hash_insert(BufHead* bh) {
-    size_t const IDX = hash_key(bh->bdev, bh->block_no);
+    size_t const IDX = hash_key(bh->bdev, bh->block_no, bh->size);
     BufHead* old_head = hash_bucket_at(IDX);
     if (old_head != nullptr && !is_valid_bufhead_ptr(old_head)) {
         log::critical("corrupt bucket head in insert(bh=%p bdev=%p block=%llu bucket=%zu) old_head=%p", reinterpret_cast<void*>(bh),
@@ -108,7 +111,7 @@ void hash_insert(BufHead* bh) {
 }
 
 void hash_remove(BufHead* bh) {
-    size_t const IDX = hash_key(bh->bdev, bh->block_no);
+    size_t const IDX = hash_key(bh->bdev, bh->block_no, bh->size);
     // Validate bh->hash_next before propagating — if it is garbage it would
     // corrupt the live predecessor's hash_next and cause the crash we've seen.
     if (bh->hash_next != nullptr && !is_valid_bufhead_ptr(bh->hash_next)) {
@@ -265,9 +268,29 @@ auto alloc_buffer(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     return bh;
 }
 
+auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data) -> int {
+    constexpr int MAX_ATTEMPTS = 3;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        int const RC = dev::block_read(bdev, block_no, count, data);
+        if (RC == 0) {
+            return 0;
+        }
+        if (attempt < MAX_ATTEMPTS) {
+            log::warn("transient read failure on %s block=%llu count=%zu rc=%d attempt=%d/%d", bdev->name.data(),
+                      static_cast<unsigned long long>(block_no), count, RC, attempt, MAX_ATTEMPTS);
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        log::warn("read failed on %s block=%llu count=%zu rc=%d after %d attempts", bdev->name.data(),
+                  static_cast<unsigned long long>(block_no), count, RC, MAX_ATTEMPTS);
+        return RC;
+    }
+    return -EIO;
+}
+
 // Read the block data from disk into an already-allocated buffer.
 auto read_block_from_disk(BufHead* bh) -> int {
-    int const RC = dev::block_read(bh->bdev, bh->block_no, 1, bh->data);
+    int const RC = read_blocks_with_retry(bh->bdev, bh->block_no, 1, bh->data);
     if (RC == 0) {
         bh->flags |= BH_VALID;
     }
@@ -317,7 +340,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     uint64_t irqflags = cache_lock.lock_irqsave();
 
     // 1. Lookup in cache
-    BufHead* bh = hash_lookup(bdev, block_no);
+    BufHead* bh = hash_lookup(bdev, block_no, bdev->block_size);
     if (bh != nullptr) {
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
@@ -351,7 +374,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     }
 
     irqflags = cache_lock.lock_irqsave();
-    BufHead* existing = hash_lookup(bdev, block_no);
+    BufHead* existing = hash_lookup(bdev, block_no, bdev->block_size);
     if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
@@ -383,24 +406,17 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     size_t const BLK_SIZE = bdev->block_size;
     size_t const TOTAL_SIZE = BLK_SIZE * count;
 
-    // Multi-block buffers are cached by (bdev, block_no) like single-block
-    // buffers.  This is critical for correctness: within a transaction,
-    // multiple reads of the same XFS block (e.g. AG block 0) must return
-    // the same buffer so that in-transaction writes are visible to subsequent
-    // reads and the transaction system can merge dirty regions correctly.
+    // Multi-block buffers are cached by their exact span. This avoids aliasing
+    // a single-block and multi-block view of the same starting device block.
     uint64_t irqflags = cache_lock.lock_irqsave();
 
-    BufHead* bh = hash_lookup(bdev, block_no);
+    BufHead* bh = hash_lookup(bdev, block_no, TOTAL_SIZE);
     if (bh != nullptr) {
-        // Verify size matches (should always match for fixed XFS block size)
-        if (bh->size == TOTAL_SIZE) {
-            bh->refcount.fetch_add(1, std::memory_order_relaxed);
-            lru_touch(bh);
-            stat_hits++;
-            cache_lock.unlock_irqrestore(irqflags);
-            return bh;
-        }
-        // Size mismatch - fall through to allocate fresh (shouldn't happen)
+        bh->refcount.fetch_add(1, std::memory_order_relaxed);
+        lru_touch(bh);
+        stat_hits++;
+        cache_lock.unlock_irqrestore(irqflags);
+        return bh;
     }
 
     stat_misses++;
@@ -434,7 +450,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     cache_lock.unlock_irqrestore(irqflags);
 
     // Read from disk outside the lock
-    int const RC = dev::block_read(bdev, block_no, count, data);
+    int const RC = read_blocks_with_retry(bdev, block_no, count, data);
     if (RC != 0) {
         irqflags = cache_lock.lock_irqsave();
         free_buffer(bh);
@@ -444,8 +460,8 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     bh->flags |= BH_VALID;
 
     irqflags = cache_lock.lock_irqsave();
-    BufHead* existing = hash_lookup(bdev, block_no);
-    if (existing != nullptr && existing->size == TOTAL_SIZE) {
+    BufHead* existing = hash_lookup(bdev, block_no, TOTAL_SIZE);
+    if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         free_buffer(bh);
@@ -473,7 +489,7 @@ void brelse(BufHead* bh) {
 
 auto bwrite(BufHead* bh) -> int {
     if (bh == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     int const RC = write_block_to_disk(bh);
@@ -509,7 +525,7 @@ auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
 
     // If the block is already cached, return it (caller will overwrite).
-    BufHead* bh = hash_lookup(bdev, block_no);
+    BufHead* bh = hash_lookup(bdev, block_no, bdev->block_size);
     if (bh != nullptr) {
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
@@ -545,15 +561,12 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
 
     // If already cached, return it (caller will overwrite contents).
-    BufHead* bh = hash_lookup(bdev, block_no);
+    BufHead* bh = hash_lookup(bdev, block_no, TOTAL_SIZE);
     if (bh != nullptr) {
-        if (bh->size == TOTAL_SIZE) {
-            bh->refcount.fetch_add(1, std::memory_order_relaxed);
-            lru_touch(bh);
-            cache_lock.unlock_irqrestore(IRQFLAGS);
-            return bh;
-        }
-        // Size mismatch - fall through to allocate fresh (shouldn't happen)
+        bh->refcount.fetch_add(1, std::memory_order_relaxed);
+        lru_touch(bh);
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return bh;
     }
 
     evict_lru();
@@ -592,7 +605,7 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
 
 auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     int result = 0;

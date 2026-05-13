@@ -410,12 +410,12 @@ static auto get_next_cluster(const FAT32MountContext* ctx, uint32_t cluster) -> 
 // Helper function to read a cluster from the block device
 static auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* buffer) -> int {
     if (ctx == nullptr || ctx->device == nullptr || buffer == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     cluster &= FAT32_CLUSTER_MASK;
     if (cluster < 2 || cluster >= FAT32_EOC_MIN) {
-        return -1;
+        return -EINVAL;
     }
 
     uint32_t data_clusters = 0;
@@ -423,10 +423,10 @@ static auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* b
         data_clusters = (ctx->total_sectors - ctx->data_start_sector) / ctx->sectors_per_cluster;
     }
     if (data_clusters == 0) {
-        return -1;
+        return -EINVAL;
     }
     if (cluster - 2 >= data_clusters) {
-        return -1;
+        return -EINVAL;
     }
 
     // Calculate the LBA of the cluster
@@ -434,11 +434,11 @@ static auto read_cluster(const FAT32MountContext* ctx, uint32_t cluster, void* b
         ctx->partition_offset + ctx->data_start_sector + ((static_cast<uint64_t>(cluster) - 2) * ctx->sectors_per_cluster);
     uint64_t const PARTITION_END_LBA = ctx->partition_offset + ctx->total_sectors;
     if (CLUSTER_LBA + ctx->sectors_per_cluster > PARTITION_END_LBA) {
-        return -1;
+        return -EINVAL;
     }
 
     // Read the cluster
-    return ker::dev::block_read(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer);
+    return ker::dev::block_read(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer) == 0 ? 0 : -EIO;
 }
 
 // Helper function to compare FAT32 filenames (8.3 format with spaces)
@@ -962,13 +962,13 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 
     if ((f == nullptr) || (f->private_data == nullptr)) {
         log::warn("fat32_read: invalid file or private_data");
-        return -1;
+        return -EBADF;
     }
 
     auto* node = static_cast<FAT32Node*>(f->private_data);
     if (node->context == nullptr) {
         log::warn("fat32_read: mount context is null");
-        return -1;
+        return -EIO;
     }
 
     FAT32MountContext* ctx = node->context;
@@ -1019,7 +1019,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         current_cluster = get_next_cluster(ctx, current_cluster);
         if (current_cluster == 0) {
             ctx->lock.unlock();
-            return -1;
+            return -EIO;
         }
     }
 
@@ -1029,7 +1029,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     if (cluster_buf == nullptr) {
         log::warn("fat32_read: failed to allocate cluster buffer");
         ctx->lock.unlock();
-        return -1;
+        return -ENOMEM;
     }
 
     // Read data
@@ -1119,7 +1119,7 @@ auto fat32_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 auto flush_fat_table(const FAT32MountContext* ctx) -> int {
     if (ctx == nullptr || ctx->device == nullptr || ctx->fat_table == nullptr) {
         log::warn("flush_fat_table: invalid context");
-        return -1;
+        return -EINVAL;
     }
 
     // Calculate how many sectors to write
@@ -1136,7 +1136,7 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
 
     if (result != 0) {
         log::warn("flush_fat_table: failed to write FAT1");
-        return -1;
+        return -EIO;
     }
 
     // Write to FAT2 as well (backup FAT)
@@ -1145,7 +1145,7 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
 
     if (result != 0) {
         log::warn("flush_fat_table: failed to write FAT2");
-        return -1;
+        return -EIO;
     }
 
 #ifdef FAT32_DEBUG
@@ -1177,7 +1177,7 @@ auto fat32_fsync(File* f) -> int {
 static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
     if (node == nullptr || node->context == nullptr || node->context->device == nullptr) {
         log::warn("update_directory_entry: invalid node or context");
-        return -1;
+        return -EINVAL;
     }
 
     const FAT32MountContext* ctx = node->context;
@@ -1192,7 +1192,7 @@ static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> 
     auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         log::warn("update_directory_entry: failed to allocate cluster buffer");
-        return -1;
+        return -ENOMEM;
     }
 
     // Read the cluster containing the directory entry
@@ -1201,7 +1201,7 @@ static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> 
     if (ker::dev::block_read(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, cluster_buf) != 0) {
         log::warn("update_directory_entry: failed to read directory cluster");
         delete[] cluster_buf;
-        return -1;
+        return -EIO;
     }
 
     // Get the directory entry
@@ -1223,7 +1223,7 @@ static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> 
     // Write the cluster back to disk
     if (ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, cluster_buf) != 0) {
         log::warn("update_directory_entry: failed to write directory cluster");
-        return -1;
+        return -EIO;
     }
 
 #ifdef FAT32_DEBUG
@@ -1235,19 +1235,19 @@ static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> 
 // Write to a FAT32 file
 auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if ((f == nullptr) || (f->private_data == nullptr) || (buf == nullptr)) {
-        return -1;
+        return (buf == nullptr) ? -EINVAL : -EBADF;
     }
 
     auto* node = static_cast<FAT32Node*>(f->private_data);
     if (node->context == nullptr) {
         log::warn("fat32_write: no mount context available");
-        return -1;
+        return -EIO;
     }
 
     const FAT32MountContext* ctx = node->context;
     if (ctx->device == nullptr) {
         log::warn("fat32_write: no block device available");
-        return -1;
+        return -EIO;
     }
 
     // Calculate starting cluster and offset within cluster
@@ -1270,7 +1270,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
         }
         if (current_cluster == 0) {
             log::warn("fat32_write: no free clusters");
-            return -1;
+            return -ENOSPC;
         }
         byte_offset = 0;
         cluster_offset = 0;
@@ -1306,7 +1306,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
         if (ker::dev::block_read(ctx->device, CLUSTER_SECTOR, ctx->sectors_per_cluster, cluster_buf) != 0) {
             log::warn("fat32_write: failed to read cluster");
             delete[] cluster_buf;
-            return -1;
+            return -EIO;
         }
 
         // Write data into cluster buffer
@@ -1317,7 +1317,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
         if (ker::dev::block_write(ctx->device, CLUSTER_SECTOR, ctx->sectors_per_cluster, cluster_buf) != 0) {
             log::warn("fat32_write: failed to write cluster");
             delete[] cluster_buf;
-            return -1;
+            return -EIO;
         }
 
         bytes_written += BYTES_IN_CLUSTER;
@@ -1354,19 +1354,19 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
     // Flush FAT table to disk
     if (flush_fat_table(ctx) != 0) {
         log::warn("fat32_write: failed to flush FAT table");
-        return -1;
+        return -EIO;
     }
 
     // Update the directory entry on disk with the new file size
     if (update_directory_entry(node, node->file_size) != 0) {
         log::warn("fat32_write: failed to update directory entry");
-        return -1;
+        return -EIO;
     }
 
     // Flush block device
     if (ctx->device != nullptr && ker::dev::block_flush(ctx->device) != 0) {
         log::warn("fat32_write: failed to flush device");
-        return -1;
+        return -EIO;
     }
 
 #ifdef FAT32_DEBUG
@@ -1379,7 +1379,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
 // Seek in a FAT32 file
 auto fat32_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {
-        return -1;
+        return -EBADF;
     }
 
     auto* node = static_cast<FAT32Node*>(f->private_data);
@@ -1396,11 +1396,11 @@ auto fat32_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             newpos = static_cast<off_t>(node->file_size) + offset;
             break;
         default:
-            return -1;
+            return -EINVAL;
     }
 
     if (newpos < 0) {
-        return -1;
+        return -EINVAL;
     }
     f->pos = newpos;
     return f->pos;
@@ -1409,7 +1409,7 @@ auto fat32_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
 // Close a FAT32 file
 auto fat32_close(ker::vfs::File* f) -> int {
     if ((f == nullptr) || (f->private_data == nullptr)) {
-        return -1;
+        return -EBADF;
     }
 
     auto* node = static_cast<FAT32Node*>(f->private_data);
@@ -1429,7 +1429,7 @@ constexpr auto fat32_isatty(ker::vfs::File* f) -> bool {
 // Read directory entry at given index
 static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
     if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     auto* node = static_cast<FAT32Node*>(f->private_data);
@@ -1437,13 +1437,13 @@ static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> i
     // Check if this is a directory
     if (!node->is_directory) {
         log::warn("fat32_readdir: not a directory");
-        return -1;
+        return -ENOTDIR;
     }
 
     // Read directory entries from the directory's cluster chain
     if (node->context == nullptr) {
         log::warn("fat32_readdir: no mount context");
-        return -1;
+        return -EIO;
     }
 
     FAT32MountContext* ctx = node->context;
@@ -1479,7 +1479,7 @@ static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> i
     auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
     if (cluster_buf == nullptr) {
         ctx->lock.unlock();
-        return -1;
+        return -ENOMEM;
     }
 
     uint32_t current_cluster = node->start_cluster;
@@ -1497,7 +1497,7 @@ static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> i
         if (read_cluster(ctx, current_cluster, cluster_buf) != 0) {
             delete[] cluster_buf;
             ctx->lock.unlock();
-            return -1;
+            return -EIO;
         }
 
         // Parse directory entries
@@ -1511,7 +1511,7 @@ static auto fat32_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> i
             if (dir_entry->name[0] == 0x00) {
                 delete[] cluster_buf;
                 ctx->lock.unlock();
-                return -1;  // No more entries
+                return -ENOENT;  // No more entries
             }
 
             // Deleted entry - reset LFN accumulator
@@ -1853,11 +1853,11 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int {
 // Write a cluster to disk
 static auto write_cluster(const FAT32MountContext* ctx, uint32_t cluster, const void* buffer) -> int {
     if (ctx == nullptr || ctx->device == nullptr || cluster < 2) {
-        return -1;
+        return -EINVAL;
     }
     uint64_t const CLUSTER_LBA =
         ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(cluster - 2) * ctx->sectors_per_cluster);
-    return ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer);
+    return ker::dev::block_write(ctx->device, CLUSTER_LBA, ctx->sectors_per_cluster, buffer) == 0 ? 0 : -EIO;
 }
 
 // Calculate total data clusters for bounds checking FAT scans

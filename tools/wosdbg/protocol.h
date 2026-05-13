@@ -1,5 +1,7 @@
 #pragma once
 
+#include <qtypes.h>
+
 #include <QDataStream>
 #include <QString>
 #include <QVector>
@@ -9,87 +11,96 @@
 #include "log_entry.h"
 
 enum class MessageType : uint8_t {
-    Hello = 1,
-    Welcome = 2,
-    SelectFile = 3,
-    FileReady = 4,
-    RequestData = 5,
-    DataResponse = 6,
-    Error = 7,
-    Progress = 8,
-    SearchRequest = 9,
-    SearchResponse = 10,
-    GetInterruptsRequest = 11,
-    GetInterruptsResponse = 12,
-    SetFilterRequest = 13,
-    SetFilterResponse = 14,
-    RequestRowForLine = 15,
-    RowForLineResponse = 16,
-    OpenSourceFile = 17,
-    RequestFileList = 18,
-    FileListResponse = 19,
-    StartMcpServer = 20,
-    StopMcpServer = 21,
-    McpServerStatusRequest = 22,
-    McpServerStatusResponse = 23
+    HELLO = 1,
+    WELCOME = 2,
+    SELECT_FILE = 3,
+    FILE_READY = 4,
+    REQUEST_DATA = 5,
+    DATA_RESPONSE = 6,
+    ERROR = 7,
+    PROGRESS = 8,
+    SEARCH_REQUEST = 9,
+    SEARCH_RESPONSE = 10,
+    GET_INTERRUPTS_REQUEST = 11,
+    GET_INTERRUPTS_RESPONSE = 12,
+    SET_FILTER_REQUEST = 13,
+    SET_FILTER_RESPONSE = 14,
+    REQUEST_ROW_FOR_LINE = 15,
+    ROW_FOR_LINE_RESPONSE = 16,
+    OPEN_SOURCE_FILE = 17,
+    REQUEST_FILE_LIST = 18,
+    FILE_LIST_RESPONSE = 19,
+    START_MCP_SERVER = 20,
+    STOP_MCP_SERVER = 21,
+    MCP_SERVER_STATUS_REQUEST = 22,
+    MCP_SERVER_STATUS_RESPONSE = 23
 };
 
 // Serialization helpers for LogEntry
-inline QDataStream& operator<<(QDataStream& out, const LogEntry& entry) {
-    out << entry.lineNumber << static_cast<int>(entry.type) << QString::fromStdString(entry.address)
-        << QString::fromStdString(entry.function) << QString::fromStdString(entry.hexBytes) << QString::fromStdString(entry.assembly)
-        << QString::fromStdString(entry.originalLine) << static_cast<qulonglong>(entry.addressValue) << entry.isExpanded << entry.isChild
-        << QString::fromStdString(entry.interruptNumber) << QString::fromStdString(entry.cpuStateInfo)
-        << QString::fromStdString(entry.sourceFile) << entry.sourceLine;
+inline auto operator<<(QDataStream& out, const LogEntry& entry) -> QDataStream& {
+    out << entry.line_number << static_cast<int>(entry.type) << QString::fromStdString(entry.address)
+        << QString::fromStdString(entry.function) << QString::fromStdString(entry.hex_bytes) << QString::fromStdString(entry.assembly)
+        << QString::fromStdString(entry.original_line) << static_cast<qulonglong>(entry.address_value) << entry.is_expanded
+        << entry.is_child << QString::fromStdString(entry.interrupt_number) << QString::fromStdString(entry.cpu_state_info)
+        << QString::fromStdString(entry.source_file) << entry.source_line;
 
-    out << static_cast<quint32>(entry.childEntries.size());
-    for (const auto& child : entry.childEntries) {
+    out << static_cast<quint32>(entry.child_entries.size());
+    for (const auto& child : entry.child_entries) {
         out << child;
     }
     return out;
 }
 
-inline QDataStream& operator>>(QDataStream& in, LogEntry& entry) {
-    int typeInt;
-    QString address, function, hexBytes, assembly, originalLine, interruptNumber, cpuStateInfo, sourceFile;
-    qulonglong addressValue;
-    quint32 childCount;
-    int sourceLine;
+inline auto operator>>(QDataStream& in, LogEntry& entry) -> QDataStream& {
+    int type_int;
+    QString address;
+    QString function;
+    QString hex_bytes;
+    QString assembly;
+    QString original_line;
+    QString interrupt_number;
+    QString cpu_state_info;
+    QString source_file;
+    qulonglong address_value;
+    quint32 child_count;
+    int source_line;
 
-    in >> entry.lineNumber >> typeInt >> address >> function >> hexBytes >> assembly >> originalLine >> addressValue >> entry.isExpanded >>
-        entry.isChild >> interruptNumber >> cpuStateInfo >> sourceFile >> sourceLine >> childCount;
+    in >> entry.line_number >> type_int >> address >> function >> hex_bytes >> assembly >> original_line >> address_value >>
+        entry.is_expanded >> entry.is_child >> interrupt_number >> cpu_state_info >> source_file >> source_line >> child_count;
 
-    entry.type = static_cast<EntryType>(typeInt);
+    entry.type = static_cast<EntryType>(type_int);
     entry.address = address.toStdString();
     entry.function = function.toStdString();
-    entry.hexBytes = hexBytes.toStdString();
+    entry.hex_bytes = hex_bytes.toStdString();
     entry.assembly = assembly.toStdString();
-    entry.originalLine = originalLine.toStdString();
-    entry.addressValue = static_cast<uint64_t>(addressValue);
-    entry.interruptNumber = interruptNumber.toStdString();
-    entry.cpuStateInfo = cpuStateInfo.toStdString();
-    entry.sourceFile = sourceFile.toStdString();
-    entry.sourceLine = sourceLine;
+    entry.original_line = original_line.toStdString();
+    entry.address_value = static_cast<uint64_t>(address_value);
+    entry.interrupt_number = interrupt_number.toStdString();
+    entry.cpu_state_info = cpu_state_info.toStdString();
+    entry.source_file = source_file.toStdString();
+    entry.source_line = source_line;
 
-    entry.childEntries.resize(childCount);
-    for (quint32 i = 0; i < childCount; ++i) {
-        in >> entry.childEntries[i];
+    entry.child_entries.resize(child_count);
+    for (quint32 i = 0; i < child_count; ++i) {
+        in >> entry.child_entries[i];
     }
     return in;
 }
 
 // Serialization helpers for AddressLookup (Config)
-inline QDataStream& operator<<(QDataStream& out, const AddressLookup& lookup) {
-    out << static_cast<qulonglong>(lookup.fromAddress) << static_cast<qulonglong>(lookup.toAddress) << static_cast<qulonglong>(lookup.loadOffset)
-        << lookup.symbolFilePath;
+inline auto operator<<(QDataStream& out, const AddressLookup& lookup) -> QDataStream& {
+    out << static_cast<qulonglong>(lookup.from_address) << static_cast<qulonglong>(lookup.to_address)
+        << static_cast<qulonglong>(lookup.load_offset) << lookup.symbol_file_path;
     return out;
 }
 
-inline QDataStream& operator>>(QDataStream& in, AddressLookup& lookup) {
-    qulonglong from, to, loadOffset;
-    in >> from >> to >> loadOffset >> lookup.symbolFilePath;
-    lookup.fromAddress = static_cast<uint64_t>(from);
-    lookup.toAddress = static_cast<uint64_t>(to);
-    lookup.loadOffset = static_cast<uint64_t>(loadOffset);
+inline auto operator>>(QDataStream& in, AddressLookup& lookup) -> QDataStream& {
+    qulonglong from;
+    qulonglong to;
+    qulonglong load_offset;
+    in >> from >> to >> load_offset >> lookup.symbol_file_path;
+    lookup.from_address = static_cast<uint64_t>(from);
+    lookup.to_address = static_cast<uint64_t>(to);
+    lookup.load_offset = static_cast<uint64_t>(load_offset);
     return in;
 }

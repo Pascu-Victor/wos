@@ -1,13 +1,13 @@
 #pragma once
 
+#include <capstone/capstone.h>
+
 #include <QDockWidget>
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <cstdint>
 #include <vector>
-
-#include <capstone/capstone.h>
 
 namespace wosdbg {
 struct CoreDump;
@@ -25,31 +25,30 @@ class CoredumpDisasmPanel : public QDockWidget {
     ~CoredumpDisasmPanel() override;
 
     /// Load the coredump and symbol context.  Call this when a dump is opened.
-    void loadCoreDump(const wosdbg::CoreDump* dump,
-                      const std::vector<wosdbg::SymbolTable*>& symTables = {},
-                      const std::vector<wosdbg::SectionMap*>& sectionMaps = {});
+    void load_core_dump(const wosdbg::CoreDump* dump, const std::vector<wosdbg::SymbolTable*>& sym_tables = {},
+                        const std::vector<wosdbg::SectionMap*>& section_maps = {});
 
     /// Disassemble around an arbitrary virtual address (from the embedded ELF).
-    void disassembleAt(uint64_t va, int numInstructions = 30);
+    void disassemble_at(uint64_t va, int num_instructions = 30);
 
     void clear();
 
    signals:
-    void addressClicked(uint64_t addr);
+    void address_clicked(uint64_t addr);
 
    private:
-    void setupUI();
-    QString disassembleRange(uint64_t va, int numInstructions);
+    void setup_ui();
+    QString disassemble_range(uint64_t va, int num_instructions);
 
-    QLabel*        ripLabel_    = nullptr;
-    QLabel*        savedLabel_  = nullptr;
-    QPushButton*   trapRipBtn_  = nullptr;
-    QPushButton*   savedRipBtn_ = nullptr;
-    QPlainTextEdit* view_       = nullptr;
+    QLabel* rip_label = nullptr;
+    QLabel* saved_label = nullptr;
+    QPushButton* trap_rip_btn = nullptr;
+    QPushButton* saved_rip_btn = nullptr;
+    QPlainTextEdit* view = nullptr;
 
-    const wosdbg::CoreDump*               dump_         = nullptr;
-    std::vector<wosdbg::SymbolTable*>     symTables_;
-    std::vector<wosdbg::SectionMap*>      sectionMaps_;
+    const wosdbg::CoreDump* dump = nullptr;
+    std::vector<wosdbg::SymbolTable*> sym_tables;
+    std::vector<wosdbg::SectionMap*> section_maps;
 
-    csh cs_ = 0;  // Capstone handle (0 = not initialised)
+    csh cs = 0;  // Capstone handle (0 = not initialised)
 };

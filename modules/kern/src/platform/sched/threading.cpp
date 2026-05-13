@@ -6,7 +6,6 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sys/spinlock.hpp>
-#include <util/hcf.hpp>
 #include <util/list.hpp>
 
 #include "platform/asm/cpu.hpp"
@@ -20,9 +19,117 @@ using log = ker::mod::dbg::logger<"thread">;
 
 util::List<Thread*> active_threads;
 sys::Spinlock active_threads_lock;
+constexpr uint64_t STACK_INITIAL_BACKING_BYTES = 256ULL * 1024ULL;
+constexpr uint64_t STACK_GROW_NORMAL_BYTES = 256ULL * 1024ULL;
+constexpr uint64_t STACK_GROW_MEDIUM_BYTES = 512ULL * 1024ULL;
+constexpr uint64_t STACK_GROW_LARGE_BYTES = 1024ULL * 1024ULL;
+constexpr uint64_t STACK_GROW_NEAR_BYTES = 64ULL * 1024ULL;
+constexpr uint64_t STACK_GROW_RSP_FAR_BYTES = 512ULL * 1024ULL;
+
+auto min_u64(uint64_t a, uint64_t b) -> uint64_t { return a < b ? a : b; }
+
+auto max_u64(uint64_t a, uint64_t b) -> uint64_t { return a > b ? a : b; }
+
+auto stack_top(const Thread* thread) -> uint64_t {
+    if (thread == nullptr || thread->stack_size == 0) {
+        return 0;
+    }
+    uint64_t const TOP = thread->stack_base_virt + thread->stack_size;
+    return TOP < thread->stack_base_virt ? 0 : TOP;
+}
+
+void free_mapped_user_range(mm::paging::PageTable* page_table, uint64_t start, uint64_t end) {
+    if (page_table == nullptr || start >= end) {
+        return;
+    }
+    uint64_t const LOW = page_align_down(start);
+    uint64_t const HIGH = page_align_up(end);
+    for (uint64_t addr = LOW; addr < HIGH; addr += mm::paging::PAGE_SIZE) {
+        if (mm::virt::translate(page_table, addr) == mm::virt::PADDR_INVALID) {
+            continue;
+        }
+        mm::virt::unmap_page(page_table, addr);
+    }
+}
 }  // namespace
 
 void init_threading() {}
+
+bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end) {
+    if (thread == nullptr || page_table == nullptr || start > end) {
+        return false;
+    }
+    if (start == end) {
+        return true;
+    }
+
+    uint64_t const BASE = thread->stack_base_virt;
+    uint64_t const TOP = stack_top(thread);
+    if (BASE == 0 || TOP == 0 || start < BASE || end > TOP) {
+        return false;
+    }
+
+    uint64_t const LOW = max_u64(BASE, page_align_down(start));
+    uint64_t const HIGH = min_u64(TOP, page_align_up(end));
+    for (uint64_t addr = LOW; addr < HIGH; addr += mm::paging::PAGE_SIZE) {
+        if (mm::virt::translate(page_table, addr) != mm::virt::PADDR_INVALID) {
+            continue;
+        }
+
+        void* page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_stack_lazy");
+        if (page == nullptr) {
+            log::error("ensure_stack_backing: OOM backing stack page vaddr=0x%llx range=[0x%llx,0x%llx)",
+                       static_cast<unsigned long long>(addr), static_cast<unsigned long long>(LOW), static_cast<unsigned long long>(HIGH));
+            return false;
+        }
+
+        auto const PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+        mm::virt::map_page(page_table, addr, PHYS, mm::paging::page_types::USER);
+    }
+
+    if (thread->stack_lowest_backed == 0 || LOW < thread->stack_lowest_backed) {
+        thread->stack_lowest_backed = LOW;
+    }
+    return true;
+}
+
+bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp) {
+    if (thread == nullptr || page_table == nullptr) {
+        return false;
+    }
+
+    uint64_t const BASE = thread->stack_base_virt;
+    uint64_t const TOP = stack_top(thread);
+    if (BASE == 0 || TOP == 0 || fault_addr < BASE || fault_addr >= TOP) {
+        return false;
+    }
+
+    uint64_t const FAULT_PAGE = page_align_down(fault_addr);
+    uint64_t const RSP_PAGE = (rsp >= BASE && rsp < TOP) ? page_align_down(rsp) : FAULT_PAGE;
+    uint64_t const LOWEST_BACKED = thread->stack_lowest_backed != 0 ? thread->stack_lowest_backed : TOP;
+    uint64_t const GAP_FROM_HINT = LOWEST_BACKED > FAULT_PAGE ? LOWEST_BACKED - FAULT_PAGE : 0;
+    uint64_t const RSP_DISTANCE = RSP_PAGE > FAULT_PAGE ? RSP_PAGE - FAULT_PAGE : FAULT_PAGE - RSP_PAGE;
+
+    uint64_t batch = STACK_GROW_NORMAL_BYTES;
+    if (GAP_FROM_HINT > STACK_GROW_LARGE_BYTES || RSP_DISTANCE > STACK_GROW_RSP_FAR_BYTES) {
+        batch = STACK_GROW_LARGE_BYTES;
+    } else if (GAP_FROM_HINT > STACK_GROW_NEAR_BYTES) {
+        batch = STACK_GROW_MEDIUM_BYTES;
+    }
+
+    uint64_t const ABOVE = batch / 4;
+    uint64_t const BELOW = batch - ABOVE;
+    uint64_t low = FAULT_PAGE > BASE + BELOW ? FAULT_PAGE - BELOW : BASE;
+    uint64_t high = min_u64(TOP, FAULT_PAGE + mm::paging::PAGE_SIZE + ABOVE);
+
+    // If the fault is just below the hot stack slice, fill the short gap so
+    // normal downward growth stays mostly fault-free.
+    if (LOWEST_BACKED > high && LOWEST_BACKED - high <= STACK_GROW_LARGE_BYTES) {
+        high = LOWEST_BACKED;
+    }
+
+    return ensure_stack_backing(thread, page_table, low, high);
+}
 
 Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table,
                       const ker::loader::elf::TlsModule& tls_info) {
@@ -42,24 +149,28 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     uint64_t const TCB_SIZE = 256;          // Extra space for mlibc's Tcb structure
     uint64_t const SAFESTACK_SIZE = 65536;  // 64KB for SafeStack unsafe stack
     uint64_t const TOTAL_TLS_SIZE = ACTUAL_TLS_SIZE + TCB_SIZE + SAFESTACK_SIZE;
+    uint64_t const ALIGNED_TOTAL_SIZE = page_align_up(TOTAL_TLS_SIZE);
 
-    void* tls = mm::phys::page_alloc(page_align_up(TOTAL_TLS_SIZE));
+    void* tls = mm::phys::page_alloc(ALIGNED_TOTAL_SIZE, "thread_tls");
     if (tls == nullptr) {
-        log::error("create_thread: failed to allocate TLS memory (%d bytes)", page_align_up(TOTAL_TLS_SIZE));
+        log::error("create_thread: failed to allocate TLS memory (%llu bytes)", static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
         delete thread;
         return nullptr;
     }
 
-    void* stack = mm::phys::page_alloc(stack_size);
-    if (stack == nullptr) {
-        log::error("create_thread: failed to allocate stack memory (%d bytes)", stack_size);
+    // TLS is reclaimed one 4 KiB leaf at a time during destroy_user_space() /
+    // COW teardown, so split the bulk allocation before exposing it through
+    // page tables. The user stack is backed lazily with single-page leaves.
+    bool const TLS_SPLIT = mm::phys::page_split_to_order0(tls);
+    if (!TLS_SPLIT) {
+        log::error("create_thread: failed to split TLS backing pages tls=%p tls_size=%llu", tls,
+                   static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
         mm::phys::page_free(tls);
         delete thread;
         return nullptr;
     }
 
     // CRITICAL FIX: Use page-aligned size for virtual address calculation too
-    uint64_t const ALIGNED_TOTAL_SIZE = page_align_up(TOTAL_TLS_SIZE);
     uint64_t const TLS_VIRT_ADDR = 0x7FFF00000000ULL - ALIGNED_TOTAL_SIZE;
     uint64_t const STACK_VIRT_ADDR = TLS_VIRT_ADDR - stack_size;
     thread->magic = 0xDEADBEEF;
@@ -68,20 +179,6 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     for (uint64_t offset = 0; offset < ALIGNED_TOTAL_SIZE; offset += mm::paging::PAGE_SIZE) {
         auto const TLS_PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(tls) + offset));
         mm::virt::map_page(page_table, TLS_VIRT_ADDR + offset, TLS_PHYS, mm::paging::page_types::USER);
-    }
-
-    // Map all pages for stack
-    for (uint64_t offset = 0; offset < stack_size; offset += mm::paging::PAGE_SIZE) {
-        auto const STACK_PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(stack) + offset));
-        mm::virt::map_page(page_table, STACK_VIRT_ADDR + offset, STACK_PHYS, mm::paging::page_types::USER);
-    }
-
-    // TLS and user stacks are reclaimed one 4 KiB leaf at a time during
-    // destroyUserSpace() / COW teardown, so split the bulk allocations into
-    // independently freeable pages once the mappings are established.
-    if (!mm::phys::page_split_to_order0(tls) || !mm::phys::page_split_to_order0(stack)) {
-        log::error("create_thread: failed to split TLS/stack backing pages");
-        hcf();
     }
 
     // TCB goes at the TOP of the TLS area (highest address)
@@ -157,23 +254,36 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     thread->tls_base_virt = TLS_VIRT_ADDR;
     thread->safestack_ptr_value = SAFESTACK_PTR_VALUE;
 
-    // Stack grows downward, so thread->stack points to the TOP of the stack
-    // Reserve space at the BOTTOM of stack for PerCpu scratch area (used by syscall handler after swapgs)
+    // Stack grows downward, so thread->stack points near the TOP of the reserved stack.
+    // The actual syscall scratch area lives in kernel memory on Task::context.
     uint64_t const SCRATCH_AREA_SIZE = sizeof(cpu::PerCpu);
     thread->stack = STACK_VIRT_ADDR + stack_size - SCRATCH_AREA_SIZE;  // Stack starts above scratch area
+    thread->stack_base_virt = STACK_VIRT_ADDR;
+    thread->stack_lowest_backed = STACK_VIRT_ADDR + stack_size;
     thread->fsbase = TCB_VIRT_ADDR;
-    // User GS_BASE points to TLS/stack base area (user-accessible)
-    thread->gsbase = STACK_VIRT_ADDR;  // Bottom of stack where scratch area lives
-
-    // Initialize the scratch area at the bottom of the stack
-    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(stack);
-    std::memset(scratch_area, 0, sizeof(cpu::PerCpu));
-    scratch_area->syscall_stack = 0;  // Will be set by task initialization
-    scratch_area->cpu_id = 0;         // Will be set by task initialization
+    // User GS_BASE points at the base of the reserved stack range.
+    thread->gsbase = STACK_VIRT_ADDR;
 
     // Store the physical (HHDM) pointers for cleanup
     thread->tls_phys_ptr = reinterpret_cast<uint64_t>(tls);
-    thread->stack_phys_ptr = reinterpret_cast<uint64_t>(stack);
+    thread->stack_phys_ptr = 0;
+
+    uint64_t const STACK_TOP = STACK_VIRT_ADDR + stack_size;
+    uint64_t const INITIAL_STACK_BYTES = min_u64(STACK_INITIAL_BACKING_BYTES, stack_size);
+    bool const INITIAL_STACK_OK = ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP) &&
+                                  ensure_stack_backing(thread, page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE);
+    if (!INITIAL_STACK_OK) {
+        log::error("create_thread: failed to lazily back initial stack windows stack=0x%llx size=%llu initial=%llu",
+                   static_cast<unsigned long long>(STACK_VIRT_ADDR), static_cast<unsigned long long>(stack_size),
+                   static_cast<unsigned long long>(INITIAL_STACK_BYTES));
+        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
+        free_mapped_user_range(page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP);
+        free_mapped_user_range(page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE);
+        thread->tls_phys_ptr = 0;
+        delete thread;
+        return nullptr;
+    }
+    thread->stack_lowest_backed = STACK_TOP - INITIAL_STACK_BYTES;
 
     active_threads_lock.lock();
     active_threads.push_back(thread);

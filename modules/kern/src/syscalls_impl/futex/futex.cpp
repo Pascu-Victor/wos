@@ -162,8 +162,7 @@ int64_t futex_wake(int* addr) {  // NOLINT
                                                                    std::memory_order_acquire)) {
                 own_waiter = false;
             }
-            waiter_task->deferred_task_switch = false;
-            mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
+            mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
             woken_count++;
             waiter_task->release();
         }
@@ -205,8 +204,7 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
                                                                    std::memory_order_acquire)) {
                 own_waiter = false;
             }
-            waiter_task->deferred_task_switch = false;
-            mod::sched::reschedule_task_for_cpu(waiter->task_cpu, waiter_task);
+            mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
             woken_count++;
             waiter_task->release();
         }

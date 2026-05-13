@@ -3,6 +3,7 @@
 #include <qabstractitemmodel.h>
 #include <qabstractitemview.h>
 #include <qcontainerfwd.h>
+#include <qlogging.h>
 #include <qnamespace.h>
 #include <qobject.h>
 #include <qtableview.h>
@@ -24,43 +25,47 @@
 // VirtualRowCache Implementation
 // ============================================================================
 
-VirtualRowCache::VirtualRowCache(size_t maxRows) : maxCachedRows(maxRows) {}
+VirtualRowCache::VirtualRowCache(size_t max_rows) : maxCachedRows(max_rows) {}
 
-const VirtualRowCache::CachedRow* VirtualRowCache::getRow(int logicalRow) const {
-    auto it = cachedRows.find(logicalRow);
+const VirtualRowCache::CachedRow* VirtualRowCache::getRow(int logical_row) const {
+    auto it = cachedRows.find(logical_row);
     if (it != cachedRows.end()) {
-        if (trackingEnabled) ++cacheHits;
-        const_cast<VirtualRowCache*>(this)->updateLRUOrder(logicalRow);
+        if (trackingEnabled) {
+            ++cacheHits;
+        }
+        const_cast<VirtualRowCache*>(this)->updateLRUOrder(logical_row);
         return &it->second;
     }
 
-    if (trackingEnabled) ++cacheMisses;
+    if (trackingEnabled) {
+        ++cacheMisses;
+    }
     return nullptr;
 }
 
-void VirtualRowCache::setRow(int logicalRow, const std::vector<QString>& cells, QColor bgColor) {
+void VirtualRowCache::setRow(int logical_row, const std::vector<QString>& cells, QColor bg_color) {
     // Check if we need to evict
-    if (cachedRows.size() >= maxCachedRows && cachedRows.find(logicalRow) == cachedRows.end()) {
+    if (cachedRows.size() >= maxCachedRows && !cachedRows.contains(logical_row)) {
         evictLRU();
     }
 
-    CachedRow& row = cachedRows[logicalRow];
+    CachedRow& row = cachedRows[logical_row];
     row.cells = cells;
-    row.backgroundColor = bgColor;
+    row.backgroundColor = bg_color;
     row.isValid = true;
 
-    updateLRUOrder(logicalRow);
+    updateLRUOrder(logical_row);
 }
 
-void VirtualRowCache::removeRow(int logicalRow) {
-    auto it = cachedRows.find(logicalRow);
+void VirtualRowCache::removeRow(int logical_row) {
+    auto it = cachedRows.find(logical_row);
     if (it != cachedRows.end()) {
         cachedRows.erase(it);
 
         // Also remove from LRU order
-        auto lruIt = std::find(lruOrder.begin(), lruOrder.end(), logicalRow);
-        if (lruIt != lruOrder.end()) {
-            lruOrder.erase(lruIt);
+        auto lru_it = std::ranges::find(lruOrder, logical_row);
+        if (lru_it != lruOrder.end()) {
+            lruOrder.erase(lru_it);
         }
     }
 }
@@ -72,77 +77,85 @@ void VirtualRowCache::clear() {
     cacheMisses = 0;
 }
 
-void VirtualRowCache::getStats(size_t& outCachedRows, size_t& outHits, size_t& outMisses) const {
-    outCachedRows = cachedRows.size();
-    outHits = cacheHits;
-    outMisses = cacheMisses;
+void VirtualRowCache::getStats(size_t& out_cached_rows, size_t& out_hits, size_t& out_misses) const {
+    out_cached_rows = cachedRows.size();
+    out_hits = cacheHits;
+    out_misses = cacheMisses;
 }
 
 void VirtualRowCache::evictLRU() {
-    if (lruOrder.empty()) return;
+    if (lruOrder.empty()) {
+        return;
+    }
 
-    int lruRow = lruOrder.front();
+    int lru_row = lruOrder.front();
     lruOrder.erase(lruOrder.begin());
-    cachedRows.erase(lruRow);
+    cachedRows.erase(lru_row);
 }
 
-void VirtualRowCache::updateLRUOrder(int logicalRow) {
+void VirtualRowCache::updateLRUOrder(int logical_row) {
     // Remove from existing position if present
-    auto it = std::find(lruOrder.begin(), lruOrder.end(), logicalRow);
+    auto it = std::ranges::find(lruOrder, logical_row);
     if (it != lruOrder.end()) {
         lruOrder.erase(it);
     }
 
     // Add to end (most recently used)
-    lruOrder.push_back(logicalRow);
+    lruOrder.push_back(logical_row);
 }
 
 // ============================================================================
 // VirtualTableModel Implementation
 // ============================================================================
 
-VirtualTableModel::VirtualTableModel(int totalRows, const QStringList& headers, QObject* parent)
-    : QAbstractTableModel(parent), columnHeaders(headers), totalRowCount(totalRows), cache(500) {}
+VirtualTableModel::VirtualTableModel(int total_rows, QStringList headers, QObject* parent)
+    : QAbstractTableModel(parent), columnHeaders(std::move(headers)), totalRowCount(total_rows), cache(500) {}
 
 int VirtualTableModel::rowCount(const QModelIndex& parent) const {
-    if (parent.isValid()) return 0;
+    if (parent.isValid()) {
+        return 0;
+    }
     return totalRowCount;
 }
 
 int VirtualTableModel::columnCount(const QModelIndex& parent) const {
-    if (parent.isValid()) return 0;
+    if (parent.isValid()) {
+        return 0;
+    }
     return columnHeaders.size();
 }
 
 QVariant VirtualTableModel::data(const QModelIndex& index, int role) const {
     if (!index.isValid() || index.row() < 0 || index.row() >= totalRowCount || index.column() < 0 ||
         index.column() >= columnHeaders.size()) {
-        return QVariant();
+        return {};
     }
 
     ensureRowLoaded(index.row());
-    const VirtualRowCache::CachedRow* cachedRow = cache.getRow(index.row());
+    const VirtualRowCache::CachedRow* cached_row = cache.getRow(index.row());
 
-    if (!cachedRow || !cachedRow->isValid) {
-        if (index.row() < 5) qDebug() << "VirtualTableModel::data: Row" << index.row() << "not in cache or invalid";
-        return QVariant();
+    if (!cached_row || !cached_row->isValid) {
+        if (index.row() < 5) {
+            qDebug() << "VirtualTableModel::data: Row" << index.row() << "not in cache or invalid";
+        }
+        return {};
     }
 
     switch (role) {
         case Qt::DisplayRole: {
-            if (static_cast<size_t>(index.column()) < cachedRow->cells.size()) {
-                return cachedRow->cells[index.column()];
+            if (static_cast<size_t>(index.column()) < cached_row->cells.size()) {
+                return cached_row->cells[index.column()];
             }
-            return QVariant();
+            return {};
         }
         case Qt::BackgroundRole: {
-            return cachedRow->backgroundColor;
+            return cached_row->backgroundColor;
         }
         case Qt::TextAlignmentRole: {
             return static_cast<int>(Qt::AlignLeft | Qt::AlignVCenter);
         }
         default:
-            return QVariant();
+            return {};
     }
 }
 
@@ -150,40 +163,42 @@ QVariant VirtualTableModel::headerData(int section, Qt::Orientation orientation,
     if (orientation == Qt::Horizontal && role == Qt::DisplayRole && section >= 0 && section < columnHeaders.size()) {
         return columnHeaders[section];
     }
-    return QVariant();
+    return {};
 }
 
 void VirtualTableModel::setDataProvider(std::function<void(int, std::vector<QString>&, QColor&)> provider,
-                                        std::function<bool(const QString&)> highlightPredicate) {
+                                        std::function<bool(const QString&)> highlight_predicate) {
     dataProvider = std::move(provider);
-    this->highlightPredicate = highlightPredicate;
+    this->highlightPredicate = std::move(highlight_predicate);
 }
 
-void VirtualTableModel::invalidateRows(int startRow, int endRow) {
+void VirtualTableModel::invalidateRows(int start_row, int end_row) {
     // Handle edge case: zero rows
     if (totalRowCount == 0) {
         return;
     }
 
-    if (startRow < 0) startRow = 0;
-    if (endRow >= totalRowCount) endRow = totalRowCount - 1;
+    start_row = std::max(start_row, 0);
+    if (end_row >= totalRowCount) {
+        end_row = totalRowCount - 1;
+    }
 
     // Ensure valid range
-    if (startRow > endRow || startRow >= totalRowCount) {
+    if (start_row > end_row || start_row >= totalRowCount) {
         return;
     }
 
     // Clear from cache so they are re-fetched
-    for (int i = startRow; i <= endRow; ++i) {
+    for (int i = start_row; i <= end_row; ++i) {
         cache.removeRow(i);
     }
 
-    emit dataChanged(index(startRow, 0), index(endRow, columnCount() - 1));
+    emit dataChanged(index(start_row, 0), index(end_row, columnCount() - 1));
 }
 
-void VirtualTableModel::setCacheSize(size_t newSize) {
+void VirtualTableModel::setCacheSize(size_t new_size) {
     cache.clear();
-    VirtualRowCache newCache(newSize);
+    VirtualRowCache new_cache(new_size);
     // Can't directly reassign, so we recreate with move semantics
     // This is a limitation of the current design; could be improved with pimpl
 }
@@ -194,16 +209,16 @@ void VirtualTableModel::resetModel() {
     endResetModel();
 }
 
-void VirtualTableModel::setRowCount(int rowCount) {
+void VirtualTableModel::setRowCount(int row_count) {
     beginResetModel();
-    totalRowCount = rowCount;
+    totalRowCount = row_count;
     cache.clear();
     endResetModel();
 }
 
-void VirtualTableModel::ensureRowLoaded(int logicalRow) const {
+void VirtualTableModel::ensureRowLoaded(int logical_row) const {
     // Check if already cached
-    if (cache.getRow(logicalRow) != nullptr) {
+    if (cache.getRow(logical_row) != nullptr) {
         return;
     }
 
@@ -214,17 +229,20 @@ void VirtualTableModel::ensureRowLoaded(int logicalRow) const {
     // Load via provider
     if (dataProvider) {
         std::vector<QString> cells;
-        QColor bgColor = Qt::transparent;
-        dataProvider(logicalRow, cells, bgColor);
+        QColor bg_color = Qt::transparent;
+        dataProvider(logical_row, cells, bg_color);
 
-        if (logicalRow < 5)
-            qDebug() << "VirtualTableModel::ensureRowLoaded: Provider returned" << cells.size() << "cells for row" << logicalRow;
+        if (logical_row < 5) {
+            qDebug() << "VirtualTableModel::ensureRowLoaded: Provider returned" << cells.size() << "cells for row" << logical_row;
+        }
 
         // Cast away const to fill cache
-        const_cast<VirtualTableModel*>(this)->cache.setRow(logicalRow, cells, bgColor);
+        const_cast<VirtualTableModel*>(this)->cache.setRow(logical_row, cells, bg_color);
 
         // Debug logging for first few rows
-        if (logicalRow < 5) qDebug() << "VirtualTableModel loaded row" << logicalRow << "cells:" << cells.size();
+        if (logical_row < 5) {
+            qDebug() << "VirtualTableModel loaded row" << logical_row << "cells:" << cells.size();
+        }
     }
 }
 
@@ -253,7 +271,9 @@ void VirtualTableView::setVirtualModel(VirtualTableModel* model) {
 }
 
 void VirtualTableView::scrollToLogicalRow(int row, QAbstractItemView::ScrollHint hint) {
-    if (!virtualModel) return;
+    if (!virtualModel) {
+        return;
+    }
 
     // Ensure the row is loaded
     virtualModel->invalidateRows(row, row);
@@ -263,15 +283,17 @@ void VirtualTableView::scrollToLogicalRow(int row, QAbstractItemView::ScrollHint
 }
 
 int VirtualTableView::getViewportStartRow() const {
-    if (!virtualModel) return 0;
+    if (!virtualModel) {
+        return 0;
+    }
 
     // Find first visible row
     int row = 0;
-    int accumulatedHeight = 0;
-    int viewportTop = verticalScrollBar()->value();
+    int accumulated_height = 0;
+    int viewport_top = verticalScrollBar()->value();
 
-    while (row < virtualModel->rowCount() && accumulatedHeight < viewportTop) {
-        accumulatedHeight += rowHeight(row);
+    while (row < virtualModel->rowCount() && accumulated_height < viewport_top) {
+        accumulated_height += rowHeight(row);
         row++;
     }
 
@@ -286,7 +308,9 @@ void VirtualTableView::resizeEvent(QResizeEvent* event) {
 void VirtualTableView::scrollContentsBy(int dx, int dy) {
     QTableView::scrollContentsBy(dx, dy);
     if (dy != 0) {
-        if (virtualModel) virtualModel->setLoadingEnabled(false);
+        if (virtualModel) {
+            virtualModel->setLoadingEnabled(false);
+        }
         scrollDebounceTimer->stop();
         scrollDebounceTimer->start();
     }
@@ -294,17 +318,21 @@ void VirtualTableView::scrollContentsBy(int dx, int dy) {
 
 void VirtualTableView::onVerticalScrollBarValueChanged(int value) {
     Q_UNUSED(value)
-    if (virtualModel) virtualModel->setLoadingEnabled(false);
+    if (virtualModel) {
+        virtualModel->setLoadingEnabled(false);
+    }
     scrollDebounceTimer->stop();
     scrollDebounceTimer->start();
 }
 
 void VirtualTableView::updateVisibleRows() {
-    if (!virtualModel) return;
+    if (!virtualModel) {
+        return;
+    }
 
     virtualModel->setLoadingEnabled(true);
 
-    int currentStart = getViewportStartRow();
+    int current_start = getViewportStartRow();
 
     // Always update if we are here, because the timer fired meaning we stopped scrolling
     // or we need to refresh.
@@ -312,27 +340,27 @@ void VirtualTableView::updateVisibleRows() {
     //    return;
     // }
 
-    lastVisibleRowStart = currentStart;
+    lastVisibleRowStart = current_start;
 
     // Calculate how many rows are visible
-    int viewportHeight = viewport()->height();
-    int visibleRowCount = 0;
-    int currentRow = currentStart;
-    int accHeight = 0;
+    int viewport_height = viewport()->height();
+    int visible_row_count = 0;
+    int current_row = current_start;
+    int acc_height = 0;
 
-    while (currentRow < virtualModel->rowCount() && accHeight < viewportHeight) {
-        accHeight += rowHeight(currentRow);
-        visibleRowCount++;
-        currentRow++;
+    while (current_row < virtualModel->rowCount() && acc_height < viewport_height) {
+        acc_height += rowHeight(current_row);
+        visible_row_count++;
+        current_row++;
     }
 
     // Pre-load visible rows plus some buffer rows
-    int bufferSize = visibleRowCount / 2;  // Load 50% extra on each side
-    int startPreload = std::max(0, currentStart - bufferSize);
-    int endPreload = std::min(virtualModel->rowCount() - 1, currentStart + visibleRowCount + bufferSize);
+    int buffer_size = visible_row_count / 2;  // Load 50% extra on each side
+    int start_preload = std::max(0, current_start - buffer_size);
+    int end_preload = std::min(virtualModel->rowCount() - 1, current_start + visible_row_count + buffer_size);
 
     // Trigger loading
-    virtualModel->invalidateRows(startPreload, endPreload);
+    virtualModel->invalidateRows(start_preload, end_preload);
 
     // Force a repaint of the viewport to ensure new data is drawn
     viewport()->update();

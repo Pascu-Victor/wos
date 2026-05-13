@@ -1,30 +1,42 @@
 #include "coredump_segment_panel.h"
 
+#include <qabstractitemview.h>
+#include <qcolor.h>
+#include <qdockwidget.h>
+#include <qnamespace.h>
+#include <qobject.h>
+#include <qtablewidget.h>
+#include <qtmetamacros.h>
+#include <qwidget.h>
+
 #include <QFont>
 #include <QHeaderView>
 #include <QVBoxLayout>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
 #include "coredump_parser.h"
 
-CoredumpSegmentPanel::CoredumpSegmentPanel(QWidget* parent) : QDockWidget("Segments", parent) { setupUI(); }
+CoredumpSegmentPanel::CoredumpSegmentPanel(QWidget* parent) : QDockWidget("Segments", parent) { setup_ui(); }
 
-void CoredumpSegmentPanel::setupUI() {
+void CoredumpSegmentPanel::setup_ui() {
     auto* container = new QWidget(this);
     auto* layout = new QVBoxLayout(container);
     layout->setContentsMargins(4, 4, 4, 4);
 
-    table_ = new QTableWidget(container);
-    table_->setColumnCount(6);
-    table_->setHorizontalHeaderLabels({"#", "Type", "VA Start", "VA End", "Size", "Present"});
-    table_->verticalHeader()->setVisible(false);
-    table_->horizontalHeader()->setStretchLastSection(true);
-    table_->setAlternatingRowColors(true);
-    table_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    table_->setSelectionMode(QAbstractItemView::SingleSelection);
+    table = new QTableWidget(container);
+    table->setColumnCount(6);
+    table->setHorizontalHeaderLabels({"#", "Type", "VA Start", "VA End", "Size", "Present"});
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->setAlternatingRowColors(true);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
 
-    connect(table_, &QTableWidget::cellDoubleClicked, this, &CoredumpSegmentPanel::onSegmentActivated);
+    connect(table, &QTableWidget::cellDoubleClicked, this, &CoredumpSegmentPanel::on_segment_activated);
 
-    layout->addWidget(table_);
+    layout->addWidget(table);
     setWidget(container);
 }
 
@@ -37,45 +49,45 @@ static QTableWidgetItem* make_mono_item(const QString& text) {
     return item;
 }
 
-void CoredumpSegmentPanel::loadCoreDump(const wosdbg::CoreDump& dump) {
-    table_->clearContents();
-    segInfos_.clear();
+void CoredumpSegmentPanel::load_core_dump(const wosdbg::CoreDump& dump) {
+    table->clearContents();
+    seg_infos.clear();
 
-    int count = static_cast<int>(std::min(dump.segmentCount, static_cast<uint64_t>(dump.segments.size())));
-    table_->setRowCount(count);
+    int count = static_cast<int>(std::min(dump.segment_count, static_cast<uint64_t>(dump.segments.size())));
+    table->setRowCount(count);
 
     for (int i = 0; i < count; ++i) {
         const auto& seg = dump.segments[static_cast<size_t>(i)];
 
-        table_->setItem(i, 0, make_mono_item(QString::number(i)));
-        table_->setItem(i, 1, make_mono_item(seg.typeName()));
-        table_->setItem(i, 2, make_mono_item(wosdbg::formatU64(seg.vaddr)));
-        table_->setItem(i, 3, make_mono_item(wosdbg::formatU64(seg.vaddrEnd())));
-        table_->setItem(i, 4, make_mono_item(QString("0x%1").arg(seg.size, 0, 16)));
+        table->setItem(i, 0, make_mono_item(QString::number(i)));
+        table->setItem(i, 1, make_mono_item(seg.type_name()));
+        table->setItem(i, 2, make_mono_item(wosdbg::format_u64(seg.vaddr)));
+        table->setItem(i, 3, make_mono_item(wosdbg::format_u64(seg.vaddr_end())));
+        table->setItem(i, 4, make_mono_item(QString("0x%1").arg(seg.size, 0, 16)));
 
-        auto* present_item = make_mono_item(seg.isPresent() ? "Yes" : "No");
-        if (!seg.isPresent()) {
+        auto* present_item = make_mono_item(seg.is_present() ? "Yes" : "No");
+        if (!seg.is_present()) {
             present_item->setForeground(QColor(255, 100, 100));
         }
-        table_->setItem(i, 5, present_item);
+        table->setItem(i, 5, present_item);
 
-        segInfos_.push_back({i, seg.vaddr, seg.vaddrEnd(), seg.isPresent()});
+        seg_infos.push_back({.index = i, .vaStart = seg.vaddr, .vaEnd = seg.vaddr_end(), .present = seg.is_present()});
     }
 
-    table_->resizeColumnsToContents();
+    table->resizeColumnsToContents();
 }
 
 void CoredumpSegmentPanel::clear() {
-    table_->setRowCount(0);
-    segInfos_.clear();
+    table->setRowCount(0);
+    seg_infos.clear();
 }
 
-void CoredumpSegmentPanel::onSegmentActivated(int row, int /*column*/) {
-    if (row < 0 || static_cast<size_t>(row) >= segInfos_.size()) {
+void CoredumpSegmentPanel::on_segment_activated(int row, int /*column*/) {
+    if (row < 0 || static_cast<size_t>(row) >= seg_infos.size()) {
         return;
     }
-    const auto& info = segInfos_[static_cast<size_t>(row)];
+    const auto& info = seg_infos[static_cast<size_t>(row)];
     if (info.present) {
-        emit dumpSegmentRequested(info.index, info.vaStart, info.vaEnd);
+        emit dump_segment_requested(info.index, info.vaStart, info.vaEnd);
     }
 }

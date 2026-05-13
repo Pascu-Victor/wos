@@ -45,6 +45,10 @@ struct File {
 
     // Optional VFS-core streamed-read cache attachment.
     void* stream_cache_attachment = nullptr;
+
+    // Hint for filesystem backends that this file is currently being serviced
+    // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.
+    std::atomic<uint32_t> positional_read_depth{0};
 };
 
 }  // namespace ker::vfs

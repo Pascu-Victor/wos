@@ -89,6 +89,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             }
             task->has_exited = true;
             task->exit_status = 0;
+            task->exit_notify_ready.store(true, std::memory_order_release);
             // Record death epoch for GC grace period, then transition to DEAD.
             // Without this, threads stay EXITING forever and GC never reclaims them.
             task->death_epoch.store(mod::sched::EpochManager::current_epoch(), std::memory_order_release);

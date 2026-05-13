@@ -1,9 +1,15 @@
 [submodule "modules/extern/limine"]
 	path = modules/extern/limine
 	url = https://github.com/limine-bootloader/limine.git
-[submodule "tools/llvm-project"]
-	path = tools/llvm-project
-	url = https://github.com/llvm/llvm-project.git
-[submodule "modules/stdlib/musl"]
-	path = modules/stdlib/musl
-	url = https://git.musl-libc.org/git/musl
+[submodule "toolchain/src/llvm-project"]
+	path = toolchain/src/llvm-project
+	url = https://github.com/Pascu-Victor/llvm-project.git
+[submodule "toolchain/src/mlibc"]
+	path = toolchain/src/mlibc
+	url = https://github.com/Pascu-Victor/mlibc.git
+[submodule "toolchain/src/dropbear"]
+	path = toolchain/src/dropbear
+	url = https://github.com/Pascu-Victor/dropbear.git
+[submodule "toolchain/src/busybox"]
+	path = toolchain/src/busybox
+	url = https://github.com/Pascu-Victor/busybox.git

@@ -55,7 +55,7 @@ void int_to_str(uint64_t val, char* buf, size_t bufsz) {
 
 auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     if (f == nullptr || f->private_data == nullptr) {
-        return -1;
+        return -EBADF;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
 
@@ -127,11 +127,11 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
         size_t const PID_INDEX = count - 7;
         uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
         if (PID_INDEX >= TASK_COUNT) {
-            return -1;  // No more entries
+            return -ENOENT;  // No more entries
         }
         auto* task = ker::mod::sched::get_active_task_at(static_cast<uint32_t>(PID_INDEX));
         if (task == nullptr) {
-            return -1;
+            return -ENOENT;
         }
         buf->d_ino = task->pid + 100;
         buf->d_off = count + 1;
@@ -200,7 +200,7 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
             return 0;
         }
-        return -1;  // No more entries
+        return -ENOENT;  // No more entries
     }
 
     if (pfd->node.type == ProcNodeType::WKI_DIR) {
@@ -212,21 +212,21 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "peers", 6);
             return 0;
         }
-        return -1;
+        return -ENOENT;
     }
 
-    return -1;
+    return -ENOENT;
 }
 
 // Helper to parse a PID from a path component
 auto parse_pid(const char* s) -> int64_t {
     if (s == nullptr || *s == '\0') {
-        return -1;
+        return -EINVAL;
     }
     int64_t val = 0;
     for (const char* p = s; *p != 0; ++p) {
         if (*p < '0' || *p > '9') {
-            return -1;
+            return -EINVAL;
         }
         val = (val * 10) + (*p - '0');
     }
@@ -900,8 +900,8 @@ void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
 // Format:
 //   S <ts_ns> <cpu> <pid> <rip_hex>   <lag_v>  <flags>    SAMPLE
 //   X <ts_ns> <cpu> <prev_pid> <next_pid> <lag_v> <flags> <run_us> <callsite>   SWITCH
-//   W <ts_ns> <cpu> <pid> <wake_at_us> <sleep_us> <flags> <callsite>            WAKE
-//   B <ts_ns> <cpu> <pid> <wake_at_us> <run_us>   <flags> <callsite>            SLEEP
+//   W <ts_ns> <cpu> <pid> <wake_at_us> <sleep_us> <flags> <callsite> <wait_channel> WAKE
+//   B <ts_ns> <cpu> <pid> <wake_at_us> <run_us>   <flags> <callsite> <wait_channel> SLEEP
 //   K <ts_ns> <cpu> <pid> <scope> <op> <phase> <peer> <channel> <corr> <status> <aux> <callsite>
 auto generate_kperf(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
@@ -1028,6 +1028,9 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 append_dec64(p, end, ev.flags);
                 *p++ = ' ';
                 append_perf_callsite(p, end, ev.callsite);
+                *p++ = ' ';
+                auto const* WAIT_CHANNEL = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
+                append_sconst(p, end, WAIT_CHANNEL != nullptr ? WAIT_CHANNEL : "-");
             }
             if (p + 1 < end) {
                 *p++ = '\n';

@@ -11,7 +11,7 @@
 -- Protocol constants
 local WKI_ETHERTYPE = 0x88B7
 local WKI_VERSION = 1
-local WKI_HELLO_MAGIC = 0x574B4900  -- "WKI\0"
+local WKI_HELLO_MAGIC = 0x574B4900 -- "WKI\0"
 local WKI_HEADER_SIZE = 32
 
 -- Create the protocol
@@ -116,6 +116,7 @@ local op_ids = {
     [0x0100] = "BLOCK_READ",
     [0x0101] = "BLOCK_WRITE",
     [0x0102] = "BLOCK_FLUSH",
+    [0x0103] = "BLOCK_INFO",
     [0x0104] = "BLOCK_BULK_READ",
     [0x0105] = "BLOCK_BULK_WRITE",
     [0x0200] = "CHAR_OPEN",
@@ -129,6 +130,7 @@ local op_ids = {
     [0x0304] = "NET_OPEN",
     [0x0305] = "NET_CLOSE",
     [0x0306] = "NET_RX_CREDIT",
+    [0x0307] = "NET_STATE_NOTIFY",
     [0x0400] = "VFS_OPEN",
     [0x0401] = "VFS_READ",
     [0x0402] = "VFS_WRITE",
@@ -318,6 +320,7 @@ local pf_hello_caps = ProtoField.uint16("wki.hello.capabilities", "Capabilities"
 local pf_hello_hb_interval = ProtoField.uint16("wki.hello.heartbeat_interval", "Heartbeat Interval (ms)", base.DEC)
 local pf_hello_max_channels = ProtoField.uint16("wki.hello.max_channels", "Max Channels", base.DEC)
 local pf_hello_rdma_zones = ProtoField.uint32("wki.hello.rdma_zones", "RDMA Zone Bitmap", base.HEX)
+local pf_hello_hostname = ProtoField.string("wki.hello.hostname", "Hostname")
 
 -- Protocol fields - HEARTBEAT payload
 local pf_hb_timestamp = ProtoField.uint64("wki.heartbeat.timestamp", "Timestamp (ns)", base.DEC)
@@ -346,6 +349,13 @@ local pf_res_id = ProtoField.uint32("wki.resource.id", "Resource ID", base.DEC)
 local pf_res_flags = ProtoField.uint8("wki.resource.flags", "Flags", base.HEX)
 local pf_res_name_len = ProtoField.uint8("wki.resource.name_len", "Name Length", base.DEC)
 local pf_res_name = ProtoField.string("wki.resource.name", "Resource Name")
+local pf_res_ext = {
+    ipv4 = ProtoField.string("wki.resource.ipv4", "IPv4 Address"),
+    ipv4_mask = ProtoField.string("wki.resource.ipv4_mask", "IPv4 Mask"),
+    real_mac = ProtoField.ether("wki.resource.real_mac", "Real MAC"),
+    link_state = ProtoField.uint16("wki.resource.link_state", "Link State", base.DEC, { [0] = "DOWN", [1] = "UP" }),
+    mtu = ProtoField.uint32("wki.resource.mtu", "MTU", base.DEC),
+}
 
 -- Protocol fields - ZONE_CREATE_REQ payload
 local pf_zone_id = ProtoField.uint32("wki.zone.id", "Zone ID", base.HEX)
@@ -383,12 +393,51 @@ local pf_dev_req_channel = ProtoField.uint16("wki.dev.requested_channel", "Reque
 local pf_dev_status = ProtoField.uint8("wki.dev.status", "Status", base.DEC, dev_attach_status)
 local pf_dev_assigned_ch = ProtoField.uint16("wki.dev.assigned_channel", "Assigned Channel", base.DEC)
 local pf_dev_max_op_size = ProtoField.uint16("wki.dev.max_op_size", "Max Op Size", base.DEC)
+local pf_dev_ext = {
+    resource_id_echo = ProtoField.uint32("wki.dev.resource_id_echo", "Echoed Resource ID", base.DEC),
+    rdma_flags = ProtoField.uint16("wki.dev.rdma_flags", "RDMA Flags", base.HEX),
+    blk_zone_id = ProtoField.uint32("wki.dev.blk_zone_id", "Block Zone / Write RKey", base.HEX),
+    read_staging_rkey = ProtoField.uint32("wki.dev.read_staging_rkey", "Read Staging RKey", base.HEX),
+    bulk_staging_rkey = ProtoField.uint32("wki.dev.bulk_staging_rkey", "Bulk Staging RKey", base.HEX),
+    ipv4 = ProtoField.string("wki.dev.ipv4", "IPv4 Address"),
+    ipv4_mask = ProtoField.string("wki.dev.ipv4_mask", "IPv4 Mask"),
+    real_mac = ProtoField.ether("wki.dev.real_mac", "Real MAC"),
+    link_state = ProtoField.uint16("wki.dev.link_state", "Link State", base.DEC, { [0] = "DOWN", [1] = "UP" }),
+    mtu = ProtoField.uint32("wki.dev.mtu", "MTU", base.DEC),
+}
 
 -- Protocol fields - DEV_OP payload
 local pf_dev_op_id = ProtoField.uint16("wki.dev.op_id", "Operation ID", base.HEX, op_ids)
 local pf_dev_op_name = ProtoField.string("wki.dev.op_name", "Operation Name")
 local pf_dev_op_data_len = ProtoField.uint16("wki.dev.data_len", "Data Length", base.DEC)
 local pf_dev_op_status = ProtoField.int16("wki.dev.op_status", "Status", base.DEC)
+local pf_dev_op_reserved = ProtoField.uint16("wki.dev.reserved", "Reserved / Request Cookie", base.DEC)
+
+local pf_vfs = {
+    flags = ProtoField.uint32("wki.vfs.flags", "Flags", base.HEX),
+    mode = ProtoField.uint32("wki.vfs.mode", "Mode", base.HEX),
+    path_len = ProtoField.uint16("wki.vfs.path_len", "Path Length", base.DEC),
+    path = ProtoField.string("wki.vfs.path", "Path"),
+    path_old = ProtoField.string("wki.vfs.old_path", "Old Path"),
+    path_new = ProtoField.string("wki.vfs.new_path", "New Path"),
+    target_len = ProtoField.uint16("wki.vfs.target_len", "Target Length", base.DEC),
+    target = ProtoField.string("wki.vfs.target", "Target"),
+    fd = ProtoField.int32("wki.vfs.fd", "Remote FD", base.DEC),
+    is_dir = ProtoField.uint8("wki.vfs.is_dir", "Is Directory", base.DEC, { [0] = "No", [1] = "Yes" }),
+    index = ProtoField.uint32("wki.vfs.index", "Index", base.DEC),
+    start_idx = ProtoField.uint32("wki.vfs.start_idx", "Start Index", base.DEC),
+    max_count = ProtoField.uint32("wki.vfs.max_count", "Max Count", base.DEC),
+    entry_count = ProtoField.uint32("wki.vfs.entry_count", "Entry Count", base.DEC),
+    length = ProtoField.uint32("wki.vfs.length", "Length", base.DEC),
+    offset = ProtoField.int64("wki.vfs.offset", "Offset", base.DEC),
+    rkey = ProtoField.uint32("wki.vfs.rkey", "RDMA RKey", base.HEX),
+    bytes = ProtoField.uint32("wki.vfs.bytes", "Bytes", base.DEC),
+    dirent_name = ProtoField.string("wki.vfs.dirent.name", "Name"),
+    dirent_ino = ProtoField.uint64("wki.vfs.dirent.ino", "Inode", base.DEC),
+    dirent_off = ProtoField.uint64("wki.vfs.dirent.off", "Next Offset", base.DEC),
+    dirent_reclen = ProtoField.uint16("wki.vfs.dirent.reclen", "Record Length", base.DEC),
+    dirent_type = ProtoField.uint8("wki.vfs.dirent.type", "Entry Type", base.DEC),
+}
 
 -- Protocol fields - DEV_IRQ_FWD payload
 local pf_irq_device = ProtoField.uint16("wki.irq.device_id", "Device ID", base.DEC)
@@ -425,8 +474,10 @@ local pf_analysis_retransmit = ProtoField.bool("wki.analysis.retransmit", "Retra
 local pf_analysis_dup_ack = ProtoField.bool("wki.analysis.dup_ack", "Duplicate ACK")
 local pf_analysis_out_of_order = ProtoField.bool("wki.analysis.out_of_order", "Out of Order")
 local pf_analysis_rtt = ProtoField.double("wki.analysis.rtt", "Round Trip Time (ms)")
-local pf_analysis_req_frame = ProtoField.framenum("wki.analysis.req_frame", "Request Frame", base.NONE, frametype.REQUEST)
-local pf_analysis_resp_frame = ProtoField.framenum("wki.analysis.resp_frame", "Response Frame", base.NONE, frametype.RESPONSE)
+local pf_analysis_req_frame = ProtoField.framenum("wki.analysis.req_frame", "Request Frame", base.NONE, frametype
+    .REQUEST)
+local pf_analysis_resp_frame = ProtoField.framenum("wki.analysis.resp_frame", "Response Frame", base.NONE,
+    frametype.RESPONSE)
 local pf_analysis_resp_time = ProtoField.double("wki.analysis.response_time", "Response Time (ms)")
 local pf_analysis_credit_zero = ProtoField.bool("wki.analysis.credit_zero", "Zero Credits (Stalled)")
 
@@ -441,6 +492,7 @@ wki_proto.fields = {
     -- HELLO
     pf_hello_magic, pf_hello_proto_ver, pf_hello_node_id, pf_hello_mac,
     pf_hello_caps, pf_hello_hb_interval, pf_hello_max_channels, pf_hello_rdma_zones,
+    pf_hello_hostname,
     -- HEARTBEAT
     pf_hb_timestamp, pf_hb_load, pf_hb_mem_free,
     -- LSA
@@ -450,6 +502,7 @@ wki_proto.fields = {
     pf_fence_fenced, pf_fence_fencing, pf_fence_reason,
     -- RESOURCE
     pf_res_node, pf_res_type, pf_res_type_name, pf_res_id, pf_res_flags, pf_res_name_len, pf_res_name,
+    pf_res_ext.ipv4, pf_res_ext.ipv4_mask, pf_res_ext.real_mac, pf_res_ext.link_state, pf_res_ext.mtu,
     -- ZONE
     pf_zone_id, pf_zone_size, pf_zone_access, pf_zone_notify_mode, pf_zone_type,
     pf_zone_status, pf_zone_phys_addr, pf_zone_rkey,
@@ -458,8 +511,14 @@ wki_proto.fields = {
     pf_event_class, pf_event_id, pf_event_origin, pf_event_data_len, pf_event_delivery,
     -- DEV
     pf_dev_target, pf_dev_res_type, pf_dev_res_type_name, pf_dev_res_id, pf_dev_attach_mode, pf_dev_req_channel,
-    pf_dev_status, pf_dev_assigned_ch, pf_dev_max_op_size,
-    pf_dev_op_id, pf_dev_op_name, pf_dev_op_data_len, pf_dev_op_status,
+    pf_dev_status, pf_dev_assigned_ch, pf_dev_ext.resource_id_echo, pf_dev_max_op_size,
+    pf_dev_ext.rdma_flags, pf_dev_ext.blk_zone_id, pf_dev_ext.read_staging_rkey, pf_dev_ext.bulk_staging_rkey,
+    pf_dev_ext.ipv4, pf_dev_ext.ipv4_mask, pf_dev_ext.real_mac, pf_dev_ext.link_state, pf_dev_ext.mtu,
+    pf_dev_op_id, pf_dev_op_name, pf_dev_op_data_len, pf_dev_op_status, pf_dev_op_reserved,
+    pf_vfs.flags, pf_vfs.mode, pf_vfs.path_len, pf_vfs.path, pf_vfs.path_old, pf_vfs.path_new,
+    pf_vfs.target_len, pf_vfs.target, pf_vfs.fd, pf_vfs.is_dir, pf_vfs.index, pf_vfs.start_idx, pf_vfs.max_count,
+    pf_vfs.entry_count, pf_vfs.length, pf_vfs.offset, pf_vfs.rkey, pf_vfs.bytes,
+    pf_vfs.dirent_name, pf_vfs.dirent_ino, pf_vfs.dirent_off, pf_vfs.dirent_reclen, pf_vfs.dirent_type,
     -- IRQ
     pf_irq_device, pf_irq_vector, pf_irq_status,
     -- CHANNEL
@@ -483,15 +542,15 @@ wki_proto.fields = {
 
 -- Per-direction stream state: keyed by "src_node:dst_node:channel_id"
 -- Tracks expected next seq to detect retransmits and out-of-order
-local stream_state = {}  -- [stream_key] = { next_seq, seen_seqs={} }
+local stream_state = {} -- [stream_key] = { next_seq, seen_seqs={} }
 
 -- Request-response correlation: keyed by "src_node:dst_node:channel_id:seq_num"
 -- For DEV_OP_REQ (0x43) -> DEV_OP_RESP (0x44) matching
-local pending_requests = {}  -- [key] = { frame_num, timestamp, op_id }
+local pending_requests = {} -- [key] = { frame_num, timestamp, op_id }
 -- Reverse map: response frame -> request info
-local response_info = {}  -- [frame_num] = { req_frame, latency_ms, op_id }
+local response_info = {}    -- [frame_num] = { req_frame, latency_ms, op_id }
 -- Forward map: request frame -> response info
-local request_info = {}  -- [frame_num] = { resp_frame }
+local request_info = {}     -- [frame_num] = { resp_frame }
 
 -- ACK tracking: keyed by "src_node:dst_node:channel_id:seq_num"
 -- When a data frame is sent, record timestamp. When ACK arrives, compute RTT.
@@ -499,21 +558,21 @@ local sent_frames = {}  -- [key] = { frame_num, timestamp }
 local ack_rtt_info = {} -- [frame_num] = { rtt_ms }
 
 -- Per-peer statistics
-local peer_stats = {}  -- [node_id] = { tx_frames, rx_frames, tx_bytes, rx_bytes, retransmits }
+local peer_stats = {}    -- [node_id] = { tx_frames, rx_frames, tx_bytes, rx_bytes, retransmits }
 -- Per-channel statistics
 local channel_stats = {} -- [stream_key] = { msg_counts={}, total_frames, credits_zero_count }
 -- Per-operation latency tracking
-local op_latencies = {} -- [op_name] = { values={}, count, sum, min, max }
+local op_latencies = {}  -- [op_name] = { values={}, count, sum, min, max }
 
 -- REQ/RESP message type pairs for correlation
 local req_resp_pairs = {
-    [0x43] = 0x44,  -- DEV_OP_REQ -> DEV_OP_RESP
-    [0x40] = 0x41,  -- DEV_ATTACH_REQ -> DEV_ATTACH_ACK
-    [0x20] = 0x21,  -- ZONE_CREATE_REQ -> ZONE_CREATE_ACK
-    [0x25] = 0x26,  -- ZONE_READ_REQ -> ZONE_READ_RESP
-    [0x27] = 0x28,  -- ZONE_WRITE_REQ -> ZONE_WRITE_ACK
-    [0x50] = 0x51,  -- TASK_SUBMIT -> TASK_ACCEPT (or TASK_REJECT)
-    [0x46] = 0x47,  -- CHANNEL_OPEN -> CHANNEL_OPEN_ACK
+    [0x43] = 0x44, -- DEV_OP_REQ -> DEV_OP_RESP
+    [0x40] = 0x41, -- DEV_ATTACH_REQ -> DEV_ATTACH_ACK
+    [0x20] = 0x21, -- ZONE_CREATE_REQ -> ZONE_CREATE_ACK
+    [0x25] = 0x26, -- ZONE_READ_REQ -> ZONE_READ_RESP
+    [0x27] = 0x28, -- ZONE_WRITE_REQ -> ZONE_WRITE_ACK
+    [0x50] = 0x51, -- TASK_SUBMIT -> TASK_ACCEPT (or TASK_REJECT)
+    [0x46] = 0x47, -- CHANNEL_OPEN -> CHANNEL_OPEN_ACK
 }
 -- Build reverse map
 local resp_req_pairs = {}
@@ -538,9 +597,13 @@ end
 local function ensure_peer_stats(node_id)
     if not peer_stats[node_id] then
         peer_stats[node_id] = {
-            tx_frames = 0, rx_frames = 0,
-            tx_bytes = 0, rx_bytes = 0,
-            retransmits = 0, rtt_sum = 0, rtt_count = 0
+            tx_frames = 0,
+            rx_frames = 0,
+            tx_bytes = 0,
+            rx_bytes = 0,
+            retransmits = 0,
+            rtt_sum = 0,
+            rtt_count = 0
         }
     end
     return peer_stats[node_id]
@@ -549,8 +612,10 @@ end
 local function ensure_channel_stats(key)
     if not channel_stats[key] then
         channel_stats[key] = {
-            msg_counts = {}, total_frames = 0,
-            credits_zero_count = 0, total_bytes = 0
+            msg_counts = {},
+            total_frames = 0,
+            credits_zero_count = 0,
+            total_bytes = 0
         }
     end
     return channel_stats[key]
@@ -576,6 +641,370 @@ local function compute_percentile(sorted_values, pct)
     return sorted_values[idx]
 end
 
+local function has_range(tvb, offset, size)
+    return offset >= 0 and size >= 0 and (offset + size) <= tvb:len()
+end
+
+local function add_generated_string(tree, field, value)
+    local item = tree:add(field, value)
+    item:set_generated(true)
+    return item
+end
+
+local function add_generated_bool(tree, field, value)
+    local item = tree:add(field, value)
+    item:set_generated(true)
+    return item
+end
+
+local function add_truncation_note(tree, captured_len, expected_len)
+    local item = tree:add_expert_info(PI_MALFORMED, PI_WARN,
+        string.format("Truncated payload: captured %u of %u advertised bytes", captured_len, expected_len))
+    return item
+end
+
+local function format_ipv4_host_order(v)
+    local b1 = bit.band(bit.rshift(v, 24), 0xFF)
+    local b2 = bit.band(bit.rshift(v, 16), 0xFF)
+    local b3 = bit.band(bit.rshift(v, 8), 0xFF)
+    local b4 = bit.band(v, 0xFF)
+    return string.format("%u.%u.%u.%u", b1, b2, b3, b4)
+end
+
+local dirent_types = {
+    [0] = "UNKNOWN",
+    [1] = "REG",
+    [2] = "DIR",
+    [3] = "CHR",
+    [4] = "BLK",
+    [5] = "FIFO",
+    [6] = "SOCK",
+    [7] = "LNK",
+    [0x82] = "DIR|WOSLINK",
+}
+
+local function get_dirent_type_name(v)
+    return dirent_types[v] or string.format("0x%02X", v)
+end
+
+local function build_rdma_flags_string(flags)
+    local parts = {}
+    if bit.band(flags, 0x0001) ~= 0 then table.insert(parts, "BLK_RING") end
+    if bit.band(flags, 0x0002) ~= 0 then table.insert(parts, "VFS_WRITE_RECV") end
+    if bit.band(flags, 0x0004) ~= 0 then table.insert(parts, "BULK") end
+    if bit.band(flags, 0x0008) ~= 0 then table.insert(parts, "VFS_READ_PULL") end
+    if bit.band(flags, 0x0010) ~= 0 then table.insert(parts, "BULK_PULL") end
+    if #parts == 0 then return "none" end
+    return table.concat(parts, ", ")
+end
+
+local function read_string_field(tvb, offset, length)
+    if length <= 0 or not has_range(tvb, offset, length) then
+        return nil
+    end
+    return tvb(offset, length):string()
+end
+
+local function add_vfs_path_field(tree, field, len_field, tvb, len_offset, path_offset)
+    if not has_range(tvb, len_offset, 2) then
+        return nil, nil
+    end
+    local path_len = tvb(len_offset, 2):le_uint()
+    tree:add_le(len_field, tvb(len_offset, 2))
+    if not has_range(tvb, path_offset, path_len) then
+        return path_len, nil
+    end
+    local path = tvb(path_offset, path_len):string()
+    tree:add(field, tvb(path_offset, path_len), path)
+    return path_len, path
+end
+
+local function summarize_vfs_devop(msg_type, op_id, data_tvb, data_len, status)
+    local op_name = get_op_name(op_id)
+    if msg_type == 0x43 then
+        if op_id == 0x0307 and data_len >= 20 then
+            return string.format("%s ip=%s mtu=%u", op_name, format_ipv4_host_order(data_tvb(0, 4):le_uint()),
+                data_tvb(16, 4):le_uint())
+        elseif op_id == 0x0303 then
+            return op_name
+        elseif op_id == 0x0103 then
+            return op_name
+        end
+        if op_id == 0x0400 and data_len >= 10 then
+            local path_len = data_tvb(8, 2):le_uint()
+            local path = read_string_field(data_tvb, 10, math.min(path_len, data_len - 10))
+            return path and string.format("%s path=%s", op_name, path) or op_name
+        elseif (op_id == 0x0405 or op_id == 0x0407 or op_id == 0x0409 or op_id == 0x040A) and data_len >= 2 then
+            local path_len = data_tvb(0, 2):le_uint()
+            local path = read_string_field(data_tvb, 2, math.min(path_len, data_len - 2))
+            return path and string.format("%s path=%s", op_name, path) or op_name
+        elseif op_id == 0x0406 and data_len >= 6 then
+            local path_len = data_tvb(4, 2):le_uint()
+            local path = read_string_field(data_tvb, 6, math.min(path_len, data_len - 6))
+            return path and string.format("%s path=%s", op_name, path) or op_name
+        elseif op_id == 0x040B and data_len >= 4 then
+            local old_len = data_tvb(0, 2):le_uint()
+            if data_len >= (4 + old_len) then
+                local old_path = read_string_field(data_tvb, 2, old_len)
+                local new_len = data_tvb(2 + old_len, 2):le_uint()
+                local new_path = read_string_field(data_tvb, 4 + old_len, math.min(new_len, data_len - 4 - old_len))
+                if old_path and new_path then
+                    return string.format("%s %s -> %s", op_name, old_path, new_path)
+                end
+            end
+            return op_name
+        elseif (op_id == 0x0401 or op_id == 0x0410 or op_id == 0x0413) and data_len >= 16 then
+            return string.format("%s fd=%d len=%u", op_name, data_tvb(0, 4):le_int(), data_tvb(4, 4):le_uint())
+        elseif op_id == 0x0411 and data_len >= 16 then
+            return string.format("%s fd=%d len=%u", op_name, data_tvb(0, 4):le_int(), data_tvb(12, 4):le_uint())
+        elseif op_id == 0x0402 and data_len >= 12 then
+            return string.format("%s fd=%d bytes=%u", op_name, data_tvb(0, 4):le_int(), data_len - 12)
+        elseif (op_id == 0x0403 or op_id == 0x040C) and data_len >= 4 then
+            return string.format("%s fd=%d", op_name, data_tvb(0, 4):le_int())
+        elseif op_id == 0x0404 and data_len >= 8 then
+            return string.format("%s fd=%d idx=%u", op_name, data_tvb(0, 4):le_int(), data_tvb(4, 4):le_uint())
+        elseif op_id == 0x0412 and data_len >= 12 then
+            return string.format("%s fd=%d start=%u max=%u", op_name, data_tvb(0, 4):le_int(), data_tvb(4, 4):le_uint(),
+                data_tvb(8, 4):le_uint())
+        elseif (op_id == 0x040D or op_id == 0x040E) and data_len >= 12 then
+            return string.format("%s fd=%d", op_name, data_tvb(0, 4):le_int())
+        elseif op_id == 0x0408 and data_len >= 4 then
+            local target_len = data_tvb(0, 2):le_uint()
+            local target = read_string_field(data_tvb, 2, math.min(target_len, data_len - 2))
+            if target and data_len >= (4 + target_len) then
+                local link_len = data_tvb(2 + target_len, 2):le_uint()
+                local link = read_string_field(data_tvb, 4 + target_len, math.min(link_len, data_len - 4 - target_len))
+                if link then
+                    return string.format("%s %s -> %s", op_name, link, target)
+                end
+            end
+        end
+        return op_name
+    end
+
+    if status ~= nil then
+        if status ~= 0 then
+            return string.format("%s status=%d", op_name, status)
+        elseif op_id == 0x0307 and data_len >= 20 then
+            return string.format("%s ip=%s mtu=%u", op_name, format_ipv4_host_order(data_tvb(0, 4):le_uint()),
+                data_tvb(16, 4):le_uint())
+        elseif op_id == 0x0303 and data_len >= 48 then
+            return string.format("%s stats", op_name)
+        elseif op_id == 0x0103 and data_len >= 16 then
+            return string.format("%s ok", op_name)
+        elseif op_id == 0x0400 and data_len >= 5 then
+            return string.format("%s fd=%d dir=%u", op_name, data_tvb(0, 4):le_int(), data_tvb(4, 1):uint())
+        elseif op_id == 0x0401 then
+            return string.format("%s bytes=%u", op_name, data_len)
+        elseif op_id == 0x0402 and data_len >= 4 then
+            return string.format("%s bytes=%u", op_name, data_tvb(0, 4):le_uint())
+        elseif (op_id == 0x0410 or op_id == 0x0411 or op_id == 0x0413) and data_len >= 4 then
+            return string.format("%s bytes=%u", op_name, data_tvb(0, 4):le_uint())
+        elseif op_id == 0x0407 and data_len >= 2 then
+            local target_len = data_tvb(0, 2):le_uint()
+            local target = read_string_field(data_tvb, 2, math.min(target_len, data_len - 2))
+            return target and string.format("%s target=%s", op_name, target) or op_name
+        elseif op_id == 0x0412 and data_len >= 4 then
+            return string.format("%s count=%u", op_name, data_tvb(0, 4):le_uint())
+        elseif op_id == 0x0405 and data_len >= 28 then
+            return string.format("%s mode=0x%X", op_name, data_tvb(24, 4):le_uint())
+        end
+    end
+
+    return op_name
+end
+
+local function decode_vfs_dirent(tree, tvb, offset, entry_len, label)
+    if entry_len < 19 or not has_range(tvb, offset, entry_len) then
+        tree:add(pf_payload_data, tvb(offset, math.max(0, math.min(entry_len, tvb:len() - offset))))
+        return
+    end
+    local dent = tree:add(wki_proto, tvb(offset, entry_len), label)
+    dent:add_le(pf_vfs.dirent_ino, tvb(offset, 8))
+    dent:add_le(pf_vfs.dirent_off, tvb(offset + 8, 8))
+    dent:add_le(pf_vfs.dirent_reclen, tvb(offset + 16, 2))
+    local dtype = tvb(offset + 18, 1):uint()
+    dent:add(pf_vfs.dirent_type, tvb(offset + 18, 1)):append_text(" (" .. get_dirent_type_name(dtype) .. ")")
+
+    local name_len = entry_len - 19
+    if name_len > 0 then
+        local raw_name = tvb(offset + 19, name_len):stringz()
+        dent:add(pf_vfs.dirent_name, tvb(offset + 19, name_len), raw_name)
+    end
+end
+
+local function decode_vfs_devop_payload(tree, msg_type, op_id, data_tvb, data_len, status)
+    if msg_type == 0x43 then
+        if op_id == 0x0307 and data_len >= 20 then
+            tree:add(pf_dev_ext.ipv4, format_ipv4_host_order(data_tvb(0, 4):le_uint()))
+            tree:add(pf_dev_ext.ipv4_mask, format_ipv4_host_order(data_tvb(4, 4):le_uint()))
+            tree:add(pf_dev_ext.real_mac, data_tvb(8, 6))
+            tree:add_le(pf_dev_ext.link_state, data_tvb(14, 2))
+            tree:add_le(pf_dev_ext.mtu, data_tvb(16, 4))
+            return
+        end
+        if op_id == 0x0400 then
+            if data_len >= 10 then
+                tree:add_le(pf_vfs.flags, data_tvb(0, 4))
+                tree:add_le(pf_vfs.mode, data_tvb(4, 4))
+                add_vfs_path_field(tree, pf_vfs.path, pf_vfs.path_len, data_tvb, 8, 10)
+            end
+        elseif op_id == 0x0405 or op_id == 0x0407 or op_id == 0x0409 or op_id == 0x040A then
+            if data_len >= 2 then
+                add_vfs_path_field(tree, pf_vfs.path, pf_vfs.path_len, data_tvb, 0, 2)
+            end
+        elseif op_id == 0x0406 then
+            if data_len >= 6 then
+                tree:add_le(pf_vfs.mode, data_tvb(0, 4))
+                add_vfs_path_field(tree, pf_vfs.path, pf_vfs.path_len, data_tvb, 4, 6)
+            end
+        elseif op_id == 0x0408 then
+            if data_len >= 4 then
+                local target_len = data_tvb(0, 2):le_uint()
+                tree:add_le(pf_vfs.target_len, data_tvb(0, 2))
+                if has_range(data_tvb, 2, target_len) then
+                    tree:add(pf_vfs.target, data_tvb(2, target_len), data_tvb(2, target_len):string())
+                end
+                if has_range(data_tvb, 2 + target_len, 2) then
+                    add_vfs_path_field(tree, pf_vfs.path, pf_vfs.path_len, data_tvb, 2 + target_len, 4 + target_len)
+                end
+            end
+        elseif op_id == 0x040B then
+            if data_len >= 4 then
+                local old_len, old_path = add_vfs_path_field(tree, pf_vfs.path_old, pf_vfs.path_len, data_tvb, 0, 2)
+                if old_len ~= nil and has_range(data_tvb, 2 + old_len, 2) then
+                    local _new_len, _new_path = add_vfs_path_field(tree, pf_vfs.path_new, pf_vfs.path_len, data_tvb,
+                        2 + old_len, 4 + old_len)
+                end
+            end
+        elseif op_id == 0x0401 or op_id == 0x0410 or op_id == 0x0413 then
+            if data_len >= 16 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.length, data_tvb(4, 4))
+                tree:add_le(pf_vfs.offset, data_tvb(8, 8))
+                if data_len >= 20 then
+                    tree:add_le(pf_vfs.rkey, data_tvb(16, 4))
+                end
+            end
+        elseif op_id == 0x0411 then
+            if data_len >= 16 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.offset, data_tvb(4, 8))
+                tree:add_le(pf_vfs.length, data_tvb(12, 4))
+            end
+        elseif op_id == 0x0402 then
+            if data_len >= 12 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.offset, data_tvb(4, 8))
+                if data_len > 12 then
+                    tree:add(pf_payload_data, data_tvb(12, data_len - 12))
+                end
+            end
+        elseif op_id == 0x0403 or op_id == 0x040C then
+            if data_len >= 4 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+            end
+        elseif op_id == 0x0404 then
+            if data_len >= 8 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.index, data_tvb(4, 4))
+            end
+        elseif op_id == 0x0412 then
+            if data_len >= 12 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.start_idx, data_tvb(4, 4))
+                tree:add_le(pf_vfs.max_count, data_tvb(8, 4))
+            end
+        elseif op_id == 0x040D or op_id == 0x040E then
+            if data_len >= 12 then
+                tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+                tree:add_le(pf_vfs.offset, data_tvb(4, 8))
+            end
+        else
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        end
+        return
+    end
+
+    if status ~= 0 then
+        if data_len > 0 then
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        end
+        return
+    end
+
+    if op_id == 0x0103 then
+        if data_len >= 16 then
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        end
+    elseif op_id == 0x0303 then
+        if data_len >= 48 then
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        end
+    elseif op_id == 0x0307 then
+        if data_len >= 20 then
+            tree:add(pf_dev_ext.ipv4, format_ipv4_host_order(data_tvb(0, 4):le_uint()))
+            tree:add(pf_dev_ext.ipv4_mask, format_ipv4_host_order(data_tvb(4, 4):le_uint()))
+            tree:add(pf_dev_ext.real_mac, data_tvb(8, 6))
+            tree:add_le(pf_dev_ext.link_state, data_tvb(14, 2))
+            tree:add_le(pf_dev_ext.mtu, data_tvb(16, 4))
+        end
+    elseif op_id == 0x0400 then
+        if data_len >= 5 then
+            tree:add_le(pf_vfs.fd, data_tvb(0, 4))
+            tree:add(pf_vfs.is_dir, data_tvb(4, 1))
+        end
+    elseif op_id == 0x0401 then
+        if data_len > 0 then
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+            add_generated_string(tree, pf_dev_op_name, string.format("%s (%u data bytes)", get_op_name(op_id), data_len))
+        end
+    elseif op_id == 0x0404 then
+        decode_vfs_dirent(tree, data_tvb, 0, data_len, "DirEntry")
+    elseif op_id == 0x0412 then
+        if data_len >= 4 then
+            local count = data_tvb(0, 4):le_uint()
+            tree:add_le(pf_vfs.entry_count, data_tvb(0, 4))
+            local remaining = data_len - 4
+            if count > 0 and remaining > 0 then
+                local per_entry = math.floor(remaining / count)
+                for i = 0, count - 1 do
+                    local off = 4 + (i * per_entry)
+                    if per_entry > 0 and has_range(data_tvb, off, per_entry) then
+                        decode_vfs_dirent(tree, data_tvb, off, per_entry, string.format("DirEntry %u", i))
+                    end
+                end
+            end
+        end
+    elseif op_id == 0x0405 then
+        if data_len >= 144 then
+            tree:add_le(pf_vfs.mode, data_tvb(24, 4))
+            tree:add_le(pf_vfs.bytes, data_tvb(48, 8))
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        elseif data_len > 0 then
+            tree:add(pf_payload_data, data_tvb(0, data_len))
+        end
+    elseif op_id == 0x0407 then
+        if data_len >= 2 then
+            local target_len = data_tvb(0, 2):le_uint()
+            tree:add_le(pf_vfs.target_len, data_tvb(0, 2))
+            if has_range(data_tvb, 2, target_len) then
+                tree:add(pf_vfs.target, data_tvb(2, target_len), data_tvb(2, target_len):string())
+            end
+        end
+    elseif op_id == 0x0410 or op_id == 0x0411 or op_id == 0x0413 or op_id == 0x0402 then
+        if data_len >= 4 then
+            tree:add_le(pf_vfs.bytes, data_tvb(0, 4))
+        end
+    elseif op_id == 0x040E then
+        if data_len >= 8 then
+            tree:add_le(pf_vfs.offset, data_tvb(0, 8))
+        end
+    elseif data_len > 0 then
+        tree:add(pf_payload_data, data_tvb(0, data_len))
+    end
+end
+
 -- Dissector function
 function wki_proto.dissector(buffer, pinfo, tree)
     local length = buffer:len()
@@ -596,16 +1025,45 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local payload_len = buffer(16, 2):le_uint()
     local credits = buffer(18, 1):uint()
     local hop_ttl = buffer(19, 1):uint()
+    local payload_captured_len = math.max(0, math.min(payload_len, length - WKI_HEADER_SIZE))
 
     -- Build info column
     local msg_name = get_msg_type_name(msg_type)
     local channel_name = get_channel_name(channel_id)
+    local info_suffix = nil
+    if (msg_type == 0x43 or msg_type == 0x44) and payload_captured_len >= 4 then
+        local op_id = buffer(WKI_HEADER_SIZE, 2):le_uint()
+        if msg_type == 0x43 then
+            local req_data_len = buffer(WKI_HEADER_SIZE + 2, 2):le_uint()
+            local req_data_cap = math.max(0, math.min(req_data_len, payload_captured_len - 4))
+            if req_data_cap > 0 then
+                info_suffix = summarize_vfs_devop(msg_type, op_id, buffer(WKI_HEADER_SIZE + 4, req_data_cap),
+                    req_data_cap, nil)
+            else
+                info_suffix = get_op_name(op_id)
+            end
+        elseif payload_captured_len >= 8 then
+            local status = buffer(WKI_HEADER_SIZE + 2, 2):le_int()
+            local resp_data_len = buffer(WKI_HEADER_SIZE + 4, 2):le_uint()
+            local resp_data_cap = math.max(0, math.min(resp_data_len, payload_captured_len - 8))
+            if resp_data_cap > 0 then
+                info_suffix = summarize_vfs_devop(msg_type, op_id, buffer(WKI_HEADER_SIZE + 8, resp_data_cap),
+                    resp_data_cap, status)
+            else
+                info_suffix = summarize_vfs_devop(msg_type, op_id,
+                    buffer(WKI_HEADER_SIZE, math.min(payload_captured_len, 8)), 0, status)
+            end
+        end
+    end
     pinfo.cols.info = string.format("%s %s->%s ch=%s seq=%d",
         msg_name,
         format_node_id(src_node),
         format_node_id(dst_node),
         channel_name,
         seq_num)
+    if info_suffix ~= nil then
+        pinfo.cols.info:append(" " .. info_suffix)
+    end
 
     -- =====================================================================
     -- Analysis: retransmit/out-of-order detection, request-response matching
@@ -689,10 +1147,16 @@ function wki_proto.dissector(buffer, pinfo, tree)
         end
 
         -- Request-Response correlation
-        if req_resp_pairs[msg_type] then
+        if msg_type == 0x43 and payload_captured_len >= 4 then
+            local op_id = buffer(WKI_HEADER_SIZE, 2):le_uint()
+            local req_key = string.format("devop:%d:%d:%d:%d", dst_node, src_node, channel_id, seq_num)
+            pending_requests[req_key] = {
+                frame_num = frame_num, timestamp = timestamp, op_id = op_id
+            }
+        elseif req_resp_pairs[msg_type] then
             -- This is a request message, record it
             local op_id = nil
-            if (msg_type == 0x43 or msg_type == 0x44) and payload_len >= 2 then
+            if (msg_type == 0x43 or msg_type == 0x44) and payload_captured_len >= 2 then
                 op_id = buffer(WKI_HEADER_SIZE, 2):le_uint()
             end
             -- Key: responder will send from dst_node to src_node on same channel
@@ -700,6 +1164,21 @@ function wki_proto.dissector(buffer, pinfo, tree)
             pending_requests[resp_key] = {
                 frame_num = frame_num, timestamp = timestamp, op_id = op_id
             }
+        elseif msg_type == 0x44 and payload_captured_len >= 8 then
+            local req_cookie = buffer(WKI_HEADER_SIZE + 6, 2):le_uint()
+            local req_key = string.format("devop:%d:%d:%d:%d", src_node, dst_node, channel_id, req_cookie)
+            local req = pending_requests[req_key]
+            if req then
+                local latency_ms = (timestamp - req.timestamp) * 1000
+                response_info[frame_num] = {
+                    req_frame = req.frame_num, latency_ms = latency_ms, op_id = req.op_id
+                }
+                request_info[req.frame_num] = { resp_frame = frame_num }
+                matched_resp_time_ms = latency_ms
+                matched_req_frame = req.frame_num
+                record_op_latency(op_ids[req.op_id] or string.format("OP_0x%04X", req.op_id), latency_ms)
+                pending_requests[req_key] = nil
+            end
         elseif resp_req_pairs[msg_type] then
             -- This is a response, find the matching request
             local req_type = resp_req_pairs[msg_type]
@@ -721,7 +1200,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 end
                 record_op_latency(op_name, latency_ms)
 
-                pending_requests[req_key] = nil  -- consumed
+                pending_requests[req_key] = nil -- consumed
             end
         end
     else
@@ -779,8 +1258,8 @@ function wki_proto.dissector(buffer, pinfo, tree)
 
     -- Analysis subtree
     local has_analysis = is_retransmit or is_dup_ack or is_out_of_order or
-                         matched_rtt_ms or matched_resp_time_ms or
-                         matched_req_frame or matched_resp_frame or is_credit_zero
+        matched_rtt_ms or matched_resp_time_ms or
+        matched_req_frame or matched_resp_frame or is_credit_zero
     if has_analysis then
         local analysis_tree = subtree:add(wki_proto, buffer(0, 0), "Analysis")
         if is_retransmit then
@@ -826,13 +1305,18 @@ function wki_proto.dissector(buffer, pinfo, tree)
     end
 
     -- Parse payload based on message type
-    if payload_len > 0 and length >= WKI_HEADER_SIZE + payload_len then
-        local payload_buf = buffer(WKI_HEADER_SIZE, payload_len)
-        local payload_tree = subtree:add(wki_proto, payload_buf, "Payload (" .. msg_name .. ")")
+    if payload_len > 0 and length > WKI_HEADER_SIZE then
+        local payload_buf = buffer(WKI_HEADER_SIZE, payload_captured_len)
+        local payload_tree = subtree:add(wki_proto, payload_buf, string.format("Payload (%s)%s", msg_name,
+            (payload_captured_len < payload_len) and
+            string.format(" [truncated %u/%u]", payload_captured_len, payload_len) or ""))
+        if payload_captured_len < payload_len then
+            add_truncation_note(payload_tree, payload_captured_len, payload_len)
+        end
 
         -- HELLO / HELLO_ACK
         if msg_type == 0x01 or msg_type == 0x02 then
-            if payload_len >= 32 then
+            if payload_captured_len >= 32 then
                 local magic = payload_buf(0, 4):le_uint()
                 payload_tree:add_le(pf_hello_magic, payload_buf(0, 4))
                     :append_text(magic == WKI_HELLO_MAGIC and " (valid)" or " (INVALID!)")
@@ -845,19 +1329,23 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 payload_tree:add_le(pf_hello_hb_interval, payload_buf(16, 2))
                 payload_tree:add_le(pf_hello_max_channels, payload_buf(18, 2))
                 payload_tree:add_le(pf_hello_rdma_zones, payload_buf(20, 4))
+                if payload_captured_len >= 96 then
+                    local hostname = payload_buf(32, 64):stringz()
+                    payload_tree:add(pf_hello_hostname, payload_buf(32, 64), hostname)
+                end
             end
 
-        -- HEARTBEAT / HEARTBEAT_ACK
+            -- HEARTBEAT / HEARTBEAT_ACK
         elseif msg_type == 0x03 or msg_type == 0x04 then
-            if payload_len >= 16 then
+            if payload_captured_len >= 16 then
                 payload_tree:add_le(pf_hb_timestamp, payload_buf(0, 8))
                 payload_tree:add_le(pf_hb_load, payload_buf(8, 2))
                 payload_tree:add_le(pf_hb_mem_free, payload_buf(10, 2))
             end
 
-        -- LSA
+            -- LSA
         elseif msg_type == 0x05 then
-            if payload_len >= 10 then
+            if payload_captured_len >= 10 then
                 payload_tree:add_le(pf_lsa_origin, payload_buf(0, 2))
                 payload_tree:add_le(pf_lsa_seq, payload_buf(2, 4))
                 local num_neighbors = payload_buf(6, 2):le_uint()
@@ -867,7 +1355,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 -- Parse neighbor entries
                 local offset = 12
                 for i = 1, num_neighbors do
-                    if offset + 6 <= payload_len then
+                    if offset + 6 <= payload_captured_len then
                         local nbr_tree = payload_tree:add(wki_proto, payload_buf(offset, 6),
                             string.format("Neighbor %d", i))
                         nbr_tree:add_le(pf_lsa_neighbor_id, payload_buf(offset, 2))
@@ -878,9 +1366,9 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 end
             end
 
-        -- FENCE_NOTIFY
+            -- FENCE_NOTIFY
         elseif msg_type == 0x07 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_fence_fenced, payload_buf(0, 2))
                 payload_tree:add_le(pf_fence_fencing, payload_buf(2, 2))
                 local reason = payload_buf(4, 4):le_uint()
@@ -888,26 +1376,41 @@ function wki_proto.dissector(buffer, pinfo, tree)
                     :append_text(reason == 0 and " (heartbeat timeout)" or " (manual)")
             end
 
-        -- RESOURCE_ADVERT / RESOURCE_WITHDRAW
+            -- RESOURCE_ADVERT / RESOURCE_WITHDRAW
         elseif msg_type == 0x0A or msg_type == 0x0B then
-            if payload_len >= 10 then
+            if payload_captured_len >= 10 then
                 local resource_type = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_res_node, payload_buf(0, 2))
                 payload_tree:add_le(pf_res_type, payload_buf(2, 2))
                 local resource_type_name_item = payload_tree:add(pf_res_type_name, get_resource_type_name(resource_type))
                 resource_type_name_item:set_generated(true)
-                payload_tree:add_le(pf_res_id, payload_buf(4, 4))
-                payload_tree:add(pf_res_flags, payload_buf(8, 1))
-                local name_len = payload_buf(9, 1):uint()
-                payload_tree:add(pf_res_name_len, payload_buf(9, 1))
-                if name_len > 0 and payload_len >= 10 + name_len then
-                    payload_tree:add(pf_res_name, payload_buf(10, name_len))
+                if resource_type == 3 and payload_captured_len >= 32 then
+                    payload_tree:add_le(pf_res_id, payload_buf(4, 4))
+                    payload_tree:add(pf_res_flags, payload_buf(8, 1))
+                    local name_len = payload_buf(9, 1):uint()
+                    payload_tree:add(pf_res_name_len, payload_buf(9, 1))
+                    payload_tree:add(pf_res_ext.ipv4, format_ipv4_host_order(payload_buf(12, 4):le_uint()))
+                    payload_tree:add(pf_res_ext.ipv4_mask, format_ipv4_host_order(payload_buf(16, 4):le_uint()))
+                    payload_tree:add(pf_res_ext.real_mac, payload_buf(20, 6))
+                    payload_tree:add_le(pf_res_ext.link_state, payload_buf(26, 2))
+                    payload_tree:add_le(pf_res_ext.mtu, payload_buf(28, 4))
+                    if name_len > 0 and payload_captured_len >= 32 + name_len then
+                        payload_tree:add(pf_res_name, payload_buf(32, name_len))
+                    end
+                else
+                    payload_tree:add_le(pf_res_id, payload_buf(4, 4))
+                    payload_tree:add(pf_res_flags, payload_buf(8, 1))
+                    local name_len = payload_buf(9, 1):uint()
+                    payload_tree:add(pf_res_name_len, payload_buf(9, 1))
+                    if name_len > 0 and payload_captured_len >= 10 + name_len then
+                        payload_tree:add(pf_res_name, payload_buf(10, name_len))
+                    end
                 end
             end
 
-        -- ZONE_CREATE_REQ
+            -- ZONE_CREATE_REQ
         elseif msg_type == 0x20 then
-            if payload_len >= 16 then
+            if payload_captured_len >= 16 then
                 payload_tree:add_le(pf_zone_id, payload_buf(0, 4))
                 payload_tree:add_le(pf_zone_size, payload_buf(4, 4))
                 payload_tree:add(pf_zone_access, payload_buf(8, 1))
@@ -915,24 +1418,24 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 payload_tree:add(pf_zone_type, payload_buf(10, 1))
             end
 
-        -- ZONE_CREATE_ACK
+            -- ZONE_CREATE_ACK
         elseif msg_type == 0x21 then
-            if payload_len >= 24 then
+            if payload_captured_len >= 24 then
                 payload_tree:add_le(pf_zone_id, payload_buf(0, 4))
                 payload_tree:add(pf_zone_status, payload_buf(4, 1))
                 payload_tree:add_le(pf_zone_phys_addr, payload_buf(8, 8))
                 payload_tree:add_le(pf_zone_rkey, payload_buf(16, 4))
             end
 
-        -- ZONE_DESTROY
+            -- ZONE_DESTROY
         elseif msg_type == 0x22 then
-            if payload_len >= 4 then
+            if payload_captured_len >= 4 then
                 payload_tree:add_le(pf_zone_id, payload_buf(0, 4))
             end
 
-        -- ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST
+            -- ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST
         elseif msg_type == 0x23 or msg_type == 0x24 then
-            if payload_len >= 16 then
+            if payload_captured_len >= 16 then
                 payload_tree:add_le(pf_zone_id, payload_buf(0, 4))
                 payload_tree:add_le(pf_zone_notify_offset, payload_buf(4, 4))
                 payload_tree:add_le(pf_zone_notify_length, payload_buf(8, 4))
@@ -941,59 +1444,81 @@ function wki_proto.dissector(buffer, pinfo, tree)
                     :append_text(op == 0 and " (READ)" or " (WRITE)")
             end
 
-        -- EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE
+            -- EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE
         elseif msg_type == 0x30 or msg_type == 0x31 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_event_class, payload_buf(0, 2))
                 payload_tree:add_le(pf_event_id, payload_buf(2, 2))
                 payload_tree:add(pf_event_delivery, payload_buf(4, 1))
             end
 
-        -- EVENT_PUBLISH
+            -- EVENT_PUBLISH
         elseif msg_type == 0x32 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_event_class, payload_buf(0, 2))
                 payload_tree:add_le(pf_event_id, payload_buf(2, 2))
                 payload_tree:add_le(pf_event_origin, payload_buf(4, 2))
                 local data_len = payload_buf(6, 2):le_uint()
                 payload_tree:add_le(pf_event_data_len, payload_buf(6, 2))
-                if data_len > 0 and payload_len >= 8 + data_len then
+                if data_len > 0 and payload_captured_len >= 8 + data_len then
                     payload_tree:add(pf_payload_data, payload_buf(8, data_len))
                 end
             end
 
-        -- DEV_ATTACH_REQ
+            -- DEV_ATTACH_REQ
         elseif msg_type == 0x40 then
-            if payload_len >= 12 then
+            if payload_captured_len >= 12 then
                 local resource_type = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_dev_target, payload_buf(0, 2))
                 payload_tree:add_le(pf_dev_res_type, payload_buf(2, 2))
-                local resource_type_name_item = payload_tree:add(pf_dev_res_type_name, get_resource_type_name(resource_type))
+                local resource_type_name_item = payload_tree:add(pf_dev_res_type_name,
+                    get_resource_type_name(resource_type))
                 resource_type_name_item:set_generated(true)
                 payload_tree:add_le(pf_dev_res_id, payload_buf(4, 4))
                 payload_tree:add(pf_dev_attach_mode, payload_buf(8, 1))
                 payload_tree:add_le(pf_dev_req_channel, payload_buf(10, 2))
             end
 
-        -- DEV_ATTACH_ACK
+            -- DEV_ATTACH_ACK
         elseif msg_type == 0x41 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add(pf_dev_status, payload_buf(0, 1))
                 payload_tree:add_le(pf_dev_assigned_ch, payload_buf(2, 2))
-                payload_tree:add_le(pf_dev_max_op_size, payload_buf(4, 2))
+                if payload_captured_len >= 36 then
+                    payload_tree:add_le(pf_dev_ext.resource_id_echo, payload_buf(4, 4))
+                    payload_tree:add_le(pf_dev_max_op_size, payload_buf(8, 2))
+                    payload_tree:add_le(pf_dev_ext.rdma_flags, payload_buf(10, 2))
+                    payload_tree:add_le(pf_dev_ext.blk_zone_id, payload_buf(12, 4))
+                    payload_tree:add(pf_dev_ext.ipv4, format_ipv4_host_order(payload_buf(16, 4):le_uint()))
+                    payload_tree:add(pf_dev_ext.ipv4_mask, format_ipv4_host_order(payload_buf(20, 4):le_uint()))
+                    payload_tree:add(pf_dev_ext.real_mac, payload_buf(24, 6))
+                    payload_tree:add_le(pf_dev_ext.link_state, payload_buf(30, 2))
+                    payload_tree:add_le(pf_dev_ext.mtu, payload_buf(32, 4))
+                elseif payload_captured_len >= 24 then
+                    payload_tree:add_le(pf_dev_ext.resource_id_echo, payload_buf(4, 4))
+                    payload_tree:add_le(pf_dev_max_op_size, payload_buf(8, 2))
+                    local rdma_flags = payload_buf(10, 2):le_uint()
+                    payload_tree:add_le(pf_dev_ext.rdma_flags, payload_buf(10, 2)):append_text(" (" ..
+                        build_rdma_flags_string(rdma_flags) .. ")")
+                    payload_tree:add_le(pf_dev_ext.blk_zone_id, payload_buf(12, 4))
+                    payload_tree:add_le(pf_dev_ext.read_staging_rkey, payload_buf(16, 4))
+                    payload_tree:add_le(pf_dev_ext.bulk_staging_rkey, payload_buf(20, 4))
+                else
+                    payload_tree:add_le(pf_dev_max_op_size, payload_buf(4, 2))
+                end
             end
 
-        -- DEV_DETACH
+            -- DEV_DETACH
         elseif msg_type == 0x42 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_dev_target, payload_buf(0, 2))
                 payload_tree:add_le(pf_dev_res_type, payload_buf(2, 2))
                 payload_tree:add_le(pf_dev_res_id, payload_buf(4, 4))
             end
 
-        -- DEV_OP_REQ
+            -- DEV_OP_REQ
         elseif msg_type == 0x43 then
-            if payload_len >= 4 then
+            if payload_captured_len >= 4 then
                 local op_id = payload_buf(0, 2):le_uint()
                 local op_name = get_op_name(op_id)
                 payload_tree:add_le(pf_dev_op_id, payload_buf(0, 2)):append_text(" (" .. op_name .. ")")
@@ -1001,94 +1526,114 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 op_name_item:set_generated(true)
                 local data_len = payload_buf(2, 2):le_uint()
                 payload_tree:add_le(pf_dev_op_data_len, payload_buf(2, 2))
-                if data_len > 0 and payload_len >= 4 + data_len then
-                    payload_tree:add(pf_payload_data, payload_buf(4, data_len))
+                local captured_data_len = math.max(0, math.min(data_len, payload_captured_len - 4))
+                local op_tree = payload_tree:add(
+                    wki_proto,
+                    payload_buf(0, math.min(payload_captured_len, 4 + captured_data_len)),
+                    string.format("Decoded Request (%s)", op_name)
+                )
+                if captured_data_len > 0 then
+                    decode_vfs_devop_payload(op_tree, msg_type, op_id, payload_buf(4, captured_data_len),
+                        captured_data_len, nil)
+                elseif data_len > 0 then
+                    add_truncation_note(op_tree, captured_data_len, data_len)
                 end
             end
 
-        -- DEV_OP_RESP
+            -- DEV_OP_RESP
         elseif msg_type == 0x44 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 local op_id = payload_buf(0, 2):le_uint()
                 local op_name = get_op_name(op_id)
                 payload_tree:add_le(pf_dev_op_id, payload_buf(0, 2)):append_text(" (" .. op_name .. ")")
                 local op_name_item = payload_tree:add(pf_dev_op_name, op_name)
                 op_name_item:set_generated(true)
+                local status = payload_buf(2, 2):le_int()
                 payload_tree:add_le(pf_dev_op_status, payload_buf(2, 2))
                 local data_len = payload_buf(4, 2):le_uint()
                 payload_tree:add_le(pf_dev_op_data_len, payload_buf(4, 2))
-                if data_len > 0 and payload_len >= 8 + data_len then
-                    payload_tree:add(pf_payload_data, payload_buf(8, data_len))
+                payload_tree:add_le(pf_dev_op_reserved, payload_buf(6, 2))
+                local captured_data_len = math.max(0, math.min(data_len, payload_captured_len - 8))
+                local op_tree = payload_tree:add(
+                    wki_proto,
+                    payload_buf(0, math.min(payload_captured_len, 8 + captured_data_len)),
+                    string.format("Decoded Response (%s)", op_name)
+                )
+                if captured_data_len > 0 then
+                    decode_vfs_devop_payload(op_tree, msg_type, op_id, payload_buf(8, captured_data_len),
+                        captured_data_len, status)
+                elseif data_len > 0 then
+                    add_truncation_note(op_tree, captured_data_len, data_len)
                 end
             end
 
-        -- DEV_IRQ_FWD
+            -- DEV_IRQ_FWD
         elseif msg_type == 0x45 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_irq_device, payload_buf(0, 2))
                 payload_tree:add_le(pf_irq_vector, payload_buf(2, 2))
                 payload_tree:add_le(pf_irq_status, payload_buf(4, 4))
             end
 
-        -- CHANNEL_OPEN
+            -- CHANNEL_OPEN
         elseif msg_type == 0x46 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_chan_req_id, payload_buf(0, 2))
                 payload_tree:add(pf_chan_priority, payload_buf(2, 1))
                 payload_tree:add_le(pf_chan_credits, payload_buf(4, 2))
             end
 
-        -- CHANNEL_OPEN_ACK
+            -- CHANNEL_OPEN_ACK
         elseif msg_type == 0x47 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_chan_assigned_id, payload_buf(0, 2))
                 payload_tree:add(pf_chan_status, payload_buf(2, 1))
                 payload_tree:add_le(pf_chan_credits, payload_buf(4, 2))
             end
 
-        -- CHANNEL_CLOSE
+            -- CHANNEL_CLOSE
         elseif msg_type == 0x48 then
-            if payload_len >= 4 then
+            if payload_captured_len >= 4 then
                 payload_tree:add_le(pf_channel_id, payload_buf(0, 2))
             end
 
-        -- TASK_SUBMIT
+            -- TASK_SUBMIT
         elseif msg_type == 0x50 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 payload_tree:add_le(pf_task_id, payload_buf(0, 4))
                 payload_tree:add(pf_task_delivery, payload_buf(4, 1))
                 payload_tree:add_le(pf_task_args_len, payload_buf(6, 2))
             end
 
-        -- TASK_ACCEPT / TASK_REJECT
+            -- TASK_ACCEPT / TASK_REJECT
         elseif msg_type == 0x51 or msg_type == 0x52 then
-            if payload_len >= 16 then
+            if payload_captured_len >= 16 then
                 payload_tree:add_le(pf_task_id, payload_buf(0, 4))
                 payload_tree:add(pf_task_status, payload_buf(4, 1))
                 payload_tree:add_le(pf_task_remote_pid, payload_buf(8, 8))
             end
 
-        -- TASK_COMPLETE
+            -- TASK_COMPLETE
         elseif msg_type == 0x53 then
-            if payload_len >= 12 then
+            if payload_captured_len >= 12 then
                 payload_tree:add_le(pf_task_id, payload_buf(0, 4))
                 payload_tree:add_le(pf_task_exit_status, payload_buf(4, 4))
                 local output_len = payload_buf(8, 2):le_uint()
                 payload_tree:add_le(pf_task_output_len, payload_buf(8, 2))
-                if output_len > 0 and payload_len >= 12 + output_len then
+                if output_len > 0 and payload_captured_len >= 12 + output_len then
                     payload_tree:add(pf_payload_data, payload_buf(12, output_len))
                 end
             end
 
-        -- TASK_CANCEL
+            -- TASK_CANCEL
         elseif msg_type == 0x54 then
-            if payload_len >= 4 then
+            if payload_captured_len >= 4 then
                 payload_tree:add_le(pf_task_id, payload_buf(0, 4))
             end
 
-        -- LOAD_REPORT
+            -- LOAD_REPORT
         elseif msg_type == 0x55 then
-            if payload_len >= 8 then
+            if payload_captured_len >= 8 then
                 local num_cpus = payload_buf(0, 2):le_uint()
                 payload_tree:add_le(pf_load_num_cpus, payload_buf(0, 2))
                 payload_tree:add_le(pf_load_runnable, payload_buf(2, 2))
@@ -1098,7 +1643,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 -- Per-CPU loads
                 local offset = 8
                 for i = 1, num_cpus do
-                    if offset + 2 <= payload_len then
+                    if offset + 2 <= payload_captured_len then
                         local cpu_load = payload_buf(offset, 2):le_uint()
                         payload_tree:add(wki_proto, payload_buf(offset, 2),
                             string.format("CPU %d Load: %d (%.1f%%)", i - 1, cpu_load, cpu_load / 10.0))
@@ -1106,10 +1651,9 @@ function wki_proto.dissector(buffer, pinfo, tree)
                     end
                 end
             end
-
         else
             -- Unknown/unhandled message type - show raw payload
-            payload_tree:add(pf_payload_data, payload_buf(0, payload_len))
+            payload_tree:add(pf_payload_data, payload_buf(0, payload_captured_len))
         end
     end
 
@@ -1229,7 +1773,9 @@ local function show_wki_statistics()
         table.insert(lines, string.format("  Min:   %.3f ms", all_latencies[1]))
         table.insert(lines, string.format("  Max:   %.3f ms", all_latencies[total]))
         table.insert(lines, string.format("  Avg:   %.3f ms",
-            (function() local s=0; for _,v in ipairs(all_latencies) do s=s+v end; return s/total end)()))
+            (function()
+                local s = 0; for _, v in ipairs(all_latencies) do s = s + v end; return s / total
+            end)()))
     else
         table.insert(lines, "  No request-response pairs captured.")
     end
@@ -1260,11 +1806,11 @@ print("WKI Protocol dissector loaded (EtherType 0x88B7) with statistics support"
 -- WKI RoCE RDMA Transport Dissector (EtherType 0x88B8)
 -- =========================================================================
 
-local WKI_ETHERTYPE_ROCE = 0x88B8
-local ROCE_HEADER_SIZE = 24
-local ROCE_VERSION = 1
+local WKI_ETHERTYPE_ROCE      = 0x88B8
+local ROCE_HEADER_SIZE        = 24
+local ROCE_VERSION            = 1
 
-local roce_opcodes = {
+local roce_opcodes            = {
     [0x01] = "RDMA_WRITE",
     [0x02] = "RDMA_READ_REQ",
     [0x03] = "RDMA_READ_RESP",
@@ -1272,30 +1818,30 @@ local roce_opcodes = {
 }
 
 -- Create the RoCE protocol
-local wki_roce_proto = Proto("wki_roce", "WKI RoCE RDMA Transport")
+local wki_roce_proto          = Proto("wki_roce", "WKI RoCE RDMA Transport")
 
 -- RoCE header fields
-local pf_roce_opcode    = ProtoField.uint8("wki_roce.opcode", "Opcode", base.HEX, roce_opcodes)
-local pf_roce_version   = ProtoField.uint8("wki_roce.version", "Version", base.DEC)
-local pf_roce_src_node  = ProtoField.uint16("wki_roce.src_node", "Source Node", base.HEX)
-local pf_roce_rkey      = ProtoField.uint32("wki_roce.rkey", "Remote Key", base.HEX)
-local pf_roce_offset    = ProtoField.uint64("wki_roce.offset", "Offset", base.DEC)
-local pf_roce_length    = ProtoField.uint32("wki_roce.length", "Length", base.DEC)
-local pf_roce_doorbell  = ProtoField.uint32("wki_roce.doorbell_val", "Doorbell Value", base.HEX)
-local pf_roce_payload   = ProtoField.bytes("wki_roce.payload", "RDMA Payload")
+local pf_roce_opcode          = ProtoField.uint8("wki_roce.opcode", "Opcode", base.HEX, roce_opcodes)
+local pf_roce_version         = ProtoField.uint8("wki_roce.version", "Version", base.DEC)
+local pf_roce_src_node        = ProtoField.uint16("wki_roce.src_node", "Source Node", base.HEX)
+local pf_roce_rkey            = ProtoField.uint32("wki_roce.rkey", "Remote Key", base.HEX)
+local pf_roce_offset          = ProtoField.uint64("wki_roce.offset", "Offset", base.DEC)
+local pf_roce_length          = ProtoField.uint32("wki_roce.length", "Length", base.DEC)
+local pf_roce_doorbell        = ProtoField.uint32("wki_roce.doorbell_val", "Doorbell Value", base.HEX)
+local pf_roce_payload         = ProtoField.bytes("wki_roce.payload", "RDMA Payload")
 
 -- Analysis fields
-local pf_roce_is_fragmented  = ProtoField.bool("wki_roce.fragmented", "Fragmented Transfer")
+local pf_roce_is_fragmented   = ProtoField.bool("wki_roce.fragmented", "Fragmented Transfer")
 local pf_roce_payload_preview = ProtoField.string("wki_roce.payload_preview", "Payload Preview")
 
-wki_roce_proto.fields = {
+wki_roce_proto.fields         = {
     pf_roce_opcode, pf_roce_version, pf_roce_src_node, pf_roce_rkey,
     pf_roce_offset, pf_roce_length, pf_roce_doorbell, pf_roce_payload,
     pf_roce_is_fragmented, pf_roce_payload_preview,
 }
 
 -- RoCE statistics tracking
-local roce_stats = {
+local roce_stats              = {
     total_frames = 0,
     write_frames = 0,
     read_req_frames = 0,
@@ -1305,10 +1851,10 @@ local roce_stats = {
 }
 
 -- Per-rkey transfer tracking: rkey => { writes, reads, bytes, first_frame, last_frame }
-local roce_rkey_stats = {}
+local roce_rkey_stats         = {}
 
 -- Per-node stats: node_id => { tx_writes, tx_reads, tx_doorbells, bytes }
-local roce_node_stats = {}
+local roce_node_stats         = {}
 
 local function reset_roce_stats()
     roce_stats = {
@@ -1332,13 +1878,13 @@ function wki_roce_proto.dissector(buffer, pinfo, tree)
 
     pinfo.cols.protocol:set("WKI-RoCE")
 
-    local opcode      = buffer(0, 1):uint()
-    local version     = buffer(1, 1):uint()
-    local src_node    = buffer(2, 2):le_uint()
-    local rkey        = buffer(4, 4):le_uint()
-    local offset      = buffer(8, 8):le_uint64()
-    local data_length = buffer(16, 4):le_uint()
-    local doorbell_v  = buffer(20, 4):le_uint()
+    local opcode       = buffer(0, 1):uint()
+    local version      = buffer(1, 1):uint()
+    local src_node     = buffer(2, 2):le_uint()
+    local rkey         = buffer(4, 4):le_uint()
+    local offset       = buffer(8, 8):le_uint64()
+    local data_length  = buffer(16, 4):le_uint()
+    local doorbell_v   = buffer(20, 4):le_uint()
     --   uint8_t  opcode;        // offset 0
     --   uint8_t  version;       // offset 1
     --   uint16_t src_node;      // offset 2
@@ -1348,7 +1894,7 @@ function wki_roce_proto.dissector(buffer, pinfo, tree)
     --   uint32_t doorbell_val;  // offset 20
     -- Total = 24 bytes
 
-    local opcode_str = roce_opcodes[opcode] or string.format("UNKNOWN(0x%02X)", opcode)
+    local opcode_str   = roce_opcodes[opcode] or string.format("UNKNOWN(0x%02X)", opcode)
     local src_node_str = format_node_id(src_node)
 
     -- Update info column

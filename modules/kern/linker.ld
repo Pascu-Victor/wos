@@ -26,9 +26,11 @@ SECTIONS
     /* base load address. */
     . = 0xffffffff80000000 + SIZEOF_HEADERS;
 
+    __kernel_text_start = .;
     .text : {
         *(.text .text.*)
     } :text
+    __kernel_text_end = .;
 
     /* Move to the next memory page for .rodata */
     . = ALIGN(CONSTANT(MAXPAGESIZE));

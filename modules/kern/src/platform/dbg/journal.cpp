@@ -21,6 +21,7 @@
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 
+#include "platform/asm/msr.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/sched/task.hpp"
@@ -275,12 +276,7 @@ void wake_waiters() {
         if (waiter == nullptr) {
             continue;
         }
-        waiter->deferred_task_switch = false;
-        uint64_t target_cpu = waiter->cpu;
-        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
-            target_cpu = ker::mod::sched::get_least_loaded_cpu();
-        }
-        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
     }
 }
@@ -357,7 +353,7 @@ void init() {
     seed ^= rdtsc();
     seed ^= reinterpret_cast<uint64_t>(&s_ring);
     seed ^= reinterpret_cast<uint64_t>(&s_modules);
-    seed ^= static_cast<uint64_t>(ker::mod::cpu::get_current_cpu_id_safe()) << 48;
+    seed ^= ker::mod::cpu::get_current_cpu_id_safe() << 48;
     s_boot_id = mix_boot_id(seed);
     if (s_boot_id == 0) {
         s_boot_id = 1;

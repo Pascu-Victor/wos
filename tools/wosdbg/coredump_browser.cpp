@@ -1,5 +1,18 @@
 #include "coredump_browser.h"
 
+#include <qcontainerfwd.h>
+#include <qfont.h>
+#include <qlogging.h>
+#include <qmap.h>
+#include <qnamespace.h>
+#include <qoverload.h>
+#include <qpoint.h>
+#include <qprocess.h>
+#include <qstringview.h>
+#include <qtmetamacros.h>
+#include <qtreewidget.h>
+#include <qtypes.h>
+
 #include <QAction>
 #include <QDebug>
 #include <QDir>
@@ -10,64 +23,65 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QVBoxLayout>
+#include <algorithm>
 
 #include "coredump_parser.h"
 
-CoredumpBrowser::CoredumpBrowser(QWidget* parent) : QWidget(parent) { setupUI(); }
+CoredumpBrowser::CoredumpBrowser(QWidget* parent) : QWidget(parent) { setup_ui(); }
 
 CoredumpBrowser::~CoredumpBrowser() {
-    if (extractProcess_ && extractProcess_->state() != QProcess::NotRunning) {
-        extractProcess_->kill();
-        extractProcess_->waitForFinished(3000);
+    if (extract_process && extract_process->state() != QProcess::NotRunning) {
+        extract_process->kill();
+        extract_process->waitForFinished(3000);
     }
 }
 
-void CoredumpBrowser::setupUI() {
+void CoredumpBrowser::setup_ui() {
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
 
-    tree_ = new QTreeWidget(this);
-    tree_->setHeaderLabels({"Name", "Interrupt", "Size", "Timestamp"});
-    tree_->setColumnCount(4);
-    tree_->header()->setStretchLastSection(true);
-    tree_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    tree_->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    tree_->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    tree_->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
-    tree_->setAlternatingRowColors(true);
-    tree_->setRootIsDecorated(true);
+    tree = new QTreeWidget(this);
+    tree->setHeaderLabels({"Name", "Interrupt", "Size", "Timestamp"});
+    tree->setColumnCount(4);
+    tree->header()->setStretchLastSection(true);
+    tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    tree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    tree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    tree->setContextMenuPolicy(Qt::CustomContextMenu);
+    tree->setAlternatingRowColors(true);
+    tree->setRootIsDecorated(true);
 
-    connect(tree_, &QTreeWidget::itemActivated, this, &CoredumpBrowser::onItemActivated);
-    connect(tree_, &QTreeWidget::customContextMenuRequested, this, &CoredumpBrowser::onContextMenu);
+    connect(tree, &QTreeWidget::itemActivated, this, &CoredumpBrowser::on_item_activated);
+    connect(tree, &QTreeWidget::customContextMenuRequested, this, &CoredumpBrowser::on_context_menu);
 
-    layout->addWidget(tree_);
+    layout->addWidget(tree);
 }
 
-void CoredumpBrowser::setDirectory(const QString& dir) {
-    coredumpDir_ = dir;
+void CoredumpBrowser::set_directory(const QString& dir) {
+    coredump_dir = dir;
     refresh();
 }
 
-void CoredumpBrowser::refresh() { scanDirectory(); }
+void CoredumpBrowser::refresh() { scan_directory(); }
 
-void CoredumpBrowser::scanDirectory() {
-    tree_->clear();
+void CoredumpBrowser::scan_directory() {
+    tree->clear();
 
-    if (coredumpDir_.isEmpty()) {
+    if (coredump_dir.isEmpty()) {
         return;
     }
 
-    QDir root_dir(coredumpDir_);
+    QDir root_dir(coredump_dir);
     if (!root_dir.exists()) {
-        qDebug() << "Coredump directory does not exist:" << coredumpDir_;
+        qDebug() << "Coredump directory does not exist:" << coredump_dir;
         return;
     }
 
     // Recursively find all *_coredump.bin files
     QMap<QString, QTreeWidgetItem*> group_items;  // subdirectory name -> tree item
 
-    QDirIterator it(coredumpDir_, {"*_coredump.bin"}, QDir::Files, QDirIterator::Subdirectories);
+    QDirIterator it(coredump_dir, {"*_coredump.bin"}, QDir::Files, QDirIterator::Subdirectories);
     int total_count = 0;
 
     while (it.hasNext()) {
@@ -84,7 +98,7 @@ void CoredumpBrowser::scanDirectory() {
         // Get or create group item
         QTreeWidgetItem* group_item = group_items.value(rel_dir);
         if (!group_item) {
-            group_item = new QTreeWidgetItem(tree_);
+            group_item = new QTreeWidgetItem(tree);
             group_item->setText(0, rel_dir);
             group_item->setFlags(group_item->flags() & ~Qt::ItemIsSelectable);
             QFont f = group_item->font(0);
@@ -94,7 +108,7 @@ void CoredumpBrowser::scanDirectory() {
         }
 
         // Parse binary name and quick-parse the coredump header for interrupt info
-        QString binary_name = wosdbg::parseBinaryNameFromFilename(fi.fileName());
+        QString binary_name = wosdbg::parse_binary_name_from_filename(fi.fileName());
         QString interrupt_str;
         QString timestamp_str;
 
@@ -103,7 +117,7 @@ void CoredumpBrowser::scanDirectory() {
         if (file.open(QIODevice::ReadOnly)) {
             QByteArray header_data = file.read(72 + 8);  // Read through int_num field
             if (header_data.size() >= 72) {
-                auto dump = wosdbg::parseCoreDump(header_data.left(std::min(static_cast<qsizetype>(512), header_data.size())));
+                auto dump = wosdbg::parse_core_dump(header_data.left(std::min(static_cast<qsizetype>(512), header_data.size())));
                 // We can't fully parse with just the header, so read more
             }
             file.close();
@@ -113,9 +127,9 @@ void CoredumpBrowser::scanDirectory() {
         QFile full_file(full_path);
         if (full_file.open(QIODevice::ReadOnly)) {
             QByteArray data = full_file.readAll();
-            auto dump = wosdbg::parseCoreDump(data);
+            auto dump = wosdbg::parse_core_dump(data);
             if (dump) {
-                interrupt_str = wosdbg::interruptName(dump->int_num);
+                interrupt_str = wosdbg::interrupt_name(dump->int_num);
                 timestamp_str = QString::number(dump->timestamp);
             }
             full_file.close();
@@ -134,7 +148,7 @@ void CoredumpBrowser::scanDirectory() {
     }
 
     // Expand all groups
-    tree_->expandAll();
+    tree->expandAll();
 
     // Update group labels with counts
     for (auto it = group_items.begin(); it != group_items.end(); ++it) {
@@ -142,18 +156,18 @@ void CoredumpBrowser::scanDirectory() {
         it.value()->setText(0, QString("%1 (%2)").arg(it.key()).arg(count));
     }
 
-    qDebug() << "Found" << total_count << "coredump files in" << coredumpDir_;
+    qDebug() << "Found" << total_count << "coredump files in" << coredump_dir;
 }
 
-void CoredumpBrowser::onItemActivated(QTreeWidgetItem* item, int /*column*/) {
+void CoredumpBrowser::on_item_activated(QTreeWidgetItem* item, int /*column*/) {
     QString path = item->data(0, Qt::UserRole).toString();
     if (!path.isEmpty()) {
-        emit coredumpSelected(path);
+        emit coredump_selected(path);
     }
 }
 
-void CoredumpBrowser::onContextMenu(const QPoint& pos) {
-    QTreeWidgetItem* item = tree_->itemAt(pos);
+void CoredumpBrowser::on_context_menu(const QPoint& pos) {
+    QTreeWidgetItem* item = tree->itemAt(pos);
     if (!item) {
         return;
     }
@@ -168,9 +182,9 @@ void CoredumpBrowser::onContextMenu(const QPoint& pos) {
     menu.addSeparator();
     QAction* delete_action = menu.addAction("Delete");
 
-    QAction* chosen = menu.exec(tree_->viewport()->mapToGlobal(pos));
+    QAction* chosen = menu.exec(tree->viewport()->mapToGlobal(pos));
     if (chosen == open_action) {
-        emit coredumpSelected(path);
+        emit coredump_selected(path);
     } else if (chosen == delete_action) {
         auto reply = QMessageBox::question(this, "Delete Coredump", QString("Delete %1?").arg(QFileInfo(path).fileName()),
                                            QMessageBox::Yes | QMessageBox::No);
@@ -181,8 +195,8 @@ void CoredumpBrowser::onContextMenu(const QPoint& pos) {
     }
 }
 
-void CoredumpBrowser::extractCoredumps(bool cluster_mode) {
-    if (extractProcess_ && extractProcess_->state() != QProcess::NotRunning) {
+void CoredumpBrowser::extract_coredumps(bool cluster_mode) {
+    if (extract_process && extract_process->state() != QProcess::NotRunning) {
         qWarning() << "Extraction already in progress";
         return;
     }
@@ -201,34 +215,34 @@ void CoredumpBrowser::extractCoredumps(bool cluster_mode) {
     }
 
     if (script_path.isEmpty()) {
-        emit extractionFinished(false, "extract_coredumps.sh not found");
+        emit extraction_finished(false, "extract_coredumps.sh not found");
         return;
     }
 
-    extractProcess_ = new QProcess(this);
-    connect(extractProcess_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &CoredumpBrowser::onExtractionFinished);
+    extract_process = new QProcess(this);
+    connect(extract_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &CoredumpBrowser::on_extraction_finished);
 
     QStringList args;
     if (cluster_mode) {
         args << "--cluster";
     }
 
-    extractProcess_->setWorkingDirectory(QDir::currentPath());
-    extractProcess_->start("bash", QStringList() << script_path << args);
+    extract_process->setWorkingDirectory(QDir::currentPath());
+    extract_process->start("bash", QStringList() << script_path << args);
 }
 
-void CoredumpBrowser::onExtractionFinished(int exit_code, QProcess::ExitStatus status) {
-    QString output = extractProcess_->readAllStandardOutput();
-    QString error_output = extractProcess_->readAllStandardError();
+void CoredumpBrowser::on_extraction_finished(int exit_code, QProcess::ExitStatus status) {
+    QString output = extract_process->readAllStandardOutput();
+    QString error_output = extract_process->readAllStandardError();
 
     bool success = (status == QProcess::NormalExit && exit_code == 0);
     QString message = success ? output : error_output;
 
-    extractProcess_->deleteLater();
-    extractProcess_ = nullptr;
+    extract_process->deleteLater();
+    extract_process = nullptr;
 
     // Auto-refresh after extraction
     refresh();
 
-    emit extractionFinished(success, message);
+    emit extraction_finished(success, message);
 }

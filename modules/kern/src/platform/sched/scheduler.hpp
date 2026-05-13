@@ -117,13 +117,37 @@ void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_i
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
 bool can_query_current_task();
-void remove_current_task();                                       // Remove current task from runqueue (for exit)
-auto find_task_by_pid(uint64_t pid) -> task::Task*;               // Find a task by PID (O(1) via PID registry)
-auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;          // Find task by PID with refcount (caller must release!)
-void set_task_nice(task::Task* task, int nice);                   // Update task weight safely on its run queue
-void signal_process_group(uint64_t pgid, int sig);                // Send signal to all tasks in a process group
-void wake_task_for_signal(task::Task* task);                      // Make a signaled blocked task runnable so signal delivery can occur
+void remove_current_task();                               // Remove current task from runqueue (for exit)
+auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
+auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)
+void set_task_nice(task::Task* task, int nice);           // Update task weight safely on its run queue
+void signal_process_group(uint64_t pgid, int sig);        // Send signal to all tasks in a process group
+void wake_task_for_signal(task::Task* task);              // Make a signaled blocked task runnable so signal delivery can occur
+
+// Event-driven waiters should resume on the CPU that observed the event when
+// they are truly parked and migratable.  Keeping this policy central prevents
+// sockets, PTYs, pipes, and similar subsystems from drifting apart.
+enum class EventWakeDeferredSwitch : uint8_t {
+    PRESERVE,
+    CANCEL,
+};
+
+[[nodiscard]] constexpr auto event_wake_prefers_waker_cpu(bool cpu_pinned, bool waiting, bool voluntary_block) -> bool {
+    return !cpu_pinned && (waiting || voluntary_block);
+}
+[[nodiscard]] constexpr auto event_wake_cancels_deferred_switch(EventWakeDeferredSwitch deferred_switch) -> bool {
+    return deferred_switch == EventWakeDeferredSwitch::CANCEL;
+}
+[[nodiscard]] auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64_t;
+void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE);
+void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu,
+                                 EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE);
+[[nodiscard]] auto wake_task_by_pid_from_event(uint64_t pid, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE)
+    -> bool;
+[[nodiscard]] auto wake_task_by_pid_from_event_on_cpu(uint64_t pid, uint64_t target_cpu,
+                                                      EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE) -> bool;
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task);  // Reschedule a specific task on a specific CPU
+auto debug_stop_task(task::Task* task) -> bool;                   // Move a traced task out of runnable scheduling if possible
 void wake_cpu(uint64_t cpu_no);                                   // Send wake IPI to a CPU (unconditional, for hlt wakeup)
 void insert_into_dead_list(task::Task* task);                     // Place a task into CPU 0's dead list for GC
 void gc_expired_tasks();                                          // Garbage collect dead tasks from dead lists
@@ -138,6 +162,10 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
 void arm_idle_timer_for_this_cpu();
 void note_scheduler_timer_interrupt();
 bool has_run_queues();
+void begin_syscall_accounting();
+void finish_syscall_accounting();
+[[nodiscard]] auto pause_syscall_accounting() -> bool;
+void resume_syscall_accounting();
 
 void preempt_disable();
 void preempt_disable_at(uint64_t caller);
@@ -161,7 +189,7 @@ inline auto interrupts_enabled() -> bool {
 }
 
 inline void halt_once_preserving_interrupt_state(bool const INTERRUPTS_WERE_ENABLED) {
-    if (INTERRUPTS_WERE_ENABLED) {
+    if (INTERRUPTS_WERE_ENABLED) {  // NOLINT(bugprone-branch-clone)
         asm volatile("sti\n\thlt" ::: "memory");
     } else {
         asm volatile("sti\n\thlt\n\tcli" ::: "memory");
@@ -185,6 +213,7 @@ auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
 auto get_active_task_at_safe(uint32_t index) -> task::Task*;
 auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
+auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto get_dead_task_count(uint64_t cpu_no) -> size_t;
 auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task*;
 
@@ -231,11 +260,15 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
             return;
         }
     }
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
         task->voluntary_block = false;
         task->wait_channel = nullptr;
+    }
+    if (PAUSED_SYSCALL_ACCOUNTING) {
+        resume_syscall_accounting();
     }
 }
 
@@ -263,6 +296,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
             return;
         }
     }
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
         halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
         if (task == nullptr) {
@@ -282,6 +316,9 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         task->wants_block = false;
         task->voluntary_block = false;
         task->wait_channel = nullptr;
+    }
+    if (PAUSED_SYSCALL_ACCOUNTING) {
+        resume_syscall_accounting();
     }
 }
 
@@ -313,6 +350,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
             return;
         }
     }
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
         halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
         if (task == nullptr) {
@@ -333,6 +371,59 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         task->voluntary_block = false;
         task->wait_channel = nullptr;
     }
+    if (PAUSED_SYSCALL_ACCOUNTING) {
+        resume_syscall_accounting();
+    }
+}
+
+// preemptible_syscall_park() -- park a PROCESS syscall wait loop at a scheduler
+// safe point, then return to the same in-kernel loop after an event, signal, or
+// timeout wake. Unlike deferred_task_switch, this never returns to userspace
+// with a private retry code.
+inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t deadline_us, uint64_t perf_callsite) {
+    if (preempt_count() != 0) {
+        note_preempt_disabled_block("preemptible_syscall_park", perf_callsite);
+    }
+    bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
+    auto* task = get_current_task();
+    if (task != nullptr) {
+        task->perf_wait_callsite = perf_callsite;
+        task->wait_channel = wait_channel;
+        task->wake_at_us = deadline_us;
+        task->wants_block = true;
+        task->voluntary_block = true;
+        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
+            task->wake_at_us = 0;
+            task->wants_block = false;
+            task->voluntary_block = false;
+            task->wait_channel = nullptr;
+            return;
+        }
+    }
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
+    for (;;) {
+        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
+        if (task == nullptr) {
+            break;
+        }
+        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
+            task->wake_at_us = 0;
+            task->wants_block = false;
+            break;
+        }
+        if (!task->wants_block && task->wake_at_us == 0) {
+            break;
+        }
+    }
+    if (task != nullptr) {
+        task->wake_at_us = 0;
+        task->wants_block = false;
+        task->voluntary_block = false;
+        task->wait_channel = nullptr;
+    }
+    if (PAUSED_SYSCALL_ACCOUNTING) {
+        resume_syscall_accounting();
+    }
 }
 
 // kern_wake() - move a blocked DAEMON task back to the runnable heap.
@@ -343,6 +434,9 @@ void kern_wake(task::Task* task);
 constexpr auto kern_yield() { ker::mod::sched::kern_yield_impl(WOS_PERF_CALLSITE()); }
 constexpr auto kern_block() { ker::mod::sched::kern_block_impl(WOS_PERF_CALLSITE()); }
 constexpr auto kern_sleep_us(uint64_t sleep_us) { ker::mod::sched::kern_sleep_us_impl(sleep_us, WOS_PERF_CALLSITE()); }
+constexpr auto preemptible_syscall_park(const char* wait_channel, uint64_t deadline_us = 0) {
+    ker::mod::sched::preemptible_syscall_park_impl(wait_channel, deadline_us, WOS_PERF_CALLSITE());
+}
 
 }  // namespace ker::mod::sched
 extern "C" auto wos_get_current_task() -> ker::mod::sched::task::Task*;

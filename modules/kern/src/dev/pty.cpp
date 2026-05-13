@@ -25,10 +25,6 @@
 namespace ker::dev::pty {
 
 using log = ker::mod::dbg::logger<"pty">;
-// WOS-internal "yield and retry" error code (never reaches userspace applications).
-// Returned by device reads that would block; the mlibc sysdep layer retries internally.
-// Distinct from EAGAIN (11) which is returned for non-blocking I/O.
-static constexpr int WOS_ERESTARTSYS = 512;
 // Fairness cadence for long PTY write bursts. Yielding periodically prevents
 // a single writer from monopolizing CPU and improves terminal interactivity.
 static constexpr size_t PTY_WRITE_FAIR_YIELD_INTERVAL = 4096;
@@ -222,7 +218,6 @@ auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* w
         return false;
     }
     current_task->wait_channel = wchan;
-    current_task->deferred_task_switch = true;
     return true;
 }
 
@@ -232,26 +227,28 @@ void wake_waiters(std::span<const uint64_t> waiters) {
         if (waiter == nullptr) {
             continue;
         }
-        waiter->deferred_task_switch = false;
-        uint64_t target_cpu = waiter->cpu;
-        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
-            target_cpu = ker::mod::sched::get_least_loaded_cpu();
-        }
-        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
     }
 }
 
 void drain_and_wake_waiters(ker::mod::sys::Spinlock& lock, ker::util::SmallVec<uint64_t, 2>& waiters) {
-    std::array<uint64_t, 32> pending{};
-    uint64_t const IRQF = lock.lock_irqsave();
-    size_t const PENDING_COUNT = std::min(waiters.size(), pending.size());
-    for (size_t i = 0; i < PENDING_COUNT; i++) {
-        pending.at(i) = waiters.at(i);
+    for (;;) {
+        std::array<uint64_t, 32> pending{};
+        size_t pending_count = 0;
+        uint64_t const IRQF = lock.lock_irqsave();
+        while (pending_count < pending.size() && !waiters.empty()) {
+            pending.at(pending_count++) = waiters.at(0);
+            static_cast<void>(waiters.remove_at(0));
+        }
+        lock.unlock_irqrestore(IRQF);
+
+        if (pending_count == 0) {
+            return;
+        }
+
+        wake_waiters(std::span(pending.data(), pending_count));
     }
-    waiters.clear();
-    lock.unlock_irqrestore(IRQF);
-    wake_waiters(std::span(pending.data(), PENDING_COUNT));
 }
 
 void wake_master_pollers(PtyPair* pair) {
@@ -300,23 +297,8 @@ void wake_both_pollers(PtyPair* pair) {
     if (pair == nullptr) {
         return;
     }
-    std::array<uint64_t, 32> master_pending{};
-    std::array<uint64_t, 32> slave_pending{};
-    uint64_t const IRQF = pair->lock.lock_irqsave();
-    size_t const MASTER_PENDING_COUNT = std::min(pair->master_poll_waiters.size(), master_pending.size());
-    for (size_t i = 0; i < MASTER_PENDING_COUNT; i++) {
-        master_pending.at(i) = pair->master_poll_waiters.at(i);
-    }
-    pair->master_poll_waiters.clear();
-
-    size_t const SLAVE_PENDING_COUNT = std::min(pair->slave_poll_waiters.size(), slave_pending.size());
-    for (size_t i = 0; i < SLAVE_PENDING_COUNT; i++) {
-        slave_pending.at(i) = pair->slave_poll_waiters.at(i);
-    }
-    pair->slave_poll_waiters.clear();
-    pair->lock.unlock_irqrestore(IRQF);
-    wake_waiters(std::span(master_pending.data(), MASTER_PENDING_COUNT));
-    wake_waiters(std::span(slave_pending.data(), SLAVE_PENDING_COUNT));
+    wake_master_pollers(pair);
+    wake_slave_pollers(pair);
 }
 
 auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
@@ -571,41 +553,42 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
     };
     const int OPEN_FLAGS = file->open_flags;
 
-    // Master reads from slave->master buffer
-    uint64_t const IRQF = pair->lock.lock_irqsave();
-    size_t const RD = pair->s2m.read(buf, count);
-    bool const SLAVE_OPENED = pair->slave_opened > 0;
-    bool should_block = false;
-    if (RD == 0 && SLAVE_OPENED && (OPEN_FLAGS & 04000) == 0) {
-        should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
-    }
-    pair->lock.unlock_irqrestore(IRQF);
-    if (RD == 0) {
-        // If slave is closed, return EOF
-        if (!SLAVE_OPENED) {
-            return finish(0);
+    for (;;) {
+        // Master reads from slave->master buffer
+        uint64_t const IRQF = pair->lock.lock_irqsave();
+        size_t const RD = pair->s2m.read(buf, count);
+        bool const SLAVE_OPENED = pair->slave_opened > 0;
+        bool should_block = false;
+        if (RD == 0 && SLAVE_OPENED && (OPEN_FLAGS & 04000) == 0) {
+            should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
         }
-        // Non-blocking fd: return EAGAIN immediately (propagates to application)
-        if ((OPEN_FLAGS & 04000) != 0) {
-            return finish(-EAGAIN);  // O_NONBLOCK = 04000
+        pair->lock.unlock_irqrestore(IRQF);
+        if (RD == 0) {
+            // If slave is closed, return EOF
+            if (!SLAVE_OPENED) {
+                return finish(0);
+            }
+            // Non-blocking fd: return EAGAIN immediately (propagates to application)
+            if ((OPEN_FLAGS & 04000) != 0) {
+                return finish(-EAGAIN);  // O_NONBLOCK = 04000
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
+            }
+            if (should_block) {
+                ker::mod::sched::preemptible_syscall_park("pty_master_read");
+            } else {
+                ker::mod::sched::kern_yield();
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
+            }
+            continue;
         }
-        if (should_block) {
-            return finish(-WOS_ERESTARTSYS);
-        }
-        if (current_task_has_deliverable_signal()) {
-            return finish(-EINTR);
-        }
-        ker::mod::sched::kern_yield();
-        if (current_task_has_deliverable_signal()) {
-            return finish(-EINTR);
-        }
-        return finish(-WOS_ERESTARTSYS);
-    }
-    if (RD > 0) {
         wake_slave_writers(pair);
         wake_slave_pollers(pair);
+        return finish(static_cast<ssize_t>(RD));
     }
-    return finish(static_cast<ssize_t>(RD));
 }
 
 // --- Line discipline helpers ---
@@ -887,9 +870,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                         return finish(-EINTR);
                     }
                     if (should_block) {
-                        return finish(-WOS_ERESTARTSYS);
+                        ker::mod::sched::preemptible_syscall_park("pty_master_write");
+                    } else {
+                        ker::mod::sched::kern_yield();
                     }
-                    ker::mod::sched::kern_yield();
                     if (current_task_has_deliverable_signal()) {
                         return finish(-EINTR);
                     }
@@ -914,6 +898,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     if (processed == 0) {
         return finish(-EAGAIN);
     }
+    wake_master_readers(pair);
     wake_slave_readers(pair);
     wake_both_pollers(pair);
     return finish(static_cast<ssize_t>(processed));
@@ -992,19 +977,35 @@ int master_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             }
             pair->termios = *in;
             pair->lock.unlock_irqrestore(IRQF);
+            if (cmd == TCSETSF) {
+                wake_master_writers(pair);
+                wake_master_pollers(pair);
+            }
             return 0;
         }
         case TCFLSH: {
             int const QUEUE = static_cast<int>(arg);
+            bool flushed_m2s = false;
+            bool flushed_s2m = false;
             uint64_t const IRQF = pair->lock.lock_irqsave();
             if (QUEUE == 0 || QUEUE == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
+                flushed_m2s = true;
             }
             if (QUEUE == 1 || QUEUE == 2) {
                 pair->s2m.flush();
+                flushed_s2m = true;
             }
             pair->lock.unlock_irqrestore(IRQF);
+            if (flushed_m2s) {
+                wake_master_writers(pair);
+                wake_master_pollers(pair);
+            }
+            if (flushed_s2m) {
+                wake_slave_writers(pair);
+                wake_slave_pollers(pair);
+            }
             return 0;
         }
         default:
@@ -1130,41 +1131,42 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
     };
     const int OPEN_FLAGS = file->open_flags;
 
-    // Slave reads from master->slave buffer
-    uint64_t const IRQF = pair->lock.lock_irqsave();
-    size_t const RD = pair->m2s.read(buf, count);
-    bool const MASTER_OPENED = pair->master_opened > 0;
-    bool should_block = false;
-    if (RD == 0 && MASTER_OPENED && (OPEN_FLAGS & 04000) == 0) {
-        should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
-    }
-    pair->lock.unlock_irqrestore(IRQF);
-    if (RD == 0) {
-        // If master is closed, return EOF
-        if (!MASTER_OPENED) {
-            return finish(0);
+    for (;;) {
+        // Slave reads from master->slave buffer
+        uint64_t const IRQF = pair->lock.lock_irqsave();
+        size_t const RD = pair->m2s.read(buf, count);
+        bool const MASTER_OPENED = pair->master_opened > 0;
+        bool should_block = false;
+        if (RD == 0 && MASTER_OPENED && (OPEN_FLAGS & 04000) == 0) {
+            should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
         }
-        // Non-blocking fd: return EAGAIN immediately
-        if ((OPEN_FLAGS & 04000) != 0) {
-            return finish(-EAGAIN);  // O_NONBLOCK = 04000
+        pair->lock.unlock_irqrestore(IRQF);
+        if (RD == 0) {
+            // If master is closed, return EOF
+            if (!MASTER_OPENED) {
+                return finish(0);
+            }
+            // Non-blocking fd: return EAGAIN immediately
+            if ((OPEN_FLAGS & 04000) != 0) {
+                return finish(-EAGAIN);  // O_NONBLOCK = 04000
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
+            }
+            if (should_block) {
+                ker::mod::sched::preemptible_syscall_park("pty_slave_read");
+            } else {
+                ker::mod::sched::kern_yield();
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
+            }
+            continue;
         }
-        if (should_block) {
-            return finish(-WOS_ERESTARTSYS);
-        }
-        if (current_task_has_deliverable_signal()) {
-            return finish(-EINTR);
-        }
-        ker::mod::sched::kern_yield();
-        if (current_task_has_deliverable_signal()) {
-            return finish(-EINTR);
-        }
-        return finish(-WOS_ERESTARTSYS);
-    }
-    if (RD > 0) {
         wake_master_writers(pair);
         wake_master_pollers(pair);
+        return finish(static_cast<ssize_t>(RD));
     }
-    return finish(static_cast<ssize_t>(RD));
 }
 
 ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
@@ -1239,9 +1241,10 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                     if (should_block) {
                         wake_master_readers(pair);
                         wake_both_pollers(pair);
-                        return finish(-WOS_ERESTARTSYS);
+                        ker::mod::sched::preemptible_syscall_park("pty_slave_write");
+                    } else {
+                        ker::mod::sched::kern_yield();
                     }
-                    ker::mod::sched::kern_yield();
                     if (current_task_has_deliverable_signal()) {
                         return finish(-EINTR);
                     }
@@ -1291,9 +1294,10 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 if (should_block) {
                     wake_master_readers(pair);
                     wake_both_pollers(pair);
-                    return finish(-WOS_ERESTARTSYS);
+                    ker::mod::sched::preemptible_syscall_park("pty_slave_write");
+                } else {
+                    ker::mod::sched::kern_yield();
                 }
-                ker::mod::sched::kern_yield();
                 if (current_task_has_deliverable_signal()) {
                     return finish(-EINTR);
                 }
@@ -1421,19 +1425,35 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             }
             pair->termios = *in;
             pair->lock.unlock_irqrestore(IRQF);
+            if (cmd == TCSETSF) {
+                wake_master_writers(pair);
+                wake_master_pollers(pair);
+            }
             return 0;
         }
         case TCFLSH: {
             int const QUEUE = static_cast<int>(arg);
+            bool flushed_m2s = false;
+            bool flushed_s2m = false;
             uint64_t const IRQF = pair->lock.lock_irqsave();
             if (QUEUE == 0 || QUEUE == 2) {
                 pair->m2s.flush();
                 pair->canon_len = 0;
+                flushed_m2s = true;
             }
             if (QUEUE == 1 || QUEUE == 2) {
                 pair->s2m.flush();
+                flushed_s2m = true;
             }
             pair->lock.unlock_irqrestore(IRQF);
+            if (flushed_m2s) {
+                wake_master_writers(pair);
+                wake_master_pollers(pair);
+            }
+            if (flushed_s2m) {
+                wake_slave_writers(pair);
+                wake_slave_pollers(pair);
+            }
             return 0;
         }
         default:
@@ -1640,6 +1660,25 @@ auto pty_is_file(ker::vfs::File* f) -> bool {
     }
 
     return device == &pair->master_dev || device == &pair->slave_dev;
+}
+
+auto pty_file_identity_key(ker::vfs::File* f) -> const void* {
+    auto* dff = devfs_file_from_file(f, "identity_key");
+    if (dff == nullptr || dff->device == nullptr) {
+        return nullptr;
+    }
+
+    auto* device = dff->device;
+    auto* pair = static_cast<PtyPair*>(device->private_data);
+    if (pair == nullptr || !is_valid_kernel_pointer(pair)) {
+        return nullptr;
+    }
+
+    if (device != &pair->master_dev && device != &pair->slave_dev) {
+        return nullptr;
+    }
+
+    return device;
 }
 
 }  // namespace ker::dev::pty

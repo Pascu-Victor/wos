@@ -27,5 +27,6 @@ void backlog_init();
 void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt);
 auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t;
 auto backlog_ready() -> bool;
+auto backlog_drain_all_pending_inline() -> int;
 
 }  // namespace ker::net

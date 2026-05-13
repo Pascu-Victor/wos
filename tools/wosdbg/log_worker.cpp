@@ -10,13 +10,13 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #define PACKAGE "qemu_log_worker"
 #define PACKAGE_VERSION "1.0"
 extern "C" {
 #include <bfd.h>
 }
-#include <capstone/capstone.h>
 #include <llvm/Demangle/Demangle.h>
 
 #include <QtCore/QCoreApplication>
@@ -39,8 +39,8 @@ extern "C" {
 
 // Helper function to demangle C++ symbols using LLVM's demangler
 // This handles modern C++20 features like concepts that cxxabi can't
-static std::string demangleSymbol(const std::string& mangled) {
-    if (mangled.length() > 2 && mangled.substr(0, 2) == "_Z") {
+static std::string demangle_symbol(const std::string& mangled) {
+    if (mangled.length() > 2 && mangled.starts_with("_Z")) {
         std::string demangled = llvm::demangle(mangled);
         // llvm::demangle returns the original string if it can't demangle
         if (demangled != mangled) {
@@ -56,10 +56,10 @@ static std::string demangleSymbol(const std::string& mangled) {
 struct BinaryInfo {
     bfd* abfd = nullptr;
     asymbol** symbols = nullptr;
-    long symCount = 0;
-    uint64_t fromAddress = 0;
-    uint64_t toAddress = 0;
-    uint64_t loadOffset = 0;  // Runtime load offset to subtract from addresses
+    long sym_count = 0;
+    uint64_t from_address = 0;
+    uint64_t to_address = 0;
+    uint64_t load_offset = 0;  // Runtime load offset to subtract from addresses
     QString path;
 
     ~BinaryInfo() {
@@ -71,10 +71,10 @@ struct BinaryInfo {
         }
     }
 
-    bool containsAddress(uint64_t addr) const { return addr >= fromAddress && addr <= toAddress; }
+    [[nodiscard]] bool contains_address(uint64_t addr) const { return addr >= from_address && addr <= to_address; }
 
     // Convert runtime address to file-relative address for BFD lookups
-    uint64_t toFileAddress(uint64_t runtimeAddress) const { return runtimeAddress - loadOffset; }
+    [[nodiscard]] uint64_t to_file_address(uint64_t runtime_address) const { return runtime_address - load_offset; }
 };
 
 class LogWorker {
@@ -82,63 +82,63 @@ class LogWorker {
     LogWorker();
     ~LogWorker();
 
-    void loadConfig(const QString& configPath);
-    void processChunk(const QString& inputFile, const QString& outputFile);
+    void load_config(const QString& config_path);
+    void process_chunk(const QString& input_file, const QString& output_file);
 
    private:
     std::vector<std::unique_ptr<BinaryInfo>> binaries;
 
-    BinaryInfo* findBinaryForAddress(uint64_t address);
+    BinaryInfo* find_binary_for_address(uint64_t address);
 
-    LogEntry processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler);
+    LogEntry process_line(const QString& line, int line_number, CapstoneDisassembler& disassembler);
 
-    void resolveAddressInfo(uint64_t address, std::string& function, std::string& sourceFile, int& sourceLine);
+    void resolve_address_info(uint64_t address, std::string& function, std::string& source_file, int& source_line);
 
-    QJsonObject logEntryToJson(const LogEntry& entry);
+    QJsonObject log_entry_to_json(const LogEntry& entry);
 };
 
 LogWorker::LogWorker() { bfd_init(); }
 
 LogWorker::~LogWorker() { binaries.clear(); }
 
-void LogWorker::loadConfig(const QString& configPath) {
+void LogWorker::load_config(const QString& config_path) {
     Config config;
 
     // Get the directory containing the config file for relative path resolution
-    QFileInfo configFileInfo(configPath);
-    QString configDir = configFileInfo.absolutePath();
+    QFileInfo config_file_info(config_path);
+    QString config_dir = config_file_info.absolutePath();
 
-    if (!config.loadFromFile(configPath)) {
-        qDebug() << "Failed to load config from" << configPath << ", using defaults";
+    if (!config.load_from_file(config_path)) {
+        qDebug() << "Failed to load config from" << config_path << ", using defaults";
     }
 
-    const auto& lookups = config.getAddressLookups();
+    const auto& lookups = config.get_address_lookups();
     qDebug() << "Loading" << lookups.size() << "address lookups from config";
 
     for (const auto& lookup : lookups) {
         auto info = std::make_unique<BinaryInfo>();
-        info->fromAddress = lookup.fromAddress;
-        info->toAddress = lookup.toAddress;
-        info->loadOffset = lookup.loadOffset;
+        info->from_address = lookup.from_address;
+        info->to_address = lookup.to_address;
+        info->load_offset = lookup.load_offset;
 
         // Resolve relative paths against the config file directory
-        QString binaryPath = lookup.symbolFilePath;
-        if (!QFileInfo(binaryPath).isAbsolute()) {
-            binaryPath = configDir + "/" + binaryPath;
+        QString binary_path = lookup.symbol_file_path;
+        if (!QFileInfo(binary_path).isAbsolute()) {
+            binary_path = config_dir + "/" + binary_path;
         }
-        info->path = binaryPath;
+        info->path = binary_path;
 
-        qDebug() << "Loading binary:" << binaryPath << "for range" << QString("0x%1").arg(lookup.fromAddress, 0, 16) << "-"
-                 << QString("0x%1").arg(lookup.toAddress, 0, 16) << "offset" << QString("0x%1").arg(lookup.loadOffset, 0, 16);
+        qDebug() << "Loading binary:" << binary_path << "for range" << QString("0x%1").arg(lookup.from_address, 0, 16) << "-"
+                 << QString("0x%1").arg(lookup.to_address, 0, 16) << "offset" << QString("0x%1").arg(lookup.load_offset, 0, 16);
 
-        info->abfd = bfd_openr(binaryPath.toStdString().c_str(), nullptr);
+        info->abfd = bfd_openr(binary_path.toStdString().c_str(), nullptr);
         if (!info->abfd) {
-            qDebug() << "Failed to open binary:" << binaryPath << "-" << bfd_errmsg(bfd_get_error());
+            qDebug() << "Failed to open binary:" << binary_path << "-" << bfd_errmsg(bfd_get_error());
             continue;
         }
 
         if (!bfd_check_format(info->abfd, bfd_object)) {
-            qDebug() << "Binary format check failed:" << binaryPath << "-" << bfd_errmsg(bfd_get_error());
+            qDebug() << "Binary format check failed:" << binary_path << "-" << bfd_errmsg(bfd_get_error());
             bfd_close(info->abfd);
             info->abfd = nullptr;
             continue;
@@ -146,30 +146,30 @@ void LogWorker::loadConfig(const QString& configPath) {
 
         long storage = bfd_get_symtab_upper_bound(info->abfd);
         if (storage > 0) {
-            info->symbols = (asymbol**)malloc(storage);
-            info->symCount = bfd_canonicalize_symtab(info->abfd, info->symbols);
-            qDebug() << "Loaded" << info->symCount << "symbols from" << binaryPath;
+            info->symbols = static_cast<asymbol**>(malloc(storage));
+            info->sym_count = bfd_canonicalize_symtab(info->abfd, info->symbols);
+            qDebug() << "Loaded" << info->sym_count << "symbols from" << binary_path;
         } else {
-            qDebug() << "Binary has no symbols:" << binaryPath;
+            qDebug() << "Binary has no symbols:" << binary_path;
         }
 
         binaries.push_back(std::move(info));
     }
 }
 
-BinaryInfo* LogWorker::findBinaryForAddress(uint64_t address) {
+BinaryInfo* LogWorker::find_binary_for_address(uint64_t address) {
     for (auto& info : binaries) {
-        if (info->containsAddress(address)) {
+        if (info->contains_address(address)) {
             return info.get();
         }
     }
     return nullptr;
 }
 
-void LogWorker::processChunk(const QString& inputFile, const QString& outputFile) {
-    QFile file(inputFile);
+void LogWorker::process_chunk(const QString& input_file, const QString& output_file) {
+    QFile file(input_file);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qDebug() << "Cannot open input file:" << inputFile;
+        qDebug() << "Cannot open input file:" << input_file;
         return;
     }
 
@@ -180,181 +180,179 @@ void LogWorker::processChunk(const QString& inputFile, const QString& outputFile
     CapstoneDisassembler disassembler;
 
     // Pre-compile regexes for CPU state detection (instead of compiling per-line)
-    static const QRegularExpression cpuStateRegex(
+    static const QRegularExpression CPU_STATE_REGEX(
         R"(RAX=|RBX=|RCX=|RDX=|RSI=|RDI=|RBP=|RSP=|R\d+=|RIP=|RFL=|[CEDFGS]S =|LDT=|TR =|[GI]DT=|CR[0234]=|DR[0-7]=|CC[CDs]=|CCO=|EFER=)");
 
-    int lineNumber = 1;
+    int line_number = 1;
     QString line;
-    ptrdiff_t currentInterruptGroupIndex = -1;  // Use index instead of pointer
+    ptrdiff_t current_interrupt_group_index = -1;  // Use index instead of pointer
 
     while (!in.atEnd()) {
         line = in.readLine();
 
-        LogEntry entry = processLine(line, lineNumber, disassembler);
+        LogEntry entry = process_line(line, line_number, disassembler);
 
         // Handle interrupt grouping and extract key information
         if (entry.type == EntryType::INTERRUPT) {
             entries.push_back(std::move(entry));
-            currentInterruptGroupIndex = entries.size() - 1;  // Store index of the interrupt entry
-        } else if (currentInterruptGroupIndex != -1 &&
+            current_interrupt_group_index = entries.size() - 1;  // Store index of the interrupt entry
+        } else if (current_interrupt_group_index != -1 &&
                    (entry.type == EntryType::REGISTER ||
-                    (entry.type == EntryType::OTHER && !entry.originalLine.empty() && cpuStateRegex.match(line).hasMatch()))) {
-            entry.isChild = true;
-            entries[currentInterruptGroupIndex].childEntries.push_back(std::move(entry));
+                    (entry.type == EntryType::OTHER && !entry.original_line.empty() && CPU_STATE_REGEX.match(line).hasMatch()))) {
+            entry.is_child = true;
+            entries[current_interrupt_group_index].child_entries.push_back(std::move(entry));
 
             // Extract key information for interrupt summary
-            LogEntry& interruptEntry = entries[currentInterruptGroupIndex];
+            LogEntry& interrupt_entry = entries[current_interrupt_group_index];
 
-            if (entries[currentInterruptGroupIndex].childEntries.back().type == EntryType::REGISTER) {
-                const auto& childEntry = entries[currentInterruptGroupIndex].childEntries.back();
-                if (interruptEntry.cpuStateInfo.empty()) {
-                    interruptEntry.cpuStateInfo = childEntry.assembly;
+            if (entries[current_interrupt_group_index].child_entries.back().type == EntryType::REGISTER) {
+                const auto& child_entry = entries[current_interrupt_group_index].child_entries.back();
+                if (interrupt_entry.cpu_state_info.empty()) {
+                    interrupt_entry.cpu_state_info = child_entry.assembly;
                 }
 
                 // Extract RIP from the register dump line
-                static const QRegularExpression ripRegex(R"(pc=([0-9a-fA-F]+))");
-                QString lineStr = QString::fromStdString(childEntry.originalLine);
-                auto ripMatch = ripRegex.match(lineStr);
-                if (ripMatch.hasMatch()) {
-                    interruptEntry.address = "0x" + ripMatch.captured(1).toStdString();
+                static const QRegularExpression RIP_REGEX(R"(pc=([0-9a-fA-F]+))");
+                QString line_str = QString::fromStdString(child_entry.original_line);
+                auto rip_match = RIP_REGEX.match(line_str);
+                if (rip_match.hasMatch()) {
+                    interrupt_entry.address = "0x" + rip_match.captured(1).toStdString();
                     bool ok;
-                    interruptEntry.addressValue = ripMatch.captured(1).toULongLong(&ok, 16);
+                    interrupt_entry.address_value = rip_match.captured(1).toULongLong(&ok, 16);
                 }
             } else if (line.contains("RIP=")) {
                 // Extract RIP from CPU state lines
-                static const QRegularExpression ripRegex(R"(RIP=([0-9a-fA-F]+))");
-                auto ripMatch = ripRegex.match(line);
-                if (ripMatch.hasMatch() && interruptEntry.address.empty()) {
-                    interruptEntry.address = "0x" + ripMatch.captured(1).toStdString();
+                static const QRegularExpression RIP_REGEX(R"(RIP=([0-9a-fA-F]+))");
+                auto rip_match = RIP_REGEX.match(line);
+                if (rip_match.hasMatch() && interrupt_entry.address.empty()) {
+                    interrupt_entry.address = "0x" + rip_match.captured(1).toStdString();
                     bool ok;
-                    interruptEntry.addressValue = ripMatch.captured(1).toULongLong(&ok, 16);
+                    interrupt_entry.address_value = rip_match.captured(1).toULongLong(&ok, 16);
                 }
             }
         } else {
             // Finalize interrupt entry summary when ending the group
-            if (currentInterruptGroupIndex != -1) {
-                LogEntry& interruptEntry = entries[currentInterruptGroupIndex];
-                if (!interruptEntry.childEntries.empty()) {
+            if (current_interrupt_group_index != -1) {
+                LogEntry& interrupt_entry = entries[current_interrupt_group_index];
+                if (!interrupt_entry.child_entries.empty()) {
                     // Create a concise summary for the table
-                    std::string summary = "Exception 0x" + interruptEntry.interruptNumber;
-                    if (!interruptEntry.address.empty()) {
-                        summary += " at " + interruptEntry.address;
+                    std::string summary = "Exception 0x" + interrupt_entry.interrupt_number;
+                    if (!interrupt_entry.address.empty()) {
+                        summary += " at " + interrupt_entry.address;
                     }
-                    interruptEntry.assembly = std::move(summary);
+                    interrupt_entry.assembly = std::move(summary);
                 }
             }
 
-            currentInterruptGroupIndex = -1;
-            if (entry.type != EntryType::OTHER || !entry.originalLine.empty()) {
+            current_interrupt_group_index = -1;
+            if (entry.type != EntryType::OTHER || !entry.original_line.empty()) {
                 entries.push_back(std::move(entry));
             }
         }
 
-        lineNumber++;
+        line_number++;
     }
 
     // Cleanup BFD resources
     // Write results to JSON file
-    QJsonArray jsonArray;
+    QJsonArray json_array;
     for (const auto& entry : entries) {
-        jsonArray.append(logEntryToJson(entry));
+        json_array.append(log_entry_to_json(entry));
     }
 
-    QJsonDocument doc(jsonArray);
+    QJsonDocument doc(json_array);
 
-    QFile outputFileObj(outputFile);
-    if (outputFileObj.open(QIODevice::WriteOnly)) {
-        outputFileObj.write(doc.toJson());
-        outputFileObj.close();
+    QFile output_file_obj(output_file);
+    if (output_file_obj.open(QIODevice::WriteOnly)) {
+        output_file_obj.write(doc.toJson());
+        output_file_obj.close();
     }
 }
 
-auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisassembler& disassembler) -> LogEntry {
+auto LogWorker::process_line(const QString& line, int line_number, CapstoneDisassembler& disassembler) -> LogEntry {
     LogEntry entry;
-    entry.lineNumber = lineNumber;
-    entry.originalLine = line.toStdString();
+    entry.line_number = line_number;
+    entry.original_line = line.toStdString();
     entry.type = EntryType::OTHER;
 
-    QString trimmedLine = line.trimmed();
+    QString trimmed_line = line.trimmed();
 
     // Pre-compile static regexes for better performance
     // Relaxed regex to handle variable spacing
     // Matches: 0x[hex]: [hex bytes] [assembly]
     // Example: 0x0000000000401000: 48 89 e5                 mov    rbp,rsp
-    static const QRegularExpression instrRegex(R"(^0x([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)(.+)$)");
-    static const QRegularExpression intRegex(R"(^Servicing hardware INT=0x([0-9a-fA-F]+))");
-    static const QRegularExpression excRegex(R"(^check_exception\s+old:\s*0x([0-9a-fA-F]+)\s+new\s+0x([0-9a-fA-F]+))");
-    static const QRegularExpression regRegex(R"(^\s*(\d+):\s+v=([0-9a-fA-F]+)\s+e=([0-9a-fA-F]+))");
+    static const QRegularExpression INSTR_REGEX(R"(^0x([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)(.+)$)");
+    static const QRegularExpression INT_REGEX(R"(^Servicing hardware INT=0x([0-9a-fA-F]+))");
+    static const QRegularExpression EXC_REGEX(R"(^check_exception\s+old:\s*0x([0-9a-fA-F]+)\s+new\s+0x([0-9a-fA-F]+))");
+    static const QRegularExpression REG_REGEX(R"(^\s*(\d+):\s+v=([0-9a-fA-F]+)\s+e=([0-9a-fA-F]+))");
 
     // Check if it's an instruction line: 0x[address]:  [hex bytes]  [assembly]
-    auto instrMatch = instrRegex.match(trimmedLine);
-    if (instrMatch.hasMatch()) {
+    auto instr_match = INSTR_REGEX.match(trimmed_line);
+    if (instr_match.hasMatch()) {
         entry.type = EntryType::INSTRUCTION;
-        entry.address = ("0x" + instrMatch.captured(1)).toStdString();
+        entry.address = ("0x" + instr_match.captured(1)).toStdString();
 
         bool ok;
-        entry.addressValue = instrMatch.captured(1).toULongLong(&ok, 16);
+        entry.address_value = instr_match.captured(1).toULongLong(&ok, 16);
         if (ok) {
-            resolveAddressInfo(entry.addressValue, entry.function, entry.sourceFile, entry.sourceLine);
+            resolve_address_info(entry.address_value, entry.function, entry.source_file, entry.source_line);
 
-            QString hexStr = instrMatch.captured(2).simplified();
-            hexStr.remove(' ');
-            entry.hexBytes = hexStr.toStdString();
+            QString hex_str = instr_match.captured(2).simplified();
+            hex_str.remove(' ');
+            entry.hex_bytes = hex_str.toStdString();
 
-            QString asmStr = instrMatch.captured(3).trimmed();
-            entry.assembly = disassembler.convert_to_intel(asmStr.toStdString());
+            QString asm_str = instr_match.captured(3).trimmed();
+            entry.assembly = disassembler.convert_to_intel(asm_str.toStdString());
 
             // Debug logging for disassembly
             // qDebug() << "Parsed instruction:" << QString::fromStdString(entry.address) << QString::fromStdString(entry.assembly);
         }
 
         return entry;
-    } else {
-        // Debug why regex failed for lines that look like instructions
-        if (trimmedLine.startsWith("0x") && trimmedLine.contains(":")) {
-            static int failCount = 0;
-            if (failCount < 5) {
-                qDebug() << "Regex failed for line:" << trimmedLine;
-                failCount++;
-            }
+    }  // Debug why regex failed for lines that look like instructions
+    if (trimmed_line.startsWith("0x") && trimmed_line.contains(":")) {
+        static int fail_count = 0;
+        if (fail_count < 5) {
+            qDebug() << "Regex failed for line:" << trimmed_line;
+            fail_count++;
         }
     }
 
     // Check for hardware interrupt
-    auto intMatch = intRegex.match(trimmedLine);
-    if (intMatch.hasMatch()) {
+    auto int_match = INT_REGEX.match(trimmed_line);
+    if (int_match.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
-        entry.interruptNumber = intMatch.captured(1).toStdString();
-        entry.assembly = "Hardware Interrupt " + entry.interruptNumber;
+        entry.interrupt_number = int_match.captured(1).toStdString();
+        entry.assembly = "Hardware Interrupt " + entry.interrupt_number;
         return entry;
     }
 
     // Check for exception
-    auto excMatch = excRegex.match(trimmedLine);
-    if (excMatch.hasMatch()) {
+    auto exc_match = EXC_REGEX.match(trimmed_line);
+    if (exc_match.hasMatch()) {
         entry.type = EntryType::INTERRUPT;
-        entry.interruptNumber = excMatch.captured(2).toStdString();  // new vector
-        entry.assembly = "Exception " + entry.interruptNumber;
+        entry.interrupt_number = exc_match.captured(2).toStdString();  // new vector
+        entry.assembly = "Exception " + entry.interrupt_number;
         return entry;
     }
 
     // Check for register dump lines
-    auto regMatch = regRegex.match(trimmedLine);
-    if (regMatch.hasMatch()) {
+    auto reg_match = REG_REGEX.match(trimmed_line);
+    if (reg_match.hasMatch()) {
         entry.type = EntryType::REGISTER;
-        entry.assembly = "CPU state dump (v=" + regMatch.captured(2).toStdString() + " e=" + regMatch.captured(3).toStdString() + ")";
+        entry.assembly = "CPU state dump (v=" + reg_match.captured(2).toStdString() + " e=" + reg_match.captured(3).toStdString() + ")";
         return entry;
     }
 
     // Check for IN: block markers
-    if (trimmedLine.startsWith("IN:")) {
+    if (trimmed_line.startsWith("IN:")) {
         entry.type = EntryType::BLOCK;
         entry.assembly = "Execution block";
         return entry;
     }
 
     // Check for separator lines
-    if (trimmedLine.startsWith("----")) {
+    if (trimmed_line.startsWith("----")) {
         entry.type = EntryType::SEPARATOR;
         entry.assembly = "Block separator";
         return entry;
@@ -363,29 +361,29 @@ auto LogWorker::processLine(const QString& line, int lineNumber, CapstoneDisasse
     return entry;
 }
 
-void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std::string& sourceFile, int& sourceLine) {
+void LogWorker::resolve_address_info(uint64_t address, std::string& function, std::string& source_file, int& source_line) {
     function = "";
-    sourceFile = "";
-    sourceLine = 0;
+    source_file = "";
+    source_line = 0;
 
-    BinaryInfo* binary = findBinaryForAddress(address);
-    if (!binary || !binary->abfd || !binary->symbols || binary->symCount <= 0) {
+    BinaryInfo* binary = find_binary_for_address(address);
+    if (!binary || !binary->abfd || !binary->symbols || binary->sym_count <= 0) {
         return;
     }
 
-    bfd* targetBfd = binary->abfd;
-    asymbol** targetSymbols = binary->symbols;
-    long targetSymCount = binary->symCount;
+    bfd* target_bfd = binary->abfd;
+    asymbol** target_symbols = binary->symbols;
+    long target_sym_count = binary->sym_count;
 
     // Convert runtime address to file-relative address
-    uint64_t fileAddress = binary->toFileAddress(address);
+    uint64_t file_address = binary->to_file_address(address);
 
     // STEP 1: Find the best matching symbol first (this works reliably)
-    asymbol* bestMatch = nullptr;
-    bfd_vma bestDistance = UINT64_MAX;
+    asymbol* best_match = nullptr;
+    bfd_vma best_distance = UINT64_MAX;
 
-    for (long i = 0; i < targetSymCount; i++) {
-        asymbol* sym = targetSymbols[i];
+    for (long i = 0; i < target_sym_count; i++) {
+        asymbol* sym = target_symbols[i];
         if (!sym || !sym->name) {
             continue;
         }
@@ -394,22 +392,22 @@ void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std:
             continue;
         }
 
-        bfd_vma symAddr = bfd_asymbol_value(sym);
-        if (symAddr <= fileAddress) {
-            bfd_vma distance = fileAddress - symAddr;
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestMatch = sym;
+        bfd_vma sym_addr = bfd_asymbol_value(sym);
+        if (sym_addr <= file_address) {
+            bfd_vma distance = file_address - sym_addr;
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_match = sym;
             }
         }
     }
 
-    if (bestMatch && bestMatch->name) {
-        std::string name = demangleSymbol(bestMatch->name);
+    if (best_match && best_match->name) {
+        std::string name = demangle_symbol(best_match->name);
 
-        if (bestDistance > 0) {
+        if (best_distance > 0) {
             std::ostringstream oss;
-            oss << name << "+0x" << std::hex << bestDistance;
+            oss << name << "+0x" << std::hex << best_distance;
             function = oss.str();
         } else {
             function = name;
@@ -422,51 +420,55 @@ void LogWorker::resolveAddressInfo(uint64_t address, std::string& function, std:
         const char* filename = nullptr;
         unsigned int line = 0;
 
-        if (bestMatch->section) {
+        if (best_match->section) {
             const char* functionname = nullptr;
-            bfd_vma sectionVma = bfd_section_vma(bestMatch->section);
+            bfd_vma section_vma = bfd_section_vma(best_match->section);
 
-            if (bfd_find_nearest_line(targetBfd, bestMatch->section, targetSymbols, fileAddress - sectionVma, &filename, &functionname,
+            if (bfd_find_nearest_line(target_bfd, best_match->section, target_symbols, file_address - section_vma, &filename, &functionname,
                                       &line)) {
-                if (filename) sourceFile = filename;
-                sourceLine = line;
+                if (filename) {
+                    source_file = filename;
+                }
+                source_line = line;
             }
         }
 
         // If bfd_find_nearest_line didn't work, fall back to bfd_find_line
         // (this only gives the function declaration line, but is better than nothing)
-        if (sourceFile.empty()) {
-            if (bfd_find_line(targetBfd, targetSymbols, bestMatch, &filename, &line)) {
-                if (filename) sourceFile = filename;
-                sourceLine = line;
+        if (source_file.empty()) {
+            if (bfd_find_line(target_bfd, target_symbols, best_match, &filename, &line)) {
+                if (filename) {
+                    source_file = filename;
+                }
+                source_line = line;
             }
         }
     }
 }
 
-auto LogWorker::logEntryToJson(const LogEntry& entry) -> QJsonObject {
+auto LogWorker::log_entry_to_json(const LogEntry& entry) -> QJsonObject {
     QJsonObject obj;
-    obj["lineNumber"] = entry.lineNumber;
+    obj["lineNumber"] = entry.line_number;
     obj["type"] = static_cast<int>(entry.type);
     obj["address"] = QString::fromStdString(entry.address);
     obj["function"] = QString::fromStdString(entry.function);
-    obj["hexBytes"] = QString::fromStdString(entry.hexBytes);
+    obj["hexBytes"] = QString::fromStdString(entry.hex_bytes);
     obj["assembly"] = QString::fromStdString(entry.assembly);
-    obj["originalLine"] = QString::fromStdString(entry.originalLine);
-    obj["addressValue"] = static_cast<qint64>(entry.addressValue);
-    obj["isExpanded"] = entry.isExpanded;
-    obj["isChild"] = entry.isChild;
-    obj["interruptNumber"] = QString::fromStdString(entry.interruptNumber);
-    obj["cpuStateInfo"] = QString::fromStdString(entry.cpuStateInfo);
-    obj["sourceFile"] = QString::fromStdString(entry.sourceFile);
-    obj["sourceLine"] = entry.sourceLine;
+    obj["originalLine"] = QString::fromStdString(entry.original_line);
+    obj["addressValue"] = static_cast<qint64>(entry.address_value);
+    obj["isExpanded"] = entry.is_expanded;
+    obj["isChild"] = entry.is_child;
+    obj["interruptNumber"] = QString::fromStdString(entry.interrupt_number);
+    obj["cpuStateInfo"] = QString::fromStdString(entry.cpu_state_info);
+    obj["sourceFile"] = QString::fromStdString(entry.source_file);
+    obj["sourceLine"] = entry.source_line;
 
     // Handle child entries
-    QJsonArray childArray;
-    for (const auto& child : entry.childEntries) {
-        childArray.append(logEntryToJson(child));
+    QJsonArray child_array;
+    for (const auto& child : entry.child_entries) {
+        child_array.append(log_entry_to_json(child));
     }
-    obj["childEntries"] = childArray;
+    obj["childEntries"] = child_array;
 
     return obj;
 }
@@ -479,17 +481,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    QString inputFile = argv[1];
-    QString outputFile = argv[2];
-    QString configFile = (argc >= 4) ? argv[3] : QString();
+    QString input_file = argv[1];
+    QString output_file = argv[2];
+    QString config_file = (argc >= 4) ? argv[3] : QString();
 
     LogWorker worker;
 
-    if (!configFile.isEmpty()) {
-        worker.loadConfig(configFile);
+    if (!config_file.isEmpty()) {
+        worker.load_config(config_file);
     }
 
-    worker.processChunk(inputFile, outputFile);
+    worker.process_chunk(input_file, output_file);
 
     return 0;
 }

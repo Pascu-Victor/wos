@@ -1,6 +1,5 @@
 #include <abi-bits/in.h>
 #include <abi-bits/ioctls.h>
-#include <abi-bits/poll.h>
 #include <abi-bits/socket.h>
 #include <abi-bits/socklen_t.h>
 #include <arpa/inet.h>
@@ -10,19 +9,20 @@
 #include <sys/ioctl.h>
 #include <sys/logging.h>
 #include <sys/net.h>
-#include <sys/poll.h>
 #include <sys/socket.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): sysroot exposes POSIX time APIs here.
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <span>
+#include <utility>
 
 #include "abi-bits/route.h"
 
@@ -47,16 +47,21 @@ constexpr uint8_t DHCPNAK = 6;
 constexpr uint8_t OPT_SUBNET_MASK = 1;
 constexpr uint8_t OPT_ROUTER = 3;
 constexpr uint8_t OPT_DNS = 6;
+constexpr uint8_t OPT_HOST_NAME = 12;
+constexpr uint8_t OPT_DOMAIN_NAME = 15;
+constexpr uint8_t OPT_FQDN = 81;
 constexpr uint8_t OPT_REQUESTED_IP = 50;
 constexpr uint8_t OPT_LEASE_TIME = 51;
 constexpr uint8_t OPT_MSG_TYPE = 53;
 constexpr uint8_t OPT_SERVER_ID = 54;
 constexpr uint8_t OPT_PARAM_LIST = 55;
+constexpr uint8_t OPT_DOMAIN_SEARCH = 119;
 constexpr uint8_t OPT_END = 255;
 
 constexpr std::array<uint8_t, 4> MAGIC_COOKIE = {99, 130, 83, 99};
 
 constexpr int RECV_TIMEOUT_SECS = 5;  // real-time timeout for DHCP responses
+constexpr uint32_t RECV_POLL_INTERVAL_US = 25'000;
 constexpr int MAX_DISCOVER_RETRIES = 5;
 constexpr int MAX_REQUEST_RETRIES = 3;
 constexpr int MAX_NAK_RESTARTS = 3;  // restart from DISCOVER on NAK
@@ -92,6 +97,8 @@ struct DhcpLease {
     uint32_t router;       // host order
     uint32_t dns;          // host order
     uint32_t lease_time;   // seconds
+    std::array<char, 256> domain_name;
+    std::array<char, 256> search_domains;
 };
 
 // ---- Helpers ----
@@ -131,7 +138,219 @@ void ip_to_str(uint32_t ip_host, char* buf, size_t len) {
     inet_ntop(AF_INET, &a, buf, static_cast<socklen_t>(len));
 }
 
-auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid) -> size_t {
+void copy_dhcp_string(std::span<char> dest, const uint8_t* data, size_t len) {
+    if (dest.empty()) {
+        return;
+    }
+
+    std::ranges::fill(dest, '\0');
+    size_t out = 0;
+    for (size_t i = 0; i < len && out + 1 < dest.size(); i++) {
+        unsigned char const CH = data[i];
+        if (CH == '\0' || CH == '\n' || CH == '\r') {
+            break;
+        }
+        if (!std::isprint(CH)) {
+            continue;
+        }
+        dest[out++] = static_cast<char>(CH);
+    }
+    dest[out] = '\0';
+}
+
+void copy_plain_string(std::span<char> dest, const char* source) {
+    if (dest.empty()) {
+        return;
+    }
+
+    std::ranges::fill(dest, '\0');
+    if (source == nullptr) {
+        return;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; source[i] != '\0' && out + 1 < dest.size(); i++) {
+        unsigned char const CH = static_cast<unsigned char>(source[i]);
+        if (!std::isprint(CH) || std::isspace(CH)) {
+            continue;
+        }
+        dest[out++] = static_cast<char>(CH);
+    }
+    dest[out] = '\0';
+}
+
+void trim_hostname_to_label(std::span<char> hostname) {
+    char* dot = std::strchr(hostname.data(), '.');
+    if (dot != nullptr) {
+        *dot = '\0';
+    }
+}
+
+auto get_primary_search_domain(const DhcpLease& lease, std::span<char> dest) -> bool {
+    if (dest.empty()) {
+        return false;
+    }
+
+    std::ranges::fill(dest, '\0');
+    if (lease.domain_name[0] != '\0') {
+        copy_plain_string(dest, lease.domain_name.data());
+        return dest[0] != '\0';
+    }
+
+    if (lease.search_domains[0] == '\0') {
+        return false;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; lease.search_domains[i] != '\0' && out + 1 < dest.size(); i++) {
+        unsigned char const CH = static_cast<unsigned char>(lease.search_domains[i]);
+        if (std::isspace(CH)) {
+            break;
+        }
+        dest[out++] = static_cast<char>(CH);
+    }
+    dest[out] = '\0';
+    return out != 0;
+}
+
+auto read_local_hostname(std::span<char> dest) -> bool {
+    if (dest.size() < 2) {
+        return false;
+    }
+
+    std::ranges::fill(dest, '\0');
+    if (gethostname(dest.data(), dest.size() - 1) != 0) {
+        return false;
+    }
+    dest.back() = '\0';
+    trim_hostname_to_label(dest);
+    return dest[0] != '\0';
+}
+
+auto build_client_fqdn(const char* hostname, const DhcpLease& lease, std::span<char> dest) -> bool {
+    if (dest.size() < 4 || hostname == nullptr || hostname[0] == '\0') {
+        return false;
+    }
+
+    std::array<char, 256> domain{};
+    if (!get_primary_search_domain(lease, domain)) {
+        return false;
+    }
+
+    int const WRITTEN = std::snprintf(dest.data(), dest.size(), "%s.%s", hostname, domain.data());
+    if (WRITTEN <= 0 || static_cast<size_t>(WRITTEN) >= dest.size()) {
+        dest[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+auto append_client_identity_options(uint8_t* opt, const char* hostname, const char* fqdn) -> uint8_t* {
+    if (hostname != nullptr && hostname[0] != '\0') {
+        size_t const HOSTNAME_LEN = std::min(std::strlen(hostname), static_cast<size_t>(255));
+        *opt++ = OPT_HOST_NAME;
+        *opt++ = static_cast<uint8_t>(HOSTNAME_LEN);
+        std::memcpy(opt, hostname, HOSTNAME_LEN);
+        opt += HOSTNAME_LEN;
+    }
+
+    if (fqdn != nullptr && fqdn[0] != '\0') {
+        size_t const FQDN_LEN = std::min(std::strlen(fqdn), static_cast<size_t>(252));
+        *opt++ = OPT_FQDN;
+        *opt++ = static_cast<uint8_t>(FQDN_LEN + 3);
+        *opt++ = 0x1;  // Request the server to perform A/PTR DNS updates.
+        *opt++ = 0;
+        *opt++ = 0;
+        std::memcpy(opt, fqdn, FQDN_LEN);
+        opt += FQDN_LEN;
+    }
+
+    return opt;
+}
+
+auto decode_domain_search_option(std::span<char> dest, const uint8_t* data, size_t len) -> bool {
+    if (dest.empty()) {
+        return false;
+    }
+
+    std::ranges::fill(dest, '\0');
+    size_t out = 0;
+    bool need_dot = false;
+    bool have_domain = false;
+    bool domain_started = false;
+
+    for (size_t i = 0; i < len;) {
+        uint8_t const LABEL_LEN = data[i++];
+        if (LABEL_LEN == 0) {
+            if (domain_started) {
+                have_domain = true;
+                need_dot = false;
+                domain_started = false;
+            }
+            continue;
+        }
+
+        if ((LABEL_LEN & 0xC0) != 0 || i + LABEL_LEN > len) {
+            return false;
+        }
+
+        if (have_domain) {
+            if (out + 1 >= dest.size()) {
+                return false;
+            }
+            dest[out++] = ' ';
+            have_domain = false;
+        } else if (need_dot) {
+            if (out + 1 >= dest.size()) {
+                return false;
+            }
+            dest[out++] = '.';
+        }
+
+        for (size_t j = 0; j < LABEL_LEN; j++) {
+            unsigned char const CH = data[i + j];
+            if (!std::isprint(CH) || std::isspace(CH)) {
+                return false;
+            }
+            if (out + 1 >= dest.size()) {
+                return false;
+            }
+            dest[out++] = static_cast<char>(CH);
+        }
+
+        i += LABEL_LEN;
+        need_dot = true;
+        domain_started = true;
+    }
+
+    dest[out] = '\0';
+    return out != 0;
+}
+
+void write_resolv_conf(const DhcpLease& lease) {
+    FILE* file = fopen("/etc/resolv.conf", "w");
+    if (file == nullptr) {
+        logger::warn("netd: failed to update /etc/resolv.conf: %d", errno);
+        return;
+    }
+
+    fputs("# Managed by netd via DHCP\n", file);
+    if (lease.dns != 0) {
+        std::array<char, 16> dns_str{};
+        ip_to_str(lease.dns, dns_str.data(), dns_str.size());
+        fprintf(file, "nameserver %s\n", dns_str.data());
+    }
+
+    if (lease.search_domains[0] != '\0') {
+        fprintf(file, "search %s\n", lease.search_domains.data());
+    } else if (lease.domain_name[0] != '\0') {
+        fprintf(file, "domain %s\n", lease.domain_name.data());
+    }
+
+    fclose(file);
+}
+
+auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, const char* hostname, const char* fqdn) -> size_t {
     *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
@@ -146,12 +365,15 @@ auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t x
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
     *opt++ = DHCPDISCOVER;
+    opt = append_client_identity_options(opt, hostname, fqdn);
     // Parameter request list
     *opt++ = OPT_PARAM_LIST;
-    *opt++ = 4;
+    *opt++ = 6;
     *opt++ = OPT_SUBNET_MASK;
     *opt++ = OPT_ROUTER;
     *opt++ = OPT_DNS;
+    *opt++ = OPT_DOMAIN_NAME;
+    *opt++ = OPT_DOMAIN_SEARCH;
     *opt++ = OPT_LEASE_TIME;
     // End
     *opt++ = OPT_END;
@@ -161,8 +383,8 @@ auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t x
     return USED < 300 ? 300 : USED;
 }
 
-auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t requested_ip_net, uint32_t server_ip_net)
-    -> size_t {
+auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t requested_ip_net, uint32_t server_ip_net,
+                   const char* hostname, const char* fqdn) -> size_t {
     *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
@@ -177,6 +399,7 @@ auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xi
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
     *opt++ = DHCPREQUEST;
+    opt = append_client_identity_options(opt, hostname, fqdn);
     // Requested IP
     *opt++ = OPT_REQUESTED_IP;
     *opt++ = 4;
@@ -189,10 +412,12 @@ auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xi
     opt += 4;
     // Parameter request list
     *opt++ = OPT_PARAM_LIST;
-    *opt++ = 4;
+    *opt++ = 6;
     *opt++ = OPT_SUBNET_MASK;
     *opt++ = OPT_ROUTER;
     *opt++ = OPT_DNS;
+    *opt++ = OPT_DOMAIN_NAME;
+    *opt++ = OPT_DOMAIN_SEARCH;
     *opt++ = OPT_LEASE_TIME;
     // End
     *opt++ = OPT_END;
@@ -201,7 +426,8 @@ auto build_request(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xi
     return USED < 300 ? 300 : USED;
 }
 
-auto build_renewal(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t client_ip_host) -> size_t {
+auto build_renewal(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, uint32_t client_ip_host, const char* hostname,
+                   const char* fqdn) -> size_t {
     *pkt = {};
     pkt->op = DHCP_OP_REQUEST;
     pkt->htype = DHCP_HTYPE_ETHER;
@@ -215,6 +441,7 @@ auto build_renewal(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xi
     *opt++ = OPT_MSG_TYPE;
     *opt++ = 1;
     *opt++ = DHCPREQUEST;
+    opt = append_client_identity_options(opt, hostname, fqdn);
     *opt++ = OPT_END;
 
     size_t const USED = sizeof(DhcpPacket) - pkt->options.size() + static_cast<size_t>(opt - pkt->options.data());
@@ -281,6 +508,12 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
                 if (OLEN >= 4) {
                     lease->dns = load_network_u32(opt);
                 }
+                break;
+            case OPT_DOMAIN_NAME:
+                copy_dhcp_string(lease->domain_name, opt, OLEN);
+                break;
+            case OPT_DOMAIN_SEARCH:
+                decode_domain_search_option(lease->search_domains, opt, OLEN);
                 break;
             case OPT_SERVER_ID:
                 if (OLEN >= 4) {
@@ -352,39 +585,7 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
     }
 
     close(SOCK);
-}
-
-auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> ssize_t {
-    for (;;) {
-        struct pollfd pfd{};
-        pfd.fd = sock;
-        pfd.events = POLLIN;
-
-        int const READY = poll(&pfd, 1, timeout_secs * 1000);
-        if (READY == 0) {
-            return -1;  // timeout
-        }
-        if (READY < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            logger::warn("netd: poll failed: %d", errno);
-            return -1;
-        }
-
-        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
-        if (N > 0) {
-            return N;  // got data
-        }
-
-        if (N == -EINTR || N == -EAGAIN) {
-            continue;
-        }
-
-        if (N < 0) {
-            logger::warn("netd: recvfrom returned %zd, retrying...", N);
-        }
-    }
+    write_resolv_conf(lease);
 }
 
 auto monotonic_now_us() -> uint64_t {
@@ -413,40 +614,49 @@ void sleep_until_us(uint64_t deadline_us) {
 
 void sleep_for_seconds(uint32_t seconds) { sleep_until_us(monotonic_now_us() + (static_cast<uint64_t>(seconds) * USEC_PER_SEC)); }
 
-auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t expected_xid, int timeout_secs, DhcpLease* lease)
-    -> uint8_t {
+void sleep_until_next_recv_poll(uint64_t deadline_us) {
+    uint64_t const NOW_US = monotonic_now_us();
+    if (NOW_US >= deadline_us) {
+        return;
+    }
+    sleep_until_us(std::min(deadline_us, NOW_US + RECV_POLL_INTERVAL_US));
+}
+
+auto recv_with_timeout(int sock, uint8_t* buf, size_t len, int timeout_secs) -> ssize_t {
     uint64_t const DEADLINE_US = monotonic_now_us() + (static_cast<uint64_t>(timeout_secs) * USEC_PER_SEC);
-
     while (monotonic_now_us() < DEADLINE_US) {
-        uint64_t const NOW_US = monotonic_now_us();
-        uint64_t const REMAINING_US = DEADLINE_US - NOW_US;
-        int timeout_ms = static_cast<int>((REMAINING_US + 999) / 1000);
-        if (timeout_ms <= 0) {
-            timeout_ms = 1;
+        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, MSG_DONTWAIT, nullptr);
+        if (N > 0) {
+            return N;
         }
-
-        struct pollfd pfd{};
-        pfd.fd = sock;
-        pfd.events = POLLIN;
-
-        int const READY = poll(&pfd, 1, timeout_ms);
-        if (READY == 0) {
-            return 0;
-        }
-        if (READY < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            logger::warn("netd: poll failed: %d", errno);
-            return 0;
-        }
-
-        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, 0, nullptr);
         if (N == -EINTR || N == -EAGAIN) {
+            sleep_until_next_recv_poll(DEADLINE_US);
             continue;
         }
         if (N < 0) {
-            logger::warn("netd: recvfrom returned %zd, retrying...", N);
+            logger::warn("netd: recvfrom returned %zd while waiting for DHCP packet", N);
+        }
+        sleep_until_next_recv_poll(DEADLINE_US);
+    }
+    return -1;
+}
+
+auto recv_dhcp_reply_until_timeout(int sock, uint8_t* buf, size_t len, uint32_t expected_xid, int timeout_secs, DhcpLease* lease)
+    -> uint8_t {
+    uint64_t const DEADLINE_US = monotonic_now_us() + (static_cast<uint64_t>(timeout_secs) * USEC_PER_SEC);
+    while (monotonic_now_us() < DEADLINE_US) {
+        ssize_t const N = ker::abi::net::recvfrom(sock, buf, len, MSG_DONTWAIT, nullptr);
+        if (N == -EINTR || N == -EAGAIN) {
+            sleep_until_next_recv_poll(DEADLINE_US);
+            continue;
+        }
+        if (N < 0) {
+            logger::warn("netd: recvfrom returned %zd while waiting for DHCP reply", N);
+            sleep_until_next_recv_poll(DEADLINE_US);
+            continue;
+        }
+        if (N == 0) {
+            sleep_until_next_recv_poll(DEADLINE_US);
             continue;
         }
 
@@ -544,13 +754,26 @@ auto main(int argc, char** argv) -> int {
     dst_addr.sin_port = htons(67);
     dst_addr.sin_addr.s_addr = htonl(0xFFFFFFFF);
 
-    // Derive xid from MAC address to ensure uniqueness across VMs
-    uint32_t xid = (static_cast<uint32_t>(std::get<2>(mac)) << 24) | (static_cast<uint32_t>(std::get<3>(mac)) << 16) |
-                   (static_cast<uint32_t>(std::get<4>(mac)) << 8) | static_cast<uint32_t>(std::get<5>(mac));
+    // Derive xid from the MAC and current boot time. vm0's MAC tail is all
+    // zeroes, so a MAC-only xid becomes 0x00000000 and makes packet captures
+    // harder to disambiguate across retries and reboots.
+    uint64_t const XID_TIME = monotonic_now_us();
+    uint32_t xid = 0x574f5300U ^ (static_cast<uint32_t>(std::get<2>(mac)) << 24) ^ (static_cast<uint32_t>(std::get<3>(mac)) << 16) ^
+                   (static_cast<uint32_t>(std::get<4>(mac)) << 8) ^ static_cast<uint32_t>(std::get<5>(mac)) ^
+                   static_cast<uint32_t>(XID_TIME) ^ static_cast<uint32_t>(XID_TIME >> 32);
+    if (xid == 0) {
+        xid = 0x574f5301U;
+    }
+    logger::debug("netd: DHCP transaction id 0x%x", xid);
     DhcpPacket pkt{};
     std::array<uint8_t, 1500> recv_buf{};
     DhcpLease lease{};
     int nak_restarts = 0;
+    std::array<char, 256> local_hostname{};
+    read_local_hostname(local_hostname);
+    if (local_hostname[0] != '\0') {
+        logger::info("netd: DHCP client hostname: %s", local_hostname.data());
+    }
 
 nak_restart:
     // === DHCP DISCOVER ===
@@ -558,8 +781,11 @@ nak_restart:
     lease = {};  // reset lease on restart
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
         logger::debug("netd: sending DISCOVER (attempt %d/%d)", attempt + 1, MAX_DISCOVER_RETRIES);
-        size_t const PKT_LEN = build_discover(&pkt, mac, xid);
-        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        size_t const PKT_LEN = build_discover(&pkt, mac, xid, local_hostname.data(), nullptr);
+        ssize_t const SENT = sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        if (std::cmp_not_equal(SENT, PKT_LEN)) {
+            logger::warn("netd: DISCOVER sendto returned %zd expected %zu errno=%d", SENT, PKT_LEN, errno);
+        }
 
         // Keep receiving until timeout, draining stale packets with wrong xid
         while (!got_offer) {
@@ -592,8 +818,13 @@ nak_restart:
     bool got_ack = false;
     for (int attempt = 0; attempt < MAX_REQUEST_RETRIES && !got_ack; attempt++) {
         logger::debug("netd: sending REQUEST (attempt %d/%d)", attempt + 1, MAX_REQUEST_RETRIES);
-        size_t const PKT_LEN = build_request(&pkt, mac, xid, htonl(lease.your_ip), htonl(lease.server_ip));
-        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        std::array<char, 512> local_fqdn{};
+        char const* fqdn = build_client_fqdn(local_hostname.data(), lease, local_fqdn) ? local_fqdn.data() : nullptr;
+        size_t const PKT_LEN = build_request(&pkt, mac, xid, htonl(lease.your_ip), htonl(lease.server_ip), local_hostname.data(), fqdn);
+        ssize_t const SENT = sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        if (std::cmp_not_equal(SENT, PKT_LEN)) {
+            logger::warn("netd: REQUEST sendto returned %zd expected %zu errno=%d", SENT, PKT_LEN, errno);
+        }
 
         // Keep receiving until timeout, draining stale packets with wrong xid
         while (!got_ack) {
@@ -619,6 +850,12 @@ nak_restart:
                 }
                 if (ack_lease.your_ip != 0) {
                     lease.your_ip = ack_lease.your_ip;
+                }
+                if (ack_lease.domain_name[0] != '\0') {
+                    lease.domain_name = ack_lease.domain_name;
+                }
+                if (ack_lease.search_domains[0] != '\0') {
+                    lease.search_domains = ack_lease.search_domains;
                 }
                 got_ack = true;
             } else if (MSG == DHCPNAK) {
@@ -657,6 +894,11 @@ request_failed:
         ip_to_str(lease.dns, dns_str.data(), dns_str.size());
         logger::info("netd: %s configured: ip=%s mask=%s gw=%s dns=%s lease=%us", ifname, ip_str.data(), mask_str.data(), gw_str.data(),
                      dns_str.data(), lease.lease_time);
+        if (lease.search_domains[0] != '\0') {
+            logger::info("netd: resolver search domains: %s", lease.search_domains.data());
+        } else if (lease.domain_name[0] != '\0') {
+            logger::info("netd: resolver domain: %s", lease.domain_name.data());
+        }
     }
 
     // === LEASE RENEWAL LOOP ===
@@ -683,7 +925,9 @@ request_failed:
         }
         ++xid;
 
-        size_t const PKT_LEN = build_renewal(&pkt, mac, xid, lease.your_ip);
+        std::array<char, 512> local_fqdn{};
+        char const* fqdn = build_client_fqdn(local_hostname.data(), lease, local_fqdn) ? local_fqdn.data() : nullptr;
+        size_t const PKT_LEN = build_renewal(&pkt, mac, xid, lease.your_ip, local_hostname.data(), fqdn);
 
         // Renewal: unicast to DHCP server
         struct sockaddr_in server{};
@@ -691,13 +935,43 @@ request_failed:
         server.sin_port = htons(67);
         server.sin_addr.s_addr = htonl(lease.server_ip);
 
-        sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
+        ssize_t const SENT = sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
+        if (std::cmp_not_equal(SENT, PKT_LEN)) {
+            logger::warn("netd: renewal REQUEST sendto returned %zd expected %zu errno=%d", SENT, PKT_LEN, errno);
+        }
 
         DhcpLease renew_lease{};
         uint8_t const MSG = recv_dhcp_reply_until_timeout(SOCK, recv_buf.data(), recv_buf.size(), xid, RECV_TIMEOUT_SECS, &renew_lease);
         if (MSG == DHCPACK) {
+            bool network_changed = false;
+            bool resolver_changed = false;
+            if (renew_lease.subnet_mask != 0 && renew_lease.subnet_mask != lease.subnet_mask) {
+                lease.subnet_mask = renew_lease.subnet_mask;
+                network_changed = true;
+            }
+            if (renew_lease.router != 0 && renew_lease.router != lease.router) {
+                lease.router = renew_lease.router;
+                network_changed = true;
+            }
+            if (renew_lease.dns != 0 && renew_lease.dns != lease.dns) {
+                lease.dns = renew_lease.dns;
+                resolver_changed = true;
+            }
             if (renew_lease.lease_time != 0) {
                 lease.lease_time = renew_lease.lease_time;
+            }
+            if (renew_lease.domain_name[0] != '\0' && renew_lease.domain_name != lease.domain_name) {
+                lease.domain_name = renew_lease.domain_name;
+                resolver_changed = true;
+            }
+            if (renew_lease.search_domains[0] != '\0' && renew_lease.search_domains != lease.search_domains) {
+                lease.search_domains = renew_lease.search_domains;
+                resolver_changed = true;
+            }
+            if (network_changed) {
+                apply_lease(ifname, lease);
+            } else if (resolver_changed) {
+                write_resolv_conf(lease);
             }
             t1_seconds = lease.lease_time / 2;
             if (consecutive_renewal_failures > 0) {

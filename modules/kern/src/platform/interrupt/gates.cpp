@@ -7,13 +7,16 @@
 #include <cstdint>
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/debug/ptrace.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <sanitizer/kcov.hpp>
 #include <syscalls_impl/process/exit.hpp>
 
+#include "abi/ptrace.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/msr.hpp"
@@ -31,6 +34,7 @@ constexpr uint64_t HHDM_BEGIN = 0xffff800000000000ULL;
 constexpr uint64_t HHDM_END = 0xffff900000000000ULL;
 constexpr uint64_t KERNEL_STATIC_BEGIN = 0xffffffff80000000ULL;
 constexpr uint64_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
+constexpr uint64_t PAGE_TABLE_BASE_MASK = ~((uint64_t{1} << ker::mod::mm::paging::PAGE_SHIFT) - 1U);
 
 std::array<interruptHandler_t, INTERRUPT_VECTOR_COUNT> interrupt_handlers{};
 std::atomic<bool> panic_lock{false};
@@ -53,6 +57,34 @@ uint8_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
 
 [[nodiscard]] constexpr auto page_table_index(uint64_t vaddr, uint8_t shift) -> size_t {
     return static_cast<size_t>((vaddr >> shift) & 0x1FFU);
+}
+
+auto load_u64_unaligned(const void* ptr) -> uint64_t {
+    uint64_t value = 0;
+    __builtin_memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+void dump_stack_owner(const char* label, uint64_t rsp) {
+    auto* active_owner = sched::debug_find_task_by_kernel_stack(rsp);
+    auto* dead_owner = sched::debug_find_dead_task_by_kernel_stack(rsp);
+    if (active_owner != nullptr) {
+        journal::panic("%s active owner: pid=%lu name=%s task=0x%lx stack=0x%lx state=%u queue=%u", label, active_owner->pid,
+                       active_owner->name != nullptr ? active_owner->name : "?", reinterpret_cast<uint64_t>(active_owner),
+                       active_owner->context.syscall_kernel_stack,
+                       static_cast<unsigned>(active_owner->state.load(std::memory_order_relaxed)),
+                       static_cast<unsigned>(active_owner->sched_queue));
+    } else {
+        journal::panic("%s active owner: <none>", label);
+    }
+    if (dead_owner != nullptr) {
+        journal::panic("%s dead owner: pid=%lu name=%s task=0x%lx stack=0x%lx state=%u queue=%u", label, dead_owner->pid,
+                       dead_owner->name != nullptr ? dead_owner->name : "?", reinterpret_cast<uint64_t>(dead_owner),
+                       dead_owner->context.syscall_kernel_stack, static_cast<unsigned>(dead_owner->state.load(std::memory_order_relaxed)),
+                       static_cast<unsigned>(dead_owner->sched_queue));
+    } else {
+        journal::panic("%s dead owner: <none>", label);
+    }
 }
 
 auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
@@ -125,6 +157,20 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
     // simultaneously) and must never be mistaken for nested kernel panics.
     uint64_t const CPL = frame.cs & 0x3;
     if (CPL == 3) {
+        if (frame.int_num == 1) {
+            uint64_t dr6 = 0;
+            asm volatile("mov %%dr6, %0" : "=r"(dr6));
+            if (ker::mod::debug::ptrace::report_user_stop(gpr, frame, ker::abi::ptrace::stop_reason::TRACE, 5, dr6)) {
+                const uint64_t DR6_CLEAR = 0xFFFF0FF0;
+                asm volatile("mov %0, %%dr6" ::"r"(DR6_CLEAR));
+                return;
+            }
+        }
+        if (frame.int_num == 3 &&
+            ker::mod::debug::ptrace::report_user_stop(gpr, frame, ker::abi::ptrace::stop_reason::BREAKPOINT, 5, frame.rip)) {
+            return;
+        }
+
         auto* current_task_for_dump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
@@ -299,6 +345,10 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::panic("Invalid RSP: 0x%lx - skipping stack trace", rsp_addr);
     }
 
+#ifdef WOS_KCOV
+    ker::sanitizer::kcov::dump_panic_trace_for_cpu(apic::get_apic_id());
+#endif
+
     // Dump current task information - use getCurrentTask() instead of hardcoded address
     // The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
     uint64_t const CPU_ID = apic::get_apic_id();
@@ -374,6 +424,7 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
                        current_task->yield_switch ? 1U : 0U);
         journal::panic("  preemptDepth=%u preempt_pending=%u preemptMaxUs=%lu", current_task->preempt_disable_depth,
                        current_task->preempt_pending ? 1U : 0U, current_task->preempt_disable_max_us);
+        dump_stack_owner("  frame.rsp", current_task->context.frame.rsp);
     } else {
         journal::panic("WARNING: currentTask is NULL!");
     }
@@ -382,8 +433,9 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
 skip_task_dump:
 
     // Check if page 0 is mapped (it should NOT be - null derefs should crash)
-    auto* pml4 = reinterpret_cast<uint64_t*>(cr3 + HHDM_BEGIN);
-    uint64_t const PML4E = pml4[0];  // Entry for VA 0x0
+    uint64_t const CR3_BASE = cr3 & PAGE_TABLE_BASE_MASK;
+    const auto* pml4 = reinterpret_cast<const uint64_t*>(CR3_BASE + HHDM_BEGIN);
+    uint64_t const PML4E = load_u64_unaligned(&pml4[0]);  // Entry for VA 0x0
     journal::panic("Page 0 check: PML4[0] = 0x%lx (Present=%d)", PML4E, ((PML4E & 1) != 0U) ? 1 : 0);
     if ((PML4E & 1) != 0U) {
         journal::panic("WARNING: Page 0 is mapped! NULL derefs won't crash!");
@@ -399,6 +451,7 @@ skip_task_dump:
     journal::panic("RFLAGS: 0x%lx", frame.flags);
     journal::panic("RSP: 0x%lx", frame.rsp);
     journal::panic("SS: 0x%x", frame.ss);
+    dump_stack_owner("fault rsp", frame.rsp);
     journal::panic("CR0: 0x%lx", cr0);
     journal::panic("CR2: 0x%lx", cr2);
     journal::panic("CR3: 0x%lx", cr3);
@@ -477,7 +530,7 @@ skip_task_dump:
             return;
         }
 
-        uint64_t const DESC = *reinterpret_cast<const uint64_t*>(DESC_ADDR);
+        uint64_t const DESC = load_u64_unaligned(reinterpret_cast<const void*>(DESC_ADDR));
 
         journal::panic("  Raw descriptor: 0x%lx", DESC);
 
@@ -504,7 +557,7 @@ skip_task_dump:
             const bool DESC_ADDR_HIGH_VALID = is_kernel_pointer_range(static_cast<uintptr_t>(DESC_ADDR_HIGH));
 
             if (DESC_ADDR_HIGH_VALID) {
-                const uint64_t DESC_HIGH = *reinterpret_cast<const uint64_t*>(DESC_ADDR_HIGH);
+                const uint64_t DESC_HIGH = load_u64_unaligned(reinterpret_cast<const void*>(DESC_ADDR_HIGH));
                 const uint64_t BASE_HIGH = DESC_HIGH & 0xFFFFFFFF;
                 const uint64_t FULL_BASE = BASE | (BASE_HIGH << 32);
                 journal::panic("  System descriptor (likely TSS). Base: 0x%lx, Limit: 0x%lx", FULL_BASE, limit);
@@ -585,10 +638,8 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
         ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.int_num));
         ker::mod::io::serial::write("\n");
     } else {
-        // CPU exception with no registered handler - route to exception_handler
-        // which kills the userspace process or panics for kernel-mode faults.
         exception_handler(gpr, frame);
-        __builtin_unreachable();
+        return;
     }
     ker::mod::apic::eoi();
 }

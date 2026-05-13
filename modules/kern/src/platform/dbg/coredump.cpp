@@ -27,7 +27,7 @@ namespace {
 using log = ker::mod::dbg::logger<"cdmp">;
 
 constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534fULL;  // "WOSCODMP" little-endian-ish identifier
-constexpr uint32_t COREDUMP_VERSION = 2;
+constexpr uint32_t COREDUMP_VERSION = 3;
 constexpr size_t MAX_WALK_WARNINGS_PER_LEVEL = 8;
 
 // x86-64 canonical address check: bits[63:47] must all be the same.
@@ -117,8 +117,68 @@ struct CoreDumpHeader {
     char exe_path[ker::mod::sched::task::Task::EXE_PATH_MAX];
     char cwd[ker::mod::sched::task::Task::CWD_MAX];
     char root[ker::mod::sched::task::Task::CWD_MAX];
+    char wait_channel[64];
+    char wki_target_hostname[ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX];
+    char wki_submitter_hostname[ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX];
     // NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+
+    // Version 3 richer Task snapshot. Keep this scalar-only and append-only:
+    // the request is captured from the exception path without allocation.
+    uint64_t task_ptr;
+    uint64_t thread_ptr;
+    uint64_t parent_pid;
+    uint64_t owner_pid;
+    uint64_t wki_remote_pid;
+    uint64_t session_id;
+    uint64_t pgid;
+    uint64_t task_type;
+    uint64_t task_state;
+    uint64_t sched_queue;
+    uint64_t current_cpu;
+    uint64_t domain_id;
+    uint64_t domain_mask;
+    uint64_t wki_target_flags;
+    uint64_t wki_proxy_task_id;
+    uint64_t elf_buffer_addr;
+    uint64_t captured_elf_buffer_size;
+    uint64_t elf_buffer_shared;
+    uint64_t start_time_us;
+    uint64_t user_time_us;
+    uint64_t system_time_us;
+    uint64_t vruntime;
+    uint64_t vdeadline;
+    uint64_t wake_at_us;
+    uint64_t wait_channel_addr;
+    uint64_t waiting_for_pid;
+    uint64_t wait_status_user_addr;
+    uint64_t wait_rusage_user_addr;
+    uint64_t sig_pending;
+    uint64_t sig_mask;
+    uint64_t ptrace_tracer_pid;
+    uint64_t uid;
+    uint64_t gid;
+    uint64_t euid;
+    uint64_t egid;
+    uint64_t task_flags;
 } __attribute__((packed));
+
+constexpr uint64_t TASK_FLAG_IS_THREAD = 1ULL << 0;
+constexpr uint64_t TASK_FLAG_IS_ELF_BUFFER_SHARED = 1ULL << 1;
+constexpr uint64_t TASK_FLAG_HAS_RUN = 1ULL << 2;
+constexpr uint64_t TASK_FLAG_HAS_EXITED = 1ULL << 3;
+constexpr uint64_t TASK_FLAG_WAITED_ON = 1ULL << 4;
+constexpr uint64_t TASK_FLAG_DEFERRED_TASK_SWITCH = 1ULL << 5;
+constexpr uint64_t TASK_FLAG_YIELD_SWITCH = 1ULL << 6;
+constexpr uint64_t TASK_FLAG_VOLUNTARY_BLOCK = 1ULL << 7;
+constexpr uint64_t TASK_FLAG_PREEMPT_PENDING = 1ULL << 8;
+constexpr uint64_t TASK_FLAG_IN_SIGNAL_HANDLER = 1ULL << 9;
+constexpr uint64_t TASK_FLAG_DO_SIGRETURN = 1ULL << 10;
+constexpr uint64_t TASK_FLAG_WANTS_BLOCK = 1ULL << 11;
+constexpr uint64_t TASK_FLAG_JUST_WOKE = 1ULL << 12;
+constexpr uint64_t TASK_FLAG_CPU_PINNED = 1ULL << 13;
+constexpr uint64_t TASK_FLAG_DOMAIN_HARD = 1ULL << 14;
+constexpr uint64_t TASK_FLAG_WKI_PREFER_INLINE = 1ULL << 15;
+constexpr uint64_t TASK_FLAG_WKI_SKIP_LEGACY_PLACEMENT = 1ULL << 16;
 
 enum class SegmentType : uint8_t {
     STACK_PAGE = 1,
@@ -356,6 +416,42 @@ struct CoreDumpRequest {
     uint64_t thread_tls_base;
     uint64_t thread_tls_size;
     uint64_t thread_safe_stack;
+    uint64_t task_ptr_value;
+    uint64_t thread_ptr_value;
+    uint64_t parent_pid;
+    uint64_t owner_pid;
+    uint64_t wki_remote_pid;
+    uint64_t session_id;
+    uint64_t pgid;
+    uint64_t task_type;
+    uint64_t task_state;
+    uint64_t sched_queue;
+    uint64_t current_cpu;
+    uint64_t domain_id;
+    uint64_t domain_mask;
+    uint64_t wki_target_flags;
+    uint64_t wki_proxy_task_id;
+    uint64_t elf_buffer_addr;
+    uint64_t captured_elf_buffer_size;
+    uint64_t elf_buffer_shared_value;
+    uint64_t start_time_us;
+    uint64_t user_time_us;
+    uint64_t system_time_us;
+    uint64_t vruntime;
+    uint64_t vdeadline;
+    uint64_t wake_at_us;
+    uint64_t wait_channel_addr;
+    uint64_t waiting_for_pid;
+    uint64_t wait_status_user_addr;
+    uint64_t wait_rusage_user_addr;
+    uint64_t sig_pending;
+    uint64_t sig_mask;
+    uint64_t ptrace_tracer_pid;
+    uint64_t uid;
+    uint64_t gid;
+    uint64_t euid;
+    uint64_t egid;
+    uint64_t task_flags;
     uint8_t* elf_buffer;  // stolen from task->elf_buffer; retained after write to avoid allocator re-entry during crash handling
     size_t elf_buffer_size;
     bool elf_buffer_shared;
@@ -367,6 +463,9 @@ struct CoreDumpRequest {
     std::array<char, ker::mod::sched::task::Task::EXE_PATH_MAX> exe_path{};
     std::array<char, ker::mod::sched::task::Task::CWD_MAX> cwd{};
     std::array<char, ker::mod::sched::task::Task::CWD_MAX> root{};
+    std::array<char, 64> wait_channel{};
+    std::array<char, ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX> wki_target_hostname{};
+    std::array<char, ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX> wki_submitter_hostname{};
 };
 
 struct CoreDumpSlot {
@@ -543,6 +642,45 @@ void perform_coredump(const CoreDumpRequest& req) {
     std::copy_n(req.exe_path.begin(), req.exe_path.size(), std::begin(hdr.exe_path));
     std::copy_n(req.cwd.begin(), req.cwd.size(), std::begin(hdr.cwd));
     std::copy_n(req.root.begin(), req.root.size(), std::begin(hdr.root));
+    std::copy_n(req.wait_channel.begin(), req.wait_channel.size(), std::begin(hdr.wait_channel));
+    std::copy_n(req.wki_target_hostname.begin(), req.wki_target_hostname.size(), std::begin(hdr.wki_target_hostname));
+    std::copy_n(req.wki_submitter_hostname.begin(), req.wki_submitter_hostname.size(), std::begin(hdr.wki_submitter_hostname));
+    hdr.task_ptr = req.task_ptr_value;
+    hdr.thread_ptr = req.thread_ptr_value;
+    hdr.parent_pid = req.parent_pid;
+    hdr.owner_pid = req.owner_pid;
+    hdr.wki_remote_pid = req.wki_remote_pid;
+    hdr.session_id = req.session_id;
+    hdr.pgid = req.pgid;
+    hdr.task_type = req.task_type;
+    hdr.task_state = req.task_state;
+    hdr.sched_queue = req.sched_queue;
+    hdr.current_cpu = req.current_cpu;
+    hdr.domain_id = req.domain_id;
+    hdr.domain_mask = req.domain_mask;
+    hdr.wki_target_flags = req.wki_target_flags;
+    hdr.wki_proxy_task_id = req.wki_proxy_task_id;
+    hdr.elf_buffer_addr = req.elf_buffer_addr;
+    hdr.captured_elf_buffer_size = req.captured_elf_buffer_size;
+    hdr.elf_buffer_shared = req.elf_buffer_shared_value;
+    hdr.start_time_us = req.start_time_us;
+    hdr.user_time_us = req.user_time_us;
+    hdr.system_time_us = req.system_time_us;
+    hdr.vruntime = req.vruntime;
+    hdr.vdeadline = req.vdeadline;
+    hdr.wake_at_us = req.wake_at_us;
+    hdr.wait_channel_addr = req.wait_channel_addr;
+    hdr.waiting_for_pid = req.waiting_for_pid;
+    hdr.wait_status_user_addr = req.wait_status_user_addr;
+    hdr.wait_rusage_user_addr = req.wait_rusage_user_addr;
+    hdr.sig_pending = req.sig_pending;
+    hdr.sig_mask = req.sig_mask;
+    hdr.ptrace_tracer_pid = req.ptrace_tracer_pid;
+    hdr.uid = req.uid;
+    hdr.gid = req.gid;
+    hdr.euid = req.euid;
+    hdr.egid = req.egid;
+    hdr.task_flags = req.task_flags;
 
     bool ok = write_all(FD, &hdr, sizeof(hdr));
     ok = ok && (seg_capacity == 0 || write_all(FD, segs, seg_capacity * sizeof(CoreDumpSegment)));
@@ -663,6 +801,59 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
         req.thread_tls_size = task->thread->tls_size;
         req.thread_safe_stack = task->thread->safestack_ptr_value;
     }
+    req.task_ptr_value = reinterpret_cast<uint64_t>(task);
+    req.thread_ptr_value = reinterpret_cast<uint64_t>(task->thread);
+    req.parent_pid = task->parent_pid;
+    req.owner_pid = task->owner_pid;
+    req.wki_remote_pid = task->wki_remote_pid;
+    req.session_id = task->session_id;
+    req.pgid = task->pgid;
+    req.task_type = static_cast<uint64_t>(task->type);
+    req.task_state = static_cast<uint64_t>(task->state.load(std::memory_order_acquire));
+    req.sched_queue = static_cast<uint64_t>(task->sched_queue);
+    req.current_cpu = task->cpu;
+    req.domain_id = task->domain_id;
+    req.domain_mask = task->domain_mask;
+    req.wki_target_flags = task->wki_target_flags;
+    req.wki_proxy_task_id = task->wki_proxy_task_id;
+    req.elf_buffer_addr = reinterpret_cast<uint64_t>(task->elf_buffer);
+    req.captured_elf_buffer_size = task->elf_buffer_size;
+    req.elf_buffer_shared_value = task->is_elf_buffer_shared ? 1 : 0;
+    req.start_time_us = task->start_time_us;
+    req.user_time_us = task->user_time_us;
+    req.system_time_us = task->system_time_us;
+    req.vruntime = static_cast<uint64_t>(task->vruntime);
+    req.vdeadline = static_cast<uint64_t>(task->vdeadline);
+    req.wake_at_us = task->wake_at_us;
+    req.wait_channel_addr = reinterpret_cast<uint64_t>(task->wait_channel);
+    req.waiting_for_pid = task->waiting_for_pid;
+    req.wait_status_user_addr = task->wait_status_user_addr;
+    req.wait_rusage_user_addr = task->wait_rusage_user_addr;
+    req.sig_pending = task->sig_pending;
+    req.sig_mask = task->sig_mask;
+    req.ptrace_tracer_pid = task->ptrace_tracer_pid;
+    req.uid = task->uid;
+    req.gid = task->gid;
+    req.euid = task->euid;
+    req.egid = task->egid;
+    req.task_flags = 0;
+    req.task_flags |= task->is_thread ? TASK_FLAG_IS_THREAD : 0;
+    req.task_flags |= task->is_elf_buffer_shared ? TASK_FLAG_IS_ELF_BUFFER_SHARED : 0;
+    req.task_flags |= task->has_run ? TASK_FLAG_HAS_RUN : 0;
+    req.task_flags |= task->has_exited ? TASK_FLAG_HAS_EXITED : 0;
+    req.task_flags |= task->waited_on ? TASK_FLAG_WAITED_ON : 0;
+    req.task_flags |= task->deferred_task_switch ? TASK_FLAG_DEFERRED_TASK_SWITCH : 0;
+    req.task_flags |= task->yield_switch ? TASK_FLAG_YIELD_SWITCH : 0;
+    req.task_flags |= task->voluntary_block ? TASK_FLAG_VOLUNTARY_BLOCK : 0;
+    req.task_flags |= task->preempt_pending ? TASK_FLAG_PREEMPT_PENDING : 0;
+    req.task_flags |= task->in_signal_handler ? TASK_FLAG_IN_SIGNAL_HANDLER : 0;
+    req.task_flags |= task->do_sigreturn ? TASK_FLAG_DO_SIGRETURN : 0;
+    req.task_flags |= task->wants_block ? TASK_FLAG_WANTS_BLOCK : 0;
+    req.task_flags |= task->just_woke ? TASK_FLAG_JUST_WOKE : 0;
+    req.task_flags |= task->cpu_pinned ? TASK_FLAG_CPU_PINNED : 0;
+    req.task_flags |= task->domain_hard ? TASK_FLAG_DOMAIN_HARD : 0;
+    req.task_flags |= task->wki_prefer_inline ? TASK_FLAG_WKI_PREFER_INLINE : 0;
+    req.task_flags |= task->wki_skip_legacy_placement ? TASK_FLAG_WKI_SKIP_LEGACY_PLACEMENT : 0;
     req.pagemap = task->pagemap;
     req.user_rsp = frame.rsp;
     req.timestamp = ker::mod::time::get_ticks();
@@ -671,6 +862,9 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     std::copy_n(task->exe_path.begin(), req.exe_path.size(), req.exe_path.begin());
     std::copy_n(task->cwd.begin(), req.cwd.size(), req.cwd.begin());
     std::copy_n(task->root.begin(), req.root.size(), req.root.begin());
+    copy_cstr(req.wait_channel.data(), req.wait_channel.size(), task->wait_channel != nullptr ? task->wait_channel : "");
+    std::copy_n(task->wki_target_hostname.begin(), req.wki_target_hostname.size(), req.wki_target_hostname.begin());
+    std::copy_n(task->wki_submitter_hostname.begin(), req.wki_submitter_hostname.size(), req.wki_submitter_hostname.begin());
 
     // Steal elf_buffer so exit() won't free it before the coredump task writes it.
     // Private buffers are intentionally retained after writing; see coredump_task_fn().

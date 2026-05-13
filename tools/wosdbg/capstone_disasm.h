@@ -25,7 +25,7 @@ class CapstoneDisassembler {
     [[nodiscard]] auto convert_to_intel(const std::string& atnt_assembly) const -> std::string;
 
    private:
-    csh handle;
+    csh handle{0};
     static auto extract_hex_bytes(const std::string& line) -> std::string;
     static auto hex_string_to_bytes(const std::string& hex) -> std::vector<uint8_t>;
     static auto manual_att_to_intel_conversion(const std::string& atnt_assembly) -> std::string;

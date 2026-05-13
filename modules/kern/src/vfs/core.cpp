@@ -78,6 +78,7 @@ constexpr size_t STREAM_DETACHED_REUSE_MAX = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
 constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = uint64_t{2} * 1024 * 1024;
+constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
 
 void stream_detach_file(File* file);
@@ -916,6 +917,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actu
 
     auto* dst = static_cast<uint8_t*>(buf);
     size_t total = 0;
+    int premature_eof_retries = 0;
 
     while (total < count) {
         uint64_t const OFFSET = static_cast<uint64_t>(file->pos) + total;
@@ -972,6 +974,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actu
 
         g_stream_cache_lock.lock();
         island->producer_active = false;
+        bool retry_premature_eof = false;
         if (READ_RET > 0) {
             chunk->size = static_cast<uint32_t>(READ_RET);
             island->next_fetch_offset = FETCH_OFFSET + chunk->size;
@@ -985,12 +988,33 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actu
                 stream_trim_island_front_locked(attachment->entry, island);
             }
             stream_enforce_entry_cap_locked(attachment->entry, OFFSET);
+            premature_eof_retries = 0;
         } else if (READ_RET == 0) {
-            island->eof = true;
+            bool const PREMATURE_EOF =
+                attachment->entry->freshness.size > 0 && std::cmp_less(FETCH_OFFSET, attachment->entry->freshness.size);
+            if (PREMATURE_EOF && premature_eof_retries < STREAM_PREMATURE_EOF_RETRIES) {
+                premature_eof_retries++;
+                retry_premature_eof = true;
+            } else if (PREMATURE_EOF) {
+                island->error = -EIO;
+                log::warn("stream cache: premature EOF for %s at offset=%llu size=%llu after %d retries", file->vfs_path,
+                          static_cast<unsigned long long>(FETCH_OFFSET), static_cast<unsigned long long>(attachment->entry->freshness.size),
+                          STREAM_PREMATURE_EOF_RETRIES);
+            } else {
+                island->eof = true;
+            }
         } else {
             island->error = static_cast<int>(READ_RET);
         }
         g_stream_cache_lock.unlock();
+
+        if (retry_premature_eof) {
+            log::warn("stream cache: retrying premature EOF for %s at offset=%llu size=%llu attempt=%d/%d", file->vfs_path,
+                      static_cast<unsigned long long>(FETCH_OFFSET), static_cast<unsigned long long>(attachment->entry->freshness.size),
+                      premature_eof_retries, STREAM_PREMATURE_EOF_RETRIES);
+            ker::mod::sched::kern_yield();
+            continue;
+        }
 
         if (READ_RET < 0) {
             if (total == 0) {
@@ -1261,6 +1285,122 @@ auto build_wki_host_path(const char* hostname, const char* suffix, char* out, si
     return 0;
 }
 
+auto is_loader_debug_path(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    return std::strcmp(path, "libc.so") == 0 || std::strcmp(path, "libc++abi.so") == 0 || std::strcmp(path, "debugserver") == 0;
+}
+
+void log_loader_path_event(const char* stage, const char* raw_path, const char* resolved_path, const MountPoint* mount, int rc) {
+    if (!is_loader_debug_path(raw_path) && !is_loader_debug_path(resolved_path)) {
+        return;
+    }
+
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    char const* task_name = (task != nullptr) ? task->name : "?";
+    uint64_t const pid = (task != nullptr) ? task->pid : 0;
+    char const* submitter = (task != nullptr && task->wki_submitter_hostname[0] != '\0') ? task->wki_submitter_hostname.data() : "-";
+    char const* mount_path = (mount != nullptr && mount->path != nullptr) ? mount->path : "-";
+    int const mount_type = (mount != nullptr) ? static_cast<int>(mount->fs_type) : -1;
+
+    log::info("loader-path: stage=%s pid=%llx task=%s submitter=%s raw=%s resolved=%s mount=%s fs=%d rc=%d", stage,
+              static_cast<unsigned long long>(pid), task_name, submitter, raw_path != nullptr ? raw_path : "-",
+              resolved_path != nullptr ? resolved_path : "-", mount_path, mount_type, rc);
+}
+
+auto ensure_wki_host_root_mount(const char* path) -> int {
+    if (path == nullptr || !ker::net::wki::g_wki.initialized) {
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> logical{};
+    if (strip_current_task_root_prefix(path, logical.data(), logical.size()) < 0) {
+        return 0;
+    }
+
+    constexpr std::string_view WKI_PREFIX{"/wki/"};
+    if (std::strncmp(logical.data(), WKI_PREFIX.data(), WKI_PREFIX.size()) != 0) {
+        return 0;
+    }
+
+    const char* host_part = logical.data() + WKI_PREFIX.size();
+    const char* host_end = host_part;
+    while (*host_end != '\0' && *host_end != '/') {
+        host_end++;
+    }
+    if (host_end == host_part) {
+        return 0;
+    }
+
+    std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname{};
+    auto host_len = static_cast<size_t>(host_end - host_part);
+    if (host_len >= hostname.size()) {
+        return 0;
+    }
+    std::memcpy(hostname.data(), host_part, host_len);
+    hostname[host_len] = '\0';
+
+    if (std::strcmp(hostname.data(), ker::net::wki::g_wki.local_hostname) == 0) {
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> mount_root{};
+    int const MOUNT_PATH_RET = std::snprintf(mount_root.data(), mount_root.size(), "/wki/%s", hostname.data());
+    if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size()) {
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved_mount_root{};
+    if (resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0) {
+        if (MountPoint const* existing = find_mount_point(resolved_mount_root.data());
+            existing != nullptr && existing->fs_type == FSType::REMOTE && std::strcmp(existing->path, resolved_mount_root.data()) == 0) {
+            return 0;
+        }
+    }
+
+    uint16_t const NODE_ID = ker::net::wki::wki_peer_find_by_hostname(hostname.data());
+    if (NODE_ID == ker::net::wki::WKI_NODE_INVALID || NODE_ID == ker::net::wki::g_wki.my_node_id) {
+        return 0;
+    }
+    auto* peer = ker::net::wki::wki_peer_find(NODE_ID);
+    if (peer == nullptr || peer->state != ker::net::wki::PeerState::CONNECTED) {
+        return 0;
+    }
+
+    struct RootExportFindCtx {
+        uint16_t node_id;
+        ker::net::wki::DiscoveredResource* result;
+    };
+    RootExportFindCtx find_ctx = {.node_id = NODE_ID, .result = nullptr};
+    ker::net::wki::wki_resource_foreach(
+        [](const ker::net::wki::DiscoveredResource& res, void* ctx_ptr) {
+            auto* ctx = static_cast<RootExportFindCtx*>(ctx_ptr);
+            if (ctx == nullptr || ctx->result != nullptr) {
+                return;
+            }
+            bool const IS_ROOT_EXPORT =
+                std::strncmp(static_cast<const char*>(res.name), "/", ker::net::wki::DISCOVERED_RESOURCE_NAME_LEN) == 0;
+            if (res.node_id == ctx->node_id && res.resource_type == ker::net::wki::ResourceType::VFS && IS_ROOT_EXPORT) {
+                ctx->result = const_cast<ker::net::wki::DiscoveredResource*>(&res);
+            }
+        },
+        &find_ctx);
+
+    if (find_ctx.result == nullptr) {
+        return 0;
+    }
+
+    vfs_mkdir("/wki", 0755);
+    vfs_mkdir(mount_root.data(), 0755);
+
+    int const RET = ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result->resource_id, mount_root.data());
+    if (RET == 0) {
+        log::info("auto-mounted WKI host root %s for path %s", mount_root.data(), logical.data());
+    }
+    return RET;
+}
+
 auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char* path, char* out, size_t out_size) -> int {
     constexpr std::string_view HOST_PREFIX{"/wki/host"};
     constexpr size_t HOST_PREFIX_LEN = HOST_PREFIX.size();
@@ -1290,8 +1430,8 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
     }
 
     for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
-        bool const REWRITE_HOST_ALIAS = std::strncmp(current.data(), HOST_PREFIX.data(), HOST_PREFIX_LEN) == 0 &&
-                                        (current[HOST_PREFIX_LEN] == '\0' || current[HOST_PREFIX_LEN] == '/');
+        bool const REWRITE_HOST_ALIAS = std::strncmp(current.data(), HOST_PREFIX.data(), HOST_PREFIX.size()) == 0 &&
+                                        (current[HOST_PREFIX.size()] == '\0' || current[HOST_PREFIX.size()] == '/');
         bool const REWRITE_SELF_ALIAS = self_prefix_len > WKI_PATH_PREFIX_LEN &&
                                         std::strncmp(current.data(), self_prefix.data(), self_prefix_len) == 0 &&
                                         (current[self_prefix_len] == '\0' || current[self_prefix_len] == '/');
@@ -1851,7 +1991,7 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
 // Returns 0 on success, -ENAMETOOLONG if the path is too long.
 auto canonicalize_path(char* path, size_t bufsize) -> int {
     if (path == nullptr || bufsize == 0 || path[0] != '/') {
-        return -1;
+        return -EINVAL;
     }
 
     // Split into components, resolving . and ..
@@ -1930,10 +2070,10 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 }
 
 // Resolve symlinks in a path. The resolved path is written to resolved_buf.
-// Returns 0 on success, -ELOOP on too many symlinks, -1 on other errors.
+// Returns 0 on success, -ELOOP on too many symlinks, or another negative errno.
 auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false) -> int {
     if (path == nullptr || resolved_buf == nullptr || bufsize == 0) {
-        return -1;
+        return -EINVAL;
     }
 
     // Copy initial path to working buffer
@@ -2004,7 +2144,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
             if (linkbuf[0] == '/') {
                 if (std::cmp_greater_equal(LINK_LEN, bufsize)) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
                 int const RR = reapply_root_prefix(resolved_buf, bufsize);
@@ -2022,7 +2162,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 }
                 size_t const PREFIX_LEN = found_slash ? last_slash + 1 : 0;
                 if (PREFIX_LEN + static_cast<size_t>(LINK_LEN) >= bufsize) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::array<char, MAX_PATH_LEN> new_path{};
                 std::memcpy(new_path.data(), resolved_buf, PREFIX_LEN);
@@ -2071,7 +2211,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (linkbuf[0] == '/') {
                 // Absolute symlink target - replace entire path
                 if (std::cmp_greater_equal(LINK_LEN, bufsize)) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
                 int const RR = reapply_root_prefix(resolved_buf, bufsize);
@@ -2090,7 +2230,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 }
                 size_t const PREFIX_LEN = found_slash ? last_slash + 1 : 0;
                 if (PREFIX_LEN + static_cast<size_t>(LINK_LEN) >= bufsize) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::array<char, MAX_PATH_LEN> new_path{};
                 std::memcpy(new_path.data(), resolved_buf, PREFIX_LEN);
@@ -2150,7 +2290,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
             if (linkbuf[0] == '/') {
                 if (std::cmp_greater_equal(LINK_LEN, bufsize)) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
                 int const RR = reapply_root_prefix(resolved_buf, bufsize);
@@ -2168,7 +2308,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 }
                 size_t const PREFIX_LEN = found_slash ? last_slash + 1 : 0;
                 if (PREFIX_LEN + static_cast<size_t>(LINK_LEN) >= bufsize) {
-                    return -1;
+                    return -ENAMETOOLONG;
                 }
                 std::array<char, MAX_PATH_LEN> new_path{};
                 std::memcpy(new_path.data(), resolved_buf, PREFIX_LEN);
@@ -2207,7 +2347,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         }
 
         if (node->symlink_target == nullptr) {
-            return -1;
+            return -EIO;
         }
 
         // Build the new path
@@ -2220,7 +2360,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         if (node->symlink_target[0] == '/') {
             // Absolute symlink target - replace entire path
             if (target_len >= bufsize) {
-                return -1;
+                return -ENAMETOOLONG;
             }
             std::memcpy(resolved_buf, node->symlink_target, target_len + 1);
             int const RR = reapply_root_prefix(resolved_buf, bufsize);
@@ -2240,7 +2380,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
 
             size_t const PREFIX_LEN = found_slash ? last_slash + 1 : 0;
             if (PREFIX_LEN + target_len >= bufsize) {
-                return -1;
+                return -ENAMETOOLONG;
             }
             std::memcpy(new_path.data(), resolved_buf, PREFIX_LEN);
             std::memcpy(new_path.data() + PREFIX_LEN, node->symlink_target, target_len);
@@ -2281,36 +2421,52 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
     if (resolve_task_path_raw(rawPath, pathBuffer, MAX_PATH_LEN) < 0) {
+        log_loader_path_event("resolve-failed", rawPath, nullptr, nullptr, -ENOENT);
         return -ENOENT;
     }
 
-    // Resolve symlinks in the path
-    char resolved[MAX_PATH_LEN];  // NOLINT
-    int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true);
-    if (RESOLVE_RET == -ELOOP) {
-        log::warn("vfs_open: too many symlink levels");
-        return -ELOOP;
-    }
-    if (RESOLVE_RET == 0) {
-        // Use the resolved path
-        std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+    ensure_wki_host_root_mount(pathBuffer);
+    log_loader_path_event("resolved", rawPath, pathBuffer, nullptr, 0);
+
+    // Remote mounts resolve symlinks on the server side during the actual open.
+    // Avoid probing each path component with client-side READLINK RPCs here:
+    // they are redundant and can fail independently of the real open.
+    MountPoint const* mount = find_mount_point(pathBuffer);
+    bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+
+    if (!REMOTE_MOUNT) {
+        char resolved[MAX_PATH_LEN];  // NOLINT
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, true);
+        if (RESOLVE_RET == -ELOOP) {
+            log::warn("vfs_open: too many symlink levels");
+            return -ELOOP;
+        }
+        if (RESOLVE_RET == 0) {
+            // Use the resolved path
+            std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+        }
+        log_loader_path_event("symlink-resolved", rawPath, pathBuffer, nullptr, RESOLVE_RET);
+    } else {
+        log_loader_path_event("symlink-deferred-remote", rawPath, pathBuffer, mount, 0);
     }
 
     auto* current = ker::mod::sched::get_current_task();
     if (current == nullptr) {
         vfs_debug_log("vfs_open: no current task\n");
-        return -1;
+        return -ESRCH;
     }
 
     int const ACCMODE = flags & 3;
 
     // Find the mount point for this path
-    MountPoint const* mount = find_mount_point(pathBuffer);
+    mount = find_mount_point(pathBuffer);
     if (mount == nullptr) {
         vfs_debug_log("vfs_open: no mount point found for path\n");
         log::warn("vfs_open: no mount point found for path: %s", pathBuffer);
-        return -1;
+        log_loader_path_event("mount-miss", rawPath, pathBuffer, nullptr, -ENOENT);
+        return -ENOENT;
     }
+    log_loader_path_event("mount-found", rawPath, pathBuffer, mount, 0);
 
     const char* fs_relative_path = strip_mount_prefix(mount, pathBuffer);
 
@@ -2363,7 +2519,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             break;
         default:
             vfs_debug_log("vfs_open: unknown filesystem type\n");
-            return -1;
+            return -ENOSYS;
     }
 
     if (f == nullptr && ACCMODE == 0 && (flags & ker::vfs::O_CREAT) == 0) {
@@ -2372,8 +2528,10 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     if (f == nullptr) {
         vfs_debug_log("vfs_open: failed to open file\n");
+        log_loader_path_event("open-failed", rawPath, pathBuffer, mount, -ENOENT);
         return -ENOENT;
     }
+    log_loader_path_event("open-ok", rawPath, pathBuffer, mount, 0);
 
     // Store the absolute VFS path for mount-overlay directory listing
     size_t const PATH_LEN = std::strlen(pathBuffer);
@@ -2414,7 +2572,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     int const FD = vfs_alloc_fd(current, f);
     if (FD < 0) {
-        return -1;
+        return FD;
     }
     if ((flags & ker::vfs::O_CLOEXEC) != 0) {
         current->set_fd_cloexec(static_cast<unsigned>(FD));
@@ -2533,7 +2691,7 @@ auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
 
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     if ((task == nullptr) || (file == nullptr)) {
-        return -1;
+        return -EINVAL;
     }
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
     uint64_t const SLOT = task->fd_table.find_first_unset(0);
@@ -2542,7 +2700,7 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!INSERTED) {
-        return -1;  // EMFILE (too many open files) or OOM
+        return -EMFILE;  // fd_table cannot currently distinguish OOM from exhaustion
     }
     file->fd = static_cast<int>(SLOT);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
@@ -2586,7 +2744,7 @@ void vfs_put_file(File* f) {
 
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     if (task == nullptr || fd < 0) {
-        return -1;
+        return -EINVAL;
     }
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
     task->fd_table.remove(static_cast<uint64_t>(fd));
@@ -3204,21 +3362,36 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
     if (resolve_task_path) {
         if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) {
+            log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);
             return -ENOENT;
         }
+        ensure_wki_host_root_mount(pathBuffer);
     } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer)) < 0) {
         return -ENOENT;
     }
+    log_loader_path_event("stat-resolved", path, pathBuffer, nullptr, 0);
 
-    char resolved[MAX_PATH_LEN];  // NOLINT
-    int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy);
-    if (RESOLVE_RET == -ELOOP) {
-        return -ELOOP;
+    // Remote mounts resolve symlinks on the server side during the actual stat.
+    // Avoid a redundant client-side READLINK walk here; it pessimizes metadata
+    // traffic and can fail independently of the real remote stat operation.
+    MountPoint const* mount = find_mount_point(pathBuffer);
+    bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+
+    if (!REMOTE_MOUNT) {
+        char resolved[MAX_PATH_LEN];  // NOLINT
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy);
+        if (RESOLVE_RET == -ELOOP) {
+            return -ELOOP;
+        }
+        if (RESOLVE_RET < 0) {
+            log_loader_path_event("stat-symlink-failed", path, pathBuffer, nullptr, RESOLVE_RET);
+            return RESOLVE_RET;
+        }
+        std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+        log_loader_path_event("stat-symlink-resolved", path, pathBuffer, nullptr, RESOLVE_RET);
+    } else {
+        log_loader_path_event("stat-symlink-deferred-remote", path, pathBuffer, mount, 0);
     }
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
-    }
-    std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
 
     // Post-rewrite WOSLINK check: after host alias rewriting, deeper paths
     // like /wki/host/wki resolve to /wki, and /wki/host/wki/wos-1 resolves
@@ -3242,10 +3415,12 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     // Find mount point
-    MountPoint const* mount = find_mount_point(pathBuffer);
+    mount = find_mount_point(pathBuffer);
     if (mount == nullptr) {
+        log_loader_path_event("stat-mount-miss", path, pathBuffer, nullptr, -ENOENT);
         return -ENOENT;
     }
+    log_loader_path_event("stat-mount-found", path, pathBuffer, mount, 0);
 
     const char* fs_path = strip_mount_prefix(mount, pathBuffer);
 
@@ -3388,6 +3563,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     if (result == 0 && is_wki_entry && (statbuf->st_mode & S_IFMT) == S_IFDIR) {
         statbuf->st_mode |= S_WOSLINK;
     }
+
+    log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, pathBuffer, mount, result);
 
     return result;
 }
@@ -3951,7 +4128,9 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
         return -ENOSYS;
     }
     // Read at given offset without modifying file position
+    f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
     auto result = f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset));
+    f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
     return result;
 }
@@ -4605,14 +4784,12 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
 
 // --- pipe ---
 
-// PipeState is shared between both ends. It includes wait queues for blocking.
-static constexpr ssize_t PIPE_WOS_ERESTARTSYS = 512;
-
 // File-scope pointers to the pipe fops (set once during first vfs_pipe() call).
 // Used by vfs_is_pipe_file() to identify pipe file descriptors.
-static FileOperations* g_pipe_read_fops_ptr = nullptr;
-static FileOperations* g_pipe_write_fops_ptr = nullptr;
-
+namespace {
+FileOperations* g_pipe_read_fops_ptr = nullptr;
+FileOperations* g_pipe_write_fops_ptr = nullptr;
+using PipeWakeList = std::array<uint64_t, PIPE_WAKE_BATCH>;
 struct PipeState {
     char* buf;
     size_t capacity;
@@ -4634,30 +4811,65 @@ struct PipeState {
     ker::util::SmallVec<uint64_t, 2> write_poll_waiting;
 };
 
-static auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
-    for (size_t i = 0; i < waiters.size(); i++) {
-        if (waiters[i] == pid) {
+auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+    for (unsigned long waiter : waiters) {
+        if (waiter == pid) {
             return true;
         }
     }
     return waiters.push_back(pid);
 }
 
-static auto pipe_register_poll_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+auto pipe_register_poll_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
     return pipe_register_waiter(waiters, pid);
 }
 
-using PipeWakeList = std::array<uint64_t, PIPE_WAKE_BATCH>;
-
-static void pipe_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, PipeWakeList& pending, size_t* pending_count) {
-    *pending_count = std::min(waiters.size(), pending.size());
-    for (size_t i = 0; i < *pending_count; i++) {
-        pending[i] = waiters[i];
-    }
-    waiters.clear();
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
 }
 
-static void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, bool sigpipe = false) {
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+auto current_task_has_deliverable_signal() -> bool {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return false;
+    }
+    return (task->sig_pending & ~task->sig_mask) != 0;
+}
+
+void perf_record_local_pipe_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint32_t correlation, int32_t status, uint32_t aux,
+                                  uint64_t callsite) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::LOCAL_PIPE, op, phase, 0, 0,
+                                     correlation, status, aux, callsite);
+}
+
+void perf_record_local_pipe_summary(uint8_t op, int32_t status, uint32_t latency_us, uint64_t bytes = 0) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PIPE, op, 0, 0, status, latency_us, true, 0, bytes);
+}
+
+void pipe_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, PipeWakeList& pending, size_t* pending_count) {
+    size_t copied = 0;
+    while (copied < pending.size() && !waiters.empty()) {
+        pending[copied++] = waiters.at(0);
+        static_cast<void>(waiters.remove_at(0));
+    }
+    *pending_count = copied;
+}
+
+void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, bool sigpipe = false) {
     for (size_t i = 0; i < waiter_count; i++) {
         auto* waiter = ker::mod::sched::find_task_by_pid_safe(waiters[i]);
         if (waiter == nullptr) {
@@ -4668,15 +4880,11 @@ static void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_c
             waiter->sig_pending |= (1ULL << (13 - 1));
         }
 
-        waiter->deferred_task_switch = false;
-        uint64_t target_cpu = waiter->cpu;
-        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
-            target_cpu = ker::mod::sched::get_least_loaded_cpu();
-        }
-        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
     }
 }
+}  // namespace
 
 auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     if (pipefd == nullptr) {
@@ -4703,143 +4911,180 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
 
     // Pipe fops - static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
+        uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+        uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+        uint64_t const STARTED_US = ker::mod::time::get_us();
+        auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+            uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
+            int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+            perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::READ), ker::mod::perf::WkiPerfPhase::END,
+                                         CORRELATION, STATUS, ELAPSED_US, CALLSITE);
+            perf_record_local_pipe_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::READ), STATUS, ELAPSED_US, bytes);
+            return rc;
+        };
+        perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::READ), ker::mod::perf::WkiPerfPhase::BEGIN,
+                                     CORRELATION, 0, 0, CALLSITE);
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) {
-            return -EBADF;
+            return finish(-EBADF);
         }
 
-        PipeWakeList pending_writers{};
-        size_t pending_writers_count = 0;
-        PipeWakeList pending_write_pollers{};
-        size_t pending_write_pollers_count = 0;
-        ssize_t result = 0;
+        for (;;) {
+            PipeWakeList pending_writers{};
+            size_t pending_writers_count = 0;
+            PipeWakeList pending_write_pollers{};
+            size_t pending_write_pollers_count = 0;
+            uint64_t const IRQF = st->lock.lock_irqsave();
 
-        uint64_t const IRQF = st->lock.lock_irqsave();
+            if (st->count > 0) {
+                size_t const TO_READ = count < st->count ? count : st->count;
+                auto* dst = static_cast<char*>(buf);
+                size_t const FIRST = st->capacity - st->tail;
+                if (FIRST >= TO_READ) {
+                    std::memcpy(dst, st->buf + st->tail, TO_READ);
+                } else {
+                    std::memcpy(dst, st->buf + st->tail, FIRST);
+                    std::memcpy(dst + FIRST, st->buf, TO_READ - FIRST);
+                }
+                st->tail = (st->tail + TO_READ) % st->capacity;
+                st->count -= TO_READ;
 
-        if (st->count > 0) {
-            size_t const TO_READ = count < st->count ? count : st->count;
-            auto* dst = static_cast<char*>(buf);
-            size_t const FIRST = st->capacity - st->tail;
-            if (FIRST >= TO_READ) {
-                std::memcpy(dst, st->buf + st->tail, TO_READ);
+                if (!st->writers_waiting.empty()) {
+                    pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
+                }
+                if (!st->write_poll_waiting.empty()) {
+                    pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
+                }
+
+                st->lock.unlock_irqrestore(IRQF);
+                pipe_reschedule_waiters(pending_writers, pending_writers_count);
+                pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+                return finish(static_cast<ssize_t>(TO_READ), static_cast<uint64_t>(TO_READ));
+            }
+
+            if (st->write_closed) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(0);
+            }
+
+            if (f->open_flags & O_NONBLOCK) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-EAGAIN);
+            }
+
+            auto* current_task = ker::mod::sched::get_current_task();
+            if (current_task == nullptr) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-ESRCH);
+            }
+
+            if (current_task_has_deliverable_signal()) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-EINTR);
+            }
+
+            bool const REGISTERED = pipe_register_waiter(st->readers_waiting, current_task->pid);
+            uint32_t const PIPE_COUNT = static_cast<uint32_t>(st->count);
+            st->lock.unlock_irqrestore(IRQF);
+            perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_READ),
+                                         ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_COUNT, CALLSITE);
+            if (REGISTERED) {
+                ker::mod::sched::preemptible_syscall_park("pipe_read");
             } else {
-                std::memcpy(dst, st->buf + st->tail, FIRST);
-                std::memcpy(dst + FIRST, st->buf, TO_READ - FIRST);
+                ker::mod::sched::kern_yield();
             }
-            st->tail = (st->tail + TO_READ) % st->capacity;
-            st->count -= TO_READ;
-
-            if (!st->writers_waiting.empty()) {
-                pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
-            }
-            if (!st->write_poll_waiting.empty()) {
-                pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
-            }
-
-            result = static_cast<ssize_t>(TO_READ);
-            st->lock.unlock_irqrestore(IRQF);
-            pipe_reschedule_waiters(pending_writers, pending_writers_count);
-            pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
-            return result;
         }
-
-        if (st->write_closed) {
-            st->lock.unlock_irqrestore(IRQF);
-            return 0;
-        }
-
-        if (f->open_flags & O_NONBLOCK) {
-            st->lock.unlock_irqrestore(IRQF);
-            return -EAGAIN;
-        }
-
-        auto* current_task = ker::mod::sched::get_current_task();
-        if (current_task == nullptr) {
-            st->lock.unlock_irqrestore(IRQF);
-            return -ESRCH;
-        }
-
-        if (pipe_register_waiter(st->readers_waiting, current_task->pid)) {
-            current_task->wait_channel = "pipe_read";
-            current_task->deferred_task_switch = true;
-            st->lock.unlock_irqrestore(IRQF);
-            return -PIPE_WOS_ERESTARTSYS;
-        }
-
-        st->lock.unlock_irqrestore(IRQF);
-        return -EAGAIN;
     };
 
     static auto pipe_write = [](File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
+        uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+        uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+        uint64_t const STARTED_US = ker::mod::time::get_us();
+        auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+            uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
+            int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+            perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), ker::mod::perf::WkiPerfPhase::END,
+                                         CORRELATION, STATUS, ELAPSED_US, CALLSITE);
+            perf_record_local_pipe_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), STATUS, ELAPSED_US, bytes);
+            return rc;
+        };
+        perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::WRITE), ker::mod::perf::WkiPerfPhase::BEGIN,
+                                     CORRELATION, 0, 0, CALLSITE);
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) {
-            return -EBADF;
+            return finish(-EBADF);
         }
 
-        PipeWakeList pending_readers{};
-        size_t pending_readers_count = 0;
-        PipeWakeList pending_read_pollers{};
-        size_t pending_read_pollers_count = 0;
-
-        uint64_t const IRQF = st->lock.lock_irqsave();
-        if (st->read_closed) {
-            st->lock.unlock_irqrestore(IRQF);
-            // Send SIGPIPE to the writing process (signal 13)
-            auto* task = ker::mod::sched::get_current_task();
-            if (task) {
-                task->sig_pending |= (1ULL << (13 - 1));
+        for (;;) {
+            PipeWakeList pending_readers{};
+            size_t pending_readers_count = 0;
+            PipeWakeList pending_read_pollers{};
+            size_t pending_read_pollers_count = 0;
+            uint64_t const IRQF = st->lock.lock_irqsave();
+            if (st->read_closed) {
+                st->lock.unlock_irqrestore(IRQF);
+                // Send SIGPIPE to the writing process (signal 13)
+                auto* task = ker::mod::sched::get_current_task();
+                if (task) {
+                    task->sig_pending |= (1ULL << (13 - 1));
+                }
+                return finish(-EPIPE);
             }
-            return -EPIPE;
-        }
 
-        size_t const AVAIL = st->capacity - st->count;
-        if (AVAIL > 0) {
-            size_t const TO_WRITE = count < AVAIL ? count : AVAIL;
-            const auto* src = static_cast<const char*>(buf);
-            // Bulk copy into ring buffer (at most 2 memcpy segments for wraparound)
-            size_t const FIRST = st->capacity - st->head;
-            if (FIRST >= TO_WRITE) {
-                std::memcpy(st->buf + st->head, src, TO_WRITE);
+            size_t const AVAIL = st->capacity - st->count;
+            if (AVAIL > 0) {
+                size_t const TO_WRITE = count < AVAIL ? count : AVAIL;
+                const auto* src = static_cast<const char*>(buf);
+                size_t const FIRST = st->capacity - st->head;
+                if (FIRST >= TO_WRITE) {
+                    std::memcpy(st->buf + st->head, src, TO_WRITE);
+                } else {
+                    std::memcpy(st->buf + st->head, src, FIRST);
+                    std::memcpy(st->buf, src + FIRST, TO_WRITE - FIRST);
+                }
+                st->head = (st->head + TO_WRITE) % st->capacity;
+                st->count += TO_WRITE;
+
+                if (!st->readers_waiting.empty()) {
+                    pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
+                }
+                if (!st->read_poll_waiting.empty()) {
+                    pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
+                }
+
+                st->lock.unlock_irqrestore(IRQF);
+                pipe_reschedule_waiters(pending_readers, pending_readers_count);
+                pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
+                return finish(static_cast<ssize_t>(TO_WRITE), static_cast<uint64_t>(TO_WRITE));
+            }
+
+            if (f->open_flags & O_NONBLOCK) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-EAGAIN);
+            }
+
+            auto* current_task = ker::mod::sched::get_current_task();
+            if (current_task == nullptr) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-ESRCH);
+            }
+
+            if (current_task_has_deliverable_signal()) {
+                st->lock.unlock_irqrestore(IRQF);
+                return finish(-EINTR);
+            }
+
+            bool const REGISTERED = pipe_register_waiter(st->writers_waiting, current_task->pid);
+            uint32_t const PIPE_SPACE = static_cast<uint32_t>(st->capacity - st->count);
+            st->lock.unlock_irqrestore(IRQF);
+            perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
+                                         ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_SPACE, CALLSITE);
+            if (REGISTERED) {
+                ker::mod::sched::preemptible_syscall_park("pipe_write");
             } else {
-                std::memcpy(st->buf + st->head, src, FIRST);
-                std::memcpy(st->buf, src + FIRST, TO_WRITE - FIRST);
+                ker::mod::sched::kern_yield();
             }
-            st->head = (st->head + TO_WRITE) % st->capacity;
-            st->count += TO_WRITE;
-
-            if (!st->readers_waiting.empty()) {
-                pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
-            }
-            if (!st->read_poll_waiting.empty()) {
-                pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
-            }
-
-            st->lock.unlock_irqrestore(IRQF);
-            pipe_reschedule_waiters(pending_readers, pending_readers_count);
-            pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
-            return static_cast<ssize_t>(TO_WRITE);
         }
-
-        if (f->open_flags & O_NONBLOCK) {
-            st->lock.unlock_irqrestore(IRQF);
-            return -EAGAIN;
-        }
-
-        auto* current_task = ker::mod::sched::get_current_task();
-        if (current_task == nullptr) {
-            st->lock.unlock_irqrestore(IRQF);
-            return -ESRCH;
-        }
-
-        if (pipe_register_waiter(st->writers_waiting, current_task->pid)) {
-            current_task->wait_channel = "pipe_write";
-            current_task->deferred_task_switch = true;
-            st->lock.unlock_irqrestore(IRQF);
-            return -PIPE_WOS_ERESTARTSYS;
-        }
-
-        st->lock.unlock_irqrestore(IRQF);
-        return -EAGAIN;
     };
 
     static auto pipe_close_read = [](File* f) -> int {
@@ -5490,18 +5735,6 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
             size_t bytes_written = 0;
             ssize_t const WRITE_RESULT = vfs_write(outfd, buffer + chunk_offset, CHUNK_SIZE - chunk_offset, &bytes_written);
             if (WRITE_RESULT < 0) {
-                auto* current = mod::sched::get_current_task();
-                if (current != nullptr && current->deferred_task_switch) {
-                    delete[] buffer;
-                    if (offset != nullptr) {
-                        *offset = source_offset;
-                    } else {
-                        infile->pos = source_offset;
-                    }
-                    vfs_put_file(outfile);
-                    vfs_put_file(infile);
-                    return total_sent > 0 ? total_sent : WRITE_RESULT;
-                }
                 if (total_sent == 0) {
                     delete[] buffer;
                     if (offset != nullptr) {

@@ -39,8 +39,8 @@ constexpr size_t VFS_HOST_DIR_LEN = 256;
 
 // Deferred VFS mount queue - wki_remote_vfs_mount() spin-waits for an attach
 // ACK, but handle_resource_advert() runs inside the NAPI poll handler where
-// napi_poll_inline() re-entrantly returns 0.  Queue the mount and process
-// it from the timer tick (outside NAPI context).
+// inline NAPI draining cannot re-enter the current poll handler. Queue the
+// mount and process it from the timer tick (outside NAPI context).
 struct PendingVfsMount {
     uint16_t node_id;
     uint32_t resource_id;

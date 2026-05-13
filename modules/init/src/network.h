@@ -1,3 +1,3 @@
 #pragma once
 
-void start_network();
+auto start_network() -> bool;

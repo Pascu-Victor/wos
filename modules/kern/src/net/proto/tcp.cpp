@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <net/backlog.hpp>
 #include <net/net_trace.hpp>
 #include <net/netif.hpp>
 #include <net/netpoll.hpp>
@@ -58,7 +59,6 @@ void defer_socket_wait(Socket* sock) {
         sock->owner_pid = current_task->pid;
     }
     current_task->wait_channel = "tcp_wait";
-    current_task->deferred_task_switch = true;
 }
 
 // Simple ISS generator.
@@ -417,18 +417,16 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
 
     // Drain any already-pending RX work before committing to a blocking wait.
     ker::net::napi_poll_all_pending();
+    ker::net::backlog_drain_all_pending_inline();
     if (maybe_finish_recv()) {
         return completed;
     }
 
     socket_defer_wait(sock, "tcp_wait");
 
-    // Close the race where data arrives after the last readiness check but
-    // before syscall exit. A concurrent wake clears deferred_task_switch; if
-    // the bytes are already present here, consume them immediately.
+    // Close the race where data arrives after the last readiness check.
     if (maybe_finish_recv()) {
         if (auto* current_task = ker::mod::sched::get_current_task(); current_task != nullptr) {
-            current_task->deferred_task_switch = false;
             current_task->wait_channel = nullptr;
         }
         return completed;
@@ -574,6 +572,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
 
         ker::mod::sched::kern_yield();
         ker::net::napi_poll_all_pending();
+        ker::net::backlog_drain_all_pending_inline();
     }
 }
 

@@ -35,5 +35,6 @@ enum class procmgmt_ops : uint64_t {
     SETPRIORITY,   // 27
     SETWKITARGET,  // 28
     GETWKITARGET,  // 29
+    PTRACE,        // 30
 };
 }  // namespace ker::abi::process

@@ -229,6 +229,14 @@ const char* wki_scope_name(WkiPerfScope scope) {
             return "transport";
         case WkiPerfScope::REMOTE_VFS:
             return "remote_vfs";
+        case WkiPerfScope::REMOTE_VFS_SERVER:
+            return "remote_vfs_srv";
+        case WkiPerfScope::REMOTE_IPC:
+            return "remote_ipc";
+        case WkiPerfScope::LOCAL_PIPE:
+            return "local_pipe";
+        case WkiPerfScope::LOCAL_PROC:
+            return "local_proc";
         case WkiPerfScope::REMOTE_COMPUTE:
             return "remote_compute";
         case WkiPerfScope::EVENT_BUS:
@@ -267,6 +275,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "no_credits";
                 case WkiPerfTransportOp::WAIT:
                     return "wait";
+                case WkiPerfTransportOp::STALL:
+                    return "stall";
                 default:
                     return "unknown";
             }
@@ -304,6 +314,120 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "rename";
                 case WkiPerfVfsOp::RETRY:
                     return "retry";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::REMOTE_VFS_SERVER:
+            switch (static_cast<WkiPerfVfsServerOp>(op)) {
+                case WkiPerfVfsServerOp::RX:
+                    return "rx";
+                case WkiPerfVfsServerOp::REPLY_SEND:
+                    return "reply_send";
+                case WkiPerfVfsServerOp::OPEN:
+                    return "open";
+                case WkiPerfVfsServerOp::STAT:
+                    return "stat";
+                case WkiPerfVfsServerOp::READ:
+                    return "read";
+                case WkiPerfVfsServerOp::READDIR:
+                    return "readdir";
+                case WkiPerfVfsServerOp::WRITE:
+                    return "write";
+                case WkiPerfVfsServerOp::SEEK:
+                    return "seek";
+                case WkiPerfVfsServerOp::TRUNCATE:
+                    return "truncate";
+                case WkiPerfVfsServerOp::READLINK:
+                    return "readlink";
+                case WkiPerfVfsServerOp::CLOSE:
+                    return "close";
+                case WkiPerfVfsServerOp::MKDIR:
+                    return "mkdir";
+                case WkiPerfVfsServerOp::UNLINK:
+                    return "unlink";
+                case WkiPerfVfsServerOp::RMDIR:
+                    return "rmdir";
+                case WkiPerfVfsServerOp::RENAME:
+                    return "rename";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::REMOTE_IPC:
+            switch (static_cast<WkiPerfIpcOp>(op)) {
+                case WkiPerfIpcOp::PROXY_READ:
+                    return "proxy_read";
+                case WkiPerfIpcOp::PROXY_WRITE:
+                    return "proxy_write";
+                case WkiPerfIpcOp::PTY_IOCTL:
+                    return "pty_ioctl";
+                case WkiPerfIpcOp::SOCK_CTRL:
+                    return "sock_ctrl";
+                case WkiPerfIpcOp::PIPE_PUMP_READ:
+                    return "pipe_pump_read";
+                case WkiPerfIpcOp::PIPE_PUMP_SEND:
+                    return "pipe_pump_send";
+                case WkiPerfIpcOp::PIPE_DATA:
+                    return "pipe_data";
+                case WkiPerfIpcOp::DEV_OP_QUEUE:
+                    return "dev_op_queue";
+                case WkiPerfIpcOp::DEV_OP_HANDLE:
+                    return "dev_op_handle";
+                case WkiPerfIpcOp::WAKE_READER:
+                    return "wake_reader";
+                case WkiPerfIpcOp::POLL_WAKE:
+                    return "poll_wake";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_PIPE:
+            switch (static_cast<WkiPerfLocalPipeOp>(op)) {
+                case WkiPerfLocalPipeOp::READ:
+                    return "read";
+                case WkiPerfLocalPipeOp::WRITE:
+                    return "write";
+                case WkiPerfLocalPipeOp::BLOCK_READ:
+                    return "block_read";
+                case WkiPerfLocalPipeOp::BLOCK_WRITE:
+                    return "block_write";
+                case WkiPerfLocalPipeOp::WAKE_READERS:
+                    return "wake_readers";
+                case WkiPerfLocalPipeOp::WAKE_WRITERS:
+                    return "wake_writers";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_PROC:
+            switch (static_cast<WkiPerfLocalProcOp>(op)) {
+                case WkiPerfLocalProcOp::FORK:
+                    return "fork";
+                case WkiPerfLocalProcOp::EXECVE:
+                    return "execve";
+                case WkiPerfLocalProcOp::ELF_READ:
+                    return "elf_read";
+                case WkiPerfLocalProcOp::FIRST_RUN:
+                    return "first_run";
+                case WkiPerfLocalProcOp::ARG_COPY:
+                    return "arg_copy";
+                case WkiPerfLocalProcOp::OPEN_ACCESS:
+                    return "open_access";
+                case WkiPerfLocalProcOp::REMOTE_SPAWN:
+                    return "remote_spawn";
+                case WkiPerfLocalProcOp::NEW_IMAGE:
+                    return "new_image";
+                case WkiPerfLocalProcOp::LOAD_ELF:
+                    return "load_elf";
+                case WkiPerfLocalProcOp::LOAD_INTERP:
+                    return "load_interp";
+                case WkiPerfLocalProcOp::STACK_SETUP:
+                    return "stack_setup";
+                case WkiPerfLocalProcOp::COMMIT:
+                    return "commit";
+                case WkiPerfLocalProcOp::DESTROY_OLD:
+                    return "destroy_old";
+                case WkiPerfLocalProcOp::WAITPID:
+                    return "waitpid";
+                case WkiPerfLocalProcOp::EXIT:
+                    return "exit";
                 default:
                     return "unknown";
             }
@@ -512,7 +636,8 @@ void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t f
 // ---------------------------------------------------------------------------
 // record_wake
 // ---------------------------------------------------------------------------
-void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t sleep_us, uint64_t callsite) {
+void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t sleep_us, uint64_t callsite,
+                 const char* wait_channel) {
     if (cpu >= g_num_cpus) {
         return;
     }
@@ -529,7 +654,7 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
         evt.pid = pid;
         evt.data = wake_at_us;
         evt.callsite = callsite;
-        evt.lag_v = 0;
+        evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
         evt.cpu = static_cast<uint16_t>(cpu);
         evt.type = static_cast<uint8_t>(PerfEventType::WAKE);
         evt.flags = flags;
@@ -542,7 +667,8 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
 // ---------------------------------------------------------------------------
 // record_sleep
 // ---------------------------------------------------------------------------
-void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t run_us, uint64_t callsite) {
+void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t run_us, uint64_t callsite,
+                  const char* wait_channel) {
     if (cpu >= g_num_cpus) {
         return;
     }
@@ -559,7 +685,7 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
         evt.pid = pid;
         evt.data = wake_at_us;
         evt.callsite = callsite;
-        evt.lag_v = 0;
+        evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
         evt.cpu = static_cast<uint16_t>(cpu);
         evt.type = static_cast<uint8_t>(PerfEventType::SLEEP);
         evt.flags = flags;

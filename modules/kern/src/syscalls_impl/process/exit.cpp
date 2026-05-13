@@ -9,8 +9,10 @@
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
@@ -26,6 +28,22 @@ namespace ker::syscall::process {
 
 namespace {
 using log = ker::mod::dbg::logger<"pexit">;
+
+constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
+
+auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
+
+void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, ker::mod::perf::WkiPerfPhase phase,
+                             uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite) {
+    if (task == nullptr) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), task->pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), phase, 0, 0, correlation, status,
+                                     aux, callsite);
+}
 
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
 void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
@@ -105,6 +123,50 @@ void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::m
     }
 }
 
+void reschedule_on_task_cpu(ker::mod::sched::task::Task* task) {
+    uint64_t cpu = task->cpu;
+    if (cpu >= ker::mod::smt::get_core_count()) {
+        cpu = ker::mod::sched::get_least_loaded_cpu();
+    }
+    ker::mod::sched::reschedule_task_for_cpu(cpu, task);
+}
+
+void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
+    if (child == nullptr || child->is_thread || child->parent_pid == 0) {
+        return;
+    }
+
+    auto* parent = ker::mod::sched::find_task_by_pid_safe(child->parent_pid);
+    if (parent == nullptr) {
+        return;
+    }
+
+    parent->sig_pending |= SIGCHLD_MASK;
+
+    bool wake_parent = false;
+    if (!child->waited_on) {
+        if (parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch) {
+            parent->context.regs.rax = child->pid;
+            validate_waiter_resume_for_exit(parent, child, "exit-any");
+            write_wait_status_for_waiter(parent, child->exit_status);
+            fill_rusage_for_waiter(parent, child);
+            parent->waiting_for_pid = 0;
+            child->waited_on = true;
+            wake_parent = true;
+        } else if (parent->deferred_task_switch || parent->voluntary_block) {
+            // The deferred switch path will re-check waitability after it saves
+            // the parent's syscall context.  This is also how unrelated blocking
+            // syscalls notice SIGCHLD promptly.
+            wake_parent = true;
+        }
+    }
+
+    if (wake_parent) {
+        reschedule_on_task_cpu(parent);
+    }
+    parent->release();
+}
+
 }  // namespace
 
 void wos_proc_exit(int status) {
@@ -112,6 +174,10 @@ void wos_proc_exit(int status) {
     if (current_task == nullptr) {
         return;
     }
+    uint32_t const EXIT_CORR = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const EXIT_STARTED_US = ker::mod::time::get_us();
+    record_local_proc_event(current_task, ker::mod::perf::WkiPerfLocalProcOp::EXIT, ker::mod::perf::WkiPerfPhase::BEGIN, EXIT_CORR, status,
+                            0, WOS_PERF_CALLSITE());
 
     // CRITICAL: Atomically transition to EXITING state.
     // This prevents other CPUs from scheduling this task while we're cleaning up.
@@ -138,48 +204,6 @@ void wos_proc_exit(int status) {
                current_task->name != nullptr ? current_task->name : "?", status, current_task->is_thread, current_task->owner_pid,
                static_cast<void*>(current_task->pagemap));
 #endif
-    // Send SIGCHLD to parent process.
-    // Threads do not send SIGCHLD - their exit is handled via futex (pthread_join).
-    if (!current_task->is_thread && current_task->parent_pid != 0) {
-        auto* parent = ker::mod::sched::find_task_by_pid_safe(current_task->parent_pid);
-        if (parent != nullptr) {
-            // Set SIGCHLD (signal 17) pending on parent
-            parent->sig_pending |= (1ULL << (17 - 1));
-
-            // If parent is waiting for any child (pid==-1 / WAIT_ANY_CHILD),
-            // set the return value so waitpid returns the exited child's PID.
-            // Only safe when deferred_task_switch is false (parent is in wait queue,
-            // its context is stable). If deferred_task_switch is still true,
-            // the deferred_task_switch race check will handle it.
-            static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-            if (parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch) {
-                parent->context.regs.rax = current_task->pid;
-                validate_waiter_resume_for_exit(parent, current_task, "exit-any");
-                write_wait_status_for_waiter(parent, current_task->exit_status);
-                fill_rusage_for_waiter(parent, current_task);
-                parent->waiting_for_pid = 0;
-                current_task->waited_on = true;
-                // Parent is in the wait queue (not deferred_task_switch, not voluntary_block) -
-                // we must explicitly reschedule it so it actually wakes up.
-                uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::get_core_count()) {
-                    cpu = ker::mod::sched::get_least_loaded_cpu();
-                }
-                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if (parent->deferred_task_switch || parent->voluntary_block) {
-                // Parent is blocked for another reason (or WAIT_ANY_CHILD with
-                // deferred_task_switch still true - race check will handle RAX).
-                // Wake it so it can handle the signal / race check.
-                uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::get_core_count()) {
-                    cpu = ker::mod::sched::get_least_loaded_cpu();
-                }
-                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            }
-            parent->release();
-        }
-    }
-
     // Reparent all children of this process to init (PID 1), so init can reap them.
     // Threads do not own children directly - skip reparenting for thread exits.
     if (!current_task->is_thread) {
@@ -225,6 +249,9 @@ void wos_proc_exit(int status) {
             current_task->elf_buffer_size = 0;
         }
     }
+
+    ker::mod::sched::finish_syscall_accounting();
+    current_task->exit_notify_ready.store(true, std::memory_order_release);
 
     // Reschedule all tasks waiting for this process to exit.
     // This happens AFTER reparenting + FD cleanup so that any files written
@@ -293,6 +320,8 @@ void wos_proc_exit(int status) {
         }
     }
 
+    notify_parent_after_exit_ready(current_task);
+
     // CRITICAL: Do NOT modify or destroy pagemap/thread here!
     // Another CPU might be in switchTo() and about to:
     //   - Load our pagemap into CR3
@@ -335,6 +364,12 @@ void wos_proc_exit(int status) {
     ker::syscall::shm::shm_cleanup_for_task(current_task);
 
     // TODO: Handle signal handlers cleanup
+
+    uint32_t const EXIT_US = clamp_perf_aux(ker::mod::time::get_us() - EXIT_STARTED_US);
+    record_local_proc_event(current_task, ker::mod::perf::WkiPerfLocalProcOp::EXIT, ker::mod::perf::WkiPerfPhase::END, EXIT_CORR, 0,
+                            EXIT_US, WOS_PERF_CALLSITE());
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PROC,
+                                       static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalProcOp::EXIT), 0, 0, 0, EXIT_US, true, 0, 0);
 
     // Transition to DEAD state and record death epoch for garbage collection.
     // The task will be reclaimed once all CPUs have passed through the grace period.

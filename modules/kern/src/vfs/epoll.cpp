@@ -1,6 +1,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <net/backlog.hpp>
+#include <net/netpoll.hpp>
 #include <net/socket.hpp>
 #include <net/wki/remote_ipc.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -15,7 +17,6 @@
 namespace ker::vfs {
 
 namespace {
-constexpr int WOS_ERESTARTSYS = 512;
 constexpr uint64_t USEC_PER_MSEC = 1000;
 constexpr int EPOLL_CLOEXEC_FLAG = 02000000;
 
@@ -51,6 +52,11 @@ void clear_poll_timeout(ker::mod::sched::task::Task* task) {
     if (task != nullptr) {
         task->poll_wait_deadline_us = 0;
     }
+}
+
+void drain_network_rx_work() {
+    ker::net::napi_poll_all_pending();
+    ker::net::backlog_drain_all_pending_inline();
 }
 
 // -- FileOperations for epoll fds ---------------------------------------------
@@ -271,133 +277,119 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         return -EINVAL;
     }
 
-    uint64_t const DEADLINE_US = begin_poll_timeout(task, timeout_ms);
+    for (;;) {
+        uint64_t const DEADLINE_US = begin_poll_timeout(task, timeout_ms);
 
-    // Scan all interest entries and collect ready events
-    int ready = 0;
-    for (auto& interest : inst->interests) {
-        if (ready >= maxevents) {
-            break;
-        }
-        if (!interest.active) {
-            continue;
-        }
+        drain_network_rx_work();
 
-        auto* target = vfs_get_file_retain(task, interest.fd);
-        if (target == nullptr) {
-            // fd was closed - auto-remove from interest list
-            interest.active = false;
-            inst->count--;
-            continue;
-        }
+        // Scan all interest entries and collect ready events
+        int ready = 0;
+        for (auto& interest : inst->interests) {
+            if (ready >= maxevents) {
+                break;
+            }
+            if (!interest.active) {
+                continue;
+            }
 
-        uint32_t const REVENTS = poll_fd(target, interest.events);
-        vfs_put_file(target);
-        if (REVENTS != 0) {
-            events[ready].events = REVENTS;
-            events[ready].data.u64 = interest.data;
-            ready++;
+            auto* target = vfs_get_file_retain(task, interest.fd);
+            if (target == nullptr) {
+                // fd was closed - auto-remove from interest list
+                interest.active = false;
+                inst->count--;
+                continue;
+            }
 
-            // EPOLLONESHOT: disable after reporting
-            if ((interest.events & EPOLLONESHOT) != 0U) {
-                interest.events = 0;
+            uint32_t const REVENTS = poll_fd(target, interest.events);
+            vfs_put_file(target);
+            if (REVENTS != 0) {
+                events[ready].events = REVENTS;
+                events[ready].data.u64 = interest.data;
+                ready++;
+
+                // EPOLLONESHOT: disable after reporting
+                if ((interest.events & EPOLLONESHOT) != 0U) {
+                    interest.events = 0;
+                }
             }
         }
-    }
 
-    if (ready > 0 || timeout_ms == 0) {
-        clear_poll_timeout(task);
-        vfs_put_file(epfile);
-        return ready;
-    }
+        if (ready > 0 || timeout_ms == 0) {
+            clear_poll_timeout(task);
+            vfs_put_file(epfile);
+            return ready;
+        }
 
-    if (DEADLINE_US != 0 && ker::mod::time::get_us() >= DEADLINE_US) {
-        clear_poll_timeout(task);
-        vfs_put_file(epfile);
-        return 0;
-    }
+        if (DEADLINE_US != 0 && ker::mod::time::get_us() >= DEADLINE_US) {
+            clear_poll_timeout(task);
+            vfs_put_file(epfile);
+            return 0;
+        }
 
-    // No events ready - check for deliverable signals before retrying.
-    // This lets pselect/poll return -EINTR so signal handlers run promptly.
-    // (task was already fetched at the top of this function)
-    {
         uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
         if (DELIVERABLE != 0) {
             clear_poll_timeout(task);
             vfs_put_file(epfile);
             return -EINTR;
         }
-    }
 
-    bool can_block = (inst->count > 0);
-    if (can_block) {
-        for (auto& interest : inst->interests) {
-            if (!interest.active) {
-                continue;
-            }
-            auto* f = vfs_get_file_retain(task, interest.fd);
-            bool const OK = (f != nullptr) && register_poll_waiter(f, task->pid);
-            if (f != nullptr) {
-                vfs_put_file(f);
-            }
-            if (!OK) {
-                can_block = false;
-                break;
-            }
-        }
-    }
-
-    if (can_block) {
-        task->wake_at_us = DEADLINE_US;
-        task->wait_channel = "epoll_wait";
-        task->deferred_task_switch = true;
-
-        // Re-check interests after registration + deferred mark to close
-        // the race window where an event fires between the initial scan
-        // and waiter registration.  With deferred_task_switch already set,
-        // any concurrent wake_waiters will clear it, preventing a block.
-        int recheck = 0;
-        for (auto& interest : inst->interests) {
-            if (recheck >= maxevents) {
-                break;
-            }
-            if (!interest.active) {
-                continue;
-            }
-            auto* target = vfs_get_file_retain(task, interest.fd);
-            if (target == nullptr) {
-                continue;
-            }
-            uint32_t const REVENTS = poll_fd(target, interest.events);
-            vfs_put_file(target);
-            if (REVENTS != 0) {
-                events[recheck].events = REVENTS;
-                events[recheck].data.u64 = interest.data;
-                recheck++;
-                if ((interest.events & EPOLLONESHOT) != 0U) {
-                    interest.events = 0;
+        bool can_block = (inst->count > 0);
+        if (can_block) {
+            for (auto& interest : inst->interests) {
+                if (!interest.active) {
+                    continue;
+                }
+                auto* f = vfs_get_file_retain(task, interest.fd);
+                bool const OK = (f != nullptr) && register_poll_waiter(f, task->pid);
+                if (f != nullptr) {
+                    vfs_put_file(f);
+                }
+                if (!OK) {
+                    can_block = false;
+                    break;
                 }
             }
         }
-        if (recheck > 0) {
-            task->deferred_task_switch = false;
-            task->wake_at_us = 0;
-            task->wait_channel = nullptr;
-            clear_poll_timeout(task);
-            vfs_put_file(epfile);
-            return recheck;
+
+        if (can_block) {
+            drain_network_rx_work();
+
+            // Re-check interests after waiter registration to close the race
+            // window where an event fires between the initial scan and sleep.
+            int recheck = 0;
+            for (auto& interest : inst->interests) {
+                if (recheck >= maxevents) {
+                    break;
+                }
+                if (!interest.active) {
+                    continue;
+                }
+                auto* target = vfs_get_file_retain(task, interest.fd);
+                if (target == nullptr) {
+                    continue;
+                }
+                uint32_t const REVENTS = poll_fd(target, interest.events);
+                vfs_put_file(target);
+                if (REVENTS != 0) {
+                    events[recheck].events = REVENTS;
+                    events[recheck].data.u64 = interest.data;
+                    recheck++;
+                    if ((interest.events & EPOLLONESHOT) != 0U) {
+                        interest.events = 0;
+                    }
+                }
+            }
+            if (recheck > 0) {
+                clear_poll_timeout(task);
+                vfs_put_file(epfile);
+                return recheck;
+            }
+
+            ker::mod::sched::preemptible_syscall_park("epoll_wait", DEADLINE_US);
+        } else {
+            ker::mod::sched::kern_yield();
         }
-
-        vfs_put_file(epfile);
-        return -WOS_ERESTARTSYS;
     }
-
-    if (timeout_ms < 0) {
-        clear_poll_timeout(task);
-    }
-    ker::mod::sched::kern_yield();
-    vfs_put_file(epfile);
-    return -WOS_ERESTARTSYS;
 }
 
 auto vfs_is_epoll_file(const File* f) -> bool { return f != nullptr && f->fops == &epoll_fops; }

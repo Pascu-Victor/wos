@@ -97,6 +97,11 @@ struct XfsInode {
     XfsInode* hash_next;      // hash chain link
     mod::sys::Spinlock lock;  // per-inode lock
 
+    // Final zero-link teardown is in progress.  The inode remains in the
+    // cache with refcount 0 while the on-disk free transaction runs so stale
+    // path lookups cannot instantiate a second in-memory copy.
+    bool inactivation_started;
+
     // Dirty flag (set when in-memory changes need writeback)
     bool dirty;
 };

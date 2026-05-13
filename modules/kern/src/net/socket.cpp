@@ -184,7 +184,6 @@ void socket_defer_wait(Socket* sock, const char* wait_channel) {
         sock->owner_pid = current_task->pid;
     }
     current_task->wait_channel = wait_channel;
-    current_task->deferred_task_switch = true;
 }
 
 void socket_wake_waiters(Socket* sock) {
@@ -192,18 +191,7 @@ void socket_wake_waiters(Socket* sock) {
         return;
     }
 
-    auto* task = ker::mod::sched::find_task_by_pid_safe(sock->owner_pid);
-    if (task == nullptr) {
-        return;
-    }
-
-    task->deferred_task_switch = false;
-    uint64_t target_cpu = task->cpu;
-    if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || task->voluntary_block) {
-        target_cpu = ker::mod::sched::get_least_loaded_cpu();
-    }
-    ker::mod::sched::reschedule_task_for_cpu(target_cpu, task);
-    task->release();
+    static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(sock->owner_pid));
 }
 
 }  // namespace ker::net

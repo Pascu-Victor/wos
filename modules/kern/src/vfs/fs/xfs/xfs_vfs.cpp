@@ -14,6 +14,7 @@
 #include <cstring>
 #include <new>
 #include <platform/mm/paging.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -72,6 +73,27 @@ auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint
     uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
     return LINEAR_BLOCK * (ctx->block_size / ctx->device->block_size);
 }
+
+auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* buffer) -> int {
+    constexpr int MAX_ATTEMPTS = 3;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        int const RC = dev::block_read(bdev, block_no, count, buffer);
+        if (RC == 0) {
+            return 0;
+        }
+        if (attempt < MAX_ATTEMPTS) {
+            log::warn("transient extent read failure on %s block=%llu count=%zu rc=%d attempt=%d/%d", bdev->name.data(),
+                      static_cast<unsigned long long>(block_no), count, RC, attempt, MAX_ATTEMPTS);
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        log::warn("extent read failed on %s block=%llu count=%zu rc=%d after %d attempts", bdev->name.data(),
+                  static_cast<unsigned long long>(block_no), count, RC, MAX_ATTEMPTS);
+        return RC;
+    }
+    return -EIO;
+}
+
 
 auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
     // Start at the root inode
@@ -228,10 +250,23 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         if (RET < 0) {
             return (total_read > 0) ? static_cast<ssize_t>(total_read) : RET;
         }
+        if (bmap.blockcount == 0) {
+            log::warn("read: zero-length bmap for ino=%lu off=%lu file_block=%lu fmt=%d size=%lu nblocks=%lu hole=%d startblk=%lu",
+                      static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(offset + total_read),
+                      static_cast<unsigned long>(file_block), ip->data_fork.format, static_cast<unsigned long>(ip->size),
+                      static_cast<unsigned long>(ip->nblocks), bmap.is_hole, static_cast<unsigned long>(bmap.startblock));
+            return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+        }
 
         if (bmap.is_hole || bmap.startblock == NULLFSBLOCK) {
             // Hole - return zeros
             size_t hole_bytes = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
+            if (hole_bytes == 0) {
+                log::warn("read: zero-length hole span for ino=%lu off=%lu file_block=%lu blkcnt=%lu", static_cast<unsigned long>(ip->ino),
+                          static_cast<unsigned long>(offset + total_read), static_cast<unsigned long>(file_block),
+                          static_cast<unsigned long>(bmap.blockcount));
+                return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+            }
             hole_bytes = std::min(hole_bytes, remaining);
             std::memset(dst + total_read, 0, hole_bytes);
             total_read += hole_bytes;
@@ -245,6 +280,14 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         // How many bytes does this extent cover from our current position?
         size_t const EXTENT_BYTES = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
         size_t chunk = std::min(EXTENT_BYTES, remaining);
+        if (chunk == 0) {
+            log::warn(
+                "read: zero-length extent span for ino=%lu off=%lu file_block=%lu startblk=%lu blkcnt=%lu block_off=%zu remaining=%zu",
+                static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(offset + total_read),
+                static_cast<unsigned long>(file_block), static_cast<unsigned long>(bmap.startblock),
+                static_cast<unsigned long>(bmap.blockcount), BLOCK_OFF, remaining);
+            return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+        }
 
 #ifdef XFS_BENCH
         t0 = ker::mod::tsc::get_ns();
@@ -264,7 +307,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 std::memcpy(dst + total_read, cache_bp->data, chunk);
                 brelse(cache_bp);
             } else {
-                int const RC = dev::block_read(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read);
+                int const RC = xfs_block_read_with_retry(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read);
                 if (RC != 0) {
                     return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
                 }

@@ -110,7 +110,7 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
         // Validate magic "070701"
         if (hdr[0] != '0' || hdr[1] != '7' || hdr[2] != '0' || hdr[3] != '7' || hdr[4] != '0' || hdr[5] != '1') {
             log::error("invalid magic at offset 0x%x", static_cast<unsigned>(offset));
-            return -1;
+            return -EINVAL;
         }
 
         // Parse header fields

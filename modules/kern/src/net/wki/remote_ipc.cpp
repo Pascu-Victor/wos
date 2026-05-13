@@ -15,6 +15,7 @@
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -36,6 +37,60 @@ namespace ker::net::wki {
 // =============================================================================
 
 namespace {
+
+constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 10'000'000;
+constexpr int WKI_LATENCY_DAEMON_NICE = 0;
+
+void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = WKI_LATENCY_DAEMON_SLICE_NS;
+    ker::mod::sched::set_task_nice(task, WKI_LATENCY_DAEMON_NICE);
+}
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+auto current_task_has_deliverable_signal() -> bool {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return false;
+    }
+    return (task->sig_pending & ~task->sig_mask) != 0;
+}
+
+void perf_record_ipc_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint16_t peer, uint16_t channel, uint32_t correlation,
+                           int32_t status, uint32_t aux, uint64_t callsite) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_IPC, op, phase, peer,
+                                     channel, correlation, status, aux, callsite);
+}
+
+void perf_record_ipc_summary(uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us, uint64_t bytes = 0) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_IPC, op, peer, channel, status, latency_us, true, 0, bytes);
+}
+
+void wake_blocked_ipc_reader(ker::mod::sched::task::Task* reader) {
+    if (reader == nullptr) {
+        return;
+    }
+
+    ker::mod::sched::wake_task_from_event(reader);
+}
 
 constexpr uint16_t WKI_IPC_FD_ACCESS_MASK = 0x0003;
 
@@ -87,12 +142,10 @@ std::deque<IpcDevOpWork*> g_ipc_dev_op_queue;
 ker::mod::sched::task::Task* g_ipc_dev_op_worker_task = nullptr;
 constexpr size_t WKI_IPC_DEV_OP_MAX_PENDING = 256;
 
-constexpr ssize_t WKI_IPC_PIPE_RESTARTSYS = -512;
 constexpr uint64_t WKI_IPC_PIPE_WRITE_RETRY_US = 1000;
 constexpr uint32_t WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS = 128;
 constexpr size_t WKI_IPC_MAX_POLL_WAKE_WAITERS = 32;
 
-auto consume_deferred_wait_for_daemon() -> bool;
 auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool;
 void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 
@@ -128,16 +181,10 @@ auto proxy_register_waiter_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uin
 void proxy_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_WAITERS>& pending,
                                   size_t* pending_count) {
     size_t copied = 0;
-    auto* pending_it = pending.begin();
-    for (auto waiter : waiters) {
-        if (pending_it == pending.end()) {
-            break;
-        }
-        *pending_it = waiter;
-        ++pending_it;
-        copied++;
+    while (copied < pending.size() && !waiters.empty()) {
+        pending.at(copied++) = waiters.at(0);
+        static_cast<void>(waiters.remove_at(0));
     }
-    waiters.clear();
     *pending_count = copied;
 }
 
@@ -148,12 +195,7 @@ void proxy_reschedule_waiters(const std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_W
             continue;
         }
 
-        waiter->deferred_task_switch = false;
-        uint64_t target_cpu = waiter->cpu;
-        if (waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || waiter->voluntary_block) {
-            target_cpu = ker::mod::sched::get_least_loaded_cpu();
-        }
-        ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiter);
+        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
     }
 }
@@ -201,6 +243,10 @@ auto ipc_acquire_export_file_locked(uint32_t resource_id) -> ker::vfs::File* {
         return exp->file;
     }
     return nullptr;
+}
+
+void compact_inactive_exports_locked() {
+    std::erase_if(g_ipc_exports, [](const WkiIpcExport* exp) { return exp == nullptr || !exp->active || exp->file == nullptr; });
 }
 
 void ipc_release_file_ref(ker::vfs::File* file) {
@@ -414,6 +460,7 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         } else if (close_pending) {
             exp->file = nullptr;
             exp->active = false;
+            compact_inactive_exports_locked();
             erase_export_pipe_write_backlog_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
             if (file->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -470,21 +517,18 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
             continue;
         }
 
-        if (write_ret == WKI_IPC_PIPE_RESTARTSYS || write_ret == -EAGAIN) {
+        if (write_ret == -EAGAIN) {
             queue_export_pipe_write_flush_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
             bool ready_now = false;
-            bool const POLL_REGISTERED = write_ret == -EAGAIN && register_poll_write_waiter(file, &ready_now);
+            bool const POLL_REGISTERED = register_poll_write_waiter(file, &ready_now);
             ipc_release_file_ref(file);
-            if (write_ret == WKI_IPC_PIPE_RESTARTSYS || POLL_REGISTERED) {
-                bool const WAIT_REGISTERED = write_ret == WKI_IPC_PIPE_RESTARTSYS ? consume_deferred_wait_for_daemon() : POLL_REGISTERED;
-                if (WAIT_REGISTERED && !ready_now) {
-                    ker::mod::sched::kern_block();
-                } else if (!WAIT_REGISTERED) {
-                    ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_WRITE_RETRY_US);
-                }
-            } else {
+            if (POLL_REGISTERED && !ready_now) {
+                ker::mod::sched::kern_block();
+            } else if (!POLL_REGISTERED) {
                 ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_WRITE_RETRY_US);
+            } else {
+                ker::mod::sched::kern_yield();
             }
             continue;
         }
@@ -492,6 +536,7 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp) -> bool {
         ker::mod::dbg::log("[WKI] IPC export pipe write failed: resource_id=%u ret=%ld remaining=%u", resource_id, write_ret, remaining);
         exp->file = nullptr;
         exp->active = false;
+        compact_inactive_exports_locked();
         erase_export_pipe_write_backlog_locked(backlog);
         s_ipc_lock.unlock_irqrestore(irqf);
         ipc_release_file_ref(file);
@@ -606,11 +651,7 @@ void proxy_mark_pipe_closed(ProxyIpcState* proxy, uint32_t resource_id) {
     ker::mod::dbg::log("[WKI] IPC proxy EOF received: resource_id=%u reader_pid=0x%lx", resource_id, reader != nullptr ? reader->pid : 0UL);
 #endif
 
-    if (reader != nullptr) {
-        reader->deferred_task_switch = false;
-        reader->wait_channel = nullptr;
-        ker::mod::sched::kern_wake(reader);
-    }
+    wake_blocked_ipc_reader(reader);
 
     wki_ipc_proxy_wake_poll_waiters(proxy);
 }
@@ -621,20 +662,31 @@ void wake_proxy_reader(ProxyIpcState* proxy) {
     }
 
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
-    if (reader != nullptr) {
-        reader->deferred_task_switch = false;
-        reader->wait_channel = nullptr;
-        ker::mod::sched::kern_wake(reader);
-    }
+    wake_blocked_ipc_reader(reader);
 }
 
 auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, STATUS, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, STATUS, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_READ), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
     if (proxy->ring_buf == nullptr) {
-        return -EIO;
+        return finish(-EIO);
     }
 
     // Spin briefly then block
@@ -659,16 +711,16 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
                     std::memcpy(dst + FIRST, proxy->ring_buf, TO_READ - FIRST);
                 }
                 proxy->ring_tail.store(TAIL + TO_READ, std::memory_order_release);
-                return static_cast<ssize_t>(TO_READ);
+                return finish(static_cast<ssize_t>(TO_READ), TO_READ);
             }
 
             size_t const QUEUED = drain_pending_pipe_data(proxy->home_node, proxy->resource_id, buf, count);
             if (QUEUED > 0) {
-                return static_cast<ssize_t>(QUEUED);
+                return finish(static_cast<ssize_t>(QUEUED), QUEUED);
             }
 
             if (proxy->write_closed.load(std::memory_order_acquire) != 0U) {
-                return 0;
+                return finish(0);
             }
 
             asm volatile("pause" ::: "memory");
@@ -676,7 +728,7 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
 
         auto* task = ker::mod::sched::get_current_task();
         if (task == nullptr) {
-            return -ESRCH;
+            return finish(-ESRCH);
         }
 
         // Serialize block registration with incoming DATA/CLOSE and pending
@@ -700,22 +752,46 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
         if (proxy->write_closed.load(std::memory_order_acquire) != 0U) {
             proxy->lock.unlock_irqrestore(IRQF);
             s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
-            return 0;
+            return finish(0);
+        }
+        if (current_task_has_deliverable_signal()) {
+            proxy->lock.unlock_irqrestore(IRQF);
+            s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
+            return finish(-EINTR);
         }
 
         task->wait_channel = "wki_proxy_pipe";
-        task->deferred_task_switch = true;
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(IRQF);
         s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
-        return -512;  // ERESTARTSYS
+        ker::mod::sched::preemptible_syscall_park("wki_proxy_pipe");
+        if (current_task_has_deliverable_signal()) {
+            auto* expected = task;
+            proxy->blocked_reader.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+            return finish(-EINTR);
+        }
     }
 }
 
 auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, STATUS, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, STATUS, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
 
     // Send data via wire message to home node
@@ -727,7 +803,7 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     size_t const MSG_SIZE = HEADER_SIZE + TO_SEND;
     auto* msg = new (std::nothrow) uint8_t[MSG_SIZE];
     if (msg == nullptr) {
-        return -ENOMEM;
+        return finish(-ENOMEM);
     }
 
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
@@ -742,9 +818,9 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     delete[] msg;
 
     if (RET != WKI_OK) {
-        return -EIO;
+        return finish(-EIO);
     }
-    return static_cast<ssize_t>(TO_SEND);
+    return finish(static_cast<ssize_t>(TO_SEND), TO_SEND);
 }
 
 auto proxy_pipe_close(ker::vfs::File* f) -> int {
@@ -782,13 +858,20 @@ auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
     uint32_t const TAIL = proxy->ring_tail.load(std::memory_order_acquire);
     uint32_t const AVAIL = HEAD - TAIL;
     bool const WR_CLOSED = proxy->write_closed.load(std::memory_order_acquire) != 0U;
+    bool has_pending_data = false;
+
+    uint64_t const PENDING_IRQF = s_ipc_lock.lock_irqsave();
+    if (auto* pending = find_pending_pipe_delivery_locked(proxy->home_node, proxy->resource_id); pending != nullptr) {
+        has_pending_data = !pending->chunks.empty();
+    }
+    s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
 
     if (f->fops != nullptr && f->fops->vfs_write == nullptr) {
         // Read end
-        if (((events & dev::pty::POLLIN) != 0) && (AVAIL > 0 || WR_CLOSED)) {
+        if (((events & dev::pty::POLLIN) != 0) && (AVAIL > 0 || has_pending_data || WR_CLOSED)) {
             ready |= dev::pty::POLLIN;
         }
-        if (WR_CLOSED && AVAIL == 0) {
+        if (WR_CLOSED && AVAIL == 0 && !has_pending_data) {
             ready |= dev::pty::POLLHUP;
         }
     } else {
@@ -918,11 +1001,25 @@ constexpr size_t PTY_IOCTL_ARG_SIZE = 128;  // max bytes we send/receive for ioc
 
 auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) -> int {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](int rc) -> int {
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PTY_IOCTL), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, rc, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PTY_IOCTL),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, rc, ELAPSED_US);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PTY_IOCTL), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
     if (proxy->home_node == WKI_NODE_INVALID) {
-        return -EHOSTUNREACH;
+        return finish(-EHOSTUNREACH);
     }
 
     // Wire layout (after resource_id): [cmd:u64][arg_val:u64][arg_in:128B]
@@ -952,7 +1049,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     uint64_t irqf = proxy->lock.lock_irqsave();
     if (proxy->pending_wait != nullptr) {
         proxy->lock.unlock_irqrestore(irqf);
-        return -EBUSY;
+        return finish(-EBUSY);
     }
     proxy->pending_wait = &wait;
     proxy->pending_wait_op = OP_PTY_IOCTL;
@@ -965,7 +1062,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
         proxy->lock.unlock_irqrestore(irqf);
-        return -EIO;
+        return finish(-EIO);
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
@@ -973,7 +1070,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
         proxy->lock.unlock_irqrestore(irqf);
-        return -ETIMEDOUT;
+        return finish(-ETIMEDOUT);
     }
 
     irqf = proxy->lock.lock_irqsave();
@@ -984,7 +1081,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     }
     proxy->pending_wait = nullptr;
     proxy->lock.unlock_irqrestore(irqf);
-    return STATUS;
+    return finish(STATUS);
 }
 
 auto proxy_pty_isatty(ker::vfs::File* /*f*/) -> bool { return true; }
@@ -1062,21 +1159,6 @@ void wake_pipe_pump(ker::mod::sched::task::Task* task) {
     if (task != nullptr) {
         ker::mod::sched::kern_wake(task);
     }
-}
-
-auto consume_deferred_wait_for_daemon() -> bool {
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
-        return false;
-    }
-
-    // Blocking file ops set deferred_task_switch for the userspace syscall exit
-    // path. WKI pump workers park explicitly with kern_block(), so consume the
-    // syscall-only marker before entering the scheduler wait path.
-    bool const HAD_DEFERRED_WAIT = task->deferred_task_switch;
-    task->deferred_task_switch = false;
-    task->yield_switch = false;
-    return HAD_DEFERRED_WAIT;
 }
 
 auto register_poll_read_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
@@ -1165,16 +1247,27 @@ template <int SLOT>
             ker::mod::dbg::log("[WKI] IPC pump: malloc failed for resource_id=%u", resource_id);
             continue;
         }
-
+#ifdef DEBUG_WKI_IPC
         ker::mod::dbg::log("[WKI] IPC pipe pump started: resource_id=%u target=0x%04x", resource_id, target);
-
+#endif
         while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
+            uint64_t const READ_CALLSITE = WOS_PERF_CALLSITE();
+            uint32_t const READ_CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+            uint64_t const READ_STARTED_US = wki_now_us();
+            perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ), ker::mod::perf::WkiPerfPhase::BEGIN,
+                                  target, WKI_CHAN_RESOURCE, READ_CORRELATION, 0, 0, READ_CALLSITE);
             ssize_t n = 0;
             if (file != nullptr && file->fops != nullptr && file->fops->vfs_read != nullptr) {
                 n = file->fops->vfs_read(file, buf, BUF_SIZE, 0);
             } else {
                 break;
             }
+            uint32_t const READ_ELAPSED_US = static_cast<uint32_t>(wki_now_us() - READ_STARTED_US);
+            perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ), ker::mod::perf::WkiPerfPhase::END,
+                                  target, WKI_CHAN_RESOURCE, READ_CORRELATION, n >= 0 ? 0 : static_cast<int32_t>(n), READ_ELAPSED_US,
+                                  READ_CALLSITE);
+            perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ), target, WKI_CHAN_RESOURCE,
+                                    n >= 0 ? 0 : static_cast<int32_t>(n), READ_ELAPSED_US, n > 0 ? static_cast<uint64_t>(n) : 0);
 
             if (n > 0) {
                 auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
@@ -1183,6 +1276,12 @@ template <int SLOT>
                 std::memcpy(msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
                 std::memcpy(msg + HEADER_SIZE, buf, static_cast<size_t>(n));
 
+                uint64_t const SEND_CALLSITE = WOS_PERF_CALLSITE();
+                uint32_t const SEND_CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+                uint64_t const SEND_STARTED_US = wki_now_us();
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_SEND),
+                                      ker::mod::perf::WkiPerfPhase::BEGIN, target, WKI_CHAN_RESOURCE, SEND_CORRELATION, 0,
+                                      static_cast<uint32_t>(n), SEND_CALLSITE);
                 int ret = WKI_ERR_TX_FAILED;
                 uint32_t attempts = 0;
                 while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
@@ -1192,6 +1291,11 @@ template <int SLOT>
                     }
                     ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(ret, attempts++));
                 }
+                uint32_t const SEND_ELAPSED_US = static_cast<uint32_t>(wki_now_us() - SEND_STARTED_US);
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_SEND), ker::mod::perf::WkiPerfPhase::END,
+                                      target, WKI_CHAN_RESOURCE, SEND_CORRELATION, ret, SEND_ELAPSED_US, SEND_CALLSITE);
+                perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_SEND), target, WKI_CHAN_RESOURCE, ret,
+                                        SEND_ELAPSED_US, static_cast<uint64_t>(n));
                 if (ret != WKI_OK) {
                     ker::mod::dbg::log("[WKI] IPC pipe pump DATA send failed: resource_id=%u ret=%d len=%ld", resource_id, ret, n);
                     break;
@@ -1226,13 +1330,6 @@ template <int SLOT>
                 }
 #endif
                 break;
-            } else if (n == WKI_IPC_PIPE_RESTARTSYS) {
-                if (consume_deferred_wait_for_daemon()) {
-                    ker::mod::sched::kern_block();
-                } else {
-                    ker::mod::sched::kern_sleep_us(1000);
-                }
-                continue;
             } else if (n == -EAGAIN) {
                 bool ready_now = false;
                 if (register_poll_read_waiter(file, &ready_now)) {
@@ -1300,6 +1397,7 @@ void start_pipe_pump(WkiIpcExport* exp) {
             ker::mod::dbg::log("[WKI] IPC pump: failed to create kernel thread");
             return;
         }
+        promote_latency_sensitive_daemon(task);
         slot_arg->worker = task;
         ker::mod::sched::post_task_balanced(task);
     } else {
@@ -1379,6 +1477,8 @@ auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_
 
 auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, uint16_t op_id, uint32_t resource_id)
     -> bool {
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = hdr != nullptr ? static_cast<uint32_t>(hdr->seq_num & UINT16_MAX) : 0U;
     auto* work = new (std::nothrow) IpcDevOpWork();
     auto* payload_copy = new (std::nothrow) uint8_t[payload_len];
     if (work == nullptr || payload_copy == nullptr) {
@@ -1402,6 +1502,9 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
         g_ipc_dev_op_queue.push_back(work);
         worker = g_ipc_dev_op_worker_task;
         queued = true;
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::DEV_OP_QUEUE), ker::mod::perf::WkiPerfPhase::POINT,
+                              hdr != nullptr ? hdr->src_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0,
+                              static_cast<uint32_t>(g_ipc_dev_op_queue.size()), CALLSITE);
     }
     s_ipc_lock.unlock_irqrestore(IRQF);
 
@@ -1434,7 +1537,17 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
             continue;
         }
 
+        uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+        uint32_t const CORRELATION = static_cast<uint32_t>(work->hdr.seq_num & UINT16_MAX);
+        uint64_t const STARTED_US = wki_now_us();
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::DEV_OP_HANDLE), ker::mod::perf::WkiPerfPhase::BEGIN,
+                              work->hdr.src_node, work->hdr.channel_id, CORRELATION, 0, 0, CALLSITE);
         handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len);
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::DEV_OP_HANDLE), ker::mod::perf::WkiPerfPhase::END,
+                              work->hdr.src_node, work->hdr.channel_id, CORRELATION, 0, ELAPSED_US, CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::DEV_OP_HANDLE), work->hdr.src_node, work->hdr.channel_id,
+                                0, ELAPSED_US);
         free_ipc_dev_op_work(work);
     }
 }
@@ -1452,12 +1565,14 @@ void wki_ipc_subsystem_init() {
     g_ipc_initialized = true;
     g_export_pipe_write_flush_task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_write", export_pipe_write_flush_thread_fn);
     if (g_export_pipe_write_flush_task != nullptr) {
+        promote_latency_sensitive_daemon(g_export_pipe_write_flush_task);
         ker::mod::sched::post_task_balanced(g_export_pipe_write_flush_task);
     } else {
         ker::mod::dbg::log("[WKI] IPC export pipe writer thread creation failed");
     }
     g_ipc_dev_op_worker_task = ker::mod::sched::task::Task::create_kernel_thread("wki_ipc_devop", ipc_dev_op_worker_thread_fn);
     if (g_ipc_dev_op_worker_task != nullptr) {
+        promote_latency_sensitive_daemon(g_ipc_dev_op_worker_task);
         ker::mod::sched::post_task_balanced(g_ipc_dev_op_worker_task);
     } else {
         ker::mod::dbg::log("[WKI] IPC dev-op worker thread creation failed");
@@ -1504,6 +1619,13 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
 
     uint16_t count = 0;
     constexpr uint16_t MAX_IPC_FDS = 16;
+    struct DeferredPtyPump {
+        const void* identity = nullptr;
+        uint64_t fd = UINT64_MAX;
+        WkiIpcExport* exp = nullptr;
+    };
+    std::array<DeferredPtyPump, MAX_IPC_FDS> deferred_pty_pumps = {};
+    size_t deferred_pty_pump_count = 0;
 
     task->fd_table.for_each([&](uint64_t fd_key, void* val) {
         if (val == nullptr || count >= MAX_IPC_FDS) {
@@ -1539,10 +1661,35 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         g_ipc_exports.push_back(exp);
         s_ipc_lock.unlock_irqrestore(IRQF);
 
-        bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && file->open_flags == 0) ||
-                                     res_type == ResourceType::IPC_SOCKET || res_type == ResourceType::IPC_PTY;
+        bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && file->open_flags == 0) || res_type == ResourceType::IPC_SOCKET;
         if (NEEDS_DATA_PUMP) {
             start_pipe_pump(exp);
+        } else if (res_type == ResourceType::IPC_PTY) {
+            void const* identity = ker::dev::pty::pty_file_identity_key(file);
+            if (identity == nullptr) {
+                identity = static_cast<const void*>(file);
+            }
+
+            bool found = false;
+            for (size_t i = 0; i < deferred_pty_pump_count; ++i) {
+                auto& candidate = deferred_pty_pumps.at(i);
+                if (candidate.identity != identity) {
+                    continue;
+                }
+                found = true;
+                if (fd_key < candidate.fd) {
+                    candidate.fd = fd_key;
+                    candidate.exp = exp;
+                }
+                break;
+            }
+
+            if (!found && deferred_pty_pump_count < deferred_pty_pumps.size()) {
+                auto& candidate = deferred_pty_pumps.at(deferred_pty_pump_count++);
+                candidate.identity = identity;
+                candidate.fd = fd_key;
+                candidate.exp = exp;
+            }
         }
 
         auto& entry = map_out[count];
@@ -1555,6 +1702,12 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         entry.rdma_offset = 0;
         count++;
     });
+
+    for (size_t i = 0; i < deferred_pty_pump_count; ++i) {
+        if (deferred_pty_pumps.at(i).exp != nullptr) {
+            start_pipe_pump(deferred_pty_pumps.at(i).exp);
+        }
+    }
 
     *count_out = count;
     return count > 0;
@@ -1653,7 +1806,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         proxy->refcount.fetch_add(1, std::memory_order_acq_rel);
         g_ipc_proxies.push_back(proxy);
-        if (proxy->res_type == ResourceType::IPC_PIPE) {
+        if (proxy->ring_buf != nullptr) {
             auto* pending = find_pending_pipe_delivery_locked(entry.home_node, entry.resource_id);
             pending_write_closed = pending != nullptr && pending->write_closed;
             if (pending != nullptr && pending->write_closed && pending->chunks.empty()) {
@@ -1817,11 +1970,7 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
         s_ipc_lock.unlock_irqrestore(IRQF);
         if (proxy != nullptr) {
             auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
-            if (reader != nullptr) {
-                reader->deferred_task_switch = false;
-                reader->wait_channel = nullptr;
-                ker::mod::sched::kern_wake(reader);
-            }
+            wake_blocked_ipc_reader(reader);
             proxy_release(proxy);
         }
         return;
@@ -1923,11 +2072,7 @@ void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
     }
 
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
-    if (reader != nullptr) {
-        reader->deferred_task_switch = false;
-        reader->wait_channel = nullptr;
-        ker::mod::sched::kern_wake(reader);
-    }
+    wake_blocked_ipc_reader(reader);
     wki_ipc_proxy_wake_poll_waiters(proxy);
 
     if (f != nullptr) {
@@ -1973,6 +2118,7 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
             exp->active = false;
         }
     }
+    compact_inactive_exports_locked();
 
     size_t detached_proxy_count = 0;
     std::array<ProxyIpcState*, WKI_IPC_MAX_PROXIES> detached_proxies = {};
@@ -2033,11 +2179,7 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
 
     for (auto* proxy : std::span(detached_proxies.data(), detached_proxy_count)) {
         auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
-        if (reader != nullptr) {
-            reader->deferred_task_switch = false;
-            reader->wait_channel = nullptr;
-            ker::mod::sched::kern_wake(reader);
-        }
+        wake_blocked_ipc_reader(reader);
         wki_ipc_proxy_wake_poll_waiters(proxy);
         proxy_release(proxy);
     }
@@ -2086,8 +2228,13 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
     std::memcpy(&resource_id, data, sizeof(uint32_t));
     const auto* op_data = data + sizeof(uint32_t);
     uint16_t const OP_DATA_LEN = req.data_len - sizeof(uint32_t);
+    uint64_t const IPC_CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const IPC_CORRELATION = static_cast<uint32_t>(hdr->seq_num & UINT16_MAX);
 
     if (OP_ID == OP_PIPE_DATA) {
+        uint64_t const STARTED_US = wki_now_us();
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::BEGIN,
+                              hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, OP_DATA_LEN, IPC_CALLSITE);
         // Consumer receives pipe data — write into the local proxy ring if
         // present, otherwise route it to the exported home-side pipe.
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
@@ -2109,10 +2256,21 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 if (!queue_pending_pipe_data(hdr->src_node, resource_id, op_data, OP_DATA_LEN)) {
                     ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
                 } else {
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::WAKE_READER),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0,
+                                          OP_DATA_LEN, IPC_CALLSITE);
                     wake_proxy_reader(proxy);
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::POLL_WAKE),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, 0,
+                                          IPC_CALLSITE);
                     wki_ipc_proxy_wake_poll_waiters(proxy);
                 }
                 proxy_release(proxy);
+                uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                                      hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+                perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                        ELAPSED_US, OP_DATA_LEN);
                 return;
             }
 
@@ -2124,10 +2282,21 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 if (!queue_pending_pipe_data(hdr->src_node, resource_id, op_data, OP_DATA_LEN)) {
                     ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
                 } else {
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::WAKE_READER),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0,
+                                          OP_DATA_LEN, IPC_CALLSITE);
                     wake_proxy_reader(proxy);
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::POLL_WAKE),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, 0,
+                                          IPC_CALLSITE);
                     wki_ipc_proxy_wake_poll_waiters(proxy);
                 }
                 proxy_release(proxy);
+                uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                                      hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+                perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                        ELAPSED_US, OP_DATA_LEN);
                 return;
             }
 
@@ -2157,19 +2326,38 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 if (!queue_pending_pipe_data(hdr->src_node, resource_id, op_data, OP_DATA_LEN)) {
                     ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
                 } else {
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::WAKE_READER),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0,
+                                          OP_DATA_LEN, IPC_CALLSITE);
                     wake_proxy_reader(proxy);
+                    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::POLL_WAKE),
+                                          ker::mod::perf::WkiPerfPhase::POINT, hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, 0,
+                                          IPC_CALLSITE);
+                    wki_ipc_proxy_wake_poll_waiters(proxy);
                 }
                 proxy_release(proxy);
+                uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                                      hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+                perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                        ELAPSED_US, OP_DATA_LEN);
                 return;
             }
 
             if (reader != nullptr) {
-                reader->deferred_task_switch = false;
-                reader->wait_channel = nullptr;
-                ker::mod::sched::kern_wake(reader);
+                perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::WAKE_READER), ker::mod::perf::WkiPerfPhase::POINT,
+                                      hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, OP_DATA_LEN, IPC_CALLSITE);
+                wake_blocked_ipc_reader(reader);
             }
+            perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::POLL_WAKE), ker::mod::perf::WkiPerfPhase::POINT,
+                                  hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, 0, IPC_CALLSITE);
             wki_ipc_proxy_wake_poll_waiters(proxy);
             proxy_release(proxy);
+            uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+            perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                                  hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+            perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                    ELAPSED_US, OP_DATA_LEN);
             return;
         }
 
@@ -2181,6 +2369,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         }
         if (OP_DATA_LEN == 0) {
             ipc_release_file_ref(export_file);
+            uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+            perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                                  hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+            perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                    ELAPSED_US, 0);
             return;
         }
         if (export_file->fops != nullptr && export_file->fops->vfs_write != nullptr) {
@@ -2190,7 +2383,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 uint16_t written = 0;
                 if (WRITE_RET > 0) {
                     written = static_cast<uint16_t>(std::cmp_less(WRITE_RET, OP_DATA_LEN) ? WRITE_RET : OP_DATA_LEN);
-                } else if (WRITE_RET != WKI_IPC_PIPE_RESTARTSYS && WRITE_RET != -EAGAIN) {
+                } else if (WRITE_RET != -EAGAIN) {
                     ker::mod::dbg::log("[WKI] IPC export pipe immediate write failed: resource_id=%u ret=%ld len=%u", resource_id,
                                        WRITE_RET, OP_DATA_LEN);
                 }
@@ -2205,6 +2398,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             }
         }
         ipc_release_file_ref(export_file);
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), ker::mod::perf::WkiPerfPhase::END,
+                              hdr->src_node, hdr->channel_id, IPC_CORRELATION, 0, ELAPSED_US, IPC_CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA), hdr->src_node, hdr->channel_id, 0,
+                                ELAPSED_US, OP_DATA_LEN);
         return;
     }
 
@@ -2385,6 +2583,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             ker::vfs::File* f = exp->file;
             exp->file = nullptr;
             exp->active = false;
+            compact_inactive_exports_locked();
             s_ipc_lock.unlock_irqrestore(IRQF);
             wake_pipe_pump(pump_task);
             if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -2441,6 +2640,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             ker::vfs::File* f = exp->file;
             exp->file = nullptr;
             exp->active = false;
+            compact_inactive_exports_locked();
             s_ipc_lock.unlock_irqrestore(IRQF);
             wake_pipe_pump(pump_task);
             if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -2479,6 +2679,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 ker::vfs::File* f = exp->file;
                 exp->file = nullptr;
                 exp->active = false;
+                compact_inactive_exports_locked();
                 s_ipc_lock.unlock_irqrestore(IRQF);
                 wake_pipe_pump(pump_task);
 

@@ -48,17 +48,29 @@ struct IcacheBucket {
 std::array<IcacheBucket, ICACHE_BUCKETS> icache;
 bool icache_inited = false;
 
-auto icache_hash(xfs_ino_t ino) -> size_t {
-    // Simple multiplicative hash
-    return static_cast<size_t>((ino * 2654435761ULL) & ICACHE_HASH_MASK);
+auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
+    auto const MOUNT_BITS = reinterpret_cast<uintptr_t>(mount) >> 6;
+    auto const MIXED = (ino * 2654435761ULL) ^ static_cast<uint64_t>(MOUNT_BITS);
+    return static_cast<size_t>(MIXED & ICACHE_HASH_MASK);
 }
 
 // Look up an inode in the cache.  Returns with bucket locked and refcount
-// incremented if found, or nullptr with bucket locked if not found.
-auto icache_lookup_locked(xfs_ino_t ino, size_t bucket) -> XfsInode* {
+// incremented if found.  If the matching inode is in final inactivation,
+// returns nullptr and sets unavailable so the caller will not read a second
+// copy from disk.
+auto icache_lookup_locked(const XfsMountContext* mount, xfs_ino_t ino, size_t bucket, bool* unavailable = nullptr) -> XfsInode* {
+    if (unavailable != nullptr) {
+        *unavailable = false;
+    }
     XfsInode* ip = icache.at(bucket).head;
     while (ip != nullptr) {
-        if (ip->ino == ino) {
+        if (ip->ino == ino && ip->mount == mount) {
+            if (ip->inactivation_started) {
+                if (unavailable != nullptr) {
+                    *unavailable = true;
+                }
+                return nullptr;
+            }
             ip->refcount++;
             return ip;
         }
@@ -121,24 +133,29 @@ void free_inode(XfsInode* ip) {
     delete ip;
 }
 
-void inactivate_unlinked_inode(XfsInode* ip) {
+auto inactivate_unlinked_inode(XfsInode* ip) -> int {
     if (ip == nullptr || ip->mount == nullptr || ip->mount->read_only || ip->nlink != 0) {
-        return;
+        return 0;
     }
 
     auto* tp = xfs_trans_alloc(ip->mount);
     if (tp == nullptr) {
         mod::dbg::logger<"xfs">::error("xfs_inode_release: failed to allocate inactivation transaction for inode %lu",
                                        static_cast<unsigned long>(ip->ino));
-        return;
+        return -ENOMEM;
     }
 
     int rc = xfs_ifree(ip->mount, tp, ip->ino);
     if (rc != 0) {
         xfs_trans_cancel(tp);
+        if (rc == -EEXIST) {
+            mod::dbg::logger<"xfs">::debug("xfs_inode_release: inode %lu already free during inactivation",
+                                           static_cast<unsigned long>(ip->ino));
+            return 0;
+        }
         mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree failed for inode %lu rc=%d", static_cast<unsigned long>(ip->ino),
                                        rc);
-        return;
+        return rc;
     }
 
     rc = xfs_trans_commit(tp);
@@ -146,6 +163,7 @@ void inactivate_unlinked_inode(XfsInode* ip) {
         mod::dbg::logger<"xfs">::error("xfs_inode_release: deferred ifree commit failed for inode %lu rc=%d",
                                        static_cast<unsigned long>(ip->ino), rc);
     }
+    return rc;
 }
 
 // Parse a fork from the on-disk inode.  data_ptr points to the start of the
@@ -261,16 +279,31 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
 
     xfs_icache_init();
 
-    size_t const BUCKET = icache_hash(ino);
+    size_t const BUCKET = icache_hash(mount, ino);
 
     // Check cache first
     uint64_t flags = icache.at(BUCKET).lock.lock_irqsave();
-    XfsInode* ip = icache_lookup_locked(ino, BUCKET);
+    bool unavailable = false;
+    XfsInode* ip = icache_lookup_locked(mount, ino, BUCKET, &unavailable);
     if (ip != nullptr) {
         icache.at(BUCKET).lock.unlock_irqrestore(flags);
         return ip;
     }
     icache.at(BUCKET).lock.unlock_irqrestore(flags);
+    if (unavailable) {
+        return nullptr;
+    }
+
+    int const ALLOCATED = xfs_inode_allocated(mount, ino);
+    if (ALLOCATED <= 0) {
+        if (ALLOCATED < 0) {
+            mod::dbg::logger<"xfs">::warn("xfs_inode_read: allocation lookup failed for inode %lu rc=%d", static_cast<unsigned long>(ino),
+                                          ALLOCATED);
+        } else {
+            mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free", static_cast<unsigned long>(ino));
+        }
+        return nullptr;
+    }
 
     // Not in cache - read from disk
     xfs_fsblock_t const BLOCK = xfs_inode_block(mount, ino);
@@ -403,15 +436,22 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     // Insert into cache
     ip->refcount = 1;
     ip->hash_next = nullptr;
+    ip->inactivation_started = false;
     ip->dirty = false;
 
     flags = icache.at(BUCKET).lock.lock_irqsave();
     // Check for a race - another thread might have loaded the same inode
-    XfsInode* existing = icache_lookup_locked(ino, BUCKET);
+    unavailable = false;
+    XfsInode* existing = icache_lookup_locked(mount, ino, BUCKET, &unavailable);
     if (existing != nullptr) {
         icache.at(BUCKET).lock.unlock_irqrestore(flags);
         free_inode(ip);
         return existing;
+    }
+    if (unavailable) {
+        icache.at(BUCKET).lock.unlock_irqrestore(flags);
+        free_inode(ip);
+        return nullptr;
     }
     icache_insert_locked(ip, BUCKET);
     icache.at(BUCKET).lock.unlock_irqrestore(flags);
@@ -424,23 +464,25 @@ void xfs_inode_release(XfsInode* ip) {
         return;
     }
 
-    size_t const BUCKET = icache_hash(ip->ino);
-    uint64_t const FLAGS = icache.at(BUCKET).lock.lock_irqsave();
+    size_t const BUCKET = icache_hash(ip->mount, ip->ino);
+    uint64_t flags = icache.at(BUCKET).lock.lock_irqsave();
 
     ip->refcount--;
     if (ip->refcount <= 0) {
-        // Inode is no longer referenced - remove from cache and free
-        bool const NEEDS_INACTIVATION = (ip->nlink == 0);
-        icache_remove_locked(ip, BUCKET);
-        icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+        bool const NEEDS_INACTIVATION = (ip->nlink == 0 && !ip->inactivation_started);
         if (NEEDS_INACTIVATION) {
-            inactivate_unlinked_inode(ip);
+            ip->inactivation_started = true;
+            icache.at(BUCKET).lock.unlock_irqrestore(flags);
+            static_cast<void>(inactivate_unlinked_inode(ip));
+            flags = icache.at(BUCKET).lock.lock_irqsave();
         }
+        icache_remove_locked(ip, BUCKET);
+        icache.at(BUCKET).lock.unlock_irqrestore(flags);
         free_inode(ip);
         return;
     }
 
-    icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+    icache.at(BUCKET).lock.unlock_irqrestore(flags);
 }
 
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {

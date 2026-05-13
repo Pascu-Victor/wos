@@ -8,9 +8,11 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <net/backlog.hpp>
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
+#include <net/netpoll.hpp>
 #include <net/route.hpp>
 #include <net/socket.hpp>
 #include <net/wki/dev_server.hpp>
@@ -21,7 +23,6 @@
 #include <platform/sched/task.hpp>
 #include <span>
 #include <string_view>
-#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -36,7 +37,6 @@
 namespace ker::syscall::net {
 
 namespace {
-constexpr int WOS_ERESTARTSYS = 512;
 constexpr int WOS_MSG_DONTWAIT = 0x0040;
 constexpr int WOS_O_NONBLOCK = 04000;
 constexpr int WOS_O_RDWR = 2;
@@ -76,6 +76,19 @@ void clear_poll_timeout(ker::mod::sched::task::Task* task) {
     }
 }
 
+auto current_task_has_deliverable_signal() -> bool {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return false;
+    }
+    return (task->sig_pending & ~task->sig_mask) != 0;
+}
+
+void drain_network_rx_work() {
+    ker::net::napi_poll_all_pending();
+    ker::net::backlog_drain_all_pending_inline();
+}
+
 auto socket_effective_nonblock(const ker::vfs::File* file, const ker::net::Socket* sock, int call_flags) -> bool {
     bool const FILE_NONBLOCK = file != nullptr && (file->open_flags & WOS_O_NONBLOCK) != 0;
     bool const MSG_NONBLOCK = (call_flags & WOS_MSG_DONTWAIT) != 0;
@@ -101,22 +114,41 @@ struct SocketNonblockGuard {
     }
 };
 
-template <typename T>
-auto maybe_restart_socket_wait(T result, bool nonblock) -> T {
-    if ((result == static_cast<T>(-EAGAIN) || result == static_cast<T>(-EINPROGRESS)) && !nonblock) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr && task->deferred_task_switch) {
-            return static_cast<T>(-WOS_ERESTARTSYS);
-        }
-    }
-    return result;
-}
-
 template <typename T, typename Fn>
 auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, Fn&& fn) -> T {
     bool const EFFECTIVE_NONBLOCK = socket_effective_nonblock(file, sock, call_flags);
     SocketNonblockGuard const GUARD(sock, EFFECTIVE_NONBLOCK);
-    return maybe_restart_socket_wait<T>(std::forward<Fn>(fn)(), EFFECTIVE_NONBLOCK);
+    for (;;) {
+        T const RESULT = fn();
+        bool const RETRYABLE = RESULT == static_cast<T>(-EAGAIN) || RESULT == static_cast<T>(-EINPROGRESS);
+        if (!RETRYABLE) {
+            return RESULT;
+        }
+        auto* task = ker::mod::sched::get_current_task();
+        if (task == nullptr) {
+            return RESULT;
+        }
+        if (EFFECTIVE_NONBLOCK) {
+            drain_network_rx_work();
+            return fn();
+        }
+        char const* wait_channel = task->wait_channel != nullptr ? task->wait_channel : "sock_wait";
+        if (current_task_has_deliverable_signal()) {
+            task->wait_channel = nullptr;
+            return static_cast<T>(-EINTR);
+        }
+
+        drain_network_rx_work();
+        T const AFTER_DRAIN = fn();
+        if (AFTER_DRAIN != static_cast<T>(-EAGAIN) && AFTER_DRAIN != static_cast<T>(-EINPROGRESS)) {
+            return AFTER_DRAIN;
+        }
+
+        ker::mod::sched::preemptible_syscall_park(wait_channel);
+        if (current_task_has_deliverable_signal()) {
+            return static_cast<T>(-EINTR);
+        }
+    }
 }
 
 // Socket file operations (integrate sockets with VFS fd table)
@@ -1184,130 +1216,118 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EINVAL);
             }
 
-            uint64_t const DEADLINE_US = begin_poll_timeout(task, timeout);
+            for (;;) {
+                uint64_t const DEADLINE_US = begin_poll_timeout(task, timeout);
 
-            int num_events = 0;
-            for (size_t i = 0; i < nfds; i++) {
-                fds[i].revents = 0;
+                drain_network_rx_work();
 
-                if (fds[i].fd < 0) {
-                    continue;
-                }
-
-                auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
-                if (file == nullptr) {
-                    fds[i].revents = 0x0020;  // POLLNVAL
-                    num_events++;
-                    continue;
-                }
-
-                if (file->fs_type == ker::vfs::FSType::SOCKET) {
-                    auto* sock = static_cast<ker::net::Socket*>(file->private_data);
-                    if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
-                        fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
-                    }
-                } else if (file->fops != nullptr && file->fops->vfs_poll_check != nullptr) {
-                    // Use per-file poll_check callback (pipes, etc.)
-                    fds[i].revents = static_cast<int16_t>(file->fops->vfs_poll_check(file, fds[i].events));
-                } else {
-                    // Non-socket fds without poll_check (regular files, devices) are always ready
-                    fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));  // POLLIN|POLLOUT
-                }
-                ker::vfs::vfs_put_file(file);
-
-                if (fds[i].revents != 0) {
-                    num_events++;
-                }
-            }
-
-            if (num_events > 0 || timeout == 0) {
-                clear_poll_timeout(task);
-                return static_cast<uint64_t>(num_events);
-            }
-
-            if (DEADLINE_US != 0 && ker::mod::time::get_us() >= DEADLINE_US) {
-                clear_poll_timeout(task);
-                return 0;
-            }
-
-            // No events - check for deliverable signals before retrying.
-            {
-                uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
-                if (DELIVERABLE != 0) {
-                    clear_poll_timeout(task);
-                    return static_cast<uint64_t>(-EINTR);
-                }
-            }
-
-            bool can_block = (nfds > 0);
-            if (can_block) {
-                for (size_t i = 0; i < nfds; i++) {
-                    if (fds[i].fd < 0) {
-                        continue;
-                    }
-                    auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
-                    bool const OK = (file != nullptr) && register_poll_waiter(file, task->pid);
-                    if (file != nullptr) {
-                        ker::vfs::vfs_put_file(file);
-                    }
-                    if (!OK) {
-                        can_block = false;
-                        break;
-                    }
-                }
-            }
-
-            if (can_block) {
-                task->wake_at_us = DEADLINE_US;
-                task->wait_channel = "poll";
-                task->deferred_task_switch = true;
-
-                // Re-check fds after registration + deferred mark to close
-                // the race window where an event fires between the initial
-                // poll_check and waiter registration.  With deferred_task_switch
-                // already set, any concurrent wake_waiters will clear it, so
-                // syscall.asm will skip the block and retry the syscall.
-                int recheck = 0;
+                int num_events = 0;
                 for (size_t i = 0; i < nfds; i++) {
                     fds[i].revents = 0;
+
                     if (fds[i].fd < 0) {
                         continue;
                     }
-                    auto* rf = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
-                    if (rf == nullptr) {
+
+                    auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
+                    if (file == nullptr) {
+                        fds[i].revents = 0x0020;  // POLLNVAL
+                        num_events++;
                         continue;
                     }
-                    if (rf->fs_type == ker::vfs::FSType::SOCKET) {
-                        auto* sock = static_cast<ker::net::Socket*>(rf->private_data);
+
+                    if (file->fs_type == ker::vfs::FSType::SOCKET) {
+                        auto* sock = static_cast<ker::net::Socket*>(file->private_data);
                         if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
                             fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
                         }
-                    } else if (rf->fops != nullptr && rf->fops->vfs_poll_check != nullptr) {
-                        fds[i].revents = static_cast<int16_t>(rf->fops->vfs_poll_check(rf, fds[i].events));
+                    } else if (file->fops != nullptr && file->fops->vfs_poll_check != nullptr) {
+                        // Use per-file poll_check callback (pipes, etc.)
+                        fds[i].revents = static_cast<int16_t>(file->fops->vfs_poll_check(file, fds[i].events));
                     } else {
-                        fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));
+                        // Non-socket fds without poll_check (regular files, devices) are always ready
+                        fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));  // POLLIN|POLLOUT
                     }
-                    ker::vfs::vfs_put_file(rf);
+                    ker::vfs::vfs_put_file(file);
+
                     if (fds[i].revents != 0) {
-                        recheck++;
+                        num_events++;
                     }
                 }
-                if (recheck > 0) {
-                    task->deferred_task_switch = false;
-                    task->wake_at_us = 0;
-                    task->wait_channel = nullptr;
+
+                if (num_events > 0 || timeout == 0) {
                     clear_poll_timeout(task);
-                    return static_cast<uint64_t>(recheck);
+                    return static_cast<uint64_t>(num_events);
                 }
 
-                return static_cast<uint64_t>(-WOS_ERESTARTSYS);
-            }
+                if (DEADLINE_US != 0 && ker::mod::time::get_us() >= DEADLINE_US) {
+                    clear_poll_timeout(task);
+                    return 0;
+                }
 
-            if (timeout < 0) {
-                clear_poll_timeout(task);
+                if (current_task_has_deliverable_signal()) {
+                    clear_poll_timeout(task);
+                    return static_cast<uint64_t>(-EINTR);
+                }
+
+                bool can_block = (nfds > 0);
+                if (can_block) {
+                    for (size_t i = 0; i < nfds; i++) {
+                        if (fds[i].fd < 0) {
+                            continue;
+                        }
+                        auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
+                        bool const OK = (file != nullptr) && register_poll_waiter(file, task->pid);
+                        if (file != nullptr) {
+                            ker::vfs::vfs_put_file(file);
+                        }
+                        if (!OK) {
+                            can_block = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (can_block) {
+                    drain_network_rx_work();
+
+                    // Re-check fds after waiter registration to close the race
+                    // window where an event fires between the initial scan and sleep.
+                    int recheck = 0;
+                    for (size_t i = 0; i < nfds; i++) {
+                        fds[i].revents = 0;
+                        if (fds[i].fd < 0) {
+                            continue;
+                        }
+                        auto* rf = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
+                        if (rf == nullptr) {
+                            continue;
+                        }
+                        if (rf->fs_type == ker::vfs::FSType::SOCKET) {
+                            auto* sock = static_cast<ker::net::Socket*>(rf->private_data);
+                            if (sock != nullptr && sock->proto_ops != nullptr && sock->proto_ops->poll_check != nullptr) {
+                                fds[i].revents = static_cast<int16_t>(sock->proto_ops->poll_check(sock, fds[i].events));
+                            }
+                        } else if (rf->fops != nullptr && rf->fops->vfs_poll_check != nullptr) {
+                            fds[i].revents = static_cast<int16_t>(rf->fops->vfs_poll_check(rf, fds[i].events));
+                        } else {
+                            fds[i].revents = static_cast<int16_t>(fds[i].events & (0x0001 | 0x0004));
+                        }
+                        ker::vfs::vfs_put_file(rf);
+                        if (fds[i].revents != 0) {
+                            recheck++;
+                        }
+                    }
+                    if (recheck > 0) {
+                        clear_poll_timeout(task);
+                        return static_cast<uint64_t>(recheck);
+                    }
+
+                    ker::mod::sched::preemptible_syscall_park("poll", DEADLINE_US);
+                } else {
+                    ker::mod::sched::kern_yield();
+                }
             }
-            ker::mod::sched::kern_yield();
-            return static_cast<uint64_t>(-WOS_ERESTARTSYS);
         }
 
         default:

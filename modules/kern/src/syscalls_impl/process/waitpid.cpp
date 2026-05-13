@@ -1,5 +1,7 @@
 #include "waitpid.hpp"
 
+#include <abi/ptrace.hpp>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
@@ -30,6 +32,53 @@ void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) 
 
 // Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child"
 constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr int WOS_WNOHANG = 1;
+constexpr int WOS_WSTOPPED = 2;
+constexpr int STOP_STATUS_LOW = 0x7f;
+
+void clear_wait_resume_debug(ker::mod::sched::task::Task* task);
+
+auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
+    return task != nullptr && task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited;
+}
+
+auto ptrace_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
+    uint32_t signal = task.ptrace_stop_signal != 0 ? task.ptrace_stop_signal : 5;
+    if ((task.ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
+         task.ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) &&
+        (task.ptrace_options & 0x00000001U) != 0) {
+        signal |= 0x80U;
+    }
+    return static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW);
+}
+
+auto is_ptrace_wait_target(const ker::mod::sched::task::Task& waiter, const ker::mod::sched::task::Task& target) -> bool {
+    return target.ptrace_traced && target.ptrace_tracer_pid == waiter.pid;
+}
+
+auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
+                                     int32_t options) -> bool {
+    if (waiter == nullptr || target == nullptr || !is_ptrace_wait_target(*waiter, *target)) {
+        return false;
+    }
+    if ((options & WOS_WSTOPPED) == 0 && !target->ptrace_stop_pending) {
+        return false;
+    }
+    if (!target->ptrace_stopped || !target->ptrace_stop_pending) {
+        return false;
+    }
+    if (status != nullptr) {
+        *status = ptrace_stop_status(*target);
+    }
+    target->ptrace_stop_pending = false;
+    waiter->waiting_for_pid = 0;
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
+    clear_wait_resume_debug(waiter);
+    return true;
+}
 
 // Scan for an exited child of the given parent task.
 // Returns the exited child task pointer, or nullptr if none found.
@@ -38,7 +87,7 @@ auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* t = ker::mod::sched::get_active_task_at(i);
-        if (t != nullptr && t->parent_pid == parent->pid && t->has_exited && !t->waited_on) {
+        if (t != nullptr && t->parent_pid == parent->pid && is_waitable_exit(t) && !t->waited_on) {
             return t;
         }
     }
@@ -125,7 +174,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         }
 
         // WNOHANG: return 0 immediately if no exited child
-        if ((options & 1) != 0 /* WNOHANG */) {
+        if ((options & WOS_WNOHANG) != 0) {
             return 0;
         }
 
@@ -169,12 +218,13 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         return static_cast<uint64_t>(-1);  // Task not found
     }
 
-    if (target_task->parent_pid != current_task->pid || target_task->waited_on) {
+    bool const TRACE_WAIT = is_ptrace_wait_target(*current_task, *target_task);
+    if ((!TRACE_WAIT && target_task->parent_pid != current_task->pid) || target_task->waited_on) {
         return static_cast<uint64_t>(-ECHILD);
     }
 
     // Check if the target task has already exited
-    if (target_task->has_exited) {
+    if (is_waitable_exit(target_task)) {
 #ifdef WAITPID_DEBUG
         log::debug("target task PID %x has already exited with status %d", pid, target_task->exit_status);
 #endif
@@ -193,6 +243,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         // Mark that the parent has retrieved the exit status (zombie can now be reaped)
         target_task->waited_on = true;
         return pid;  // Return the PID of the exited process
+    }
+
+    if (consume_ptrace_stop_if_waitable(current_task, target_task, status, options)) {
+        return pid;
+    }
+
+    if (TRACE_WAIT && (options & WOS_WNOHANG) != 0) {
+        return 0;
     }
 
     // Prepare the current task's wait state before publishing ourselves on the child's
@@ -217,10 +275,15 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     capture_wait_resume_debug(current_task, gpr);
     current_task->wait_channel = "waitpid";
 
+    if (TRACE_WAIT) {
+        current_task->deferred_task_switch = true;
+        return 0;
+    }
+
     // Serialize with exit: recheck hasExited while holding the waiter-list lock so we
     // cannot miss a child that exits while we're registering as a waiter.
     uint64_t const WAITER_LOCK_FLAGS = target_task->exit_waiters_lock.lock_irqsave();
-    if (target_task->has_exited) {
+    if (is_waitable_exit(target_task)) {
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
         if (status != nullptr) {
             *status = target_task->exit_status;

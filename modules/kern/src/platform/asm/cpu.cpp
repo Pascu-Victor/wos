@@ -11,7 +11,7 @@ namespace {
 std::atomic<bool> s_per_cpu_ready{false};
 }  // namespace
 
-auto get_current_cpu_id_safe() -> uint64_t {
+[[clang::no_sanitize("coverage")]] auto get_current_cpu_id_safe() -> uint64_t {
     if (s_per_cpu_ready.load(std::memory_order_acquire)) {
         return current_cpu();
     }
@@ -23,6 +23,8 @@ auto get_current_cpu_id_safe() -> uint64_t {
     return 0;  // BSP during very early init
 }
 
+[[clang::no_sanitize("coverage")]] auto is_per_cpu_ready() -> bool { return s_per_cpu_ready.load(std::memory_order_acquire); }
+
 void notify_per_cpu_ready() { s_per_cpu_ready.store(true, std::memory_order_release); }
 void cpuid(struct CpuidContext* cpuid_context) {
     asm volatile("cpuid"
@@ -30,7 +32,7 @@ void cpuid(struct CpuidContext* cpuid_context) {
                  : "a"(cpuid_context->function));
 }
 
-uint64_t current_cpu() {
+[[clang::no_sanitize("coverage")]] uint64_t current_cpu() {
     // After swapgs in syscall/interrupt handler, GS_BASE points to the per-task
     // scratch area (PerCpu structure). cpuId is at offset 0x10 in PerCpu.
     // We must read via gs: segment, NOT from KERNEL_GS_BASE (which holds user's TLS after swapgs).
@@ -40,7 +42,7 @@ uint64_t current_cpu() {
     return cpu_id;
 }
 
-void set_current_cpuid(uint64_t id) {
+[[clang::no_sanitize("coverage")]] void set_current_cpuid(uint64_t id) {
     // Write cpuId to gs:0x10 (offset of cpuId in PerCpu structure)
     asm volatile("mov %0, %%gs:0x10" ::"r"(id) : "memory");
 }

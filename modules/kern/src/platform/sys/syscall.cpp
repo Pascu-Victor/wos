@@ -16,7 +16,9 @@
 #include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
+#include "platform/debug/ptrace.hpp"
 #include "platform/interrupt/gdt.hpp"
+#include "platform/sched/scheduler.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadInfo.hpp"
 #include "syscalls_impl/process/process.hpp"
@@ -25,7 +27,14 @@
 namespace ker::mod::sys {
 
 extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
-    auto callnum = static_cast<abi::callnums>(regs.rax);
+    sched::begin_syscall_accounting();
+
+    uint64_t callnum_raw = regs.rax;
+    if (ker::mod::debug::ptrace::report_syscall_stop(regs, callnum_raw, false)) {
+        callnum_raw = regs.rax;
+    }
+
+    auto callnum = static_cast<abi::callnums>(callnum_raw);
     uint64_t const A1 = regs.rdi;
     uint64_t const A2 = regs.rsi;
     uint64_t const A3 = regs.rdx;
@@ -33,35 +42,45 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
     uint64_t const A5 = regs.r9;
     uint64_t const A6 = regs.r10;
 
+    uint64_t result = 0;
     switch (callnum) {
         case abi::callnums::SYS_LOG:
-            return ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), reinterpret_cast<const char*>(A2), A3, A4,
-                                              reinterpret_cast<const char*>(A5));
+            result = ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), reinterpret_cast<const char*>(A2), A3, A4,
+                                                reinterpret_cast<const char*>(A5));
+            break;
         case abi::callnums::FUTEX:
-            return ker::syscall::futex::sys_futex(A1, A2, A3, A4);
+            result = ker::syscall::futex::sys_futex(A1, A2, A3, A4);
+            break;
         case abi::callnums::THREADING:
-            // Dispatch based on operation - threadControlOps start at 0x100
             if (A1 >= 0x100) {
-                return ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1),
-                                                               reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3),
-                                                               reinterpret_cast<void*>(A4));
+                result =
+                    ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1), reinterpret_cast<void*>(A2),
+                                                            reinterpret_cast<void*>(A3), reinterpret_cast<void*>(A4));
+            } else {
+                result = ker::syscall::multiproc::thread_info(static_cast<abi::multiproc::threadInfoOps>(A1));
             }
-            return ker::syscall::multiproc::thread_info(static_cast<abi::multiproc::threadInfoOps>(A1));
+            break;
         case abi::callnums::TIME:
-            return ker::syscall::time::sys_time_get(A1, reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3));
+            result = ker::syscall::time::sys_time_get(A1, reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3));
+            break;
         case abi::callnums::VFS:
-            return ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5);
+            result = ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5);
+            break;
         case abi::callnums::NET:
-            return ker::syscall::net::sys_net(A1, A2, A3, A4, A5, A6);
+            result = ker::syscall::net::sys_net(A1, A2, A3, A4, A5, A6);
+            break;
         case abi::callnums::VMEM:
-            return ker::syscall::vmem::sys_vmem(A1, A2, A3, A4, A5);
+            result = ker::syscall::vmem::sys_vmem(A1, A2, A3, A4, A5);
+            break;
         case abi::callnums::VMEM_MAP:
-            return ker::syscall::vmem::sys_vmem_map(A1, A2, A3, A4, A5, A6);
+            result = ker::syscall::vmem::sys_vmem_map(A1, A2, A3, A4, A5, A6);
+            break;
         case abi::callnums::PROCESS:
-            return ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(A1), A2, A3, A4, A5, regs);
+            result = ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(A1), A2, A3, A4, A5, regs);
+            break;
         case abi::callnums::SHM:
-            return ker::syscall::shm::sys_shm(A1, A2, A3, A4, A5);
-
+            result = ker::syscall::shm::sys_shm(A1, A2, A3, A4, A5);
+            break;
         case abi::callnums::DEBUG:
             // a1=0: disable interrupts on this CPU; a1=1: re-enable
             // clang-tidy treats distinct inline asm branches as identical.
@@ -76,7 +95,8 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
                     break;
             }
             // NOLINTEND(bugprone-branch-clone)
-            return 0;
+            result = 0;
+            break;
 
         default:
             io::serial::write("Syscall undefined\n");
@@ -105,6 +125,14 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             hcf();
             __builtin_unreachable();
     }
+
+    auto exit_regs = regs;
+    exit_regs.rax = result;
+    sched::finish_syscall_accounting();
+    if (ker::mod::debug::ptrace::report_syscall_stop(exit_regs, callnum_raw, true)) {
+        result = exit_regs.rax;
+    }
+    return result;
 }
 
 // Called from syscall.asm when RCX (return RIP) was corrupted during syscall handling.
@@ -142,6 +170,20 @@ extern "C" [[noreturn]] void wos_sysret_corrupt_panic(uint64_t actual_rcx, uint6
     io::serial::write(gs_cpu_id);
 
     io::serial::write("\n  Halting.\n");
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
+
+extern "C" [[noreturn]] void wos_syscall_bad_stack_panic(uint64_t gs_stack, uint64_t user_rsp, uint64_t cpu_id) {
+    io::serial::write("\n!!! SYSCALL STACK CORRUPTION DETECTED !!!\n");
+    io::serial::write("  gs:0x00 stack: 0x");
+    io::serial::write(gs_stack);
+    io::serial::write("\n  user RSP:      0x");
+    io::serial::write(user_rsp);
+    io::serial::write("\n  gs:0x10 CPU:   0x");
+    io::serial::write(cpu_id);
+    io::serial::write("\n  Halting before touching the user red zone.\n");
     for (;;) {
         asm volatile("hlt");
     }

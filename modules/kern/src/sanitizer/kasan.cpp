@@ -156,17 +156,7 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
     }
     s_shadow_fault_cpus.fetch_or(CPU_BIT, std::memory_order_acquire);
 
-    // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
-    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
-    if (phys_page == nullptr) {
-        log::error("OOM allocating shadow page for cr2=0x%lx", cr2);
-        s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
-        return false;
-    }
-    std::memset(phys_page, 0x00, mm::paging::PAGE_SIZE);
-
     auto shadow_vaddr = static_cast<mm::addr::vaddr_t>(cr2 & ~(mm::paging::PAGE_SIZE - 1));
-    auto shadow_paddr = reinterpret_cast<mm::addr::paddr_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(phys_page)));
 
     // Serialise page-table manipulation so two CPUs faulting on the same
     // shadow page don't both create a mapping and leak the second page.
@@ -181,7 +171,7 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
         uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
         bool const SYNCED_CURRENT_PML4 = sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
         if (!SYNCED_CURRENT_PML4 && (DUPS % 1000) == 0) {
-            log::warn(
+            log::debug(
                 "already-mapped hit #%lu for shadow_vaddr=0x%lx (concurrent CPUs) \n"
                 "hit info: cr2=0x%lx source=%.*s\nrip=0x%lx rsp=0x%lx rflags=0x%lx dups=%lu\n"
                 "gpr info: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx "
@@ -191,6 +181,32 @@ auto handle_shadow_fault(uint64_t cr2, const std::string_view SOURCE, const gate
                 gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
         } else if (SYNCED_CURRENT_PML4 && (DUPS % 100000) == 0) {
             log::debug("shadow page already mapped in kernel; synced current CR3 #%lu shadow_vaddr=0x%lx", DUPS, shadow_vaddr);
+        }
+        s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
+        return true;
+    }
+    s_shadow_map_lock.clear(std::memory_order_release);
+
+    // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
+    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, SOURCE);
+    if (phys_page == nullptr) {
+        log::error("OOM allocating shadow page for cr2=0x%lx", cr2);
+        s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);
+        return false;
+    }
+    std::memset(phys_page, 0x00, mm::paging::PAGE_SIZE);
+
+    auto shadow_paddr = reinterpret_cast<mm::addr::paddr_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(phys_page)));
+
+    while (s_shadow_map_lock.test_and_set(std::memory_order_acquire)) {
+        asm volatile("pause");
+    }
+    if (mm::virt::translate(kernel_pt, shadow_vaddr) != mm::virt::PADDR_INVALID) {
+        s_shadow_map_lock.clear(std::memory_order_release);
+        uint64_t const DUPS = s_shadow_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        (void)sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
+        if ((DUPS % 100000) == 0) {
+            log::debug("shadow page already mapped after allocation #%lu shadow_vaddr=0x%lx", DUPS, shadow_vaddr);
         }
         mm::phys::page_free(phys_page);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);

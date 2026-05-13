@@ -8,6 +8,7 @@
 #include <deque>
 #include <dev/block_device.hpp>
 #include <memory>
+#include <net/backlog.hpp>
 #include <net/netpoll.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
@@ -1718,7 +1719,8 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                     // Drive NIC + WKI RX so the rkey-exchange notification can be processed
                     net::NetDevice* net_dev = wki_eth_get_netdev();
                     if (net_dev != nullptr) {
-                        net::napi_poll_inline(net_dev);
+                        net::napi_poll_all_pending();
+                        net::backlog_drain_all_pending_inline();
                     }
                 }
             }
@@ -1746,7 +1748,8 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 // ring_hdr->server_ready is never updated locally.
                 net::NetDevice* net_dev = wki_eth_get_netdev();
                 if (net_dev != nullptr) {
-                    net::napi_poll_inline(net_dev);
+                    net::napi_poll_all_pending();
+                    net::backlog_drain_all_pending_inline();
                 }
 
                 // Also re-check rkey - the 0xFE notification may arrive

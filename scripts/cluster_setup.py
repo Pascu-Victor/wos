@@ -743,6 +743,7 @@ TCG_LOG_LEVELS = {
     "": "cpu_reset,int,tid,in_asm,nochain,guest_errors,page",
     "int": "cpu_reset,int,tid,pcall,in_asm,nochain,guest_errors,page",
     "full": "cpu_reset,int,tid,exec,cpu,fpu,pcall,in_asm,nochain,guest_errors,page,mmu",
+    "none": "",
 }
 
 
@@ -822,7 +823,7 @@ def build_qemu_args(
             f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}"
         )
     else:
-        accel_args = ["-cpu", "host", "--enable-kvm"]
+        accel_args = ["-cpu", "host,migratable=no,+invtsc", "--enable-kvm"]
         # Under KVM only trace events and guest_errors produce output;
         # in_asm/nochain/page/exec/cpu are TCG-only and silently ignored.
         log_flags = "cpu_reset,guest_errors"
@@ -854,8 +855,7 @@ def build_qemu_args(
         "none",
         "-bios",
         "/usr/share/OVMF/x64/OVMF.4m.fd",
-        "-d",
-        log_flags,
+        *(["-d", log_flags] if log_flags else []),
         "-D",
         qemu_log,
         "-no-reboot",

@@ -196,6 +196,43 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
     return NULLFSINO;
 }
 
+auto xfs_inode_allocated(XfsMountContext* mount, xfs_ino_t ino) -> int {
+    if (mount == nullptr || ino == NULLFSINO) {
+        return -EINVAL;
+    }
+
+    auto const AGNO = static_cast<xfs_agnumber_t>(ino >> mount->agino_log);
+    auto const AGINO = static_cast<xfs_agino_t>(ino & ((1ULL << mount->agino_log) - 1));
+
+    if (AGNO >= mount->ag_count) {
+        return -EINVAL;
+    }
+
+    XfsPerAG* pag = &mount->per_ag[AGNO];
+    xfs_agino_t const CHUNK_START = AGINO & ~static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK - 1);
+    uint32_t const BIT = AGINO - CHUNK_START;
+
+    XfsBtreeCursor<XfsInobtTraits> cur;
+    cur.mount = mount;
+    cur.agno = AGNO;
+
+    XfsInobtTraits::IRec target{};
+    target.startino = CHUNK_START;
+
+    int const RC = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
+    if (RC != 0) {
+        return -EIO;
+    }
+
+    XfsInobtTraits::IRec const REC = xfs_btree_get_rec(&cur);
+    if (REC.startino != CHUNK_START) {
+        return -EIO;
+    }
+
+    uint64_t const INODE_BIT = static_cast<uint64_t>(1) << BIT;
+    return (REC.free_mask & INODE_BIT) == 0 ? 1 : 0;
+}
+
 auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int {
     if (mount == nullptr || ino == NULLFSINO) {
         return -EINVAL;

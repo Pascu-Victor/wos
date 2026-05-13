@@ -1,5 +1,8 @@
 #pragma once
 
+#include <qpoint.h>
+#include <qtmetamacros.h>
+
 #include <QProcess>
 #include <QString>
 #include <QTreeWidget>
@@ -20,33 +23,33 @@ class CoredumpBrowser : public QWidget {
     ~CoredumpBrowser() override;
 
     // Set the root directory to scan for coredumps
-    void setDirectory(const QString& dir);
-    [[nodiscard]] QString directory() const { return coredumpDir_; }
+    void set_directory(const QString& dir);
+    [[nodiscard]] QString directory() const { return coredump_dir; }
 
    public slots:
     // Re-scan the coredump directory
     void refresh();
 
     // Run extract_coredumps.sh to extract from QCOW2 disk images
-    void extractCoredumps(bool clusterMode = true);
+    void extract_coredumps(bool cluster_mode = true);
 
    signals:
     // Emitted when a coredump is double-clicked / activated
-    void coredumpSelected(const QString& filePath);
+    void coredump_selected(const QString& file_path);
 
     // Emitted when extraction finishes (success or failure)
-    void extractionFinished(bool success, const QString& message);
+    void extraction_finished(bool success, const QString& message);
 
    private slots:
-    void onItemActivated(QTreeWidgetItem* item, int column);
-    void onContextMenu(const QPoint& pos);
-    void onExtractionFinished(int exitCode, QProcess::ExitStatus status);
+    void on_item_activated(QTreeWidgetItem* item, int column);
+    void on_context_menu(const QPoint& pos);
+    void on_extraction_finished(int exit_code, QProcess::ExitStatus status);
 
    private:
-    void setupUI();
-    void scanDirectory();
+    void setup_ui();
+    void scan_directory();
 
-    QTreeWidget* tree_;
-    QString coredumpDir_;
-    QProcess* extractProcess_ = nullptr;
+    QTreeWidget* tree;
+    QString coredump_dir;
+    QProcess* extract_process = nullptr;
 };

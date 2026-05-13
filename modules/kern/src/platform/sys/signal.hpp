@@ -25,6 +25,12 @@ struct SignalFrame {
 static_assert(sizeof(SignalFrame) == 176, "SignalFrame layout is userspace ABI");
 static_assert(offsetof(SignalFrame, saved_regs) == 56, "SignalFrame saved_regs offset is userspace ABI");
 
+constexpr uint64_t USER_RED_ZONE_SIZE = 128;
+
+constexpr auto signal_frame_address(uint64_t user_rsp) -> uint64_t {
+    return ((user_rsp - USER_RED_ZONE_SIZE - sizeof(SignalFrame)) & ~0xFULL) - 8;
+}
+
 // Deliver one pending signal when an interrupt/scheduler path is about to
 // return directly to userspace via iretq.
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);

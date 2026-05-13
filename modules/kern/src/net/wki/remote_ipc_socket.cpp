@@ -10,6 +10,7 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <vfs/file.hpp>
@@ -20,6 +21,40 @@
 namespace ker::net::wki {
 
 namespace {
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+auto current_task_has_deliverable_signal() -> bool {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return false;
+    }
+    return (task->sig_pending & ~task->sig_mask) != 0;
+}
+
+void perf_record_ipc_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint16_t peer, uint16_t channel, uint32_t correlation,
+                           int32_t status, uint32_t aux, uint64_t callsite) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_IPC, op, phase, peer,
+                                     channel, correlation, status, aux, callsite);
+}
+
+void perf_record_ipc_summary(uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us, uint64_t bytes = 0) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_IPC, op, peer, channel, status, latency_us, true, 0, bytes);
+}
 
 struct __attribute__((packed)) PeerAddrWire {
     uint16_t family;
@@ -68,11 +103,26 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
 
 auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max,
                          uint16_t* resp_len_out) -> int {
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
+    uint64_t const STARTED_US = wki_now_us();
+    auto finish = [&](int rc, uint64_t bytes = 0) -> int {
+        uint32_t const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::SOCK_CTRL), ker::mod::perf::WkiPerfPhase::END,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, rc, ELAPSED_US,
+                              CALLSITE);
+        perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::SOCK_CTRL),
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, rc, ELAPSED_US, bytes);
+        return rc;
+    };
+    perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::SOCK_CTRL), ker::mod::perf::WkiPerfPhase::BEGIN,
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, op_id, extra_len,
+                          CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
+        return finish(-EBADF);
     }
     if (proxy->home_node == WKI_NODE_INVALID) {
-        return -EHOSTUNREACH;
+        return finish(-EHOSTUNREACH);
     }
 
     // Build request: [DevOpReqPayload][resource_id:u32][extra...]
@@ -82,7 +132,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
 
     auto* msg = new (std::nothrow) uint8_t[MSG_SIZE];
     if (msg == nullptr) {
-        return -ENOMEM;
+        return finish(-ENOMEM);
     }
 
     auto* req_hdr = reinterpret_cast<DevOpReqPayload*>(msg);
@@ -100,7 +150,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         // Another in-flight control op — unlikely, return busy.
         proxy->lock.unlock_irqrestore(irqf);
         delete[] msg;
-        return -EBUSY;
+        return finish(-EBUSY);
     }
     proxy->pending_wait = &wait;
     proxy->pending_wait_op = op_id;
@@ -115,7 +165,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
         proxy->lock.unlock_irqrestore(irqf);
-        return -EIO;
+        return finish(-EIO);
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
@@ -123,7 +173,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         irqf = proxy->lock.lock_irqsave();
         proxy->pending_wait = nullptr;
         proxy->lock.unlock_irqrestore(irqf);
-        return -ETIMEDOUT;
+        return finish(-ETIMEDOUT);
     }
 
     irqf = proxy->lock.lock_irqsave();
@@ -139,7 +189,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
     proxy->pending_wait = nullptr;
     proxy->lock.unlock_irqrestore(irqf);
 
-    return STATUS;
+    return finish(STATUS, RESP_LEN);
 }
 
 auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max)
@@ -202,11 +252,19 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
             proxy->lock.unlock_irqrestore(IRQF);
             return 0;
         }
+        if (current_task_has_deliverable_signal()) {
+            proxy->lock.unlock_irqrestore(IRQF);
+            return -EINTR;
+        }
         task->wait_channel = "wki_proxy_sock";
-        task->deferred_task_switch = true;
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(IRQF);
-        return -512;  // ERESTARTSYS
+        ker::mod::sched::preemptible_syscall_park("wki_proxy_sock");
+        if (current_task_has_deliverable_signal()) {
+            auto* expected = task;
+            proxy->blocked_reader.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+            return -EINTR;
+        }
     }
 }
 

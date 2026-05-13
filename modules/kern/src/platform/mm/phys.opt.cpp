@@ -126,6 +126,88 @@ constexpr size_t CALLER_STAT_SLOTS = 64;
 __attribute__((section(".bss"))) std::array<CallerStat, CALLER_STAT_SLOTS> caller_stats{};
 std::atomic<bool> caller_stat_lock{false};
 
+struct PhysRange {
+    uint64_t base = 0;
+    uint64_t end = 0;
+};
+
+constexpr size_t MAX_SANITIZED_RANGES = 128;
+
+auto checked_range_end(uint64_t base, uint64_t length) -> uint64_t {
+    uint64_t const END = base + length;
+    return END < base ? ~0ULL : END;
+}
+
+auto page_range_from_usable(uint64_t base, uint64_t length) -> PhysRange {
+    uint64_t const END = checked_range_end(base, length);
+    return {.base = page_align_up(base), .end = page_align_down(END)};
+}
+
+auto page_range_from_reserved(uint64_t base, uint64_t length) -> PhysRange {
+    uint64_t const END = checked_range_end(base, length);
+    return {.base = page_align_down(base), .end = page_align_up(END)};
+}
+
+auto range_valid(PhysRange range) -> bool { return range.base < range.end; }
+
+auto range_overlaps(PhysRange a, PhysRange b) -> bool { return a.base < b.end && b.base < a.end; }
+
+void append_range(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t& count, PhysRange range) {
+    if (!range_valid(range) || count >= ranges.size()) {
+        return;
+    }
+    ranges.at(count++) = range;
+}
+
+void remove_range_at(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t& count, size_t index) {
+    for (size_t i = index + 1; i < count; ++i) {
+        ranges.at(i - 1) = ranges.at(i);
+    }
+    --count;
+}
+
+void subtract_range(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t& count, PhysRange cut) {
+    if (!range_valid(cut)) {
+        return;
+    }
+
+    for (size_t i = 0; i < count;) {
+        PhysRange const CUR = ranges.at(i);
+        if (!range_overlaps(CUR, cut)) {
+            ++i;
+            continue;
+        }
+
+        if (cut.base <= CUR.base && cut.end >= CUR.end) {
+            remove_range_at(ranges, count, i);
+            continue;
+        }
+
+        if (cut.base <= CUR.base) {
+            ranges.at(i).base = cut.end;
+            ++i;
+            continue;
+        }
+
+        if (cut.end >= CUR.end) {
+            ranges.at(i).end = cut.base;
+            ++i;
+            continue;
+        }
+
+        ranges.at(i).end = cut.base;
+        append_range(ranges, count, {.base = cut.end, .end = CUR.end});
+        ++i;
+    }
+}
+
+void subtract_ranges(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t& count,
+                     const std::array<PhysRange, MAX_SANITIZED_RANGES>& cuts, size_t cut_count) {
+    for (size_t i = 0; i < cut_count; ++i) {
+        subtract_range(ranges, count, cuts.at(i));
+    }
+}
+
 void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
     if (caller_addr == nullptr) {
         return;
@@ -241,7 +323,7 @@ auto init_page_zone(uint64_t base, uint64_t len, uint64_t zone_num) -> paging::P
     allocator->init(base, len);
     zone->allocator = allocator;
     zone->start = base;
-    zone->len = static_cast<uint64_t>(allocator->get_usable_pages()) * paging::PAGE_SIZE;
+    zone->len = static_cast<uint64_t>(allocator->total_pages) * paging::PAGE_SIZE;
     zone->page_count = allocator->get_usable_pages();
 
     return zone;
@@ -271,7 +353,7 @@ auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
     allocator->init(virt_base, len);
     zone->allocator = allocator;
     zone->start = virt_base;
-    zone->len = static_cast<uint64_t>(allocator->get_usable_pages()) * paging::PAGE_SIZE;
+    zone->len = static_cast<uint64_t>(allocator->total_pages) * paging::PAGE_SIZE;
     zone->page_count = allocator->get_usable_pages();
     zone->next = nullptr;
 
@@ -310,6 +392,17 @@ void init(limine_memmap_response* memmap_response) {
         hcf();
     }
     limine_memmap_response const MEMMAP = *memmap_response;
+    std::array<PhysRange, MAX_SANITIZED_RANGES> reserved_ranges{};
+    size_t reserved_range_count = 0;
+    std::array<PhysRange, MAX_SANITIZED_RANGES> accepted_ranges{};
+    size_t accepted_range_count = 0;
+
+    for (size_t i = 0; i < MEMMAP.entry_count; i++) {
+        if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE || MEMMAP.entries[i]->length == 0) {
+            continue;
+        }
+        append_range(reserved_ranges, reserved_range_count, page_range_from_reserved(MEMMAP.entries[i]->base, MEMMAP.entries[i]->length));
+    }
 
     // Initialize per-CPU caches
     num_cpus = smt::get_core_count();
@@ -324,9 +417,8 @@ void init(limine_memmap_response* memmap_response) {
         if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE && MEMMAP.entries[i]->length >= per_cpu_caches_size + paging::PAGE_SIZE) {
             // Save the physical address for later mapping
             per_cpu_caches_phys_base = MEMMAP.entries[i]->base;
-            // Carve it out from the memory map
-            MEMMAP.entries[i]->base += per_cpu_caches_size;
-            MEMMAP.entries[i]->length -= per_cpu_caches_size;
+            append_range(reserved_ranges, reserved_range_count,
+                         {.base = per_cpu_caches_phys_base, .end = per_cpu_caches_phys_base + per_cpu_caches_size});
             break;
         }
     }
@@ -339,21 +431,35 @@ void init(limine_memmap_response* memmap_response) {
     size_t zone_num = 0;
 
     for (size_t i = 0; i < MEMMAP.entry_count; i++) {
-        if (MEMMAP.entries[i]->type != LIMINE_MEMMAP_USABLE || MEMMAP.entries[i]->length == paging::PAGE_SIZE) {
+        if (MEMMAP.entries[i]->type != LIMINE_MEMMAP_USABLE || MEMMAP.entries[i]->length <= paging::PAGE_SIZE) {
             continue;
         }
 
-        main_heap_size += MEMMAP.entries[i]->length;
+        std::array<PhysRange, MAX_SANITIZED_RANGES> usable_ranges{};
+        size_t usable_range_count = 0;
+        append_range(usable_ranges, usable_range_count, page_range_from_usable(MEMMAP.entries[i]->base, MEMMAP.entries[i]->length));
+        subtract_ranges(usable_ranges, usable_range_count, reserved_ranges, reserved_range_count);
+        subtract_ranges(usable_ranges, usable_range_count, accepted_ranges, accepted_range_count);
 
-        paging::PageZone* zone = init_page_zone(reinterpret_cast<uint64_t>(addr::get_virt_pointer(MEMMAP.entries[i]->base)),
-                                                MEMMAP.entries[i]->length, zone_num++);
+        for (size_t range_i = 0; range_i < usable_range_count; ++range_i) {
+            PhysRange const RANGE = usable_ranges.at(range_i);
+            if (RANGE.end - RANGE.base <= paging::PAGE_SIZE) {
+                continue;
+            }
 
-        if (zones_tail == nullptr) {
-            zones = zone;  // set the head
-        } else {
-            zones_tail->next = zone;
+            main_heap_size += RANGE.end - RANGE.base;
+
+            paging::PageZone* zone =
+                init_page_zone(reinterpret_cast<uint64_t>(addr::get_virt_pointer(RANGE.base)), RANGE.end - RANGE.base, zone_num++);
+
+            if (zones_tail == nullptr) {
+                zones = zone;  // set the head
+            } else {
+                zones_tail->next = zone;
+            }
+            zones_tail = zone;
+            append_range(accepted_ranges, accepted_range_count, RANGE);
         }
-        zones_tail = zone;
     }
 
     if (zones_tail == nullptr) {

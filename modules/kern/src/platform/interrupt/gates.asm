@@ -16,6 +16,7 @@ extern iterrupt_handler
 
 __idt_isr_handler:
     cld
+    clear_live_tf
 
     ; Same-CPL kernel interrupts/exceptions only provide RIP, CS, and RFLAGS
     ; after our int/error-code shim. Build a by-value copy with synthetic
@@ -140,6 +141,7 @@ global isr32
 extern task_switch_handler
 isr32:
     cld
+    clear_live_tf
 
     ; Same-CPL kernel interrupts only push RIP, CS, and RFLAGS. The scheduler
     ; consumes a uniform InterruptFrame with RSP and SS as well, so build that

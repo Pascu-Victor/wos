@@ -43,6 +43,7 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->has_run = false;     // Task hasn't run yet, context.frame contains initial setup
     this->exit_status = 0;     // Initialize exit status
     this->has_exited = false;  // Task hasn't exited yet
+    this->exit_notify_ready.store(false, std::memory_order_relaxed);
     this->waited_on = false;
     this->deferred_task_switch = false;  // No deferred switch by default
     this->yield_switch = false;
@@ -64,6 +65,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->start_time_us = 0;  // Will be set when task is first scheduled
     this->user_time_us = 0;
     this->system_time_us = 0;
+    this->syscall_account_start_us = 0;
+    this->precharged_syscall_time_us = 0;
 
     // EEVDF scheduling fields
     this->vruntime = 0;
@@ -414,6 +417,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     // Scheduling defaults
     t->has_run = false;
     t->has_exited = false;
+    t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;
     t->waited_on = false;
     t->deferred_task_switch = false;
@@ -445,6 +449,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->start_time_us = 0;
     t->user_time_us = 0;
     t->system_time_us = 0;
+    t->syscall_account_start_us = 0;
+    t->precharged_syscall_time_us = 0;
     t->itimer_real_expire_us = 0;
     t->itimer_real_interval_us = 0;
 

@@ -1,0 +1,1190 @@
+#include <abi-bits/in.h>
+#include <abi-bits/pid_t.h>
+#include <abi-bits/signal.h>
+#include <abi-bits/socket.h>
+#include <abi-bits/socklen_t.h>
+#include <abi-bits/wait.h>
+#include <arpa/inet.h>
+#include <bits/ssize_t.h>
+#include <sys/process.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <abi/ptrace.hpp>
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <format>
+#include <poll.h>
+#include <print>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+constexpr uint16_t DEFAULT_PORT = 2159;
+constexpr size_t MAX_PACKET = 4096;
+constexpr size_t MAX_THREADS = 128;
+constexpr uint64_t MAX_MEM_READ = 4096;
+constexpr uint8_t X86_INT3 = 0xcc;
+
+constexpr std::string_view TARGET_XML = R"xml(<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target>
+  <architecture>i386:x86-64</architecture>
+  <feature name="org.gnu.gdb.i386.core">
+    <reg name="rax" bitsize="64" type="uint64" regnum="0"/>
+    <reg name="rbx" bitsize="64" type="uint64" regnum="1"/>
+    <reg name="rcx" bitsize="64" type="uint64" regnum="2"/>
+    <reg name="rdx" bitsize="64" type="uint64" regnum="3"/>
+    <reg name="rsi" bitsize="64" type="uint64" regnum="4"/>
+    <reg name="rdi" bitsize="64" type="uint64" regnum="5"/>
+    <reg name="rbp" bitsize="64" type="data_ptr" regnum="6"/>
+    <reg name="rsp" bitsize="64" type="data_ptr" regnum="7"/>
+    <reg name="r8" bitsize="64" type="uint64" regnum="8"/>
+    <reg name="r9" bitsize="64" type="uint64" regnum="9"/>
+    <reg name="r10" bitsize="64" type="uint64" regnum="10"/>
+    <reg name="r11" bitsize="64" type="uint64" regnum="11"/>
+    <reg name="r12" bitsize="64" type="uint64" regnum="12"/>
+    <reg name="r13" bitsize="64" type="uint64" regnum="13"/>
+    <reg name="r14" bitsize="64" type="uint64" regnum="14"/>
+    <reg name="r15" bitsize="64" type="uint64" regnum="15"/>
+    <reg name="rip" bitsize="64" type="code_ptr" regnum="16" group="general"/>
+    <reg name="rflags" bitsize="64" type="i386_eflags" regnum="17" group="general"/>
+    <reg name="cs" bitsize="64" type="uint64" regnum="18"/>
+    <reg name="ss" bitsize="64" type="uint64" regnum="19"/>
+    <reg name="fs_base" bitsize="64" type="data_ptr" regnum="20"/>
+    <reg name="gs_base" bitsize="64" type="data_ptr" regnum="21"/>
+  </feature>
+</target>
+)xml";
+
+struct SoftwareBreakpoint {
+    uint64_t address = 0;
+    uint8_t original_byte = 0;
+    bool installed = false;
+};
+
+struct HardwareBreakpoint {
+    uint64_t address = 0;
+    uint64_t kind = 0;
+    ker::abi::ptrace::hw_break_type type = ker::abi::ptrace::hw_break_type::EXECUTE;
+    uint32_t slot = 0;
+};
+
+struct Session {
+    int fd = -1;
+    uint64_t pid = 0;
+    bool no_ack = false;
+    bool received_interrupt = false;
+    std::vector<SoftwareBreakpoint> software_breakpoints;
+    std::vector<HardwareBreakpoint> hardware_breakpoints;
+};
+
+auto hex_digit(uint8_t value) -> char {
+    value &= 0xf;
+    return value < 10 ? static_cast<char>('0' + value) : static_cast<char>('a' + value - 10);
+}
+
+auto from_hex(char c) -> int {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+auto checksum(std::string_view payload) -> uint8_t {
+    uint8_t sum = 0;
+    for (const char C : payload) {
+        sum = static_cast<uint8_t>(sum + static_cast<uint8_t>(C));
+    }
+    return sum;
+}
+
+auto write_all(int fd, std::string_view data) -> bool {
+    size_t done = 0;
+    while (done < data.size()) {
+        ssize_t const BYTES_WRITTEN = write(fd, data.data() + done, data.size() - done);
+        if (BYTES_WRITTEN <= 0) {
+            return false;
+        }
+        done += static_cast<size_t>(BYTES_WRITTEN);
+    }
+    return true;
+}
+
+auto send_packet(Session& session, std::string_view payload) -> bool {
+    std::string framed;
+    framed.reserve(payload.size() + 4);
+    framed.push_back('$');
+    framed.append(payload);
+    framed.push_back('#');
+    uint8_t const SUM = checksum(payload);
+    framed.push_back(hex_digit(SUM >> 4U));
+    framed.push_back(hex_digit(SUM));
+    return write_all(session.fd, framed);
+}
+
+auto recv_packet(Session& session, std::string& out) -> bool {
+    out.clear();
+    session.received_interrupt = false;
+    char c = 0;
+    while (true) {
+        ssize_t const BYTES_READ = read(session.fd, &c, 1);
+        if (BYTES_READ <= 0) {
+            return false;
+        }
+        if (c == '$' || c == 0x03) {
+            break;
+        }
+    }
+
+    if (c == 0x03) {
+        (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::INTERRUPT), session.pid, 0, 0);
+        session.received_interrupt = true;
+        out = "?";
+        return true;
+    }
+
+    uint8_t sum = 0;
+    while (true) {
+        ssize_t const BYTES_READ = read(session.fd, &c, 1);
+        if (BYTES_READ <= 0) {
+            return false;
+        }
+        if (c == '#') {
+            break;
+        }
+        if (out.size() >= MAX_PACKET) {
+            return false;
+        }
+        out.push_back(c);
+        sum = static_cast<uint8_t>(sum + static_cast<uint8_t>(c));
+    }
+
+    std::array<char, 2> csum{};
+    if (read(session.fd, csum.data(), csum.size()) != static_cast<ssize_t>(csum.size())) {
+        return false;
+    }
+    int const HI = from_hex(csum.at(0));
+    int const LO = from_hex(csum.at(1));
+    if (HI < 0 || LO < 0 || sum != static_cast<uint8_t>((HI << 4U) | LO)) {
+        if (!session.no_ack) {
+            (void)write_all(session.fd, "-");
+        }
+        return false;
+    }
+    if (!session.no_ack) {
+        (void)write_all(session.fd, "+");
+    }
+    return true;
+}
+
+auto hex_bytes(const void* data, size_t len) -> std::string {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(hex_digit(bytes[i] >> 4U));
+        out.push_back(hex_digit(bytes[i]));
+    }
+    return out;
+}
+
+auto parse_hex_u64(std::string_view text, uint64_t& value) -> bool {
+    value = 0;
+    if (text.empty()) {
+        return false;
+    }
+    for (const char C : text) {
+        int const DECODED_HEX = from_hex(C);
+        if (DECODED_HEX < 0) {
+            return false;
+        }
+        value = (value << 4U) | static_cast<uint64_t>(DECODED_HEX);
+    }
+    return true;
+}
+
+auto fetch_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
+    int64_t const GETEVENTMSG_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GETEVENTMSG), session.pid, 0,
+                                                            reinterpret_cast<uint64_t>(&event));
+    return GETEVENTMSG_RESULT >= 0;
+}
+
+auto stop_reason_name(ker::abi::ptrace::stop_reason reason) -> std::string_view {
+    switch (reason) {
+        case ker::abi::ptrace::stop_reason::BREAKPOINT:
+            return "breakpoint";
+        case ker::abi::ptrace::stop_reason::TRACE:
+            return "trace";
+        case ker::abi::ptrace::stop_reason::WATCHPOINT:
+            return "watchpoint";
+        case ker::abi::ptrace::stop_reason::EXEC:
+            return "exec";
+        case ker::abi::ptrace::stop_reason::FORK:
+            return "fork";
+        case ker::abi::ptrace::stop_reason::CLONE:
+            return "clone";
+        case ker::abi::ptrace::stop_reason::EXIT:
+            return "exit";
+        case ker::abi::ptrace::stop_reason::EXCEPTION:
+            return "exception";
+        case ker::abi::ptrace::stop_reason::INTERRUPT:
+        case ker::abi::ptrace::stop_reason::SIGNAL:
+        case ker::abi::ptrace::stop_reason::NONE:
+        case ker::abi::ptrace::stop_reason::SYSCALL_ENTER:
+        case ker::abi::ptrace::stop_reason::SYSCALL_EXIT:
+            return "signal";
+    }
+    return "signal";
+}
+
+auto stop_reply_from_event(Session& session, const ker::abi::ptrace::Event& event) -> std::string {
+    uint32_t const SIG = event.signal != 0 ? event.signal : SIGTRAP;
+    std::string reply = std::format("T{:02x}thread:{:x};reason:{};", SIG, session.pid, stop_reason_name(event.reason));
+    if (event.reason == ker::abi::ptrace::stop_reason::INTERRUPT) {
+        reply += "description:interrupted;";
+    }
+    if (event.reason == ker::abi::ptrace::stop_reason::WATCHPOINT && event.address != 0) {
+        reply += std::format("watch:{:x};description:watchpoint;", event.address);
+    }
+    return reply;
+}
+
+auto stop_reply(Session& session) -> std::string {
+    ker::abi::ptrace::Event event{};
+    if (!fetch_event(session, event)) {
+        event.signal = SIGTRAP;
+        event.reason = ker::abi::ptrace::stop_reason::SIGNAL;
+        event.tid = session.pid;
+    }
+    return stop_reply_from_event(session, event);
+}
+
+auto get_gprs(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> bool {
+    ker::abi::ptrace::RegsetIo io{
+        .kind = ker::abi::ptrace::regset::X86_64_GPR,
+        .buffer = &gprs,
+        .size = sizeof(gprs),
+    };
+    int64_t const REGISTER_SET_RESULT =
+        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GETREGSET), session.pid, 0, reinterpret_cast<uint64_t>(&io));
+    return REGISTER_SET_RESULT >= 0;
+}
+
+auto set_gprs(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> bool {
+    ker::abi::ptrace::RegsetIo io{
+        .kind = ker::abi::ptrace::regset::X86_64_GPR,
+        .buffer = &gprs,
+        .size = sizeof(gprs),
+    };
+    int64_t const REGISTER_SET_RESULT =
+        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::SETREGSET), session.pid, 0, reinterpret_cast<uint64_t>(&io));
+    return REGISTER_SET_RESULT >= 0;
+}
+
+auto read_registers(Session& session) -> std::string {
+    ker::abi::ptrace::X86_64GprState gprs{};
+    if (!get_gprs(session, gprs)) {
+        return "E01";
+    }
+    return hex_bytes(&gprs, sizeof(gprs));
+}
+
+auto decode_hex_bytes(std::string_view text, void* output, size_t size) -> bool {
+    if (text.size() != size * 2) {
+        return false;
+    }
+    auto* bytes = static_cast<uint8_t*>(output);
+    for (size_t i = 0; i < size; ++i) {
+        int const HI = from_hex(text[i * 2]);
+        int const LO = from_hex(text[i * 2 + 1]);
+        if (HI < 0 || LO < 0) {
+            return false;
+        }
+        bytes[i] = static_cast<uint8_t>((HI << 4U) | LO);
+    }
+    return true;
+}
+
+auto write_registers(Session& session, std::string_view packet) -> std::string {
+    ker::abi::ptrace::X86_64GprState gprs{};
+    if (!decode_hex_bytes(packet.substr(1), &gprs, sizeof(gprs))) {
+        return "E22";
+    }
+    return set_gprs(session, gprs) ? "OK" : "E01";
+}
+
+auto register_slot(ker::abi::ptrace::X86_64GprState& gprs, uint64_t regno) -> uint64_t* {
+    auto* words = reinterpret_cast<uint64_t*>(&gprs);
+    size_t constexpr WORD_COUNT = sizeof(ker::abi::ptrace::X86_64GprState) / sizeof(uint64_t);
+    return regno < WORD_COUNT ? &words[regno] : nullptr;
+}
+
+auto read_one_register(Session& session, std::string_view packet) -> std::string {
+    uint64_t regno = 0;
+    if (!parse_hex_u64(packet.substr(1), regno)) {
+        return "E22";
+    }
+    ker::abi::ptrace::X86_64GprState gprs{};
+    if (!get_gprs(session, gprs)) {
+        return "E01";
+    }
+    auto* slot = register_slot(gprs, regno);
+    return slot == nullptr ? "E45" : hex_bytes(slot, sizeof(*slot));
+}
+
+auto write_one_register(Session& session, std::string_view packet) -> std::string {
+    size_t const EQUALS = packet.find('=');
+    if (EQUALS == std::string_view::npos) {
+        return "E22";
+    }
+    uint64_t regno = 0;
+    if (!parse_hex_u64(packet.substr(1, EQUALS - 1), regno)) {
+        return "E22";
+    }
+    ker::abi::ptrace::X86_64GprState gprs{};
+    if (!get_gprs(session, gprs)) {
+        return "E01";
+    }
+    auto* slot = register_slot(gprs, regno);
+    if (slot == nullptr || !decode_hex_bytes(packet.substr(EQUALS + 1), slot, sizeof(*slot))) {
+        return "E22";
+    }
+    return set_gprs(session, gprs) ? "OK" : "E01";
+}
+
+auto read_memory_exact(Session& session, uint64_t addr, void* buffer, size_t size) -> bool {
+    ker::abi::ptrace::MemIo io{
+        .address = addr,
+        .buffer = buffer,
+        .size = size,
+        .transferred = 0,
+    };
+    int64_t const READ_MEM_RESULT =
+        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::READ_MEM), session.pid, 0, reinterpret_cast<uint64_t>(&io));
+    return READ_MEM_RESULT >= 0 && io.transferred == size;
+}
+
+auto write_memory_exact(Session& session, uint64_t addr, void* buffer, size_t size) -> bool {
+    ker::abi::ptrace::MemIo io{
+        .address = addr,
+        .buffer = buffer,
+        .size = size,
+        .transferred = 0,
+    };
+    int64_t const WRITE_MEM_RESULT =
+        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::WRITE_MEM), session.pid, 0, reinterpret_cast<uint64_t>(&io));
+    return WRITE_MEM_RESULT >= 0 && io.transferred == size;
+}
+
+auto read_memory_packet(Session& session, std::string_view packet) -> std::string {
+    size_t const COMMA = packet.find(',');
+    if (COMMA == std::string_view::npos) {
+        return "E22";
+    }
+    uint64_t addr = 0;
+    uint64_t len = 0;
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1), len) || len > MAX_MEM_READ) {
+        return "E22";
+    }
+    std::vector<uint8_t> buffer(static_cast<size_t>(len));
+    if (!read_memory_exact(session, addr, buffer.data(), buffer.size())) {
+        return "E14";
+    }
+    return hex_bytes(buffer.data(), buffer.size());
+}
+
+auto write_memory_hex_packet(Session& session, std::string_view packet) -> std::string {
+    size_t const COMMA = packet.find(',');
+    size_t const COLON = packet.find(':');
+    if (COMMA == std::string_view::npos || COLON == std::string_view::npos || COMMA > COLON) {
+        return "E22";
+    }
+    uint64_t addr = 0;
+    uint64_t len = 0;
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len)) {
+        return "E22";
+    }
+    std::vector<uint8_t> buffer(static_cast<size_t>(len));
+    if (!decode_hex_bytes(packet.substr(COLON + 1), buffer.data(), buffer.size())) {
+        return "E22";
+    }
+    return write_memory_exact(session, addr, buffer.data(), buffer.size()) ? "OK" : "E14";
+}
+
+auto decode_binary_packet_data(std::string_view data, std::vector<uint8_t>& out) -> bool {
+    out.clear();
+    out.reserve(data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+        uint8_t byte = static_cast<uint8_t>(data[i]);
+        if (byte == 0x7d) {
+            if (++i >= data.size()) {
+                return false;
+            }
+            byte = static_cast<uint8_t>(static_cast<uint8_t>(data[i]) ^ 0x20U);
+        }
+        out.push_back(byte);
+    }
+    return true;
+}
+
+auto write_memory_binary_packet(Session& session, std::string_view packet) -> std::string {
+    size_t const COMMA = packet.find(',');
+    size_t const COLON = packet.find(':');
+    if (COMMA == std::string_view::npos || COLON == std::string_view::npos || COMMA > COLON) {
+        return "E22";
+    }
+    uint64_t addr = 0;
+    uint64_t len = 0;
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len)) {
+        return "E22";
+    }
+    std::vector<uint8_t> buffer;
+    if (!decode_binary_packet_data(packet.substr(COLON + 1), buffer) || buffer.size() != static_cast<size_t>(len)) {
+        return "E22";
+    }
+    return write_memory_exact(session, addr, buffer.data(), buffer.size()) ? "OK" : "E14";
+}
+
+auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageRecord>& images) -> bool {
+    images.assign(8, ker::abi::ptrace::ImageRecord{});
+    ker::abi::ptrace::ImageList list{
+        .images = images.data(),
+        .capacity = images.size(),
+        .count = 0,
+    };
+    int64_t result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
+                                          reinterpret_cast<uint64_t>(&list));
+    if (result == -ENOSPC && list.count > images.size()) {
+        images.assign(list.count, ker::abi::ptrace::ImageRecord{});
+        list.images = images.data();
+        list.capacity = images.size();
+        result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
+                                      reinterpret_cast<uint64_t>(&list));
+    }
+    if (result < 0) {
+        images.clear();
+        return false;
+    }
+    images.resize(std::min(list.count, images.size()));
+    return true;
+}
+
+auto main_load_base(Session& session, uint64_t& load_base) -> bool {
+    std::vector<ker::abi::ptrace::ImageRecord> images;
+    if (!get_images(session, images) || images.empty()) {
+        return false;
+    }
+    load_base = images.front().load_base;
+    return true;
+}
+
+auto xml_escape(std::string_view text) -> std::string {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        switch (c) {
+            case '&':
+                out += "&amp;";
+                break;
+            case '<':
+                out += "&lt;";
+                break;
+            case '>':
+                out += "&gt;";
+                break;
+            case '"':
+                out += "&quot;";
+                break;
+            default:
+                out.push_back(c);
+                break;
+        }
+    }
+    return out;
+}
+
+auto image_path(const ker::abi::ptrace::ImageRecord& image) -> std::string_view {
+    size_t len = 0;
+    while (len < ker::abi::ptrace::ImageRecord::PATH_LEN && image.path[len] != '\0') {
+        ++len;
+    }
+    return {image.path, len};
+}
+
+auto libraries_svr4_xml(Session& session) -> std::string {
+    std::vector<ker::abi::ptrace::ImageRecord> images;
+    if (!get_images(session, images)) {
+        return R"xml(<?xml version="1.0"?><library-list-svr4 version="1.0"/>)xml";
+    }
+
+    std::string out = R"xml(<?xml version="1.0"?><library-list-svr4 version="1.0">)xml";
+    for (const auto& image : images) {
+        std::string const PATH = xml_escape(image_path(image));
+        out += std::format(R"xml(<library name="{}" lm="0x0" l_addr="0x{:x}" l_ld="0x0"/>)xml", PATH, image.load_base);
+    }
+    out += "</library-list-svr4>";
+    return out;
+}
+
+auto read_qxfer(std::string_view packet, std::string_view object, std::string_view annex, std::string_view content) -> std::string {
+    std::string const PREFIX = std::format("qXfer:{}:read:{}:", object, annex);
+    if (!packet.starts_with(PREFIX)) {
+        return "";
+    }
+    std::string_view const RANGE = packet.substr(PREFIX.size());
+    size_t const COMMA = RANGE.find(',');
+    if (COMMA == std::string_view::npos) {
+        return "E22";
+    }
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!parse_hex_u64(RANGE.substr(0, COMMA), offset) || !parse_hex_u64(RANGE.substr(COMMA + 1), length)) {
+        return "E22";
+    }
+    if (offset > content.size()) {
+        return "E22";
+    }
+    size_t const START = static_cast<size_t>(offset);
+    size_t const COUNT = std::min(static_cast<size_t>(length), content.size() - START);
+    bool const LAST = START + COUNT >= content.size();
+    std::string out;
+    out.reserve(COUNT + 1);
+    out.push_back(LAST ? 'l' : 'm');
+    out.append(content.substr(START, COUNT));
+    return out;
+}
+
+auto process_info(Session& session) -> std::string {
+    return std::format(
+        "pid:{:x};parent-pid:0;real-uid:0;effective-uid:0;cputype:1000007;cpusubtype:3;ptrsize:8;endian:little;"
+        "ostype:wos;triple:x86_64-unknown-wos;",
+        session.pid);
+}
+
+auto offsets(Session& session) -> std::string {
+    uint64_t load_base = 0;
+    if (!main_load_base(session, load_base)) {
+        return "Text=0;Data=0;Bss=0";
+    }
+    return std::format("Text={:x};Data={:x};Bss={:x}", load_base, load_base, load_base);
+}
+
+auto thread_is_alive(Session& session, std::string_view packet) -> std::string {
+    uint64_t tid = 0;
+    if (!parse_hex_u64(packet.substr(1), tid)) {
+        return "E22";
+    }
+    std::array<uint64_t, MAX_THREADS> tids{};
+    ker::abi::ptrace::ThreadList list{
+        .tids = tids.data(),
+        .capacity = tids.size(),
+        .count = 0,
+    };
+    int64_t const LIST_THREADS_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::LIST_THREADS), session.pid, 0,
+                                                             reinterpret_cast<uint64_t>(&list));
+    if (LIST_THREADS_RESULT < 0) {
+        return "E01";
+    }
+    size_t const COUNT = list.count < tids.size() ? list.count : tids.size();
+    for (size_t i = 0; i < COUNT; ++i) {
+        if (tids.at(i) == tid) {
+            return "OK";
+        }
+    }
+    return "E44";
+}
+
+auto wait_for_debug_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
+    int status = 0;
+    pid_t const WAITED = waitpid(static_cast<pid_t>(session.pid), &status, WUNTRACED);
+    if (WAITED < 0) {
+        return false;
+    }
+    return fetch_event(session, event);
+}
+
+auto poll_debug_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
+    int status = 0;
+    pid_t const WAITED = waitpid(static_cast<pid_t>(session.pid), &status, WUNTRACED | WNOHANG);
+    if (WAITED <= 0) {
+        return false;
+    }
+    return fetch_event(session, event);
+}
+
+auto find_breakpoint(Session& session, uint64_t address) -> SoftwareBreakpoint* {
+    for (auto& bp : session.software_breakpoints) {
+        if (bp.address == address) {
+            return &bp;
+        }
+    }
+    return nullptr;
+}
+
+auto install_breakpoint(Session& session, SoftwareBreakpoint& bp) -> bool {
+    if (bp.installed) {
+        return true;
+    }
+    uint8_t byte = X86_INT3;
+    if (!write_memory_exact(session, bp.address, &byte, sizeof(byte))) {
+        return false;
+    }
+    bp.installed = true;
+    return true;
+}
+
+auto uninstall_breakpoint(Session& session, SoftwareBreakpoint& bp) -> bool {
+    if (!bp.installed) {
+        return true;
+    }
+    uint8_t byte = bp.original_byte;
+    if (!write_memory_exact(session, bp.address, &byte, sizeof(byte))) {
+        return false;
+    }
+    bp.installed = false;
+    return true;
+}
+
+auto parse_breakpoint_packet(std::string_view packet, uint64_t& address, uint64_t& kind) -> bool {
+    size_t const FIRST_COMMA = packet.find(',');
+    if (FIRST_COMMA == std::string_view::npos) {
+        return false;
+    }
+    size_t const SECOND_COMMA = packet.find(',', FIRST_COMMA + 1);
+    if (SECOND_COMMA == std::string_view::npos) {
+        return false;
+    }
+    return parse_hex_u64(packet.substr(FIRST_COMMA + 1, SECOND_COMMA - FIRST_COMMA - 1), address) &&
+           parse_hex_u64(packet.substr(SECOND_COMMA + 1), kind);
+}
+
+auto insert_software_breakpoint(Session& session, std::string_view packet) -> std::string {
+    uint64_t address = 0;
+    uint64_t kind = 0;
+    if (!parse_breakpoint_packet(packet, address, kind) || kind == 0) {
+        return "E22";
+    }
+    if (find_breakpoint(session, address) != nullptr) {
+        return "OK";
+    }
+    uint8_t original = 0;
+    if (!read_memory_exact(session, address, &original, sizeof(original))) {
+        return "E14";
+    }
+    session.software_breakpoints.push_back(SoftwareBreakpoint{
+        .address = address,
+        .original_byte = original,
+        .installed = false,
+    });
+    auto* bp = find_breakpoint(session, address);
+    if (bp == nullptr || !install_breakpoint(session, *bp)) {
+        return "E14";
+    }
+    return "OK";
+}
+
+auto remove_software_breakpoint(Session& session, std::string_view packet) -> std::string {
+    uint64_t address = 0;
+    uint64_t kind = 0;
+    if (!parse_breakpoint_packet(packet, address, kind)) {
+        return "E22";
+    }
+    for (auto it = session.software_breakpoints.begin(); it != session.software_breakpoints.end(); ++it) {
+        if (it->address == address) {
+            if (!uninstall_breakpoint(session, *it)) {
+                return "E14";
+            }
+            session.software_breakpoints.erase(it);
+            return "OK";
+        }
+    }
+    return "OK";
+}
+
+auto hardware_type_for_packet(std::string_view packet, ker::abi::ptrace::hw_break_type& type) -> bool {
+    if (packet.starts_with("Z1") || packet.starts_with("z1")) {
+        type = ker::abi::ptrace::hw_break_type::EXECUTE;
+        return true;
+    }
+    if (packet.starts_with("Z2") || packet.starts_with("z2")) {
+        type = ker::abi::ptrace::hw_break_type::WRITE;
+        return true;
+    }
+    if (packet.starts_with("Z3") || packet.starts_with("z3") || packet.starts_with("Z4") || packet.starts_with("z4")) {
+        // x86 has execute, write, and read/write data breakpoints.  A pure
+        // read watchpoint is represented as access watchpoint.
+        type = ker::abi::ptrace::hw_break_type::READ_WRITE;
+        return true;
+    }
+    return false;
+}
+
+auto find_hardware_breakpoint(Session& session, uint64_t address, uint64_t kind, ker::abi::ptrace::hw_break_type type)
+    -> HardwareBreakpoint* {
+    for (auto& bp : session.hardware_breakpoints) {
+        if (bp.address == address && bp.kind == kind && bp.type == type) {
+            return &bp;
+        }
+    }
+    return nullptr;
+}
+
+auto hardware_slot_in_use(Session& session, uint32_t slot) -> bool {
+    for (const auto& bp : session.hardware_breakpoints) {
+        if (bp.slot == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto allocate_hardware_slot(Session& session, uint32_t& slot) -> bool {
+    for (uint32_t candidate = 0; candidate < 4; ++candidate) {
+        if (!hardware_slot_in_use(session, candidate)) {
+            slot = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+auto apply_hardware_breakpoint(Session& session, const HardwareBreakpoint& bp, bool enable) -> bool {
+    uint32_t const LENGTH = bp.type == ker::abi::ptrace::hw_break_type::EXECUTE ? 1U : static_cast<uint32_t>(bp.kind);
+    ker::abi::ptrace::HwBreak desc{
+        .address = bp.address,
+        .length = LENGTH,
+        .type = bp.type,
+        .slot = bp.slot,
+        .reserved = 0,
+    };
+    auto const REQUEST = enable ? ker::abi::ptrace::request::SET_HW_BREAK : ker::abi::ptrace::request::DEL_HW_BREAK;
+    int64_t const RESULT = ker::process::ptrace(static_cast<uint64_t>(REQUEST), session.pid, 0, reinterpret_cast<uint64_t>(&desc));
+    return RESULT >= 0;
+}
+
+auto insert_hardware_breakpoint(Session& session, std::string_view packet) -> std::string {
+    ker::abi::ptrace::hw_break_type type = ker::abi::ptrace::hw_break_type::EXECUTE;
+    uint64_t address = 0;
+    uint64_t kind = 0;
+    if (!hardware_type_for_packet(packet, type) || !parse_breakpoint_packet(packet, address, kind) || kind == 0) {
+        return "E22";
+    }
+    if (find_hardware_breakpoint(session, address, kind, type) != nullptr) {
+        return "OK";
+    }
+    uint32_t slot = 0;
+    if (!allocate_hardware_slot(session, slot)) {
+        return "E28";
+    }
+    HardwareBreakpoint bp{
+        .address = address,
+        .kind = kind,
+        .type = type,
+        .slot = slot,
+    };
+    if (!apply_hardware_breakpoint(session, bp, true)) {
+        return "E22";
+    }
+    session.hardware_breakpoints.push_back(bp);
+    return "OK";
+}
+
+auto remove_hardware_breakpoint(Session& session, std::string_view packet) -> std::string {
+    ker::abi::ptrace::hw_break_type type = ker::abi::ptrace::hw_break_type::EXECUTE;
+    uint64_t address = 0;
+    uint64_t kind = 0;
+    if (!hardware_type_for_packet(packet, type) || !parse_breakpoint_packet(packet, address, kind)) {
+        return "E22";
+    }
+    for (auto it = session.hardware_breakpoints.begin(); it != session.hardware_breakpoints.end(); ++it) {
+        if (it->address == address && it->kind == kind && it->type == type) {
+            if (!apply_hardware_breakpoint(session, *it, false)) {
+                return "E14";
+            }
+            session.hardware_breakpoints.erase(it);
+            return "OK";
+        }
+    }
+    return "OK";
+}
+
+auto breakpoint_at_pc(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> SoftwareBreakpoint* {
+    auto* bp = find_breakpoint(session, gprs.rip);
+    if (bp != nullptr && bp->installed) {
+        return bp;
+    }
+    return nullptr;
+}
+
+auto single_step_one_instruction(Session& session, ker::abi::ptrace::Event& event) -> bool {
+    int64_t const STEP_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::SINGLESTEP), session.pid, 0, 0);
+    return STEP_RESULT >= 0 && wait_for_debug_event(session, event);
+}
+
+auto stop_for_internal_update(Session& session, ker::abi::ptrace::Event& event) -> bool {
+    int64_t const INTERRUPT_RESULT =
+        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::INTERRUPT), session.pid, 0, 0);
+    return INTERRUPT_RESULT >= 0 && wait_for_debug_event(session, event);
+}
+
+auto continue_tracee(Session& session) -> bool {
+    int64_t const CONT_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::CONT), session.pid, 0, 0);
+    return CONT_RESULT >= 0;
+}
+
+auto continue_event_loop(Session& session) -> std::string;
+
+auto resume_with_breakpoint_step_over(Session& session, bool user_requested_step) -> std::string {
+    ker::abi::ptrace::X86_64GprState gprs{};
+    if (!get_gprs(session, gprs)) {
+        return "E01";
+    }
+
+    auto* bp = breakpoint_at_pc(session, gprs);
+    if (bp != nullptr) {
+        if (!uninstall_breakpoint(session, *bp)) {
+            return "E14";
+        }
+
+        ker::abi::ptrace::Event step_event{};
+        if (!single_step_one_instruction(session, step_event)) {
+            (void)install_breakpoint(session, *bp);
+            return "E01";
+        }
+        if (!install_breakpoint(session, *bp)) {
+            return "E14";
+        }
+        if (user_requested_step || step_event.reason != ker::abi::ptrace::stop_reason::TRACE) {
+            return stop_reply_from_event(session, step_event);
+        }
+    }
+
+    if (user_requested_step) {
+        ker::abi::ptrace::Event step_event{};
+        return single_step_one_instruction(session, step_event) ? stop_reply_from_event(session, step_event) : "E01";
+    }
+
+    return continue_tracee(session) ? continue_event_loop(session) : "E01";
+}
+
+auto handle_vcont(Session& session, std::string_view packet) -> std::string {
+    if (packet == "vCont?") {
+        return "vCont;c;s";
+    }
+    if (packet.starts_with("vCont;s")) {
+        return resume_with_breakpoint_step_over(session, true);
+    }
+    if (packet.starts_with("vCont;c")) {
+        return resume_with_breakpoint_step_over(session, false);
+    }
+    return "";
+}
+
+auto packet_needs_internal_stop(std::string_view packet) -> bool {
+    return packet.starts_with("Z0") || packet.starts_with("z0") || packet.starts_with("Z1") || packet.starts_with("Z2") ||
+           packet.starts_with("Z3") || packet.starts_with("Z4") || packet.starts_with("z1") || packet.starts_with("z2") ||
+           packet.starts_with("z3") || packet.starts_with("z4") || packet.starts_with('M') || packet.starts_with('X') ||
+           packet.starts_with('G') || packet.starts_with('P');
+}
+
+auto handle_packet(Session& session, std::string_view packet) -> std::string {
+    if (packet == "?") {
+        return stop_reply(session);
+    }
+    if (packet == "g") {
+        return read_registers(session);
+    }
+    if (packet.starts_with('G')) {
+        return write_registers(session, packet);
+    }
+    if (packet.starts_with('p')) {
+        return read_one_register(session, packet);
+    }
+    if (packet.starts_with('P')) {
+        return write_one_register(session, packet);
+    }
+    if (packet.starts_with('m')) {
+        return read_memory_packet(session, packet);
+    }
+    if (packet.starts_with('M')) {
+        return write_memory_hex_packet(session, packet);
+    }
+    if (packet.starts_with('X')) {
+        return write_memory_binary_packet(session, packet);
+    }
+    if (packet.starts_with("vCont")) {
+        return handle_vcont(session, packet);
+    }
+    if (packet.starts_with("qSupported")) {
+        return "PacketSize=1000;QStartNoAckMode+;qXfer:features:read+;qXfer:libraries-svr4:read+;qThreadStopInfo+;vContSupported+";
+    }
+    if (packet == "QStartNoAckMode") {
+        session.no_ack = true;
+        return "OK";
+    }
+    if (packet == "qHostInfo") {
+        return "triple:x86_64-unknown-wos;endian:little;ptrsize:8;";
+    }
+    if (packet == "qAttached") {
+        return "1";
+    }
+    if (packet == "qC") {
+        return std::format("QC{:x}", session.pid);
+    }
+    if (packet == "qProcessInfo") {
+        return process_info(session);
+    }
+    if (packet == "qOffsets") {
+        return offsets(session);
+    }
+    if (packet.starts_with("qThreadStopInfo")) {
+        return stop_reply(session);
+    }
+    if (packet.starts_with("qXfer:features:read:target.xml:")) {
+        return read_qxfer(packet, "features", "target.xml", TARGET_XML);
+    }
+    if (packet.starts_with("qXfer:libraries-svr4:read::")) {
+        return read_qxfer(packet, "libraries-svr4", "", libraries_svr4_xml(session));
+    }
+    if (packet == "qfThreadInfo") {
+        std::array<uint64_t, MAX_THREADS> tids{};
+        ker::abi::ptrace::ThreadList list{
+            .tids = tids.data(),
+            .capacity = tids.size(),
+            .count = 0,
+        };
+        int64_t const LIST_THREADS_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::LIST_THREADS),
+                                                                 session.pid, 0, reinterpret_cast<uint64_t>(&list));
+        if (LIST_THREADS_RESULT < 0 || list.count == 0) {
+            return "l";
+        }
+        std::string out = "m";
+        size_t const COUNT = list.count < tids.size() ? list.count : tids.size();
+        for (size_t i = 0; i < COUNT; ++i) {
+            if (i != 0) {
+                out.push_back(',');
+            }
+            out += std::format("{:x}", tids.at(i));
+        }
+        return out;
+    }
+    if (packet == "qsThreadInfo") {
+        return "l";
+    }
+    if (packet == "c") {
+        return resume_with_breakpoint_step_over(session, false);
+    }
+    if (packet == "s") {
+        return resume_with_breakpoint_step_over(session, true);
+    }
+    if (packet.starts_with("Z0")) {
+        return insert_software_breakpoint(session, packet);
+    }
+    if (packet.starts_with("z0")) {
+        return remove_software_breakpoint(session, packet);
+    }
+    if (packet.starts_with("Z1") || packet.starts_with("Z2") || packet.starts_with("Z3") || packet.starts_with("Z4")) {
+        return insert_hardware_breakpoint(session, packet);
+    }
+    if (packet.starts_with("z1") || packet.starts_with("z2") || packet.starts_with("z3") || packet.starts_with("z4")) {
+        return remove_hardware_breakpoint(session, packet);
+    }
+    if (packet.starts_with('H')) {
+        return "OK";
+    }
+    if (packet.starts_with('T')) {
+        return thread_is_alive(session, packet);
+    }
+    if (packet == "k") {
+        (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::KILL), session.pid, 0, 0);
+        return "OK";
+    }
+    if (packet == "D") {
+        (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::DETACH), session.pid, 0, 0);
+        return "OK";
+    }
+    return "";
+}
+
+auto continue_event_loop(Session& session) -> std::string {
+    for (;;) {
+        ker::abi::ptrace::Event event{};
+        if (poll_debug_event(session, event)) {
+            return stop_reply_from_event(session, event);
+        }
+
+        pollfd pfd{
+            .fd = session.fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        int const POLL_RESULT = poll(&pfd, 1, 10);
+        if (POLL_RESULT < 0) {
+            return "E0b";
+        }
+        if (POLL_RESULT == 0 || (pfd.revents & POLLIN) == 0) {
+            continue;
+        }
+
+        std::string packet;
+        if (!recv_packet(session, packet)) {
+            return "E0c";
+        }
+
+        if (session.received_interrupt || packet == "?") {
+            ker::abi::ptrace::Event interrupt_event{};
+            if (!session.received_interrupt) {
+                (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::INTERRUPT), session.pid, 0, 0);
+            }
+            return wait_for_debug_event(session, interrupt_event) ? stop_reply_from_event(session, interrupt_event) : "E0a";
+        }
+
+        if (packet == "c" || packet.starts_with("vCont;c")) {
+            continue;
+        }
+
+        if (packet == "s" || packet.starts_with("vCont;s")) {
+            ker::abi::ptrace::Event step_base{};
+            if (!stop_for_internal_update(session, step_base)) {
+                return "E01";
+            }
+            if (step_base.reason != ker::abi::ptrace::stop_reason::INTERRUPT) {
+                return stop_reply_from_event(session, step_base);
+            }
+            ker::abi::ptrace::Event step_event{};
+            return single_step_one_instruction(session, step_event) ? stop_reply_from_event(session, step_event) : "E01";
+        }
+
+        if (packet_needs_internal_stop(packet)) {
+            ker::abi::ptrace::Event update_base{};
+            if (!stop_for_internal_update(session, update_base)) {
+                if (!send_packet(session, "E01")) {
+                    return "E0c";
+                }
+                continue;
+            }
+
+            std::string const REPLY = handle_packet(session, packet);
+            if (!send_packet(session, REPLY)) {
+                return "E0c";
+            }
+
+            if (update_base.reason != ker::abi::ptrace::stop_reason::INTERRUPT) {
+                return stop_reply_from_event(session, update_base);
+            }
+            if (!continue_tracee(session)) {
+                return "E01";
+            }
+            continue;
+        }
+
+        std::string const REPLY = handle_packet(session, packet);
+        if (!send_packet(session, REPLY)) {
+            return "E0c";
+        }
+    }
+}
+
+auto listen_socket(uint16_t port) -> int {
+    int const FD = socket(AF_INET, SOCK_STREAM, 0);
+    if (FD < 0) {
+        return -1;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(FD);
+        return -1;
+    }
+    if (listen(FD, 1) < 0) {
+        close(FD);
+        return -1;
+    }
+    return FD;
+}
+
+void usage() { std::println("usage: debugserver --listen :PORT --attach PID"); }
+
+}  // namespace
+
+auto main(int argc, char** argv) -> int {
+    uint16_t port = DEFAULT_PORT;
+    uint64_t pid = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view ARG = argv[i];
+        if (ARG == "--listen" && i + 1 < argc) {
+            const std::string_view LISTEN = argv[++i];
+            size_t const COLON = LISTEN.rfind(':');
+            const std::string_view PORT_TEXT = COLON == std::string_view::npos ? LISTEN : LISTEN.substr(COLON + 1);
+            port = static_cast<uint16_t>(std::strtoul(std::string(PORT_TEXT).c_str(), nullptr, 10));
+        } else if (ARG == "--attach" && i + 1 < argc) {
+            pid = std::strtoull(argv[++i], nullptr, 10);
+        } else {
+            usage();
+            return 1;
+        }
+    }
+
+    if (pid == 0) {
+        usage();
+        return 1;
+    }
+    int64_t const ATTACH_RET = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::ATTACH), pid, 0, 0);
+    if (ATTACH_RET < 0) {
+        std::println("debugserver: attach failed: {}", static_cast<long long>(ATTACH_RET));
+        return 1;
+    }
+
+    int const SERVER = listen_socket(port);
+    if (SERVER < 0) {
+        std::println("debugserver: listen failed: errno={}", errno);
+        return 1;
+    }
+    std::println("debugserver: listening on :{} attached to pid {}", port, static_cast<unsigned long long>(pid));
+
+    sockaddr_in peer{};
+    socklen_t peer_len = sizeof(peer);
+    int const CLIENT = accept(SERVER, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    close(SERVER);
+    if (CLIENT < 0) {
+        return 1;
+    }
+
+    Session session{.fd = CLIENT, .pid = pid, .no_ack = false, .software_breakpoints = {}, .hardware_breakpoints = {}};
+    std::string packet;
+    while (recv_packet(session, packet)) {
+        const std::string REPLY = handle_packet(session, packet);
+        if (!send_packet(session, REPLY)) {
+            break;
+        }
+    }
+    close(CLIENT);
+    for (auto& bp : session.hardware_breakpoints) {
+        (void)apply_hardware_breakpoint(session, bp, false);
+    }
+    for (auto& bp : session.software_breakpoints) {
+        (void)uninstall_breakpoint(session, bp);
+    }
+    (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::DETACH), pid, 0, 0);
+    return 0;
+}

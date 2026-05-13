@@ -3,6 +3,7 @@ project(init_service CXX)
 
 set(TARGET init)
 set(CXXFILES
+    src/env.cpp
     src/init.cpp
     src/fstab.cpp
     src/network.cpp

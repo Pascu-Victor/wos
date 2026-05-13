@@ -150,12 +150,26 @@ wos_asm_enter_usermode:
     o64 sysret
 
 extern wos_sched_timer
+extern wos_repair_timer_return_frame
 global task_switch_handler
 task_switch_handler:
     mov rdi, rsp
     call wos_sched_timer
     cli
 
+    ; The C++ scheduler mutates the frame in-place.  If a bad frame selector
+    ; reaches iretq, the CPU raises #GP with little context; repair or panic
+    ; while the saved register/frame block is still easy to inspect.
+    mov rax, [rsp + GPREGS_SIZE + 24]
+    cmp rax, 0x23
+    je .return_frame_ready
+    cmp rax, 0x08
+    je .return_frame_ready
+    mov rdi, rsp
+    call wos_repair_timer_return_frame
+    cli
+
+.return_frame_ready:
     ; Same-CPL iretq does not pop SS:RSP, so kernel-mode task switches
     ; must explicitly move to the target kernel stack first.
     cmp qword [rsp + GPREGS_SIZE + 24], qword 0x23

@@ -79,6 +79,10 @@ enum class WkiPerfScope : uint8_t {
     REMOTE_VFS = 2,
     REMOTE_COMPUTE = 3,
     EVENT_BUS = 4,
+    REMOTE_VFS_SERVER = 5,
+    REMOTE_IPC = 6,
+    LOCAL_PIPE = 7,
+    LOCAL_PROC = 8,
 };
 
 enum class WkiPerfPhase : uint8_t {
@@ -94,6 +98,7 @@ enum class WkiPerfTransportOp : uint8_t {
     FAST_RETRANSMIT = 4,
     NO_CREDITS = 5,
     WAIT = 6,
+    STALL = 7,
 };
 
 enum class WkiPerfVfsOp : uint8_t {
@@ -113,6 +118,24 @@ enum class WkiPerfVfsOp : uint8_t {
     RMDIR = 14,
     RENAME = 15,
     RETRY = 16,
+};
+
+enum class WkiPerfVfsServerOp : uint8_t {
+    RX = 1,
+    REPLY_SEND = 2,
+    OPEN = 3,
+    STAT = 4,
+    READ = 5,
+    READDIR = 6,
+    WRITE = 7,
+    SEEK = 8,
+    TRUNCATE = 9,
+    READLINK = 10,
+    CLOSE = 11,
+    MKDIR = 12,
+    UNLINK = 13,
+    RMDIR = 14,
+    RENAME = 15,
 };
 
 enum class WkiPerfComputeOp : uint8_t {
@@ -138,6 +161,47 @@ enum class WkiPerfEventOp : uint8_t {
     ACK = 4,
     RETRY = 5,
     REPLAY = 6,
+};
+
+enum class WkiPerfIpcOp : uint8_t {
+    PROXY_READ = 1,
+    PROXY_WRITE = 2,
+    PTY_IOCTL = 3,
+    SOCK_CTRL = 4,
+    PIPE_PUMP_READ = 5,
+    PIPE_PUMP_SEND = 6,
+    PIPE_DATA = 7,
+    DEV_OP_QUEUE = 8,
+    DEV_OP_HANDLE = 9,
+    WAKE_READER = 10,
+    POLL_WAKE = 11,
+};
+
+enum class WkiPerfLocalPipeOp : uint8_t {
+    READ = 1,
+    WRITE = 2,
+    BLOCK_READ = 3,
+    BLOCK_WRITE = 4,
+    WAKE_READERS = 5,
+    WAKE_WRITERS = 6,
+};
+
+enum class WkiPerfLocalProcOp : uint8_t {
+    FORK = 1,
+    EXECVE = 2,
+    ELF_READ = 3,
+    FIRST_RUN = 4,
+    ARG_COPY = 5,
+    OPEN_ACCESS = 6,
+    REMOTE_SPAWN = 7,
+    NEW_IMAGE = 8,
+    LOAD_ELF = 9,
+    LOAD_INTERP = 10,
+    STACK_SETUP = 11,
+    COMMIT = 12,
+    DESTROY_OLD = 13,
+    WAITPID = 14,
+    EXIT = 15,
 };
 
 const char* wki_scope_name(WkiPerfScope scope);
@@ -295,10 +359,12 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
 void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t flags, int64_t lag_v, uint32_t run_us, uint64_t callsite);
 
 // Record a task being woken from the wait list (timer expiry).
-void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t sleep_us, uint64_t callsite);
+void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t sleep_us, uint64_t callsite,
+                 const char* wait_channel);
 
 // Record a task voluntarily entering the wait list.
-void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t run_us, uint64_t callsite);
+void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags, uint32_t run_us, uint64_t callsite,
+                  const char* wait_channel);
 
 // Drain up to max_events events into dst.
 // cpu_filter < get_num_perf_cpus() -> drain only that CPU.

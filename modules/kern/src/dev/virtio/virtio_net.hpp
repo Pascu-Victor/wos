@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <dev/pci.hpp>
 #include <dev/virtio/virtio.hpp>
@@ -8,19 +9,28 @@
 
 namespace ker::dev::virtio {
 
+constexpr uint8_t VIRTIO_NET_MAX_QUEUE_PAIRS = 8;
+
+struct VirtIONetDevice;
+
+struct VirtIONetQueuePair {
+    VirtIONetDevice* dev{};
+    Virtqueue* rxq{};
+    Virtqueue* txq{};
+    ker::net::NapiStruct napi{};
+    uint8_t index{};
+    uint8_t irq_vector{};
+};
+
 struct VirtIONetDevice {
     ker::net::NetDevice netdev;  // Embedded, first member for casting
     ker::dev::pci::PCIDevice* pci{};
-    Virtqueue* rxq{};            // Virtqueue 0 (receive, pair 0)
-    Virtqueue* txq{};            // Virtqueue 1 (transmit, pair 0)
-    Virtqueue* rxq2{};           // Virtqueue 2 (receive, pair 1), nullptr if single-queue
-    Virtqueue* txq2{};           // Virtqueue 3 (transmit, pair 1), nullptr if single-queue
+    std::array<VirtIONetQueuePair, VIRTIO_NET_MAX_QUEUE_PAIRS> queue_pairs{};
     Virtqueue* ctrlq{};          // Control queue (activated when MQ is negotiated)
     uint16_t io_base{};          // BAR0 I/O port base (legacy path)
-    uint8_t irq_vector{};        // Allocated IRQ vector (pair 0 / single-queue)
-    uint8_t irq_vector2{};       // Allocated IRQ vector for pair 1 (0 if unused)
-    uint8_t num_queue_pairs{1};  // 1 = single-queue, 2 = multi-queue
-    uint8_t hdr_size{};          // sizeof virtio-net header: 10 (legacy) or 12 (modern/VERSION_1)
+    uint8_t num_queue_pairs{1};  // Active queue pairs after MQ negotiation
+    uint8_t configured_queue_pairs{1};
+    uint8_t hdr_size{};  // sizeof virtio-net header: 10 (legacy) or 12 (modern/VERSION_1)
     uint32_t negotiated_features{};
     bool msix_enabled{};
 
@@ -32,9 +42,6 @@ struct VirtIONetDevice {
 
     // Serializes QUEUE_SELECT + MSI_QUEUE_VECTOR programming.
     ker::mod::sys::Spinlock irq_lock;
-
-    ker::net::NapiStruct napi{};   // NAPI for queue pair 0
-    ker::net::NapiStruct napi2{};  // NAPI for queue pair 1 (used when num_queue_pairs == 2)
 };
 
 auto virtio_net_init() -> int;

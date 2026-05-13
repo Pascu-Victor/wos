@@ -15,6 +15,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/context_switch.hpp>
 
 namespace ker::net {
 
@@ -25,7 +26,57 @@ BacklogQueue* queues = nullptr;
 std::atomic<bool> ready{false};
 uint64_t num_cpus = 0;
 
+constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 10'000'000;
+constexpr int NET_LATENCY_DAEMON_NICE = 0;
+
 auto is_loopback_dev(const NetDevice* dev) -> bool { return dev != nullptr && std::strncmp(dev->name.data(), "lo", dev->name.size()) == 0; }
+
+void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = NET_LATENCY_DAEMON_SLICE_NS;
+    ker::mod::sched::set_task_nice(task, NET_LATENCY_DAEMON_NICE);
+}
+
+void process_backlog_batch(PacketBuffer* batch) {
+    // Reverse LIFO->FIFO to preserve packet ordering.
+    PacketBuffer* reversed = nullptr;
+    while (batch != nullptr) {
+        PacketBuffer* next = batch->next;
+        batch->next = reversed;
+        reversed = batch;
+        batch = next;
+    }
+
+    // Process each packet through the protocol stack.
+    while (reversed != nullptr) {
+        PacketBuffer* next = reversed->next;
+        reversed->next = nullptr;
+        NET_TRACE_TICK();
+        if (is_loopback_dev(reversed->dev)) {
+            if (reversed->len > 0) {
+                uint8_t const VERSION = (reversed->data[0] >> 4) & 0xF;
+                if (VERSION == 4) {
+                    proto::ipv4_rx(reversed->dev, reversed);
+                    reversed = next;
+                    continue;
+                }
+                if (VERSION == 6) {
+                    proto::ipv6_rx(reversed->dev, reversed);
+                    reversed = next;
+                    continue;
+                }
+            }
+            pkt_free(reversed);
+            reversed = next;
+            continue;
+        }
+        proto::eth_rx(reversed->dev, reversed);
+        reversed = next;
+    }
+}
 
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
@@ -56,41 +107,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             continue;
         }
 
-        // Reverse LIFO->FIFO to preserve packet ordering.
-        PacketBuffer* reversed = nullptr;
-        while (batch != nullptr) {
-            PacketBuffer* next = batch->next;
-            batch->next = reversed;
-            reversed = batch;
-            batch = next;
-        }
-
-        // Process each packet through the protocol stack.
-        while (reversed != nullptr) {
-            PacketBuffer* next = reversed->next;
-            reversed->next = nullptr;
-            NET_TRACE_TICK();
-            if (is_loopback_dev(reversed->dev)) {
-                if (reversed->len > 0) {
-                    uint8_t const VERSION = (reversed->data[0] >> 4) & 0xF;
-                    if (VERSION == 4) {
-                        proto::ipv4_rx(reversed->dev, reversed);
-                        reversed = next;
-                        continue;
-                    }
-                    if (VERSION == 6) {
-                        proto::ipv6_rx(reversed->dev, reversed);
-                        reversed = next;
-                        continue;
-                    }
-                }
-                pkt_free(reversed);
-                reversed = next;
-                continue;
-            }
-            proto::eth_rx(reversed->dev, reversed);
-            reversed = next;
-        }
+        process_backlog_batch(batch);
     }
 }
 
@@ -124,6 +141,7 @@ void backlog_init() {
         }
         queues[i].handler = task;
         queues[i].handler_active.store(false, std::memory_order_relaxed);
+        promote_latency_sensitive_daemon(task);
         ker::mod::sched::post_task_pinned_cpu(i, task);
     }
 
@@ -143,7 +161,16 @@ void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
         pkt->next = old_head;
     } while (!q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed));
 
-    ker::mod::sched::kern_wake(q.handler);
+    if (q.handler != nullptr) {
+        ker::mod::sched::kern_wake(q.handler);
+        if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
+            // Same-CPU wake_cpu() is a no-op; force a local reschedule so the
+            // backlog worker does not wait for the next timer quantum.
+            ker::mod::sys::context_switch::request_reschedule();
+        } else {
+            ker::mod::sched::wake_cpu(q.handler->cpu);
+        }
+    }
 }
 
 auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
@@ -185,6 +212,31 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
     mac_hash ^= static_cast<uint32_t>(src.at(4)) | (static_cast<uint32_t>(src.at(5)) << 8);
     mac_hash *= 0x9e3779b9U;
     return mac_hash % num_cpus;
+}
+
+auto backlog_drain_all_pending_inline() -> int {
+    if (!ready.load(std::memory_order_acquire) || queues == nullptr) {
+        return 0;
+    }
+
+    int drained = 0;
+    for (uint64_t cpu_idx = 0; cpu_idx < num_cpus; ++cpu_idx) {
+        auto& q = queues[cpu_idx];
+        PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
+        if (batch == nullptr) {
+            continue;
+        }
+
+        PacketBuffer* cursor = batch;
+        while (cursor != nullptr) {
+            ++drained;
+            cursor = cursor->next;
+        }
+
+        process_backlog_batch(batch);
+    }
+
+    return drained;
 }
 
 auto backlog_ready() -> bool { return ready.load(std::memory_order_acquire); }

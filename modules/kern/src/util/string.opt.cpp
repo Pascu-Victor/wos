@@ -186,6 +186,25 @@ auto strdup(const char* str) -> char* {
     strncpy(new_str, str, LEN);
     return new_str;
 }
+__attribute__((no_builtin("strstr"))) auto strstr(char* haystack, const char* needle) -> char* {
+    size_t const HAYSTACK_LEN = ker::util::string::strlen(haystack);
+    size_t const NEEDLE_LEN = ker::util::string::strlen(needle);
+
+    if (NEEDLE_LEN == 0) {
+        return haystack;
+    }
+    if (HAYSTACK_LEN < NEEDLE_LEN) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i <= HAYSTACK_LEN - NEEDLE_LEN; i++) {
+        if (ker::util::string::strncmp(haystack + i, needle, NEEDLE_LEN) == 0) {
+            return haystack + i;
+        }
+    }
+
+    return nullptr;
+}
 }  // namespace
 }  // namespace ker::util::string
 
@@ -200,6 +219,10 @@ __attribute__((no_builtin("strncpy"))) char* strncpy(char* dest, const char* src
 }
 
 __attribute__((no_builtin("strlen"))) void reverse(char* s) { ker::util::string::reverse(s); }
+
+__attribute__((no_builtin("strstr"))) char* strstr(const char* haystack, const char* needle) {
+    return ker::util::string::strstr(const_cast<char*>(haystack), needle);
+}
 
 auto itoa(int n, std::span<char> s, int base) -> int { return ker::util::string::itoa(n, s, base); }
 

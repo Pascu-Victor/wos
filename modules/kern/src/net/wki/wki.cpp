@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <net/backlog.hpp>
 #include <net/netpoll.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
@@ -29,6 +30,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <ranges>
 #include <span>
 #include <util/hostname.hpp>
@@ -87,6 +89,13 @@ auto perf_current_cpu() -> uint32_t {
     return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
 }
 
+void mark_peer_rx_progress(uint16_t src_node) {
+    WkiPeer* peer = wki_peer_find(src_node);
+    if (peer != nullptr) {
+        peer->last_rx_activity = wki_now_us();
+    }
+}
+
 void perf_record_transport_point(mod::perf::WkiPerfTransportOp op, uint16_t peer, uint16_t channel, int32_t status, uint32_t aux,
                                  uint32_t correlation, uint64_t callsite) {
     if (!mod::perf::is_wki_recording_enabled()) {
@@ -132,6 +141,82 @@ void perf_record_transport_rtt(uint16_t peer, uint16_t channel, uint32_t correla
                                   channel, 0, rtt_us, true, retries, 0);
 }
 
+constexpr uint32_t WKI_PERF_STALL_THRESHOLD_US = 5000;
+constexpr uint32_t WKI_PERF_STALL_REPORT_INTERVAL_US = 50000;
+
+constexpr uint32_t WKI_PERF_STALL_FLAG_OUTSTANDING = 1U << 0;
+constexpr uint32_t WKI_PERF_STALL_FLAG_NO_CREDITS = 1U << 1;
+constexpr uint32_t WKI_PERF_STALL_FLAG_ACK_PENDING = 1U << 2;
+constexpr uint32_t WKI_PERF_STALL_FLAG_HAS_RETRANSMIT = 1U << 3;
+constexpr uint32_t WKI_PERF_STALL_FLAG_RETRANSMIT_DUE = 1U << 4;
+constexpr uint32_t WKI_PERF_STALL_FLAG_FAST_RETRANSMIT = 1U << 5;
+constexpr uint32_t WKI_PERF_STALL_FLAG_ACK_DELAY_DUE = 1U << 6;
+
+auto pack_transport_stall_status(WkiChannel const* ch, uint64_t now_us) -> uint32_t {
+    uint32_t flags = 0;
+    if (ch->tx_seq != ch->tx_ack) {
+        flags |= WKI_PERF_STALL_FLAG_OUTSTANDING;
+    }
+    if (ch->tx_credits == 0) {
+        flags |= WKI_PERF_STALL_FLAG_NO_CREDITS;
+    }
+    if (ch->ack_pending) {
+        flags |= WKI_PERF_STALL_FLAG_ACK_PENDING;
+        if (now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
+            flags |= WKI_PERF_STALL_FLAG_ACK_DELAY_DUE;
+        }
+    }
+    if (ch->retransmit_head != nullptr) {
+        flags |= WKI_PERF_STALL_FLAG_HAS_RETRANSMIT;
+        if (now_us >= ch->retransmit_deadline) {
+            flags |= WKI_PERF_STALL_FLAG_RETRANSMIT_DUE;
+        }
+    }
+    if (ch->dup_ack_count >= WKI_FAST_RETRANSMIT_THRESH) {
+        flags |= WKI_PERF_STALL_FLAG_FAST_RETRANSMIT;
+    }
+
+    uint32_t const TX_CREDITS = std::min<uint32_t>(ch->tx_credits, UINT8_MAX);
+    uint32_t const RETRANSMIT_COUNT = std::min<uint32_t>(ch->retransmit_count, UINT8_MAX);
+    uint32_t const INFLIGHT = std::min<uint32_t>(ch->tx_seq - ch->tx_ack, 0x7FU);
+    return flags | (TX_CREDITS << 8U) | (RETRANSMIT_COUNT << 16U) | (INFLIGHT << 24U);
+}
+
+void perf_record_transport_stall_locked(WkiChannel* ch, uint64_t now_us) {
+    if (!mod::perf::is_wki_recording_enabled()) {
+        ch->perf_last_stall_report_us = 0;
+        ch->perf_last_stall_status = 0;
+        return;
+    }
+
+    if (ch->retransmit_head == nullptr || now_us < ch->retransmit_head->send_time_us) {
+        ch->perf_last_stall_report_us = 0;
+        ch->perf_last_stall_status = 0;
+        return;
+    }
+
+    uint64_t const STALL_AGE_US = now_us - ch->retransmit_head->send_time_us;
+    if (STALL_AGE_US < WKI_PERF_STALL_THRESHOLD_US) {
+        ch->perf_last_stall_report_us = 0;
+        ch->perf_last_stall_status = 0;
+        return;
+    }
+
+    uint32_t const STATUS = pack_transport_stall_status(ch, now_us);
+    bool const SHOULD_REPORT = (ch->perf_last_stall_report_us == 0) ||
+                               (now_us - ch->perf_last_stall_report_us >= WKI_PERF_STALL_REPORT_INTERVAL_US) ||
+                               (STATUS != ch->perf_last_stall_status);
+    if (!SHOULD_REPORT) {
+        return;
+    }
+
+    perf_record_transport_point(mod::perf::WkiPerfTransportOp::STALL, ch->peer_node_id, ch->channel_id, static_cast<int32_t>(STATUS),
+                                static_cast<uint32_t>(std::min<uint64_t>(STALL_AGE_US, UINT32_MAX)), ch->retransmit_head->seq,
+                                WOS_PERF_CALLSITE());
+    ch->perf_last_stall_report_us = now_us;
+    ch->perf_last_stall_status = STATUS;
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -145,7 +230,8 @@ void wki_spin_yield() {
     // the caller is busy-waiting on this CPU.
     net::NetDevice* dev = wki_eth_get_netdev();
     if (dev != nullptr) {
-        net::napi_poll_inline(dev);
+        net::napi_poll_all_pending();
+        net::backlog_drain_all_pending_inline();
     }
 
     // Process retransmit timers and delayed ACKs
@@ -249,20 +335,36 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
         }
     }
 
-    // Sleep until RX/timer completion.  This used to actively call
-    // wki_spin_yield(), which let multiple remote exec/VFS/IPC waiters turn
-    // into full-time NAPI/timer pollers and starve unrelated networking.
+    // Sleep until RX/timer completion.
+    //
+    // DAEMON waiters can use a true block. PROCESS waiters must stay on the
+    // existing voluntary-yield path for now: proxy exec handoff intentionally
+    // suppresses one class of concurrent wake in deferred_task_switch(), and
+    // using kern_block() here can therefore lose a wake and strand the task
+    // until an unrelated signal arrives. The tighter WKI timer cadence and the
+    // broader inline RX draining still reduce the latency floor for process
+    // callers without taking that scheduler risk.
     while (!entry->completed.load(std::memory_order_acquire)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
-            // Timed out - unlink and return error
+            // Timed out locally. Claim completion before returning so a late
+            // response cannot still complete the same stack waiter after the
+            // caller has started timeout cleanup/retry handling.
+            bool expected = false;
+            if (entry->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                entry->result = WKI_ERR_TIMEOUT;
+            }
             if (linked) {
                 wait_list_unlink(entry);
             }
-            return WKI_ERR_TIMEOUT;
+            return entry->result;
         }
         if (entry->task != nullptr) {
             entry->task->wait_channel = "wki_wait";
-            mod::sched::kern_block();
+            if (entry->task->type == mod::sched::task::TaskType::DAEMON) {
+                mod::sched::kern_block();
+            } else {
+                mod::sched::kern_yield();
+            }
         } else {
             mod::sched::kern_yield();
         }
@@ -708,6 +810,8 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->bytes_sent = 0;
     ch->bytes_received = 0;
     ch->retransmits = 0;
+    ch->perf_last_stall_report_us = 0;
+    ch->perf_last_stall_status = 0;
     ch->tx_rt_entry_in_use = false;
 }
 
@@ -1536,16 +1640,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         return;
     }
 
-    // Update last_rx_activity for traffic-based liveness detection.
-    // Any valid packet from a peer proves it is alive, so the heartbeat
-    // timeout check can use this alongside the explicit heartbeat timestamp.
-    {
-        WkiPeer* rx_peer = wki_peer_find(hdr->src_node);
-        if (rx_peer != nullptr) {
-            rx_peer->last_rx_activity = wki_now_us();
-        }
-    }
-
     // Process piggybacked ACK
     if ((wki_flags(hdr->version_flags) & WKI_FLAG_ACK_PRESENT) != 0) {
         WkiChannel* ch = wki_channel_get(hdr->src_node, hdr->channel_id);
@@ -1554,11 +1648,13 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             uint16_t fast_retransmit_len = 0;
             uint16_t fast_retransmit_peer = 0;
             uint32_t fast_retransmit_seq = 0;
+            bool ack_progress = false;
 
             ch->lock.lock();
 
             // Advance tx_ack - release ACKed retransmit entries
             if (seq_after(hdr->ack_num + 1, ch->tx_ack)) {
+                ack_progress = true;
                 ch->tx_ack = hdr->ack_num + 1;
                 ch->last_dup_ack = hdr->ack_num;
                 ch->dup_ack_count = 0;
@@ -1632,6 +1728,13 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             ch->tx_credits = static_cast<uint16_t>(std::min<uint16_t>(hdr->credits, MAX_CREDITS));
 
             ch->lock.unlock();
+
+            if (ack_progress) {
+                // Only count ACK traffic as liveness when it advanced the
+                // peer's acknowledgement state. Duplicate ACK-only chatter can
+                // otherwise keep a wedged peer falsely "alive".
+                mark_peer_rx_progress(hdr->src_node);
+            }
 
             if (fast_retransmit_data != nullptr) {
                 int tx_ret = -1;
@@ -1760,6 +1863,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->bytes_received += PAYLOAD_LEN;
 
                 ch->lock.unlock();
+                mark_peer_rx_progress(hdr->src_node);
 
                 // Dispatch to handler via shared helper
                 wki_dispatch_reliable_msg(msg, hdr, payload, PAYLOAD_LEN);
@@ -1876,6 +1980,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                                 *pp = ro;
                                 ch->reorder_count++;
                                 refresh_rx_credits(ch);
+                                // A newly buffered future sequence number is
+                                // evidence of fresh peer progress. Old
+                                // duplicates do not get to refresh liveness.
+                                mark_peer_rx_progress(hdr->src_node);
                             } else {
                                 delete ro;
                             }
@@ -2036,7 +2144,8 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
 void wki_spin_yield_channel(WkiChannel* ch) {
     net::NetDevice* dev = wki_eth_get_netdev();
     if (dev != nullptr) {
-        net::napi_poll_inline(dev);
+        net::napi_poll_all_pending();
+        net::backlog_drain_all_pending_inline();
     }
 
     wki_timer_tick_single(ch, wki_now_us());
@@ -2111,6 +2220,8 @@ void wki_timer_tick(uint64_t now_us) {
             ack_num = ch->rx_ack_pending;
             do_ack = true;
         }
+
+        perf_record_transport_stall_locked(ch, now_us);
 
         ch->lock.unlock();
 

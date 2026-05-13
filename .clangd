@@ -1,26 +1,6 @@
+If:
+    PathExclude: "toolchain/src/llvm-project/.*"
 Diagnostics:
-    ClangTidy:
-        Add:
-            - "bugprone-*"
-            - "clang-analyzer-*"
-            - "readability-*"
-            - "performance-*"
-            - "misc-*"
-            - "modernize-*"
-            - "cppcoreguidelines-*"
-            - "misc-include-cleaner"
-        Remove:
-            - readability-identifier-length
-            - cppcoreguidelines-pro-type-reinterpret-cast
-            - cppcoreguidelines-owning-memory
-            - cppcoreguidelines-pro-bounds-pointer-arithmetic
-            - cppcoreguidelines-avoid-non-const-global-variables
-            - cppcoreguidelines-pro-type-cstyle-cast
-            - cppcoreguidelines-pro-type-union-access
-            - bugprone-easily-swappable-parameters
-            - bugprone-reserved-identifier
-            - misc-non-private-member-variables-in-classes
-
     Includes:
         IgnoreHeader: ".*toolchain/sysroot/.*"
     UnusedIncludes: Strict
@@ -58,7 +38,19 @@ Hover:
 # C-only third-party trees: no compile_commands.json so clangd defaults to
 # clang++, which rejects -std=c11. Force the C driver explicitly.
 If:
-    PathMatch: ".*/(busybox|dropbear)/.*\\.c$"
+    PathMatch: ".*/busybox/.*\\.c$"
+CompileFlags:
+    Compiler: clang
+    Add:
+        - -std=c11
+        - -Itoolchain/src/busybox/include
+        - -Itoolchain/src/busybox/libbb
+    Remove:
+        - -std=c++*
+
+---
+If:
+    PathMatch: ".*/dropbear/.*\\.c$"
 CompileFlags:
     Compiler: clang
     Add:
@@ -69,6 +61,9 @@ CompileFlags:
 ---
 If:
     PathMatch: ".*\\.(cpp|cxx|cc|hpp|hxx|hh)$"
+    PathExclude:
+        - "toolchain/src/llvm-project/.*"
+        - "tools/.*"
 CompileFlags:
     Add:
         - -std=c++23
@@ -79,7 +74,9 @@ CompileFlags:
 ---
 If:
     PathMatch: ".*\\.c$"
-    PathExclude: ".*/(busybox|dropbear)/.*"
+    PathExclude:
+        - ".*/(busybox|dropbear)/.*"
+        - "toolchain/src/llvm-project/.*"
 CompileFlags:
     Add:
         - -std=c11

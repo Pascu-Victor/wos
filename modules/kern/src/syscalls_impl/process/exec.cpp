@@ -1,5 +1,6 @@
 #include "exec.hpp"
 
+#include <bits/off_t.h>
 #include <bits/ssize_t.h>
 #include <extern/elf.h>
 
@@ -15,10 +16,12 @@
 #include <iterator>
 #include <net/wki/remote_compute.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <string_view>
@@ -35,7 +38,6 @@
 #include "platform/mm/virt.hpp"
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/shm/shm.hpp"
-#include "util/hcf.hpp"
 #include "vfs/stat.hpp"
 namespace ker::syscall::process {
 
@@ -46,6 +48,43 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
 constexpr int MAX_SHEBANG_DEPTH = 4;
 using exec_log = ker::mod::dbg::logger<"exec">;
+
+void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, ker::mod::perf::WkiPerfPhase phase,
+                             uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite) {
+    if (task == nullptr) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), task->pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), phase, 0, 0, correlation, status,
+                                     aux, callsite);
+}
+
+auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
+
+struct LocalProcStage {
+    uint32_t correlation;
+    uint64_t started_us;
+};
+
+auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
+    -> LocalProcStage {
+    LocalProcStage const STAGE = {
+        .correlation = ker::mod::perf::next_wki_trace_correlation(),
+        .started_us = ker::mod::time::get_us(),
+    };
+    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::BEGIN, STAGE.correlation, 0, aux, callsite);
+    return STAGE;
+}
+
+auto end_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, const LocalProcStage& stage,
+                          int32_t status, uint64_t bytes, uint64_t callsite) -> uint32_t {
+    uint32_t const ELAPSED_US = clamp_perf_aux(ker::mod::time::get_us() - stage.started_us);
+    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::END, stage.correlation, status, ELAPSED_US, callsite);
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), 0, 0, status, ELAPSED_US, true,
+                                       0, bytes);
+    return ELAPSED_US;
+}
 
 template <typename T, size_t N>
 auto fixed_slot(std::array<T, N>& values, size_t index) -> T& {
@@ -69,6 +108,39 @@ auto allocate_kernel_stack() -> uint64_t {
     }
 
     return stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
+}
+
+auto read_file_fully(int fd, uint8_t* dst, size_t size, const char* path) -> ssize_t {
+    if (dst == nullptr) {
+        return -EINVAL;
+    }
+    size_t total = 0;
+    int consecutive_errors = 0;
+    constexpr int MAX_CONSECUTIVE_ERRORS = 3;
+
+    while (total < size) {
+        ssize_t const RC = vfs::vfs_pread(fd, dst + total, size - total, static_cast<off_t>(total));
+        if (RC > 0) {
+            total += static_cast<size_t>(RC);
+            consecutive_errors = 0;
+            continue;
+        }
+        if (RC == 0) {
+            exec_log::warn("exec: unexpected EOF while reading '%s' at %llu/%llu bytes", path, static_cast<unsigned long long>(total),
+                           static_cast<unsigned long long>(size));
+            return static_cast<ssize_t>(total);
+        }
+
+        consecutive_errors++;
+        if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+            exec_log::warn("exec: read failed for '%s' at %llu/%llu bytes rc=%lld after %d attempts", path,
+                           static_cast<unsigned long long>(total), static_cast<unsigned long long>(size), static_cast<long long>(RC),
+                           MAX_CONSECUTIVE_ERRORS);
+            return RC;
+        }
+    }
+
+    return static_cast<ssize_t>(total);
 }
 
 auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo* out) -> bool {
@@ -211,11 +283,20 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    ssize_t bytes_read = 0;
-    vfs::vfs_read(FD, elf_buffer, FILE_SIZE, reinterpret_cast<size_t*>(&bytes_read));
+    uint32_t const ELF_READ_CORR = perf::next_wki_trace_correlation();
+    uint64_t const ELF_READ_STARTED_US = time::get_us();
+    record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
+                            clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
+    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
+    uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
+    int32_t const ELF_READ_STATUS = BYTES_READ == FILE_SIZE ? 0 : -EIO;
+    record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS,
+                            ELF_READ_US, WOS_PERF_CALLSITE());
+    perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::ELF_READ), 0, 0,
+                             ELF_READ_STATUS, ELF_READ_US, true, 0, BYTES_READ > 0 ? static_cast<uint64_t>(BYTES_READ) : 0);
     vfs::vfs_close(FD);
 
-    if (bytes_read != FILE_SIZE) {
+    if (BYTES_READ != FILE_SIZE) {
         dbg::log("wos_proc_exec: Failed to read file completely");
         delete[] elf_buffer;
         return 0;
@@ -401,6 +482,42 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     uint64_t current_virt_offset = 0;
 
+    auto copy_to_user_stack = [&](uint64_t vaddr, const void* data, size_t size) -> bool {
+        if (size == 0) {
+            return true;
+        }
+        uint64_t const END = vaddr + static_cast<uint64_t>(size);
+        if (END < vaddr) {
+            return false;
+        }
+        if (!mod::sched::threading::ensure_stack_backing(new_task->thread, new_task->pagemap, vaddr, END)) {
+            exec_log::error("copyToStack: failed to back stack range [0x%llx,0x%llx)", static_cast<unsigned long long>(vaddr),
+                            static_cast<unsigned long long>(END));
+            return false;
+        }
+
+        auto const* src = static_cast<const uint8_t*>(data);
+        size_t copied = 0;
+        while (copied < size) {
+            uint64_t const CUR = vaddr + copied;
+            uint64_t const PAGE_VIRT = CUR & ~(mod::mm::paging::PAGE_SIZE - 1);
+            uint64_t const PAGE_OFFSET = CUR & (mod::mm::paging::PAGE_SIZE - 1);
+            size_t const CHUNK =
+                (size - copied < mod::mm::paging::PAGE_SIZE - PAGE_OFFSET) ? size - copied : mod::mm::paging::PAGE_SIZE - PAGE_OFFSET;
+
+            uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
+            if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
+                exec_log::error("copyToStack: translate failed for stack vaddr 0x%llx", static_cast<unsigned long long>(PAGE_VIRT));
+                return false;
+            }
+
+            auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
+            std::memcpy(dest_ptr, src + copied, CHUNK);
+            copied += CHUNK;
+        }
+        return true;
+    };
+
     auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
         if (current_virt_offset + size > ker::mod::mm::USER_STACK_SIZE) {
             return 0;  // Stack overflow
@@ -408,17 +525,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         current_virt_offset += size;
         uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
 
-        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mod::mm::paging::PAGE_SIZE - 1);
-
-        uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
-        if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
-            exec_log::critical("pushData: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
-            hcf();
+        if (!copy_to_user_stack(VIRT_ADDR, data, size)) {
+            return 0;
         }
-
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
-        std::memcpy(dest_ptr, data, size);
 
         return VIRT_ADDR;
     };
@@ -431,18 +540,13 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         current_virt_offset += LEN;
         uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
 
-        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mod::mm::paging::PAGE_SIZE - 1);
-
-        uint64_t const PAGE_PHYS = mod::mm::virt::translate(new_task->pagemap, PAGE_VIRT);
-        if (PAGE_PHYS == mod::mm::virt::PADDR_INVALID) {
-            exec_log::critical("pushString: translate failed for stack vaddr 0x%x - stack page not mapped", PAGE_VIRT);
-            hcf();
+        if (!copy_to_user_stack(VIRT_ADDR, str.data(), str.size())) {
+            return 0;
         }
-
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mod::mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
-        std::memcpy(dest_ptr, str.data(), str.size());
-        dest_ptr[str.size()] = '\0';
+        char const ZERO = '\0';
+        if (!copy_to_user_stack(VIRT_ADDR + str.size(), &ZERO, sizeof(ZERO))) {
+            return 0;
+        }
 
         return VIRT_ADDR;
     };
@@ -618,8 +722,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #endif
         return static_cast<uint64_t>(-ESRCH);
     }
+    uint32_t const EXEC_CORR = perf::next_wki_trace_correlation();
+    uint64_t const EXEC_STARTED_US = time::get_us();
+    record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::BEGIN, EXEC_CORR, 0,
+                            static_cast<uint32_t>(shebang_depth), WOS_PERF_CALLSITE());
 
     // --- Copy argv/envp strings into kernel memory (before we destroy user mappings) ---
+    LocalProcStage const ARG_COPY_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
     size_t argv_count = 0;
     if (argv != nullptr) {
         while (argv[argv_count] != nullptr) {
@@ -667,13 +776,16 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             kernel_arg_env_freed = true;
         }
     };
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, ARG_COPY_STAGE, 0, argv_count + envp_count, WOS_PERF_CALLSITE());
 
     // --- Read the ELF file ---
+    LocalProcStage const OPEN_ACCESS_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, 0, WOS_PERF_CALLSITE());
     int const FD = vfs::vfs_open(std::string_view(path, std::strlen(path)), 0, 0);
     if (FD < 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: Failed to open '%s' (fd=%d)", path, fd);
 #endif
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOENT, 0, WOS_PERF_CALLSITE());
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOENT);
     }
@@ -683,6 +795,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", path, access_ret);
 #endif
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -EACCES, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EACCES);
@@ -693,12 +806,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: SEEK_END failed for '%s' (fileSize=%ld)", path, file_size);
 #endif
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-EIO);
     }
     if (FILE_SIZE == 0) {
         dbg::log("wos_proc_execve: empty file '%s'", path);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
@@ -710,18 +825,30 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", path, file_size);
 #endif
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOMEM);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
+                         WOS_PERF_CALLSITE());
 
-    ssize_t bytes_read = 0;
-    vfs::vfs_read(FD, elf_buffer, FILE_SIZE, reinterpret_cast<size_t*>(&bytes_read));
+    uint32_t const ELF_READ_CORR = perf::next_wki_trace_correlation();
+    uint64_t const ELF_READ_STARTED_US = time::get_us();
+    record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
+                            clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
+    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
+    uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
+    int32_t const ELF_READ_STATUS = BYTES_READ == FILE_SIZE ? 0 : -EIO;
+    record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
+                            WOS_PERF_CALLSITE());
+    perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::ELF_READ), 0, 0,
+                             ELF_READ_STATUS, ELF_READ_US, true, 0, BYTES_READ > 0 ? static_cast<uint64_t>(BYTES_READ) : 0);
     vfs::vfs_close(FD);
 
-    if (bytes_read != FILE_SIZE) {
+    if (BYTES_READ != FILE_SIZE) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, bytes_read, file_size);
+        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", path, BYTES_READ, file_size);
 #endif
         delete[] elf_buffer;
         free_kernel_arg_env();
@@ -756,6 +883,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
 
     {
+        LocalProcStage const REMOTE_SPAWN_STAGE =
+            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, 0, WOS_PERF_CALLSITE());
         uint8_t* saved_elf_buffer = task->elf_buffer;
         size_t const SAVED_ELF_BUFFER_SIZE = task->elf_buffer_size;
         bool const SAVED_IS_ELF_BUFFER_SHARED = task->is_elf_buffer_shared;
@@ -781,6 +910,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             .cwd = task->cwd.data(),
         };
         auto remote_result = ker::net::wki::wki_try_remote_spawn(task, REMOTE_SPAWN);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE, static_cast<int32_t>(remote_result),
+                             static_cast<uint64_t>(FILE_SIZE), WOS_PERF_CALLSITE());
 
         task->elf_buffer = saved_elf_buffer;
         task->elf_buffer_size = SAVED_ELF_BUFFER_SIZE;
@@ -808,11 +939,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // --- Replace the pagemap with a fresh one ---
     // Note: We are executing in kernel context (syscall handler) so our
     // kernel mappings are active. We'll create a new user pagemap.
+    LocalProcStage const NEW_IMAGE_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
     uint8_t* old_elf_buffer = task->elf_buffer;
     auto* old_pagemap = task->pagemap;
     auto* old_thread = task->thread;
     auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         delete[] elf_buffer;
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
@@ -849,10 +982,12 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
     };
     if (new_thread == nullptr) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         cleanup_new_image();
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
     // execve() reuses the same PID. The loader debug registry is keyed by PID,
     // so we must discard the old image's symbol metadata before registering the
@@ -861,16 +996,22 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     loader::debug::unregister_process(task->pid);
 
     // --- Load ELF into new pagemap ---
+    LocalProcStage const LOAD_ELF_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF,
+                                                                 clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
     loader::elf::ElfLoadResult elf_result =
         loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", path);
 #endif
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, -ENOEXEC, static_cast<uint64_t>(FILE_SIZE),
+                             WOS_PERF_CALLSITE());
         cleanup_new_image();
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOEXEC);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
+                         WOS_PERF_CALLSITE());
 
     uint64_t const NEW_EXEC_ENTRY = elf_result.entry_point;
     uint64_t new_initial_rip = elf_result.entry_point;
@@ -884,10 +1025,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     if (elf_result.has_interp) {
         constexpr uint64_t INTERP_BASE = 0x40000000ULL;
         const char* const INTERP_PATH = std::begin(elf_result.interp_path);
+        LocalProcStage const LOAD_INTERP_STAGE =
+            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, 0, WOS_PERF_CALLSITE());
 
         int const INTERP_FD = vfs::vfs_open(std::string_view(INTERP_PATH, std::strlen(INTERP_PATH)), 0, 0);
         if (INTERP_FD < 0) {
             dbg::log("wos_proc_execve: Failed to open interpreter '%s'", INTERP_PATH);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
@@ -897,18 +1041,19 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         vfs::vfs_lseek(INTERP_FD, 0, 0);
         if (INTERP_SIZE <= 0) {
             vfs::vfs_close(INTERP_FD);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
         auto* interp_buf = new uint8_t[INTERP_SIZE];
-        ssize_t interp_read = 0;
-        vfs::vfs_read(INTERP_FD, interp_buf, INTERP_SIZE, reinterpret_cast<size_t*>(&interp_read));
+        ssize_t const INTERP_READ = read_file_fully(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH);
         vfs::vfs_close(INTERP_FD);
 
-        if (interp_read != INTERP_SIZE) {
+        if (INTERP_READ != INTERP_SIZE) {
             delete[] interp_buf;
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-EIO);
@@ -919,10 +1064,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
         if (INTERP_RESULT.entry_point == 0) {
             delete[] interp_buf;
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC,
+                                 static_cast<uint64_t>(INTERP_SIZE), WOS_PERF_CALLSITE());
             cleanup_new_image();
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, 0, static_cast<uint64_t>(INTERP_SIZE),
+                             WOS_PERF_CALLSITE());
 
         // Override entry point to the interpreter — ld.so reads AT_ENTRY from auxv
         new_initial_rip = INTERP_RESULT.entry_point;
@@ -930,6 +1079,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
         delete[] interp_buf;
     }
+
+    LocalProcStage const STACK_SETUP_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::STACK_SETUP, 0, WOS_PERF_CALLSITE());
 
     std::string_view const PATH_STR(path, std::strlen(path));
     const char* base_name = PATH_STR.data();
@@ -951,21 +1102,49 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t user_stack_virt = new_thread->stack;
     uint64_t current_virt_offset = 0;
 
+    auto copy_to_user_stack = [&](uint64_t vaddr, const void* data, size_t size) -> bool {
+        if (size == 0) {
+            return true;
+        }
+        uint64_t const END = vaddr + static_cast<uint64_t>(size);
+        if (END < vaddr) {
+            return false;
+        }
+        if (!mod::sched::threading::ensure_stack_backing(new_thread, new_pagemap, vaddr, END)) {
+            exec_log::error("copyToStack: failed to back stack range [0x%llx,0x%llx)", static_cast<unsigned long long>(vaddr),
+                            static_cast<unsigned long long>(END));
+            return false;
+        }
+
+        auto const* src = static_cast<const uint8_t*>(data);
+        size_t copied = 0;
+        while (copied < size) {
+            uint64_t const CUR = vaddr + copied;
+            uint64_t const PAGE_VIRT = CUR & ~(mm::paging::PAGE_SIZE - 1);
+            uint64_t const PAGE_OFFSET = CUR & (mm::paging::PAGE_SIZE - 1);
+            size_t const CHUNK =
+                (size - copied < mm::paging::PAGE_SIZE - PAGE_OFFSET) ? size - copied : mm::paging::PAGE_SIZE - PAGE_OFFSET;
+            uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
+            if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
+                exec_log::error("copyToStack: translate failed for stack vaddr 0x%llx", static_cast<unsigned long long>(PAGE_VIRT));
+                return false;
+            }
+            auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
+            std::memcpy(dest_ptr, src + copied, CHUNK);
+            copied += CHUNK;
+        }
+        return true;
+    };
+
     auto push_to_stack = [&](const void* data, size_t size) -> uint64_t {
         if (current_virt_offset + size > ker::mod::mm::USER_STACK_SIZE) {
             return 0;
         }
         current_virt_offset += size;
         uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
-        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
-        if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
-            exec_log::critical("pushData: translate failed for stack vaddr 0x%x", PAGE_VIRT);
-            hcf();
+        if (!copy_to_user_stack(VIRT_ADDR, data, size)) {
+            return 0;
         }
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
-        std::memcpy(dest_ptr, data, size);
         return VIRT_ADDR;
     };
 
@@ -976,15 +1155,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
         current_virt_offset += LEN;
         uint64_t const VIRT_ADDR = user_stack_virt - current_virt_offset;
-        uint64_t const PAGE_VIRT = VIRT_ADDR & ~(mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_OFFSET = VIRT_ADDR & (mm::paging::PAGE_SIZE - 1);
-        uint64_t const PAGE_PHYS = mm::virt::translate(new_pagemap, PAGE_VIRT);
-        if (PAGE_PHYS == mm::virt::PADDR_INVALID) {
-            exec_log::critical("pushString: translate failed for stack vaddr 0x%x", PAGE_VIRT);
-            hcf();
+        if (!copy_to_user_stack(VIRT_ADDR, str, LEN)) {
+            return 0;
         }
-        auto* dest_ptr = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PAGE_PHYS)) + PAGE_OFFSET;
-        std::memcpy(dest_ptr, str, LEN);
         return VIRT_ADDR;
     };
 
@@ -1107,6 +1280,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         cleanup_new_image();
         return static_cast<uint64_t>(-E2BIG);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::STACK_SETUP, STACK_SETUP_STAGE, 0, current_virt_offset, WOS_PERF_CALLSITE());
+
+    LocalProcStage const COMMIT_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
 
     // exec only closes FD_CLOEXEC descriptors after the new image is ready;
     // failed execve() must leave the original process image intact.
@@ -1242,11 +1418,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         cpu::wrfsbase(new_thread->fsbase);
         cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
     // execve() replaces the current image in-place, so the old address space
     // and thread backing storage must be reclaimed now rather than deferred to
     // task GC. Otherwise each successful exec leaks another user stack/TLS set
     // plus the old pagemap's user pages.
+    LocalProcStage const DESTROY_OLD_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
     ker::syscall::shm::shm_cleanup_for_task(task);
     if (old_pagemap != nullptr && old_pagemap != new_pagemap) {
         mm::virt::switch_to_kernel_pagemap();
@@ -1259,6 +1437,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         old_thread->stack_phys_ptr = 0;
         mod::sched::threading::destroy_thread(old_thread);
     }
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, DESTROY_OLD_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
     task->pagemap = new_pagemap;
     task->thread = new_thread;
@@ -1294,6 +1473,11 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path.data(), elf_result.entryPoint,
              new_rsp);
 #endif
+    uint32_t const EXEC_US = clamp_perf_aux(time::get_us() - EXEC_STARTED_US);
+    record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::END, EXEC_CORR, 0, EXEC_US, WOS_PERF_CALLSITE());
+    perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXECVE), 0, 0, 0, EXEC_US, true,
+                             0, static_cast<uint64_t>(FILE_SIZE));
+
     // Compute physical pagemap address before we enter the critical section
     auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
 

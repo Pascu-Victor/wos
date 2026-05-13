@@ -13,12 +13,3 @@ CompileFlags:
 
 Diagnostics:
     UnusedIncludes: Strict
-    ClangTidy:
-        Add:
-            - bugprone-*
-            - modernize-*
-            - readability-*
-        Remove:
-            - modernize-use-trailing-return-type
-            - readability-magic-numbers
-            - readability-identifier-length

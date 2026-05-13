@@ -151,6 +151,32 @@ auto dir2_read_block(XfsInode* dp, xfs_dir2_db_t db, BufHead** bhp) -> int {
     return (*bhp != nullptr) ? 0 : -EIO;
 }
 
+auto dir2_is_single_block_dir(XfsInode* dp) -> bool {
+    if (dp == nullptr || dp->mount == nullptr) {
+        return false;
+    }
+
+    BufHead* bh = nullptr;
+    int const RC = dir2_read_block(dp, 0, &bh);
+    if (RC != 0 || bh == nullptr) {
+        return dp->size <= dp->mount->dir_blk_size;
+    }
+
+    const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(bh->data);
+    uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
+    brelse(bh);
+
+    if (MAGIC == XFS_DIR3_BLOCK_MAGIC) {
+        return true;
+    }
+    if (MAGIC == XFS_DIR3_DATA_MAGIC) {
+        return false;
+    }
+
+    mod::dbg::logger<"xfs">::error("dir format detect: unexpected magic 0x%x", MAGIC);
+    return dp->size <= dp->mount->dir_blk_size;
+}
+
 // ============================================================================
 // Shortform directory operations
 // ============================================================================
@@ -502,6 +528,14 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
     const uint8_t* block = bh->data;
     size_t const BLKSIZE = ctx->dir_blk_size;
 
+    const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
+    uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
+    if (MAGIC != XFS_DIR3_DATA_MAGIC && MAGIC != XFS_DIR3_BLOCK_MAGIC) {
+        mod::dbg::logger<"xfs">::error("dir data block: bad magic 0x%x", MAGIC);
+        brelse(bh);
+        return -EINVAL;
+    }
+
     // v3 data header
     size_t offset = sizeof(XfsDir3DataHdr);
     XfsDirEntry entry{};
@@ -762,9 +796,7 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            // Check if it's block format (single block) or leaf/node
-            // Block format: directory size <= dir_blk_size
-            if (dp->size <= dp->mount->dir_blk_size) {
+            if (dir2_is_single_block_dir(dp)) {
                 return dir2_block_lookup(dp, name, namelen, entry);
             }
             return dir2_leaf_node_lookup(dp, name, namelen, entry);
@@ -789,7 +821,7 @@ auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int {
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            if (dp->size <= dp->mount->dir_blk_size) {
+            if (dir2_is_single_block_dir(dp)) {
                 return dir2_block_iterate(dp, fn, ctx);
             }
             return dir2_leaf_node_iterate(dp, fn, ctx);
@@ -1780,7 +1812,7 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            if (dp->size <= dp->mount->dir_blk_size) {
+            if (dir2_is_single_block_dir(dp)) {
                 return dir2_block_addname(dp, name, namelen, ino, ftype, tp);
             }
             // Leaf/node format add not yet implemented
@@ -1809,7 +1841,7 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            if (dp->size <= dp->mount->dir_blk_size) {
+            if (dir2_is_single_block_dir(dp)) {
                 return dir2_block_removename(dp, name, namelen, tp);
             }
             // Leaf/node format remove not yet implemented

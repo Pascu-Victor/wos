@@ -44,6 +44,9 @@ void reset();
 // Get the current task's KCOV buffer (nullptr if none allocated)
 KcovBuffer* current_buffer();
 
+// Dump a small always-on recent-PC ring for the given CPU to the panic log.
+void dump_panic_trace_for_cpu(uint64_t cpu_id);
+
 }  // namespace ker::sanitizer::kcov
 
 #endif  // WOS_KCOV
