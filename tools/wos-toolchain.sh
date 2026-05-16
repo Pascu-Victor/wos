@@ -377,12 +377,23 @@ cd $B/src
 mkdir -p $B/dropbear-build
 cd $B/dropbear-build
 
+cat > localoptions.h <<'EOF'
+#define DROPBEAR_SFTPSERVER 1
+#define SFTPSERVER_PATH "/usr/libexec/sftp-server"
+#define DROPBEAR_PATH_SSH_PROGRAM "/usr/bin/dbclient"
+#define DROPBEAR_SMALL_CODE 0
+#define DEFAULT_RECV_WINDOW (1024 * 1024)
+#define RECV_MAX_PAYLOAD_LEN (128 * 1024)
+#define TRANS_MAX_PAYLOAD_LEN (64 * 1024)
+EOF
+
 TARGET_SYSROOT="$SYSROOT"
+DROPBEAR_CFLAGS="--sysroot=$TARGET_SYSROOT -O3 -g -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
 export CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
-export CFLAGS="--sysroot=$TARGET_SYSROOT -g -O0 -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
+export CFLAGS="$DROPBEAR_CFLAGS"
 export LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib"
 
 if [ ! -f "$B/src/dropbear/configure" ]; then
@@ -407,7 +418,7 @@ $B/src/dropbear/configure \
     --disable-syslog \
     --disable-harden
 
-make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+make -j$(nproc) CFLAGS="$DROPBEAR_CFLAGS" PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
 
 cp $B/dropbear-build/dropbearmulti $SYSROOT/bin/dropbearmulti
 echo "Dropbear installed to $SYSROOT/bin/dropbearmulti"

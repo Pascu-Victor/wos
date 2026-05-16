@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
+#include <vfs/stat.hpp>
 
 namespace ker::vfs::procfs {
 
@@ -48,6 +49,9 @@ void procfs_init();
 
 // Open a procfs path (relative to /proc mount)
 auto procfs_open_path(const char* path, int flags, int mode) -> File*;
+
+// Fill stat metadata for an already-open procfs file.
+auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int;
 
 // Get procfs FileOperations
 auto get_procfs_fops() -> FileOperations*;

@@ -55,6 +55,14 @@ struct RetransmitEntry {
     RetransmitEntry* next{};
 };
 
+struct TcpOutOfOrderSegment {
+    uint32_t seq{};
+    size_t len{};
+    size_t allocated_len{};
+    uint8_t* data{};
+    TcpOutOfOrderSegment* next{};
+};
+
 constexpr uint8_t TCP_KEEPALIVE_PROBES_DEFAULT = 9;
 constexpr uint64_t TCP_KEEPALIVE_IDLE_MS_DEFAULT = 7200000;  // 2 hours
 constexpr uint64_t TCP_KEEPALIVE_INTVL_MS_DEFAULT = 75000;   // 75 seconds
@@ -95,6 +103,10 @@ struct TcpCB {
     RetransmitEntry* retransmit_head = nullptr;
     RetransmitEntry* retransmit_tail = nullptr;
     uint64_t retransmit_deadline = 0;
+
+    TcpOutOfOrderSegment* ooo_head = nullptr;
+    size_t ooo_allocated_bytes = 0;
+    std::atomic<size_t> ooo_bytes{0};
 
     uint64_t time_wait_deadline = 0;
 
@@ -184,6 +196,22 @@ inline auto tcp_seq_before(uint32_t a, uint32_t b) -> bool { return static_cast<
 inline auto tcp_seq_after(uint32_t a, uint32_t b) -> bool { return tcp_seq_before(b, a); }
 inline auto tcp_seq_between(uint32_t seq, uint32_t low, uint32_t high) -> bool {
     return !tcp_seq_before(seq, low) && tcp_seq_before(seq, high);
+}
+
+inline auto tcp_receive_window_space(const TcpCB* cb, const Socket* sock) -> uint32_t {
+    if (sock == nullptr) {
+        return 0;
+    }
+
+    size_t const FREE_SPACE = sock->rcvbuf.free_space();
+    size_t const OOO_BYTES = cb != nullptr ? cb->ooo_bytes.load(std::memory_order_acquire) : 0;
+    return static_cast<uint32_t>(FREE_SPACE > OOO_BYTES ? FREE_SPACE - OOO_BYTES : 0);
+}
+
+inline void tcp_refresh_receive_window(TcpCB* cb) {
+    if (cb != nullptr && cb->socket != nullptr) {
+        cb->rcv_wnd = tcp_receive_window_space(cb, cb->socket);
+    }
 }
 
 // Minimum shift so advertised window fits in 16 bits.

@@ -32,6 +32,9 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 
+// Commit dirty inode metadata for an open file.
+auto xfs_fsync(File* f) -> int;
+
 // Filesystem statistics (statvfs).
 auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 

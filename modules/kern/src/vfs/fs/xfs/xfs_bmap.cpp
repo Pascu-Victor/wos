@@ -25,6 +25,7 @@
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 
+#include "net/endian.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
 #include "vfs/fs/xfs/xfs_inode.hpp"
 #include "vfs/fs/xfs/xfs_mount.hpp"

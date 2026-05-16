@@ -4,6 +4,7 @@
 #
 # Layout:
 #   /usr/lib/       ← shared libraries (libc.so, libc++.so, ld.so, etc.) + CRT objects
+#   /usr/include/   ← sysroot headers
 #   /usr/bin/       ← busybox + applets, dropbearmulti + applets, perf, testprog, wkictl
 #   /usr/sbin/      ← httpd, netd
 #   /lib -> /usr/lib

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <platform/sys/mutex.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -31,6 +32,9 @@ struct TmpNode {
     uint32_t mode = 0;  // Permission bits (e.g. 0644 for files, 0755 for dirs)
     uint32_t uid = 0;   // Owner user ID
     uint32_t gid = 0;   // Owner group ID
+
+    // Serializes file data/size updates for regular file I/O.
+    ker::mod::sys::Mutex io_lock;
 
     // Reference counting for POSIX unlink semantics
     std::atomic<uint32_t> open_count{0};
@@ -67,6 +71,7 @@ auto create_root_file() -> ker::vfs::File*;
 auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File*;
 auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;
+auto tmpfs_write_append(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t* offset_out) -> ssize_t;
 auto tmpfs_get_size(ker::vfs::File* f) -> std::size_t;
 
 // FileOperations callback wrappers

@@ -1,8 +1,16 @@
+#ifndef TRACEBENCH_ENABLE_MPI
+#define TRACEBENCH_ENABLE_MPI 0
+#endif
+
+#if TRACEBENCH_ENABLE_MPI
+#include <mpi.h>
+#else
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/process.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -15,11 +23,15 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
-#include <mandelbench/tinycthread.hpp>
-#include <print>
 #include <span>
 #include <string>
 #include <string_view>
+#if TRACEBENCH_ENABLE_MPI
+#include <thread>
+#else
+#include <mandelbench/tinycthread.hpp>
+#include <print>
+#endif
 #include <utility>
 #include <vector>
 
@@ -27,6 +39,7 @@
 
 namespace {
 
+#if !TRACEBENCH_ENABLE_MPI
 constexpr std::array<char, 4> TILE_PACKET_MAGIC = {'R', 'B', 'T', 'L'};
 constexpr int WORKER_STDOUT_FD = 1;
 volatile sig_atomic_t g_cancel_signal = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -89,7 +102,9 @@ struct WorkerThreadState {
     std::atomic<bool>* failed = nullptr;
     mtx_t* output_lock = nullptr;
 };
+#endif
 
+#if !TRACEBENCH_ENABLE_MPI
 void handle_cancel_signal(int signum) { g_cancel_signal = signum; }
 
 void install_cancel_signal_handlers() {
@@ -170,6 +185,7 @@ auto local_cpu_count() -> int {
     long const ONLINE = ::sysconf(_SC_NPROCESSORS_ONLN);
     return ONLINE > 0 ? static_cast<int>(ONLINE) : 1;
 }
+#endif
 
 auto make_progress(const tracebench::Options& options, uint64_t tiles_done, uint64_t total_tiles, double started, bool done)
     -> tracebench::Progress {
@@ -186,6 +202,147 @@ auto make_progress(const tracebench::Options& options, uint64_t tiles_done, uint
     };
 }
 
+#if TRACEBENCH_ENABLE_MPI
+auto mpi_worker_count(const tracebench::Options& options) -> int {
+    if (options.threads > 0) {
+        return options.threads;
+    }
+    unsigned int const THREADS = std::thread::hardware_concurrency();
+    return THREADS == 0 ? 1 : static_cast<int>(THREADS);
+}
+
+void print_mpi_metrics_json(const tracebench::Options& options, const tracebench::Progress& progress, double rays_per_second,
+                            int world_size, int threads_per_rank) {
+    std::printf("{");
+    std::printf("\"benchmark\":\"mpi_renderbench\",");
+    std::printf("\"run_id\":\"%s\",", options.run_id.c_str());
+    std::printf("\"backend\":\"%s\",", tracebench::backend_name(options.backend));
+    std::printf("\"placement\":\"%s\",", tracebench::placement_name(options.placement));
+    std::printf("\"debug_edge_colors\":%s,", options.debug_edge_colors ? "true" : "false");
+    std::printf("\"world_size\":%d,", world_size);
+    std::printf("\"threads_per_rank\":%d,", threads_per_rank);
+    std::printf("\"width\":%d,", options.width);
+    std::printf("\"height\":%d,", options.height);
+    std::printf("\"spp\":%d,", options.spp);
+    std::printf("\"max_depth\":%d,", options.max_depth);
+    std::printf("\"tile_size\":%d,", options.tile_size);
+    std::printf("\"total_tiles\":%llu,", static_cast<unsigned long long>(progress.total_tiles));
+    std::printf("\"primary_samples\":%llu,", static_cast<unsigned long long>(progress.total_samples));
+    std::printf("\"elapsed_seconds\":%.9f,", progress.elapsed_seconds);
+    std::printf("\"rays_per_second_estimate\":%.3f", rays_per_second);
+    std::printf("}\n");
+    std::fflush(stdout);
+}
+
+auto run_mpi_renderbench(int argc, char** argv) -> int {
+    MPI_Init(&argc, &argv);
+
+    int rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    tracebench::Options options;
+    auto const PARSE_STATUS = tracebench::parse_options(argc, argv, tracebench::Backend::Mpi, options);
+    if (PARSE_STATUS == tracebench::ParseStatus::Help) {
+        MPI_Finalize();
+        return 0;
+    }
+    if (PARSE_STATUS == tracebench::ParseStatus::Error) {
+        if (rank == 0) {
+            tracebench::print_usage(argv[0]);
+        }
+        MPI_Finalize();
+        return 2;
+    }
+    if (options.backend != tracebench::Backend::Mpi) {
+        if (rank == 0) {
+            std::fprintf(stderr, "renderbench: Linux MPI target supports --backend mpi\n");
+        }
+        MPI_Finalize();
+        return 2;
+    }
+
+    auto scene = tracebench::load_scene(options.scene_path);
+    int const LOCAL_SCENE_OK = scene ? 1 : 0;
+    int all_scenes_ok = 0;
+    MPI_Allreduce(&LOCAL_SCENE_OK, &all_scenes_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (all_scenes_ok == 0) {
+        MPI_Finalize();
+        return 2;
+    }
+
+    if (rank == 0 && !tracebench::ensure_output_tree(options)) {
+        std::fprintf(stderr, "renderbench: unable to create output tree under %s\n", options.output_root.c_str());
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    auto tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
+    auto local_storage = tracebench::make_film_storage(options.width, options.height);
+    tracebench::FilmView local_film{
+        .width = options.width,
+        .height = options.height,
+        .rgb = std::span<float>(local_storage.data(), local_storage.size()),
+    };
+
+    double const STARTED = tracebench::monotonic_seconds();
+    if (rank == 0) {
+        (void)tracebench::write_status(options, make_progress(options, 0, tiles.size(), STARTED, false));
+    }
+
+    int const THREADS = options.placement == tracebench::Placement::NodeThreads ? mpi_worker_count(options) : 1;
+    std::atomic<int> next_tile{rank};
+    std::atomic<uint64_t> local_tiles_done{0};
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(THREADS));
+    for (int thread_id = 0; thread_id < THREADS; ++thread_id) {
+        workers.emplace_back([&, thread_id]() {
+            for (;;) {
+                int const INDEX = next_tile.fetch_add(world_size);
+                if (INDEX >= static_cast<int>(tiles.size())) {
+                    break;
+                }
+                tracebench::render_tile(*scene, local_film, options, tiles[static_cast<size_t>(INDEX)],
+                                        0x1234ABCDEFULL + static_cast<uint64_t>((rank * 4099) + thread_id) + static_cast<uint64_t>(INDEX));
+                local_tiles_done.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    std::vector<float> final_storage;
+    if (rank == 0) {
+        final_storage = tracebench::make_film_storage(options.width, options.height);
+    }
+
+    MPI_Reduce(local_storage.data(), rank == 0 ? final_storage.data() : nullptr, static_cast<int>(local_storage.size()), MPI_FLOAT, MPI_SUM,
+               0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        tracebench::FilmView final_film{
+            .width = options.width,
+            .height = options.height,
+            .rgb = std::span<float>(final_storage.data(), final_storage.size()),
+        };
+        auto progress = make_progress(options, tiles.size(), tiles.size(), STARTED, true);
+        double const RAYS_PER_SECOND =
+            progress.elapsed_seconds > 0.0 ? static_cast<double>(progress.total_samples) / progress.elapsed_seconds : 0.0;
+        (void)tracebench::write_status(options, progress);
+        (void)tracebench::write_metrics(options, progress, RAYS_PER_SECOND);
+        (void)tracebench::write_final_png(options, final_film);
+        (void)tracebench::write_preview_png(options, final_film);
+        print_mpi_metrics_json(options, progress, RAYS_PER_SECOND, world_size, THREADS);
+    }
+
+    MPI_Finalize();
+    return 0;
+}
+
+#else
 auto thread_worker(void* raw) -> int {
     auto* state = static_cast<ThreadState*>(raw);
     for (;;) {
@@ -377,7 +534,7 @@ auto renderbench_program_path(const char* argv0) -> std::string {
 
 auto make_worker_args(const std::string& program_path, const tracebench::Options& options, const IpcWorkerSpec& spec)
     -> std::vector<std::string> {
-    return {
+    std::vector<std::string> args{
         program_path,
         "--tracebench-worker",
         "--worker-id",
@@ -407,6 +564,10 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
         "--run-id",
         options.run_id,
     };
+    if (options.debug_edge_colors) {
+        args.emplace_back("--debug-edge-colors");
+    }
+    return args;
 }
 
 [[noreturn]] void exec_worker_child(const std::string& program_path, const tracebench::Options& options, const IpcWorkerSpec& spec,
@@ -846,3 +1007,10 @@ auto main(int argc, char** argv) -> int {
     }
     return run_distributed_ipc(options, peers, argv[0]);
 }
+#endif
+
+#if TRACEBENCH_ENABLE_MPI
+}  // namespace
+
+auto main(int argc, char** argv) -> int { return run_mpi_renderbench(argc, argv); }
+#endif

@@ -297,8 +297,15 @@ auto devfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> s
     return -ENOSYS;
 }
 
-auto devfs_lseek(File* /*f*/, off_t /*offset*/, int /*whence*/) -> off_t {
-    return -ESPIPE;  // devfs does not support seeking
+auto devfs_lseek(File* f, off_t offset, int whence) -> off_t {
+    auto* devfs_file = validate_devfs_file(f, "lseek");
+    if (devfs_file == nullptr) {
+        return -EBADF;
+    }
+    if (devfs_file->device != nullptr && devfs_file->device->char_ops != nullptr && devfs_file->device->char_ops->lseek != nullptr) {
+        return devfs_file->device->char_ops->lseek(f, offset, whence);
+    }
+    return -ESPIPE;
 }
 
 auto devfs_isatty(File* f) -> bool {

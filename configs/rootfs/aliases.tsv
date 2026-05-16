@@ -1,11 +1,13 @@
-# action<TAB>source<TAB>target
+# action<TAB>source<TAB>target[<TAB>mode for copy-mode]
 copy	configs/rootfs/etc/services	/etc/services
 copy	build/modules/testprog/testprog	/usr/bin/testprog
 copy	build/modules/testd/testd	/usr/bin/testd
 copy	build/modules/perf/perf	/usr/bin/perf
 copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
+copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
 copy	build/modules/debugserver/debugserver	/usr/bin/debugserver
 copy	build/modules/strace/strace	/usr/bin/strace
+copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
 copy	build/modules/journal/journal	/usr/bin/journalctl
 copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
 symlink	/usr/bin/wkictl	/usr/bin/locally

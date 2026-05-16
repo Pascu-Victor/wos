@@ -129,10 +129,10 @@
 
     async function tick() {
       try {
-        const latest = await json("/tracebench/runs/latest.json");
+        const latest = await json("/srv/tracebench/runs/latest.json");
         activeRun = latest.run_id || activeRun;
         if (!activeRun) return;
-        const status = await json(`/tracebench/runs/${activeRun}/status.json`);
+        const status = await json(`/srv/tracebench/runs/${activeRun}/status.json`);
         const percent = status.total_tiles ? (status.tiles_done / status.total_tiles) * 100 : 0;
         fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
         el.run.textContent = status.run_id || activeRun;
@@ -143,7 +143,7 @@
         el.samples.textContent = `${status.samples_done} / ${status.total_samples}`;
         el.elapsed.textContent = `${Number(status.elapsed_seconds || 0).toFixed(2)}s`;
         el.state.textContent = status.done ? "Frame complete." : "Rendering.";
-        preview.src = `/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}?t=${Date.now()}`;
+        preview.src = `/srv/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}?t=${Date.now()}`;
       } catch {
         el.state.textContent = "Waiting for a render.";
       }

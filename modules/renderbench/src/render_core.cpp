@@ -33,6 +33,14 @@ namespace {
 
 constexpr float PI = std::numbers::pi_v<float>;
 constexpr float EPSILON = 0.0005F;
+constexpr int MAX_TRANSPARENT_HOPS = 16;
+constexpr float DEBUG_BLACK_TEXTURE_LUMINANCE = 0.04F;
+constexpr float DEBUG_TRIANGLE_EDGE_DISTANCE = 0.008F;
+constexpr float DEBUG_NORMAL_DIVERGENCE_DOT = 0.35F;
+constexpr float DEBUG_GRAZING_VIEW_DOT = 0.08F;
+constexpr float DEBUG_DARK_BASE_LUMINANCE = 0.08F;
+constexpr float DEBUG_DARK_RESULT_LUMINANCE = 0.025F;
+constexpr float MIN_GEOMETRIC_OUTGOING_DOT = 0.05F;
 
 struct Vec3 {
     float x = 0.0F;
@@ -85,16 +93,27 @@ auto reflect(const Vec3& direction, const Vec3& normal) -> Vec3 { return directi
 
 auto luminance(const Vec3& value) -> float { return (0.2126F * value.x) + (0.7152F * value.y) + (0.0722F * value.z); }
 
+auto face_forward(const Vec3& normal, const Vec3& direction) -> Vec3 { return dot(normal, direction) < 0.0F ? normal : normal * -1.0F; }
+
 struct Ray {
     Vec3 origin;
     Vec3 direction;
 };
 
+enum class AlphaMode : uint8_t {
+    OPAQUE,
+    MASK,
+    BLEND,
+};
+
 struct Material {
     Vec3 base_color{.x = 0.8F, .y = 0.8F, .z = 0.8F};
     Vec3 emissive{};
+    float base_alpha = 1.0F;
     float metallic = 0.0F;
     float roughness = 0.7F;
+    AlphaMode alpha_mode = AlphaMode::OPAQUE;
+    float alpha_cutoff = 0.5F;
     int base_color_texture = -1;
     int metallic_roughness_texture = -1;
     int normal_texture = -1;
@@ -127,21 +146,27 @@ struct Texture {
         return width > 0 && height > 0 && rgba.size() >= static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
     }
 
-    auto sample(Vec2 uv) const -> std::array<float, 4> {
+    auto sample(Vec2 uv, bool alpha_weighted_rgb = false) const -> std::array<float, 4> {
         if (!valid()) {
             return {1.0F, 1.0F, 1.0F, 1.0F};
         }
 
         float const U = uv.x - std::floor(uv.x);
         float const V = uv.y - std::floor(uv.y);
-        float const PX = U * static_cast<float>(width - 1);
-        float const PY = V * static_cast<float>(height - 1);
-        int const X0 = std::clamp(static_cast<int>(std::floor(PX)), 0, width - 1);
-        int const Y0 = std::clamp(static_cast<int>(std::floor(PY)), 0, height - 1);
-        int const X1 = std::min(X0 + 1, width - 1);
-        int const Y1 = std::min(Y0 + 1, height - 1);
-        float const TX = PX - static_cast<float>(X0);
-        float const TY = PY - static_cast<float>(Y0);
+        float const PX = (U * static_cast<float>(width)) - 0.5F;
+        float const PY = (V * static_cast<float>(height)) - 0.5F;
+        auto wrap_index = [](int value, int limit) -> int {
+            int const WRAPPED = value % limit;
+            return WRAPPED < 0 ? WRAPPED + limit : WRAPPED;
+        };
+        int const X_BASE = static_cast<int>(std::floor(PX));
+        int const Y_BASE = static_cast<int>(std::floor(PY));
+        int const X0 = wrap_index(X_BASE, width);
+        int const Y0 = wrap_index(Y_BASE, height);
+        int const X1 = wrap_index(X_BASE + 1, width);
+        int const Y1 = wrap_index(Y_BASE + 1, height);
+        float const TX = PX - static_cast<float>(X_BASE);
+        float const TY = PY - static_cast<float>(Y_BASE);
 
         auto load = [&](int x, int y) -> std::array<float, 4> {
             size_t const PIXEL = (static_cast<size_t>(y) * static_cast<size_t>(width)) + static_cast<size_t>(x);
@@ -157,11 +182,35 @@ struct Texture {
         auto const B = load(X1, Y0);
         auto const C = load(X0, Y1);
         auto const D = load(X1, Y1);
+        std::array<float, 4> const WEIGHT{
+            (1.0F - TX) * (1.0F - TY),
+            TX * (1.0F - TY),
+            (1.0F - TX) * TY,
+            TX * TY,
+        };
         std::array<float, 4> out{};
-        for (size_t i = 0; i < out.size(); ++i) {
-            float const TOP = (A[i] * (1.0F - TX)) + (B[i] * TX);
-            float const BOTTOM = (C[i] * (1.0F - TX)) + (D[i] * TX);
-            out[i] = (TOP * (1.0F - TY)) + (BOTTOM * TY);
+        std::array<std::array<float, 4>, 4> const TAP{A, B, C, D};
+        if (alpha_weighted_rgb) {
+            float alpha = 0.0F;
+            for (size_t tap = 0; tap < TAP.size(); ++tap) {
+                alpha += TAP[tap][3] * WEIGHT[tap];
+            }
+            out[3] = alpha;
+            if (alpha > 1.0e-6F) {
+                for (size_t channel = 0; channel < 3U; ++channel) {
+                    float premul = 0.0F;
+                    for (size_t tap = 0; tap < TAP.size(); ++tap) {
+                        premul += TAP[tap][channel] * TAP[tap][3] * WEIGHT[tap];
+                    }
+                    out[channel] = premul / alpha;
+                }
+            }
+            return out;
+        }
+        for (size_t channel = 0; channel < out.size(); ++channel) {
+            for (size_t tap = 0; tap < TAP.size(); ++tap) {
+                out[channel] += TAP[tap][channel] * WEIGHT[tap];
+            }
         }
         return out;
     }
@@ -323,22 +372,28 @@ auto axis_value(const Vec3& value, int axis) -> float {
 }
 
 auto intersect_aabb(const Aabb& box, const Ray& ray, float max_t) -> bool {
-    float tmin = EPSILON;
-    float tmax = max_t;
-    std::array<float, 3> const ORIGIN{ray.origin.x, ray.origin.y, ray.origin.z};
-    std::array<float, 3> const DIR{ray.direction.x, ray.direction.y, ray.direction.z};
-    std::array<float, 3> const BMIN{box.min.x, box.min.y, box.min.z};
-    std::array<float, 3> const BMAX{box.max.x, box.max.y, box.max.z};
+    double tmin = EPSILON;
+    double tmax = max_t;
+    std::array<double, 3> const ORIGIN{ray.origin.x, ray.origin.y, ray.origin.z};
+    std::array<double, 3> const DIR{ray.direction.x, ray.direction.y, ray.direction.z};
+    std::array<double, 3> const BMIN{box.min.x, box.min.y, box.min.z};
+    std::array<double, 3> const BMAX{box.max.x, box.max.y, box.max.z};
     for (size_t axis = 0; axis < DIR.size(); ++axis) {
-        float const INV_D = 1.0F / DIR.at(axis);
-        float t0 = (BMIN.at(axis) - ORIGIN.at(axis)) * INV_D;
-        float t1 = (BMAX.at(axis) - ORIGIN.at(axis)) * INV_D;
-        if (INV_D < 0.0F) {
+        if (std::fabs(DIR.at(axis)) < 1.0e-12) {
+            if (ORIGIN.at(axis) < BMIN.at(axis) || ORIGIN.at(axis) > BMAX.at(axis)) {
+                return false;
+            }
+            continue;
+        }
+        double const INV_D = 1.0 / DIR.at(axis);
+        double t0 = (BMIN.at(axis) - ORIGIN.at(axis)) * INV_D;
+        double t1 = (BMAX.at(axis) - ORIGIN.at(axis)) * INV_D;
+        if (INV_D < 0.0) {
             std::swap(t0, t1);
         }
         tmin = std::max(tmin, t0);
         tmax = std::min(tmax, t1);
-        if (tmax <= tmin) {
+        if (tmax < tmin) {
             return false;
         }
     }
@@ -346,26 +401,45 @@ auto intersect_aabb(const Aabb& box, const Ray& ray, float max_t) -> bool {
 }
 
 auto intersect_triangle(const Triangle& tri, const Ray& ray, float& t, float& u, float& v) -> bool {
-    Vec3 const E1 = tri.b - tri.a;
-    Vec3 const E2 = tri.c - tri.a;
-    Vec3 const P = cross(ray.direction, E2);
-    float const DET = dot(E1, P);
-    if (std::fabs(DET) < 1.0e-8F) {
+    double const E1X = static_cast<double>(tri.b.x) - static_cast<double>(tri.a.x);
+    double const E1Y = static_cast<double>(tri.b.y) - static_cast<double>(tri.a.y);
+    double const E1Z = static_cast<double>(tri.b.z) - static_cast<double>(tri.a.z);
+    double const E2X = static_cast<double>(tri.c.x) - static_cast<double>(tri.a.x);
+    double const E2Y = static_cast<double>(tri.c.y) - static_cast<double>(tri.a.y);
+    double const E2Z = static_cast<double>(tri.c.z) - static_cast<double>(tri.a.z);
+    double const DX = ray.direction.x;
+    double const DY = ray.direction.y;
+    double const DZ = ray.direction.z;
+    double const PX = (DY * E2Z) - (DZ * E2Y);
+    double const PY = (DZ * E2X) - (DX * E2Z);
+    double const PZ = (DX * E2Y) - (DY * E2X);
+    double const DET = (E1X * PX) + (E1Y * PY) + (E1Z * PZ);
+    if (std::fabs(DET) < 1.0e-12) {
         return false;
     }
-    float const INV_DET = 1.0F / DET;
-    Vec3 const T = ray.origin - tri.a;
-    u = dot(T, P) * INV_DET;
-    if (u < 0.0F || u > 1.0F) {
+    double const INV_DET = 1.0 / DET;
+    double const TX = static_cast<double>(ray.origin.x) - static_cast<double>(tri.a.x);
+    double const TY = static_cast<double>(ray.origin.y) - static_cast<double>(tri.a.y);
+    double const TZ = static_cast<double>(ray.origin.z) - static_cast<double>(tri.a.z);
+    double const U = ((TX * PX) + (TY * PY) + (TZ * PZ)) * INV_DET;
+    if (U < 0.0 || U > 1.0) {
         return false;
     }
-    Vec3 const Q = cross(T, E1);
-    v = dot(ray.direction, Q) * INV_DET;
-    if (v < 0.0F || u + v > 1.0F) {
+    double const QX = (TY * E1Z) - (TZ * E1Y);
+    double const QY = (TZ * E1X) - (TX * E1Z);
+    double const QZ = (TX * E1Y) - (TY * E1X);
+    double const V = ((DX * QX) + (DY * QY) + (DZ * QZ)) * INV_DET;
+    if (V < 0.0 || U + V > 1.0) {
         return false;
     }
-    t = dot(E2, Q) * INV_DET;
-    return t > EPSILON;
+    double const T_HIT = ((E2X * QX) + (E2Y * QY) + (E2Z * QZ)) * INV_DET;
+    if (T_HIT <= static_cast<double>(EPSILON) || T_HIT > static_cast<double>(std::numeric_limits<float>::max())) {
+        return false;
+    }
+    t = static_cast<float>(T_HIT);
+    u = static_cast<float>(U);
+    v = static_cast<float>(V);
+    return true;
 }
 
 auto fallback_basis(const Vec3& normal) -> std::array<Vec3, 2> {
@@ -1023,12 +1097,21 @@ auto parse_gltf_document(const JsonValue& root) -> GltfDocument {
             Material material;
             if (const JsonValue* pbr = json_member(item, "pbrMetallicRoughness");
                 pbr != nullptr && pbr->type == JsonValue::Type::JSON_OBJECT) {
-                material.base_color = json_vec3_value(json_member(*pbr, "baseColorFactor"), material.base_color);
+                const JsonValue* base_color_factor = json_member(*pbr, "baseColorFactor");
+                material.base_color = json_vec3_value(base_color_factor, material.base_color);
+                material.base_alpha = std::clamp(json_array_float(base_color_factor, 3U, material.base_alpha), 0.0F, 1.0F);
                 material.metallic = std::clamp(json_member_float(*pbr, "metallicFactor", material.metallic), 0.0F, 1.0F);
                 material.roughness = std::clamp(json_member_float(*pbr, "roughnessFactor", material.roughness), 0.03F, 1.0F);
                 material.base_color_texture = image_for_texture(doc, texture_index_from(*pbr, "baseColorTexture"));
                 material.metallic_roughness_texture = image_for_texture(doc, texture_index_from(*pbr, "metallicRoughnessTexture"));
             }
+            std::string const ALPHA_MODE = json_member_string(item, "alphaMode");
+            if (ALPHA_MODE == "MASK") {
+                material.alpha_mode = AlphaMode::MASK;
+            } else if (ALPHA_MODE == "BLEND") {
+                material.alpha_mode = AlphaMode::BLEND;
+            }
+            material.alpha_cutoff = std::clamp(json_member_float(item, "alphaCutoff", material.alpha_cutoff), 0.0F, 1.0F);
             material.normal_texture = image_for_texture(doc, texture_index_from(item, "normalTexture"));
             material.emissive = json_vec3_value(json_member(item, "emissiveFactor"), material.emissive);
             material.emissive_texture = image_for_texture(doc, texture_index_from(item, "emissiveTexture"));
@@ -1568,7 +1651,7 @@ void append_node(Scene& scene, const GltfDocument& doc, std::span<const uint8_t>
     Mat4 const TRANSFORM = mat4_mul(parent, node.local);
     if (!camera_set && node.camera >= 0 && static_cast<size_t>(node.camera) < doc.cameras.size()) {
         set_camera_basis(scene, transform_point(TRANSFORM, {}), transform_vector(TRANSFORM, {0.0F, 0.0F, -1.0F}),
-                         transform_vector(TRANSFORM, {1.0F, 0.0F, 0.0F}), transform_vector(TRANSFORM, {0.0F, 1.0F, 0.0F}),
+                         transform_vector(TRANSFORM, {.x = 1.0F, .y = 0.0F, .z = 0.0F}), transform_vector(TRANSFORM, {0.0F, 1.0F, 0.0F}),
                          doc.cameras[static_cast<size_t>(node.camera)].yfov_degrees);
         camera_set = true;
     }
@@ -1642,7 +1725,11 @@ struct Hit {
     float t = std::numeric_limits<float>::max();
     Vec3 position;
     Vec3 normal;
+    Vec3 geometric_normal;
     Vec2 uv;
+    float u = 0.0F;
+    float v = 0.0F;
+    float w = 0.0F;
     Vec3 tangent;
     Vec3 bitangent;
     int material = 0;
@@ -1666,21 +1753,29 @@ auto intersect_scene(const Scene& scene, const Ray& ray) -> Hit {
         }
         if (node.count > 0) {
             for (int i = 0; i < node.count; ++i) {
-                int const TRI_INDEX = scene.triangle_indices[static_cast<size_t>(node.start + i)];
+                int const TRI_INDEX = scene.triangle_indices[static_cast<size_t>(node.start) + i];
                 const auto& tri = scene.triangles[static_cast<size_t>(TRI_INDEX)];
                 float t = 0.0F;
                 float u = 0.0F;
                 float v = 0.0F;
                 if (intersect_triangle(tri, ray, t, u, v) && t < closest.t) {
                     float const W = 1.0F - u - v;
+                    Vec3 const GEOMETRIC_NORMAL = face_forward(tri.normal, ray.direction);
                     Vec3 normal = normalize((tri.n0 * W) + (tri.n1 * u) + (tri.n2 * v));
                     if (length(normal) <= 0.0F) {
                         normal = tri.normal;
                     }
+                    if (dot(normal, GEOMETRIC_NORMAL) < 0.0F) {
+                        normal = normal * -1.0F;
+                    }
                     closest.t = t;
                     closest.position = ray.origin + (ray.direction * t);
-                    closest.normal = dot(normal, ray.direction) < 0.0F ? normal : normal * -1.0F;
+                    closest.normal = normal;
+                    closest.geometric_normal = GEOMETRIC_NORMAL;
                     closest.uv = (tri.uv0 * W) + (tri.uv1 * u) + (tri.uv2 * v);
+                    closest.u = u;
+                    closest.v = v;
+                    closest.w = W;
                     closest.tangent = normalize(tri.tangent - (closest.normal * dot(tri.tangent, closest.normal)));
                     if (length(closest.tangent) <= 0.0F) {
                         closest.tangent = fallback_basis(closest.normal)[0];
@@ -1707,49 +1802,109 @@ auto cosine_hemisphere(const Vec3& normal, Rng& rng) -> Vec3 {
     float const R2 = rng.uniform();
     float const PHI = 2.0F * PI * R1;
     float const R = std::sqrt(R2);
-    Vec3 const LOCAL{std::cos(PHI) * R, std::sin(PHI) * R, std::sqrt(std::max(0.0F, 1.0F - R2))};
-    Vec3 const TANGENT = normalize(cross(std::fabs(normal.x) > 0.5F ? Vec3{0.0F, 1.0F, 0.0F} : Vec3{1.0F, 0.0F, 0.0F}, normal));
+    Vec3 const LOCAL{.x = std::cos(PHI) * R, .y = std::sin(PHI) * R, .z = std::sqrt(std::max(0.0F, 1.0F - R2))};
+    Vec3 const TANGENT =
+        normalize(cross(std::fabs(normal.x) > 0.5F ? Vec3{.x = 0.0F, .y = 1.0F, .z = 0.0F} : Vec3{1.0F, 0.0F, 0.0F}, normal));
     Vec3 const BITANGENT = cross(normal, TANGENT);
     return normalize((TANGENT * LOCAL.x) + (BITANGENT * LOCAL.y) + (normal * LOCAL.z));
 }
 
-auto sample_scene_texture(const Scene& scene, int texture_index, Vec2 uv) -> std::array<float, 4> {
+auto clamp_to_geometric_hemisphere(const Vec3& direction, const Vec3& geometric_normal) -> Vec3 {
+    float const D = dot(direction, geometric_normal);
+    if (D >= MIN_GEOMETRIC_OUTGOING_DOT) {
+        return direction;
+    }
+
+    Vec3 const TANGENT = direction - (geometric_normal * D);
+    if (length(TANGENT) <= 1.0e-6F) {
+        return geometric_normal;
+    }
+    return normalize(TANGENT + (geometric_normal * MIN_GEOMETRIC_OUTGOING_DOT));
+}
+
+auto spawn_surface_ray(const Hit& hit, const Vec3& direction) -> Ray {
+    Vec3 const OUT_DIR = clamp_to_geometric_hemisphere(direction, hit.geometric_normal);
+    return {.origin = hit.position + (hit.geometric_normal * EPSILON) + (OUT_DIR * EPSILON), .direction = OUT_DIR};
+}
+
+auto sample_scene_texture(const Scene& scene, int texture_index, Vec2 uv, bool alpha_weighted_rgb = false) -> std::array<float, 4> {
     if (texture_index < 0 || static_cast<size_t>(texture_index) >= scene.textures.size()) {
         return {1.0F, 1.0F, 1.0F, 1.0F};
     }
-    return scene.textures[static_cast<size_t>(texture_index)].sample(uv);
+    return scene.textures[static_cast<size_t>(texture_index)].sample(uv, alpha_weighted_rgb);
 }
 
 struct ShadedMaterial {
     Vec3 base_color;
     Vec3 emissive;
+    float alpha = 1.0F;
     float metallic = 0.0F;
     float roughness = 0.7F;
+    float base_texture_luminance = 1.0F;
+    float base_texture_alpha = 1.0F;
+    bool sampled_base_texture = false;
 };
 
 auto shade_material(const Scene& scene, const Material& material, Vec2 uv) -> ShadedMaterial {
     ShadedMaterial shaded;
     shaded.base_color = material.base_color;
     shaded.emissive = material.emissive;
+    shaded.alpha = material.base_alpha;
     shaded.metallic = material.metallic;
     shaded.roughness = material.roughness;
 
-    auto const BASE = sample_scene_texture(scene, material.base_color_texture, uv);
-    shaded.base_color = shaded.base_color * Vec3{BASE[0], BASE[1], BASE[2]};
+    bool const ALPHA_AWARE = material.alpha_mode != AlphaMode::OPAQUE;
+    auto const BASE = sample_scene_texture(scene, material.base_color_texture, uv, ALPHA_AWARE);
+    Vec3 const BASE_RGB{.x = BASE[0], .y = BASE[1], .z = BASE[2]};
+    shaded.sampled_base_texture = material.base_color_texture >= 0;
+    shaded.base_texture_luminance = luminance(BASE_RGB);
+    shaded.base_texture_alpha = BASE[3];
+    shaded.base_color = shaded.base_color * BASE_RGB;
+    shaded.alpha = std::clamp(shaded.alpha * BASE[3], 0.0F, 1.0F);
 
     auto const MR = sample_scene_texture(scene, material.metallic_roughness_texture, uv);
     shaded.roughness = std::clamp(shaded.roughness * MR[1], 0.03F, 1.0F);
     shaded.metallic = std::clamp(shaded.metallic * MR[2], 0.0F, 1.0F);
 
     auto const EMISSIVE = sample_scene_texture(scene, material.emissive_texture, uv);
-    shaded.emissive = shaded.emissive * Vec3{EMISSIVE[0], EMISSIVE[1], EMISSIVE[2]};
+    shaded.emissive = shaded.emissive * Vec3{.x = EMISSIVE[0], .y = EMISSIVE[1], .z = EMISSIVE[2]};
 
     auto const OCCLUSION = sample_scene_texture(scene, material.occlusion_texture, uv);
     shaded.base_color = shaded.base_color * std::clamp(OCCLUSION[0], 0.2F, 1.0F);
     return shaded;
 }
 
-auto shade_normal(const Scene& scene, const Material& material, const Hit& hit, const Ray& ray) -> Vec3 {
+auto skip_alpha_hit(const Material& material, const ShadedMaterial& shaded, Rng& rng) -> bool {
+    if (material.alpha_mode == AlphaMode::OPAQUE) {
+        return false;
+    }
+    if (material.alpha_mode == AlphaMode::MASK) {
+        return shaded.alpha < material.alpha_cutoff;
+    }
+    return rng.uniform() >= shaded.alpha;
+}
+
+auto debug_color_for_hit(const Material& material, const Hit& hit, const ShadedMaterial& shaded) -> std::optional<Vec3> {
+    if (shaded.sampled_base_texture && shaded.base_texture_luminance <= DEBUG_BLACK_TEXTURE_LUMINANCE) {
+        return Vec3{.x = 18.0F, .y = 0.0F, .z = 18.0F};
+    }
+
+    float const EDGE_DISTANCE = std::min({hit.u, hit.v, hit.w});
+    if (EDGE_DISTANCE <= DEBUG_TRIANGLE_EDGE_DISTANCE) {
+        return Vec3{.x = 18.0F, .y = 18.0F, .z = 0.0F};
+    }
+
+    if (shaded.alpha < 0.98F) {
+        if (material.alpha_mode == AlphaMode::OPAQUE) {
+            return Vec3{.x = 0.0F, .y = 18.0F, .z = 0.0F};
+        }
+        return Vec3{.x = 0.0F, .y = 18.0F, .z = 18.0F};
+    }
+
+    return std::nullopt;
+}
+
+auto shade_normal(const Scene& scene, const Material& material, const Hit& hit) -> Vec3 {
     if (material.normal_texture < 0) {
         return hit.normal;
     }
@@ -1763,7 +1918,7 @@ auto shade_normal(const Scene& scene, const Material& material, const Hit& hit, 
     if (length(normal) <= 0.0F) {
         return hit.normal;
     }
-    return dot(normal, ray.direction) < 0.0F ? normal : normal * -1.0F;
+    return dot(normal, hit.geometric_normal) >= 0.0F ? normal : normal * -1.0F;
 }
 
 auto environment(const Scene& scene, const Vec3& dir) -> Vec3 {
@@ -1784,7 +1939,10 @@ auto environment(const Scene& scene, const Vec3& dir) -> Vec3 {
 auto trace_ray(const Scene& scene, Ray ray, const Options& options, Rng& rng) -> Vec3 {
     Vec3 radiance{};
     Vec3 throughput{1.0F, 1.0F, 1.0F};
-    for (int depth = 0; depth < options.max_depth; ++depth) {
+    std::optional<Vec3> dark_primary_debug_color;
+    std::optional<Vec3> grazing_primary_debug_color;
+    int transparent_hops = 0;
+    for (int depth = 0; depth < options.max_depth;) {
         Hit const hit = intersect_scene(scene, ray);
         if (!hit.hit) {
             radiance += throughput * environment(scene, ray.direction);
@@ -1793,7 +1951,38 @@ auto trace_ray(const Scene& scene, Ray ray, const Options& options, Rng& rng) ->
 
         const auto& material = scene.materials[static_cast<size_t>(hit.material)];
         ShadedMaterial const SHADED = shade_material(scene, material, hit.uv);
-        Vec3 const SURFACE_NORMAL = shade_normal(scene, material, hit, ray);
+        if (skip_alpha_hit(material, SHADED, rng)) {
+            if (options.debug_edge_colors && depth == 0) {
+                return {.x = 0.0F, .y = 18.0F, .z = 18.0F};
+            }
+            if (++transparent_hops > MAX_TRANSPARENT_HOPS) {
+                radiance += throughput * environment(scene, ray.direction);
+                break;
+            }
+            ray = {.origin = hit.position + (ray.direction * EPSILON), .direction = ray.direction};
+            continue;
+        }
+        transparent_hops = 0;
+
+        if (options.debug_edge_colors && depth == 0) {
+            if (auto debug_color = debug_color_for_hit(material, hit, SHADED); debug_color.has_value()) {
+                return *debug_color;
+            }
+        }
+
+        Vec3 const SURFACE_NORMAL = shade_normal(scene, material, hit);
+        if (options.debug_edge_colors && depth == 0) {
+            if (dot(SURFACE_NORMAL, hit.normal) <= DEBUG_NORMAL_DIVERGENCE_DOT) {
+                return Vec3{.x = 18.0F, .y = 4.0F, .z = 0.0F};
+            }
+            if (std::fabs(dot(hit.normal, ray.direction)) <= DEBUG_GRAZING_VIEW_DOT) {
+                grazing_primary_debug_color = Vec3{.x = 0.0F, .y = 0.0F, .z = 18.0F};
+            }
+            if (luminance(SHADED.base_color) > DEBUG_DARK_BASE_LUMINANCE) {
+                dark_primary_debug_color = Vec3{.x = 18.0F, .y = 8.0F, .z = 0.0F};
+            }
+        }
+
         if (luminance(SHADED.emissive) > 0.0F) {
             radiance += throughput * SHADED.emissive;
             break;
@@ -1805,13 +1994,14 @@ auto trace_ray(const Scene& scene, Ray ray, const Options& options, Rng& rng) ->
             Vec3 const REFLECTED = reflect(ray.direction, SURFACE_NORMAL);
             Vec3 const GLOSS = cosine_hemisphere(REFLECTED, rng);
             next_dir = normalize((REFLECTED * (1.0F - SHADED.roughness)) + (GLOSS * SHADED.roughness));
-            throughput = throughput * ((SHADED.base_color * SHADED.metallic) + (Vec3{0.04F, 0.04F, 0.04F} * (1.0F - SHADED.metallic)));
+            throughput = throughput *
+                         ((SHADED.base_color * SHADED.metallic) + (Vec3{.x = 0.04F, .y = 0.04F, .z = 0.04F} * (1.0F - SHADED.metallic)));
         } else {
             next_dir = cosine_hemisphere(SURFACE_NORMAL, rng);
             throughput = throughput * SHADED.base_color;
         }
 
-        ray = {.origin = hit.position + (SURFACE_NORMAL * EPSILON), .direction = next_dir};
+        ray = spawn_surface_ray(hit, next_dir);
         if (depth >= 3) {
             float const P = std::clamp(luminance(throughput), 0.1F, 0.95F);
             if (rng.uniform() > P) {
@@ -1819,6 +2009,13 @@ auto trace_ray(const Scene& scene, Ray ray, const Options& options, Rng& rng) ->
             }
             throughput = throughput / P;
         }
+        ++depth;
+    }
+    if (options.debug_edge_colors && dark_primary_debug_color.has_value() && luminance(radiance) <= DEBUG_DARK_RESULT_LUMINANCE) {
+        return *dark_primary_debug_color;
+    }
+    if (options.debug_edge_colors && grazing_primary_debug_color.has_value()) {
+        return *grazing_primary_debug_color;
     }
     return radiance;
 }
@@ -1826,22 +2023,28 @@ auto trace_ray(const Scene& scene, Ray ray, const Options& options, Rng& rng) ->
 auto default_scene() -> Scene {
     Scene scene;
     scene.materials = {
-        {.base_color = {0.76F, 0.74F, 0.68F}, .roughness = 0.85F},
-        {.base_color = {0.85F, 0.18F, 0.14F}, .roughness = 0.7F},
-        {.base_color = {0.20F, 0.55F, 0.78F}, .roughness = 0.62F},
-        {.base_color = {0.75F, 0.68F, 0.52F}, .metallic = 0.6F, .roughness = 0.24F},
-        {.base_color = {1.0F, 0.92F, 0.78F}, .emissive = {8.0F, 7.1F, 5.6F}, .roughness = 0.2F},
+        {.base_color = {.x = 0.76F, .y = 0.74F, .z = 0.68F}, .roughness = 0.85F},
+        {.base_color = {.x = 0.85F, .y = 0.18F, .z = 0.14F}, .roughness = 0.7F},
+        {.base_color = {.x = 0.20F, .y = 0.55F, .z = 0.78F}, .roughness = 0.62F},
+        {.base_color = {.x = 0.75F, .y = 0.68F, .z = 0.52F}, .metallic = 0.6F, .roughness = 0.24F},
+        {.base_color = {.x = 1.0F, .y = 0.92F, .z = 0.78F}, .emissive = {8.0F, 7.1F, 5.6F}, .roughness = 0.2F},
     };
-    add_quad(scene.triangles, {-2.6F, 0.0F, -2.6F}, {2.6F, 0.0F, -2.6F}, {2.6F, 0.0F, 2.6F}, {-2.6F, 0.0F, 2.6F}, 0);
-    add_quad(scene.triangles, {-2.6F, 0.0F, -2.6F}, {-2.6F, 2.6F, -2.6F}, {2.6F, 2.6F, -2.6F}, {2.6F, 0.0F, -2.6F}, 0);
-    add_quad(scene.triangles, {-2.6F, 2.6F, -2.6F}, {-2.6F, 2.6F, 2.6F}, {2.6F, 2.6F, 2.6F}, {2.6F, 2.6F, -2.6F}, 0);
-    add_quad(scene.triangles, {-2.6F, 0.0F, 2.6F}, {-2.6F, 2.6F, 2.6F}, {-2.6F, 2.6F, -2.6F}, {-2.6F, 0.0F, -2.6F}, 1);
-    add_quad(scene.triangles, {2.6F, 0.0F, -2.6F}, {2.6F, 2.6F, -2.6F}, {2.6F, 2.6F, 2.6F}, {2.6F, 0.0F, 2.6F}, 2);
-    add_quad(scene.triangles, {-0.55F, 2.58F, -1.25F}, {0.55F, 2.58F, -1.25F}, {0.55F, 2.58F, -0.25F}, {-0.55F, 2.58F, -0.25F}, 4);
-    add_box(scene.triangles, {-1.2F, 0.0F, -1.4F}, {-0.25F, 1.1F, -0.45F}, 3);
-    add_box(scene.triangles, {0.45F, 0.0F, -1.8F}, {1.25F, 1.65F, -0.95F}, 0);
+    add_quad(scene.triangles, {.x = -2.6F, .y = 0.0F, .z = -2.6F}, {.x = 2.6F, .y = 0.0F, .z = -2.6F}, {.x = 2.6F, .y = 0.0F, .z = 2.6F},
+             {.x = -2.6F, .y = 0.0F, .z = 2.6F}, 0);
+    add_quad(scene.triangles, {.x = -2.6F, .y = 0.0F, .z = -2.6F}, {.x = -2.6F, .y = 2.6F, .z = -2.6F}, {.x = 2.6F, .y = 2.6F, .z = -2.6F},
+             {.x = 2.6F, .y = 0.0F, .z = -2.6F}, 0);
+    add_quad(scene.triangles, {.x = -2.6F, .y = 2.6F, .z = -2.6F}, {.x = -2.6F, .y = 2.6F, .z = 2.6F}, {.x = 2.6F, .y = 2.6F, .z = 2.6F},
+             {.x = 2.6F, .y = 2.6F, .z = -2.6F}, 0);
+    add_quad(scene.triangles, {.x = -2.6F, .y = 0.0F, .z = 2.6F}, {.x = -2.6F, .y = 2.6F, .z = 2.6F}, {.x = -2.6F, .y = 2.6F, .z = -2.6F},
+             {.x = -2.6F, .y = 0.0F, .z = -2.6F}, 1);
+    add_quad(scene.triangles, {.x = 2.6F, .y = 0.0F, .z = -2.6F}, {.x = 2.6F, .y = 2.6F, .z = -2.6F}, {.x = 2.6F, .y = 2.6F, .z = 2.6F},
+             {.x = 2.6F, .y = 0.0F, .z = 2.6F}, 2);
+    add_quad(scene.triangles, {.x = -0.55F, .y = 2.58F, .z = -1.25F}, {.x = 0.55F, .y = 2.58F, .z = -1.25F},
+             {.x = 0.55F, .y = 2.58F, .z = -0.25F}, {.x = -0.55F, .y = 2.58F, .z = -0.25F}, 4);
+    add_box(scene.triangles, {.x = -1.2F, .y = 0.0F, .z = -1.4F}, {.x = -0.25F, .y = 1.1F, .z = -0.45F}, 3);
+    add_box(scene.triangles, {.x = 0.45F, .y = 0.0F, .z = -1.8F}, {.x = 1.25F, .y = 1.65F, .z = -0.95F}, 0);
     scene.camera.forward = normalize(scene.camera.forward);
-    scene.camera.right = normalize(cross(scene.camera.forward, {0.0F, 1.0F, 0.0F}));
+    scene.camera.right = normalize(cross(scene.camera.forward, {.x = 0.0F, .y = 1.0F, .z = 0.0F}));
     scene.camera.up = normalize(cross(scene.camera.right, scene.camera.forward));
     scene.build_bvh();
     return scene;
@@ -1851,7 +2054,7 @@ auto default_scene() -> Scene {
 
 namespace tracebench {
 
-void FilmView::set_pixel(int x, int y, float r, float g, float b) {
+void FilmView::set_pixel(int x, int y, float r, float g, float b) const {
     size_t const PIXEL = (static_cast<size_t>(y) * static_cast<size_t>(width)) + static_cast<size_t>(x);
     size_t const OFFSET = PIXEL * 3U;
     rgb[OFFSET] = r;
@@ -1904,7 +2107,8 @@ auto parse_int_option(std::string_view name, const char* value, int minimum, int
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --scene scene.glb --backend ipc|mpi --placement node-threads|process-per-core "
-                 "--width N --height N --spp N --max-depth N --tile-size N --output-root PATH [--threads N]\n",
+                 "--width N --height N --spp N --max-depth N --tile-size N --output-root PATH [--threads N] "
+                 "[--debug-edge-colors]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -1987,6 +2191,8 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
                 return ParseStatus::Error;
             }
             options.run_id = VALUE;
+        } else if (ARG == "--debug-edge-colors") {
+            options.debug_edge_colors = true;
         } else if (ARG == "--tracebench-worker") {
             continue;
         } else if (ARG == "--worker-id") {
@@ -2097,6 +2303,7 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"spp\": " << options.spp << ",\n"
         << "  \"max_depth\": " << options.max_depth << ",\n"
         << "  \"tile_size\": " << options.tile_size << ",\n"
+        << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2117,6 +2324,7 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"run_id\": \"" << options.run_id << "\",\n"
         << "  \"backend\": \"" << backend_name(options.backend) << "\",\n"
         << "  \"placement\": \"" << placement_name(options.placement) << "\",\n"
+        << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"

@@ -1,6 +1,7 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -32,6 +34,8 @@ constexpr uint8_t TCP_OPTION_MSS_LEN = 4;
 constexpr uint8_t TCP_OPTION_WSCALE_LEN = 3;
 constexpr size_t TCP_OPTION_LEN_OFFSET = 1;
 constexpr size_t TCP_OPTION_DATA_OFFSET = 2;
+constexpr size_t TCP_OOO_MAX_BYTES = static_cast<size_t>(1024U) * 1024U;
+constexpr size_t TCP_OOO_MAX_SEGMENTS = 512;
 
 auto tcp_header_len(const TcpHeader* hdr) -> size_t { return static_cast<size_t>(hdr->data_offset >> 4U) * sizeof(uint32_t); }
 
@@ -115,6 +119,176 @@ void drain_retransmit_queue(TcpCB* cb) {
     if (n > 0) {
         log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local_port, ker::net::pkt_pool_free_count());
     }
+}
+
+auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, size_t payload_len) -> bool {
+    if (cb == nullptr || sock == nullptr || payload == nullptr || payload_len == 0) {
+        return false;
+    }
+
+    size_t const FREE = sock->rcvbuf.free_space();
+    if (FREE < payload_len) {
+        tcp_refresh_receive_window(cb);
+#ifdef TCP_DEBUG
+        log::trace("rx full: port=%u free=%zu payload=%zu rcv_nxt=%u", cb->local_port, FREE, payload_len, cb->rcv_nxt);
+#endif
+        return false;
+    }
+
+    ssize_t const WRITTEN = sock->rcvbuf.write(payload, payload_len);
+    if (std::cmp_not_equal(WRITTEN, payload_len)) {
+        log::warn("rx partial queue write port=%u written=%zd payload=%zu free=%zu", cb->local_port, WRITTEN, payload_len, FREE);
+        if (WRITTEN <= 0) {
+            tcp_refresh_receive_window(cb);
+            return false;
+        }
+        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
+        tcp_refresh_receive_window(cb);
+        return true;
+    }
+
+    cb->rcv_nxt += static_cast<uint32_t>(payload_len);
+    tcp_refresh_receive_window(cb);
+    return true;
+}
+
+auto tcp_seq_end(uint32_t seq, size_t len) -> uint32_t { return seq + static_cast<uint32_t>(len); }
+
+auto count_out_of_order_segments(const TcpCB* cb) -> size_t {
+    size_t count = 0;
+    for (auto* seg = cb != nullptr ? cb->ooo_head : nullptr; seg != nullptr; seg = seg->next) {
+        ++count;
+    }
+    return count;
+}
+
+void drop_out_of_order_segment(TcpCB* cb, TcpOutOfOrderSegment* seg) {
+    if (cb == nullptr || seg == nullptr) {
+        return;
+    }
+    size_t const OOO_BYTES = cb->ooo_bytes.load(std::memory_order_acquire);
+    cb->ooo_bytes.store(OOO_BYTES > seg->len ? OOO_BYTES - seg->len : 0, std::memory_order_release);
+    cb->ooo_allocated_bytes = cb->ooo_allocated_bytes > seg->allocated_len ? cb->ooo_allocated_bytes - seg->allocated_len : 0;
+    delete[] seg->data;
+    delete seg;
+    tcp_refresh_receive_window(cb);
+}
+
+void discard_stale_out_of_order_segments(TcpCB* cb) {
+    while (cb != nullptr && cb->ooo_head != nullptr) {
+        uint32_t const END = tcp_seq_end(cb->ooo_head->seq, cb->ooo_head->len);
+        if (!tcp_seq_after(END, cb->rcv_nxt)) {
+            auto* stale = cb->ooo_head;
+            cb->ooo_head = stale->next;
+            drop_out_of_order_segment(cb, stale);
+            continue;
+        }
+
+        if (tcp_seq_before(cb->ooo_head->seq, cb->rcv_nxt)) {
+            auto const TRIM = static_cast<size_t>(cb->rcv_nxt - cb->ooo_head->seq);
+            if (TRIM >= cb->ooo_head->len) {
+                auto* stale = cb->ooo_head;
+                cb->ooo_head = stale->next;
+                drop_out_of_order_segment(cb, stale);
+                continue;
+            }
+            std::memmove(cb->ooo_head->data, cb->ooo_head->data + TRIM, cb->ooo_head->len - TRIM);
+            cb->ooo_head->seq = cb->rcv_nxt;
+            cb->ooo_head->len -= TRIM;
+            size_t const OOO_BYTES = cb->ooo_bytes.load(std::memory_order_acquire);
+            cb->ooo_bytes.store(OOO_BYTES > TRIM ? OOO_BYTES - TRIM : 0, std::memory_order_release);
+            tcp_refresh_receive_window(cb);
+        }
+        break;
+    }
+}
+
+auto queue_out_of_order_payload(TcpCB* cb, const uint8_t* payload, size_t payload_len, uint32_t seq) -> bool {
+    if (cb == nullptr || payload == nullptr || payload_len == 0 || cb->socket == nullptr) {
+        return false;
+    }
+
+    size_t const OOO_BYTES = cb->ooo_bytes.load(std::memory_order_acquire);
+    if (payload_len > TCP_OOO_MAX_BYTES || cb->ooo_allocated_bytes + payload_len > TCP_OOO_MAX_BYTES ||
+        count_out_of_order_segments(cb) >= TCP_OOO_MAX_SEGMENTS) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    size_t const BUFFERED = cb->socket->rcvbuf.available() + OOO_BYTES;
+    if (BUFFERED > cb->socket->rcvbuf.capacity || payload_len > cb->socket->rcvbuf.capacity - BUFFERED) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    uint32_t const END = tcp_seq_end(seq, payload_len);
+    uint32_t const WINDOW_END = cb->rcv_nxt + tcp_receive_window_space(cb, cb->socket);
+    if (!tcp_seq_after(seq, cb->rcv_nxt) || tcp_seq_after(END, WINDOW_END)) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    TcpOutOfOrderSegment** link = &cb->ooo_head;
+    while (*link != nullptr && tcp_seq_before((*link)->seq, seq)) {
+        uint32_t const EXISTING_END = tcp_seq_end((*link)->seq, (*link)->len);
+        if (tcp_seq_after(EXISTING_END, seq)) {
+            tcp_refresh_receive_window(cb);
+            return false;
+        }
+        link = &(*link)->next;
+    }
+
+    if (*link != nullptr && tcp_seq_after(END, (*link)->seq)) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    auto* data = new (std::nothrow) uint8_t[payload_len];
+    if (data == nullptr) {
+        return false;
+    }
+    std::memcpy(data, payload, payload_len);
+
+    auto* seg = new (std::nothrow) TcpOutOfOrderSegment{
+        .seq = seq,
+        .len = payload_len,
+        .allocated_len = payload_len,
+        .data = data,
+        .next = *link,
+    };
+    if (seg == nullptr) {
+        delete[] data;
+        return false;
+    }
+
+    *link = seg;
+    cb->ooo_allocated_bytes += payload_len;
+    cb->ooo_bytes.fetch_add(payload_len, std::memory_order_release);
+    tcp_refresh_receive_window(cb);
+    return true;
+}
+
+auto drain_out_of_order_payload(TcpCB* cb, Socket* sock) -> bool {
+    if (cb == nullptr || sock == nullptr) {
+        return false;
+    }
+
+    bool progressed = false;
+    discard_stale_out_of_order_segments(cb);
+    while (cb->ooo_head != nullptr && cb->ooo_head->seq == cb->rcv_nxt) {
+        auto* seg = cb->ooo_head;
+        if (sock->rcvbuf.free_space() < seg->len) {
+            tcp_refresh_receive_window(cb);
+            break;
+        }
+        cb->ooo_head = seg->next;
+        if (queue_in_order_payload(cb, sock, seg->data, seg->len)) {
+            progressed = true;
+        }
+        drop_out_of_order_segment(cb, seg);
+        discard_stale_out_of_order_segments(cb);
+    }
+    return progressed;
 }
 
 // Handle SYN on a listening socket.
@@ -381,10 +555,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     if (payload_len > 0 && child_sock != nullptr) {
                         cb_lock_flags = cb->lock.lock_irqsave();
                         if (SEG_SEQ == cb->rcv_nxt) {
-                            ssize_t const WRITTEN = child_sock->rcvbuf.write(payload, payload_len);
-                            if (WRITTEN > 0) {
-                                cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
-                                cb->rcv_wnd = child_sock->rcvbuf.free_space();
+                            if (queue_in_order_payload(cb, child_sock, payload, payload_len)) {
+                                static_cast<void>(drain_out_of_order_payload(cb, child_sock));
+                                deferred_wake = true;
                             }
                             build_deferred_ack();
                         }
@@ -440,24 +613,24 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             process_stream_ack();
 
             if (payload_len > 0 && SEG_SEQ == cb->rcv_nxt) {
+                bool accepted_payload = false;
+                bool drained_ooo = false;
                 if (cb->socket != nullptr) {
-                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (WRITTEN > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
+                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
+                        accepted_payload = true;
+                        drained_ooo = drain_out_of_order_payload(cb, cb->socket);
                         deferred_wake = true;
                     } else {
                         log::warn("rcvbuf full port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port, cb->socket->rcvbuf.available(),
                                   cb->socket->rcvbuf.capacity, payload_len);
                     }
-                    // Keep advertised window in sync with receive buffer.
-                    cb->rcv_wnd = cb->socket->rcvbuf.free_space();
                 }
                 // Interactive streams such as SSH commonly send tiny PSH
                 // records during key exchange. ACK those immediately; relying
                 // on the delayed-ACK timer here can stall the peer if the timer
                 // worker is not scheduled quickly enough under early boot/load.
                 const bool ACK_IMMEDIATELY = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
-                bool should_ack_now = ACK_IMMEDIATELY;
+                bool should_ack_now = !accepted_payload || drained_ooo || ACK_IMMEDIATELY;
                 if (!should_ack_now) {
                     should_ack_now = ++cb->segs_pending_ack >= 2;
                 }
@@ -478,7 +651,10 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 // the current rcv_nxt. Without this, a lost delayed ACK leaves
                 // the peer retransmitting a segment we already consumed.
                 if (cb->socket != nullptr) {
-                    cb->rcv_wnd = cb->socket->rcvbuf.free_space();
+                    tcp_refresh_receive_window(cb);
+                    if (tcp_seq_after(SEG_SEQ, cb->rcv_nxt)) {
+                        static_cast<void>(queue_out_of_order_payload(cb, payload, payload_len, SEG_SEQ));
+                    }
                 }
                 cb->segs_pending_ack = 0;
                 cb->delayed_ack_deadline = 0;
@@ -578,10 +754,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             }
             if (payload_len > 0 && cb->socket != nullptr) {
                 if (SEG_SEQ == cb->rcv_nxt) {
-                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (WRITTEN > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
-                        cb->rcv_wnd = cb->socket->rcvbuf.free_space();
+                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
                         deferred_wake = true;
                     }
                     build_deferred_ack();
@@ -617,10 +790,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             if (payload_len > 0 && cb->socket != nullptr) {
                 if (SEG_SEQ == cb->rcv_nxt) {
-                    ssize_t const WRITTEN = cb->socket->rcvbuf.write(payload, payload_len);
-                    if (WRITTEN > 0) {
-                        cb->rcv_nxt += static_cast<uint32_t>(WRITTEN);
-                        cb->rcv_wnd = cb->socket->rcvbuf.free_space();
+                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
                         deferred_wake = true;
                     }
                     build_deferred_ack();

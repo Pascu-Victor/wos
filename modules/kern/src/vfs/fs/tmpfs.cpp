@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
 
@@ -87,6 +88,29 @@ void add_child(TmpNode* parent, TmpNode* child) {
     parent->children[parent->children_count] = child;
     parent->children_count++;
     child->parent = parent;
+}
+
+auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset) -> ssize_t {
+    if (count == 0) {
+        return 0;
+    }
+    size_t const NEED = offset + count;
+    if (NEED > n->capacity) {
+        size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
+        while (newcap < NEED) {
+            newcap *= 2;
+        }
+        char* nd = new char[newcap];
+        if (n->data != nullptr) {
+            std::memcpy(nd, n->data, n->size);
+        }
+        delete[] n->data;
+        n->data = nd;
+        n->capacity = newcap;
+    }
+    std::memcpy(n->data + offset, buf, count);
+    n->size = std::max(NEED, n->size);
+    return static_cast<ssize_t>(count);
 }
 }  // namespace
 
@@ -379,6 +403,7 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
         return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
+    ker::mod::sys::MutexGuard guard(n->io_lock);
     if (offset >= n->size) {
         return 0;
     }
@@ -393,23 +418,22 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
         return -EBADF;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
-    size_t const NEED = offset + count;
-    if (NEED > n->capacity) {
-        size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
-        while (newcap < NEED) {
-            newcap *= 2;
-        }
-        char* nd = new char[newcap];
-        if (n->data != nullptr) {
-            std::memcpy(nd, n->data, n->size);
-        }
-        delete[] n->data;
-        n->data = nd;
-        n->capacity = newcap;
+    ker::mod::sys::MutexGuard guard(n->io_lock);
+    return tmpfs_write_locked(n, buf, count, offset);
+}
+
+auto tmpfs_write_append(ker::vfs::File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
+    if ((f == nullptr) || (f->private_data == nullptr)) {
+        return -EBADF;
     }
-    std::memcpy(n->data + offset, buf, count);
-    n->size = std::max(NEED, n->size);
-    return static_cast<ssize_t>(count);
+    auto* n = static_cast<TmpNode*>(f->private_data);
+    ker::mod::sys::MutexGuard guard(n->io_lock);
+    size_t const OFFSET = n->size;
+    ssize_t const RET = tmpfs_write_locked(n, buf, count, OFFSET);
+    if (RET >= 0 && offset_out != nullptr) {
+        *offset_out = OFFSET;
+    }
+    return RET;
 }
 
 auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
@@ -417,6 +441,7 @@ auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
         return 0;
     }
     auto* n = static_cast<TmpNode*>(f->private_data);
+    ker::mod::sys::MutexGuard guard(n->io_lock);
     return n->size;
 }
 
@@ -590,6 +615,7 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     if (n->type != TmpNodeType::FILE) {
         return -EISDIR;
     }
+    ker::mod::sys::MutexGuard guard(n->io_lock);
     auto new_size = static_cast<size_t>(length);
     if (new_size > n->capacity) {
         size_t newcap = (n->capacity == 0) ? 4096 : n->capacity;

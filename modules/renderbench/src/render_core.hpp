@@ -36,6 +36,7 @@ struct Options {
     std::string output_root = "/srv/tracebench/runs";
     int threads = 0;
     std::string run_id;
+    bool debug_edge_colors = false;
 };
 
 struct Tile {
@@ -60,7 +61,7 @@ struct FilmView {
     int height = 0;
     std::span<float> rgb;
 
-    void set_pixel(int x, int y, float r, float g, float b);
+    void set_pixel(int x, int y, float r, float g, float b) const;
 };
 
 struct Scene;

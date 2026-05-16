@@ -32,6 +32,7 @@
 #include "syscalls_impl/process/waitpid.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "util/hostname.hpp"
+#include "util/smallvec.hpp"
 #include "vfs/file.hpp"
 #include "vfs/vfs.hpp"
 
@@ -65,6 +66,60 @@ inline auto is_ptrace_launch_stop_signal(int sig) -> bool { return sig == WOS_SI
 
 inline auto is_live_signal_target(const ker::mod::sched::task::Task& task) -> bool {
     return task.state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task.has_exited;
+}
+
+auto wos_proc_getgroups(size_t size, uint32_t* list) -> uint64_t {
+    constexpr size_t GETGROUPS_SIZE_MAX = 0x7FFFFFFFU;
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    if (size > GETGROUPS_SIZE_MAX) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    size_t const COUNT = task->supplementary_groups.size();
+    if (size == 0) {
+        return COUNT;
+    }
+    if (list == nullptr) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (size < COUNT) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    for (size_t i = 0; i < COUNT; ++i) {
+        list[i] = task->supplementary_groups.at(i);
+    }
+    return COUNT;
+}
+
+auto wos_proc_setgroups(size_t size, const uint32_t* list) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    if (task->euid != 0) {
+        return static_cast<uint64_t>(-EPERM);
+    }
+    if (size > ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if (size > 0 && list == nullptr) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    ker::util::SmallVec<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups;
+    for (size_t i = 0; i < size; ++i) {
+        if (!groups.push_back(list[i])) {
+            return static_cast<uint64_t>(-ENOMEM);
+        }
+    }
+
+    task->supplementary_groups = std::move(groups);
+    return 0;
 }
 
 inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op,
@@ -240,6 +295,12 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->suid = parent->suid;
     child->sgid = parent->sgid;
     child->umask = parent->umask;
+    if (!child->supplementary_groups.clone_from(parent->supplementary_groups)) {
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        delete child;
+        return finish_fork(-ENOMEM);
+    }
 
     // Copy session, process group, and controlling terminal
     child->session_id = parent->session_id;
@@ -711,6 +772,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->egid : 0;
         }
+        case abi::process::procmgmt_ops::GETGROUPS: {
+            return wos_proc_getgroups(static_cast<size_t>(a2), reinterpret_cast<uint32_t*>(a3));
+        }
         case abi::process::procmgmt_ops::SETUID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
@@ -769,6 +833,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 return 0;
             }
             return static_cast<uint64_t>(-EPERM);
+        }
+        case abi::process::procmgmt_ops::SETGROUPS: {
+            return wos_proc_setgroups(static_cast<size_t>(a2), reinterpret_cast<const uint32_t*>(a3));
         }
         case abi::process::procmgmt_ops::GETUMASK: {
             auto* task = ker::mod::sched::get_current_task();

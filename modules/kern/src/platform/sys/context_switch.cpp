@@ -643,6 +643,9 @@ void request_reschedule() {
                 static_cast<unsigned long long>(rsp),
                 task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL);
         }
+        if (timer_quantum != 0) {
+            apic::one_shot_timer(timer_quantum);
+        }
         return;
     }
     apic::one_shot_timer(1);

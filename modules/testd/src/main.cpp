@@ -51,7 +51,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <print>
 #include <string_view>
 #include <utility>
 
@@ -94,17 +93,43 @@ constexpr mode_t MODE_0644 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 constexpr mode_t MODE_0755 = S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
 constexpr mode_t MODE_0600 = S_IRUSR | S_IWUSR;
 constexpr mode_t MODE_MASK = 0777;
+// FIXME: look into the print flushing to fix this
+//  Keep testd's own progress reporting off std::println/FILE flushing; the
+//  current WOS libc++/stdio path can fault while formatting these status lines.
+void testd_write_all(const char* data, size_t size) {
+    while (size > 0) {
+        ssize_t const NW = write(STDOUT_FILENO, data, size);
+        if (NW <= 0) {
+            return;
+        }
+        data += NW;
+        size -= static_cast<size_t>(NW);
+    }
+}
+
+template <size_t FMT_SIZE, typename... Args>
+void testd_logf(const char (&fmt)[FMT_SIZE], Args... args) {
+    std::array<char, 1024> buf{};
+    int const N = std::snprintf(buf.data(), buf.size(), fmt, args...);
+    if (N < 0) {
+        return;
+    }
+
+    size_t const LEN = (static_cast<size_t>(N) < buf.size()) ? static_cast<size_t>(N) : buf.size() - 1;
+    testd_write_all(buf.data(), LEN);
+    testd_write_all("\n", 1);
+}
 
 void testd_pass_impl(const char* name) {
     g_pass++;
-    std::println("[TESTD] {}/{} PASS: {}", g_pass, total_tests(), name);
-    fflush(stdout);
+    testd_logf("[TESTD] %d/%d PASS: %s", g_pass, total_tests(), name);
 }
 
 void fail(const char* name, const char* reason) {
+    int const SAVED_ERRNO = errno;
     g_fail++;
-    std::println(stdout, "[TESTD] {}/{} FAIL: {}: {} (errno={})", g_pass, total_tests(), name, reason, errno);
-    fflush(stdout);
+    testd_logf("[TESTD] %d/%d FAIL: %s: %s (errno=%d)", g_pass, total_tests(), name, reason, SAVED_ERRNO);
+    errno = SAVED_ERRNO;
 }
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
 #define TESTD_PASS(name)                \
@@ -363,6 +388,83 @@ TESTD_RUN(test_vfs_unlink_rename) {
 }
 TESTD_RUN_END(test_vfs_unlink_rename)
 
+TESTD_RUN(test_vfs_shell_fsops_shape) {
+    const char* base = "/tmp/testd_fsops_shape";
+    const char* d1 = "/tmp/testd_fsops_shape/d1";
+    const char* d2 = "/tmp/testd_fsops_shape/d1/d2";
+    const char* src = "/tmp/testd_fsops_shape/f1_cp";
+    const char* dst = "/tmp/testd_fsops_shape/f1_mv";
+    constexpr std::array<const char*, 7> FILES = {
+        "/tmp/testd_fsops_shape/f1", "/tmp/testd_fsops_shape/f2",        "/tmp/testd_fsops_shape/f3",  "/tmp/testd_fsops_shape/f4",
+        "/tmp/testd_fsops_shape/f5", "/tmp/testd_fsops_shape/stdin_src", "/tmp/testd_fsops_shape/cap",
+    };
+
+    unlink(dst);
+    unlink(src);
+    for (const char* path : FILES) {
+        unlink(path);
+    }
+    rmdir(d2);
+    rmdir(d1);
+    rmdir(base);
+
+    if (mkdir(base, MODE_0755) != 0) {
+        fail("vfs_shell_fsops_base", "mkdir base failed");
+        return;
+    }
+
+    for (const char* path : FILES) {
+        int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+        if (fd < 0) {
+            fail("vfs_shell_fsops_seed", "open seed file failed");
+            return;
+        }
+        close(fd);
+    }
+
+    if (mkdir(d1, MODE_0755) != 0 || mkdir(d2, MODE_0755) != 0) {
+        fail("vfs_shell_nested_mkdir", "nested mkdir failed");
+        return;
+    }
+
+    struct stat st{};
+    if (stat(d2, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fail("vfs_shell_nested_mkdir_stat", "nested directory missing");
+        return;
+    }
+    TESTD_PASS("vfs_shell_nested_mkdir_stat");
+
+    int fd = open(src, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+    if (fd < 0) {
+        fail("vfs_shell_rename_create", "open source failed");
+        return;
+    }
+    close(fd);
+
+    if (rename(src, dst) != 0) {
+        fail("vfs_shell_rename", "rename failed");
+        return;
+    }
+    if (stat(dst, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fail("vfs_shell_rename_dst", "destination missing");
+        return;
+    }
+    if (stat(src, &st) == 0) {
+        fail("vfs_shell_rename_src", "source still exists");
+        return;
+    }
+    TESTD_PASS("vfs_shell_rename");
+
+    unlink(dst);
+    for (const char* path : FILES) {
+        unlink(path);
+    }
+    rmdir(d2);
+    rmdir(d1);
+    rmdir(base);
+}
+TESTD_RUN_END(test_vfs_shell_fsops_shape)
+
 TESTD_RUN(test_vfs_dup) {
     std::array<int, 2> fds = {-1, -1};
     if (pipe(fds.data()) != 0) {
@@ -449,6 +551,112 @@ TESTD_RUN(test_vfs_readdir) {
     TESTD_PASS("vfs_readdir");
 }
 TESTD_RUN_END(test_vfs_readdir)
+
+TESTD_RUN(test_vfs_directory_requirements) {
+    const char* file = "/tmp/testd_not_dir.txt";
+    unlink(file);
+
+    int fd = open(file, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+    if (fd < 0) {
+        fail("vfs_dirreq_create", "open failed");
+        return;
+    }
+    close(fd);
+
+    errno = 0;
+    DIR* dir = opendir(file);
+    if (dir != nullptr) {
+        closedir(dir);
+        unlink(file);
+        fail("vfs_opendir_regular_file", "opendir regular file succeeded");
+        return;
+    }
+    if (errno != ENOTDIR) {
+        int const SAVED_ERRNO = errno;
+        unlink(file);
+        errno = SAVED_ERRNO;
+        fail("vfs_opendir_regular_file_errno", "expected ENOTDIR");
+        return;
+    }
+    TESTD_PASS("vfs_opendir_regular_file");
+
+    struct stat st{};
+    errno = 0;
+    if (stat("/tmp/testd_not_dir.txt/", &st) == 0 || errno != ENOTDIR) {
+        int const SAVED_ERRNO = errno;
+        unlink(file);
+        errno = SAVED_ERRNO;
+        fail("vfs_stat_trailing_slash", "expected ENOTDIR");
+        return;
+    }
+    TESTD_PASS("vfs_stat_trailing_slash");
+
+    unlink(file);
+}
+TESTD_RUN_END(test_vfs_directory_requirements)
+
+TESTD_RUN(test_vfs_rename_file_parent_enotdir) {
+    const char* src = "/tmp/testd_rename_src.txt";
+    const char* parent_file = "/tmp/testd_rename_parent.txt";
+    const char* nested_dst = "/tmp/testd_rename_parent.txt/src.txt";
+    unlink(src);
+    unlink(parent_file);
+
+    int fd = open(src, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+    if (fd < 0) {
+        fail("vfs_rename_file_parent_create_src", "open src failed");
+        return;
+    }
+    close(fd);
+
+    fd = open(parent_file, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+    if (fd < 0) {
+        unlink(src);
+        fail("vfs_rename_file_parent_create_parent", "open parent failed");
+        return;
+    }
+    close(fd);
+
+    errno = 0;
+    if (rename(src, "/tmp/testd_rename_parent.txt/") == 0 || errno != ENOTDIR) {
+        int const SAVED_ERRNO = errno;
+        unlink(src);
+        unlink(parent_file);
+        errno = SAVED_ERRNO;
+        fail("vfs_rename_trailing_slash_file", "expected ENOTDIR");
+        return;
+    }
+    TESTD_PASS("vfs_rename_trailing_slash_file");
+
+    errno = 0;
+    if (rename(src, nested_dst) == 0 || errno != ENOTDIR) {
+        int const SAVED_ERRNO = errno;
+        unlink(src);
+        unlink(parent_file);
+        errno = SAVED_ERRNO;
+        fail("vfs_rename_file_parent", "expected ENOTDIR");
+        return;
+    }
+
+    struct stat st{};
+    if (stat(src, &st) != 0 || !S_ISREG(st.st_mode)) {
+        unlink(src);
+        unlink(parent_file);
+        fail("vfs_rename_file_parent_src", "source was not preserved");
+        return;
+    }
+    if (stat(parent_file, &st) != 0 || !S_ISREG(st.st_mode)) {
+        unlink(src);
+        unlink(parent_file);
+        fail("vfs_rename_file_parent_parent", "parent file was not preserved");
+        return;
+    }
+
+    unlink(src);
+    unlink(parent_file);
+    TESTD_PASS("vfs_rename_file_parent");
+}
+TESTD_RUN_END(test_vfs_rename_file_parent_enotdir)
 
 TESTD_RUN(test_vfs_access) {
     int const FD = open("/tmp/testd_access.txt", O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
@@ -822,8 +1030,8 @@ TESTD_RUN(test_fork_pipe_byte) {
     pid_t wait_ret = waitpid(PID, nullptr, 0);
     int wait_errno = errno;
     if (nr != 1) {
-        std::println("[TESTD] DBG fork_pipe_byte: nr={} read_errno={} b=0x{:x} close_errno={} wait_ret={} wait_errno={}", nr, read_errno,
-                     static_cast<unsigned char>(b), close_errno, wait_ret, wait_errno);
+        testd_logf("[TESTD] DBG fork_pipe_byte: nr=%zd read_errno=%d b=0x%x close_errno=%d wait_ret=%d wait_errno=%d", nr, read_errno,
+                   static_cast<unsigned>(static_cast<unsigned char>(b)), close_errno, static_cast<int>(wait_ret), wait_errno);
         fail("fork_pipe_byte_count", "read returned wrong count");
         return;
     }
@@ -1104,8 +1312,7 @@ void tcp_echo_server(int ready_fd) {
     }
     if (n < 0) {
         recv_errno = errno;
-        std::println("[TESTD] INFO: tcp_echo_server recv ended rc={} errno={}", n, recv_errno);
-        fflush(stdout);
+        testd_logf("[TESTD] INFO: tcp_echo_server recv ended rc=%zd errno=%d", n, recv_errno);
     }
     close(CLI);
     close(SRV);
@@ -1211,9 +1418,8 @@ TESTD_RUN(test_tcp_loopback) {
     waitpid(SRV_PID, &srv_status, 0);
 
     if (std::cmp_not_equal(total_recv, DATA_SIZE)) {
-        std::println("[TESTD] INFO: tcp_recv short total_recv={} expected={} last_recv={} errno={} srv_status={}", total_recv, DATA_SIZE,
-                     last_recv, last_recv_errno, srv_status);
-        fflush(stdout);
+        testd_logf("[TESTD] INFO: tcp_recv short total_recv=%zd expected=%d last_recv=%zd errno=%d srv_status=%d", total_recv, DATA_SIZE,
+                   last_recv, last_recv_errno, srv_status);
         fail("tcp_recv", "short recv");
         return;
     }
@@ -1248,7 +1454,7 @@ TESTD_RUN(test_tcp_nonblocking_connect_refused) {
         return;
     }
     if (saved_errno != ECONNREFUSED) {
-        std::println("[TESTD] WARN: tcp_refused got errno={} (expected {})", saved_errno, ECONNREFUSED);
+        testd_logf("[TESTD] WARN: tcp_refused got errno=%d (expected %d)", saved_errno, ECONNREFUSED);
     }
     TESTD_PASS("tcp_connect_refused");
 }
@@ -1909,9 +2115,12 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_vfs_lseek)                           \
     X(test_vfs_mkdir_rmdir)                     \
     X(test_vfs_unlink_rename)                   \
+    X(test_vfs_shell_fsops_shape)               \
     X(test_vfs_dup)                             \
     X(test_vfs_dup2)                            \
     X(test_vfs_readdir)                         \
+    X(test_vfs_directory_requirements)          \
+    X(test_vfs_rename_file_parent_enotdir)      \
     X(test_vfs_access)                          \
     X(test_chmod)                               \
     X(test_truncate)                            \
@@ -2125,8 +2334,7 @@ auto main(int argc, char** argv) -> int {
         return RH_EXIT_UNKNOWN_MODE;
     }
 
-    std::println("[TESTD] starting");
-    fflush(stdout);
+    testd_logf("%s", "[TESTD] starting");
 
     // Ensure /tmp exists
     mkdir("/tmp", MODE_0755);  // idempotent
@@ -2135,8 +2343,7 @@ auto main(int argc, char** argv) -> int {
         test.run();
     }
 
-    std::println("[TESTD] DONE: {} passed, {} failed", g_pass, g_fail);
-    fflush(stdout);
+    testd_logf("[TESTD] DONE: %d passed, %d failed", g_pass, g_fail);
 
     return (g_fail == 0) ? 0 : 1;
 }

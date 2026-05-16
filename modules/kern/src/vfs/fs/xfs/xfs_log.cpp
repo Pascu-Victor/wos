@@ -4,9 +4,8 @@
 // recovery is needed: log records are replayed to bring the filesystem back
 // to a consistent state.
 //
-// The current implementation handles log head/tail detection and basic
-// clean/dirty state.  Full transaction log writing is deferred to a
-// dedicated kernel thread (not yet implemented).
+// This implementation handles log head/tail detection, basic recovery for the
+// compact WOS log item format, and synchronous transaction log writes.
 //
 // Reference: reference/xfs/xfs_log.c, reference/xfs/xfs_log_recover.c
 

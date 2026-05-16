@@ -53,7 +53,10 @@ constexpr uint16_t PERF_MASK_LOCAL_PIPE = 1U << 7;
 constexpr uint16_t PERF_MASK_LOCAL_PROC = 1U << 8;
 constexpr uint16_t PERF_MASK_LOCAL_VMEM = 1U << 9;
 constexpr uint16_t PERF_MASK_LOCAL_LOADER = 1U << 10;
-constexpr uint16_t PERF_MASK_LOCAL = PERF_MASK_LOCAL_PIPE | PERF_MASK_LOCAL_PROC | PERF_MASK_LOCAL_VMEM | PERF_MASK_LOCAL_LOADER;
+constexpr uint16_t PERF_MASK_LOCAL_XFS = 1U << 11;
+constexpr uint16_t PERF_MASK_LOCAL_IRQ = 1U << 12;
+constexpr uint16_t PERF_MASK_LOCAL =
+    PERF_MASK_LOCAL_PIPE | PERF_MASK_LOCAL_PROC | PERF_MASK_LOCAL_VMEM | PERF_MASK_LOCAL_LOADER | PERF_MASK_LOCAL_XFS | PERF_MASK_LOCAL_IRQ;
 constexpr uint16_t PERF_MASK_ALL = PERF_MASK_SAMPLE | PERF_MASK_SWITCH | PERF_MASK_WAKE | PERF_MASK_SLEEP | PERF_MASK_CONTAINER |
                                    PERF_MASK_WKI | PERF_MASK_WKI_LAUNCH | PERF_MASK_LOCAL;
 
@@ -91,6 +94,8 @@ enum class WkiPerfScope : uint8_t {
     LOCAL_PROC = 8,
     LOCAL_VMEM = 9,
     LOCAL_LOADER = 10,
+    LOCAL_XFS = 11,
+    LOCAL_IRQ = 12,
 };
 
 enum class WkiPerfPhase : uint8_t {
@@ -235,6 +240,45 @@ enum class WkiPerfLocalLoaderOp : uint8_t {
     PT_LOAD_INTERP = 2,
     FINAL_PERMS_MAIN = 3,
     FINAL_PERMS_INTERP = 4,
+};
+
+enum class WkiPerfLocalXfsOp : uint8_t {
+    READ = 1,
+    WRITE = 2,
+    READ_BMAP = 3,
+    READ_IO = 4,
+    WRITE_BMAP = 5,
+    WRITE_ALLOC = 6,
+    WRITE_IO = 7,
+    WRITE_ILOG = 8,
+    WRITE_HOLE_ITER = 9,
+    WRITE_MAP_ITER = 10,
+    DIRECT_READ = 11,
+    DIRECT_WRITE = 12,
+    BUFFERED_READ = 13,
+    BUFFERED_WRITE = 14,
+    BUF_READ_HIT = 15,
+    BUF_READ_MISS = 16,
+    BUF_GET_HIT = 17,
+    BUF_GET_MISS = 18,
+    BUF_DISK_READ = 19,
+    BUF_DISK_WRITE = 20,
+    BUF_DIRTY = 21,
+    BUF_DISCARD = 22,
+    INODE_FETCH = 23,
+    INODE_CACHE_HIT = 24,
+    INODE_CACHE_MISS = 25,
+    INODE_UNAVAILABLE = 26,
+    SYNC_BLOCKDEV = 27,
+    BUF_FLUSH = 28,
+    BUF_ALLOC = 29,
+    READ_COPY = 30,
+    READ_ZERO = 31,
+    READ_GAP = 32,
+};
+
+enum class WkiPerfLocalIrqOp : uint8_t {
+    HANDLER = 1,
 };
 
 const char* wki_scope_name(WkiPerfScope scope);
@@ -434,6 +478,9 @@ void set_event_mask(uint16_t mask);
 uint16_t get_event_mask();
 
 bool is_wki_recording_enabled();
+bool is_wki_scope_recording_enabled(WkiPerfScope scope, uint8_t op = 0);
+bool is_local_xfs_recording_enabled();
+bool is_local_irq_recording_enabled();
 void register_local_vmem_zero_page(const void* page);
 bool is_local_vmem_zero_page(const void* page);
 
@@ -448,11 +495,14 @@ void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op
                       uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite);
 void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us,
                         bool has_latency, uint32_t retries, uint64_t bytes);
+void record_local_xfs_summary(WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, bool has_latency, uint64_t bytes);
+void record_local_irq_summary(WkiPerfLocalIrqOp op, uint16_t vector, uint16_t kind, int32_t status, uint32_t latency_us, bool has_latency);
 size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max);
 
 // Parse a comma-separated event type string into a mask.
 // Recognized names: sample, switch, wake, sleep, container, wki, wki_launch,
-// local_pipe, local_proc, local_vmem/vmem, local_loader/loader, local, all.
+// local_pipe, local_proc, local_vmem/vmem, local_loader/loader,
+// local_xfs/xfs, local_irq/irq, local, all.
 // Returns 0 on parse error.
 uint16_t parse_event_mask(const char* str, size_t len);
 

@@ -76,7 +76,7 @@ auto check_exec_permission_from_stat(const ker::mod::sched::task::Task* task, co
     uint32_t perm_bits = 0;
     if (task->euid == statbuf.st_uid) {
         perm_bits = (FILE_MODE >> 6U) & 7U;
-    } else if (task->egid == statbuf.st_gid) {
+    } else if (task->has_group(statbuf.st_gid)) {
         perm_bits = (FILE_MODE >> 3U) & 7U;
     } else {
         perm_bits = FILE_MODE & 7U;
@@ -449,6 +449,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->suid = parent_task->suid;
     new_task->sgid = parent_task->sgid;
     new_task->umask = parent_task->umask;
+    [[maybe_unused]] bool const CLONED_GROUPS = new_task->supplementary_groups.clone_from(parent_task->supplementary_groups);
     new_task->session_id = parent_task->session_id;
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : parent_task->pid;
     new_task->controlling_tty = parent_task->controlling_tty;

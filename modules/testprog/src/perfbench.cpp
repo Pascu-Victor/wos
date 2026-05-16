@@ -6,12 +6,15 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <print>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -83,6 +86,8 @@ auto scramble_work(uint64_t value, uint64_t index) -> uint64_t {
 struct SpawnArg {
     uint64_t spawn_ns;  // set by parent just before thrd_create
     uint64_t start_ns;  // set by thread at first instruction
+    std::atomic<int>* started_count;
+    std::atomic<int>* done_count;
     int cpu_id;
     int id;
 };
@@ -101,18 +106,43 @@ auto spawn_thread(void* param) -> int {
     auto* a = static_cast<SpawnArg*>(param);
     a->start_ns = now_ns();
     a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
+    a->started_count->fetch_add(1, std::memory_order_release);
+    a->done_count->fetch_add(1, std::memory_order_release);
     return 0;
 }
 
-void test_spawn_and_placement(int n) {
+constexpr uint64_t COUNTER_WAIT_TIMEOUT_NS = 5000000000ULL;
+
+auto wait_for_counter(std::atomic<int>& counter, int expected, uint64_t timeout_ns) -> bool {
+    uint64_t const START_NS = now_ns();
+    while (counter.load(std::memory_order_acquire) != expected) {
+        if (now_ns() - START_NS > timeout_ns) {
+            return false;
+        }
+        thrd_yield();
+    }
+    return true;
+}
+
+auto test_spawn_and_placement(int n, bool verbose) -> bool {
     std::vector<SpawnArg> args(static_cast<std::size_t>(n));
     std::vector<thrd_t> threads(static_cast<std::size_t>(n));
+    uint64_t overall_sum = 0;
+    uint64_t overall_min = UINT64_MAX;
+    uint64_t overall_max = 0;
+    int overall_samples = 0;
+    int min_unique = n;
+    int max_unique = 0;
 
     for (int repeat = 0; repeat < 3; ++repeat) {
+        std::atomic<int> started_count{0};
+        std::atomic<int> done_count{0};
         int id = 0;
         for (auto& arg : args) {
             arg.id = id;
             arg.start_ns = 0;
+            arg.started_count = &started_count;
+            arg.done_count = &done_count;
             arg.cpu_id = -1;
             ++id;
         }
@@ -120,11 +150,33 @@ void test_spawn_and_placement(int n) {
         auto thread_it = threads.begin();
         for (auto& arg : args) {
             arg.spawn_ns = now_ns();
-            thrd_create(&*thread_it, spawn_thread, &arg);
+            int const CREATE_RESULT = thrd_create(&*thread_it, spawn_thread, &arg);
+            if (CREATE_RESULT != THRD_SUCCESS) {
+                std::println(stderr, "[perf] spawn_latency[{}]: FAILED (create t{} rc={})", repeat, arg.id, CREATE_RESULT);
+                return false;
+            }
             ++thread_it;
         }
+
+        if (!wait_for_counter(started_count, n, COUNTER_WAIT_TIMEOUT_NS)) {
+            std::println(stderr, "[perf] spawn_latency[{}]: FAILED (started timeout {}/{})", repeat,
+                         started_count.load(std::memory_order_acquire), n);
+            return false;
+        }
+        if (!wait_for_counter(done_count, n, COUNTER_WAIT_TIMEOUT_NS)) {
+            std::println(stderr, "[perf] spawn_latency[{}]: FAILED (done timeout {}/{})", repeat,
+                         done_count.load(std::memory_order_acquire), n);
+            return false;
+        }
+
+        int thread_index = 0;
         for (auto* thread : threads) {
-            thrd_join(thread, nullptr);
+            int const JOIN_RESULT = thrd_join(thread, nullptr);
+            if (JOIN_RESULT != THRD_SUCCESS) {
+                std::println(stderr, "[perf] spawn_latency[{}]: FAILED (join t{} rc={})", repeat, thread_index, JOIN_RESULT);
+                return false;
+            }
+            ++thread_index;
         }
 
         uint64_t sum = 0;
@@ -136,6 +188,8 @@ void test_spawn_and_placement(int n) {
         for (const auto& arg : args) {
             uint64_t const LAT = arg.start_ns - arg.spawn_ns;
             sum += LAT;
+            overall_sum += LAT;
+            ++overall_samples;
             if (LAT < mn) {
                 mn = LAT;
                 min_idx = arg_index;
@@ -144,6 +198,8 @@ void test_spawn_and_placement(int n) {
                 mx = LAT;
                 max_idx = arg_index;
             }
+            overall_min = std::min(overall_min, LAT);
+            overall_max = std::max(overall_max, LAT);
             ++arg_index;
         }
         double mean_ms = static_cast<double>(sum) / n / 1e6;
@@ -160,24 +216,42 @@ void test_spawn_and_placement(int n) {
                 ++unique;
             }
         }
+        min_unique = std::min(min_unique, unique);
+        max_unique = std::max(max_unique, unique);
 
-        std::print(stderr, "[perf] spawn_latency[{}]:  min={:.2f}ms max={:.2f}ms mean={:.2f}ms  cpus:", repeat, min_ms, max_ms, mean_ms);
-        arg_index = 0;
-        for (const auto& arg : args) {
-            std::print(stderr, " t{}->c{}", arg_index, arg.cpu_id);
-            ++arg_index;
+        if (verbose) {
+            std::print(stderr, "[perf] spawn_latency[{}]:  min={:.2f}ms max={:.2f}ms mean={:.2f}ms  cpus:", repeat, min_ms, max_ms,
+                       mean_ms);
+            arg_index = 0;
+            for (const auto& arg : args) {
+                std::print(stderr, " t{}->c{}", arg_index, arg.cpu_id);
+                ++arg_index;
+            }
+            std::print(stderr, "  [{}/{} unique CPUs", unique, n);
+            if (unique < n) {
+                std::print(stderr, " *** CO-LOCATION DETECTED ***");
+            }
+            std::println(stderr, "]");
+            const auto& min_arg = args.at(static_cast<std::size_t>(min_idx));
+            const auto& max_arg = args.at(static_cast<std::size_t>(max_idx));
+            std::println(stderr,
+                         "[perf]   spawn_outliers[{}]: best=t{} c{} lat={:.2f}ms same_cpu={}  worst=t{} c{} lat={:.2f}ms same_cpu={}",
+                         repeat, min_idx, min_arg.cpu_id, min_ms, count_threads_on_cpu(args, min_arg.cpu_id), max_idx, max_arg.cpu_id,
+                         max_ms, count_threads_on_cpu(args, max_arg.cpu_id));
         }
-        std::print(stderr, "  [{}/{} unique CPUs", unique, n);
-        if (unique < n) {
-            std::print(stderr, " *** CO-LOCATION DETECTED ***");
-        }
-        std::println(stderr, "]");
-        const auto& min_arg = args.at(static_cast<std::size_t>(min_idx));
-        const auto& max_arg = args.at(static_cast<std::size_t>(max_idx));
-        std::println(stderr, "[perf]   spawn_outliers[{}]: best=t{} c{} lat={:.2f}ms same_cpu={}  worst=t{} c{} lat={:.2f}ms same_cpu={}",
-                     repeat, min_idx, min_arg.cpu_id, min_ms, count_threads_on_cpu(args, min_arg.cpu_id), max_idx, max_arg.cpu_id, max_ms,
-                     count_threads_on_cpu(args, max_arg.cpu_id));
     }
+
+    double const OVERALL_MEAN_MS = static_cast<double>(overall_sum) / overall_samples / 1e6;
+    double const OVERALL_MIN_MS = static_cast<double>(overall_min) / 1e6;
+    double const OVERALL_MAX_MS = static_cast<double>(overall_max) / 1e6;
+    if (min_unique == max_unique) {
+        std::println(stderr, "[perf] spawn_latency:    min={:.2f}ms max={:.2f}ms mean={:.2f}ms  unique_cpus={}/{}", OVERALL_MIN_MS,
+                     OVERALL_MAX_MS, OVERALL_MEAN_MS, min_unique, n);
+    } else {
+        std::println(stderr, "[perf] spawn_latency:    min={:.2f}ms max={:.2f}ms mean={:.2f}ms  unique_cpus={}..{}/{}", OVERALL_MIN_MS,
+                     OVERALL_MAX_MS, OVERALL_MEAN_MS, min_unique, max_unique, n);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +334,7 @@ struct ParEffArg {
     uint64_t cpu_mask;
     uint32_t cpu_changes;
     std::atomic<int>* ready_count;
+    std::atomic<int>* done_count;
     std::atomic<bool>* go;
 };
 
@@ -307,6 +382,7 @@ auto par_eff_thread(void* param) -> int {
     a->result = sum;
     a->end_ns = now_ns();
     a->cpu_ns = rdtsc() - CPU_START;
+    a->done_count->fetch_add(1, std::memory_order_release);
     return 0;
 }
 
@@ -419,9 +495,10 @@ auto choose_spread_targets(int cpu_count, int worker_count) -> std::vector<int> 
     return targets;
 }
 
-void test_parallel_efficiency() {
-    constexpr int ITERS = 250000000;
-    constexpr int REPEATS = 5;
+constexpr uint64_t PARALLEL_READY_TIMEOUT_NS = 5000000000ULL;
+constexpr uint64_t PARALLEL_DONE_TIMEOUT_NS = 10000000000ULL;
+
+auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
     constexpr std::array<int, 4> THREAD_COUNTS{1, 2, 4, 8};
     double time_1 = 0;
     std::array<double, THREAD_COUNTS.size()> speedups{};
@@ -429,7 +506,7 @@ void test_parallel_efficiency() {
 
     if (CPU_TOTAL <= 0) {
         std::println(stderr, "[perf] parallel_eff:       FAILED (no CPUs reported)");
-        return;
+        return false;
     }
 
     std::size_t thread_count_index = 0;
@@ -439,11 +516,12 @@ void test_parallel_efficiency() {
         std::vector<std::vector<ParEffArg>> repeat_args;
         std::vector<double> repeat_seconds;
 
-        repeat_args.reserve(REPEATS);
-        repeat_seconds.reserve(REPEATS);
+        repeat_args.reserve(static_cast<std::size_t>(repeats));
+        repeat_seconds.reserve(static_cast<std::size_t>(repeats));
 
-        for (int repeat = 0; repeat < REPEATS; ++repeat) {
+        for (int repeat = 0; repeat < repeats; ++repeat) {
             std::atomic<int> ready_count{0};
+            std::atomic<int> done_count{0};
             std::atomic<bool> go{false};
             auto target_cpus = choose_spread_targets(CPU_TOTAL, n);
             std::ranges::fill(threads, nullptr);
@@ -451,7 +529,7 @@ void test_parallel_efficiency() {
             for (auto& arg : args) {
                 arg = {.id = arg_id,
                        .threads = n,
-                       .iters = ITERS,
+                       .iters = iters,
                        .result = 0,
                        .start_ns = 0,
                        .end_ns = 0,
@@ -461,6 +539,7 @@ void test_parallel_efficiency() {
                        .cpu_mask = 0,
                        .cpu_changes = 0,
                        .ready_count = &ready_count,
+                       .done_count = &done_count,
                        .go = &go};
                 ++arg_id;
             }
@@ -496,13 +575,26 @@ void test_parallel_efficiency() {
                         thrd_join(thread, nullptr);
                     }
                 }
-                return;
+                return false;
             }
-            while (ready_count.load(std::memory_order_acquire) != n) {
-                thrd_yield();
+            if (!wait_for_counter(ready_count, n, PARALLEL_READY_TIMEOUT_NS)) {
+                int const READY = ready_count.load(std::memory_order_acquire);
+                go.store(true, std::memory_order_release);
+                std::println(stderr, "[perf] parallel_eff[{}]: FAILED (ready timeout repeat={} ready={}/{})", n, repeat + 1, READY, n);
+                return false;
             }
             uint64_t const T0 = now_ns();
             go.store(true, std::memory_order_release);
+            if (!wait_for_counter(done_count, n, PARALLEL_DONE_TIMEOUT_NS)) {
+                int const DONE = done_count.load(std::memory_order_acquire);
+                std::println(stderr, "[perf] parallel_eff[{}]: FAILED (done timeout repeat={} done={}/{})", n, repeat + 1, DONE, n);
+                for (int i = 0; i < n; ++i) {
+                    auto const& arg = args.at(static_cast<std::size_t>(i));
+                    std::println(stderr, "[perf]   worker[{}]: start={} end={} cpu={} last_cpu={} changes={} result={:#x}", i, arg.start_ns,
+                                 arg.end_ns, arg.cpu_id, arg.cpu_end_id, arg.cpu_changes, static_cast<unsigned long long>(arg.result));
+                }
+                return false;
+            }
             for (auto* thread : threads) {
                 thrd_join(thread, nullptr);
             }
@@ -518,7 +610,7 @@ void test_parallel_efficiency() {
             repeat_args.push_back(args);
         }
 
-        std::array<int, REPEATS> order{};
+        std::vector<int> order(repeat_seconds.size());
         int order_index = 0;
         for (auto& entry : order) {
             entry = order_index;
@@ -528,7 +620,7 @@ void test_parallel_efficiency() {
             return repeat_seconds.at(static_cast<std::size_t>(lhs)) < repeat_seconds.at(static_cast<std::size_t>(rhs));
         });
 
-        int const MEDIAN_INDEX = order.at(REPEATS / 2);
+        int const MEDIAN_INDEX = order.at(order.size() / 2);
         double const MEDIAN_S = repeat_seconds.at(static_cast<std::size_t>(MEDIAN_INDEX));
         double const MIN_S = repeat_seconds.at(static_cast<std::size_t>(order.front()));
         double const MAX_S = repeat_seconds.at(static_cast<std::size_t>(order.back()));
@@ -536,13 +628,15 @@ void test_parallel_efficiency() {
         if (n == 1) {
             time_1 = MEDIAN_S;
             speedups.at(thread_count_index) = 1.0;
-            std::println(stderr, "[perf]   parallel_base[1]: median={:.2f}ms min={:.2f}ms max={:.2f}ms", MEDIAN_S * 1e3, MIN_S * 1e3,
-                         MAX_S * 1e3);
+            if (verbose) {
+                std::println(stderr, "[perf]   parallel_base[1]: median={:.2f}ms min={:.2f}ms max={:.2f}ms", MEDIAN_S * 1e3, MIN_S * 1e3,
+                             MAX_S * 1e3);
+            }
         } else {
             speedups.at(thread_count_index) = time_1 / MEDIAN_S;
         }
 
-        if (n > 1 && !repeat_args.empty()) {
+        if (verbose && n > 1 && !repeat_args.empty()) {
             print_parallel_outliers(n, repeat_args.at(static_cast<std::size_t>(MEDIAN_INDEX)));
         }
         ++thread_count_index;
@@ -550,6 +644,7 @@ void test_parallel_efficiency() {
 
     std::println(stderr, "[perf] parallel_eff:       t1={:.2f}x t2={:.2f}x t4={:.2f}x t8={:.2f}x  (ideal: 2/4/8x)", speedups.at(0),
                  speedups.at(1), speedups.at(2), speedups.at(3));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,25 +727,109 @@ void test_timer_overhead() {
     std::println(stderr, "[perf] timer_overhead:     {:.1f}% cycles lost to interrupts  (tsc_hz={:.0f}MHz)", pct_lost, TSC_HZ / 1e6);
 }
 
+struct PerfOptions {
+    int spawn_threads = 8;
+    int parallel_iters = 250000000;
+    int parallel_repeats = 5;
+    bool spawn_only = false;
+    bool verbose = false;
+};
+
+auto parse_positive_int(const char* text, int& value) -> bool {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+
+    int parsed = 0;
+    const auto* const END = text + std::strlen(text);
+    auto const [PTR, EC] = std::from_chars(text, END, parsed);
+    if (EC != std::errc{} || PTR != END || parsed <= 0) {
+        return false;
+    }
+
+    value = parsed;
+    return true;
+}
+
+auto parse_perf_options(int argc, char** argv, PerfOptions& options) -> bool {
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            if (!parse_positive_int(argv[++i], options.spawn_threads)) {
+                std::println(stderr, "[perf] invalid --threads '{}'", argv[i]);
+                return false;
+            }
+            continue;
+        }
+
+        if (std::strcmp(argv[i], "--parallel-iters") == 0 && i + 1 < argc) {
+            if (!parse_positive_int(argv[++i], options.parallel_iters)) {
+                std::println(stderr, "[perf] invalid --parallel-iters '{}'", argv[i]);
+                return false;
+            }
+            continue;
+        }
+
+        if (std::strcmp(argv[i], "--parallel-repeats") == 0 && i + 1 < argc) {
+            if (!parse_positive_int(argv[++i], options.parallel_repeats)) {
+                std::println(stderr, "[perf] invalid --parallel-repeats '{}'", argv[i]);
+                return false;
+            }
+            continue;
+        }
+
+        if (std::strcmp(argv[i], "--spawn-only") == 0) {
+            options.spawn_only = true;
+            continue;
+        }
+
+        if (std::strcmp(argv[i], "--verbose") == 0) {
+            options.verbose = true;
+            continue;
+        }
+
+        if (std::strcmp(argv[i], "--full") == 0) {
+            options.parallel_iters = 250000000;
+            options.parallel_repeats = 5;
+            continue;
+        }
+
+        std::println(stderr, "[perf] unknown option '{}'", argv[i]);
+        return false;
+    }
+
+    return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-auto run_perf([[maybe_unused]] int argc, [[maybe_unused]] char** argv) -> int {
-    constexpr int N_THREADS = 8;
+auto run_perf(int argc, char** argv) -> int {
+    PerfOptions options;
+    if (!parse_perf_options(argc, argv, options)) {
+        return 2;
+    }
 
     std::println(stderr, "[perf] === WOS perf suite ===");
 
-    std::println(stderr, "[perf] --- spawn latency + CPU placement ({} threads) ---", N_THREADS);
-    test_spawn_and_placement(N_THREADS);
+    std::println(stderr, "[perf] --- spawn latency + CPU placement ({} threads) ---", options.spawn_threads);
+    if (!test_spawn_and_placement(options.spawn_threads, options.verbose)) {
+        return 1;
+    }
+    if (options.spawn_only) {
+        std::println(stderr, "[perf] === done ===");
+        return 0;
+    }
 
     std::println(stderr, "[perf] --- context switch cost ---");
     test_context_switch();
 
     std::println(stderr, "[perf] --- parallel efficiency ---");
-    test_parallel_efficiency();
+    if (!test_parallel_efficiency(options.parallel_iters, options.parallel_repeats, options.verbose)) {
+        return 1;
+    }
 
     std::println(stderr, "[perf] --- memory bandwidth ---");
     test_mem_bandwidth();

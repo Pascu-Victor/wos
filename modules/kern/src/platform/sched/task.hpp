@@ -124,6 +124,7 @@ struct Task {
     static constexpr unsigned FD_CLOEXEC_WORDS = FD_TABLE_SIZE / 64;
     static constexpr unsigned CWD_MAX = 256;
     static constexpr unsigned EXE_PATH_MAX = 256;
+    static constexpr unsigned SUPPLEMENTARY_GROUPS_MAX = 8;
     static constexpr unsigned WKI_TARGET_HOSTNAME_MAX = 64;
     using FdCloexecBitmap = std::array<uint64_t, FD_CLOEXEC_WORDS>;
     using SignalHandlerTable = std::array<SigHandler, MAX_SIGNALS>;
@@ -284,6 +285,7 @@ struct Task {
     uint32_t suid = 0;     // Saved set-user-ID
     uint32_t sgid = 0;     // Saved set-group-ID
     uint32_t umask = 022;  // File creation mask (default: rw-r--r-- for files)
+    ker::util::SmallVec<uint32_t, SUPPLEMENTARY_GROUPS_MAX> supplementary_groups;
 
     // Controlling terminal: index into PTY pool, or -1 if none.
     int controlling_tty = -1;
@@ -395,6 +397,8 @@ struct Task {
         const auto* word = std::next(fd_cloexec.data(), static_cast<ptrdiff_t>(fd / 64));
         return (*word & (1ULL << (fd % 64))) != 0;
     }
+
+    [[nodiscard]] bool has_group(uint32_t group) const { return egid == group || supplementary_groups.contains(group); }
 
     void load_context(cpu::GPRegs* gpr);
     void save_context(cpu::GPRegs* gpr) const;

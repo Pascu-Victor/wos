@@ -13,7 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
-#include <platform/mm/paging.hpp>
+#include <platform/ktime/ktime.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
@@ -34,6 +35,8 @@
 #include "dev/block_device.hpp"
 #include "platform/dbg/dbg.hpp"
 #ifdef XFS_BENCH
+#include <atomic>
+
 #include "platform/tsc/tsc.hpp"
 #endif
 
@@ -42,6 +45,9 @@ namespace ker::vfs::xfs {
 using log = ker::mod::dbg::logger<"xfs">;
 
 namespace {
+
+constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
+constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{64} * 1024;
 
 // ============================================================================
 // Per-open-file state
@@ -52,6 +58,85 @@ struct XfsFileData {
     XfsInode* inode;  // reference-counted inode
 };
 
+auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
+    return ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))
+               ? ker::mod::time::get_us()
+               : 0;
+}
+
+auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    uint64_t const ELAPSED_US = NOW_US >= started_us ? NOW_US - started_us : 0;
+    return ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
+}
+
+void perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t started_us, int32_t status, uint64_t bytes) {
+    if (started_us == 0) {
+        return;
+    }
+    ker::mod::perf::record_local_xfs_summary(op, status, perf_elapsed_since_us(started_us), true, bytes);
+}
+
+auto perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t started_us, int32_t status, uint64_t bytes) -> uint32_t {
+    if (started_us == 0) {
+        return 0;
+    }
+    uint32_t const ELAPSED_US = perf_elapsed_since_us(started_us);
+    ker::mod::perf::record_local_xfs_summary(op, status, ELAPSED_US, true, bytes);
+    return ELAPSED_US;
+}
+
+void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes = 0, int32_t status = 0) {
+    if (!ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))) {
+        return;
+    }
+    ker::mod::perf::record_local_xfs_summary(op, status, 0, false, bytes);
+}
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+auto perf_clamp_u16(uint64_t value) -> uint16_t { return value > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(value); }
+
+void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, uint64_t bytes,
+                                uint64_t callsite) {
+    if (status >= 0 && latency_us < XFS_SLOW_TRACE_US) {
+        return;
+    }
+    if (!ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))) {
+        return;
+    }
+
+    uint16_t const BYTES_KIB = perf_clamp_u16((bytes + 1023U) / 1024U);
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::LOCAL_XFS,
+                                     static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::END, 0, BYTES_KIB,
+                                     ker::mod::perf::next_wki_trace_correlation(), status, latency_us, callsite);
+}
+
+auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip) -> int {
+    if (ctx == nullptr || ip == nullptr || ctx->read_only || !ip->dirty) {
+        return 0;
+    }
+
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG);
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, -ENOMEM, 0);
+        return -ENOMEM;
+    }
+    xfs_trans_log_inode(tp, ip);
+    int const RET = xfs_trans_commit(tp);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, RET, 0);
+    return RET == 0 ? 0 : -EIO;
+}
+
 // ============================================================================
 // Path walking
 // ============================================================================
@@ -59,13 +144,6 @@ struct XfsFileData {
 // Walk a filesystem-relative path and return the inode.
 // An empty path or "/" refers to the root inode.
 // Returns a reference-counted inode on success, nullptr on error.
-
-auto pointer_looks_like_kernel_object(const void* ptr) -> bool {
-    auto addr = reinterpret_cast<uint64_t>(ptr);
-    bool const IN_HHDM = addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL;
-    bool const IN_KERNEL_STATIC = addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL;
-    return (IN_HHDM || IN_KERNEL_STATIC) && ((addr & 0x7ULL) == 0);
-}
 
 auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
     auto agno = xfs_ag_number(fsbno, ctx->ag_blk_log);
@@ -76,10 +154,13 @@ auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint
 
 auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* buffer) -> int {
     constexpr int MAX_ATTEMPTS = 3;
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_READ);
+    int rc = -EIO;
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
         int const RC = dev::block_read(bdev, block_no, count, buffer);
         if (RC == 0) {
-            return 0;
+            rc = 0;
+            break;
         }
         if (attempt < MAX_ATTEMPTS) {
             log::warn("transient extent read failure on %s block=%llu count=%zu rc=%d attempt=%d/%d", bdev->name.data(),
@@ -89,11 +170,76 @@ auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t
         }
         log::warn("extent read failed on %s block=%llu count=%zu rc=%d after %d attempts", bdev->name.data(),
                   static_cast<unsigned long long>(block_no), count, RC, MAX_ATTEMPTS);
-        return RC;
+        rc = RC;
     }
-    return -EIO;
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_READ, STARTED_US, rc, count * static_cast<uint64_t>(bdev->block_size));
+    return rc;
 }
 
+auto direct_full_block_write(XfsMountContext* ctx, xfs_fsblock_t disk_block, const uint8_t* src, size_t bytes) -> bool {
+    if (ctx == nullptr || ctx->device == nullptr || src == nullptr || bytes == 0 || (bytes & (ctx->block_size - 1)) != 0) {
+        return false;
+    }
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, disk_block);
+    size_t const DEV_COUNT = bytes / ctx->device->block_size;
+    discard_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE);
+    int const RC = dev::block_write(ctx->device, DEV_BLOCK, DEV_COUNT, src);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE, STARTED_US, RC, bytes);
+    return RC == 0;
+}
+
+auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
+    return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
+}
+
+template <typename Fn>
+auto visit_inode_data_ranges(XfsMountContext* ctx, XfsInode* ip, uint64_t byte_count, Fn fn) -> int {
+    if (ctx == nullptr || ctx->device == nullptr || ip == nullptr || byte_count == 0 || ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
+        return 0;
+    }
+
+    auto const FILE_BLOCKS = static_cast<xfs_fileoff_t>((byte_count + ctx->block_size - 1) >> ctx->block_log);
+    xfs_fileoff_t file_block = 0;
+    int result = 0;
+
+    while (file_block < FILE_BLOCKS) {
+        XfsBmapResult bmap{};
+        int const RET = xfs_bmap_lookup(ip, file_block, &bmap);
+        if (RET < 0) {
+            return RET;
+        }
+        if (bmap.blockcount == 0) {
+            return result != 0 ? result : -EIO;
+        }
+
+        auto const REMAINING = static_cast<xfs_filblks_t>(FILE_BLOCKS - file_block);
+        xfs_filblks_t const SPAN = std::min(bmap.blockcount, REMAINING);
+        if (!bmap.is_hole && bmap.startblock != NULLFSBLOCK) {
+            int const RC = fn(bmap.startblock, SPAN);
+            if (RC != 0) {
+                result = RC;
+            }
+        }
+        file_block += SPAN;
+    }
+
+    return result;
+}
+
+auto sync_inode_data_buffers(XfsMountContext* ctx, XfsInode* ip, uint64_t byte_count) -> int {
+    return visit_inode_data_ranges(ctx, ip, byte_count, [&](xfs_fsblock_t startblock, xfs_filblks_t blockcount) -> int {
+        return sync_bdev_range(ctx->device, xfs_fsblock_to_dev_block(ctx, startblock), xfs_fsb_to_dev_count(ctx, blockcount));
+    });
+}
+
+auto discard_inode_data_buffers(XfsMountContext* ctx, XfsInode* ip, uint64_t byte_count) -> int {
+    return visit_inode_data_ranges(ctx, ip, byte_count, [&](xfs_fsblock_t startblock, xfs_filblks_t blockcount) -> int {
+        discard_bdev_range(ctx->device, xfs_fsblock_to_dev_block(ctx, startblock), xfs_fsb_to_dev_count(ctx, blockcount));
+        return 0;
+    });
+}
 
 auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
     // Start at the root inode
@@ -167,26 +313,19 @@ auto xfs_vfs_close(File* f) -> int {
     if (f == nullptr) {
         return -EBADF;
     }
+    int close_result = 0;
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
     if (xfd != nullptr) {
-        // Remote VFS executable loads open files read-only; syncing the whole
-        // filesystem on every close stalls those fetches and can trip WKI fencing.
-        constexpr int XFS_O_TRUNC_FLAG = 01000;
-        int const ACCMODE = f->open_flags & 3;
-        bool const WRITE_LIKE_CLOSE = (ACCMODE == 1 || ACCMODE == 2 || (f->open_flags & XFS_O_TRUNC_FLAG) != 0);
-        if (WRITE_LIKE_CLOSE && pointer_looks_like_kernel_object(xfd->mount)) {
-            auto* mount = xfd->mount;
-            if (pointer_looks_like_kernel_object(mount->device)) {
-                sync_blockdev(mount->device);
-            }
-        }
         if (xfd->inode != nullptr) {
+            int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
+            int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
+            close_result = (DATA_RET != 0) ? DATA_RET : INODE_RET;
             xfs_inode_release(xfd->inode);
         }
         delete xfd;
         f->private_data = nullptr;
     }
-    return 0;
+    return close_result;
 }
 
 auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
@@ -225,13 +364,31 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     size_t remaining = count < AVAIL ? count : AVAIL;
     size_t total_read = 0;
     auto* dst = static_cast<uint8_t*>(buf);
+    uint64_t const PERF_READ_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ);
+    uint32_t perf_accounted_us = 0;
+    auto finish_read = [&](ssize_t result) -> ssize_t {
+        uint64_t const BYTES = result > 0 ? static_cast<uint64_t>(result) : static_cast<uint64_t>(total_read);
+        int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
+        if (PERF_READ_STARTED_US != 0) {
+            uint32_t const LATENCY_US = perf_elapsed_since_us(PERF_READ_STARTED_US);
+            ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::READ, STATUS, LATENCY_US, true, BYTES);
+            perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp::READ, STATUS, LATENCY_US, BYTES, WOS_PERF_CALLSITE());
+            if (LATENCY_US > perf_accounted_us) {
+                uint32_t const GAP_US = LATENCY_US - perf_accounted_us;
+                ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::READ_GAP, STATUS, GAP_US, true, BYTES);
+                perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp::READ_GAP, STATUS, GAP_US, BYTES, WOS_PERF_CALLSITE());
+            }
+        }
+        return result;
+    };
 
 #ifdef XFS_BENCH
     static std::atomic<uint64_t> s_read_calls{0};
     static std::atomic<uint64_t> s_read_ns_bmap{0};
     static std::atomic<uint64_t> s_read_ns_io{0};
     static std::atomic<uint64_t> s_read_bytes{0};
-    uint64_t acc_bmap = 0, acc_io = 0;
+    uint64_t acc_bmap = 0;
+    uint64_t acc_io = 0;
 #endif
 
     while (remaining > 0) {
@@ -240,22 +397,24 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         size_t const BLOCK_OFF = (offset + total_read) & (ctx->block_size - 1);
 
         XfsBmapResult bmap{};
+        uint64_t const PERF_BMAP_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_BMAP);
 #ifdef XFS_BENCH
         uint64_t t0 = ker::mod::tsc::get_ns();
 #endif
         int const RET = xfs_bmap_lookup(ip, file_block, &bmap);
+        perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_BMAP, PERF_BMAP_STARTED_US, RET, 0);
 #ifdef XFS_BENCH
         acc_bmap += ker::mod::tsc::get_ns() - t0;
 #endif
         if (RET < 0) {
-            return (total_read > 0) ? static_cast<ssize_t>(total_read) : RET;
+            return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : RET);
         }
         if (bmap.blockcount == 0) {
             log::warn("read: zero-length bmap for ino=%lu off=%lu file_block=%lu fmt=%d size=%lu nblocks=%lu hole=%d startblk=%lu",
                       static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(offset + total_read),
                       static_cast<unsigned long>(file_block), ip->data_fork.format, static_cast<unsigned long>(ip->size),
                       static_cast<unsigned long>(ip->nblocks), bmap.is_hole, static_cast<unsigned long>(bmap.startblock));
-            return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+            return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
         }
 
         if (bmap.is_hole || bmap.startblock == NULLFSBLOCK) {
@@ -265,16 +424,20 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 log::warn("read: zero-length hole span for ino=%lu off=%lu file_block=%lu blkcnt=%lu", static_cast<unsigned long>(ip->ino),
                           static_cast<unsigned long>(offset + total_read), static_cast<unsigned long>(file_block),
                           static_cast<unsigned long>(bmap.blockcount));
-                return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+                return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
             }
             hole_bytes = std::min(hole_bytes, remaining);
+            uint64_t const PERF_ZERO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_ZERO);
             std::memset(dst + total_read, 0, hole_bytes);
+            perf_accounted_us +=
+                perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_ZERO, PERF_ZERO_STARTED_US, 0, hole_bytes);
             total_read += hole_bytes;
             remaining -= hole_bytes;
             continue;
         }
 
-        // Read contiguous blocks in bulk, bypassing the buffer cache.
+        // Read contiguous blocks in bulk through the cache so dirty buffers stay
+        // authoritative while adjacent mappings can still use one I/O.
         xfs_fsblock_t const DISK_BLOCK = bmap.startblock;
 
         // How many bytes does this extent cover from our current position?
@@ -286,31 +449,103 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(offset + total_read),
                 static_cast<unsigned long>(file_block), static_cast<unsigned long>(bmap.startblock),
                 static_cast<unsigned long>(bmap.blockcount), BLOCK_OFF, remaining);
-            return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+            return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
         }
 
+        if (BLOCK_OFF == 0 && chunk >= ctx->block_size) {
+            chunk &= ~(ctx->block_size - 1);
+        }
+
+        if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
+            auto const START_AG = static_cast<xfs_agnumber_t>(DISK_BLOCK >> ctx->ag_blk_log);
+            while (chunk < remaining) {
+                size_t const CURRENT_BLOCKS = chunk >> ctx->block_log;
+                size_t const REMAINING_FULL_BLOCKS = (remaining - chunk) >> ctx->block_log;
+                if (CURRENT_BLOCKS == 0 || REMAINING_FULL_BLOCKS == 0) {
+                    break;
+                }
+
+                XfsBmapResult next_bmap{};
+                xfs_fileoff_t const NEXT_FILE_BLOCK = file_block + static_cast<xfs_fileoff_t>(CURRENT_BLOCKS);
+                uint64_t const PERF_NEXT_BMAP_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_BMAP);
+                int const NEXT_RET = xfs_bmap_lookup(ip, NEXT_FILE_BLOCK, &next_bmap);
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_BMAP, PERF_NEXT_BMAP_STARTED_US, NEXT_RET, 0);
+                if (NEXT_RET != 0 || next_bmap.blockcount == 0 || next_bmap.is_hole || next_bmap.startblock == NULLFSBLOCK ||
+                    next_bmap.unwritten != bmap.unwritten) {
+                    break;
+                }
+
+                auto const NEXT_AG = static_cast<xfs_agnumber_t>(next_bmap.startblock >> ctx->ag_blk_log);
+                xfs_fsblock_t const EXPECTED_DISK_BLOCK = DISK_BLOCK + static_cast<xfs_fsblock_t>(CURRENT_BLOCKS);
+                if (NEXT_AG != START_AG || next_bmap.startblock != EXPECTED_DISK_BLOCK) {
+                    break;
+                }
+
+                size_t const ADD_BLOCKS = std::min(static_cast<size_t>(next_bmap.blockcount), REMAINING_FULL_BLOCKS);
+                if (ADD_BLOCKS == 0) {
+                    break;
+                }
+                chunk += ADD_BLOCKS << ctx->block_log;
+            }
+        }
+
+        uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO);
 #ifdef XFS_BENCH
         t0 = ker::mod::tsc::get_ns();
 #endif
-        bool const DMA_SAFE_DST = ((reinterpret_cast<uintptr_t>(dst + total_read) & (ker::mod::mm::paging::PAGE_SIZE - 1)) == 0);
-        if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0 && DMA_SAFE_DST) {
-            // Aligned, full-block read.  Check the buffer cache first: a dirty
-            // buffer contains data not yet flushed to disk, so a direct read
-            // would return stale on-disk bytes instead of the intended content.
+        if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
+            // Full-block read. Dirty smaller cache entries must remain
+            // authoritative: a larger multi-block buffer has a different cache
+            // key, so it would otherwise miss freshly buffered writes.
+            size_t const FSB_COUNT = chunk >> ctx->block_log;
             uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
-            size_t const DEV_COUNT = chunk / ctx->device->block_size;
-            BufHead* cache_bp = (DEV_COUNT <= 1) ? bread(ctx->device, DEV_BLOCK) : bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+            size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
+            bool const HAS_DIRTY_OVERLAP = has_dirty_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+            bool const PREFER_DIRECT_READ = !HAS_DIRTY_OVERLAP && chunk >= XFS_DIRECT_READ_MIN_BYTES;
+            BufHead* cache_bp = nullptr;
+            if (!HAS_DIRTY_OVERLAP && !PREFER_DIRECT_READ) {
+                cache_bp = (FSB_COUNT <= 1) ? xfs_buf_read(ctx, DISK_BLOCK) : xfs_buf_read_multi(ctx, DISK_BLOCK, FSB_COUNT);
+            }
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             if (cache_bp != nullptr) {
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
+                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
                 std::memcpy(dst + total_read, cache_bp->data, chunk);
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
                 brelse(cache_bp);
+            } else if (HAS_DIRTY_OVERLAP) {
+                bool ok = true;
+                for (size_t i = 0; i < FSB_COUNT; ++i) {
+                    BufHead* bp = xfs_buf_read(ctx, DISK_BLOCK + static_cast<xfs_fsblock_t>(i));
+                    if (bp == nullptr) {
+                        ok = false;
+                        break;
+                    }
+                    std::memcpy(dst + total_read + (i << ctx->block_log), bp->data, ctx->block_size);
+                    brelse(bp);
+                }
+                perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
+                                                                   ok ? 0 : -EIO, ok ? chunk : 0);
+                if (!ok) {
+                    return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
+                }
+                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             } else {
                 int const RC = xfs_block_read_with_retry(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read);
                 if (RC != 0) {
-                    return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+                    perf_accounted_us +=
+                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, RC, chunk);
+                    return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
                 }
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
             }
         } else {
             // Partial or unaligned - fall back to single cached block.
@@ -319,10 +554,15 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
+            perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
+                                                               bp != nullptr ? 0 : -EIO, chunk);
             if (bp == nullptr) {
-                return (total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO;
+                return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
             }
+            uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
             std::memcpy(dst + total_read, bp->data + BLOCK_OFF, chunk);
+            perf_accounted_us +=
+                perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             brelse(bp);
         }
 
@@ -346,29 +586,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     }
 #endif
 
-    // Diagnostic: detect all-zero reads and dump bmap details
-    if (total_read > 0 && offset == 0) {
-        const auto* dbg_dst = static_cast<const uint8_t*>(buf);
-        bool all_zero = true;
-        for (size_t i = 0; i < std::min(total_read, static_cast<size_t>(64)); i++) {
-            if (dbg_dst[i] != 0) {
-                all_zero = false;
-                break;
-            }
-        }
-        if (all_zero) {
-            XfsBmapResult dbg_bmap{};
-            int const DBG_RC = xfs_bmap_lookup(ip, 0, &dbg_bmap);
-            ker::mod::dbg::log(
-                "[XFS-DIAG] ZERO READ: ino=%lu size=%lu nextents=%u fmt=%d nblocks=%lu"
-                " bmap_rc=%d hole=%d startblk=%lu blkcnt=%lu unwritten=%d",
-                static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(ip->size), ip->nextents, ip->data_fork.format,
-                static_cast<unsigned long>(ip->nblocks), DBG_RC, dbg_bmap.is_hole, static_cast<unsigned long>(dbg_bmap.startblock),
-                static_cast<unsigned long>(dbg_bmap.blockcount), dbg_bmap.unwritten);
-        }
-    }
-
-    return static_cast<ssize_t>(total_read);
+    return finish_read(static_cast<ssize_t>(total_read));
 }
 
 // Maximum blocks to allocate per metadata transaction.
@@ -402,19 +620,34 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
     const auto* src = static_cast<const uint8_t*>(buf);
     size_t total_written = 0;
+    int write_error = 0;
+    uint64_t const PERF_WRITE_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE);
+    auto finish_write = [&](ssize_t result) -> ssize_t {
+        uint64_t const BYTES = result > 0 ? static_cast<uint64_t>(result) : static_cast<uint64_t>(total_written);
+        int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
+        if (PERF_WRITE_STARTED_US != 0) {
+            uint32_t const LATENCY_US = perf_elapsed_since_us(PERF_WRITE_STARTED_US);
+            ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::WRITE, STATUS, LATENCY_US, true, BYTES);
+            perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp::WRITE, STATUS, LATENCY_US, BYTES, WOS_PERF_CALLSITE());
+        }
+        return result;
+    };
 
     auto buffered_write = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
+        uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUFFERED_WRITE);
         size_t remaining_bytes = bytes;
         size_t block_off = initial_block_off;
         xfs_fsblock_t current_disk_block = disk_block;
         size_t current_src_offset = src_offset;
+        bool ok = true;
 
         while (remaining_bytes > 0) {
             size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
             BufHead* bp =
                 (block_off == 0 && CHUNK == ctx->block_size) ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
             if (bp == nullptr) {
-                return false;
+                ok = false;
+                break;
             }
 
             std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
@@ -425,6 +658,41 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             current_src_offset += CHUNK;
             current_disk_block++;
             block_off = 0;
+        }
+
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUFFERED_WRITE, STARTED_US, ok ? 0 : -EIO, bytes - remaining_bytes);
+        return ok;
+    };
+
+    auto write_extent_data = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
+        size_t remaining_bytes = bytes;
+        size_t block_off = initial_block_off;
+        xfs_fsblock_t current_disk_block = disk_block;
+        size_t current_src_offset = src_offset;
+
+        if (block_off != 0 && remaining_bytes > 0) {
+            size_t const HEAD = std::min(ctx->block_size - block_off, remaining_bytes);
+            if (!buffered_write(current_disk_block, block_off, HEAD, current_src_offset)) {
+                return false;
+            }
+            remaining_bytes -= HEAD;
+            current_src_offset += HEAD;
+            current_disk_block++;
+            block_off = 0;
+        }
+
+        size_t const DIRECT_BYTES = remaining_bytes & ~(ctx->block_size - 1);
+        if (DIRECT_BYTES > 0) {
+            if (!direct_full_block_write(ctx, current_disk_block, src + current_src_offset, DIRECT_BYTES)) {
+                return false;
+            }
+            remaining_bytes -= DIRECT_BYTES;
+            current_src_offset += DIRECT_BYTES;
+            current_disk_block += DIRECT_BYTES >> ctx->block_log;
+        }
+
+        if (remaining_bytes > 0) {
+            return buffered_write(current_disk_block, 0, remaining_bytes, current_src_offset);
         }
 
         return true;
@@ -439,8 +707,12 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
     static std::atomic<uint64_t> s_wr_bytes{0};
     static std::atomic<uint64_t> s_wr_hole_calls{0};
     static std::atomic<uint64_t> s_wr_map_calls{0};
-    uint64_t acc_bmap = 0, acc_alloc = 0, acc_io = 0, acc_ilog = 0;
-    uint64_t loc_hole = 0, loc_map = 0;
+    uint64_t acc_bmap = 0;
+    uint64_t acc_alloc = 0;
+    uint64_t acc_io = 0;
+    uint64_t acc_ilog = 0;
+    uint64_t loc_hole = 0;
+    uint64_t loc_map = 0;
     uint64_t t0 = 0;
 #endif
 
@@ -450,18 +722,22 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
         size_t const BLOCK_OFF = WRITE_POS & (ctx->block_size - 1);
 
         XfsBmapResult bmap{};
+        uint64_t const PERF_BMAP_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_BMAP);
 #ifdef XFS_BENCH
         t0 = ker::mod::tsc::get_ns();
 #endif
         int ret = xfs_bmap_lookup(ip, file_block, &bmap);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_BMAP, PERF_BMAP_STARTED_US, ret, 0);
 #ifdef XFS_BENCH
         acc_bmap += ker::mod::tsc::get_ns() - t0;
 #endif
         if (ret < 0) {
+            write_error = ret;
             break;
         }
 
         if (bmap.is_hole || bmap.startblock == NULLFSBLOCK) {
+            perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_HOLE_ITER);
 #ifdef XFS_BENCH
             loc_hole++;
 #endif
@@ -485,8 +761,11 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
 #endif
+            uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC);
             XfsTransaction* tp = xfs_trans_alloc(ctx);
             if (tp == nullptr) {
+                perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
+                write_error = -ENOMEM;
                 break;
             }
 
@@ -503,6 +782,8 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             ret = xfs_alloc_extent(ctx, tp, req, &alloc_result);
             if (ret != 0) {
                 xfs_trans_cancel(tp);
+                perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, ret, 0);
+                write_error = ret;
                 break;
             }
 
@@ -517,6 +798,8 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             ret = xfs_bmap_add_extent(ip, tp, new_ext);
             if (ret != 0) {
                 xfs_trans_cancel(tp);
+                perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, ret, 0);
+                write_error = ret;
                 break;
             }
 
@@ -529,15 +812,18 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
             xfs_trans_log_inode(tp, ip);
 
             ret = xfs_trans_commit(tp);
+            perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, ret,
+                                  static_cast<uint64_t>(alloc_result.len) << ctx->block_log);
 #ifdef XFS_BENCH
             acc_alloc += ker::mod::tsc::get_ns() - t0;
 #endif
             if (ret != 0) {
+                write_error = ret;
                 break;
             }
 
-            // Write the data blocks covered by this allocation through the
-            // buffer cache so subsequent cached reads observe the new contents.
+            // Write the data blocks covered by this allocation, using direct
+            // full-block I/O while keeping partial head/tail blocks buffered.
             {
                 size_t const EXTENT_BYTES = static_cast<size_t>(alloc_result.len) << ctx->block_log;
                 size_t const WRITE_END = offset + count;
@@ -552,21 +838,28 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #ifdef XFS_BENCH
                 t0 = ker::mod::tsc::get_ns();
 #endif
+                uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
                 if (SLICE_BYTES > 0) {
                     size_t const SLICE_BLOCK_OFF = SLICE_START - EXTENT_START;
-                    if (!buffered_write(DISK_BLOCK, SLICE_BLOCK_OFF, SLICE_BYTES, SLICE_START - offset)) {
+                    bool const WROTE = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log),
+                                                         SLICE_BLOCK_OFF & (ctx->block_size - 1), SLICE_BYTES, SLICE_START - offset);
+                    if (!WROTE) {
 #ifdef XFS_BENCH
                         acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
+                        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO, PERF_IO_STARTED_US, -EIO, 0);
+                        write_error = -EIO;
                         goto write_done;
                     }
                     total_written += SLICE_BYTES;
                 }
+                perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO, PERF_IO_STARTED_US, 0, SLICE_BYTES);
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
             }
         } else {
+            perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_MAP_ITER);
 #ifdef XFS_BENCH
             loc_map++;
 #endif
@@ -579,12 +872,17 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
 #endif
-            if (!buffered_write(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written)) {
+            uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
+            bool const WROTE = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written);
+            if (!WROTE) {
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
+                perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO, PERF_IO_STARTED_US, -EIO, 0);
+                write_error = -EIO;
                 break;
             }
+            perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO, PERF_IO_STARTED_US, 0, CHUNK);
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
@@ -595,27 +893,13 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
 write_done:
     if (total_written == 0) {
-        return -EIO;
+        return finish_write(write_error != 0 ? write_error : -EIO);
     }
 
     // Update file size if we wrote past the end
     if (offset + total_written > ip->size) {
         ip->size = offset + total_written;
         ip->dirty = true;
-    }
-
-    if (ip->dirty) {
-#ifdef XFS_BENCH
-        t0 = ker::mod::tsc::get_ns();
-#endif
-        XfsTransaction* tp = xfs_trans_alloc(ctx);
-        if (tp != nullptr) {
-            xfs_trans_log_inode(tp, ip);
-            xfs_trans_commit(tp);
-        }
-#ifdef XFS_BENCH
-        acc_ilog = ker::mod::tsc::get_ns() - t0;
-#endif
     }
 
 #ifdef XFS_BENCH
@@ -645,7 +929,7 @@ write_done:
     }
 #endif
 
-    return static_cast<ssize_t>(total_written);
+    return finish_write(static_cast<ssize_t>(total_written));
 }
 
 auto xfs_vfs_lseek(File* f, off_t offset, int whence) -> off_t {
@@ -819,8 +1103,16 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
     // Shrinking to an arbitrary size would require freeing blocks.
     auto new_size = static_cast<uint64_t>(length);
 
-    if (new_size == ip->size) {
+    uint64_t const OLD_SIZE = ip->size;
+    if (new_size == OLD_SIZE) {
         return 0;  // no change
+    }
+
+    if (new_size == 0 && OLD_SIZE != 0) {
+        int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
+        if (DISCARD_RET < 0) {
+            return DISCARD_RET;
+        }
     }
 
     // Update the inode size
@@ -858,6 +1150,19 @@ FileOperations xfs_fops = {
 }  // anonymous namespace
 
 auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
+
+auto xfs_fsync(File* f) -> int {
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr) {
+        return -EBADF;
+    }
+    int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
+    int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
+    return (DATA_RET != 0) ? DATA_RET : INODE_RET;
+}
 
 // ============================================================================
 // Open path
@@ -996,6 +1301,14 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", static_cast<unsigned long>(ip->ino),
                       static_cast<unsigned long>(ip->size));
 #endif
+        uint64_t const OLD_SIZE = ip->size;
+        if (OLD_SIZE != 0) {
+            int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
+            if (DISCARD_RET < 0) {
+                xfs_inode_release(ip);
+                return nullptr;
+            }
+        }
         ip->size = 0;
         ip->dirty = true;
         XfsTransaction* tp = xfs_trans_alloc(ctx);
@@ -1312,12 +1625,6 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         return -EIO;
     }
 
-    new_ip->mode = INODE_MODE;
-    new_ip->size = 0;
-    new_ip->nlink = 2;  // . and parent ref
-    new_ip->nblocks = 0;
-    new_ip->nextents = 0;
-
     // Build minimal shortform directory: count=0, parent=parent_ino
     bool const USE_I8 = (PARENT_INO > 0xFFFFFFFFULL);
     size_t const INO_BYTES = USE_I8 ? 8 : 4;
@@ -1340,6 +1647,11 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         }
     }
 
+    new_ip->mode = INODE_MODE;
+    new_ip->size = SF_SIZE;
+    new_ip->nlink = 2;  // . and parent ref
+    new_ip->nblocks = 0;
+    new_ip->nextents = 0;
     new_ip->data_fork.format = XFS_DINODE_FMT_LOCAL;
     new_ip->data_fork.local.data = sf_data;
     new_ip->data_fork.local.size = static_cast<uint32_t>(SF_SIZE);
@@ -1387,11 +1699,12 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
         name = last_slash + 1;
     }
 
-    if (parent_ip == nullptr || !xfs_inode_isdir(parent_ip)) {
-        if (parent_ip != nullptr) {
-            xfs_inode_release(parent_ip);
-        }
+    if (parent_ip == nullptr) {
         return -ENOENT;
+    }
+    if (!xfs_inode_isdir(parent_ip)) {
+        xfs_inode_release(parent_ip);
+        return -ENOTDIR;
     }
 
     uint16_t namelen = 0;
@@ -1739,7 +2052,7 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
     }
 
     if (xfs_log_needs_recovery(ctx)) {
-        log::warn("journal is dirty, recovery not implemented");
+        log::warn("journal remains dirty after log mount/recovery");
     }
 
     log::info("mounted successfully (%s)", ctx->read_only ? "read-only" : "read-write");

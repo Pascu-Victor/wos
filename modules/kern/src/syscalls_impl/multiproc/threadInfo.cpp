@@ -4,15 +4,17 @@
 #include <platform/asm/cpu.hpp>
 
 #include "abi/callnums/multiproc.h"
-#include "platform/acpi/apic/apic.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/sched/scheduler.hpp"
 #include "platform/smt/smt.hpp"
 
 namespace ker::syscall::multiproc {
 auto thread_info(abi::multiproc::threadInfoOps op) -> uint64_t {
     switch (op) {
-        case abi::multiproc::threadInfoOps::CURRENT_THREAD_ID:
-            return mod::apic::get_apic_id();
+        case abi::multiproc::threadInfoOps::CURRENT_THREAD_ID: {
+            auto* task = mod::sched::get_current_task();
+            return task != nullptr ? task->pid : 0;
+        }
 
         case abi::multiproc::threadInfoOps::NATIVE_THREAD_COUNT:
             return mod::smt::cpu_count();

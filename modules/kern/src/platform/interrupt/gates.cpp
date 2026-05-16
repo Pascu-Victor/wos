@@ -8,6 +8,7 @@
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/debug/ptrace.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
@@ -23,9 +24,11 @@
 #include "abi/ptrace.hpp"
 #include "mod/io/serial/serial.hpp"
 #include "platform/acpi/apic/apic.hpp"
+#include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "util/hcf.hpp"
 
@@ -39,6 +42,10 @@ constexpr uint64_t HHDM_END = 0xffff900000000000ULL;
 constexpr uint64_t KERNEL_STATIC_BEGIN = 0xffffffff80000000ULL;
 constexpr uint64_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
 constexpr uint64_t PAGE_TABLE_BASE_MASK = ~((uint64_t{1} << ker::mod::mm::paging::PAGE_SHIFT) - 1U);
+constexpr uint32_t IRQ_SLOW_TRACE_US = 30;
+constexpr uint16_t IRQ_KIND_CONTEXT = 1;
+constexpr uint16_t IRQ_KIND_LEGACY = 2;
+constexpr uint16_t IRQ_KIND_UNHANDLED = 3;
 
 std::array<interruptHandler_t, INTERRUPT_VECTOR_COUNT> interrupt_handlers{};
 std::atomic<bool> panic_lock{false};
@@ -67,6 +74,37 @@ auto load_u64_unaligned(const void* ptr) -> uint64_t {
     uint64_t value = 0;
     __builtin_memcpy(&value, ptr, sizeof(value));
     return value;
+}
+
+auto clamp_irq_latency_us(uint64_t latency_us) -> uint32_t {
+    return latency_us > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(latency_us);
+}
+
+auto current_perf_pid() -> uint64_t {
+    if (!sched::can_query_current_task()) {
+        return 0;
+    }
+    auto* task = sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+void record_irq_perf(uint8_t vector, uint16_t kind, int32_t status, uint64_t started_us) {
+    if (started_us == 0) {
+        return;
+    }
+
+    uint64_t const NOW_US = time::get_us();
+    uint64_t const ELAPSED_US = NOW_US >= started_us ? NOW_US - started_us : 0;
+    uint32_t const LATENCY_US = clamp_irq_latency_us(ELAPSED_US);
+    auto const CPU_ID = static_cast<uint32_t>(cpu::get_current_cpu_id_safe());
+    perf::record_local_irq_summary(perf::WkiPerfLocalIrqOp::HANDLER, vector, kind, status, LATENCY_US, true);
+    if (status >= 0 && ELAPSED_US < IRQ_SLOW_TRACE_US) {
+        return;
+    }
+
+    perf::record_wki_event(CPU_ID, current_perf_pid(), perf::WkiPerfScope::LOCAL_IRQ,
+                           static_cast<uint8_t>(perf::WkiPerfLocalIrqOp::HANDLER), perf::WkiPerfPhase::END, vector, kind,
+                           perf::next_wki_trace_correlation(), status, LATENCY_US, WOS_PERF_CALLSITE());
 }
 
 void dump_stack_owner(const char* label, uint64_t rsp) {
@@ -627,13 +665,18 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
         return;
     }
     const auto VECTOR = static_cast<size_t>(frame.int_num);
+    bool const TRACE_IRQ = perf::is_local_irq_recording_enabled();
+    uint64_t const IRQ_STARTED_US = TRACE_IRQ ? time::get_us() : 0;
 
     if (irq_contexts.at(VECTOR).handler != nullptr) {
         irq_contexts.at(VECTOR).handler(static_cast<uint8_t>(frame.int_num), irq_contexts.at(VECTOR).data);
         ker::mod::apic::eoi();
+        record_irq_perf(static_cast<uint8_t>(frame.int_num), IRQ_KIND_CONTEXT, 0, IRQ_STARTED_US);
         return;
     }
 
+    uint16_t irq_kind = IRQ_KIND_LEGACY;
+    int32_t irq_status = 0;
     if (interrupt_handlers.at(VECTOR) != nullptr) {
         interrupt_handlers.at(VECTOR)(gpr, frame);
     } else if (is_irq(frame.int_num)) {
@@ -641,11 +684,14 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
         ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
         ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.int_num));
         ker::mod::io::serial::write("\n");
+        irq_kind = IRQ_KIND_UNHANDLED;
+        irq_status = -1;
     } else {
         exception_handler(gpr, frame);
         return;
     }
     ker::mod::apic::eoi();
+    record_irq_perf(static_cast<uint8_t>(frame.int_num), irq_kind, irq_status, IRQ_STARTED_US);
 }
 
 // Vector 32 (0x20) is the timer interrupt, hardcoded in gates.asm (isr32 -> task_switch_handler).

@@ -73,6 +73,12 @@ printf 'discard me\n' > /dev/null
 check "/dev/null write succeeds" "$?"                          "0"
 check "/dev/null read is empty"  "$(cat /dev/null | wc -c)"   "0"
 
+# Terminal control
+section "Terminal control"
+
+CLEAR_BYTES=$(clear | od -An -tx1 | tr -d ' \n')
+check "clear emits scrollback erase" "$CLEAR_BYTES" "1b5b481b5b324a1b5b334a"
+
 # Pipes
 section "Pipes"
 
@@ -245,11 +251,28 @@ printf '' > "$WORKDIR/bg_out"
 wait $!
 check "background job output"  "$(cat "$WORKDIR/bg_out")"  "bg_done"
 
-# parallel appenders — stress O_APPEND
+wait
+check "wait with no background jobs" "$?" "0"
+
+> "$WORKDIR/wait_any_out"
+(printf 'a\n' >> "$WORKDIR/wait_any_out") &
+(printf 'b\n' >> "$WORKDIR/wait_any_out") &
+wait
+check "wait for all background jobs" "$?" "0"
+LINES=$(wc -l < "$WORKDIR/wait_any_out")
+check "wait for all background jobs output" "$LINES" "2"
+
+# parallel appenders - stress O_APPEND with explicit PID waits
 > "$WORKDIR/par_out"
 (for i in 1 2 3 4 5; do printf '%d\n' $i >> "$WORKDIR/par_out"; done) &
+PID1=$!
 (for i in 6 7 8 9 10; do printf '%d\n' $i >> "$WORKDIR/par_out"; done) &
-wait
+PID2=$!
+wait "$PID1"
+RC1=$?
+wait "$PID2"
+RC2=$?
+check "parallel appenders exit" "$RC1:$RC2" "0:0"
 LINES=$(wc -l < "$WORKDIR/par_out")
 check "parallel append line count"  "$LINES"  "10"
 

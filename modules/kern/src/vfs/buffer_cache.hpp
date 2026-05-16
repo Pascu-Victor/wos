@@ -80,8 +80,20 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
 // Returns 0 on success, negative errno on failure.
 auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 
+// Return true if any dirty cached buffer overlaps a device block range.
+auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
+
+// Write dirty buffers overlapping a device block range to disk.
+// Returns 0 on success, negative errno on failure.
+auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
+
 // Invalidate all cached buffers for a device (e.g. on unmount).
 void invalidate_bdev(dev::BlockDevice* bdev);
+
+// Discard cached buffers overlapping a device block range without writeback.
+// Use only when the caller has made the storage range authoritative by other
+// means, such as overwriting freshly allocated blocks directly.
+void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count);
 
 // Get cache statistics for diagnostics.
 struct BufferCacheStats {

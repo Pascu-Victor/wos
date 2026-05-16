@@ -22,6 +22,7 @@ rootfs_resolve_source() {
 rootfs_copy_entry() {
     local source="$1"
     local target="$2"
+    local mode="${3:-}"
     local resolved
 
     resolved=$(rootfs_resolve_source "$source")
@@ -31,6 +32,9 @@ rootfs_copy_entry() {
 
     mkdir -p "$ROOTFS_STAGING$(dirname "$target")"
     cp -a "$resolved" "$ROOTFS_STAGING$target"
+    if [ -n "$mode" ]; then
+        chmod "$mode" "$ROOTFS_STAGING$target"
+    fi
     rootfs_record_managed_path "$target"
     ROOTFS_CHANGED=1
 }
@@ -59,6 +63,17 @@ rootfs_stage_sysroot_libs() {
         [ -e "$file" ] || continue
         rootfs_copy_entry "$file" "/usr/lib/$(basename "$file")"
     done
+}
+
+rootfs_stage_sysroot_headers() {
+    local sysroot_include
+
+    sysroot_include="$ROOTFS_REPO/toolchain/sysroot/include"
+    if [ ! -d "$sysroot_include" ]; then
+        return 0
+    fi
+
+    rootfs_copy_entry "$sysroot_include" "/usr/include"
 }
 
 rootfs_stage_busybox_install() {
@@ -110,19 +125,28 @@ rootfs_stage_manifest() {
     local action
     local source
     local target
+    local mode
+    local extra
 
     manifest="$ROOTFS_REPO/configs/rootfs/aliases.tsv"
     if [ ! -f "$manifest" ]; then
         return 0
     fi
 
-    while IFS=$'\t' read -r action source target; do
+    while IFS=$'\t' read -r action source target mode extra; do
         case "$action" in
             ""|\#*)
                 continue
                 ;;
             copy)
                 rootfs_copy_entry "$source" "$target"
+                ;;
+            copy-mode)
+                if [ -z "$mode" ] || [ -n "$extra" ]; then
+                    echo "Invalid copy-mode rootfs manifest entry in $manifest" >&2
+                    return 1
+                fi
+                rootfs_copy_entry "$source" "$target" "$mode"
                 ;;
             symlink)
                 rootfs_symlink_entry "$source" "$target"
@@ -248,6 +272,7 @@ rootfs_stage_tree() {
     : > "$ROOTFS_MANAGED_TMP"
 
     rootfs_stage_sysroot_libs
+    rootfs_stage_sysroot_headers
     rootfs_stage_busybox_install
     rootfs_stage_manifest
     rootfs_stage_etc

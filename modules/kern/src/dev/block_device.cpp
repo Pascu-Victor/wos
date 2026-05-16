@@ -20,8 +20,16 @@ using log = ker::mod::dbg::logger<"bdev">;
 // Block device registry
 namespace {
 constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
+constexpr size_t MAX_BLOCK_IO_BYTES = size_t{1024} * 1024;
 ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
 ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
+
+auto max_io_blocks(BlockDevice const* bdev) -> size_t {
+    if (bdev == nullptr || bdev->block_size == 0) {
+        return 1;
+    }
+    return std::max<size_t>(1, MAX_BLOCK_IO_BYTES / bdev->block_size);
+}
 }  // namespace
 
 auto block_device_register(BlockDevice* bdev) -> int {
@@ -113,7 +121,7 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
         return -1;
     }
 
-    if (block + count > bdev->total_blocks) {
+    if (block > bdev->total_blocks || count > bdev->total_blocks - block) {
         log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
                   static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
         return -1;
@@ -124,7 +132,33 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
         return -1;
     }
 
-    return bdev->read_blocks(bdev, block, count, buffer);
+    if (count == 0) {
+        return 0;
+    }
+
+    if (bdev->block_size == 0) {
+        log::error("block_read: invalid zero block size for %s", bdev->name.data());
+        return -1;
+    }
+
+    auto* out = static_cast<uint8_t*>(buffer);
+    uint64_t current_block = block;
+    size_t remaining = count;
+    size_t const MAX_BLOCKS = max_io_blocks(bdev);
+
+    while (remaining > 0) {
+        size_t const CHUNK_BLOCKS = std::min(remaining, MAX_BLOCKS);
+        int const RC = bdev->read_blocks(bdev, current_block, CHUNK_BLOCKS, out);
+        if (RC != 0) {
+            return RC;
+        }
+
+        remaining -= CHUNK_BLOCKS;
+        current_block += CHUNK_BLOCKS;
+        out += CHUNK_BLOCKS * bdev->block_size;
+    }
+
+    return 0;
 }
 
 auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* buffer) -> int {
@@ -132,7 +166,7 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
         return -1;
     }
 
-    if (block + count > bdev->total_blocks) {
+    if (block > bdev->total_blocks || count > bdev->total_blocks - block) {
         log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
                   static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
         return -1;
@@ -143,7 +177,33 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
         return -1;
     }
 
-    return bdev->write_blocks(bdev, block, count, buffer);
+    if (count == 0) {
+        return 0;
+    }
+
+    if (bdev->block_size == 0) {
+        log::error("block_write: invalid zero block size for %s", bdev->name.data());
+        return -1;
+    }
+
+    auto const* in = static_cast<uint8_t const*>(buffer);
+    uint64_t current_block = block;
+    size_t remaining = count;
+    size_t const MAX_BLOCKS = max_io_blocks(bdev);
+
+    while (remaining > 0) {
+        size_t const CHUNK_BLOCKS = std::min(remaining, MAX_BLOCKS);
+        int const RC = bdev->write_blocks(bdev, current_block, CHUNK_BLOCKS, in);
+        if (RC != 0) {
+            return RC;
+        }
+
+        remaining -= CHUNK_BLOCKS;
+        current_block += CHUNK_BLOCKS;
+        in += CHUNK_BLOCKS * bdev->block_size;
+    }
+
+    return 0;
 }
 
 auto block_flush(BlockDevice* bdev) -> int {

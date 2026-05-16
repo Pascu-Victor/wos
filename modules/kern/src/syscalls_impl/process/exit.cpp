@@ -131,6 +131,19 @@ void reschedule_on_task_cpu(ker::mod::sched::task::Task* task) {
     ker::mod::sched::reschedule_task_for_cpu(cpu, task);
 }
 
+auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
+    return waiter != nullptr && child != nullptr && (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid);
+}
+
+void complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
+    waiter->context.regs.rax = child->pid;
+    validate_waiter_resume_for_exit(waiter, child, path);
+    write_wait_status_for_waiter(waiter, child->exit_status);
+    fill_rusage_for_waiter(waiter, child);
+    waiter->waiting_for_pid = 0;
+    child->waited_on = true;
+}
+
 void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     if (child == nullptr || child->is_thread || child->parent_pid == 0) {
         return;
@@ -145,15 +158,11 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
 
     bool wake_parent = false;
     if (!child->waited_on) {
-        if (parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch) {
-            parent->context.regs.rax = child->pid;
-            validate_waiter_resume_for_exit(parent, child, "exit-any");
-            write_wait_status_for_waiter(parent, child->exit_status);
-            fill_rusage_for_waiter(parent, child);
-            parent->waiting_for_pid = 0;
-            child->waited_on = true;
+        if (waiter_matches_child(parent, child) && !parent->deferred_task_switch) {
+            complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
             wake_parent = true;
-        } else if (parent->deferred_task_switch || parent->voluntary_block) {
+        } else if ((waiter_matches_child(parent, child) && parent->voluntary_block) || parent->deferred_task_switch ||
+                   parent->voluntary_block) {
             // The deferred switch path will re-check waitability after it saves
             // the parent's syscall context.  This is also how unrelated blocking
             // syscalls notice SIGCHLD promptly.
@@ -165,6 +174,32 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         reschedule_on_task_cpu(parent);
     }
     parent->release();
+}
+
+void notify_tracer_after_exit_ready(ker::mod::sched::task::Task* child) {
+    if (child == nullptr || child->is_thread || !child->ptrace_traced || child->ptrace_tracer_pid == 0) {
+        return;
+    }
+
+    auto* tracer = ker::mod::sched::find_task_by_pid_safe(child->ptrace_tracer_pid);
+    if (tracer == nullptr) {
+        return;
+    }
+
+    bool wake_tracer = false;
+    if (!child->waited_on && waiter_matches_child(tracer, child)) {
+        if (!tracer->deferred_task_switch) {
+            complete_exit_wait(tracer, child, "exit-ptrace");
+            wake_tracer = true;
+        } else {
+            wake_tracer = true;
+        }
+    }
+
+    if (wake_tracer) {
+        reschedule_on_task_cpu(tracer);
+    }
+    tracer->release();
 }
 
 }  // namespace
@@ -320,6 +355,7 @@ void wos_proc_exit(int status) {
         }
     }
 
+    notify_tracer_after_exit_ready(current_task);
     notify_parent_after_exit_ready(current_task);
 
     // CRITICAL: Do NOT modify or destroy pagemap/thread here!

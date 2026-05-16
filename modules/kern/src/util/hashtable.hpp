@@ -95,6 +95,35 @@ class IntrHashTable {
         return true;
     }
 
+    // Insert element only if predicate returns true while holding the target
+    // bucket lock. on_inserted runs after the element is linked but before
+    // the bucket is unlocked, which lets callers publish side state atomically
+    // with respect to remove/remove_all_by_key on the same key.
+    template <typename Predicate, typename OnInserted>
+    bool insert_if(T* elem, Predicate&& predicate, OnInserted&& on_inserted) {
+        if ((m_buckets == nullptr) || (elem == nullptr)) {
+            return false;
+        }
+
+        auto key = m_key_extract(*elem);
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
+
+        auto saved = bucket.lock.lock_irqsave();
+        if (!std::forward<Predicate>(predicate)()) {
+            bucket.lock.unlock_irqrestore(saved);
+            return false;
+        }
+
+        elem->hash_next = bucket.head;
+        bucket.head = elem;
+        bucket.count++;
+        m_size.fetch_add(1, std::memory_order_relaxed);
+        std::forward<OnInserted>(on_inserted)();
+        bucket.lock.unlock_irqrestore(saved);
+        return true;
+    }
+
     // Remove element from table. Returns true if found and removed.
     bool remove(T* elem) {
         if ((m_buckets == nullptr) || (elem == nullptr)) {

@@ -367,9 +367,12 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
             ssize_t const N = sock->rcvbuf.read(buf, len);
             if (N > 0) {
                 uint32_t const OLD_WND = cb->rcv_wnd;
-                cb->rcv_wnd = sock->rcvbuf.free_space();
-                // Only send proactive update when recovering from zero-window.
-                if (OLD_WND == 0) {
+                cb->rcv_wnd = tcp_receive_window_space(cb, sock);
+                uint32_t const WND_GROWTH = cb->rcv_wnd > OLD_WND ? cb->rcv_wnd - OLD_WND : 0;
+                uint32_t const UPDATE_THRESHOLD = std::max<uint32_t>(static_cast<uint32_t>(cb->rcv_mss) * 2U, cb->rcv_wnd / 4U);
+                bool const SHOULD_UPDATE_WINDOW =
+                    cb->rcv_wnd > OLD_WND && (OLD_WND == 0 || OLD_WND < cb->rcv_mss || WND_GROWTH >= UPDATE_THRESHOLD);
+                if (SHOULD_UPDATE_WINDOW) {
                     if (!tcp_send_ack(cb)) {
                         cb->ack_pending = true;
                         tcp_timer_arm(cb);
@@ -726,6 +729,14 @@ namespace {
 void tcp_cb_destroy(TcpCB* cb) {
     if (cb == nullptr) {
         return;
+    }
+
+    auto* ooo = cb->ooo_head;
+    while (ooo != nullptr) {
+        auto* next = ooo->next;
+        delete[] ooo->data;
+        delete ooo;
+        ooo = next;
     }
 
     auto* entry = cb->retransmit_head;

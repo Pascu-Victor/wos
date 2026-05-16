@@ -6,6 +6,7 @@
 // 2. Search the cntbt (by-count tree) for the smallest free extent >= minlen.
 // 3. If alignment is required, round up the starting block.
 // 4. Split the free extent: allocate the requested portion, leave the rest.
+// 5. On free, coalesce immediately adjacent extents before re-inserting.
 //
 // Reference: reference/xfs/libxfs/xfs_alloc.c
 
@@ -300,6 +301,60 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     return 0;
 }
 
+void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) {
+    XfsPerAG const* pag = &mount->per_ag[agno];
+    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
+    BufHead* agf_bh = xfs_buf_read(mount, AG_START_BLOCK);
+    if (agf_bh == nullptr) {
+        return;
+    }
+
+    size_t const AGF_OFFSET = mount->sect_size;
+    auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + AGF_OFFSET);
+    agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
+    agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
+    agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
+    agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
+    agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
+    agf->agf_crc = Be32{0};
+    uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
+    __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
+    xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
+    brelse(agf_bh);
+}
+
+auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t startblock,
+                               xfs_extlen_t blockcount) -> int {
+    XfsPerAG const* pag = &mount->per_ag[agno];
+
+    XfsBtreeCursor<XfsBnobtTraits> bno_cur;
+    bno_cur.mount = mount;
+    bno_cur.agno = agno;
+    XfsBnobtTraits::IRec const BNO_TARGET{.startblock = startblock, .blockcount = 0};
+    int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::EQ);
+    if (rc != 0) {
+        return rc;
+    }
+    XfsBnobtTraits::IRec const BNO_REC = xfs_btree_get_rec(&bno_cur);
+    if (BNO_REC.blockcount != blockcount) {
+        return -EIO;
+    }
+    rc = xfs_btree_delete(&bno_cur, tp);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsBtreeCursor<XfsCntbtTraits> cnt_cur;
+    cnt_cur.mount = mount;
+    cnt_cur.agno = agno;
+    XfsCntbtTraits::IRec const CNT_TARGET{.startblock = startblock, .blockcount = blockcount};
+    rc = xfs_btree_lookup(&cnt_cur, pag->agf_cnt_root, pag->agf_cnt_level, CNT_TARGET, XfsBtreeLookup::EQ);
+    if (rc != 0) {
+        return rc;
+    }
+    return xfs_btree_delete(&cnt_cur, tp);
+}
+
 }  // anonymous namespace
 
 auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAllocReq& req, XfsAllocResult* result) -> int {
@@ -343,10 +398,66 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
         return -EINVAL;
     }
 
-    // NOTE: A production implementation would merge with adjacent free
-    // extents (coalescing).  For now we insert directly into both btrees.
-
     XfsPerAG* pag = &mount->per_ag[agno];
+
+    xfs_agblock_t merged_start = agbno;
+    xfs_extlen_t merged_len = len;
+
+    XfsBtreeCursor<XfsBnobtTraits> prev_cur;
+    prev_cur.mount = mount;
+    prev_cur.agno = agno;
+    XfsBnobtTraits::IRec const PREV_TARGET{.startblock = agbno, .blockcount = 0};
+    bool merge_prev = false;
+    XfsBnobtTraits::IRec prev_rec{};
+    int rc = xfs_btree_lookup(&prev_cur, pag->agf_bno_root, pag->agf_bno_level, PREV_TARGET, XfsBtreeLookup::LE);
+    if (rc == 0) {
+        prev_rec = xfs_btree_get_rec(&prev_cur);
+        xfs_agblock_t const PREV_END = prev_rec.startblock + prev_rec.blockcount;
+        if (PREV_END > agbno) {
+            return -EIO;
+        }
+        if (PREV_END == agbno) {
+            merge_prev = true;
+            merged_start = prev_rec.startblock;
+            merged_len += prev_rec.blockcount;
+        }
+    } else if (rc != -ENOENT) {
+        return rc;
+    }
+
+    xfs_agblock_t const FREE_END = agbno + len;
+    XfsBtreeCursor<XfsBnobtTraits> next_cur;
+    next_cur.mount = mount;
+    next_cur.agno = agno;
+    XfsBnobtTraits::IRec const NEXT_TARGET{.startblock = FREE_END, .blockcount = 0};
+    bool merge_next = false;
+    XfsBnobtTraits::IRec next_rec{};
+    rc = xfs_btree_lookup(&next_cur, pag->agf_bno_root, pag->agf_bno_level, NEXT_TARGET, XfsBtreeLookup::GE);
+    if (rc == 0) {
+        next_rec = xfs_btree_get_rec(&next_cur);
+        if (next_rec.startblock < FREE_END) {
+            return -EIO;
+        }
+        if (next_rec.startblock == FREE_END) {
+            merge_next = true;
+            merged_len += next_rec.blockcount;
+        }
+    } else if (rc != -ENOENT) {
+        return rc;
+    }
+
+    if (merge_prev) {
+        rc = delete_free_extent_record(mount, tp, agno, prev_rec.startblock, prev_rec.blockcount);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    if (merge_next) {
+        rc = delete_free_extent_record(mount, tp, agno, next_rec.startblock, next_rec.blockcount);
+        if (rc != 0) {
+            return rc;
+        }
+    }
 
     // Insert into bnobt
     XfsBtreeCursor<XfsBnobtTraits> bno_cur;
@@ -355,8 +466,8 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
 
     uint64_t new_bno_root = pag->agf_bno_root;
     uint8_t new_bno_lvl = pag->agf_bno_level;
-    XfsBnobtTraits::IRec const BNO_REC{.startblock = agbno, .blockcount = len};
-    int rc = xfs_btree_insert(&bno_cur, tp, BNO_REC, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
+    XfsBnobtTraits::IRec const BNO_REC{.startblock = merged_start, .blockcount = merged_len};
+    rc = xfs_btree_insert(&bno_cur, tp, BNO_REC, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
     if (rc != 0) {
         return rc;
     }
@@ -370,7 +481,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
 
     uint64_t new_cnt_root = pag->agf_cnt_root;
     uint8_t new_cnt_lvl = pag->agf_cnt_level;
-    XfsCntbtTraits::IRec const CNT_REC{.startblock = agbno, .blockcount = len};
+    XfsCntbtTraits::IRec const CNT_REC{.startblock = merged_start, .blockcount = merged_len};
     rc = xfs_btree_insert(&cnt_cur, tp, CNT_REC, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
     if (rc != 0) {
         return rc;
@@ -381,26 +492,11 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     // Update AGF free block count and possibly new btree roots
     pag->agf_freeblks += len;
 
-    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-    BufHead* agf_bh = xfs_buf_read(mount, AG_START_BLOCK);
-    if (agf_bh != nullptr) {
-        size_t const AGF_OFFSET = mount->sect_size;
-        auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + AGF_OFFSET);
-        agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
-        agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
-        agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
-        agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
-        agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
-        // Recompute CRC
-        agf->agf_crc = Be32{0};
-        uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
-        __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-        // Log the AGF buffer
-        xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
-        brelse(agf_bh);
-    }
+    log_agf_free_space_roots(mount, tp, agno);
 
-    mod::dbg::log("[xfs free] freed AG %u block %u len %u\n", agno, agbno, len);
+#ifdef XFS_DEBUG
+    mod::dbg::log("[xfs free] freed AG %u block %u len %u (merged to block %u len %u)\n", agno, agbno, len, merged_start, merged_len);
+#endif
     return 0;
 }
 

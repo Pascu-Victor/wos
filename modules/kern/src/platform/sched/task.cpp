@@ -401,6 +401,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->suid = parent->suid;
     t->sgid = parent->sgid;
     t->umask = parent->umask;
+    (void)t->supplementary_groups.clone_from(parent->supplementary_groups);
     t->session_id = parent->session_id;
     t->pgid = parent->pgid;
     t->controlling_tty = parent->controlling_tty;

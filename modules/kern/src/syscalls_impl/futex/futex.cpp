@@ -101,33 +101,31 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     waiter->task_cpu = current_task->cpu;
     waiter->hash_next = nullptr;
 
-    // We need atomic check-and-enqueue. The hash table locks per-bucket,
-    // but we need to check the value under the same lock to prevent races.
-    // Use a separate spinlock for the value check + insert atomicity.
-    // (The hash table's per-bucket lock handles concurrent wake/insert on same bucket.)
-    // Actually, we can rely on the hash table's bucket lock since insert acquires it.
-    // But the value check must happen before insert returns. Since the hash table
-    // insert is unconditional, we check first, then insert.
-    int const CURRENT_VALUE = *kernel_addr;
-    if (CURRENT_VALUE != expected) {
-        delete waiter;
-        return -EAGAIN;  // Value changed, don't wait
-    }
-
-    // Insert into hash table (per-bucket lock acquired internally)
-    if (!futex_table.insert(waiter)) {
+    if (!futex_table.valid()) {
         delete waiter;
         return -ENOMEM;
     }
 
-    void* previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
+    void* previous_waiter = nullptr;
+    bool const INSERTED = futex_table.insert_if(
+        waiter,
+        [kernel_addr, expected]() -> bool {
+            int const CURRENT_VALUE = *kernel_addr;
+            return CURRENT_VALUE == expected;
+        },
+        [current_task, waiter, &previous_waiter]() {
+            current_task->wait_channel = "futex_wait";
+            current_task->deferred_task_switch = true;
+            previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
+        });
+    if (!INSERTED) {
+        delete waiter;
+        return -EAGAIN;  // Value changed, don't wait
+    }
+
     if (previous_waiter != nullptr) {
         log::warn("wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
     }
-
-    // Set deferred task switch to move task to wait queue
-    current_task->wait_channel = "futex_wait";
-    current_task->deferred_task_switch = true;
 
     return 0;
 }

@@ -1,7 +1,9 @@
 #include "null_device.hpp"
 
+#include <bits/off_t.h>
 #include <bits/ssize_t.h>
 
+#include <cerrno>
 #include <cstring>
 #include <vfs/file.hpp>
 
@@ -25,6 +27,13 @@ ssize_t null_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) 
     return static_cast<ssize_t>(count);  // Discard all data
 }
 
+off_t null_lseek(ker::vfs::File* /*file*/, off_t /*offset*/, int whence) {
+    if (whence != 0 && whence != 1 && whence != 2) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 bool null_isatty(ker::vfs::File* /*file*/) { return false; }
 
 CharDeviceOps null_ops = {
@@ -36,6 +45,7 @@ CharDeviceOps null_ops = {
     .ioctl = nullptr,
     .poll_check = nullptr,
     .poll_register_waiter = nullptr,
+    .lseek = null_lseek,
 };
 
 // --- /dev/zero operations ---
@@ -55,6 +65,13 @@ ssize_t zero_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) 
     return static_cast<ssize_t>(count);  // Discard all data
 }
 
+off_t zero_lseek(ker::vfs::File* /*file*/, off_t /*offset*/, int whence) {
+    if (whence != 0 && whence != 1 && whence != 2) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 bool zero_isatty(ker::vfs::File* /*file*/) { return false; }
 
 CharDeviceOps zero_ops = {
@@ -66,6 +83,7 @@ CharDeviceOps zero_ops = {
     .ioctl = nullptr,
     .poll_check = nullptr,
     .poll_register_waiter = nullptr,
+    .lseek = zero_lseek,
 };
 
 // Device instances

@@ -1,9 +1,8 @@
 // XFS Transaction implementation.
 //
-// Provides transactional metadata modification.  Currently implements a
-// simplified version that logs buffer and inode modifications and commits
-// them synchronously to disk.  A full implementation would batch transactions
-// into log records and write them to the circular journal area.
+// Provides transactional metadata modification.  The current model writes one
+// compact log record per committed transaction, then marks metadata buffers
+// dirty for deferred writeback.
 //
 // Reference: reference/xfs/xfs_trans.c, reference/xfs/xfs_trans_buf.c
 

@@ -117,6 +117,39 @@ KTEST(VFS, AppendMode) {
     ker::vfs::vfs_unlink("/tmp/ktest_append");
 }
 
+KTEST(VFS, TmpfsAppendUsesCurrentEnd) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    ker::vfs::File* first = ker::vfs::vfs_open_file("/tmp/ktest_append_current_end", ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(first, nullptr);
+    ker::vfs::File* second = ker::vfs::vfs_open_file("/tmp/ktest_append_current_end", 1, 0644);
+    KREQUIRE_NE(second, nullptr);
+
+    constexpr char FIRST[] = "one\n";
+    constexpr char SECOND[] = "two\n";
+    constexpr size_t FIRST_LEN = sizeof(FIRST) - 1;
+    constexpr size_t SECOND_LEN = sizeof(SECOND) - 1;
+
+    size_t first_offset = 99;
+    ssize_t const FIRST_WRITE = ker::vfs::tmpfs::tmpfs_write_append(first, static_cast<const void*>(FIRST), FIRST_LEN, &first_offset);
+    KEXPECT_EQ(FIRST_WRITE, static_cast<ssize_t>(FIRST_LEN));
+    KEXPECT_EQ(first_offset, static_cast<size_t>(0));
+
+    size_t second_offset = 99;
+    ssize_t const SECOND_WRITE = ker::vfs::tmpfs::tmpfs_write_append(second, static_cast<const void*>(SECOND), SECOND_LEN, &second_offset);
+    KEXPECT_EQ(SECOND_WRITE, static_cast<ssize_t>(SECOND_LEN));
+    KEXPECT_EQ(second_offset, FIRST_LEN);
+
+    char rbuf[16] = {};
+    ssize_t const READ = ker::vfs::tmpfs::tmpfs_read(first, static_cast<void*>(rbuf), FIRST_LEN + SECOND_LEN, 0);
+    KEXPECT_EQ(READ, static_cast<ssize_t>(FIRST_LEN + SECOND_LEN));
+    KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), "one\ntwo\n", FIRST_LEN + SECOND_LEN) == 0);
+
+    ker::vfs::tmpfs::tmpfs_fops_close(second);
+    ker::vfs::tmpfs::tmpfs_fops_close(first);
+    ker::vfs::vfs_unlink("/tmp/ktest_append_current_end");
+}
+
 KTEST(VFS, WriteReadAligned4K) {
     // Write exactly 4 KB then read it back from the same file.
     // Exercises the aligned write→read path (same as mmap_file in testd):

@@ -1311,7 +1311,8 @@ template <int SLOT>
                 perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_SEND), target, WKI_CHAN_RESOURCE, ret,
                                         SEND_ELAPSED_US, static_cast<uint64_t>(n), attempts);
                 if (ret != WKI_OK) {
-                    ker::mod::dbg::log("[WKI] IPC pipe pump DATA send failed: resource_id=%u ret=%d len=%ld", resource_id, ret, n);
+                    ker::mod::dbg::logger<"wki">::warn("IPC pipe pump DATA send failed: resource_id=%u ret=%d len=%ld", resource_id, ret,
+                                                       n);
                     break;
                 }
             } else if (n == 0) {
@@ -1334,8 +1335,8 @@ template <int SLOT>
                 }
                 if (ret != WKI_OK) {
                     if (attempts != 0 && exp->active) {
-                        ker::mod::dbg::log("[WKI] IPC pipe pump EOF send failed: resource_id=%u ret=%d attempts=%u retries=%u", resource_id,
-                                           ret, attempts, retries);
+                        ker::mod::dbg::logger<"wki">::warn("IPC pipe pump EOF send failed: resource_id=%u ret=%d attempts=%u retries=%u",
+                                                           resource_id, ret, attempts, retries);
                     }
                 }
 #ifdef WKI_IPC_DEBUG
@@ -1355,7 +1356,7 @@ template <int SLOT>
                 }
                 continue;
             } else {
-                ker::mod::dbg::log("[WKI] IPC pipe pump read error: resource_id=%u err=%ld", resource_id, n);
+                ker::mod::dbg::logger<"wki">::warn("IPC pipe pump read error: resource_id=%u err=%ld", resource_id, n);
                 break;
             }
         }

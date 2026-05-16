@@ -53,9 +53,9 @@ auto xfs_attr_list(XfsInode* ip, XfsAttrIterFn fn, void* private_data) -> int;
 // ============================================================================
 
 // Set (create or replace) an extended attribute.
-// For shortform attrs: inserts or replaces in the inline attr fork.
-// Returns 0 on success, -ENOSPC if no room (conversion to leaf not yet
-// implemented), or other negative errno.
+// Supports inline shortform attrs and single-block leaf attrs in an extents
+// attr fork.  Values that require remote attr blocks or DA-btree mutation
+// return a negative errno.
 auto xfs_attr_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* value, uint32_t valuelen,
                   uint8_t flags) -> int;
 

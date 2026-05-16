@@ -17,6 +17,8 @@
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_inode.hpp>
 
+#include "net/endian.hpp"
+
 namespace ker::vfs::xfs {
 
 // ============================================================================

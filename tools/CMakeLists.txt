@@ -74,6 +74,7 @@ project(wos_tools
     LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux MPI benchmark binaries with the host compiler" OFF)
 
 # Enable color output for clang
 add_compile_options(-fdiagnostics-color=always)
@@ -91,6 +92,9 @@ foreach(SUBDIR ${SUBDIRS})
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${SUBDIR})
         # Skip build directories
         if(NOT ${SUBDIR} STREQUAL "build")
+            if("${SUBDIR}" STREQUAL "benchmarks" AND NOT WOS_BUILD_LINUX_BENCHMARKS)
+                continue()
+            endif()
             if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${SUBDIR}/CMakeLists.txt)
                 message(STATUS "Adding subdirectory: ${SUBDIR}")
                 add_subdirectory(${SUBDIR})

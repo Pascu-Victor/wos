@@ -86,7 +86,7 @@ patch_guest_identity() {
   local disk_path="$1"
   local hostname="$2"
   local guest_mac="$3"
-  local fqdn="${hostname}.internal"
+  local fqdn="${hostname}.wos"
   local temp_dir
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN

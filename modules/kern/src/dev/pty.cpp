@@ -301,6 +301,11 @@ void wake_both_pollers(PtyPair* pair) {
     wake_slave_pollers(pair);
 }
 
+void wake_master_output_available(PtyPair* pair) {
+    wake_master_readers(pair);
+    wake_master_pollers(pair);
+}
+
 auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
     auto* pair = pair_from_file(file);
     auto* device = device_from_file(file);
@@ -560,6 +565,10 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
         bool const SLAVE_OPENED = pair->slave_opened > 0;
         bool should_block = false;
         if (RD == 0 && SLAVE_OPENED && (OPEN_FLAGS & 04000) == 0) {
+            if (current_task_has_deliverable_signal()) {
+                pair->lock.unlock_irqrestore(IRQF);
+                return finish(-EINTR);
+            }
             should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
         }
         pair->lock.unlock_irqrestore(IRQF);
@@ -573,7 +582,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
                 return finish(-EAGAIN);  // O_NONBLOCK = 04000
             }
             if (current_task_has_deliverable_signal()) {
-                return finish(-EINTR);
+                continue;
             }
             if (should_block) {
                 ker::mod::sched::preemptible_syscall_park("pty_master_read");
@@ -581,7 +590,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
                 ker::mod::sched::kern_yield();
             }
             if (current_task_has_deliverable_signal()) {
-                return finish(-EINTR);
+                continue;
             }
             continue;
         }
@@ -1138,6 +1147,10 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
         bool const MASTER_OPENED = pair->master_opened > 0;
         bool should_block = false;
         if (RD == 0 && MASTER_OPENED && (OPEN_FLAGS & 04000) == 0) {
+            if (current_task_has_deliverable_signal()) {
+                pair->lock.unlock_irqrestore(IRQF);
+                return finish(-EINTR);
+            }
             should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
         }
         pair->lock.unlock_irqrestore(IRQF);
@@ -1151,7 +1164,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
                 return finish(-EAGAIN);  // O_NONBLOCK = 04000
             }
             if (current_task_has_deliverable_signal()) {
-                return finish(-EINTR);
+                continue;
             }
             if (should_block) {
                 ker::mod::sched::preemptible_syscall_park("pty_slave_read");
@@ -1159,7 +1172,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
                 ker::mod::sched::kern_yield();
             }
             if (current_task_has_deliverable_signal()) {
-                return finish(-EINTR);
+                continue;
             }
             continue;
         }
@@ -1252,14 +1265,22 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
             uint8_t cr = '\r';
             uint64_t const IRQF = pair->lock.lock_irqsave();
-            pair->s2m.write(&cr, 1);
+            bool const WAS_EMPTY = pair->s2m.available() == 0;
+            size_t const WR = pair->s2m.write(&cr, 1);
             pair->lock.unlock_irqrestore(IRQF);
+            if (WR != 0 && (WAS_EMPTY || written == 0)) {
+                wake_master_output_available(pair);
+            }
         }
 
         if ((OPEN_FLAGS & 04000) != 0) {
             uint64_t const IRQF = pair->lock.lock_irqsave();
+            bool const WAS_EMPTY = pair->s2m.available() == 0;
             size_t const WR = pair->s2m.write(&ch, 1);
             pair->lock.unlock_irqrestore(IRQF);
+            if (WR != 0 && (WAS_EMPTY || written == 0)) {
+                wake_master_output_available(pair);
+            }
             if (WR == 0) {
                 if (written == 0) {
                     return finish(-EAGAIN);
@@ -1269,6 +1290,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         } else {
             while (true) {
                 uint64_t const IRQF = pair->lock.lock_irqsave();
+                bool const WAS_EMPTY = pair->s2m.available() == 0;
                 size_t const WR = pair->s2m.write(&ch, 1);
                 bool const MASTER_OPENED = pair->master_opened > 0;
                 bool should_block = false;
@@ -1277,6 +1299,9 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->lock.unlock_irqrestore(IRQF);
                 if (WR != 0) {
+                    if (WAS_EMPTY || written == 0) {
+                        wake_master_output_available(pair);
+                    }
                     break;
                 }
                 if (!MASTER_OPENED) {

@@ -3,19 +3,20 @@
 // Usage:
 //   perf stat     [ms=1000]   CPU% per process over given sampling window
 //   perf record   [ms=1000]   Enable kernel event recording for N ms, save to perf.data
-//   perf report   [n=2000]    Display events from perf.data (or live /proc/kperf)
-//   perf sched    [n=2000]    Alias for perf report
+//   perf report   [n=2000] [--time=boot|unix-ns|iso] Display events from perf.data (or live /proc/kperf)
+//   perf sched    [n=2000] [--time=boot|unix-ns|iso] Alias for perf report
 //   perf cpustat              Per-CPU aggregate scheduler statistics
-//   perf ipc-report [n=15]    IPC latency/jitter/throughput/memory report
+//   perf ipc-report [n=15] [--time=boot|unix-ns|iso] IPC latency/jitter/throughput/memory report
 //   perf wki-report           Remote/WKI summary statistics
 //   perf local-report         Local pipe/process summary statistics
 //   perf vmem-report          Local mmap/cache/COW summary statistics
 //   perf all-report           Combined WKI and local summary statistics
 //   perf top      [ms=1000]   Continuous stat snapshots (Ctrl-C to stop)
-//   perf run      <cmd> [args] Trace cmd+descendants, save to perf.data
+//   perf run      [--time=boot|unix-ns|iso] <cmd> [args] Trace cmd+descendants, save to perf.data
 //   perf show-map             Show PID->name/cmdline map from perf.data
 
 #include <abi-bits/access.h>
+#include <abi-bits/clockid_t.h>
 #include <abi-bits/fcntl.h>
 #include <abi-bits/mode_t.h>
 #include <bits/ssize_t.h>
@@ -59,6 +60,7 @@ constexpr int64_t MILLISECONDS_PER_SECOND = 1000;
 constexpr int64_t MICROSECONDS_PER_MILLISECOND = 1000;
 constexpr int64_t NANOSECONDS_PER_MICROSECOND = 1000;
 constexpr int64_t NANOSECONDS_PER_MILLISECOND = 1000000;
+constexpr int64_t NANOSECONDS_PER_SECOND = 1000000000;
 constexpr int SLEEP_SLICE_MS = 10;
 constexpr int PARSE_BASE_DECIMAL = 10;
 constexpr int PROC_STAT_SKIP_FIELDS = 8;
@@ -73,6 +75,9 @@ constexpr int DEFAULT_WKI_TRACE_EVENTS = 200;
 constexpr int DEFAULT_WKI_TAIL_ROWS = 15;
 constexpr int DEFAULT_WKI_LAUNCH_ROWS = 20;
 constexpr uint64_t PERF_PAGE_SIZE = 4096;
+constexpr int BOOT_TIME_COLUMN_WIDTH = 18;
+constexpr int UNIX_TIME_COLUMN_WIDTH = 19;
+constexpr int ISO_TIME_COLUMN_WIDTH = 30;
 
 constexpr std::size_t INITIAL_FILE_CAPACITY = 131072;
 constexpr std::size_t PROC_READ_CAPACITY = 512;
@@ -98,6 +103,8 @@ constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
 constexpr std::string_view KCONTSTAT_PATH = "/proc/kcontstat";
 constexpr std::string_view DEV_NODES_ROOT = "/dev/nodes";
 constexpr std::string_view SECTION_HEADER = "--- SECTION";
+constexpr std::string_view SECTION_TIMEBASE = "--- SECTION TIMEBASE ---\n";
+constexpr std::string_view SECTION_TIMEBASE_END = "--- END TIMEBASE ---\n";
 constexpr std::string_view SECTION_EVENTS = "--- SECTION EVENTS ---\n";
 constexpr std::string_view SECTION_EVENTS_END = "--- END EVENTS ---\n";
 constexpr std::string_view SECTION_WKI_SUMMARY = "--- SECTION WKI_SUMMARY ---\n";
@@ -109,6 +116,7 @@ constexpr std::string_view SECTION_PROC_MAP_END = "--- END PROC_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP = "--- SECTION PEER_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP_END = "--- END PEER_MAP ---\n";
 constexpr std::string_view END_PREFIX = "--- END";
+constexpr std::string_view REALTIME_OFFSET_NS_KEY = "realtime_offset_ns=";
 constexpr std::string_view UNKNOWN_CALLSITE = "?";
 constexpr std::string_view COMM_FIELD_PREFIX = " comm=";
 constexpr std::string_view CMD_FIELD_PREFIX = " cmd=";
@@ -282,6 +290,7 @@ struct WkiGapRow {
 struct WkiLaunchRow {
     uint64_t peer{};
     uint64_t correlation{};
+    std::optional<uint64_t> first_ts_ns;
     std::optional<uint32_t> submit_total_us;
     std::optional<int32_t> submit_status;
     std::optional<uint32_t> handle_submit_us;
@@ -320,6 +329,12 @@ enum class WkiDataView : uint8_t {
     ALL,
 };
 
+enum class TimeDisplayFormat : uint8_t {
+    BOOT_NS,
+    UNIX_NS,
+    ISO_REALTIME,
+};
+
 struct HotspotStats {
     uint64_t pid{};
     std::string callsite;
@@ -347,6 +362,7 @@ struct WkiPeerMapEntry {
 
 struct WkiDisplayOptions {
     bool show_peer_ids{};
+    TimeDisplayFormat time_format{TimeDisplayFormat::BOOT_NS};
 };
 
 struct WkiPeerResolver {
@@ -371,10 +387,140 @@ struct CpuRow {
     bool in_group{};
 };
 
+auto parse_timebase_offset(std::string_view buffer, bool sectioned) -> std::optional<int64_t>;
+
 auto now_ms() -> int64_t {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (static_cast<int64_t>(ts.tv_sec) * MILLISECONDS_PER_SECOND) + (static_cast<int64_t>(ts.tv_nsec) / NANOSECONDS_PER_MILLISECOND);
+}
+
+auto timespec_to_ns(const timespec& ts) -> int64_t {
+    return (static_cast<int64_t>(ts.tv_sec) * NANOSECONDS_PER_SECOND) + static_cast<int64_t>(ts.tv_nsec);
+}
+
+auto read_clock_ns(clockid_t clock_id) -> std::optional<int64_t> {
+    timespec ts{};
+    if (clock_gettime(clock_id, &ts) != 0) {
+        return std::nullopt;
+    }
+    return timespec_to_ns(ts);
+}
+
+auto realtime_offset_ns() -> int64_t {
+    auto const MONOTONIC_NS = read_clock_ns(CLOCK_MONOTONIC);
+    auto const REALTIME_NS = read_clock_ns(CLOCK_REALTIME);
+    if (!MONOTONIC_NS.has_value() || !REALTIME_NS.has_value()) {
+        return 0;
+    }
+    return *REALTIME_NS - *MONOTONIC_NS;
+}
+
+struct TimeDisplay {
+    TimeDisplayFormat format{TimeDisplayFormat::BOOT_NS};
+    int64_t realtime_offset_ns{};
+};
+
+auto make_time_display(const WkiDisplayOptions& options, std::string_view buffer = {}, bool sectioned = false) -> TimeDisplay {
+    TimeDisplay display{.format = options.time_format};
+    if (display.format != TimeDisplayFormat::BOOT_NS) {
+        display.realtime_offset_ns = parse_timebase_offset(buffer, sectioned).value_or(realtime_offset_ns());
+    }
+    return display;
+}
+
+auto add_realtime_offset(uint64_t boot_ns, int64_t offset_ns) -> int64_t {
+    if (boot_ns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::max();
+    }
+
+    auto const BOOT_NS = static_cast<int64_t>(boot_ns);
+    if (offset_ns > 0 && BOOT_NS > std::numeric_limits<int64_t>::max() - offset_ns) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (offset_ns < 0 && BOOT_NS < std::numeric_limits<int64_t>::min() - offset_ns) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return BOOT_NS + offset_ns;
+}
+
+auto format_nine_digits(uint64_t value) -> std::string {
+    std::string out(9, '0');
+    for (auto index = out.size(); index > 0; --index) {
+        out.at(index - 1) = static_cast<char>('0' + (value % 10U));
+        value /= 10U;
+    }
+    return out;
+}
+
+auto format_iso_realtime_ns(int64_t realtime_ns) -> std::string {
+    int64_t seconds = realtime_ns / NANOSECONDS_PER_SECOND;
+    int64_t nanos = realtime_ns % NANOSECONDS_PER_SECOND;
+    if (nanos < 0) {
+        nanos += NANOSECONDS_PER_SECOND;
+        --seconds;
+    }
+
+    auto const UNIX_SECONDS = static_cast<time_t>(seconds);
+    tm utc{};
+    if (gmtime_r(&UNIX_SECONDS, &utc) == nullptr) {
+        return std::to_string(realtime_ns);
+    }
+
+    std::array<char, 32> prefix{};
+    std::size_t const PREFIX_LEN = strftime(prefix.data(), prefix.size(), "%Y-%m-%dT%H:%M:%S", &utc);
+    if (PREFIX_LEN == 0) {
+        return std::to_string(realtime_ns);
+    }
+
+    std::string out(prefix.data(), PREFIX_LEN);
+    out += '.';
+    out += format_nine_digits(static_cast<uint64_t>(nanos));
+    out += 'Z';
+    return out;
+}
+
+auto format_event_time(uint64_t boot_ns, const TimeDisplay& display) -> std::string {
+    switch (display.format) {
+        case TimeDisplayFormat::BOOT_NS:
+            return std::to_string(boot_ns);
+        case TimeDisplayFormat::UNIX_NS:
+            return std::to_string(add_realtime_offset(boot_ns, display.realtime_offset_ns));
+        case TimeDisplayFormat::ISO_REALTIME:
+            return format_iso_realtime_ns(add_realtime_offset(boot_ns, display.realtime_offset_ns));
+        default:
+            return std::to_string(boot_ns);
+    }
+}
+
+auto format_optional_event_time(const std::optional<uint64_t>& boot_ns, const TimeDisplay& display) -> std::string {
+    return boot_ns.has_value() ? format_event_time(*boot_ns, display) : std::string("-");
+}
+
+auto time_column_header(const TimeDisplay& display) -> std::string_view {
+    switch (display.format) {
+        case TimeDisplayFormat::BOOT_NS:
+            return "TIME(boot-ns)";
+        case TimeDisplayFormat::UNIX_NS:
+            return "TIME(unix-ns)";
+        case TimeDisplayFormat::ISO_REALTIME:
+            return "TIME(iso)";
+        default:
+            return "TIME(boot-ns)";
+    }
+}
+
+auto time_column_width(const TimeDisplay& display) -> int {
+    switch (display.format) {
+        case TimeDisplayFormat::BOOT_NS:
+            return BOOT_TIME_COLUMN_WIDTH;
+        case TimeDisplayFormat::UNIX_NS:
+            return UNIX_TIME_COLUMN_WIDTH;
+        case TimeDisplayFormat::ISO_REALTIME:
+            return ISO_TIME_COLUMN_WIDTH;
+        default:
+            return BOOT_TIME_COLUMN_WIDTH;
+    }
 }
 
 auto syscall_result_i64(uint64_t raw) -> int64_t {
@@ -549,6 +695,41 @@ auto next_line(std::string_view text, std::size_t& pos) -> std::string_view {
     return LINE;
 }
 
+auto parse_timebase_offset(std::string_view buffer, bool sectioned) -> std::optional<int64_t> {
+    if (!sectioned) {
+        return std::nullopt;
+    }
+
+    std::size_t const HEADER_POS = buffer.find(SECTION_TIMEBASE);
+    if (HEADER_POS == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t pos = buffer.find('\n', HEADER_POS);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+
+    while (pos < buffer.size()) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (LINE.starts_with(END_PREFIX)) {
+            break;
+        }
+
+        std::size_t const KEY_POS = LINE.find(REALTIME_OFFSET_NS_KEY);
+        if (KEY_POS == std::string_view::npos) {
+            continue;
+        }
+
+        std::size_t const VALUE_POS = KEY_POS + REALTIME_OFFSET_NS_KEY.size();
+        std::size_t const END = LINE.find(' ', VALUE_POS);
+        return parse_i64(LINE.substr(VALUE_POS, END == std::string_view::npos ? LINE.size() - VALUE_POS : END - VALUE_POS));
+    }
+
+    return std::nullopt;
+}
+
 auto is_all_digits(std::string_view text) -> bool {
     if (text.empty()) {
         return false;
@@ -677,6 +858,15 @@ auto peer_map_line(uint64_t peer, std::string_view hostname) -> std::string {
     return line;
 }
 
+void write_section_timebase(int fd) {
+    write_all(fd, SECTION_TIMEBASE);
+    std::string line(REALTIME_OFFSET_NS_KEY);
+    line += std::to_string(realtime_offset_ns());
+    line += '\n';
+    write_all(fd, line);
+    write_all(fd, SECTION_TIMEBASE_END);
+}
+
 auto collect_live_wki_peer_map() -> std::vector<WkiPeerMapEntry> {
     std::vector<WkiPeerMapEntry> entries;
     ScopedDir const DIR(opendir(std::string(DEV_NODES_ROOT).c_str()));
@@ -774,16 +964,18 @@ void save_perf_data() {
         return;
     }
 
+    write_section_timebase(FD.get());
     write_section_proc_map(FD.get());
     write_section_peer_map(FD.get());
     ssize_t event_bytes = write_section_events(FD.get());
-    write_section_wki_summary(FD.get());
-    write_section_ipc_stats(FD.get());
+    ssize_t const SUMMARY_BYTES = write_section_wki_summary(FD.get());
+    ssize_t const IPC_BYTES = write_section_ipc_stats(FD.get());
 
-    if (event_bytes <= 0) {
+    if (event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
-        std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, event_bytes);
+        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, event_bytes, SUMMARY_BYTES,
+                     IPC_BYTES);
     }
 }
 
@@ -873,6 +1065,7 @@ void cmd_record(int ms, const char* filter = nullptr) {
 
     ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
     if (data_fd.valid()) {
+        write_section_timebase(data_fd.get());
         write_all(data_fd.get(), SECTION_EVENTS);
     }
 
@@ -938,8 +1131,8 @@ void cmd_record(int ms, const char* filter = nullptr) {
     }
 
     write_all(data_fd.get(), SECTION_EVENTS_END);
-    write_section_wki_summary(data_fd.get());
-    write_section_ipc_stats(data_fd.get());
+    ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
+    ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
     write_section_peer_map(data_fd.get());
 
     // Write proc map: current live processes plus any tracked ones that exited.
@@ -962,10 +1155,11 @@ void cmd_record(int ms, const char* filter = nullptr) {
     }
     write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
-    if (total_event_bytes <= 0) {
+    if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
-        std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, total_event_bytes);
+        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, total_event_bytes, SUMMARY_BYTES,
+                     IPC_BYTES);
     }
 }
 
@@ -1396,6 +1590,10 @@ auto is_local_vmem_event(const EventInfo& event) -> bool { return event.scope_na
 
 auto is_local_loader_event(const EventInfo& event) -> bool { return event.scope_name == "local_loader"; }
 
+auto is_local_xfs_event(const EventInfo& event) -> bool { return event.scope_name == "local_xfs"; }
+
+auto is_local_irq_event(const EventInfo& event) -> bool { return event.scope_name == "local_irq"; }
+
 auto is_vmem_cow_op(std::string_view op) -> bool { return op == "cow_zero" || op == "cow_copy" || op == "cow_promote"; }
 
 auto is_vmem_file_cache_op(std::string_view op) -> bool { return op.starts_with("file_cache_"); }
@@ -1504,6 +1702,39 @@ auto format_local_loader_detail(const EventInfo& event) -> std::string {
     return out;
 }
 
+auto format_local_xfs_detail(const EventInfo& event) -> std::string {
+    std::string out(display_callsite(event.callsite));
+    out += " bytes~";
+    out += std::to_string(static_cast<uint64_t>(event.channel) * 1024ULL);
+    return out;
+}
+
+auto format_local_irq_kind(uint64_t kind) -> std::string_view {
+    switch (kind) {
+        case 1:
+            return "context";
+        case 2:
+            return "legacy";
+        case 3:
+            return "unhandled";
+        case 4:
+            return "timer";
+        default:
+            return "?";
+    }
+}
+
+auto format_local_irq_detail(const EventInfo& event) -> std::string {
+    std::string out;
+    out += "vector=";
+    out += std::to_string(event.peer);
+    out += " kind=";
+    out += std::string(format_local_irq_kind(event.channel));
+    out += " site=";
+    out += std::string(display_callsite(event.callsite));
+    return out;
+}
+
 auto format_wki_trace_detail(const EventInfo& event) -> std::string {
     std::string out(display_callsite(event.callsite));
     if (is_local_vmem_event(event)) {
@@ -1511,6 +1742,12 @@ auto format_wki_trace_detail(const EventInfo& event) -> std::string {
     }
     if (is_local_loader_event(event)) {
         return format_local_loader_detail(event);
+    }
+    if (is_local_xfs_event(event)) {
+        return format_local_xfs_detail(event);
+    }
+    if (is_local_irq_event(event)) {
+        return format_local_irq_detail(event);
     }
     if (!is_transport_stall_event(event)) {
         return out;
@@ -1793,47 +2030,49 @@ void cmd_sched(int max_events, const WkiDisplayOptions& display_options) {
     auto peer_resolver = make_wki_peer_resolver(VIEW, SECTIONED, display_options);
     auto hotspot_rows = summarize_hotspots(EVENT_VIEW, SECTIONED, proc_map);
     print_hotspot_tables(hotspot_rows);
+    auto const TIME_DISPLAY = make_time_display(display_options, VIEW, SECTIONED);
+    int const TIME_WIDTH = time_column_width(TIME_DISPLAY);
 
     std::println("=== perf report [{}] (up to {} events) ============================", src, max_events);
-    std::println("{:>3}  {:>18}  {:>3}  {}", "EVT", "TIME(ns)", "CPU", "DETAILS");
-    std::println("{:->3}  {:->18}  {:->3}  {:->40}", "", "", "", "");
+    std::println("{:>3}  {:>{}}  {:>3}  {}", "EVT", time_column_header(TIME_DISPLAY), TIME_WIDTH, "CPU", "DETAILS");
+    std::println("{:->3}  {:->{}}  {:->3}  {:->40}", "", "", TIME_WIDTH, "", "");
 
     int count = 0;
     EventInfo event{};
     std::size_t event_pos = 0;
     while (count < max_events && next_event(EVENT_VIEW, event_pos, SECTIONED, event)) {
         if (event.type == 'S') {
-            std::print("SMP  {:>18}  {:>3}  {:<24} rip={:#016x} lag={:>10}  ", event.ts_ns, event.cpu, format_pid_name(event.pid, proc_map),
-                       event.data, event.lag);
+            std::print("SMP  {:>{}}  {:>3}  {:<24} rip={:#016x} lag={:>10}  ", format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH,
+                       event.cpu, format_pid_name(event.pid, proc_map), event.data, event.lag);
             print_sched_flags(event.flags);
             std::println("");
         } else if (event.type == 'X') {
-            std::print("CTX  {:>18}  {:>3}  {:<24} -> {:<24} lag={:>10} run_us={:>6} site={}  ", event.ts_ns, event.cpu,
-                       format_pid_name(event.pid, proc_map), format_pid_name(event.other_pid, proc_map), event.lag, event.aux,
-                       display_callsite(event.callsite));
+            std::print("CTX  {:>{}}  {:>3}  {:<24} -> {:<24} lag={:>10} run_us={:>6} site={}  ",
+                       format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                       format_pid_name(event.other_pid, proc_map), event.lag, event.aux, display_callsite(event.callsite));
             print_sched_flags(event.flags);
             std::println("");
         } else if (event.type == 'W') {
-            std::print("WKE  {:>18}  {:>3}  {:<24} wake_at_us={} sleep_us={:>6} wait={} site={}  ", event.ts_ns, event.cpu,
-                       format_pid_name(event.pid, proc_map), event.data, event.aux, display_wait_channel(event.wait_channel),
-                       display_callsite(event.callsite));
+            std::print("WKE  {:>{}}  {:>3}  {:<24} wake_at_us={} sleep_us={:>6} wait={} site={}  ",
+                       format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                       event.data, event.aux, display_wait_channel(event.wait_channel), display_callsite(event.callsite));
             print_wait_flags(event.flags);
             std::println("");
         } else if (event.type == 'B') {
-            std::print("SLP  {:>18}  {:>3}  {:<24} wake_at_us={} run_us={:>6} wait={} site={}  ", event.ts_ns, event.cpu,
-                       format_pid_name(event.pid, proc_map), event.data, event.aux, display_wait_channel(event.wait_channel),
-                       display_callsite(event.callsite));
+            std::print("SLP  {:>{}}  {:>3}  {:<24} wake_at_us={} run_us={:>6} wait={} site={}  ",
+                       format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                       event.data, event.aux, display_wait_channel(event.wait_channel), display_callsite(event.callsite));
             print_wait_flags(event.flags);
             std::println("");
         } else if (event.type == 'C') {
-            std::println("CNT  {:>18}  {:>3}  {:<24} subsys={} count={} cap={} flags={} site={}", event.ts_ns, event.cpu,
-                         format_pid_name(event.pid, proc_map), event.subsys_name, event.lag, event.aux, static_cast<unsigned>(event.flags),
-                         display_callsite(event.callsite));
+            std::println("CNT  {:>{}}  {:>3}  {:<24} subsys={} count={} cap={} flags={} site={}",
+                         format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                         event.subsys_name, event.lag, event.aux, static_cast<unsigned>(event.flags), display_callsite(event.callsite));
         } else if (event.type == 'K') {
-            std::println("WKI  {:>18}  {:>3}  {:<24} {}:{}:{} peer={} ch={} corr={} status={} aux={} site={}", event.ts_ns, event.cpu,
-                         format_pid_name(event.pid, proc_map), event.scope_name, event.op_name, event.phase_name,
-                         wki_peer_label(event.peer, peer_resolver), event.channel, event.correlation, event.status, event.aux,
-                         display_callsite(event.callsite));
+            std::println("WKI  {:>{}}  {:>3}  {:<24} {}:{}:{} peer={} ch={} corr={} status={} aux={} site={}",
+                         format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                         event.scope_name, event.op_name, event.phase_name, wki_peer_label(event.peer, peer_resolver), event.channel,
+                         event.correlation, event.status, event.aux, display_callsite(event.callsite));
         }
 
         ++count;
@@ -2059,14 +2298,14 @@ auto wki_view_name(WkiDataView view) -> std::string_view {
 auto is_local_data_scope(std::string_view scope) -> bool { return scope.starts_with("local_"); }
 
 auto summary_peer_for_event(const EventInfo& event) -> uint64_t {
-    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader") {
+    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader" || event.scope_name == "local_xfs") {
         return 0;
     }
     return event.peer;
 }
 
 auto summary_channel_for_event(const EventInfo& event) -> uint64_t {
-    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader") {
+    if (event.scope_name == "local_vmem" || event.scope_name == "local_loader" || event.scope_name == "local_xfs") {
         return 0;
     }
     return event.channel;
@@ -2505,6 +2744,9 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
         }
 
         auto& row = find_wki_launch_row(launch_rows, event.peer, event.correlation);
+        if (!row.first_ts_ns.has_value() || event.ts_ns < *row.first_ts_ns) {
+            row.first_ts_ns = event.ts_ns;
+        }
         if (event.phase_name == "end") {
             if (event.op_name == "submit_vfs_ref" || event.op_name == "submit_inline") {
                 row.submit_total_us = event.aux;
@@ -2558,22 +2800,25 @@ void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options) {
 
     std::println("");
     std::println("=== slowest WKI launches [{}] ======================================", event_loaded->source);
-    std::println("{:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}", "PEER", "CORR", "TOTAL(us)",
-                 "HANDLE(us)", "LOAD(us)", "SETUP(us)", "QUEUE(us)", "RUN(us)", "READY(us)", "HOLD(us)", "WAIT(us)", "RESULT");
-    std::println("{:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "", "", "",
-                 "", "", "", "", "", "", "", "", "");
+    auto const TIME_DISPLAY = make_time_display(display_options, event_loaded->buffer, event_loaded->sectioned);
+    int const TIME_WIDTH = time_column_width(TIME_DISPLAY);
+    std::println("{:<{}}  {:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
+                 time_column_header(TIME_DISPLAY), TIME_WIDTH, "PEER", "CORR", "TOTAL(us)", "HANDLE(us)", "LOAD(us)", "SETUP(us)",
+                 "QUEUE(us)", "RUN(us)", "READY(us)", "HOLD(us)", "WAIT(us)", "RESULT");
+    std::println("{:->{}}  {:->18}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}", "",
+                 TIME_WIDTH, "", "", "", "", "", "", "", "", "", "", "", "");
     for (int i = 0; std::cmp_less(i, launch_rows.size()) && i < limit; ++i) {
         const auto& row = launch_rows.at(static_cast<std::size_t>(i));
         std::optional<uint32_t> setup_us;
         if (row.handle_submit_us.has_value() && row.load_elf_us.has_value() && *row.handle_submit_us >= *row.load_elf_us) {
             setup_us = *row.handle_submit_us - *row.load_elf_us;
         }
-        std::println("{:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
-                     wki_peer_label(row.peer, peer_resolver), row.correlation, format_optional_us(row.submit_total_us),
-                     format_optional_us(row.handle_submit_us), format_optional_us(row.load_elf_us), format_optional_us(setup_us),
-                     format_optional_us(row.defer_wait_us), format_optional_us(row.task_runtime_us),
-                     format_optional_us(row.proxy_ready_wait_us), format_optional_us(row.complete_hold_us),
-                     format_optional_us(row.complete_wait_us), format_wki_launch_result(row));
+        std::println("{:<{}}  {:<18}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
+                     format_optional_event_time(row.first_ts_ns, TIME_DISPLAY), TIME_WIDTH, wki_peer_label(row.peer, peer_resolver),
+                     row.correlation, format_optional_us(row.submit_total_us), format_optional_us(row.handle_submit_us),
+                     format_optional_us(row.load_elf_us), format_optional_us(setup_us), format_optional_us(row.defer_wait_us),
+                     format_optional_us(row.task_runtime_us), format_optional_us(row.proxy_ready_wait_us),
+                     format_optional_us(row.complete_hold_us), format_optional_us(row.complete_wait_us), format_wki_launch_result(row));
     }
 }
 
@@ -2654,16 +2899,19 @@ void cmd_ipc_report(int limit, WkiTraceFilter filter, const WkiDisplayOptions& d
     std::ranges::sort(slow_events, [](const EventInfo& lhs, const EventInfo& rhs) { return lhs.aux > rhs.aux; });
 
     auto event_peer_resolver = make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options);
+    auto const TIME_DISPLAY = make_time_display(display_options, event_loaded->buffer, event_loaded->sectioned);
+    int const TIME_WIDTH = time_column_width(TIME_DISPLAY);
     std::println("");
     std::println("=== slowest IPC events [{}] ========================================", event_loaded->source);
-    std::println("{:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)",
-                 "STATUS", "CORR", "DETAILS");
-    std::println("{:->12}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", "", "", "", "", "", "", "", "");
+    std::println("{:<{}}  {:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", time_column_header(TIME_DISPLAY), TIME_WIDTH,
+                 "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "DETAILS");
+    std::println("{:->{}}  {:->12}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", TIME_WIDTH, "", "", "", "", "",
+                 "", "", "", "");
     for (int i = 0; std::cmp_less(i, slow_events.size()) && i < limit; ++i) {
         const auto& event = slow_events.at(static_cast<std::size_t>(i));
-        std::println("{:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", event.scope_name, event.op_name, event.phase_name,
-                     wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation,
-                     display_callsite(event.callsite));
+        std::println("{:<{}}  {:<12}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", format_event_time(event.ts_ns, TIME_DISPLAY),
+                     TIME_WIDTH, event.scope_name, event.op_name, event.phase_name, wki_peer_label(event.peer, event_peer_resolver),
+                     event.channel, event.aux, event.status, event.correlation, display_callsite(event.callsite));
     }
 }
 
@@ -2672,7 +2920,8 @@ void cmd_wki_report(const WkiTraceFilter& filter, const WkiDisplayOptions& displ
     std::vector<WkiSummaryRow> rows;
     std::optional<WkiLoadedText> event_loaded;
     std::optional<WkiLoadedText> summary_loaded;
-    bool const PREFER_SAVED_SUMMARY = view == WkiDataView::VMEM || filter.scope == "local_vmem" || filter.scope == "local_loader";
+    bool const PREFER_SAVED_SUMMARY =
+        view == WkiDataView::VMEM || filter.scope == "local_vmem" || filter.scope == "local_loader" || filter.scope == "local_xfs";
 
     auto load_summary_rows = [&]() {
         summary_loaded = load_wki_summary_text();
@@ -2856,6 +3105,8 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
 
     auto events = collect_wki_events(event_loaded->buffer, event_loaded->sectioned);
     auto event_peer_resolver = make_wki_peer_resolver(event_loaded->buffer, event_loaded->sectioned, display_options);
+    auto const TIME_DISPLAY = make_time_display(display_options, event_loaded->buffer, event_loaded->sectioned);
+    int const TIME_WIDTH = time_column_width(TIME_DISPLAY);
     if (events.empty()) {
         if (!rows.empty()) {
             std::println("");
@@ -2876,14 +3127,15 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
 
     std::println("");
     std::println("=== slowest {} events [{}] ========================================", wki_view_name(view), event_loaded->source);
-    std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)",
-                 "STATUS", "CORR", "DETAILS");
-    std::println("{:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", "", "", "", "", "", "", "", "");
+    std::println("{:<{}}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", time_column_header(TIME_DISPLAY), TIME_WIDTH,
+                 "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "DETAILS");
+    std::println("{:->{}}  {:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->10}  {:->24}", "", TIME_WIDTH, "", "", "", "", "",
+                 "", "", "", "");
     for (int i = 0; std::cmp_less(i, slow_events.size()) && i < limit; ++i) {
         const auto& event = slow_events.at(static_cast<std::size_t>(i));
-        std::println("{:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", event.scope_name, event.op_name, event.phase_name,
-                     wki_peer_label(event.peer, event_peer_resolver), event.channel, event.aux, event.status, event.correlation,
-                     format_wki_trace_detail(event));
+        std::println("{:<{}}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>10}  {}", format_event_time(event.ts_ns, TIME_DISPLAY),
+                     TIME_WIDTH, event.scope_name, event.op_name, event.phase_name, wki_peer_label(event.peer, event_peer_resolver),
+                     event.channel, event.aux, event.status, event.correlation, format_wki_trace_detail(event));
     }
 
     struct LastBegin {
@@ -2929,12 +3181,15 @@ void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptio
 
     std::println("");
     std::println("=== largest {} inter-call gaps ====================================", wki_view_name(view));
-    std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", "SCOPE", "OP", "PEER", "CH", "GAP(us)");
-    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}", "", "", "", "", "");
+    std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}  {:<{}}  {:<{}}", "SCOPE", "OP", "PEER", "CH", "GAP(us)",
+                 time_column_header(TIME_DISPLAY), TIME_WIDTH, "NEXT", TIME_WIDTH);
+    std::println("{:->14}  {:->16}  {:->18}  {:->4}  {:->12}  {:->{}}  {:->{}}", "", "", "", "", "", "", TIME_WIDTH, "", TIME_WIDTH);
     for (int i = 0; std::cmp_less(i, gaps.size()) && i < limit; ++i) {
         const auto& gap = gaps.at(static_cast<std::size_t>(i));
-        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}", gap.scope, gap.op, wki_peer_label(gap.peer, event_peer_resolver), gap.channel,
-                     gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND));
+        std::println("{:<14}  {:<16}  {:<18}  {:>4}  {:>12}  {:<{}}  {:<{}}", gap.scope, gap.op,
+                     wki_peer_label(gap.peer, event_peer_resolver), gap.channel,
+                     gap.gap_ns / static_cast<uint64_t>(NANOSECONDS_PER_MICROSECOND), format_event_time(gap.prev_ts_ns, TIME_DISPLAY),
+                     TIME_WIDTH, format_event_time(gap.next_ts_ns, TIME_DISPLAY), TIME_WIDTH);
     }
 }
 
@@ -2958,6 +3213,8 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
     auto proc_map = loaded->sectioned ? parse_proc_map_section(loaded->buffer) : current_proc_map();
     auto events = collect_wki_events(loaded->buffer, loaded->sectioned);
     auto peer_resolver = make_wki_peer_resolver(loaded->buffer, loaded->sectioned, display_options);
+    auto const TIME_DISPLAY = make_time_display(display_options, loaded->buffer, loaded->sectioned);
+    int const TIME_WIDTH = time_column_width(TIME_DISPLAY);
     if (events.empty()) {
         auto summary_loaded = load_wki_summary_text();
         if (summary_loaded.has_value() && !parse_wki_summary_section(summary_loaded->buffer, summary_loaded->sectioned).empty()) {
@@ -2970,20 +3227,20 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
     }
 
     std::println("=== perf {}-trace [{}] ============================================", wki_view_name(view), loaded->source);
-    std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}", "TIME(ns)", "CPU", "PID", "SCOPE",
-                 "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "CALLSITE/DETAILS");
-    std::println("{:->18}  {:->3}  {:->24}  {:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->8}  {:->28}", "", "", "", "", "",
-                 "", "", "", "", "", "", "");
+    std::println("{:<{}}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}", time_column_header(TIME_DISPLAY),
+                 TIME_WIDTH, "CPU", "PID", "SCOPE", "OP", "PHASE", "PEER", "CH", "AUX(us)", "STATUS", "CORR", "CALLSITE/DETAILS");
+    std::println("{:->{}}  {:->3}  {:->24}  {:->14}  {:->16}  {:->6}  {:->18}  {:->4}  {:->8}  {:->8}  {:->8}  {:->28}", "", TIME_WIDTH, "",
+                 "", "", "", "", "", "", "", "", "", "");
 
     int printed = 0;
     for (const auto& event : events) {
         if (!view_trace_matches(event, filter, view)) {
             continue;
         }
-        std::println("{:<18}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}", event.ts_ns, event.cpu,
-                     format_pid_name(event.pid, proc_map), event.scope_name, event.op_name, event.phase_name,
-                     wki_peer_label(event.peer, peer_resolver), event.channel, event.aux, event.status, event.correlation,
-                     format_wki_trace_detail(event));
+        std::println("{:<{}}  {:>3}  {:<24}  {:<14}  {:<16}  {:<6}  {:<18}  {:>4}  {:>8}  {:>8}  {:>8}  {}",
+                     format_event_time(event.ts_ns, TIME_DISPLAY), TIME_WIDTH, event.cpu, format_pid_name(event.pid, proc_map),
+                     event.scope_name, event.op_name, event.phase_name, wki_peer_label(event.peer, peer_resolver), event.channel, event.aux,
+                     event.status, event.correlation, format_wki_trace_detail(event));
         printed++;
         if (printed >= max_events) {
             break;
@@ -2991,7 +3248,55 @@ void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDispla
     }
 }
 
+auto parse_time_display_format(std::string_view value, TimeDisplayFormat& out) -> bool {
+    if (value == "boot" || value == "boot-ns" || value == "since-boot" || value == "monotonic" || value == "ns") {
+        out = TimeDisplayFormat::BOOT_NS;
+        return true;
+    }
+    if (value == "unix" || value == "unix-ns" || value == "epoch-ns" || value == "realtime-ns") {
+        out = TimeDisplayFormat::UNIX_NS;
+        return true;
+    }
+    if (value == "iso" || value == "iso8601" || value == "realtime-iso") {
+        out = TimeDisplayFormat::ISO_REALTIME;
+        return true;
+    }
+    return false;
+}
+
+auto parse_display_arg(std::string_view arg, WkiDisplayOptions& display_options) -> bool {
+    constexpr std::string_view TIME_PREFIX = "--time=";
+    constexpr std::string_view TIMECODE_PREFIX = "--timecode=";
+
+    if (arg == "--peer-ids") {
+        display_options.show_peer_ids = true;
+        return true;
+    }
+    if (arg.starts_with(TIME_PREFIX)) {
+        return parse_time_display_format(arg.substr(TIME_PREFIX.size()), display_options.time_format);
+    }
+    if (arg.starts_with(TIMECODE_PREFIX)) {
+        return parse_time_display_format(arg.substr(TIMECODE_PREFIX.size()), display_options.time_format);
+    }
+    if (arg == "--boot-time" || arg == "--time-boot") {
+        display_options.time_format = TimeDisplayFormat::BOOT_NS;
+        return true;
+    }
+    if (arg == "--unix-time" || arg == "--time-unix-ns") {
+        display_options.time_format = TimeDisplayFormat::UNIX_NS;
+        return true;
+    }
+    if (arg == "--iso-time" || arg == "--time-iso") {
+        display_options.time_format = TimeDisplayFormat::ISO_REALTIME;
+        return true;
+    }
+    return false;
+}
+
 auto parse_wki_filter_arg(std::string_view arg, WkiTraceFilter& filter, WkiDisplayOptions& display_options) -> bool {
+    if (parse_display_arg(arg, display_options)) {
+        return true;
+    }
     if (arg.starts_with("--scope=")) {
         filter.scope = std::string(arg.substr(8));
         return true;
@@ -3030,10 +3335,6 @@ auto parse_wki_filter_arg(std::string_view arg, WkiTraceFilter& filter, WkiDispl
     }
     if (arg.starts_with("--to-ns=")) {
         filter.to_ns = parse_u64(arg.substr(8), 0);
-        return true;
-    }
-    if (arg == "--peer-ids") {
-        display_options.show_peer_ids = true;
         return true;
     }
     return false;
@@ -3131,11 +3432,14 @@ void cmd_run(int argc, char** argv) {
 
     // Parse --filter=... option (strip from argv before exec)
     const char* filter = "switch,wake,sleep";  // default: no container spam
+    WkiDisplayOptions display_options{};
     std::vector<char*> cmd_argv;
     for (int i = 0; i < argc; i++) {
         std::string_view const ARG(argv[i]);
         if (ARG.starts_with("--filter=")) {
             filter = argv[i] + 9;
+        } else if (parse_display_arg(ARG, display_options)) {
+            continue;
         } else {
             cmd_argv.push_back(argv[i]);
         }
@@ -3233,6 +3537,7 @@ void cmd_run(int argc, char** argv) {
 
     ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
     if (data_fd.valid()) {
+        write_section_timebase(data_fd.get());
         write_all(data_fd.get(), SECTION_EVENTS);
     }
 
@@ -3370,8 +3675,8 @@ void cmd_run(int argc, char** argv) {
         }
 
         write_all(data_fd.get(), SECTION_EVENTS_END);
-        write_section_wki_summary(data_fd.get());
-        write_section_ipc_stats(data_fd.get());
+        ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
+        ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
         write_section_peer_map(data_fd.get());
         write_all(data_fd.get(), SECTION_PROC_MAP);
 
@@ -3394,16 +3699,17 @@ void cmd_run(int argc, char** argv) {
 
         write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
-        if (total_event_bytes <= 0) {
+        if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
             std::println("perf: ring buffer empty - PROC_MAP saved, no events");
         } else {
-            std::println("perf: saved to {} ({} event bytes)", PERF_DATA_FILE, total_event_bytes);
+            std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, total_event_bytes,
+                         SUMMARY_BYTES, IPC_BYTES);
         }
     } else {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
     }
 
-    cmd_sched(DEFAULT_MAX_EVENTS, {});
+    cmd_sched(DEFAULT_MAX_EVENTS, display_options);
 }
 
 void cmd_show_map() {
@@ -3511,11 +3817,11 @@ constexpr std::array<CommandSpec, 24> COMMANDS = {{
      .summary = "Record kernel perf events to perf.data",
      .handler = run_record_command},
     {.name = "report",
-     .args = "[n=2000] [--peer-ids]",
+     .args = "[n=2000] [--time=FMT] [--peer-ids]",
      .summary = "Display events from perf.data or live /proc/kperf",
      .handler = run_report_command},
     {.name = "sched",
-     .args = "[n=2000] [--peer-ids]",
+     .args = "[n=2000] [--time=FMT] [--peer-ids]",
      .summary = "Alias for report with scheduler hotspot tables",
      .handler = run_report_command},
     {.name = "cpustat", .args = "", .summary = "Per-CPU aggregate scheduler statistics", .handler = run_cpustat_command},
@@ -3531,7 +3837,10 @@ constexpr std::array<CommandSpec, 24> COMMANDS = {{
      .args = "[filters]",
      .summary = "Local vmem mmap/COW/cache summary statistics",
      .handler = run_vmem_report_command},
-    {.name = "wki-launch", .args = "[n=20] [--peer-ids]", .summary = "Remote launch stage timings", .handler = run_wki_launch_command},
+    {.name = "wki-launch",
+     .args = "[n=20] [--time=FMT] [--peer-ids]",
+     .summary = "Remote launch stage timings",
+     .handler = run_wki_launch_command},
     {.name = "wki-tail",
      .args = "[n=15] [filters]",
      .summary = "Tail-latency WKI summary and slow remote events",
@@ -3553,7 +3862,10 @@ constexpr std::array<CommandSpec, 24> COMMANDS = {{
      .handler = run_all_trace_command},
     {.name = "vmem-trace", .args = "[n=200] [filters]", .summary = "Raw local vmem trace events", .handler = run_vmem_trace_command},
     {.name = "top", .args = "[ms=1000]", .summary = "Continuous CPU% snapshots", .handler = run_top_command},
-    {.name = "run", .args = "[--filter=<filters>] <cmd> [args]", .summary = "Trace a command and descendants", .handler = run_run_command},
+    {.name = "run",
+     .args = "[--filter=<filters>] [--time=FMT] <cmd> [args]",
+     .summary = "Trace a command and descendants",
+     .handler = run_run_command},
     {.name = "show-map", .args = "", .summary = "Show PID to command map from perf.data", .handler = run_show_map_command},
     {.name = "help", .args = "[filters]", .summary = "Show this screen or detailed filter help", .handler = run_help_command},
 }};
@@ -3563,7 +3875,7 @@ struct FilterHelp {
     std::string_view summary;
 };
 
-constexpr std::array<FilterHelp, 13> RECORD_FILTER_HELP = {{
+constexpr std::array<FilterHelp, 15> RECORD_FILTER_HELP = {{
     {.name = "sample", .summary = "timer CPU samples"},
     {.name = "switch", .summary = "context-switch events"},
     {.name = "wake", .summary = "task wake events"},
@@ -3575,13 +3887,15 @@ constexpr std::array<FilterHelp, 13> RECORD_FILTER_HELP = {{
     {.name = "local_proc", .summary = "local fork/exec/process events"},
     {.name = "vmem", .summary = "local vmem mmap/cache/COW events"},
     {.name = "loader", .summary = "local ELF loader segment/perms events"},
-    {.name = "local", .summary = "all local pipe/process/vmem/loader events"},
+    {.name = "xfs", .summary = "local XFS/buffer-cache/inode events"},
+    {.name = "irq", .summary = "slow local interrupt-handler events"},
+    {.name = "local", .summary = "all local pipe/process/vmem/loader/XFS/IRQ events"},
     {.name = "all", .summary = "all event classes"},
 }};
 
-constexpr std::array<FilterHelp, 11> WKI_FILTER_HELP = {{
-    {.name = "--scope=NAME", .summary = "scope name such as remote_ipc, local_pipe, local_proc, local_vmem, local_loader"},
-    {.name = "--op=NAME", .summary = "operation name such as cow_zero, file_mmap, pt_load_main, execve, read"},
+constexpr std::array<FilterHelp, 12> WKI_FILTER_HELP = {{
+    {.name = "--scope=NAME", .summary = "scope name such as remote_ipc, local_pipe, local_vmem, local_xfs, local_irq"},
+    {.name = "--op=NAME", .summary = "operation name such as write_io, inode_fetch, buf_disk_write, execve, read"},
     {.name = "--phase=NAME", .summary = "begin, end, or point"},
     {.name = "--peer=N", .summary = "numeric WKI peer id"},
     {.name = "--channel=N", .summary = "WKI channel id"},
@@ -3590,6 +3904,7 @@ constexpr std::array<FilterHelp, 11> WKI_FILTER_HELP = {{
     {.name = "--min-us=N", .summary = "minimum auxiliary latency in microseconds"},
     {.name = "--from-ns=N", .summary = "minimum event timestamp"},
     {.name = "--to-ns=N", .summary = "maximum event timestamp"},
+    {.name = "--time=FMT", .summary = "timestamp display: boot (default), unix-ns, or iso"},
     {.name = "--peer-ids", .summary = "show numeric peer ids instead of hostnames"},
 }};
 
@@ -3610,7 +3925,7 @@ void print_filters() {
         std::println("  {:<12} {}", filter.name, filter.summary);
     }
     std::println("");
-    std::println("Trace filter options:");
+    std::println("Trace filter and display options:");
     for (const auto& filter : WKI_FILTER_HELP) {
         std::println("  {:<14} {}", filter.name, filter.summary);
     }
@@ -3624,7 +3939,7 @@ void usage() {
     }
     std::println("");
     std::println("Available --filter names: {}", joined_record_filter_names());
-    std::println("Use 'perf help filters' for filter details.");
+    std::println("Use 'perf help filters' for filter and display details.");
 }
 
 int run_stat_command(int argc, char** argv) {
@@ -3653,10 +3968,14 @@ int run_report_command(int argc, char** argv) {
     WkiDisplayOptions display_options{};
     for (int i = 2; i < argc; ++i) {
         std::string_view const ARG(argv[i]);
-        if (ARG == "--peer-ids") {
-            display_options.show_peer_ids = true;
-        } else {
+        if (parse_display_arg(ARG, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
             max_events = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf report: unrecognized argument '{}'", argv[i]);
+            return 1;
         }
     }
     cmd_sched(max_events, display_options);
@@ -3733,10 +4052,14 @@ int run_wki_launch_command(int argc, char** argv) {
     WkiDisplayOptions display_options{};
     for (int i = 2; i < argc; ++i) {
         std::string_view const ARG(argv[i]);
-        if (ARG == "--peer-ids") {
-            display_options.show_peer_ids = true;
-        } else {
+        if (parse_display_arg(ARG, display_options)) {
+            continue;
+        }
+        if (!ARG.empty() && ARG.front() != '-') {
             rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf wki-launch: unrecognized argument '{}'", argv[i]);
+            return 1;
         }
     }
     cmd_wki_launch(rows, display_options);

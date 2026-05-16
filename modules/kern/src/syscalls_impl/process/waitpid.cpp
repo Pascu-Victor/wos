@@ -42,6 +42,10 @@ auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
     return task != nullptr && task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited;
 }
 
+auto is_unwaited_child(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child) -> bool {
+    return parent != nullptr && child != nullptr && !child->is_thread && child->parent_pid == parent->pid && !child->waited_on;
+}
+
 auto ptrace_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
     uint32_t signal = task.ptrace_stop_signal != 0 ? task.ptrace_stop_signal : 5;
     if ((task.ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
@@ -80,31 +84,28 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
     return true;
 }
 
-// Scan for an exited child of the given parent task.
-// Returns the exited child task pointer, or nullptr if none found.
+// Scan for an exited child of the given parent task. Zombie children are kept
+// in the active registry while the parent is alive, but Task::try_acquire()
+// intentionally rejects DEAD/EXITING tasks. Use the registry pointer directly:
+// a matching unwaited child cannot be reclaimed until this parent marks it
+// waited_on.
 auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
-    // Iterate active task list for children
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
-        auto* t = ker::mod::sched::get_active_task_at(i);
-        if (t != nullptr && !t->is_thread && t->parent_pid == parent->pid && is_waitable_exit(t) && !t->waited_on) {
-            return t;
+        auto* child = ker::mod::sched::get_active_task_at(i);
+        if (is_unwaited_child(parent, child) && is_waitable_exit(child)) {
+            return child;
         }
     }
-    // Also check via PID table for recently-exited zombies (may not be in active list)
-    // Zombies are removed from active list when they exit but remain in PID table until GC.
-    // We need to scan children - use the PID of each active child isn't enough since exited
-    // children are removed from active list. However, find_task_by_pid still works for zombies.
-    // There's no direct child list, so we can't efficiently scan zombies.
-    // For now, the SIGCHLD wakeup + retry approach handles this case.
+
     return nullptr;
 }
 
 auto has_unwaited_child(ker::mod::sched::task::Task* parent) -> bool {
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
-        auto* t = ker::mod::sched::get_active_task_at(i);
-        if (t != nullptr && !t->is_thread && t->parent_pid == parent->pid && !t->waited_on) {
+        auto* child = ker::mod::sched::get_active_task_at(i);
+        if (is_unwaited_child(parent, child)) {
             return true;
         }
     }
@@ -227,13 +228,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     log::debug("PID %x waiting for PID %x", current_task->pid, pid);
 #endif
 
-    // Find the task with the given PID
+    // Use zombie-visible lookup. A matching unwaited child cannot be reclaimed
+    // while its parent is alive and has not consumed the exit status.
     auto* target_task = ker::mod::sched::find_task_by_pid(pid);
     if (target_task == nullptr) {
 #ifdef WAITPID_DEBUG
         log::debug("target task PID %x not found", pid);
 #endif
-        return static_cast<uint64_t>(-1);  // Task not found
+        return static_cast<uint64_t>(-ECHILD);
     }
 
     bool const TRACE_WAIT = is_ptrace_wait_target(*current_task, *target_task);
@@ -267,7 +269,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         return pid;
     }
 
-    if (TRACE_WAIT && (options & WOS_WNOHANG) != 0) {
+    if ((options & WOS_WNOHANG) != 0) {
         return 0;
     }
 

@@ -30,10 +30,12 @@ wos_proc$getuid(op const[10]) int64
 wos_proc$geteuid(op const[11]) int64
 wos_proc$getgid(op const[12]) int64
 wos_proc$getegid(op const[13]) int64
+wos_proc$getgroups(op const[31], size len[list], list ptr[out, array[int32]]) int64
 wos_proc$setuid(op const[14], uid int32) int64
 wos_proc$setgid(op const[15], gid int32) int64
 wos_proc$seteuid(op const[16], euid int32) int64
 wos_proc$setegid(op const[17], egid int32) int64
+wos_proc$setgroups(op const[32], size len[list], list ptr[in, array[int32]]) int64
 wos_proc$getumask(op const[18]) int64
 wos_proc$setumask(op const[19], mask int32) int64
 

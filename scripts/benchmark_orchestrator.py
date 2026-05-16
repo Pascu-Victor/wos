@@ -140,6 +140,8 @@ def run_suite(args: argparse.Namespace) -> int:
             "--host-ip",
             args.host_ip,
         ]
+        if args.linux_np:
+            cmd += ["--np", str(args.linux_np)]
         if args.linux_benchmark == "net":
             cmd += [
                 "--mode",
@@ -151,11 +153,32 @@ def run_suite(args: argparse.Namespace) -> int:
                 cmd += ["--iterations", str(args.linux_iterations)]
             else:
                 cmd += ["--total-bytes", str(args.linux_total_bytes)]
-        else:
+        elif args.linux_benchmark == "file":
             cmd += ["--chunk-size", str(args.linux_chunk_size)]
             if args.linux_file_path:
                 cmd += ["--file-path", args.linux_file_path]
             cmd += ["--generate-file-bytes", str(args.linux_generate_file_bytes)]
+        else:
+            cmd += [
+                "--width",
+                str(args.linux_render_width),
+                "--height",
+                str(args.linux_render_height),
+                "--spp",
+                str(args.linux_render_spp),
+                "--max-depth",
+                str(args.linux_render_max_depth),
+                "--tile-size",
+                str(args.linux_render_tile_size),
+                "--placement",
+                args.linux_render_placement,
+                "--render-output-root",
+                args.linux_render_output_root,
+            ]
+            if args.linux_render_scene:
+                cmd += ["--scene", args.linux_render_scene]
+            if args.linux_render_threads is not None:
+                cmd += ["--threads", str(args.linux_render_threads)]
         result = run_command(cmd)
         manifest["steps"].append(
             {"kind": "linux-mpi", "command": cmd, "stdout": result.stdout.strip()}
@@ -295,8 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     suite_parser.add_argument("--linux-launcher")
     suite_parser.add_argument("--linux-hosts")
+    suite_parser.add_argument("--linux-np", type=int)
     suite_parser.add_argument(
-        "--linux-benchmark", choices=["net", "file"], default="net"
+        "--linux-benchmark", choices=["net", "file", "render"], default="net"
     )
     suite_parser.add_argument(
         "--linux-net-mode", choices=["pingpong", "stream"], default="pingpong"
@@ -307,6 +331,22 @@ def build_parser() -> argparse.ArgumentParser:
     suite_parser.add_argument("--linux-file-path")
     suite_parser.add_argument("--linux-chunk-size", type=int, default=65536)
     suite_parser.add_argument("--linux-generate-file-bytes", type=int, default=67108864)
+    suite_parser.add_argument("--linux-render-scene")
+    suite_parser.add_argument("--linux-render-width", type=int, default=640)
+    suite_parser.add_argument("--linux-render-height", type=int, default=360)
+    suite_parser.add_argument("--linux-render-spp", type=int, default=16)
+    suite_parser.add_argument("--linux-render-max-depth", type=int, default=6)
+    suite_parser.add_argument("--linux-render-tile-size", type=int, default=32)
+    suite_parser.add_argument(
+        "--linux-render-placement",
+        choices=["node-threads", "process-per-core"],
+        default="node-threads",
+    )
+    suite_parser.add_argument("--linux-render-threads", type=int)
+    suite_parser.add_argument(
+        "--linux-render-output-root",
+        default="/var/lib/wos-bench/results/tracebench",
+    )
 
     return parser
 

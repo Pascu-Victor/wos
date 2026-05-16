@@ -64,7 +64,8 @@ add_subdirectory(journal)
 add_subdirectory(wkictl)
 add_subdirectory(renderbench)
 add_subdirectory(strace)
+add_subdirectory(sftpserver)
 
 # Aggregate target for all WOS modules
 add_custom_target(wos_modules)
-add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd debugserver perf journal wkictl renderbench strace)
+add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd debugserver perf journal wkictl renderbench strace sftpserver)

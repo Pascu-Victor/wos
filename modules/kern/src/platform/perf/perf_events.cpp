@@ -201,6 +201,10 @@ auto wki_should_record(uint16_t mask, WkiPerfScope scope, uint8_t op) -> bool {
             return (mask & PERF_MASK_LOCAL_VMEM) != 0U;
         case WkiPerfScope::LOCAL_LOADER:
             return (mask & PERF_MASK_LOCAL_LOADER) != 0U;
+        case WkiPerfScope::LOCAL_XFS:
+            return (mask & PERF_MASK_LOCAL_XFS) != 0U;
+        case WkiPerfScope::LOCAL_IRQ:
+            return (mask & PERF_MASK_LOCAL_IRQ) != 0U;
         default:
             return false;
     }
@@ -257,6 +261,10 @@ const char* wki_scope_name(WkiPerfScope scope) {
             return "local_vmem";
         case WkiPerfScope::LOCAL_LOADER:
             return "local_loader";
+        case WkiPerfScope::LOCAL_XFS:
+            return "local_xfs";
+        case WkiPerfScope::LOCAL_IRQ:
+            return "local_irq";
         case WkiPerfScope::REMOTE_COMPUTE:
             return "remote_compute";
         case WkiPerfScope::EVENT_BUS:
@@ -496,6 +504,82 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "final_perms_main";
                 case WkiPerfLocalLoaderOp::FINAL_PERMS_INTERP:
                     return "final_perms_interp";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_XFS:
+            switch (static_cast<WkiPerfLocalXfsOp>(op)) {
+                case WkiPerfLocalXfsOp::READ:
+                    return "read";
+                case WkiPerfLocalXfsOp::WRITE:
+                    return "write";
+                case WkiPerfLocalXfsOp::READ_BMAP:
+                    return "read_bmap";
+                case WkiPerfLocalXfsOp::READ_IO:
+                    return "read_io";
+                case WkiPerfLocalXfsOp::WRITE_BMAP:
+                    return "write_bmap";
+                case WkiPerfLocalXfsOp::WRITE_ALLOC:
+                    return "write_alloc";
+                case WkiPerfLocalXfsOp::WRITE_IO:
+                    return "write_io";
+                case WkiPerfLocalXfsOp::WRITE_ILOG:
+                    return "write_ilog";
+                case WkiPerfLocalXfsOp::WRITE_HOLE_ITER:
+                    return "write_hole_iter";
+                case WkiPerfLocalXfsOp::WRITE_MAP_ITER:
+                    return "write_map_iter";
+                case WkiPerfLocalXfsOp::DIRECT_READ:
+                    return "direct_read";
+                case WkiPerfLocalXfsOp::DIRECT_WRITE:
+                    return "direct_write";
+                case WkiPerfLocalXfsOp::BUFFERED_READ:
+                    return "buffered_read";
+                case WkiPerfLocalXfsOp::BUFFERED_WRITE:
+                    return "buffered_write";
+                case WkiPerfLocalXfsOp::BUF_READ_HIT:
+                    return "buf_read_hit";
+                case WkiPerfLocalXfsOp::BUF_READ_MISS:
+                    return "buf_read_miss";
+                case WkiPerfLocalXfsOp::BUF_GET_HIT:
+                    return "buf_get_hit";
+                case WkiPerfLocalXfsOp::BUF_GET_MISS:
+                    return "buf_get_miss";
+                case WkiPerfLocalXfsOp::BUF_DISK_READ:
+                    return "buf_disk_read";
+                case WkiPerfLocalXfsOp::BUF_DISK_WRITE:
+                    return "buf_disk_write";
+                case WkiPerfLocalXfsOp::BUF_DIRTY:
+                    return "buf_dirty";
+                case WkiPerfLocalXfsOp::BUF_DISCARD:
+                    return "buf_discard";
+                case WkiPerfLocalXfsOp::INODE_FETCH:
+                    return "inode_fetch";
+                case WkiPerfLocalXfsOp::INODE_CACHE_HIT:
+                    return "inode_cache_hit";
+                case WkiPerfLocalXfsOp::INODE_CACHE_MISS:
+                    return "inode_cache_miss";
+                case WkiPerfLocalXfsOp::INODE_UNAVAILABLE:
+                    return "inode_unavailable";
+                case WkiPerfLocalXfsOp::SYNC_BLOCKDEV:
+                    return "sync_blockdev";
+                case WkiPerfLocalXfsOp::BUF_FLUSH:
+                    return "buf_flush";
+                case WkiPerfLocalXfsOp::BUF_ALLOC:
+                    return "buf_alloc";
+                case WkiPerfLocalXfsOp::READ_COPY:
+                    return "read_copy";
+                case WkiPerfLocalXfsOp::READ_ZERO:
+                    return "read_zero";
+                case WkiPerfLocalXfsOp::READ_GAP:
+                    return "read_gap";
+                default:
+                    return "unknown";
+            }
+        case WkiPerfScope::LOCAL_IRQ:
+            switch (static_cast<WkiPerfLocalIrqOp>(op)) {
+                case WkiPerfLocalIrqOp::HANDLER:
+                    return "handler";
                 default:
                     return "unknown";
             }
@@ -846,6 +930,19 @@ bool is_wki_recording_enabled() {
     return (mask & (PERF_MASK_WKI | PERF_MASK_WKI_LAUNCH | PERF_MASK_LOCAL)) != 0U;
 }
 
+bool is_wki_scope_recording_enabled(WkiPerfScope scope, uint8_t op) {
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    return wki_should_record(mask, scope, op);
+}
+
+bool is_local_xfs_recording_enabled() { return is_wki_scope_recording_enabled(WkiPerfScope::LOCAL_XFS); }
+
+bool is_local_irq_recording_enabled() { return is_wki_scope_recording_enabled(WkiPerfScope::LOCAL_IRQ); }
+
 void register_local_vmem_zero_page(const void* page) {
     g_local_vmem_zero_page.store(reinterpret_cast<uintptr_t>(page), std::memory_order_release);
 }
@@ -935,6 +1032,14 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
         }
     }
     g_wki_summary_lock.unlock_irqrestore(saved);
+}
+
+void record_local_xfs_summary(WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, bool has_latency, uint64_t bytes) {
+    record_wki_summary(WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op), 0, 0, status, latency_us, has_latency, 0, bytes);
+}
+
+void record_local_irq_summary(WkiPerfLocalIrqOp op, uint16_t vector, uint16_t kind, int32_t status, uint32_t latency_us, bool has_latency) {
+    record_wki_summary(WkiPerfScope::LOCAL_IRQ, static_cast<uint8_t>(op), vector, kind, status, latency_us, has_latency, 0, 0);
 }
 
 size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max) {
@@ -1086,6 +1191,10 @@ uint16_t parse_event_mask(const char* str, size_t len) {
             mask |= PERF_MASK_LOCAL_VMEM;
         } else if (TOKEN == "local_loader" || TOKEN == "loader") {
             mask |= PERF_MASK_LOCAL_LOADER;
+        } else if (TOKEN == "local_xfs" || TOKEN == "xfs") {
+            mask |= PERF_MASK_LOCAL_XFS;
+        } else if (TOKEN == "local_irq" || TOKEN == "irq") {
+            mask |= PERF_MASK_LOCAL_IRQ;
         } else if (TOKEN == "local") {
             mask |= PERF_MASK_LOCAL;
         } else if (TOKEN == "all") {

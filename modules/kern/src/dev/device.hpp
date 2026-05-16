@@ -21,6 +21,7 @@ struct CharDeviceOps {
     int (*ioctl)(ker::vfs::File* file, unsigned long cmd, unsigned long arg) = nullptr;  // nullptr = not supported
     int (*poll_check)(ker::vfs::File* file, int events) = nullptr;                       // nullptr = always ready
     bool (*poll_register_waiter)(ker::vfs::File* file, uint64_t pid) = nullptr;          // nullptr = no explicit wake registration
+    off_t (*lseek)(ker::vfs::File* file, off_t offset, int whence) = nullptr;            // nullptr = not seekable
 };
 
 enum class DeviceType : uint8_t {

@@ -569,6 +569,9 @@ uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global
 
 // Cached APIC timer tick count for the idle timer.
 uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint8_t PERF_TIMER_VECTOR = 32;
+constexpr uint16_t PERF_IRQ_KIND_TIMER = 4;
+constexpr uint32_t PERF_IRQ_SLOW_TRACE_US = 30;
 
 // ============================================================================
 // Internal helpers
@@ -582,6 +585,42 @@ inline auto current_task_for_preempt() -> task::Task* {
     }
     return get_current_task();
 }
+
+auto perf_current_pid() -> uint64_t {
+    auto* task = current_task_for_preempt();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_clamp_irq_latency_us(uint64_t latency_us) -> uint32_t {
+    return latency_us > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(latency_us);
+}
+
+class TimerIrqPerfScope {
+   public:
+    TimerIrqPerfScope() : started_us(perf::is_local_irq_recording_enabled() ? time::get_us() : 0) {}
+
+    ~TimerIrqPerfScope() {
+        if (started_us == 0) {
+            return;
+        }
+
+        uint64_t const NOW_US = time::get_us();
+        uint64_t const ELAPSED_US = NOW_US >= started_us ? NOW_US - started_us : 0;
+        uint32_t const LATENCY_US = perf_clamp_irq_latency_us(ELAPSED_US);
+        auto const CPU_ID = static_cast<uint32_t>(cpu::current_cpu());
+        perf::record_local_irq_summary(perf::WkiPerfLocalIrqOp::HANDLER, PERF_TIMER_VECTOR, PERF_IRQ_KIND_TIMER, 0, LATENCY_US, true);
+        if (ELAPSED_US < PERF_IRQ_SLOW_TRACE_US) {
+            return;
+        }
+
+        perf::record_wki_event(CPU_ID, perf_current_pid(), perf::WkiPerfScope::LOCAL_IRQ,
+                               static_cast<uint8_t>(perf::WkiPerfLocalIrqOp::HANDLER), perf::WkiPerfPhase::END, PERF_TIMER_VECTOR,
+                               PERF_IRQ_KIND_TIMER, perf::next_wki_trace_correlation(), 0, LATENCY_US, WOS_PERF_CALLSITE());
+    }
+
+   private:
+    uint64_t started_us;
+};
 
 // Restore kernel GS_BASE before entering idle loop.
 // Ensures cpu::current_cpu() returns the correct CPU index when
@@ -1586,6 +1625,8 @@ auto debug_stop_task(task::Task* task) -> bool {
 }
 
 void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame) {
+    TimerIrqPerfScope const TIMER_IRQ_PERF;
+
     // Enter epoch critical section - protects task pointers from GC
     EpochGuard const EPOCH_GUARD;
 
@@ -2467,43 +2508,68 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
     if (!IS_YIELD && current_task->waiting_for_pid != 0) {
         if (current_task->waiting_for_pid == WAIT_ANY_CHILD) {
-            // Wait-for-any-child: scan for an exited child of this task
+            auto try_reap_wait_any_child = [&](task::Task* child, const char* path) -> bool {
+                if (child == nullptr || child->is_thread || child->parent_pid != current_task->pid ||
+                    !child->exit_notify_ready.load(std::memory_order_acquire) || !child->has_exited || child->waited_on) {
+                    return false;
+                }
+
+                skip_wait_queue = true;
+                current_task->context.regs.rax = child->pid;
+                validate_wait_resume_mapping(current_task, child, path);
+                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
+                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
+                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
+                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
+                        *status_ptr = child->exit_status;
+                    }
+                    current_task->wait_status_user_addr = 0;
+                    current_task->wait_status_phys_addr = 0;
+                }
+                if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
+                    uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
+                    if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
+                        auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
+                        ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
+                        ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
+                        ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
+                        ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
+                    }
+                    current_task->wait_rusage_user_addr = 0;
+                    current_task->wait_rusage_phys_addr = 0;
+                }
+                current_task->waiting_for_pid = 0;
+                child->waited_on = true;
+                return true;
+            };
+
+            // Wait-for-any-child: scan for an exited child of this task.
+            // Zombie children stay in the active registry while the parent is
+            // alive, but the safe accessor refuses DEAD/EXITING tasks.  The
+            // deferred-switch race check must still see those zombies or a
+            // parent can be parked forever after its child already exited.
             uint32_t const COUNT = get_active_task_count();
             for (uint32_t i = 0; i < COUNT; i++) {
-                auto* child = get_active_task_at_safe(i);
-                if (child != nullptr) {
-                    if (!child->is_thread && child->parent_pid == current_task->pid &&
-                        child->exit_notify_ready.load(std::memory_order_acquire) && child->has_exited && !child->waited_on) {
-                        skip_wait_queue = true;
-                        current_task->context.regs.rax = child->pid;
-                        validate_wait_resume_mapping(current_task, child, "sched-any");
-                        if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                            uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                            if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                                auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                                *status_ptr = child->exit_status;
-                            }
-                            current_task->wait_status_user_addr = 0;
-                            current_task->wait_status_phys_addr = 0;
+                auto* child = get_active_task_at(i);
+                if (try_reap_wait_any_child(child, "sched-any")) {
+                    break;
+                }
+            }
+            if (!skip_wait_queue) {
+                uint64_t const CORE_COUNT = smt::get_core_count();
+                for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT && !skip_wait_queue; ++cpu_no) {
+                    size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
+                    for (size_t i = 0; i < DEAD_COUNT; ++i) {
+                        auto* child = get_dead_task_at_safe(cpu_no, i);
+                        if (child == nullptr) {
+                            continue;
                         }
-                        if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
-                            uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
-                            if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
-                                auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                                ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
-                                ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
-                                ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
-                                ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
-                            }
-                            current_task->wait_rusage_user_addr = 0;
-                            current_task->wait_rusage_phys_addr = 0;
-                        }
-                        current_task->waiting_for_pid = 0;
-                        child->waited_on = true;
+                        bool const REAPED = try_reap_wait_any_child(child, "sched-any-dead");
                         child->release();
-                        break;
+                        if (REAPED) {
+                            break;
+                        }
                     }
-                    child->release();
                 }
             }
         } else {
@@ -2965,12 +3031,11 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         // be visible to this CPU yet. We already recorded wakeup_pending, so
         // always poke that CPU to make sure it observes the flag promptly.
         // Use request_reschedule() for same-CPU since wake_cpu() is a no-op
-        // for the current CPU.
+        // for the current CPU. request_reschedule() falls back to a delayed
+        // timer if this runs during a stack handoff window.
         if (current_cpu_of_task != UINT64_MAX) {
             if (current_cpu_of_task == cpu::current_cpu()) {
-                if (sys::context_switch::can_request_local_reschedule()) {
-                    request_local_reschedule();
-                }
+                request_local_reschedule();
             } else {
                 wake_cpu(current_cpu_of_task);
             }
@@ -3195,9 +3260,7 @@ void wake_task_for_signal(task::Task* task) {
     // Nudge the task's current CPU immediately so hlt/deferred paths react fast.
     // For same-CPU delivery we cannot self-IPI, so arm the local timer instead.
     if (task->cpu == cpu::current_cpu()) {
-        if (sys::context_switch::can_request_local_reschedule()) {
-            request_local_reschedule();
-        }
+        request_local_reschedule();
     } else {
         wake_cpu(task->cpu);
     }

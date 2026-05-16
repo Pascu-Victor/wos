@@ -18,6 +18,7 @@
 #include <utility>
 #include <vfs/file.hpp>
 #include <vfs/mount.hpp>
+#include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
 #include "net/wki/remote_compute.hpp"
@@ -31,6 +32,11 @@
 namespace ker::vfs::procfs {
 
 namespace {
+
+constexpr uint64_t NS_PER_SEC = 1000000000ULL;
+constexpr uint64_t NS_PER_US = 1000ULL;
+
+uint64_t g_procfs_creation_epoch_ns = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // Helper: int to decimal string
 void int_to_str(uint64_t val, char* buf, size_t bufsz) {
@@ -1121,8 +1127,8 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 *p++ = ' ';
                 append_perf_callsite(p, end, ev.callsite);
                 *p++ = ' ';
-                auto const* WAIT_CHANNEL = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
-                append_sconst(p, end, WAIT_CHANNEL != nullptr ? WAIT_CHANNEL : "-");
+                auto const* wait_channel = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
+                append_sconst(p, end, wait_channel != nullptr ? wait_channel : "-");
             }
             if (p + 1 < end) {
                 *p++ = '\n';
@@ -1446,6 +1452,86 @@ FileOperations procfs_fops_instance = {
 
 auto get_procfs_fops() -> FileOperations* { return &procfs_fops_instance; }
 
+namespace {
+
+auto task_start_epoch_ns(const ker::mod::sched::task::Task* task) -> uint64_t {
+    if (task == nullptr || task->start_time_us == 0) {
+        return 0;
+    }
+
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    uint64_t const NOW_EPOCH_NS = ker::mod::time::get_epoch_ns();
+    if (task->start_time_us >= NOW_US) {
+        return NOW_EPOCH_NS;
+    }
+
+    uint64_t const AGE_NS = (NOW_US - task->start_time_us) * NS_PER_US;
+    return (NOW_EPOCH_NS > AGE_NS) ? (NOW_EPOCH_NS - AGE_NS) : NOW_EPOCH_NS;
+}
+
+auto procfs_node_creation_epoch_ns(const ker::mod::sched::task::Task* owner_task) -> uint64_t {
+    uint64_t const TASK_EPOCH_NS = task_start_epoch_ns(owner_task);
+    if (TASK_EPOCH_NS != 0) {
+        return TASK_EPOCH_NS;
+    }
+
+    if (g_procfs_creation_epoch_ns != 0) {
+        return g_procfs_creation_epoch_ns;
+    }
+
+    return ker::mod::time::get_epoch_ns();
+}
+
+void set_stat_timestamps(Stat* statbuf, uint64_t epoch_ns) {
+    if (epoch_ns == 0) {
+        epoch_ns = ker::mod::time::get_epoch_ns();
+    }
+
+    Timespec const TS{
+        .tv_sec = static_cast<int64_t>(epoch_ns / NS_PER_SEC),
+        .tv_nsec = static_cast<int64_t>(epoch_ns % NS_PER_SEC),
+    };
+    statbuf->st_atim = TS;
+    statbuf->st_mtim = TS;
+    statbuf->st_ctim = TS;
+}
+
+}  // namespace
+
+auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
+    if (f == nullptr || statbuf == nullptr || f->private_data == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    const ker::mod::sched::task::Task* owner_task = nullptr;
+    if (pfd->node.pid != 0) {
+        owner_task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+    }
+
+    std::memset(statbuf, 0, sizeof(Stat));
+    statbuf->st_dev = dev_id;
+    statbuf->st_ino = 1;
+    statbuf->st_nlink = 1;
+    statbuf->st_uid = (owner_task != nullptr) ? owner_task->uid : 0;
+    statbuf->st_gid = (owner_task != nullptr) ? owner_task->gid : 0;
+    statbuf->st_rdev = 0;
+    statbuf->st_size = 0;
+    statbuf->st_blksize = 4096;
+    statbuf->st_blocks = 0;
+
+    if (f->is_directory) {
+        statbuf->st_mode = S_IFDIR | 0555;
+    } else if (pfd->node.type == ProcNodeType::EXE_LINK || pfd->node.type == ProcNodeType::SELF_LINK) {
+        statbuf->st_mode = S_IFLNK | 0777;
+    } else {
+        statbuf->st_mode = S_IFREG | 0444;
+    }
+
+    set_stat_timestamps(statbuf, procfs_node_creation_epoch_ns(owner_task));
+    return 0;
+}
+
 // --- Open a procfs path ---
 
 auto procfs_open_path(const char* path, int flags, int mode) -> File* {
@@ -1641,6 +1727,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
 }
 
 void procfs_init() {
+    if (g_procfs_creation_epoch_ns == 0) {
+        g_procfs_creation_epoch_ns = ker::mod::time::get_epoch_ns();
+    }
+
     // Mount procfs at /proc
     ker::vfs::mount_filesystem("/proc", "procfs", nullptr);
 }
