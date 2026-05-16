@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
 include(ExternalProject)
+
+option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux host benchmark binaries alongside WOS artifacts" OFF)
+
 ExternalProject_Add(wos_tools_build
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
     BINARY_DIR ${CMAKE_BINARY_DIR}/tools
@@ -8,6 +11,7 @@ ExternalProject_Add(wos_tools_build
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
         -DCMAKE_BUILD_TYPE=Release
+        -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
     INSTALL_COMMAND ""
     USES_TERMINAL_CONFIGURE TRUE
     USES_TERMINAL_BUILD TRUE
@@ -120,7 +124,7 @@ add_custom_target(boot_image
 )
 add_dependencies(boot_image wos_modules mountfs_disk)
 
-foreach(mod wos init testprog testd netd httpd perf journal wkictl renderbench)
+foreach(mod wos init testprog testd netd httpd perf journal wkictl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
 # busybox and dropbear are only needed for image creation, not compilation.
