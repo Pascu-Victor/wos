@@ -6,6 +6,7 @@
 #include <test/ktest.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -65,6 +66,45 @@ KTEST(VFS, WriteRead) {
     ker::vfs::vfs_unlink("/tmp/ktest_wr");
 }
 
+KTEST(VFS, TmpfsOpenTruncatesExistingFile) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_trunc";
+    constexpr char OLD[] = "old content\n";
+    constexpr char NEW[] = "new\n";
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ssize_t const OLD_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(OLD), sizeof(OLD) - 1, 0);
+    KEXPECT_EQ(OLD_WRITE, static_cast<ssize_t>(sizeof(OLD) - 1));
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | ker::vfs::O_TRUNC | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ssize_t const NEW_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(NEW), sizeof(NEW) - 1, 0);
+    KEXPECT_EQ(NEW_WRITE, static_cast<ssize_t>(sizeof(NEW) - 1));
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    f = ker::vfs::vfs_open_file(PATH, 0, 0);
+    KREQUIRE_NE(f, nullptr);
+    char rbuf[sizeof(OLD)] = {};
+    ssize_t const READ = ker::vfs::tmpfs::tmpfs_read(f, static_cast<void*>(rbuf), sizeof(rbuf), 0);
+    KEXPECT_EQ(READ, static_cast<ssize_t>(sizeof(NEW) - 1));
+    KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), static_cast<const void*>(NEW), sizeof(NEW) - 1) == 0);
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_TRUNC | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    f = ker::vfs::vfs_open_file(PATH, 0, 0);
+    KREQUIRE_NE(f, nullptr);
+    KEXPECT_EQ(ker::vfs::tmpfs::tmpfs_read(f, static_cast<void*>(rbuf), sizeof(rbuf), 0), static_cast<ssize_t>(0));
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    ker::vfs::vfs_unlink(PATH);
+}
+
 KTEST(VFS, Unlink) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
@@ -85,6 +125,41 @@ KTEST(VFS, Mkdir) {
     ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat("/tmp/ktest_dir", &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFDIR) != 0U);
+}
+
+KTEST(VFS, TmpfsMountHasSeparateRoot) {
+    constexpr const char* MOUNTPOINT = "/tmp/ktest_tmpfs_mount";
+    constexpr const char* ROOT_ONLY_FILE = "/tmp/ktest_tmpfs_root_only";
+    constexpr const char* MOUNTED_TMP_DIR = "/tmp/ktest_tmpfs_mount/tmp";
+    constexpr const char* MOUNT_FILE = "/tmp/ktest_tmpfs_mount/ktest_tmpfs_mount_file";
+
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    ker::vfs::File* root_file = ker::vfs::vfs_open_file(ROOT_ONLY_FILE, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(root_file, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(root_file);
+
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(MOUNTPOINT, 0755), 0);
+    KEXPECT_EQ(ker::vfs::mount_filesystem(MOUNTPOINT, "tmpfs", nullptr), 0);
+
+    ker::vfs::File* inherited_tmp = ker::vfs::vfs_open_file(MOUNTED_TMP_DIR, 0, 0);
+    KEXPECT_EQ(inherited_tmp, nullptr);
+    if (inherited_tmp != nullptr) {
+        ker::vfs::tmpfs::tmpfs_fops_close(inherited_tmp);
+    }
+
+    ker::vfs::File* mount_file = ker::vfs::vfs_open_file(MOUNT_FILE, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(mount_file, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(mount_file);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_stat(MOUNT_FILE, &st), 0);
+
+    KEXPECT_EQ(ker::vfs::unmount_filesystem(MOUNTPOINT), 0);
+    KEXPECT_NE(ker::vfs::vfs_stat(MOUNT_FILE, &st), 0);
+
+    ker::vfs::vfs_unlink(ROOT_ONLY_FILE);
+    ker::vfs::vfs_rmdir(MOUNTPOINT);
 }
 
 KTEST(VFS, AppendMode) {

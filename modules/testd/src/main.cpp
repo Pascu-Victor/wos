@@ -21,6 +21,7 @@
 #include <abi-bits/socket.h>
 #include <abi-bits/socklen_t.h>
 #include <abi-bits/stat.h>
+#include <abi-bits/termios.h>
 #include <abi-bits/vm-flags.h>
 #include <abi-bits/wait.h>
 #include <arpa/inet.h>
@@ -182,6 +183,33 @@ auto spawn_remote_helper(const char* mode, int fd, int close_fd) -> pid_t {
         _exit(RH_EXIT_EXEC_FAILED);
     }
     return PID;
+}
+
+auto make_pty_raw(int fd) -> bool {
+    struct termios tio{};
+    if (tcgetattr(fd, &tio) != 0) {
+        return false;
+    }
+    cfmakeraw(&tio);
+    return tcsetattr(fd, TCSANOW, &tio) == 0;
+}
+
+auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+    size_t total = 0;
+    while (total < expected) {
+        ssize_t const N = read(fd, buf + total, expected - total);
+        if (N < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (N == 0) {
+            break;
+        }
+        total += static_cast<size_t>(N);
+    }
+    return static_cast<ssize_t>(total);
 }
 
 auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) -> pid_t {
@@ -936,6 +964,12 @@ TESTD_RUN(test_pty_blocking_read_wake) {
         fail("pty_blocking_open_slave", "open slave failed");
         return;
     }
+    if (!make_pty_raw(SLAVE_FD)) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_blocking_raw", "failed to set raw PTY mode");
+        return;
+    }
 
     pid_t const PID = fork();
     if (PID < 0) {
@@ -956,7 +990,7 @@ TESTD_RUN(test_pty_blocking_read_wake) {
 
     close(SLAVE_FD);
     std::array<char, 64> buf{};
-    ssize_t const NR = read(MASTER_FD, buf.data(), buf.size());
+    ssize_t const NR = read_expected_bytes(MASTER_FD, buf.data(), MSG.size());
     close(MASTER_FD);
 
     int status = 0;
@@ -1701,6 +1735,12 @@ TESTD_RUN(test_remote_ipc_pty_child_write) {
         fail("remote_pty_data_open_slave", "open slave failed");
         return;
     }
+    if (!make_pty_raw(SLAVE_FD)) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("remote_pty_data_raw", "failed to set raw PTY mode");
+        return;
+    }
 
     ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
     pid_t const PID = spawn_remote_helper("pty-write", SLAVE_FD, MASTER_FD);
@@ -1716,7 +1756,7 @@ TESTD_RUN(test_remote_ipc_pty_child_write) {
     close(SLAVE_FD);
 
     std::array<char, 64> buf{};
-    ssize_t const N = read(MASTER_FD, buf.data(), buf.size());
+    ssize_t const N = read_expected_bytes(MASTER_FD, buf.data(), RH_PTY_WRITE_MSG.size());
 
     int status = 0;
     waitpid(PID, &status, 0);

@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
@@ -96,6 +97,7 @@ struct XfsInode {
     int refcount;             // reference count
     XfsInode* hash_next;      // hash chain link
     mod::sys::Spinlock lock;  // per-inode lock
+    mod::sys::Mutex io_lock;  // sleeping lock for data/metadata I/O mutation
 
     // Final zero-link teardown is in progress.  The inode remains in the
     // cache with refcount 0 while the on-disk free transaction runs so stale

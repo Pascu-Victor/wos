@@ -186,6 +186,13 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         mount->fops = ker::vfs::fat32::get_fat32_fops();
     } else if (std::strcmp(fstype, "tmpfs") == 0) {
         // tmpfs filesystem
+        mount->private_data =
+            (std::strcmp(resolved.data(), "/") == 0) ? ker::vfs::tmpfs::get_root_node() : ker::vfs::tmpfs::create_root_node();
+        if (mount->private_data == nullptr) {
+            vfs_debug_log("mount_filesystem: tmpfs root allocation failed\n");
+            destroy_mount(mount);
+            return -ENOMEM;
+        }
         mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
     } else if (std::strcmp(fstype, "devfs") == 0) {
         // devfs filesystem

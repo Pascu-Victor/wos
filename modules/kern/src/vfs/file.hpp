@@ -13,6 +13,8 @@ namespace ker::vfs {
 constexpr int O_CLOEXEC = 02000000;
 // O_CREAT: create file if it does not exist
 constexpr int O_CREAT = 0100;
+// O_TRUNC: truncate regular file to zero length on open
+constexpr int O_TRUNC = 01000;
 // O_DIRECTORY: fail open unless the resolved path is a directory.
 constexpr int O_DIRECTORY = 0200000;
 // O_APPEND: writes always go to end of file (Linux value)

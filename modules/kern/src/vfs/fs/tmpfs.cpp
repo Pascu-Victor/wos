@@ -112,6 +112,38 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     n->size = std::max(NEED, n->size);
     return static_cast<ssize_t>(count);
 }
+
+auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
+    if (new_size > n->capacity) {
+        size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
+        while (newcap < new_size) {
+            newcap *= 2;
+        }
+        char* nd = new char[newcap];
+        if (n->data != nullptr) {
+            std::memcpy(nd, n->data, n->size);
+        }
+        delete[] n->data;
+        n->data = nd;
+        n->capacity = newcap;
+    }
+    if (new_size > n->size) {
+        std::memset(n->data + n->size, 0, new_size - n->size);
+    }
+    n->size = new_size;
+    return 0;
+}
+
+auto create_root_node_internal() -> TmpNode* {
+    auto* node = new TmpNode;
+    if (node == nullptr) {
+        return nullptr;
+    }
+    copy_name(node->name, "/");
+    node->type = TmpNodeType::DIRECTORY;
+    node->mode = 0755;
+    return node;
+}
 }  // namespace
 
 void tmpfs_free_node(TmpNode* node) {
@@ -203,7 +235,11 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
 namespace {
 
 // Internal unlocked version - caller must hold tmpfs_lock
-auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate) -> TmpNode* {
+auto tmpfs_walk_path_unlocked(TmpNode* root, const char* path, bool create_intermediate) -> TmpNode* {
+    if (root == nullptr) {
+        return nullptr;
+    }
+
     // Skip leading slashes
     while (*path == '/') {
         path++;
@@ -211,10 +247,10 @@ auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate) -> Tmp
 
     // Empty path means root
     if (*path == '\0') {
-        return root_node;
+        return root;
     }
 
-    TmpNode* current = root_node;
+    TmpNode* current = root;
 
     // Parse path component by component
     while (*path != '\0') {
@@ -273,14 +309,18 @@ auto tmpfs_walk_path_unlocked(const char* path, bool create_intermediate) -> Tmp
 
 }  // namespace
 
-auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
-    if (path == nullptr || root_node == nullptr) {
+auto tmpfs_walk_path(TmpNode* root, const char* path, bool create_intermediate) -> TmpNode* {
+    if (path == nullptr || root == nullptr) {
         return nullptr;
     }
     tmpfs_lock.lock();
-    TmpNode* result = tmpfs_walk_path_unlocked(path, create_intermediate);
+    TmpNode* result = tmpfs_walk_path_unlocked(root, path, create_intermediate);
     tmpfs_lock.unlock();
     return result;
+}
+
+auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
+    return tmpfs_walk_path(root_node, path, create_intermediate);
 }
 
 // --- Initialization ---
@@ -288,21 +328,23 @@ auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
 void register_tmpfs() {
     vfs_debug_log("tmpfs: register_tmpfs called\n");
     if (root_node == nullptr) {
-        root_node = new TmpNode;
-        copy_name(root_node->name, "/");
-        root_node->type = TmpNodeType::DIRECTORY;
-        root_node->mode = 0755;
+        root_node = create_root_node_internal();
     }
 }
+
+auto create_root_node() -> TmpNode* { return create_root_node_internal(); }
 
 auto get_root_node() -> TmpNode* { return root_node; }
 
 // --- File-level operations ---
 
-auto create_root_file() -> ker::vfs::File* {
-    root_node->open_count.fetch_add(1, std::memory_order_relaxed);
+auto create_root_file(TmpNode* root) -> ker::vfs::File* {
+    if (root == nullptr) {
+        return nullptr;
+    }
+    root->open_count.fetch_add(1, std::memory_order_relaxed);
     auto* f = new File;
-    f->private_data = root_node;
+    f->private_data = root;
     f->fd = -1;
     f->pos = 0;
     f->is_directory = true;
@@ -311,15 +353,17 @@ auto create_root_file() -> ker::vfs::File* {
     return f;
 }
 
-auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
+auto create_root_file() -> ker::vfs::File* { return create_root_file(root_node); }
+
+auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File* {
     // mode is now used for O_CREAT
-    if (path == nullptr) {
+    if (path == nullptr || root == nullptr) {
         return nullptr;
     }
 
     // Handle root path
     if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
-        return create_root_file();
+        return create_root_file(root);
     }
 
     // Skip leading slash for walk_path
@@ -328,7 +372,7 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
         rel_path++;
     }
     if (rel_path[0] == '\0') {
-        return create_root_file();
+        return create_root_file(root);
     }
 
     // Split path into parent path and final component
@@ -345,9 +389,9 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
     tmpfs_lock.lock();
     if (last_slash == nullptr) {
         // Single component path (e.g., "file.txt")
-        node = tmpfs_lookup(root_node, rel_path);
+        node = tmpfs_lookup(root, rel_path);
         if (node == nullptr && (flags & O_CREAT) != 0) {
-            node = tmpfs_create_file(root_node, rel_path, static_cast<uint32_t>(mode) & 07777);
+            node = tmpfs_create_file(root, rel_path, static_cast<uint32_t>(mode) & 07777);
         }
     } else {
         // Multi-component path (e.g., "etc/fstab")
@@ -365,10 +409,10 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
         const char* final_name = last_slash + 1;
         if (*final_name == '\0') {
             // Path ends with '/' - open the directory itself
-            node = tmpfs_walk_path_unlocked(parent_path.data(), (flags & O_CREAT) != 0);
+            node = tmpfs_walk_path_unlocked(root, parent_path.data(), (flags & O_CREAT) != 0);
         } else {
             // Walk to parent, then lookup/create the final component
-            TmpNode* parent = tmpfs_walk_path_unlocked(parent_path.data(), (flags & O_CREAT) != 0);
+            TmpNode* parent = tmpfs_walk_path_unlocked(root, parent_path.data(), (flags & O_CREAT) != 0);
             if (parent == nullptr) {
                 tmpfs_lock.unlock();
                 return nullptr;
@@ -388,6 +432,18 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
         return nullptr;
     }
 
+    if ((flags & ker::vfs::O_TRUNC) != 0 && node->type == TmpNodeType::FILE) {
+        ker::mod::sys::MutexGuard guard(node->io_lock);
+        int const TRUNCATE_RET = tmpfs_resize_locked(node, 0);
+        if (TRUNCATE_RET < 0) {
+            uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
+            if (PREV == 1 && node->unlinked) {
+                tmpfs_free_node(node);
+            }
+            return nullptr;
+        }
+    }
+
     auto* f = new File;
     f->private_data = node;
     f->fd = -1;
@@ -397,6 +453,8 @@ auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* {
     f->refcount = 1;
     return f;
 }
+
+auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* { return tmpfs_open_path(root_node, path, flags, mode); }
 
 auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {
@@ -615,26 +673,12 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     if (n->type != TmpNodeType::FILE) {
         return -EISDIR;
     }
+    if (length < 0) {
+        return -EINVAL;
+    }
     ker::mod::sys::MutexGuard guard(n->io_lock);
-    auto new_size = static_cast<size_t>(length);
-    if (new_size > n->capacity) {
-        size_t newcap = (n->capacity == 0) ? 4096 : n->capacity;
-        while (newcap < new_size) {
-            newcap *= 2;
-        }
-        char* nd = new char[newcap];
-        if (n->data != nullptr) {
-            std::memcpy(nd, n->data, n->size);
-        }
-        delete[] n->data;
-        n->data = nd;
-        n->capacity = newcap;
-    }
-    if (new_size > n->size) {
-        std::memset(n->data + n->size, 0, new_size - n->size);
-    }
-    n->size = new_size;
-    return 0;
+    auto const NEW_SIZE = static_cast<size_t>(length);
+    return tmpfs_resize_locked(n, NEW_SIZE);
 }
 
 ker::vfs::FileOperations tmpfs_fops_instance = {

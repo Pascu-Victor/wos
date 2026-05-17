@@ -64,6 +64,7 @@ auto canonicalize_path(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
 auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize_t;
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
+auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode*;
 
 ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
 
@@ -1064,8 +1065,16 @@ auto path_requires_directory(const char* path) -> bool {
     return end > 0 && path[end] == '/';
 }
 
-auto tmpfs_resolve_parent_directory_and_name(const char* fs_path, ker::vfs::tmpfs::TmpNode** parent_out, const char** name_out) -> int {
-    if (fs_path == nullptr || parent_out == nullptr || name_out == nullptr) {
+auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode* {
+    if (mount != nullptr && mount->fs_type == FSType::TMPFS && mount->private_data != nullptr) {
+        return static_cast<ker::vfs::tmpfs::TmpNode*>(mount->private_data);
+    }
+    return ker::vfs::tmpfs::get_root_node();
+}
+
+auto tmpfs_resolve_parent_directory_and_name(ker::vfs::tmpfs::TmpNode* root, const char* fs_path, ker::vfs::tmpfs::TmpNode** parent_out,
+                                             const char** name_out) -> int {
+    if (root == nullptr || fs_path == nullptr || parent_out == nullptr || name_out == nullptr) {
         return -EINVAL;
     }
 
@@ -1086,8 +1095,8 @@ auto tmpfs_resolve_parent_directory_and_name(const char* fs_path, ker::vfs::tmpf
 
     const char* const PARENT_END = (last_slash == nullptr) ? fs_path : last_slash;
     ker::vfs::tmpfs::tmpfs_lock_tree();
-    auto* current = ker::vfs::tmpfs::get_root_node();
-    int result = (current == nullptr) ? -ENOENT : 0;
+    auto* current = root;
+    int result = 0;
     const char* cursor = fs_path;
 
     while (result == 0 && cursor < PARENT_END) {
@@ -2433,7 +2442,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         }
 
         // Walk the tmpfs path to find the node
-        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
         if (node == nullptr) {
             return 0;  // Path doesn't exist yet (might be created with O_CREAT)
         }
@@ -2600,7 +2609,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             }
             break;
         case FSType::TMPFS:
-            f = ker::vfs::tmpfs::tmpfs_open_path(fs_relative_path, backend_flags, mode);
+            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode);
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
@@ -2765,33 +2774,37 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
         vfs_put_file(f);
         return -EINVAL;
     }
-    ssize_t R = 0;
+    ssize_t result = 0;
     size_t append_offset = 0;
     bool const TMPFS_APPEND =
         ((f->open_flags & ker::vfs::O_APPEND) != 0) && f->fs_type == FSType::TMPFS && f->fops == ker::vfs::tmpfs::get_tmpfs_fops();
+    bool const XFS_APPEND =
+        ((f->open_flags & ker::vfs::O_APPEND) != 0) && f->fs_type == FSType::XFS && f->fops == ker::vfs::xfs::get_xfs_fops();
     if (TMPFS_APPEND) {
-        R = ker::vfs::tmpfs::tmpfs_write_append(f, buf, count, &append_offset);
+        result = ker::vfs::tmpfs::tmpfs_write_append(f, buf, count, &append_offset);
+    } else if (XFS_APPEND) {
+        result = ker::vfs::xfs::xfs_write_append(f, buf, count, &append_offset);
     } else {
         if (((f->open_flags & ker::vfs::O_APPEND) != 0) && (f->fops->vfs_lseek != nullptr)) {
             f->fops->vfs_lseek(f, 0, 2);  // SEEK_END
         }
-        R = f->fops->vfs_write(f, buf, count, static_cast<size_t>(f->pos));
+        result = f->fops->vfs_write(f, buf, count, static_cast<size_t>(f->pos));
     }
-    if (R >= 0) {
+    if (result >= 0) {
         stream_invalidate_file(f);
-        if (TMPFS_APPEND) {
-            f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(R));
+        if (TMPFS_APPEND || XFS_APPEND) {
+            f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(result));
         } else {
-            f->pos += R;
+            f->pos += result;
         }
         if (actual_size != nullptr) {
-            *actual_size = static_cast<size_t>(R);
+            *actual_size = static_cast<size_t>(result);
         }
         vfs_put_file(f);
-        return R;
+        return result;
     }
     vfs_put_file(f);
-    return R;
+    return result;
 }
 
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
@@ -3266,7 +3279,7 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
     const char* link_name = nullptr;
 
     if (last_slash == nullptr) {
-        parent = ker::vfs::tmpfs::get_root_node();
+        parent = tmpfs_root_for_mount(mount);
         link_name = fs_path;
     } else {
         std::array<char, MAX_PATH_LEN> parent_path{};
@@ -3276,7 +3289,7 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         }
         std::memcpy(parent_path.data(), fs_path, parent_len);
         parent_path[parent_len] = '\0';
-        parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path.data(), true);
+        parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), parent_path.data(), true);
         link_name = last_slash + 1;
     }
 
@@ -3372,7 +3385,7 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
 
     const char* fs_path = strip_mount_prefix(mount, abs_path);
 
-    auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+    auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
     if (node == nullptr) {
         return -ENOENT;
     }
@@ -3432,7 +3445,7 @@ auto vfs_mkdir(const char* path, int mode) -> int {
     const char* fs_path = strip_mount_prefix(mount, abs_path.data());
 
     if (mount->fs_type == FSType::TMPFS) {
-        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, true);
+        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, true);
         return (node != nullptr) ? 0 : -1;
     }
 
@@ -3555,7 +3568,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
-            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -4307,7 +4320,7 @@ auto vfs_unlink(const char* path) -> int {
     const char* name = nullptr;
 
     if (last_slash == nullptr) {
-        parent = ker::vfs::tmpfs::get_root_node();
+        parent = tmpfs_root_for_mount(mount);
         name = fs_path;
     } else {
         std::array<char, MAX_PATH_LEN> parent_path{};
@@ -4317,7 +4330,7 @@ auto vfs_unlink(const char* path) -> int {
         }
         std::memcpy(parent_path.data(), fs_path, paren_len);
         parent_path[paren_len] = '\0';
-        parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path.data(), false);
+        parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), parent_path.data(), false);
         name = last_slash + 1;
     }
 
@@ -4407,7 +4420,7 @@ auto vfs_rmdir(const char* path) -> int {
     const char* name = nullptr;
 
     if (last_slash == nullptr) {
-        parent = ker::vfs::tmpfs::get_root_node();
+        parent = tmpfs_root_for_mount(mount);
         name = fs_path;
     } else {
         std::array<char, MAX_PATH_LEN> parent_path{};
@@ -4417,7 +4430,7 @@ auto vfs_rmdir(const char* path) -> int {
         }
         std::memcpy(parent_path.data(), fs_path, paren_len);
         parent_path[paren_len] = '\0';
-        parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path.data(), false);
+        parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), parent_path.data(), false);
         name = last_slash + 1;
     }
 
@@ -4524,6 +4537,9 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (old_mount->fs_type != FSType::TMPFS || new_mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
+    if (old_mount != new_mount) {
+        return -EXDEV;
+    }
 
     // Helper lambda to strip mount prefix
     auto strip_mount = [](const char* buf, MountPoint* m) -> const char* {
@@ -4546,7 +4562,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 
     ker::vfs::tmpfs::TmpNode* old_parent = nullptr;
     const char* old_name = nullptr;
-    int parent_result = tmpfs_resolve_parent_directory_and_name(old_fs, &old_parent, &old_name);
+    int parent_result = tmpfs_resolve_parent_directory_and_name(tmpfs_root_for_mount(old_mount), old_fs, &old_parent, &old_name);
     if (parent_result < 0) {
         return parent_result;
     }
@@ -4563,7 +4579,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 
     ker::vfs::tmpfs::TmpNode* new_parent = nullptr;
     const char* new_name = nullptr;
-    parent_result = tmpfs_resolve_parent_directory_and_name(new_fs, &new_parent, &new_name);
+    parent_result = tmpfs_resolve_parent_directory_and_name(tmpfs_root_for_mount(new_mount), new_fs, &new_parent, &new_name);
     if (parent_result < 0) {
         return parent_result;
     }
@@ -4676,7 +4692,7 @@ auto vfs_chmod(const char* path, int mode) -> int {
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
-            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -4755,7 +4771,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
-            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(fs_path, false);
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -6238,7 +6254,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             }
             break;
         case FSType::TMPFS:
-            f = ker::vfs::tmpfs::tmpfs_open_path(fs_relative_path, backend_flags, mode);
+            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode);
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
@@ -6476,7 +6492,7 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
     const char* new_fs = strip_mount_prefix(new_mount, new_buf.data());
 
     // Look up the source node
-    auto* src_node = ker::vfs::tmpfs::tmpfs_walk_path(old_fs, false);
+    auto* src_node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(old_mount), old_fs, false);
     if (src_node == nullptr) {
         return -ENOENT;
     }
@@ -6498,7 +6514,7 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
     const char* new_name = nullptr;
 
     if (new_last_slash == nullptr) {
-        new_parent = ker::vfs::tmpfs::get_root_node();
+        new_parent = tmpfs_root_for_mount(new_mount);
         new_name = new_fs;
     } else {
         std::array<char, MAX_PATH_LEN> parent_path{};
@@ -6508,7 +6524,7 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         }
         std::memcpy(parent_path.data(), new_fs, plen);
         parent_path[plen] = '\0';
-        new_parent = ker::vfs::tmpfs::tmpfs_walk_path(parent_path.data(), false);
+        new_parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(new_mount), parent_path.data(), false);
         new_name = new_last_slash + 1;
     }
 

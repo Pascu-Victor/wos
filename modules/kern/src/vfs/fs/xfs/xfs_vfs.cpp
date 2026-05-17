@@ -16,6 +16,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/mutex.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -317,9 +318,12 @@ auto xfs_vfs_close(File* f) -> int {
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
     if (xfd != nullptr) {
         if (xfd->inode != nullptr) {
-            int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
-            int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
-            close_result = (DATA_RET != 0) ? DATA_RET : INODE_RET;
+            {
+                ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+                int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
+                int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
+                close_result = (DATA_RET != 0) ? DATA_RET : INODE_RET;
+            }
             xfs_inode_release(xfd->inode);
         }
         delete xfd;
@@ -344,6 +348,8 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (xfs_inode_isdir(ip)) {
         return -EISDIR;
     }
+
+    ker::mod::sys::MutexGuard guard(ip->io_lock);
 
     // Inline data (LOCAL format)
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
@@ -594,7 +600,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 // number of transactions for a sequential write is (total_blocks / batch).
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
 
-auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -932,6 +938,19 @@ write_done:
     return finish_write(static_cast<ssize_t>(total_written));
 }
 
+auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr) {
+        return -EBADF;
+    }
+
+    ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+    return xfs_vfs_write_locked(f, buf, count, offset);
+}
+
 auto xfs_vfs_lseek(File* f, off_t offset, int whence) -> off_t {
     if (f == nullptr) {
         return -EBADF;
@@ -1099,6 +1118,8 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
         return -EINVAL;
     }
 
+    ker::mod::sys::MutexGuard guard(ip->io_lock);
+
     // For now, only support truncating to 0 (common case) or extending.
     // Shrinking to an arbitrary size would require freeing blocks.
     auto new_size = static_cast<uint64_t>(length);
@@ -1151,6 +1172,24 @@ FileOperations xfs_fops = {
 
 auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
 
+auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
+    if (f == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr) {
+        return -EBADF;
+    }
+
+    ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+    auto const OFFSET = static_cast<size_t>(xfd->inode->size);
+    ssize_t const RET = xfs_vfs_write_locked(f, buf, count, OFFSET);
+    if (RET >= 0 && offset_out != nullptr) {
+        *offset_out = OFFSET;
+    }
+    return RET;
+}
+
 auto xfs_fsync(File* f) -> int {
     if (f == nullptr) {
         return -EBADF;
@@ -1159,6 +1198,7 @@ auto xfs_fsync(File* f) -> int {
     if (xfd == nullptr || xfd->inode == nullptr) {
         return -EBADF;
     }
+    ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
     int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
     return (DATA_RET != 0) ? DATA_RET : INODE_RET;
@@ -1297,6 +1337,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
     // Handle O_TRUNC on regular files
     if ((flags & O_TRUNC_FLAG) != 0 && xfs_inode_isreg(ip) && !ctx->read_only) {
+        ker::mod::sys::MutexGuard guard(ip->io_lock);
 #ifdef XFS_DEBUG
         mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", static_cast<unsigned long>(ip->ino),
                       static_cast<unsigned long>(ip->size));

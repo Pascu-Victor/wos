@@ -187,6 +187,7 @@ check "unset var is empty"     "${TESTVAR:-gone}"      "gone"
 # /tmp (tmpfs)
 section "/tmp (tmpfs)"
 
+if grep -q '^tmpfs /tmp tmpfs ' /proc/mounts 2>/dev/null; then ok "/tmp listed as tmpfs"; else fail "/tmp listed as tmpfs"; fi
 printf 'tmpfs_data\n' > /tmp/wos_vtest_$$
 check "write to /tmp"          "$(cat /tmp/wos_vtest_$$)"  "tmpfs_data"
 printf 'more\n' >> /tmp/wos_vtest_$$

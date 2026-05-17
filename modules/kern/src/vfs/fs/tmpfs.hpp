@@ -53,6 +53,7 @@ void tmpfs_unlock_tree();
 void register_tmpfs();
 
 // Root node access (used by initramfs unpacker)
+auto create_root_node() -> TmpNode*;
 auto get_root_node() -> TmpNode*;
 
 // Node operations
@@ -64,10 +65,13 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
 // Walk a multi-component path relative to root.
 // If create_intermediate is true, missing directory components are created.
 // The path should NOT have a leading "/" (it's relative to tmpfs root).
+auto tmpfs_walk_path(TmpNode* root, const char* path, bool create_intermediate) -> TmpNode*;
 auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode*;
 
 // File-level operations
+auto create_root_file(TmpNode* root) -> ker::vfs::File*;
 auto create_root_file() -> ker::vfs::File*;
+auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File*;
 auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File*;
 auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;

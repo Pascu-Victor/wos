@@ -7,9 +7,9 @@ set(KERNEL wos)
 # ---------------------------------------------------------------------------
 # Kernel build-time diagnostics, sanitizers, and instrumentation.
 # ---------------------------------------------------------------------------
-option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity"                         ON)
-option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           ON)
-option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               ON)
+option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity"                         OFF)
+option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           OFF)
+option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               OFF)
 option(WOS_KCOV                    "Enable kernel coverage instrumentation (for Syzkaller)"             OFF)
 option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps using KCOV callbacks"       OFF)
 option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             ON)

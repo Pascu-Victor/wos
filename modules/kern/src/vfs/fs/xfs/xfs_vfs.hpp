@@ -10,6 +10,8 @@
 //   - xfs_fstat()            - fstat on open file
 //   - get_xfs_fops()         - return the XFS FileOperations vtable
 
+#include <bits/ssize_t.h>
+
 #include <dev/block_device.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -31,6 +33,9 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
 
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+
+// Atomically append to an open file and return the starting append offset.
+auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t;
 
 // Commit dirty inode metadata for an open file.
 auto xfs_fsync(File* f) -> int;
