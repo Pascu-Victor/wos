@@ -478,8 +478,13 @@ local pf_analysis_req_frame = ProtoField.framenum("wki.analysis.req_frame", "Req
     .REQUEST)
 local pf_analysis_resp_frame = ProtoField.framenum("wki.analysis.resp_frame", "Response Frame", base.NONE,
     frametype.RESPONSE)
+local pf_analysis_ack_frame = ProtoField.framenum("wki.analysis.ack_frame", "Acknowledged Frame", base.NONE,
+    frametype.ACK)
+local pf_analysis_acked_by_frame = ProtoField.framenum("wki.analysis.acked_by_frame", "Acknowledged By Frame",
+    base.NONE, frametype.ACK)
 local pf_analysis_resp_time = ProtoField.double("wki.analysis.response_time", "Response Time (ms)")
 local pf_analysis_credit_zero = ProtoField.bool("wki.analysis.credit_zero", "Zero Credits (Stalled)")
+local pf_analysis_ack_carrier = ProtoField.bool("wki.analysis.ack_carrier", "Standalone ACK Carrier")
 
 -- Add all fields to protocol
 wki_proto.fields = {
@@ -533,7 +538,8 @@ wki_proto.fields = {
     -- Analysis
     pf_analysis_retransmit, pf_analysis_dup_ack, pf_analysis_out_of_order,
     pf_analysis_rtt, pf_analysis_req_frame, pf_analysis_resp_frame,
-    pf_analysis_resp_time, pf_analysis_credit_zero,
+    pf_analysis_ack_frame, pf_analysis_acked_by_frame,
+    pf_analysis_resp_time, pf_analysis_credit_zero, pf_analysis_ack_carrier,
 }
 
 -- =========================================================================
@@ -554,8 +560,9 @@ local request_info = {}     -- [frame_num] = { resp_frame }
 
 -- ACK tracking: keyed by "src_node:dst_node:channel_id:seq_num"
 -- When a data frame is sent, record timestamp. When ACK arrives, compute RTT.
-local sent_frames = {}  -- [key] = { frame_num, timestamp }
-local ack_rtt_info = {} -- [frame_num] = { rtt_ms }
+local sent_frames = {}      -- [key] = { frame_num, timestamp }
+local ack_rtt_info = {}     -- [ack_frame_num] = { rtt_ms, acked_frame }
+local acked_by_info = {}    -- [data_frame_num] = { ack_frame, rtt_ms }
 
 -- Per-peer statistics
 local peer_stats = {}    -- [node_id] = { tx_frames, rx_frames, tx_bytes, rx_bytes, retransmits }
@@ -589,6 +596,7 @@ local function reset_analysis_state()
     request_info = {}
     sent_frames = {}
     ack_rtt_info = {}
+    acked_by_info = {}
     peer_stats = {}
     channel_stats = {}
     op_latencies = {}
@@ -1026,9 +1034,12 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local credits = buffer(18, 1):uint()
     local hop_ttl = buffer(19, 1):uint()
     local payload_captured_len = math.max(0, math.min(payload_len, length - WKI_HEADER_SIZE))
+    local ack_present = bit.band(flags, 0x08) ~= 0
+    local is_ack_carrier = msg_type == 0x04 and ack_present and payload_len == 0
 
     -- Build info column
     local msg_name = get_msg_type_name(msg_type)
+    local display_msg_name = is_ack_carrier and "ACK" or msg_name
     local channel_name = get_channel_name(channel_id)
     local info_suffix = nil
     if (msg_type == 0x43 or msg_type == 0x44) and payload_captured_len >= 4 then
@@ -1056,11 +1067,14 @@ function wki_proto.dissector(buffer, pinfo, tree)
         end
     end
     pinfo.cols.info = string.format("%s %s->%s ch=%s seq=%d",
-        msg_name,
+        display_msg_name,
         format_node_id(src_node),
         format_node_id(dst_node),
         channel_name,
         seq_num)
+    if ack_present then
+        pinfo.cols.info:append(string.format(" ack=%d", ack_num))
+    end
     if info_suffix ~= nil then
         pinfo.cols.info:append(" " .. info_suffix)
     end
@@ -1076,6 +1090,8 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local matched_resp_time_ms = nil
     local matched_req_frame = nil
     local matched_resp_frame = nil
+    local matched_ack_frame = nil
+    local matched_acked_by_frame = nil
 
     -- Only run analysis on first pass (not when user clicks on a packet)
     if not pinfo.visited then
@@ -1130,7 +1146,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
         end
 
         -- ACK processing: if ACK_PRESENT, compute RTT for the acked frame
-        if bit.band(flags, 0x08) ~= 0 then
+        if ack_present then
             -- The ACK is from src_node to dst_node, acknowledging dst_node's seq
             -- Reverse key: original sender was dst_node -> src_node on this channel
             local rev_key = string.format("%d:%d:%d", dst_node, src_node, channel_id)
@@ -1138,8 +1154,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
             local original = sent_frames[ack_sent_key]
             if original then
                 local rtt_ms = (timestamp - original.timestamp) * 1000
-                ack_rtt_info[frame_num] = { rtt_ms = rtt_ms }
+                ack_rtt_info[frame_num] = { rtt_ms = rtt_ms, acked_frame = original.frame_num }
+                acked_by_info[original.frame_num] = { ack_frame = frame_num, rtt_ms = rtt_ms }
                 matched_rtt_ms = rtt_ms
+                matched_ack_frame = original.frame_num
                 -- Update peer RTT stats
                 dst_stats.rtt_sum = dst_stats.rtt_sum + rtt_ms
                 dst_stats.rtt_count = dst_stats.rtt_count + 1
@@ -1208,6 +1226,13 @@ function wki_proto.dissector(buffer, pinfo, tree)
         local frame_num = pinfo.number
         if ack_rtt_info[frame_num] then
             matched_rtt_ms = ack_rtt_info[frame_num].rtt_ms
+            matched_ack_frame = ack_rtt_info[frame_num].acked_frame
+        end
+        if acked_by_info[frame_num] then
+            matched_acked_by_frame = acked_by_info[frame_num].ack_frame
+            if matched_rtt_ms == nil then
+                matched_rtt_ms = acked_by_info[frame_num].rtt_ms
+            end
         end
         if response_info[frame_num] then
             matched_resp_time_ms = response_info[frame_num].latency_ms
@@ -1236,6 +1261,9 @@ function wki_proto.dissector(buffer, pinfo, tree)
     hdr_tree:add(pf_msg_type, buffer(1, 1)):append_text(" (" .. msg_name .. ")")
     local msg_name_item = hdr_tree:add(pf_msg_type_name, msg_name)
     msg_name_item:set_generated(true)
+    if is_ack_carrier then
+        msg_name_item:append_text(" (ACK carrier)")
+    end
     hdr_tree:add_le(pf_src_node, buffer(2, 2)):append_text(" (" .. format_node_id(src_node) .. ")")
     hdr_tree:add_le(pf_dst_node, buffer(4, 2)):append_text(" (" .. format_node_id(dst_node) .. ")")
     hdr_tree:add_le(pf_channel_id, buffer(6, 2)):append_text(" (" .. channel_name .. ")")
@@ -1244,7 +1272,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
     hdr_tree:add_le(pf_seq_num, buffer(8, 4))
 
     local ack_item = hdr_tree:add_le(pf_ack_num, buffer(12, 4))
-    if bit.band(flags, 0x08) == 0 then
+    if not ack_present then
         ack_item:append_text(" (not valid)")
     end
 
@@ -1259,9 +1287,14 @@ function wki_proto.dissector(buffer, pinfo, tree)
     -- Analysis subtree
     local has_analysis = is_retransmit or is_dup_ack or is_out_of_order or
         matched_rtt_ms or matched_resp_time_ms or
-        matched_req_frame or matched_resp_frame or is_credit_zero
+        matched_req_frame or matched_resp_frame or
+        matched_ack_frame or matched_acked_by_frame or is_credit_zero or is_ack_carrier
     if has_analysis then
         local analysis_tree = subtree:add(wki_proto, buffer(0, 0), "Analysis")
+        if is_ack_carrier then
+            local item = analysis_tree:add(pf_analysis_ack_carrier, true)
+            item:set_generated(true)
+        end
         if is_retransmit then
             local item = analysis_tree:add(pf_analysis_retransmit, true)
             item:set_generated(true)
@@ -1282,6 +1315,14 @@ function wki_proto.dissector(buffer, pinfo, tree)
             local item = analysis_tree:add(pf_analysis_rtt, matched_rtt_ms)
             item:set_generated(true)
             item:append_text(string.format(" (%.3f ms)", matched_rtt_ms))
+        end
+        if matched_ack_frame then
+            local item = analysis_tree:add(pf_analysis_ack_frame, matched_ack_frame)
+            item:set_generated(true)
+        end
+        if matched_acked_by_frame then
+            local item = analysis_tree:add(pf_analysis_acked_by_frame, matched_acked_by_frame)
+            item:set_generated(true)
         end
         if matched_req_frame then
             local item = analysis_tree:add(pf_analysis_req_frame, matched_req_frame)
