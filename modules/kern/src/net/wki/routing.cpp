@@ -61,7 +61,24 @@ auto lsdb_alloc(uint16_t origin_node) -> LsdbEntry* {
 // LSA flooding - send an LSA to all direct CONNECTED neighbors
 // -----------------------------------------------------------------------------
 
-void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node) {
+auto lsa_lists_neighbor(const void* payload, uint16_t payload_len, uint16_t node_id) -> bool {
+    if (payload == nullptr || payload_len < sizeof(LsaPayload) || node_id == WKI_NODE_INVALID) {
+        return false;
+    }
+
+    auto const* lsa = static_cast<const LsaPayload*>(payload);
+    uint16_t const NBR_COUNT = std::min<uint16_t>(lsa->num_neighbors, static_cast<uint16_t>(WKI_MAX_NEIGHBORS_PER_LSA));
+    size_t const EXPECTED = sizeof(LsaPayload) + (static_cast<size_t>(NBR_COUNT) * sizeof(LsaNeighborEntry));
+    if (payload_len < EXPECTED) {
+        return false;
+    }
+
+    std::span<LsaNeighborEntry const> const NBRS{lsa_neighbors(lsa), NBR_COUNT};
+    return std::ranges::any_of(NBRS, [node_id](auto const& neighbor) { return neighbor.node_id == node_id; });
+}
+
+void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node, bool suppress_origin_neighbors) {
+    auto const* lsa = payload_len >= sizeof(LsaPayload) ? static_cast<const LsaPayload*>(payload) : nullptr;
     for (auto const& peer : g_wki.peers) {
         if (peer.node_id == WKI_NODE_INVALID) {
             continue;
@@ -73,6 +90,12 @@ void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node)
             continue;
         }
         if (peer.node_id == exclude_node) {
+            continue;
+        }
+        if (lsa != nullptr && peer.node_id == lsa->origin_node) {
+            continue;
+        }
+        if (suppress_origin_neighbors && lsa_lists_neighbor(payload, payload_len, peer.node_id)) {
             continue;
         }
 
@@ -189,7 +212,7 @@ void wki_lsa_generate_and_flood() {
     s_routing_lock.unlock();
 
     // Flood to all direct neighbors (no exclusion for our own LSA)
-    flood_lsa(buf.data(), PAYLOAD_LEN, WKI_NODE_INVALID);
+    flood_lsa(buf.data(), PAYLOAD_LEN, WKI_NODE_INVALID, false);
 
     // Recompute routes with updated topology
     wki_routing_recompute();
@@ -262,7 +285,7 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
     wki_routing_recompute();
 
     // Flood to all direct neighbors except the one that sent this to us
-    flood_lsa(payload, payload_len, hdr->src_node);
+    flood_lsa(payload, payload_len, hdr->src_node, true);
 #ifdef DEBUG_WKI_ROUTING
     log::debug("LSA from 0x%04x seq=%u nbrs=%u", lsa->origin_node, lsa->lsa_seq, lsa->num_neighbors);
 #endif

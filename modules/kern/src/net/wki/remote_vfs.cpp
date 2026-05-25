@@ -732,6 +732,51 @@ void invalidate_readlink_cache(ProxyVfsState* state) {
     state->lock.unlock();
 }
 
+void release_vfs_proxy_buffers(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    delete[] state->rdma_bounce_buf;
+    state->rdma_bounce_buf = nullptr;
+    state->rdma_read_rkey = 0;
+    state->rdma_capable = false;
+
+    delete[] state->rdma_bulk_buf;
+    state->rdma_bulk_buf = nullptr;
+    state->rdma_bulk_rkey = 0;
+    state->rdma_bulk_size = 0;
+    state->bulk_rdma_capable = false;
+}
+
+void discard_failed_attached_proxy(ProxyVfsState* state, WkiChannel* reserved_channel) {
+    if (state == nullptr) {
+        return;
+    }
+
+    uint16_t const OWNER_NODE = state->owner_node;
+    uint32_t const RESOURCE_ID = state->resource_id;
+    s_vfs_lock.lock();
+    state->active = false;
+    s_vfs_lock.unlock();
+
+    DevDetachPayload det = {};
+    det.target_node = OWNER_NODE;
+    det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
+    det.resource_id = RESOURCE_ID;
+    wki_send(OWNER_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+
+    if (reserved_channel != nullptr) {
+        wki_channel_close(reserved_channel);
+    }
+
+    release_vfs_proxy_buffers(state);
+
+    s_vfs_lock.lock();
+    std::erase_if(g_vfs_proxies, [state](const std::unique_ptr<ProxyVfsState>& proxy) { return proxy.get() == state; });
+    s_vfs_lock.unlock();
+}
+
 auto readlink_status_is_cacheable(int status) -> bool {
     return status == 0 || status == -EINVAL || status == -ENOENT || status == -ENOTDIR;
 }
@@ -1205,6 +1250,8 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
 }
 
 constexpr uint32_t VFS_READ_RETRIES = 2;
+constexpr uint32_t VFS_DIRECT_READ_STACK_SIZE = 4096;
+static_assert(VFS_DIRECT_READ_STACK_SIZE <= WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
 
 // Remote readlink sits on an interactive hot path (`ls -l`, path resolution,
 // loader symlink traversal). A full-second first timeout turns transient
@@ -1635,18 +1682,23 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     // Max data per response
     auto max_resp_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
 
+    std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf{};
+
     while (remaining > 0) {
-        auto fetch_size = POSITIONAL_READ ? remaining : static_cast<uint32_t>(VFS_CACHE_SIZE);
+        bool const USING_CACHE = !POSITIONAL_READ && remaining >= VFS_CACHE_SIZE;
+        auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE);
         fetch_size = std::min(fetch_size, max_resp_data);
 
-        if (ctx->read_cache == nullptr) {
+        uint8_t* fetch_dest = direct_read_buf.data();
+        if (USING_CACHE && ctx->read_cache == nullptr) {
             ctx->read_cache = new ReadAheadCache();  // NOLINT(cppcoreguidelines-owning-memory)
             if (ctx->read_cache == nullptr) {
                 return (total_read > 0) ? total_read : -ENOMEM;
             }
         }
-        uint8_t* fetch_dest = ctx->read_cache->data.data();
-        bool const USING_CACHE = !POSITIONAL_READ;
+        if (USING_CACHE) {
+            fetch_dest = ctx->read_cache->data.data();
+        }
 
         uint32_t chunk = fetch_size;
 
@@ -3713,10 +3765,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     int const MOUNT_RET = ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr);
     if (MOUNT_RET != 0) {
         ker::mod::dbg::log("[WKI] Remote VFS mount failed at %s", local_mount_path);
-        s_vfs_lock.lock();
-        state->active = false;
-        g_vfs_proxies.pop_back();
-        s_vfs_lock.unlock();
+        discard_failed_attached_proxy(state, reserved_channel);
         return MOUNT_RET;
     }
 
@@ -3736,10 +3785,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     if (!configured) {
         ker::mod::dbg::log("[WKI] Remote VFS mount configuration failed at %s", local_mount_path);
         ker::vfs::unmount_filesystem(local_mount_path);
-        s_vfs_lock.lock();
-        state->active = false;
-        g_vfs_proxies.pop_back();
-        s_vfs_lock.unlock();
+        discard_failed_attached_proxy(state, reserved_channel);
         return -EIO;
     }
 
@@ -3784,6 +3830,34 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
 
     // Unmount
     ker::vfs::unmount_filesystem(local_mount_path);
+}
+
+auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    s_vfs_lock.lock();
+    for (const auto& proxy : g_vfs_proxies) {
+        if (proxy == nullptr || !proxy->active || count >= max) {
+            continue;
+        }
+
+        auto& row = out[count++];
+        row.owner_node = proxy->owner_node;
+        row.assigned_channel = proxy->assigned_channel;
+        row.resource_id = proxy->resource_id;
+        row.active = proxy->active;
+        row.op_pending = proxy->op_pending.load(std::memory_order_acquire);
+        row.op_expected_id = proxy->op_expected_id;
+        row.op_expected_seq = proxy->op_expected_seq;
+        row.attach_pending = proxy->attach_pending.load(std::memory_order_acquire);
+        row.local_mount_path = proxy->local_mount_path;
+    }
+    s_vfs_lock.unlock();
+
+    return count;
 }
 
 auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resource_id, char* out, size_t out_size) -> bool {

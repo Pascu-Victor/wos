@@ -13,7 +13,9 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
 
@@ -49,17 +51,25 @@ constexpr uint32_t ROCE_MAX_PAYLOAD = 9000 - proto::ETH_HLEN - sizeof(RoceHeader
 // Memory region registry - maps rkey -> (vaddr, size)
 // -----------------------------------------------------------------------------
 
-constexpr size_t ROCE_MAX_REGIONS = 64;
+constexpr size_t ROCE_REGION_BUCKETS = 256;
+static_assert((ROCE_REGION_BUCKETS & (ROCE_REGION_BUCKETS - 1)) == 0, "RoCE region bucket count must be a power of two");
 
 struct RoceRegion {
-    bool active = false;
     uint32_t rkey = 0;
+    void* vaddr = nullptr;
+    uint32_t size = 0;
+    bool temporary = false;
+    RoceRegion* next = nullptr;
+};
+
+struct RoceRegionSnapshot {
     void* vaddr = nullptr;
     uint32_t size = 0;
 };
 
-std::array<RoceRegion, ROCE_MAX_REGIONS> s_regions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t s_next_rkey = 1;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<RoceRegion*, ROCE_REGION_BUCKETS> s_region_buckets{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_region_lock;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t s_next_rkey = 1;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // Transport state
@@ -72,17 +82,26 @@ bool s_roce_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-gl
 // Region management
 // -----------------------------------------------------------------------------
 
-auto region_find(uint32_t rkey) -> RoceRegion* {
-    for (auto& r : s_regions) {
-        if (r.active && r.rkey == rkey) {
-            return &r;
+auto region_bucket_index(uint32_t rkey) -> size_t {
+    constexpr uint64_t HASH_MULT = 0x9E3779B97F4A7C15ULL;
+    return (static_cast<uint64_t>(rkey) * HASH_MULT) & (ROCE_REGION_BUCKETS - 1);
+}
+
+auto region_bucket(uint32_t rkey) -> RoceRegion*& { return s_region_buckets.at(region_bucket_index(rkey)); }
+
+auto region_find_locked(uint32_t rkey) -> RoceRegion* {
+    RoceRegion* cur = region_bucket(rkey);
+    while (cur != nullptr) {
+        if (cur->rkey == rkey) {
+            return cur;
         }
+        cur = cur->next;
     }
     return nullptr;
 }
 
-auto next_temp_rkey() -> uint32_t {
-    // Keep temp response rkeys below 0x00010000 so they stay disjoint from
+auto next_region_rkey_locked() -> uint32_t {
+    // Keep RoCE region rkeys below 0x00010000 so they stay disjoint from
     // zone doorbell values (node_id<<16 | counter, minimum 0x00010001).
     // Always allocate a fresh key when recycling a slot so late RDMA_WRITE /
     // DOORBELL packets from an older read cannot target a newly registered
@@ -94,11 +113,122 @@ auto next_temp_rkey() -> uint32_t {
             s_next_rkey = 1;
         }
 
-        if (region_find(candidate) == nullptr) {
+        if (region_find_locked(candidate) == nullptr) {
             return candidate;
         }
     }
     return 0;
+}
+
+auto region_register(uint64_t vaddr, uint32_t size, bool temporary, uint32_t* rkey) -> int {
+    if (rkey == nullptr) {
+        return WKI_ERR_INVALID;
+    }
+
+    auto* region = new (std::nothrow) RoceRegion{};
+    if (region == nullptr) {
+        return WKI_ERR_NO_MEM;
+    }
+
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    uint32_t const NEW_RKEY = next_region_rkey_locked();
+    if (NEW_RKEY == 0) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        delete region;
+        return WKI_ERR_NO_MEM;
+    }
+
+    region->rkey = NEW_RKEY;
+    // In wOS callers pass a kernel virtual address here for non-ivshmem RoCE.
+    region->vaddr = reinterpret_cast<void*>(vaddr);
+    region->size = size;
+    region->temporary = temporary;
+
+    RoceRegion*& bucket = region_bucket(NEW_RKEY);
+    region->next = bucket;
+    bucket = region;
+    *rkey = NEW_RKEY;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return 0;
+}
+
+auto region_unregister(uint32_t rkey) -> bool {
+    RoceRegion* removed = nullptr;
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion** link = &region_bucket(rkey);
+    while (*link != nullptr) {
+        if ((*link)->rkey == rkey) {
+            removed = *link;
+            *link = removed->next;
+            removed->next = nullptr;
+            break;
+        }
+        link = &((*link)->next);
+    }
+    s_region_lock.unlock_irqrestore(FLAGS);
+
+    delete removed;
+    return removed != nullptr;
+}
+
+auto region_unregister_temporary(uint32_t rkey) -> bool {
+    RoceRegion* removed = nullptr;
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion** link = &region_bucket(rkey);
+    while (*link != nullptr) {
+        if ((*link)->rkey == rkey) {
+            if (!(*link)->temporary) {
+                break;
+            }
+            removed = *link;
+            *link = removed->next;
+            removed->next = nullptr;
+            break;
+        }
+        link = &((*link)->next);
+    }
+    s_region_lock.unlock_irqrestore(FLAGS);
+
+    delete removed;
+    return removed != nullptr;
+}
+
+auto region_is_registered(uint32_t rkey) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    bool const FOUND = region_find_locked(rkey) != nullptr;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return FOUND;
+}
+
+auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    out.vaddr = region->vaddr;
+    out.size = region->size;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32_t length, uint32_t payload_len) -> bool {
+    if (payload == nullptr || length > payload_len) {
+        return false;
+    }
+
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr || offset > region->size || length > (static_cast<uint64_t>(region->size) - offset)) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    memcpy(static_cast<uint8_t*>(region->vaddr) + offset, payload, length);
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -147,23 +277,7 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
 // -----------------------------------------------------------------------------
 
 int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32_t size, uint32_t* rkey) {
-    for (auto& r : s_regions) {
-        if (!r.active) {
-            uint32_t const NEW_RKEY = next_temp_rkey();
-            if (NEW_RKEY == 0) {
-                return WKI_ERR_NO_MEM;
-            }
-            r.active = true;
-            r.rkey = NEW_RKEY;
-            // Convert physical address to HHDM virtual address
-            // In wOS, phys_to_virt is simple offset addition via HHDM
-            r.vaddr = reinterpret_cast<void*>(phys_addr);  // zone passes vaddr as phys_addr for non-ivshmem
-            r.size = size;
-            *rkey = r.rkey;
-            return 0;
-        }
-    }
-    return WKI_ERR_NO_MEM;  // no free slots
+    return region_register(phys_addr, size, false, rkey);
 }
 
 int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf,
@@ -205,7 +319,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
 
     // Register our local buffer as a temporary region for the response
     uint32_t local_rkey = 0;
-    int const REG_RET = roce_rdma_register_region(&s_roce_transport, reinterpret_cast<uint64_t>(local_buf), len, &local_rkey);
+    int const REG_RET = region_register(reinterpret_cast<uint64_t>(local_buf), len, true, &local_rkey);
     if (REG_RET != 0) {
         return REG_RET;
     }
@@ -221,11 +335,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
 
     int const RET = roce_eth_tx(neighbor_id, hdr, nullptr, 0);
     if (RET != 0) {
-        // Unregister temp region
-        auto* reg = region_find(local_rkey);
-        if (reg != nullptr) {
-            reg->active = false;
-        }
+        region_unregister(local_rkey);
         return RET;
     }
 
@@ -233,9 +343,8 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
     // We MUST poll the NIC during the wait, otherwise the response frames can never
     // be received and the read will always time out.
     uint64_t const DEADLINE = wki_now_us() + 100000;  // 100ms timeout
-    volatile auto* reg = region_find(local_rkey);
     while (wki_now_us() < DEADLINE) {
-        if (reg == nullptr || !reg->active) {
+        if (!region_is_registered(local_rkey)) {
             break;  // region was deregistered by DOORBELL handler -> data arrived
         }
         // Drive NIC RX so the RDMA_WRITE + DOORBELL response can be processed.
@@ -248,9 +357,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
     }
 
     // Clean up if still registered (timeout)
-    auto* cleanup_reg = region_find(local_rkey);
-    if (cleanup_reg != nullptr && cleanup_reg->active) {
-        cleanup_reg->active = false;
+    if (region_unregister(local_rkey)) {
         return WKI_ERR_TIMEOUT;  // timeout
     }
 
@@ -294,35 +401,24 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 
     switch (static_cast<RoceOpcode>(hdr->opcode)) {
         case RoceOpcode::RDMA_WRITE: {
-            // Write data into the registered region at (rkey, offset)
-            auto* region = region_find(hdr->rkey);
-            if (region == nullptr) {
-                break;
-            }
-
-            // Bounds check
-            if (hdr->offset + hdr->length > region->size || hdr->length > PAYLOAD_LEN) {
-                break;
-            }
-
-            memcpy(static_cast<uint8_t*>(region->vaddr) + hdr->offset, payload, hdr->length);
+            region_write(hdr->rkey, hdr->offset, payload, hdr->length, PAYLOAD_LEN);
             break;
         }
 
         case RoceOpcode::RDMA_READ_REQ: {
             // Peer wants to read from our registered region - send data back as RDMA_WRITE
-            auto* region = region_find(hdr->rkey);
-            if (region == nullptr) {
+            RoceRegionSnapshot region = {};
+            if (!region_snapshot(hdr->rkey, region)) {
                 break;
             }
 
-            if (hdr->offset + hdr->length > region->size) {
+            if (hdr->offset > region.size || hdr->length > (static_cast<uint64_t>(region.size) - hdr->offset)) {
                 break;
             }
 
             // Send the data back to the requestor using RDMA_WRITE to their local_rkey
             uint32_t const RESP_RKEY = hdr->doorbell_val;  // requestor's local region key
-            const auto* src_data = static_cast<const uint8_t*>(region->vaddr) + hdr->offset;
+            const auto* src_data = static_cast<const uint8_t*>(region.vaddr) + hdr->offset;
             uint32_t remaining = hdr->length;
             uint64_t write_offset = 0;
 
@@ -368,17 +464,14 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
             // Doorbell received - determine if it's a read-completion (deregister
             // a temp region) or a zone notification (invoke post_handler).
             //
-            // The namespaces are disjoint: temp rkeys are small sequential values
-            // [1..ROCE_MAX_REGIONS], while zone_ids are node_id<<16 | counter
-            // (always >= 0x00010001).  So region_find() will only match a temp
-            // read region, never a zone_id.
+            // The namespaces are disjoint: RoCE region rkeys are small sequential
+            // values below 0x00010000, while zone_ids are node_id<<16 | counter
+            // (always >= 0x00010001).
             uint32_t const VAL = hdr->doorbell_val;
 
-            auto* region = region_find(VAL);
-            if (region != nullptr) {
-                // Read-completion doorbell - deregister temp region to unblock
-                // the roce_rdma_read spin-wait.
-                region->active = false;
+            if (region_unregister_temporary(VAL)) {
+                // Read-completion doorbell - deregister temporary region to
+                // unblock the roce_rdma_read spin-wait.
                 break;
             }
 
@@ -406,9 +499,8 @@ void wki_roce_transport_init() {
         return;
     }
 
-    for (auto& r : s_regions) {
-        r.active = false;
-    }
+    s_region_buckets.fill(nullptr);
+    s_next_rkey = 1;
 
     // RoCE is an RDMA-only overlay transport - no WKI message TX (tx/tx_pkt are null)
     s_roce_transport.name = "wki-roce";

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 
 #include "dev/pci.hpp"
@@ -196,6 +198,29 @@ void free_pkt_list(ker::net::PacketBuffer* head) {
         ker::net::pkt_free(head);
         head = next;
     }
+}
+
+void fill_virtqueue_diag(Virtqueue* vq, VirtqueueDiagSnapshot& out) {
+    out = {};
+    if (vq == nullptr) {
+        return;
+    }
+
+    uint64_t const FLAGS = vq->lock.lock_irqsave();
+    out.size = vq->size;
+    out.num_free = vq->num_free;
+    out.pending = virtq_pending_count(vq);
+    out.avail_idx = vq->avail->idx;
+    out.used_idx = vq->used->idx;
+    out.last_used_idx = vq->last_used_idx;
+    uint16_t mapped = 0;
+    for (uint16_t i = 0; i < vq->size && i < vq->pkt_map.size(); ++i) {
+        if (vq->pkt_map.at(i) != nullptr) {
+            ++mapped;
+        }
+    }
+    out.mapped = mapped;
+    vq->lock.unlock_irqrestore(FLAGS);
 }
 
 // Per-queue-pair MSI-X vector control. The MSI-X entry index matches the
@@ -1034,6 +1059,47 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     return 0;
 }
 }  // namespace
+
+auto virtio_net_diag_snapshot(VirtIONetDiagSnapshot* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (size_t dev_idx = 0; dev_idx < device_count && count < max; ++dev_idx) {
+        auto* dev = devices.at(dev_idx);
+        if (dev == nullptr) {
+            continue;
+        }
+
+        uint8_t const CONFIGURED = std::min<uint8_t>(dev->configured_queue_pairs, VIRTIO_NET_MAX_QUEUE_PAIRS);
+        for (uint8_t pair_idx = 0; pair_idx < CONFIGURED && count < max; ++pair_idx) {
+            auto& pair = dev->queue_pairs.at(pair_idx);
+            auto& row = out[count++];
+            row.name = dev->netdev.name;
+            row.ifindex = dev->netdev.ifindex;
+            row.negotiated_features = dev->negotiated_features;
+            row.pair = pair_idx;
+            row.num_queue_pairs = dev->num_queue_pairs;
+            row.configured_queue_pairs = dev->configured_queue_pairs;
+            row.hdr_size = dev->hdr_size;
+            row.irq_vector = pair.irq_vector;
+            row.msix_enabled = dev->msix_enabled;
+            row.active = pair_idx < dev->num_queue_pairs;
+            row.napi_state = static_cast<uint8_t>(pair.napi.state.load(std::memory_order_acquire));
+            row.napi_has_work = pair.napi.has_work.load(std::memory_order_acquire);
+            row.napi_polls = pair.napi.poll_count;
+            row.napi_completes = pair.napi.complete_count;
+            if (pair.napi.worker != nullptr) {
+                row.napi_worker_pid = pair.napi.worker->pid;
+                row.napi_worker_cpu = pair.napi.worker->cpu;
+            }
+            fill_virtqueue_diag(pair.rxq, row.rx);
+            fill_virtqueue_diag(pair.txq, row.tx);
+        }
+    }
+    return count;
+}
 
 auto virtio_net_init() -> int {
     int found = 0;

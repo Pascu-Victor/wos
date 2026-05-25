@@ -308,12 +308,9 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
         }
 
         // Limit by send window
-        uint32_t window = cb->snd_wnd;
-        if (window == 0) {
-            window = 1;
-        }
+        uint32_t const WINDOW = cb->snd_wnd;
         uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
-        if (IN_FLIGHT >= window) {
+        if (IN_FLIGHT >= WINDOW) {
             cb->lock.unlock();
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
@@ -324,7 +321,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             defer_socket_wait(sock);
             return -EAGAIN;
         }
-        uint32_t const AVAILABLE = window - IN_FLIGHT;
+        uint32_t const AVAILABLE = WINDOW - IN_FLIGHT;
         chunk = std::min<size_t>(chunk, AVAILABLE);
 
         cb->lock.unlock();
@@ -820,6 +817,42 @@ auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
     }
     bucket.lock.unlock();
     return nullptr;
+}
+
+auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (auto& bucket : listener_hash) {
+        bucket.lock.lock();
+        for (TcpCB const* cb = bucket.head; cb != nullptr && count < max; cb = cb->hash_next) {
+            if (cb->state != TcpState::LISTEN) {
+                continue;
+            }
+
+            auto& row = out[count++];
+            row.local_ip = cb->local_ip;
+            row.local_port = cb->local_port;
+            row.state = static_cast<uint8_t>(cb->state);
+            row.rcv_wnd = cb->rcv_wnd;
+            row.refcount = cb->refcnt.load(std::memory_order_acquire);
+            Socket const* sock = cb->socket;
+            if (sock != nullptr) {
+                row.owner_pid = sock->owner_pid;
+                row.accept_queue = sock->aq_count;
+                row.backlog = sock->backlog;
+                row.rcvbuf_used = sock->rcvbuf.available();
+                row.rcvbuf_capacity = sock->rcvbuf.capacity;
+            }
+        }
+        bucket.lock.unlock();
+        if (count >= max) {
+            break;
+        }
+    }
+    return count;
 }
 
 }  // namespace ker::net::proto

@@ -147,6 +147,7 @@ struct Socket {
     bool reuse_addr = false;
     bool reuse_port = false;
     bool nonblock = false;
+    uint32_t bound_ifindex = 0;
 
     ker::mod::sys::Spinlock lock;  // protects accept_queue and state transitions
 };

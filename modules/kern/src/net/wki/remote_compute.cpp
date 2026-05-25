@@ -76,6 +76,46 @@ uint64_t g_last_load_report_us = 0;                            // NOLINT(cppcore
 uint16_t g_preferred_remote_cursor = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_compute_lock;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+struct SubmittedIpcCleanup {
+    std::array<WkiIpcFdEntry, 16> map = {};
+    uint16_t count = 0;
+    uint16_t target_node = WKI_NODE_INVALID;
+};
+
+void remember_submitted_ipc_fds(SubmittedTask& submitted, const WkiIpcFdEntry* ipc_fd_map, uint16_t ipc_fd_count) {
+    submitted.ipc_fd_count = 0;
+    if (ipc_fd_map == nullptr || ipc_fd_count == 0) {
+        return;
+    }
+
+    uint16_t const COPY_COUNT = std::min<uint16_t>(ipc_fd_count, static_cast<uint16_t>(submitted.ipc_fd_map.size()));
+    for (uint16_t i = 0; i < COPY_COUNT; ++i) {
+        submitted.ipc_fd_map.at(i) = ipc_fd_map[i];
+    }
+    submitted.ipc_fd_count = COPY_COUNT;
+}
+
+auto submitted_ipc_cleanup_snapshot_locked(const SubmittedTask* submitted) -> SubmittedIpcCleanup {
+    SubmittedIpcCleanup cleanup = {};
+    if (submitted == nullptr || submitted->ipc_fd_count == 0) {
+        return cleanup;
+    }
+
+    cleanup.target_node = submitted->target_node;
+    cleanup.count = std::min<uint16_t>(submitted->ipc_fd_count, static_cast<uint16_t>(cleanup.map.size()));
+    for (uint16_t i = 0; i < cleanup.count; ++i) {
+        cleanup.map.at(i) = submitted->ipc_fd_map.at(i);
+    }
+    return cleanup;
+}
+
+void cleanup_submitted_ipc_exports(const SubmittedIpcCleanup& cleanup) {
+    if (cleanup.count == 0 || cleanup.target_node == WKI_NODE_INVALID) {
+        return;
+    }
+    wki_ipc_cleanup_exported_fds(cleanup.map.data(), cleanup.count, cleanup.target_node);
+}
+
 // Pending queue for VFS_REF/RESOURCE_REF task submits.
 // These delivery modes call load_elf_from_vfs_path() which does blocking
 // remote VFS reads.  Running those from NAPI poll context causes
@@ -196,9 +236,14 @@ constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
 constexpr uint32_t WKI_VFS_LOAD_MAX_ATTEMPTS = 24;
 constexpr uint64_t WKI_VFS_LOAD_RETRY_WINDOW_US = 15000000;
 constexpr uint64_t WKI_VFS_LOAD_RETRY_BACKOFF_US = 750000;
-constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 8;
-constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
-constexpr uint64_t WKI_EXEC_CACHE_RETENTION_US = 30000000;
+// Remote executable buffers sit on the receiver and prevent repeat VFS_REF
+// submits from retransferring multi-MiB binaries over the same WKI links that
+// carry stdout/stderr pipes.  Keep enough room for the normal perf-suite mix
+// (renderbench + testprog + testd) and retain finished workers long enough that
+// early-finishing render nodes stay warm for the next run.
+constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 16;
+constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 96ULL * 1024ULL * 1024ULL;
+constexpr uint64_t WKI_EXEC_CACHE_RETENTION_US = 300000000;
 constexpr int32_t WKI_SIGINT_NUM = 2;
 constexpr int32_t WKI_SIGKILL_NUM = 9;
 constexpr int32_t WKI_SIGTERM_NUM = 15;
@@ -575,6 +620,7 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
         uint64_t const WAITING_PID = waiting_pids.at(i);
         auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
         if (waiting_task != nullptr) {
+            bool completed_wait = false;
             if (!waiting_task->deferred_task_switch) {
                 waiting_task->context.regs.rax = proxy->pid;
                 if (waiting_task->wait_status_user_addr != 0 && waiting_task->pagemap != nullptr) {
@@ -586,6 +632,13 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
                     waiting_task->wait_status_user_addr = 0;
                     waiting_task->wait_status_phys_addr = 0;
                 }
+                waiting_task->wait_rusage_user_addr = 0;
+                waiting_task->wait_rusage_phys_addr = 0;
+                waiting_task->waiting_for_pid = 0;
+                completed_wait = true;
+            }
+            if (completed_wait && !proxy->waited_on) {
+                proxy->waited_on = true;
             }
             uint64_t const CPU = ker::mod::sched::get_least_loaded_cpu();
             ker::mod::sched::reschedule_task_for_cpu(CPU, waiting_task);
@@ -615,6 +668,7 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
 
     proxy->exit_status = WAIT_STATUS;
     proxy->has_exited = true;
+    proxy->exit_notify_ready.store(true, std::memory_order_release);
     proxy->wki_proxy_task_id = 0;
 
     // Send SIGCHLD to parent and wake it if blocked in waitpid(-1, ...).
@@ -653,6 +707,10 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
+            } else if ((parent->sig_pending & ~parent->sig_mask & (1ULL << (WKI_SIGCHLD_NUM - 1))) != 0 &&
+                       parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING && parent->wait_channel != nullptr &&
+                       std::strcmp(parent->wait_channel, "sigsuspend") == 0) {
+                ker::mod::sched::wake_task_for_signal(parent);
             }
             parent->release();
         }
@@ -1158,6 +1216,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     const bool STRICT_TARGET = EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
     const bool PREFER_REMOTE = !EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
     const bool STRICT_REMOTE = PREFER_REMOTE && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
+    const bool AUTOMATIC_PLACEMENT = !EXPLICIT_TARGET && !PREFER_REMOTE;
     const bool REMOTE_RECEIVER =
         task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0;
 
@@ -1213,9 +1272,11 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
         best_node = NODE_ID;
     } else if (PREFER_REMOTE) {
-        s_compute_lock.lock();
-        best_node = wki_preferred_remote_node();
-        s_compute_lock.unlock();
+        if (!wki_ipc_find_pipe_affinity_node(task, &best_node)) {
+            s_compute_lock.lock();
+            best_node = wki_preferred_remote_node();
+            s_compute_lock.unlock();
+        }
         if (best_node == WKI_NODE_INVALID) {
             return STRICT_REMOTE ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
         }
@@ -1238,8 +1299,13 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     std::array<WkiIpcFdEntry, 16> ipc_fd_map = {};
     uint16_t ipc_fd_count = 0;
     wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count);
+    bool vfs_ref_submit_attempted = false;
 
-    if (HAS_EXE_PATH && (!task->wki_prefer_inline || !HAS_INLINE_BINARY)) {
+    // Automatic placement runs on the normal exec path and must be cheap to
+    // decline. VFS_REF can wait on remote filesystem progress for the full task
+    // submit timeout, so reserve it for explicit remote policies.
+    bool const ALLOW_VFS_REF = !AUTOMATIC_PLACEMENT;
+    if (ALLOW_VFS_REF && HAS_EXE_PATH && (!task->wki_prefer_inline || !HAS_INLINE_BINARY)) {
         // Resolve relative exe_path against the task's cwd so that the
         // VFS_REF path sent to the remote node is always absolute.
         // We cannot use make_absolute() here because it queries
@@ -1268,6 +1334,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         constexpr size_t VFS_REF_PATH_MAX = 5 + WKI_HOSTNAME_MAX + ABS_PATH_MAX;
         std::array<char, VFS_REF_PATH_MAX> vfs_ref_path = {};
         if (build_vfs_ref_path(best_node, local_path, vfs_ref_path.data(), vfs_ref_path.size())) {
+            vfs_ref_submit_attempted = true;
             tid = wki_task_submit_vfs_ref(best_node, vfs_ref_path.data(), spec.argv, spec.envp, spec.cwd, task, ipc_fd_map.data(),
                                           ipc_fd_count);
 #ifdef WKI_DEBUG
@@ -1279,11 +1346,17 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     }
 
     if (tid == 0 && BINARY_FITS) {
+        if (vfs_ref_submit_attempted) {
+            ipc_fd_map = {};
+            ipc_fd_count = 0;
+            wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count);
+        }
         tid = wki_task_submit_inline(best_node, task->elf_buffer, static_cast<uint32_t>(task->elf_buffer_size), spec.argv, spec.envp,
                                      spec.cwd, task, ipc_fd_map.data(), ipc_fd_count);
     }
 
     if (tid == 0) {
+        wki_ipc_cleanup_exported_fds(ipc_fd_map.data(), ipc_fd_count, best_node);
         return STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
     }
 
@@ -1364,12 +1437,15 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
                             const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map,
                             uint16_t ipc_fd_count) -> uint32_t {
+    auto cleanup_ipc_exports = [&]() { wki_ipc_cleanup_exported_fds(ipc_fd_map, ipc_fd_count, target_node); };
     if (binary == nullptr || binary_len == 0) {
+        cleanup_ipc_exports();
         return 0;
     }
 
     SubmitContextInfo context_info = {};
     if (!build_submit_context_info(local_task, argv, envp, cwd, &context_info)) {
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1379,6 +1455,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint32_t) + binary_len + context_info.data_len + IPC_DATA_LEN);
     if (total > WKI_ETH_MAX_PAYLOAD) {
         ker::mod::dbg::log("[WKI] Task binary too large for inline submit: %u bytes", binary_len);
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1396,6 +1473,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     st.exit_status = 0;
     st.local_task = local_task;
     st.proxy_ready = false;
+    remember_submitted_ipc_fds(st, ipc_fd_map, ipc_fd_count);
 
     g_submitted_tasks.push_back(std::move(st));
     s_compute_lock.unlock();
@@ -1413,6 +1491,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1470,6 +1549,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID, SEND_RET,
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), binary_len, CALLSITE);
         return 0;
@@ -1489,6 +1569,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] Task submit wait failed: task_id=%u target=0x%04x rc=%d (%s)", TASK_ID, target_node, WAIT_RC,
                            errno_name(WAIT_RC));
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID, WAIT_RC,
@@ -1501,6 +1582,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] Task rejected: task_id=%u status=%u", TASK_ID, accept_status);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID,
                                 -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
@@ -1523,17 +1605,21 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
                              const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map,
                              uint16_t ipc_fd_count) -> uint32_t {
+    auto cleanup_ipc_exports = [&]() { wki_ipc_cleanup_exported_fds(ipc_fd_map, ipc_fd_count, target_node); };
     if (vfs_path == nullptr || vfs_path[0] == '\0') {
+        cleanup_ipc_exports();
         return 0;
     }
 
     auto path_len = static_cast<uint16_t>(std::strlen(vfs_path));
     if (path_len == 0) {
+        cleanup_ipc_exports();
         return 0;
     }
 
     SubmitContextInfo context_info = {};
     if (!build_submit_context_info(local_task, argv, envp, cwd, &context_info)) {
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1542,6 +1628,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint16_t) + path_len + context_info.data_len + IPC_DATA_LEN);
     if (total > WKI_ETH_MAX_PAYLOAD) {
         ker::mod::dbg::log("[WKI] VFS_REF path too large: %u bytes", path_len);
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1558,6 +1645,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     st.exit_status = 0;
     st.local_task = local_task;
     st.proxy_ready = false;
+    remember_submitted_ipc_fds(st, ipc_fd_map, ipc_fd_count);
 
     g_submitted_tasks.push_back(std::move(st));
     s_compute_lock.unlock();
@@ -1574,6 +1662,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         return 0;
     }
 
@@ -1631,6 +1720,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, SEND_RET,
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
         return 0;
@@ -1650,6 +1740,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] VFS_REF submit wait failed: task_id=%u rc=%d (%s) timeout_us=%llu", TASK_ID, WAIT_RC, errno_name(WAIT_RC),
                            WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, WAIT_RC,
@@ -1662,6 +1753,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] VFS_REF task rejected: task_id=%u status=%u", TASK_ID, accept_status);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID,
                                 -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
@@ -1796,6 +1888,7 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
 // ===============================================================================
 
 void wki_task_cancel(uint32_t task_id, int signum) {
+    SubmittedIpcCleanup cleanup = {};
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(task_id);
     if (task == nullptr) {
@@ -1804,6 +1897,7 @@ void wki_task_cancel(uint32_t task_id, int signum) {
     }
 
     uint16_t const TARGET_NODE = task->target_node;
+    cleanup = submitted_ipc_cleanup_snapshot_locked(task);
     s_compute_lock.unlock();
 
     TaskCancelPayload cancel = {};
@@ -1811,6 +1905,7 @@ void wki_task_cancel(uint32_t task_id, int signum) {
     cancel.signum = signum;
 
     wki_send(TARGET_NODE, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
+    cleanup_submitted_ipc_exports(cleanup);
 }
 
 // ===============================================================================
@@ -1867,6 +1962,38 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
 
     // The proxy task will be cleaned up when TASK_COMPLETE arrives
     // (or if the peer is fenced, the fencing cleanup will handle it)
+    return true;
+}
+
+auto wki_proxy_task_remote_info(const ker::mod::sched::task::Task* task, uint16_t* target_node, char* hostname, size_t hostname_size)
+    -> bool {
+    if (task == nullptr || task->wki_proxy_task_id == 0) {
+        return false;
+    }
+
+    uint16_t node = WKI_NODE_INVALID;
+    s_compute_lock.lock();
+    SubmittedTask const* submitted = find_submitted_task_any(task->wki_proxy_task_id);
+    if (submitted != nullptr) {
+        node = submitted->target_node;
+    }
+    s_compute_lock.unlock();
+
+    if (node == WKI_NODE_INVALID) {
+        return false;
+    }
+
+    if (target_node != nullptr) {
+        *target_node = node;
+    }
+    if (hostname != nullptr && hostname_size > 0) {
+        hostname[0] = '\0';
+        const char* peer_hostname = wki_peer_get_hostname(node);
+        if (peer_hostname != nullptr && peer_hostname[0] != '\0') {
+            std::strncpy(hostname, peer_hostname, hostname_size - 1);
+            hostname[hostname_size - 1] = '\0';
+        }
+    }
     return true;
 }
 
@@ -1998,23 +2125,7 @@ auto wki_preferred_remote_node() -> uint16_t {
         return NODE;
     }
 
-    candidate_count = 0;
-    for (auto* peer = std::begin(g_wki.peers); peer != std::end(g_wki.peers); ++peer) {
-        if (peer->node_id != WKI_NODE_INVALID && peer->state == PeerState::CONNECTED) {
-            candidates.at(candidate_count++) = peer->node_id;
-            if (candidate_count == candidates.size()) {
-                break;
-            }
-        }
-    }
-
-    if (candidate_count == 0) {
-        return WKI_NODE_INVALID;
-    }
-
-    uint16_t const NODE = candidates.at(g_preferred_remote_cursor % candidate_count);
-    ++g_preferred_remote_cursor;
-    return NODE;
+    return WKI_NODE_INVALID;
 }
 
 }  // namespace
@@ -2148,7 +2259,10 @@ void wki_remote_compute_check_completions() {
             // failed remote task, but this path should now be rare because
             // RunningRemoteTask holds a ref until completion is reported.
             completed = true;
-        } else if (task->has_exited) {
+        } else if (task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited) {
+            // wos_proc_exit() sets has_exited before closing fds. Wait for
+            // exit_notify_ready so remote stdout/stderr proxy closes cannot be
+            // overtaken by TASK_COMPLETE.
             exit_status = normalize_local_exit_status_for_wire(task->exit_status);
             completed = true;
         }
@@ -3228,8 +3342,27 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
                        new_task->thread ? new_task->thread->tlsBaseVirt : 0, new_task->thread ? new_task->thread->safestackPtrValue : 0);
 #endif
 
+    // Hold the completion-monitor reference before the task can run.  Very
+    // short tasks may exit before post_task_balanced() returns.
+    auto* completion_task_ref = static_cast<ker::mod::sched::task::Task*>(nullptr);
+    if (new_task->try_acquire()) {
+        completion_task_ref = new_task;
+    } else {
+        delete new_task;
+        delete EXEC.output;
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        reject.remote_pid = 0;
+        ker::mod::dbg::log("[WKI] Task submit ref failed: task_id=%u pid=0x%lx", submit->task_id, LAUNCHED_PID);
+        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
+        return;
+    }
+
     // Post to scheduler
     if (!ker::mod::sched::post_task_balanced(new_task)) {
+        completion_task_ref->release();
         delete new_task;
         delete EXEC.output;
         TaskResponsePayload reject = {};
@@ -3253,9 +3386,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     rt.task_id = submit->task_id;
     rt.submitter_node = hdr->src_node;
     rt.local_pid = LAUNCHED_PID;
-    if (new_task->try_acquire()) {
-        rt.task = new_task;
-    }
+    rt.task = completion_task_ref;
     rt.output = EXEC.output;
     s_compute_lock.lock();
     g_running_remote_tasks.push_back(rt);
@@ -3506,6 +3637,9 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     task->active = false;
     s_compute_lock.unlock();
 
+    // IPC data/close packets may already be queued on the deferred IPC worker
+    // when TASK_COMPLETE arrives.  Normal proxy close, cancel, or peer fence
+    // paths own export teardown so queued data cannot lose its backing file.
     if (emit_task_runtime) {
         uint64_t const CALLSITE = WOS_PERF_CALLSITE();
         perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::TASK_RUNTIME, hdr != nullptr ? hdr->src_node : WKI_NODE_INVALID,

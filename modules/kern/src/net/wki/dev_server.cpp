@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -23,6 +24,7 @@
 #include <net/wki/zone.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/workqueue.hpp>
 #include <utility>
 
 #include "platform/sys/spinlock.hpp"
@@ -34,9 +36,18 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 
 namespace {
-std::deque<DevServerBinding> g_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool g_dev_server_initialized = false;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_server_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::deque<DevServerBinding> g_bindings;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_dev_server_initialized = false;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_server_lock;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sched::Workqueue* s_vfs_op_wq = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct DeferredVfsOp {
+    ker::mod::sched::WorkItem work{};
+    WkiHeader hdr{};
+    uint16_t op_id = 0;
+    uint16_t req_data_len = 0;
+    uint8_t* req_data = nullptr;
+};
 
 // s_server_lock must be held by caller
 auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> DevServerBinding* {
@@ -88,6 +99,83 @@ auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice
         }
     }
     return nullptr;
+}
+
+auto is_vfs_op(uint16_t op_id) -> bool { return op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK; }
+
+auto req_cookie_from_header(const WkiHeader* hdr) -> uint16_t {
+    return hdr != nullptr ? static_cast<uint16_t>(hdr->seq_num & UINT16_MAX) : 0;
+}
+
+void send_vfs_error_response(uint16_t dst_node, uint16_t channel_id, uint16_t op_id, int16_t status, uint16_t req_cookie) {
+    DevOpRespPayload resp = {};
+    resp.op_id = op_id;
+    resp.status = status;
+    resp.data_len = 0;
+    resp.reserved = req_cookie;
+    wki_send(dst_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+}
+
+void run_deferred_vfs_op(void* arg) {
+    auto* op = static_cast<DeferredVfsOp*>(arg);
+    if (op == nullptr) {
+        return;
+    }
+
+    std::array<char, sizeof(DevServerBinding::vfs_export_path)> export_path{};
+    std::array<char, sizeof(DevServerBinding::vfs_export_name)> export_name{};
+    bool binding_active = false;
+
+    {
+        uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+        DevServerBinding* binding = find_binding_by_channel(op->hdr.src_node, op->hdr.channel_id);
+        if (binding != nullptr && binding->resource_type == ResourceType::VFS) {
+            std::memcpy(export_path.data(), static_cast<const void*>(binding->vfs_export_path), export_path.size());
+            std::memcpy(export_name.data(), static_cast<const void*>(binding->vfs_export_name), export_name.size());
+            export_path.at(export_path.size() - 1) = '\0';
+            export_name.at(export_name.size() - 1) = '\0';
+            binding_active = true;
+        }
+        s_server_lock.unlock_irqrestore(SRV_FLAGS);
+    }
+
+    if (binding_active) {
+        detail::handle_vfs_op(&op->hdr, op->hdr.channel_id, export_path.data(), export_name.data(), op->op_id, op->req_data,
+                              op->req_data_len);
+    } else {
+        send_vfs_error_response(op->hdr.src_node, op->hdr.channel_id, op->op_id, -ENOTCONN, req_cookie_from_header(&op->hdr));
+    }
+
+    delete[] op->req_data;
+    delete op;
+}
+
+auto queue_vfs_op(const WkiHeader* hdr, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> bool {
+    if (s_vfs_op_wq == nullptr) {
+        return false;
+    }
+
+    auto* op = new (std::nothrow) DeferredVfsOp{};
+    if (op == nullptr) {
+        return false;
+    }
+
+    if (req_data_len > 0) {
+        op->req_data = new (std::nothrow) uint8_t[req_data_len];
+        if (op->req_data == nullptr) {
+            delete op;
+            return false;
+        }
+        std::memcpy(op->req_data, req_data, req_data_len);
+    }
+
+    op->work.fn = run_deferred_vfs_op;
+    op->work.arg = op;
+    op->hdr = *hdr;
+    op->op_id = op_id;
+    op->req_data_len = req_data_len;
+    s_vfs_op_wq->enqueue(&op->work);
+    return true;
 }
 
 struct ExistingNetBindingInfo {
@@ -226,6 +314,10 @@ auto reserve_attach_channel(uint16_t requester_node, uint16_t requested_channel,
 void wki_dev_server_init() {
     if (g_dev_server_initialized) {
         return;
+    }
+    s_vfs_op_wq = ker::mod::sched::Workqueue::create("wki_vfs_srv");
+    if (s_vfs_op_wq == nullptr) {
+        ker::mod::dbg::log("[WKI] Dev server failed to create VFS workqueue");
     }
     g_dev_server_initialized = true;
     ker::mod::dbg::log("[WKI] Dev server subsystem initialized");
@@ -921,6 +1013,8 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
+    bool const IS_VFS_OP = is_vfs_op(req->op_id);
+
     // Find binding by (src_node, channel_id) - pointer is stable (std::deque reference stability)
     DevServerBinding* binding = nullptr;
     {
@@ -949,6 +1043,11 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             return;
         }
 
+        if (IS_VFS_OP) {
+            send_vfs_error_response(hdr->src_node, hdr->channel_id, req->op_id, -ENOTCONN, req_cookie_from_header(hdr));
+            return;
+        }
+
         // Send error response
         DevOpRespPayload resp = {};
         resp.op_id = req->op_id;
@@ -958,14 +1057,17 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
-    // Dispatch VFS operations to remote_vfs handler.
+    // Dispatch VFS operations to a worker thread. Local VFS/XFS operations can
+    // block for milliseconds or longer; keeping them out of RX preserves ACK,
+    // heartbeat, and fence progress for the peer set.
     // Upper bound is OP_VFS_READ_BULK (0x0413), the highest VFS op code.
     // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411),
     // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
     // sit above OP_VFS_SEEK_END (0x040E).
-    if (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) {
-        detail::handle_vfs_op(hdr, hdr->channel_id, static_cast<const char*>(binding->vfs_export_path),
-                              static_cast<const char*>(binding->vfs_export_name), req->op_id, req_data, REQ_DATA_LEN);
+    if (IS_VFS_OP) {
+        if (!queue_vfs_op(hdr, req->op_id, req_data, REQ_DATA_LEN)) {
+            send_vfs_error_response(hdr->src_node, hdr->channel_id, req->op_id, -ENOMEM, req_cookie_from_header(hdr));
+        }
         return;
     }
 

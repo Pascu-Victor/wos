@@ -36,9 +36,23 @@ constexpr uint64_t NO_SEQUENCE = 0;
 constexpr int EPOLLIN_VALUE = 0x001;
 constexpr int EPOLLOUT_VALUE = 0x004;
 
+struct ModuleOutputRoute {
+    const char* module;
+    uint32_t required_flags;
+    uint32_t rejected_flags;
+    uint32_t devices;
+};
+
+constexpr std::array<ModuleOutputRoute, 2> DEFAULT_MODULE_OUTPUT_ROUTES{{
+    {.module = "init", .required_flags = 0, .rejected_flags = JOURNAL_FLAG_KERNEL, .devices = JOURNAL_OUTPUT_SERIAL},
+    {.module = "netd", .required_flags = 0, .rejected_flags = JOURNAL_FLAG_KERNEL, .devices = JOURNAL_OUTPUT_SERIAL},
+}};
+
 struct ModuleDevice {
     bool used = false;
     bool device_registered = false;
+    bool output_devices_overridden = false;
+    uint32_t output_devices = JOURNAL_OUTPUT_NONE;
     std::array<char, JOURNAL_MODULE_MAX> module{};
     std::array<char, vfs::devfs::DEVFS_NAME_MAX> dev_name{};
     ker::dev::Device device{};
@@ -111,6 +125,20 @@ void copy_lower_module(char* dst, size_t dst_size, const char* module) {
         dst[i] = to_lower_ascii(src[i]);
     }
     dst[i] = '\0';
+}
+
+auto default_output_devices_for_record(const char* module, uint32_t flags) -> uint32_t {
+    if ((flags & JOURNAL_FLAG_KERNEL) != 0) {
+        return JOURNAL_OUTPUT_SERIAL;
+    }
+
+    for (const auto& route : DEFAULT_MODULE_OUTPUT_ROUTES) {
+        if (std::strcmp(route.module, module) == 0 && (flags & route.required_flags) == route.required_flags &&
+            (flags & route.rejected_flags) == 0) {
+            return route.devices;
+        }
+    }
+    return JOURNAL_OUTPUT_NONE;
 }
 
 auto extract_prefix_module(const char* message, char* out_module, size_t out_module_size, const char** out_message) -> bool {
@@ -216,6 +244,13 @@ auto oldest_sequence_locked() -> uint64_t {
         return LATEST - JOURNAL_RING_SIZE + 1;
     }
     return 1;
+}
+
+auto should_write_serial(const JournalRecord& rec, uint32_t output_devices) -> bool {
+    if (rec.level >= static_cast<uint8_t>(LogLevel::PANIC)) {
+        return true;
+    }
+    return (output_devices & JOURNAL_OUTPUT_SERIAL) != 0 && rec.level >= s_serial_threshold.load(std::memory_order_acquire);
 }
 
 void serial_write_record(const JournalRecord& rec) {
@@ -393,6 +428,33 @@ void set_serial_threshold(LogLevel level) { s_serial_threshold.store(static_cast
 
 auto get_serial_threshold() -> LogLevel { return static_cast<LogLevel>(s_serial_threshold.load(std::memory_order_acquire)); }
 
+void set_module_output_devices(const char* module, uint32_t devices) {
+    std::array<char, JOURNAL_MODULE_MAX> module_buf{};
+    copy_lower_module(module_buf.data(), module_buf.size(), module);
+
+    uint64_t const FLAGS = s_lock.lock_irqsave();
+    auto* module_entry = alloc_module_locked(module_buf.data());
+    if (module_entry != nullptr) {
+        module_entry->output_devices_overridden = true;
+        module_entry->output_devices = devices;
+        maybe_register_module_device(*module_entry);
+    }
+    s_lock.unlock_irqrestore(FLAGS);
+}
+
+auto get_module_output_devices(const char* module) -> uint32_t {
+    std::array<char, JOURNAL_MODULE_MAX> module_buf{};
+    copy_lower_module(module_buf.data(), module_buf.size(), module);
+
+    uint64_t const FLAGS = s_lock.lock_irqsave();
+    auto* module_entry = find_module_locked(module_buf.data());
+    uint32_t const DEVICES = module_entry != nullptr && module_entry->output_devices_overridden
+                                 ? module_entry->output_devices
+                                 : default_output_devices_for_record(module_buf.data(), 0);
+    s_lock.unlock_irqrestore(FLAGS);
+    return DEVICES;
+}
+
 void emit(LogLevel level, const char* module, const char* message, uint32_t flags) {
     std::array<char, JOURNAL_MODULE_MAX> module_buf{};
     const char* body = message != nullptr ? message : "";
@@ -462,9 +524,14 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     rec.message[msg_len] = '\0';
     rec.message_len = static_cast<uint16_t>(msg_len);
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    uint32_t output_devices = default_output_devices_for_record(rec.module, rec.flags);
     uint64_t const IRQ_FLAGS = s_lock.lock_irqsave();
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     auto* module_entry = alloc_module_locked(rec.module);
+    if (module_entry != nullptr && module_entry->output_devices_overridden) {
+        output_devices = module_entry->output_devices;
+    }
     if (module_entry != nullptr) {
         maybe_register_module_device(*module_entry);
     }
@@ -474,7 +541,7 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
     s_oldest_sequence.store(oldest_sequence_locked(), std::memory_order_release);
     s_lock.unlock_irqrestore(IRQ_FLAGS);
 
-    if (rec.level >= s_serial_threshold.load(std::memory_order_acquire)) {
+    if (should_write_serial(rec, output_devices)) {
         serial_write_record(rec);
     }
     wake_waiters();

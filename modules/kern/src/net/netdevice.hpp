@@ -60,6 +60,25 @@ struct NetDevice {
     uint64_t tx_dropped = 0;
 };
 
+struct NetDeviceSnapshot {
+    std::array<char, NETDEV_NAME_LEN> name{};
+    proto::MacAddress mac{};
+    uint32_t mtu = 0;
+    uint32_t tx_queue_len = 0;
+    uint32_t link_flags = 0;
+    uint32_t ifindex = 0;
+    uint8_t state = 0;
+    bool remotable = false;
+    bool wki_rx_forward = false;
+    bool wki_transport = false;
+    uint64_t rx_packets = 0;
+    uint64_t tx_packets = 0;
+    uint64_t rx_bytes = 0;
+    uint64_t tx_bytes = 0;
+    uint64_t rx_dropped = 0;
+    uint64_t tx_dropped = 0;
+};
+
 // Register a new network device (assigns ifindex, auto-names "ethN" if name is empty)
 auto netdev_register(NetDevice* dev) -> int;
 
@@ -71,6 +90,7 @@ auto netdev_unregister(NetDevice* dev) -> int;
 auto netdev_find_by_name(std::string_view name) -> NetDevice*;
 auto netdev_count() -> size_t;
 auto netdev_at(size_t i) -> NetDevice*;
+auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t;
 
 // Called by drivers when a packet is received
 void netdev_rx(NetDevice* dev, PacketBuffer* pkt);

@@ -1378,10 +1378,10 @@ void resume_syscall_accounting() {
     task->syscall_account_start_us = time::get_us();
 }
 
-void preempt_disable_at(uint64_t caller) {
+auto preempt_disable_token_at(uint64_t caller) -> task::Task* {
     auto* task = current_task_for_preempt();
     if (task == nullptr) {
-        return;
+        return nullptr;
     }
 
     if (task->preempt_disable_depth == 0) {
@@ -1389,12 +1389,14 @@ void preempt_disable_at(uint64_t caller) {
         task->preempt_disable_owner = caller;
     }
     task->preempt_disable_depth++;
+    return task;
 }
+
+void preempt_disable_at(uint64_t caller) { (void)preempt_disable_token_at(caller); }
 
 void preempt_disable() { preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
 
-void preempt_enable_at(uint64_t caller) {
-    auto* task = current_task_for_preempt();
+void preempt_enable_token_at(task::Task* task, uint64_t caller) {
     if (task == nullptr) {
         return;
     }
@@ -1430,6 +1432,8 @@ void preempt_enable_at(uint64_t caller) {
         }
     }
 }
+
+void preempt_enable_at(uint64_t caller) { preempt_enable_token_at(current_task_for_preempt(), caller); }
 
 void preempt_enable() { preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
 
@@ -2379,6 +2383,9 @@ void check_pending_signals_deferred(task::Task* task) {
     if (handler.handler == 0 /*SIG_DFL*/) {
         // Signals with default-ignore action: SIGCHLD, SIGURG, SIGWINCH, SIGCONT
         if (SIGNO == 17 || SIGNO == 23 || SIGNO == 28 || SIGNO == 18) {
+            if (task->sigsuspend_active) {
+                task->sig_mask = task->signal_frame_saved_mask();
+            }
             return;
         }
         // Stop signals
@@ -2393,6 +2400,9 @@ void check_pending_signals_deferred(task::Task* task) {
     }
 
     if (handler.handler == 1 /*SIG_IGN*/) {
+        if (task->sigsuspend_active) {
+            task->sig_mask = task->signal_frame_saved_mask();
+        }
         return;
     }
 
@@ -2406,7 +2416,7 @@ void check_pending_signals_deferred(task::Task* task) {
 
     sigframe->pretcode = handler.restorer;
     sigframe->signo = static_cast<uint64_t>(SIGNO);
-    sigframe->saved_mask = task->sig_mask;
+    sigframe->saved_mask = task->signal_frame_saved_mask();
     sigframe->saved_rip = USER_RIP;
     sigframe->saved_rsp = USER_RSP;
     sigframe->saved_rflags = USER_RFLAGS;
@@ -2629,89 +2639,162 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         }
     }
 
+    bool notify_wki_proxy_blocked = false;
+
     // Under lock: update EEVDF state and pick next task
-    task::Task* next_task = run_queues->this_cpu_locked([current_task, IS_YIELD, skip_wait_queue](RunQueue* rq) -> task::Task* {
-        // Account for time used during syscall
-        uint64_t const NOW_US = time::get_us();
-        auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
-        rq->last_tick_us = NOW_US;
-        if (delta_us <= 0) {
-            delta_us = 1;
-        }
-        int64_t const DELTA_NS = delta_us * 1000;
+    task::Task* next_task =
+        run_queues->this_cpu_locked([current_task, IS_YIELD, skip_wait_queue, &notify_wki_proxy_blocked](RunQueue* rq) -> task::Task* {
+            // Account for time used during syscall
+            uint64_t const NOW_US = time::get_us();
+            auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
+            rq->last_tick_us = NOW_US;
+            if (delta_us <= 0) {
+                delta_us = 1;
+            }
+            int64_t const DELTA_NS = delta_us * 1000;
 
-        if (current_task->type != task::TaskType::IDLE) {
-            account_task_runtime_delta(current_task, NOW_US, static_cast<uint64_t>(delta_us), false, true);
-        }
+            if (current_task->type != task::TaskType::IDLE) {
+                account_task_runtime_delta(current_task, NOW_US, static_cast<uint64_t>(delta_us), false, true);
+            }
 
-        if (rq->runnable_heap.contains(current_task)) {
-            int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
-            current_task->vruntime += VRUNTIME_DELTA;
-            rq->total_weighted_vruntime += VRUNTIME_DELTA * static_cast<int64_t>(current_task->sched_weight);
-        }
-
-        // A concurrent wakeup may have seen this task as rq->currentTask and
-        // set wakeupPending instead of moving it. Blocking now would lose that
-        // wake and leave the task stuck, so treat it as a yield instead.
-        //
-        // Remote execve handoff is the exception: once execve has been
-        // accepted as a proxy task, a signal wake must not turn the handoff
-        // back into a normal syscall return or userspace observes a spurious
-        // successful execve() return.
-        bool woke = current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
-        if (current_task->wki_proxy_task_id != 0 && current_task->wait_channel != nullptr &&
-            strcmp(current_task->wait_channel, "wki_execve_proxy") == 0) {
-            woke = false;
-        }
-
-        if (IS_YIELD || skip_wait_queue || woke) {
-            // A signal or concurrent wake can abort a futex block after the
-            // waiter node has already been published. Detach it here so a
-            // later futex_wait() does not keep replacing stale nodes.
-            ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
-
-            // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
             if (rq->runnable_heap.contains(current_task)) {
+                int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
+                current_task->vruntime += VRUNTIME_DELTA;
+                rq->total_weighted_vruntime += VRUNTIME_DELTA * static_cast<int64_t>(current_task->sched_weight);
+            }
+
+            // A concurrent wakeup may have seen this task as rq->currentTask and
+            // set wakeupPending instead of moving it. Blocking now would lose that
+            // wake and leave the task stuck, so treat it as a yield instead.
+            //
+            // Remote execve handoff is the exception: once execve has been
+            // accepted as a proxy task, a signal wake must not turn the handoff
+            // back into a normal syscall return or userspace observes a spurious
+            // successful execve() return.
+            bool woke = current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
+            if (current_task->wki_proxy_task_id != 0 && current_task->wait_channel != nullptr &&
+                strcmp(current_task->wait_channel, "wki_execve_proxy") == 0) {
+                woke = false;
+            }
+
+            if (IS_YIELD || skip_wait_queue || woke) {
+                // A signal or concurrent wake can abort a futex block after the
+                // waiter node has already been published. Detach it here so a
+                // later futex_wait() does not keep replacing stale nodes.
+                ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
+
+                // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
+                if (rq->runnable_heap.contains(current_task)) {
+                    note_perf_wait_callsite(current_task, current_task->context.frame.rip);
+                    current_task->slice_used_ns = 0;
+                    current_task->vdeadline = current_task->vruntime + ((static_cast<int64_t>(current_task->slice_ns) * 1024) /
+                                                                        static_cast<int64_t>(current_task->sched_weight));
+                    rq->runnable_heap.update(current_task);
+                }
+            } else {
+                // Block: remove from heap, add to wait list
+                if (rq->runnable_heap.contains(current_task)) {
+                    remove_from_sums(rq, current_task);
+                    rq->runnable_heap.remove(current_task);
+                }
+                current_task->last_run_us = current_task->slice_used_ns / 1000U;
                 note_perf_wait_callsite(current_task, current_task->context.frame.rip);
-                current_task->slice_used_ns = 0;
-                current_task->vdeadline = current_task->vruntime + ((static_cast<int64_t>(current_task->slice_ns) * 1024) /
-                                                                    static_cast<int64_t>(current_task->sched_weight));
-                rq->runnable_heap.update(current_task);
-            }
-        } else {
-            // Block: remove from heap, add to wait list
-            if (rq->runnable_heap.contains(current_task)) {
-                remove_from_sums(rq, current_task);
-                rq->runnable_heap.remove(current_task);
-            }
-            current_task->last_run_us = current_task->slice_used_ns / 1000U;
-            note_perf_wait_callsite(current_task, current_task->context.frame.rip);
-            current_task->last_sleep_start_us = NOW_US;
-            uint64_t const WAKE_AT_US = current_task->wake_at_us;
-            current_task->sched_queue = task::Task::sched_queue::WAITING;
-            rq->wait_list.push(current_task);
-            perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
-                               current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
-        }
+                current_task->last_sleep_start_us = NOW_US;
+                uint64_t const WAKE_AT_US = current_task->wake_at_us;
+                current_task->sched_queue = task::Task::sched_queue::WAITING;
+                rq->wait_list.push(current_task);
+                perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
+                                   current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
+                notify_wki_proxy_blocked = current_task->wki_proxy_task_id != 0;
 
-        // Advance minVruntime
-        int64_t const AVG = compute_avg_vruntime(rq);
-        if (AVG > rq->min_vruntime) {
-            int64_t const DELTA_MIN = AVG - rq->min_vruntime;
-            rq->min_vruntime = AVG;
-            rq->total_weighted_vruntime -= DELTA_MIN * rq->total_weight;
-        }
+                if (notify_wki_proxy_blocked) {
+                    // wki_proxy_task_blocked() can synchronously finalize proxy tasks
+                    // and wake waiters.  Keep current_task pointing at the stack we
+                    // are still running on until that callout is done.
+                    return nullptr;
+                }
+            }
 
-        // Pick next task
-        if (rq->runnable_heap.size == 0) {
-            rq->current_task = nullptr;
-            return nullptr;
+            // Advance minVruntime
+            int64_t const AVG = compute_avg_vruntime(rq);
+            if (AVG > rq->min_vruntime) {
+                int64_t const DELTA_MIN = AVG - rq->min_vruntime;
+                rq->min_vruntime = AVG;
+                rq->total_weighted_vruntime -= DELTA_MIN * rq->total_weight;
+            }
+
+            // Pick next task
+            if (rq->runnable_heap.size == 0) {
+                rq->current_task = nullptr;
+                return nullptr;
+            }
+            task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+            rq->current_task = next;
+            rq->current_task_start_us = time::get_us();  // Track for wakeup-preemption guard
+            return next;
+        });
+
+    if (notify_wki_proxy_blocked) {
+        ker::net::wki::wki_proxy_task_blocked(current_task);
+
+        next_task = run_queues->this_cpu_locked([current_task](RunQueue* rq) -> task::Task* {
+            if (current_task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE) {
+                bool woke = current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
+                if (current_task->wki_proxy_task_id != 0 && current_task->wait_channel != nullptr &&
+                    strcmp(current_task->wait_channel, "wki_execve_proxy") == 0) {
+                    woke = false;
+                }
+
+                if (woke && current_task->sched_queue == task::Task::sched_queue::WAITING) {
+                    char const* const WAIT_CHANNEL = current_task->wait_channel;
+                    rq->wait_list.remove(current_task);
+                    current_task->wants_block = false;
+                    current_task->wake_at_us = 0;
+                    current_task->voluntary_block = false;
+                    current_task->wait_channel = nullptr;
+                    current_task->sched_queue = task::Task::sched_queue::RUNNABLE;
+                    current_task->just_woke = !is_low_latency_handoff_wait_channel(WAIT_CHANNEL);
+                    current_task->vruntime =
+                        std::max(current_task->vruntime, compute_wakeup_floor_vruntime(rq, current_task, time::get_us(), WAIT_CHANNEL));
+                    current_task->vdeadline = current_task->vruntime + ((static_cast<int64_t>(current_task->slice_ns) * 1024) /
+                                                                        static_cast<int64_t>(current_task->sched_weight));
+                    current_task->slice_used_ns = 0;
+                    if (rq->runnable_heap.insert(current_task)) {
+                        add_to_sums(rq, current_task);
+                    }
+                }
+            }
+
+            if (rq->runnable_heap.size == 0) {
+                rq->current_task = nullptr;
+                return nullptr;
+            }
+
+            int64_t const AVG = compute_avg_vruntime(rq);
+            if (AVG > rq->min_vruntime) {
+                int64_t const DELTA_MIN = AVG - rq->min_vruntime;
+                rq->min_vruntime = AVG;
+                rq->total_weighted_vruntime -= DELTA_MIN * rq->total_weight;
+            }
+
+            task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+            if (next == nullptr || next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                (next->type == task::TaskType::PROCESS && (next->thread == nullptr || next->pagemap == nullptr)) ||
+                next->type == task::TaskType::IDLE) {
+                rq->current_task = nullptr;
+                return nullptr;
+            }
+
+            rq->current_task = next;
+            rq->current_task_start_us = time::get_us();
+            return next;
+        });
+
+        if (current_task->state.load(std::memory_order_acquire) == task::TaskState::DEAD &&
+            !current_task->gc_queued.load(std::memory_order_acquire)) {
+            insert_into_dead_list(current_task);
         }
-        task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
-        rq->current_task = next;
-        rq->current_task_start_us = time::get_us();  // Track for wakeup-preemption guard
-        return next;
-    });
+    }
 
 #ifdef SCHED_DEBUG
     char const* switch_reason = "wait queue";
@@ -2728,12 +2811,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         uint8_t const SW_FLAGS = (IS_YIELD || skip_wait_queue) ? perf::PERF_FLAG_YIELD : perf::PERF_FLAG_BLOCK;
         perf::record_switch(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, next_task->pid, SW_FLAGS, 0,
                             current_task->slice_used_ns / 1000U, (IS_YIELD || !skip_wait_queue) ? perf_wait_callsite(current_task) : 0);
-    }
-
-    // Notify WKI proxy only when the task actually transitioned to WAITING.
-    if (!IS_YIELD && !skip_wait_queue && current_task->sched_queue == task::Task::sched_queue::WAITING &&
-        current_task->wki_proxy_task_id != 0) {
-        ker::net::wki::wki_proxy_task_blocked(current_task);
     }
 
     if (next_task == current_task) {
@@ -3188,9 +3265,10 @@ auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
 
     uint64_t const CORE_COUNT = smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
-        task::Task* owner = run_queues->with_lock(cpu_no, [rsp](RunQueue* rq) -> task::Task* {
+        task::Task* owner = nullptr;
+        run_queues->try_with_lock(cpu_no, [rsp, &owner](RunQueue* rq) {
             if (rq == nullptr) {
-                return nullptr;
+                return;
             }
             for (task::Task* cur = rq->dead_list.head; cur != nullptr; cur = cur->sched_next) {
                 uint64_t const STACK_TOP = cur->context.syscall_kernel_stack;
@@ -3198,10 +3276,10 @@ auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
                     continue;
                 }
                 if (rsp > STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP) {
-                    return cur;
+                    owner = cur;
+                    return;
                 }
             }
-            return nullptr;
         });
         if (owner != nullptr) {
             return owner;
@@ -3268,6 +3346,10 @@ void wake_task_for_signal(task::Task* task) {
     // If the task is blocked or sleeping in a syscall path, put it back on
     // a runnable queue so it can process pending signals promptly.
     if (task->sched_queue == task::Task::sched_queue::WAITING || task->deferred_task_switch || task->voluntary_block) {
+        if (task->wait_channel != nullptr && strcmp(task->wait_channel, "sigsuspend") == 0) {
+            task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+        }
+
         // Use the least-loaded CPU to avoid piling daemon wakeups onto CPUs
         // that are busy running compute threads.
         uint64_t const CPU = get_least_loaded_cpu();

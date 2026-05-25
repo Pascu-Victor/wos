@@ -69,6 +69,10 @@ constexpr uint32_t RENEWAL_FAILURE_LOG_INTERVAL = 10;
 constexpr uint32_t DHCP_RENEWAL_RETRY_SECS = 60;
 constexpr uint32_t USEC_PER_SEC = 1000000;
 
+#ifndef SO_BINDTODEVICE
+constexpr int SO_BINDTODEVICE = 25;
+#endif
+
 // ---- BOOTP/DHCP packet ----
 
 struct DhcpPacket {
@@ -722,6 +726,12 @@ auto main(int argc, char** argv) -> int {
     int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
     if (SOCK < 0) {
         logger::error("netd: failed to create socket: %d", SOCK);
+        return 1;
+    }
+
+    if (setsockopt(SOCK, SOL_SOCKET, SO_BINDTODEVICE, ifname, std::strlen(ifname) + 1) != 0) {
+        logger::error("netd: failed to bind DHCP socket to %s", ifname);
+        close(SOCK);
         return 1;
     }
 

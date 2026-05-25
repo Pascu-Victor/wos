@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
@@ -172,6 +173,10 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
 
     if (wake_parent) {
         reschedule_on_task_cpu(parent);
+    } else if ((parent->sig_pending & ~parent->sig_mask & SIGCHLD_MASK) != 0 &&
+               parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING && parent->wait_channel != nullptr &&
+               std::strcmp(parent->wait_channel, "sigsuspend") == 0) {
+        ker::mod::sched::wake_task_for_signal(parent);
     }
     parent->release();
 }

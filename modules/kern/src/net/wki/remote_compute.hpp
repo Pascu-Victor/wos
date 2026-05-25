@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -56,6 +57,9 @@ struct SubmittedTask {
     ker::mod::sched::task::Task* local_task = nullptr;
     bool proxy_ready = false;
 
+    std::array<WkiIpcFdEntry, 16> ipc_fd_map = {};
+    uint16_t ipc_fd_count = 0;
+
     SubmittedTask() = default;
     SubmittedTask(const SubmittedTask&) = delete;
     auto operator=(const SubmittedTask&) -> SubmittedTask& = delete;
@@ -72,7 +76,9 @@ struct SubmittedTask {
           accepted_at_us(o.accepted_at_us),
           complete_received_at_us(o.complete_received_at_us),
           local_task(o.local_task),
-          proxy_ready(o.proxy_ready) {}
+          proxy_ready(o.proxy_ready),
+          ipc_fd_map(o.ipc_fd_map),
+          ipc_fd_count(o.ipc_fd_count) {}
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
         if (this != &o) {
             active = o.active;
@@ -88,6 +94,8 @@ struct SubmittedTask {
             complete_received_at_us = o.complete_received_at_us;
             local_task = o.local_task;
             proxy_ready = o.proxy_ready;
+            ipc_fd_map = o.ipc_fd_map;
+            ipc_fd_count = o.ipc_fd_count;
         }
         return *this;
     }
@@ -190,6 +198,10 @@ auto wki_remote_compute_release_elf_buffer(uint8_t* buffer) -> bool;
 // target is a WKI proxy. Called from kill()/process-group signal delivery.
 // Returns true if signal was handled (forwarded).
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool;
+
+// Submitter side: read the runner node for a proxy task.
+auto wki_proxy_task_remote_info(const ker::mod::sched::task::Task* task, uint16_t* target_node, char* hostname, size_t hostname_size)
+    -> bool;
 
 // Check running remote tasks for completion (called from timer tick).
 // When a task exits, sends TASK_COMPLETE back to the submitter.

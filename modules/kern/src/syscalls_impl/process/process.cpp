@@ -310,6 +310,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy signal dispositions from parent (fork inherits signal handlers)
     child->sig_pending = 0;  // Pending signals are NOT inherited
     child->sig_mask = parent->sig_mask;
+    child->sigsuspend_saved_mask = 0;
+    child->sigsuspend_active = false;
     child->in_signal_handler = false;
     child->do_sigreturn = false;
     child->sig_handlers = parent->sig_handlers;
@@ -561,6 +563,36 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
     return 0;
 }
 
+auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+    using namespace ker::mod;
+
+    auto* task = sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    if (set_ptr == 0) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    const auto* setp = reinterpret_cast<const uint64_t*>(set_ptr);
+    uint64_t set = *setp;
+    uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
+    set &= ~UNBLOCKABLE;
+
+    task->context.regs = gpr;
+    task->sigsuspend_saved_mask = task->sig_mask;
+    task->sigsuspend_active = true;
+    task->sig_mask = set;
+
+    if ((task->sig_pending & ~task->sig_mask) != 0) {
+        return static_cast<uint64_t>(-EINTR);
+    }
+
+    task->wait_channel = "sigsuspend";
+    task->deferred_task_switch = true;
+    return 0;
+}
+
 auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     using namespace ker::mod;
 
@@ -742,6 +774,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::SIGPROCMASK: {
             return wos_proc_sigprocmask(static_cast<int>(a2), a3, a4);
+        }
+        case abi::process::procmgmt_ops::SIGSUSPEND: {
+            return wos_proc_sigsuspend(a2, gpr);
         }
         case abi::process::procmgmt_ops::KILL: {
             return wos_proc_kill(static_cast<int64_t>(a2), static_cast<int>(a3));

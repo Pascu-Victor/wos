@@ -3444,6 +3444,10 @@ auto vfs_mkdir(const char* path, int mode) -> int {
 
     const char* fs_path = strip_mount_prefix(mount, abs_path.data());
 
+    if (fs_path[0] == '\0') {
+        return 0;
+    }
+
     if (mount->fs_type == FSType::TMPFS) {
         auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, true);
         return (node != nullptr) ? 0 : -1;
@@ -3453,6 +3457,11 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx);
         // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
+        return (R == -EEXIST) ? 0 : R;
+    }
+
+    if (mount->fs_type == FSType::REMOTE) {
+        int const R = ker::net::wki::wki_remote_vfs_mkdir(mount->private_data, fs_path, mode);
         return (R == -EEXIST) ? 0 : R;
     }
 

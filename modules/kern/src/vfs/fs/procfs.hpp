@@ -31,6 +31,7 @@ enum class ProcNodeType : uint8_t {
     WKI_REMOTE_PID_FILE,  // /proc/<pid>/wki_remote_pid -> remote execution PID for this process
     WKI_DIR,              // /proc/wki
     WKI_PEERS_FILE,       // /proc/wki/peers -> WKI topology rows
+    WKI_NETDIAG_FILE,     // /proc/wki/netdiag -> network packet/listener/channel diagnostics
 };
 
 struct ProcNode {

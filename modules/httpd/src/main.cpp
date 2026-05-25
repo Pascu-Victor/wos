@@ -148,8 +148,8 @@ auto get_mime_type(std::string_view path) -> const char* {
     return "application/octet-stream";
 }
 
-// URL decode a path (handle %XX encoding)
-auto url_decode(std::string_view encoded) -> std::string {
+// URL decode a path or form component (handle %XX encoding)
+auto url_decode(std::string_view encoded, bool plus_as_space = false) -> std::string {
     std::string result;
     result.reserve(encoded.size());
 
@@ -164,7 +164,7 @@ auto url_decode(std::string_view encoded) -> std::string {
                 i += 2;
                 continue;
             }
-        } else if (CURRENT == '+') {
+        } else if (CURRENT == '+' && plus_as_space) {
             result += ' ';
             continue;
         }
@@ -577,7 +577,7 @@ auto parse_request_method(std::string_view request) -> std::string_view {
     return request.substr(0, first_space);
 }
 
-// Parse HTTP request to extract the path
+// Parse HTTP request to extract the path without query parameters
 auto parse_request_path(std::string_view request) -> std::string_view {
     // Find the first line (GET /path HTTP/1.1)
     auto line_end = request.find("\r\n");
@@ -597,7 +597,12 @@ auto parse_request_path(std::string_view request) -> std::string_view {
         return "/";
     }
 
-    return first_line.substr(first_space + 1, second_space - first_space - 1);
+    auto target = first_line.substr(first_space + 1, second_space - first_space - 1);
+    auto query_start = target.find('?');
+    if (query_start != std::string_view::npos) {
+        return target.substr(0, query_start);
+    }
+    return target;
 }
 
 // Extract POST body from HTTP request (content after \r\n\r\n)
@@ -623,7 +628,7 @@ auto get_form_field(std::string_view body, std::string_view key) -> std::string 
             if (end == std::string_view::npos) {
                 end = body.size();
             }
-            return url_decode(body.substr(pos, end - pos));
+            return url_decode(body.substr(pos, end - pos), true);
         }
         // Skip to next field
         auto amp = body.find('&', pos);

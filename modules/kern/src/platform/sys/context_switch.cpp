@@ -420,22 +420,17 @@ inline auto hot_task_tracker_slot(uint64_t cpu_no) -> HotTaskTracker& {
 
 extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_repair_timer_return_frame(void* stack_ptr) {
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
-    auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
+    auto* frame_ptr = stack_ptr != nullptr
+                          ? reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs))
+                          : nullptr;
     auto* task = sched::get_current_task();
 
     uint64_t const BAD_CS = frame_ptr != nullptr ? frame_ptr->cs : 0;
     static std::atomic<uint64_t> repair_count{0};
 
-    if (task != nullptr && frame_ptr != nullptr &&
+    if (task != nullptr && gpr_ptr != nullptr && frame_ptr != nullptr &&
         (task->context.frame.cs == TIMER_FRAME_USER_CS || task->context.frame.cs == TIMER_FRAME_KERNEL_CS)) {
-        uint64_t const N = repair_count.fetch_add(1, std::memory_order_relaxed);
-        if (N < 16) {
-            dbg::logger<"ctxswitch">::warn(
-                "repair timer return frame: bad_cs=0x%llx pid=%lu name=%s saved_cs=0x%llx saved_rip=0x%llx saved_rsp=0x%llx stack=%p",
-                static_cast<unsigned long long>(BAD_CS), task->pid, task->name != nullptr ? task->name : "?",
-                static_cast<unsigned long long>(task->context.frame.cs), static_cast<unsigned long long>(task->context.frame.rip),
-                static_cast<unsigned long long>(task->context.frame.rsp), stack_ptr);
-        }
+        repair_count.fetch_add(1, std::memory_order_relaxed);
         *gpr_ptr = task->context.regs;
         *frame_ptr = task->context.frame;
         return;
@@ -628,6 +623,9 @@ void start_sched_timer() {
 
 void request_reschedule() {
     if (!current_stack_allows_local_reschedule()) {
+        if (!sched::interrupts_enabled()) {
+            return;
+        }
         static std::atomic<uint64_t> skipped_mismatch_logs{0};
         uint64_t const N = skipped_mismatch_logs.fetch_add(1, std::memory_order_relaxed);
         if (N < 8) {

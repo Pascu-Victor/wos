@@ -1,5 +1,6 @@
 #include "backlog.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,15 @@ void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
 
     task->slice_ns = NET_LATENCY_DAEMON_SLICE_NS;
     ker::mod::sched::set_task_nice(task, NET_LATENCY_DAEMON_NICE);
+}
+
+auto packet_list_count(const PacketBuffer* batch) -> uint64_t {
+    uint64_t count = 0;
+    while (batch != nullptr) {
+        ++count;
+        batch = batch->next;
+    }
+    return count;
 }
 
 void process_backlog_batch(PacketBuffer* batch) {
@@ -107,6 +117,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             continue;
         }
 
+        q.depth.fetch_sub(packet_list_count(batch), std::memory_order_relaxed);
         process_backlog_batch(batch);
     }
 }
@@ -156,6 +167,7 @@ void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
     auto& q = queues[target_cpu];
 
     // Lock-free MPSC push: CAS on head.
+    q.depth.fetch_add(1, std::memory_order_relaxed);
     PacketBuffer* old_head = q.head.load(std::memory_order_relaxed);
     do {  // NOLINT
         pkt->next = old_head;
@@ -227,12 +239,15 @@ auto backlog_drain_all_pending_inline() -> int {
             continue;
         }
 
+        int queue_drained = 0;
         PacketBuffer* cursor = batch;
         while (cursor != nullptr) {
-            ++drained;
+            ++queue_drained;
             cursor = cursor->next;
         }
+        drained += queue_drained;
 
+        q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed);
         process_backlog_batch(batch);
     }
 
@@ -240,5 +255,28 @@ auto backlog_drain_all_pending_inline() -> int {
 }
 
 auto backlog_ready() -> bool { return ready.load(std::memory_order_acquire); }
+
+void backlog_get_snapshot(BacklogSnapshot& out) {
+    out = {};
+    out.ready = ready.load(std::memory_order_acquire);
+    out.num_cpus = num_cpus;
+    if (!out.ready || queues == nullptr) {
+        return;
+    }
+
+    out.queue_count = std::min<size_t>(num_cpus, BACKLOG_SNAPSHOT_MAX_CPUS);
+    for (size_t i = 0; i < out.queue_count; ++i) {
+        auto& row = out.queues.at(i);
+        auto& q = queues[i];
+        row.cpu = i;
+        row.queued = q.depth.load(std::memory_order_relaxed);
+        row.handler_active = q.handler_active.load(std::memory_order_acquire);
+        if (q.handler != nullptr) {
+            row.handler_pid = q.handler->pid;
+            row.handler_cpu = q.handler->cpu;
+        }
+        out.total_queued += row.queued;
+    }
+}
 
 }  // namespace ker::net

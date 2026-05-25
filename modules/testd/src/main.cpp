@@ -212,6 +212,31 @@ auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
     return static_cast<ssize_t>(total);
 }
 
+auto recv_retry(int fd, void* buf, size_t len, int flags) -> ssize_t {
+    for (;;) {
+        ssize_t const N = recv(fd, buf, len, flags);
+        if (N < 0 && errno == EINTR) {
+            continue;
+        }
+        return N;
+    }
+}
+
+auto recv_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+    size_t total = 0;
+    while (total < expected) {
+        ssize_t const N = recv_retry(fd, buf + total, expected - total, 0);
+        if (N < 0) {
+            return -1;
+        }
+        if (N == 0) {
+            break;
+        }
+        total += static_cast<size_t>(N);
+    }
+    return static_cast<ssize_t>(total);
+}
+
 auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) -> pid_t {
     std::array<char, 16> fd_str{};
     std::array<char, 16> arg_str{};
@@ -1334,7 +1359,7 @@ void tcp_echo_server(int ready_fd) {
     std::array<char, 512> buf{};
     ssize_t n = 0;
     int recv_errno = 0;
-    while ((n = recv(CLI, buf.data(), buf.size(), 0)) > 0) {
+    while ((n = recv_retry(CLI, buf.data(), buf.size(), 0)) > 0) {
         ssize_t sent = 0;
         while (sent < n) {
             ssize_t const S = send(CLI, buf.data() + sent, static_cast<size_t>(n - sent), 0);
@@ -1436,7 +1461,8 @@ TESTD_RUN(test_tcp_loopback) {
     int last_recv_errno = 0;
     shutdown(CLI, SHUT_WR);  // signal EOF to server
     while (std::cmp_less(total_recv, DATA_SIZE)) {
-        ssize_t const N = recv(CLI, recv_buf.data() + total_recv, static_cast<size_t>(DATA_SIZE) - static_cast<size_t>(total_recv), 0);
+        ssize_t const N =
+            recv_retry(CLI, recv_buf.data() + total_recv, static_cast<size_t>(DATA_SIZE) - static_cast<size_t>(total_recv), 0);
         last_recv = N;
         if (N < 0) {
             last_recv_errno = errno;
@@ -1903,7 +1929,7 @@ TESTD_RUN(test_remote_ipc_socket_child_write) {
     close(CLIENT_FD);
 
     std::array<char, 64> recv_buf{};
-    ssize_t const NR = recv(SERVER_FD, recv_buf.data(), recv_buf.size(), 0);
+    ssize_t const NR = recv_expected_bytes(SERVER_FD, recv_buf.data(), RH_SOCKET_WRITE_MSG.size());
     close(SERVER_FD);
 
     int status = 0;
@@ -1994,7 +2020,7 @@ TESTD_RUN(test_remote_ipc_socket_control_ops) {
     close(CLIENT_FD);
 
     char eof_probe = 0;
-    ssize_t const NR = recv(SERVER_FD, &eof_probe, sizeof(eof_probe), 0);
+    ssize_t const NR = recv_retry(SERVER_FD, &eof_probe, sizeof(eof_probe), 0);
     close(SERVER_FD);
 
     int status = 0;

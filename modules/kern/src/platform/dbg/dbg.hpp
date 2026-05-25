@@ -41,6 +41,7 @@ struct FixedString {
 };
 
 void emit_log(const char* module, LogLevel level, const char* format, ...);
+void emit_kernel_log(const char* module, LogLevel level, const char* format, ...);
 void set_serial_threshold(LogLevel level);
 auto get_serial_threshold() -> LogLevel;
 
@@ -49,7 +50,7 @@ template <FixedString Tag>
 struct logger {
     template <typename... Args>
     [[gnu::always_inline]] static void log(LogLevel level, const char* format, Args... args) {
-        emit_log(Tag.c_str(), level, format, args...);
+        emit_kernel_log(Tag.c_str(), level, format, args...);
     }
 
     template <typename... Args>

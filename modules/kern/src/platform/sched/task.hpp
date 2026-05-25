@@ -197,8 +197,20 @@ struct Task {
     uint64_t wait_resume_rsp_phys_addr{};  // Last translated physical address for wait_resume_rsp_user_addr (debug; may change after COW)
 
     // Signal state.
-    uint64_t sig_pending{};  // Bit N = signal N+1 is pending, signals 1-64
-    uint64_t sig_mask{};     // Bitmask of blocked signals
+    uint64_t sig_pending{};            // Bit N = signal N+1 is pending, signals 1-64
+    uint64_t sig_mask{};               // Bitmask of blocked signals
+    uint64_t sigsuspend_saved_mask{};  // Mask to restore after a sigsuspend wake.
+    bool sigsuspend_active{};          // Current signal mask is temporary for sigsuspend.
+
+    auto signal_frame_saved_mask() -> uint64_t {
+        if (!sigsuspend_active) {
+            return sig_mask;
+        }
+        uint64_t const SAVED = sigsuspend_saved_mask;
+        sigsuspend_active = false;
+        sigsuspend_saved_mask = 0;
+        return SAVED;
+    }
 
     // Ptrace/debugging state. The syscall ABI is node-local; WKI proxy routing
     // is represented through RemoteInfo and handled by userland debug brokers.

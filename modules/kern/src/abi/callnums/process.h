@@ -38,5 +38,6 @@ enum class procmgmt_ops : uint64_t {
     PTRACE,        // 30
     GETGROUPS,     // 31
     SETGROUPS,     // 32
+    SIGSUSPEND,    // 33
 };
 }  // namespace ker::abi::process

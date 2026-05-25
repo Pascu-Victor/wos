@@ -111,6 +111,9 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
         // SIGKILL, SIGTERM, SIGINT, etc: terminate
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
+            if (task->sigsuspend_active) {
+                task->sig_mask = task->signal_frame_saved_mask();
+            }
             return 0;  // Ignore
         }
         // Uncatchable stop signal
@@ -139,6 +142,9 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Handle SIG_IGN
     if (handler.handler == WOS_SIG_IGN) {
+        if (task->sigsuspend_active) {
+            task->sig_mask = task->signal_frame_saved_mask();
+        }
         return 0;
     }
 
@@ -156,7 +162,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     // (We're still in the task's pagemap during syscall, so direct writes work)
     frame->pretcode = handler.restorer;  // sa_restorer trampoline
     frame->signo = static_cast<uint64_t>(SIGNO);
-    frame->saved_mask = task->sig_mask;
+    frame->saved_mask = task->signal_frame_saved_mask();
     frame->saved_rip = USER_RIP;
     frame->saved_rsp = USER_RSP;
     frame->saved_rflags = USER_RFLAGS;
@@ -216,6 +222,9 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
 
     if (handler.handler == WOS_SIG_DFL) {
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
+            if (task->sigsuspend_active) {
+                task->sig_mask = task->signal_frame_saved_mask();
+            }
             return;
         }
         if (SIGNO == WOS_SIGSTOP) {
@@ -237,6 +246,9 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     }
 
     if (handler.handler == WOS_SIG_IGN) {
+        if (task->sigsuspend_active) {
+            task->sig_mask = task->signal_frame_saved_mask();
+        }
         return;
     }
 
@@ -245,7 +257,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
 
     sigframe->pretcode = handler.restorer;
     sigframe->signo = static_cast<uint64_t>(SIGNO);
-    sigframe->saved_mask = task->sig_mask;
+    sigframe->saved_mask = task->signal_frame_saved_mask();
     sigframe->saved_rip = frame.rip;
     sigframe->saved_rsp = frame.rsp;
     sigframe->saved_rflags = frame.flags;

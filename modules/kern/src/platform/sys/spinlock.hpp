@@ -11,6 +11,10 @@
 #include <array>
 #endif
 
+namespace ker::mod::sched::task {
+struct Task;
+}  // namespace ker::mod::sched::task
+
 namespace ker::mod::sys {
 
 // Ticket spinlock - FIFO fair, prevents starvation.
@@ -20,6 +24,9 @@ namespace ker::mod::sys {
 struct Spinlock {
     std::atomic<uint32_t> next_ticket{0};
     std::atomic<uint32_t> now_serving{0};
+    // Unlock must restore the task whose preempt count was disabled, even if
+    // scheduler code rewrote rq->current_task while this lock was held.
+    sched::task::Task* preempt_owner{nullptr};
 
 #if SPINLOCK_DEBUG
     // Debug: caller that successfully acquired the lock + its full stack trace.

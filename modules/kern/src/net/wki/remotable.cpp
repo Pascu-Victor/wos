@@ -68,6 +68,7 @@ std::deque<PendingNetAttach> g_pending_net_attaches;  // NOLINT(cppcoreguideline
 constexpr uint8_t NET_AUTO_ATTACH_MAX_RETRIES = 8;
 constexpr uint64_t NET_AUTO_ATTACH_RETRY_BASE_US = 1000000;
 constexpr uint64_t NET_AUTO_ATTACH_RETRY_MAX_US = 5000000;
+constexpr uint64_t NET_AUTO_ATTACH_LOCAL_IPV4_RETRY_US = 500000;
 
 ker::mod::sys::Spinlock s_remotable_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -119,6 +120,34 @@ auto has_local_subnet_overlap(uint32_t remote_ip, uint32_t remote_mask) -> bool 
         }
     }
     return false;
+}
+
+auto is_local_l3_candidate(ker::net::NetDevice const* dev) -> bool {
+    if (dev == nullptr || dev->state == 0 || dev->wki_transport) {
+        return false;
+    }
+    if (std::strncmp(dev->name.data(), "lo", ker::net::NETDEV_NAME_LEN) == 0) {
+        return false;
+    }
+    return std::strncmp(dev->name.data(), "wki-", 4) != 0;
+}
+
+auto local_ipv4_configuration_pending() -> bool {
+    bool found_candidate = false;
+    size_t const NDEV_COUNT = ker::net::netdev_count();
+    for (size_t i = 0; i < NDEV_COUNT; i++) {
+        ker::net::NetDevice* dev = ker::net::netdev_at(i);
+        if (!is_local_l3_candidate(dev)) {
+            continue;
+        }
+
+        found_candidate = true;
+        auto* nif = ker::net::netif_get(dev);
+        if (nif != nullptr && nif->ipv4_addr_count != 0) {
+            return false;
+        }
+    }
+    return found_candidate;
 }
 
 // Build the auto-mount path for a VFS export:
@@ -273,6 +302,15 @@ auto requeue_net_attach(PendingNetAttach& pending) -> bool {
                             pending.remote_name.data(), pending.retry_count, pending.next_attempt_us);
     s_remotable_lock.unlock();
     return true;
+}
+
+void defer_net_attach_for_local_ipv4(PendingNetAttach& pending) {
+    pending.next_attempt_us = wki_now_us() + NET_AUTO_ATTACH_LOCAL_IPV4_RETRY_US;
+
+    s_remotable_lock.lock();
+    queue_net_attach_locked(pending.node_id, pending.resource_id, pending.nic_name.data(), pending.hostname.data(),
+                            pending.remote_name.data(), pending.retry_count, pending.next_attempt_us);
+    s_remotable_lock.unlock();
 }
 
 }  // namespace
@@ -882,6 +920,12 @@ void wki_remotable_process_pending_net_attaches() {
             if (ker::net::netdev_find_by_name(pending.nic_name.data()) != nullptr) {
                 log::debug("Skipping duplicate NET auto-attach name: %s node=0x%04x res_id=%u", pending.nic_name.data(), pending.node_id,
                            pending.resource_id);
+                continue;
+            }
+
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE && local_ipv4_configuration_pending()) {
+                defer_net_attach_for_local_ipv4(pending);
+                log::debug("Deferring NET auto-attach: %s waits for local IPv4 configuration", pending.nic_name.data());
                 continue;
             }
 

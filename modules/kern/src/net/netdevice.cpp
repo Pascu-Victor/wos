@@ -1,5 +1,6 @@
 #include "netdevice.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -141,6 +142,40 @@ auto netdev_at(size_t i) -> NetDevice* {
     NetDevice* dev = devices.at(i);
     devices_lock.unlock();
     return dev;
+}
+
+auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+
+    devices_lock.lock();
+    size_t const COUNT = std::min(device_count, max);
+    for (size_t i = 0; i < COUNT; ++i) {
+        NetDevice const* dev = devices.at(i);
+        if (dev == nullptr) {
+            continue;
+        }
+        auto& row = out[i];
+        row.name = dev->name;
+        row.mac = dev->mac;
+        row.mtu = dev->mtu;
+        row.tx_queue_len = dev->tx_queue_len;
+        row.link_flags = dev->link_flags;
+        row.ifindex = dev->ifindex;
+        row.state = dev->state;
+        row.remotable = dev->remotable != nullptr;
+        row.wki_rx_forward = dev->wki_rx_forward != nullptr;
+        row.wki_transport = dev->wki_transport;
+        row.rx_packets = dev->rx_packets;
+        row.tx_packets = dev->tx_packets;
+        row.rx_bytes = dev->rx_bytes;
+        row.tx_bytes = dev->tx_bytes;
+        row.rx_dropped = dev->rx_dropped;
+        row.tx_dropped = dev->tx_dropped;
+    }
+    devices_lock.unlock();
+    return COUNT;
 }
 
 // Forward declaration - will be implemented in ethernet.cpp

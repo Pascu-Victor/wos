@@ -168,13 +168,31 @@ void error(const char* str) {
     journal::emit(LogLevel::ERROR, "kernel", str, journal::JOURNAL_FLAG_KERNEL);
 }
 
+namespace {
+
+void emit_kernel_log_va(const char* module, LogLevel level, const char* format, va_list& args) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    journal::emit_v(level, module, format, args, journal::JOURNAL_FLAG_KERNEL);
+}
+
+}  // namespace
+
 // NOLINTNEXTLINE(modernize-avoid-variadic-functions)
 void emit_log(const char* module, LogLevel level, const char* format, ...) {
     va_list args;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     va_start(args, format);
+    emit_kernel_log_va(module, level, format, args);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-    journal::emit_v(level, module, format, args, journal::JOURNAL_FLAG_KERNEL);
+    va_end(args);
+}
+
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions)
+void emit_kernel_log(const char* module, LogLevel level, const char* format, ...) {
+    va_list args;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    va_start(args, format);
+    emit_kernel_log_va(module, level, format, args);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
     va_end(args);
 }

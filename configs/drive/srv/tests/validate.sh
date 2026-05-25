@@ -6,7 +6,15 @@ PASS=0
 FAIL=0
 WORKDIR=/tmp/vtest_$$
 mkdir -p "$WORKDIR"
-trap 'rm -rf "$WORKDIR"' EXIT
+
+cleanup() {
+    # Expand contents before deletion so rm does not mutate the directory it is
+    # recursively scanning on tmpfs.
+    rm -rf "$WORKDIR"/* "$WORKDIR"/.[!.]* "$WORKDIR"/..?*
+    rmdir "$WORKDIR" 2>/dev/null || true
+}
+
+trap cleanup EXIT
 
 ok() {
     PASS=$((PASS + 1))

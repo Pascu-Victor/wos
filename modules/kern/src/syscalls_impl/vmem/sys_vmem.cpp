@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -725,14 +726,10 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         rollback_mapped_pages(task, vaddr, mapped_pages);
     }
 
-    // Read file content into the backing pages
+    // Read file content into the backing pages. File-backed mmap must not
+    // mutate the descriptor offset, and positional reads avoid remote VFS
+    // sequential read-ahead while materializing ELF segments.
     auto const FILE_SIZE = static_cast<uint64_t>(st.st_size);
-    uint64_t file_bytes_remaining = 0;
-    if (offset < FILE_SIZE) {
-        file_bytes_remaining = std::min(FILE_SIZE - offset, size);
-        ker::vfs::vfs_lseek(fd, static_cast<off_t>(offset), 0 /* SEEK_SET */);
-    }
-
     uint64_t mapped_pages = 0;
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
@@ -741,18 +738,28 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             rollback_mapped_pages(task, vaddr, mapped_pages);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
+        std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
 
-        if (file_bytes_remaining > 0) {
-            uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, file_bytes_remaining);
-            ssize_t const READ_RET = ker::vfs::vfs_read(fd, PHYS_PAGE, static_cast<size_t>(READ_SIZE));
-            if (READ_RET > 0) {
-                auto const BYTES_READ = static_cast<uint64_t>(READ_RET);
-                file_bytes_remaining -= std::min(BYTES_READ, file_bytes_remaining);
-                if (BYTES_READ < READ_SIZE) {
-                    file_bytes_remaining = 0;
-                }
-            } else {
-                file_bytes_remaining = 0;
+        if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
+            ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
+            rollback_mapped_pages(task, vaddr, mapped_pages);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
+        }
+
+        uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
+        if (FILE_OFFSET < FILE_SIZE) {
+            uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - FILE_OFFSET);
+            if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+                ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
+                rollback_mapped_pages(task, vaddr, mapped_pages);
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
+            }
+
+            ssize_t const READ_RET = ker::vfs::vfs_pread(fd, PHYS_PAGE, static_cast<size_t>(READ_SIZE), static_cast<off_t>(FILE_OFFSET));
+            if (READ_RET < 0) {
+                ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
+                rollback_mapped_pages(task, vaddr, mapped_pages);
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
             }
         }
 
@@ -765,7 +772,8 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
                 "prot=0x%llx fd=%d off=0x%llx",
                 task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(current_vaddr),
                 static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), fd, static_cast<unsigned long long>(offset));
+                static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), fd,
+                static_cast<unsigned long long>(FILE_OFFSET));
         }
     }
 

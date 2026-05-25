@@ -158,6 +158,20 @@ inline auto tcp_hash_4tuple(uint32_t lip, uint16_t lp, uint32_t rip, uint16_t rp
 inline auto tcp_hash_listener(uint16_t lp) -> uint32_t { return static_cast<uint32_t>(lp) * 0x9e3779b9U; }
 
 constexpr size_t MAX_TCP_BINDINGS = 128;
+constexpr size_t TCP_LISTENER_SNAPSHOT_MAX = 64;
+
+struct TcpListenerSnapshot {
+    uint32_t local_ip = 0;
+    uint16_t local_port = 0;
+    uint8_t state = 0;
+    uint64_t owner_pid = 0;
+    size_t accept_queue = 0;
+    int backlog = 0;
+    size_t rcvbuf_used = 0;
+    size_t rcvbuf_capacity = 0;
+    uint32_t rcv_wnd = 0;
+    uint32_t refcount = 0;
+};
 
 void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip);
 void tcp_timer_tick(uint64_t now_ms);
@@ -191,6 +205,7 @@ void tcp_cb_acquire(TcpCB* cb);
 void tcp_cb_release(TcpCB* cb);
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB*;
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB*;
+auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t;
 
 inline auto tcp_seq_before(uint32_t a, uint32_t b) -> bool { return static_cast<int32_t>(a - b) < 0; }
 inline auto tcp_seq_after(uint32_t a, uint32_t b) -> bool { return tcp_seq_before(b, a); }

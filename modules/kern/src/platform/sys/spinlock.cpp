@@ -144,22 +144,26 @@ void unlock_ticket(Spinlock* lock) {
 }  // namespace
 
 void Spinlock::lock() {
-    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    auto* const PREEMPT_OWNER = sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     lock_ticket(this);
+    preempt_owner = PREEMPT_OWNER;
 }
 
 auto Spinlock::try_lock() -> bool {
-    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    auto* const PREEMPT_OWNER = sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     if (!try_lock_ticket(this)) {
-        sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
         return false;
     }
+    preempt_owner = PREEMPT_OWNER;
     return true;
 }
 
 void Spinlock::unlock() {
+    auto* const PREEMPT_OWNER = preempt_owner;
+    preempt_owner = nullptr;
     unlock_ticket(this);
-    sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 auto Spinlock::lock_irqsave() -> uint64_t {
@@ -167,17 +171,20 @@ auto Spinlock::lock_irqsave() -> uint64_t {
     uint64_t flags = 0;
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli");
-    sched::preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    auto* const PREEMPT_OWNER = sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     lock_ticket(this);
+    preempt_owner = PREEMPT_OWNER;
     return flags;
 }
 
 void Spinlock::unlock_irqrestore(uint64_t flags) {
+    auto* const PREEMPT_OWNER = preempt_owner;
+    preempt_owner = nullptr;
     unlock_ticket(this);
+    sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     if ((flags & 0x200) != 0) {
         asm volatile("sti");
     }
-    sched::preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 }  // namespace ker::mod::sys

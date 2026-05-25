@@ -20,6 +20,8 @@ constexpr size_t JOURNAL_MESSAGE_MAX = 512;
 constexpr uint32_t JOURNAL_FLAG_TRUNCATED = 1U << 0;
 constexpr uint32_t JOURNAL_FLAG_KERNEL = 1U << 1;
 constexpr uint32_t JOURNAL_FLAG_PREFIX_COMPAT = 1U << 2;
+constexpr uint32_t JOURNAL_OUTPUT_NONE = 0;
+constexpr uint32_t JOURNAL_OUTPUT_SERIAL = 1U << 0;
 
 // On-disk/userspace ABI: raw fixed arrays are intentional and covered by the
 // size assertion below.
@@ -52,6 +54,8 @@ void register_devices();
 void mark_devfs_ready();
 void set_serial_threshold(LogLevel level);
 auto get_serial_threshold() -> LogLevel;
+void set_module_output_devices(const char* module, uint32_t devices);
+auto get_module_output_devices(const char* module) -> uint32_t;
 void emit(LogLevel level, const char* module, const char* message, uint32_t flags);
 void emit_v(LogLevel level, const char* module, const char* format, va_list args, uint32_t flags);
 auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* module_filter) -> ssize_t;

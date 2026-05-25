@@ -195,11 +195,19 @@ void proxy_net_close(ker::net::NetDevice* dev) {
 }
 
 auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> int {
+    if (pkt == nullptr) {
+        return -1;
+    }
+    auto drop_pkt = [&]() -> int {
+        ker::net::pkt_free(pkt);
+        return -1;
+    };
+
     s_net_proxy_lock.lock();
     auto* state = find_net_proxy_by_dev(dev);
-    if (state == nullptr || !state->active || pkt == nullptr) {
+    if (state == nullptr || !state->active) {
         s_net_proxy_lock.unlock();
-        return -1;
+        return drop_pkt();
     }
     s_net_proxy_lock.unlock();
 
@@ -209,12 +217,12 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
 
     // Check MTU
     if (req_total > WKI_ETH_MAX_PAYLOAD) {
-        return -1;
+        return drop_pkt();
     }
 
     auto* req_buf = new (std::nothrow) uint8_t[req_total];
     if (req_buf == nullptr) {
-        return -1;
+        return drop_pkt();
     }
 
     auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
@@ -340,9 +348,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             pkt->dev = net_dev;
 
             int const RET = net_dev->ops->start_xmit(net_dev, pkt);
-            if (RET != 0) {
-                ker::net::pkt_free(pkt);
-            }
+            (void)RET;
             // No response for fire-and-forget XMIT
             break;
         }

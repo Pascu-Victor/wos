@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <abi/ptrace.hpp>
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -27,11 +28,27 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
 constexpr uint64_t TRACE_SYSGOOD_OPTION = 0x00000001ULL;
 constexpr size_t MAX_STRING_LEN = 256;
+
+auto strace_path_arg() -> char* {
+    static std::array<char, sizeof("/usr/bin/strace")> arg{"/usr/bin/strace"};
+    return arg.data();
+}
+
+auto remote_attach_flag_arg() -> char* {
+    static std::array<char, sizeof("--wos-remote-attach")> arg{"--wos-remote-attach"};
+    return arg.data();
+}
+
+auto remote_command_flag_arg() -> char* {
+    static std::array<char, sizeof("--wos-remote-command")> arg{"--wos-remote-command"};
+    return arg.data();
+}
 
 struct PendingSyscall {
     uint64_t callnum = 0;
@@ -44,6 +61,27 @@ struct PendingSyscall {
 };
 
 void usage() { std::println(stderr, "usage: strace [-p pid] command [args...]"); }
+
+auto command_basename(const char* path) -> std::string_view {
+    if (path == nullptr) {
+        return {};
+    }
+    const char* slash = std::strrchr(path, '/');
+    return slash == nullptr ? std::string_view(path) : std::string_view(slash + 1);
+}
+
+auto parse_pid_arg(const char* text, uint64_t& pid) -> bool {
+    if (text == nullptr || text[0] == '\0') {
+        return false;
+    }
+    char* end = nullptr;
+    unsigned long long const PARSED = std::strtoull(text, &end, 10);
+    if (end == nullptr || *end != '\0') {
+        return false;
+    }
+    pid = PARSED;
+    return true;
+}
 
 auto ptrace_call(ker::abi::ptrace::request request, uint64_t pid, uint64_t addr, uint64_t data) -> int64_t {
     return ker::process::ptrace(static_cast<uint64_t>(request), pid, addr, data);
@@ -227,6 +265,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "sigaction";
                 case ker::abi::process::procmgmt_ops::SIGPROCMASK:
                     return "sigprocmask";
+                case ker::abi::process::procmgmt_ops::SIGSUSPEND:
+                    return "sigsuspend";
                 case ker::abi::process::procmgmt_ops::KILL:
                     return "kill";
                 case ker::abi::process::procmgmt_ops::SIGRETURN:
@@ -552,27 +592,58 @@ auto format_result(int64_t result) -> std::string {
     return std::format("{}", result);
 }
 
-auto target_is_remote(uint64_t pid) -> bool {
+auto target_is_proxy(uint64_t pid) -> bool {
     ker::abi::ptrace::RemoteInfo info{};
     if (!read_remote_info(pid, info)) {
         return false;
     }
-    return info.is_proxy != 0 || info.state == 1 || info.remote_pid != 0;
+    return info.is_proxy != 0 && info.remote_pid != 0;
 }
 
-void print_remote_target_warning(uint64_t pid) {
-    ker::abi::ptrace::RemoteInfo info{};
-    if (!read_remote_info(pid, info)) {
-        return;
+auto is_proxy_info(const ker::abi::ptrace::RemoteInfo& info) -> bool { return info.is_proxy != 0 && info.remote_pid != 0; }
+
+auto exec_strace_with_command(char** command_argv) -> int {
+    std::vector<char*> helper_argv;
+    helper_argv.push_back(strace_path_arg());
+    helper_argv.push_back(remote_command_flag_arg());
+    for (char** arg = command_argv; arg != nullptr && *arg != nullptr; ++arg) {
+        helper_argv.push_back(*arg);
     }
-    if (info.is_proxy == 0 && info.state != 1 && info.remote_pid == 0) {
-        return;
+    helper_argv.push_back(nullptr);
+
+    execvp(strace_path_arg(), helper_argv.data());
+    std::perror("strace: exec remote helper");
+    return 127;
+}
+
+auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info) -> int {
+    if (!is_proxy_info(info)) {
+        std::println(stderr, "strace: remote attach requested for a non-proxy target");
+        return 1;
+    }
+    if (info.target_hostname.at(0) == '\0') {
+        std::println(stderr, "strace: pid {} is a WKI proxy for remote pid {}, but the runner hostname is unavailable", info.proxy_pid,
+                     info.remote_pid);
+        return 1;
     }
 
-    std::string_view const TARGET_HOST =
-        info.target_hostname[0] != '\0' ? std::string_view(info.target_hostname) : std::string_view("remote");
-    std::println(stderr, "strace: pid {} is running remotely via {} (remote pid {})", pid, TARGET_HOST, info.remote_pid);
-    std::println(stderr, "strace: syscall tracing is node-local right now; attach on the runner node or launch with local pinning");
+    int64_t const TARGET_RC = ker::process::setwkitarget(info.target_hostname.data(), std::strlen(info.target_hostname.data()),
+                                                         ker::process::WKI_TARGET_FLAG_STRICT);
+    if (TARGET_RC < 0) {
+        std::println(stderr, "strace: failed to target runner '{}': {}", info.target_hostname.data(), format_result(TARGET_RC));
+        return 1;
+    }
+
+    std::string remote_pid = std::format("{}", info.remote_pid);
+    std::array<char*, 4> helper_argv = {
+        strace_path_arg(),
+        remote_attach_flag_arg(),
+        remote_pid.data(),
+        nullptr,
+    };
+    execvp(strace_path_arg(), helper_argv.data());
+    std::perror("strace: exec remote attach helper");
+    return 127;
 }
 
 auto trace_loop(uint64_t pid) -> int {
@@ -663,6 +734,79 @@ auto launch_tracee(char** argv) -> int {
     return 127;
 }
 
+auto attach_and_trace(uint64_t pid, bool route_proxy) -> int {
+    if (route_proxy) {
+        ker::abi::ptrace::RemoteInfo info{};
+        if (read_remote_info(pid, info) && is_proxy_info(info)) {
+            return exec_strace_remote_attach(info);
+        }
+    }
+
+    if (ptrace_call(ker::abi::ptrace::request::ATTACH, pid, 0, 0) < 0) {
+        std::println(stderr, "strace: attach to {} failed", pid);
+        return 1;
+    }
+    int status = 0;
+    if (waitpid(static_cast<pid_t>(pid), &status, WUNTRACED) < 0) {
+        std::perror("strace: waitpid");
+        return 1;
+    }
+    return trace_loop(pid);
+}
+
+auto trace_command(char** argv) -> int {
+    pid_t const CHILD = fork();
+    if (CHILD < 0) {
+        std::perror("strace: fork");
+        return 1;
+    }
+    if (CHILD == 0) {
+        return launch_tracee(argv);
+    }
+    int status = 0;
+    if (waitpid(CHILD, &status, WUNTRACED) < 0) {
+        std::perror("strace: waitpid");
+        return 1;
+    }
+    if (target_is_proxy(static_cast<uint64_t>(CHILD))) {
+        std::println(stderr, "strace: tracee became a WKI proxy before syscall tracing could start");
+        return 1;
+    }
+    return trace_loop(static_cast<uint64_t>(CHILD));
+}
+
+auto route_remote_preferred(char** command_argv) -> int {
+    int64_t const TARGET_RC = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    if (TARGET_RC < 0) {
+        std::println(stderr, "strace: failed to set remote policy: {}", format_result(TARGET_RC));
+        return 1;
+    }
+    return exec_strace_with_command(command_argv);
+}
+
+auto route_to_host(const char* hostname, char** command_argv) -> int {
+    if (hostname == nullptr || hostname[0] == '\0') {
+        usage();
+        return 1;
+    }
+    int64_t const TARGET_RC = ker::process::setwkitarget(hostname, std::strlen(hostname), ker::process::WKI_TARGET_FLAG_STRICT);
+    if (TARGET_RC < 0) {
+        std::println(stderr, "strace: failed to target '{}': {}", hostname, format_result(TARGET_RC));
+        return 1;
+    }
+    return exec_strace_with_command(command_argv);
+}
+
+auto route_homeward(char** command_argv) -> int {
+    std::array<char, ker::abi::ptrace::RemoteInfo::TARGET_HOSTNAME_LEN> launcher = {};
+    int64_t const LAUNCHER_LEN = ker::process::wki_launcher_node(launcher.data(), launcher.size());
+    if (LAUNCHER_LEN <= 0 || launcher.front() == '\0') {
+        std::println(stderr, "strace: failed to resolve launcher node");
+        return 1;
+    }
+    return route_to_host(launcher.data(), command_argv);
+}
+
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
@@ -671,50 +815,69 @@ auto main(int argc, char** argv) -> int {
         return 1;
     }
 
+    if (std::string_view(argv[1]) == remote_attach_flag_arg()) {
+        if (argc != 3) {
+            usage();
+            return 1;
+        }
+        uint64_t pid = 0;
+        if (!parse_pid_arg(argv[2], pid)) {
+            std::println(stderr, "strace: invalid pid '{}'", argv[2]);
+            return 1;
+        }
+        return attach_and_trace(pid, false);
+    }
+
+    if (std::string_view(argv[1]) == remote_command_flag_arg()) {
+        if (argc < 3) {
+            usage();
+            return 1;
+        }
+        return trace_command(&argv[2]);
+    }
+
     if (std::strcmp(argv[1], "-p") == 0) {
         if (argc != 3) {
             usage();
             return 1;
         }
-        char* end = nullptr;
-        unsigned long long const PARSED = std::strtoull(argv[2], &end, 10);
-        if (end == nullptr || *end != '\0') {
+        uint64_t pid = 0;
+        if (!parse_pid_arg(argv[2], pid)) {
             std::println(stderr, "strace: invalid pid '{}'", argv[2]);
             return 1;
         }
-        uint64_t const PID = PARSED;
-        if (ptrace_call(ker::abi::ptrace::request::ATTACH, PID, 0, 0) < 0) {
-            std::println(stderr, "strace: attach to {} failed", PID);
-            return 1;
-        }
-        int status = 0;
-        if (waitpid(static_cast<pid_t>(PID), &status, WUNTRACED) < 0) {
-            std::perror("strace: waitpid");
-            return 1;
-        }
-        if (target_is_remote(PID)) {
-            print_remote_target_warning(PID);
-            return 1;
-        }
-        return trace_loop(PID);
+        return attach_and_trace(pid, true);
     }
 
-    pid_t const CHILD = fork();
-    if (CHILD < 0) {
-        std::perror("strace: fork");
-        return 1;
+    std::string_view const WRAPPER = command_basename(argv[1]);
+    if (WRAPPER == "locally") {
+        if (argc < 3) {
+            usage();
+            return 1;
+        }
+        return trace_command(&argv[2]);
     }
-    if (CHILD == 0) {
-        return launch_tracee(&argv[1]);
+    if (WRAPPER == "remotely") {
+        if (argc < 3) {
+            usage();
+            return 1;
+        }
+        return route_remote_preferred(&argv[2]);
     }
-    int status = 0;
-    if (waitpid(CHILD, &status, WUNTRACED) < 0) {
-        std::perror("strace: waitpid");
-        return 1;
+    if (WRAPPER == "on") {
+        if (argc < 4) {
+            usage();
+            return 1;
+        }
+        return route_to_host(argv[2], &argv[3]);
     }
-    if (target_is_remote(static_cast<uint64_t>(CHILD))) {
-        print_remote_target_warning(static_cast<uint64_t>(CHILD));
-        return 1;
+    if (WRAPPER == "homeward") {
+        if (argc < 3) {
+            usage();
+            return 1;
+        }
+        return route_homeward(&argv[2]);
     }
-    return trace_loop(static_cast<uint64_t>(CHILD));
+
+    return trace_command(&argv[1]);
 }

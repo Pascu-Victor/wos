@@ -10,6 +10,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dev/virtio/virtio_net.hpp>
+#include <net/backlog.hpp>
+#include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
+#include <net/packet.hpp>
+#include <net/proto/tcp.hpp>
 #include <new>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -23,6 +29,7 @@
 
 #include "net/wki/remote_compute.hpp"
 #include "net/wki/remote_ipc.hpp"
+#include "net/wki/remote_vfs.hpp"
 #include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -218,6 +225,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "peers", 6);
+            return 0;
+        }
+        if (count == 3) {
+            buf->d_ino = 21;
+            buf->d_off = 4;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "netdiag", 8);
             return 0;
         }
         return -ENOENT;
@@ -959,6 +974,409 @@ void append_sconst(char*& p, const char* end, const char* s) {
     }
 }
 
+void append_char(char*& p, const char* end, char c) {
+    if (p + 1 < end) {
+        *p++ = c;
+    }
+}
+
+void append_bool01(char*& p, const char* end, bool v) { append_dec64(p, end, v ? 1U : 0U); }
+
+void append_hex16(char*& p, const char* end, uint16_t v) {
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    if (p + 6 >= end) {
+        return;
+    }
+    *p++ = '0';
+    *p++ = 'x';
+    for (int i = 12; i >= 0; i -= 4) {
+        *p++ = HEX_DIGITS[static_cast<size_t>((v >> i) & 0xf)];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    }
+}
+
+void append_ipv4(char*& p, const char* end, uint32_t ip) {
+    append_dec64(p, end, (ip >> 24U) & 0xffU);
+    append_char(p, end, '.');
+    append_dec64(p, end, (ip >> 16U) & 0xffU);
+    append_char(p, end, '.');
+    append_dec64(p, end, (ip >> 8U) & 0xffU);
+    append_char(p, end, '.');
+    append_dec64(p, end, ip & 0xffU);
+}
+
+auto peer_state_name(ker::net::wki::PeerState state) -> const char* {
+    switch (state) {
+        case ker::net::wki::PeerState::UNKNOWN:
+            return "UNKNOWN";
+        case ker::net::wki::PeerState::HELLO_SENT:
+            return "HELLO_SENT";
+        case ker::net::wki::PeerState::CONNECTED:
+            return "CONNECTED";
+        case ker::net::wki::PeerState::FENCED:
+            return "FENCED";
+        case ker::net::wki::PeerState::RECONNECTING:
+            return "RECONNECTING";
+    }
+    return "?";
+}
+
+auto tcp_state_name(uint8_t state) -> const char* {
+    switch (static_cast<ker::net::proto::TcpState>(state)) {
+        case ker::net::proto::TcpState::CLOSED:
+            return "CLOSED";
+        case ker::net::proto::TcpState::LISTEN:
+            return "LISTEN";
+        case ker::net::proto::TcpState::SYN_SENT:
+            return "SYN_SENT";
+        case ker::net::proto::TcpState::SYN_RECEIVED:
+            return "SYN_RECEIVED";
+        case ker::net::proto::TcpState::ESTABLISHED:
+            return "ESTABLISHED";
+        case ker::net::proto::TcpState::FIN_WAIT_1:
+            return "FIN_WAIT_1";
+        case ker::net::proto::TcpState::FIN_WAIT_2:
+            return "FIN_WAIT_2";
+        case ker::net::proto::TcpState::CLOSE_WAIT:
+            return "CLOSE_WAIT";
+        case ker::net::proto::TcpState::CLOSING:
+            return "CLOSING";
+        case ker::net::proto::TcpState::LAST_ACK:
+            return "LAST_ACK";
+        case ker::net::proto::TcpState::TIME_WAIT:
+            return "TIME_WAIT";
+    }
+    return "?";
+}
+
+auto priority_name(uint8_t priority) -> const char* {
+    return priority == static_cast<uint8_t>(ker::net::wki::PriorityClass::THROUGHPUT) ? "THROUGHPUT" : "LATENCY";
+}
+
+auto napi_state_name(uint8_t state) -> const char* {
+    switch (static_cast<ker::net::NapiState>(state)) {
+        case ker::net::NapiState::IDLE:
+            return "IDLE";
+        case ker::net::NapiState::SCHEDULED:
+            return "SCHEDULED";
+        case ker::net::NapiState::POLLING:
+            return "POLLING";
+        case ker::net::NapiState::DISABLED:
+            return "DISABLED";
+    }
+    return "?";
+}
+
+void append_netdev_name(char*& p, const char* end, const std::array<char, ker::net::NETDEV_NAME_LEN>& name) {
+    for (char c : name) {
+        if (c == '\0') {
+            return;
+        }
+        append_char(p, end, c);
+    }
+}
+
+void append_virtqueue_diag(char*& p, const char* end, const char* prefix, const ker::dev::virtio::VirtqueueDiagSnapshot& q) {
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_size=");
+    append_dec64(p, end, q.size);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_free=");
+    append_dec64(p, end, q.num_free);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_inflight=");
+    append_dec64(p, end, q.size >= q.num_free ? q.size - q.num_free : 0);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_pending=");
+    append_dec64(p, end, q.pending);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_mapped=");
+    append_dec64(p, end, q.mapped);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_avail_idx=");
+    append_dec64(p, end, q.avail_idx);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_used_idx=");
+    append_dec64(p, end, q.used_idx);
+    append_char(p, end, ' ');
+    append_sconst(p, end, prefix);
+    append_sconst(p, end, "_last_used=");
+    append_dec64(p, end, q.last_used_idx);
+}
+
+auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    auto pool = ker::net::pkt_pool_snapshot();
+    append_sconst(p, end, "packet_pool capacity=");
+    append_dec64(p, end, pool.capacity);
+    append_sconst(p, end, " free=");
+    append_dec64(p, end, pool.free);
+    append_sconst(p, end, " used=");
+    append_dec64(p, end, pool.used);
+    append_sconst(p, end, " rx_reserve=");
+    append_dec64(p, end, pool.rx_reserve);
+    append_sconst(p, end, " grow_chunk=");
+    append_dec64(p, end, pool.grow_chunk);
+    append_sconst(p, end, " buf_size=");
+    append_dec64(p, end, pool.buffer_size);
+    append_sconst(p, end, " headroom=");
+    append_dec64(p, end, pool.headroom);
+    append_sconst(p, end, " tx_refused=");
+    append_dec64(p, end, pool.tx_refused);
+    append_sconst(p, end, " expanding=");
+    append_bool01(p, end, pool.expand_in_progress);
+    append_char(p, end, '\n');
+
+    ker::net::BacklogSnapshot backlog{};
+    ker::net::backlog_get_snapshot(backlog);
+    append_sconst(p, end, "backlog ready=");
+    append_bool01(p, end, backlog.ready);
+    append_sconst(p, end, " cpus=");
+    append_dec64(p, end, backlog.num_cpus);
+    append_sconst(p, end, " queues=");
+    append_dec64(p, end, backlog.queue_count);
+    append_sconst(p, end, " queued=");
+    append_dec64(p, end, backlog.total_queued);
+    append_char(p, end, '\n');
+    for (size_t i = 0; i < backlog.queue_count; ++i) {
+        const auto& row = backlog.queues.at(i);
+        append_sconst(p, end, "backlog_cpu cpu=");
+        append_dec64(p, end, row.cpu);
+        append_sconst(p, end, " queued=");
+        append_dec64(p, end, row.queued);
+        append_sconst(p, end, " handler_pid=");
+        append_dec64(p, end, row.handler_pid);
+        append_sconst(p, end, " handler_cpu=");
+        append_dec64(p, end, row.handler_cpu);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, row.handler_active);
+        append_char(p, end, '\n');
+    }
+
+    std::array<ker::net::NetDeviceSnapshot, ker::net::MAX_NET_DEVICES> devs{};
+    size_t const DEV_COUNT = ker::net::netdev_snapshot(devs.data(), devs.size());
+    for (size_t i = 0; i < DEV_COUNT; ++i) {
+        const auto& dev = devs.at(i);
+        append_sconst(p, end, "netdev name=");
+        append_netdev_name(p, end, dev.name);
+        append_sconst(p, end, " ifindex=");
+        append_dec64(p, end, dev.ifindex);
+        append_sconst(p, end, " state=");
+        append_sconst(p, end, dev.state != 0 ? "up" : "down");
+        append_sconst(p, end, " mtu=");
+        append_dec64(p, end, dev.mtu);
+        append_sconst(p, end, " txqlen=");
+        append_dec64(p, end, dev.tx_queue_len);
+        append_sconst(p, end, " wki_transport=");
+        append_bool01(p, end, dev.wki_transport);
+        append_sconst(p, end, " rx_forward=");
+        append_bool01(p, end, dev.wki_rx_forward);
+        append_sconst(p, end, " remotable=");
+        append_bool01(p, end, dev.remotable);
+        append_sconst(p, end, " rx_packets=");
+        append_dec64(p, end, dev.rx_packets);
+        append_sconst(p, end, " rx_bytes=");
+        append_dec64(p, end, dev.rx_bytes);
+        append_sconst(p, end, " rx_dropped=");
+        append_dec64(p, end, dev.rx_dropped);
+        append_sconst(p, end, " tx_packets=");
+        append_dec64(p, end, dev.tx_packets);
+        append_sconst(p, end, " tx_bytes=");
+        append_dec64(p, end, dev.tx_bytes);
+        append_sconst(p, end, " tx_dropped=");
+        append_dec64(p, end, dev.tx_dropped);
+        append_char(p, end, '\n');
+    }
+
+    std::array<ker::dev::virtio::VirtIONetDiagSnapshot, ker::dev::virtio::VIRTIO_NET_DIAG_MAX_ROWS> virtio_rows{};
+    size_t const VIRTIO_COUNT = ker::dev::virtio::virtio_net_diag_snapshot(virtio_rows.data(), virtio_rows.size());
+    for (size_t i = 0; i < VIRTIO_COUNT; ++i) {
+        const auto& row = virtio_rows.at(i);
+        append_sconst(p, end, "virtio_net name=");
+        append_netdev_name(p, end, row.name);
+        append_sconst(p, end, " ifindex=");
+        append_dec64(p, end, row.ifindex);
+        append_sconst(p, end, " pair=");
+        append_dec64(p, end, row.pair);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, row.active);
+        append_sconst(p, end, " pairs=");
+        append_dec64(p, end, row.num_queue_pairs);
+        append_sconst(p, end, " configured=");
+        append_dec64(p, end, row.configured_queue_pairs);
+        append_sconst(p, end, " msix=");
+        append_bool01(p, end, row.msix_enabled);
+        append_sconst(p, end, " vector=");
+        append_dec64(p, end, row.irq_vector);
+        append_sconst(p, end, " hdr_size=");
+        append_dec64(p, end, row.hdr_size);
+        append_sconst(p, end, " napi_state=");
+        append_sconst(p, end, napi_state_name(row.napi_state));
+        append_sconst(p, end, " napi_work=");
+        append_bool01(p, end, row.napi_has_work);
+        append_sconst(p, end, " worker_pid=");
+        append_dec64(p, end, row.napi_worker_pid);
+        append_sconst(p, end, " worker_cpu=");
+        append_dec64(p, end, row.napi_worker_cpu);
+        append_sconst(p, end, " polls=");
+        append_dec64(p, end, row.napi_polls);
+        append_sconst(p, end, " completes=");
+        append_dec64(p, end, row.napi_completes);
+        append_virtqueue_diag(p, end, "rx", row.rx);
+        append_virtqueue_diag(p, end, "tx", row.tx);
+        append_char(p, end, '\n');
+    }
+    if (VIRTIO_COUNT == virtio_rows.size()) {
+        append_sconst(p, end, "virtio_net_truncated max=");
+        append_dec64(p, end, virtio_rows.size());
+        append_char(p, end, '\n');
+    }
+
+    std::array<ker::net::proto::TcpListenerSnapshot, ker::net::proto::TCP_LISTENER_SNAPSHOT_MAX> listeners{};
+    size_t const LISTENER_COUNT = ker::net::proto::tcp_listener_snapshot(listeners.data(), listeners.size());
+    for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+        const auto& listener = listeners.at(i);
+        append_sconst(p, end, "tcp_listener local=");
+        append_ipv4(p, end, listener.local_ip);
+        append_char(p, end, ':');
+        append_dec64(p, end, listener.local_port);
+        append_sconst(p, end, " state=");
+        append_sconst(p, end, tcp_state_name(listener.state));
+        append_sconst(p, end, " owner_pid=");
+        append_dec64(p, end, listener.owner_pid);
+        append_sconst(p, end, " accept_queue=");
+        append_dec64(p, end, listener.accept_queue);
+        append_sconst(p, end, " backlog=");
+        append_dec64(p, end, static_cast<uint64_t>(listener.backlog));
+        append_sconst(p, end, " rcvbuf_used=");
+        append_dec64(p, end, listener.rcvbuf_used);
+        append_sconst(p, end, " rcvbuf_capacity=");
+        append_dec64(p, end, listener.rcvbuf_capacity);
+        append_sconst(p, end, " rcv_wnd=");
+        append_dec64(p, end, listener.rcv_wnd);
+        append_sconst(p, end, " refcnt=");
+        append_dec64(p, end, listener.refcount);
+        append_char(p, end, '\n');
+    }
+
+    ker::net::wki::WkiIpcPerfSnapshot ipc{};
+    ker::net::wki::wki_ipc_get_perf_snapshot(ipc);
+    append_sconst(p, end, "wki_ipc exports=");
+    append_dec64(p, end, ipc.exports);
+    append_sconst(p, end, " proxies=");
+    append_dec64(p, end, ipc.proxies);
+    append_sconst(p, end, " active_pumps=");
+    append_dec64(p, end, ipc.pump_tasks);
+    append_sconst(p, end, " ring_used=");
+    append_dec64(p, end, ipc.proxy_ring_used_bytes);
+    append_sconst(p, end, " pending_deliveries=");
+    append_dec64(p, end, ipc.pending_deliveries);
+    append_sconst(p, end, " pending_bytes=");
+    append_dec64(p, end, ipc.pending_bytes);
+    append_sconst(p, end, " export_flush_queue=");
+    append_dec64(p, end, ipc.export_flush_queue);
+    append_sconst(p, end, " dev_op_queue=");
+    append_dec64(p, end, ipc.dev_op_queue);
+    append_char(p, end, '\n');
+
+    std::array<ker::net::wki::WkiRemoteVfsProxyDiag, ker::net::wki::WKI_REMOTE_VFS_PROXY_DIAG_MAX> vfs_proxies{};
+    size_t const VFS_PROXY_COUNT = ker::net::wki::wki_remote_vfs_proxy_diag_snapshot(vfs_proxies.data(), vfs_proxies.size());
+    for (size_t i = 0; i < VFS_PROXY_COUNT; ++i) {
+        const auto& proxy = vfs_proxies.at(i);
+        append_sconst(p, end, "wki_vfs_proxy owner=");
+        append_hex16(p, end, proxy.owner_node);
+        append_sconst(p, end, " res_id=");
+        append_dec64(p, end, proxy.resource_id);
+        append_sconst(p, end, " ch=");
+        append_dec64(p, end, proxy.assigned_channel);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, proxy.active);
+        append_sconst(p, end, " op_pending=");
+        append_bool01(p, end, proxy.op_pending);
+        append_sconst(p, end, " op_id=");
+        append_dec64(p, end, proxy.op_expected_id);
+        append_sconst(p, end, " op_seq=");
+        append_dec64(p, end, proxy.op_expected_seq);
+        append_sconst(p, end, " attach_pending=");
+        append_bool01(p, end, proxy.attach_pending);
+        append_sconst(p, end, " mount=");
+        append_sconst(p, end, proxy.local_mount_path.data());
+        append_char(p, end, '\n');
+    }
+    if (VFS_PROXY_COUNT == vfs_proxies.size()) {
+        append_sconst(p, end, "wki_vfs_proxy_truncated max=");
+        append_dec64(p, end, vfs_proxies.size());
+        append_char(p, end, '\n');
+    }
+
+    std::array<ker::net::wki::WkiChannelDiag, ker::net::wki::WKI_CHANNEL_DIAG_MAX> channels{};
+    size_t const CHANNEL_COUNT = ker::net::wki::wki_channel_diag_snapshot(channels.data(), channels.size());
+    for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
+        const auto& ch = channels.at(i);
+        append_sconst(p, end, "wki_channel peer=");
+        append_hex16(p, end, ch.peer_node);
+        append_sconst(p, end, " state=");
+        append_sconst(p, end, peer_state_name(ch.peer_state));
+        append_sconst(p, end, " direct=");
+        append_bool01(p, end, ch.peer_direct);
+        append_sconst(p, end, " next_hop=");
+        append_hex16(p, end, ch.next_hop);
+        append_sconst(p, end, " hops=");
+        append_dec64(p, end, ch.hop_count);
+        append_sconst(p, end, " ch=");
+        append_dec64(p, end, ch.channel_id);
+        append_sconst(p, end, " priority=");
+        append_sconst(p, end, priority_name(ch.priority));
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, ch.active);
+        append_sconst(p, end, " tx_seq=");
+        append_dec64(p, end, ch.tx_seq);
+        append_sconst(p, end, " tx_ack=");
+        append_dec64(p, end, ch.tx_ack);
+        append_sconst(p, end, " rx_seq=");
+        append_dec64(p, end, ch.rx_seq);
+        append_sconst(p, end, " rx_ack=");
+        append_dec64(p, end, ch.rx_ack_pending);
+        append_sconst(p, end, " ack_pending=");
+        append_bool01(p, end, ch.ack_pending);
+        append_sconst(p, end, " tx_credits=");
+        append_dec64(p, end, ch.tx_credits);
+        append_sconst(p, end, " rx_credits=");
+        append_dec64(p, end, ch.rx_credits);
+        append_sconst(p, end, " retransmit_count=");
+        append_dec64(p, end, ch.retransmit_count);
+        append_sconst(p, end, " reorder_count=");
+        append_dec64(p, end, ch.reorder_count);
+        append_sconst(p, end, " retransmits=");
+        append_dec64(p, end, ch.retransmits);
+        append_sconst(p, end, " bytes_tx=");
+        append_dec64(p, end, ch.bytes_sent);
+        append_sconst(p, end, " bytes_rx=");
+        append_dec64(p, end, ch.bytes_received);
+        append_char(p, end, '\n');
+    }
+    if (CHANNEL_COUNT == channels.size()) {
+        append_sconst(p, end, "wki_channel_truncated max=");
+        append_dec64(p, end, channels.size());
+        append_char(p, end, '\n');
+    }
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
     if (callsite == 0) {
         append_sconst(p, end, "?");
@@ -1218,7 +1636,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
-                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE);
+                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE);
         size_t const ALLOC_SZ = IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
         pfd->content = new (std::nothrow) char[ALLOC_SZ];
         if (pfd->content == nullptr) {
@@ -1273,6 +1691,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::WKI_PEERS_FILE:
                 pfd->content_len = generate_wki_peers(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::WKI_NETDIAG_FILE:
+                pfd->content_len = generate_wki_netdiag(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
@@ -1626,6 +2047,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/wki/peers
     if (strcmp(path, "wki/peers") == 0) {
         return make_file(ProcNodeType::WKI_PEERS_FILE, 0, false);
+    }
+
+    // /proc/wki/netdiag
+    if (strcmp(path, "wki/netdiag") == 0) {
+        return make_file(ProcNodeType::WKI_NETDIAG_FILE, 0, false);
     }
 
     // /proc/self -> symlink to /proc/<pid>

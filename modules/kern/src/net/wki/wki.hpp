@@ -42,6 +42,7 @@ constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
 constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 300;       // 300 ms
 constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
 constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 10;            // 10 misses = 10 second timeout
+constexpr uint32_t WKI_PEER_FENCE_CONFIRM_GRACE_MS = 30000;   // second chance before destructive fence cleanup
 
 // Grace period for newly connected peers
 constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = static_cast<uint32_t>(WKI_DEFAULT_MISS_THRESHOLD) * WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
@@ -62,6 +63,17 @@ constexpr uint16_t WKI_CREDITS_ZONE_MGMT = 32;
 constexpr uint16_t WKI_CREDITS_EVENT_BUS = 128;
 constexpr uint16_t WKI_CREDITS_RESOURCE = 32;
 constexpr uint16_t WKI_CREDITS_DYNAMIC = 256;
+
+// Reorder-buffer limits are intentionally separate from advertised credits.
+// Credits bound what the peer should send concurrently; reorder limits bound
+// how much future traffic we can retain while one missing sequence is being
+// retransmitted. Resource channels fan in pipe/device traffic and can arrive
+// much farther ahead than their nominal credit window under load.
+constexpr uint16_t WKI_REORDER_CONTROL = WKI_CREDITS_CONTROL;
+constexpr uint16_t WKI_REORDER_ZONE_MGMT = WKI_CREDITS_ZONE_MGMT;
+constexpr uint16_t WKI_REORDER_EVENT_BUS = WKI_CREDITS_EVENT_BUS;
+constexpr uint16_t WKI_REORDER_RESOURCE = 1024;
+constexpr uint16_t WKI_REORDER_DYNAMIC = WKI_CREDITS_DYNAMIC;
 
 // LSA
 constexpr uint32_t WKI_LSA_REFRESH_MS = 5000;  // 5 seconds
@@ -182,6 +194,13 @@ struct WkiPeer {
     uint16_t capabilities = 0;
     uint16_t max_channels = 0;
 
+    // Channel reset epochs advertised through HELLO reserved bytes.  When a
+    // peer observes our local epoch change, it drops stale channel seq state
+    // for this node so a post-fence seq=0 stream is not mistaken for an old
+    // duplicate.
+    uint32_t local_channel_epoch = 0;
+    uint32_t remote_channel_epoch = 0;
+
     // HELLO retry
     uint64_t hello_sent_time = 0;
     uint8_t hello_retries = 0;
@@ -218,11 +237,12 @@ struct WkiRetransmitEntry {
 // -----------------------------------------------------------------------------
 
 struct WkiReorderEntry {
-    uint8_t* data;  // payload only
-    uint16_t len;
-    uint8_t msg_type;
-    uint32_t seq;
-    WkiReorderEntry* next;
+    WkiHeader hdr = {};
+    uint8_t* data = nullptr;  // payload only
+    uint16_t len = 0;
+    uint8_t msg_type = 0;
+    uint32_t seq = 0;
+    WkiReorderEntry* next = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -285,6 +305,31 @@ struct WkiChannel {
     bool tx_rt_entry_in_use = false;  // true while inline entry is in the retransmit queue
 
     ker::mod::sys::Spinlock lock;
+};
+
+constexpr size_t WKI_CHANNEL_DIAG_MAX = 256;
+
+struct WkiChannelDiag {
+    uint16_t peer_node = WKI_NODE_INVALID;
+    PeerState peer_state = PeerState::UNKNOWN;
+    bool peer_direct = false;
+    uint16_t next_hop = WKI_NODE_INVALID;
+    uint8_t hop_count = 0;
+    uint16_t channel_id = 0;
+    uint8_t priority = 0;
+    bool active = false;
+    uint32_t tx_seq = 0;
+    uint32_t tx_ack = 0;
+    uint32_t rx_seq = 0;
+    uint32_t rx_ack_pending = 0;
+    bool ack_pending = false;
+    uint16_t tx_credits = 0;
+    uint16_t rx_credits = 0;
+    uint32_t retransmit_count = 0;
+    uint32_t reorder_count = 0;
+    uint32_t retransmits = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -414,6 +459,9 @@ void wki_channel_close(WkiChannel* ch);
 
 // Close all channels to a specific peer (used during fencing)
 void wki_channels_close_for_peer(uint16_t node_id);
+
+// Snapshot active channels for diagnostics. Values are approximate but bounded.
+auto wki_channel_diag_snapshot(WkiChannelDiag* out, size_t max) -> size_t;
 
 // -----------------------------------------------------------------------------
 // Public API - Timer Tick (called from timer interrupt / periodic thread)

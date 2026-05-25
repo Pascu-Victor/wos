@@ -242,6 +242,23 @@ auto pkt_pool_size() -> size_t { return pool_capacity; }
 
 auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_relaxed); }
 
+auto pkt_pool_snapshot() -> PacketPoolSnapshot {
+    PacketPoolSnapshot snapshot{};
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
+    snapshot.capacity = pool_capacity;
+    pool_lock.unlock_irqrestore(FLAGS);
+
+    snapshot.free = free_count.load(std::memory_order_relaxed);
+    snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
+    snapshot.rx_reserve = RX_RESERVE;
+    snapshot.grow_chunk = PKT_POOL_GROW_CHUNK;
+    snapshot.buffer_size = PKT_BUF_SIZE;
+    snapshot.headroom = PKT_HEADROOM;
+    snapshot.tx_refused = refuse_count.load(std::memory_order_relaxed);
+    snapshot.expand_in_progress = expand_in_progress.load(std::memory_order_acquire);
+    return snapshot;
+}
+
 void pkt_pool_ensure_free(size_t min_free) { static_cast<void>(pkt_pool_try_grow(min_free, "runtime")); }
 
 auto pkt_alloc() -> PacketBuffer* {

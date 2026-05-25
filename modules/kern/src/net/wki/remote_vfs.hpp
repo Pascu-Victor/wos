@@ -157,6 +157,20 @@ struct RemoteFileContext {
     uint32_t bulk_cached_len = 0;
 };
 
+constexpr size_t WKI_REMOTE_VFS_PROXY_DIAG_MAX = 128;
+
+struct WkiRemoteVfsProxyDiag {
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t resource_id = 0;
+    bool active = false;
+    bool op_pending = false;
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    bool attach_pending = false;
+    std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -178,6 +192,9 @@ void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
 
 // Consumer side: mount a remote VFS at local_mount_path
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
+
+// Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
+auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;
 
 // Consumer side: unmount a remote VFS
 void wki_remote_vfs_unmount(const char* local_mount_path);

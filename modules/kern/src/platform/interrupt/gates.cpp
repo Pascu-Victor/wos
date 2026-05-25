@@ -109,7 +109,6 @@ void record_irq_perf(uint8_t vector, uint16_t kind, int32_t status, uint64_t sta
 
 void dump_stack_owner(const char* label, uint64_t rsp) {
     auto* active_owner = sched::debug_find_task_by_kernel_stack(rsp);
-    auto* dead_owner = sched::debug_find_dead_task_by_kernel_stack(rsp);
     if (active_owner != nullptr) {
         journal::panic("%s active owner: pid=%lu name=%s task=0x%lx stack=0x%lx state=%u queue=%u", label, active_owner->pid,
                        active_owner->name != nullptr ? active_owner->name : "?", reinterpret_cast<uint64_t>(active_owner),
@@ -119,6 +118,8 @@ void dump_stack_owner(const char* label, uint64_t rsp) {
     } else {
         journal::panic("%s active owner: <none>", label);
     }
+
+    auto* dead_owner = sched::debug_find_dead_task_by_kernel_stack(rsp);
     if (dead_owner != nullptr) {
         journal::panic("%s dead owner: pid=%lu name=%s task=0x%lx stack=0x%lx state=%u queue=%u", label, dead_owner->pid,
                        dead_owner->name != nullptr ? dead_owner->name : "?", reinterpret_cast<uint64_t>(dead_owner),

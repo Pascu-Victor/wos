@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <net/wki/remote_compute.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/addr.hpp>
@@ -26,7 +27,7 @@ using log = ker::mod::dbg::logger<"ptrace">;
 using Task = ker::mod::sched::task::Task;
 
 constexpr uint64_t X86_RFLAGS_TF = 1ULL << 8;
-constexpr uint64_t WKI_NODE_INVALID = 0xffff'ffff'ffff'ffffULL;
+constexpr uint64_t PTRACE_REMOTE_NODE_INVALID = 0xffff'ffff'ffff'ffffULL;
 constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint32_t STOP_STATUS_LOW = 0x7f;
 constexpr uint64_t X86_DR6_BREAKPOINT_MASK = 0xf;
@@ -481,9 +482,15 @@ auto remote_info(Task& target, uint64_t data) -> uint64_t {
     }
     out->proxy_pid = target.pid;
     out->task_id = target.wki_proxy_task_id;
-    out->target_node = WKI_NODE_INVALID;
+    out->target_node = PTRACE_REMOTE_NODE_INVALID;
     out->remote_pid = target.wki_remote_pid;
-    std::strncpy(out->target_hostname.data(), target.wki_target_hostname.data(), out->target_hostname.size() - 1);
+    uint16_t proxy_target_node = 0;
+    if (ker::net::wki::wki_proxy_task_remote_info(&target, &proxy_target_node, out->target_hostname.data(), out->target_hostname.size())) {
+        out->target_node = proxy_target_node;
+    }
+    if (out->target_hostname.at(0) == '\0') {
+        std::strncpy(out->target_hostname.data(), target.wki_target_hostname.data(), out->target_hostname.size() - 1);
+    }
     if (out->target_hostname.at(0) == '\0') {
         std::strncpy(out->target_hostname.data(), target.wki_submitter_hostname.data(), out->target_hostname.size() - 1);
     }

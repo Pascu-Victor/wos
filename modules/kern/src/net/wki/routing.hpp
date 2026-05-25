@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 

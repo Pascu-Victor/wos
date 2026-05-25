@@ -176,7 +176,26 @@ run_case() {
         case_pid="$!"
         (
             killed=0
-            sleep "$CASE_TIMEOUT_SECONDS"
+            timeout_sleep_pid=
+            grace_sleep_pid=
+
+            cleanup_watchdog() {
+                if [ -n "$timeout_sleep_pid" ]; then
+                    kill "$timeout_sleep_pid" >/dev/null 2>&1 || true
+                fi
+                if [ -n "$grace_sleep_pid" ]; then
+                    kill "$grace_sleep_pid" >/dev/null 2>&1 || true
+                fi
+                exit 0
+            }
+
+            trap cleanup_watchdog TERM INT HUP
+
+            sleep "$CASE_TIMEOUT_SECONDS" &
+            timeout_sleep_pid="$!"
+            wait "$timeout_sleep_pid" || exit 0
+            timeout_sleep_pid=
+
             if [ "$case_has_group" -eq 1 ] && kill -TERM "-$case_pid" >/dev/null 2>&1; then
                 killed=1
             elif kill "$case_pid" >/dev/null 2>&1; then
@@ -185,7 +204,11 @@ run_case() {
 
             if [ "$killed" -eq 1 ]; then
                 printf 'timeout after %ss\n' "$CASE_TIMEOUT_SECONDS" > "$timeout_marker"
-                sleep "$TIMEOUT_KILL_GRACE_SECONDS"
+                sleep "$TIMEOUT_KILL_GRACE_SECONDS" &
+                grace_sleep_pid="$!"
+                wait "$grace_sleep_pid" || exit 0
+                grace_sleep_pid=
+
                 if [ "$case_has_group" -eq 1 ]; then
                     kill -KILL "-$case_pid" >/dev/null 2>&1 || kill -KILL "$case_pid" >/dev/null 2>&1 || true
                 else
@@ -200,7 +223,11 @@ run_case() {
 
         wait "$case_pid"
         rc="$?"
-        kill "$watchdog_pid" >/dev/null 2>&1 || true
+        if [ "$case_has_group" -eq 1 ]; then
+            kill -TERM "-$watchdog_pid" >/dev/null 2>&1 || kill "$watchdog_pid" >/dev/null 2>&1 || true
+        else
+            kill "$watchdog_pid" >/dev/null 2>&1 || true
+        fi
         wait "$watchdog_pid" 2>/dev/null || true
 
         if [ -f "$timeout_marker" ]; then

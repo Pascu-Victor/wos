@@ -41,6 +41,7 @@ namespace {
 
 #if !TRACEBENCH_ENABLE_MPI
 constexpr std::array<char, 4> TILE_PACKET_MAGIC = {'R', 'B', 'T', 'L'};
+constexpr std::array<char, 4> DONE_PACKET_MAGIC = {'R', 'B', 'T', 'D'};
 constexpr int WORKER_STDOUT_FD = 1;
 volatile sig_atomic_t g_cancel_signal = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -75,9 +76,34 @@ struct TilePacketHeader {
     uint32_t float_count = 0;
 };
 
+struct WorkerDonePacket {
+    std::array<char, 4> magic = DONE_PACKET_MAGIC;
+    uint32_t worker_id = 0;
+    uint32_t expected_tiles = 0;
+    uint32_t rendered_tiles = 0;
+    uint32_t sent_tiles = 0;
+    uint32_t failed = 0;
+    uint32_t reserved = 0;
+};
+
+static_assert(sizeof(WorkerDonePacket) == sizeof(TilePacketHeader));
+
 struct ChildWorker {
     pid_t pid = -1;
     int read_fd = -1;
+    int worker_id = 0;
+    int worker_count = 1;
+    uint64_t expected_tiles = 0;
+    uint64_t received_packets = 0;
+    uint64_t unique_tiles = 0;
+    uint64_t duplicate_tiles = 0;
+    uint64_t foreign_tiles = 0;
+    uint64_t last_tile_index = UINT64_MAX;
+    bool done_seen = false;
+    uint64_t done_expected_tiles = 0;
+    uint64_t done_rendered_tiles = 0;
+    uint64_t done_sent_tiles = 0;
+    bool done_failed = false;
     std::string hostname;
     std::vector<unsigned char> buffer;
     bool pipe_open = true;
@@ -100,6 +126,8 @@ struct WorkerThreadState {
     const std::vector<tracebench::Tile>* tiles = nullptr;
     std::atomic<int>* next_tile = nullptr;
     std::atomic<bool>* failed = nullptr;
+    std::atomic<uint64_t>* tiles_rendered = nullptr;
+    std::atomic<uint64_t>* tiles_sent = nullptr;
     mtx_t* output_lock = nullptr;
 };
 #endif
@@ -178,7 +206,7 @@ auto read_wki_peers() -> std::vector<WkiPeerInfo> {
 
 auto local_cpu_count() -> int {
     auto peers = read_wki_peers();
-    auto local = std::find_if(peers.begin(), peers.end(), [](const WkiPeerInfo& peer) { return peer.local; });
+    auto local = std::ranges::find_if(peers, [](const WkiPeerInfo& peer) { return peer.local; });
     if (local != peers.end()) {
         return local->cpus;
     }
@@ -411,6 +439,21 @@ auto send_tile_packet(int fd, tracebench::FilmView film, const tracebench::Tile&
            write_all(fd, std::span<const unsigned char>(payload_bytes, payload.size() * sizeof(float)));
 }
 
+auto send_worker_done_packet(int fd, int worker_id, uint64_t expected_tiles, uint64_t rendered_tiles, uint64_t sent_tiles, bool failed)
+    -> bool {
+    WorkerDonePacket const PACKET = {
+        .magic = DONE_PACKET_MAGIC,
+        .worker_id = static_cast<uint32_t>(std::max(0, worker_id)),
+        .expected_tiles = static_cast<uint32_t>(std::min<uint64_t>(expected_tiles, UINT32_MAX)),
+        .rendered_tiles = static_cast<uint32_t>(std::min<uint64_t>(rendered_tiles, UINT32_MAX)),
+        .sent_tiles = static_cast<uint32_t>(std::min<uint64_t>(sent_tiles, UINT32_MAX)),
+        .failed = failed ? 1U : 0U,
+        .reserved = 0,
+    };
+    auto const* bytes = reinterpret_cast<const unsigned char*>(&PACKET);
+    return write_all(fd, std::span<const unsigned char>(bytes, sizeof(PACKET)));
+}
+
 auto worker_thread(void* raw) -> int {
     auto* state = static_cast<WorkerThreadState*>(raw);
     for (;;) {
@@ -423,6 +466,7 @@ auto worker_thread(void* raw) -> int {
         }
         const auto& tile = state->tiles->at(static_cast<size_t>(INDEX));
         tracebench::render_tile(*state->scene, state->film, *state->options, tile, 0xBADC0DEULL + static_cast<uint64_t>(tile.index));
+        state->tiles_rendered->fetch_add(1, std::memory_order_relaxed);
         mtx_lock(state->output_lock);
         bool const SENT = send_tile_packet(WORKER_STDOUT_FD, state->film, tile);
         mtx_unlock(state->output_lock);
@@ -430,6 +474,7 @@ auto worker_thread(void* raw) -> int {
             state->failed->store(true, std::memory_order_relaxed);
             break;
         }
+        state->tiles_sent->fetch_add(1, std::memory_order_relaxed);
     }
     return 0;
 }
@@ -465,24 +510,175 @@ auto apply_tile_payload(tracebench::FilmView film, const TilePacketHeader& heade
     return true;
 }
 
-auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, uint64_t& tiles_done) -> bool {
+enum class WorkerPacketKind : uint8_t {
+    NONE,
+    TILE,
+    DONE,
+};
+
+auto packet_magic_at(const std::vector<unsigned char>& bytes, size_t offset, std::span<const char, 4> magic) -> bool {
+    if (offset + magic.size() > bytes.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < magic.size(); ++i) {
+        if (bytes.at(offset + i) != static_cast<unsigned char>(magic[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto packet_kind_at(const std::vector<unsigned char>& bytes, size_t offset) -> WorkerPacketKind {
+    if (packet_magic_at(bytes, offset, TILE_PACKET_MAGIC)) {
+        return WorkerPacketKind::TILE;
+    }
+    if (packet_magic_at(bytes, offset, DONE_PACKET_MAGIC)) {
+        return WorkerPacketKind::DONE;
+    }
+    return WorkerPacketKind::NONE;
+}
+
+auto find_packet_magic(const std::vector<unsigned char>& bytes, size_t offset) -> size_t {
+    for (size_t i = offset; i + TILE_PACKET_MAGIC.size() <= bytes.size(); ++i) {
+        if (packet_kind_at(bytes, i) != WorkerPacketKind::NONE) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+auto validate_tile_header(tracebench::FilmView film, const TilePacketHeader& header, size_t& payload_floats) -> bool {
+    if (header.magic != TILE_PACKET_MAGIC) {
+        return false;
+    }
+    if (header.x1 > static_cast<uint32_t>(film.width) || header.y1 > static_cast<uint32_t>(film.height) || header.x0 >= header.x1 ||
+        header.y0 >= header.y1) {
+        return false;
+    }
+
+    tracebench::Tile const TILE{
+        .x0 = static_cast<int>(header.x0),
+        .y0 = static_cast<int>(header.y0),
+        .x1 = static_cast<int>(header.x1),
+        .y1 = static_cast<int>(header.y1),
+        .index = static_cast<int>(header.tile_index),
+    };
+    payload_floats = tile_float_count(TILE);
+    return header.float_count == payload_floats;
+}
+
+void note_worker_done_packet(ChildWorker& worker, const WorkerDonePacket& packet) {
+    if (worker.done_seen) {
+        std::println(stderr, "renderbench: duplicate done packet from {}", worker.hostname);
+    }
+    worker.done_seen = true;
+    worker.done_expected_tiles = packet.expected_tiles;
+    worker.done_rendered_tiles = packet.rendered_tiles;
+    worker.done_sent_tiles = packet.sent_tiles;
+    worker.done_failed = packet.failed != 0;
+    if (packet.worker_id != static_cast<uint32_t>(worker.worker_id)) {
+        std::println(stderr, "renderbench: done packet from {} reported worker {} expected {}", worker.hostname, packet.worker_id,
+                     worker.worker_id);
+    }
+    if (worker.done_failed || worker.done_expected_tiles != worker.expected_tiles ||
+        worker.done_rendered_tiles != worker.done_expected_tiles || worker.done_sent_tiles != worker.done_expected_tiles) {
+        std::println(stderr, "renderbench: worker {} done mismatch host={} expected={} reported_expected={} rendered={} sent={} failed={}",
+                     worker.worker_id, worker.hostname, worker.expected_tiles, worker.done_expected_tiles, worker.done_rendered_tiles,
+                     worker.done_sent_tiles, worker.done_failed ? 1 : 0);
+    }
+}
+
+auto note_worker_tile_packet(ChildWorker& worker, const TilePacketHeader& header, std::vector<unsigned char>& tile_seen,
+                             uint64_t& tiles_done) -> bool {
+    if (header.tile_index >= tile_seen.size()) {
+        std::println(stderr, "renderbench: tile index {} from {} outside total {}", header.tile_index, worker.hostname, tile_seen.size());
+        return false;
+    }
+
+    ++worker.received_packets;
+    worker.last_tile_index = header.tile_index;
+    if (worker.worker_count > 0 && static_cast<int>(header.tile_index % static_cast<uint32_t>(worker.worker_count)) != worker.worker_id) {
+        ++worker.foreign_tiles;
+        std::println(stderr, "renderbench: tile {} arrived from {} worker {} but belongs to worker {}", header.tile_index, worker.hostname,
+                     worker.worker_id, header.tile_index % static_cast<uint32_t>(worker.worker_count));
+    }
+
+    auto& seen = tile_seen.at(static_cast<size_t>(header.tile_index));
+    if (seen != 0) {
+        ++worker.duplicate_tiles;
+        return true;
+    }
+
+    seen = 1;
+    ++worker.unique_tiles;
+    ++tiles_done;
+    return true;
+}
+
+auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen, uint64_t& tiles_done)
+    -> bool {
     size_t consumed = 0;
     while (worker.buffer.size() - consumed >= sizeof(TilePacketHeader)) {
+        WorkerPacketKind const KIND = packet_kind_at(worker.buffer, consumed);
+        if (KIND == WorkerPacketKind::NONE) {
+            size_t const NEXT = find_packet_magic(worker.buffer, consumed + 1U);
+            if (NEXT == std::string::npos) {
+                consumed = worker.buffer.size() >= TILE_PACKET_MAGIC.size() - 1U ? worker.buffer.size() - (TILE_PACKET_MAGIC.size() - 1U)
+                                                                                 : consumed;
+                break;
+            }
+            std::println(stderr, "renderbench: resynchronized {} after skipping {} stray byte(s)", worker.hostname, NEXT - consumed);
+            consumed = NEXT;
+            continue;
+        }
+
+        if (KIND == WorkerPacketKind::DONE) {
+            WorkerDonePacket packet = {};
+            std::memcpy(&packet, worker.buffer.data() + consumed, sizeof(packet));
+            note_worker_done_packet(worker, packet);
+            consumed += sizeof(packet);
+            continue;
+        }
+
         TilePacketHeader header = {};
         std::memcpy(&header, worker.buffer.data() + consumed, sizeof(header));
-        size_t const PAYLOAD_BYTES = static_cast<size_t>(header.float_count) * sizeof(float);
+
+        size_t payload_floats = 0;
+        if (!validate_tile_header(film, header, payload_floats)) {
+            size_t const NEXT = find_packet_magic(worker.buffer, consumed + 1U);
+            if (NEXT == std::string::npos) {
+                std::println(stderr, "renderbench: invalid tile header from {} tile={} rect={}x{}..{}x{} floats={} buffered={}",
+                             worker.hostname, header.tile_index, header.x0, header.y0, header.x1, header.y1, header.float_count,
+                             worker.buffer.size() - consumed);
+                return false;
+            }
+            std::println(stderr, "renderbench: resynchronized {} after invalid tile header, skipped {} byte(s)", worker.hostname,
+                         NEXT - consumed);
+            consumed = NEXT;
+            continue;
+        }
+
+        size_t const PAYLOAD_BYTES = payload_floats * sizeof(float);
         size_t const PACKET_BYTES = sizeof(TilePacketHeader) + PAYLOAD_BYTES;
         if (worker.buffer.size() - consumed < PACKET_BYTES) {
             break;
         }
 
-        std::vector<float> payload(header.float_count);
+        if (header.tile_index >= tile_seen.size()) {
+            std::println(stderr, "renderbench: invalid tile index from {} tile={} total={}", worker.hostname, header.tile_index,
+                         tile_seen.size());
+            return false;
+        }
+
+        std::vector<float> payload(payload_floats);
         std::memcpy(payload.data(), worker.buffer.data() + consumed + sizeof(TilePacketHeader), PAYLOAD_BYTES);
         if (!apply_tile_payload(film, header, std::span<const float>(payload.data(), payload.size()))) {
             std::println(stderr, "renderbench: invalid tile packet from {}", worker.hostname);
             return false;
         }
-        ++tiles_done;
+        if (!note_worker_tile_packet(worker, header, tile_seen, tiles_done)) {
+            return false;
+        }
         consumed += PACKET_BYTES;
     }
 
@@ -492,7 +688,8 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, uint64
     return true;
 }
 
-auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, uint64_t& tiles_done) -> bool {
+auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen, uint64_t& tiles_done)
+    -> bool {
     std::array<unsigned char, 16384> chunk = {};
     for (;;) {
         ssize_t const READ = ::read(worker.read_fd, chunk.data(), chunk.size());
@@ -515,7 +712,23 @@ auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, uint64_t&
         std::perror("renderbench: read worker pipe");
         return false;
     }
-    return parse_worker_packets(worker, film, tiles_done);
+    return parse_worker_packets(worker, film, tile_seen, tiles_done);
+}
+
+void print_partial_worker_packet(const ChildWorker& worker) {
+    std::println(stderr, "renderbench: partial worker packet left by {} worker={} received={}/{} last_tile={} ({} byte(s) buffered)",
+                 worker.hostname, worker.worker_id, worker.unique_tiles, worker.expected_tiles,
+                 worker.last_tile_index == UINT64_MAX ? 0 : worker.last_tile_index, worker.buffer.size());
+    if (worker.buffer.size() < sizeof(TilePacketHeader)) {
+        return;
+    }
+
+    TilePacketHeader header = {};
+    std::memcpy(&header, worker.buffer.data(), sizeof(header));
+    std::println(stderr, "renderbench: partial header tile={} rect={}x{}..{}x{} floats={} magic={},{},{},{}", header.tile_index, header.x0,
+                 header.y0, header.x1, header.y1, header.float_count, static_cast<unsigned>(worker.buffer.at(0)),
+                 static_cast<unsigned>(worker.buffer.at(1)), static_cast<unsigned>(worker.buffer.at(2)),
+                 static_cast<unsigned>(worker.buffer.at(3)));
 }
 
 void set_nonblocking(int fd) {
@@ -636,11 +849,55 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
     out = {
         .pid = PID,
         .read_fd = pipe_fds[0],
+        .worker_id = spec.worker_id,
+        .worker_count = spec.worker_count,
         .hostname = spec.hostname,
         .buffer = {},
         .pipe_open = true,
     };
     return true;
+}
+
+auto expected_tile_count_for_worker(size_t total_tiles, int worker_id, int worker_count) -> uint64_t {
+    if (worker_count <= 0 || worker_id < 0 || worker_id >= worker_count) {
+        return 0;
+    }
+    size_t const FIRST = static_cast<size_t>(worker_id);
+    if (FIRST >= total_tiles) {
+        return 0;
+    }
+    return static_cast<uint64_t>(((total_tiles - 1U - FIRST) / static_cast<size_t>(worker_count)) + 1U);
+}
+
+void print_missing_tile_summary(std::span<const unsigned char> tile_seen) {
+    constexpr size_t MAX_RANGES = 16;
+    size_t printed = 0;
+    size_t missing_total = 0;
+    size_t index = 0;
+    while (index < tile_seen.size()) {
+        if (tile_seen[index] != 0) {
+            ++index;
+            continue;
+        }
+
+        size_t const START = index;
+        while (index < tile_seen.size() && tile_seen[index] == 0) {
+            ++index;
+        }
+        size_t const END = index - 1U;
+        missing_total += END - START + 1U;
+        if (printed < MAX_RANGES) {
+            if (START == END) {
+                std::println(stderr, "renderbench: missing tile {}", START);
+            } else {
+                std::println(stderr, "renderbench: missing tiles {}..{}", START, END);
+            }
+            ++printed;
+        }
+    }
+    if (printed == MAX_RANGES && missing_total > printed) {
+        std::println(stderr, "renderbench: {} missing tile(s) total", missing_total);
+    }
 }
 
 void signal_workers(std::span<ChildWorker> workers, int signum) {
@@ -792,6 +1049,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     std::vector<WorkerThreadState> states(static_cast<size_t>(THREADS));
     std::atomic<int> next_tile{0};
     std::atomic<bool> failed{false};
+    std::atomic<uint64_t> tiles_rendered{0};
+    std::atomic<uint64_t> tiles_sent{0};
     mtx_t output_lock{};
     if (mtx_init(&output_lock, MTX_PLAIN) != THRD_SUCCESS) {
         std::println(stderr, "renderbench: failed to initialize worker output lock");
@@ -807,6 +1066,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             .tiles = &assigned_tiles,
             .next_tile = &next_tile,
             .failed = &failed,
+            .tiles_rendered = &tiles_rendered,
+            .tiles_sent = &tiles_sent,
             .output_lock = &output_lock,
         };
         if (thrd_create(&threads[static_cast<size_t>(i)], worker_thread, &states[static_cast<size_t>(i)]) != THRD_SUCCESS) {
@@ -820,8 +1081,18 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     for (int i = 0; i < created_threads; ++i) {
         thrd_join(threads[static_cast<size_t>(i)], nullptr);
     }
+
+    uint64_t const EXPECTED = assigned_tiles.size();
+    uint64_t const RENDERED = tiles_rendered.load(std::memory_order_relaxed);
+    uint64_t const SENT = tiles_sent.load(std::memory_order_relaxed);
+    bool const WORKER_FAILED = failed.load(std::memory_order_relaxed) || RENDERED != EXPECTED || SENT != EXPECTED;
+    bool const DONE_SENT = send_worker_done_packet(WORKER_STDOUT_FD, worker.worker_id, EXPECTED, RENDERED, SENT, WORKER_FAILED);
+    if (WORKER_FAILED || !DONE_SENT) {
+        std::println(stderr, "renderbench: worker {} completed host-side with expected={} rendered={} sent={} failed={} done_sent={}",
+                     worker.worker_id, EXPECTED, RENDERED, SENT, failed.load(std::memory_order_relaxed) ? 1 : 0, DONE_SENT ? 1 : 0);
+    }
     mtx_destroy(&output_lock);
-    return failed.load(std::memory_order_relaxed) ? 2 : 0;
+    return WORKER_FAILED || !DONE_SENT ? 2 : 0;
 }
 
 auto wait_for_children(std::span<ChildWorker> workers, bool cancellation_expected) -> bool {
@@ -858,6 +1129,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     auto storage = tracebench::make_film_storage(options.width, options.height);
     tracebench::FilmView film{.width = options.width, .height = options.height, .rgb = std::span<float>(storage.data(), storage.size())};
     std::vector<ChildWorker> workers(specs.size());
+    std::vector<unsigned char> tile_seen(tiles.size(), 0);
     std::string const PROGRAM_PATH = renderbench_program_path(argv0);
 
     double const STARTED = tracebench::monotonic_seconds();
@@ -871,6 +1143,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             (void)wait_for_children(std::span<ChildWorker>(workers.data(), i), true);
             return 2;
         }
+        workers[i].expected_tiles = expected_tile_count_for_worker(tiles.size(), specs[i].worker_id, specs[i].worker_count);
         if (cancel_requested()) {
             signal_workers(std::span<ChildWorker>(workers.data(), i + 1U), static_cast<int>(g_cancel_signal));
             (void)wait_for_children(std::span<ChildWorker>(workers.data(), i + 1U), true);
@@ -895,14 +1168,28 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             if (!worker.pipe_open) {
                 continue;
             }
-            if (!drain_worker_pipe(worker, film, tiles_done)) {
+            if (!drain_worker_pipe(worker, film, tile_seen, tiles_done)) {
                 ok = false;
                 worker.pipe_open = false;
             }
             if (!worker.pipe_open) {
                 --open_pipes;
                 if (!worker.buffer.empty()) {
-                    std::println(stderr, "renderbench: partial tile packet left by {}", worker.hostname);
+                    print_partial_worker_packet(worker);
+                    if (worker.unique_tiles != worker.expected_tiles || worker.buffer.size() >= sizeof(TilePacketHeader)) {
+                        ok = false;
+                    }
+                }
+                if (worker.done_failed) {
+                    ok = false;
+                }
+                if (worker.unique_tiles != worker.expected_tiles) {
+                    std::println(stderr,
+                                 "renderbench: worker {} on {} delivered {}/{} unique tiles packets={} duplicates={} foreign={} done={}"
+                                 " done_sent={}/{}",
+                                 worker.worker_id, worker.hostname, worker.unique_tiles, worker.expected_tiles, worker.received_packets,
+                                 worker.duplicate_tiles, worker.foreign_tiles, worker.done_seen ? 1 : 0, worker.done_sent_tiles,
+                                 worker.done_expected_tiles);
                     ok = false;
                 }
             }
@@ -928,6 +1215,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     ok = wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), cancellation_sent) && ok;
     if (tiles_done != tiles.size()) {
         std::println(stderr, "renderbench: completed {} of {} tiles", tiles_done, tiles.size());
+        print_missing_tile_summary(tile_seen);
         ok = false;
     }
     if (!ok) {

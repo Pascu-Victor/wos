@@ -15,6 +15,7 @@ REMOTE_USER="${WOS_SSH_USER:-root}"
 REMOTE_PORT="${WOS_SSH_PORT:-}"
 
 SSH_ARGS=(
+  -F /dev/null
   -o BatchMode=yes
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null

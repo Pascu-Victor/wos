@@ -169,8 +169,10 @@ void resume_syscall_accounting();
 
 void preempt_disable();
 void preempt_disable_at(uint64_t caller);
+[[nodiscard]] auto preempt_disable_token_at(uint64_t caller) -> task::Task*;
 void preempt_enable();
 void preempt_enable_at(uint64_t caller);
+void preempt_enable_token_at(task::Task* task, uint64_t caller);
 auto preempt_count() -> uint32_t;
 bool preemptible();
 void note_preempt_disabled_block(const char* op, uint64_t perf_callsite);

@@ -19,6 +19,18 @@ constexpr size_t PKT_POOL_PER_NIC = 1024;
 // Runtime expansion granularity. Rounded to keep slab counts close to ring sizes.
 constexpr size_t PKT_POOL_GROW_CHUNK = 256;
 
+struct PacketPoolSnapshot {
+    size_t capacity = 0;
+    size_t free = 0;
+    size_t used = 0;
+    size_t rx_reserve = 0;
+    size_t grow_chunk = 0;
+    size_t buffer_size = 0;
+    size_t headroom = 0;
+    uint32_t tx_refused = 0;
+    bool expand_in_progress = false;
+};
+
 struct PacketBuffer {
     std::array<uint8_t, PKT_BUF_SIZE> storage{};
     uint8_t* data{};            // current data pointer
@@ -66,6 +78,7 @@ void pkt_pool_init();
 void pkt_pool_expand_for_nics();       // Call after NIC drivers have registered
 auto pkt_pool_size() -> size_t;        // Get current pool size
 auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
+auto pkt_pool_snapshot() -> PacketPoolSnapshot;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)

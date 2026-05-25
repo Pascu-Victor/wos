@@ -2,6 +2,7 @@
 
 #include <bits/ssize_t.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -24,6 +25,8 @@ constexpr auto UDP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
 constexpr int SO_REUSEADDR = 2;
 constexpr int SO_RCVBUF = 8;
 constexpr int SO_REUSEPORT = 15;
+constexpr int SO_BINDTODEVICE = 25;
+constexpr int SOL_SOCKET_LEVEL = 1;
 constexpr int POLLIN = 0x001;
 constexpr int POLLOUT = 0x004;
 
@@ -57,6 +60,14 @@ auto alloc_binding() -> UdpBinding* {
         }
     }
     return nullptr;
+}
+
+auto binding_accepts_dev(const UdpBinding* binding, NetDevice const* dev) -> bool {
+    if (binding == nullptr || binding->sock == nullptr) {
+        return false;
+    }
+    uint32_t const BOUND_IFINDEX = binding->sock->bound_ifindex;
+    return BOUND_IFINDEX == 0 || (dev != nullptr && dev->ifindex == BOUND_IFINDEX);
 }
 
 int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
@@ -235,7 +246,7 @@ void udp_close(Socket* sock) {
 }
 
 int udp_shutdown(Socket* /*unused*/, int /*unused*/) { return 0; }
-int udp_setsockopt(Socket* sock, int /*unused*/, int optname, const void* optval, size_t optlen) {
+int udp_setsockopt(Socket* sock, int level, int optname, const void* optval, size_t optlen) {
     int optint = 0;
     if (optval != nullptr && optlen >= sizeof(optint)) {
         std::memcpy(&optint, optval, sizeof(optint));
@@ -249,6 +260,26 @@ int udp_setsockopt(Socket* sock, int /*unused*/, int optname, const void* optval
     }
     if (optname == SO_RCVBUF && optlen >= sizeof(int)) {
         socket_resize_rcvbuf(sock, static_cast<size_t>(optint));
+    }
+    if (level == SOL_SOCKET_LEVEL && optname == SO_BINDTODEVICE) {
+        if (optval == nullptr || optlen == 0) {
+            sock->bound_ifindex = 0;
+            return 0;
+        }
+
+        std::array<char, NETDEV_NAME_LEN> ifname{};
+        size_t const COPY_LEN = std::min(optlen, ifname.size() - 1);
+        std::memcpy(ifname.data(), optval, COPY_LEN);
+        if (ifname.front() == '\0') {
+            sock->bound_ifindex = 0;
+            return 0;
+        }
+
+        auto* dev = netdev_find_by_name(ifname.data());
+        if (dev == nullptr) {
+            return -1;
+        }
+        sock->bound_ifindex = dev->ifindex;
     }
     // SO_SNDBUF (7): UDP has no kernel send buffer - accept silently
     return 0;
@@ -315,9 +346,15 @@ void udp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
     Socket* wake_sock = nullptr;
     udp_lock.lock();
     auto* binding = find_binding(dst_ip, DST_PORT);
+    if (!binding_accepts_dev(binding, dev)) {
+        binding = nullptr;
+    }
     if (binding == nullptr) {
         // Try INADDR_ANY
         binding = find_binding(0, DST_PORT);
+        if (!binding_accepts_dev(binding, dev)) {
+            binding = nullptr;
+        }
     }
 
     if (binding != nullptr && binding->sock != nullptr) {

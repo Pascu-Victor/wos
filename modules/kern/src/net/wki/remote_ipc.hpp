@@ -11,6 +11,8 @@
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 
+#include "platform/sched/task.hpp"
+
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
@@ -126,9 +128,10 @@ struct ProxyIpcState {
     // Local ring buffer for pipe data (filled by wire message handler)
     uint8_t* ring_buf = nullptr;  // allocated ring data
     uint32_t ring_capacity = 0;
-    std::atomic<uint32_t> ring_head{0};     // writer (message handler) position
-    std::atomic<uint32_t> ring_tail{0};     // reader (proxy_pipe_read) position
-    std::atomic<uint32_t> write_closed{0};  // set when home sends EOF/close
+    std::atomic<uint32_t> ring_head{0};      // writer (message handler) position
+    std::atomic<uint32_t> ring_tail{0};      // reader (proxy_pipe_read) position
+    std::atomic<uint32_t> write_closed{0};   // set when home sends EOF/close
+    std::atomic<uint64_t> bytes_written{0};  // bytes accepted by proxy_pipe_write()
 
     // Blocked reader task (for wakeup from message handler)
     std::atomic<ker::mod::sched::task::Task*> blocked_reader{nullptr};
@@ -169,6 +172,7 @@ struct WkiIpcExport {
     ker::vfs::File* file = nullptr;  // refcount bumped; original file kept alive
     uint16_t assigned_channel = 0;
     uint16_t consumer_node = WKI_NODE_INVALID;
+    uint64_t pipe_bytes_received = 0;
 
     // Server-side pump state
     std::atomic<bool> pump_running{false};
@@ -209,6 +213,15 @@ void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out);
 // Iterates fd_table, identifies IPC primitives, creates exports.
 // Returns the number of exported fds, fills map_out.
 auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_node, WkiIpcFdEntry* map_out, uint16_t* count_out) -> bool;
+
+// Tear down exports created by wki_ipc_export_task_fds() for one submitted task.
+// This is idempotent and is used when submit/cancel/complete cleanup must not
+// depend on the remote proxy close packet making it back to the home node.
+void wki_ipc_cleanup_exported_fds(const WkiIpcFdEntry* map, uint16_t count, uint16_t consumer_node);
+
+// If one of task's local pipe fds already has its sibling exported to a remote
+// node, return that node so pipeline stages can stay co-located.
+auto wki_ipc_find_pipe_affinity_node(const ker::mod::sched::task::Task* task, uint16_t* node_out) -> bool;
 
 // Attach IPC proxy fds on the remote task after TASK_SUBMIT.
 // Replaces File::fops with proxy fops for each IPC fd.

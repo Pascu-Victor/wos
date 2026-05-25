@@ -105,6 +105,7 @@ void wake_socket(Socket* sock) {
 
 // Free all retransmit entries.
 void drain_retransmit_queue(TcpCB* cb) {
+    [[maybe_unused]]
     size_t n = 0;
     while (cb->retransmit_head != nullptr) {
         auto* entry = cb->retransmit_head;
@@ -116,9 +117,11 @@ void drain_retransmit_queue(TcpCB* cb) {
         n++;
     }
     cb->retransmit_tail = nullptr;
+#ifdef TCP_DEBUG
     if (n > 0) {
         log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local_port, ker::net::pkt_pool_free_count());
     }
+#endif
 }
 
 auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, size_t payload_len) -> bool {
