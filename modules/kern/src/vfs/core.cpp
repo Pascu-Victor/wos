@@ -3511,7 +3511,13 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
             log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);
             return -ENOENT;
         }
-        ensure_wki_host_root_mount(pathBuffer);
+        // Stat probes for exact /wki/<host> entries are common during shell
+        // completion. Do not turn those metadata checks into synchronous remote
+        // attaches; deeper paths still lazy-mount below when they are actually
+        // accessed.
+        if (!is_wki_entry) {
+            ensure_wki_host_root_mount(pathBuffer);
+        }
     } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer)) < 0) {
         return -ENOENT;
     }
