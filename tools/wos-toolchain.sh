@@ -418,7 +418,7 @@ $B/src/dropbear/configure \
     --disable-syslog \
     --disable-harden
 
-make -j$(nproc) CFLAGS="$DROPBEAR_CFLAGS" PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
 
 cp $B/dropbear-build/dropbearmulti $SYSROOT/bin/dropbearmulti
 echo "Dropbear installed to $SYSROOT/bin/dropbearmulti"
